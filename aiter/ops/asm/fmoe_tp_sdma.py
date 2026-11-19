@@ -36,8 +36,15 @@ _WIN_CFGS = {
     3584: ((2048, 1024, 512),),
     2560: ((1280, 768, 512),),
 }
-_EPI_Q = ("add_rmsnorm_fp4", "add_rmsnorm_fp8", "rmsnorm_only_fp4", "rmsnorm_only_fp8")
-EPI_MODES = ("add_rmsnorm", "rmsnorm_only", "raw_bf16", *_EPI_Q)
+_EPI_Q = (
+    "add_rmsnorm_fp4",
+    "add_rmsnorm_fp4_shuf",
+    "add_rmsnorm_fp8",
+    "rmsnorm_only_fp4",
+    "rmsnorm_only_fp4_shuf",
+    "rmsnorm_only_fp8",
+)
+EPI_MODES = ("add_rmsnorm", "rmsnorm_only", "raw_bf16", "raw_bf16_sp", *_EPI_Q)
 _ERR_NAMES = {1: "RS flag timeout", 2: "AG flag timeout", 4: "local counter timeout"}
 _LOCK, _LOADED, _POOL = threading.RLock(), set(), {}
 _U64_29, _U32_3 = ctypes.c_uint64 * 29, ctypes.c_uint32 * 3
@@ -73,6 +80,27 @@ class TpMoeOut:
     out: Tensor
     residual_out: Tensor | None = None
     out_scale: Tensor | None = None
+    row_start: int = 0
+    valid_rows: int = 0
+    l_rows: int = 0
+
+
+def sp_pad_rows(
+    tokens: int,
+    model_dim: int,
+    world: int,
+    align_rows: int = 32,
+) -> tuple[int, int]:
+    """Return ``(L_rows, T_phys)`` for ``raw_bf16_sp`` cross-window owner alignment."""
+    wins = _WIN_CFGS.get(int(model_dim))
+    if wins is None:
+        raise ValueError(f"unsupported model_dim={model_dim} for sp_pad_rows")
+    q = int(align_rows)
+    for cw in wins[0]:
+        q = math.lcm(q, 2048 // math.gcd(2048, int(cw)))
+    ru = int(world) * q
+    l_rows = ((int(tokens) + ru - 1) // ru) * q
+    return l_rows, int(world) * l_rows
 
 
 def quantize_moe_input(x: Tensor, a_dtype: str = "fp4") -> tuple[Tensor, Tensor]:
@@ -530,8 +558,16 @@ def tp_moe_layer_asm(
         ctx = ctx.context
     ctx._ensure_open()
     res_o, co_dir = kw.get("residual_out"), kw.get("co_dir")
+    out_scale_shuffled = bool(kw.get("out_scale_shuffled", False))
     a_dt, act_n = kw.get("a_dtype", "fp4"), kw.get("act", "silu")
     act_n = "situ" if act_n == "situv2" else act_n
+    if out_scale_shuffled:
+        if epi_mode in ("add_rmsnorm_fp4", "rmsnorm_only_fp4"):
+            epi_mode = f"{epi_mode}_shuf"
+        elif not epi_mode.endswith("_fp4_shuf"):
+            raise ValueError(
+                f"out_scale_shuffled=True requires fp4 epilogue mode, got {epi_mode!r}"
+            )
     bad_m = epi_mode not in EPI_MODES or a_dt not in ("fp4", "fp8")
     if bad_m or act_n not in ("silu", "situ"):
         raise ValueError(f"unsupported epi={epi_mode!r}, a_dtype={a_dt!r}")
@@ -584,8 +620,12 @@ def tp_moe_layer_asm(
     ):
         if t.device != ctx.device or not t.is_contiguous():
             raise ValueError(f"{nm} must be contiguous on {ctx.device}")
-    is_add, is_norm = epi_mode.startswith("add_rmsnorm"), epi_mode != "raw_bf16"
-    is_fp4_o, is_fp8_o = epi_mode.endswith("_fp4"), epi_mode.endswith("_fp8")
+    is_raw_sp = epi_mode == "raw_bf16_sp"
+    is_add = epi_mode.startswith("add_rmsnorm")
+    is_norm = epi_mode not in ("raw_bf16", "raw_bf16_sp")
+    is_shuf_fp4 = epi_mode.endswith("_fp4_shuf")
+    is_fp4_o = epi_mode.endswith("_fp4") or is_shuf_fp4
+    is_fp8_o = epi_mode.endswith("_fp8")
     bp = (float(kw.get("beta1", 4.0)), float(kw.get("beta2", 25.0)))
     bad_eps = is_norm and abs(float(call.eps) - 1e-6) > 1e-12
     if bad_eps or (act_n == "situ" and bp != (4.0, 25.0)):
@@ -619,20 +659,41 @@ def tp_moe_layer_asm(
     if is_fp4_o or is_fp8_o:
         oc, odt = (d // 2, dtypes.fp4x2) if is_fp4_o else (d, dtypes.fp8)
         out = emp((tokens, oc), odt) if out is None else out
-        sc_shape = (tokens, d // 32)
+        if is_shuf_fp4:
+            sc_shape = (((tokens + 255) // 256) * 256, (((d // 32) + 7) // 8) * 8)
+        else:
+            sc_shape = (tokens, d // 32)
         out_scale = emp(sc_shape, dtypes.fp8_e8m0) if out_scale is None else out_scale
         if (
             out.device != ctx.device
             or out_scale.device != ctx.device
             or not (ok_1b(out, (tokens, oc)) and ok_1b(out_scale, sc_shape))
             or out.nbytes < tokens * oc
-            or out_scale.nbytes < tokens * (d // 32)
+            or out_scale.nbytes < sc_shape[0] * sc_shape[1]
             or out.dtype not in (odt, torch.uint8)
             or out_scale.dtype not in (dtypes.fp8_e8m0, torch.uint8)
         ):
             raise ValueError(f"invalid out or out_scale for {epi_mode!r}")
         if _ranges_overlap(out, out_scale):
             raise ValueError("out and out_scale must not overlap")
+        row_start, valid_rows, l_rows = 0, tokens, tokens
+    elif is_raw_sp:
+        l_rows, _ = sp_pad_rows(tokens, d, ctx.world)
+        row_start = ctx.rank * l_rows
+        valid_rows = max(0, min(l_rows, tokens - row_start))
+        out = emp((l_rows, d), dtypes.bf16) if out is None else out
+        if (
+            out.shape != (l_rows, d)
+            or out.dtype != dtypes.bf16
+            or out.nbytes < l_rows * d * 2
+            or not out.is_contiguous()
+            or out.device != ctx.device
+        ):
+            raise ValueError(
+                f"invalid bf16 out {tuple(out.shape)} {out.dtype} for {epi_mode!r} "
+                f"(expected ({l_rows}, {d}))"
+            )
+        out_scale = None
     else:
         out = emp((tokens, d), dtypes.bf16) if out is None else out
         if (
@@ -646,6 +707,7 @@ def tp_moe_layer_asm(
                 f"invalid bf16 out {tuple(out.shape)} {out.dtype} for {epi_mode!r}"
             )
         out_scale = None
+        row_start, valid_rows, l_rows = 0, tokens, tokens
     res_u = res_o if is_norm else None
     res_u = emp((tokens, d), dtypes.bf16) if (is_add and res_u is None) else res_u
     if is_add:
@@ -699,21 +761,34 @@ def tp_moe_layer_asm(
         karg = _FmoeTpKernarg(_U64_29(*u64s), _U32_3(ctx.rank, tokens, st.inbox_bytes))
         stream = _au.current_raw_stream(ctx.device_idx)
         _au.launch_co(fn, (512, 1, 1), (256, 1, 1), karg, stream)
-    return TpMoeOut(out, res_u if is_add else res_o, out_scale)
+    return TpMoeOut(
+        out,
+        res_u if is_add else res_o,
+        out_scale,
+        row_start=row_start,
+        valid_rows=valid_rows,
+        l_rows=l_rows,
+    )
 
 
 def prepare_downstream_mx_inputs(
-    out_q: Tensor, out_scale: Tensor, a_dtype: str = "fp4"
+    out_q: Tensor,
+    out_scale: Tensor,
+    a_dtype: str = "fp4",
+    scale_shuffled: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Prepare ``tp_moe_layer_asm`` quantized epilogue outputs for AITER dense MX GEMMs.
 
     - ``a_dtype == "fp4"``: ``gemm_a4w4`` on gfx950 consumes ``mfma_tile`` (32x8)
-      preshuffled ``e8m0`` scales, so ``out_scale`` is shuffled via
-      ``fp4_utils.e8m0_shuffle``.
+      preshuffled ``e8m0`` scales. When ``scale_shuffled=True`` (from
+      ``add_rmsnorm_fp4_shuf``), ``out_scale`` is already preshuffled and returned
+      with zero copy; otherwise it is shuffled via ``fp4_utils.e8m0_shuffle``.
     - ``a_dtype == "fp8"``: ``gemm_a8w8_mxfp8_bpreshuffle`` on gfx950 consumes
       plain row-major ``[T, D // 32]`` ``e8m0`` scales directly with zero copy.
     """
     if a_dtype == "fp4":
+        if scale_shuffled:
+            return out_q, out_scale
         from aiter.utility import fp4_utils
 
         return out_q, fp4_utils.e8m0_shuffle(out_scale)
@@ -730,5 +805,6 @@ __all__ = [
     "TpMoeOut",
     "prepare_downstream_mx_inputs",
     "quantize_moe_input",
+    "sp_pad_rows",
     "tp_moe_layer_asm",
 ]

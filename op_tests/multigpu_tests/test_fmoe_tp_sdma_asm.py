@@ -320,7 +320,7 @@ def test_zero_flydsl_import() -> None:
     )
     c2 = (
         "from aiter.ops.asm.fmoe_tp_sdma import load_fmoe_tp_sdma_registry as r; "
-        "assert len(EPI_MODES)==7 and len(r())==108"
+        "assert len(EPI_MODES)==10 and len(r())==144"
     )
     env = {**os.environ, "PYTHONPATH": f"{_REPO_ROOT}:{os.getenv('PYTHONPATH', '')}"}
     subprocess.run([sys.executable, "-c", f"{c1}{c2}"], check=True, env=env)
@@ -513,6 +513,32 @@ def test_hardened_v2_validation_and_manifest(tmp_path) -> None:
             out_scale=sc_overlap,
         )
 
+    # 3b. raw_bf16_sp & add_rmsnorm_fp4_shuf host validation + prepare_downstream_mx_inputs
+    assert mod.sp_pad_rows(19, 2560, 4) == (32, 128)
+    assert mod.sp_pad_rows(517, 4096, 4) == (160, 640)
+    with pytest.raises(ValueError, match="out_scale_shuffled=True"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_ok, wts, w1, w2, w1s, w2s, residual=x, norm_weight=nw),
+            ctx_fake,
+            "add_rmsnorm",
+            out_scale_shuffled=True,
+        )
+    sc_plain_t = torch.empty((t, d // 32), dtype=dtypes.fp8_e8m0)
+    sc_shuf_t = torch.empty((256, d // 32), dtype=dtypes.fp8_e8m0)
+    q_pass, s_pass = mod.prepare_downstream_mx_inputs(
+        out_fp4, sc_shuf_t, "fp4", scale_shuffled=True
+    )
+    assert q_pass.data_ptr() == out_fp4.data_ptr()
+    assert s_pass.data_ptr() == sc_shuf_t.data_ptr()
+    with pytest.raises(ValueError, match="invalid out or out_scale"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_ok, wts, w1, w2, w1s, w2s, residual=x, norm_weight=nw),
+            ctx_fake,
+            "add_rmsnorm_fp4_shuf",
+            out=out_fp4,
+            out_scale=sc_plain_t,
+        )
+
     # 4. Use-after-close refusal
     ctx_fake._closed = True
     with pytest.raises(RuntimeError, match="closed"):
@@ -583,3 +609,240 @@ def test_fmoe_tp_sdma_asm(tp: int, full: bool) -> None:
         sock.bind(("127.0.0.1", 0))
         init = f"tcp://127.0.0.1:{sock.getsockname()[1]}"
     mp.spawn(_worker, args=(tp, init, full), nprocs=tp, join=True)
+
+
+def _wave2_worker(rank: int, world: int, init: str) -> None:
+    import torch.distributed as dist
+
+    import aiter
+    from aiter import dtypes
+
+    sys.modules["flydsl"] = None
+    os.environ["AITER_USE_CK_MOE_SORTING"] = "1"
+    torch.cuda.set_device(rank)
+    dev = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "nccl", init_method=init, world_size=world, rank=rank, device_id=dev
+    )
+    gloo = dist.new_group(backend="gloo")
+    sync = torch.cuda.synchronize
+    try:
+        from aiter.ops.asm import (
+            TpAsmContext,
+            TpMoeCall,
+            prepare_downstream_mx_inputs,
+            sp_pad_rows,
+            tp_moe_layer_asm,
+        )
+        from aiter.ops.shuffle import shuffle_weight
+        from aiter.utility import fp4_utils
+
+        shapes = [
+            ("q38", 8192, 256, 10, 64, False),
+            ("v4_flash", 4096, 256, 6, 64, True),
+            ("flash_next", 2560, 384 if world == 2 else 256, 10, 64, True),
+        ]
+        ts_test = [19, 512, 517, 1021, 4096]
+        max_t = max(ts_test)
+        for s_idx, (sname, D, I, k, E, has_sp) in enumerate(shapes):
+            ctx = TpAsmContext(gloo, dev, max_t, D, k, E, I, slot_id=s_idx)
+            try:
+                g = torch.Generator(device="cuda").manual_seed(120 + rank)
+                w1 = torch.randint(
+                    0,
+                    256,
+                    (E, 2 * I, D // 2),
+                    device=dev,
+                    dtype=torch.uint8,
+                    generator=g,
+                ).view(dtypes.fp4x2)
+                w2 = torch.randint(
+                    0, 256, (E, D, I // 2), device=dev, dtype=torch.uint8, generator=g
+                ).view(dtypes.fp4x2)
+                w1s = torch.randint(
+                    121,
+                    124,
+                    (E, 2 * I, D // 32),
+                    device=dev,
+                    dtype=torch.uint8,
+                    generator=g,
+                ).view(dtypes.fp8_e8m0)
+                w2s = torch.randint(
+                    121,
+                    124,
+                    (E, D, I // 32),
+                    device=dev,
+                    dtype=torch.uint8,
+                    generator=g,
+                ).view(dtypes.fp8_e8m0)
+                # Downstream GEMM weight (N=256, K=D) in MXFP4 preshuffled format
+                n_gemm = 256
+                gw_raw = torch.randint(
+                    0, 256, (n_gemm, D // 2), device=dev, dtype=torch.uint8, generator=g
+                ).view(dtypes.fp4x2)
+                gws_raw = torch.randint(
+                    122,
+                    129,
+                    (n_gemm, D // 32),
+                    device=dev,
+                    dtype=torch.uint8,
+                    generator=g,
+                ).view(dtypes.fp8_e8m0)
+                gw = shuffle_weight(gw_raw, layout=(16, 16))
+                gws = fp4_utils.e8m0_shuffle(gws_raw)
+
+                for T in ts_test:
+                    g_in = torch.Generator(device="cuda").manual_seed(700 + T + rank)
+                    xa = (
+                        torch.randn(
+                            (T, D), device=dev, dtype=dtypes.bf16, generator=g_in
+                        )
+                        * 0.25
+                    )
+                    res = (
+                        torch.randn(
+                            (T, D), device=dev, dtype=dtypes.bf16, generator=g_in
+                        )
+                        * 0.25
+                    )
+                    nw = (
+                        torch.rand((D,), device=dev, dtype=dtypes.bf16, generator=g_in)
+                        * 0.5
+                        + 0.75
+                    )
+                    ids = (
+                        torch.topk(
+                            torch.randn((T, E), device=dev, generator=g_in),
+                            k,
+                            dim=-1,
+                        )
+                        .indices.to(torch.int32)
+                        .contiguous()
+                    )
+                    wts = torch.softmax(
+                        torch.randn(
+                            (T, k), device=dev, dtype=torch.float32, generator=g_in
+                        ),
+                        dim=-1,
+                    )
+                    call = TpMoeCall(
+                        xa, ids, wts, w1, w2, w1s, w2s, residual=res, norm_weight=nw
+                    )
+
+                    # 1. Verify add_rmsnorm_fp4_shuf byte-exact vs fp4_utils.e8m0_shuffle
+                    _ = tp_moe_layer_asm(call, ctx, "add_rmsnorm_fp4")
+                    ctx.check_error()
+                    sync()
+                    out_p = tp_moe_layer_asm(call, ctx, "add_rmsnorm_fp4")
+                    ctx.check_error()
+                    sync()
+                    t_pad = ((T + 255) // 256) * 256
+                    s_cols = (((D // 32) + 7) // 8) * 8
+                    sc_shuf_buf = torch.full(
+                        (t_pad, s_cols), 0xAA, device=dev, dtype=torch.uint8
+                    ).view(dtypes.fp8_e8m0)
+                    out_s = tp_moe_layer_asm(
+                        call,
+                        ctx,
+                        "add_rmsnorm_fp4",
+                        out_scale=sc_shuf_buf,
+                        out_scale_shuffled=True,
+                    )
+                    ctx.check_error()
+                    sync()
+
+                    q_ref, sc_ref = prepare_downstream_mx_inputs(
+                        out_p.out, out_p.out_scale, "fp4", scale_shuffled=False
+                    )
+                    q_shuf, sc_shuf = prepare_downstream_mx_inputs(
+                        out_s.out, out_s.out_scale, "fp4", scale_shuffled=True
+                    )
+                    assert sc_shuf.data_ptr() == sc_shuf_buf.data_ptr()
+
+                    if torch.equal(out_s.residual_out, out_p.residual_out):
+                        assert torch.equal(
+                            out_s.out.view(torch.uint8), out_p.out.view(torch.uint8)
+                        ), f"{sname} T={T} out_q mismatch"
+                        assert torch.equal(
+                            sc_shuf.view(torch.uint8), sc_ref.view(torch.uint8)
+                        ), f"{sname} T={T} out_scale byte mismatch"
+
+                        gemm_ref = aiter.gemm_a4w4(
+                            q_ref, gw, sc_ref, gws, None, dtypes.bf16, bpreshuffle=True
+                        )
+                        gemm_shuf = aiter.gemm_a4w4(
+                            q_shuf,
+                            gw,
+                            sc_shuf,
+                            gws,
+                            None,
+                            dtypes.bf16,
+                            bpreshuffle=True,
+                        )
+                        assert torch.equal(
+                            gemm_ref, gemm_shuf
+                        ), f"{sname} T={T} gemm_a4w4 not bit-identical"
+                    else:
+                        assert (
+                            sname == "flash_next" and world == 2
+                        ), f"{sname} TP={world} T={T} unexpected residual_out diff"
+                        gemm_shuf = aiter.gemm_a4w4(
+                            q_shuf,
+                            gw,
+                            sc_shuf,
+                            gws,
+                            None,
+                            dtypes.bf16,
+                            bpreshuffle=True,
+                        )
+                        assert torch.isfinite(gemm_shuf).all()
+
+                    # 2. Verify raw_bf16_sp ragged & poisoned-tail correctness
+                    if has_sp:
+                        l_rows, _ = sp_pad_rows(T, D, world)
+                        sp_buf = torch.full(
+                            (l_rows, D), 777.0, device=dev, dtype=dtypes.bf16
+                        )
+                        out_raw = tp_moe_layer_asm(call, ctx, "raw_bf16")
+                        ctx.check_error()
+                        out_sp = tp_moe_layer_asm(call, ctx, "raw_bf16_sp", out=sp_buf)
+                        ctx.check_error()
+                        sync()
+
+                        r0 = out_sp.row_start
+                        vr = out_sp.valid_rows
+                        assert vr == max(0, min(l_rows, T - r0))
+                        if vr > 0:
+                            sp_f = out_sp.out[:vr].float()
+                            raw_f = out_raw.out[r0 : r0 + vr].float()
+                            assert torch.isfinite(sp_f).all()
+                            sc_n = raw_f.abs().max().clamp_min(1.0)
+                            rel = float(
+                                ((sp_f - raw_f) / sc_n).norm()
+                                / (raw_f / sc_n).norm().clamp_min(1e-6)
+                            )
+                            assert (
+                                rel < 0.12
+                            ), f"{sname} T={T} raw_bf16_sp rel diff vs raw_bf16 too high: {rel:.4f}"
+                        if vr < l_rows:
+                            assert torch.all(
+                                out_sp.out[vr:] == 777.0
+                            ), f"{sname} T={T} raw_bf16_sp clobbered tail"
+            finally:
+                ctx.close()
+                sync()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_fmoe_tp_sdma_wave2_sp_and_shuf_scale(tp: int) -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
+        pytest.skip(f"requires >= {tp} GPUs")
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
+    if arch != "gfx950":
+        pytest.skip("fmoe_tp_sdma requires gfx950")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        init = f"tcp://127.0.0.1:{sock.getsockname()[1]}"
+    mp.spawn(_wave2_worker, args=(tp, init), nprocs=tp, join=True)
