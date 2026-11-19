@@ -653,6 +653,7 @@ def build_qsa_indexer_prefill_scores_module(
     k_strides: tuple[int, int, int] | None = None,
     block_n: int = _ROWS_BLOCK_N,
     fold_heads: bool = False,
+    store_key16: bool = False,
 ):
     """Build the 16-row MFMA scorer, ``block_n`` columns per workgroup.
 
@@ -668,6 +669,11 @@ def build_qsa_indexer_prefill_scores_module(
     instead of 16 rows per head: a tile is 4 rows, one MFMA chain, and each
     lane holds one row's four heads, so the head sum stays in the lane. An
     MTP batch with 4 rows per request then has one request per tile.
+
+    ``store_key16`` writes the high 16 bits of the order-preserving fp32 key
+    into an int16 buffer. A column that is invisible or on a missing page
+    stores -1, which sorts below every positive key. The default store is
+    the fp32 score, unchanged.
     """
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
@@ -725,6 +731,7 @@ def build_qsa_indexer_prefill_scores_module(
             fh=int(fold_heads),
             wide=int(wide_cache),
             **({"kvs": "x".join(str(s) for s in k_strides)} if strided_wide else {}),
+            **({"k16": 1} if store_key16 else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -1011,9 +1018,20 @@ def build_qsa_indexer_prefill_scores_module(
                                 # ``scores`` must keep a dynamic row stride:
                                 # a static layout, use_32bit_stride=True, or
                                 # an Int32 linear index would wrap.
-                                scores[row_t, out_col_t] = live_t.select(
-                                    score_t * score_scale, _neg_inf()
-                                )
+                                scored_t = score_t * score_scale
+                                if const_expr(store_key16):
+                                    bits_t = scored_t.bitcast(Int32)
+                                    ordered_t = bits_t ^ (
+                                        (bits_t >> Int32(31)) & Int32(0x7FFFFFFF)
+                                    )
+                                    scores[row_t, out_col_t] = live_t.select(
+                                        (ordered_t >> Int32(16)).to(fx.Int16),
+                                        fx.Int16(-1),
+                                    )
+                                else:
+                                    scores[row_t, out_col_t] = live_t.select(
+                                        scored_t, _neg_inf()
+                                    )
                         else:
                             for i_t in range_constexpr(4):
                                 row_local_t = Int32(fx.get_scalar(c_m[i_t]))
@@ -1033,9 +1051,20 @@ def build_qsa_indexer_prefill_scores_module(
                                     # ``scores`` must keep a dynamic row stride:
                                     # a static layout, use_32bit_stride=True, or
                                     # an Int32 linear index would wrap.
-                                    scores[row_t, out_col_t] = live_t.select(
-                                        score_t * score_scale, _neg_inf()
-                                    )
+                                    scored_t = score_t * score_scale
+                                    if const_expr(store_key16):
+                                        bits_t = scored_t.bitcast(Int32)
+                                        ordered_t = bits_t ^ (
+                                            (bits_t >> Int32(31)) & Int32(0x7FFFFFFF)
+                                        )
+                                        scores[row_t, out_col_t] = live_t.select(
+                                            (ordered_t >> Int32(16)).to(fx.Int16),
+                                            fx.Int16(-1),
+                                        )
+                                    else:
+                                        scores[row_t, out_col_t] = live_t.select(
+                                            scored_t, _neg_inf()
+                                        )
                         # The next tile or request overwrites k_lds and live_lds.
                         gpu.barrier()
 

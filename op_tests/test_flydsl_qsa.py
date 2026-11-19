@@ -2827,6 +2827,131 @@ def test_qsa_score_key16(case, rows, context):
     }
 
 
+def _key16_store_inputs(rows, context, device):
+    """The seeded 32K request, packed into an identity page-392 table."""
+    idx = FLASH_NEXT_INDEXER
+    q, k_bar, qpos, slen, token_to_req = _indexer_inputs(
+        idx, rows, context, dtypes.bf16, device
+    )
+    n_blocks = k_bar.shape[0]
+    n_pages = (n_blocks + _SELECT_PAGE - 1) // _SELECT_PAGE
+    cache = torch.zeros(
+        n_pages,
+        _SELECT_PAGE,
+        1,
+        idx.head_dim,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    cache.view(-1, idx.head_dim)[:n_blocks].copy_(k_bar)
+    table = torch.arange(n_pages, dtype=torch.int32, device=device).view(1, n_pages)
+    return q, cache, table, token_to_req, qpos, slen, n_blocks
+
+
+@benchmark()
+def test_qsa_score_key16_store():
+    """int16 keys from the 16-row scorer against its own fp32 scores.
+
+    The 32K case is 128 rows at context 32768, seed 0. Keys on finite
+    columns match ``_score_key16`` of the fp32 store. The boundary rescore
+    then matches that store's top-512. Both launches use the same column
+    count, so the time bar is the scorer, not the halved buffer.
+    """
+    device = torch.device("cuda")
+    rows, context = 128, 32768
+    q, cache, table, token_to_req, qpos, slen, n_blocks = _key16_store_inputs(
+        rows, context, device
+    )
+    n_columns = int(table.shape[1]) * _SELECT_PAGE
+    fp32 = torch.full((rows, n_columns), float("nan"), device=device)
+    keys = torch.full((rows, n_columns), -2, dtype=torch.int16, device=device)
+
+    def launch(scores, store_key16):
+        qsa_paged.qsa_indexer_prefill_score_buffer(
+            q,
+            cache,
+            table,
+            token_to_req,
+            qpos,
+            slen,
+            scores,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+            store_key16=store_key16,
+        )
+
+    launch(fp32, False)
+    launch(keys, True)
+    finite = torch.isfinite(fp32)
+    missing = fp32 == float("-inf")
+    # A skipped visible column would still let the written keys match.
+    visible = torch.minimum(
+        (qpos.to(torch.int32) + 1) // FLASH_NEXT_INDEXER.compress_ratio,
+        slen[token_to_req.to(torch.long)],
+    )
+    visible = torch.minimum(visible, torch.full_like(visible, n_columns))
+    if not torch.equal(finite.sum(1), visible.to(torch.int64)):
+        raise AssertionError(
+            "fp32 scorer did not write every visible column "
+            f"(finite {int(finite.sum(1).min())}..{int(finite.sum(1).max())}, "
+            f"visible {int(visible.min())}..{int(visible.max())})"
+        )
+    expected = torch.full_like(keys, -2)
+    expected[finite] = _score_key16(fp32)[finite].to(torch.int16)
+    expected[missing] = -1
+    err = checkAllclose(
+        expected.to(torch.float32),
+        keys.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg="score key16 store",
+    )
+    assert err == 0, "int16 keys do not match the fp32 scorer"
+    # Columns past the last visible tile are unwritten. They are not scores.
+    scored = torch.where(finite, fp32, torch.full_like(fp32, float("-inf")))
+    picked, _widths = _boundary_select(scored, keys.to(torch.int32), 512)
+    mismatch = _exact_set_mismatch(qsa_topk_blocks(scored, 512), picked)
+    set_err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([mismatch]),
+        rtol=0,
+        atol=0,
+        msg="score key16 boundary",
+    )
+    assert set_err == 0, f"boundary rescore set mismatch {mismatch:.2%}"
+    _, fp32_us = run_perftest(
+        launch, fp32, False, num_iters=50, num_warmup=5, use_cuda_event=True
+    )
+    _, key_us = run_perftest(
+        launch, keys, True, num_iters=50, num_warmup=5, use_cuda_event=True
+    )
+    if key_us > fp32_us * 1.05:
+        raise AssertionError(
+            f"key16 scorer {key_us:.2f} us is more than 5% over fp32 {fp32_us:.2f} us"
+        )
+    flops = 2 * rows * 4 * 128 * n_blocks
+    row_tiles = (rows + 15) // 16
+    read = q.numel() * q.element_size() + row_tiles * n_blocks * 128 * 2
+    return {
+        "gfx": get_gfx_runtime(),
+        "rows": rows,
+        "columns": n_columns,
+        "fp32 us": fp32_us,
+        "key16 us": key_us,
+        "key16/fp32": key_us / fp32_us if fp32_us else 0.0,
+        "fp32 TFLOPS": flops / fp32_us / 1e6 if fp32_us else 0.0,
+        "key16 TFLOPS": flops / key_us / 1e6 if key_us else 0.0,
+        "fp32 TB/s": (read + fp32.numel() * 4) / fp32_us / 1e6 if fp32_us else 0.0,
+        "key16 TB/s": (read + keys.numel() * 2) / key_us / 1e6 if key_us else 0.0,
+        "key16 err": err,
+        "set err": set_err,
+    }
+
+
+def run_qsa_score_key16_store():
+    """Same-width 16-bit store against the fp32 16-row scorer on the 32K case."""
+    _summarize("QSA indexer 16-bit key store", [test_qsa_score_key16_store()])
+
+
 def run_qsa_score_key16():
     """Key collisions and boundary width on the oracle's three seeded cases."""
     rows = []
@@ -2999,6 +3124,7 @@ def main():
     check_qsa_edges()
     run_qsa_indexer_select_oracle()
     run_qsa_score_key16()
+    run_qsa_score_key16_store()
     run_qsa_indexer_select_gate()
 
     for dtype in args.dtype:

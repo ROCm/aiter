@@ -66,9 +66,9 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### 2. Store 16-bit keys from the existing scorer
 
-- [ ] Add a scorer path that writes uint16 keys for the visible prefix and leaves the fp32 store unchanged. Same 16-row tile, same bf16 MFMA, same 4-head ReLU sum, same masking of invisible, incomplete, and missing-page blocks.
-- [ ] Faithfulness: decoding the stored keys with the Phase 1 rule matches the fp32 scorer's visible scores on the 32K case, within the tie bound, and the kernel time stays within 5% of the same-session fp32 scorer when the store width is not the thing under test. The 5% check uses a same-width comparison only if one is cheap to run; the real comparison is the halved buffer in Phase 4.
-- [ ] Do not change the production dispatch.
+- [x] Add a scorer path that writes uint16 keys for the visible prefix and leaves the fp32 store unchanged. Same 16-row tile, same bf16 MFMA, same 4-head ReLU sum, same masking of invisible, incomplete, and missing-page blocks.
+- [x] Faithfulness: decoding the stored keys with the Phase 1 rule matches the fp32 scorer's visible scores on the 32K case, within the tie bound, and the kernel time stays within 5% of the same-session fp32 scorer when the store width is not the thing under test. The 5% check uses a same-width comparison only if one is cheap to run; the real comparison is the halved buffer in Phase 4. Passed. Same-width ratio 1.007. The set match is exact.
+- [x] Do not change the production dispatch. `qsa_indexer_block_ids` still launches the fp32 store. `_fused_select_wins` stays false.
 
 ### 3. Select on keys, rescore the boundary
 
@@ -113,7 +113,7 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 | Session | Date | `get_gfx()` | gpuq / rocm-smi / bus | Device | Idle |
 | --- | --- | --- | --- | --- | --- |
-| | | | | | |
+| Phase 2 store | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:75:00.0 | MI355X | rocm-smi GPU 3, use 0%, no other pids |
 
 ### Budget
 
@@ -143,6 +143,12 @@ The faster arm at `p128k` and `p256k` is aiter#5996, both in this baseline (`T_s
 | padded prefix | 128 | 65856 | 51048 | 497783 | 0.0307 | 2 / 8 / 17 | yes |
 
 The key is coarser than 1.7e-6: one key spans up to about 0.031 in score. The boundary bucket stays under 20 blocks, so the fp32 rescore reads that many blocks per row on these cases, not the whole row. The check is `test_qsa_score_key16` in `op_tests/test_flydsl_qsa.py`.
+
+### 16-bit store
+
+The 16-row scorer has a second store, `store_key16`, launched only by `qsa_indexer_prefill_score_buffer`. The fp32 store is the default, and `qsa_indexer_block_ids` does not call the new entry. The key buffer is int16. A positive score's key is 0..32767, the same bits as the Phase 1 high-16 map. An invisible or missing-page column stores -1, which sorts below those keys. Columns past the last visited tile are left unwritten.
+
+The check is `test_qsa_score_key16_store`, the seeded 32K case: 128 rows, context 32768, page 392, identity page table, 8232 columns. Both launches use that width. The kernel wrote every visible column. On those columns the stored key equals `_score_key16` of the fp32 scorer, and -1 where that scorer wrote `-inf`. Treating the unwritten tail as not visible, the Phase 1 boundary rescore matches the fp32 scorer's top-512 on every row. Same-session CUDA-event means, 5 warmup and 50 timed, on bus 0000:75:00.0: fp32 21.867 µs, key16 22.018 µs, ratio 1.007. That is inside the 5% bar. The halved buffer is Phase 4.
 
 ### Kernel gate
 
@@ -181,7 +187,7 @@ No gate. Filled only if Phase 6 passes.
 
 Phase 0, 2026-11-19: the stop does not fire. At `p128k` and `p256k` the faster arm is aiter#5996, and this path is a change to that arm, so the miss is a strict improvement on its step. The baseline score stage is 2072.9 µs of 3797.3 µs (0.546) and 3905.9 µs of 5861.4 µs (0.666). That share is larger than the miss. Phase 1 is next. The 16-bit counts, 1019 rows per chunk and 17 chunks on the 16384-row cases, are the workspace formula and are not a measured win.
 
-Outcome: open. Option 1 stays a miss in the master. This fallback has not been built.
+Outcome: open. Option 1 stays a miss in the master. The 16-bit store exists. Selection, chunking, and the gate do not.
 
 Gates met: none. Gate 5 stays closed, as the master applied it.
 
@@ -190,6 +196,8 @@ Margins: not measured. The budget is the table under [Budget](#budget).
 gfx942 enablement: not measured.
 
 Phase 1, 2026-11-19: keep `_score_key16`. On the three seeded cases the boundary rescore matches the oracle set, and the boundary bucket is at most 19 blocks.
+
+Phase 2, 2026-11-19: the 16-row scorer can store int16 keys. On the seeded 32K case the stored keys match the fp32 scorer, the boundary rescore matches that scorer's top-512, and the same-width time is 1.007× the fp32 scorer (22.018 µs vs 21.867 µs). The public dispatch is unchanged. Phase 3 is next.
 
 Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 
@@ -204,3 +212,4 @@ Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 - 2026-11-19: Plan opened. The master is [qsa-indexer-fused-select-plan.md](qsa-indexer-fused-select-plan.md), and its fixed decisions carry over. Option 1 misses gate 1 on the probe-free interleaved run: `p128k` fused 3814.2 µs against aiter#5996 at 3623.9 µs, `p256k` 7934.8 µs against 5845.4 µs, and every other case misses, including `p8k` at 1.13× vllm#65188. Option 2 stays out, per the master. This document is the ticket's 16-bit score-buffer fallback. No kernel work has started. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 0 budget, from the master's baseline. No GPU run. aiter#5996 scores 65856 columns, 509 fp32 rows per 128 MiB chunk: 17 chunks at `p8k` (8192 rows) and 33 at `p32k`, `p128k`, and `p256k` (16384 rows). Score bytes are 2058.0 MiB and 4116.0 MiB. The 2-byte formula gives 1019 rows per chunk, 9 chunks at `p8k` and 17 on the 16384-row cases, and half the bytes. Stage times are in [Budget](#budget). The faster arm at `p128k` and `p256k` is aiter#5996, and its score stage is 0.546 and 0.666 of `T_step`, larger than the strict improvement this path has to find. The stop does not fire. Phase 1 is next. At `p8k` the faster arm is vllm#65188 at 207.3 µs and the whole aiter score stage is 328.0 µs, so that miss is not a score-buffer miss. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 1 key check, gfx950, gpuq GPU 0. `test_qsa_score_key16` uses the oracle's seeded 8K, 32K, and padded-prefix inputs. `_score_key16` stays. Colliding pairs, scores that share a key and differ by more than 1.7e-6, are 975004, 8062017, and 497783. The widest key span is 0.0311. Boundary width is 2/8/18, 3/11/19, and 2/8/17 (min/median/max). The fp32 rescore of that bucket matches the oracle top-512 on every row. Phase 2 is next. `_fused_select_wins` stays false.
+- 2026-11-19: Phase 2 store, gfx950, ROCm 7.2.1, bus 0000:75:00.0, rocm-smi GPU 3 at 0% with no other pids. `test_qsa_score_key16_store` on the seeded 32K case, 128 rows, 8232 columns. The int16 keys match `_score_key16` of the fp32 16-row scorer on every visible column, and the boundary rescore matches that scorer's top-512. Same-width CUDA-event means, 5 warmup and 50 timed, are 21.867 µs (fp32) and 22.018 µs (key16), ratio 1.007. `qsa_indexer_block_ids` still stores fp32. Phase 3 is next. `_fused_select_wins` stays false.

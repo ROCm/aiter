@@ -15,7 +15,9 @@ and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
 rows x 4 heads per MFMA instead. The long-row score workspace is at most
 128 MiB. Rows past that are scored in chunks, and the scorer and selector
 stay the ones chosen for the whole batch. The indexer head count is 4 or
-8, each a separate compile.
+8, each a separate compile. ``qsa_indexer_prefill_score_buffer`` is that
+16-row tile with an optional int16 key store. The public indexer does not
+call it.
 
 ``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. ``n_sel`` is the packed live prefix; the default walks the
@@ -218,9 +220,88 @@ def _prefill_scores_plan(
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
     fold_heads: bool = False,
+    store_key16: bool = False,
 ):
     return build_qsa_indexer_prefill_scores_module(
-        page_size, use_k32, n_heads, wide_cache, k_strides, fold_heads=fold_heads
+        page_size,
+        use_k32,
+        n_heads,
+        wide_cache,
+        k_strides,
+        fold_heads=fold_heads,
+        store_key16=store_key16,
+    )
+
+
+def qsa_indexer_prefill_score_buffer(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    score_scale: float,
+    store_key16: bool = False,
+) -> None:
+    """Write the 16-row scorer into ``scores`` and return.
+
+    ``store_key16`` stores int16 keys for the visible prefix and -1 for an
+    invisible or missing-page column. The default stores the fp32 score.
+    ``qsa_indexer_block_ids`` does not call this, so the public dispatch
+    stays on the fp32 store.
+    """
+    m = int(q.shape[0])
+    n_heads = int(q.shape[1])
+    page_size = int(k_cache.shape[1])
+    n_columns = int(page_table.shape[1]) * page_size
+    if tuple(scores.shape) != (m, n_columns):
+        raise ValueError(
+            f"scores must be [{m}, {n_columns}], got {tuple(scores.shape)}"
+        )
+    want = torch.int16 if store_key16 else torch.float32
+    if scores.dtype != want:
+        raise ValueError(f"scores dtype must be {want}, got {scores.dtype}")
+    arch = _qsa_arch()
+    if not _indexer_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
+        raise ValueError("this launch is not the 16-row scorer")
+    use_k32 = arch == "gfx950"
+    wide_cache = span_bytes(k_cache) > (1 << 32)
+    k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
+    fold_heads, tiles_per_wg = _indexer_rows_scorer_layout(
+        int(context_lens.shape[0]), m, n_heads, n_columns
+    )
+    col_tiles = ceildiv(n_columns, _ROWS_BLOCK_N)
+    tile_rows = 16 // n_heads if fold_heads else 16
+    row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
+    _run_compiled(
+        _prefill_scores_plan(
+            page_size,
+            use_k32,
+            n_heads,
+            wide_cache,
+            k_strides,
+            fold_heads,
+            store_key16,
+        ),
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        scores,
+        row_lens,
+        n_columns,
+        m,
+        int(context_lens.shape[0]),
+        float(score_scale),
+        int(k_cache.shape[0]),
+        ceildiv(m, tile_rows),
+        ceildiv(col_tiles, tiles_per_wg),
+        tiles_per_wg,
+        torch.cuda.current_stream(q.device),
     )
 
 
