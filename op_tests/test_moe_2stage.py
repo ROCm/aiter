@@ -1947,9 +1947,9 @@ def test_presorted_moe_std_pipelines():
     at 64), and A16W4 runs BM=32 (heuristic) to 32 tokens and BM=16 FlyDSL
     kernels from 33, none with the aux sort. presorted_moe_block_m must report
     each pipeline's block_m. For each, a presort in moe_sorting's layout must replace the sort
-    (no moe_sorting call) and give fused_moe's own result: bit-identical where
-    two own-sort runs are (the reduce GEMM2), within atomic-accumulation noise
-    otherwise. Pad rows of plain M are taken too. A stale output is zeroed
+    (no moe_sorting call) and give fused_moe's own result: bit-identical when the
+    selected GEMM2 runs the route-reduce epilogue, whose summation order is
+    fixed, and within atomic-accumulation noise otherwise. Pad rows of plain M are taken too. A stale output is zeroed
     unless the presort says the caller zeroed it, and a presort for another
     block_m is ignored, so fused_moe sorts again.
     """
@@ -2047,8 +2047,11 @@ def test_presorted_moe_std_pipelines():
                         # The BM=16 aux-sort pipeline (test_presorted_moe_hook
                         # runs it on a presort).
                         continue
-                    own2, _ = run(call)
-                    deterministic = torch.equal(own, own2)
+                    # Only the route-reduce epilogue fixes the summation order;
+                    # an atomic one may differ in BF16 rounding from run to run.
+                    deterministic = fm._stage2_runtime_uses_route_reduce(
+                        metadata.stage2, token, model_dim
+                    )
                     aux = _reference_presort(topk_ids, topk_weights, E, block_m)
                     pre, sorted_ = run(call, aux)
                     assert not sorted_, f"{what}: presort unused"
@@ -2092,7 +2095,8 @@ def test_presorted_moe_std_pipelines():
                         "pipeline": name,
                         "token": token,
                         "block_m": block_m,
-                        "bit-identical": deterministic,
+                        "stage2 reduce": deterministic,
+                        "bit-identical": torch.equal(own, pre),
                         "presorted max abs diff": float(
                             (own.float() - pre.float()).abs().max()
                         ),
