@@ -208,13 +208,17 @@ def test_qsa_multi_chunk_selection_matches_unchunked(rows):
     small `logits_workspace_bytes`. Groups and expanded tokens must then match
     an unchunked call exactly.
     """
-    from aiter.ops.qsa import qsa_select_paged_groups, qsa_select_paged_tokens
+    from aiter.ops.qsa import (
+        _selection_widths,
+        qsa_select_paged_groups,
+        qsa_select_paged_tokens,
+    )
 
     torch.manual_seed(11)
-    block, ratio, budget, start, columns = 16, 4, 2048, 2000, 256
+    block, ratio, budget, start, pages = 16, 4, 2048, 2000, 256
     s = _make_paged_scenario(
         rows,
-        columns,
+        pages,
         block,
         ratio,
         index_heads=4,
@@ -226,13 +230,19 @@ def test_qsa_multi_chunk_selection_matches_unchunked(rows):
     )
     args = (s["index_q"], s["compressed"], s["tables"])
     tail = (s["requests"], s["positions"], s["lengths"], budget, ratio)
+    # The scored width is bucketed to a power of two, so derive the budget from
+    # it rather than from the page table's raw column count.
+    scored_columns, _, _ = _selection_widths(
+        s["compressed"], s["tables"], budget, ratio, start + rows
+    )
+    workspace = 400 * scored_columns * 4
 
     # 400 rows per chunk: 1100 -> 400 + 400 + 300, 1500 -> 400 + 400 + 400 + 300.
     chunked_groups, chunked_width = qsa_select_paged_groups(
         *args,
         *tail,
         max_seq_len=start + rows,
-        logits_workspace_bytes=400 * columns * 4,
+        logits_workspace_bytes=workspace,
     )
     whole_groups, whole_width = qsa_select_paged_groups(
         *args, *tail, max_seq_len=start + rows
@@ -245,7 +255,7 @@ def test_qsa_multi_chunk_selection_matches_unchunked(rows):
             *args,
             *tail,
             max_seq_len=start + rows,
-            logits_workspace_bytes=400 * columns * 4,
+            logits_workspace_bytes=workspace,
         ),
         qsa_select_paged_tokens(*args, *tail, max_seq_len=start + rows),
     )
