@@ -2424,7 +2424,17 @@ def _gemm_mxfp8_preshuffle_kernel(
     b_scale_layout_epi: gl.constexpr = None,
     shared_C_epi: gl.constexpr = None,
     b_scale_layout4: gl.constexpr = None,
+    res_ptr=None,
+    ssq_ptr=None,
+    stride_res_m=0,
+    stride_ssq_m=0,
+    RES_SSQ: gl.constexpr = 0,
 ):
+    # RES_SSQ (ATOM_FOLD_POSTNORM, the post-attention RMSNorm folded away): the epilogue adds the bf16
+    # residual (fp32 add of the bf16-rounded GEMM output, as _gluon_fused_rms_kernel), stores the sum
+    # rounded to c's dtype as c, and stores the row's fp32 sum of squares over this tile's columns
+    # (unrounded sum, as the norm) at ssq[row, tile_n]. The consumer (the fold D router kernel) applies
+    # the norm. One CTA a tile (num_ctas == 1), EPI_SPLIT == 1.
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
     if num_warps == 2:
@@ -2920,7 +2930,28 @@ def _gemm_mxfp8_preshuffle_kernel(
             layout=shared_C,
         )
 
-        c_buffer.store(acc.to(c_ptr.type.element_ty))
+        if RES_SSQ:
+            gl.static_assert(num_ctas == 1)
+            rr = tile_m * BLOCK_SIZE_M + gl.arange(
+                0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout)
+            )
+            cc = tile_n * BLOCK_SIZE_N + gl.arange(
+                0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout)
+            )
+            rmask = rr < M
+            msk = rmask[:, None] & (cc < N)[None, :]
+            rv = gl.load(
+                res_ptr + rr[:, None] * stride_res_m + cc[None, :], mask=msk, other=0.0
+            )
+            sv = acc.to(c_ptr.type.element_ty).to(gl.float32) + rv.to(gl.float32)
+            gl.store(
+                ssq_ptr + rr * stride_ssq_m + tile_n,
+                gl.sum(sv * sv, axis=1),
+                mask=rmask,
+            )
+            c_buffer.store(sv.to(c_ptr.type.element_ty))
+        else:
+            c_buffer.store(acc.to(c_ptr.type.element_ty))
 
         gl.amd.gfx1250.tdm.async_store(
             c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer
