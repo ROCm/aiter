@@ -87,6 +87,10 @@ def launch_gemm_a8w8_256x256(
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
         (256, 256, 128, 2, 2, 2),
+        (256, 192, 128, 2, 2, 2),
+        (192, 256, 128, 2, 2, 4),
+        (192, 256, 128, 2, 2, 2),
+        (192, 192, 128, 2, 2, 2),
         (128, 128, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 3),
@@ -869,8 +873,11 @@ def launch_gemm_a8w8_256x256(
         def _sb_of(word):
             return word if const_expr(mx32) else _bcast_byte(word, sb_sel)
 
-        N_SA = half_m // 2 * 2
-        N_SB = half_n // 2 * 2 if const_expr(mx32) else 1
+        # MX32 has one scale word for each pair of 16-row/column WMMAs.
+        # half_m/half_n are exactly those pair counts, including odd counts
+        # for 192-wide tile dimensions.
+        N_SA = half_m
+        N_SB = half_n if const_expr(mx32) else 1
 
         seed_a = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_m)]
         seed_b = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_n)]
