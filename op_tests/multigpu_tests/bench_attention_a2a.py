@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 
 # Requested global shapes (B, S, H, D); S is padded up to a multiple of world * 32.
 _SHAPES = {
@@ -350,6 +351,8 @@ def _run_recipe(
     if not flag.item():
         if rank == 0:
             print(f"MISMATCH {recipe.name}: timing skipped", flush=True)
+        # Every rank reaches this point together after the agreement above.
+        op.close()
         return []
     if rank == 0:
         print(f"PASS {shape_name} {recipe.name}: all ranks match baseline", flush=True)
@@ -379,13 +382,16 @@ def _run_recipe(
                     "wire_bytes": wire_bytes,
                 }
             )
+    op.close()
     return records
 
 
 def _render(records, shapes, world, arch, args, elapsed_s):
     lines = [
         (
-            f"world={world}; GPU arch={arch}; rotations={_ROTATIONS}; "
+            f"world={world}; GPU arch={arch}; link={args.link}; "
+            f"inbox={args.resolved_inbox}; "
+            f"rotations={_ROTATIONS}; "
             f"warmup={args.warmup}; iters={args.iterations}"
         )
     ]
@@ -427,9 +433,13 @@ def _render(records, shapes, world, arch, args, elapsed_s):
 def _worker(rank, world, args):
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
 
-    import mori.shmem as ms
     import torch
     import torch.distributed as dist
+
+    # Only the uncached (MoRI heap) path needs MoRI.
+    ms = None
+    if args.resolved_inbox == "uncached":
+        import mori.shmem as ms
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -446,8 +456,9 @@ def _worker(rank, world, args):
     start = time.perf_counter()
     try:
         cpu_group = dist.new_group(backend="gloo")
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        ms.shmem_torch_process_group_init("mori")
+        if ms is not None:
+            torch._C._distributed_c10d._register_process_group("mori", cpu_group)
+            ms.shmem_torch_process_group_init("mori")
         for shape_name in args.shapes:
             requested = _SHAPES[shape_name]
             shape = _local_shape(requested, world)
@@ -482,7 +493,11 @@ def _worker(rank, world, args):
                     recipe,
                     args,
                     dist.group.WORLD,
-                    functools.partial(AttentionA2AIntraNodeOp, group=cpu_group),
+                    functools.partial(
+                        AttentionA2AIntraNodeOp,
+                        group=cpu_group,
+                        inbox_memory=args.resolved_inbox,
+                    ),
                     packers,
                 )
             del inputs
@@ -495,7 +510,7 @@ def _worker(rank, world, args):
                 all_records, args.shapes, world, arch, args, time.perf_counter() - start
             )
             print(report, flush=True)
-            output = f"/tmp/bench_attention_a2a_w{world}.md"
+            output = f"/tmp/bench_attention_a2a_w{world}_{args.resolved_inbox}.md"
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(report + "\n")
             print(f"Wrote {output}", flush=True)
@@ -503,9 +518,27 @@ def _worker(rank, world, args):
         # Skip finalize while an exception unwinds: a peer may be mid-collective.
         if sys.exc_info()[0] is None:
             try:
-                ms.shmem_finalize()
+                if ms is not None:
+                    ms.shmem_finalize()
             finally:
                 dist.destroy_process_group()
+
+
+def _resolve_inbox(mode, world_size):
+    """(link for the report, resolved inbox memory), on the op's own policy.
+
+    The inbox memory comes from the op's resolver, so an undetectable link
+    falls back to uncached as in the op. The link is only reported, as
+    "unknown" when it cannot be detected.
+    """
+    from aiter.ops.flydsl.allreduce_policy import detect_link
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
+
+    try:
+        link = detect_link()
+    except ValueError:
+        link = "unknown"
+    return link, resolve_inbox_flags(mode, world_size)[1]
 
 
 def main():
@@ -523,6 +556,13 @@ def main():
     parser.add_argument("--master-port", type=int, default=29517)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=15)
+    parser.add_argument(
+        "--inbox-memory",
+        choices=INBOX_MEMORY_MODES,
+        default="auto",
+        help="memory type of the peer-written buffers (auto: uncached on xGMI, "
+        "fine-grained on PCIe); only uncached needs MoRI",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("--warmup must be nonnegative and --iterations positive")
@@ -546,6 +586,7 @@ def main():
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
+    args.link, args.resolved_inbox = _resolve_inbox(args.inbox_memory, args.world_size)
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 
