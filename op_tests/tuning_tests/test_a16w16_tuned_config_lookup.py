@@ -929,17 +929,19 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
             mock.patch.object(tdm, "gemm_a16w16_tdm") as launch,
         ):
             for interleave in (False, True):
-                with self.subTest(interleave=interleave):
-                    with self.assertRaisesRegex(ValueError, "BF16 preshuffle requires"):
-                        self.kernels.flydsl_hgemm(
-                            self.a,
-                            self.b,
-                            out=self.out,
-                            stream=self.stream,
-                            policy="tdm",
-                            interleave=interleave,
-                            bpreshuffle=True,
-                        )
+                with (
+                    self.subTest(interleave=interleave),
+                    self.assertRaisesRegex(ValueError, "BF16 preshuffle requires"),
+                ):
+                    self.kernels.flydsl_hgemm(
+                        self.a,
+                        self.b,
+                        out=self.out,
+                        stream=self.stream,
+                        policy="tdm",
+                        interleave=interleave,
+                        bpreshuffle=True,
+                    )
             launch.assert_not_called()
 
     def test_interleave_cannot_enter_gfx950_preshuffle_path(self):
