@@ -78,9 +78,9 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### 4. Chunk the 2-byte buffer
 
-- [ ] Size the workspace at 2 bytes per column under the 128 MiB cap. A full step of 16384 rows reuses one buffer across chunks.
-- [ ] A short last chunk keeps the scorer and the selector chosen for the full batch.
-- [ ] Record chunk count and bytes written and read per case.
+- [x] Size the workspace at 2 bytes per column under the 128 MiB cap. A full step of 16384 rows reuses one buffer across chunks. 1019 rows per chunk, 17 chunks, one buffer.
+- [x] A short last chunk keeps the scorer and the selector chosen for the full batch. An 8-row tail of a 1027-row step kept the full-batch scorer.
+- [x] Record chunk count and bytes written and read per case. Recorded under [16-bit chunks](#16-bit-chunks).
 
 ### 5. Set gate
 
@@ -115,6 +115,7 @@ Change these only by editing this section and adding a log line. Code, tests, an
 | --- | --- | --- | --- | --- | --- |
 | Phase 2 store | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:75:00.0 | MI355X | rocm-smi GPU 3, use 0%, no other pids |
 | Phase 3 select | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:65:00.0 | MI355X | rocm-smi GPU 2, use 0%, no other pids |
+| Phase 4 chunks | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:f5:00.0 | MI355X | rocm-smi GPU 7, use 0%, no other pids |
 
 ### Budget
 
@@ -157,6 +158,21 @@ The check is `test_qsa_score_key16_store`, the seeded 32K case: 128 rows, contex
 
 The check is `test_qsa_key16_select`. On the seeded 32K case the block set matches the oracle within 1.7e-6 on every row, and the token ids match the expand of those blocks. The boundary bucket holds 1365 blocks across the 128 rows. A 16-row context-2048 case has no boundary bucket, and its set matches too. CUDA-event means, 5 warmup and 10 timed, on bus 0000:65:00.0: 1247.49 µs for the 32K select and 243.90 µs for the short row. That time is this host partition, not the kernel gate.
 
+### 16-bit chunks
+
+`qsa_indexer_key16_score_and_select` stores int16 keys in one buffer of `_key16_workspace_rows` rows and reuses it for every chunk. That is 1019 rows at 65856 columns, `128 MiB / (65856 × 2)`. The fp32 helper stays at 509 rows. A short last chunk passes the full batch into the scorer, so an 8-row tail does not fold the heads. The selector is the same key select on every chunk. `qsa_indexer_block_ids` does not call this.
+
+Key bytes are `rows × 65856 × 2`, written once and read once by the select. K read is one compressed-K pass per chunk, `chunks × visible_blocks × 128 × 2`. The scorer also rereads K inside a pass; that extra traffic is not in this column.
+
+| Case | Rows | Chunks | Key written | Key read | K read |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p8k | 8192 | 9 | 1029 MiB | 1029 MiB | 4.5 MiB |
+| p32k | 16384 | 17 | 2058 MiB | 2058 MiB | 34 MiB |
+| p128k | 16384 | 17 | 2058 MiB | 2058 MiB | 136 MiB |
+| p256k | 16384 | 17 | 2058 MiB | 2058 MiB | 272 MiB |
+
+The short-tail check is `test_qsa_key16_chunks`: 1027 rows, 65856 columns, chunks of 1019 and 8. The tail's keys match a direct score that was told the full batch, the first chunk's block ids match its own select, and the whole step matches the oracle within 1.7e-6. Token ids are the expand, width 2051. CUDA-event mean, 2 warmup and 5 timed, on bus 0000:f5:00.0: 12725.1 µs. That is this host select over two chunks, not the kernel gate.
+
 ### Kernel gate
 
 Median microseconds per QSA layer per step, gfx950. Margin is this path divided by the faster of aiter#5996 and vllm#65188.
@@ -194,7 +210,7 @@ No gate. Filled only if Phase 6 passes.
 
 Phase 0, 2026-11-19: the stop does not fire. At `p128k` and `p256k` the faster arm is aiter#5996, and this path is a change to that arm, so the miss is a strict improvement on its step. The baseline score stage is 2072.9 µs of 3797.3 µs (0.546) and 3905.9 µs of 5861.4 µs (0.666). That share is larger than the miss. Phase 1 is next. The 16-bit counts, 1019 rows per chunk and 17 chunks on the 16384-row cases, are the workspace formula and are not a measured win.
 
-Outcome: open. Option 1 stays a miss in the master. The 16-bit store and the boundary select exist. Chunking and the gate do not.
+Outcome: open. Option 1 stays a miss in the master. The 16-bit store, the boundary select, and the 2-byte chunks exist. The gate does not.
 
 Gates met: none. Gate 5 stays closed, as the master applied it.
 
@@ -207,6 +223,8 @@ Phase 1, 2026-11-19: keep `_score_key16`. On the three seeded cases the boundary
 Phase 2, 2026-11-19: the 16-row scorer can store int16 keys. On the seeded 32K case the stored keys match the fp32 scorer, the boundary rescore matches that scorer's top-512, and the same-width time is 1.007× the fp32 scorer (22.018 µs vs 21.867 µs). The public dispatch is unchanged. Phase 3 is next.
 
 Phase 3, 2026-11-19: `qsa_indexer_key16_select` keeps every key above the 512th and rescores that bucket with the oracle score. On the seeded 32K case the block set matches the oracle within 1.7e-6, the token ids are the expand of those blocks, and the bucket holds 1365 blocks across 128 rows. A short row keeps every visible block and does not rescore. The public dispatch is unchanged. Phase 4 is next.
+
+Phase 4, 2026-11-19: the int16 workspace holds 1019 rows at 65856 columns. A 16384-row step reuses that one buffer across 17 chunks, and an 8-row tail keeps the full-batch scorer. Key traffic is 1029 MiB at `p8k` and 2058 MiB on the 16384-row cases. The public dispatch is unchanged. Phase 5 is next.
 
 Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 
@@ -223,3 +241,4 @@ Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 - 2026-11-19: Phase 1 key check, gfx950, gpuq GPU 0. `test_qsa_score_key16` uses the oracle's seeded 8K, 32K, and padded-prefix inputs. `_score_key16` stays. Colliding pairs, scores that share a key and differ by more than 1.7e-6, are 975004, 8062017, and 497783. The widest key span is 0.0311. Boundary width is 2/8/18, 3/11/19, and 2/8/17 (min/median/max). The fp32 rescore of that bucket matches the oracle top-512 on every row. Phase 2 is next. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 2 store, gfx950, ROCm 7.2.1, bus 0000:75:00.0, rocm-smi GPU 3 at 0% with no other pids. `test_qsa_score_key16_store` on the seeded 32K case, 128 rows, 8232 columns. The int16 keys match `_score_key16` of the fp32 16-row scorer on every visible column, and the boundary rescore matches that scorer's top-512. Same-width CUDA-event means, 5 warmup and 50 timed, are 21.867 µs (fp32) and 22.018 µs (key16), ratio 1.007. `qsa_indexer_block_ids` still stores fp32. Phase 3 is next. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 3 select, gfx950, ROCm 7.2.1, bus 0000:65:00.0, rocm-smi GPU 2 at 0% with no other pids. `test_qsa_key16_select` on the seeded 32K case and a 16-row context-2048 case. The 32K block set matches the oracle within 1.7e-6, and both cases' token ids match the existing expand, width 2051. The 32K boundary bucket holds 1365 blocks. The short case does not rescore. CUDA-event means, 5 warmup and 10 timed, are 1247.49 µs and 243.90 µs. `qsa_indexer_block_ids` is unchanged. Phase 4 is next. `_fused_select_wins` stays false.
+- 2026-11-19: Phase 4 chunks, gfx950, ROCm 7.2.1, bus 0000:f5:00.0, rocm-smi GPU 7 at 0% with no other pids. The int16 workspace is 1019 rows at 65856 columns. `p8k` is 9 chunks and 1029 MiB of keys. `p32k`, `p128k`, and `p256k` are 17 chunks and 2058 MiB. K is read once per chunk: 4.5, 34, 136, and 272 MiB. An 8-row tail of 1027 rows kept the full-batch scorer, and that step matched the oracle within 1.7e-6. `qsa_indexer_block_ids` is unchanged. Phase 5 is next. `_fused_select_wins` stays false.

@@ -3089,6 +3089,215 @@ def run_qsa_key16_select():
     _summarize("QSA indexer 16-bit key select", rows)
 
 
+_KEY16_COLUMNS = 168 * _SELECT_PAGE
+_KEY16_CHUNK_CASES = (
+    ("p8k", 8192, 8192, 9),
+    ("p32k", 16384, 32768, 17),
+    ("p128k", 16384, 131072, 17),
+    ("p256k", 16384, 262144, 17),
+)
+
+
+def _key16_case_traffic(rows, context):
+    """Chunk count and key traffic at the bench's padded column width."""
+    rows_per_chunk, chunks, written, read = qsa_paged.qsa_indexer_key16_chunk_counts(
+        rows, _KEY16_COLUMNS
+    )
+    visible = min(context // 4, _KEY16_COLUMNS)
+    return {
+        "rows/chunk": rows_per_chunk,
+        "chunks": chunks,
+        "key MiB": written / (1024 * 1024),
+        "key read MiB": read / (1024 * 1024),
+        "K read MiB": chunks * visible * 128 * 2 / (1024 * 1024),
+    }
+
+
+@benchmark()
+def test_qsa_key16_chunks():
+    """Reuse one 2-byte buffer, and keep the full-batch scorer on a short tail.
+
+    The tail is 8 rows, below the 16-row tile. Deciding the scorer from
+    those 8 rows would fold the heads. The chunk loop must ask for the
+    full batch instead.
+    """
+    for case, n_rows, context, expect_chunks in _KEY16_CHUNK_CASES:
+        traffic = _key16_case_traffic(n_rows, context)
+        if traffic["rows/chunk"] != 1019 or traffic["chunks"] != expect_chunks:
+            raise AssertionError(f"{case}: {traffic}")
+        written = n_rows * _KEY16_COLUMNS * 2
+        if traffic["key MiB"] != written / (1024 * 1024):
+            raise AssertionError(f"{case}: key bytes are not 2 per column")
+    device = torch.device("cuda")
+    idx = FLASH_NEXT_INDEXER
+    rows_per_chunk = qsa_paged.qsa_indexer_key16_chunk_counts(1, _KEY16_COLUMNS)[0]
+    rows = rows_per_chunk + 8
+    context = 8192
+    torch.manual_seed(0)
+    q = torch.randn(rows, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    n_blocks = context // idx.compress_ratio
+    n_pages = _KEY16_COLUMNS // _SELECT_PAGE
+    cache = torch.zeros(
+        n_pages, _SELECT_PAGE, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    cache.view(-1, idx.head_dim)[:n_blocks].copy_(k_bar)
+    table = torch.arange(n_pages, dtype=torch.int32, device=device).view(1, n_pages)
+    qpos = _query_positions(rows, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
+    keys = torch.empty(rows_per_chunk, _KEY16_COLUMNS, dtype=torch.int16, device=device)
+    block_ids = torch.full(
+        (rows, idx.block_budget), 2**31 - 1, dtype=torch.int32, device=device
+    )
+    token_ids = torch.full(
+        (rows, idx.index_width), 2**31 - 1, dtype=torch.int32, device=device
+    )
+    seen = []
+    original = qsa_paged._indexer_rows_scorer_layout
+
+    def _spy(n_requests, n_rows, n_heads, live_columns, row_bounded=False):
+        seen.append(int(n_rows))
+        return original(
+            n_requests, n_rows, n_heads, live_columns, row_bounded=row_bounded
+        )
+
+    def launch():
+        return qsa_paged.qsa_indexer_key16_score_and_select(
+            q,
+            cache,
+            table,
+            token_to_req,
+            qpos,
+            slen,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+            block_ids=block_ids,
+            token_ids=token_ids,
+            keys=keys,
+        )
+
+    qsa_paged._indexer_rows_scorer_layout = _spy
+    try:
+        launch()
+    finally:
+        qsa_paged._indexer_rows_scorer_layout = original
+    tail_at = seen.index(8) if 8 in seen else -1
+    if tail_at < 1 or seen[tail_at - 1] != rows:
+        raise AssertionError(f"short chunk did not keep the batch scorer: {seen}")
+    tail = 8
+    direct = torch.empty(tail, _KEY16_COLUMNS, dtype=torch.int16, device=device)
+    qsa_paged.qsa_indexer_prefill_score_buffer(
+        q[-tail:],
+        cache,
+        table,
+        token_to_req[-tail:],
+        qpos[-tail:],
+        slen,
+        direct,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+        store_key16=True,
+        batch_rows=rows,
+    )
+    visible = qsa_paged._key16_visible(
+        qpos[-tail:], slen, token_to_req[-tail:], _KEY16_COLUMNS
+    )
+    columns = torch.arange(_KEY16_COLUMNS, device=device)
+    mask = columns.unsqueeze(0) < visible.unsqueeze(1)
+    if not torch.equal(keys[:tail][mask], direct[mask]):
+        raise AssertionError("short chunk keys differ from the full-batch scorer")
+    head = torch.empty(rows_per_chunk, _KEY16_COLUMNS, dtype=torch.int16, device=device)
+    head_ids = torch.full(
+        (rows_per_chunk, idx.block_budget), 2**31 - 1, dtype=torch.int32, device=device
+    )
+    head_tokens = torch.full(
+        (rows_per_chunk, idx.index_width), 2**31 - 1, dtype=torch.int32, device=device
+    )
+    qsa_paged.qsa_indexer_prefill_score_buffer(
+        q[:rows_per_chunk],
+        cache,
+        table,
+        token_to_req[:rows_per_chunk],
+        qpos[:rows_per_chunk],
+        slen,
+        head,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+        store_key16=True,
+        batch_rows=rows,
+    )
+    qsa_paged.qsa_indexer_key16_select(
+        q[:rows_per_chunk],
+        cache,
+        table,
+        token_to_req[:rows_per_chunk],
+        qpos[:rows_per_chunk],
+        slen,
+        head,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+        block_ids=head_ids,
+        token_ids=head_tokens,
+    )
+    if not torch.equal(block_ids[:rows_per_chunk], head_ids):
+        raise AssertionError("first chunk block ids differ from its own select")
+    scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    mismatch = _tie_mismatch(
+        qsa_topk_blocks(scores, idx.block_budget), block_ids, scores, _FP32_TIE_BOUND
+    )
+    err = checkAllclose(
+        torch.zeros(1), torch.tensor([mismatch]), rtol=0, atol=0, msg="key16 chunks"
+    )
+    assert err == 0, f"chunked set mismatch {mismatch:.2%}"
+    expanded = qsa_expand_tail(
+        block_ids, qpos, slen, token_to_req, idx.compress_ratio, idx.token_budget
+    )
+    token_err = checkAllclose(
+        expanded.to(torch.float32),
+        token_ids.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg="key16 chunk expand",
+    )
+    assert token_err == 0, "chunked token ids are not the expanded blocks"
+    _, us = run_perftest(launch, num_iters=5, num_warmup=2, use_cuda_event=True)
+    visible_blocks = int(
+        qsa_visible_blocks(qpos, slen, token_to_req, idx.compress_ratio).sum()
+    )
+    flops = 2 * visible_blocks * idx.n_heads * idx.head_dim
+    written = rows * _KEY16_COLUMNS * 2
+    nbytes = (
+        written * 2 + q.numel() * q.element_size() + 2 * n_blocks * idx.head_dim * 2
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "rows": rows,
+        "columns": _KEY16_COLUMNS,
+        "chunks": 2,
+        "tail": tail,
+        "key16 us": us,
+        "key16 TFLOPS": flops / us / 1e6 if us else 0.0,
+        "key16 TB/s": nbytes / us / 1e6 if us else 0.0,
+        "key16 err": err,
+    }
+
+
+def run_qsa_key16_chunks():
+    """2-byte chunk counts for the bench cases, and a short-tail score check."""
+    traffic = []
+    for case, n_rows, context, _chunks in _KEY16_CHUNK_CASES:
+        row = {"case": case, "rows": n_rows, "context": context}
+        row.update(_key16_case_traffic(n_rows, context))
+        traffic.append(row)
+    _summarize("QSA indexer 16-bit chunks", traffic)
+    _summarize("QSA indexer 16-bit chunk tail", [test_qsa_key16_chunks()])
+
+
 def run_qsa_score_key16():
     """Key collisions and boundary width on the oracle's three seeded cases."""
     rows = []
@@ -3263,6 +3472,7 @@ def main():
     run_qsa_score_key16()
     run_qsa_score_key16_store()
     run_qsa_key16_select()
+    run_qsa_key16_chunks()
     run_qsa_indexer_select_gate()
 
     for dtype in args.dtype:

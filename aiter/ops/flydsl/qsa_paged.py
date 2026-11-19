@@ -18,7 +18,9 @@ stay the ones chosen for the whole batch. The indexer head count is 4 or
 8, each a separate compile. ``qsa_indexer_prefill_score_buffer`` is that
 16-row tile with an optional int16 key store.
 ``qsa_indexer_key16_select`` ranks those keys and rescores the boundary
-bucket with the oracle score. The public indexer does not call either.
+bucket with the oracle score. ``qsa_indexer_key16_score_and_select``
+chunks that path at 2 bytes per column under the same 128 MiB cap. The
+public indexer does not call any of these.
 
 ``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. ``n_sel`` is the packed live prefix; the default walks the
@@ -245,15 +247,20 @@ def qsa_indexer_prefill_score_buffer(
     *,
     score_scale: float,
     store_key16: bool = False,
+    batch_rows: int | None = None,
 ) -> None:
     """Write the 16-row scorer into ``scores`` and return.
 
     ``store_key16`` stores int16 keys for the visible prefix and -1 for an
     invisible or missing-page column. The default stores the fp32 score.
-    ``qsa_indexer_block_ids`` does not call this, so the public dispatch
-    stays on the fp32 store.
+    ``batch_rows`` is the full batch when ``q`` is a short chunk, so the
+    scorer stays the one chosen for that batch. ``qsa_indexer_block_ids``
+    does not call this, so the public dispatch stays on the fp32 store.
     """
     m = int(q.shape[0])
+    batch = m if batch_rows is None else int(batch_rows)
+    if batch < m:
+        raise ValueError(f"batch_rows {batch} is below this chunk's {m} rows")
     n_heads = int(q.shape[1])
     page_size = int(k_cache.shape[1])
     n_columns = int(page_table.shape[1]) * page_size
@@ -265,14 +272,19 @@ def qsa_indexer_prefill_score_buffer(
     if scores.dtype != want:
         raise ValueError(f"scores dtype must be {want}, got {scores.dtype}")
     arch = _qsa_arch()
-    if not _indexer_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
+    n_requests = int(context_lens.shape[0])
+    if not _indexer_uses_prefill_scorer(n_requests, batch, n_heads, arch):
         raise ValueError("this launch is not the 16-row scorer")
     use_k32 = arch == "gfx950"
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     fold_heads, tiles_per_wg = _indexer_rows_scorer_layout(
-        int(context_lens.shape[0]), m, n_heads, n_columns
+        n_requests, batch, n_heads, n_columns
     )
+    # tiles_per_wg only fills the GPU, so a chunk may retune it.
+    # fold_heads stays on the batch decision.
+    if m != batch and not fold_heads:
+        tiles_per_wg = _indexer_rows_scorer_layout(n_requests, m, n_heads, n_columns)[1]
     col_tiles = ceildiv(n_columns, _ROWS_BLOCK_N)
     tile_rows = 16 // n_heads if fold_heads else 16
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
@@ -464,6 +476,97 @@ def qsa_indexer_key16_select(
         _K * _R,
         token_ids,
     )
+
+
+def _key16_workspace_rows(n_columns: int) -> int:
+    """How many int16 key rows of ``n_columns`` fit in 128 MiB."""
+    return max(1, _SCORE_WORKSPACE_BYTES // max(int(n_columns) * 2, 1))
+
+
+def qsa_indexer_key16_chunk_counts(
+    rows: int, n_columns: int
+) -> tuple[int, int, int, int]:
+    """``(rows_per_chunk, chunks, key_bytes_written, key_bytes_read)``.
+
+    The select reads every stored key once, so the two byte counts match.
+    Each chunk also reads compressed K again. That traffic is not included.
+    """
+    rows_per_chunk = _key16_workspace_rows(n_columns)
+    chunks = (int(rows) + rows_per_chunk - 1) // rows_per_chunk
+    written = int(rows) * int(n_columns) * 2
+    return rows_per_chunk, chunks, written, written
+
+
+def qsa_indexer_key16_score_and_select(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    *,
+    score_scale: float,
+    block_ids: torch.Tensor | None = None,
+    token_ids: torch.Tensor | None = None,
+    keys: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score int16 keys in 2-byte chunks and select each chunk.
+
+    One key buffer is reused across the chunks of a step. A short last
+    chunk keeps the scorer and the selector chosen for the whole batch.
+    ``qsa_indexer_block_ids`` does not call this.
+    """
+    rows = int(q.shape[0])
+    n_columns = int(page_table.shape[1]) * int(k_cache.shape[1])
+    rows_per_chunk = _key16_workspace_rows(n_columns)
+    slot_rows = min(rows, rows_per_chunk)
+    if keys is None:
+        keys = torch.empty(slot_rows, n_columns, dtype=torch.int16, device=q.device)
+    elif (
+        keys.dtype != torch.int16
+        or keys.shape[0] < slot_rows
+        or keys.shape[1] != n_columns
+        or keys.stride(-1) != 1
+    ):
+        raise ValueError(
+            f"keys must be int16 [>= {slot_rows}, {n_columns}] with a unit "
+            f"column stride, got {keys.dtype} {tuple(keys.shape)} "
+            f"stride {tuple(keys.stride())}"
+        )
+    if block_ids is None:
+        block_ids = torch.empty(rows, _K, dtype=torch.int32, device=q.device)
+    if token_ids is None:
+        token_ids = torch.empty(
+            rows, _FUSED_TOKEN_WIDTH, dtype=torch.int32, device=q.device
+        )
+    for row_start in range(0, rows, rows_per_chunk):
+        row_end = min(rows, row_start + rows_per_chunk)
+        slot = keys[: row_end - row_start]
+        qsa_indexer_prefill_score_buffer(
+            q[row_start:row_end],
+            k_cache,
+            page_table,
+            token_to_req[row_start:row_end],
+            query_positions[row_start:row_end],
+            context_lens,
+            slot,
+            score_scale=score_scale,
+            store_key16=True,
+            batch_rows=rows,
+        )
+        qsa_indexer_key16_select(
+            q[row_start:row_end],
+            k_cache,
+            page_table,
+            token_to_req[row_start:row_end],
+            query_positions[row_start:row_end],
+            context_lens,
+            slot,
+            score_scale=score_scale,
+            block_ids=block_ids[row_start:row_end],
+            token_ids=token_ids[row_start:row_end],
+        )
+    return token_ids
 
 
 _ROWS_SCORER_MIN_ROWS_PER_REQUEST = 2
