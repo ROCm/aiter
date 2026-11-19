@@ -16,8 +16,9 @@ rows x 4 heads per MFMA instead. The long-row score workspace is at most
 128 MiB. Rows past that are scored in chunks, and the scorer and selector
 stay the ones chosen for the whole batch. The indexer head count is 4 or
 8, each a separate compile. ``qsa_indexer_prefill_score_buffer`` is that
-16-row tile with an optional int16 key store. The public indexer does not
-call it.
+16-row tile with an optional int16 key store.
+``qsa_indexer_key16_select`` ranks those keys and rescores the boundary
+bucket with the oracle score. The public indexer does not call either.
 
 ``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. ``n_sel`` is the packed live prefix; the default walks the
@@ -302,6 +303,166 @@ def qsa_indexer_prefill_score_buffer(
         ceildiv(col_tiles, tiles_per_wg),
         tiles_per_wg,
         torch.cuda.current_stream(q.device),
+    )
+
+
+def _key16_visible(query_positions, context_lens, token_to_req, n_columns):
+    """Complete compressed blocks each row can see, capped at ``n_columns``."""
+    n_req = int(context_lens.shape[0])
+    req = token_to_req.clamp(0, max(n_req - 1, 0))
+    slen = context_lens[req]
+    valid = (token_to_req >= 0) & (token_to_req < n_req)
+    slen = torch.where(valid, slen, torch.zeros_like(slen))
+    span = torch.minimum(
+        torch.div(query_positions + 1, _R, rounding_mode="floor"),
+        torch.div(slen, _R, rounding_mode="floor"),
+    )
+    return torch.minimum(span, torch.full_like(span, n_columns))
+
+
+def _key16_bucket_scores(q, k_cache, page_table, token_to_req, block_ids, score_scale):
+    """Oracle score of ``block_ids``, and ``-inf`` on a padding or missing page.
+
+    bf16 values are accumulated in fp32, matching ``qsa_indexer_scores``.
+    This is not the production scorer.
+    """
+    page = int(k_cache.shape[1])
+    n_pages = int(k_cache.shape[0])
+    logical = torch.div(block_ids.clamp(min=0), page, rounding_mode="floor")
+    off = block_ids.clamp(min=0) - logical * page
+    req = token_to_req.clamp(min=0)
+    logical = logical.clamp(0, max(int(page_table.shape[1]) - 1, 0))
+    phys = page_table[req.unsqueeze(1), logical]
+    present = (block_ids >= 0) & (phys >= 0) & (phys < n_pages)
+    phys = phys.clamp(0, max(n_pages - 1, 0))
+    off = off.clamp(0, page - 1)
+    gathered = k_cache[phys, off, 0].to(torch.float32)
+    dots = torch.einsum("mhd,mbd->mhb", q.to(torch.float32), gathered)
+    scores = torch.relu(dots).sum(dim=1) * float(score_scale)
+    return torch.where(present, scores, torch.full_like(scores, float("-inf")))
+
+
+def qsa_indexer_key16_select(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    keys: torch.Tensor,
+    *,
+    score_scale: float,
+    block_ids: torch.Tensor | None = None,
+    token_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select top 512 from int16 keys and expand them to token ids.
+
+    A row with at most 512 visible blocks keeps those blocks and does not
+    rescore. A longer row keeps every key strictly above the 512th key and
+    fills the rest from that key's bucket. The bucket is rescored in fp32
+    from compressed K, with the oracle's bf16-in fp32-accumulate score.
+    ``qsa_indexer_block_ids`` does not call this.
+    """
+    from aiter.ops.qsa import qsa_expand_block_indices
+
+    rows = int(q.shape[0])
+    n_columns = int(page_table.shape[1]) * int(k_cache.shape[1])
+    if keys.dtype != torch.int16 or tuple(keys.shape) != (rows, n_columns):
+        raise ValueError(
+            f"keys must be int16 [{rows}, {n_columns}], "
+            f"got {keys.dtype} {tuple(keys.shape)}"
+        )
+    if block_ids is None:
+        block_ids = torch.empty(rows, _K, dtype=torch.int32, device=q.device)
+    elif block_ids.dtype != torch.int32 or tuple(block_ids.shape) != (rows, _K):
+        raise ValueError(
+            f"block_ids must be int32 [{rows}, {_K}], "
+            f"got {block_ids.dtype} {tuple(block_ids.shape)}"
+        )
+    if token_ids is None:
+        token_ids = torch.empty(
+            rows, _FUSED_TOKEN_WIDTH, dtype=torch.int32, device=q.device
+        )
+    elif token_ids.dtype != torch.int32 or tuple(token_ids.shape) != (
+        rows,
+        _FUSED_TOKEN_WIDTH,
+    ):
+        raise ValueError(
+            f"token_ids must be int32 [{rows}, {_FUSED_TOKEN_WIDTH}], "
+            f"got {token_ids.dtype} {tuple(token_ids.shape)}"
+        )
+    visible = _key16_visible(query_positions, context_lens, token_to_req, n_columns)
+    columns = torch.arange(n_columns, device=q.device)
+    work = keys.to(torch.int32)
+    live = (work >= 0) & (columns.unsqueeze(0) < visible.unsqueeze(1))
+    live_count = live.sum(dim=1)
+    rank = torch.where(live, work, torch.full_like(work, -32768))
+    order = torch.argsort(rank, dim=-1, descending=True, stable=True)
+    if n_columns >= _K:
+        packed = order[:, :_K]
+    else:
+        packed = torch.full((rows, _K), -1, dtype=torch.int32, device=q.device)
+        packed[:, :n_columns] = order
+    slot = torch.arange(_K, device=q.device)
+    short_ids = torch.where(
+        slot.unsqueeze(0) < live_count.unsqueeze(1), packed, torch.full_like(packed, -1)
+    )
+    long = (
+        (live_count > _K)
+        if n_columns > _K
+        else torch.zeros(rows, dtype=torch.bool, device=q.device)
+    )
+    chosen = short_ids
+    if bool(long.any()):
+        boundary = work.gather(1, order[:, _K - 1 : _K]).squeeze(1)
+        # Short rows are packed above. Rescore only a long row's boundary.
+        above = long.unsqueeze(1) & live & (work > boundary.unsqueeze(1))
+        bucket = long.unsqueeze(1) & live & (work == boundary.unsqueeze(1))
+        n_above = above.sum(dim=1)
+        if bool((n_above[long] > _K).any()):
+            raise RuntimeError("more than 512 keys sit above the boundary key")
+        b_count = bucket.sum(dim=1)
+        width = int(b_count.max().item())
+        b_order = torch.argsort(
+            bucket.to(torch.int32), dim=-1, descending=True, stable=True
+        )
+        b_idx = b_order[:, :width]
+        b_slot = torch.arange(width, device=q.device)
+        b_valid = b_slot.unsqueeze(0) < b_count.unsqueeze(1)
+        b_scores = _key16_bucket_scores(
+            q, k_cache, page_table, token_to_req, b_idx, score_scale
+        )
+        b_scores = torch.where(
+            b_valid, b_scores, torch.full_like(b_scores, float("-inf"))
+        )
+        # Stable: an exact tie keeps the smaller block index.
+        b_rank = torch.argsort(b_scores, dim=-1, descending=True, stable=True)
+        take = b_idx.gather(1, b_rank)
+        above_order = torch.argsort(
+            above.to(torch.int32), dim=-1, descending=True, stable=True
+        )
+        long_ids = torch.full((rows, _K), -1, dtype=torch.int32, device=q.device)
+        slot_k = torch.arange(_K, device=q.device)
+        long_ids = torch.where(
+            slot_k.unsqueeze(0) < n_above.unsqueeze(1),
+            above_order[:, :_K].to(torch.int32),
+            long_ids,
+        )
+        need = (_K - n_above).clamp(min=0)
+        dest = n_above.unsqueeze(1) + b_slot.unsqueeze(0)
+        place = b_valid & (b_slot.unsqueeze(0) < need.unsqueeze(1)) & (dest < _K)
+        row_idx = torch.arange(rows, device=q.device).unsqueeze(1).expand_as(dest)
+        long_ids[row_idx[place], dest[place]] = take[place].to(torch.int32)
+        chosen = torch.where(long.unsqueeze(1), long_ids, short_ids)
+    block_ids.copy_(chosen.to(torch.int32))
+    return qsa_expand_block_indices(
+        block_ids,
+        query_positions,
+        context_lens,
+        token_to_req,
+        _R,
+        _K * _R,
+        token_ids,
     )
 
 
