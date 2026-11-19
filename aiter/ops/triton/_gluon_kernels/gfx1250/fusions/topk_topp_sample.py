@@ -15,6 +15,15 @@ columns hold the k first columns by (key desc, column asc), and those columns
 are >= T, the k-th group max. Candidates are compacted in shared memory and
 ranked pairwise. When a bound leaves more than CAP candidates, exact
 bisections pick the k first.
+
+FAST (aiter AITER_TOPK_SELECT_FAST): the group rank takes up to CAP1_ (128)
+candidates, the bisections carry their counts and skip the index bisection
+when the ties at the k-th key are all taken, and up to 1024 group candidates
+are compacted before their bisection: the same k columns, far fewer dependent
+steps when the chunk bound is loose (realistic rows: 30-200 groups >= L).
+RNG_STATE / OUT2 / REC_CTX (atom ATOM_MTP_DRAFT_FUSED_SELECT): the draft
+draw's uniform (tl.rand at a device counter the stats kernel advances), a
+second copy of the tokens and the draft presence record, in the kernels.
 """
 
 import triton.language as tl
@@ -27,11 +36,11 @@ KEY_NONE = gl.constexpr(-32769)  # below the key of every bf16 value
 
 _stats_repr = make_kernel_repr(
     "_topk_topp_sample_stats_gluon_kernel",
-    ["GROUPS", "CPP", "ROW_MAP", "PENALTY", "ANCHOR", "NW"],
+    ["GROUPS", "CPP", "ROW_MAP", "PENALTY", "ANCHOR", "NW", "RNG_ADV"],
 )
 _select_repr = make_kernel_repr(
     "_topk_topp_sample_select_gluon_kernel",
-    ["GROUPS", "KB", "ROW_MAP", "PENALTY", "ANCHOR", "PHILOX", "NW"],
+    ["GROUPS", "KB", "ROW_MAP", "PENALTY", "ANCHOR", "PHILOX", "NW", "FAST", "RNG_STATE", "REC_CTX"],
 )
 
 
@@ -75,6 +84,60 @@ def _first_k(key, idx, valid, K, lo, IDX_HI):
         ihi = gl.where(ok, mid, ihi)
         ilo = gl.where(ok, ilo, mid)
     return valid & ((key > lo) | (eq & (idx <= ihi)))
+
+
+@gluon.jit
+def _first_k2(key, idx, valid, K, lo, c_lo, IDX_HI):
+    """_first_k's mask (the same bits) with its counts carried: the K-th key
+    by bisection from (lo, c_lo = count(valid & key >= lo)), the count above
+    it known at the end, and the index bisection only when the ties at the
+    K-th key are cut."""
+    hi = gl.max(gl.max(gl.where(valid, key, KEY_NONE), axis=1), axis=0) + 1
+    c_hi = c_lo * 0
+    while hi - lo > 1:
+        mid = (lo + hi) >> 1
+        c = _count(valid & (key >= mid))
+        ok = c >= K
+        lo = gl.where(ok, mid, lo)
+        c_lo = gl.where(ok, c, c_lo)
+        hi = gl.where(ok, hi, mid)
+        c_hi = gl.where(ok, c_hi, c)
+    need = K - c_hi
+    eq = valid & (key == lo)
+    ihi = IDX_HI
+    if c_lo - c_hi > need:
+        ilo = -1
+        while ihi - ilo > 1:
+            mid = (ilo + ihi) >> 1
+            ok = _count(eq & (idx <= mid)) >= need
+            ihi = gl.where(ok, mid, ihi)
+            ilo = gl.where(ok, ilo, mid)
+    return valid & ((key > lo) | (eq & (idx <= ihi)))
+
+
+@gluon.jit
+def _rand_at(seed_lo, seed_hi, off, like):
+    """tl.rand(seed, off) (triton.language.random) for an int64 scalar
+    counter: Philox-4x32-10 at counter (lo(off), hi(off), 0, 0), key
+    (lo(seed), hi(seed)); shaped like `like`."""
+    c0 = (gl.zeros_like(like).to(gl.int64) + off).to(gl.uint32)
+    c1 = ((gl.zeros_like(like).to(gl.int64) + off) >> 32).to(gl.uint32)
+    c2 = gl.zeros_like(like).to(gl.uint32)
+    c3 = gl.zeros_like(like).to(gl.uint32)
+    k0 = (gl.zeros_like(like) + seed_lo).to(gl.uint32)
+    k1 = (gl.zeros_like(like) + seed_hi).to(gl.uint32)
+    for _ in gl.static_range(10):
+        _c0 = c0
+        _c2 = c2
+        c0 = gl.umulhi(_c2, 0xCD9E8D57) ^ c1 ^ k0
+        c2 = gl.umulhi(_c0, 0xD2511F53) ^ c3 ^ k1
+        c1 = _c2 * 0xCD9E8D57
+        c3 = _c0 * 0xD2511F53
+        k0 = k0 + 0x9E3779B9
+        k1 = k1 + 0xBB67AE85
+    x = c0.to(gl.int32, bitcast=True)
+    x = gl.where(x < 0, ~x, x)
+    return x.to(gl.float32) * 4.6566127342e-10
 
 
 @gluon.jit
@@ -204,6 +267,7 @@ def _topk_topp_sample_stats_gluon_kernel(
     V,
     NG,
     NCH,
+    rng_state_ptr,
     ROW_MAP: gl.constexpr,
     BLOCK_BS: gl.constexpr,
     PENALTY: gl.constexpr,
@@ -212,6 +276,7 @@ def _topk_topp_sample_stats_gluon_kernel(
     GROUPS: gl.constexpr,
     CPP: gl.constexpr,
     NW: gl.constexpr,
+    RNG_ADV: gl.constexpr = False,
 ):
     """A program per (row, CPP chunks): each chunk's max and sum of exp of
     logits / t, and each 32-column group's max as a 16-bit ordered key."""
@@ -265,6 +330,11 @@ def _topk_topp_sample_stats_gluon_kernel(
     z = gl.sum(gl.sum(gl.exp2((xf - ref[:, None, None]) * (L2E / t)), axis=2), axis=1)
     gl.store(m_ptr + r * NCH + c, xmax / t, mask=c < NCH)
     gl.store(z_ptr + r * NCH + c, z, mask=c < NCH)
+    if RNG_ADV:
+        # the draft draws' Philox counter += rows (the select reads it back
+        # as state - rows, after this kernel)
+        if (r == 0) & (pc == 0):
+            gl.store(rng_state_ptr, gl.load(rng_state_ptr) + gl.num_programs(0))
 
 
 @gluon.jit(repr=_select_repr)
@@ -303,6 +373,10 @@ def _topk_topp_sample_select_gluon_kernel(
     NCH,
     K,
     eps,
+    rng_state_ptr,
+    out2_ptr,
+    rec_ctx_ptr,
+    rec_pos_ptr,
     ROW_MAP: gl.constexpr,
     BLOCK_BS: gl.constexpr,
     PENALTY: gl.constexpr,
@@ -316,7 +390,17 @@ def _topk_topp_sample_select_gluon_kernel(
     PHILOX: gl.constexpr,
     DEBUG: gl.constexpr,
     NW: gl.constexpr,
+    FAST: gl.constexpr = False,
+    RNG_STATE: gl.constexpr = False,
+    OUT2: gl.constexpr = False,
+    REC_CTX: gl.constexpr = 0,
+    CAP1_: gl.constexpr = 0,
+    CAP2_: gl.constexpr = 0,
 ):
+    # FAST: the pairwise ranks take up to CAP1_ groups / CAP2_ columns before
+    # the exact first-k searches (realistic rows often bound 64-200 groups)
+    CAP1: gl.constexpr = CAP1_ if CAP1_ > 0 else CAP
+    CAP2: gl.constexpr = CAP2_ if CAP2_ > 0 else CAP
     L1: gl.constexpr = gl.BlockedLayout([1], [32], [NW], [0])
     TPW1: gl.constexpr = GROUPS // 8
     GT: gl.constexpr = gl.BlockedLayout([1, 8], [32 // TPW1, TPW1], [NW, 1], [1, 0])
@@ -361,12 +445,33 @@ def _topk_topp_sample_select_gluon_kernel(
     # the groups >= L, compacted in group order
     cand = gv & (G >= L)
     n1 = _count(cand)
-    if n1 > CAP:
-        cand = _first_k(G, gid, gv, K, L, NG)
-        n1 = K
-    slot = _slots(cand, gid & 1023, L1)
     gpk = ((G + 32768) << 13) | (8191 - gid)
     s1 = gl.allocate_shared_memory(gl.int32, [2048], SH)
+    if n1 > CAP1:
+        if FAST & (n1 <= 1024):
+            # the candidates compacted (gpk: key, then group order) in a
+            # [32, 32] tile, 4 a thread, the first-k search over them
+            s1.scatter(
+                gl.reshape(gpk, [NCH_P2 * GROUPS]),
+                gl.reshape(_slots(cand, gid & 1023, L1), [NCH_P2 * GROUPS]),
+                axis=0,
+            )
+            gl.barrier()
+            fi = gl.arange(0, 32, layout=gl.SliceLayout(1, FL))
+            fj = gl.arange(0, 32, layout=gl.SliceLayout(0, FL))
+            fv = (fi[:, None] * 32 + fj[None, :]) < n1
+            P1 = gl.convert_layout(gl.reshape(s1.slice(0, 1024).load(L1), [32, 32]), FL)
+            ck = gl.where(fv, (P1 >> 13) - 32768, KEY_NONE)
+            cg = 8191 - (P1 & 8191)
+            m1 = _first_k2(ck, cg, fv, K, L, n1, NG)
+            # the K-th by (key desc, group asc): its gpk is the smallest taken
+            Tp1 = gl.min(gl.min(gl.where(m1, P1, 2147483647), axis=1), axis=0)
+            gl.barrier()
+            cand = gv & (gpk >= Tp1)
+        else:
+            cand = _first_k(G, gid, gv, K, L, NG)
+        n1 = K
+    slot = _slots(cand, gid & 1023, L1)
     s1.scatter(
         gl.reshape(gpk, [NCH_P2 * GROUPS]),
         gl.reshape(slot, [NCH_P2 * GROUPS]),
@@ -375,17 +480,17 @@ def _topk_topp_sample_select_gluon_kernel(
     gl.barrier()
 
     # their order by (key desc, group asc); T is the K-th group max
-    sa = gl.arange(0, CAP, layout=gl.SliceLayout(1, RL))
-    sb = gl.arange(0, CAP, layout=gl.SliceLayout(0, RL))
-    A = gl.where(sa < n1, s1.slice(0, CAP).load(gl.SliceLayout(1, RL)), -1)
-    B = gl.where(sb < n1, s1.slice(0, CAP).load(gl.SliceLayout(0, RL)), -1)
+    sa = gl.arange(0, CAP1, layout=gl.SliceLayout(1, RL))
+    sb = gl.arange(0, CAP1, layout=gl.SliceLayout(0, RL))
+    A = gl.where(sa < n1, s1.slice(0, CAP1).load(gl.SliceLayout(1, RL)), -1)
+    B = gl.where(sb < n1, s1.slice(0, CAP1).load(gl.SliceLayout(0, RL)), -1)
     before = (B[None, :] > A[:, None]) | (
         (B[None, :] == A[:, None]) & (sb[None, :] < sa[:, None])
     )
     grank = gl.sum(before.to(gl.int32), axis=1)
     Tp = gl.max(gl.where(grank == K - 1, A, -1), axis=0)
     T = (Tp >> 13) - 32768
-    s2 = gl.allocate_shared_memory(gl.int32, [CAP], SH)
+    s2 = gl.allocate_shared_memory(gl.int32, [CAP1], SH)
     s2.scatter(A, grank, axis=0)
     gl.barrier()
 
@@ -418,8 +523,11 @@ def _topk_topp_sample_select_gluon_kernel(
     key = gl.where(cv, _ordered_key(xc.to(gl.int16, bitcast=True)), KEY_NONE)
     cand2 = cv & (key >= T)
     n2 = _count(cand2)
-    if n2 > CAP:
-        cand2 = _first_k(key, ccols, cv, K, T, V)
+    if n2 > CAP2:
+        if FAST:
+            cand2 = _first_k2(key, ccols, cv, K, T, n2, V)
+        else:
+            cand2 = _first_k(key, ccols, cv, K, T, V)
         n2 = K
     slot2 = _slots(cand2, (kk[:, None] * 32 + ln[None, :]) & 1023, L1)
     s3k = gl.allocate_shared_memory(gl.int32, [2048], SH)
@@ -429,16 +537,18 @@ def _topk_topp_sample_select_gluon_kernel(
     gl.barrier()
 
     # the K first columns by (key desc, column asc), in that order
-    Ak = gl.where(sa < n2, s3k.slice(0, CAP).load(gl.SliceLayout(1, RL)), KEY_NONE)
-    Ac = gl.where(sa < n2, s3c.slice(0, CAP).load(gl.SliceLayout(1, RL)), V + sa)
-    Bk = gl.where(sb < n2, s3k.slice(0, CAP).load(gl.SliceLayout(0, RL)), KEY_NONE)
-    Bc = gl.where(sb < n2, s3c.slice(0, CAP).load(gl.SliceLayout(0, RL)), V + sb)
+    sa2 = gl.arange(0, CAP2, layout=gl.SliceLayout(1, RL))
+    sb2 = gl.arange(0, CAP2, layout=gl.SliceLayout(0, RL))
+    Ak = gl.where(sa2 < n2, s3k.slice(0, CAP2).load(gl.SliceLayout(1, RL)), KEY_NONE)
+    Ac = gl.where(sa2 < n2, s3c.slice(0, CAP2).load(gl.SliceLayout(1, RL)), V + sa2)
+    Bk = gl.where(sb2 < n2, s3k.slice(0, CAP2).load(gl.SliceLayout(0, RL)), KEY_NONE)
+    Bc = gl.where(sb2 < n2, s3c.slice(0, CAP2).load(gl.SliceLayout(0, RL)), V + sb2)
     before2 = (Bk[None, :] > Ak[:, None]) | (
         (Bk[None, :] == Ak[:, None]) & (Bc[None, :] < Ac[:, None])
     )
     rank2 = gl.sum(before2.to(gl.int32), axis=1)
-    s4k = gl.allocate_shared_memory(gl.int32, [CAP], SH)
-    s4c = gl.allocate_shared_memory(gl.int32, [CAP], SH)
+    s4k = gl.allocate_shared_memory(gl.int32, [CAP2], SH)
+    s4c = gl.allocate_shared_memory(gl.int32, [CAP2], SH)
     s4k.scatter(Ak, rank2, axis=0)
     s4c.scatter(Ac, rank2, axis=0)
     gl.barrier()
@@ -459,7 +569,12 @@ def _topk_topp_sample_select_gluon_kernel(
     else:
         tp = top_p_val
     top_p = gl.minimum(tp / denom, 1.0, propagate_nan=tl.PropagateNan.ALL)
-    if PHILOX:
+    if RNG_STATE:
+        # _draft_uniform_kernel's draw: tl.rand(seed, state + r), the state
+        # already advanced by the rows (the stats kernel)
+        st = gl.load(rng_state_ptr) - gl.num_programs(0)
+        u = _rand_at(seed_lo, seed_hi, st + r, offs)
+    elif PHILOX:
         u = _philox_uniform(r, seed_lo, seed_hi, off_lo, off_hi, offs)
     else:
         u = gl.load(u_ptr + r)
@@ -486,6 +601,15 @@ def _topk_topp_sample_select_gluon_kernel(
     nan_row = (Z != Z) | (M == float("-inf"))  # noqa: PLR0124 (isnan)
     token = gl.where((t <= eps) & nan_row, 0, token)
     gl.store(out_ptr + r, token)
+    if OUT2:
+        gl.store(out2_ptr + r, token)
+    if REC_CTX > 0:
+        # DraftPresencePenalty.record: the row's draft into its context at
+        # 1 + pos, then pos + 1 (row r is request r)
+        rpos = gl.load(rec_pos_ptr + r)
+        if rpos < REC_CTX - 1:
+            gl.store(rec_ctx_ptr + r * REC_CTX + 1 + rpos, token)
+        gl.store(rec_pos_ptr + r, rpos + 1)
     if PENALTY and ANCHOR:
         # the query's first token joins the request's marked tokens
         s = gl.load(pen_row_seq_ptr + src)

@@ -10,6 +10,8 @@ logits are read once. Only the k largest columns of each row get a
 probability.
 """
 
+import os
+
 import torch
 import triton
 
@@ -38,6 +40,13 @@ __all__ = [
 MAX_K = 64
 # the Gluon select packs a group index in 13 bits and a chunk index in 10 bits
 _GLUON_SELECT_MAX_VOCAB = 8192 * 32
+# AITER_TOPK_SELECT_FAST=1: the Gluon select's exact first-k (taken when a
+# bound leaves more than CAP candidates) as 5-way searches, four thresholds a
+# reduction, its tie search only when ties are cut: the same mask, fewer steps.
+_SELECT_FAST = os.environ.get("AITER_TOPK_SELECT_FAST", "0") == "1"
+# with AITER_TOPK_SELECT_FAST: the pairwise ranks' capacities (groups, columns)
+_CAP1 = int(os.environ.get("AITER_TOPK_SELECT_CAP1", "128"))
+_CAP2 = int(os.environ.get("AITER_TOPK_SELECT_CAP2", "64"))
 
 
 def _get_config(rows: int) -> tuple[dict, dict]:
@@ -91,6 +100,9 @@ def topk_topp_sample(
     presence: dict | None = None,
     gluon_select: bool = False,
     philox: tuple[int, int] | None = None,
+    rng_state: tuple[torch.Tensor, int] | None = None,
+    out2: torch.Tensor | None = None,
+    record: tuple[torch.Tensor, torch.Tensor, int] | None = None,
 ) -> torch.Tensor:
     """Sample one token a row from ``softmax(logits / t)`` under top-k and top-p.
 
@@ -134,6 +146,14 @@ def topk_topp_sample(
             Philox-4x32-10 at key ``seed`` and counter ``(r, offset)``, made
             in the kernel, in place of ``uniform``. Use a new offset for
             each call.
+        rng_state: ``(state, seed)``, gluon_select only: the uniform of row r
+            is ``tl.rand(seed, state[0] + r)`` and ``state[0] += n`` (int64
+            device counter), the draw of atom's ``_draft_uniform_kernel``,
+            made in the kernels in place of ``uniform``.
+        out2: int32 [n], gluon_select only: a second copy of the tokens.
+        record: ``(ctx, pos, width)``, gluon_select only: after the draw,
+            ``ctx[r * width + 1 + pos[r]] = token`` (when ``pos[r] < width -
+            1``) and ``pos[r] += 1`` (atom ``DraftPresencePenalty.record``).
 
     Returns:
         int32 [n] token ids.
@@ -159,7 +179,13 @@ def topk_topp_sample(
         philox is None and not anchor
     ), "philox and anchor need gluon_select"
     assert philox is None or uniform is None, "philox replaces uniform"
-    if uniform is None and philox is None:
+    assert gluon_select or (
+        rng_state is None and out2 is None and record is None
+    ), "rng_state, out2 and record need gluon_select"
+    assert rng_state is None or (
+        uniform is None and philox is None
+    ), "rng_state replaces uniform"
+    if uniform is None and philox is None and rng_state is None:
         uniform = torch.rand(n, dtype=torch.float32, device=device)
     _LOGGER.info(
         "TOPK_TOPP_SAMPLE: logits=%s rows=%d k=%d", tuple(logits.shape), n, top_k
@@ -220,6 +246,7 @@ def topk_topp_sample(
             V,
             NG,
             NCH,
+            rng_state[0] if rng_state is not None else out,
             ROW_MAP=row_map,
             BLOCK_BS=block_bs,
             PENALTY=penalty,
@@ -228,10 +255,14 @@ def topk_topp_sample(
             GROUPS=groups,
             CPP=gcpp,
             NW=4 * gcpp,
+            RNG_ADV=rng_state is not None,
             num_warps=4 * gcpp,
         )
         nw = gcfg["num_warps"]
-        seed, offset = philox if philox is not None else (0, 0)
+        if rng_state is not None:
+            seed, offset = int(rng_state[1]), 0
+        else:
+            seed, offset = philox if philox is not None else (0, 0)
         _topk_topp_sample_select_gluon_kernel[(n,)](
             logits,
             logits.stride(0),
@@ -260,6 +291,10 @@ def topk_topp_sample(
             NCH,
             top_k,
             eps,
+            rng_state[0] if rng_state is not None else out,
+            out2 if out2 is not None else out,
+            record[0] if record is not None else out,
+            record[1] if record is not None else out,
             ROW_MAP=row_map,
             BLOCK_BS=block_bs,
             PENALTY=penalty,
@@ -273,7 +308,12 @@ def topk_topp_sample(
             PHILOX=philox is not None,
             DEBUG=debug is not None,
             NW=nw,
+            FAST=_SELECT_FAST,
+            RNG_STATE=rng_state is not None,
+            OUT2=out2 is not None,
+            REC_CTX=int(record[2]) if record is not None else 0,
             num_warps=nw,
+            **({"CAP1_": _CAP1, "CAP2_": _CAP2} if _SELECT_FAST else {}),
         )
         return out
     cpp = stats_cfg["CHUNKS_PER_PROGRAM"]
