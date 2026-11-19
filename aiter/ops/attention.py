@@ -593,18 +593,29 @@ def _attention_ps_reduce_asm(
 
 
 def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
-    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
+    """Estimate reducer waves from the page16 256-token split budget.
 
-    This is not a live split count. Callers with padded kv_indices should pass
-    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
+    This is an average split count inferred from packed, used KV pages. It
+    avoids a device-to-host metadata read, so callers with padded ``kv_indices``
+    must pass an explicit ``reduce_waves`` value.
     """
-    if num_cu != 256 or not 1 <= batch_size <= 8:
+    if batch_size < 1 or kv_pages < batch_size or num_cu < 1:
         return 0
-    output_rows = batch_size * 4 * 16
-    if output_rows < num_cu:
-        return 0
-    context_threshold = 32768 if output_rows <= num_cu else 65536
-    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
+    average_pages = (kv_pages + batch_size - 1) // batch_size
+    average_splits = (average_pages + 15) // 16
+    split_budget = min((num_cu + batch_size - 1) // batch_size, 256)
+    estimated_splits = max(1, min(average_splits, split_budget))
+    if estimated_splits <= 8:
+        waves = 1
+        output_rows = batch_size * 64
+        while waves < 8 and output_rows * waves < num_cu:
+            waves *= 2
+        return waves
+    if estimated_splits <= 16:
+        return 2
+    if estimated_splits <= 32:
+        return 4
+    return 8
 
 
 def pa_persistent_fwd(
@@ -640,10 +651,9 @@ def pa_persistent_fwd(
     device without reading metadata back to the host.
     reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
     PA workload heuristic, while 1/2/4/8 explicitly overrides it. The Q4/GQA16
-    policy expects packed kv_indices containing only used pages. Other paths
-    use the native output-row/CU heuristic. No tuning or device-to-host readback
-    occurs. The automatic wave choice is an occupancy heuristic, not a measured
-    performance optimum for every split distribution.
+    policy estimates average 256-token splits from packed, used kv_indices pages
+    and selects 1/2/4/8 waves without device-to-host readback. Other paths retain
+    the native output-row/CU fallback.
     return_lse=False skips final LSE allocation and computation and returns None
     for the second result. The default preserves the existing LSE output.
     Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
