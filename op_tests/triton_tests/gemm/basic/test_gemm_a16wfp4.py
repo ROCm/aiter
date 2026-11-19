@@ -8,6 +8,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+from op_tests.triton_tests.utils.scale_tail import scales_with_tail
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -209,5 +210,26 @@ def test_gemm_a16wfp4(
             ).to(dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+
+    torch.testing.assert_close(torch_out, y)
+
+
+@pytest.mark.parametrize("K", [2080, 2048])
+def test_gemm_a16wfp4_ragged_k_scales(K: int):
+    """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
+    scale bytes past K // 32: 0xFF there is the e8m0 NaN."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    M, N, dtype = 32, 64, torch.bfloat16
+    x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
+        M, N, K, output=True, atomic_add=False, dtype=dtype, layout="TN"
+    )
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+    # K = 2080 leaves a partial last block for every BLOCK_SIZE_K from 64 to 2048,
+    # K = 2048 leaves none.
+    y = gemm_a16wfp4(
+        x, w, scales_with_tail(w_scales, 255), atomic_add=False, dtype=dtype, y=y
+    ).to(dtype)
 
     torch.testing.assert_close(torch_out, y)
