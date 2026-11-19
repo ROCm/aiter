@@ -32,6 +32,7 @@ import functools
 import math
 import re
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -734,10 +735,10 @@ _GATE_UP_SILU_CU_NUM = 256
 _GATE_UP_SILU_SHAPES = ((4608, 5120),)
 # (largest M, kernelName) at those shapes. Each name pins its K loop with
 # ``_pl``, the loop the tile was timed with, instead of inheriting the default
-# pick. Above the last bound the 2-D compute GEMM followed by silu_and_mul and
-# quantize_fp8 was faster, so gate_up_silu_kernel_for leaves those rows to the
-# caller's unfused path; the launch itself runs any M (see
-# run_gate_up_silu_mxfp8_32_gfx1250).
+# pick. Past the last bound the fused path is not measured to win (the larger
+# prefill row counts that were timed showed little or no gain), so
+# gate_up_silu_kernel_for leaves those rows to the caller's unfused path;
+# the launch itself accepts any M (see run_gate_up_silu_mxfp8_32_gfx1250).
 _GATE_UP_SILU_TILES = (
     (384, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl"),
     (512, "flydsl_bmm_mxfp8_32_wmma_t64x256x256_mw1_nw4_nb3_sk1_cm1_cn1_pl"),
@@ -847,16 +848,20 @@ def gate_up_silu_kernel_for(m: int, n2: int, k: int) -> str | None:
 
 def gate_up_silu_limit(swiglu_limit: float) -> float:
     """``swiglu_limit`` as the fused kernel takes it, with the meaning aiter
-    ``silu_and_mul`` gives it: a positive limit clamps (gate from above at L, up
-    to [-L, L]), 0 clamps nothing, and a negative or NaN limit is an error.
-    +inf also clamps nothing, so it runs the same kernel as 0."""
+    ``silu_and_mul`` gives it: a limit whose f32 value is positive clamps (gate
+    from above at L, up to [-L, L]), 0 clamps nothing, and a negative or NaN
+    limit is an error. silu_and_mul takes the limit as f32, so +inf and a
+    positive value that rounds to f32 0 also clamp nothing and run the same
+    kernel as 0."""
     limit = float(swiglu_limit)
     if not limit >= 0.0:
         raise ValueError(
             "[FlyDSL gfx1250 gate_up silu] swiglu_limit must be >= 0 "
             f"(0 = no clamp), got {swiglu_limit!r}"
         )
-    return 0.0 if math.isinf(limit) else limit
+    if math.isinf(limit) or not np.float32(limit) > 0:
+        return 0.0
+    return limit
 
 
 def run_gate_up_silu_mxfp8_32_gfx1250(
@@ -877,15 +882,16 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
     scale. Writes ``Out`` [M, I] e4m3 and ``y_scale_out`` [M, I//32] e8m0
     (either may also be uint8 storage): ``quantize_fp8`` of aiter
     ``silu_and_mul(gemm_out, swiglu_limit)`` on the bf16 GEMM output, with the
-    same scales and the same e4m3 codes up to one step. The epilogue's exp/rcp
-    can round a bf16 activation to the neighbour of silu_and_mul's, which can
-    move an e4m3 rounding midpoint; with a limit bf16 cannot represent, the
-    gate is also clamped in f32 where silu_and_mul rounds the clamped gate to
-    bf16. ``swiglu_limit`` follows silu_and_mul (see ``gate_up_silu_limit``).
+    same clamp (the clamped gate rounded to bf16, as silu_and_mul does). The
+    epilogue's exp/rcp can round a bf16 activation to the neighbour of
+    silu_and_mul's; that moves an e4m3 code by one step where it crosses a
+    rounding midpoint (the op test requires the scales to match exactly and
+    allows only such isolated one-step codes). ``swiglu_limit`` follows
+    silu_and_mul (see ``gate_up_silu_limit``).
 
     ``kernel_name`` None picks the tile from ``XQ``'s row count; past
-    GATE_UP_SILU_MAX_ROWS that is the largest bucket's tile, which computes the
-    same values but was not measured to beat the unfused chain there.
+    GATE_UP_SILU_MAX_ROWS that is the largest bucket's tile (not measured
+    there).
 
     This is the raw FlyDSL launch; a torch.compile region calls the registered
     op ``aiter.ops.batched_gemm_op_a8w8.gate_up_silu_mxfp8_32`` instead.
@@ -935,6 +941,12 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
     if not _gate_up_silu_tiles_shape(cfg, n2, k):
         raise RuntimeError(f"{tag} {name!r} does not tile I={inter}, K={k}")
+    tensors = (XQ, WQ, x_scale, w_scale, Out, y_scale_out)
+    if any(t.device != XQ.device for t in tensors):
+        raise RuntimeError(f"{tag} all operands must be on {XQ.device}")
+    # TDM descriptors take 16-byte aligned bases.
+    if any(t.data_ptr() % 16 for t in tensors):
+        raise RuntimeError(f"{tag} operand base pointers must be 16-byte aligned")
     gfx = get_gfx_runtime()
     if gfx not in _GFX1250_ARCHS:
         raise RuntimeError(f"{tag} requires gfx1250, got {gfx}")

@@ -144,7 +144,16 @@ def test_kernel_ok_rejects(name):
 
 @pytest.mark.parametrize(
     "limit,want",
-    [(10.0, 10.0), (7, 7.0), (0.0, 0.0), (1e-3, 1e-3), (math.inf, 0.0)],
+    [
+        (10.0, 10.0),
+        (7, 7.0),
+        (0.0, 0.0),
+        (1e-3, 1e-3),
+        (math.inf, 0.0),
+        # positive doubles whose f32 value is 0: silu_and_mul gets 0.0f
+        (1e-46, 0.0),
+        (5e-324, 0.0),
+    ],
 )
 def test_limit_accepts(limit, want):
     assert bmm.gate_up_silu_limit(limit) == want
@@ -154,6 +163,75 @@ def test_limit_accepts(limit, want):
 def test_limit_rejects(limit):
     with pytest.raises(ValueError, match="swiglu_limit"):
         bmm.gate_up_silu_limit(limit)
+
+
+# CPU model of the clamp + SiLU*up + group-32 e8m0 step, to check the clamp
+# semantics without a gfx1250: a gate g past the limit and every bf16 up u in
+# (0, L] (one element per 32-column group, the rest zero), e8m0 of the bf16
+# activation.
+
+
+def _bf16(x):
+    return x.to(torch.bfloat16).to(torch.float32)
+
+
+def _e8m0(amax):
+    # ceil pow2 of amax / 448 (amax floored at 1e-10), as an e8m0 exponent.
+    q = torch.clamp(amax, min=1e-10) / 448.0
+    mant, exp = torch.frexp(q)  # q = mant * 2**exp, mant in [0.5, 1)
+    return exp - 1 + (mant > 0.5).to(exp.dtype) + 127
+
+
+def _silu_and_mul_ref(g, u, limit):
+    # csrc/kernels/activation_kernels.cu, silu with a limit: the gate is
+    # clamped in f32 and cast back to bf16, the up clamped in f32 (fmed3).
+    lim = torch.tensor(limit, dtype=torch.float32)
+    gx = _bf16(torch.minimum(g, lim))
+    uy = torch.clamp(u, -lim, lim)
+    return _bf16(gx / (1 + torch.exp(-gx)) * uy)
+
+
+def _epilogue_model(g, u, limit, round_gate):
+    # The fused epilogue's `_act`: min / fmed3 clamp, SiLU, times up. The SiLU
+    # is written as in the reference, so only the clamp differs (the exp / rcp
+    # rounding difference is the op test's one-step allowance).
+    lim = torch.tensor(limit, dtype=torch.float32)
+    g = torch.minimum(g, lim)
+    if round_gate:
+        g = _bf16(g)
+    u = torch.maximum(torch.minimum(u, lim), -lim)
+    return _bf16(g / (1 + torch.exp(-g)) * u)
+
+
+def _saturated_rows(limit):
+    # every positive bf16 up to the limit as u, a gate well past the limit
+    top = int(torch.tensor(limit).to(torch.bfloat16).view(torch.int16)) + 1
+    u = torch.arange(1, top, dtype=torch.int16).view(torch.bfloat16).float()
+    g = torch.full_like(u, 64.0)
+    return g, u
+
+
+@pytest.mark.parametrize("limit", [7.49, 5.02, 5.14])
+def test_clamped_gate_rounding_matches_silu_and_mul(limit):
+    """At limits bf16 cannot hold, an f32-clamped gate moves some groups' e8m0
+    scale against silu_and_mul (the old epilogue); rounding the clamped gate to
+    bf16, as the epilogue now does, gives silu_and_mul's values and scales."""
+    assert float(torch.tensor(limit).to(torch.bfloat16)) != limit
+    g, u = _saturated_rows(limit)
+    ref = _silu_and_mul_ref(g, u, limit)
+    new = _epilogue_model(g, u, limit, round_gate=True)
+    old = _epilogue_model(g, u, limit, round_gate=False)
+    assert torch.equal(new, ref)
+    assert torch.equal(_e8m0(new.abs()), _e8m0(ref.abs()))
+    # The f32 clamp the epilogue had reproduces the reported scale flips.
+    assert bool((_e8m0(old.abs()) != _e8m0(ref.abs())).any())
+
+
+@pytest.mark.parametrize("limit", [10.0, 7.5, 0.5])
+def test_bf16_limits_unaffected_by_gate_rounding(limit):
+    g, u = _saturated_rows(limit)
+    old = _epilogue_model(g, u, limit, round_gate=False)
+    assert torch.equal(old, _epilogue_model(g, u, limit, round_gate=True))
 
 
 def _args(
@@ -232,6 +310,20 @@ def test_run_rejects_kernel(other_arch):
     with pytest.raises(RuntimeError, match="does not tile"):
         bmm.run_gate_up_silu_mxfp8_32_gfx1250(
             **_args(n2=4480), swiglu_limit=10.0, kernel_name=_bucket(4096)
+        )
+
+
+def test_run_rejects_device_and_alignment(other_arch):
+    args = _args(device="cpu")
+    with pytest.raises(RuntimeError, match="must be on"):
+        bmm.run_gate_up_silu_mxfp8_32_gfx1250(
+            **{**args, "Out": torch.empty(8, INTER, dtype=FP8, device="meta")},
+            swiglu_limit=10.0,
+        )
+    shifted = torch.empty(8 * INTER + 1, dtype=FP8)[1:].view(8, INTER)
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        bmm.run_gate_up_silu_mxfp8_32_gfx1250(
+            **{**args, "Out": shifted}, swiglu_limit=10.0
         )
 
 

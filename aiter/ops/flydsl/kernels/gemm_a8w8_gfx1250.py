@@ -7,6 +7,7 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import numpy as np
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -136,6 +137,10 @@ def launch_gemm_a8w8(
             "[FlyDSL gfx1250] act_limit must be finite and >= 0 (0 = no clamp), "
             f"got {act_limit!r}"
         )
+    # Clamp only where the f32 limit the kernel sees is positive: silu_and_mul
+    # takes the limit as f32, so a positive double that rounds to 0 clamps
+    # nothing there either.
+    act_clamp = bool(fuse_act_mul and np.float32(act_limit) > 0)
     if fuse_act_mul and not (
         fuse_quant_out
         and b_scale_32x32
@@ -1427,18 +1432,18 @@ def launch_gemm_a8w8(
             GN = OUT_TN // 32
             S8_OFF = tile_m * C8_ROW
             one = fx.Float32(1.0)
-            if const_expr(act_limit > 0):
+            if const_expr(act_clamp):
                 lim = fx.Float32(act_limit)
                 nlim = fx.Float32(-act_limit)
 
             def _act(g, u):
                 # aiter act_and_mul_kernel<silu>: with a limit, the fminf /
-                # fmed3 clamp (none at act_limit 0, as silu_and_mul with 0),
-                # here in f32 (silu_and_mul rounds the clamped gate to bf16,
-                # the same value whenever bf16 holds the limit exactly);
+                # fmed3 clamp (none when the f32 limit is 0, as silu_and_mul),
+                # the clamped gate rounded back to bf16 as silu_and_mul does
+                # (the up clamp stays f32 there too);
                 # x * rcp(1 + exp(-x)), times up, rounded to bf16.
-                if const_expr(act_limit > 0):
-                    g = fx.Float32(fx.minnumf(g, lim))
+                if const_expr(act_clamp):
+                    g = fx.Float32(fx.minnumf(g, lim)).to(out_cls).to(fx.Float32)
                     u = fx.Float32(fx.maxnumf(fx.minnumf(u, lim), nlim))
                 e = fx.Float32(fx.exp(-g))
                 sig = fx.Float32(rocdl.rcp(T.f32, _raw_f32(one + e)))

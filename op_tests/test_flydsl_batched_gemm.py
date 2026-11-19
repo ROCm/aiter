@@ -616,10 +616,11 @@ def test_pipelined_k_loop(b, m, n, k, kernel_name):
 
 # Fused gate_up + SwiGLU + MXFP8 quant at the DSv4.1 shared-expert shape
 # (2*I = 4608, K = 5120): M covers every tile bucket of the picker's table,
-# ragged M included, with swiglu_limit 10 and 0 (no clamp, as silu_and_mul).
+# ragged M included, with swiglu_limit 10, 0 (no clamp, as silu_and_mul) and
+# 5.02, which bf16 cannot hold (the clamped gate is rounded to bf16).
 GATE_UP_SILU_MS = (1, 7, 384, 500, 640, 768, 960, 1152, 1345, 2048, 4096)
 GATE_UP_SILU_SHAPE = (4608, 5120)
-GATE_UP_SILU_LIMITS = (10.0, 0.0)
+GATE_UP_SILU_LIMITS = (10.0, 0.0, 5.02)
 
 
 def _gate_up_silu_table_tile(m):
@@ -647,10 +648,13 @@ def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
     inter = n2 // 2
     torch.manual_seed(SEED)
     x = blockwise_randn(m, 1, k, dtype=dtypes.bf16) * 20
-    # Rows past the clamp, tiny rows and a zero row.
+    # Rows past the clamp, tiny rows and a zero row, each only where it does
+    # not land on another one (at M = 1 the one row carries the clamp).
     x[: max(m // 8, 1)] *= 8
-    x[m // 4 : m // 4 + max(m // 8, 1)] *= 1e-3
-    x[m - 1] = 0
+    if m >= 4:  # below that m // 4 is row 0, the clamped row
+        x[m // 4 : m // 4 + max(m // 8, 1)] *= 1e-3
+    if m > 1:  # at M = 1 row 0 is already the clamped row
+        x[m - 1] = 0
     w = blockwise_randn(1, n2, k, dtype=dtypes.bf16, rows=32)
     x8, xs8 = quant_act_e8m0(x.to(dtypes.bf16), 32)
     w8, ws8 = quant_weight_e8m0(w, 32, 32)
@@ -870,6 +874,8 @@ def main():
             else [(2, m, 1024, 4096) for m in (16, 48, 128, 256)]
         )
         _run_fused_quant(shapes, pin_tiles=not custom_shape)
+        if not custom_shape:
+            _run_gate_up_silu()
         return
 
     for dtype in args.dtype:

@@ -563,10 +563,9 @@ def gate_up_silu_mxfp8_32(
     replayed for another M still runs that M's tile. Check
     ``gate_up_silu_supported(2*I, K)`` once (e.g. when the model is built)
     before routing through it. The op runs every M; past
-    ``GATE_UP_SILU_MAX_ROWS`` the fused kernel computes the same values but
-    was not measured to beat the unfused chain, so a caller that keeps an
-    unfused path for those rows makes that split inside its own op, where the
-    row count is real.
+    ``GATE_UP_SILU_MAX_ROWS`` it uses the largest bucket's tile, which is not
+    measured there, so a caller that keeps an unfused path for those rows
+    makes that split inside its own op, where the row count is real.
     """
     from .flydsl.batched_gemm_a8w8_gfx1250 import run_gate_up_silu_mxfp8_32_gfx1250
 
