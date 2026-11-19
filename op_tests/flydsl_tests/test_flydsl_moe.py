@@ -1143,3 +1143,121 @@ def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
     _check_close(
         d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
     )
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_e2e_a8w4_situv2_experts_past_4gib():
+    """Experts past 4 GiB of w1/w2 (Kimi-K3.1 TP1: 9.9 GB w1, 4.9 GB w2) read their own
+    weights in both stages. Only the routed tail experts carry data; shuffles are expert-major.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    torch.set_default_device("cuda")
+    token, model_dim, inter_dim, E, topk, tail, block_m = 64, 3584, 3072, 896, 8, 16, 32
+    assert E * model_dim * inter_dim // 2 > 2**32  # w2, so w1 too
+    torch.manual_seed(31)
+    inp = torch.randn((token, model_dim), dtype=torch.bfloat16) / 4
+    w1 = torch.randn((tail, inter_dim * 2, model_dim), dtype=torch.bfloat16) / 4
+    w2 = torch.randn((tail, model_dim, inter_dim), dtype=torch.bfloat16) / 4
+    local_ids = torch.stack([torch.randperm(tail)[:topk] for _ in range(token)])
+    topk_ids = (local_ids + (E - tail)).to(torch.int32)
+    topk_weights = torch.rand((token, topk))
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
+    )
+    a_q, a_scale = per_1x32_f8_scale_f8_quant(
+        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w1_q = w1_q.view(tail, inter_dim * 2, model_dim // 2)
+    w2_q = w2_q.view(tail, model_dim, inter_dim // 2)
+    ref1 = torch_moe_stage1(
+        a_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        local_ids,
+        dtype=torch.bfloat16,
+        activation=ActivationType.Situv2,
+        quant_type=Q_TYPE,
+        a1_scale=a_scale,
+        w1_scale=w1_scale,
+        situ_beta=SITUV2_BETA,
+        situ_linear_beta=SITUV2_LINEAR_BETA,
+    )
+    ref2 = torch_moe_stage2(
+        ref1,
+        w1_q,
+        w2_q,
+        topk_weights,
+        local_ids,
+        dtype=torch.bfloat16,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    def at_tail(t, *shape):
+        rows = t.view(torch.uint8).reshape(tail, -1)
+        full = torch.zeros((E, rows.shape[1]), dtype=torch.uint8)
+        full[-tail:] = rows
+        return full.view(t.dtype).view(*shape)
+
+    kw = {
+        "sorted_token_ids": sorted_ids,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "topk": topk,
+        "tile_m": 32,
+        "tile_n": 256,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+    }
+    s1 = flydsl_moe_stage1(
+        a=a_q,
+        w1=at_tail(shuffle_weight(w1_q, (16, 16)), E, inter_dim * 2, model_dim // 2),
+        act="situv2",
+        situ_beta=SITUV2_BETA,
+        situ_linear_beta=SITUV2_LINEAR_BETA,
+        w1_scale=at_tail(e8m0_shuffle(w1_scale), E * inter_dim * 2, model_dim // 32),
+        a1_scale=mxfp4_moe_sort_fwd(
+            a_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=model_dim,
+        ),
+        gate_mode="separated",
+        **kw,
+    )
+    torch.cuda.synchronize()
+    _check_close(ref1.float(), s1.float(), "situv2_past_4gib_stage1")
+    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+        s1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    out = flydsl_moe_stage2(
+        inter_states=a2_q.view(token, topk, inter_dim),
+        w2=at_tail(shuffle_weight_a16w4(w2_q, 16, False), E, model_dim, inter_dim // 2),
+        mode="atomic",
+        w2_scale=at_tail(
+            shuffle_scale_a16w4(w2_scale, tail, False), E * model_dim, inter_dim // 32
+        ),
+        a2_scale=mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=inter_dim,
+        ),
+        sorted_weights=sorted_weights,
+        inter_dim_pad=0,
+        model_dim_pad=0,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    _check_close(ref2.float(), out.float(), "situv2_past_4gib_e2e")

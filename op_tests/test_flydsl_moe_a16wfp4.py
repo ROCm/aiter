@@ -1275,6 +1275,51 @@ def _moe_reference(hidden, weight1, weight2, routing_ids, routing_weights, round
     return contributions.sum(dim=1).to(hidden.dtype)
 
 
+@_SKIP
+def test_moe_experts_past_4gib_of_weights():
+    """Experts past 4 GiB of w1/w2 (Kimi-K3.1 TP1: 9.9 GB w1, 4.9 GB w2) read their own
+    weights. Only the routed tail experts carry data; the preshuffles are expert-major.
+    """
+    token, model_dim, inter_dim, experts, topk, tail = 64, 3584, 3072, 896, 8, 16
+    assert experts * model_dim * inter_dim // 2 > 2**32  # w2, so w1 too
+    torch.manual_seed(29)
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    weight1 = torch.randn(
+        (tail, 2 * inter_dim, model_dim), dtype=dtypes.bf16, device="cuda"
+    )
+    weight2 = torch.randn(
+        (tail, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda"
+    )
+    packed1, scales1, reference1 = _pack_mxfp4_reference(weight1)
+    packed2, scales2, reference2 = _pack_mxfp4_reference(weight2)
+
+    def at_tail(tensor, *shape):
+        rows = tensor.view(torch.uint8).reshape(tail, -1)
+        full = torch.zeros((experts, rows.shape[1]), dtype=torch.uint8, device="cuda")
+        full[-tail:] = rows
+        return full.view(*shape)
+
+    local_ids = torch.stack(
+        [torch.randperm(tail, device="cuda")[:topk] for _ in range(token)]
+    ).to(torch.int32)
+    routing_weights = torch.rand((token, topk), device="cuda")
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    actual = flydsl_a16w4_moe(
+        hidden_states=hidden,
+        w1=at_tail(packed1, experts, 2 * inter_dim, model_dim // 2),
+        w2=at_tail(packed2, experts, model_dim, inter_dim // 2),
+        w1_scale=at_tail(scales1, experts * 2 * inter_dim, model_dim // 32),
+        w2_scale=at_tail(scales2, experts * model_dim, inter_dim // 32),
+        topk_ids=local_ids + (experts - tail),
+        topk_weights=routing_weights,
+        swiglu_limit=10.0,
+    )
+    reference = _moe_reference(
+        hidden, reference1, reference2, local_ids, routing_weights, False
+    )
+    _check_moe_output(reference.float(), actual, "a16w4 experts past 4 GiB")
+
+
 @benchmark()
 def benchmark_moe_clamped_silu(
     token,
