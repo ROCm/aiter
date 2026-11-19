@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 import functools
 import math
 import operator
@@ -1434,6 +1435,7 @@ def _flydsl_mxfp8_fallback_kernel(
     tile_n must be a multiple of 32.
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        compute_grid_ctas,
         is_compute_kernel,
         kernel_fits_shape,
         kernels_list,
@@ -1456,7 +1458,7 @@ def _flydsl_mxfp8_fallback_kernel(
         # Prefer denser clusters. Fewer LDS buffers (nb2 over nb4) and
         # non-persistent grids win on gfx1250 compute_wmma gemm-request
         # shapes — extra buffers / ps>1 inflate the K / N pipeline.
-        return min(
+        best = min(
             compute,
             key=lambda x: (
                 abs(x.tile_m - want_tm),
@@ -1467,6 +1469,31 @@ def _flydsl_mxfp8_fallback_kernel(
                 x.num_buffers,
             ),
         )
+        # Short-K mx32 nb2 is the exception: four tiles per CTA let the C store
+        # overlap the next tile's loads, while the grid still fills every CU.
+        if (
+            mx32
+            and best.split_k == 1
+            and best.num_buffers == 2
+            and (k // best.tile_k <= 16)
+        ):
+            ps4 = dataclasses.replace(best, persistent_n_tiles=4)
+            if ps4 in compute and compute_grid_ctas(ps4, m, n) >= 2 * get_cu_num():
+                return ps4
+        # Long-K mx32: four one-K-tile slots keep more of K in flight than two
+        # two-K-tile slots, which hides the TDM latency the nb2 loop waits on.
+        # Below ~4 tiles per CU the deeper prologue is not amortized.
+        if (
+            mx32
+            and best.split_k == 1
+            and best.num_buffers == 2
+            and best.tile_n == 256
+            and k // best.tile_k >= 32
+        ):
+            nb4 = dataclasses.replace(best, num_buffers=4)
+            if nb4 in compute and compute_grid_ctas(nb4, m, n) >= 4 * get_cu_num():
+                return nb4
+        return best
     return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
 
 
