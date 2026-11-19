@@ -17,6 +17,7 @@ node.
 | `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `quick_allreduce_lamport.py` | The Lamport handshake's receive (poll and spin), re-arm and post-push release, which the mesh, the ring and the hierarchical kernel share. Each kernel keeps its own buffer count and re-arm timing. |
 | `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
 The host classes are in `aiter/ops/flydsl/`:
@@ -130,7 +131,8 @@ ways (`TwoShotRung.handshake`, or the `handshake` argument of
   the sender keeps its packets off that value (`lamport_fix` in
   `quick_allreduce_codec.py`). Each thread polls the packet words that it
   reads until none is the sentinel, then writes the sentinel back. This
-  removes the drain, the flag store and two barriers from each lap.
+  removes the drain, the flag store and two barriers from each lap. The poll,
+  the re-arm and the release are in `quick_allreduce_lamport.py`.
 
 Only one packet can hold the sentinel: an INT4 nibble word whose eight values
 are all at code 15. The sender moves one of them down one step. This needs
@@ -565,7 +567,7 @@ and how it prevents bias in the comparison.
 
 FlyDSL 0.5.0 and later key the JIT cache on the traced kernel IR. A change to a
 helper in another module, for example `transport.py`,
-`quick_allreduce_codec.py` or the epilogue modules (`*_epilogue.py`,
+`quick_allreduce_codec.py`, `quick_allreduce_lamport.py` or the epilogue modules (`*_epilogue.py`,
 `*_rmsnorm.py`), changes the IR of every kernel that uses it, so FlyDSL
 compiles a new binary.
 

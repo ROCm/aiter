@@ -34,7 +34,6 @@ from flydsl.expr.typing import T
 
 from ...allreduce_policy import (
     AG_CODECS,
-    HANDSHAKES,
     RING_SUPER_TILES,
     RS_CODECS,
     SUPPORTED_WORLDS,
@@ -49,13 +48,20 @@ from .quick_allreduce_codec import (
     _scale_from_word,
     codecs_for_block,
     lamport_fix,
-    lamport_slots,
     scale_slot_of,
-    split_lamport_packet,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .quick_allreduce_fusions import check_fusion_args
+from .quick_allreduce_lamport import (
+    check_handshake,
+    lamport_offsets,
+    lamport_packets,
+    lamport_poll,
+    lamport_pushed,
+    lamport_rearm_dwords,
+    lamport_rearm_modifier,
+)
 from .quick_allreduce_rmsnorm import RingRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
@@ -64,23 +70,20 @@ from .transport import (
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     LAMPORT_FILL_BYTE,
-    LAMPORT_SENTINEL,
     QUAD_LANES,
     QUADS_PER_WAVE,
     _acquire_inbox,
-    _any_sentinel,
     _buffer_load,
     _buffer_ptr,
-    _buffer_store,
     _color_io,
     _i32_to_bytes,
+    _lds_free,
     _load_flag,
     _load_peers,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
-    lamport_rearm_modifier,
     make_pack_storage,
 )
 
@@ -147,9 +150,7 @@ def make_quick_allreduce_ring_kernel(
     is where the ring's throughput goes to die.
     """
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
-    if handshake not in HANDSHAKES:
-        raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
-    lamport = handshake == "lamport"
+    lamport = check_handshake(handshake)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -381,39 +382,22 @@ def make_quick_allreduce_ring_kernel(
         def _lamport_recv(codec, step, sub, buf):
             """``[(words, scale_word)]`` per rank-atom of our slot for *step*
             in *buf*, raw as ``_recv_raw`` returns them, once none of the
-            dwords this thread reads is the sentinel; then put the sentinel
-            back in them.
-
-            As the mesh's ``_lamport_recv``: every dword is read before any is
-            tested and all are re-read together, past L1 and L2, with relaxed
-            system-scope atomics on the re-reads. ``vmcnt(0)`` drains the
-            re-arms issued before it, which must land before this group's
-            op ``N`` push (``LAMPORT_BUFFERS``).
+            dwords this thread reads is the sentinel (``lamport_poll``); then
+            put the sentinel back in them (``lamport_rearm_dwords``), which
+            must land before this group's op ``N`` push (``LAMPORT_BUFFERS``).
             """
-            offs, rearm = [], []
-            for j in range_constexpr(rank_atoms):
-                base = _slot_i32(step, sub, buf) + fx.Int32(j * codec.rank_tile_i32)
-                for off, pred in lamport_slots(codec, tid, scale_slot):
-                    offs.append(base + off)
-                    rearm.append((base + off, pred))
-            got = fx.Vector.from_elements(
-                [_load_i32_at(inbox, o, _RECV_POLICY) for o in offs], fx.Int32
+            offs, rearm = lamport_offsets(
+                codec,
+                tid,
+                scale_slot,
+                (
+                    _slot_i32(step, sub, buf) + fx.Int32(j * codec.rank_tile_i32)
+                    for j in range_constexpr(rank_atoms)
+                ),
             )
-            addrs = [self_base + _i32_to_bytes(o) for o in offs]
-            while _any_sentinel(got):
-                got = fx.Vector.from_elements([_load_flag(a) for a in addrs], fx.Int32)
-            rocdl.s_waitcnt(vmcnt=0)
-            armed = fx.Vector.from_elements([fx.Int32(LAMPORT_SENTINEL)], fx.Int32)
-            for off, pred in rearm:
-                if pred:
-                    _buffer_store(inbox, off, armed, rearm_cm)
-            per = len(offs) // rank_atoms
-            return [
-                split_lamport_packet(
-                    codec, [got[j * per + e] for e in range_constexpr(per)]
-                )
-                for j in range_constexpr(rank_atoms)
-            ]
+            got = lamport_poll(inbox, self_base, offs)
+            lamport_rearm_dwords(inbox, rearm, rearm_cm)
+            return list(lamport_packets(codec, got, rank_atoms))
 
         def _scale_of(codec, word):
             return _scale_from_word(codec, word, pair_in_slot)
@@ -705,13 +689,11 @@ def make_quick_allreduce_ring_kernel(
                     if const_expr(k <= steps):
                         # The last fanout's LDS reads must land before this
                         # op overwrites the staging rows.
-                        rocdl.s_waitcnt(lgkmcnt=0)
-                        gpu.barrier()
+                        _lds_free()
                         _op_substep(k, tile, s, recv, buf)
                         gpu.barrier()
                         _fanout_to_next(k - 1, s, buf)
-                        if const_expr(release_scope is not None):
-                            _release_inbox(release_scope)
+                        lamport_pushed(release_scope)
                     else:
                         _op_substep(k, tile, s, recv, buf)
                     if const_expr(k >= world_size):

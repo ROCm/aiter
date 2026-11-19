@@ -69,7 +69,8 @@ which left after the writer's release:
   through the ring, left after that rank had finished ``i - 1``.
 * The partner's cross slot of ``i - 1``, after its packet of ``i`` has landed.
 
-Whole slots are re-armed with 16 B write-through stores (``_rearm``).
+Whole slots are re-armed with 16 B write-through stores
+(``quick_allreduce_lamport.lamport_rearm_span``).
 
 Buffers:
 
@@ -95,7 +96,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from ...allreduce_policy import (
-    HANDSHAKES,
     HIER_CODECS,
     HIER_LOCAL_SCHEDULES,
     HIER_SUPER_TILES,
@@ -112,37 +112,40 @@ from .quick_allreduce_codec import (
     _scale_from_word,
     codecs_for_block,
     lamport_fix,
-    lamport_slots,
     scale_slot_of,
-    split_lamport_packet,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
+from .quick_allreduce_lamport import (
+    check_handshake,
+    lamport_offsets,
+    lamport_packets,
+    lamport_poll,
+    lamport_pushed,
+    lamport_rearm_modifier,
+    lamport_rearm_span,
+)
 from .transport import (
     _CM_SC1,
     _INBOX_POLICY,
-    _RECV_POLICY,
     ATOMS,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     LAMPORT_FILL_BYTE,
-    LAMPORT_SENTINEL,
     QUAD_LANES,
     QUADS_PER_WAVE,
     _acquire_inbox,
-    _any_sentinel,
     _buffer_load,
     _buffer_ptr,
-    _buffer_store,
     _color_io,
     _i32_to_bytes,
+    _lds_free,
     _load_flag,
     _load_peers,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
-    lamport_rearm_modifier,
     make_pack_storage,
 )
 
@@ -251,9 +254,7 @@ def make_quick_allreduce_hier_kernel(
     *local_ag* pick the schedule of the two local laps, ``"mesh"`` or
     ``"ring"``. *handshake* is one of ``HANDSHAKES``, for all three laps.
     """
-    if handshake not in HANDSHAKES:
-        raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
-    lamport = handshake == "lamport"
+    lamport = check_handshake(handshake)
     groups = check_groups(groups, world_size)
     if not 0 <= int(rank) < world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
@@ -764,47 +765,21 @@ def make_quick_allreduce_hier_kernel(
 
         # ---- Lamport handshake; see the module docstring. ----
 
-        rearm_vec = fx.Vector.from_elements([fx.Int32(LAMPORT_SENTINEL)] * 4, fx.Int32)
-
         def _poll(c, bases):
             """``[(words, scale_word)]`` of the packets of codec *c* at the i32
             offsets *bases* of our inbox, raw as ``_recv_raw`` returns them,
-            once none of the dwords this thread reads is the sentinel.
-
-            As the mesh's Lamport receive: every dword is read before any is
-            tested, past L1 and L2, then all are re-read together with relaxed
-            system-scope atomics until every one has landed. There is no
-            re-arm here (``_rearm``); ``vmcnt(0)`` drains every store issued
-            before, the re-arms among them, which the buffer argument needs.
+            once none of the dwords this thread reads is the sentinel
+            (``lamport_poll``).
+            ``vmcnt(0)`` drains every store issued before, the re-arms among
+            them, which the buffer argument needs.
             """
-            slots = lamport_slots(c, tid, scale_slot)
-            offs = [b + off for b in bases for off, _pred in slots]
-            got = fx.Vector.from_elements(
-                [_buffer_load(inbox, o, 1, fx.Int32, _RECV_POLICY)[0] for o in offs],
-                fx.Int32,
-            )
-            addrs = [self_base + _i32_to_bytes(o) for o in offs]
-            while _any_sentinel(got):
-                got = fx.Vector.from_elements([_load_flag(a) for a in addrs], fx.Int32)
+            offs, _rearm = lamport_offsets(c, tid, scale_slot, bases)
+            got = lamport_poll(inbox, self_base, offs)
             rocdl.s_waitcnt(vmcnt=0)
-            per = len(slots)
-            return [
-                split_lamport_packet(
-                    c, [got[i * per + j] for j in range_constexpr(per)]
-                )
-                for i in range_constexpr(len(bases))
-            ]
+            return list(lamport_packets(c, got, len(bases)))
 
         def _rearm(base_i32, n_i32):
-            """Put the sentinel back in *n_i32* dwords of our inbox from
-            *base_i32*, 16 B per lane (``lamport_rearm_modifier``)."""
-            n_vec = fx.Int32(n_i32 // 4)
-            for v0 in range(fx.Int32(0), n_vec, fx.Int32(block)):
-                v = v0 + tid
-                if v < n_vec:
-                    _buffer_store(
-                        inbox, base_i32 + v * fx.Int32(4), rearm_vec, rearm_cm
-                    )
+            lamport_rearm_span(inbox, base_i32, n_i32, tid, block, rearm_cm)
 
         def _rearm_local(buf):
             """Every local slot of this block in buffer *buf*."""
@@ -814,19 +789,6 @@ def make_quick_allreduce_hier_kernel(
         def _rearm_cross(buf):
             """The partner's cross slot of this block in buffer *buf*."""
             _rearm(_x_slot(buf, 1 - my_group, fx.Int32(0)), x_slot)
-
-        def _pushed():
-            """After a Lamport lap's (or ring hop's) pushes: on a cacheable
-            inbox this wave writes them back out of L2. No barrier, no flag."""
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-
-        def _lds_free():
-            """Join the workgroup once this wave's LDS reads have landed, so
-            the next pack cannot overwrite rows a push still reads. The flag
-            handshake gets this join from its publish and wait."""
-            rocdl.s_waitcnt(lgkmcnt=0)
-            gpu.barrier()
 
         def _rank_tiles(slot_fn, idxs, s, c, buf):
             """``(keys, bases)``: ``(idx, k)`` and the i32 offset of rank-tile
@@ -871,7 +833,7 @@ def make_quick_allreduce_hier_kernel(
                         )
                 gpu.barrier()
                 _fanout_local(rs, _rs_slot(fx.Int32(li), s, buf))
-            _pushed()
+            lamport_pushed(release_scope)
 
         def _rs_ring_lamport(i, n_this, buf):
             """Lap 1 on the ring: as ``_rs_ring``, each sub-tile of hop ``h``
@@ -905,7 +867,7 @@ def make_quick_allreduce_hier_kernel(
                         _lds_write_packet(rs, fx.Int32(k), words, scale, is_leader)
                     gpu.barrier()
                     _store_rows(rs, next_base, _rs_slot(fx.Int32(h - 1), s, buf))
-                _pushed()
+                lamport_pushed(release_scope)
 
         def _ag_mesh_lamport(i, n_this, buf):
             """The gather on the mesh: every local peer's packet of each
@@ -966,7 +928,7 @@ def make_quick_allreduce_hier_kernel(
                     else:
                         pass  # the last hop receives only
                 if const_expr(h < G):
-                    _pushed()
+                    lamport_pushed(release_scope)
                 else:
                     pass
 
@@ -1001,7 +963,7 @@ def make_quick_allreduce_hier_kernel(
                     gpu.barrier()
                     _store_rows(xc, partner_base, _x_slot(xbuf, my_group, s))
                     _store_rows(xc, self_base, _x_slot(xbuf, my_group, s))
-                _pushed()
+                lamport_pushed(release_scope)
                 # This group's reduce-scatter has landed from every local
                 # rank: the previous group's local slots can be re-armed.
                 _rearm_local(fx.Int32(1) - lbuf)
@@ -1066,7 +1028,7 @@ def make_quick_allreduce_hier_kernel(
                         _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s, lbuf))
                     else:
                         _fanout_local(ag, _ag_slot(fx.Int32(li), s, lbuf))
-                _pushed()
+                lamport_pushed(release_scope)
                 # The partner's packet of this group has landed: its previous
                 # cross slot can be re-armed.
                 _rearm_cross(
