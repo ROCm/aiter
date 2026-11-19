@@ -114,6 +114,18 @@ def fused_qknorm_idxrqknorm(
     #   index_cache is whole contiguous 9216 B pages ([128 x 64 B e2m1][128 x 8 B e4m3]); k_scale / v_scale are
     #   the fp32 [1] global scales of K and V (the index key has none). The rounding is integer/compare
     #   arithmetic, not a hardware convert, but nvfp4 (like mxfp4) is refused off gfx950.
+    # kv_cache_dtype="nvfp4" with byte k_scale / v_scale (uint8 or float8_e4m3fn) instead of
+    #   the fp32 globals: the NVFP4 row layout of the MiniMax-M3 sparse pool and of the FlyDSL
+    #   paged decode's NVFP4 K/V (gfx950 and gfx1250). kv_cache_k / kv_cache_v are the e2m1
+    #   payloads [num_pages, num_kv_heads, 128, head_dim // 2] (element 2j in the low nibble of
+    #   byte j) and k_scale / v_scale their E4M3 scale planes [num_pages, num_kv_heads, 128,
+    #   head_dim // 16], one per 16 elements, no global scale; rows contiguous inside a
+    #   (page, head), page and head strides free (the two scale planes share theirs). K (normed,
+    #   roped) and V are rounded to the model dtype, then scale = e4m3(amax / 6) (round to
+    #   nearest even, saturating at 448) and codes = e2m1(x * (1 / scale)) (half to even,
+    #   saturating at 6), IEEE divisions. block_size 128; the index cache is "auto" or fp8
+    #   as in the FP8 path, addressed by index_slot_mapping alone (or absent with
+    #   skip_index_branch).
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
@@ -124,9 +136,21 @@ def fused_qknorm_idxrqknorm(
         )
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
-    # stores would silently write zeros.
+    # stores would silently write zeros. The NVFP4 row layout (byte scale planes) is integer
+    # and compare arithmetic only, so it also runs on gfx1250.
     fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
-    if fp4_dtypes and get_gfx_runtime() != "gfx950":
+    nvfp4_rows = (
+        kv_cache_dtype == "nvfp4"
+        and k_scale is not None
+        and (k_scale.dtype == torch.uint8 or _is_fp8_e4m3_tensor(k_scale))
+        and index_cache_dtype not in ("mxfp4", "nvfp4")
+    )
+    if nvfp4_rows:
+        if get_gfx_runtime() not in ("gfx950", "gfx1250"):
+            raise RuntimeError(
+                "fused_qknorm_idxrqknorm NVFP4 row-layout K/V requires gfx950 or gfx1250"
+            )
+    elif fp4_dtypes and get_gfx_runtime() != "gfx950":
         raise RuntimeError("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
     if (
         q_out is not None
