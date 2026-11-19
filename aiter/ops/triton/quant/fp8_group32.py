@@ -25,7 +25,7 @@ def quantize_fp8_group32(
 
     Args:
         x: Contiguous BF16 tensor on gfx1250. Its last width is divisible by 32.
-        persistent: Use a 16 by 16 grid with four waves per worker.
+        persistent: Use a 1 by 256 grid with four waves per worker.
             Each iteration processes one, two or four 1024-element tiles
             from the worker's task sequence at stride 256.
         dequantize: Return QAT values in BF16 instead of FP8 and scale tensors.
@@ -65,7 +65,7 @@ def quantize_fp8_group32(
             if persistent
             else 1
         )
-        grid = (16, 16) if persistent else (tasks,)
+        grid = (1, 256) if persistent else (tasks,)
         _quantize_fp8_group32_kernel[grid](
             x,
             out,

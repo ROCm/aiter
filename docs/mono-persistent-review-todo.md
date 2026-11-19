@@ -1,6 +1,13 @@
 # A03/A09 mono review and acceptance
 
-## Current acceptance checklist: 2026-11-19
+## Current grid correction: 2026-11-19
+
+The requirement is fixed 256 TGs. The selected A03/A09 PS grid is now
+`(1,256)`, with the TG id from `program_id(1)`. Each TG has 128 threads.
+Batch selection and memory scope are unchanged. The earlier 16 x 16 checklist
+below records that tested revision only. New GPU validation is pending.
+
+## Previous 16 x 16 acceptance checklist: 2026-11-19
 
 [Published raw results and JIT evidence](mono-persistent-results/2026-11-19)
 include all four target profiles and the rejected weight-load trial.

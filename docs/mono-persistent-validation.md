@@ -12,7 +12,7 @@ not been connected to these standalone wrappers.
 
 | Item | Required behavior | Required evidence |
 | --- | --- | --- |
-| Scheduling | Exactly 256 TGs in a physical 16 x 16 grid. Linear TG id is `tg = x + 16*y`. Each op processes `task = tg + j*256`. A TG without work returns from the op and still reaches the next join. | Actual main-kernel launch, task coverage, and a join test with idle TGs. A standalone `(256,1,1)` grid does not pass the geometry check. |
+| Scheduling | Exactly 256 TGs. The selected grid is `(1,256)`, with `tg = program_id(1)`. Each op processes `task = tg + j*256`. A TG without work returns from the op and still reaches the next join. | Actual main-kernel launch, task coverage, and a join test with idle TGs. For this wrapper, check a `(1,256,1)` TG grid and `(128,1,1)` workgroup. |
 | Residency | All 256 TGs must be able to reside together for the join. The flag array has 256 four-byte entries, or 1 KB. | Resource and residency checks for the final fused launch, plus a join progress test. TG count alone is not residency evidence. |
 | TG shape | Four wave32 waves, or 128 threads, for every op in the launch. | Real dispatch metadata. The join assigns 64 flags to each wave. |
 | SGPRs | The op must neither read nor write `s104` or `s105`. These are ordinary hardware SGPRs reserved by the mono ABI for the main kernel. | Check all actual op instruction operands, including register ranges and helper code. Verify preservation through the main-kernel call path. SH L2148 and L2419 are the supplied references. |
@@ -73,7 +73,17 @@ non-regression or invent an allowed slowdown. Repeat unresolved c16 evidence
 as needed. Model-level non-regression requires the model path to be exercised;
 an isolated op benchmark must be labeled as such.
 
-### Current measured result: 2026-11-19
+### Grid correction: 2026-11-19
+
+The user clarified that the invariant is 256 TGs, not a 16 x 16 geometry.
+The A03 and A09 PS wrappers now use `(1,256)`. The kernel takes the TG id
+from `program_id(1)`. Task ownership remains `task = tg + j*256`.
+The TG still has four wave32 waves (128 threads). Batch selection, native
+math, DEV activation loads and DEV + HT output stores are unchanged.
+The prior 16 x 16 measurements below remain historical. GPU validation of
+the new geometry is pending; do not relabel the old trace as a 1 x 256 run.
+
+### Previous 16 x 16 result: 2026-11-19
 
 Published evidence is in [mono-persistent-results/2026-11-19](mono-persistent-results/2026-11-19).
 The [manifest](mono-persistent-results/2026-11-19/manifest.json) records the tested

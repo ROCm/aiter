@@ -137,7 +137,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         eps_k: K RMSNorm epsilon; defaults to eps_q.
         yq, sq, yk: optional pre-allocated outputs.
         amax_floor: floor of each Q group's amax (0: none).
-        persistent: use 256 workers in a 16 by 16 grid with four
+        persistent: use 256 workers in a 1 by 256 grid with four
             wave32 waves per worker on gfx1250.
             The task count selects one or four rows at stride 256 per iteration.
             This is a standalone
@@ -178,7 +178,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         yk = torch.empty((M, KK), dtype=k.dtype, device=k.device)
 
     NUM_PRGMS = 256 if persistent else M
-    grid = (16, 16) if persistent else (NUM_PRGMS,)
+    grid = (1, 256) if persistent else (NUM_PRGMS,)
 
     kernel = _fused_dual_rmsnorm_mxfp8_quant_kernel
     launch_options = {}

@@ -59,7 +59,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
     k_cols = gl.arange(0, BLOCK_SIZE_KK, layout=gl.SliceLayout(0, k_layout))
     q_rows = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, q_layout))
     k_rows = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, k_layout))
-    tg = gl.program_id(0) + 16 * gl.program_id(1)
+    tg = gl.program_id(1)
     for first in range(tg, M, NUM_PRGMS * ROWS_PER_ITER):
         gq = load_dev(gq_ptr, q_cols, q_cols < KQ).to(gl.float32)
         gk = load_dev(gk_ptr, k_cols, k_cols < KK).to(gl.float32)
