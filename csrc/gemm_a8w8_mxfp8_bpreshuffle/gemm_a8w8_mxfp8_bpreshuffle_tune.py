@@ -851,7 +851,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     int(row["K"]),
                     str(row["w_scale_block"]),
                 )
-                existing[key] = (str(row["kernelName"]), float(row["us"]))
+                existing[key] = (
+                    str(row["kernelName"]),
+                    float(row["us"]),
+                    float(row.get("errRatio", 0.0)),
+                )
 
         tasks_by_shape = defaultdict(dict)
         for task in tasks:
@@ -863,7 +867,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             if baseline is None or baseline[0] not in by_name:
                 _, _, m, n, k, _ = shape
                 name = _mxfp8_32_fallback_kernel_name(m, n, k)
-                baseline = (name, None)
+                baseline = (name, None, None)
             if baseline[0] not in by_name:
                 raise RuntimeError(
                     f"gfx1250 1x32 baseline {baseline[0]!r} is not a legal "
@@ -884,10 +888,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         confirm_tasks = []
         rounds = max(1, int(args.confirm_rounds))
         for shape, by_name in tasks_by_shape.items():
-            baseline_name, stored_us = baselines[shape]
+            baseline_name, stored_us, stored_err = baselines[shape]
             valid = sorted(coarse_by_shape.get(shape, ()), key=lambda result: result[1])
             candidate_name = valid[0][0][3] if valid else baseline_name
-            choices[shape] = (baseline_name, candidate_name, stored_us)
+            choices[shape] = (baseline_name, candidate_name, stored_us, stored_err)
             for round_index in range(rounds):
                 order = (
                     (baseline_name, candidate_name)
@@ -905,7 +909,12 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
         selected = []
         min_speedup = 1.0 + float(args.min_gain_pct) / 100.0
-        for shape, (baseline_name, candidate_name, stored_us) in choices.items():
+        for shape, (
+            baseline_name,
+            candidate_name,
+            stored_us,
+            stored_err,
+        ) in choices.items():
             baseline = measured[(shape, baseline_name)]
             candidate = measured[(shape, candidate_name)]
             if len(baseline) != rounds or len(candidate) != rounds:
@@ -932,11 +941,21 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             name = candidate_name if keep else baseline_name
             values = candidate if keep else baseline
             info = tasks_by_shape[shape][name][0]
+            selected_us = (
+                float(stored_us)
+                if not keep and stored_us is not None
+                else statistics.median(value[0] for value in values)
+            )
+            selected_err = (
+                float(stored_err)
+                if not keep and stored_err is not None
+                else max(value[1] for value in values)
+            )
             selected.append(
                 (
                     info,
-                    round(statistics.median(value[0] for value in values), 4),
-                    max(value[1] for value in values),
+                    round(selected_us, 4),
+                    selected_err,
                 )
             )
         return selected
