@@ -127,7 +127,7 @@ def fused_gemm_afp4wfp4_mul_add(
         else:
             IS_B_SCALAR = False
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert arch_info.is_any_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
     N, K = w.shape

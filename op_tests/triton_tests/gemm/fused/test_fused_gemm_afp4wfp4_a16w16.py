@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
@@ -73,12 +76,17 @@ def run_triton(
 
 def get_x_vals():
 
+    m_vals = [1, 8, 32, 64, 128, 8192]
+    if arch_info.is_sw_emulated_fp4_avail():
+        # The preshuffled table there bounds M at 31: M < 32 must get a
+        # BLOCK_SIZE_M of 16 or less, or the wrapper's assert fails.
+        m_vals += [16, 17, 31]
     x_vals = [
         (m, n1, n2, k)
         for k in [1024, 8192, 7168]
         for n2 in [256, 512]
         for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
+        for m in m_vals
     ]
     return x_vals
 
@@ -90,8 +98,19 @@ def get_x_vals():
 @pytest.mark.parametrize("fp4_shuffle", [True, False])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    config_name = (
+        "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
+        if fp4_shuffle
+        else "FUSED-GEMM-AFP4WFP4-A16W16"
+    )
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(resolve_config_dir("gemm", config_name), "DEFAULT.json")
+    ):
+        pytest.skip(f"No {config_name} config for {arch_info.get_arch()}.")
     torch.manual_seed(0)
 
     (

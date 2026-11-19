@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -5,6 +7,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -188,8 +191,14 @@ def run_torch(x, w, w_scales, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(resolve_config_dir("gemm", "BATCHED_GEMM-A16WFP4"), "DEFAULT.json")
+    ):
+        pytest.skip(f"No BATCHED_GEMM-A16WFP4 config for {arch_info.get_arch()}.")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -201,7 +210,15 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
 
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
-    torch.testing.assert_close(torch_out, out)
+    if arch_info.is_sw_emulated_fp4_avail():
+        # Same tolerance as test_gemm_afp4wfp4.py on these archs: the emulated
+        # dot_scaled result can differ from the reference by one ULP of the
+        # output dtype after rounding.
+        torch.testing.assert_close(
+            torch_out, out, atol=1e-2, rtol=torch.finfo(torch_out.dtype).eps
+        )
+    else:
+        torch.testing.assert_close(torch_out, out)
 
 
 def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():

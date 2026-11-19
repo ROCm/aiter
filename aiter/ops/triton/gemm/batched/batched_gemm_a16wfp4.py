@@ -103,7 +103,7 @@ def batched_gemm_a16wfp4_(
 
     assert prequant is True, "prequant = False is not yet supported"
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert arch_info.is_any_fp4_avail(), "MXFP4 is not available on your device"
 
     # K_unpacked counts fp4 elements; w packs two of them per uint8, so w's K
     # is half of x's. Everything below works in the packed K.
