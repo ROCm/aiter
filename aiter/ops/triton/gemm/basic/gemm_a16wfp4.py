@@ -75,7 +75,7 @@ def gemm_a16wfp4_(
         tuple(w_scales.shape),
     )
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert arch_info.is_any_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
     N, K = w.shape
