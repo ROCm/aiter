@@ -741,7 +741,19 @@ def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
 
         pre_scale_a, pre_scale_b = prefetch_first_phase(fx.Int32(0))
 
-        for kidx in range(0, num_tiles, 2):
+        # LLVM flattens a one-iteration loop (K=256), then folds the zero
+        # accumulators and schedules across phases, which needs 256 VGPRs plus
+        # scratch spills. Hiding the trip count in an SGPR keeps the loop at
+        # the K >= 512 register count. Inline asm because no stable FlyDSL op
+        # is opaque to LLVM constant folding.
+        loop_end = num_tiles
+        if const_expr(num_tiles == 2):
+            loop_end = fx.Int32(
+                _llvm.inline_asm(
+                    T.i32, [], "s_mov_b32 $0, 2", "=s", has_side_effects=False
+                )
+            )
+        for kidx in range(0, loop_end, 2):
             fifo_scale_a_0 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
             fifo_scale_b_0 = fx.Float32(0)
             kiter = fx.Int32(kidx)
