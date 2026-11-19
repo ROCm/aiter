@@ -39,7 +39,8 @@ Environment knobs:
 4. Extracts likely failure snippets from `latest_test.log` and job logs.
 5. Finds the latest successful Aiter Test run before the failed run and ranks commits in
    that range by path and keyword overlap with the failure surface.
-6. Gives the evidence to the configured headless agent for a concise report. If the agent
+6. Writes `evidence.json` and `culprit.json` for downstream automation.
+7. Gives the evidence to the configured headless agent for a concise report. If the agent
    is unavailable, it writes the deterministic fallback report instead.
 
 ## Reporting Rules
