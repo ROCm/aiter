@@ -428,50 +428,47 @@ def test_override_cannot_enable_an_algorithm_without_a_ladder(cell):
 
 
 def test_mesh_is_the_fallback_of_a_host_that_does_not_split():
-    """PCIe TP8 runs the mesh unless the host splits into two groups. The mesh
-    variables move that fallback, and on a split host they are ignored with a
-    warning."""
+    """PCIe TP8 runs the mesh up to the ring unless the host splits into two
+    groups, where it runs up to ``hier``. The mesh variables move the mesh
+    window on either kind of host, and a mesh floor at or above ``hier``'s
+    leaves a split host no mesh."""
     var = "AITER_FLY_AR_MESH_MIN_BYTES"
     flat = _resolve(ws=8)
-    assert flat.window(MESH, quantized=True) == Window(96 << 10, 24 << 20)
+    assert flat.window(MESH, quantized=True) == Window(96 << 10, 256 << 20)
     assert (
         flat.with_topology(hierarchical=False).select(1 << 20, quantized=True) == MESH
     )
-    with mock.patch.object(P.logger, "warning") as w:
-        split = flat.with_topology(hierarchical=True)
-    w.assert_not_called()
-    assert split.window(MESH, quantized=True) is None
+    split = flat.with_topology(hierarchical=True)
+    assert split.window(MESH, quantized=True) == Window(96 << 10, 28 << 20)
+    assert split.select(27 << 20, quantized=True) == MESH
+    assert split.select(28 << 20, quantized=True) == HIER
     with _env(**{var: str(256 << 10)}):
         flat = _resolve(ws=8)
-        assert flat.window(MESH, quantized=True) == Window(256 << 10, 24 << 20)
-        with mock.patch.object(P.logger, "warning") as w:
-            split = flat.with_topology(hierarchical=True)
-    w.assert_called_once()
-    assert var in w.call_args.args[1]
-    assert split.window(MESH, quantized=True) is None
+        assert flat.window(MESH, quantized=True) == Window(256 << 10, 256 << 20)
+        split = flat.with_topology(hierarchical=True)
+        assert split.window(MESH, quantized=True) == Window(256 << 10, 28 << 20)
+    with _env(**{var: str(32 << 20)}):
+        split = _resolve(ws=8).with_topology(hierarchical=True)
+        assert split.window(MESH, quantized=True) is None
 
 
 def test_split_host_runs_hier_over_the_ring_window():
-    """On a split PCIe TP8 host ``hier`` takes every quantized payload and the
-    ring does not run; the mesh-lap rungs end where the policy's mesh window
-    ends, and the rungs above run the ring inside each group. A bounded
+    """On a split PCIe TP8 host ``hier`` takes the quantized payloads from its
+    floor up and the ring does not run, and below it the mesh runs. A bounded
     ``hier`` hands the rest to the ring."""
     flat = _resolve(ws=8)
     split = flat.with_topology(hierarchical=True)
-    assert split.window(HIER, quantized=True) == Window(96 << 10, None)
+    assert split.window(HIER, quantized=True) == Window(28 << 20, None)
     assert split.window(RING, quantized=True) is None
     assert split.select(1 << 31, quantized=True) == HIER
     assert flat.with_topology(hierarchical=False).window(RING, quantized=True) == (
-        Window(24 << 20, None)
+        Window(256 << 20, None)
     )
-    mesh_max = flat.window(MESH, quantized=True).max
-    for rung in P.hier_st_ladder(world_size=8, link="pcie", arch="gfx950"):
-        expect = ("mesh", "mesh") if rung.min_bytes < mesh_max else ("ring", "ring")
-        assert (rung.local_rs, rung.local_ag) == expect, rung
-    with _env(AITER_FLY_AR_HIER_MAX_BYTES=str(64 << 20)):
+    with _env(AITER_FLY_AR_HIER_MAX_BYTES=str(512 << 20)):
         split = _resolve(ws=8).with_topology(hierarchical=True)
-        assert split.window(RING, quantized=True) == Window(64 << 20, None)
-        assert split.select(64 << 20, quantized=True) == RING
+        assert split.window(RING, quantized=True) == Window(512 << 20, None)
+        assert split.select(512 << 20, quantized=True) == RING
+        assert split.select(511 << 20, quantized=True) == HIER
 
 
 def test_equal_bounds_disable():
@@ -495,7 +492,7 @@ def test_ignored_overrides():
 def test_overlapping_overrides_raise():
     # Raising the mesh ceiling without moving the ring floor.
     with (
-        _env(AITER_FLY_AR_MESH_MAX_BYTES=str(64 << 20)),
+        _env(AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20)),
         pytest.raises(ValueError, match="overlaps"),
     ):
         _resolve()
@@ -1723,7 +1720,7 @@ def test_hier_takes_its_window_first_on_a_split_host(cell):
     if hier is None:
         assert split == dataclasses.replace(flat, hierarchical=False)
         return
-    assert split.mesh is None
+    assert split.mesh is None or split.mesh.max <= hier.min
     for k in range(4, 33):
         n = 1 << k
         if hier.contains(n):

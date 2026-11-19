@@ -666,8 +666,8 @@ class FamilyPolicy:
     ``hier`` is the window of the hierarchical schedule, which needs the ranks
     to split into two uniform groups (``PeerTopology.is_hierarchical``). It
     applies only once ``with_topology(hierarchical=True)`` has set
-    ``hierarchical``, and then it replaces the mesh and takes the start of the
-    ring's window.
+    ``hierarchical``, and then it takes over from the mesh at ``hier.min`` and
+    takes the start of the ring's window.
     """
 
     arch: str
@@ -745,24 +745,18 @@ class FamilyPolicy:
 
     def with_topology(self, *, hierarchical: bool) -> FamilyPolicy:
         """This policy on a host whose ranks do (or do not) split into two
-        uniform groups. Splitting enables ``hier``, drops the mesh, and starts
-        the ring where ``hier`` ends, so that no ring engine is built for
-        payloads it would never run."""
+        uniform groups. Splitting enables ``hier``, ends the mesh where
+        ``hier`` starts, and starts the ring where ``hier`` ends, so that no
+        ring engine is built for payloads it would never run."""
         if not hierarchical or self.hier is None or self.hier.is_empty:
             return dataclasses.replace(self, hierarchical=False)
-        if self.mesh is not None and not self.mesh.is_empty:
-            ignored = [
-                v
-                for v in ("AITER_FLY_AR_MESH_MIN_BYTES", "AITER_FLY_AR_MESH_MAX_BYTES")
-                if os.environ.get(v, "").strip()
-            ]
-            if ignored:
-                logger.warning(
-                    "%s ignored: this host splits into two groups and runs the "
-                    "hierarchical schedule, not the mesh, on %s.",
-                    ", ".join(ignored),
-                    self._cell(),
-                )
+        mesh = self.mesh
+        if mesh is not None and not mesh.is_empty:
+            if self.hier.min <= mesh.min:
+                mesh = None
+            else:
+                end = self.hier.min if mesh.max is None else min(mesh.max, self.hier.min)
+                mesh = Window(mesh.min, end)
         ring = self.ring
         if ring is not None and not ring.is_empty:
             if self.hier.max is None:
@@ -770,7 +764,7 @@ class FamilyPolicy:
             else:
                 lo = max(ring.min, self.hier.max)
                 ring = Window(lo, None if ring.max is None else max(ring.max, lo))
-        return dataclasses.replace(self, hierarchical=True, mesh=None, ring=ring)
+        return dataclasses.replace(self, hierarchical=True, mesh=mesh, ring=ring)
 
     def describe(self, *, quantized: bool) -> str:
         """The enabled windows, for logs."""
@@ -852,8 +846,10 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="pcie",
         world_size=4,
         oneshot=Window(0, 896 * KiB),
-        mesh=Window(128 * KiB, 18 * MiB),
-        ring=Window(18 * MiB, None),
+        # The Lamport mesh leads the flag ring up to 24 MiB (PCIe search on
+        # one socket's four GPUs, 2026-11-19).
+        mesh=Window(128 * KiB, 24 * MiB),
+        ring=Window(24 * MiB, None),
     ),
     FamilyPolicy(
         arch="gfx950",
@@ -862,10 +858,12 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         oneshot=Window(0, 1216 * KiB),
         # The mesh/ring is the fallback of a host that does not split into two
         # groups, or whose topology cannot be read.
-        mesh=Window(96 * KiB, 24 * MiB),
-        ring=Window(24 * MiB, None),
-        # The hierarchical algorithm is the default for TP=8,
-        hier=Window(96 * KiB, None),
+        mesh=Window(96 * KiB, 256 * MiB),
+        ring=Window(256 * MiB, None),
+        # On a host that splits into two groups the hierarchical algorithm
+        # takes over from the Lamport mesh at 28 MiB (2-8 % ahead up to
+        # 128 MiB; the mesh is ahead below).
+        hier=Window(28 * MiB, None),
     ),
 )
 
@@ -985,8 +983,15 @@ _STRIPE_FULL = MeshKnobs(stripe="full")
 #             from 80 MiB, and ties both below.
 #           Against the previous Lamport ladder: 1.02-1.06x at 2-4 MiB,
 #           1.07-1.09x at TP2 8-9 MiB, 1.03-1.11x at TP8 from 28 MiB.
-#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere, for a host that does not split into groups.
+#   PCIe  The Lamport handshake, with rungs and ``MeshKnobs`` from a knob
+#         search (2026-11-19; a portfolio search at six anchor payloads from
+#         256 KiB to 128 MiB per TP, then a dense 128 KiB-128 MiB sweep of the
+#         winners and the former flag rungs, fitted to at most four rungs).
+#         Against the flag ladders it replaces, per size: 1.03-1.19x at TP2,
+#         0.95-1.52x at TP4 (ties from 12 MiB up) and 1.4-2.4x at TP8. The mesh runs ST=1 almost
+#         everywhere (TP2 ST=2 from 12 MiB); the large rungs use ``fanout=peer``
+#         or a poll sleep, the small ones ``stripe=full``, ``lds_bufs=2`` and
+#         ``prio``. The search ran on one socket's GPUs for TP2 and TP4.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -1076,15 +1081,97 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=384,
+            block=128,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", fanout="sector", lds_bufs=2),
+        ),
+        TwoShotRung(
+            min_bytes=3 * MiB,
+            super_tile=1,
+            grid_cap=128,
+            block=256,
+            handshake="lamport",
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=12 * MiB,
+            super_tile=2,
+            grid_cap=128,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1, recv_order="per_source", lds_bufs=2, prio=2),
+        ),
     ),
     ("gfx950", "pcie", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=768 * KiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", lds_bufs=2, prio=1),
+        ),
+        TwoShotRung(
+            min_bytes=2 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1, lds_bufs=2),
+        ),
+        TwoShotRung(
+            min_bytes=6 * MiB,
+            super_tile=1,
+            grid_cap=128,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", poll_sleep=2, lds_bufs=2, prio=1),
+        ),
+        TwoShotRung(
+            min_bytes=8 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=2, lds_bufs=2),
+        ),
     ),
     ("gfx950", "pcie", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=128,
+            block=256,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=1536 * KiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=96 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1),
+        ),
     ),
 }
 
@@ -1116,21 +1203,30 @@ RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
 }
 
 # Hierarchical, ``HierRung``. Only for hosts whose ranks split into two
-# uniform groups. Its local laps carry the bytes of a TP``G`` mesh or ring, so
-# it starts from the PCIe TP4 mesh's ladder.
+# uniform groups, and only from its window's start, 28 MiB, where it overtakes
+# the Lamport mesh. Rungs from the same search as the PCIe mesh's (2026-11-19):
+# the exchange runs INT5, a mesh reduce-scatter and a ring all-gather up to
+# 96 MiB, then the INT6 exchange between mesh laps at ST=8.
 HIER_ST_LADDER: dict[tuple[str, str, int], tuple[HierRung, ...]] = {
     ("gfx950", "pcie", 8): (
-        HierRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        HierRung(min_bytes=768 * KiB, super_tile=8, grid_cap=128, block=512),
         HierRung(
-            min_bytes=24 * MiB,
-            super_tile=32,
-            grid_cap=128,
+            min_bytes=0,
+            super_tile=16,
+            grid_cap=256,
             block=512,
-            local_rs="ring",
+            handshake="lamport",
+            local_rs="mesh",
             local_ag="ring",
-            rs_codec="int5",
+            rs_codec="int4",
             x_codec="int5",
+            ag_codec="int5",
+        ),
+        HierRung(
+            min_bytes=96 * MiB,
+            super_tile=8,
+            grid_cap=256,
+            block=256,
+            handshake="lamport",
         ),
     ),
 }
