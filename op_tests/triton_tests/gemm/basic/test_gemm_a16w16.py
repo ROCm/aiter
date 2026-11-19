@@ -222,6 +222,12 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 @pytest.mark.parametrize("strided", [False, True])
 def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
     """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if N % 16 != 0 and "gfx942" in (get_arch() or ""):
+        pytest.skip(
+            "On gfx942 the accumulate config for N % 16 != 0 needs more than 64 KB of LDS"
+        )
     torch.cuda.empty_cache()
 
     x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
