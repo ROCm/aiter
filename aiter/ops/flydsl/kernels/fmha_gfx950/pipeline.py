@@ -266,11 +266,27 @@ def _apply_dualwave_causal_mask_pair(s_values, rel_i32, neg_inf_i32, pair_thresh
         s_values[idx_y] = _bitcast_f32(new_y)
 
 
+def _load_elem(div, idx, atom, vec_ty):
+    """One buffer_load of element ``idx`` of a (1, N)-divided buffer tensor, returned as an SSA vector.
+
+    Raw fly op: fx.copy needs an rmem destination tensor and a memref_load_vec back out of it; FlyDSL 0.5.0 has no
+    stable copy that yields the loaded value directly. All scalar global loads in this pipeline go through here.
+    """
+    return fly.copy_atom_call_ssa([vec_ty], atom, fx.slice(div, (None, fx.Int32(idx))))
+
+
+def _load_scalar_f32(tensor, idx=0):
+    """Load tensor[idx] (fp32) through a one-element buffer descriptor view."""
+    div = fx.logical_divide(fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1))
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    return Vec(
+        _load_elem(div, idx, atom, Vec.make_type(1, fx.Float32)), (1,), fx.Float32
+    )[0]
+
+
 def _cu_load(div, idx, cu_atom, cu_v1i32):
     """Load cu_seqlens[idx] into an SGPR. ``idx`` must be wave-uniform."""
-    v = fly.copy_atom_call_ssa(
-        [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
-    )
+    v = _load_elem(div, idx, cu_atom, cu_v1i32)
     return fx.Index(
         rocdl.readfirstlane(T.i32, as_mlir_value(Vec(v, (1,), fx.Int32)[0]))
     )
@@ -342,11 +358,7 @@ def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
     """128-bit global->register load (buffer_load_dwordx4) from Q."""
-    return fly.copy_atom_call_ssa(
-        [q_load_i32x4_type],
-        _load_atom_128,
-        fx.slice(q_div, (None, fx.Int32(elem_index))),
-    )
+    return _load_elem(q_div, elem_index, _load_atom_128, q_load_i32x4_type)
 
 
 def _buffer_load_lds_128(
@@ -960,28 +972,18 @@ class DualwaveFp8KernelContext:
         n_bad = fx.Int32(0)
         carry = fx.Int32(0)
         cu_lanes, kv_lanes, start_lanes = [], [], []
+        # Entry i of the scan lives in lane i % warp of chunk i // warp.
+        lane_chunk = fx.make_layout((warp, _UNBOUNDED), (1, warp))
         for c in range_constexpr(traits.BATCH_CHUNKS):
-            l_i32 = lane + fx.Int32(c * warp)
+            l_i32 = fx.Int32(fx.get_scalar(fx.crd2idx((lane, c), lane_chunk)))
             # Lanes past the batch re-read the last entry rather than run off the tensor.
             lq = (l_i32 < nb).select(l_i32, nb)
             lk = (l_i32 < nb).select(l_i32, nb - fx.Int32(1))
             cu_l = fx.Int32(
-                Vec(
-                    fly.copy_atom_call_ssa(
-                        [cu_v1i32], cu_atom, fx.slice(cuq_div, (None, lq))
-                    ),
-                    (1,),
-                    fx.Int32,
-                )[0]
+                Vec(_load_elem(cuq_div, lq, cu_atom, cu_v1i32), (1,), fx.Int32)[0]
             )
             kv_l = fx.Int32(
-                Vec(
-                    fly.copy_atom_call_ssa(
-                        [cu_v1i32], cu_atom, fx.slice(cuk_div, (None, lk))
-                    ),
-                    (1,),
-                    fx.Int32,
-                )[0]
+                Vec(_load_elem(cuk_div, lk, cu_atom, cu_v1i32), (1,), fx.Int32)[0]
             )
             cu_lanes.append(cu_l)
             kv_lanes.append(kv_l)
@@ -1042,8 +1044,9 @@ class DualwaveFp8KernelContext:
 
         def _lane_value(vals, idx):
             # Raw rocdl op: readlane fetches the owner lane's entry with no second memory round trip.
-            lane_idx = idx & fx.Int32(warp - 1)
-            chunk = fx.Int32(fx.arith.shrui(idx, fx.Int32(warp.bit_length() - 1)))
+            crd = fx.idx2crd(idx, lane_chunk)
+            lane_idx = fx.Int32(crd[0].unpack())
+            chunk = fx.Int32(crd[1].unpack())
             out = fx.Int32(
                 rocdl.readlane(T.i32, as_mlir_value(vals[0]), as_mlir_value(lane_idx))
             )
@@ -1292,45 +1295,21 @@ class DualwaveFp8KernelContext:
     def issue_descale_loads(self):
         """Issue the three descale loads; at kernel entry they share the sequence lookup's memory round trip."""
 
-        def _load_scale_scalar(tensor):
-            _div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1)
-            )
-            _atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            _v = fly.copy_atom_call_ssa(
-                [Vec.make_type(1, fx.Float32)],
-                _atom,
-                fx.slice(_div, (None, fx.Int32(0))),
-            )
-            return Vec(_v, (1,), fx.Float32)[0]
-
         self._descales = (
-            _load_scale_scalar(self.QDescale),
-            _load_scale_scalar(self.KDescale),
-            _load_scale_scalar(self.VDescale),
+            _load_scalar_f32(self.QDescale),
+            _load_scalar_f32(self.KDescale),
+            _load_scalar_f32(self.VDescale),
         )
 
     def init_descale(self):
-        def _load_scale_scalar(tensor):
-            _div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1)
-            )
-            _atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            _v = fly.copy_atom_call_ssa(
-                [Vec.make_type(1, fx.Float32)],
-                _atom,
-                fx.slice(_div, (None, fx.Int32(0))),
-            )
-            return Vec(_v, (1,), fx.Float32)[0]
-
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = self.softmax_scale * c_log2e_f
         if const_expr(getattr(self, "_descales", None) is not None):
             _qd, _kd, self.vd_fp8 = self._descales
         else:
-            _qd = _load_scale_scalar(self.QDescale)
-            _kd = _load_scale_scalar(self.KDescale)
-            self.vd_fp8 = _load_scale_scalar(self.VDescale)
+            _qd = _load_scalar_f32(self.QDescale)
+            _kd = _load_scalar_f32(self.KDescale)
+            self.vd_fp8 = _load_scalar_f32(self.VDescale)
         # fp8 feeds raw Q/K into the MFMA, so q/k descale * softmax scale multiplies
         # the fp32 logits after QK.
         self.c_logit_scale = c_sm_scale_log2e * (_qd * _kd)
@@ -1414,7 +1393,7 @@ class DualwaveFp8KernelContext:
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
         if const_expr(_bn64_compact_grid(traits)):
-            # An empty segment keeps page 0 (Decision 8): its tile-0 DMA then has an in-range base.
+            # An empty segment keeps page 0: tile 0's unconditional DMA then has an in-range base.
             self.page0 = (fx.Int32(split_t_end) > fx.Int32(0)).select(
                 self.page0_raw, fx.Int32(0)
             )

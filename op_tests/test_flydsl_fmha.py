@@ -10,6 +10,7 @@ measured is the kernel's, not the quantizer's.
 
 import argparse
 import itertools
+import math
 import os
 import sys
 import warnings
@@ -1780,6 +1781,107 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
                 z["softmax_scale"] == (192**-0.5 if scale is None else scale)
                 for z in launches
             )
+
+
+def _shuffle_paged_kv(k, v, width=16):
+    """Linear [nb, page, Hkv, D] pools to the 5D layout the shuffled BN64 path reads."""
+    nb, page, hkv, d = k.shape
+    k5 = k.permute(0, 2, 3, 1).reshape(nb, hkv, d // width, width, page)
+    v5 = v.permute(0, 2, 1, 3).reshape(nb, hkv, page // width, width, d)
+    return (
+        k5.permute(0, 1, 2, 4, 3).contiguous(),
+        v5.permute(0, 1, 2, 4, 3).contiguous(),
+    )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("layout", ["linear", "shuffled"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("gap_log2", [10.0, 160.0], ids=["rebase", "inf_recompute"])
+def test_fp8_packed_bn64_late_logit_spike(gap_log2, causal, layout):
+    """A key in tile 3 beats every earlier logit by gap_log2 log2 units.
+
+    Packed BN64's fast loop fixes its softmax offset from tile 0 and keeps it until a tile fails the bound test.
+    A ~10 log2 gap exceeds the rescale threshold but not fp32 (max-of-P rebase); a 160 log2 gap overflows P to
+    inf (S recompute from LDS, then rebase). The empty sequence covers a workgroup that issues tile 0's DMA and
+    runs no tile.
+    """
+    from aiter.ops.flydsl.unified_attention_kernels import flydsl_unified_attention
+
+    torch.manual_seed(FP8_SEED)
+    page, hkv, group, D = 64, 4, 16, 128
+    H = hkv * group
+    q_lens, kv_lens = [16, 16, 16], [1024, 0, 640]
+    spike = 3 * page + 5
+    pages = [-(-n // page) for n in kv_lens]
+    # The logit is softmax_scale * <q, k>; q = k_spike = ones makes it softmax_scale * D at the spike and
+    # (near) zero elsewhere.
+    scale = gap_log2 * math.log(2) / D
+    q_bf = torch.ones(sum(q_lens), H, D, dtype=torch.bfloat16, device="cuda")
+    k_bf = 0.05 * torch.randn(sum(pages), page, hkv, D, device="cuda").bfloat16()
+    v_bf = torch.randn(sum(pages), page, hkv, D, device="cuda").bfloat16()
+    table = torch.zeros(len(kv_lens), max(pages), dtype=torch.int32, device="cuda")
+    first = 0
+    for b, n in enumerate(pages):
+        table[b, :n] = torch.arange(first, first + n, device="cuda")
+        if kv_lens[b] > spike:
+            k_bf[first + spike // page, spike % page] = 1.0
+        first += n
+    q, qs = _fp8_quant(q_bf)
+    k, ks = _fp8_quant(k_bf)
+    v, vs = _fp8_quant(v_bf)
+    qd, kd, vd = (_fp8_dequant(t, s_) for t, s_ in ((q, qs), (k, ks), (v, vs)))
+
+    ref = torch.zeros(sum(q_lens), H, D, device="cuda")
+    q0 = 0
+    for b, (nq, nk) in enumerate(zip(q_lens, kv_lens)):
+        if nk:
+            rows = table[b, : pages[b]].long()
+            kb = kd[rows].reshape(-1, hkv, D)[:nk].repeat_interleave(group, dim=1)
+            vb = vd[rows].reshape(-1, hkv, D)[:nk].repeat_interleave(group, dim=1)
+            logits = torch.einsum("qhd,khd->hqk", qd[q0 : q0 + nq], kb) * scale
+            if causal:
+                # Bottom-right aligned: query i sees keys < nk - nq + i + 1.
+                i = torch.arange(nq, device="cuda")[:, None]
+                j = torch.arange(nk, device="cuda")[None, :]
+                logits = logits.masked_fill(j > nk - nq + i, float("-inf"))
+            ref[q0 : q0 + nq] = torch.einsum(
+                "hqk,khd->qhd", torch.softmax(logits, dim=-1), vb
+            )
+        q0 += nq
+
+    if layout == "shuffled":
+        k, v = _shuffle_paged_kv(k, v)
+    out = torch.full(q.shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+    cu_q = torch.tensor(
+        [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device="cuda"
+    )
+    got = flydsl_unified_attention(
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        max(q_lens),
+        torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+        max(kv_lens),
+        scale,
+        causal,
+        (-1, -1),
+        table,
+        0,
+        qs,
+        ks,
+        vs,
+        num_kv_heads=hkv,
+        block_size=page,
+        num_seqs=len(q_lens),
+        shuffled_kv_cache=layout == "shuffled",
+    )
+    assert got is not None, "packed BN64 declined the case"
+    assert not got.isnan().any()
+    assert _fp8_rel_err(got.float(), ref)[0] < FP8_REL_ERR[got.dtype]
+    assert torch.count_nonzero(got[q_lens[0] : q_lens[0] + q_lens[1]]) == 0
 
 
 @pytest.mark.parametrize("head_dim", [128, 192])

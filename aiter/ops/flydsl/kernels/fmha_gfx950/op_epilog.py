@@ -111,8 +111,11 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
             [self._packed_o_128_vec(v_o, dc, g) for g in range_constexpr(2)]
             for dc in range_constexpr(traits.D_CHUNKS)
         ]
-        # The stage overlaps the K/V ring, which other waves may still be reading for the last tile.
-        rocdl.s_waitcnt(lgkmcnt=0)
+        # The stage overlaps the K/V ring, which other waves may still be reading for the last tile. vmcnt(0) drains
+        # this wave's LDS DMAs (tracked by vmcnt, not lgkmcnt): an empty segment issues tile 0's K/V DMA and runs
+        # no loop, so nothing else guarantees it landed before the stage overwrites it. The loop path issues no
+        # prefetch on its last tile, so the wait is already satisfied there.
+        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
         # Raw rocdl op: keeps the scheduler from moving LDS accesses across the barrier; FlyDSL 0.5.0 exports no sched_barrier wrapper.
         rocdl.sched_barrier(0)
         fx.gpu.barrier()
@@ -137,9 +140,10 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         rocdl.s_waitcnt(lgkmcnt=0)
         # Raw rocdl op (see above): no sched_barrier wrapper in FlyDSL 0.5.0.
         rocdl.sched_barrier(0)
-        lane = fx.Int32(self.lane)
-        c = lane % fx.Int32(16)
-        hl0 = lane // fx.Int32(16)
+        # Read map: lane = 16-byte chunk c of the row + 16 * row-in-store hl0, so one dwordx4 store covers 4 rows.
+        read_crd = fx.idx2crd(fx.Int32(self.lane), fx.make_layout((16, 4), (1, 16)))
+        c = fx.Int32(read_crd[0].unpack())
+        hl0 = fx.Int32(read_crd[1].unpack())
         vals = []
         for i in range_constexpr(traits.ROWS_PER_WAVE // 4):
             r_row = wave_row0 + fx.Int32(4 * i) + hl0
@@ -150,12 +154,16 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                 )
             )
         G = traits.GQA_GROUP_SIZE
-        # Packed row 4i + hl0 of the wave is token (4i) // G, head (4i) % G + hl0 (G % 4 == 0: no carry).
+        # Packed rows are (head-in-group, token), head fastest. G % 4 == 0, so rows 4i..4i+3 share the token of
+        # row 4i and hl0 adds to its head with no carry; the row-4i coordinate is compile-time.
+        packed = fx.make_layout((G, traits.ROWS_PER_WAVE // G), (1, G))
         tok0 = self.q_start + self.wave_id_uni * (traits.ROWS_PER_WAVE // G)
         for i in range_constexpr(traits.ROWS_PER_WAVE // 4):
-            head = fx.Index(hl0) + ((4 * i) % G)
+            head_tok = fx.idx2crd(4 * i, packed)
+            head = fx.Index(hl0) + fx.Index(head_tok[0].unpack())
             o_global = (
-                (self.q_tok_base + tok0 + (4 * i) // G) * self.stride_o_n_v
+                (self.q_tok_base + tok0 + fx.Index(head_tok[1].unpack()))
+                * self.stride_o_n_v
                 + (self.q_head_idx + head) * traits.HEAD_DIM_V
                 + fx.Index(c) * 8
             )

@@ -522,7 +522,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # V's LDS reads between P's two fp8 packing halves, so the second half's conversions cover their
                 # latency before PV's first wait. Packing all of P after the reads kept its fp32 copy live under V
                 # and spilled (168 VGPRs, 56 B scratch); the anchored first half frees 16 of those first. Drained
-                # first as the champion does: a pending LDS read would make PV's partial waits lgkmcnt(0).
+                # first: a pending LDS read would make PV's partial waits lgkmcnt(0).
                 # Non-causal measured no gain (0.997).
                 rocdl.s_waitcnt(lgkmcnt=0)
                 p_lo8 = gemm_helper.cast_p_fp8_half(p_lists, 0)
@@ -1039,6 +1039,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Compact 1D grid over (slot, KV head): total_q // block_q + batch slots cover every sequence's
             # q-blocks (pipeline._init_compact_sequence). It depends only on total_q and the batch size, so a
             # captured graph stays valid for any cu_seqlens_q with the same totals. Grid x avoids y's 65535 cap.
+            # No XCD remap: the K/V a q-block reuses is its sequence's page set, which on a prefill is far larger
+            # than L2 per XCD, so co-locating sibling q-blocks was not expected to cut HBM traffic; a remap would
+            # also break the longest-first dispatch order the slot order encodes. Not A/B measured.
             block_q = BLOCK_M // traits.GQA_GROUP_SIZE
             num_slots = fx.Index(total_q) // block_q + fx.Index(batch_size)
             flash_attn_dualwave_swp_fp8_paged_bn64_kernel(
