@@ -215,6 +215,7 @@ def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_id)
         cluster_n=ki.cluster_n,
         m_warp=ki.m_warp,
         n_warp=ki.n_warp,
+        fused_splitk=ki.fused_splitk,
     )
     return out
 
@@ -629,6 +630,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         for i in sorted(kernels_list_flydsl_wmma.keys()):
             ki = kernels_list_flydsl_wmma[i]
             if not kernel_fits_shape_wmma(ki, M, N, K):
+                continue
+            if ki.split_k > 1 and not ki.fused_splitk:
                 continue
             info = (info_keys, i, 0, ki.name, "flydsl")
             tasks.append(

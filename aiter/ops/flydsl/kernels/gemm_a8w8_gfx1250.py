@@ -19,8 +19,13 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     pipeline_fence,
     workgroup_barrier,
 )
-from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks_runtime
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
+from aiter.ops.flydsl.kernels.splitk_fused_epilogue_gfx1250 import (
+    MAX_PARTIAL_VECTORS,
+    UNROLL,
+    emit_fused_splitk_epilogue,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -50,6 +55,8 @@ def launch_gemm_a8w8(
     stride_ascale_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
+    arg_out: fx.Pointer,
+    i32_cm: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -57,11 +64,12 @@ def launch_gemm_a8w8(
     n_warp: Constexpr[int],
     out_is_f16: Constexpr[int],
     num_buffers: Constexpr[int],
-    cluster_m: Constexpr[int],
+    use_cluster: Constexpr[bool],
     cluster_n: Constexpr[int],
     is_mxscale: Constexpr[bool],
     block_size: Constexpr[int],
     split_k: Constexpr[int] = 1,
+    fused_splitk: Constexpr[bool] = False,
     batched: Constexpr[bool] = False,
     preload_ks: Constexpr[int] = 0,
     batch: fx.Int32 = 1,
@@ -72,6 +80,10 @@ def launch_gemm_a8w8(
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
 ):
+    # i32_cm: runtime cluster_m; use_cluster is False only for a one-workgroup launch.
+    # fused_splitk: the K splits of a tile are one cluster along grid.z and reduce
+    # through arg_c (FP32 scratch) into arg_out; otherwise split_k > 1 writes
+    # FP32 planes to arg_c for gemm_a8w8_splitk_reduce.
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
     # output and arg_scale_out the row-major [M, (B*N)//32] e8m0 scale -- the
@@ -133,18 +145,25 @@ def launch_gemm_a8w8(
             "[M, B, K/32] A scale; a_scale_preshuffled is 2-D only"
         )
     if preload and not (
-        batched
-        and mx128
-        and cluster_m == 1
-        and cluster_n == 1
-        and preload_ks % (tile_k // 128) == 0
+        batched and mx128 and not use_cluster and preload_ks % (tile_k // 128) == 0
     ):
         raise ValueError(
             f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched mx128, no cluster "
             f"and a multiple of tile_k/128={tile_k // 128}; got batched={batched}, "
-            f"cluster={cluster_m}x{cluster_n}"
+            f"use_cluster={use_cluster}"
         )
-    use_cluster = cluster_m > 1 or cluster_n > 1
+    cluster_k = split_k if fused_splitk else 1
+    if fused_splitk and not (split_k > 1 and tile_m % split_k == 0):
+        raise ValueError(
+            "[FlyDSL gfx1250] fused_splitk needs split_k > 1 dividing "
+            f"tile_m, got split_k={split_k}, tile_m={tile_m}"
+        )
+    if not 1 <= cluster_n * cluster_k <= 16:
+        raise ValueError(
+            f"[FlyDSL gfx1250] cluster_n*split_k must be 1..16, got {cluster_n}x{cluster_k}"
+        )
+    if not use_cluster and cluster_n * cluster_k > 1:
+        raise ValueError("[FlyDSL gfx1250] a plain launch has no cluster_n or K splits")
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -160,6 +179,34 @@ def launch_gemm_a8w8(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
+    if fused_splitk:
+        # Geometry of splitk_fused_epilogue_gfx1250 (see fused_splitk_ok).
+        if block < 128:
+            raise ValueError(
+                f"[FlyDSL gfx1250] fused_splitk needs at least 4 waves, got {num_waves}"
+            )
+        lanes_per_row = tile_n // 4
+        rows_per_iter, reduce_m = block // lanes_per_row, tile_m // split_k
+        tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
+        unroll = max(
+            1,
+            min(
+                UNROLL,
+                MAX_PARTIAL_VECTORS // (block // 128) // split_k,
+                reduce_m // max(1, rows_per_iter),
+            ),
+        )
+        if (
+            block % lanes_per_row
+            or not (
+                reduce_m < rows_per_iter or reduce_m % (rows_per_iter * unroll) == 0
+            )
+            or any(rows % num_waves for rows in tdm_rows)
+        ):
+            raise ValueError(
+                f"[FlyDSL gfx1250] fused_splitk does not fit tile_m={tile_m}, "
+                f"tile_n={tile_n}, split_k={split_k} with {num_waves} waves"
+            )
 
     LDS_PAD_A = 16
     A_LDS_ROWS = tile_m // A_PAIR
@@ -211,7 +258,8 @@ def launch_gemm_a8w8(
     SA_LDS_ROW = SB_LDS_ROW = preload_ks if preload else K_WS
     SA_TDM_SHAPE = (tile_m, preload_ks) if preload else SA_SHAPE
     SB_TDM_SHAPE = (N_BLOCKS, preload_ks) if preload else SB_SHAPE
-    out_cls = fx.Float32 if split_k > 1 else (fx.Float16 if out_is_f16 else fx.BFloat16)
+    out_elem = fx.Float16 if out_is_f16 else fx.BFloat16
+    out_cls = fx.Float32 if split_k > 1 else out_elem
     c_bytes = 4 if split_k > 1 else 2
     C_PAD = 8 if tile_n >= 128 else 0
     C_LDS_ROW = tile_n + C_PAD
@@ -232,7 +280,9 @@ def launch_gemm_a8w8(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
-        f"_cm{cluster_m}_cn{cluster_n}"
+        f"_cn{cluster_n}"
+        + ("_fsk" if fused_splitk else "")
+        + ("" if use_cluster else "_plain")
         + ("_mbn" if batched else "")
         + (f"_pre{preload_ks}" if preload else "")
         + ("_apre" if a_preshuffle else "")
@@ -255,6 +305,8 @@ def launch_gemm_a8w8(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_scale_out_k: fx.Pointer,
+        arg_out_k: fx.Pointer,
+        i32_cm_k: fx.Int32,
     ):
         if const_expr(k_tail):
             # The ragged last tile needs no separate extent: every view spans
@@ -279,7 +331,16 @@ def launch_gemm_a8w8(
         wave_n = wave % n_warp
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+            a_mask, b_mask = compute_mcast_masks_runtime(
+                local_x, local_y, i32_cm_k, cluster_n
+            )
+            if const_expr(fused_splitk):
+                # Multicast within this K split's plane of the cluster (X, Y, then Z).
+                plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (
+                    i32_cm_k * cluster_n
+                )
+                a_mask = fx.Int32(a_mask) << plane
+                b_mask = fx.Int32(b_mask) << plane
         else:
             a_mask, b_mask = 0, 0
         blk_m = bid_x * tile_m
@@ -960,6 +1021,11 @@ def launch_gemm_a8w8(
             accs = epilogue_apply_ptpc_scale(scale_regs)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
+            if const_expr(fused_splitk):
+                # Rotate rows so the locally reduced stripe is last.
+                row_rel = (
+                    row_rel + tile_m - (bid_z + 1) * (tile_m // split_k)
+                ) % tile_m
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
                 h = accs[wm * wmma_n_rep + wn].to(out_cls)
@@ -968,7 +1034,25 @@ def launch_gemm_a8w8(
                     base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
                 )
         workgroup_barrier(use_cluster=False)
-        if const_expr(not fuse_quant_out):
+        if const_expr(fused_splitk):
+            emit_fused_splitk_epilogue(
+                elem=out_elem,
+                tid=tid,
+                block=block,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                lds_base_ptr=base_ptr,
+                partials=arg_c,
+                out=arg_out_k,
+                c_off=blk_m64 * ldc64 + blk_n64,
+                ldc64=ldc64,
+                c_lds_row=C_LDS_ROW,
+                split_k=split_k,
+                split_idx=fx.Int32(bid_z),
+                mn_oob=mn_oob,
+                flat_tile=fx.Int64(bid_y) * fx.Int64(fx.grid_dim.x) + fx.Int64(bid_x),
+            )
+        elif const_expr(not fuse_quant_out):
             c_off_rt = blk_m64 * ldc64 + blk_n64
             if const_expr(batched):
                 c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
@@ -1066,11 +1150,12 @@ def launch_gemm_a8w8(
                         fx.add_offset(s8, s_off),
                     )
 
+    cm = i32_cm if const_expr(use_cluster) else 1
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    if use_cluster:
-        gx = ((gx + (cluster_m - 1)) // cluster_m) * cluster_m
-    cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+    if const_expr(use_cluster):
+        gx = ((gx + (cm - 1)) // cm) * cm
+    cluster_arg = (cm, cluster_n, cluster_k) if use_cluster else None
     kernel_gemm_a8w8(
         arg_c,
         arg_a,
@@ -1084,9 +1169,8 @@ def launch_gemm_a8w8(
         i32_lda,
         i32_ldc,
         arg_scale_out if fuse_quant_out else arg_c,
-        value_attrs={
-            "rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None
-        },
+        arg_out,
+        i32_cm,
     ).launch(
         grid=(gx, gy, batch if batched else split_k),  # batched pins split_k==1
         block=(block, 1, 1),
