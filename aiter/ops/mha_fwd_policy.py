@@ -20,7 +20,7 @@ import torch
 
 from .. import logger
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, ENABLE_CK
-from ..jit.utils.chip_info import get_gfx, get_gfx_runtime, get_gpu_model
+from ..jit.utils.chip_info import get_gfx_list, get_gfx_runtime, get_gpu_model
 from ..utility.dispatch_verification import record_selection
 
 # The hardware a tuned row is valid for, in tuned-CSV column order.
@@ -342,6 +342,7 @@ def clear_mha_fwd_tuning_cache() -> None:
     _mha_fwd_hardware_prefixes.cache_clear()
     _mha_fwd_coarse_keys.cache_clear()
     _mha_fwd_serving_hardware.cache_clear()
+    _mha_fwd_built_archs.cache_clear()
 
 
 def _mha_fwd_has_rows() -> bool:
@@ -353,11 +354,16 @@ def _mha_fwd_has_coarse_rows(coarse: tuple[str, ...]) -> bool:
     return coarse in _mha_fwd_coarse_keys(_mha_fwd_table_path())
 
 
+@functools.lru_cache(maxsize=1)
+def _mha_fwd_built_archs() -> frozenset[str]:
+    return frozenset(get_gfx_list())
+
+
 def _mha_fwd_local_hardware(device_id: int) -> tuple[str, ...]:
     """This device's (gfx, gpu_model, cu_num) as row cells, or () when the
-    running arch is not the built one, which the kernel gates test."""
+    running arch is not one this build targets (GPU_ARCHS may list several)."""
     hardware = get_tuning_hardware(device_id)
-    if hardware["gfx"] != get_gfx():
+    if hardware["gfx"] not in _mha_fwd_built_archs():
         return ()
     return tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
 

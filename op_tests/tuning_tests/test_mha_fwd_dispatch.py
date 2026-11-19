@@ -106,12 +106,12 @@ def _dummy_varlen_tensors():
     return q, k, v, cu_q, cu_k
 
 
-def _on_hardware():
-    """Run on HARDWARE with gfx942 as the built arch."""
+def _on_hardware(built_archs=("gfx942",)):
+    """Run on HARDWARE (a gfx942) with ``built_archs`` as GPU_ARCHS."""
     return mock.patch.multiple(
         policy,
         get_tuning_hardware=mock.Mock(return_value=HARDWARE),
-        get_gfx=mock.Mock(return_value="gfx942"),
+        get_gfx_list=mock.Mock(return_value=list(built_archs)),
     )
 
 
@@ -248,6 +248,22 @@ class TestMhaFwdLookup(_Table):
         self.use([_tuned_row("opus")])
         with _on_hardware():
             self.assertEqual(policy.get_mha_fwd_tuned_backend(**_key_args()), "opus")
+
+    def test_a_multi_arch_build_serves_rows_on_every_arch_it_targets(self):
+        """get_gfx() names only the last GPU_ARCHS entry, so comparing with it
+        dropped every row on a gfx942 under GPU_ARCHS=gfx942;gfx950."""
+        self.use([_tuned_row("ck")])
+        cases = {
+            "gfx942;gfx950": (("gfx942", "gfx950"), "ck"),
+            "gfx950 only": (("gfx950",), None),
+        }
+        for name, (built_archs, backend) in cases.items():
+            with self.subTest(name):
+                policy.clear_mha_fwd_tuning_cache()
+                with _on_hardware(built_archs):
+                    self.assertEqual(
+                        policy.get_mha_fwd_tuned_backend(**_key_args()), backend
+                    )
 
     def test_rows_for_other_hardware_or_head_dims_skip_the_key(self):
         for row in (
