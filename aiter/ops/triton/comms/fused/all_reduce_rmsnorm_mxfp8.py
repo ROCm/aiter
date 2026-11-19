@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import ctypes
-
 import torch
-import torch.distributed as dist
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.comms.fused.all_reduce_rmsnorm_mxfp8 import (
     _all_reduce_rmsnorm_mxfp8_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.comms.ipc_buffers import ERROR_BYTES, IpcCommBuffers
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
@@ -20,9 +17,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _CONFIG_NAME = "ALL_REDUCE_RMSNORM_MXFP8"
-_SUPPORTED_WORLDS = (2, 4, 8)
 _MAX_HIDDEN = 8192  # 2 vectors of 8 bf16 values for each of 512 threads
-_ERROR_BYTES = 256  # the error record [flag, rank, colour, site], then padding
 
 
 def _get_config(hidden: int) -> dict:
@@ -40,7 +35,7 @@ def _push_units(rows, world, blocks):
     return most
 
 
-class AllReduceRmsnormMxfp8:
+class AllReduceRmsnormMxfp8(IpcCommBuffers):
     """
     The IPC buffers and launch colours of ``fused_all_reduce_rmsnorm_mxfp8`` for one
     group of 2, 4 or 8 ranks on gfx950.
@@ -49,7 +44,8 @@ class AllReduceRmsnormMxfp8:
     reduce-scatter inbox and the all-gather inbox. Each inbox has 2 halves (for odd
     and even launches) of world x ceil(max_tokens / world) rows of hidden bf16
     values. The constructor, ``reset`` and ``close`` are collective: all ranks of
-    the group must call them.
+    the group must call them. The error sites are 1 (reduce-scatter) and 2
+    (all-gather).
 
     Args:
         group: The CPU (gloo) process group of the ranks.
@@ -59,99 +55,22 @@ class AllReduceRmsnormMxfp8:
     """
 
     def __init__(self, group, max_tokens, hidden, timeout_s=60.0):
-        from aiter.dist.device_communicators.custom_all_reduce import IPCBufferPool
-
-        assert get_arch() == "gfx950", "needs gfx950"
-        self.world = dist.get_world_size(group)
-        assert (
-            self.world in _SUPPORTED_WORLDS
-        ), f"the group size must be one of {_SUPPORTED_WORLDS}"
+        super().__init__(group, timeout_s)
         assert (
             hidden % 64 == 0 and hidden <= _MAX_HIDDEN
         ), f"hidden must be a multiple of 64, up to {_MAX_HIDDEN}"
-        self.timeout_us = max(1, int(timeout_s * 1e6))
-        assert self.timeout_us < 2**31, "timeout_s is too large"
-        self.group = group
-        self.rank = dist.get_rank(group)
         self.hidden, self.max_tokens = hidden, max_tokens
-        self.device = torch.device("cuda", torch.cuda.current_device())
         self.config = _get_config(hidden)
-        cus = torch.cuda.get_device_properties(self.device).multi_processor_count
         # All CTAs must run at the same time: one CTA a CU.
-        self.blocks = min(self.config["BLOCKS"], cus)
+        self.blocks = min(self.config["BLOCKS"], self.num_cus)
         self.gmax = triton.cdiv(max_tokens, self.world)
         assert (
             0 < max_tokens and self.world * self.gmax <= self.blocks
         ), f"max_tokens must be 1 to {self.blocks // self.world * self.world}"
         self.push_units = _push_units(max_tokens, self.world, self.blocks)
         inbox = 2 * self.world * self.gmax * hidden * 2
-        self.offsets = {"rs": _ERROR_BYTES, "ag": _ERROR_BYTES + inbox}
-        self.nbytes = triton.cdiv(_ERROR_BYTES + 2 * inbox, 2 << 20) * (2 << 20)
-        self._pool = IPCBufferPool(self.device, group)
-        self._pool.create("inbox", self.nbytes, uncached=True)
-        addrs = self._pool.open_peer_buffers("inbox")
-        # The buffers of ranks rank, rank + 1, ..., rank + world - 1.
-        self.peers = tuple(
-            addrs[(self.rank + d) % self.world] for d in range(self.world)
-        )
-        self.colors = torch.empty(self.blocks, dtype=torch.int32, device=self.device)
-        self._clear()
-        dist.barrier(group=self.group)
-
-    def _clear(self):
-        """Fills the inboxes with 0xFFFF (empty) and clears the error record and the
-        colours."""
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        rt = _loaded_hip_runtime()
-        torch.cuda.synchronize(self.device)
-        own = ctypes.c_void_p(self.peers[0])
-        err = rt.hipMemset(own, 0xFF, ctypes.c_size_t(self.nbytes))
-        err = err or rt.hipMemset(own, 0, ctypes.c_size_t(_ERROR_BYTES))
-        assert err == 0, f"hipMemset failed: {err}"
-        self.colors.zero_()
-        torch.cuda.synchronize(self.device)
-
-    def error(self):
-        """
-        Returns the error record of this rank: [0, 0, 0, 0], or [1, rank, colour,
-        site] after a wait timed out (site 1: reduce-scatter, site 2: all-gather).
-        Synchronizes the device.
-        """
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        record = (ctypes.c_int32 * 4)()
-        torch.cuda.synchronize(self.device)
-        err = _loaded_hip_runtime().hipMemcpy(
-            record, ctypes.c_void_p(self.peers[0]), ctypes.c_size_t(16), 2
-        )
-        assert err == 0, f"hipMemcpy failed: {err}"
-        return list(record)
-
-    def reset(self):
-        """Empties the inboxes and clears the error record and the colours, for
-        example after a wait timed out. All ranks must call it with no launch in
-        flight."""
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        self._clear()
-        dist.barrier(group=self.group)
-
-    def close(self):
-        """Unmaps the peer buffers and frees the buffer of this rank. All ranks must
-        call it."""
-        if self._pool is None:
-            return
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        self._pool.close_peer_buffers()
-        dist.barrier(group=self.group)  # no peer uses the buffer of this rank now
-        self._pool.close()
-        self._pool = None
+        self.offsets = {"rs": ERROR_BYTES, "ag": ERROR_BYTES + inbox}
+        self._open(ERROR_BYTES + 2 * inbox, self.blocks)
 
 
 def fused_all_reduce_rmsnorm_mxfp8(
