@@ -46,7 +46,7 @@ inline constexpr Options options[] = {
     {4, 4, 2, 4, 0, 0, 4, false},     //  9 mid1024
     {2, 2, 2, 2, 0, 0, 4, false},     // 10 mid2048
     {1, 4, 1, 4, 0, 0, 4, true},      // 11 large
-    {1, 4, 1, 4, 4160, 0, 4, true},   // 12 tail (large + generic K=32)
+    {1, 4, 1, 4, 0, 0, 4, true},      // 12 tail (large + generic K=32)
     {0, 2, 1, 2, 0, 0, 4, false},     // 13 generic (runtime K)
 };
 
@@ -204,6 +204,18 @@ using bf16          = opus::bf16_t;
 using bf16x8        = opus::vector_t<bf16, 8>;
 using f32x4         = opus::vector_t<float, 4>;
 
+// On gfx950, a packed FP32 op whose low half reads src1's high dword sees zero
+// there in lanes 48..63 while another wave on the same SIMD runs MFMA. Without
+// post, split-tail and body blocks share CUs, so keep their collapse scalar.
+template <bool SCALAR>
+__device__ __forceinline__ float collapse_fma(float x, float w, float acc)
+{
+    acc = fmaf(x, w, acc);
+    if constexpr(SCALAR)
+        asm("" : "+v"(acc));
+    return acc;
+}
+
 __device__ __forceinline__ float sum_k_lanes(float x)
 {
     x += __shfl_xor(x, 16, 64);
@@ -277,10 +289,12 @@ template <int H,
           int VARIANT,
           bool MXFP8,
           int SPLIT,
-          int TILE_M     = BM,
-          int STAGE_COLS = 0,
-          int GROUPS     = 1,
-          int THREADS    = 256>
+          int TILE_M      = BM,
+          int STAGE_COLS  = 0,
+          int GROUPS      = 1,
+          int THREADS     = 256,
+          bool INTERLEAVE = false,
+          int KEPT        = 0>
 __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float (&reduction)[4][TILE_M][SLOTS],
                                                   unsigned int& last,
@@ -306,7 +320,8 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float norm_eps,
                                                   int sinkhorn_repeat,
                                                   int hidden_arg,
-                                                  bf16* staged = nullptr)
+                                                  bf16* staged       = nullptr,
+                                                  const bf16x8* kept = nullptr)
 {
     const int hidden     = H ? H : hidden_arg;
     const int split_k    = SPLIT ? SPLIT : split_arg;
@@ -514,26 +529,30 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
         const int ncol     = (lane % 8) * 8 + (GROUPS == 2 ? 0 : (wid / 2) * 64);
         constexpr int STEP = GROUPS == 2 ? 64 : 128;
         auto normalize     = [&]<bool FROM_LDS>() {
-            constexpr int first = FROM_LDS ? 0 : STAGE_COLS / GROUPS;
-            constexpr int end   = FROM_LDS ? STAGE_COLS / GROUPS : hidden / GROUPS;
+            constexpr int first      = FROM_LDS ? 0 : STAGE_COLS / GROUPS;
+            constexpr int end        = FROM_LDS ? STAGE_COLS / GROUPS : hidden / GROUPS;
+            constexpr int kept_begin = hidden / GROUPS - KEPT * STEP;
 #pragma unroll
             for(int m = 0; m < TILE_M / 16; ++m)
             {
                 const int r      = nrow + m * 16;
                 const float rstd = total[min(r, tile_rows - 1)][25];
-                for(int k = first; k < end; k += 4 * STEP)
-                {
+                auto batch       = [&](int k) {
                     bf16x8 x[4], w[4];
 #pragma unroll
                     for(int u = 0; u < 4; ++u)
                     {
-                        const int col = ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
+                        const int col = INTERLEAVE
+                                            ? 2 * (k + u * STEP) + ngroup * STEP + ncol
+                                            : ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
                         if constexpr(FROM_LDS)
                         {
                             const int p  = ngroup * (STAGE_COLS / GROUPS) + k + u * STEP + ncol;
                             const int sw = ((p / 8) ^ ((r & 7) ^ ((r & 1) << 2))) * 8 + (p & 7);
                             x[u] = *reinterpret_cast<const bf16x8*>(staged + r * STAGE_COLS + sw);
                         }
+                        else if(KEPT > 0 && k + u * STEP >= kept_begin)
+                            x[u] = kept[(k + u * STEP - kept_begin) / STEP];
                         else
                             x[u] = load_vector_nbytes<bf16, 8, 16, 1>(g_norm, r * hidden + col);
                         w[u] = load_vector_nbytes<bf16, 8, 16>(g_weight, col);
@@ -542,7 +561,9 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
 #pragma unroll
                     for(int u = 0; u < 4; ++u)
                     {
-                        const int col = ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
+                        const int col = INTERLEAVE
+                                            ? 2 * (k + u * STEP) + ngroup * STEP + ncol
+                                            : ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
                         bf16x8 out;
 #pragma unroll
                         for(int e = 0; e < 8; ++e)
@@ -552,7 +573,17 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                             g_norm, out, r * hidden + col);
                         quant.store(out, r * hidden + col);
                     }
+                };
+                // Constant indices keep the register-resident columns in VGPRs.
+                if constexpr(!FROM_LDS && KEPT > 0)
+                {
+#pragma unroll
+                    for(int k = first; k < end; k += 4 * STEP)
+                        batch(k);
                 }
+                else
+                    for(int k = first; k < end; k += 4 * STEP)
+                        batch(k);
             }
         };
         normalize.template operator()<true>();
@@ -1492,16 +1523,26 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         __builtin_amdgcn_sched_barrier(0);
         return tile;
     };
-    // Keep only the current residual tile at eight waves. Chunk zero of fn
-    // overlaps its load; chunk one is loaded at its MFMA to stay within VGPRs.
-    Tile current{};
-    if constexpr(!EIGHT_WAVE_POST)
-        current = load_tile(begin);
-#pragma unroll(HAS_POST ? 1 : 2)
-    for(int ki = 0; ki < hidden_part; ki += NC * BK)
-    {
-        const int k = begin + ki;
-        bf16x8 fn[STREAMS_PER_WAVE][NC][3];
+    constexpr int STEP = NC * BK;
+    // Four-wave tiles alternate two tile and fn buffers (PINGPONG below). Post
+    // tiles with two groups also alternate STEP-column chunks, so each k-step
+    // reads and writes 2 * STEP contiguous columns per row and stream.
+    constexpr bool PINGPONG   = !EIGHT_WAVE_POST;
+    constexpr bool INTERLEAVE = HAS_POST && PINGPONG && GROUPS == 2;
+    auto kcol = [&](int ki) { return INTERLEAVE ? 2 * ki + group * STEP : begin + ki; };
+    // Prefetches past the last k-step fall outside every buffer.
+    auto kload = [&](int ki) { return ki < hidden_part ? kcol(ki) : 1 << 20; };
+    // Staged tiles run one workgroup per CU, so registers past 256 (AGPRs) are
+    // free. Keep each lane's last KEPT unstaged collapse vectors there for the
+    // RMSNorm pass instead of a layer_input round trip; the pass reads them
+    // back with the main loop's row and column ownership.
+    constexpr int UNSTAGED   = (hidden_part - STAGED / GROUPS) / STEP;
+    constexpr int KEPT       = INTERLEAVE && STAGED > 0 ? (UNSTAGED < 20 ? UNSTAGED : 20) : 0;
+    constexpr int KEEP_BEGIN = hidden_part - KEPT * STEP;
+    static_assert(KEPT == 0 || (KEPT % 2 == 0 && NC * MT == WAVES_PER_GROUP));
+    bf16x8 kept[KEPT ? KEPT : 1];
+    using Fn     = bf16x8[STREAMS_PER_WAVE][NC][3];
+    auto load_fn = [&](Fn& fn, int k) {
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
 #pragma unroll
@@ -1515,12 +1556,13 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         8;
                     fn[s][c][op] = load_vector_nbytes<bf16, 8, 16>(g_fn, off);
                 }
-        __builtin_amdgcn_sched_barrier(0);
-        Tile next{};
-        if constexpr(EIGHT_WAVE_POST)
-            current = load_tile(k);
-        else if(ki + NC * BK < hidden_part)
-            next = load_tile(k + NC * BK);
+    };
+    // One k-step: post-mix, residual store, collapse and projection of the
+    // STEP columns at ki.
+    auto step = [&](int ki, const Tile& current, Fn& fn) __attribute__((always_inline))
+    {
+        const int k = kcol(ki);
+        bf16x8 kept_value{};
         bf16x8 r[STREAMS_PER_WAVE][NC * MT];
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
@@ -1635,9 +1677,10 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = fmaf(static_cast<float>(new_regs[h][e]),
-                                     pre[c % 2 + (c / NC) * 2][h],
-                                     v);
+                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
+                                static_cast<float>(new_regs[h][e]),
+                                pre[c % 2 + (c / NC) * 2][h],
+                                v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -1648,9 +1691,10 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                     const int col = group * (STAGED / GROUPS) + ki + ((c % NC) / 2) * 64 + k_lane;
                     *reinterpret_cast<bf16x8*>(&collapse_lds[tr][lds_col(tr, col)]) = collapsed;
                 }
-                else
+                else if(ki < KEEP_BEGIN)
                     store_vector_nbytes<bf16, bf16, 8, 16>(
                         g_norm, collapsed, tr * hidden + k + ((c % NC) / 2) * 64 + k_lane);
+                kept_value = collapsed;
             }
         }
         if constexpr(EIGHT_WAVE_POST)
@@ -1722,8 +1766,73 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
             __syncthreads();
         if constexpr(STREAMS_PER_WAVE == 4)
             __builtin_amdgcn_wave_barrier();
+        return kept_value;
+    };
+    // Rotating one prefetched tile through register copies would make those
+    // copies wait on the loads just issued, and on the preceding residual
+    // stores, since vmcnt retires in order.
+    if constexpr(PINGPONG)
+    {
+        static_assert(hidden_part % (2 * STEP) == 0);
+        Tile a = load_tile(kload(0)), b;
+        Fn fa, fb;
+        auto two_steps = [&](int ki, bf16x8(&x)[2]) {
+            load_fn(fa, kcol(ki));
+            __builtin_amdgcn_sched_barrier(0);
+            b    = load_tile(kload(ki + STEP));
+            x[0] = step(ki, a, fa);
+            load_fn(fb, kcol(ki + STEP));
+            __builtin_amdgcn_sched_barrier(0);
+            a    = load_tile(kload(ki + 2 * STEP));
+            x[1] = step(ki + STEP, b, fb);
+        };
+#pragma unroll 1
+        for(int ki = 0; ki < KEEP_BEGIN; ki += 2 * STEP)
+        {
+            bf16x8 x[2];
+            two_steps(ki, x);
+        }
+        // Shift instead of unrolling: one step body per kept vector would
+        // crowd the instruction cache. Past 20 vectors the shifts cost more
+        // than the round trip they save (H=7168).
+        if constexpr(KEPT > 0)
+        {
+#pragma unroll 1
+            for(int ki = KEEP_BEGIN; ki < hidden_part; ki += 2 * STEP)
+            {
+                bf16x8 x[2];
+                two_steps(ki, x);
+#pragma unroll
+                for(int i = 0; i + 2 < KEPT; ++i)
+                    kept[i] = kept[i + 2];
+                kept[KEPT - 2] = x[0];
+                kept[KEPT - 1] = x[1];
+            }
+        }
+    }
+    else
+    {
+        // Keep only the current residual tile at eight waves. Chunk zero of fn
+        // overlaps its load; chunk one is loaded at its MFMA to stay within VGPRs.
+        Tile current{};
         if constexpr(!EIGHT_WAVE_POST)
-            current = next;
+            current = load_tile(begin);
+#pragma unroll(HAS_POST ? 1 : 2)
+        for(int ki = 0; ki < hidden_part; ki += STEP)
+        {
+            const int k = begin + ki;
+            Fn fn;
+            load_fn(fn, k);
+            __builtin_amdgcn_sched_barrier(0);
+            Tile next{};
+            if constexpr(EIGHT_WAVE_POST)
+                current = load_tile(k);
+            else if(ki + STEP < hidden_part)
+                next = load_tile(k + STEP);
+            step(ki, current, fn);
+            if constexpr(!EIGHT_WAVE_POST)
+                current = next;
+        }
     }
 #pragma unroll
     for(int m = 0; m < MT; ++m)
@@ -1767,32 +1876,34 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                 v += local_reduction[w][i / SLOTS][i % SLOTS];
         total[i / SLOTS][i % SLOTS] = v;
     }
-    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS>(total,
-                                                                         reduction,
-                                                                         last,
-                                                                         1,
-                                                                         tokens,
-                                                                         token_block,
-                                                                         tile_rows,
-                                                                         partials,
-                                                                         counters,
-                                                                         layer_input,
-                                                                         quant_out,
-                                                                         quant_scale,
-                                                                         norm_weight,
-                                                                         hc_scale,
-                                                                         hc_base,
-                                                                         next_pre,
-                                                                         post_out,
-                                                                         comb_out,
-                                                                         rms_eps,
-                                                                         pre_eps,
-                                                                         sinkhorn_eps,
-                                                                         post_mult,
-                                                                         norm_eps,
-                                                                         20,
-                                                                         hidden_arg,
-                                                                         &collapse_lds[0][0]);
+    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS, INTERLEAVE, KEPT>(
+        total,
+        reduction,
+        last,
+        1,
+        tokens,
+        token_block,
+        tile_rows,
+        partials,
+        counters,
+        layer_input,
+        quant_out,
+        quant_scale,
+        norm_weight,
+        hc_scale,
+        hc_base,
+        next_pre,
+        post_out,
+        comb_out,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_mult,
+        norm_eps,
+        20,
+        hidden_arg,
+        &collapse_lds[0][0],
+        kept);
 #endif
 }
 
@@ -1823,13 +1934,14 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                                               float sinkhorn_eps,
                                               float post_mult,
                                               float norm_eps,
-                                              int sinkhorn_repeat)
+                                              int sinkhorn_repeat,
+                                              int first_block = 0)
 {
 #if defined(__gfx950__) || defined(__gfx942__)
     constexpr int THREADS = 256;
     const int hidden      = H ? H : hidden_arg;
     const int split_k     = FIXED_SPLIT ? FIXED_SPLIT : split_arg;
-    const int bid         = VARIANT == 12 && HAS_POST ? blockIdx.x - 256 : blockIdx.x;
+    const int bid         = blockIdx.x - first_block;
     const int token_block = split_k > 1 ? (bid / 8 / split_k) * 8 + bid % 8 : bid;
     if(token_block * BM >= tokens)
         return;
@@ -2002,7 +2114,8 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = fmaf(static_cast<float>(new_regs[h][e]), pre[h], v);
+                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
+                                static_cast<float>(new_regs[h][e]), pre[h], v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -2233,122 +2346,33 @@ __global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>
     }
     else
     {
-        if constexpr(HAS_POST)
-        {
-            // The first CU round handles the body; separate blocks cover the
-            // tail as CUs become available. All blocks still use one launch.
-            if(blockIdx.x < 256)
-            {
-                large_tiles<H, VARIANT, MXFP8, 16, 2560, HAS_POST, IDENTITY_PRE, 4>(residual,
-                                                                                    sublayer,
-                                                                                    post_mix,
-                                                                                    comb_mix,
-                                                                                    pre_mix,
-                                                                                    fn_packed,
-                                                                                    4096,
-                                                                                    1,
-                                                                                    residual_out,
-                                                                                    post_out,
-                                                                                    comb_out,
-                                                                                    layer_input,
-                                                                                    quant_out,
-                                                                                    quant_scale,
-                                                                                    next_pre,
-                                                                                    hc_scale,
-                                                                                    hc_base,
-                                                                                    norm_weight,
-                                                                                    partials,
-                                                                                    counters,
-                                                                                    H,
-                                                                                    rms_eps,
-                                                                                    pre_eps,
-                                                                                    sinkhorn_eps,
-                                                                                    post_mult,
-                                                                                    norm_eps,
-                                                                                    20);
-            }
-            else
-            {
-                generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                    residual_out + 4096LL * 4 * H,
-                    post_out + 4096LL * 4,
-                    comb_out + 4096LL * 16,
-                    layer_input + 4096LL * H,
-                    quant_out + (MXFP8 ? 4096LL * H : 0),
-                    quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
-                    next_pre + 4096LL * 4,
-                    residual + 4096LL * 4 * H,
-                    fn_packed,
-                    hc_scale,
-                    hc_base,
-                    IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                    HAS_POST ? sublayer + 4096LL * H : sublayer,
-                    HAS_POST ? post_mix + 4096LL * 4 : post_mix,
-                    HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
-                    norm_weight,
-                    partials,
-                    counters,
-                    64,
-                    H,
-                    32,
-                    rms_eps,
-                    pre_eps,
-                    sinkhorn_eps,
-                    post_mult,
-                    norm_eps,
-                    20);
-            }
-        }
-        else
-        {
-            large_tiles<H, VARIANT, MXFP8, 16, 0, HAS_POST, IDENTITY_PRE>(residual,
-                                                                          sublayer,
-                                                                          post_mix,
-                                                                          comb_mix,
-                                                                          pre_mix,
-                                                                          fn_packed,
-                                                                          4096,
-                                                                          1,
-                                                                          residual_out,
-                                                                          post_out,
-                                                                          comb_out,
-                                                                          layer_input,
-                                                                          quant_out,
-                                                                          quant_scale,
-                                                                          next_pre,
-                                                                          hc_scale,
-                                                                          hc_base,
-                                                                          norm_weight,
-                                                                          partials,
-                                                                          counters,
-                                                                          H,
-                                                                          rms_eps,
-                                                                          pre_eps,
-                                                                          sinkhorn_eps,
-                                                                          post_mult,
-                                                                          norm_eps,
-                                                                          20);
-            __syncthreads();
+        // Whole CU rounds of 16-row tiles form the body. The one to eight
+        // remaining tiles are split 32 ways over H instead of taking a sparse
+        // extra round.
+        const int body       = tokens / 4096 * 4096;
+        const int body_tiles = body / 16;
+        const int64_t b      = body;
+        auto tail            = [&](int first_block) {
             generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                residual_out + 4096LL * 4 * H,
-                post_out + 4096LL * 4,
-                comb_out + 4096LL * 16,
-                layer_input + 4096LL * H,
-                quant_out + (MXFP8 ? 4096LL * H : 0),
-                quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
-                next_pre + 4096LL * 4,
-                residual + 4096LL * 4 * H,
+                residual_out + b * 4 * H,
+                post_out + b * 4,
+                comb_out + b * 16,
+                layer_input + b * H,
+                quant_out + (MXFP8 ? b * H : 0),
+                quant_scale + (MXFP8 ? b * (H / 32) : 0),
+                next_pre + b * 4,
+                residual + b * 4 * H,
                 fn_packed,
                 hc_scale,
                 hc_base,
-                IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                HAS_POST ? sublayer + 4096LL * H : sublayer,
-                HAS_POST ? post_mix + 4096LL * 4 : post_mix,
-                HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
+                IDENTITY_PRE ? pre_mix : pre_mix + b * 4,
+                HAS_POST ? sublayer + b * H : sublayer,
+                HAS_POST ? post_mix + b * 4 : post_mix,
+                HAS_POST ? comb_mix + b * 16 : comb_mix,
                 norm_weight,
                 partials,
                 counters,
-                64,
+                tokens - body,
                 H,
                 32,
                 rms_eps,
@@ -2356,7 +2380,50 @@ __global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>
                 sinkhorn_eps,
                 post_mult,
                 norm_eps,
+                20,
+                first_block);
+        };
+        constexpr int BODY_STAGE = HAS_POST ? LARGE_STAGE : 0;
+        if(!HAS_POST || static_cast<int>(blockIdx.x) < body_tiles)
+            large_tiles<H, VARIANT, MXFP8, 16, BODY_STAGE, HAS_POST, IDENTITY_PRE, POST_STREAMS>(
+                residual,
+                sublayer,
+                post_mix,
+                comb_mix,
+                pre_mix,
+                fn_packed,
+                body,
+                1,
+                residual_out,
+                post_out,
+                comb_out,
+                layer_input,
+                quant_out,
+                quant_scale,
+                next_pre,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                partials,
+                counters,
+                H,
+                rms_eps,
+                pre_eps,
+                sinkhorn_eps,
+                post_mult,
+                norm_eps,
                 20);
+        // With post, separate blocks cover the tail as CUs become available.
+        // Without post, the first CU round also covers the tail.
+        if constexpr(HAS_POST)
+        {
+            if(static_cast<int>(blockIdx.x) >= body_tiles)
+                tail(body_tiles);
+        }
+        else if(blockIdx.x < 256)
+        {
+            __syncthreads();
+            tail(0);
         }
     }
 #endif
@@ -2484,7 +2551,8 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
             AITER_CHECK(t <= StreamTuning::decode_rows, "token count exceeds decode tile");
     }
     if constexpr(VARIANT == 12)
-        AITER_CHECK(t == 4160, "two-phase tail requires T=4160");
+        AITER_CHECK(blocks > 256 && blocks % 256 >= 1 && blocks % 256 <= 8,
+                    "split tail requires 1..8 tiles past whole CU rounds");
     if(t == 0)
         return;
     const hipStream_t stream = getCurrentHIPStream();
@@ -2493,7 +2561,7 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     (KernelTuning<H, VARIANT, POST>::distributed ? KernelTuning<H, VARIANT, POST>::split : split_k)
 #define LAUNCH(POST, IDENTITY, ROWS, STAGE, STREAMS)                                   \
     mega_mhc_kernel<H, VARIANT, MXFP8, POST, IDENTITY, ROWS, STAGE, STREAMS>           \
-        <<<dim3(VARIANT == 12            ? (POST ? 512 : 256)                          \
+        <<<dim3(VARIANT == 12            ? blocks / 256 * 256 + (POST ? 256 : 0)       \
                 : KERNEL_SPLIT(POST) > 1 ? ((blocks + 7) / 8) * 8 * KERNEL_SPLIT(POST) \
                                          : (t + ROWS - 1) / ROWS),                     \
            (launch_threads<H, VARIANT, POST, STREAMS>),                                \
@@ -2525,9 +2593,9 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                      hc_post_mult,                                                     \
                      norm_eps,                                                         \
                      sinkhorn_repeat)
-    // Tuned for gfx950's 256 CUs. A sparse final CU round loses more to
-    // scheduling than M/weight reuse or LDS staging saves. All token counts
-    // remain dynamic; require at least 15/16 of the final round to be full.
+    // Tuned for gfx950's 256 CUs. Without post, a sparse final CU round loses
+    // more to scheduling than M/weight reuse or LDS staging saves. All token
+    // counts remain dynamic; require at least 15/16 of the final round to be full.
     const auto full_round = [](int workgroups) {
         const int tail = workgroups % 256;
         return tail == 0 || tail >= 240;
@@ -2535,33 +2603,33 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     constexpr int no_post_stage = H == 4096 ? 3072 : 4096;
     const bool stage_large      = blocks <= 256 || full_round(blocks);
     const bool use_m32          = t >= 8192 && full_round((t + 31) / 32);
-#define DISPATCH(POST, IDENTITY)                              \
-    if constexpr(VARIANT == 11)                               \
-    {                                                         \
-        if(!POST && use_m32)                                  \
-        {                                                     \
-            LAUNCH(POST, IDENTITY, (POST ? 16 : 32), 0, 2);   \
-        }                                                     \
-        else if(stage_large)                                  \
-        {                                                     \
-            if constexpr(POST)                                \
-            {                                                 \
-                if(blocks <= 256)                             \
-                    LAUNCH(POST, IDENTITY, 16, 3584, 4);      \
-                else                                          \
-                    LAUNCH(POST, IDENTITY, 16, 3584, 2);      \
-            }                                                 \
-            else                                              \
-                LAUNCH(POST, IDENTITY, 16, no_post_stage, 2); \
-        }                                                     \
-        else                                                  \
-        {                                                     \
-            LAUNCH(POST, IDENTITY, 16, 0, 2);                 \
-        }                                                     \
-    }                                                         \
-    else                                                      \
-    {                                                         \
-        LAUNCH(POST, IDENTITY, 16, 0, 2);                     \
+#define DISPATCH(POST, IDENTITY)                          \
+    if constexpr(VARIANT == 11 && POST)                   \
+    {                                                     \
+        if(blocks <= 256)                                 \
+            LAUNCH(POST, IDENTITY, 16, 3584, 4);          \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 3584, 2);          \
+    }                                                     \
+    else if constexpr(VARIANT == 11)                      \
+    {                                                     \
+        if(use_m32)                                       \
+            LAUNCH(POST, IDENTITY, 32, 0, 2);             \
+        else if(stage_large)                              \
+            LAUNCH(POST, IDENTITY, 16, no_post_stage, 2); \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 0, 2);             \
+    }                                                     \
+    else if constexpr(VARIANT == 12 && POST)              \
+    {                                                     \
+        if(blocks < 512)                                  \
+            LAUNCH(POST, IDENTITY, 16, 2560, 4);          \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 2560, 2);          \
+    }                                                     \
+    else                                                  \
+    {                                                     \
+        LAUNCH(POST, IDENTITY, 16, 0, 2);                 \
     }
     if(has_post)
     {

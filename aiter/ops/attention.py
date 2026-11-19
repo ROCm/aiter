@@ -1587,8 +1587,8 @@ def get_ps_metadata_v1(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
-def mla_prefill_ps_asm_fwd(
+@compile_ops(MD_NAME, fc_name="mla_prefill_ps_asm_fwd", ffi_type="ctypes")
+def _mla_prefill_ps_asm_fwd_binding(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -1607,6 +1607,75 @@ def mla_prefill_ps_asm_fwd(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None: ...
+
+
+# Routed here, on the public name SGLang's MLA prefill and aiter.mla call, with
+# the ASM binding beneath it under its own name. The op name drops the backend:
+# a provider serves the persistent-schedule prefill, not this kernel.
+@_route(op="mla_prefill_ps")
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Persistent-schedule MLA prefill (the "PS" prefill) over a paged KV.
+
+    It runs the work items of a schedule from ``get_ps_metadata_v1``: each
+    ``(query tile, kv split)`` in ``work_info_set``, grouped per worker by
+    ``work_indptr``. A query tile whose KV is not split is finished here and
+    written into ``output``; a split one leaves its partial attention in
+    ``splitData`` and its log-sum-exp in ``splitLse``, which
+    :func:`mla_reduce_v1` then merges into ``output``. So the result is the
+    pair of calls, and a provider that computes the whole prefill in this
+    call must leave ``mla_reduce_v1`` nothing to merge for it.
+
+    Args:
+        Q: ``[total_q, h, d_qk]``; K: paged ``[pages, h_kv, d_qk]``;
+            V: ``[pages, h_kv, d_v]`` (fp8 with ``q_scale``/``k_scale``/
+            ``v_scale``, else bf16).
+        qo_indptr, kv_indptr: per-sequence offsets into Q and the pages;
+            ``kv_page_indices`` lists each sequence's pages.
+        work_indptr, work_info_set: the schedule.
+        max_seqlen_q, softmax_scale, is_causal: the attention's parameters.
+        splitData, splitLse: fp32 partial-output and lse scratch.
+        output: ``[total_q, h, d_v]`` destination.
+
+    Writes ``output`` (and ``splitData``/``splitLse``) in place and returns
+    None.
+    """
+    _mla_prefill_ps_asm_fwd_binding(
+        Q,
+        K,
+        V,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        softmax_scale,
+        is_causal,
+        splitData,
+        splitLse,
+        output,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
 
 
 class MlaBackend(str, _enum.Enum):
@@ -3002,7 +3071,24 @@ def get_mla_metadata_v1(
     )
 
 
-@compile_ops("module_mla_reduce", develop=True)
+@compile_ops("module_mla_reduce", fc_name="mla_reduce_v1", develop=True)
+def _mla_reduce_v1_binding(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor | None,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None: ...
+
+
+# Routed on the public name: SGLang calls it after mla_prefill_ps_asm_fwd, and
+# AITER's own MLA decode calls it after its split-KV kernels, so both reach it.
+# The HIP binding beneath keeps its symbol under a private name.
+@_route(op="mla_reduce")
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -3046,7 +3132,21 @@ def mla_reduce_v1(
             in-place).
         final_lse: optional [bs, h] fp32. Combined LSE; written only when
             provided.
+
+    Writes ``final_output`` (and ``final_lse`` when given) in place and
+    returns None.
     """
+    _mla_reduce_v1_binding(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        final_output,
+        final_lse,
+    )
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
