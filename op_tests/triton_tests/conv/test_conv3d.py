@@ -600,9 +600,39 @@ def test_conv3d_execution_rejects_cpu_tensors():
         conv3d_general(x, w)
 
 
+def test_prepared_padding_handles_empty_batch():
+    source = torch.empty((0, 4, 3, 5, 7), device="cuda", dtype=torch.float16)
+    actual, conv_padding = conv_launch._prepare_conv_padding(
+        source, (1, 2, 1), "replicate", layout="ndhwc"
+    )
+    context = "empty-batch Conv3D replicate padding in ndhwc layout"
+    assert actual.shape == (
+        0,
+        4,
+        5,
+        9,
+        9,
+    ), f"{context}: expected padded shape (0, 4, 5, 9, 9), got {actual.shape}"
+    assert actual.is_contiguous(
+        memory_format=torch.channels_last_3d
+    ), f"{context}: expected channels-last output, got strides={actual.stride()}"
+    assert (
+        actual.dtype == source.dtype
+    ), f"{context}: expected dtype {source.dtype}, got {actual.dtype}"
+    assert (
+        actual.device == source.device
+    ), f"{context}: expected device {source.device}, got {actual.device}"
+    assert conv_padding == (
+        0,
+        0,
+        0,
+    ), f"{context}: expected zero convolution padding, got {conv_padding}"
+
+
 @pytest.mark.parametrize("entry_point", ["routed", "specialized"])
 @pytest.mark.parametrize(
-    "api,layout,route_name,padding_mode,dtype,filter_shape,stride,dilation,padding",
+    "api,layout,route_name,padding_mode,dtype,filter_shape,stride,dilation,padding,"
+    "activation",
     [
         (
             "conv3d",
@@ -614,6 +644,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (1, 2, 1),
+            "relu",
         ),
         (
             "conv3d_ncdhw",
@@ -625,6 +656,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 2, 1),
             (1, 1, 2),
             (1, 2, 2),
+            "none",
         ),
         (
             "conv3d_ndhwc",
@@ -636,6 +668,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (1, 2, 1),
+            "none",
         ),
         (
             "conv3d_ndhwc",
@@ -647,6 +680,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (2, 1, 1),
             (1, 1, 1),
             (4, 0, 2),
+            "none",
         ),
         (
             "conv3d",
@@ -657,7 +691,8 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (3, 5, 3),
             (1, 2, 1),
             (1, 1, 1),
-            (1, 2, 1),
+            (3, 6, 8),
+            "none",
         ),
         (
             "conv3d_ndhwc",
@@ -669,6 +704,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (5, 1, 2),
+            "none",
         ),
         (
             "conv3d_ncdhw",
@@ -680,6 +716,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (1, 2, 1),
+            "none",
         ),
         (
             "conv3d",
@@ -691,6 +728,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (1, 2, 1),
+            "none",
         ),
         (
             "conv3d_ncdhw",
@@ -702,6 +740,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 1, 1),
             (1, 1, 1),
             (1, 2, 1),
+            "none",
         ),
     ],
 )
@@ -717,6 +756,7 @@ def test_padding_matches_reference(
     stride,
     dilation,
     padding,
+    activation,
 ):
     torch.manual_seed(0)
     source = torch.randn((1, 64, 4, 7, 9), device="cuda", dtype=dtype)
@@ -767,6 +807,7 @@ def test_padding_matches_reference(
         dilation,
         padding_mode=padding_mode,
     )
+    expected = apply_activation(expected, activation)
     actual = getattr(conv3d_module, api)(
         source,
         weight,
@@ -774,6 +815,7 @@ def test_padding_matches_reference(
         stride,
         padding,
         dilation,
+        activation=activation,
         padding_mode=padding_mode,
         **kwargs,
     )
@@ -785,7 +827,7 @@ def test_padding_matches_reference(
     rtol, atol = tolerances(dtype, weight[0].numel())
     context = (
         f"{api}, entry_point={entry_point}, route={route_name}, "
-        f"mode={padding_mode}, layout={layout}, dtype={dtype}"
+        f"mode={padding_mode}, layout={layout}, dtype={dtype}, activation={activation}"
     )
     if entry_point == "routed":
         assert selected_routes == [Route3D[route_name]], (
