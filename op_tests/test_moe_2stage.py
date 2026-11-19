@@ -3464,11 +3464,12 @@ else:
         aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
     elif get_gfx() == "gfx950":
         test_presorted_moe_hook()
-        test_presorted_moe_std_pipelines()
     else:
         aiter.logger.warning(
             "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
         )
+    if args.quant is None and get_gfx_runtime() == "gfx950":
+        test_presorted_moe_std_pipelines()
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
