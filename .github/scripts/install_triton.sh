@@ -61,7 +61,7 @@ install_triton_from_wheelhouse() {
 }
 
 TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
-TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
+TRITON_INDEX_URL="https://pypi.amd.com/triton/release_1031/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}' || true)
 if [[ -z "$ROCM_VERSION" ]]; then
     # RPM-based systems (e.g. rocm-core-7.2.0.70200-43.el8.x86_64 -> 7.2.0.70200)
@@ -72,11 +72,11 @@ if [[ -z "$ROCM_VERSION" ]]; then
 fi
 if [[ -n "$ROCM_VERSION" ]]; then
     ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)
-    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_1031/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
     if [[ "$(printf '%s\n' "${ROCM_MAJOR_MINOR}" 10.2 | sort -V | tail -n1)" != 10.2 ]] \
         && ! curl -fsS -o /dev/null "${TRITON_INDEX_URL}triton/" 2>/dev/null; then
         echo "No Triton index for ROCm ${ROCM_MAJOR_MINOR}; using ROCm 10.2.0"
-        TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-10.2.0/simple/"
+        TRITON_INDEX_URL="https://pypi.amd.com/triton/release_1031/rocm-10.2.0/simple/"
     fi
 else
     echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
@@ -85,7 +85,7 @@ fi
 TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
 if ! install_triton_from_wheelhouse "${TRITON_WHEEL_DIR}"; then
     echo "Installing triton from $TRITON_INDEX_URL"
-    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" "triton==3.8.0"
+    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" "triton==3.9.0"
 
     echo "Installing triton-kernels from $TRITON_INDEX_URL"
     python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" "triton-kernels==1.0.0"
