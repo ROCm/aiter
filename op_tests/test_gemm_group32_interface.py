@@ -479,6 +479,41 @@ def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
     assert calls[0][-1] == {"num_waves": waves, "split_k": split_k}
 
 
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        (
+            (64, 6144, 768),
+            "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1",
+        ),
+        (
+            (128, 6144, 768),
+            "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk1",
+        ),
+        ((63, 6144, 768), None),
+        ((65, 6144, 768), None),
+        ((127, 6144, 768), None),
+        ((129, 6144, 768), None),
+        ((64, 6144, 2048), None),
+        ((64, 6080, 768), None),
+    ],
+)
+def test_gfx1250_smallm_1x32_retention_boundaries(shape, expected):
+    assert gemm_op_a8w8._mxfp8_32_retained_smallm_kernel_name(*shape) == expected
+
+
+def test_gfx1250_smallm_1x32_retained_row_overrides_tuned_table(monkeypatch):
+    name = "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1"
+    lookup = gemm_op_a8w8._get_mxfp8_bpreshuffle_config
+    lookup.cache_clear()
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(gemm_op_a8w8, "get_cu_num", lambda: 256)
+    try:
+        assert lookup(64, 6144, 768) == ("flydsl", name, 1)
+    finally:
+        lookup.cache_clear()
+
+
 def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
     from aiter.ops.flydsl.gemm_tune import (

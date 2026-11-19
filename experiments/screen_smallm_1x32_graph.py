@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from aiter import dtypes
+from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     MX32_SMALLM_1X32_NAME_PREFIX,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
@@ -17,10 +18,10 @@ from aiter.ops.gemm_op_a8w8 import _mxfp8_32_fallback_kernel_name
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 
 DEFAULT_FAMILIES = (
-    (1280, 6144),
     (1536, 6144),
     (2304, 6144),
     (2560, 6144),
+    (6144, 768),
     (6144, 2048),
     (6144, 3072),
     (6144, 6144),
@@ -30,9 +31,9 @@ DEFAULT_MS = (64, 128, 256, 512)
 
 def error_ratio(output, reference):
     return 1.0 - float(
-        torch.isclose(
-            output.float(), reference.float(), atol=0.01, rtol=0.01
-        ).float().mean()
+        torch.isclose(output.float(), reference.float(), atol=0.01, rtol=0.01)
+        .float()
+        .mean()
     )
 
 
@@ -50,27 +51,43 @@ def make_data(m, n, k):
     torch.manual_seed(113000 + m + n + k)
     x = (torch.randn((m, k), device="cuda") * 2).to(dtypes.fp8)
     weight = (torch.randn((n, k), device="cuda") * 2).to(dtypes.fp8)
-    x_scale_u8 = torch.randint(
-        124, 131, (m, k // 32), dtype=torch.uint8, device="cuda"
-    )
-    w_scale_u8 = torch.randint(
-        124, 131, (n, k // 32), dtype=torch.uint8, device="cuda"
-    )
+    x_scale_u8 = torch.randint(124, 131, (m, k // 32), dtype=torch.uint8, device="cuda")
+    w_scale_u8 = torch.randint(124, 131, (n, k // 32), dtype=torch.uint8, device="cuda")
     return {
         "x": x,
         "weight": weight,
         "x_scale_u8": x_scale_u8,
         "w_scale_u8": w_scale_u8,
         "x_scale": x_scale_u8.view(dtypes.fp8_e8m0),
-        "w_scale": shuffle_mxfp8fp4_scale(
-            w_scale_u8.view(dtypes.fp8_e8m0)
-        ),
+        "w_scale": shuffle_mxfp8fp4_scale(w_scale_u8.view(dtypes.fp8_e8m0)),
         "shuffled_weight": shuffle_weight(weight, layout=(16, 16)),
         "out": torch.empty((m, n), dtype=torch.bfloat16, device="cuda"),
     }
 
 
 def runner(data, kernel_name):
+    if kernel_name.startswith("flydsl_bmm_mxfp8_32_wmma"):
+
+        def run():
+            return run_bmm_a8w8_mxfp8(
+                data["x"].view(data["x"].shape[0], 1, data["x"].shape[1]),
+                data["shuffled_weight"].view(
+                    1,
+                    data["shuffled_weight"].shape[0],
+                    data["shuffled_weight"].shape[1],
+                ),
+                data["x_scale"].view(
+                    data["x_scale"].shape[0], 1, data["x_scale"].shape[1]
+                ),
+                data["w_scale"].view(
+                    1, data["w_scale"].shape[0], data["w_scale"].shape[1]
+                ),
+                data["out"].view(data["out"].shape[0], 1, data["out"].shape[1]),
+                kernel_name,
+            )
+
+        return run
+
     def run():
         return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
             data["x"],
@@ -219,9 +236,7 @@ def main():
                 graphs,
                 key=lambda name: sorted(coarse[name])[len(coarse[name]) // 2],
             )
-            finalists = list(
-                dict.fromkeys([baseline_name, *ranked[: args.finalists]])
-            )
+            finalists = list(dict.fromkeys([baseline_name, *ranked[: args.finalists]]))
             samples = {name: [] for name in finalists}
             for round_index in range(args.stable_rounds):
                 order = (
@@ -254,9 +269,7 @@ def main():
             )
             winner = measured[0]
             speedup = baseline["median_us"] / winner["median_us"]
-            retained = (
-                winner["kernelName"] != baseline_name and speedup >= 1.02
-            )
+            retained = winner["kernelName"] != baseline_name and speedup >= 1.02
             result = {
                 "M": m,
                 "N": n,
