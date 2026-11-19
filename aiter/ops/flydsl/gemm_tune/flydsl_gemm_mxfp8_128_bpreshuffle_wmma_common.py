@@ -59,6 +59,7 @@ _COMPUTE_PROFILES = (
     (128, 256, 128, 2, 2, 3),
 )
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
+_COMPUTE_UNCLUSTERED = ((1, 1),)
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _SMALL_PROFILES = ((64, 128, 128, 2, 2, 2),)
 _PERSISTENT_N_TILES = (2, 4, 8)
@@ -392,7 +393,10 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             return False
         if profile not in _COMPUTE_PROFILES:
             return False
-        if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
+        if (ki.cluster_m, ki.cluster_n) not in (
+            *_COMPUTE_CLUSTERS,
+            *_COMPUTE_UNCLUSTERED,
+        ):
             return False
         if ki.fused_splitk and (
             ki.split_k <= 1

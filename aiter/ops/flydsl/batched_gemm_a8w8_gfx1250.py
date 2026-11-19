@@ -526,19 +526,28 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         or pick_bmm_mx32_compute_kernel_name(b, m, n, k)
         or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
     )
-    if is_compute_wmma_kernel_name(name):
-        ccfg = parse_mxfp8_32_wmma_kernel_name(name) if fused else None
+    direct_cfg = parse_mxfp8_32_wmma_kernel_name(name)
+    if direct_cfg is not None:
+        compute = is_compute_wmma_kernel_name(name)
+        if fused and not compute:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] direct kernel {name!r} has no fused quant "
+                "epilogue; drop y_scale_out or use a compute kernel"
+            )
         if fused and (
-            ccfg is None
-            or ccfg["split_k"] != 1
-            or ccfg["persistent_n_tiles"] != 1
-            or ccfg["a_preshuffle"]
-            or ccfg["a_scale_preshuffled"]
+            direct_cfg["split_k"] != 1
+            or direct_cfg["persistent_n_tiles"] != 1
+            or direct_cfg["a_preshuffle"]
+            or direct_cfg["a_scale_preshuffled"]
         ):
             raise ValueError(
                 f"[FlyDSL gfx1250 bmm] compute kernel {name!r} has no fused quant "
                 "epilogue (it needs split_k 1, no persistent tiles and row-major "
                 "A); drop y_scale_out or pick another kernel"
+            )
+        if b != 1 and not compute:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] non-compute direct kernel {name!r} needs B=1"
             )
         if m:
             from aiter.utility import dtypes
@@ -551,7 +560,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
                 Out[:, 0],
                 name,
                 w_scale_32x32=w_scale_32x32,
-                batch=b,
+                batch=b if compute else 1,
                 y_scale_out=y_scale_out,
             )
         return Out

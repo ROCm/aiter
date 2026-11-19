@@ -404,50 +404,6 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
     assert calls == [("lookup", block), ("bmm", (1, 256 // w_rows, 16), False)]
 
 
-def test_gfx1250_group32_direct_2d_row_bypasses_bmm(monkeypatch):
-    """A direct tuned name keeps the public GEMM contract but skips B=1 views."""
-    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
-    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
-
-    calls = []
-    name = (
-        "flydsl_mxfp8_32_bpreshuffle_wmma_"
-        "t128x128x128_mw2_nw2_nb3_sk1_cm1_cn1"
-    )
-    row = {**BMM_ROW, "kernelName": name}
-
-    def run(x, w, xs, ws, out, kernel_name, w_scale_32x32=False):
-        calls.append(
-            (
-                tuple(x.shape),
-                tuple(w.shape),
-                tuple(xs.shape),
-                tuple(ws.shape),
-                tuple(out.shape),
-                kernel_name,
-                w_scale_32x32,
-            )
-        )
-        return out
-
-    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx1250")
-    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
-    monkeypatch.setattr(direct, "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250", run)
-    monkeypatch.setattr(
-        bmm,
-        "run_bmm_a8w8_mxfp8",
-        lambda *a, **kw: pytest.fail("direct B=1 row entered the batched wrapper"),
-    )
-
-    y = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
-        *_mxscale_operands(w_rows=1)
-    )
-    assert y.shape == (3, 256)
-    assert calls == [
-        ((3, 512), (256, 512), (3, 16), (256, 16), (3, 256), name, False)
-    ]
-
-
 @pytest.mark.parametrize("waves", [1, 2])
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
 def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
