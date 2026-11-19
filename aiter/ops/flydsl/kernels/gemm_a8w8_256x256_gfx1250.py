@@ -116,6 +116,9 @@ def launch_gemm_a8w8_256x256(
     assert not fused_splitk or tile_m & (tile_m - 1) == 0, (
         "the fused split-K row rotation needs a power-of-two tile_m"
     )
+    assert not fused_splitk or (m_warp * n_warp * 32) % (tile_n // 4) == 0, (
+        "the fused split-K row schedule needs whole rows per wavegroup"
+    )
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16

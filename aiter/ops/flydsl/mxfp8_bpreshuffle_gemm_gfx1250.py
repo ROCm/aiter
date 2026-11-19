@@ -79,6 +79,7 @@ def _smallm_1x32_workspace(
 
 def _fused_splitk_ok(
     tile_m,
+    tile_n,
     cluster_m,
     cluster_n,
     split_k,
@@ -90,6 +91,7 @@ def _fused_splitk_ok(
     return bool(
         split_k > 1
         and tile_m % split_k == 0
+        and (m_warp * n_warp * 32) % (tile_n // 4) == 0
         and cluster_m * cluster_n * split_k <= 16
         and (
             native_fused_splitk
@@ -463,6 +465,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     stream = _fx.Stream(torch_stream)
     fused = fused_splitk and _fused_splitk_ok(
         tile_m,
+        tile_n,
         cluster_m,
         cluster_n,
         split_k,

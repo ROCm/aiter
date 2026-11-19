@@ -361,6 +361,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return (K // ki.split_k) // ki.tile_k >= ki.num_buffers
 
     if is_compute_kernel(ki):
+        if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
+            return False
         profile = (
             ki.tile_m,
             ki.tile_n,
@@ -382,6 +384,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             ki.split_k <= 1
             or ki.tile_m % ki.split_k
             or ki.tile_m & (ki.tile_m - 1)
+            or (ki.m_warp * ki.n_warp * 32) % (ki.tile_n // 4)
             or ki.cluster_m * ki.cluster_n * ki.split_k > 16
         ):
             return False
