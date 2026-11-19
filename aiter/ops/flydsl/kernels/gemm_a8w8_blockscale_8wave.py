@@ -15,6 +15,8 @@ Raw DMA loads A and B directly into LDS; tiled DMA is not supported.
 A/B slice and chunk offsets are precomputed per lane. K offsets rebase the
 DMA descriptors with shrinking byte bounds. A/B and ScaleA DMA use zero
 soffset; ScaleB retains its scalar buffer loads.
+The 16-bit epilogue regroups C with permlane16 swaps, stages it in the A/B
+LDS tiles the K loop no longer needs, then stores whole rows of C.
 """
 
 import flydsl.compiler as flyc
@@ -780,7 +782,7 @@ def compile_gemm_fp8_8wave(
             # t = tick (k%2), u = tock; operands use tile k unless noted.
             # Each DOT phase: 4 MFMA + 16 FMA retiring the previous frag_P.
             # LDS reads / AC below precede that phase's begin barrier.
-            # | MFMA Phase | MFMA/DOT | DQ phase(VALU)   | LDS read (slot) | AC (slot,tile) / wait |
+            # | Phase | MFMA/DOT | DQ (VALU)   | LDS read (slot) | AC (slot,tile) / wait |
             # |-------|----------|-------------|-----------------|----------------------|
             # | TL s0 | A00*B0   | BR s1 (k-1) | A00, SA00 (t)   | A1 (u,k+1)           |
             # | TR s0 | A00*B1   | TL s0       | B1 (t)          | -                    |
@@ -789,9 +791,11 @@ def compile_gemm_fp8_8wave(
             # | TL s1 | A01*B0   | BR s0       | A01, SA01 (t)   | -                    |
             # | TR s1 | A01*B1   | TL s1       | -               | A0 (t,k+2)           |
             # | BL s1 | A11*B0   | TR s1       | A11, SA11 (t)   | vmcnt(6)             |
-            # | BR s1 | A11*B1   | BL s1       | B0 (u,k+1)      | SA (t,k+2), before LR|
+            # | BR s1 | A11*B1   | BL s1       | B0 (u,k+1)      | SA (t,k+2), after LR |
             # Every phase: LR/AC/wait -> lgkmcnt(0) -> s_barrier -> DOT -> s_barrier.
             # TL s0 also loads two ScaleB SGPRs (SMEM, not LDS/AC).
+            # For even k, prefetch_first_phase issues TL s0's loads at the end
+            # of the previous iteration (or before the loop for k = 0).
             # B0(k=0) is read in the prologue; the first DQ retires zero.
             # BR s1's pending partial is retired by the next TL s0, or the epilogue.
 
@@ -1021,7 +1025,7 @@ def compile_gemm_fp8_8wave(
                         fx.copy(c_stage_copy_atom, staged, c_dst)
 
             # Before C overwrites the A/B tiles, every wave must be done
-            # reading them, and the speculative DMAs into them must land.
+            # reading them, and the prefetch DMAs past K into them must land.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
             fx.barrier()
             store_c_quadrant(frag_C_tl, 0, 0)
@@ -1032,22 +1036,22 @@ def compile_gemm_fp8_8wave(
             # Each store writes two whole rows, 512 B each: lanes 0-31 one
             # row, lanes 32-63 the next, 8 contiguous 16-bit values per lane.
             # Wave w stores rows 4w..4w+3 of every staged 32-row block.
-            half = lane_id // 32
-            lcol = lane_id % 32 * 8
+            row_of_pair = lane_id // 32
+            lane_col = lane_id % 32 * 8
             rows_per_wave = C_ROWS_PER_TILE // 8
             for c_tile in range_constexpr(TILE_M // C_ROWS_PER_TILE):
                 for pair in range_constexpr(rows_per_wave // 2):
-                    row_in_tile = wave_id * rows_per_wave + pair * 2 + half
-                    srow = c_tile * C_ROWS_PER_TILE + row_in_tile
-                    c_src = c_stage_view(c_tile, row_in_tile, lcol)
+                    row_in_tile = wave_id * rows_per_wave + pair * 2 + row_of_pair
+                    c_row = c_tile * C_ROWS_PER_TILE + row_in_tile
+                    c_src = c_stage_view(c_tile, row_in_tile, lane_col)
                     staged = fx.make_fragment_like(c_src)
                     fx.copy(c_stage_copy_atom, c_src, staged)
-                    c_off = srow * N + lcol
+                    c_off = c_row * N + lane_col
                     if const_expr(N_tail):
                         # N % 8 == 0, so each 8-column store is wholly in or
                         # out. 2**30 elements is 2**31 bytes, past this WG's
                         # C bound (asserted < 2**31), so the buffer drops it.
-                        c_off = (lcol < b_rows_left).select(c_off, fx.Int32(2**30))
+                        c_off = (lane_col < b_rows_left).select(c_off, fx.Int32(2**30))
                     c_dst = fx.make_view(
                         fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_off)),
                         fx.make_layout(8, 1),
