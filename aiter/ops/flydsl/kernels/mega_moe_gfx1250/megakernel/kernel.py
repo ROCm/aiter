@@ -44,13 +44,16 @@ from .core import (
     TIMEOUT_S,
     TR_N,
     KCtx,
+    compact_aux_words,
     compact_flag_bytes,
     compact_scratch_bytes,
     compact_tail_bytes,
+    compact_wire_off,
     ctl_arena_bytes,
     ctl_layout,
     epr_pad,
     read_mtready,
+    read_sortsend,
     read_tailrdy,
     segs_pad,
     src_off,
@@ -185,6 +188,17 @@ def make_megakernel(
     FL2_OFF = CTL_ARENA_B
     if TAIL:
         CTL_ARENA_B += compact_tail_bytes(npes=npes, experts_per_rank=EPR)
+    # Compact sorted send: the route buffer holds the route slots, the
+    # position -> route table (INV_W), the prefix per segment (PFX_W), the
+    # route total (NV_W), then the local wire rows (WIRE_OFF bytes in).
+    SORT = int(MTREADY and read_sortsend())
+    INV_W = PFX_W = NV_W = WIRE_OFF = AUX_W = 0
+    if SORT:
+        INV_W = MAXR
+        PFX_W = 2 * MAXR
+        NV_W = PFX_W + SEGS_PAD
+        AUX_W = compact_aux_words(maxr=MAXR, segs=SEGS_PAD)
+        WIRE_OFF = compact_wire_off(maxr=MAXR, segs=SEGS_PAD)
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
@@ -278,6 +292,7 @@ def make_megakernel(
             ("rb", RED_B64, RED_B64_DEF),
             ("mr", MTREADY, int(COMPACT)),
             ("tl", TAIL, 0),
+            ("ss", SORT, MTREADY),
             ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
@@ -331,6 +346,12 @@ def make_megakernel(
         FLG_OFF=FLG_OFF,
         TAIL=TAIL,
         FL2_OFF=FL2_OFF,
+        SORT=SORT,
+        INV_W=INV_W,
+        PFX_W=PFX_W,
+        NV_W=NV_W,
+        AUX_W=AUX_W,
+        WIRE_OFF=WIRE_OFF,
         MT_CAP=MT_CAP,
         REP_W=REP_W,
         ROW=ROW,

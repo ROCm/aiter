@@ -26,7 +26,9 @@ from .core import (
     CTL_FAIL,
     RT_N,
     TR_N,
+    compact_route_bytes,
     ctl_words,
+    segs_pad,
 )
 from .kernel import make_megakernel
 
@@ -61,8 +63,18 @@ class MegaKernel:
             self.cap = rows
             self.mt_cap = rows // t["tile_m"]
             self.regions = (*compact_row_regions(), ctl)
+            # Route slots, and with the sorted send its tables and the local
+            # wire rows (core.compact_route_bytes).
+            maxr = geo.max_tokens_per_rank * config.topk
             self.route = torch.empty(
-                geo.max_tokens_per_rank * config.topk, dtype=torch.int32, device=device
+                compact_route_bytes(
+                    maxr=maxr,
+                    segs=segs_pad(npes=config.world_size, experts_per_rank=epr),
+                    max_tok=geo.max_tokens_per_rank,
+                    row=self.row,
+                ),
+                dtype=torch.uint8,
+                device=device,
             )
         else:
             cap = self.cap = slots_cap(config)

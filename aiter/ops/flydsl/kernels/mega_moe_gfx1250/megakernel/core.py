@@ -54,6 +54,9 @@ CTL_QHEAD = 4096  # + 32 * parity: the GEMM work queue head
 CTL_ERR = 5120  # routes dropped for a full expert slot (never expected)
 CTL_FAIL = 5121  # + wait site: AITER_DMK_NOTRAP's timed-out waits (debug)
 CTL_TALLY = 5248  # + 32 * parity: compact layout, tally CTAs done
+CTL_QDONE = 5312  # + 32 * parity: compact sorted send, tokens quantized
+CTL_INVD = 5376  # + 32 * parity: compact sorted send, tally CTAs past inv
+CTL_PFX = 5440  # compact sorted send: gen once the prefix table is out
 #: Per m-tile: g1_cnt at word 0 and g1_ready at word 32, each on its own
 #: 128 B line, so the ready polls do not queue the completion atomics.
 CTL_G1 = 6144
@@ -156,6 +159,25 @@ def read_mtready() -> bool:
     return os.environ.get("AITER_DMK_MTREADY", "1") != "0"
 
 
+def read_sortsend() -> bool:
+    """AITER_DMK_SORTSEND=1 (off by default, needs MTREADY; wrong past ~8k
+    tokens/rank, not yet found): compact quantizes this
+    rank's tokens once into a local wire buffer while X1 is in flight, then
+    sends route by route in (local expert, destination) order, so every
+    destination's first experts land first and their GEMM items start."""
+    return read_mtready() and os.environ.get("AITER_DMK_SORTSEND", "0") != "0"
+
+
+#: Debug: AITER_DMK_GATEP_SHORT=0 has every GEMM item poll its expert's
+#: flags even once GATE_P is open.
+GATEP_SHORT = os.environ.get("AITER_DMK_GATEP_SHORT", "1") != "0"
+
+
+#: Sorted send: route rows a wave copies before one wait for their stores
+#: (AITER_DMK_SEND_B overrides, debug).
+SEND_B = int(os.environ.get("AITER_DMK_SEND_B", "4"))
+
+
 def vdst_fence(v):
     """``v`` once every VALU write has landed. The fp4 converts are inline
     asm, so no VALU -> VMEM wait guards a store that reads their results;
@@ -183,6 +205,24 @@ def compact_tail_bytes(*, npes: int, experts_per_rank: int) -> int:
     if not read_tailrdy():
         return 0
     return segs_pad(npes=npes, experts_per_rank=experts_per_rank) * 4
+
+
+def compact_aux_words(*, maxr: int, segs: int) -> int:
+    """i32 words of the compact route buffer: route slots, then (sorted send)
+    the position -> route table, the prefix per segment and the route total."""
+    return 2 * int(maxr) + int(segs) + 32 if read_sortsend() else int(maxr)
+
+
+def compact_wire_off(*, maxr: int, segs: int) -> int:
+    """Byte offset of the local wire rows (sorted send) in the route buffer."""
+    return (4 * compact_aux_words(maxr=maxr, segs=segs) + 255) // 256 * 256
+
+
+def compact_route_bytes(*, maxr: int, segs: int, max_tok: int, row: int) -> int:
+    """Bytes of the compact route buffer."""
+    if not read_sortsend():
+        return 4 * int(maxr)
+    return compact_wire_off(maxr=maxr, segs=segs) + int(max_tok) * int(row)
 
 
 def compact_flag_bytes(experts_per_rank: int) -> int:
@@ -361,6 +401,7 @@ def start(kc):
     EPR_PAD, G, INV, addr_ctl, alive = kc.EPR_PAD, kc.G, kc.INV, kc.addr_ctl, kc.alive
     bc, bid, is_t0, lane, rsrc_actl = kc.bc, kc.bid, kc.is_t0, kc.lane, kc.rsrc_actl
     rsrc_ctl, stamp, wave = kc.rsrc_ctl, kc.stamp, kc.wave
+    SORT = kc.SORT
     stamp(0)
     if const_expr(INV):  # noqa: SIM102 - preserve DSL staging
         if wave == fx.Int32(0):
@@ -420,18 +461,22 @@ def start(kc):
                     * fx.Int32(RUN_STRIDE),
                     cache_modifier=SCOPE_SYS,
                 )
-        # Lane 3 resets the tally (compact) or reserved (EARLY) count.
-        if lane < fx.Int32(4 if (COMPACT or EARLY) else 3):
+        # Lane 3 resets the tally (compact) or reserved (EARLY) count, lanes
+        # 4 and 5 the sorted send's quant and inv counts.
+        if lane < fx.Int32(6 if SORT else (4 if (COMPACT or EARLY) else 3)):
+            word = fx.Int32(
+                (lane == fx.Int32(3)).select(
+                    fx.Int32(CTL_TALLY),
+                    fx.Int32(CTL_PROD) + lane * fx.Int32(CTL_CLOSE - CTL_PROD),
+                )
+            )
+            if const_expr(SORT):
+                word = fx.Int32((lane == fx.Int32(4)).select(fx.Int32(CTL_QDONE), word))
+                word = fx.Int32((lane == fx.Int32(5)).select(fx.Int32(CTL_INVD), word))
             buffer_store(
                 fx.Int32(0),
                 rsrc_ctl,
-                fx.Int32(
-                    (lane == fx.Int32(3)).select(
-                        fx.Int32(CTL_TALLY),
-                        fx.Int32(CTL_PROD) + lane * fx.Int32(CTL_CLOSE - CTL_PROD),
-                    )
-                )
-                + other * fx.Int32(32),
+                word + other * fx.Int32(32),
                 cache_modifier=SCOPE_DEV,
             )
         rocdl.s_wait_storecnt(0)
@@ -783,6 +828,8 @@ def gemm_queue(kc, n_mt):
         landed = _uniform(
             _load_i32_dev(rsrc_ctl, fx.Int32(GATE_P) + bid * fx.Int32(GATE_STRIDE))
         )
+        if const_expr(not GATEP_SHORT):
+            landed = gen + fx.Int32(1)
         src = fx.Int32((lane < fx.Int32(npes)).select(lane, fx.Int32(0)))
         flag_w = fx.Int32(FLG_OFF // 4) + e_ * fx.Int32(WAVE) + src
         bad = fx.Int32(0)
