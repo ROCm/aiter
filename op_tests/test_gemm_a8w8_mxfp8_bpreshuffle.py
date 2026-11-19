@@ -15,6 +15,7 @@ import argparse
 from unittest import mock
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -116,6 +117,75 @@ def tuned_shapes():
     if not shapes and get_gfx() == "gfx950":
         return DEFAULT_MNK_GFX950  # not tuned on this machine yet
     return shapes
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() != "gfx1250",
+    reason="gfx1250 native small-M MXFP8 kernel",
+)
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1",
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk4",
+    ],
+)
+def test_gfx1250_smallm_1x32_changed_input_graph_replay(kernel_name):
+    """FP32 tolerance plus fresh A/A-scale reads on graph replay."""
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+    )
+
+    torch.manual_seed(719)
+    m, n, k = 64, 256, 1024
+    x = (torch.randn((m, k), device="cuda") * 2).to(dtypes.fp8)
+    weight = (torch.randn((n, k), device="cuda") * 2).to(dtypes.fp8)
+    x_scale_u8 = torch.randint(
+        124, 131, (m, k // 32), dtype=torch.uint8, device="cuda"
+    )
+    w_scale_u8 = torch.randint(
+        124, 131, (n, k // 32), dtype=torch.uint8, device="cuda"
+    )
+    x_scale = x_scale_u8.view(dtypes.fp8_e8m0)
+    w_scale = w_scale_u8.view(dtypes.fp8_e8m0)
+    shuffled_weight = shuffle_weight(weight, layout=(16, 16))
+    shuffled_scale = shuffle_mxfp8_bpreshuffle_scale(w_scale)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+
+    def launch():
+        return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+            x,
+            shuffled_weight,
+            x_scale,
+            shuffled_scale,
+            out,
+            kernel_name,
+        )
+
+    def error_ratio(reference):
+        return 1.0 - float(
+            torch.isclose(
+                out.float(), reference.float(), atol=0.01, rtol=0.01
+            ).float().mean()
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    assert error_ratio(run_torch(x, x_scale, weight, w_scale, (1, 32))) <= 0.05
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    x.copy_((torch.randn_like(x.float()) * 1.5).to(dtypes.fp8))
+    x_scale_u8.copy_(
+        torch.randint(
+            123, 130, x_scale_u8.shape, dtype=torch.uint8, device="cuda"
+        )
+    )
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert error_ratio(run_torch(x, x_scale, weight, w_scale, (1, 32))) <= 0.05
 
 
 if __name__ == "__main__":

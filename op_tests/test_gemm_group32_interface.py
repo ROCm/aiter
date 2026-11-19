@@ -448,6 +448,37 @@ def test_gfx1250_group32_direct_2d_row_bypasses_bmm(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("waves", [1, 2])
+@pytest.mark.parametrize("split_k", [1, 2, 4, 8])
+def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
+    monkeypatch, waves, split_k
+):
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+
+    name = f"{direct.MX32_SMALLM_1X32_NAME_PREFIX}_w{waves}_sk{split_k}"
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(name)
+    assert parsed == {
+        "smallm_1x32": True,
+        "num_waves": waves,
+        "split_k": split_k,
+    }
+
+    operands = _mxscale_operands(m=64, n=256, k=1024, w_rows=1)
+    out = torch.empty((64, 256), dtype=torch.bfloat16)
+    calls = []
+
+    def run(x, w, xs, ws, output, **config):
+        calls.append((x, w, xs, ws, output, config))
+        return output
+
+    monkeypatch.setattr(direct, "_run_mxfp8_32_smallm_1x32_gfx1250", run)
+    actual = direct.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+        *operands, out, name
+    )
+    assert actual is out
+    assert calls[0][-1] == {"num_waves": waves, "split_k": split_k}
+
+
 def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
     from aiter.ops.flydsl.gemm_tune import (
