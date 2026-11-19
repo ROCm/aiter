@@ -15,6 +15,9 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+    MX32_SMALL_WMMA_NAME_PREFIX as SMALL_NAME_PREFIX,
+)
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
 )
@@ -56,6 +59,7 @@ _COMPUTE_PROFILES = (
 )
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
 _COMPUTE_MIN_K_PER_SPLIT = 512
+_SMALL_PROFILES = ((64, 128, 128, 2, 2, 2),)
 _PERSISTENT_N_TILES = (2, 4, 8)
 
 _CLUSTER_MIN_DIM = 8192
@@ -281,6 +285,30 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                     fused_splitk=True,
                 )
                 idx += 1
+    # Native 1x32 small-M split-K uses the generic row-wise K schedule.  Its
+    # per-wave WMMA geometry is only 2x4 (half_m/half_n 1x2), so it
+    # deliberately does not enter the large compute kernel's four-quadrant
+    # seed schedule.
+    for sk in _SPLIT_K:
+        if sk not in (2, 8):
+            continue
+        for tm, tn, tk, mw, nw, nb in _SMALL_PROFILES:
+            if tm % sk:
+                continue
+            kl[idx] = WmmaKernelInstance(
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                num_buffers=nb,
+                split_k=sk,
+                cluster_m=1,
+                cluster_n=1,
+                m_warp=mw,
+                n_warp=nw,
+                name_prefix=SMALL_NAME_PREFIX,
+                fused_splitk=True,
+            )
+            idx += 1
     # PeakGemm/flydsl-examples use this gfx1250 arbitration mode for TDM+WMMA.
     # Keep it an opt-in strategy because scaled FP8 has extra LDS/scale traffic.
     for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
@@ -311,6 +339,29 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     # Row pairs need both rows, so an odd M has no valid pairing.
     if ki.a_preshuffle and M % 2 != 0:
         return False
+
+    if is_small_kernel(ki):
+        profile = (
+            ki.tile_m,
+            ki.tile_n,
+            ki.tile_k,
+            ki.m_warp,
+            ki.n_warp,
+            ki.num_buffers,
+        )
+        if profile not in _SMALL_PROFILES or M < ki.tile_m:
+            return False
+        if (
+            not ki.fused_splitk
+            or ki.split_k <= 1
+            or ki.tile_m % ki.split_k
+            or ki.cluster_m != 1
+            or ki.cluster_n != 1
+            or N % ki.tile_n
+            or K % (ki.split_k * ki.tile_k)
+        ):
+            return False
+        return (K // ki.split_k) // ki.tile_k >= ki.num_buffers
 
     if is_compute_kernel(ki):
         profile = (
@@ -404,3 +455,8 @@ def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:
     """Return whether a tuning instance targets the compute-bound kernel."""
     return kernel.name_prefix == COMPUTE_NAME_PREFIX
+
+
+def is_small_kernel(kernel: WmmaKernelInstance) -> bool:
+    """Whether an instance uses the native low-resource small-M schedule."""
+    return kernel.name_prefix == SMALL_NAME_PREFIX

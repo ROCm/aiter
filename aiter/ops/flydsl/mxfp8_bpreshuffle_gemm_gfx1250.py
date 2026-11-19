@@ -35,6 +35,7 @@ WMMA_NAME_PREFIX = "flydsl_mxfp8_128_bpreshuffle_wmma"
 COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_128_bpreshuffle_compute_wmma"
 MX32_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_wmma"
 MX32_COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_compute_wmma"
+MX32_SMALL_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_small_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
@@ -52,10 +53,12 @@ def _fused_splitk_workspace(
         return torch.empty(shape, dtype=torch.float32, device=device)
 
 
-def _fused_splitk_ok(tile_m, cluster_m, cluster_n, split_k, compute_bound) -> bool:
+def _fused_splitk_ok(
+    tile_m, cluster_m, cluster_n, split_k, native_fused_splitk
+) -> bool:
     """Whether this launch can run the clustered fused split-K epilogue."""
     return bool(
-        compute_bound
+        native_fused_splitk
         and split_k > 1
         and tile_m % split_k == 0
         and cluster_m * cluster_n * split_k <= 16
@@ -192,6 +195,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     fuse_quant = y_scale_out is not None
+    small_native = is_small_wmma_kernel_name(kernel_name)
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
         raise RuntimeError(
@@ -419,7 +423,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
     fused = fused_splitk and _fused_splitk_ok(
-        tile_m, cluster_m, cluster_n, split_k, compute_bound
+        tile_m, cluster_m, cluster_n, split_k, compute_bound or small_native
     )
     bounded_m = bool(M % tile_m)
     if fused:
@@ -511,6 +515,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             a_preshuffle,
             a_scale_preshuffled,
             w_scale_32x32,
+            fused,
+            bounded_m,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -525,6 +531,10 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,  # b_scale_32x32
             False,  # k_tail
             _ptr_arg(Out),  # arg_scale_out
+            False,  # fuse_quant_out
+            _ptr_arg(Out),  # arg_out
+            fused,
+            bounded_m,
             specialization_key=specialization,
         )
     if partials is not None and not fused:
@@ -568,6 +578,9 @@ _MX32_KERNEL_NAME_RE = re.compile(
 _MX32_COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_COMPUTE_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
 )
+_MX32_SMALL_KERNEL_NAME_RE = re.compile(
+    rf"^{re.escape(MX32_SMALL_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
+)
 
 
 def _parse_name(match):
@@ -602,6 +615,7 @@ def parse_mxfp8_32_wmma_kernel_name(name: str):
     """Parse a generic or compute-bound mxfp8_32 kernelName."""
     return _parse_name(
         _MX32_COMPUTE_KERNEL_NAME_RE.fullmatch(name)
+        or _MX32_SMALL_KERNEL_NAME_RE.fullmatch(name)
         or _MX32_KERNEL_NAME_RE.fullmatch(name)
     )
 
@@ -638,6 +652,11 @@ def is_compute_wmma_kernel_name(name: str) -> bool:
         _COMPUTE_KERNEL_NAME_RE.fullmatch(name) is not None
         or _MX32_COMPUTE_KERNEL_NAME_RE.fullmatch(name) is not None
     )
+
+
+def is_small_wmma_kernel_name(name: str) -> bool:
+    """Return whether ``name`` selects the low-resource small-M schedule."""
+    return _MX32_SMALL_KERNEL_NAME_RE.fullmatch(name) is not None
 
 
 @functools.lru_cache(maxsize=1024)

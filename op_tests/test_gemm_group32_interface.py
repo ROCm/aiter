@@ -495,7 +495,7 @@ def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
     ]
     assert fused
     assert all(
-        catalog.is_compute_kernel(instance)
+        (catalog.is_compute_kernel(instance) or catalog.is_small_kernel(instance))
         and instance.split_k > 1
         and instance.tile_m % instance.split_k == 0
         and instance.cluster_m * instance.cluster_n * instance.split_k <= 16
@@ -506,6 +506,42 @@ def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
         fused[0].name.replace("mxfp8_128", "mxfp8_32")
     )
     assert parsed is not None and parsed["fused_splitk"] is True
+
+
+def test_gfx1250_small_splitk_uses_low_resource_profiles():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    small = [
+        instance
+        for instance in catalog.kernels_list.values()
+        if catalog.is_small_kernel(instance)
+    ]
+    assert small
+    assert {
+        (
+            instance.tile_m,
+            instance.tile_n,
+            instance.m_warp,
+            instance.n_warp,
+            instance.num_buffers,
+        )
+        for instance in small
+    } == {(64, 128, 2, 2, 2)}
+    assert all(
+        instance.fused_splitk
+        and instance.cluster_m == instance.cluster_n == 1
+        and instance.split_k in (2, 8)
+        and catalog.kernel_fits_shape(instance, 64, 6144, 6144)
+        for instance in small
+    )
+    assert all(
+        direct.is_small_wmma_kernel_name(instance.name)
+        and direct.parse_mxfp8_32_wmma_kernel_name(instance.name)["fused_splitk"]
+        for instance in small
+    )
 
 
 def test_gfx1250_compute_catalog_exposes_arbitration_strategy():
