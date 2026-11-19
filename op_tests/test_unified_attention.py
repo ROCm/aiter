@@ -10,7 +10,9 @@ import argparse
 import itertools
 import os
 import sys
+from contextlib import contextmanager
 from functools import partial
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -361,10 +363,7 @@ def test_decode(dtype, depth, layout):
         if dtype not in _LAYER_GRAPH_CHECKED:
             _LAYER_GRAPH_CHECKED.add(dtype)
             check_decode_routing(dtype)
-            # These exercise the pa_decode route, which needs FP8-query pa_decode.
-            from aiter.ops.flydsl import unified_attention_kernels as kernels
-
-            if kernels._PA_DECODE_FP8_QUERY:
+            if pa_decode_route_live():
                 check_decode_layer_graphs(dtype)
                 check_decode_workspace_growth(dtype)
     if layout == "linear":
@@ -382,25 +381,283 @@ def test_decode(dtype, depth, layout):
     return ret
 
 
+def _kernels():
+    # Imported lazily: the module needs FlyDSL, which main() gates on.
+    from aiter.ops.flydsl import unified_attention_kernels
+
+    return unified_attention_kernels
+
+
+@contextmanager
+def spy_backends():
+    """Count calls into each decode backend: Triton, the fmha kernel (through its
+    builder cache) and the pa_decode route. Numerics alone cannot tell them apart."""
+    from aiter.ops.triton.attention import unified_attention as triton_ua
+
+    kernels = _kernels()
+    with (
+        mock.patch.object(
+            triton_ua, "unified_attention", wraps=triton_ua.unified_attention
+        ) as triton,
+        mock.patch.object(kernels, "_get_kernel", wraps=kernels._get_kernel) as fmha,
+        mock.patch.object(
+            kernels, "_route_pa_decode", wraps=kernels._route_pa_decode
+        ) as pa_decode,
+    ):
+        yield {"triton": triton, "fmha": fmha, "pa_decode": pa_decode}
+
+
+def pa_decode_route_live():
+    """The pa_decode route is dormant until pa_decode exports SUPPORTS_FP8_QUERY;
+    its graph and workspace checks skip, loudly, while it is."""
+    if _kernels()._PA_DECODE_FP8_QUERY:
+        return True
+    aiter.logger.warning(
+        "SKIPPED check_decode_layer_graphs and check_decode_workspace_growth: "
+        "the pa_decode route is dormant (pa_decode.SUPPORTS_FP8_QUERY is unset)"
+    )
+    return False
+
+
+def called(spies):
+    return {name for name, spy in spies.items() if spy.call_count}
+
+
+def decode_case(
+    query_lens, kv_lens, dtype, causal, layout, group=H // HKV, with_reference=True
+):
+    case = make_case(query_lens, kv_lens, dtype, causal=causal, group=group)
+    want = reference(case, query_lens, kv_lens) if with_reference else None
+    if layout == "vectorized":
+        case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
+    case["shuffled_kv_cache"] = layout == "vectorized"
+    return case, want
+
+
 def check_decode_routing(dtype):
-    """Decode routing: pa_decode when it takes FP8 queries, else the fmha kernel
-    (non-causal, forced causal) and Triton (auto causal)."""
+    """Decode routing, asserted on which backend ran: Triton for auto causal
+    decode, pa_decode on a shuffled cache when it takes FP8 queries, else the
+    fmha kernel (non-causal and forced causal)."""
+    kernels = _kernels()
     query_lens, kv_lens = [1] * 4, [64, 777, 1024, 129]
-    for causal in (True, False):
-        for backend in (None, "flydsl"):
-            for layout in ("linear", "vectorized"):
-                case = make_case(query_lens, kv_lens, dtype, causal=causal)
-                want = reference(case, query_lens, kv_lens)
-                if layout == "vectorized":
-                    case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
-                case["shuffled_kv_cache"] = layout == "vectorized"
-                ua.unified_attention(**case, backend=backend)
+
+    def expected(causal, backend, layout, env):
+        if backend is None and causal and env != "1":
+            return "triton"
+        if kernels._PA_DECODE_FP8_QUERY and layout == "vectorized" and env != "0":
+            return "pa_decode"
+        return "fmha"
+
+    # G2 is not a packed-BN64 group, so it runs the default fmha body.
+    for group, env in itertools.product((H // HKV, 2), (None, "1")):
+        for causal, backend, layout in itertools.product(
+            (True, False), (None, "flydsl"), ("linear", "vectorized")
+        ):
+            if group == 2 and env == "1":
+                continue
+            want_backend = expected(causal, backend, layout, env)
+            case, want = decode_case(query_lens, kv_lens, dtype, causal, layout, group)
+            environ = {} if env is None else {"AITER_UNIFIED_ATTN_PA_DECODE": env}
+            with mock.patch.dict(os.environ, environ):
+                if env is None:
+                    os.environ.pop("AITER_UNIFIED_ATTN_PA_DECODE", None)
+                with spy_backends() as spies:
+                    ua.unified_attention(**case, backend=backend)
+            label = (
+                f"decode routing G{group} causal={causal} backend={backend} "
+                f"{layout} env={env}"
+            )
+            assert called(spies) == {
+                want_backend
+            }, f"{label}: ran {called(spies)}, expected {want_backend}"
+            compare(
+                want, case["out"], FP8_REL_ERR[dtype] * want.abs().max().item(), label
+            )
+
+    # With the pa_decode route live, decode it declines must still reach fmha: linear
+    # cache and AITER_UNIFIED_ATTN_PA_DECODE=0 on a shuffled cache.
+    for layout, env in (("linear", None), ("vectorized", "0")):
+        case, want = decode_case(query_lens, kv_lens, dtype, False, layout)
+        environ = {} if env is None else {"AITER_UNIFIED_ATTN_PA_DECODE": env}
+        with (
+            mock.patch.dict(os.environ, environ),
+            mock.patch.object(kernels, "_PA_DECODE_FP8_QUERY", True),
+            spy_backends() as spies,
+        ):
+            ua.unified_attention(**case, backend=None)
+        assert called(spies) == {"fmha"}, f"flag set, {layout}, env={env}: {spies}"
+        compare(
+            want,
+            case["out"],
+            FP8_REL_ERR[dtype] * want.abs().max().item(),
+            f"decode fallthrough with flag set {layout} env={env}",
+        )
+
+    # Under FLYDSL_RUNTIME_RUN_ONLY only the AOT-built packed Hkv=4 decode keys serve;
+    # any other decode shape declines instead of compiling.
+    run_only = mock.patch.object(kernels, "_flydsl_runtime", mock.Mock(run_only=True))
+    for group, serves in ((H // HKV, True), (2, False)):
+        case, want = decode_case(query_lens, kv_lens, dtype, False, "linear", group)
+        with run_only, spy_backends() as spies:
+            if serves:
+                ua.unified_attention(**case, backend="flydsl")
+                assert called(spies) == {"fmha"}
                 compare(
                     want,
                     case["out"],
                     FP8_REL_ERR[dtype] * want.abs().max().item(),
-                    f"decode routing causal={causal} backend={backend} {layout}",
+                    "run-only packed decode",
                 )
+            else:
+                try:
+                    ua.unified_attention(**case, backend="flydsl")
+                except RuntimeError as error:
+                    assert "does not support this configuration" in str(error)
+                else:
+                    raise AssertionError("run-only default-body decode did not decline")
+                assert not called(spies)
+
+
+def check_batch_limits(dtype):
+    """Batch-chunk bucket edges and the causal / non-causal batch limits."""
+    kernels = _kernels()
+    bucket = kernels._bucket_batch_chunks
+    # need = ceil((B + 1) / 64); 63 and 64 straddle the first crossing.
+    for num_seqs, causal, want in (
+        (1, True, 1),
+        (63, True, 1),
+        (64, True, 2),
+        (127, True, 2),
+        (128, True, 4),
+        (511, True, 8),
+        (512, True, None),
+        (511, False, 8),
+        (512, False, 16),
+        (1023, False, 16),
+        (1024, False, 32),
+        (2047, False, 32),
+        (2048, False, None),
+    ):
+        got = bucket(num_seqs, causal)
+        assert (
+            got == want
+        ), f"bucket(B={num_seqs}, causal={causal}) = {got}, want {want}"
+
+    def decode(num_seqs, causal, with_reference=True):
+        kv_lens = [(1, 64, 70)[i % 3] for i in range(num_seqs)]
+        return decode_case(
+            [1] * num_seqs,
+            kv_lens,
+            dtype,
+            causal,
+            "linear",
+            with_reference=with_reference,
+        )
+
+    # Causal B=512 has no packed kernel and declines. Triton serves it once FlyDSL
+    # decode is forced on (env=1 would otherwise send auto causal decode to FlyDSL).
+    case, want = decode(512, True)
+    try:
+        ua.unified_attention(**case, backend="flydsl")
+    except RuntimeError as error:
+        assert "does not support this configuration" in str(error)
+    else:
+        raise AssertionError("causal B=512 did not decline")
+    with (
+        mock.patch.dict(os.environ, {"AITER_UNIFIED_ATTN_PA_DECODE": "1"}),
+        spy_backends() as spies,
+    ):
+        ua.unified_attention(**case, backend=None)
+    assert called(spies) == {"triton"}, f"causal B=512 auto: {called(spies)}"
+    compare(
+        want,
+        case["out"],
+        FP8_REL_ERR[dtype] * want.abs().max().item(),
+        "causal B=512 falls back to Triton",
+    )
+    # Non-causal has no fallback, so B=2048 raises rather than declines.
+    case, _ = decode(2048, False, with_reference=False)
+    for backend in (None, "flydsl"):
+        try:
+            ua.unified_attention(**case, backend=backend)
+        except ValueError as error:
+            assert "non-causal batches are limited" in str(error)
+        else:
+            raise AssertionError(f"non-causal B=2048 did not raise ({backend})")
+
+    # The largest batch each limit admits.
+    for num_seqs, causal in ((511, True), (512, False), (2047, False)):
+        case, want = decode(num_seqs, causal)
+        ua.unified_attention(**case, backend="flydsl")
+        compare(
+            want,
+            case["out"],
+            FP8_REL_ERR[dtype] * want.abs().max().item(),
+            f"batch limit B={num_seqs} causal={causal}",
+        )
+
+
+def check_bucket_crossings(dtype):
+    """Prefill at batch sizes on both sides of each batch_chunks bucket edge. Causal
+    batches are uniform (the no-decode proof rejects a ragged one, which has fewer
+    rows than (B - 1) * S + 1); non-causal ones are ragged with zero-length query
+    sequences, which exercise the compact-slot scan."""
+    for num_seqs in (63, 64, 128):
+        for causal in (True, False):
+            if causal:
+                query_lens = [2] * num_seqs
+            else:
+                query_lens = [(3, 0, 2, 1)[i % 4] for i in range(num_seqs)]
+            kv_lens = [(70, 200, 5, 129)[i % 4] for i in range(num_seqs)]
+            case = make_case(query_lens, kv_lens, dtype, causal=causal)
+            want = reference(case, query_lens, kv_lens)
+            atol = FP8_REL_ERR[dtype] * want.abs().max().item()
+            for layout in ("linear", "vectorized"):
+                got = dict(case, out=torch.full_like(case["out"], float("nan")))
+                if layout == "vectorized":
+                    got["k"], got["v"] = shuffle_kv_cache(case["k"], case["v"])
+                got["shuffled_kv_cache"] = layout == "vectorized"
+                ua.unified_attention(**got, backend="flydsl")
+                compare(
+                    want,
+                    got["out"],
+                    atol,
+                    f"bucket crossing B={num_seqs} causal={causal} {layout}",
+                )
+
+
+def check_uniform_capture_ragged_replay(dtype):
+    """A graph captured on a uniform batch compiles the interleaved (rank-major)
+    q-block order. The kernel re-checks uniformity on the device, so replaying the
+    graph with a ragged cu_seqlens_q of the same total must stay correct."""
+    kv_lens = [300, 777, 100, 2048]
+    capture_lens, replay_lens = [32] * 4, [64, 16, 32, 16]
+    for layout in ("linear", "vectorized"):
+        case = make_case(capture_lens, kv_lens, dtype, causal=True)
+        linear = dict(case)  # the reference reads the linear pools
+        if layout == "vectorized":
+            case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
+        case["shuffled_kv_cache"] = layout == "vectorized"
+        call = partial(ua.unified_attention, **case, backend="flydsl")
+        call()  # warm the kernel outside capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        for lens in (capture_lens, replay_lens):
+            case["cu_seqlens_q"].copy_(
+                torch.tensor(
+                    [0, *itertools.accumulate(lens)], device="cuda", dtype=torch.int32
+                )
+            )
+            case["out"].fill_(float("nan"))
+            graph.replay()
+            want = reference(linear, lens, kv_lens)
+            compare(
+                want,
+                case["out"],
+                FP8_REL_ERR[dtype] * want.abs().max().item(),
+                f"uniform capture, replay lens={lens} {layout}",
+            )
 
 
 def check_decode_layer_graphs(dtype):
@@ -728,6 +985,10 @@ def main():
         aiter.logger.info(
             "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
         )
+    for dtype in args.dtype:
+        check_batch_limits(dtype)
+        check_bucket_crossings(dtype)
+        check_uniform_capture_ragged_replay(dtype)
     aiter.logger.info(
         "PASS: all unified-attention test groups; all candidate timings non-zero"
     )

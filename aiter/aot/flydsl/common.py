@@ -440,6 +440,7 @@ AOT_MODULES = (
     "aiter.aot.flydsl.gdn_fused_prefill",
     "aiter.aot.flydsl.fmha_fp8",
     "aiter.aot.flydsl.pa_decode_plan",
+    "aiter.aot.flydsl.unified_attention",
 )
 
 
@@ -587,13 +588,5 @@ def run_aot(cache_dir: str) -> None:
                 )
         if errors:
             raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
-
-    from .unified_attention import compile_one_config, default_jobs
-
-    targets = aot_target_archs()
-    if targets is None or "gfx950" in targets:
-        results = run_jobs_parallel(compile_one_config, default_jobs())
-        if any(result.get("compile_time") is None for result in results):
-            raise AssertionError("[aiter] FlyDSL UNIFIED_ATTENTION AOT failed")
 
     assert_no_strict_errata_products(cache_dir)

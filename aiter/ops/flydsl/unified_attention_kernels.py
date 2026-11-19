@@ -3,20 +3,21 @@
 
 """FlyDSL fp8 paged unified attention on gfx950.
 
-The fmha_gfx950 builder serves single-pass prefill and pa_decode serves shuffled
-decode. Causal calls outside that routing region return None so the caller falls
-back to the Triton wrapper (Gluon on gfx950).
+The fmha_gfx950 builder serves prefill and, by default, decode (1-token rows).
+FlyDSL pa_decode takes shuffled-cache decode instead once ``pa_decode`` sets
+``SUPPORTS_FP8_QUERY``. Causal calls outside the routing region return None so
+the caller falls back to the Triton wrapper (Gluon on gfx950).
 """
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 import torch
 from flydsl.utils.env import runtime as _flydsl_runtime
 
 from aiter import logger
+from aiter.ops.unified_attention import _pa_decode_env
 
 from .kernels.flash_attn_func_fp8_gfx950 import (
     _FP8_MAX_FLAT_ELEMS,
@@ -61,6 +62,10 @@ _FP8_DTYPE = torch.float8_e4m3fn
 # GQA group sizes routed to the packed BN64 body. Group 1 is deliberately absent:
 # packing one head per group is a no-op, so it keeps the unpacked body.
 _PACKED_BN64_GROUPS = (4, 8, 16)
+
+# KV head count of the AOT-built keys (Qwen3-VL); aiter/aot/flydsl/unified_attention.py
+# enrolls GQA groups _PACKED_BN64_GROUPS at this count.
+_AOT_NUM_KV_HEADS = 4
 
 # Lanes per wave in packed BN64's cu_seqlens_q scan.
 _SCAN_LANES = 64
@@ -153,16 +158,10 @@ _PA_DECODE_MAX_NP = 32
 _PA_DECODE_WGS_PER_CU = 3
 
 
-def _env_use_pa_decode(default: bool = True) -> bool:
-    raw = os.environ.get("AITER_UNIFIED_ATTN_PA_DECODE")
-    return default if raw is None else raw == "1"
-
-
-_USE_PA_DECODE = _env_use_pa_decode()
-
-
 def _pa_decode_supports_fp8_query() -> bool:
-    # The FP8-query pa_decode PR sets SUPPORTS_FP8_QUERY; this route needs it.
+    # The route below passes FP8 queries, which only a pa_decode that exports
+    # SUPPORTS_FP8_QUERY accepts; without it the route stays dormant and decode
+    # runs on the fmha kernel.
     try:
         from . import pa_decode
     except ModuleNotFoundError:
@@ -170,6 +169,8 @@ def _pa_decode_supports_fp8_query() -> bool:
     return getattr(pa_decode, "SUPPORTS_FP8_QUERY", False)
 
 
+# Dormant until pa_decode exports SUPPORTS_FP8_QUERY: the route, its workspace
+# cache and their op_tests are kept so that unification only flips this flag.
 _PA_DECODE_FP8_QUERY = _pa_decode_supports_fp8_query()
 
 
@@ -188,7 +189,7 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
     """Layout/dtype gate on top of _supported (which already pins fp8 QKV,
     5D shuffled strides, page 64, D128, int32 index tensors, no softcap/alibi)."""
     return (
-        _USE_PA_DECODE
+        _pa_decode_env() is not False
         and _PA_DECODE_FP8_QUERY
         and max_seqlen_q == 1
         and shuffled_kv_cache
@@ -718,14 +719,22 @@ def flydsl_unified_attention(
         return None
     block_table = block_table[:num_seqs]
 
+    num_query_heads = q.shape[1]
+    group = num_query_heads // num_kv_heads
+    packed_bn64 = group in _PACKED_BN64_GROUPS
+
     if max_seqlen_q == 1:
-        # Decode kernels are not AOT-compiled; decline so run-only deployments
-        # fall back. FlyDSL exposes no stable runtime-options API, so read the
-        # parsed run_only option directly (not os.environ, whose OptBool parse
-        # differs).
-        if _flydsl_runtime.run_only:
+        # FlyDSL exposes no stable runtime-options API, so read the parsed
+        # run_only option directly (not os.environ, whose OptBool parse differs).
+        run_only = _flydsl_runtime.run_only
+        # Decode on the fmha kernel reuses the packed prefill keys, which AOT
+        # builds only at _AOT_NUM_KV_HEADS; any other decode shape has no
+        # artifact, so run-only deployments decline it. pa_decode has none either.
+        if run_only and not (packed_bn64 and num_kv_heads == _AOT_NUM_KV_HEADS):
             return None
-        if _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs):
+        if not run_only and _pa_decode_ok(
+            max_seqlen_q, shuffled_kv_cache, out, num_seqs
+        ):
             return _route_pa_decode(
                 q,
                 k,
@@ -741,11 +750,9 @@ def flydsl_unified_attention(
                 num_kv_heads=num_kv_heads,
                 num_seqs=num_seqs,
             )
-        if _PA_DECODE_FP8_QUERY:
-            # Linear-cache decode has no FlyDSL kernel.
-            return None
-        # Without pa_decode FP8-query support, decode runs on the fmha kernel below
-        # (1-token varlen rows). Auto causal decode reaches here only when forced.
+        # Decode that pa_decode does not take (flag unset, linear cache, env off,
+        # B > 4096) runs on the fmha kernel below as 1-token varlen rows. Auto
+        # causal decode reaches here only when forced.
 
     # One query-length-1 row caps M at (B-1)*S+1, so a larger M has no decode rows.
     # Possibly mixed: BN64 pads decode rows to full tiles, slower than the fallback.
@@ -757,7 +764,6 @@ def flydsl_unified_attention(
     ):
         return None
 
-    num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
     target_num_prgms = _num_cu(q.device)
     block_m = _fp8_auto_block_m(
@@ -771,8 +777,6 @@ def flydsl_unified_attention(
     # only the packing groups 4/8/16 are routed) folds the GQA group into the
     # 128-row M tile: one workgroup per KV head and 128 // group query tokens.
     # Everything else keeps one query head per workgroup.
-    group = num_query_heads // num_kv_heads
-    packed_bn64 = group in _PACKED_BN64_GROUPS
     bn64_key = {}
     bn64_args = {}
     if packed_bn64:

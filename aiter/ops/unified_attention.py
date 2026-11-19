@@ -6,6 +6,17 @@
 import os
 
 
+def _pa_decode_env() -> bool | None:
+    """Parse AITER_UNIFIED_ATTN_PA_DECODE once for every consumer.
+
+    True for "1", False for any other value, None when unset. The router sends
+    auto causal decode to FlyDSL only on True; the FlyDSL decode route is disabled
+    on False.
+    """
+    raw = os.environ.get("AITER_UNIFIED_ATTN_PA_DECODE")
+    return None if raw is None else raw == "1"
+
+
 def unified_attention(
     q,
     k,
@@ -48,19 +59,24 @@ def unified_attention(
     ``skip_reduce`` are backend-dependent. ``shuffled_kv_cache=None`` infers
     the layout; False with rank-5 K raises ValueError.
 
-    ``backend=None`` tries FlyDSL then Triton/Gluon (causal decode, max_seqlen_q == 1,
-    goes straight to Triton/Gluon unless AITER_UNIFIED_ATTN_PA_DECODE=1); explicit ``"flydsl"``
-    raises RuntimeError when declined. ``"triton"``/``"gluon"`` bypass FlyDSL.
-    The Triton/Gluon fallback supports causal attention only. Returns ``out``
-    written in place; with ``skip_reduce`` the fallback may instead return
-    unreduced segment buffers.
+    ``backend=None`` tries FlyDSL then Triton/Gluon, except that causal decode
+    (max_seqlen_q == 1) goes straight to Triton/Gluon unless
+    AITER_UNIFIED_ATTN_PA_DECODE=1; explicit ``"flydsl"`` raises RuntimeError when
+    declined. ``"triton"``/``"gluon"`` bypass FlyDSL. The Triton/Gluon fallback
+    supports causal attention only. Returns ``out`` written in place; with
+    ``skip_reduce`` the fallback may instead return unreduced segment buffers.
 
     FlyDSL contract: q/k/v are float8_e4m3fn, out is bf16/f16, and the three
     descales are float32 with one element (0-dim is widened to [1]). Q/out are
     contiguous with equal row stride; the block table is int32 with stride-1
     last dim; K/V use the exact linear or shuffled layout. AOT covers bf16 and
-    f16 prefill for the H64/Hkv4 shape; other shapes and decode JIT-compile.
-    A captured decode call requires sufficient workspace capacity prepared outside
+    f16 outputs for Hkv=4 with GQA group 4, 8 and 16 (both cache layouts, causal
+    and non-causal; decode calls share the prefill keys). Other shapes JIT-compile
+    on first call, and under FLYDSL_RUNTIME_RUN_ONLY=1 raise on a cache miss.
+
+    Decode (max_seqlen_q == 1) runs on the fmha kernel as 1-token rows, or on
+    FlyDSL pa_decode once ``pa_decode`` sets ``SUPPORTS_FP8_QUERY``. In that
+    pa_decode route a captured call requires workspace capacity prepared outside
     capture on the same stream and head geometry; otherwise it falls back to
     Triton/Gluon with a one-time warning (``backend="flydsl"`` raises instead).
     Each captured call records a planner refresh, so sequence lengths may change
@@ -82,17 +98,17 @@ def unified_attention(
     else:
         shuffled_kv_cache = bool(shuffled_kv_cache)
 
-    # Auto decode goes to the Triton/Gluon kernel: paired A/B showed FlyDSL pa_decode
-    # slower on 33/35 uniform cells (up to 1.98x), and no sync-free host quantity
-    # separates the skew batches where it wins (max_seqlen_k, num_seqs and table
-    # width are identical to the uniform cells). Non-causal decode has no fallback,
-    # so it stays on FlyDSL. backend="flydsl" or AITER_UNIFIED_ATTN_PA_DECODE=1
-    # keeps FlyDSL pa_decode reachable.
+    # Auto causal decode goes to the Triton/Gluon kernel: paired A/B showed FlyDSL
+    # pa_decode slower on 33/35 uniform cells (up to 1.98x), and no sync-free host
+    # quantity separates the skew batches where it wins (max_seqlen_k, num_seqs and
+    # table width are identical to the uniform cells). Non-causal decode has no
+    # Triton path, so it stays on FlyDSL. backend="flydsl" or
+    # AITER_UNIFIED_ATTN_PA_DECODE=1 sends causal decode to FlyDSL as well.
     auto_decode_to_triton = (
         backend is None
         and max_seqlen_q == 1
         and causal
-        and os.environ.get("AITER_UNIFIED_ATTN_PA_DECODE") != "1"
+        and _pa_decode_env() is not True
     )
 
     unified_attention_flydsl = None
