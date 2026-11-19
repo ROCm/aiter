@@ -23,6 +23,7 @@ from ..jit.utils.mha_recipes import (
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from ..utility import dtypes
 from .mha_fwd_policy import (
     get_mha_fwd_tuned_backend,
@@ -4204,6 +4205,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+# Routed on the public entry: callers (vLLM's MLA prefill, SGLang's aiter
+# backend) use this name, and the gfx1250 ASM, FlyDSL, Triton and CK choices are
+# all made beneath it. A provider serves the forward only; see the docstring.
+@_route(op="flash_attn_varlen")
 def flash_attn_varlen_func(
     q,
     k,
@@ -4233,13 +4238,6 @@ def flash_attn_varlen_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
 ):
-    if block_table is not None and (
-        cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
-    ):
-        raise NotImplementedError(
-            "Paged/Split-KV attention (using block_table) does not currently support "
-            "physical sequence padding (cu_seqlens_*_padded)."
-        )
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
@@ -4295,7 +4293,28 @@ def flash_attn_varlen_func(
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
+
+    Contract for a provider:
+        Returns ``out`` alone when neither ``return_lse`` nor
+        ``return_attn_probs`` is set; otherwise a tuple of ``out``, then
+        ``softmax_lse`` (``(nheads, total_q)``, fp32) when ``return_lse``, then
+        ``S_dmask`` when ``return_attn_probs``. When ``out`` is passed the
+        result is written into it in place and that tensor is returned. The
+        result carries no autograd
+        graph, so a provider declines a call whose q, k or v requires grad
+        while grad is enabled; AITER's own path keeps the backward.
+        ``how_v3_bf16_cvt`` and ``min_seqlen_q`` tune AITER's kernels and may
+        be ignored; ``q_descale``, ``k_descale`` and ``v_descale`` come
+        together for fp8 inputs; ``block_table`` reads k and v from a paged
+        cache, and ``cu_seqlens_*_padded`` give physical row offsets.
     """
+    if block_table is not None and (
+        cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
+    ):
+        raise NotImplementedError(
+            "Paged/Split-KV attention (using block_table) does not currently support "
+            "physical sequence padding (cu_seqlens_*_padded)."
+        )
     descales = (q_descale, k_descale, v_descale)
     has_any_descale = any(descale is not None for descale in descales)
     has_all_descales = all(descale is not None for descale in descales)
