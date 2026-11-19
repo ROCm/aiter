@@ -74,7 +74,8 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
-    early_ab: bool = False
+    early_a: bool = False
+    early_b: bool = False
     fused_splitk: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
@@ -85,7 +86,11 @@ class WmmaKernelInstance:
             + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
-            + ("_eab" if self.early_ab else "")
+            + (
+                "_eab"
+                if self.early_a and self.early_b
+                else ("_ea" if self.early_a else ("_eb" if self.early_b else ""))
+            )
         )
 
     @property
@@ -227,22 +232,24 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     # selected wide-N occupancy regimes and can regress narrower grids. Append
     # split_k=1, non-persistent variants so existing numeric IDs remain stable
     # and per-shape tuning decides whether to use it.
-    for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
-        for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
-            kl[idx] = WmmaKernelInstance(
-                tile_m=tm,
-                tile_n=tn,
-                tile_k=tk,
-                num_buffers=nb,
-                split_k=1,
-                cluster_m=cm,
-                cluster_n=cn,
-                m_warp=mw,
-                n_warp=nw,
-                name_prefix=COMPUTE_NAME_PREFIX,
-                early_ab=True,
-            )
-            idx += 1
+    for early_a, early_b in ((True, False), (False, True), (True, True)):
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=1,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    early_a=early_a,
+                    early_b=early_b,
+                )
+                idx += 1
     # Cluster-local split-K keeps all splits of an output tile in one hardware
     # cluster and reduces there, avoiding the global FP32 workspace reduction
     # launch. It is a separate strategy because the larger cluster can reduce

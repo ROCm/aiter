@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--families", required=True)
     parser.add_argument("--ms", required=True)
+    parser.add_argument("--exclude-fused-splitk", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     rows = config_rows(args.config)
@@ -64,6 +65,7 @@ def main():
                 for instance in kernels_list.values()
                 if is_compute_kernel(instance)
                 and kernel_fits_shape(instance, m, n, k)
+                and (not args.exclude_fused_splitk or not instance.fused_splitk)
             )
             names = list(dict.fromkeys(names))
             coarse = []

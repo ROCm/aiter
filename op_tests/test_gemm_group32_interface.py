@@ -454,21 +454,34 @@ def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
         flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
     )
 
-    early = [instance for instance in catalog.kernels_list.values() if instance.early_ab]
+    early = [
+        instance
+        for instance in catalog.kernels_list.values()
+        if instance.early_a or instance.early_b
+    ]
     assert early
     assert all(
         catalog.is_compute_kernel(instance)
         and instance.split_k == 1
         and instance.persistent_n_tiles == 1
-        and instance.name.endswith("_eab")
+        and instance.name.endswith(("_ea", "_eb", "_eab"))
         for instance in early
     )
-    parsed = direct.parse_mxfp8_32_wmma_kernel_name(
-        early[0].name.replace("mxfp8_128", "mxfp8_32")
+    base = (
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_"
+        "t256x256x128_mw2_nw2_nb2_sk1_cm1_cn1"
     )
-    assert parsed is not None and parsed["early_ab"] is True
-    base = early[0].name.removesuffix("_eab").replace("mxfp8_128", "mxfp8_32")
-    assert direct.parse_mxfp8_32_wmma_kernel_name(base)["early_ab"] is False
+    expected = {
+        "_ea": (True, False),
+        "_eb": (False, True),
+        "_eab": (True, True),
+    }
+    for suffix, flags in expected.items():
+        parsed = direct.parse_mxfp8_32_wmma_kernel_name(base + suffix)
+        assert parsed is not None
+        assert (parsed["early_a"], parsed["early_b"]) == flags
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(base)
+    assert parsed is not None and not parsed["early_a"] and not parsed["early_b"]
 
 
 def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
