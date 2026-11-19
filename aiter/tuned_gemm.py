@@ -133,6 +133,7 @@ def get_GEMM_A16W16_tuned_config(
     config = None
     if gfx is None:
         gfx = get_gfx_runtime()
+    runtime_gfx = gfx
     # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
@@ -199,17 +200,19 @@ def get_GEMM_A16W16_tuned_config(
                         parse_integer,
                     )
 
+                    # OPUS dispatch resolves the kid under the device's exact
+                    # arch, not the gfx1250 row key a strict device reuses.
                     try:
                         kid = parse_integer(config["solidx"], name="saved kernel id")
                         instance = get_kernel_instance(
-                            gfx, "a16w16", kid, cu_num=cu_num
+                            runtime_gfx, "a16w16", kid, cu_num=cu_num
                         )
                         name = str(config.get("kernelName", ""))
                         if instance is not None and (
                             name in ("", "nan", "None") or name == instance.name
                         ):
                             resolved = resolve_a16w16_tuned_candidate(
-                                arch=gfx,
+                                arch=runtime_gfx,
                                 M=M,
                                 N=N,
                                 K=K,
@@ -236,7 +239,7 @@ def get_GEMM_A16W16_tuned_config(
                             "Ignoring invalid OPUS tuned row for gfx=%s, "
                             "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
                             "the next padded row or default backend",
-                            gfx,
+                            runtime_gfx,
                             padded_M,
                             N,
                             K,
@@ -421,6 +424,12 @@ def gemm_a16w16_out(
         raise RuntimeError("gemm_a16w16_out: the result was not written into out=")
 
 
+def _opus_reads_layout(operand: Tensor, k: int) -> bool:
+    """Whether the OPUS launcher accepts this 2D operand: K-contiguous rows
+    with an optional padded leading dimension. It raises on any other layout."""
+    return operand.stride(-1) == 1 and operand.stride(0) >= k
+
+
 # Routed here, beneath both guarded spellings and `tgemm.mm`, for the reason
 # `rmsnorm` is: every one of them arrives here, so this is where the op begins.
 @_route(op="gemm_a16w16", version=1)
@@ -493,6 +502,15 @@ def _gemm_a16w16(
         gfx=gfx,
         cu_num=cu_num,
     )
+    if config["libtype"] == "opus" and not (
+        _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
+    ):
+        # Both backends read arbitrary strides, and an OPUS row implies no
+        # scales and no bpreshuffle, which is all Triton requires.
+        config = {
+            "libtype": "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch",
+            "solidx": 0,
+        }
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
