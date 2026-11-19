@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import multiprocessing as mp
 import os
 
@@ -27,22 +28,32 @@ WORLD_SIZE = 4
 HIDDEN = 2048
 EPS = 1e-6
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+# The token counts of each hidden size. 7168 (DeepSeek-R1) is 19 chunks of 384 values,
+# not a power of 2. 513 rows are more than the receivers: a receiver gets 2 rows.
+CASES = {HIDDEN: TOKENS, 7168: [1, 2, 3, 7, 16, 64, 513]}
+# quant, per_token, store_out
+MODES = (
+    (False, False, True),
+    (True, False, True),
+    (True, True, True),
+    (True, True, False),  # q, scale and residual_out only, as before a GEMM
+)
 
 SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
-def _inputs(tokens, rank, device):
+def _inputs(tokens, rank, device, hidden=HIDDEN):
     """This rank's x, the residual and the weight, and the fp32 references of
     residual_out and out. The 4 inputs are added in rank order, as in the kernel."""
     gen = torch.Generator(device=device).manual_seed(tokens)
-    shape = (tokens, HIDDEN)
+    shape = (tokens, hidden)
     xs = [
         torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
         for _ in range(WORLD_SIZE)
     ]
     residual = torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
-    w = torch.randn(HIDDEN, generator=gen, dtype=torch.bfloat16, device=device)
+    w = torch.randn(hidden, generator=gen, dtype=torch.bfloat16, device=device)
     weight = 0.1 * w  # a Gemma weight: 1 + weight is near 1
     s = xs[0].float() + xs[1].float() + xs[2].float() + xs[3].float() + residual.float()
     out = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + EPS) * (1 + weight.float())
@@ -50,11 +61,13 @@ def _inputs(tokens, rank, device):
 
 
 def _compare(name, outs, ref_residual, ref_out, group):
+    """outs is (out, residual_out) or (out, residual_out, q, scale). out can be None."""
     failures = []
     if not torch.equal(outs[1], ref_residual.to(torch.bfloat16)):
         failures.append(f"{name}: residual_out is not bit-exact")
     try:
-        torch.testing.assert_close(outs[0], ref_out.to(torch.bfloat16))
+        if outs[0] is not None:
+            torch.testing.assert_close(outs[0], ref_out.to(torch.bfloat16))
     except AssertionError as e:
         failures.append(f"{name}: out: {e}")
     if len(outs) == 4:
@@ -64,16 +77,69 @@ def _compare(name, outs, ref_residual, ref_out, group):
             torch.testing.assert_close(outs[3], amax / 448, rtol=1e-5, atol=0)
         except AssertionError as e:
             failures.append(f"{name}: scale: {e}")
-        step = outs[3].repeat_interleave(HIDDEN // groups, dim=1)
+        step = outs[3].repeat_interleave(ref_out.shape[1] // groups, dim=1)
         error = (outs[2].float() * step - ref_out).abs()
         # e4m3 has 3 mantissa bits. Its smallest step is 2^-9 of the scale.
         if not bool((error <= 2.0**-4 * ref_out.abs() + 2.0**-9 * step).all()):
             failures.append(f"{name}: fp8 values are wrong")
-    for t in outs:
+    for t in (t for t in outs if t is not None):
         parts = [torch.empty_like(t.view(torch.uint8)) for _ in range(WORLD_SIZE)]
         dist.all_gather(parts, t.view(torch.uint8), group=group)
         if not all(torch.equal(parts[0], p) for p in parts):
             failures.append(f"{name}: the ranks have different results")
+    return failures
+
+
+def _check_hidden(rank, device, tp, hidden, tokens_list):
+    """The modes at one hidden size, with its own inboxes: they serve one hidden size."""
+    group = tp.cpu_group
+    cases = [_inputs(tokens, rank, device, hidden) for tokens in tokens_list]
+    inboxes, calls = all_reduce_init(group, max(tokens_list) * hidden * 2)
+    failures = []
+    try:
+        # First, while the inboxes are empty: the call numbers wrap from 2^30 to 1.
+        # Calls of 64 to 67 tokens, so that each call has new inputs.
+        calls[:-1].fill_(2**30 - 2)
+        for i in range(4):
+            x, residual, weight, *ref = _inputs(64 + i, rank, device, hidden)
+            outs = all_reduce_rmsnorm_quant(
+                x, residual, weight, EPS, True, i % 2 == 1, group, inboxes, calls
+            )
+            name = f"rank {rank} hidden {hidden} call {i} at the counter wrap"
+            failures += _compare(name, outs, *ref, tp.device_group)
+
+        for quant, per_token, store_out in MODES:
+            mode = f"quant {quant} {per_token} store_out {store_out}"
+            run = functools.partial(
+                all_reduce_rmsnorm_quant,
+                eps=EPS,
+                gemma=True,
+                quant=quant,
+                group=group,
+                inboxes=inboxes,
+                calls=calls,
+                per_token=per_token,
+                store_out=store_out,
+            )
+            for tokens, (x, residual, weight, *ref) in zip(tokens_list, cases):
+                name = f"rank {rank} hidden {hidden} tokens {tokens} {mode}"
+                failures += _compare(
+                    name, run(x, residual, weight), *ref, tp.device_group
+                )
+
+            # All token counts in one HIP graph, replayed 10 times.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outs = [run(x, r, w) for x, r, w, _, _ in cases]
+            for _ in range(10):
+                graph.replay()
+            for tokens, o, (_, _, _, *ref) in zip(tokens_list, outs, cases):
+                name = f"rank {rank} hidden {hidden} graph tokens {tokens} {mode}"
+                failures += _compare(name, o, *ref, tp.device_group)
+        if calls[-1].item():
+            failures.append(f"rank {rank} hidden {hidden}: {calls[-1].item()} timeouts")
+    finally:
+        all_reduce_free(group, inboxes)
     return failures
 
 
@@ -82,57 +148,11 @@ def _worker(rank, init_method):
     torch.cuda.set_device(device)
     aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
     tp = get_tp_group()
-    group = tp.cpu_group
-    cases = [_inputs(tokens, rank, device) for tokens in TOKENS]
-    inboxes, calls = all_reduce_init(group, max(TOKENS) * HIDDEN * 2)
     failures = []
     try:
-        # First, while the inboxes are empty: the call numbers wrap from 2^30 to 1.
-        # Calls of 64 to 67 tokens, so that each call has new inputs.
-        calls[:-1].fill_(2**30 - 2)
-        for i in range(4):
-            x, residual, weight, *ref = _inputs(64 + i, rank, device)
-            outs = all_reduce_rmsnorm_quant(
-                x, residual, weight, EPS, True, i % 2 == 1, group, inboxes, calls
-            )
-            name = f"rank {rank} call {i} at the counter wrap"
-            failures += _compare(name, outs, *ref, tp.device_group)
-
-        for quant, per_token in ((False, False), (True, False), (True, True)):
-            for tokens, (x, residual, weight, *ref) in zip(TOKENS, cases):
-                outs = all_reduce_rmsnorm_quant(
-                    x,
-                    residual,
-                    weight,
-                    EPS,
-                    True,
-                    quant,
-                    group,
-                    inboxes,
-                    calls,
-                    per_token,
-                )
-                name = f"rank {rank} tokens {tokens} quant {quant} {per_token}"
-                failures += _compare(name, outs, *ref, tp.device_group)
-
-            # All token counts in one HIP graph, replayed 10 times.
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                outs = [
-                    all_reduce_rmsnorm_quant(
-                        x, r, w, EPS, True, quant, group, inboxes, calls, per_token
-                    )
-                    for x, r, w, _, _ in cases
-                ]
-            for _ in range(10):
-                graph.replay()
-            for tokens, o, (_, _, _, *ref) in zip(TOKENS, outs, cases):
-                name = f"rank {rank} graph tokens {tokens} quant {quant} {per_token}"
-                failures += _compare(name, o, *ref, tp.device_group)
-        if calls[-1].item():
-            failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")
+        for hidden, tokens_list in CASES.items():
+            failures += _check_hidden(rank, device, tp, hidden, tokens_list)
     finally:
-        all_reduce_free(group, inboxes)
         aiter.destroy_dist_env()
     return failures
 
