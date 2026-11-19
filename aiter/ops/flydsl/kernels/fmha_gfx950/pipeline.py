@@ -390,6 +390,17 @@ def _stagger_extra_barrier_if_one(stagger_i32):
 
 
 @dataclass(frozen=True)
+class _LdsViews:
+    """Peeked LDS arrays; ``o`` (bn64's O stage, overlaying kv/vt) and ``bt`` (paged default body) may be absent."""
+
+    kv: object
+    vt: object
+    q: object
+    bt: object = None
+    o: object = None
+
+
+@dataclass(frozen=True)
 class DualwaveSwpFp8Traits:
     """Pure compile-time tile/layout constants for the gfx950 DUALWAVE_SWP fp8 kernel."""
 
@@ -457,6 +468,8 @@ class DualwaveSwpFp8Traits:
     O_STAGED: bool = False
     # Non-temporal O stores.
     O_STORE_NT: bool = False
+    # Bytes of bn64's staged O tile (bf16/f16 rows of all waves), the union arm overlaying kv+vt; 0 otherwise.
+    O_STAGE_BYTES: int = 0
 
 
 def _make_dualwave_swp_fp8_traits(
@@ -633,17 +646,18 @@ def _make_dualwave_swp_fp8_traits(
     # BN64 loads Q straight into VGPRs: dropping the Q stage lets 3 WGs share a CU.
     qlds = head_dim <= 128 and body_variant != "conventional_bn64"
 
-    lds_bytes = lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf
+    # bn64's SharedStorage overlays the staged O tile on kv+vt in a union, so the larger of the two counts.
+    bn64 = body_variant == "conventional_bn64"
+    o_stage_bytes = num_waves * rows_per_wave * head_dim_v * 2 if bn64 else 0
+    lds_bytes = max(
+        lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf, o_stage_bytes
+    )
     if qlds:
         lds_bytes += block_m * head_dim * elem_bytes
     # bn64 reads page ids with scalar loads; only the default body stages the table in LDS.
     paged_bt_lds = paged and body_variant != "conventional_bn64"
     if paged_bt_lds:
         lds_bytes += paged_bt_lds_size * 4
-    if o_staged and (lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf) < (
-        num_waves * rows_per_wave * head_dim_v * 2
-    ):
-        raise RuntimeError("o_staged needs kv+vt LDS to hold the block's O tile")
     if lds_bytes > LDS_BYTES_GFX950:
         raise RuntimeError(
             f"fp8 flash attention head_dim={head_dim}/head_dim_v={head_dim_v} at block_m={block_m} "
@@ -715,6 +729,7 @@ def _make_dualwave_swp_fp8_traits(
         INTERLEAVED=bool(interleaved) and bool(causal),
         O_STAGED=bool(o_staged),
         O_STORE_NT=bool(o_store_nt),
+        O_STAGE_BYTES=o_stage_bytes,
     )
 
 
@@ -939,7 +954,20 @@ class DualwaveFp8KernelContext:
         self.q_start = self.q_block_idx * block_q
 
     def init_lds(self, shared_storage):
-        lds = fx.SharedAllocator().allocate(shared_storage).peek()
+        st = fx.SharedAllocator().allocate(shared_storage)
+        # A struct holding a union cannot be peeked whole (FlyDSL 0.5.0), so resolve each leaf.
+        if const_expr(hasattr(st, "u")):
+            lds = _LdsViews(
+                kv=st.u.kvvt.kv.peek(),
+                vt=st.u.kvvt.vt.peek(),
+                q=st.q.peek(),
+                o=st.u.o.peek(),
+            )
+        else:
+            whole = st.peek()
+            lds = _LdsViews(
+                kv=whole.kv, vt=whole.vt, q=whole.q, bt=getattr(whole, "bt", None)
+            )
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))

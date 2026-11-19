@@ -103,7 +103,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         o_stage = self._o_stage_layout()
         lds_i8 = fx.recast_iter(
             fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16),
-            self.lds.kv.ptr,
+            self.lds.o.ptr,
         )
         wave_row0 = fx.Int32(self.wave_id_uni) * fx.Int32(traits.ROWS_PER_WAVE)
         has_keys = self._row_has_keys(q_row)
@@ -111,7 +111,8 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
             [self._packed_o_128_vec(v_o, dc, g) for g in range_constexpr(2)]
             for dc in range_constexpr(traits.D_CHUNKS)
         ]
-        # The stage overlaps the K/V ring, which other waves may still be reading for the last tile. vmcnt(0) drains
+        # The stage is the `o` arm of the union overlaying the K/V ring (kv/vt), which other waves may still be
+        # reading for the last tile; the ring is dead only after this waitcnt + barrier. vmcnt(0) drains
         # this wave's LDS DMAs (tracked by vmcnt, not lgkmcnt): an empty segment issues tile 0's K/V DMA and runs
         # no loop, so nothing else guarantees it landed before the stage overwrites it. The loop path issues no
         # prefetch on its last tile, so the wait is already satisfied there.

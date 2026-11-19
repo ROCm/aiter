@@ -148,6 +148,24 @@ def build_flash_attn_dualwave_swp_fp8_module(
             q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
             bt: fx.Array[fx.Int32, traits.PAGED_BT_LDS_SIZE, 16]
 
+    elif traits.BODY_VARIANT == "conventional_bn64":
+
+        @fx.struct
+        class KvVtRing:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+
+        # The staged O epilogue reuses the K/V ring once the last tile is consumed.
+        @fx.union
+        class RingOrOStage:
+            kvvt: KvVtRing
+            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES, 16]
+
+        @fx.struct
+        class SharedStorage:
+            u: RingOrOStage
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+
     else:
 
         @fx.struct
