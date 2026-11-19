@@ -12,7 +12,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops import mha as mha_ops
 from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
@@ -1583,7 +1583,7 @@ def test_fmha_fwd_bf16_opus_d64_group(
     The symmetric kernel one head dim down, on the same group-mode contract matrix
     as D=128. Env-gated like the dense D=64 path.
     """
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=64 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_group_case(
@@ -1610,7 +1610,7 @@ def test_fmha_fwd_bf16_opus_group_sink(
     including the empty-KV ones, which end at O = 0 and LSE = sink. The logits are
     swept over the heads so both "sink dominates" and "keys dominate" rows occur.
     """
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus symmetric kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     sink = torch.linspace(-4.0, 12.0, nheads, device="cuda", dtype=torch.float32)
@@ -1920,7 +1920,7 @@ def test_flash_attn_varlen_func_opus_sink_dispatch(d, windowed, monkeypatch):
     """A sink reaches the OPUS symmetric kernel through the public entry point,
     except together with a window: the sliding-window kernel does not read it, so
     that call must land on a backend that applies both."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus varlen kernels require gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
 
@@ -1968,7 +1968,7 @@ def test_flash_attn_varlen_func_opus_oversized_kv(d, causal, monkeypatch):
     """One sequence whose K/V buffer is longer than cu_seqlens_k says, as in vLLM's
     fixed-size chunked-context workspace. Group mode reads each sequence's length
     from cu_seqlens, so the stale tail -- NaN here -- must never be attended."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus varlen kernels require gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
 

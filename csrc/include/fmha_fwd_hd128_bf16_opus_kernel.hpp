@@ -764,20 +764,27 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // Rebase onto M = max(m_row, sink) before folding it in so a dominant sink cannot
         // overflow exp2. The numerator and denominator rescale by
         // alpha = exp2(m_row - M); LOG2_E converts the natural-log sink to the kernel's
-        // base-2 exponent. alpha folds into l_inv below, so v_o is scaled once. With no
-        // keys, m_row=lowest and l_row=0, so alpha=0, l_row=1, O=0, and lse=sink.
+        // base-2 exponent. alpha folds into l_inv below, so v_o is scaled once.
         D_ACC alpha = D_ACC(1.0f);
         if (kargs.ptr_sink != nullptr) {
             const D_ACC sink_b2 =
                 reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
-            const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
-            alpha = __builtin_amdgcn_exp2f(m_row - m_new);
-            // Avoid exp2(+inf - +inf): when the sink is M its contribution is exactly 1.
-            const D_ACC sink_term =
-                (sink_b2 >= m_new) ? D_ACC(1.0f)
-                                   : __builtin_amdgcn_exp2f(sink_b2 - m_new);
-            l_row = l_row * alpha + sink_term;
-            m_row = m_new;
+            if (l_row > D_ACC(0.0f)) {
+                const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
+                alpha = __builtin_amdgcn_exp2f(m_row - m_new);
+                // Avoid exp2(+inf - +inf): when the sink is M its contribution is exactly 1.
+                const D_ACC sink_term =
+                    (sink_b2 >= m_new) ? D_ACC(1.0f)
+                                       : __builtin_amdgcn_exp2f(sink_b2 - m_new);
+                l_row = l_row * alpha + sink_term;
+                m_row = m_new;
+            } else {
+                // No unmasked key: m_row is only a sentinel (lowest, or attn_row_max's
+                // -1e30 on a fully masked causal row), so the sink alone sets lse; O = 0.
+                alpha = D_ACC(0.0f);
+                l_row = D_ACC(1.0f);
+                m_row = sink_b2;
+            }
         }
 
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {

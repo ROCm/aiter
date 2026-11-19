@@ -12,7 +12,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops import mha as mha_ops
 from aiter.ops.mha import fmha_fwd_bf16_opus_fwd
 from aiter.test_common import benchmark, run_perftest
@@ -1368,7 +1368,7 @@ def test_flash_attn_func_opus_d64(
     The symmetric kernel is traits-parameterised on D; this is the same coverage
     as the D=128 test one head dim down. Env-gated like the D=128 case.
     """
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=64 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_batch_case(
@@ -1408,7 +1408,7 @@ def test_flash_attn_func_opus_sink(
     Checks O against attention_ref and the fp32 LSE against logaddexp(no-sink LSE,
     sink) -- the LSE is the sharp check since the sink lives in the denominator.
     """
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus symmetric kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_batch_case(
@@ -1427,7 +1427,7 @@ def test_flash_attn_func_opus_sink_dominant(
     batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal, d, monkeypatch
 ):
     """A dominant sink must remain finite by becoming the softmax reference max."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus symmetric kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_batch_case(
@@ -1448,7 +1448,7 @@ def test_flash_attn_func_opus_sink_dominant(
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_func_opus_sink_posinf(causal, d, monkeypatch):
     """A +inf sink receives all probability: O is zero and LSE is +inf."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus symmetric kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     torch.manual_seed(0)
@@ -1469,6 +1469,40 @@ def test_flash_attn_func_opus_sink_posinf(causal, d, monkeypatch):
         lse
     ).all(), f"+inf sink must give LSE=+inf, got {lse.unique()}"
     assert (out == 0).all(), "+inf sink must receive all probability"
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_kv", [128, 0], ids=["masked_rows", "no_keys"])
+def test_flash_attn_func_opus_sink_below_sentinel(seqlen_kv, d, monkeypatch):
+    """A finite sink below the kernel's -1e30 row-max sentinel: rows with no unmasked
+    key still get LSE = sink and O = 0; elsewhere the sink is negligible."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    torch.manual_seed(0)
+    nheads, nheads_k = 8, 2
+    # Causal with seqlen_q > seqlen_kv: the top rows are fully masked inside non-empty KV.
+    q = torch.randn(2, 512, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(2, seqlen_kv, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(2, seqlen_kv, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    sink = torch.full((nheads,), -1e31, device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_func(
+            q, k, v, causal=True, return_lse=True, sink_ptr=sink
+        )
+        out_opus = fmha_fwd_bf16_opus_fwd(
+            q, k, v, softmax_scale=d**-0.5, causal=True, sink=sink
+        )
+        out_nosink = fmha_fwd_bf16_opus_fwd(q, k, v, softmax_scale=d**-0.5, causal=True)
+    assert torch.equal(out, out_opus), "did not route to the OPUS kernel"
+    no_key = opus_ref_lse(q, k, True)
+    dead = torch.isneginf(no_key)
+    assert dead.any()
+    torch.testing.assert_close(
+        lse[dead], sink.view(1, nheads, 1).expand_as(lse)[dead], rtol=1e-6, atol=0
+    )
+    opus_check_lse(f"opus-d{d}-sink-below-sentinel", lse[~dead], no_key[~dead])
+    torch.testing.assert_close(out, out_nosink)
 
 
 @pytest.mark.parametrize("grad_on", ["qkv", "sink"])
