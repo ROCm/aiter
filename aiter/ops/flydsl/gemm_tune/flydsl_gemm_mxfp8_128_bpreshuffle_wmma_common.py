@@ -306,6 +306,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if ki.fused_splitk and (
             ki.split_k <= 1
             or ki.tile_m % ki.split_k
+            or ki.tile_m & (ki.tile_m - 1)
             or ki.cluster_m * ki.cluster_n * ki.split_k > 16
         ):
             return False
