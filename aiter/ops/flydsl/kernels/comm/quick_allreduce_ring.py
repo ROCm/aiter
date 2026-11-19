@@ -67,11 +67,9 @@ from .transport import (
     _color_io,
     _i32_to_bytes,
     _load_flag,
-    _load_peers,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
-    _to_sgpr_i64,
     make_pack_storage,
 )
 
@@ -234,7 +232,6 @@ def make_quick_allreduce_ring_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
         colors_ptr: fx.Int64,
         n_blocks: fx.Int32,
         # Read only by a fused epilogue; the plain launcher passes zeros.
@@ -245,6 +242,14 @@ def make_quick_allreduce_ring_kernel(
         w_bias: fx.Float32,
         q_ptr: fx.Int64,
         q_scale_ptr: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -267,11 +272,11 @@ def make_quick_allreduce_ring_kernel(
             )
             for c in ({rs.name: rs, ag.name: ag}).values()
         }
-        peers = _load_peers(peer_ptrs, world_size)
         # The ring uses only two peers: this rank and its successor.
+        peers = [peer0, peer1, peer2, peer3, peer4, peer5, peer6, peer7][:world_size]
         self_base = peers[rank]
         next_base = peers[nxt]
-        inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
+        inbox = _buffer_ptr(self_base, T.i32, 4, inbox_bytes)
 
         # Everything that touches HBM goes through the epilogue: the plain one
         # moves atoms through ``_payload_io``, a fused one reaches the same rows
@@ -645,7 +650,14 @@ def make_quick_allreduce_ring_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
         colors_ptr: fx.Int64,
         grid_x: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -656,7 +668,6 @@ def make_quick_allreduce_ring_kernel(
             num_tiles,
             inp_ptr,
             out_ptr,
-            peer_ptrs,
             colors_ptr,
             grid_x,
             fx.Int64(0),
@@ -666,6 +677,14 @@ def make_quick_allreduce_ring_kernel(
             fx.Float32(0.0),
             fx.Int64(0),
             fx.Int64(0),
+            peer0,
+            peer1,
+            peer2,
+            peer3,
+            peer4,
+            peer5,
+            peer6,
+            peer7,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -680,7 +699,14 @@ def make_quick_allreduce_ring_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
         colors_ptr: fx.Int64,
         grid_x: fx.Int32,
         res_in_ptr: fx.Int64,
@@ -698,7 +724,6 @@ def make_quick_allreduce_ring_kernel(
             num_tiles,
             inp_ptr,
             out_ptr,
-            peer_ptrs,
             colors_ptr,
             grid_x,
             res_in_ptr,
@@ -708,6 +733,14 @@ def make_quick_allreduce_ring_kernel(
             w_bias,
             q_ptr,
             q_scale_ptr,
+            peer0,
+            peer1,
+            peer2,
+            peer3,
+            peer4,
+            peer5,
+            peer6,
+            peer7,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -761,5 +794,6 @@ def make_quick_allreduce_ring_kernel(
         "grid": grid,
         "block": block,
         "rows_per_chunk": epilogue.rows_per_chunk,
+        "device_colors": True,
         **epilogue.spec(),
     }
