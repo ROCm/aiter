@@ -28,6 +28,8 @@ so the kernels change and change back as M grows. Rows of other archs
 are replayed at the smallest M they serve and bisected between the two ends
 where they request different kernels. Either way that also reaches the FlyDSL
 heuristic kernels the runtime falls back to below a shape's smallest tuned M.
+Decode rows serve only exact M: padded-M lookups fall back to asm, so no
+smaller M is replayed for them.
 
 Rows are replayed for the arch their ``gfx`` column names (``cu_num`` for
 legacy rows); with ``GPU_ARCHS`` naming targets, only those archs. The
@@ -290,7 +292,7 @@ class Table:
     # row, or a row the runtime cannot launch, falls back to a FlyDSL kernel.
     all_rows: bool = False
     # Some tables select by kernelName rather than a libtype column.
-    kernel_prefix: str = ""
+    kernel_prefix: str | tuple[str, ...] = ""
 
 
 TABLES = (
@@ -299,7 +301,7 @@ TABLES = (
         "AITER_CONFIG_GEMM_A4W4",
         ("gfx", "cu_num", "N", "K"),
         _a4w4_blockscale,
-        kernel_prefix="flydsl_mxpsh_",
+        kernel_prefix=("flydsl_mxpsh_", "flydsl_decode_"),
     ),
     Table(
         "a8w8_bpreshuffle_tuned_gemm",
@@ -395,7 +397,8 @@ def parse_csv(csv_path: str) -> list[dict]:
     """One job per FlyDSL row of a tuned GEMM table: its shape and key cells,
     ``m`` its tuned M, ``m_low`` the smallest M it serves (the previous
     tuned M of its shape, plus one) and ``tuned``, every tuned M of its shape
-    with its kernel's (tile_m, cluster_m)."""
+    with its kernel's (tile_m, cluster_m). Decode rows serve only exact M at
+    runtime, so their ``m_low`` equals ``m``, with no range to probe."""
     table = table_of(csv_path)
     if table is None:
         raise ValueError(
@@ -436,6 +439,12 @@ def parse_csv(csv_path: str) -> list[dict]:
             job.setdefault(name, _column(row, name))
         if "b" in table.keys:
             job["b"] = _int(job["b"])
+        if kernel_name.startswith("flydsl_decode_"):
+            if _replay.job_arch(job) != "gfx950":
+                continue
+            # get_GEMM_config sends padded-M FlyDSL lookups to asm; only the
+            # exact tuned M reaches the decode launcher and needs an artifact.
+            job["m_low"] = m
         jobs += [{**job, **variant} for variant in _variants(table, job)]
     return jobs
 
