@@ -41,6 +41,7 @@ shapes, and a row's kernelId is the kernel's id in that list.
 
 """
 
+import gc
 import math
 import re
 import statistics
@@ -490,6 +491,7 @@ KERNEL_ID_BASE_BMM = 3_000_000
 KERNEL_ID_BASE_GFX1250_SMALLM = 2_000_000
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
+_GFX1250_1X32_LAST_KERNEL = None
 
 
 def _bmm_scale_args(w_scale_block):
@@ -641,10 +643,17 @@ def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_nam
 
 
 def run_gemm_flydsl_gfx1250_1x32(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
+    global _GFX1250_1X32_LAST_KERNEL
     from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        clear_mxfp8_32_workspace_cache,
         run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     )
 
+    if _GFX1250_1X32_LAST_KERNEL != kernel_name:
+        clear_mxfp8_32_workspace_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        _GFX1250_1X32_LAST_KERNEL = kernel_name
     return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         x, weight_shuffle, x_scale, w_scale, out, kernel_name
     )

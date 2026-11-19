@@ -77,6 +77,12 @@ def _smallm_1x32_workspace(
         return torch.empty(shape, dtype=torch.float32, device=device)
 
 
+def clear_mxfp8_32_workspace_cache() -> None:
+    """Release graph-scoped split-K scratch between independent tuner candidates."""
+    _fused_splitk_workspace.cache_clear()
+    _smallm_1x32_workspace.cache_clear()
+
+
 def _fused_splitk_ok(
     tile_m,
     tile_n,
