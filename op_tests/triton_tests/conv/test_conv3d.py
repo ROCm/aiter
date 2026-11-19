@@ -600,12 +600,14 @@ def test_conv3d_execution_rejects_cpu_tensors():
         conv3d_general(x, w)
 
 
+@pytest.mark.parametrize("entry_point", ["routed", "specialized"])
 @pytest.mark.parametrize(
-    "api,layout,padding_mode,dtype,filter_shape,stride,dilation,padding",
+    "api,layout,route_name,padding_mode,dtype,filter_shape,stride,dilation,padding",
     [
         (
             "conv3d",
             "ndhwc",
+            "NDHWC_3X3X3",
             "reflect",
             torch.float16,
             (3, 3, 3),
@@ -616,6 +618,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
         (
             "conv3d_ncdhw",
             "ncdhw",
+            "GENERAL",
             "replicate",
             torch.bfloat16,
             (3, 5, 3),
@@ -626,6 +629,7 @@ def test_conv3d_execution_rejects_cpu_tensors():
         (
             "conv3d_ndhwc",
             "ndhwc",
+            "NDHWC_3X3X3",
             "circular",
             torch.float16,
             (3, 3, 3),
@@ -634,8 +638,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 2, 1),
         ),
         (
-            "conv3d_1x1x1",
+            "conv3d_ndhwc",
             "ndhwc",
+            "ONE_X_ONE_X_ONE",
             "circular",
             torch.bfloat16,
             (1, 1, 1),
@@ -644,8 +649,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (4, 0, 2),
         ),
         (
-            "conv3d_general",
+            "conv3d",
             "ncdhw",
+            "GENERAL",
             "reflect",
             torch.bfloat16,
             (3, 5, 3),
@@ -654,8 +660,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 2, 1),
         ),
         (
-            "conv3d_ndhwc_3x3x3",
+            "conv3d_ndhwc",
             "ndhwc",
+            "NDHWC_3X3X3",
             "replicate",
             torch.bfloat16,
             (3, 3, 3),
@@ -664,8 +671,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (5, 1, 2),
         ),
         (
-            "conv3d_ncdhw_cblocked",
+            "conv3d_ncdhw",
             "ncdhw",
+            "CBLOCKED_NCDHW",
             "circular",
             torch.float16,
             (3, 3, 3),
@@ -674,8 +682,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 2, 1),
         ),
         (
-            "conv3d_winograd_hw_f4x3",
+            "conv3d",
             "ncdhw",
+            "WINOGRAD_HW",
             "reflect",
             torch.bfloat16,
             (3, 3, 3),
@@ -684,8 +693,9 @@ def test_conv3d_execution_rejects_cpu_tensors():
             (1, 2, 1),
         ),
         (
-            "conv3d_winograd_hw_f4x3_cblocked",
+            "conv3d_ncdhw",
             "ncdhw",
+            "WINOGRAD_HW_CBLOCKED",
             "replicate",
             torch.float16,
             (3, 3, 3),
@@ -696,7 +706,17 @@ def test_conv3d_execution_rejects_cpu_tensors():
     ],
 )
 def test_padding_matches_reference(
-    api, layout, padding_mode, dtype, filter_shape, stride, dilation, padding
+    monkeypatch,
+    entry_point,
+    api,
+    layout,
+    route_name,
+    padding_mode,
+    dtype,
+    filter_shape,
+    stride,
+    dilation,
+    padding,
 ):
     torch.manual_seed(0)
     source = torch.randn((1, 64, 4, 7, 9), device="cuda", dtype=dtype)
@@ -706,6 +726,33 @@ def test_padding_matches_reference(
     source = source.contiguous(memory_format=memory_format)
     weight = torch.randn((64, 64, *filter_shape), device="cuda", dtype=dtype)
     bias = torch.randn((64,), device="cuda", dtype=dtype)
+    selected_routes = []
+    if entry_point == "routed":
+        if layout == "ncdhw" and filter_shape == (3, 3, 3):
+            method = {
+                "CBLOCKED_NCDHW": "cblocked",
+                "WINOGRAD_HW": "winograd_hw",
+                "WINOGRAD_HW_CBLOCKED": "winograd_hw_cblocked",
+            }[route_name]
+            monkeypatch.setattr(
+                conv3d_module, "_select_3x3x3_ncdhw_method", lambda *args: method
+            )
+
+        def record_route(*args, **kwargs):
+            route = _resolve_route(*args, **kwargs)
+            selected_routes.append(route)
+            return route
+
+        monkeypatch.setattr(conv3d_module, "_resolve_route", record_route)
+    else:
+        api = {
+            "ONE_X_ONE_X_ONE": "conv3d_1x1x1",
+            "GENERAL": "conv3d_general",
+            "NDHWC_3X3X3": "conv3d_ndhwc_3x3x3",
+            "CBLOCKED_NCDHW": "conv3d_ncdhw_cblocked",
+            "WINOGRAD_HW": "conv3d_winograd_hw_f4x3",
+            "WINOGRAD_HW_CBLOCKED": "conv3d_winograd_hw_f4x3_cblocked",
+        }[route_name]
     kwargs = (
         {"layout": layout}
         if api in ("conv3d", "conv3d_general", "conv3d_1x1x1")
@@ -730,9 +777,21 @@ def test_padding_matches_reference(
         padding_mode=padding_mode,
         **kwargs,
     )
-    tolerances = _winograd_tolerances if "winograd" in api else dynamic_conv_tolerances
+    tolerances = (
+        _winograd_tolerances
+        if route_name.startswith("WINOGRAD")
+        else dynamic_conv_tolerances
+    )
     rtol, atol = tolerances(dtype, weight[0].numel())
-    context = f"{api}, mode={padding_mode}, layout={layout}, dtype={dtype}"
+    context = (
+        f"{api}, entry_point={entry_point}, route={route_name}, "
+        f"mode={padding_mode}, layout={layout}, dtype={dtype}"
+    )
+    if entry_point == "routed":
+        assert selected_routes == [Route3D[route_name]], (
+            f"{context}: expected one dispatch to {route_name}, "
+            f"got {[route.name for route in selected_routes]}"
+        )
     torch.testing.assert_close(
         actual.float(),
         expected,
