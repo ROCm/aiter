@@ -122,6 +122,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     out_is_f16=0,
     a_is_fp4=0,
     a_preshuffled=0,
+    quant_out_preshuffled=None,
     stage1_act=0,
     bias=None,
     swiglu_limit=7.0,
@@ -157,6 +158,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
     innermost 32 FP4 values packed into 16 bytes.
     """
+    if quant_out_preshuffled is None:
+        quant_out_preshuffled = a_preshuffled
+    quant_out_preshuffled = bool(quant_out_preshuffled and stage1_quant_out)
+    if quant_out_preshuffled and (not a_is_fp4 or not stage1_act):
+        raise ValueError("preshuffled quant output requires MXFP4 and activation")
     if a_preshuffled and row_major_ascale:
         raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
     if a_preshuffled and not a_is_fp4:
@@ -172,10 +178,12 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled A requires M and tile_m divisible by 16, K and "
             "tile_k divisible by 128, and no padded A row stride"
         )
-    if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
+    if quant_out_preshuffled and (
+        N % 256 or tile_n % 64 or contiguous_m % 16 or tile_m % 16
+    ):
         raise ValueError(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
-            "and tile_n divisible by 64"
+            "and tile_n divisible by 64, with M and tile_m divisible by 16"
         )
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -315,6 +323,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
         k_waves,
+        int(quant_out_preshuffled),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
