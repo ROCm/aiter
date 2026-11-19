@@ -2696,21 +2696,21 @@ def test_triton_unified_attn_split_head(v_head_size, dtype, seq_lens, block_size
 def _verify_params(batch, **kwargs):
     """MiMo-V2.6 verify on gfx950 at TP8: 8 query tokens per sequence, 16 query
     heads on one KV head, 256 CUs."""
-    params = dict(
-        head_size=192,
-        head_size_v=128,
-        max_seqlen_q=8,
-        max_seqlen_k=8192,
-        sliding_window=0,
-        shuffled_kv_cache=False,
-        q_dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        block_size=1,
-        num_sms=256,
-        target_num_prgms=1024,
-        num_queries_per_kv=16,
-        num_kv_heads=1,
-    )
+    params = {
+        "head_size": 192,
+        "head_size_v": 128,
+        "max_seqlen_q": 8,
+        "max_seqlen_k": 8192,
+        "sliding_window": 0,
+        "shuffled_kv_cache": False,
+        "q_dtype": torch.bfloat16,
+        "kv_cache_dtype": torch.bfloat16,
+        "block_size": 1,
+        "num_sms": 256,
+        "target_num_prgms": 1024,
+        "num_queries_per_kv": 16,
+        "num_kv_heads": 1,
+    }
     params.update(kwargs)
     # query blocks at the default BLOCK_Q of 1: tokens + sequences
     num_2d_prgms = batch * (params["max_seqlen_q"] + 1) * params["num_kv_heads"]
@@ -2727,20 +2727,20 @@ def _verify_params(batch, **kwargs):
     [
         # the head-192 split keeps verify on the 3D kernel at any batch
         ("verify", {}, None),
-        ("verify, 16 tokens", dict(max_seqlen_q=16), None),
+        ("verify, 16 tokens", {"max_seqlen_q": 16}, None),
         (
             "verify, fp16",
-            dict(q_dtype=torch.float16, kv_cache_dtype=torch.float16),
+            {"q_dtype": torch.float16, "kv_cache_dtype": torch.float16},
             None,
         ),
         # everything else keeps the 4-programs-per-CU switch
-        ("verify, 17 tokens", dict(max_seqlen_q=17), 57),
-        ("decode", dict(max_seqlen_q=1), 513),
-        ("sliding window", dict(sliding_window=128), 1),
-        ("short context", dict(max_seqlen_k=512), 1),
-        ("head 128", dict(head_size=128, head_size_v=128), 114),
-        ("fp8 kv", dict(kv_cache_dtype=e4m3_dtype), 114),
-        ("shuffled kv", dict(shuffled_kv_cache=True), 114),
+        ("verify, 17 tokens", {"max_seqlen_q": 17}, 57),
+        ("decode", {"max_seqlen_q": 1}, 513),
+        ("sliding window", {"sliding_window": 128}, 1),
+        ("short context", {"max_seqlen_k": 512}, 1),
+        ("head 128", {"head_size": 128, "head_size_v": 128}, 114),
+        ("fp8 kv", {"kv_cache_dtype": e4m3_dtype}, 114),
+        ("shuffled kv", {"shuffled_kv_cache": True}, 114),
     ],
 )
 def test_keep_3d_for_verify(monkeypatch, case, kwargs, uses_2d_from_batch):
