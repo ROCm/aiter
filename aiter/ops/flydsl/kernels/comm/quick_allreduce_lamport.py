@@ -27,10 +27,14 @@ re-arm is off the critical path:
   the poll (mesh, ring). A dword that several threads read (scale, extra
   plane) is re-armed by one of them, which ``lamport_slots`` picks; all of
   them are lanes of one wave, which leave the spin together.
-* ``lamport_rearm_span``: whole slots, 16 B per lane, a super-tile group late
-  (hierarchical): on a fine-grained inbox a push can reach the reader by
-  eviction before the writer's release writes the line back, and a sentinel
-  put back at once could be overwritten by the same stale bytes.
+* ``lamport_rearm_span``: whole slots, 16 B per lane, a round late. On a
+  cacheable (fine-grained) inbox a push can reach the reader by eviction
+  before the writer's release writes the line back, and a sentinel put back
+  at once could be overwritten by the same stale bytes. So a reader re-arms a
+  writer's slot only once it holds a later packet from that writer, which
+  left after the writer's release (``lamport_defers_rearm``). The
+  hierarchical kernel always does this; the mesh and the ring do it on a
+  cacheable inbox, and need one more inbox buffer for it.
 
 **Send.** No drain and no flag: the packet words are their own flag. After its
 pushes each wave writes them back out of L2 on a cacheable inbox
@@ -75,6 +79,14 @@ def lamport_rearm_modifier(inbox_memory: str) -> int:
     if _INBOX_POLICY[inbox_memory]["release"] is None:
         return _CM_NT
     return _CM_SC0 | _CM_SC1
+
+
+def lamport_defers_rearm(inbox_memory: str) -> bool:
+    """Whether the mesh and the ring re-arm a round late on *inbox_memory*
+    (``lamport_rearm_span``) rather than right after the poll
+    (``lamport_rearm_dwords``): on a cacheable inbox, whose pushes a release
+    writes back out of the writer's L2."""
+    return _INBOX_POLICY[inbox_memory]["release"] is not None
 
 
 def _any_sentinel(vec):

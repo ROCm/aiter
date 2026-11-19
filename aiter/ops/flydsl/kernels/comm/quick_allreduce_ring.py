@@ -55,12 +55,14 @@ from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .quick_allreduce_fusions import check_fusion_args
 from .quick_allreduce_lamport import (
     check_handshake,
+    lamport_defers_rearm,
     lamport_offsets,
     lamport_packets,
     lamport_poll,
     lamport_pushed,
     lamport_rearm_dwords,
     lamport_rearm_modifier,
+    lamport_rearm_span,
 )
 from .quick_allreduce_rmsnorm import RingRMSNormEpilogue
 from .transport import (
@@ -94,6 +96,16 @@ from .transport import (
 # which needs our op ``N`` of ``g + 1``; we push that after a poll of
 # ``g + 1``, whose ``vmcnt(0)`` drains every re-arm of group ``g``.
 LAMPORT_BUFFERS = 2
+
+# Inbox buffers of the Lamport handshake on a cacheable (fine-grained) inbox,
+# where the re-arm is deferred (``lamport_defers_rearm``). After our op-1
+# pushes of group ``g`` we re-arm every slot of group ``g - 2``
+# (``_rearm_group``): by then we hold ``p``'s packets of group ``g - 1``,
+# which it pushed after its release of ``g - 2``. ``p`` writes the buffer of
+# ``g - 2`` again in group ``g + 1``, only after it has finished ``g``, which
+# needs our op ``N`` of ``g``; we push that after the op-2 poll of ``g``, whose
+# ``vmcnt(0)`` drains the re-arm.
+LAMPORT_BUFFERS_DEFERRED = 3
 
 
 def _load_i32_at(ptr, elem_off, cache_modifier):
@@ -222,7 +234,15 @@ def make_quick_allreduce_ring_kernel(
         step_base_i32.append(_acc)
         _acc += grid * w
     buffer_i32 = _acc
-    inbox_bytes = (LAMPORT_BUFFERS if lamport else 1) * buffer_i32 * 4
+    # Re-arm a group late, whole slots, rather than each polled dword at once.
+    defer_rearm = lamport and lamport_defers_rearm(inbox_memory)
+    if not lamport:
+        n_buffers = 1
+    elif defer_rearm:
+        n_buffers = LAMPORT_BUFFERS_DEFERRED
+    else:
+        n_buffers = LAMPORT_BUFFERS
+    inbox_bytes = n_buffers * buffer_i32 * 4
     rearm_cm = lamport_rearm_modifier(inbox_memory)
 
     # Each slot has only one writer, the ring predecessor. For this reason, the
@@ -385,6 +405,8 @@ def make_quick_allreduce_ring_kernel(
             dwords this thread reads is the sentinel (``lamport_poll``); then
             put the sentinel back in them (``lamport_rearm_dwords``), which
             must land before this group's op ``N`` push (``LAMPORT_BUFFERS``).
+            Deferred, ``vmcnt(0)`` only: it drains ``_rearm_group``
+            (``LAMPORT_BUFFERS_DEFERRED``).
             """
             offs, rearm = lamport_offsets(
                 codec,
@@ -396,8 +418,27 @@ def make_quick_allreduce_ring_kernel(
                 ),
             )
             got = lamport_poll(inbox, self_base, offs)
-            lamport_rearm_dwords(inbox, rearm, rearm_cm)
+            if const_expr(defer_rearm):
+                rocdl.s_waitcnt(vmcnt=0)
+            else:
+                lamport_rearm_dwords(inbox, rearm, rearm_cm)
             return list(lamport_packets(codec, got, rank_atoms))
+
+        def _rearm_group(buf):
+            """Deferred re-arm, after the op-1 pushes of the group in *buf*:
+            every slot of this block in the buffer of two groups before
+            (``LAMPORT_BUFFERS_DEFERRED``)."""
+            back = buf - fx.Int32(2)
+            back = (back < fx.Int32(0)).select(back + fx.Int32(n_buffers), back)
+            for step in range_constexpr(len(wire_tile_i32)):
+                lamport_rearm_span(
+                    inbox,
+                    _slot_i32(step, fx.Int32(0), back),
+                    wire_tile_i32[step],
+                    tid,
+                    block,
+                    rearm_cm,
+                )
 
         def _scale_of(codec, word):
             return _scale_from_word(codec, word, pair_in_slot)
@@ -700,6 +741,10 @@ def make_quick_allreduce_ring_kernel(
                         _end_chunk(tile, _chunk_of(k), recv)
                     else:
                         pass
+                if const_expr(defer_rearm and k == 1):
+                    _rearm_group(buf)
+                else:
+                    pass
 
         # Stride by the launched grid, not the compile-time cap: the host
         # launches fewer blocks than `grid` when it wants each block to own a
@@ -715,7 +760,12 @@ def make_quick_allreduce_ring_kernel(
                 _ring_group_lamport(i, n_this, color)
             else:
                 _ring_group(i, n_this, color)
-            if const_expr(lamport):
+            if const_expr(defer_rearm):
+                # The colour is the Lamport buffer, 0 .. 2.
+                color = color + fx.Int32(1)
+                if color == fx.Int32(n_buffers):
+                    color = fx.Int32(0)
+            elif const_expr(lamport):
                 # The colour is the Lamport buffer, 0 or 1.
                 color = fx.Int32(1) - color
             else:
