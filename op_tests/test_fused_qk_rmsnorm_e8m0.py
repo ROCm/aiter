@@ -106,7 +106,8 @@ def _check_quant(q8, s_raw, q_norm, transpose_scale):
     # transpose_scale stores the (m, g) scale column-major
     s = s_raw.view(-1, m).t() if transpose_scale else s_raw
     # an Inf group (the last, n1 > 128) takes the 2^127 scale; its fp8 is not
-    # compared: the kernel saturates it where an unclamped convert gives NaN
+    # compared: rcp(2^127) flushes to 0, so the kernel writes its +-Inf and NaN as
+    # -fp8 max and its finite elements as 0 (as with FP32 scales)
     fin = slice(None, n1 - 128 if n1 > 128 else n1)
     q8_ref, s_ref = _ref_e8m0_quant(q_norm)
     assert torch.equal(s, s_ref)
