@@ -167,6 +167,12 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -1433,21 +1439,6 @@ def build_module(
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
-    if md_name.startswith("module_mega_mhc_stream_"):
-        # Keep source selection and host dispatch in sync for JIT and prebuild.
-        mhc_gfx1250 = any(
-            arch in ("gfx1250", "gfx1250-strict")
-            for arch in _build_archs_from_env(get_gfx)
-        )
-        if not mhc_gfx1250:
-            srcs = [
-                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
-            ]
-        flags_extra_hip = [
-            *flags_extra_hip,
-            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
-        ]
-
     for tp in third_party:
         clone_3rdparty(tp)
 
@@ -1903,6 +1894,9 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "flags_extra_hip_per_source": single_ops[
+                            "flags_extra_hip_per_source"
+                        ],
                         "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
