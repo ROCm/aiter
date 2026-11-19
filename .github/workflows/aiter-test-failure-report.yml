@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   report:
-    runs-on: [self-hosted, box308]
+    runs-on: [self-hosted, box308-pr-revert]
     timeout-minutes: 60
     env:
       AITER_TEST_FAILURE_RUN_ID: ${{ github.event.inputs.run_id || '' }}
