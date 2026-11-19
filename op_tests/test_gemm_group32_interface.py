@@ -406,7 +406,15 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
 
 @pytest.mark.parametrize(
     "tile_n,waves",
-    [(32, 1), (32, 2), (128, 1), (128, 2), (128, 4)],
+    [
+        (32, 1),
+        (32, 2),
+        (64, 1),
+        (64, 2),
+        (128, 1),
+        (128, 2),
+        (128, 4),
+    ],
 )
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
 def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(

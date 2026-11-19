@@ -128,6 +128,8 @@ def tuned_shapes():
     [
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1",
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk4",
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn64_w2_sk1",
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn64_w1_sk4",
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn128_w4_sk1",
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn128_w2_sk4",
     ],

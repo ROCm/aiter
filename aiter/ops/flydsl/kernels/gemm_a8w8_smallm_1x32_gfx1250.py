@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native gfx1250 16x{32,128} MXFP8 GEMM for small M.
+"""Native gfx1250 16x{32,64,128} MXFP8 GEMM for small M.
 
 This is intentionally separate from the four-wave compute kernel.  One
-workgroup owns one or four complete n32k4 scale groups, double-buffers only A
-and B through TDM, and reads both E8M0 scale words directly into registers.
+workgroup owns one, two, or four complete n32k4 scale groups, double-buffers
+only A and B through TDM, and reads E8M0 scales directly into registers.
 """
 
 import flydsl.compiler as flyc
@@ -47,7 +47,7 @@ def launch_gemm_a8w8_smallm_1x32(
     split_k: Constexpr[int],
     tile_n: Constexpr[int] = 32,
 ):
-    """Launch a 16x{32,128}x128 MXFP8 kernel.
+    """Launch the 16x{32,64,128}x128 MXFP8 kernel.
 
     ``split_k`` workgroups for one output tile are one hardware cluster.  Every
     rank publishes an FP32 tile, then rank zero sums ranks in increasing order
@@ -55,7 +55,9 @@ def launch_gemm_a8w8_smallm_1x32(
     independent of workgroup arrival order.
     """
 
-    assert tile_n in (32, 128), f"tile_n must be 32 or 128, got {tile_n}"
+    assert tile_n in (32, 64, 128), (
+        f"tile_n must be 32, 64, or 128, got {tile_n}"
+    )
     assert num_waves in (1, 2, 4), f"num_waves must be 1/2/4, got {num_waves}"
     assert tile_n // 16 % num_waves == 0, (
         f"tile_n/16 must be divisible by num_waves, got {tile_n}/{num_waves}"

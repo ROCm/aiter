@@ -628,7 +628,7 @@ _MX32_SMALL_KERNEL_NAME_RE = re.compile(
 )
 _MX32_SMALLM_1X32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_SMALLM_1X32_NAME_PREFIX)}_"
-    r"(?:(?:tn(?P<tile_n>128)_w(?P<wide_waves>[124]))|"
+    r"(?:(?:tn(?P<tile_n>64|128)_w(?P<wide_waves>[124]))|"
     r"(?:w(?P<narrow_waves>[12])))_sk(?P<split_k>1|2|4|8)$"
 )
 
@@ -748,7 +748,7 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
     num_waves: int,
     split_k: int,
 ) -> Tensor:
-    """Validate and launch the 16x{32,128} native small-M kernel."""
+    """Validate and launch the 16x{32,64,128} native small-M kernel."""
     if XQ.dim() != 2 or WQ.dim() != 2 or Out.dim() != 2:
         raise RuntimeError("[FlyDSL gfx1250 smallm_1x32] A/B/Out must be 2-D")
     M, K = XQ.shape
@@ -757,6 +757,10 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
         raise RuntimeError(
             "[FlyDSL gfx1250 smallm_1x32] shape mismatch: "
             f"A={tuple(XQ.shape)}, B={tuple(WQ.shape)}, Out={tuple(Out.shape)}"
+        )
+    if tile_n not in (32, 64, 128):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 smallm_1x32] tile_n must be 32/64/128, got {tile_n}"
         )
     if M % 16 or N % tile_n or K % (128 * split_k):
         raise RuntimeError(
