@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import sum_combine
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -1730,6 +1731,68 @@ def _find_seq_idx(
 
 
 @gluon.jit
+def _split_rebalance_work(
+    seq_lens_ptr,
+    split_meta_ptr,
+    num_seqs,
+    work_idx,
+    store_meta,
+    TILE_SIZE: gl.constexpr,
+    NUM_SEGMENTS: gl.constexpr,
+    SEQ_BLOCK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """Split rebalance: all segments of the batch cover the same number of KV
+    tiles, the least that gives at most num_seqs * NUM_SEGMENTS segments. Work
+    items are the segments in sequence order. Returns (seq_idx, segm_idx,
+    tiles_per_segment, seq_len, num_work) for work item work_idx.
+    """
+    gl.static_assert(SEQ_BLOCK >= WARP_SIZE and NUM_SEGMENTS > 1)
+    work_items = num_seqs * NUM_SEGMENTS
+    # Each warp holds all lengths, so the sums and the scan stay in the warp.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [SEQ_BLOCK // WARP_SIZE], [WARP_SIZE], [NUM_WARPS], [0]
+    )
+    offs = gl.arange(0, SEQ_BLOCK, layout=layout)
+    in_batch = offs < num_seqs
+    lens = gl.load(seq_lens_ptr + offs, mask=in_batch, other=0)
+    tiles = cdiv_fn(lens, TILE_SIZE)
+    total = gl.sum(tiles, axis=0)
+    tiles_per_segment = gl.maximum(cdiv_fn(total, work_items), 1)
+    if gl.sum(cdiv_fn(tiles, tiles_per_segment), axis=0) > work_items:
+        # A sequence of t > 0 tiles has cdiv(t, T) <= (t - 1) / T + 1 segments, so
+        # hi gives at most work_items segments. Find the least such value.
+        nonempty = gl.sum((tiles > 0).to(gl.int32), axis=0)
+        lo = tiles_per_segment + 1
+        hi = gl.minimum(
+            gl.max(tiles, axis=0),
+            cdiv_fn(total - nonempty, work_items - nonempty),
+        )
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if gl.sum(cdiv_fn(tiles, mid), axis=0) > work_items:
+                lo = mid + 1
+            else:
+                hi = mid
+        tiles_per_segment = hi
+    num_segments = cdiv_fn(tiles, tiles_per_segment)
+    ends = gl.associative_scan(num_segments, 0, sum_combine)
+    starts = ends - num_segments
+    # For the reduce: the first work item and the segment count of each sequence.
+    meta_mask = in_batch & store_meta
+    gl.store(split_meta_ptr + offs, starts, mask=meta_mask)
+    gl.store(split_meta_ptr + num_seqs + offs, num_segments, mask=meta_mask)
+    # The sequence of work item w is the number of sequences that end at or before w.
+    seq_idx = gl.sum((ends <= work_idx).to(gl.int32), axis=0)
+    is_seq = offs == seq_idx
+    segm_idx = work_idx - gl.sum(gl.where(is_seq, starts, 0), axis=0)
+    seq_len = gl.sum(gl.where(is_seq, lens, 0), axis=0)
+    num_work = gl.sum(num_segments, axis=0)
+    return seq_idx, segm_idx, tiles_per_segment, seq_len, num_work
+
+
+@gluon.jit
 def _mla_decode_lds_pipeline(
     pgm: MLAProgram,
     seq_idx,
@@ -1975,6 +2038,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "KV_CACHE_DTYPE",
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
+        "SEQ_BLOCK",
     ],
 )
 
@@ -2031,6 +2095,8 @@ def _mla_decode_fwd_kernel(
     output_stride_1: gl.int32 = 0,
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
+    split_meta_ptr=None,
+    SEQ_BLOCK: gl.constexpr = 0,  # power of 2, >= num_seqs and >= WARP_SIZE
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2100,22 +2166,44 @@ def _mla_decode_fwd_kernel(
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
-    if USE_LDS_PIPELINE:
+    if USE_LDS_PIPELINE or split_meta_ptr is not None:
         # The wrapper guarantees one packed query row per sequence.
         q_start_idx = seq_idx
     else:
         q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+    out_token_idx = q_start_idx
+    out_segm_idx = segm_idx
 
     token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
     head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
     head_offset = head_block_idx * BLOCK_M
 
-    # sequence len for this particular sequence
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if split_meta_ptr is not None:
+        gl.static_assert(ALL_DECODE)
+        num_seqs = gl.num_programs(0) // NUM_HEAD_BLOCKS
+        work_idx = segm_idx * num_seqs + seq_idx
+        seq_idx, segm_idx, tiles_per_segment, seq_len, num_work = _split_rebalance_work(
+            seq_lens_ptr,
+            split_meta_ptr,
+            num_seqs,
+            work_idx,
+            (q_block_global_idx == 0) & (kv_head_idx == 0) & (out_segm_idx == 0),
+            TILE_SIZE,
+            NUM_SEGMENTS_PER_SEQ,
+            SEQ_BLOCK,
+            num_warps,
+            WARP_SIZE,
+        )
+        if work_idx >= num_work:
+            return
+        q_start_idx = seq_idx
+    else:
+        # sequence len for this particular sequence
+        seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # number of segments for this particular sequence
+        num_segments = NUM_SEGMENTS_PER_SEQ
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
@@ -2317,7 +2405,7 @@ def _mla_decode_fwd_kernel(
     query_pos_qk = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_0_qk = q_start_idx + query_pos_qk
+    query_offset_0_qk = out_token_idx + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * cfg.NUM_QUERIES_PER_KV
         + head_offset
@@ -2581,7 +2669,7 @@ def _mla_decode_fwd_kernel(
             acc1,
             M,
             L,
-            segm_idx,
+            out_segm_idx,
         )
     else:
         acc = acc * out_factor
@@ -2603,8 +2691,8 @@ def _mla_decode_fwd_kernel(
                 acc,
                 M,
                 L,
-                segm_idx,
-                q_start_idx + token_q_block_local_idx,
+                out_segm_idx,
+                out_token_idx + token_q_block_local_idx,
                 kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset,
             )
         else:
@@ -2612,7 +2700,7 @@ def _mla_decode_fwd_kernel(
                 acc,
                 M,
                 L,
-                segm_idx,
+                out_segm_idx,
             )
 
 

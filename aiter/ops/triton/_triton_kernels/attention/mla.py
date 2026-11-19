@@ -661,6 +661,7 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "KV_LORA_RANK",
         "NUM_SEGMENTS_PER_SEQ",
         "ALL_DECODE",
+        "SPLIT_CHUNK",
     ],
 )
 
@@ -687,6 +688,8 @@ def _mla_decode_fwd_reduce_kernel(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # int
+    split_meta_ptr=None,  # int32 [2, num_seqs], split rebalance (gfx1250 Gluon)
+    SPLIT_CHUNK: tl.constexpr = 0,  # split rebalance: work items in one merge step
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -704,6 +707,48 @@ def _mla_decode_fwd_reduce_kernel(
     out_scale = None
     if out_scale_ptr is not None:
         out_scale = 1 / tl.load(out_scale_ptr)
+
+    if split_meta_ptr is not None:
+        first = tl.load(split_meta_ptr + seq_idx)
+        count = tl.load(split_meta_ptr + num_seqs + seq_idx)
+        offs_d = tl.arange(0, KV_LORA_RANK)
+        overall_max = float("-inf")
+        overall_expsum = 0.0
+        acc_sum = tl.zeros([KV_LORA_RANK], dtype=tl.float32)
+        for c in range(0, count, SPLIT_CHUNK):
+            work = first + c + tl.arange(0, SPLIT_CHUNK)
+            work_mask = work < first + count
+            slot = (
+                (work % num_seqs).to(tl.int64)
+                * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+                + query_head_idx * NUM_SEGMENTS_PER_SEQ
+                + work // num_seqs
+            )
+            segm_max = tl.load(segm_max_ptr + slot, mask=work_mask, other=float("-inf"))
+            segm_expsum = tl.load(segm_expsum_ptr + slot, mask=work_mask, other=0.0)
+            segm_output = tl.load(
+                segm_output_ptr + slot[:, None] * KV_LORA_RANK + offs_d[None, :],
+                mask=work_mask[:, None],
+                other=0.0,
+            )
+            new_max = tl.maximum(overall_max, tl.max(segm_max))
+            rescale = tl.math.exp2(overall_max - new_max)
+            weight = tl.math.exp2(segm_max - new_max)
+            overall_expsum = overall_expsum * rescale + tl.sum(segm_expsum * weight)
+            acc_sum = acc_sum * rescale + tl.sum(segm_output * weight[:, None], axis=0)
+            overall_max = new_max
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+        if out_scale_ptr is not None:
+            acc = acc * out_scale
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        output_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + offs_d
+        )
+        tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
+        return
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
