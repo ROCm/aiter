@@ -8,6 +8,7 @@ import functools
 import torch
 from torch import Tensor
 
+from ...jit.utils.build_targets import torch_processor_count_to_cu
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernel_fits_shape,
     kernelInstance,
@@ -30,8 +31,10 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
         return False
     if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
-    gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
+    props = torch.cuda.get_device_properties(XQ.device)
+    gfx = props.gcnArchName.split(":", 1)[0]
+    cu_num = torch_processor_count_to_cu(gfx, props.multi_processor_count)
+    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx, cu_num)
 
 
 def _prepare_scales(

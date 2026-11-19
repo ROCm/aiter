@@ -529,7 +529,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     def get_gemm_a8w8_blockscale_flydsl_tune_task(
         self, info_keys, seed, preshuffleB, run_kwargs
     ):
-        gfx, _, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         if gfx != "gfx950":
             return []
         try:
@@ -552,7 +552,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         for kernel_id, kernel in kernels_list.items():
             if kernel.preshuffle_b != preshuffleB:
                 continue
-            if not kernel_fits_shape(kernel, M, N, K, gfx):
+            if not kernel_fits_shape(kernel, M, N, K, gfx, cu_num):
                 continue
             info = (info_keys, kernel_id, 0, kernel.name, "flydsl", preshuffleB)
             tasks_flydsl.append(

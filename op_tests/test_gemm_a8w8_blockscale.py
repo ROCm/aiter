@@ -18,6 +18,7 @@ import aiter
 from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
     gemm_a8w8_blockscale_ck,
@@ -230,7 +231,7 @@ def test_gemm(
             )
 
             flydsl_kernel = kernelInstance(ck_preshuffle)
-            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
+            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx(), get_cu_num()):
                 f, avg_f = run_flydsl(
                     x,
                     gemm_weight,

@@ -18,13 +18,17 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.gemm_a8w8_blockscale import run_gemm_a8w8_blockscale
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    VALIDATED_CU_NUM,
+    kernel_fits_shape,
     kernelInstance,
 )
 from aiter.ops.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
-    reason="FlyDSL blockscale GEMM requires gfx950",
+    not torch.cuda.is_available()
+    or get_gfx_runtime() != "gfx950"
+    or torch.cuda.get_device_properties(0).multi_processor_count != VALIDATED_CU_NUM,
+    reason="FlyDSL blockscale GEMM requires a 256-CU gfx950 (MI350X/MI355X)",
 )
 
 # The kernel tile is 256x256x128; N stays a multiple of 16 for preshuffled B.
@@ -83,6 +87,13 @@ def test_flydsl_gemm_a8w8_blockscale(m, n, k, preshuffle_b, out_dtype):
         rtol=RTOL[out_dtype],
         atol=1e-3 * ref.abs().max().item(),
     )
+
+
+@pytest.mark.parametrize("cu_num", [128, 192])
+def test_flydsl_gemm_a8w8_blockscale_rejects_unvalidated_cu_count(cu_num):
+    ki = kernelInstance(False)
+    assert kernel_fits_shape(ki, 256, 512, 256, "gfx950", VALIDATED_CU_NUM)
+    assert not kernel_fits_shape(ki, 256, 512, 256, "gfx950", cu_num)
 
 
 if __name__ == "__main__":
