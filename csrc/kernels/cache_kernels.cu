@@ -5803,6 +5803,16 @@ void fused_qk_concat_and_cache_mla(
               "slot_mapping must be a contiguous int64 tensor");
   AITER_CHECK(kv_cache.size(-1) >= kv_lora_rank + pe_dim,
               "kv_cache entries must hold kv_lora_rank + pe_dim elements");
+  // Every pointer goes to a kernel on kv_c's device; the guard selects only that
+  // device and nothing moves the other tensors there.
+  AITER_CHECK(kv_c.is_gpu(), "kv_c must be on GPU");
+  for(const aiter_tensor_t* t :
+      {&q_nope, &q_pe, &k_pe, &kv_cache, &q_out, &slot_mapping, &k_scale, &q_scale})
+    AITER_CHECK(t->device_id == kv_c.device_id,
+                "all tensors must be on the same GPU as kv_c");
+  AITER_CHECK(k_scale.dtype() == AITER_DTYPE_fp32 && q_scale.dtype() == AITER_DTYPE_fp32 &&
+                  k_scale.numel() >= 1 && q_scale.numel() >= 1,
+              "k_scale/q_scale must be non-empty fp32 tensors");
   AITER_CHECK(kv_lora_rank == qk_lora_rank,
               "kv_lora_rank and qk_lora_rank must be the same");
   AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
