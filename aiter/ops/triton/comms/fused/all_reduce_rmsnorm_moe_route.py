@@ -355,18 +355,19 @@ def fused_all_reduce_rmsnorm_moe_route(
     (and its MXFP8 copy), the router logits, the top-k experts and AITER moe_sorting's outputs.
     All ranks get the same bits.
 
-    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16, as the AITER
-    custom all-reduce does. Then s = h + residual (fp32), residual_out = bf16(s), normed =
-    bf16(s * rstd * w'), w' = 1 + weight (gemma) or weight, rstd = 1 / sqrt(mean(s^2) + eps).
-    The MXFP8 copy has the E8M0 scale clamp(ceil(log2(amax / 448)) + 127, 0, 254) for each
-    group of 32 values. The logits are normed @ router_weight^T with fp32 accumulation (fp32
-    weights as three exact bf16 parts). The selection value is sigmoid(logit) + bias, or the
-    logit (softmax); with num_expert_group > 1, only the topk_group best groups (by the sum
-    of their 2 best values with a bias, else their best value) are candidates. Ties go to the
-    lower expert. The weights are the sigmoids (or the softmax over all experts), divided by
-    their sum over the top-k when renormalize, times routed_scaling_factor. sorted_ids hold
-    (slot << 24) | token with each expert's tokens in ascending order, padded to block_size
-    with (topk << 24) | tokens and weight 0; experts with no token get no block.
+    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16, as the
+    AITER custom all-reduce does. Then s = h + residual (fp32), residual_out = bf16(s),
+    normed = bf16(s * rstd * w'), w' = 1 + weight (gemma) or weight, rstd = 1 /
+    sqrt(mean(s^2) + eps). The E8M0 scale of the MXFP8 copy for a group of 32 values is
+    ``mx_e8m0_scale(amax, 8)``, as in the other AITER MXFP8 ops. The logits are normed @
+    router_weight^T with fp32 accumulation (fp32 weights as three exact bf16 parts). The
+    selection value is sigmoid(logit) + bias, or the logit (softmax); with num_expert_group
+    > 1, only the topk_group best groups (by the sum of their 2 best values with a bias,
+    else their best value) are candidates. Ties go to the lower expert. The weights are the
+    sigmoids (or the softmax over all experts), divided by their sum over the top-k when
+    renormalize, times routed_scaling_factor. sorted_ids hold (slot << 24) | token with each
+    expert's tokens in ascending order, padded to block_size with (topk << 24) | tokens and
+    weight 0; experts with no token get no block.
 
     All ranks must make the same calls in the same order. HIP graphs are supported.
 

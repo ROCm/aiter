@@ -38,7 +38,9 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan as _PropagateNan
+from triton.language.extra.hip import libdevice
 
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
 from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
     _BFLY_ADD,
     _POLL_MAX,
@@ -68,7 +70,6 @@ _SITE_GATHER: gl.constexpr = gl.constexpr(2)
 _SITE_ROUTER: gl.constexpr = gl.constexpr(3)
 _SITE_ROUTE: gl.constexpr = gl.constexpr(4)
 _SITE_SORT: gl.constexpr = gl.constexpr(5)
-_F32_TINY: gl.constexpr = gl.constexpr(1.1754943508222875e-38)
 _NEG_LOG2E: gl.constexpr = gl.constexpr(-1.4426950408889634)
 _LOG2E: gl.constexpr = gl.constexpr(1.4426950408889634)
 _BIG: gl.constexpr = gl.constexpr(1 << 30)
@@ -353,7 +354,7 @@ def _store_rest(
     W: gl.constexpr,
 ):
     """Row t: the new residual bf16(s), and the MXFP8 copy of y (a quad of lanes holds a
-    32-column group)."""
+    32-column group). The scale is mx_e8m0_scale(amax, 8)."""
     tid = _tids(W)
     lane = tid % 64
     if QUANT:
@@ -367,22 +368,16 @@ def _store_rest(
                 am = gl.maximum(am, gl.abs(yv[e]), propagate_nan=_NAN_ALL)
             am = gl.maximum(am, _quad_xor(am, 1), propagate_nan=_NAN_ALL)
             am = gl.maximum(am, _quad_xor(am, 2), propagate_nan=_NAN_ALL)
-            a = gl.maximum(am, _F32_TINY, propagate_nan=_NAN_ALL)
-            bits = gl.div_rn(a, gl.full(a.shape, 448.0, gl.float32, a.type.layout)).to(
-                gl.int32, bitcast=True
-            )
-            ex = (bits >> 23) & 0xFF
-            sb = ex + gl.where((bits & 0x7FFFFF) != 0, 1, 0)
-            sb = gl.where(ex == 0, 0, gl.minimum(gl.maximum(sb, 0), 254))
-            inv = ((254 - sb) << 23).to(gl.float32, bitcast=True)
-            c0 = _fp8_pack4(yv[0] * inv, yv[1] * inv, yv[2] * inv, yv[3] * inv)
-            c1 = _fp8_pack4(yv[4] * inv, yv[5] * inv, yv[6] * inv, yv[7] * inv)
+            sb = mx_e8m0_scale(am, 8)
+            # y / 2^(sb - 127) with ldexp: 2^-127 (sb 254) is not a normal fp32 value.
+            n = 127 - sb.to(gl.int32)
+            q = ()
+            for e in gl.static_range(8):
+                q = q + (libdevice.ldexp(yv[e], n),)
+            c0 = _fp8_pack4(q[0], q[1], q[2], q[3])
+            c1 = _fp8_pack4(q[4], q[5], q[6], q[7])
             _st2(xq, t * (HIDDEN // 4) + 2 * vec, c0, c1, act, W)
-            gl.store(
-                xs + t * (HIDDEN // 32) + vec // 4,
-                sb.to(gl.uint8),
-                mask=act & (lane % 4 == 0),
-            )
+            gl.store(xs + t * (HIDDEN // 32) + vec // 4, sb, mask=act & (lane % 4 == 0))
     for j in gl.static_range(V):
         vec = j * A + tid
         rw = ()

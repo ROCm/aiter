@@ -114,7 +114,6 @@ SHAPES = [
     ),
 ]
 MAX_TOKENS = 192
-F32_TINY = torch.finfo(torch.float32).tiny
 
 SKIP = arch_info.get_arch() != "gfx950"
 pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
@@ -154,15 +153,23 @@ def _reference_norm(parts, residual, weight, gemma, num_warps):
     rstd = one / torch.sqrt(var + eps32)
     w = weight.float() + (1.0 if gemma else 0.0)
     y = ((s * rstd[:, None]) * w).to(torch.bfloat16)
-    groups = y.float().view(tokens, hidden // 32, 32)
-    amax = torch.clamp(groups.abs().amax(-1), min=F32_TINY)
-    bits = (amax / 448.0).view(torch.int32)
-    ex = (bits >> 23) & 0xFF
-    scale = torch.clamp(ex + ((bits & 0x7FFFFF) != 0).to(torch.int32), 0, 254)
-    scale = torch.where(ex == 0, 0, scale)
-    inv = ((254 - scale) << 23).view(torch.float32)
-    x_q = (groups * inv[..., None]).view(tokens, hidden).to(torch.float8_e4m3fn)
-    return res_out, y, x_q, scale.to(torch.uint8)
+    x_q, scale = _mxfp8(y.float())
+    return res_out, y, x_q, scale
+
+
+def _mxfp8(y):
+    """MXFP8 of the fp32 y: e4m3 values and an E8M0 scale for each group of 32. The
+    group amax rounds to a power of 2 in fp32, up from 1.75 x 2^e (2^128 is inf). The
+    scale is this power / 2^8, clamped to 2^-127 .. 2^127."""
+    tokens, hidden = y.shape
+    groups = y.view(tokens, hidden // 32, 32).double()
+    amax = groups.abs().amax(-1)
+    mant, exp = torch.frexp(amax)  # amax = mant * 2^exp, 0.5 <= mant < 1
+    pow2 = torch.exp2((exp - 1 + (mant >= 0.875).to(torch.int32)).double())
+    pow2 = torch.where(amax > 0, pow2, 0.0).float().double()
+    k = (torch.log2(pow2) - 8).clamp(-127, 127)
+    x_q = (groups * torch.exp2(-k)[..., None]).float().view(tokens, hidden)
+    return x_q.to(torch.float8_e4m3fn), (k + 127).to(torch.uint8)
 
 
 def _reference_route(logits, bias, k, scoring, groups, topk_group, renorm, scale):
@@ -554,6 +561,66 @@ def _check_routing_edges(rank, device, tp, failures):
         comm.close()
 
 
+# Group amax values at the edges of the MXFP8 scale rule, and their scale bytes.
+EDGE_SCALES = [
+    (1.75 * 2.0**-119, 1),  # the smallest amax with a scale above 2^-127
+    (4e-36, 1),
+    (5.2e-36, 1),
+    (1.75 * 2.0**-118, 2),
+    (2.0**-100, 19),
+    (1.75 / 8, 117),
+    (1.7421875, 119),
+    (1.75, 120),
+    (28.0, 124),
+    (448.0, 128),
+    (2.0**100, 219),
+    (1.75 * 2.0**127, 254),  # amax rounds to 2^128 (inf) in fp32
+    (3.3e38, 254),
+]
+
+
+def _check_scales(rank, device, tp, failures):
+    """Groups of 32 with an amax from EDGE_SCALES. Rank 0 has rows of +-1, the other
+    ranks 0, and there is no residual: then normed = +-norm_weight, and the weight sets
+    the amax. The router weights are 0."""
+    shape = (6144, 128, 4, True, "sigmoid", False, 1, 1, False, True, 1.0, True, 16)
+    shape = shape + (False, [4])
+    hidden, e, k = shape[:3]
+    tokens = shape[-1][0]
+    gen = torch.Generator(device=device).manual_seed(77)
+    signs = torch.randint(0, 2, (tokens, hidden), generator=gen, device=device)
+    ones = (2 * signs - 1).to(torch.bfloat16)
+    x = ones if rank == 0 else torch.zeros_like(ones)
+    u = 0.5 + 0.5 * torch.rand(
+        (hidden // 32, 32), generator=gen, dtype=torch.float32, device=device
+    )
+    g = torch.arange(hidden // 32, device=device)
+    u[g, g % 32] = 1.0  # one value of each group is the amax
+    amax = torch.tensor([a for a, _ in EDGE_SCALES], dtype=torch.float32, device=device)
+    norm_w = (amax[g % len(EDGE_SCALES)][:, None] * u).view(hidden).to(torch.bfloat16)
+    router_w = torch.zeros((e, hidden), dtype=torch.float32, device=device)
+    comm = AllReduceRmsnormMoeRoute(tp.cpu_group, tokens, hidden, e, k)
+    parts = [ones.cpu()] + [torch.zeros_like(ones.cpu())] * (comm.world - 1)
+    res_out, y, x_q, x_s = _reference_norm(
+        parts, None, norm_w.cpu(), False, comm.num_warps
+    )
+    want = torch.tensor([b for _, b in EDGE_SCALES], dtype=torch.uint8)
+    want = want[torch.arange(hidden // 32) % len(EDGE_SCALES)]
+    assert torch.equal(x_s, want.expand(tokens, -1)), "EDGE_SCALES or _mxfp8"
+    logits = torch.zeros((tokens, e), dtype=torch.float64, device="cpu")
+    try:
+        torch.cuda.synchronize()
+        dist.barrier(group=tp.cpu_group)
+        out = _call(x, None, (norm_w, router_w, None), shape, comm)
+        torch.cuda.synchronize()
+        ref = (res_out, y, x_q, x_s, logits, None)
+        _check(out, ref, shape, True, failures, f"rank {rank}: edge scales")
+        if comm.error() != [0, 0, 0, 0]:
+            failures.append(f"rank {rank}: edge scales: error {comm.error()}")
+    finally:
+        comm.close()
+
+
 def _check_max_tokens(rank, device, tp, failures):
     """The constructor rejects a max_tokens that leaves no free CTA for a call. When it
     accepts a max_tokens, a call with that many tokens is correct. 300 tokens use a
@@ -615,6 +682,7 @@ def _worker(rank, world_size, init_method):
     try:
         for shape in SHAPES:
             _check_shape(rank, device, tp, shape, failures)
+        _check_scales(rank, device, tp, failures)
         _check_timeout(rank, device, tp, failures)
         _check_routing_edges(rank, device, tp, failures)
         _check_max_tokens(rank, device, tp, failures)
