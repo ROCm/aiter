@@ -207,6 +207,15 @@ jobs:
           ref: ${{ needs.resolve.outputs.ref }}
           persist-credentials: false
 
+      # The runners are persistent, so 3rdparty/ otherwise keeps whatever a
+      # previous job left behind and the JIT build compiles against a stale CK.
+      - name: Sync submodules
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+          echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
+
       - name: Docker login
         env:
           DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
