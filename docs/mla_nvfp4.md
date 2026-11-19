@@ -182,8 +182,25 @@ oracle checks in `test_mla_nvfp4.py`. Invalid tail tokens are NaN; empty request
 must return exact zero output and negative-infinity LSE.
 
 The CLI reports mean decode time from 30 HIP-event samples of a 32-dispatch
-graph. It excludes quantization, cache writes, reference checks and transfers.
-The default FP8 page64 test behavior is unchanged.
+graph, with a same-format warm graph before each sample. It excludes
+quantization, cache writes, reference checks and transfers.
+
+Add `--compare-fp8` to pack the same original BF16 Q/KV and physical page mapping
+for the shipped FP8 QH128 shuffled-page64 kernel as well. The paired run
+alternates NVFP4/FP8 and FP8/NVFP4 order, retains all 30 samples per format,
+and checks that graph replay is bitwise equal to eager output/LSE. Both formats
+are checked against the same original-BF16 FP32 reference: NVFP4 uses tolerance
+0.3 and FP8 uses 0.06, with the 5% element-mismatch budget and a per-request NRMS
+bound equal to the respective tolerance. The table includes both mean times,
+`fp8 / nvfp4` time ratio and each format's error metrics.
+
+```bash
+python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 --compare-fp8 -b 5120 6144 7168 -c 5120 8192 10240
+```
+
+FP8 uses unit Q/KV scales and the existing `mla_decode_fwd_qh128_asm` API with
+preallocated output/LSE; NVFP4 uses the unified MLA API with fixed gains and B6.
+Both launch their shipped ASM decode CO. The default FP8 CLI behavior is unchanged.
 
 Tests cover an independent NumPy N128 oracle, all four score contributions,
 per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
@@ -192,6 +209,56 @@ requantization, BF16-to-decode, dense-to-CSR, stream/graph and fullgraph compile
 The optional test allocates approximately 12GiB to put both KV streams above
 4GiB offsets. Full-model accuracy and shape-specific performance tuning remain
 separate from this first integration.
+
+### Paired O24a / FP8 benchmark (2026-11-19)
+
+QH128, one query, page64, no split and threshold 6. Each pair uses the same
+random BF16 Q/KV and physical pages. Times are full decode dispatch means in
+microseconds under the paired graph32/30-sample protocol above. FP8 and NVFP4
+use different quantized representations; the ratio is not an equal-precision
+kernel comparison. The FP8 CO is
+`hsa/gfx1250/mla/mla_a8w8_qh128_1tg_32mx4_64nx1_ps64.co`
+(SHA256 `ec9bcb29971bf18d9c347afbfebebac47170165438a4be74d4c8f27f623df85c`).
+
+The comparison-only revision passed 45 selected regression tests on d07-2.
+The measurements use the N16-only producer cleanup; packing is outside timing
+and preserves the N16 bytes consumed by the unchanged decode CO.
+
+**d07-2, gfx1250 B0 — requested repeat**
+
+| Batch | KV tokens | NVFP4 us | FP8 us | FP8 / NVFP4 |
+|---:|---:|---:|---:|---:|
+| 5120 | 5120 | 1399.63 | 1677.46 | 1.1985x |
+| 5120 | 8192 | 2171.23 | 2629.99 | 1.2113x |
+| 5120 | 10240 | 2685.66 | 3282.10 | 1.2221x |
+| 6144 | 5120 | 1680.36 | 2017.27 | 1.2005x |
+| 6144 | 8192 | 2605.87 | 3169.14 | 1.2162x |
+| 6144 | 10240 | 3218.04 | 3950.61 | 1.2276x |
+| 7168 | 5120 | 1959.91 | 2351.34 | 1.1997x |
+| 7168 | 8192 | 3036.21 | 3708.13 | 1.2213x |
+| 7168 | 10240 | 3754.82 | 4628.45 | 1.2327x |
+
+All nine d07-2 pairs passed output, LSE, per-request NRMS, guards and eager/graph
+checks. At each case's maximum request NRMS, NVFP4 spans 0.117564–0.133525 and
+FP8 spans 0.0322255–0.0360402 against the same original-BF16 FP32 reference.
+The largest values are **0.133525 for NVFP4** and **0.0360402 for FP8**.
+Both formats had zero element mismatches at their respective tolerances;
+this does not imply equal accuracy. Full-model accuracy is unverified.
+
+Seven of nine d07-2 ratios exceed 1.2x; the geometric mean is **1.2144x**.
+B5120/KV5120 is **1.1985x** and B7168/KV5120 is **1.1997x**, below the strict
+1.2 target. This is the requested repeat using the same protocol; the initial
+complete sweep gave 1.1991–1.2336x, and both runs retain all samples.
+
+**a07-3 status**
+
+The N16-only revision passed 44 selected regression tests on a07-3 with no
+skips. Its first paired sweep completed eight shapes, then stopped at
+B7168/KV10240 with a GPU memory fault reported in a PyTorch reference GEMM.
+The cause remains unverified. An isolated maximum-case retry followed by a
+fresh complete grid is queued under the shared GPU lock. Complete a07-3
+performance results are pending; the incomplete sweep is excluded from this
+table.
 
 ### O24a validation and decode benchmark (2026-11-19)
 
