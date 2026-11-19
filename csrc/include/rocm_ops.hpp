@@ -494,7 +494,9 @@ namespace py = pybind11;
           py::arg("is_neox") = true,                                                \
           py::arg("compute_all_q_rope") = false,                                    \
           py::arg("q_scale_out") = std::nullopt,                                    \
-          py::arg("kv_cache_scale") = std::nullopt);                                \
+          py::arg("kv_cache_scale") = std::nullopt,                                 \
+          py::arg("scale_layout") = "flydsl",                                     \
+          py::arg("rope_dim") = 64);                                               \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -595,6 +597,15 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("dim"));                                                           \
+    m.def("all_gather_lastdim_add",                                                  \
+          &aiter::all_gather_lastdim_add,                                            \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("add_b"),                                                          \
+          py::arg("add_c")     = std::nullopt,                                       \
+          py::arg("reg_ptr")   = 0,                                                  \
+          py::arg("reg_bytes") = 0);                                                 \
     m.def("all_gather_unreg",                                                        \
           &aiter::all_gather_unreg,                                                  \
           py::arg("_fa"),                                                            \
@@ -1611,22 +1622,23 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
-#define FMHA_FWD_BF16_OPUS_PYBIND                   \
-    m.def("fmha_fwd_bf16_opus_fwd",                 \
-          &fmha_fwd_bf16_opus_fwd,                  \
-          py::arg("q"),                             \
-          py::arg("k"),                             \
-          py::arg("v"),                             \
-          py::arg("out"),                           \
-          py::arg("causal"),                        \
-          py::arg("softmax_scale"),                 \
-          py::arg("lse")            = std::nullopt, \
-          py::arg("seqstart_q")     = std::nullopt, \
-          py::arg("seqstart_k")     = std::nullopt, \
-          py::arg("seqstart_q_pad") = std::nullopt, \
-          py::arg("seqstart_k_pad") = std::nullopt, \
-          py::arg("max_seqlen_q")   = 0,            \
-          py::arg("max_seqlen_k")   = 0);
+#define FMHA_FWD_BF16_OPUS_PYBIND                     \
+    m.def("fmha_fwd_bf16_opus_fwd",                   \
+          &fmha_fwd_bf16_opus_fwd,                    \
+          py::arg("q"),                               \
+          py::arg("k"),                               \
+          py::arg("v"),                               \
+          py::arg("out"),                             \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"),                   \
+          py::arg("lse")              = std::nullopt, \
+          py::arg("seqstart_q")       = std::nullopt, \
+          py::arg("seqstart_k")       = std::nullopt, \
+          py::arg("seqstart_q_pad")   = std::nullopt, \
+          py::arg("seqstart_k_pad")   = std::nullopt, \
+          py::arg("max_seqlen_q")     = 0,            \
+          py::arg("max_seqlen_k")     = 0,            \
+          py::arg("window_size_left") = -1);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
