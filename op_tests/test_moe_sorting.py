@@ -118,6 +118,82 @@ def set_moe_sorting_backend(backend: str) -> None:
         raise ValueError(f"unknown backend: {backend}")
 
 
+# A sort takes microseconds. No progress for this long means a kernel hangs.
+NO_PROGRESS_TIMEOUT_S = 300
+
+
+def _run_in_hang_guard(worker, args, label):
+    """Run worker(progress, *args) in a spawned child and return its rows.
+
+    A hung kernel cannot be stopped from its own process. The worker puts
+    ("start", case), ("row", case) and finally ("done", None) on `progress`; the
+    child is killed after NO_PROGRESS_TIMEOUT_S without a message, so a hang
+    fails the test instead of the CI job.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    progress = ctx.Queue()
+    proc = ctx.Process(target=worker, args=(progress, *args))
+    proc.start()
+    rows, current, done = [], "process start", False
+    deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
+    try:
+        while not done and time.monotonic() < deadline:
+            try:
+                kind, payload = progress.get(timeout=1.0)
+            except queue.Empty:
+                if not proc.is_alive():
+                    break
+                continue
+            deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
+            if kind == "start":
+                current = payload
+            elif kind == "row":
+                rows.append(payload)
+            else:
+                done = True
+        proc.join(timeout=60 if done else 1)
+    finally:
+        hung = proc.is_alive()
+        if hung:
+            proc.kill()
+            proc.join()
+    assert not hung, (
+        f"{label} made no progress for {NO_PROGRESS_TIMEOUT_S}s "
+        f"(GPU hang) at {current}"
+    )
+    assert done and proc.exitcode == 0, (
+        f"{label} worker failed (exit code {proc.exitcode}) at {current}; "
+        "see its traceback above"
+    )
+    return rows
+
+
+def _warm_moe_sorting(backend, dtype, model_dim, topk):
+    """Build or load, in this process, the JIT modules a hang-guarded sort uses.
+
+    The spawned child then only loads them; a cold build there (161 s for
+    module_moe_asm on MI355X) would count against NO_PROGRESS_TIMEOUT_S.
+    """
+    saved_backend = (fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING)
+    set_moe_sorting_backend(backend)
+    try:
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            1, model_dim, 32, topk, dtype, False, padding_extra=0
+        )
+        moe_sorting(
+            topk_ids,
+            topk_weights,
+            32,
+            model_dim,
+            dtype,
+            BLOCK_SIZE_M,
+            dispatch_policy=1,
+        )
+        torch.cuda.synchronize()
+    finally:
+        fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING = saved_backend
+
+
 def run_torch_moe_sorting(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -335,10 +411,8 @@ def _check_aux_outputs(out, topk_ids, block_size, expert_mask=None):
 # The Opus single kernel keeps one LDS row per sub-token. With the 64 KB host-pass
 # LDS size it has no such row from 819 experts up, and dispatch_policy=1 must then
 # take the multi-phase kernels. 818 is the last expert count that fits.
-LDS_FALLBACK_EXPERTS = (818, 896)
+LDS_FALLBACK_EXPERTS = (818, 819, 896)
 LDS_FALLBACK_FIRST_EXPERT = 819
-# A sort takes microseconds. No progress for this long means a kernel hangs.
-LDS_FALLBACK_TIMEOUT_S = 300
 
 
 def test_moe_sorting_opus_oneshot_lds_fallback_dispatch(topk=16):
@@ -413,53 +487,18 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
 
 
 def test_moe_sorting_opus_large_expert_no_hang(dtype, model_dim, topk=16):
-    """Opus sort at the single-kernel LDS limit (818/896 experts, Kimi-K3 topk=16).
+    """Opus sort at the single-kernel LDS limit (818/819/896 experts, topk 16).
 
     Before the fix, a forced or aux single-kernel sort with >= 819 experts looped
     forever on the GPU. A hung kernel cannot be stopped from its own process, so
     the cases run in a child process that is killed when it makes no progress.
     """
-    # Build or load the JIT module here, so the child does not spend its
-    # timeout on a compile.
-    aiter.moe_sorting_opus_get_workspace_size(1, LDS_FALLBACK_EXPERTS[0], topk, 1)
+    _warm_moe_sorting("opus", dtype, model_dim, topk)
 
-    ctx = multiprocessing.get_context("spawn")
-    progress = ctx.Queue()
-    proc = ctx.Process(
-        target=_moe_sorting_opus_lds_fallback_worker,
-        args=(progress, dtype, model_dim, topk),
-    )
-    proc.start()
-    rows, current, done = [], "process start", False
-    deadline = time.monotonic() + LDS_FALLBACK_TIMEOUT_S
-    try:
-        while not done and time.monotonic() < deadline:
-            try:
-                kind, payload = progress.get(timeout=1.0)
-            except queue.Empty:
-                if not proc.is_alive():
-                    break
-                continue
-            deadline = time.monotonic() + LDS_FALLBACK_TIMEOUT_S
-            if kind == "start":
-                current = payload
-            elif kind == "row":
-                rows.append(payload)
-            else:
-                done = True
-        proc.join(timeout=60 if done else 1)
-    finally:
-        hung = proc.is_alive()
-        if hung:
-            proc.kill()
-            proc.join()
-    assert not hung, (
-        f"moe_sorting made no progress for {LDS_FALLBACK_TIMEOUT_S}s "
-        f"(GPU hang) at {current}"
-    )
-    assert done and proc.exitcode == 0, (
-        f"moe_sorting large-expert worker failed (exit code {proc.exitcode}) "
-        f"at {current}; see its traceback above"
+    rows = _run_in_hang_guard(
+        _moe_sorting_opus_lds_fallback_worker,
+        (dtype, model_dim, topk),
+        "Opus moe_sorting",
     )
     aiter.logger.info(
         "moe_sorting Opus single-kernel LDS fallback (markdown):\n%s",
