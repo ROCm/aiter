@@ -32,6 +32,13 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    // CK's dispatch_policy=1 launches the single kernel without checking LDS. With no
+    // sub-token row (num_experts >= 819 under the 64 KB host-pass LDS size) its token loop
+    // advances by sub_tokens == 0 and never ends, so take the mp kernel (policy 2) instead.
+    if(dispatch_policy == 1 && num_tokens > 0 &&
+       ck_tile::moe_sorting_get_sub_token(num_tokens, num_experts) <= 0)
+        dispatch_policy = 2;
+
     int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
     torch::Tensor ws;
     void* ws_ptr = nullptr;

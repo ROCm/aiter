@@ -3,6 +3,9 @@
 
 import argparse
 import itertools
+import multiprocessing
+import queue
+import time
 
 import pandas as pd
 import torch
@@ -687,6 +690,115 @@ def test_moe_sorting_invalid_topk_ids():
     )
 
 
+# The CK single kernel keeps one LDS row per sub-token. With the 64 KB host-pass
+# LDS size it has no such row from 819 experts up, so a forced dispatch_policy=1
+# must take the multi-phase kernels. 818 is the last expert count that fits.
+CK_LDS_FALLBACK_EXPERTS = (818, 819, 896)
+# A sort takes microseconds. No progress for this long means a kernel hangs.
+CK_LDS_FALLBACK_TIMEOUT_S = 300
+
+
+def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
+    """Child process for test_moe_sorting_ck_large_expert_no_hang."""
+    set_moe_sorting_backend("ck")
+    for E, block_size, has_expert_mask, token in itertools.product(
+        CK_LDS_FALLBACK_EXPERTS, (16, 32, 64), (False, True), (1, 64)
+    ):
+        case = {
+            "E": E,
+            "topk": topk,
+            "block_size": block_size,
+            "expert_mask": has_expert_mask,
+            "token": token,
+        }
+        progress.put(("start", case))
+        topk_ids, topk_weights, expert_mask, _ = _build_moe_sorting_inputs(
+            token, model_dim, E, topk, dtype, has_expert_mask, padding_extra=0
+        )
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size, expert_mask)
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            block_size,
+            expert_mask,
+            dispatch_policy=1,
+        )
+        torch.cuda.synchronize()
+        errs = _compare_moe_sorting_outputs(ref, out, topk, token)
+        bad = {name: err for name, err in errs.items() if err}
+        assert not bad, f"CK moe_sorting mismatch at {case}: {bad}"
+        case["err"] = max(errs.values())
+        progress.put(("row", case))
+    progress.put(("done", None))
+
+
+def test_moe_sorting_ck_large_expert_no_hang(dtype, model_dim, topk=16):
+    """CK sort with a forced single kernel at its LDS limit (818/819/896 experts).
+
+    Before the fix, CK's dispatch_policy=1 with >= 819 experts looped forever on
+    the GPU. A hung kernel cannot be stopped from its own process, so the cases
+    run in a child process that is killed when it makes no progress.
+    """
+    # Build or load the CK JIT module here with a small sort that fits LDS, so
+    # the child does not spend its timeout on a compile.
+    saved_backend = (fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING)
+    set_moe_sorting_backend("ck")
+    try:
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            1, model_dim, 32, topk, dtype, False, padding_extra=0
+        )
+        moe_sorting(topk_ids, topk_weights, 32, model_dim, dtype, BLOCK_SIZE_M)
+        torch.cuda.synchronize()
+    finally:
+        fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING = saved_backend
+
+    ctx = multiprocessing.get_context("spawn")
+    progress = ctx.Queue()
+    proc = ctx.Process(
+        target=_moe_sorting_ck_lds_fallback_worker,
+        args=(progress, dtype, model_dim, topk),
+    )
+    proc.start()
+    rows, current, done = [], "process start", False
+    deadline = time.monotonic() + CK_LDS_FALLBACK_TIMEOUT_S
+    try:
+        while not done and time.monotonic() < deadline:
+            try:
+                kind, payload = progress.get(timeout=1.0)
+            except queue.Empty:
+                if not proc.is_alive():
+                    break
+                continue
+            deadline = time.monotonic() + CK_LDS_FALLBACK_TIMEOUT_S
+            if kind == "start":
+                current = payload
+            elif kind == "row":
+                rows.append(payload)
+            else:
+                done = True
+        proc.join(timeout=60 if done else 1)
+    finally:
+        hung = proc.is_alive()
+        if hung:
+            proc.kill()
+            proc.join()
+    assert not hung, (
+        f"CK moe_sorting made no progress for {CK_LDS_FALLBACK_TIMEOUT_S}s "
+        f"(GPU hang) at {current}"
+    )
+    assert done and proc.exitcode == 0, (
+        f"CK moe_sorting large-expert worker failed (exit code {proc.exitcode}) "
+        f"at {current}; see its traceback above"
+    )
+    aiter.logger.info(
+        "moe_sorting CK single-kernel LDS fallback (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_moe_sorting_decode_graph_perf(
     dtype,
     capture_capacity,
@@ -932,6 +1044,7 @@ def main():
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
+        test_moe_sorting_ck_large_expert_no_hang(dtype, args.model_dim)
         df = []
         for (
             padding_extra,
