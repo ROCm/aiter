@@ -5444,10 +5444,10 @@ def get_2stage_cfgs(
             logger.warning(f"Fmoe tuning not support for {keys}")
 
     # A padded call (stored inter_dim, zero-filled intermediate_pad) can reuse a
-    # row tuned at the logical width, but only a FLAT or EMSORT MXFP4 1-stage row:
-    # those kernels launch over the logical columns and stride over the stored ones.
-    # Every other kernel, including POST_REDUCE, computes over the full stored width
-    # it was tuned for.
+    # row tuned at the logical width, but only a FLAT or EMSORT MXFP4 SiLU/GELU
+    # 1-stage row: fmoe_g1u1 launches those over the logical columns and strides
+    # over the stored ones. Every other kernel, including POST_REDUCE and the
+    # Situv2/SwiGLU tiles, computes over the full stored width it was tuned for.
     if (
         cfg is None
         and config_file is None
@@ -5455,6 +5455,7 @@ def get_2stage_cfgs(
         and active_cfg_2stages
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
+        and activation in (ActivationType.Silu, ActivationType.Gelu)
     ):
         logical_keys = (
             keys[:4]
