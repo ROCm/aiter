@@ -204,6 +204,10 @@ def fp8_oracle(x):
         (64, 2048),
         (192, 2048),
         (384, 2048),
+        (32, 8192),
+        (64, 8192),
+        (192, 8192),
+        (384, 8192),
     ],
 )
 def test_output_quant_native_persistent(shape):

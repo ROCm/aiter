@@ -23,13 +23,13 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 from op_tests.triton_tests.utils import mono_native as native
 
 
-def inputs(op, rows):
+def inputs(op, rows, a09_width=2048):
     if op == "a03":
         storage = torch.randn((rows, 1792), device="cuda", dtype=torch.bfloat16)
         wq = torch.randn((1280,), device="cuda", dtype=torch.bfloat16)
         wk = torch.randn((512,), device="cuda", dtype=torch.bfloat16)
         return ((storage[:, :1280], storage[:, 1280:], wq, wk, 1e-20),)
-    return ((torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16),),)
+    return ((torch.randn((rows, a09_width), device="cuda", dtype=torch.bfloat16),),)
 
 
 def distribution(values):
@@ -42,11 +42,11 @@ def distribution(values):
     }
 
 
-def benchmark(op, rows, cache, trials):
+def benchmark(op, rows, cache, trials, a09_width=2048):
     started_utc = datetime.now(timezone.utc).isoformat()
     options = {"min_pool_len": 1, "max_pool_len": 1, "target_rot_pool_sz_mb": 0.0}
     bench = RotatingBufferBench.from_dict(options if cache == "hot" else {})
-    bench.build_pool([lambda: inputs(op, rows)], [("args",)])
+    bench.build_pool([lambda: inputs(op, rows, a09_width)], [("args",)])
     if op == "a03":
         baseline = functools.partial(
             native.fused_dual_rmsnorm_mxfp8_quant, amax_floor=1e-10
@@ -87,6 +87,7 @@ def benchmark(op, rows, cache, trials):
     result.update(
         op=op,
         rows=rows,
+        input_storage_shape=[rows, 1792 if op == "a03" else a09_width],
         cache=cache,
         started_utc=started_utc,
         finished_utc=datetime.now(timezone.utc).isoformat(),
@@ -111,7 +112,8 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--trials", type=int, default=15)
-    parser.add_argument("--rows", type=int, nargs="+", default=[96, 257, 513])
+    parser.add_argument("--rows", type=int, nargs="+", default=[96])
+    parser.add_argument("--a09-width", type=int, default=2048)
     parser.add_argument(
         "--ops",
         nargs="+",
@@ -122,6 +124,8 @@ def main():
     args = parser.parse_args()
     if args.trials < 3 or any(rows <= 0 for rows in args.rows):
         parser.error("Use at least three trials and positive row counts")
+    if args.a09_width <= 0 or args.a09_width % 32:
+        parser.error("A09 width must be a positive multiple of 32")
     require_wave32()
     torch.manual_seed(451)
     root = Path(__file__).resolve().parents[3]
@@ -148,7 +152,9 @@ def main():
     for op in args.ops:
         for rows in args.rows:
             for cache in caches:
-                report["results"].append(benchmark(op, rows, cache, args.trials))
+                report["results"].append(
+                    benchmark(op, rows, cache, args.trials, args.a09_width)
+                )
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 
