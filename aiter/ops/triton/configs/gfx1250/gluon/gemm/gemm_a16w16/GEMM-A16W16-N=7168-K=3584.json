@@ -27,13 +27,16 @@
         "waves_per_eu": 0
     },
     "M_LEQ_64": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 32,
         "BLOCK_K": 512,
+        "kernel_type": "bandwidth_bound",
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 1
+        "waves_per_eu": 1,
+        "num_ctas": 1,
+        "GROUP_SIZE_M": 8,
+        "TDM_STORE": 1
     },
     "M_LEQ_128": {
         "BLOCK_M": 64,
@@ -48,10 +51,13 @@
         "BLOCK_M": 64,
         "BLOCK_N": 128,
         "BLOCK_K": 256,
+        "kernel_type": "bandwidth_bound",
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "num_ctas": 1,
+        "GROUP_SIZE_M": 0,
+        "TDM_STORE": 1
     },
     "M_LEQ_512": {
         "BLOCK_M": 128,
@@ -63,13 +69,16 @@
         "waves_per_eu": 1
     },
     "M_LEQ_1024": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 256,
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
         "BLOCK_K": 128,
+        "kernel_type": "bandwidth_bound",
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "kernel_type": "compute_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "num_ctas": 1,
+        "GROUP_SIZE_M": 8,
+        "TDM_STORE": 1
     },
     "M_LEQ_2048": {
         "BLOCK_M": 256,

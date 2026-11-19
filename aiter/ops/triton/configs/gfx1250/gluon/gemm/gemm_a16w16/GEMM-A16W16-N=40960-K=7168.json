@@ -39,10 +39,13 @@
         "BLOCK_M": 128,
         "BLOCK_N": 256,
         "BLOCK_K": 128,
+        "kernel_type": "bandwidth_bound",
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "kernel_type": "compute_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 1,
+        "num_ctas": 1,
+        "GROUP_SIZE_M": 8,
+        "TDM_STORE": 1
     },
     "M_LEQ_256": {
         "BLOCK_M": 256,
