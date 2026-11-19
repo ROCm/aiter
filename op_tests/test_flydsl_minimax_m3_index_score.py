@@ -2686,6 +2686,15 @@ def check_nvfp4_cp_shards_match_unsharded(S, H, lens, qdt, k_round, tied):
         got = shard[:, :, : cols.numel()]
         live = torch.isfinite(want)
         assert torch.equal(torch.isfinite(got), live), f"rank {rank}: scored blocks"
+        err = checkAllclose(
+            want[live].float(),
+            got[live].float(),
+            atol=0,
+            rtol=0,
+            tol_err_ratio=0,
+            msg=f"cp rank {rank}",
+        )
+        assert err == 0, f"rank {rank}: shard score mismatch fraction {err}"
         assert torch.equal(got[live].view(torch.int32), want[live].view(torch.int32)), (
             f"rank {rank}: {int((got[live] != want[live]).sum())}/{int(live.sum())} "
             "shard scores differ from the unsharded ones"
