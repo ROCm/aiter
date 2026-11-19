@@ -21,9 +21,18 @@ from triton.runtime.jit import compute_cache_key, create_function_from_signature
 
 from aiter.ops.triton.utils import fast_launch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fast_launch needs a GPU"
-)
+
+def _runs_on_cpu(test):
+    test.runs_on_cpu = True
+    return test
+
+
+@pytest.fixture(autouse=True)
+def _needs_a_gpu(request):
+    if not torch.cuda.is_available() and not getattr(
+        request.function, "runs_on_cpu", False
+    ):
+        pytest.skip("fast_launch needs a GPU")
 
 
 @triton.jit
@@ -66,6 +75,32 @@ def _offset_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + _OFFSET, mask=mask)
+
+
+class _CountedConstexpr(tl.constexpr):
+    """A constexpr that counts the equality checks it takes part in."""
+
+    compared = 0
+
+    def __eq__(self, other):
+        _CountedConstexpr.compared += 1
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        _CountedConstexpr.compared += 1
+        return super().__ne__(other)
+
+    __hash__ = tl.constexpr.__hash__
+
+
+_COUNTED = _CountedConstexpr(1.0)
+
+
+@triton.jit
+def _counted_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + _COUNTED, mask=mask)
 
 
 # Not every supported Triton build has this knob.
@@ -301,14 +336,21 @@ def _axpy(wrapped, x, y, out, alpha=0.5, style="positional"):
         wrapped[grid](x, y, out, n, alpha, 128, num_warps=4)
     elif style == "mixed":
         wrapped[grid](x, y, out, n=n, alpha=alpha, BLOCK=128, num_warps=4)
-    else:
+    elif style == "callable_grid":
         grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
         wrapped[grid](x, y, out, n, alpha=alpha, BLOCK=128, num_warps=4)
+    else:
+        grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+        wrapped[grid](
+            x_ptr=x, y_ptr=y, out_ptr=out, n=n, alpha=alpha, BLOCK=128, num_warps=4
+        )
     return out
 
 
 @pytest.mark.parametrize("by_specialization", [False, True])
-@pytest.mark.parametrize("style", ["positional", "mixed", "callable_grid"])
+@pytest.mark.parametrize(
+    "style", ["positional", "mixed", "callable_grid", "keywords_callable_grid"]
+)
 def test_cached_launch_matches_ordinary_launch(by_specialization, style):
     wrapped = fast_launch.fast_launch(_axpy_kernel, by_specialization=by_specialization)
     for n in (1000, 4096, 1000, 77):
@@ -425,6 +467,46 @@ def test_a_changed_global_raises_as_triton_does(monkeypatch):
         wrapped[(2,)](x, out, 256, BLOCK=128)
 
 
+def test_a_hit_compares_globals_only_after_a_rebind(monkeypatch):
+    wrapped = fast_launch.fast_launch(_counted_kernel)
+    x = torch.randn(256, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    def launches(count):
+        _CountedConstexpr.compared = 0
+        with fast_launch.recording() as misses:
+            for _ in range(count):
+                wrapped[(2,)](x, out, 256, BLOCK=128)
+        assert misses == []
+        torch.testing.assert_close(out, x + 1.0, rtol=0, atol=0)
+        return _CountedConstexpr.compared
+
+    wrapped[(2,)](x, out, 256, BLOCK=128)
+    launches(1)
+    assert launches(3) == 0, "a hit with no rebind must not compare values"
+    # Rebound to an equal value: Triton accepts it, so the entry still serves.
+    monkeypatch.setitem(globals(), "_COUNTED", _CountedConstexpr(1.0))
+    assert launches(1) > 0
+    assert launches(3) == 0
+
+
+def test_a_global_changed_in_place_is_not_caught_on_a_hit(monkeypatch):
+    """The documented limit of the identity check; Triton's own check would
+    catch it."""
+    offset = tl.constexpr(2.0)
+    monkeypatch.setitem(globals(), "_OFFSET", offset)
+    wrapped = fast_launch.fast_launch(_offset_kernel)
+    x = torch.randn(256, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+    for _ in range(2):
+        wrapped[(2,)](x, out, 256, BLOCK=128)
+    offset.value = 3.0
+    wrapped[(2,)](x, out, 256, BLOCK=128)
+    torch.testing.assert_close(out, x + 2.0, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="_OFFSET"):
+        _offset_kernel[(2,)](x, out, 256, BLOCK=128)
+
+
 def test_a_config_pre_hook_runs_on_every_launch():
     calls = []
     tuned = triton.autotune(
@@ -485,6 +567,7 @@ def test_an_int_out_of_range_fails_only_its_own_launch():
     torch.testing.assert_close(got, x * 0.5 + y, rtol=0, atol=0)
 
 
+@_runs_on_cpu
 def test_an_interpreted_kernel_takes_the_ordinary_path(monkeypatch):
     """Under TRITON_INTERPRET=1, `triton.jit` returns an InterpretedFunction."""
     monkeypatch.setenv("TRITON_INTERPRET", "1")
@@ -493,7 +576,9 @@ def test_an_interpreted_kernel_takes_the_ordinary_path(monkeypatch):
     )
     monkeypatch.delenv("TRITON_INTERPRET")
     wrapped = fast_launch.fast_launch(interpreted)
-    x, y, out = (t.cpu() for t in _axpy_inputs(256))
+    gen = torch.Generator().manual_seed(0)
+    x, y = (torch.randn(256, generator=gen) for _ in range(2))
+    out = torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
     with fast_launch.recording() as misses:
         wrapped[grid](x, y, out, 256, 0.5)

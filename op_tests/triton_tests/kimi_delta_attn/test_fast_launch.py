@@ -21,7 +21,9 @@ import importlib
 
 import pytest
 import torch
+from triton.runtime.autotuner import Autotuner, Heuristics
 
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import flash_kda_fwd
 from aiter.ops.triton.utils import fast_launch
 
@@ -239,3 +241,30 @@ def test_alignment_is_part_of_the_key():
     got_o, got_s = run(misaligned)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_prepare_fast", "_segment_fast", "_seg_scan_fast", "_seg_scan_prefetch_fast"],
+)
+def test_no_config_choice_reads_a_shape(name):
+    """What lets these launchers pass key_shapes=False: no heuristic reads a
+    shape or stride, and no autotuner prunes or models configs from the
+    arguments (its key holds ints and bools only)."""
+    wrapped = getattr(flash_kda, name)
+    assert wrapped._key_shapes is False
+    params = wrapped._jit.arg_names
+    # Same names, tensors that differ only in shape and strides.
+    a = {n: torch.empty(2, 8) for n in params}
+    b = {n: torch.empty(4, 3).t() for n in params}
+    heuristics = 0
+    k = wrapped._kernel
+    while k is not wrapped._jit:
+        if isinstance(k, Heuristics):
+            heuristics += 1
+            for target, heur in k.values.items():
+                assert heur(a) == heur(b), target
+        if isinstance(k, Autotuner):
+            assert k.early_config_prune is None and k.perf_model is None
+        k = k.fn
+    assert heuristics

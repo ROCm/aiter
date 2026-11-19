@@ -27,7 +27,9 @@ of positional arguments, the keyword names, and for each argument:
   and strides, which a ``@triton.heuristics`` function can read. An autotuner
   keys on the values of its ``key`` arguments and on dtypes, which the key
   already holds. ``fast_launch(kernel, key_shapes=False)`` leaves shapes and
-  strides out, for a kernel whose heuristics read none;
+  strides out, for a kernel whose heuristics read none. A heuristic that reads
+  any other tensor property (``data_ptr()``, ``storage_offset()``, the device,
+  the values) is keyed in neither mode and is not supported;
 * any other value: its type and value.
 
 With ``fast_launch(kernel, by_specialization=True)``, a plain ``@triton.jit``
@@ -38,11 +40,17 @@ whose sizes change on every call then hits without a miss per size.
 
 These launches go through ``kernel[grid]`` and are not cached: launches with a
 launch-enter or launch-exit hook, a pre-run hook, or a stages-inspection hook;
-launches under torch.compile tracing; launches whose checked global values
-changed since the compile (Triton raises for them); launches of an autotuned
-config that has a ``pre_hook``; launches with a tuple argument or with an
-argument that cannot be hashed, after which the wrapper stays on the ordinary
-path.
+launches under torch.compile tracing; launches after a global the kernel reads
+was rebound to an unequal value (Triton raises for them); launches of an
+autotuned config that has a ``pre_hook``; launches of a kernel built under
+``TRITON_INTERPRET=1``; launches with a tuple argument or with an argument that
+cannot be hashed, after which the wrapper stays on the ordinary path.
+
+A hit checks those globals by identity against the objects seen at the last
+full check, and runs Triton's equality check only after a rebind. A global
+changed in place, which Triton's own check would catch, is therefore not
+caught on a hit. Gluon layouts are frozen dataclasses; a ``tl.constexpr`` is
+not.
 """
 
 import contextlib
@@ -129,6 +137,19 @@ def _tensor_spec(v) -> tuple:
     return (v.dtype, v.data_ptr() % 16 == 0, v.untyped_storage().nbytes() <= _MAX_INT32)
 
 
+def _same_objects(groups) -> bool:
+    """Whether every `globals_dict[name]` is still `obj`, for
+    `groups = ((globals_dict, ((name, obj), ...)), ...)`."""
+    try:
+        for globals_dict, objs in groups:
+            for name, obj in objs:
+                if globals_dict[name] is not obj:
+                    return False
+    except KeyError:
+        return False
+    return True
+
+
 def _picker(positions):
     """`values -> tuple(values[i] for i in positions)`."""
     if len(positions) > 1:
@@ -193,6 +214,9 @@ class _FastLaunch:
         # every launch.
         self._get_device = None
         self._get_stream = None
+        # (`used_global_vals`, ((globals dict, ((name, object), ...)), ...)) as
+        # of the last full check that passed.
+        self._globals_seen = None
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -229,7 +253,11 @@ class _FastLaunch:
             # pinned every tensor of the call that created the entry, and handed
             # a shape-dependent grid the extents of a call already returned.
             if type(grid) is not tuple and callable(grid):
-                g = grid(ChainMap(dict(zip(names, args)), kwargs, frozen))
+                g = grid(
+                    ChainMap(dict(zip(names, args)), kwargs, frozen)
+                    if args
+                    else ChainMap(kwargs, frozen)
+                )
             else:
                 g = grid
             run(
@@ -261,10 +289,28 @@ class _FastLaunch:
         )
 
     def _globals_changed(self) -> bool:
-        """Whether a global the kernel read at compile time has changed."""
-        for (name, _), (val, globals_dict) in self._jit.used_global_vals.items():
+        """Whether a global the kernel read at compile time was rebound to an
+        unequal value. Triton keeps deep copies, and comparing a Gluon layout
+        with its copy costs far more than the rest of a hit, so the comparison
+        runs only when a global is no longer the object seen last time."""
+        used = self._jit.used_global_vals
+        seen = self._globals_seen
+        if seen is not None and seen[0] is used and _same_objects(seen[1]):
+            return False
+        for (name, _), (val, globals_dict) in used.items():
             if globals_dict.get(name, _MISSING) != val:
                 return True
+        groups = {}
+        for (name, _), (_, globals_dict) in used.items():
+            groups.setdefault(id(globals_dict), (globals_dict, []))[1].append(
+                (name, globals_dict.get(name, _MISSING))
+            )
+        self._globals_seen = (
+            used,
+            tuple(
+                (globals_dict, tuple(objs)) for globals_dict, objs in groups.values()
+            ),
+        )
         return False
 
     def _key(self, device, args, kwargs) -> tuple:
@@ -436,7 +482,8 @@ def fast_launch(
     specialization classes instead of by value; it raises ``ValueError`` for a
     wrapped kernel. ``key_shapes=False`` leaves tensor shapes and strides out
     of the key of a wrapped kernel; pass it only when no ``@triton.heuristics``
-    function of the kernel reads a shape or stride. Launches return what
+    function of the kernel reads a shape or stride. A heuristic that reads any
+    other tensor property is not supported in either mode. Launches return what
     ``kernel[grid](...)`` returns.
     """
     return _FastLaunch(kernel, by_specialization, key_shapes)
