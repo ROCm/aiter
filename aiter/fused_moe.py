@@ -1191,6 +1191,12 @@ def fused_moe(
     clamp_shared: bool = True,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    # (payload, scale): also write hidden_states as MXFP8 for a consumer of the
+    # unrouted rows (e.g. a shared expert run outside this call): row-major
+    # (M, model_dim) E4M3 and (M, model_dim // 32) E8M0, the bytes of
+    # per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0). The gfx1250
+    # grouped path folds it into its A1 quant; elsewhere it is its own launch.
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1254,6 +1260,10 @@ def fused_moe(
             )
         from aiter.fhmoe import _fhmoe
 
+        if mxfp8_copy_out is not None:
+            from aiter.ops.flydsl.moe_kernels import mxfp8_row_copy
+
+            mxfp8_row_copy(hidden_states, mxfp8_copy_out)
         return _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
@@ -1341,6 +1351,8 @@ def fused_moe(
         quant_dtype_a2,  # quant_dtype_a2
         herd_topk,  # herd_topk
         herd_routed_scaling_factor,  # herd_routed_scaling_factor
+        None if mxfp8_copy_out is None else mxfp8_copy_out[0],  # mxfp8_copy_payload
+        None if mxfp8_copy_out is None else mxfp8_copy_out[1],  # mxfp8_copy_scale
     )
 
 
@@ -1385,6 +1397,8 @@ def fused_moe_fake(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    mxfp8_copy_payload: torch.Tensor | None = None,
+    mxfp8_copy_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1448,6 +1462,8 @@ def fused_moe_(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    mxfp8_copy_payload: torch.Tensor | None = None,
+    mxfp8_copy_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1493,6 +1509,11 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        mxfp8_copy_out=(
+            None
+            if mxfp8_copy_payload is None
+            else (mxfp8_copy_payload, mxfp8_copy_scale)
+        ),
     )
 
 
@@ -1529,6 +1550,7 @@ def _fused_moe_impl(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1680,10 +1702,16 @@ def _fused_moe_impl(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            mxfp8_copy_out=mxfp8_copy_out,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if mxfp8_copy_out is not None:
+        # No grouped A1 quant ran to fold it into.
+        from aiter.ops.flydsl.moe_kernels import mxfp8_row_copy
+
+        mxfp8_row_copy(hidden_states, mxfp8_copy_out)
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
