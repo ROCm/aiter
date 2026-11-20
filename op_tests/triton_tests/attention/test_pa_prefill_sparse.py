@@ -6,6 +6,15 @@ import torch
 
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.utils.dsv4_sparse_attn import (
+    V4_DIM_QK,
+    V4_FP8,
+    v4_pack_2buff,
+    v4_unpack_2buff,
+)
+from op_tests.triton_tests.utils.dsv4_sparse_attn import (
+    make_pa_prefill_sparse_inputs as _make_inputs,
+)
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -100,111 +109,6 @@ def _sparse_prefill_attn_torch(
         out[t] = torch.einsum("hk,kd->hd", weights_kv, all_kv)
 
     return out.to(q.dtype)
-
-
-# ---------------------------------------------------------------------------
-# Input builder
-# ---------------------------------------------------------------------------
-
-
-def _make_inputs(
-    T: int,
-    H: int,
-    D: int,
-    prefix_len_per_token: int,
-    extend_len_per_token: int,
-    total_pages: int,
-    total_extend_tokens: int,
-    dtype=torch.bfloat16,
-    seed: int = 0,
-    include_sentinels: bool = False,
-    variable_len: bool = False,
-):
-    torch.manual_seed(seed)
-    device = torch.device("cuda")
-
-    q = torch.randn(T, H, D, dtype=dtype, device=device) * 0.5
-    unified_kv = torch.randn(total_pages, D, dtype=dtype, device=device) * 0.5
-    kv = torch.randn(total_extend_tokens, D, dtype=dtype, device=device) * 0.5
-    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
-
-    # Prefix per-token lengths
-    if variable_len:
-        p_lens = torch.randint(
-            low=1,
-            high=prefix_len_per_token + 1,
-            size=(T,),
-            device=device,
-            dtype=torch.int64,
-        )
-    else:
-        p_lens = torch.full(
-            (T,), prefix_len_per_token, device=device, dtype=torch.int64
-        )
-
-    p_indptr = torch.zeros(T + 1, device=device, dtype=torch.int64)
-    p_indptr[1:] = p_lens.cumsum(0)
-    total_p = int(p_indptr[-1].item())
-
-    p_indices = torch.randint(
-        low=0,
-        high=total_pages,
-        size=(total_p,),
-        device=device,
-        dtype=torch.int32,
-    )
-
-    # Extend per-token lengths
-    if variable_len:
-        e_lens = torch.randint(
-            low=1,
-            high=extend_len_per_token + 1,
-            size=(T,),
-            device=device,
-            dtype=torch.int64,
-        )
-    else:
-        e_lens = torch.full(
-            (T,), extend_len_per_token, device=device, dtype=torch.int64
-        )
-
-    e_indptr = torch.zeros(T + 1, device=device, dtype=torch.int64)
-    e_indptr[1:] = e_lens.cumsum(0)
-    total_e = int(e_indptr[-1].item())
-
-    e_indices = torch.randint(
-        low=0,
-        high=total_extend_tokens,
-        size=(total_e,),
-        device=device,
-        dtype=torch.int32,
-    )
-
-    if include_sentinels:
-        if total_p > 0:
-            n_s = max(1, total_p // 16)
-            pos = torch.randperm(total_p, device=device)[:n_s]
-            p_indices[pos] = -1
-        if total_e > 0:
-            n_s = max(1, total_e // 16)
-            pos = torch.randperm(total_e, device=device)[:n_s]
-            e_indices[pos] = -1
-
-    p_indptr = p_indptr.to(torch.int32)
-    e_indptr = e_indptr.to(torch.int32)
-    softmax_scale = float(D) ** -0.5
-
-    return (
-        q,
-        unified_kv,
-        p_indices,
-        p_indptr,
-        kv,
-        e_indices,
-        e_indptr,
-        attn_sink,
-        softmax_scale,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -748,3 +652,264 @@ def test_pa_prefill_sparse_nonfinite_row0_ignored_by_invalid_slots():
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# DSv4 "2buff" packed-fp8 prefill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="packed-fp8 prefill is gfx1250-only",
+)
+@pytest.mark.parametrize("T", [1024, 4096])
+@pytest.mark.parametrize("H", [64])
+@pytest.mark.parametrize("prefix_len", [134, 352])
+@pytest.mark.parametrize("sentinels", [False, True])
+def test_pa_prefill_sparse_v4_2buff_prefix_only(T, H, prefix_len, sentinels):
+    """Packed-fp8 prefix-only prefill (kv=None) against the bf16 kernel on the
+    round-tripped tensors, so only the kernel is under test."""
+    D = V4_DIM_QK
+    # extend_len=1 because the builder needs a non-empty range; kv is unused.
+    q, unified_kv, p_idx, p_indptr, _, _, _, attn_sink, scale = _make_inputs(
+        T,
+        H,
+        D,
+        prefix_len,
+        1,
+        total_pages=max(T * 2, prefix_len * 32),
+        total_extend_tokens=8,
+        include_sentinels=sentinels,
+        variable_len=True,
+    )
+
+    q_packed, q_rope = v4_pack_2buff(q)
+    kv_packed, kv_rope = v4_pack_2buff(unified_kv)
+
+    out = pa_prefill_sparse(
+        q_packed,
+        kv_packed,
+        p_idx,
+        p_indptr,
+        None,
+        None,
+        None,
+        attn_sink,
+        scale,
+        q_rope=q_rope,
+        unified_kv_rope=kv_rope,
+    )
+
+    ref = pa_prefill_sparse(
+        v4_unpack_2buff(q_packed, q_rope),
+        v4_unpack_2buff(kv_packed, kv_rope),
+        p_idx,
+        p_indptr,
+        torch.zeros(1, D, dtype=torch.bfloat16, device=q.device),
+        torch.zeros(T, dtype=torch.int32, device=q.device),
+        torch.zeros(T + 1, dtype=torch.int32, device=q.device),
+        attn_sink,
+        scale,
+    )
+
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="packed-fp8 prefill is gfx1250-only",
+)
+@pytest.mark.parametrize("T", [1024, 4096])
+@pytest.mark.parametrize("prefix_len", [134, 352])
+@pytest.mark.parametrize("extend_len", [1, 64])
+def test_pa_prefill_sparse_v4_2buff_two_pool(T, prefix_len, extend_len):
+    """Packed-fp8 prefill over both pools against bf16 on the round-tripped
+    tensors."""
+    D = V4_DIM_QK
+    q, unified_kv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
+        T,
+        64,
+        D,
+        prefix_len,
+        extend_len,
+        total_pages=max(T * 2, prefix_len * 32),
+        total_extend_tokens=max(T, extend_len * 8),
+        include_sentinels=True,
+        variable_len=True,
+    )
+    q_packed, q_rope = v4_pack_2buff(q)
+    kv_packed, kv_rope_p = v4_pack_2buff(unified_kv)
+    ext_packed, ext_rope = v4_pack_2buff(kv)
+
+    out = pa_prefill_sparse(
+        q_packed,
+        kv_packed,
+        p_idx,
+        p_indptr,
+        ext_packed,
+        e_idx,
+        e_indptr,
+        sink,
+        scale,
+        q_rope=q_rope,
+        unified_kv_rope=kv_rope_p,
+        kv_rope=ext_rope,
+    )
+    ref = pa_prefill_sparse(
+        v4_unpack_2buff(q_packed, q_rope),
+        v4_unpack_2buff(kv_packed, kv_rope_p),
+        p_idx,
+        p_indptr,
+        v4_unpack_2buff(ext_packed, ext_rope),
+        e_idx,
+        e_indptr,
+        sink,
+        scale,
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+_V4_REC_BYTES = 640  # 512 B packed fp8 plane || 128 B bf16 RoPE plane
+
+
+def _v4_record_grid_views(pools):
+    """Copy ``[(packed, rope), ...]`` into one 640 B-row allocation and return
+    strided (packed, rope) views of it, as the vLLM allocator lays them out."""
+    n = sum(p.shape[0] for p, _ in pools)
+    dev = pools[0][0].device
+    flat = torch.zeros((n, _V4_REC_BYTES), dtype=torch.uint8, device=dev)
+    views, off = [], 0
+    for packed, rope in pools:
+        m = packed.shape[0]
+        rows = flat[off : off + m]
+        rows[:, :V4_DIM_QK] = packed.view(torch.uint8)
+        rows[:, V4_DIM_QK:] = rope.reshape(m, -1).view(torch.uint8)
+        views.append(
+            (
+                rows[:, :V4_DIM_QK].view(V4_FP8),
+                rows[:, V4_DIM_QK:].view(torch.bfloat16),
+            )
+        )
+        off += m
+    return views
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="packed-fp8 prefill is gfx1250-only",
+)
+@pytest.mark.parametrize("T", [1024])
+@pytest.mark.parametrize("prefix_len,extend_len", [(134, 64), (352, 1)])
+def test_pa_prefill_sparse_v4_2buff_record_grid_views(T, prefix_len, extend_len):
+    """Strided 640 B-row planes give the same bits as compact planes."""
+    D = V4_DIM_QK
+    q, unified_kv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
+        T,
+        64,
+        D,
+        prefix_len,
+        extend_len,
+        total_pages=max(T * 2, prefix_len * 32),
+        total_extend_tokens=max(T, extend_len * 8),
+        include_sentinels=True,
+        variable_len=True,
+    )
+    q_packed, q_rope = v4_pack_2buff(q)
+    kv_packed, kv_rope_p = v4_pack_2buff(unified_kv)
+    ext_packed, ext_rope = v4_pack_2buff(kv)
+
+    def run(prefix, extend):
+        return pa_prefill_sparse(
+            q_packed,
+            prefix[0],
+            p_idx,
+            p_indptr,
+            extend[0],
+            e_idx,
+            e_indptr,
+            sink,
+            scale,
+            q_rope=q_rope,
+            unified_kv_rope=prefix[1],
+            kv_rope=extend[1],
+        )
+
+    contiguous = run((kv_packed, kv_rope_p), (ext_packed, ext_rope))
+    gridded = run(
+        *_v4_record_grid_views([(kv_packed, kv_rope_p), (ext_packed, ext_rope)])
+    )
+
+    assert torch.equal(gridded, contiguous), (
+        "640-byte record-grid views diverged from contiguous planes; "
+        f"max |diff| = {(gridded.float() - contiguous.float()).abs().max().item()}"
+    )
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="packed-fp8 prefill is gfx1250-only",
+)
+def test_pa_prefill_sparse_v4_2buff_two_pool_needs_kv_rope():
+    """A pre-split extend pool without kv_rope raises."""
+    T, H, D = 8, 64, V4_DIM_QK
+    q, unified_kv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
+        T, H, D, 16, 4, total_pages=64, total_extend_tokens=64
+    )
+    q_packed, q_rope = v4_pack_2buff(q)
+    kv_packed, kv_rope_p = v4_pack_2buff(unified_kv)
+    ext_packed, _ = v4_pack_2buff(kv)
+    with pytest.raises(ValueError, match="kv_rope"):
+        pa_prefill_sparse(
+            q_packed,
+            kv_packed,
+            p_idx,
+            p_indptr,
+            ext_packed,
+            e_idx,
+            e_indptr,
+            sink,
+            scale,
+            q_rope=q_rope,
+            unified_kv_rope=kv_rope_p,  # kv_rope missing
+        )
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="packed-fp8 prefill is gfx1250-only",
+)
+def test_pa_prefill_sparse_v4_2buff_needs_sink():
+    """The packed-fp8 path raises without attn_sink."""
+    T, H, D = 8, 64, V4_DIM_QK
+    q, unified_kv, p_idx, p_indptr, _, _, _, _, scale = _make_inputs(
+        T, H, D, 16, 1, total_pages=64, total_extend_tokens=8
+    )
+    q_packed, q_rope = v4_pack_2buff(q)
+    kv_packed, kv_rope = v4_pack_2buff(unified_kv)
+    with pytest.raises(ValueError, match="attn_sink"):
+        pa_prefill_sparse(
+            q_packed,
+            kv_packed,
+            p_idx,
+            p_indptr,
+            None,
+            None,
+            None,
+            None,
+            scale,
+            q_rope=q_rope,
+            unified_kv_rope=kv_rope,
+        )
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx1250-strict", "gfx950"])
+def test_pa_prefill_sparse_v4_2buff_implicit_arch_gate(monkeypatch, arch):
+    """A one-tensor 640 B cache selects the packed path on both gfx1250 names
+    only."""
+    import aiter.ops.triton.attention.pa_prefill_sparse as pps
+
+    monkeypatch.setattr(pps, "DEVICE_ARCH", arch)
+    cache = torch.zeros((2, 64, 640), dtype=torch.uint8, device="cuda")
+    q = torch.zeros((1, 16, V4_DIM_QK), dtype=torch.bfloat16, device="cuda")
+    assert pps._is_v4_2buff(q, cache, None, None) == (arch != "gfx950")

@@ -10,6 +10,7 @@ import triton
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import checkAllclose
+from op_tests.triton_tests.utils.dsv4_sparse_attn import v4_pack_2buff, v4_unpack_2buff
 
 
 def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale):
@@ -328,56 +329,6 @@ def test_pa_decode_sparse_vs_reference(
 _V4_DIM_NOPE = 448
 _V4_DIM_ROPE = 64
 _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512
-_V4_TILE = 64
-_V4_NUM_TILES = _V4_DIM_NOPE // _V4_TILE  # 7
-_V4_FP8 = torch.float8_e4m3fn  # OCP e4m3, what the asm .co consumes
-
-
-def v4_pack_2buff(x_bf16):
-    """``[..., 512]`` bf16 (NoPE||RoPE) -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``."""
-    assert x_bf16.shape[-1] == _V4_DIM_QK
-    lead = x_bf16.shape[:-1]
-    nope = x_bf16[..., :_V4_DIM_NOPE].float()
-    rope = x_bf16[..., _V4_DIM_NOPE:].contiguous()
-
-    tiled = nope.reshape(*lead, _V4_NUM_TILES, _V4_TILE)
-    fp8_max = float(torch.finfo(_V4_FP8).max)
-    # amax/fp8_max rounded UP to a power of two, exactly as E8M0 stores it.
-    scale = torch.pow(
-        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
-    )
-    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(_V4_FP8).reshape(*lead, _V4_DIM_NOPE)
-    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
-
-    packed = torch.zeros((*lead, _V4_DIM_QK), dtype=torch.uint8, device=x_bf16.device)
-    packed[..., :_V4_DIM_NOPE] = nope_fp8.view(torch.uint8)
-    # the kernel reads each group's scale twice (its scaled-MMA blocks are 32
-    # elements wide, the quant group is 64), so duplicate every byte
-    packed[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES] = (
-        e8m0.repeat_interleave(2, dim=-1)
-    )
-    return packed.view(_V4_FP8), rope
-
-
-def v4_unpack_2buff(packed, rope):
-    """Inverse of ``v4_pack_2buff`` -> ``[..., 512]`` bf16."""
-    lead = packed.shape[:-1]
-    u8 = packed.view(torch.uint8)
-    nope = (
-        u8[..., :_V4_DIM_NOPE]
-        .view(_V4_FP8)
-        .float()
-        .reshape(*lead, _V4_NUM_TILES, _V4_TILE)
-    )
-    # one byte per group: read the first of each duplicated pair
-    exps = u8[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES : 2].to(torch.int32)
-    scale = torch.pow(2.0, (exps - 127).float())
-    out = torch.empty((*lead, _V4_DIM_QK), dtype=torch.bfloat16, device=packed.device)
-    out[..., :_V4_DIM_NOPE] = (
-        (nope * scale.unsqueeze(-1)).reshape(*lead, _V4_DIM_NOPE).to(torch.bfloat16)
-    )
-    out[..., _V4_DIM_NOPE:] = rope
-    return out
 
 
 @pytest.mark.parametrize("T", [1, 32, 512])

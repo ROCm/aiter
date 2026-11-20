@@ -1,0 +1,5 @@
+{
+    "_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel": {
+        "HCA_BLOCK": 128
+    }
+}
