@@ -13,7 +13,9 @@
 #include "aiter_hip_common.h"  // HipDeviceGuard, get_gpu_arch
 #include "rocm_ops.hpp"        // pybind11 + namespace py + aiter_tensor_t caster
 #include <array>
+#include <atomic>
 #include <fcntl.h>
+#include <unordered_map>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -747,75 +749,31 @@ hipblasStatus_t hipblasLt_online_tuning(
 /**
  * hipBLASLt GEMM call
  */
-hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
-                                            hipblasOperation_t op_A,
-                                            hipblasOperation_t op_B,
-                                            int m,
-                                            int n,
-                                            int k,
-                                            const void* alpha,
-                                            const void* a,
-                                            int lda,
-                                            const void* scaleA,
-                                            const void* b,
-                                            int ldb,
-                                            const void* scaleB,
-                                            const void* beta,
-                                            void* c,
-                                            int ldc,
-                                            const void* scaleC,
-                                            const void* bias,
-                                            hipDataType intype,
-                                            hipDataType outtype,
-                                            const hipStream_t& stream,
-                                            int solution_index,
-                                            bool bpreshuffle,
-                                            bool use_gelu,
-                                            hipblasLtMatmulMatrixScale_t scaleA_mode,
-                                            hipblasLtMatmulMatrixScale_t scaleB_mode)
+namespace {
+// The layouts and matmul descriptor of one GEMM.
+void create_matmul_descs(hipblasOperation_t op_A,
+                         hipblasOperation_t op_B,
+                         int m,
+                         int n,
+                         int k,
+                         int lda,
+                         int ldb,
+                         int ldc,
+                         const void* scaleA,
+                         const void* scaleB,
+                         const void* scaleC,
+                         const void* bias,
+                         hipDataType intype,
+                         hipDataType outtype,
+                         bool bpreshuffle,
+                         bool use_gelu,
+                         hipblasLtMatmulMatrixScale_t scaleA_mode,
+                         hipblasLtMatmulMatrixScale_t scaleB_mode,
+                         hipblasLtMatrixLayout_t& matA,
+                         hipblasLtMatrixLayout_t& matB,
+                         hipblasLtMatrixLayout_t& matC,
+                         hipblasLtMatmulDesc_t& matmul)
 {
-    // TODO: flag is not supported for hipblasLt yet
-    int flag{0};
-    // if (dtype == HIPBLAS_R_16F) {
-    //  use fp16 alt impl for MI200
-    //  https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    // flag = rocblas_gemm_flags_fp16_alt_impl;
-    //}
-
-    // Max value of N dimension for decode GEMM
-    int decode_max_n = 512;
-    // The CSV's use_rowwise key cannot represent mixed or MXFP8 scale modes.
-    bool tuning_mode_supported = scaleA_mode == scaleB_mode &&
-        (scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F ||
-         scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F);
-
-    // load tuning cache file and check if the gemm has been already tuned
-    const char* env = std::getenv("HIP_ONLINE_TUNING");
-    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
-    // check if there is enough memory left for online tuning
-    if (online_tuning) {
-        size_t freeMem, totalMem;
-        hipMemGetInfo(&freeMem, &totalMem);
-        if (freeMem <= 128*1024*1024) {
-            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
-            online_tuning = false;
-        }
-    }
-
-    if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
-      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
-                                                  bpreshuffle,
-                                                  op_A, op_B, m, n, k,
-                                                  intype, lda, 0,
-                                                  intype, ldb, 0,
-                                                  outtype, ldc, 0,
-                                                  HIPBLAS_COMPUTE_32F, 1,
-                                                  scaleA_mode, scaleB_mode);
-    }
-
-    // nvtxRangePushA("hipBLASLt variables creation");
-    hipblasLtMatrixLayout_t matA, matB, matC;
-    hipblasLtMatmulDesc_t matmul;
     if(op_A == HIPBLAS_OP_N)
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, m, k, lda));
@@ -901,6 +859,271 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
     }
+}
+
+// An unscaled GEMM with a given solution index builds the same layouts,
+// descriptor and algorithm on every call, so they are kept per configuration.
+// Only the bias pointer changes from call to call.
+struct GemmPlanKey
+{
+    hipblasOperation_t op_A;
+    hipblasOperation_t op_B;
+    int m;
+    int n;
+    int k;
+    int lda;
+    int ldb;
+    int ldc;
+    hipDataType intype;
+    hipDataType outtype;
+    int solution_index;
+    bool bpreshuffle;
+    bool bias;
+    bool use_gelu;
+
+    bool operator==(const GemmPlanKey&) const = default;
+};
+
+struct GemmPlanKeyHash
+{
+    size_t operator()(const GemmPlanKey& key) const
+    {
+        size_t h = 0;
+        for(int64_t v : {int64_t(key.op_A),
+                         int64_t(key.op_B),
+                         int64_t(key.m),
+                         int64_t(key.n),
+                         int64_t(key.k),
+                         int64_t(key.lda),
+                         int64_t(key.ldb),
+                         int64_t(key.ldc),
+                         int64_t(key.intype),
+                         int64_t(key.outtype),
+                         int64_t(key.solution_index),
+                         int64_t(key.bpreshuffle) | int64_t(key.bias) << 1 |
+                             int64_t(key.use_gelu) << 2})
+            h = h * 1000003 ^ std::hash<int64_t>{}(v);
+        return h;
+    }
+};
+
+struct GemmPlan
+{
+    hipblasLtMatrixLayout_t matA, matB, matC;
+    hipblasLtMatmulDesc_t matmul;
+    hipblasLtMatmulAlgo_t algo;
+};
+
+// Prefill sees a new M per batch; past this many configurations the set is
+// dropped and rebuilt rather than grown without bound.
+constexpr size_t max_gemm_plans = 1024;
+
+// Bumped by hipb_destroy_extension. A thread whose plans were built for an
+// older extension drops them before its next lookup.
+std::atomic<uint64_t> extension_generation{0};
+
+// Plans are per thread: a hit sets the bias pointer on the shared descriptor
+// before hipblasLtMatmul, so a descriptor must never be used by two threads.
+struct GemmPlanCache
+{
+    std::unordered_map<GemmPlanKey, GemmPlan, GemmPlanKeyHash> plans;
+    uint64_t generation = 0;
+
+    // Also runs at thread exit, so it must not throw.
+    void clear()
+    {
+        for(auto& entry : plans)
+        {
+            const GemmPlan& plan = entry.second;
+            hipblasLtMatmulDescDestroy(plan.matmul);
+            hipblasLtMatrixLayoutDestroy(plan.matA);
+            hipblasLtMatrixLayoutDestroy(plan.matB);
+            hipblasLtMatrixLayoutDestroy(plan.matC);
+        }
+        plans.clear();
+    }
+
+    ~GemmPlanCache() { clear(); }
+};
+
+thread_local GemmPlanCache gemm_plan_cache;
+} // namespace
+
+hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
+                                            hipblasOperation_t op_A,
+                                            hipblasOperation_t op_B,
+                                            int m,
+                                            int n,
+                                            int k,
+                                            const void* alpha,
+                                            const void* a,
+                                            int lda,
+                                            const void* scaleA,
+                                            const void* b,
+                                            int ldb,
+                                            const void* scaleB,
+                                            const void* beta,
+                                            void* c,
+                                            int ldc,
+                                            const void* scaleC,
+                                            const void* bias,
+                                            hipDataType intype,
+                                            hipDataType outtype,
+                                            const hipStream_t& stream,
+                                            int solution_index,
+                                            bool bpreshuffle,
+                                            bool use_gelu,
+                                            hipblasLtMatmulMatrixScale_t scaleA_mode,
+                                            hipblasLtMatmulMatrixScale_t scaleB_mode)
+{
+    // TODO: flag is not supported for hipblasLt yet
+    int flag{0};
+    // if (dtype == HIPBLAS_R_16F) {
+    //  use fp16 alt impl for MI200
+    //  https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    // flag = rocblas_gemm_flags_fp16_alt_impl;
+    //}
+
+    // Max value of N dimension for decode GEMM
+    int decode_max_n = 512;
+    // The CSV's use_rowwise key cannot represent mixed or MXFP8 scale modes.
+    bool tuning_mode_supported = scaleA_mode == scaleB_mode &&
+        (scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F ||
+         scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F);
+
+    // load tuning cache file and check if the gemm has been already tuned
+    const char* env = std::getenv("HIP_ONLINE_TUNING");
+    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    // check if there is enough memory left for online tuning
+    if (online_tuning) {
+        size_t freeMem, totalMem;
+        hipMemGetInfo(&freeMem, &totalMem);
+        if (freeMem <= 128*1024*1024) {
+            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
+            online_tuning = false;
+        }
+    }
+
+    if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
+      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
+                                                  bpreshuffle,
+                                                  op_A, op_B, m, n, k,
+                                                  intype, lda, 0,
+                                                  intype, ldb, 0,
+                                                  outtype, ldc, 0,
+                                                  HIPBLAS_COMPUTE_32F, 1,
+                                                  scaleA_mode, scaleB_mode);
+    }
+
+    if(!online_tuning && solution_index >= 0 && scaleA == nullptr && scaleB == nullptr &&
+       scaleC == nullptr)
+    {
+        GemmPlanKey key{op_A,
+                        op_B,
+                        m,
+                        n,
+                        k,
+                        lda,
+                        ldb,
+                        ldc,
+                        intype,
+                        outtype,
+                        solution_index,
+                        bpreshuffle,
+                        bias != nullptr,
+                        use_gelu};
+        GemmPlanCache& cache = gemm_plan_cache;
+        const uint64_t generation = extension_generation.load(std::memory_order_acquire);
+        if(cache.generation != generation)
+        {
+            cache.clear();
+            cache.generation = generation;
+        }
+        auto& gemm_plans = cache.plans;
+        auto it = gemm_plans.find(key);
+        if(it == gemm_plans.end())
+        {
+            if(gemm_plans.size() >= max_gemm_plans)
+                cache.clear();
+            GemmPlan plan;
+            create_matmul_descs(op_A,
+                                op_B,
+                                m,
+                                n,
+                                k,
+                                lda,
+                                ldb,
+                                ldc,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                bias,
+                                intype,
+                                outtype,
+                                bpreshuffle,
+                                use_gelu,
+                                scaleA_mode,
+                                scaleB_mode,
+                                plan.matA,
+                                plan.matB,
+                                plan.matC,
+                                plan.matmul);
+            std::vector<int> algoIndex(1, solution_index);
+            std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
+            CHECK_HIPBLAS_ERROR(
+                hipblaslt_ext::getAlgosFromIndex(handle, algoIndex, heuristicResult));
+            plan.algo = heuristicResult[0].algo;
+            it        = gemm_plans.emplace(key, plan).first;
+        }
+        else if(bias)
+        {
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                it->second.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
+        }
+        const GemmPlan& plan = it->second;
+        return hipblasLtMatmul(handle,
+                               plan.matmul,
+                               alpha,
+                               a,
+                               plan.matA,
+                               b,
+                               plan.matB,
+                               beta,
+                               c,
+                               plan.matC,
+                               c,
+                               plan.matC,
+                               &plan.algo,
+                               d_workspace,
+                               workspace_size,
+                               stream);
+    }
+
+    // nvtxRangePushA("hipBLASLt variables creation");
+    hipblasLtMatrixLayout_t matA, matB, matC;
+    hipblasLtMatmulDesc_t matmul;
+    create_matmul_descs(op_A,
+                        op_B,
+                        m,
+                        n,
+                        k,
+                        lda,
+                        ldb,
+                        ldc,
+                        scaleA,
+                        scaleB,
+                        scaleC,
+                        bias,
+                        intype,
+                        outtype,
+                        bpreshuffle,
+                        use_gelu,
+                        scaleA_mode,
+                        scaleB_mode,
+                        matA,
+                        matB,
+                        matC,
+                        matmul);
     // nvtxRangePop();
     //  if heuristic does not exist in the map, do search and push into the map
     // auto gemm_key { MatMulConfig { op_A, op_B, m, n, k, dtype } };
@@ -1557,6 +1780,9 @@ void hipb_destroy_extension()
     // CHECK_HIP_ERROR(hipEventDestroy(event));
 
     // hipBLASLt
+    // Other threads drop their plans on their next call or when they exit.
+    gemm_plan_cache.clear();
+    extension_generation.fetch_add(1, std::memory_order_release);
     CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
     CHECK_HIP_ERROR(hipFree(d_workspace));
