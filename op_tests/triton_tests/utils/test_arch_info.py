@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import subprocess
+import sys
 
 import pytest
 import triton
@@ -64,6 +66,35 @@ def test_kfd_arch_override_env(monkeypatch, tmp_path, env, value):
     _fake_kfd(monkeypatch, tmp_path, [0, 90402])
     monkeypatch.setenv(env, value)
     assert arch_info._probe_kfd_arch() is None
+
+
+class _NoDriver:
+    @property
+    def runtime(self):
+        raise RuntimeError("the Triton driver must not be used")
+
+
+def test_probe_arch_skips_driver_with_kfd(monkeypatch, tmp_path):
+    # A valid sysfs arch must be returned without touching the Triton driver.
+    _fake_kfd(monkeypatch, tmp_path, [0, 90402])
+    monkeypatch.setattr(arch_info, "triton", _NoDriver())
+    assert arch_info._probe_arch() == "gfx942"
+
+
+def test_import_keeps_hip_uninitialized():
+    # import aiter must leave HIP uninitialized, so the process can still fork.
+    pytest.importorskip("torch")
+    if arch_info._probe_kfd_arch() is None:
+        pytest.skip("the Triton driver probe is used on this host")
+    code = "import aiter, torch; print(torch.cuda.is_initialized())"
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=600,
+    ).stdout
+    assert out.strip().splitlines()[-1] == "False"
 
 
 @pytest.mark.skipif(
