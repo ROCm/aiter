@@ -605,6 +605,18 @@ _MHC_FUSED_POST_PRE_CONFIG = {
 }
 
 
+# gfx950, 256 CUs, FP32 fn, m <= 1024, keyed by hidden_size: m ranges that keep the
+# policy's tile_m=32. Elsewhere tile_m=16 at the policy's split_k measured faster for
+# the complete call (MI355X). Each range is one (split_k, ceil(m/32)) segment of the
+# policy. Other hidden sizes and packed BF16 fn keep the policy. tile_m does not
+# change the outputs.
+_MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256 = {
+    4096: ((97, 128), (993, 1024)),
+    5120: ((481, 512), (993, 1024)),
+    7168: ((97, 103), (481, 512), (993, 1024)),
+}
+
+
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_config(
     m: int,
@@ -626,6 +638,10 @@ def get_mhc_fused_post_pre_config(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:
+        keep = _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256.get(hidden_size)
+        if keep is not None and not any(lo <= m <= hi for lo, hi in keep):
+            tile_m = 16
     if (
         w_preshuffle_bf16
         and res_preshuffle
@@ -1075,7 +1091,170 @@ def mhc_fused_post_pre(
     implementation of the fused path (tests, benchmarks). A shuffled residual must
     then be in that backend's blocks (``mhc_res_ks(..., backend=backend)``).
     ``"gluon"`` needs gfx1250 and inputs the Gluon kernels take, or raises.
+
+    Without either pin (``force_fused=False``, ``backend=None``) the call enters
+    the routed op ``mhc_fused_post_pre``, and enabled plugins are asked first.
+    A pin picks AITER's own implementation, so a pinned call is not routed.
     """
+    if not force_fused and backend is None:
+        return _mhc_fused_post_pre_routed(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+            w_preshuffle_bf16,
+            res_preshuffle,
+        )
+    return _mhc_fused_post_pre_native(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        force_fused,
+        w_preshuffle_bf16,
+        res_preshuffle,
+        backend,
+    )
+
+
+def _mhc_fused_post_pre_routed_fake(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shapes only: the four results are new tensors, and neither pin moves a
+    shape, so this is :func:`mhc_fused_post_pre_fake` under the routed
+    signature."""
+    return mhc_fused_post_pre_fake(
+        layer_input, residual_in, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base
+    )
+
+
+# Routed below the two pins, as `mla_sparse_prefill_v41` is below `backend`:
+# `backend` and `force_fused` choose among AITER's own implementations, a
+# choice a provider with one kernel cannot honour. The public signature, which
+# vLLM probes with inspect.signature, does not change.
+#
+# Registered with a fake, as `per_group_quant` is, because the guard sits on
+# the public function, not on this one. `mutates_args=[]` is true here: all
+# four results are allocated, and nothing is written through an argument.
+@_route(
+    op="mhc_fused_post_pre",
+    version=1,
+    fake=_mhc_fused_post_pre_routed_fake,
+    mutates_args=[],
+)
+def _mhc_fused_post_pre_routed(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mhc_post of the previous layer fused with mhc_pre of the next.
+
+    Shapes and meanings are those of :func:`mhc_fused_post_pre`, minus its
+    ``force_fused`` and ``backend`` pins. Returns ``(post_mix, comb_mix,
+    layer_input_out, next_residual)`` -- four newly allocated tensors, the
+    next pre's ``(m, hc, 1)`` and ``(m, hc, hc)`` mixes, its ``(m, hidden)``
+    layer input and the ``(m, hc, hidden)`` residual stream the next post
+    reads. Nothing is written through the arguments.
+
+    ``post_layer_mix`` is ``(m, hc, 1)`` or ``(m, hc)``. ``w_preshuffle_bf16``
+    says ``fn`` comes from ``mhc_shuffle_fn``; ``res_preshuffle`` says
+    ``residual_in`` is in the shuffled layout when ``mhc_res_shuffle_enabled``
+    holds for ``m``, and ``next_residual`` is then returned in it too. A
+    provider must read both as given rather than assume row-major. With a
+    plain residual and ``m`` at or above the fused bound, this runs
+    ``mhc_post`` then ``mhc_pre``, both routed in turn.
+    """
+    return _mhc_fused_post_pre_native(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        False,
+        w_preshuffle_bf16,
+        res_preshuffle,
+        None,
+    )
+
+
+def _mhc_fused_post_pre_native(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    force_fused: bool,
+    w_preshuffle_bf16: bool,
+    res_preshuffle: bool,
+    backend: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AITER's implementations of :func:`mhc_fused_post_pre`, pins honoured."""
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
