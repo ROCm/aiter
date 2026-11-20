@@ -440,6 +440,44 @@ def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
     assert parsed is not None and not parsed["early_a"] and not parsed["early_b"]
 
 
+def test_gfx1250_compute_catalog_exposes_narrow_n_profiles_append_only():
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    narrow = {
+        kernel_id: instance
+        for kernel_id, instance in catalog.kernels_list.items()
+        if catalog.is_compute_kernel(instance)
+        and (
+            instance.tile_m,
+            instance.tile_n,
+            instance.tile_k,
+            instance.m_warp,
+            instance.n_warp,
+            instance.num_buffers,
+        )
+        == (256, 128, 128, 2, 2, 2)
+    }
+    assert len(narrow) == 12
+    assert min(narrow) > max(set(catalog.kernels_list) - set(narrow))
+    assert {(ki.cluster_m, ki.cluster_n) for ki in narrow.values()} == {
+        (1, 1),
+        (2, 1),
+        (4, 1),
+    }
+    assert {(ki.early_a, ki.early_b) for ki in narrow.values()} == {
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    }
+    assert all(
+        catalog.mxfp8_32_kernel_fits_shape(ki, 4096, 2944, 6144)
+        for ki in narrow.values()
+    )
+
+
 def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
     from aiter.ops.flydsl.gemm_tune import (

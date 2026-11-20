@@ -95,7 +95,8 @@ def launch_gemm_a8w8_256x256(
         (128, 128, 128, 2, 2, 2),
         (128, 256, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 3),
-    ), "only the tuned 2x2-wave profiles are supported"
+        (256, 128, 128, 2, 2, 2),
+    ), "only the tuned four-wave profiles are supported"
     assert (
         1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
