@@ -814,6 +814,245 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
     )
 
 
+def _run_tuned_unshuffled_decode(
+    monkeypatch,
+    num_query_heads,
+    batch_size,
+    max_seqlen_kv,
+    block_size=64,
+    kv_lora_rank=512,
+    fp8_query=True,
+    skip_reduce=False,
+):
+    """Runs mla_decode_fwd on the unshuffled path and captures the one
+    attention launch. Returns (grid, kwargs, num_pages, result, ref_args)."""
+    import aiter.ops.triton.attention.mla as mla_module
+
+    qk_rope_head_dim = 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+
+    torch.manual_seed(0)
+    num_pages = (max_seqlen_kv + block_size - 1) // block_size
+    # Full-length sequences cover every segment; short ones cover tails.
+    lengths = [max_seqlen_kv, max_seqlen_kv - 37][:batch_size]
+    lengths += torch.randint(1, 4 * block_size, (batch_size - len(lengths),)).tolist()
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    # Logical pages may reuse physical pages; the oracle follows the same table.
+    num_blocks = 2 * num_pages
+    block_tables = torch.randint(
+        0, num_blocks, (batch_size, num_pages), dtype=torch.int32, device="cuda"
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, 1, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    kv_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+    # sglang sends a bf16 query without a query descale.
+    q_descale = kv_descale if fp8_query else None
+    if fp8_query:
+        query = query.to(e4m3_dtype)
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    result = mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max_seqlen_kv,
+        block_tables=block_tables,
+        softmax_scale=qk_head_dim**-0.5,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        shuffled_kv_cache=False,
+        skip_reduce=skip_reduce,
+    )
+    assert len(launches) == 1
+    grid, kwargs = launches[0]
+    assert grid[2] == kwargs["NUM_SEGMENTS_PER_SEQ"]
+    ref_args = (query, kv_buffer, cu_seqlens_q, seq_lens_kv, block_tables)
+    ref_args += (kv_lora_rank, qk_head_dim**-0.5, q_descale, kv_descale, output)
+    return grid, kwargs, num_pages, result, ref_args
+
+
+def _check_tuned_unshuffled_output(ref_args, msg):
+    *args, q_descale, kv_descale, output = ref_args
+    ref_output = torch_mla_extend(
+        *args, q_descale=q_descale, kv_descale=kv_descale, o_dtype=torch.float32
+    )
+    assert torch.isfinite(output).all()
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.float(),
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg=msg,
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size, max_seqlen_kv, block_size, kv_lora_rank, skip_reduce",
+    [
+        (128, 16401, 64, 512, False),
+        (32, 16401, 64, 512, False),
+        (19, 65553, 64, 512, False),
+        (15, 131089, 64, 512, False),
+        # skip_reduce returns the partials to the caller: they stay FP32.
+        (32, 16401, 64, 512, True),
+        # Same bucket, other geometry: the new flags do not apply.
+        (32, 16401, 128, 128, False),
+    ],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_tuned_h64(
+    monkeypatch, batch_size, max_seqlen_kv, block_size, kv_lora_rank, skip_reduce
+):
+    """Tuned H64 FP8 entries through the wrapper's config loading: split count
+    without power-of-2 rounding (NPOT_SPLITS), BF16 partial outputs
+    (PARTIAL_BF16) and the one-barrier alpha/P exchange (XCHG_MODE). The flags
+    apply only to page64, rank 512 and RoPE 64, and partials stay FP32 with
+    skip_reduce."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import triton
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    measured = (block_size, kv_lora_rank) == (64, 512)
+    entry = mla_module._tuned_decode_config(
+        "pipelined_unshuffled", "fp8", "fp8", 64, batch_size, max_seqlen_kv
+    )
+    # The bucket must hold the tuned entry, else this test checks nothing new.
+    # NPOT_SPLITS is the measured split count; NUM_SEGMENTS_PER_SEQ is the
+    # baseline count for other geometries.
+    assert entry.get("NPOT_SPLITS", 0) > 0 and entry.get("PARTIAL_BF16"), entry
+    assert entry.get("XCHG_MODE") == 1, entry
+    assert entry["NPOT_SPLITS"] != entry["NUM_SEGMENTS_PER_SEQ"], entry
+    grid, kwargs, num_pages, result, ref_args = _run_tuned_unshuffled_decode(
+        monkeypatch,
+        64,
+        batch_size,
+        max_seqlen_kv,
+        block_size,
+        kv_lora_rank,
+        skip_reduce=skip_reduce,
+    )
+    if measured:
+        # NPOT_SPLITS: the measured count, without power-of-2 rounding.
+        assert grid[2] == min(entry["NPOT_SPLITS"], num_pages)
+        assert grid[2] & (grid[2] - 1) != 0, grid[2]
+        assert kwargs.get("XCHG_MODE", 0) == 1
+    else:
+        # Other geometries keep the baseline count, rounded as on main.
+        baseline = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
+        assert grid[2] == triton.next_power_of_2(baseline)
+        assert kwargs.get("XCHG_MODE", 0) == 0
+    partial_dtype = torch.bfloat16 if measured and not skip_reduce else torch.float32
+    assert kwargs["segm_output_ptr"].dtype == partial_dtype
+    if skip_reduce:
+        # The caller gets FP32 partials and does its own reduction.
+        segm_output, segm_max, segm_expsum = result
+        assert segm_output.dtype == torch.float32
+        assert segm_max.dtype == segm_expsum.dtype == torch.float32
+        return
+    _check_tuned_unshuffled_output(ref_args, "mla_decode_fwd tuned H64 output")
+
+
+@pytest.mark.parametrize(
+    "num_query_heads, batch_size, max_seqlen_kv, expect_tuned",
+    [
+        # B=1 at KV <= 16384 has an empty entry on purpose: the untuned path won.
+        (8, 1, 9216, False),
+        (8, 4, 9216, True),
+        (8, 32, 9216, True),
+        (8, 128, 9216, True),
+        (8, 8, 32768, True),
+        (8, 32, 32768, True),
+        (8, 64, 32768, True),
+        (8, 32, 65536, True),
+        (8, 64, 131072, True),
+        # No bucket covers these: they get the H_LEQ_8 entry.
+        (8, 136, 9216, True),
+        (8, 32, 262144, True),
+        # H < 8 uses the same entries: SPLIT_FP8 stays on, ROWSPLIT is dropped.
+        (4, 32, 32768, True),
+        (4, 136, 9216, True),
+    ],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
+    monkeypatch, num_query_heads, batch_size, max_seqlen_kv, expect_tuned
+):
+    """TP8 entries (H <= 8, bf16 query, fp8 KV) of the bf16_fp8 group. The
+    launch uses the entry's warps, stages, split count, partial dtype,
+    EARLY_PRIME and SPLIT_FP8. ROWSPLIT applies only with 8 heads, and an empty
+    entry keeps the untuned path."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    entry = mla_module._tuned_decode_config(
+        "pipelined_unshuffled",
+        "bf16",
+        "fp8",
+        num_query_heads,
+        batch_size,
+        max_seqlen_kv,
+    )
+    assert bool(entry) == expect_tuned, entry
+    if num_query_heads < 8:
+        # Else this case does not cover split-FP8 without ROWSPLIT.
+        assert entry.get("SPLIT_FP8"), entry
+    grid, kwargs, num_pages, _, ref_args = _run_tuned_unshuffled_decode(
+        monkeypatch, num_query_heads, batch_size, max_seqlen_kv, fp8_query=False
+    )
+    assert kwargs.get("XCHG_MODE", 0) == 0
+    if entry:
+        for key in ("num_warps", "num_stages", "waves_per_eu"):
+            assert kwargs[key] == entry[key], (key, kwargs[key], entry[key])
+        for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8"):
+            assert kwargs.get(key, 0) == entry.get(key, 0), (key, kwargs, entry)
+        rowsplit = entry.get("ROWSPLIT", 0) if num_query_heads == 8 else 0
+        assert kwargs.get("ROWSPLIT", 0) == rowsplit, (kwargs, entry)
+    if "NPOT_SPLITS" in entry:
+        # NPOT_SPLITS: the measured count, without power-of-2 rounding.
+        assert grid[2] == min(entry["NPOT_SPLITS"], num_pages)
+    else:
+        assert grid[2] & (grid[2] - 1) == 0, grid[2]
+    if grid[2] > 1:
+        partial_dtype = torch.bfloat16 if entry.get("PARTIAL_BF16") else torch.float32
+        assert kwargs["segm_output_ptr"].dtype == partial_dtype
+    _check_tuned_unshuffled_output(
+        ref_args, f"mla_decode_fwd tuned TP8 bf16 output, H={num_query_heads}"
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
