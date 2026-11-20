@@ -80,22 +80,25 @@ def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> in
 
 
 def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
-    """Selects the CSV value or falls back to the environment setting."""
-    if csv_num_waves in (1, 2, 4):
-        return csv_num_waves
-
-    try:
-        num_waves = int(os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
-    except ValueError as exc:
-        raise ValueError(
-            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
-        ) from exc
+    """Select the CSV value or the two-wave default."""
+    num_waves = csv_num_waves if csv_num_waves in (1, 2, 4) else 2
     if num_waves not in (1, 2, 4):
         raise ValueError(
             "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got "
             f"{num_waves}"
         )
     return num_waves
+
+
+def resolve_persistent_workers(stage: int, persistent_workers: int) -> int:
+    """Worker count after the AITER_FLYDSL_PERSISTENT_WORKERS{stage} /
+    AITER_FLYDSL_PERSISTENT_WORKERS env overrides, which are taken over CSV."""
+    return int(
+        os.environ.get(
+            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
+            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+        )
+    )
 
 
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
@@ -145,10 +148,25 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
+    persistent_single_task=0,
     rolled_drain=0,
     gemm_stage=None,
     m_align=0,
     k_waves=1,
+    k_grid=1,
+    splitk_ws=None,
+    splitk_sem=None,
+    persistent_contiguous_chunks=0,
+    reuse_resident_b=0,
+    defer_output_store_wait=0,
+    ds_first_n=-1,  # -1: kernel's per-shape IGLP default
+    mma_prio=0,
+    # moe-specific performance
+    m_alignment=0,
+    m_expert_tile_map=None,
+    expert_tile_m=0,
+    packed_expert_map=0,
+    reuse_persistent_map_loads=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -200,7 +218,21 @@ def flydsl_grouped_gemm_a8w4_masked(
             )
         if stage2_scatter is not None:
             raise ValueError(f"k_waves={k_waves} does not support the EP scatter")
-    num_buffers = min(num_buffers, max(1, k_tiles // k_waves))
+    k_grid = int(k_grid)
+    if k_grid > 1:
+        if K % tile_k or k_tiles % (k_waves * k_grid):
+            raise ValueError(
+                f"k_grid={k_grid} x k_waves={k_waves} must evenly split "
+                f"{k_tiles} K tiles (K={K}, tile_k={tile_k})"
+            )
+        if splitk_ws is None or splitk_sem is None:
+            raise ValueError("k_grid needs splitk_ws and a zeroed splitk_sem")
+    num_buffers = min(num_buffers, max(1, k_tiles // (k_waves * k_grid)))
+    m_alignment = int(m_alignment or tile_m)
+    if m_alignment % tile_m:
+        raise ValueError(
+            f"m_alignment={m_alignment} must be divisible by tile_m={tile_m}"
+        )
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:
@@ -224,14 +256,25 @@ def flydsl_grouped_gemm_a8w4_masked(
         # A tile skipped for starting in an expert's padding never reaches the
         # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
         cluster_m = 1
-    persistent_workers = int(
-        os.environ.get(
-            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
-            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
-        )
-    )
+    persistent_workers = resolve_persistent_workers(stage, persistent_workers)
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
+    persistent_single_task = int(persistent_single_task)
+    reuse_persistent_map_loads = int(reuse_persistent_map_loads)
+    defer_output_store_wait = int(defer_output_store_wait)
+    mma_prio = int(mma_prio)
+    if any(
+        value not in (0, 1)
+        for value in (
+            persistent_single_task,
+            reuse_persistent_map_loads,
+            defer_output_store_wait,
+            mma_prio,
+        )
+    ):
+        raise ValueError("persistent and pipeline policies must be 0 or 1")
+    if persistent_single_task and not persistent_workers:
+        persistent_single_task = 0
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -316,6 +359,22 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
+    expert_tile_map_ptr = ptr_arg(
+        m_expert_tile_map if m_expert_tile_map is not None else m_tile_map
+    )
+    moe_spec = (
+        m_alignment,
+        int(expert_tile_m or tile_m),
+        int(m_expert_tile_map is not None),
+        int(packed_expert_map),
+        persistent_single_task,
+        int(persistent_contiguous_chunks),
+        int(reuse_resident_b),
+        reuse_persistent_map_loads,
+        defer_output_store_wait,
+        int(ds_first_n),
+        _select_bool_env("AITER_FLYDSL_MMA_PRIO", mma_prio),
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
         ptr_arg(out, out_dtype),
@@ -339,6 +398,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        expert_tile_map_ptr,
+        *moe_spec,
+        k_grid,
+        ptr_arg(splitk_ws if splitk_ws is not None else out),
+        ptr_arg(splitk_sem if splitk_sem is not None else out),
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -346,6 +410,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            moe_spec,
+            k_grid,
         ),
     )
     return out
