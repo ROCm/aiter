@@ -1,28 +1,48 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""flydsl_sparse_mla_decode_fp8_h64 against an fp64 torch reference.
+"""flydsl_sparse_mla_decode_fp8_h64 against an fp64 torch reference (gfx950).
 
-Served shapes: 64 heads x 512 dims, e4m3 q and caches with per-tensor scales,
-a sliding-window main list (<= 128 keys) and a top-k extra list (<= 512) per
-query row, 1..6 rows per request, 16..768 rows, cache blocks of 32 / 64 / 128
-rows, a padded page pitch, the window alone, padding rows with empty lists.
+The DeepSeek-V4-style decode call of ``sparse_mla_fwd`` with a per-tensor e4m3
+cache, fp8 dots and the inverse-RoPE MXFP8 store, as vLLM's DeepSeek-V4.1
+DP-attention path makes it:
 
-Every case checks the bf16 output against the fp64 reference (per (row, head)
-relative L2 error and per-row cosine), the MXFP8 bytes against the reference
-quantization (inverse RoPE + E8M0 per 32 dims) of that bf16 output, repeat
-launches bit for bit, CUDA graph replay into NaN-filled outputs. Every cache row
-no list names holds e4m3 NaN bytes, so a wrong gather shows. The saturation
-tests drive scores of hundreds to 1e5 log2 units (q codes at +-448, large
-scales, score jumps between tiles).
+    q              [T, 64, 512]           e4m3, per-tensor q_scale ([1] f32)
+    kv_buffer      [blocks, 2^k, 512]     e4m3 sliding-window cache
+    extra_kv       [blocks, 2^k, 512]     e4m3 compressed (top-k) cache, same kv_scale
+    kv/extra       indptr [T + 1], indices: int32, <= 128 + 512 keys per row
+    attn_sink      [64] f32
+    out_mxfp8      codes [T, 32768] e4m3, scales [T, 1024] E8M0 (inverse RoPE
+                   on dims 448..511 at inv_rope_positions), or bf16 out [T, 64, 512]
 
-    pytest -q op_tests/flydsl_tests/test_flydsl_sparse_mla_decode_fp8_h64.py
+Served shapes: 1..6 rows per request, 16..768 rows, cache blocks of 32 / 64 /
+128 rows, a padded page pitch, the window alone, padding rows with empty lists,
+rows without keys over empty index tensors. Every case checks the bf16 output
+against the fp64 reference (per (row, head) relative L2 error and per-row
+cosine), the MXFP8 bytes against the reference quantization (inverse RoPE +
+E8M0 per 32 dims) of that bf16 output, repeat launches bit for bit, CUDA graph
+replay into NaN-filled outputs. Every cache row no list names holds e4m3 NaN
+bytes, so a wrong gather shows. The saturation tests drive scores of hundreds
+to 1e5 log2 units (q codes at +-448, large scales, score jumps between tiles).
+
+Run (the checks, then a perf sweep that ends in a markdown table):
+    python3 op_tests/test_flydsl_sparse_mla_decode_fp8_h64.py
+    python3 op_tests/test_flydsl_sparse_mla_decode_fp8_h64.py -b 16 768
+    pytest -q op_tests/test_flydsl_sparse_mla_decode_fp8_h64.py
 """
 
+import argparse
+import itertools
 import math
+import sys
 
+import pandas as pd
 import pytest
 import torch
+
+import aiter
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 H, D, ROT = 64, 512, 64
 FP8_MAX = 448.0
@@ -32,17 +52,18 @@ NAN_BYTE = 0x7F
 SAT = 0x7E  # e4m3 +-448
 COS_MIN = 0.9999
 REL = 0.02
+WINDOW, TOPK = 128, 512
+# CDNA4 scaled MFMAs, ds_read_b64_tr_b8 and 160 KB of LDS
+SUPPORTED_GFX = ["gfx950"]
 
 
-def _on_gfx950() -> bool:
+def _supported() -> bool:
     if not torch.cuda.is_available() or torch.version.hip is None:
         return False
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() == "gfx950"
+    return get_gfx_runtime() in SUPPORTED_GFX
 
 
-pytestmark = pytest.mark.skipif(not _on_gfx950(), reason="gfx950 required")
+pytestmark = pytest.mark.skipif(not _supported(), reason="gfx950 required")
 
 
 def _op():
@@ -226,6 +247,11 @@ def make_case(
         "extra_indices": dev(xi) if has_extra else None,
         "inv_rope_positions": dev(torch.tensor(pos)),
         "inv_rope_cos_sin_cache": torch.cat([ang.cos(), ang.sin()], dim=1).float(),
+        # sparse_mla_fwd's arguments for this call, and the caller's key bound
+        "kv_lora_rank": D,
+        "qk_rope_head_dim": 0,
+        "dot_precision": "fp8",
+        "max_keys_per_row": WINDOW + TOPK,
     }
 
 
@@ -261,6 +287,8 @@ def check_attention(out, ref, name, rel=REL):
     empty = (ref.flatten(1) == 0).all(dim=1)
     assert (out[empty] == 0).all(), name  # a row without keys is zero
     live = ~empty
+    if not live.any():
+        return
     err = rel_error(out[live], ref[live])
     assert err.max() <= rel, (name, err.max().item())
     cos = torch.nn.functional.cosine_similarity(
@@ -270,11 +298,24 @@ def check_attention(out, ref, name, rel=REL):
 
 
 def check_mxfp8(codes, scales, out_bf16, case, name):
+    """The MXFP8 bytes equal the reference epilogue of the kernel's bf16 rows."""
     rc, rs = epilogue_reference(
         out_bf16, case["inv_rope_positions"], case["inv_rope_cos_sin_cache"]
     )
-    assert torch.equal(codes.view(torch.uint8), rc), name
-    assert torch.equal(scales, rs), name
+    for got, want, what in (
+        (codes.view(torch.uint8), rc, "codes"),
+        (scales, rs, "scales"),
+    ):
+        err = checkAllclose(
+            want.float(),
+            got.float(),
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{name} {what}: ",
+            printLog=False,
+        )
+        assert err == 0, (name, what, err)
 
 
 # ----------------------------------------------------------------------------
@@ -565,33 +606,72 @@ def test_eligibility():
     args = {k: v for k, v in case.items() if k != "softmax_scale"}
     can_use = _can_use()
     out = mxfp8_outputs(rows)
-    assert can_use(**args, out_mxfp8=out)
-    assert can_use(**args, out_mxfp8=out, max_keys_per_row=640)
-    assert not can_use(**args, out_mxfp8=out, max_keys_per_row=2048)
-    assert not can_use(**args, out_mxfp8=out, has_invalid=True)
-    assert not can_use(**args)  # no output
+
+    def ok(**kw):
+        return can_use(**dict(args, **kw))
+
+    assert ok(out_mxfp8=out)
+    assert ok(out_mxfp8=out, kv_splits=4)  # a split-K hint, ignored
+    # the key bound must be stated: past 1024 keys the kernel would clamp
+    assert not ok(out_mxfp8=out, max_keys_per_row=None)
+    assert not ok(out_mxfp8=out, max_keys_per_row=2048)
+    assert ok(out_mxfp8=out, max_keys_per_row=1024)
+    # sparse_mla_fwd's arguments that change the result are declined
+    assert not ok(out_mxfp8=out, dot_precision="bf16")
+    assert not ok(out_mxfp8=out, return_lse=True)
+    assert not ok(out_mxfp8=out, skip_reduce=True)
+    assert not ok(out_mxfp8=out, qk_rope_head_dim=64)
+    assert not ok(out_mxfp8=out, kv_lora_rank=448)
+    defaults = {
+        k: v
+        for k, v in args.items()
+        if k not in ("kv_lora_rank", "qk_rope_head_dim", "dot_precision")
+    }
+    assert not can_use(**defaults, out_mxfp8=out)  # sparse_mla_fwd's defaults
+    assert not ok(out_mxfp8=out, has_invalid=True)
+    assert not ok()  # no output
     other_scale = torch.ones(1, device="cuda")
-    assert not can_use(**args, out_mxfp8=out, extra_kv_scale=other_scale)
-    assert can_use(**args, out_mxfp8=out, extra_kv_scale=case["kv_scale"])
-    no_sink = dict(args, attn_sink=None)
-    assert not can_use(**no_sink, out_mxfp8=out)
-    no_rope = dict(args, inv_rope_positions=None, inv_rope_cos_sin_cache=None)
-    assert not can_use(**no_rope, out_mxfp8=out)
+    assert not ok(out_mxfp8=out, extra_kv_scale=other_scale)
+    assert ok(out_mxfp8=out, extra_kv_scale=case["kv_scale"])
+    assert not ok(out_mxfp8=out, attn_sink=None)
+    no_rope = {"inv_rope_positions": None, "inv_rope_cos_sin_cache": None}
+    assert not ok(out_mxfp8=out, **no_rope)
     bf16 = torch.empty((rows, H, D), dtype=torch.bfloat16, device="cuda")
-    assert can_use(**no_rope, out=bf16)
-    assert not can_use(**args, out=bf16)  # bf16 rows carry no inverse RoPE
-    q32 = case["q"][:, :32]
-    assert not can_use(**dict(args, q=q32), out_mxfp8=out)
-    bf16_q = case["q"].to(torch.bfloat16)
-    assert not can_use(**dict(args, q=bf16_q), out_mxfp8=out)
-    odd_block = case["kv_buffer"][:, :24]
-    assert not can_use(**dict(args, kv_buffer=odd_block), out_mxfp8=out)
-    i64 = case["kv_indices"].long()
-    assert not can_use(**dict(args, kv_indices=i64), out_mxfp8=out)
+    assert ok(out=bf16, **no_rope)
+    assert not ok(out=bf16)  # bf16 rows carry no inverse RoPE
+    assert not ok(q=case["q"][:, :32], out_mxfp8=out)
+    assert not ok(q=case["q"].to(torch.bfloat16), out_mxfp8=out)
+    assert not ok(kv_buffer=case["kv_buffer"][:, :24], out_mxfp8=out)
+    assert not ok(kv_indices=case["kv_indices"].long(), out_mxfp8=out)
     strided = torch.empty((rows, 2 * H * D), dtype=torch.float8_e4m3fn, device="cuda")
-    assert not can_use(**args, out_mxfp8=(strided[:, : H * D], out[1]))
+    assert not ok(out_mxfp8=(strided[:, : H * D], out[1]))
+    # 16-byte vector accesses: misaligned bases and cos / sin rows
+    raw = torch.empty(rows * H * D + 16, dtype=torch.uint8, device="cuda")
+    q_off = raw[1 : 1 + rows * H * D].view(torch.float8_e4m3fn).view(rows, H, D)
+    assert q_off.is_contiguous() and not ok(q=q_off, out_mxfp8=out)
+    codes_off = raw[1 : 1 + rows * H * D].view(torch.float8_e4m3fn).view(rows, H * D)
+    assert not ok(out_mxfp8=(codes_off, out[1]))
+    cs = case["inv_rope_cos_sin_cache"]
+    cs_pitch = torch.empty((cs.shape[0], ROT + 2), device="cuda")[:, :ROT]
+    assert not ok(out_mxfp8=out, inv_rope_cos_sin_cache=cs_pitch)
+    cs_off = torch.empty(cs.numel() + 4, device="cuda")[1 : 1 + cs.numel()]
+    assert not ok(out_mxfp8=out, inv_rope_cos_sin_cache=cs_off.view(cs.shape))
+    kv_off = raw[1 : 1 + 32 * D].view(torch.float8_e4m3fn).view(32, D)
+    assert not ok(kv_buffer=kv_off, out_mxfp8=out)
+    # row count: output offsets stay 32-bit buffer offsets
+    big = torch.empty((16385, H, D), dtype=torch.float8_e4m3fn, device="cuda")
+    big_ptr = torch.zeros(16386, dtype=torch.int32, device="cuda")
+    big_args = {
+        "q": big,
+        "kv_indptr": big_ptr,
+        "extra_indptr": big_ptr,
+        "out": torch.empty((16385, H, D), dtype=torch.bfloat16, device="cuda"),
+        **no_rope,
+    }
+    assert not ok(**big_args)
+    assert ok(**dict(big_args, q=big[:16384], out=big_args["out"][:16384]))
     with pytest.raises(ValueError):
-        _op()(**case, out_mxfp8=out, has_invalid=True)
+        _op()(**dict(case, has_invalid=True), out_mxfp8=out)
 
 
 @torch.inference_mode()
@@ -600,3 +680,178 @@ def test_zero_rows():
     case["q"] = case["q"][:0]
     case["inv_rope_positions"] = case["inv_rope_positions"][:0]
     _op()(**case, out_mxfp8=mxfp8_outputs(0))
+
+
+# rows without keys over empty index tensors: CUDA-graph padding rows, and the
+# top-k lists of contexts shorter than the compression ratio. A fresh empty
+# CUDA tensor has a null data pointer, so the kernel must not read it.
+EMPTY_CASES = {
+    "all_empty": [(0, 0, 10 + i) for i in range(40)],
+    "no_topk": [((7 * i) % 129, 0, 200 + i) for i in range(40)],
+}
+
+
+@pytest.mark.parametrize(
+    "hg,wgs", HEAD_GROUPS, ids=[f"hg{h}_wgs{w}" for h, w in HEAD_GROUPS]
+)
+@pytest.mark.parametrize("lists", list(EMPTY_CASES))
+@torch.inference_mode()
+def test_rows_without_keys(lists, hg, wgs):
+    case = make_case(EMPTY_CASES[lists], pad=8)
+    assert case["extra_indices"].numel() == 0
+    if lists == "all_empty":
+        assert case["kv_indices"].numel() == 0
+    kw = {"heads_per_workgroup": hg, "workgroups_per_xcd": wgs}
+    out = launch(case, mxfp8=False, **kw)
+    torch.cuda.synchronize()
+    check_attention(out, attention_reference(case), lists)
+    codes, scales = launch(case, mxfp8=True, **kw)
+    torch.cuda.synchronize()
+    check_mxfp8(codes, scales, out, case, lists)
+
+
+def test_warmup():
+    """The warm-up compiles every head-group kernel of a configuration, so a
+    later call (e.g. during CUDA graph capture) does not compile."""
+    from aiter.ops.flydsl import warmup_flydsl_sparse_mla_decode_fp8_h64
+    from aiter.ops.flydsl.sparse_mla_decode_fp8_h64 import HEAD_GROUPS as GROUPS
+    from aiter.ops.flydsl.sparse_mla_decode_fp8_h64 import _launcher
+
+    dev = torch.cuda.current_device()
+    for p_terms, mxfp8, has_extra in ((1, True, True), (2, False, False)):
+        warmup_flydsl_sparse_mla_decode_fp8_h64(
+            dev, p_terms=p_terms, mxfp8=mxfp8, has_extra=has_extra
+        )
+        torch.cuda.synchronize()
+        for hg in GROUPS:
+            exe = _launcher(dev, hg, p_terms, mxfp8, has_extra)
+            assert getattr(exe, "_cf", None) is not None, (hg, p_terms, mxfp8)
+
+
+# ----------------------------------------------------------------------------
+# perf sweep (python3 <this file>): served shapes, the MXFP8 call
+# ----------------------------------------------------------------------------
+
+
+def dequant_mxfp8(codes, scales):
+    v = codes.view(torch.float8_e4m3fn).float().view(codes.shape[0], -1, 32)
+    return (v * torch.exp2(scales.float() - 127.0)[..., None]).view(codes.shape[0], -1)
+
+
+def run_sparse_mla_fwd(case, out_mxfp8):
+    from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+
+    keys = ("q", "kv_buffer", "kv_indptr", "kv_indices", "softmax_scale")
+    sparse_mla_fwd(
+        *(case[k] for k in keys),
+        **{k: v for k, v in case.items() if k not in keys and k != "max_keys_per_row"},
+        has_invalid=False,
+        out_mxfp8=out_mxfp8,
+    )
+    return out_mxfp8
+
+
+@benchmark()
+def test_sparse_mla_decode(rows, rows_per_request):
+    """The MXFP8 call at ``rows`` query rows in requests of
+    ``rows_per_request`` (a 128-key window + top-512 list per row): FlyDSL with
+    two and one e4m3 P terms, and aiter's Triton ``sparse_mla_fwd`` (the path
+    vLLM runs today). ``err``: dequantized MXFP8 against the inverse-RoPE'd
+    fp64 reference."""
+    q_lens = [rows_per_request] * (rows // rows_per_request)
+    q_lens += [rows % rows_per_request] if rows % rows_per_request else []
+    case = make_case(row_lengths(q_lens), pool_rows=1 << 17)
+    ref = inverse_rope(
+        attention_reference(case),
+        case["inv_rope_positions"],
+        case["inv_rope_cos_sin_cache"],
+    ).view(rows, H * D)
+    candidates = {
+        "flydsl_p2": lambda o: _op()(**case, out_mxfp8=o, p_terms=2) or o,
+        "flydsl_p1": lambda o: _op()(**case, out_mxfp8=o, p_terms=1) or o,
+        "sparse_mla_fwd": lambda o: run_sparse_mla_fwd(case, o),
+    }
+    keys = int(case["kv_indptr"][-1]) + int(case["extra_indptr"][-1])
+    flops = 4 * H * D * keys  # QK and PV, a multiply-add each per (key, head, dim)
+    nbytes = (
+        keys * (D + 4)  # gathered key rows and their ids
+        + rows * H * D * 2  # q + MXFP8 codes
+        + rows * H * D // 32  # E8M0 scales
+    )
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        (codes, scales), us = run_perftest(fn, mxfp8_outputs(rows))
+        err = checkAllclose(
+            ref,
+            dequant_mxfp8(codes, scales),
+            rtol=0.1,
+            atol=0.02,
+            tol_err_ratio=1e-3,
+            msg=f"{name}: rows={rows} ",
+        )
+        assert err <= 1e-3, (name, rows, err)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+test_sparse_mla_decode.__test__ = False
+
+
+def main():
+    if not _supported():
+        aiter.logger.warning(
+            "flydsl sparse MLA decode (fp8, 64 heads) unsupported on %s; skipping",
+            get_gfx_runtime() if torch.cuda.is_available() else "no GPU",
+        )
+        return 0
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL sparse MLA decode (fp8 KV, 64 heads x 512) checks and perf",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[16, 64, 128, 256, 768],
+        help="""Query rows (decode requests x verify rows).
+    e.g.: -b 16 768""",
+    )
+    parser.add_argument(
+        "-q",
+        "--rows-per-request",
+        type=int,
+        nargs="*",
+        default=[6],
+        help="""Query rows per request (1 + speculative tokens).
+    e.g.: -q 1 6""",
+    )
+    args = parser.parse_args()
+
+    aiter.logger.info("sparse MLA decode: running the correctness checks...")
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
+        aiter.logger.error(
+            "sparse MLA decode: checks failed (pytest exit %s); skipping perf sweep",
+            int(status),
+        )
+        return 1
+    with torch.inference_mode():
+        df = [
+            test_sparse_mla_decode(rows, per_request)
+            for per_request, rows in itertools.product(
+                args.rows_per_request, args.batch
+            )
+        ]
+    aiter.logger.info(
+        "flydsl sparse MLA decode summary (markdown):\n%s",
+        pd.DataFrame(df).to_markdown(index=False),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -53,12 +53,10 @@ split-KV combine.
 LDS (hg = 64, p_terms = 2): ring 4 x 32768 + P 2 x 128 x 80 + mu 1024 + pr
 2048 + fin 768 + ids 8192 + rec 32 = 163616 bytes of gfx950's 163840.
 
-Raw ``rocdl`` / ``llvm`` ops: FlyDSL 0.5.0 has no typed API for the
-global -> LDS DMA (``global_load_async_lds``), the scaled MFMAs with per-lane
-E8M0 operands, ``ds_read_b64_tr_b8``, ``permlane{16,32}_swap`` or invariant
-scalar loads. The unpacked fp32 VALU ops are inline asm because LLVM pairs
-plain fp32 ops into ``v_pk_*``, which cannot issue while the other wave's MFMA
-is in flight.
+Raw ``rocdl`` / ``llvm`` ops and inline asm stay only where FlyDSL 0.5.0 has
+no typed operation with the needed semantics; each helper below says why at
+the call. Memory accesses go through typed ``fx`` pointers (the backend
+resolves the address space) or buffer tensors and ``fx.copy``.
 """
 
 import math
@@ -67,15 +65,12 @@ from types import SimpleNamespace
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl_ods
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-
-from . import buffer_ops
 
 BN = 64  # keys per tile
 D = 512  # head dim = row bytes = V width
@@ -97,62 +92,115 @@ PRELOAD_HINTS = {
 TINY_F32 = 1.1754943508222875e-38
 STAGES = 4
 
-
-def _raw(v):
-    return (
-        v.ir_value() if (not isinstance(v, _ir.Value) and hasattr(v, "ir_value")) else v
-    )
+_SHARED = fx.AddressSpace.Shared
+_GLOBAL = fx.AddressSpace.Global
 
 
-def _lds_ptr(addr):
-    return _llvm.inttoptr(_ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(addr)))
-
-
-def _g_ptr(addr):
-    return _llvm.inttoptr(_ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr)))
+def _ptr(space, addr, align, elem=None):
+    """A typed pointer at a raw byte address (LDS addresses are computed with
+    XOR swizzles, global ones from gathered row ids)."""
+    ty = fx.PointerType.get(T.i32 if elem is None else elem, space, align)
+    return fx.inttoptr(ty, fx.Int64(addr))
 
 
 def _ld128(addr):
-    return Vec(_llvm.load(T.vec(4, T.i32), _lds_ptr(addr), alignment=16))
+    return Vec(fx.ptr_load(_ptr(_SHARED, addr, 16), Vec.make_type(4, fx.Int32)))
 
 
 def _st64(addr, v):
-    _llvm.store(_raw(v), _lds_ptr(addr), alignment=8)
+    fx.ptr_store(v, _ptr(_SHARED, addr, 8))
 
 
-def _tr8(addr):
-    return Vec(_rocdl_ods.ds_read_tr8_b64(T.vec(2, T.i32), _lds_ptr(addr)).result)
+def _ld_i32(addr):
+    return fx.Int32(fx.ptr_load(_ptr(_SHARED, addr, 4), fx.Int32))
+
+
+def _st_i32(addr, v):
+    fx.ptr_store(fx.Int32(v), _ptr(_SHARED, addr, 4))
 
 
 def _ld_f32(addr):
-    return fx.Float32(_llvm.load(T.f32, _lds_ptr(addr), alignment=4))
+    return fx.Float32(fx.ptr_load(_ptr(_SHARED, addr, 4, T.f32), fx.Float32))
 
 
 def _st_f32(addr, v):
-    _llvm.store(_raw(fx.Float32(v)), _lds_ptr(addr), alignment=4)
+    fx.ptr_store(fx.Float32(v), _ptr(_SHARED, addr, 4, T.f32))
+
+
+def _gld_i32(addr):
+    return fx.Int32(fx.ptr_load(_ptr(_GLOBAL, addr, 4), fx.Int32))
+
+
+def _gld_f32(addr):
+    return fx.Float32(fx.ptr_load(_ptr(_GLOBAL, addr, 4, T.f32), fx.Float32))
+
+
+def _gld_f32x4(addr):
+    return Vec(
+        fx.ptr_load(_ptr(_GLOBAL, addr, 16, T.f32), Vec.make_type(4, fx.Float32))
+    )
+
+
+def _tr8(addr):
+    # raw ds_read_b64_tr_b8 (V^T operand of the PV MFMA): the per-lane address
+    # is the ring's hand-computed XOR swizzle (swz), not a layout view.
+    return Vec(
+        _rocdl_ods.ds_read_tr8_b64(
+            T.vec(2, T.i32), fx.to_llvm_ptr(_ptr(_SHARED, addr, 8))
+        ).result
+    )
+
+
+def _ld_inv(addr, ty):
+    # raw llvm.load: !invariant.load makes a uniform global load an s_load,
+    # which fx.ptr_load cannot request.
+    p = fx.to_llvm_ptr(_ptr(_GLOBAL, addr, 4, ty))
+    return _llvm.LoadOp(ty, p, alignment=4, invariant=True).result
 
 
 def _ld_inv_i32(addr):
     """A uniform, read-only i32 (an ``s_load``)."""
-    p = _llvm.inttoptr(_ir.Type.parse("!llvm.ptr<4>"), _raw(fx.Int64(addr)))
-    return fx.Int32(_llvm.LoadOp(T.i32, p, alignment=4, invariant=True).result)
+    return fx.Int32(_ld_inv(addr, T.i32))
 
 
 def _ld_inv_f32(addr):
-    p = _llvm.inttoptr(_ir.Type.parse("!llvm.ptr<4>"), _raw(fx.Int64(addr)))
-    return fx.Float32(_llvm.LoadOp(T.f32, p, alignment=4, invariant=True).result)
+    return fx.Float32(_ld_inv(addr, T.f32))
+
+
+def _buffer(base, nbytes, elem, align):
+    """A buffer-resource tensor of ``nbytes`` at ``base``, indexed in ``elem``
+    units by ``fx.slice(buf, (None, i))``; accesses past ``nbytes`` are dropped."""
+    view = fx.make_view(_ptr(_GLOBAL, base, align, elem), fx.make_layout(1 << 30, 1))
+    buf = fx.rocdl.make_buffer_tensor(
+        fx.Tensor(view), max_size=False, num_records_bytes=nbytes
+    )
+    return fx.logical_divide(buf, fx.make_layout(1, 1))
+
+
+def _copy_in(atom, buf, idx, n, dtype):
+    frag = fx.make_rmem_tensor(n, dtype)
+    fx.copy(atom, fx.slice(buf, (None, idx)), frag)
+    return Vec(frag.load())
+
+
+def _copy_out(atom, vals, dtype, buf, idx):
+    frag = fx.make_rmem_tensor(len(vals), dtype)
+    frag.store(Vec.from_elements(vals, dtype))
+    fx.copy(atom, frag, fx.slice(buf, (None, idx)))
 
 
 def _barrier():
+    # inline asm, measured: gpu.barrier (workgroup fences around s_barrier) in
+    # its place gives wrong outputs with this LDS DMA ring (relative error > 1
+    # against the fp64 reference on the served shapes). This form always drains
+    # the wave's LDS ops, and its "memory" clobber pins every access in place.
     _llvm.inline_asm(
         None, [], "s_waitcnt lgkmcnt(0)\ns_barrier", "~{memory}", has_side_effects=True
     )
 
 
 def _waitcnt_vm(n):
-    _llvm.inline_asm(
-        None, [], f"s_waitcnt vmcnt({n})", "~{memory}", has_side_effects=True
-    )
+    fx.rocdl.s_waitcnt(vmcnt=n)
 
 
 def _bits(f):
@@ -164,6 +212,8 @@ def _as_f32(i):
 
 
 def _permlane_swap(op, d_a, d_b):
+    # raw: permlane{16,32}_swap return an LLVM struct of the two swapped words;
+    # FlyDSL 0.5.0 has no typed wrapper.
     pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
     res = op(pair_ty, fx.as_ir_value(d_a), fx.as_ir_value(d_b), False, False)
     return fx.Int32(_llvm.extractvalue(T.i32, res, [0])), fx.Int32(
@@ -172,9 +222,9 @@ def _permlane_swap(op, d_a, d_b):
 
 
 def _maxf_nn(a, b):
-    fm = _ir.Attribute.parse("#arith.fastmath<nnan>")
+    # nnan: one v_max_f32, no NaN canonicalization of the operands
     return fx.Float32(
-        _arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=fm).result
+        fx.maxnumf(fx.Float32(a), fx.Float32(b), fastmath=fx.arith.FastMathFlags.nnan)
     )
 
 
@@ -187,8 +237,10 @@ def _xlane4(x, op):
 
 
 def _valu(asm, *ops):
-    """One unpacked fp32 VALU op as inline asm (LLVM pairs plain fp32 ops into v_pk_*, which cannot issue while the
-    other wave's MFMA is in flight)."""
+    """One unpacked fp32 VALU op as inline asm: LLVM pairs plain fp32 ops of the softmax into v_pk_* (165 -> 280
+    packed ops in the hg = 64, p_terms = 2 kernel), and the QK waves share their SIMDs with the PV waves' MFMAs.
+    Measured (MI355X, CUDA-graph replay, 640 keys per row): plain ops are 1.3-2.3% slower at 192-768 rows with
+    p_terms = 2, no different with p_terms = 1."""
     return fx.Float32(
         _llvm.inline_asm(
             T.f32,
@@ -217,23 +269,20 @@ def _asub_t(a, b):
 
 
 def _exp2(x):
+    # raw v_exp_f32: fx.math.exp2 wraps it in a denormal-range rescale (4 more
+    # VALU ops); here a P under 2^-126 (< 2^-130 of the block's largest) may flush to 0.
     return fx.Float32(_rocdl.exp2(fx.Float32.ir_type, fx.Float32(x).ir_value()))
 
 
 def _pk_fp8(a, b, old, hi):
     return fx.Int32(
-        _rocdl_ods.cvt_pk_fp8_f32(
-            T.i32,
-            fx.as_ir_value(fx.Float32(a)),
-            fx.as_ir_value(fx.Float32(b)),
-            fx.as_ir_value(fx.Int32(old)),
-            hi,
-        )
+        _rocdl.cvt_pk_fp8_f32(T.i32, fx.Float32(a), fx.Float32(b), fx.Int32(old), hi)
     )
 
 
 def _pack4_fp8(x0, x1, x2, x3):
     """Four fp32 -> a dword of four e4m3 bytes, ``x0`` the lowest."""
+    # undef: the second convert writes the high half
     lo = _pk_fp8(x0, x1, fx.Int32(_llvm.mlir_undef(T.i32)), False)
     return _pk_fp8(x2, x3, lo, True)
 
@@ -254,25 +303,16 @@ def _pk_bf16(a, b):
     )
 
 
+# The scaled-MFMA wrappers take the register operands as built above (K and P
+# from swizzled LDS reads, V^T from ds_read_b64_tr_b8) and a per-call E8M0 B
+# scale (the P terms and the lazy rescale), with no MMA atom or fragments.
 def _mfma16(a8, b8, acc4):
     """v_mfma_scale_f32_16x16x128_f8f6f4, e4m3 x e4m3, unit scales. Lane (i, q) holds A[i][32 q + e], B[32 q + e][i],
     e = 0..31 (8 dwords), and gets D[4 q + r][i]."""
-    zero = fx.as_ir_value(fx.Int32(0))
-    e4m3 = _ir.Attribute.parse("#rocdl<matrix_format fp8_e4m3>")
-    sel = _ir.IntegerAttr.get(_ir.IntegerType.get_signless(32), 0)
     return Vec(
-        _rocdl_ods.mfma_scale_f32_16x16x128_f8f6f4(
-            Vec.make_type(4, fx.Float32),
-            fx.as_ir_value(a8),
-            fx.as_ir_value(b8),
-            fx.as_ir_value(acc4),
-            e4m3,
-            e4m3,
-            sel,
-            zero,
-            sel,
-            zero,
-        ).result
+        _rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            Vec.make_type(4, fx.Float32), [a8, b8, acc4, 0, 0, 0, 0, 0, 0]
+        )
     )
 
 
@@ -280,21 +320,10 @@ def _mfma32s(a8, b8, acc16, sc_b):
     """``_mfma32`` with the E8M0 scale of the B operand's K block: lane (j, h) gives the scale (low byte of ``sc_b``)
     of block h of column j; a block is bytes 16 h' .. 16 h' + 15 of the lanes' 32 operand bytes (both lane halves).
     A has unit scales."""
-    e4m3 = _ir.Attribute.parse("#rocdl<matrix_format fp8_e4m3>")
-    sel = _ir.IntegerAttr.get(_ir.IntegerType.get_signless(32), 0)
     return Vec(
-        _rocdl_ods.mfma_scale_f32_32x32x64_f8f6f4(
-            Vec.make_type(16, fx.Float32),
-            fx.as_ir_value(a8),
-            fx.as_ir_value(b8),
-            fx.as_ir_value(acc16),
-            e4m3,
-            e4m3,
-            sel,
-            fx.as_ir_value(fx.Int32(127)),
-            sel,
-            fx.as_ir_value(sc_b),
-        ).result
+        _rocdl.mfma_scale_f32_32x32x64_f8f6f4(
+            Vec.make_type(16, fx.Float32), [a8, b8, acc16, 0, 0, 0, 127, 0, sc_b]
+        )
     )
 
 
@@ -316,9 +345,15 @@ OSTAGE = (
 SLACK = 3.0  # log2 headroom of the first reference: later tiles rarely exceed it
 
 
-def _dma16(src, dst):
+def _dma16(src_addr, lds_addr):
+    # raw global_load_lds_dwordx4: lane pairs gather their own 512-byte key
+    # rows; one instruction per call, so wait_dma's vmcnt counts are exact.
     _rocdl_ods.global_load_async_lds(
-        src, dst, 16, 0, aux=_ir.IntegerAttr.get(_ir.IntegerType.get_signless(32), 0)
+        fx.to_llvm_ptr(_ptr(_GLOBAL, src_addr, 16)),
+        fx.to_llvm_ptr(_ptr(_SHARED, lds_addr, 16)),
+        16,
+        0,
+        aux=_ir.IntegerAttr.get(_ir.IntegerType.get_signless(32), 0),
     )
 
 
@@ -423,7 +458,8 @@ def compile_sparse_mla_decode_fp8_h64(
         nu = (jx < i32_units_x).select(nu, fx.Int32(0))
         for unit_i in range(fx.Index(0), fx.Index(nu), fx.Index(1)):  # type: ignore[call-overload]
             # lane-derived values are recomputed per unit: the compiler would hoist them out of this loop and keep them
-            # live through the key loops
+            # live through the key loops (without it, hg = 64 spills 46 VGPRs to scratch). Inline asm: an s_mov the
+            # compiler cannot fold.
             z = fx.Int32(
                 _llvm.inline_asm(
                     T.i32, [], "s_mov_b32 $0, 0", "=s", has_side_effects=True
@@ -461,11 +497,7 @@ def compile_sparse_mla_decode_fp8_h64(
                 zero = fx.Int32(0)
 
                 def ld(base):
-                    return fx.Int32(
-                        _llvm.load(
-                            T.i32, _g_ptr(base + fx.Int64(geom.rowc) * 4), alignment=4
-                        )
-                    )
+                    return _gld_i32(base + fx.Int64(geom.rowc) * 4)
 
                 return [
                     ld(arg_mip),
@@ -488,10 +520,18 @@ def compile_sparse_mla_decode_fp8_h64(
                 info.kmax = (info.n_unit > 0).select(info.n_unit - 1, fx.Int32(0))
                 return info
 
+            def positions(nthreads):
+                """(list position, may pass MAXK) of this thread's entries when ``nthreads`` threads stage a list."""
+                return [
+                    (tx + nthreads * k, nthreads * (k + 1) > MAXK)
+                    for k in range_constexpr(-(-MAXK // nthreads))
+                ]
+
             def stage_load(info, kps):
                 """The slot ids of the list positions ``kps`` (clamped to the unit's last key): global loads."""
+                has_keys = info.n_unit > 0
                 out = []
-                for kp in kps:
+                for kp, _ in kps:
                     kpg = (kp < info.n_unit).select(kp, info.kmax)
                     if const_expr(has_extra):
                         in_main = kpg < info.n_main
@@ -502,13 +542,17 @@ def compile_sparse_mla_decode_fp8_h64(
                     else:
                         in_main = kpg >= 0
                         sptr = arg_mid + fx.Int64(info.ms + kpg) * 4
-                    out.append(fx.Int32(_llvm.load(T.i32, _g_ptr(sptr), alignment=4)))
+                    # a unit without keys (an empty row, or one past the last row) has no valid list position: its
+                    # position 0 is one past the row's lists (past the end of an index tensor, which may be empty).
+                    # It reads the indptr instead; the ids are never used.
+                    sptr = has_keys.select(sptr, fx.Int64(arg_mip))
+                    out.append(_gld_i32(sptr))
                     out.append(in_main.select(fx.Int32(1), fx.Int32(0)))
                 return out
 
             def stage_store(loaded, kps, buf):
                 """Cache row index (bit 31: extra cache) of every position into the LDS list ``buf``."""
-                for i_, kp in enumerate(kps):
+                for i_, (kp, tail) in enumerate(kps):
                     slot = loaded[2 * i_]
                     in_main = loaded[2 * i_ + 1] != 0
                     if const_expr(has_extra):
@@ -523,32 +567,36 @@ def compile_sparse_mla_decode_fp8_h64(
                             word = rowi | in_main.select(
                                 fx.Int32(0), fx.Int32(-2147483648)
                             )
-                        _llvm.store(_raw(word), _lds_ptr(buf + kp * 4), alignment=4)
+                        # the list holds MAXK entries: a chunk that runs past it stores only its first positions
+                        if const_expr(tail):
+                            if kp < MAXK:
+                                _st_i32(buf + kp * 4, word)
+                        else:
+                            _st_i32(buf + kp * 4, word)
                     else:
                         base = (
                             in_main.select(fx.Int64(arg_main), fx.Int64(arg_xtra))
                             if has_extra
                             else fx.Int64(arg_main)
                         )
-                        _llvm.store(
-                            _raw(base + fx.Int64(rowi) * D),
-                            _lds_ptr(buf + kp * 8),
-                            alignment=8,
-                        )
+                        addr = base + fx.Int64(rowi) * D
+                        if const_expr(tail):
+                            if kp < MAXK:
+                                fx.ptr_store(
+                                    addr, _ptr(_SHARED, buf + kp * 8, 8, T.i64)
+                                )
+                        else:
+                            fx.ptr_store(addr, _ptr(_SHARED, buf + kp * 8, 8, T.i64))
 
             geom = unit_geom(unit_i)
             warm = fx.Int32(0) > fx.Int32(1)
             ptrs = [fx.Int32(0) for _ in range_constexpr(4)]
             if const_expr(PERSIST):
                 if fx.Int32(unit_i) > 0:
-                    warm = uni(_llvm.load(T.i32, _lds_ptr(lds_rec), alignment=4)) != 0
+                    warm = uni(_ld_i32(lds_rec)) != 0
                 if warm:
                     ptrs = [
-                        uni(
-                            _llvm.load(
-                                T.i32, _lds_ptr(lds_rec + 4 * (i_ + 1)), alignment=4
-                            )
-                        )
+                        uni(_ld_i32(lds_rec + 4 * (i_ + 1)))
                         for i_ in range_constexpr(4)
                     ]
                 else:
@@ -567,10 +615,7 @@ def compile_sparse_mla_decode_fp8_h64(
                 (fx.Int32(unit_i) % 2) * (MAXK * 4) if PERSIST else fx.Int32(0)
             )
             ids_nxt = lds_ids + ((fx.Int32(unit_i) + 1) % 2) * (MAXK * 4)
-            kps_all = [
-                tx + 64 * NWV * k
-                for k in range_constexpr((MAXK + 64 * NWV - 1) // (64 * NWV))
-            ]
+            kps_all = positions(64 * NWV)
             if const_expr(PERSIST):
                 if not warm:
                     stage_store(stage_load(info, kps_all), kps_all, ids_cur)
@@ -668,9 +713,7 @@ def compile_sparse_mla_decode_fp8_h64(
                     for t in range_constexpr(2)
                 ]
                 for t in range_constexpr(2):
-                    _llvm.store(
-                        _raw(ph[t]), _lds_ptr(pbase + Q.pw[hb][t][0]), alignment=4
-                    )
+                    _st_i32(pbase + Q.pw[hb][t][0], ph[t])
                 if const_expr(p_terms == 2):
                     for t in range_constexpr(2):
                         h01 = _unpack2_fp8(ph[t], False)
@@ -681,9 +724,7 @@ def compile_sparse_mla_decode_fp8_h64(
                             _asub_t(ps[4 * t + 2], h23[0]),
                             _asub_t(ps[4 * t + 3], h23[1]),
                         )
-                        _llvm.store(
-                            _raw(pl), _lds_ptr(pbase + Q.pw[hb][t][1]), alignment=4
-                        )
+                        _st_i32(pbase + Q.pw[hb][t][1], pl)
 
             def mu_addr(buf, kgi, hb):
                 return lds_mu + (((buf * 2 + kgi) * H + Q.head[hb]) * 4)
@@ -801,7 +842,7 @@ def compile_sparse_mla_decode_fp8_h64(
                 kp = (kp > MAXK - 1).select(fx.Int32(MAXK - 1), kp)
                 ids = ids_cur if ids_b is None else ids_b
                 if const_expr(PERSIST):
-                    w = fx.Int32(_llvm.load(T.i32, _lds_ptr(ids + kp * 4), alignment=4))
+                    w = _ld_i32(ids + kp * 4)
                     if const_expr(has_extra):
                         a = (
                             fx.Int64(arg_main)
@@ -812,12 +853,12 @@ def compile_sparse_mla_decode_fp8_h64(
                     else:
                         a = fx.Int64(arg_main) + fx.Int64(w) * D
                 else:
-                    a = fx.Int64(_llvm.load(T.i64, _lds_ptr(ids + kp * 8), alignment=8))
+                    a = fx.Int64(
+                        fx.ptr_load(_ptr(_SHARED, ids + kp * 8, 8, T.i64), fx.Int64)
+                    )
                 _dma16(
-                    _g_ptr(a + fx.Int64(dma_off[jj])),
-                    _lds_ptr(
-                        uni(lds_kv + slot * TILE_B + (DMA_PER_WAVE * wp + jj) * 1024)
-                    ),
+                    a + fx.Int64(dma_off[jj]),
+                    uni(lds_kv + slot * TILE_B + (DMA_PER_WAVE * wp + jj) * 1024),
                 )
 
             def wait_dma(later):
@@ -864,14 +905,8 @@ def compile_sparse_mla_decode_fp8_h64(
                 )
 
             def pv_next(slot, buf, acc, fill=None):
-                rec = Vec(
-                    _llvm.load(
-                        T.vec(4, T.i32),
-                        _lds_ptr(lds_pr + ((buf * H + Pc.head) * 4) * 4),
-                        alignment=16,
-                    )
-                )
-                alpha = fx.arith.minimumf(
+                rec = _ld128(lds_pr + ((buf * H + Pc.head) * 4) * 4)
+                alpha = fx.min(
                     fx.Int32(rec[1]).bitcast(fx.Float32),
                     fx.Int32(rec[3]).bitcast(fx.Float32),
                 )
@@ -913,28 +948,26 @@ def compile_sparse_mla_decode_fp8_h64(
                         comb.append(Vec.from_elements(el, fx.Float32))
                     acc_f = comb
                 if const_expr(not mxfp8):
-                    orr = buffer_ops.create_buffer_resource_from_addr(
-                        arg_out, num_records_bytes=fx.Int64(i32_T) * fx.Int64(H * D * 2)
-                    )
-                    for d in range_constexpr(4):
-                        x = acc_f[d]
-                        head = head_base + Pc.head
-                        for a in range_constexpr(4):
-                            lo = _pk_bf16(x[4 * a] * rv, x[4 * a + 1] * rv)
-                            hi = _pk_bf16(x[4 * a + 2] * rv, x[4 * a + 3] * rv)
-                            dim = 128 * dg + 32 * d + 8 * a + 4 * hh
-                            off = ((rowc * H + head) * D + dim) // 2
-                            if const_expr(HG == 16):
-                                buffer_ops.buffer_store(
-                                    Vec.from_elements([lo, hi], fx.Int32),
-                                    orr,
-                                    off,
-                                    mask=l32 < 16,
-                                )
-                            else:
-                                buffer_ops.buffer_store(
-                                    Vec.from_elements([lo, hi], fx.Int32), orr, off
-                                )
+                    out_w = _buffer(arg_out, fx.Int64(i32_T) * (H * D * 2), T.i32, 16)
+                    st8 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 32)
+
+                    def store_rows():
+                        for d in range_constexpr(4):
+                            x = acc_f[d]
+                            head = head_base + Pc.head
+                            for a in range_constexpr(4):
+                                lo = _pk_bf16(x[4 * a] * rv, x[4 * a + 1] * rv)
+                                hi = _pk_bf16(x[4 * a + 2] * rv, x[4 * a + 3] * rv)
+                                dim = 128 * dg + 32 * d + 8 * a + 4 * hh
+                                off = ((rowc * H + head) * D + dim) // 2
+                                _copy_out(st8, [lo, hi], fx.Int32, out_w, off)
+
+                    if const_expr(HG == 16):
+                        # lanes 16..31 hold the residual columns, added in above
+                        if l32 < 16:
+                            store_rows()
+                    else:
+                        store_rows()
                 else:
                     # rows of 1 KB at the ring's slots 2 and 3, the 16-byte chunk index XORed with the row (bank-conflict free)
                     r8 = Pc.head & 7
@@ -960,15 +993,8 @@ def compile_sparse_mla_decode_fp8_h64(
                 vv = []
                 for half in range_constexpr(2):
                     for q_ in range_constexpr(4):
-                        c4 = Vec(
-                            _llvm.load(
-                                T.vec(4, T.f32),
-                                _g_ptr(
-                                    cs_row
-                                    + fx.Int64(32 * half + 16 * (lane % 2) + 4 * q_) * 4
-                                ),
-                                alignment=16,
-                            )
+                        c4 = _gld_f32x4(
+                            cs_row + fx.Int64(32 * half + 16 * (lane % 2) + 4 * q_) * 4
                         )
                         vv += [fx.Float32(c4[k]) for k in range_constexpr(4)]
                 return vv
@@ -977,12 +1003,10 @@ def compile_sparse_mla_decode_fp8_h64(
                 """All waves: the bf16 rows in LDS -> inverse RoPE -> MXFP8 codes and E8M0 scales. A task is the block
                 pair 2 (t % 8), + 1 of the heads 32 (t // 8) .. + 31 (wave w: the tasks w, w + NWV).
                 """
-                ocr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_out, num_records_bytes=fx.Int64(i32_T) * fx.Int64(H * D)
-                )
-                osr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_osc, num_records_bytes=fx.Int64(i32_T) * fx.Int64(H * D // 32)
-                )
+                codes_w = _buffer(arg_out, fx.Int64(i32_T) * (H * D), T.i32, 16)
+                scales_b = _buffer(arg_osc, fx.Int64(i32_T) * (H * D // 32), T.i8, 1)
+                st16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
+                st1 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), 8)
 
                 def task(t):
                     blk = 2 * (t % 8) + lane % 2
@@ -1016,9 +1040,7 @@ def compile_sparse_mla_decode_fp8_h64(
                     sbf = fx.math.ceil(
                         fx.math.log2(amax / fx.Float32(448.0))
                     ) + fx.Float32(127.0)
-                    sbf = fx.arith.minimumf(
-                        fx.arith.maximumf(sbf, fx.Float32(0.0)), fx.Float32(254.0)
-                    )
+                    sbf = fx.min(fx.max(sbf, fx.Float32(0.0)), fx.Float32(254.0))
                     rs = fx.Float32(fx.math.exp2(fx.Float32(127.0) - sbf))
                     ok = head < HG
                     dw8 = [
@@ -1031,18 +1053,16 @@ def compile_sparse_mla_decode_fp8_h64(
                         for a in range_constexpr(8)
                     ]
                     off = ((rowc * H + head_base + head) * D + blk * 32) // 4
-                    buffer_ops.buffer_store(
-                        Vec.from_elements(dw8[0:4], fx.Int32), ocr, off, mask=ok
-                    )
-                    buffer_ops.buffer_store(
-                        Vec.from_elements(dw8[4:8], fx.Int32), ocr, off + 4, mask=ok
-                    )
-                    buffer_ops.buffer_store(
-                        sbf.to(fx.Int32).to(fx.Int8),
-                        osr,
-                        rowc * (H * D // 32) + (head_base + head) * (D // 32) + blk,
-                        mask=ok,
-                    )
+                    if ok:
+                        _copy_out(st16, dw8[0:4], fx.Int32, codes_w, off)
+                        _copy_out(st16, dw8[4:8], fx.Int32, codes_w, off + 4)
+                        _copy_out(
+                            st1,
+                            [sbf.to(fx.Int32).to(fx.Int8)],
+                            fx.Int8,
+                            scales_b,
+                            rowc * (H * D // 32) + (head_base + head) * (D // 32) + blk,
+                        )
 
                 for i_ in range_constexpr(-(-NTASK // NWV)):
                     if w8 + NWV * i_ < NTASK:
@@ -1055,19 +1075,12 @@ def compile_sparse_mla_decode_fp8_h64(
             cs_vals = [fx.Float32(0.0) for _ in range_constexpr(32)]
             if not isq:
                 sink2 = (
-                    fx.Float32(
-                        _llvm.load(
-                            T.f32,
-                            _g_ptr(
-                                arg_sink
-                                + fx.Int64(
-                                    head_base
-                                    + ((l32 % 16) if HG == 16 else (32 * ht0 + l32))
-                                )
-                                * 4
-                            ),
-                            alignment=4,
+                    _gld_f32(
+                        arg_sink
+                        + fx.Int64(
+                            head_base + ((l32 % 16) if HG == 16 else (32 * ht0 + l32))
                         )
+                        * 4
                     )
                     * LOG2E
                 )
@@ -1077,7 +1090,7 @@ def compile_sparse_mla_decode_fp8_h64(
             acc_f = init_acc
             if isq:
                 setup_qk()
-                kps_q = [tx + 64 * NQW * k for k in range_constexpr(MAXK // (64 * NQW))]
+                kps_q = positions(64 * NQW)
                 nxt = [fx.Int32(0) for _ in range_constexpr(2 * (MAXK // (64 * NQW)))]
                 has_nq = fx.Int32(0) > fx.Int32(1)
                 if const_expr(PERSIST):
@@ -1085,9 +1098,8 @@ def compile_sparse_mla_decode_fp8_h64(
                     raw_nq = unit_ptrs_raw(geom_nq)
                 if Q.on:
                     if nt > 0:
-                        qr = buffer_ops.create_buffer_resource_from_addr(
-                            arg_q, num_records_bytes=fx.Int64(i32_T) * fx.Int64(H * D)
-                        )
+                        q_w = _buffer(arg_q, fx.Int64(i32_T) * (H * D), T.i32, 16)
+                        ld16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
                         qfrag = []
                         for hb in range_constexpr(HBW):
                             q_dw = (rowc * H + head_base + Q.head[hb]) * (
@@ -1095,13 +1107,11 @@ def compile_sparse_mla_decode_fp8_h64(
                             ) + 8 * q4
                             fr = []
                             for s_ in range_constexpr(4):
-                                lo = buffer_ops.buffer_load(
-                                    qr, q_dw + 32 * s_, vec_width=4, dtype=fx.Int32
+                                lo = _copy_in(ld16, q_w, q_dw + 32 * s_, 4, fx.Int32)
+                                hi = _copy_in(
+                                    ld16, q_w, q_dw + 32 * s_ + 4, 4, fx.Int32
                                 )
-                                hi = buffer_ops.buffer_load(
-                                    qr, q_dw + 32 * s_ + 4, vec_width=4, dtype=fx.Int32
-                                )
-                                fr.append(_cat8(Vec(lo), Vec(hi)))
+                                fr.append(_cat8(lo, hi))
                             qfrag.append(fr)
                         _barrier()
                         _barrier()
@@ -1243,17 +1253,9 @@ def compile_sparse_mla_decode_fp8_h64(
                     info_n = unit_info(geom_n, ptrs_n)
                     has_next = info_n.live & (info_n.nt > 0)
                     if tx == 64 * NQW:
-                        _llvm.store(
-                            _raw(has_next.select(fx.Int32(1), fx.Int32(0))),
-                            _lds_ptr(lds_rec),
-                            alignment=4,
-                        )
+                        _st_i32(lds_rec, has_next.select(fx.Int32(1), fx.Int32(0)))
                         for i_ in range_constexpr(4):
-                            _llvm.store(
-                                _raw(ptrs_n[i_]),
-                                _lds_ptr(lds_rec + 4 * (i_ + 1)),
-                                alignment=4,
-                            )
+                            _st_i32(lds_rec + 4 * (i_ + 1), ptrs_n[i_])
                 _barrier()
                 if const_expr(PERSIST):
                     if has_next:

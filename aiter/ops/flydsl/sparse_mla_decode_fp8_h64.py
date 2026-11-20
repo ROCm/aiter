@@ -8,9 +8,12 @@ DeepSeek-V4-style decode call of ``sparse_mla_fwd`` (aiter Triton) with a
 per-tensor e4m3 ("fp8_scalar") cache, fp8 dots and the inverse-RoPE MXFP8
 output epilogue: 64 query heads of 512 dims whose RoPE (64 dims) sits inside
 the row, a sliding-window main list plus a top-k extra list per query row, an
-attention sink. The keyword arguments follow ``sparse_mla_fwd``, so a caller
-checks ``can_use_flydsl_sparse_mla_decode_fp8_h64`` with the arguments it
-would pass there and falls back to it otherwise.
+attention sink. Both entry points take ``sparse_mla_fwd``'s keyword
+arguments with its defaults (plus ``max_keys_per_row``), so a caller checks
+``can_use_flydsl_sparse_mla_decode_fp8_h64`` with the arguments it would pass
+there and falls back to it otherwise; a value this kernel does not implement
+(``dot_precision="bf16"``, ``return_lse=True``, an appended RoPE, ...) is
+declined.
 
 Both checks read host metadata only (shapes, dtypes, strides, pointers), so
 they are safe under CUDA graph capture.
@@ -37,16 +40,15 @@ from .kernels.sparse_mla_decode_fp8_h64 import (
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
-    "MAX_KEYS_PER_ROW",
     "can_use_flydsl_sparse_mla_decode_fp8_h64",
     "flydsl_sparse_mla_decode_fp8_h64",
+    "warmup_flydsl_sparse_mla_decode_fp8_h64",
 ]
 
-NUM_HEADS = H
-HEAD_DIM = D
-ROPE_DIM = ROPE
 # main + extra keys of one query row: the kernel stages a row's slot ids in LDS
 MAX_KEYS_PER_ROW = MAXK
+# query rows: keeps every output offset a 32-bit buffer offset (bf16 rows: 1 GiB)
+MAX_ROWS = 16384
 _FP8 = (torch.float8_e4m3fn, torch.uint8)
 _XCDS = 8
 
@@ -103,6 +105,10 @@ def _cache_geometry(cache: torch.Tensor) -> tuple[int, int] | None:
     return block.bit_length() - 1, cache.stride(0) // D
 
 
+def _aligned(t: torch.Tensor, align: int = 16) -> bool:
+    return t.data_ptr() % align == 0
+
+
 def _index_ok(t: torch.Tensor | None, device: torch.device) -> bool:
     return (
         t is not None
@@ -142,22 +148,44 @@ def _unsupported_reason(
     out: torch.Tensor | None,
     has_invalid: bool,
     max_keys_per_row: int | None,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dot_precision: str,
+    return_lse: bool,
+    skip_reduce: bool,
 ) -> str | None:
     if not q.is_cuda or torch.version.hip is None:
         return "needs a ROCm device tensor"
     if get_gfx_runtime() != "gfx950":
         return "gfx950 only"
+    if kv_lora_rank != D or qk_rope_head_dim != 0:
+        return f"rope inside the row only: kv_lora_rank={D}, qk_rope_head_dim=0"
+    if dot_precision != "fp8":
+        return 'fp8 dots only (dot_precision="fp8")'
+    if return_lse or skip_reduce:
+        return "no LSE or split-K partial outputs"
     dev = q.device
     if q.dim() != 3 or tuple(q.shape[1:]) != (H, D):
         return f"q must be [T, {H}, {D}], got {tuple(q.shape)}"
-    if q.dtype not in _FP8 or not q.is_contiguous():
-        return "q must be a contiguous float8_e4m3fn tensor"
+    if q.dtype not in _FP8 or not q.is_contiguous() or not _aligned(q):
+        return "q must be a contiguous, 16-byte aligned float8_e4m3fn tensor"
+    if q.shape[0] > MAX_ROWS:
+        return f"at most {MAX_ROWS} query rows"
     if has_invalid:
         return "-1 sentinels in the index lists are not supported"
-    if max_keys_per_row is not None and max_keys_per_row > MAXK:
-        return f"at most {MAXK} keys per row"
-    if kv_buffer.device != dev or _cache_geometry(kv_buffer) is None:
-        return "kv_buffer must be an e4m3 [blocks, 2^k, 512] or [rows, 512] cache"
+    # The kernel clamps list positions to MAXK - 1, so a longer row would be
+    # wrong without an error; the lengths live on the device, so the caller
+    # states its bound (window + top-k).
+    if max_keys_per_row is None or max_keys_per_row > MAXK:
+        return f"pass max_keys_per_row (main + extra keys of a row), at most {MAXK}"
+    if (
+        kv_buffer.device != dev
+        or _cache_geometry(kv_buffer) is None
+        or not _aligned(kv_buffer)
+    ):
+        return (
+            "kv_buffer must be an aligned e4m3 [blocks, 2^k, 512] or [rows, 512] cache"
+        )
     if not (_index_ok(kv_indptr, dev) and _index_ok(kv_indices, dev)):
         return "kv_indptr / kv_indices must be contiguous 1-D int32 on q's device"
     if kv_indptr.shape[0] < q.shape[0] + 1:
@@ -176,8 +204,12 @@ def _unsupported_reason(
     if any(t is not None for t in extra):
         if any(t is None for t in extra):
             return "extra_kv, extra_indptr and extra_indices go together"
-        if extra_kv.device != dev or _cache_geometry(extra_kv) is None:
-            return "extra_kv must be an e4m3 [blocks, 2^k, 512] or [rows, 512] cache"
+        if (
+            extra_kv.device != dev
+            or _cache_geometry(extra_kv) is None
+            or not _aligned(extra_kv)
+        ):
+            return "extra_kv must be an aligned e4m3 [blocks, 2^k, 512] or [rows, 512] cache"
         if not (_index_ok(extra_indptr, dev) and _index_ok(extra_indices, dev)):
             return "extra_indptr / extra_indices must be contiguous 1-D int32"
         if extra_indptr.shape[0] < q.shape[0] + 1:
@@ -201,22 +233,29 @@ def _unsupported_reason(
             or not pos.is_contiguous()
         ):
             return "inv_rope_positions must be contiguous [T] int32 / int64"
+        # read as 16-byte vectors: 16-byte aligned rows
         if (
             cs.device != dev
             or cs.dtype != torch.float32
             or cs.dim() != 2
             or cs.shape[1] != ROPE
             or cs.stride(1) != 1
+            or cs.stride(0) % 4
+            or not _aligned(cs)
         ):
-            return f"inv_rope_cos_sin_cache must be [P, {ROPE}] float32 (cos | sin)"
+            return (
+                f"inv_rope_cos_sin_cache must be [P, {ROPE}] float32 (cos | sin) "
+                "with 16-byte aligned rows"
+            )
         data, scale = out_mxfp8
         if (
             data.device != dev
             or data.dtype not in _FP8
             or tuple(data.shape) != (T, H * D)
             or not data.is_contiguous()
+            or not _aligned(data)
         ):
-            return f"out_mxfp8[0] must be contiguous [T, {H * D}] e4m3"
+            return f"out_mxfp8[0] must be contiguous, aligned [T, {H * D}] e4m3"
         if (
             scale.device != dev
             or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu)
@@ -232,8 +271,9 @@ def _unsupported_reason(
             or out.dtype != torch.bfloat16
             or tuple(out.shape) != (T, H, D)
             or not out.is_contiguous()
+            or not _aligned(out)
         ):
-            return f"out must be contiguous [T, {H}, {D}] bf16"
+            return f"out must be contiguous, aligned [T, {H}, {D}] bf16"
     return None
 
 
@@ -244,7 +284,15 @@ def can_use_flydsl_sparse_mla_decode_fp8_h64(
     kv_indices: torch.Tensor,
     *,
     kv_scale: torch.Tensor | None = None,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    kv_splits: int | None = None,
+    skip_reduce: bool = False,
+    has_invalid: bool = False,
+    dot_precision: str = "bf16",
     q_scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    return_lse: bool = False,
     attn_sink: torch.Tensor | None = None,
     extra_kv: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
@@ -253,18 +301,17 @@ def can_use_flydsl_sparse_mla_decode_fp8_h64(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
-    out: torch.Tensor | None = None,
-    has_invalid: bool = False,
     max_keys_per_row: int | None = None,
 ) -> bool:
     """Whether ``flydsl_sparse_mla_decode_fp8_h64`` serves this call.
 
-    Takes the arguments of ``flydsl_sparse_mla_decode_fp8_h64`` (minus
-    ``softmax_scale``). ``max_keys_per_row``: the caller's bound on a row's
-    main + extra keys (window + top-k); it cannot be read from the index
-    tensors without a device sync, so a caller that may exceed
-    ``MAX_KEYS_PER_ROW`` passes it to be declined.
+    Takes ``sparse_mla_fwd``'s keyword arguments, with its defaults, and
+    ``max_keys_per_row``: the caller's bound on a row's main + extra keys
+    (window + top-k). The lengths live on the device and the kernel clamps a
+    row to ``MAX_KEYS_PER_ROW`` (1024) keys, so a call without the bound is
+    declined. ``kv_splits`` (a split-K hint) is ignored.
     """
+    del kv_splits
     return (
         _unsupported_reason(
             q,
@@ -284,6 +331,11 @@ def can_use_flydsl_sparse_mla_decode_fp8_h64(
             out=out,
             has_invalid=has_invalid,
             max_keys_per_row=max_keys_per_row,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dot_precision=dot_precision,
+            return_lse=return_lse,
+            skip_reduce=skip_reduce,
         )
         is None
     )
@@ -297,7 +349,15 @@ def flydsl_sparse_mla_decode_fp8_h64(
     softmax_scale: float,
     *,
     kv_scale: torch.Tensor,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    kv_splits: int | None = None,
+    skip_reduce: bool = False,
+    has_invalid: bool = False,
+    dot_precision: str = "bf16",
     q_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+    return_lse: bool = False,
     attn_sink: torch.Tensor,
     extra_kv: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
@@ -306,8 +366,6 @@ def flydsl_sparse_mla_decode_fp8_h64(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
-    out: torch.Tensor | None = None,
-    has_invalid: bool = False,
     max_keys_per_row: int | None = None,
     p_terms: int = 2,
     heads_per_workgroup: int | None = None,
@@ -319,11 +377,16 @@ def flydsl_sparse_mla_decode_fp8_h64(
     ``kv_indices[kv_indptr[t]:kv_indptr[t + 1]]`` of ``kv_buffer`` followed by
     ``extra_indices[extra_indptr[t]:extra_indptr[t + 1]]`` of ``extra_kv``
     (slot ``s`` of a ``[blocks, block, 512]`` cache is row ``s % block`` of
-    block ``s // block``), at most ``MAX_KEYS_PER_ROW`` keys in all, plus the
-    sink ``exp(attn_sink[h])`` in the softmax denominator. A key row is K and V
-    (448 nope + 64 RoPE dims, e4m3, one per-tensor ``kv_scale`` for both
+    block ``s // block``), at most ``max_keys_per_row`` <= 1024 keys in all,
+    plus the sink ``exp(attn_sink[h])`` in the softmax denominator. A key row is
+    K and V (448 nope + 64 RoPE dims, e4m3, one per-tensor ``kv_scale`` for both
     caches); scores are ``q k * q_scale * kv_scale * softmax_scale``. A row
     with no key gives zeros.
+
+    The keyword arguments are ``sparse_mla_fwd``'s with its defaults; this
+    kernel implements ``kv_lora_rank=512, qk_rope_head_dim=0,
+    dot_precision="fp8"`` with ``return_lse=False``, ``skip_reduce=False`` and
+    ``has_invalid=False`` (``kv_splits`` is ignored).
 
     Output, one of:
         out_mxfp8: (codes ``[T, 64 * 512]`` e4m3, scales ``[T, 64 * 512 // 32]``
@@ -334,6 +397,8 @@ def flydsl_sparse_mla_decode_fp8_h64(
         out: ``[T, 64, 512]`` bf16 rows, no RoPE.
 
     Args:
+        max_keys_per_row: the caller's bound on a row's main + extra keys
+            (window + top-k, e.g. 128 + 512); required, at most 1024.
         p_terms: 2 runs P x V with P as two e4m3 terms (hi + residual, cosine
             to an fp64 reference > 0.99999), 1 with one e4m3 P (~0.9997, like
             the Triton kernel's fp8 dots) and 5-15% faster.
@@ -341,10 +406,14 @@ def flydsl_sparse_mla_decode_fp8_h64(
             64 heads per workgroup; the persistent 64-head kernel's workgroups
             per XCD); None picks them from the row count.
 
+    The first call of each kernel variant compiles it; call
+    ``warmup_flydsl_sparse_mla_decode_fp8_h64`` before CUDA graph capture.
+
     Raises:
         ValueError: if ``can_use_flydsl_sparse_mla_decode_fp8_h64`` would
             return False for these arguments.
     """
+    del kv_splits
     reason = _unsupported_reason(
         q,
         kv_buffer,
@@ -363,6 +432,11 @@ def flydsl_sparse_mla_decode_fp8_h64(
         out=out,
         has_invalid=has_invalid,
         max_keys_per_row=max_keys_per_row,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dot_precision=dot_precision,
+        return_lse=return_lse,
+        skip_reduce=skip_reduce,
     )
     if reason is not None:
         raise ValueError(f"flydsl_sparse_mla_decode_fp8_h64: {reason}")
@@ -437,4 +511,64 @@ def flydsl_sparse_mla_decode_fp8_h64(
             sm_log2,
             _XCDS * wgs_x,
             torch.cuda.current_stream(q.device),
+        )
+
+
+def warmup_flydsl_sparse_mla_decode_fp8_h64(
+    device: torch.device | str | int | None = None,
+    *,
+    p_terms: int = 2,
+    mxfp8: bool = True,
+    has_extra: bool = True,
+) -> None:
+    """Compile the kernels the dispatch can pick for this configuration (one
+    per head group) by running each once on a one-row input, so that no JIT
+    compile happens during CUDA graph capture. ``mxfp8`` selects the output
+    (MXFP8 with the inverse RoPE, or bf16 rows) and ``has_extra`` whether the
+    calls pass the extra (top-k) list."""
+    if device is None:
+        device = torch.cuda.current_device()
+    dev = (
+        torch.device("cuda", device)
+        if isinstance(device, int)
+        else torch.device(device)
+    )
+    f32 = {"dtype": torch.float32, "device": dev}
+    i32 = {"dtype": torch.int32, "device": dev}
+    cache = torch.zeros((2, D), dtype=torch.float8_e4m3fn, device=dev)
+    lists = {
+        "kv_indptr": torch.tensor([0, 1], **i32),
+        "kv_indices": torch.zeros(1, **i32),
+    }
+    if has_extra:
+        lists["extra_kv"] = cache
+        lists["extra_indptr"] = torch.tensor([0, 1], **i32)
+        lists["extra_indices"] = torch.ones(1, **i32)
+    if mxfp8:
+        output = {
+            "out_mxfp8": (
+                torch.empty((1, H * D), dtype=torch.float8_e4m3fn, device=dev),
+                torch.empty((1, H * D // 32), dtype=torch.uint8, device=dev),
+            ),
+            "inv_rope_positions": torch.zeros(1, **i32),
+            "inv_rope_cos_sin_cache": torch.zeros((1, ROPE), **f32),
+        }
+    else:
+        output = {"out": torch.empty((1, H, D), dtype=torch.bfloat16, device=dev)}
+    for hg in HEAD_GROUPS:
+        flydsl_sparse_mla_decode_fp8_h64(
+            torch.zeros((1, H, D), dtype=torch.float8_e4m3fn, device=dev),
+            cache,
+            softmax_scale=D**-0.5,
+            kv_scale=torch.ones(1, **f32),
+            q_scale=torch.ones(1, **f32),
+            attn_sink=torch.zeros(H, **f32),
+            kv_lora_rank=D,
+            qk_rope_head_dim=0,
+            dot_precision="fp8",
+            max_keys_per_row=2,
+            p_terms=p_terms,
+            heads_per_workgroup=hg,
+            **lists,
+            **output,
         )

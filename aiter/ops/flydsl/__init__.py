@@ -138,6 +138,10 @@ _LAZY_IMPORTS = {
         ".sparse_mla_decode_fp8_h64",
         "flydsl_sparse_mla_decode_fp8_h64",
     ),
+    "warmup_flydsl_sparse_mla_decode_fp8_h64": (
+        ".sparse_mla_decode_fp8_h64",
+        "warmup_flydsl_sparse_mla_decode_fp8_h64",
+    ),
     "CombineWorkspace": (".dcp_mailbox", "CombineWorkspace"),
     "GatherWorkspace": (".dcp_mailbox", "GatherWorkspace"),
     "dcp_lse_combine": (".dcp_mailbox", "dcp_lse_combine"),
@@ -321,6 +325,7 @@ __all__ = [
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
+    "warmup_flydsl_sparse_mla_decode_fp8_h64",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
