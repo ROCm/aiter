@@ -11,7 +11,7 @@ lowest ``us * package watts``.
 
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py               # untuned shapes
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --all         # retune them all
-    python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --run_config  # time the CSV
+    python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --run_config aiter/configs/iq2r_glm53_tuned.csv
 
 Candidates are timed by CUDA graph replay, as serving runs decode batches.
 Each call in the graph reads its own copy of the layer with its own routing,
@@ -39,49 +39,75 @@ from aiter.iq2r_glm53 import (
     MAX_DECODE_TOKENS,
     TOPK,
     IQ2RGlm53Config,
+    IQ2RGlm53Shared,
     IQ2RGlm53Workspace,
+    _mxfp8_quantize,
+    iq2r_glm53_dequantize_shared,
     iq2r_glm53_moe_out,
     iq2r_glm53_pack,
+    iq2r_glm53_pack_shared,
 )
 from aiter.jit import core
-from aiter.ops.iq2r import iq2r_encode_device, iq2r_materialize_device
-from aiter.ops.iq2r_encoder import iq2r_initial_codebook
-from aiter.ops.iq2r_format import IQ2RMetadata
+from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_LEVELS_C4,
+    iq2r_v2_encode,
+    iq2r_v2_gains,
+    iq2r_v2_materialize,
+    iq2r_v2_seed_codebook,
+    iq2r_v2_write_auxiliary,
+    iq2r_v2_write_data,
+)
 from aiter.utility.base_tuner import TunerCommon
 
 CONFIG_ENV = "AITER_CONFIG_IQ2R_GLM53"
-KEYS = ["gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk"]
+KEYS = [
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "codebook",
+    "shared",
+]
 RESULTS = ["gate_kernel", "gate_grid", "down_kernel", "down_grid", "down_chunks", "us"]
 ROTATE_BYTES = 1 << 30  # expert weights read per graph replay: 4x the MALL
 
 
-def synthetic_weights(intermediate_size: int, device: str):
-    """Three encoded random experts tiled over all 257, with their dense weights.
+def synthetic_weights(intermediate_size: int, device: str, entries: int = 512):
+    """Three encoded random experts tiled over all 256, with their dense weights,
+    for a 512- or 1,024-entry codebook.
 
     Returns ``(packed, gate, down, pick)``: expert ``e`` uses ``gate[pick[e]]``.
     """
-    codebook = iq2r_initial_codebook(device)
+    levels = IQ2R_V2_LEVELS_C4
+    codebook = iq2r_v2_seed_codebook(device, entries)
 
-    def matrix(n: int, k: int):
-        records = [
-            iq2r_encode_device(
-                torch.randn((n, k), device=device) * 0.02,
-                torch.ones((k,), device=device),
-                codebook,
-                exponent_radius=8,
+    def matrix(n: int, k: int, interleaved: bool):
+        records, dense = [], []
+        for _ in range(3):
+            weight = torch.randn((n, k), device=device) * 0.02
+            enc = iq2r_v2_encode(
+                weight, torch.ones((k,), device=device), codebook, levels
             )
-            for _ in range(3)
-        ]
-        dense = [
-            iq2r_materialize_device(d.view(1, -1), a.view(1, -1), IQ2RMetadata(n, k))
-            for d, a in records
-        ]
+            gains = iq2r_v2_gains(
+                weight, enc.reconstruction, 0.98, interleaved=interleaved
+            )
+            data = iq2r_v2_write_data(
+                enc.indices, enc.negative, enc.levels, levels, entries
+            )
+            aux = iq2r_v2_write_auxiliary(codebook[None], enc.d, gains)
+            records.append((data, aux))
+            dense.append(
+                iq2r_v2_materialize(data, aux, n, k, levels, codebook_entries=entries)
+            )
         data, aux = (torch.stack(parts)[pick] for parts in zip(*records))
         return data, aux, dense
 
     pick = torch.arange(EXPERTS, device=device) % 3
-    gate, gate_aux, gate_dense = matrix(2 * intermediate_size, HIDDEN)
-    down, down_aux, down_dense = matrix(HIDDEN, intermediate_size)
+    gate, gate_aux, gate_dense = matrix(2 * intermediate_size, HIDDEN, True)
+    down, down_aux, down_dense = matrix(HIDDEN, intermediate_size, False)
     packed = iq2r_glm53_pack(
         gate, gate_aux, down, down_aux, intermediate_size=intermediate_size
     )
@@ -89,16 +115,13 @@ def synthetic_weights(intermediate_size: int, device: str):
 
 
 def routing(tokens: int, device: str):
-    """Random top-8 routes plus the shared expert 256.
+    """Random top-8 routes over the 256 experts.
 
     Every route weighs at least 0.5, so a dropped route fails the check.
     """
-    routed = torch.rand((tokens, EXPERTS - 1), device=device).topk(TOPK - 1).indices
-    shared = torch.full((tokens, 1), EXPERTS - 1, dtype=routed.dtype, device=device)
-    ids = torch.cat((routed, shared), 1).to(torch.int32).contiguous()
+    ids = torch.rand((tokens, EXPERTS), device=device).topk(TOPK).indices
     weights = 0.5 + 0.5 * torch.rand((tokens, TOPK), device=device)
-    weights[:, -1] = 1.0  # shared expert
-    return weights, ids
+    return weights, ids.to(torch.int32).contiguous()
 
 
 def mxfp8(values: torch.Tensor) -> torch.Tensor:
@@ -128,6 +151,27 @@ def dense_reference(hidden, topk_weights, topk_ids, gate, down, pick):
     return output
 
 
+def synthetic_shared(intermediate_size: int, device: str):
+    """A random shared expert: (packed, exact FP32 gate, up, down)."""
+    weights = [
+        torch.randn(shape, device=device) * 0.02
+        for shape in (
+            (intermediate_size, HIDDEN),
+            (intermediate_size, HIDDEN),
+            (HIDDEN, intermediate_size),
+        )
+    ]
+    exact = [iq2r_glm53_dequantize_shared(*_mxfp8_quantize(w)) for w in weights]
+    return iq2r_glm53_pack_shared(*weights), exact
+
+
+def shared_reference(hidden, gate, up, down):
+    """The fused shared expert: MXFP8 activations, SiLU(gate) * up in BF16."""
+    a1 = mxfp8(hidden)
+    act = (torch.nn.functional.silu(a1 @ gate.T) * (a1 @ up.T)).to(torch.bfloat16)
+    return (mxfp8(act) @ down.T).to(torch.bfloat16).float()
+
+
 def dense_mismatch(out: torch.Tensor, expected: torch.Tensor) -> str | None:
     """Why ``out`` fails the op_test's bounds against the dense reference, or None.
 
@@ -151,6 +195,7 @@ def poison(output, workspace) -> None:
     one cannot pass with an earlier candidate's values."""
     output.fill_(float("nan"))
     workspace.route_output.fill_(float("nan"))
+    workspace.shared_act.fill_(float("nan"))
     for values, scales in (
         (workspace.route_input_fp8, workspace.route_input_scales),
         (workspace.intermediate_fp8, workspace.intermediate_scales),
@@ -159,22 +204,27 @@ def poison(output, workspace) -> None:
         scales.fill_(255)  # E8M0 NaN
 
 
-def candidates(tokens: int, intermediate_size: int):
+def candidates(tokens: int, intermediate_size: int, shared: bool = False):
     tp8 = intermediate_size == 256
     if tokens == 1:
-        yield IQ2RGlm53Config("decode", 2, "route9", 4, 1)
+        yield IQ2RGlm53Config("decode", 2, "per_token", 4, 1)
         return
     if tokens <= MAX_DECODE_TOKENS:
-        gates = ("decode", "nobarrier")
-        downs = [("route9", 4)] if tokens in (2, 4) else []
-        down_kernels = ("packed", "ordered", "single") if tp8 else ("packed", "single")
+        downs = [("per_token", 4)] if tokens in (2, 4) else []
+        down_kernels = ("m32", "m16") if tp8 else ("m16", "m16_2wg")
         downs += list(itertools.product(down_kernels, (2, 4, 8)))
-        for gate, grid in itertools.product(gates, (1, 2, 4)):
+        for gate, grid in itertools.product(("decode",), (1, 2, 4)):
             for down, down_grid in downs:
                 yield IQ2RGlm53Config(gate, grid, down, down_grid, 1)
-    if tokens > 16:
+    if tokens > 16 and not shared:
         for grid, chunks in itertools.product((1, 2, 4), (1, 2)):
             yield IQ2RGlm53Config("prefill", grid, "prefill", 0, chunks)
+
+
+def _label(tokens: int, intermediate_size: int, entries: int, shared: int = 0) -> str:
+    label = f"M={tokens} I={intermediate_size}"
+    label = label if entries == 512 else f"{label} C={entries}"
+    return f"{label} +shared" if shared else label
 
 
 def capture_graph(calls):
@@ -231,10 +281,15 @@ class IQ2RGlm53Tuner(TunerCommon):
 
     def __init__(self):
         super().__init__("iq2r_glm53_tuned", KEYS, RESULTS, __doc__.splitlines()[0])
-        self._intermediate_size = None
+        self._layer_key = None  # (intermediate, codebook entries) of self._layers
         self._layers = []  # copies of one synthetic packed layer
         self._dense = None  # (gate, down, pick) of the layer
-        self._weight_bytes = {}  # (tokens, intermediate) -> expert bytes per call
+        self._weight_bytes = (
+            {}
+        )  # (tokens, intermediate, entries) -> expert bytes per call
+        self._shared = (
+            {}
+        )  # intermediate -> (copies of the packed shared expert, exact weights)
 
     def _setup_specific_arguments(self):
         pass
@@ -259,29 +314,59 @@ class IQ2RGlm53Tuner(TunerCommon):
             | (self.untunedf.expert != EXPERTS)
             | (self.untunedf.topk != TOPK)
             | ~self.untunedf.inter_dim.isin(glm53.INTERMEDIATE_SIZES)
+            | ~self.untunedf.codebook.isin([512, 1024])
+            | ~self.untunedf.shared.isin([0, 1])
+            | ((self.untunedf.shared == 1) & (self.untunedf.token > MAX_DECODE_TOKENS))
         )
         if unsupported.any():
             raise ValueError(
-                "the GLM-5.3 tuner covers hidden 6144, 257 experts, top-9 and "
-                f"inter_dim {glm53.INTERMEDIATE_SIZES}"
+                "the GLM-5.3 tuner covers hidden 6144, 256 experts, top-8, "
+                f"inter_dim {glm53.INTERMEDIATE_SIZES}, codebooks of 512 or 1024 "
+                f"and the shared expert (0/1) up to {MAX_DECODE_TOKENS} tokens"
             )
 
-    def _layer(self, intermediate_size: int, copies: int = 1):
-        """The first ``copies`` copies of the synthetic layer for one width."""
-        if intermediate_size != self._intermediate_size:
+    def _layer(self, intermediate_size: int, entries: int, copies: int = 1):
+        """The first ``copies`` copies of the synthetic layer for one width and codebook."""
+        if (intermediate_size, entries) != self._layer_key:
             self._layers, self._dense = [], None
             torch.cuda.empty_cache()
             torch.manual_seed(0)
-            packed, gate, down, pick = synthetic_weights(intermediate_size, "cuda")
-            self._intermediate_size = intermediate_size
+            packed, gate, down, pick = synthetic_weights(
+                intermediate_size, "cuda", entries
+            )
+            self._layer_key = (intermediate_size, entries)
             self._layers, self._dense = [packed], (gate, down, pick)
         while len(self._layers) < copies:
             self._layers.append(tuple(t.clone() for t in self._layers[0]))
         return self._layers[:copies]
 
-    def _shape(self, tokens: int, intermediate_size: int):
+    def _shared_copies(self, intermediate_size: int, copies: int):
+        """``copies`` copies of one packed shared expert (rotated like the layers)."""
+        if intermediate_size not in self._shared:
+            packed, exact = synthetic_shared(intermediate_size, "cuda")
+            self._shared = {intermediate_size: ([packed], exact)}  # one width at a time
+        pool, exact = self._shared[intermediate_size]
+        while len(pool) < copies:
+            pool.append(
+                IQ2RGlm53Shared(
+                    *(
+                        t.clone()
+                        for t in (
+                            pool[0].gate,
+                            pool[0].gate_scales,
+                            pool[0].down,
+                            pool[0].down_scales,
+                        )
+                    )
+                )
+            )
+        return pool[:copies], exact
+
+    def _shape(
+        self, tokens: int, intermediate_size: int, entries: int = 512, shared: int = 0
+    ):
         """Inputs, dense reference and rotated calls for one shape."""
-        (packed,) = self._layer(intermediate_size)
+        (packed,) = self._layer(intermediate_size, entries)
         hidden = torch.randn((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
         routes = [routing(tokens, "cuda")]
         expert_bytes = sum(t.nbytes for t in packed) // EXPERTS
@@ -289,26 +374,41 @@ class IQ2RGlm53Tuner(TunerCommon):
         while sum(read) < ROTATE_BYTES:
             routes.append(routing(tokens, "cuda"))
             read.append(routes[-1][1].unique().numel() * expert_bytes)
-        self._weight_bytes[(tokens, intermediate_size)] = sum(read) / len(read)
-        layers = self._layer(intermediate_size, len(routes))
+        self._weight_bytes[(tokens, intermediate_size, entries)] = sum(read) / len(read)
+        layers = self._layer(intermediate_size, entries, len(routes))
         weights, ids = routes[0]
+        expected = dense_reference(hidden, weights, ids, *self._dense)
+        shareds = [None] * len(routes)
+        if shared:
+            shareds, exact = self._shared_copies(intermediate_size, len(routes))
+            expected = expected + shared_reference(hidden, *exact)
         return SimpleNamespace(
             hidden=hidden,
             weights=weights,
             ids=ids,
             packed=packed,
+            shared=shareds[0],
             output=torch.empty_like(hidden),
             workspace=IQ2RGlm53Workspace.allocate(
                 tokens, intermediate_size, device="cuda"
             ),
-            expected=dense_reference(hidden, weights, ids, *self._dense),
-            calls=[(layer, *route) for layer, route in zip(layers, routes)],
+            expected=expected,
+            calls=[
+                (layer, *route, s) for layer, route, s in zip(layers, routes, shareds)
+            ],
         )
 
     @staticmethod
-    def _run(shape, config, layer, weights, ids):
+    def _run(shape, config, layer, weights, ids, shared=None):
         iq2r_glm53_moe_out(
-            shape.hidden, *layer, weights, ids, shape.output, shape.workspace, config
+            shape.hidden,
+            *layer,
+            weights,
+            ids,
+            shape.output,
+            shape.workspace,
+            config,
+            shared=shared,
         )
 
     def _time(self, shape, config, args) -> float:
@@ -318,19 +418,27 @@ class IQ2RGlm53Tuner(TunerCommon):
     def tune(self, untunedf, tunedf, args):
         results = []
         for key in untunedf[self.keys].itertuples(index=False, name=None):
-            tokens, intermediate_size = int(key[2]), int(key[4])
-            shape = self._shape(tokens, intermediate_size)
-            label = f"M={tokens} I={intermediate_size}"
+            tokens, intermediate_size, entries = int(key[2]), int(key[4]), int(key[7])
+            shared = int(key[8])
+            shape = self._shape(tokens, intermediate_size, entries, shared)
+            label = _label(tokens, intermediate_size, entries, shared)
             # Every candidate must match the dense reference, and match
             # element-wise the first candidate that did (down variants may sum
-            # the nine routes in a different order).
+            # the eight routes in a different order).
             reference = None
             tolerance = 0.0
-            for config in candidates(tokens, intermediate_size):
+            for config in candidates(tokens, intermediate_size, bool(shared)):
                 info = (key, *(getattr(config, f) for f in RESULTS[:-1]))
                 poison(shape.output, shape.workspace)
                 try:
-                    self._run(shape, config, shape.packed, shape.weights, shape.ids)
+                    self._run(
+                        shape,
+                        config,
+                        shape.packed,
+                        shape.weights,
+                        shape.ids,
+                        shape.shared,
+                    )
                     torch.cuda.synchronize()
                     problem = dense_mismatch(shape.output, shape.expected)
                 except (RuntimeError, ValueError) as error:
@@ -389,10 +497,11 @@ class IQ2RGlm53Tuner(TunerCommon):
         (averaged over the rotation) plus the BF16 input and output."""
         info, us, _ = results
         tokens, intermediate_size = int(info[0][2]), int(info[0][4])
+        entries = int(info[0][7])
         if us <= 0:
             return 0.0, 0.0
         flops = 6 * tokens * TOPK * HIDDEN * intermediate_size
-        nbytes = self._weight_bytes.get((tokens, intermediate_size), 0) + (
+        nbytes = self._weight_bytes.get((tokens, intermediate_size, entries), 0) + (
             tokens * HIDDEN * (inbpe + outbpe)
         )
         return flops / us / 1e6, nbytes / us / 1e6
@@ -408,12 +517,14 @@ class IQ2RGlm53Tuner(TunerCommon):
         tuned = self.update_tunedf(self.get_tuned_gemm_list(file), results[~failed])
         tuned.to_csv(file, index=False)
 
-    def _run_lookup(self, tokens: int, intermediate_size: int, args):
+    def _run_lookup(
+        self, tokens: int, intermediate_size: int, entries: int, shared: int, args
+    ):
         """Check and time the launch choice the CSV lookup makes."""
         try:
-            shape = self._shape(tokens, intermediate_size)
+            shape = self._shape(tokens, intermediate_size, entries, shared)
             poison(shape.output, shape.workspace)
-            self._run(shape, None, shape.packed, shape.weights, shape.ids)
+            self._run(shape, None, shape.packed, shape.weights, shape.ids, shape.shared)
             problem = dense_mismatch(shape.output, shape.expected)
             us = self._time(shape, None, args)
         except (RuntimeError, ValueError) as error:
@@ -423,10 +534,15 @@ class IQ2RGlm53Tuner(TunerCommon):
     def run_config(self, args):
         results = []
         for key in self.untunedf[self.keys].itertuples(index=False, name=None):
-            tokens, intermediate_size = int(key[2]), int(key[4])
-            label = f"M={tokens} I={intermediate_size}"
-            us, status = self._run_lookup(tokens, intermediate_size, args)
-            config = glm53.iq2r_glm53_config(tokens, intermediate_size)
+            tokens, intermediate_size, entries = int(key[2]), int(key[4]), int(key[7])
+            shared = int(key[8])
+            label = _label(tokens, intermediate_size, entries, shared)
+            us, status = self._run_lookup(
+                tokens, intermediate_size, entries, shared, args
+            )
+            config = glm53.iq2r_glm53_config(
+                tokens, intermediate_size, entries, bool(shared)
+            )
             print(f"{label} {self.getKernelName(config)}: {us:.2f} us, {status}")
             results.append({"shape": label, "e2e_us": us, "status": status})
         return results
