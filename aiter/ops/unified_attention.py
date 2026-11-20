@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Route unified attention between FlyDSL and Triton/Gluon backends.
+"""Route unified attention between FlyDSL and Triton/Gluon backends."""
 
-This is the entry point that can pick FlyDSL. ``aiter.ops.triton.unified_attention``
-and ``aiter.ops.triton.attention.unified_attention`` stay Triton/Gluon only, so
-their callers keep today's kernels; a framework gets the FlyDSL routes by
-importing ``unified_attention`` from this module instead. It takes the Triton
-entry's arguments, in the same order, except ``equal_seqlen_q``, ``attn_work``,
-``force_fp8_pv_on_fp4_kv_cache``, ``output_gate`` and ``output_rows``; a caller
-that passes one of those stays on the Triton entry.
-"""
+import torch
 
 
 def unified_attention(
@@ -40,6 +33,12 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
+    # Triton/Gluon-only arguments, appended so existing positional calls keep working.
+    equal_seqlen_q: bool = False,
+    attn_work: int | None = None,
+    force_fp8_pv_on_fp4_kv_cache: bool = False,
+    output_gate: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ):
     """Compute paged variable-length scaled dot-product attention into ``out``.
 
@@ -55,6 +54,11 @@ def unified_attention(
     ``skip_reduce`` are backend-dependent. ``shuffled_kv_cache=None`` infers
     the layout; False with rank-5 K raises ValueError.
 
+    This is the entry point that can pick FlyDSL. ``aiter.ops.triton.unified_attention``
+    and ``aiter.ops.triton.attention.unified_attention`` stay Triton/Gluon only, so
+    their callers keep today's kernels; a framework gets the FlyDSL routes by
+    importing ``unified_attention`` from this module instead.
+
     ``backend=None`` tries FlyDSL then Triton/Gluon; explicit ``"flydsl"``
     raises RuntimeError when declined. ``"triton"``/``"gluon"`` bypass FlyDSL.
     The Triton/Gluon fallback supports causal attention only. Returns ``out``
@@ -68,6 +72,16 @@ def unified_attention(
     they require ``cu_seqlens_q == arange(num_seqs + 1) * max_seqlen_q``, which
     is not checked on the GPU. ``AITER_UNIFIED_ATTN_FLYDSL=0`` disables
     automatic use.
+
+    Triton/Gluon-only arguments: ``equal_seqlen_q`` (every sequence has query
+    length ``max_seqlen_q``), ``attn_work`` (host-computed causal query-key pair
+    count, used only by the gfx1250 router), ``force_fp8_pv_on_fp4_kv_cache``
+    (NVFP4 KV cache: run PV as an FP8 WMMA), ``output_gate`` (multiply ``out`` by
+    ``sigmoid(output_gate)``, [tokens, query_heads * head_dim_v]) and
+    ``output_rows`` ([R] int32/int64 token indices; ``out`` has R rows). All five
+    are forwarded to Triton/Gluon. FlyDSL implements none of the last three, so
+    when any is set auto routing uses Triton/Gluon and ``backend="flydsl"``
+    raises RuntimeError. ``equal_seqlen_q`` and ``attn_work`` do not affect routing.
     """
     if backend is not None:
         backend = backend.lower()
@@ -85,8 +99,24 @@ def unified_attention(
     else:
         shuffled_kv_cache = bool(shuffled_kv_cache)
 
+    # FlyDSL has no gate/row-select epilogue and no FP8-PV-on-FP4 path.
+    flydsl_unsupported = [
+        name
+        for name, used in (
+            ("output_gate", output_gate is not None),
+            ("output_rows", output_rows is not None),
+            ("force_fp8_pv_on_fp4_kv_cache", force_fp8_pv_on_fp4_kv_cache),
+        )
+        if used
+    ]
+    if backend == "flydsl" and flydsl_unsupported:
+        raise RuntimeError(
+            "FlyDSL unified_attention backend does not support "
+            + ", ".join(flydsl_unsupported)
+        )
+
     unified_attention_flydsl = None
-    if backend in (None, "flydsl"):
+    if backend in (None, "flydsl") and not flydsl_unsupported:
         # FlyDSL is absent in AITER_TRITON_ONLY and Windows installs, where this
         # op ran Triton; only an explicit backend="flydsl" may fail on it.
         try:
@@ -159,6 +189,11 @@ def unified_attention(
         shuffled_kv_cache=shuffled_kv_cache,
         skip_reduce=skip_reduce,
         backend=backend,
+        equal_seqlen_q=equal_seqlen_q,
+        attn_work=attn_work,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
+        output_gate=output_gate,
+        output_rows=output_rows,
     )
     return result
 

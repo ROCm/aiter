@@ -643,6 +643,25 @@ def test_routes_run_on_each_device_in_turn(set_current, route_spy):
             _check(out, ref)
 
 
+def test_triton_only_arguments_route_to_triton(route_spy):
+    q, k, v, out, cu, used, table = _inputs((300, 129), 64)
+    _call(q, k, v, out, cu, used, table, force_fp8_pv_on_fp4_kv_cache=True)
+    assert route_spy == ["triton"]
+    _check(out, _reference(q, k, v, used, table))
+    with pytest.raises(RuntimeError, match="force_fp8_pv_on_fp4_kv_cache"):
+        _call(
+            q,
+            k,
+            v,
+            out,
+            cu,
+            used,
+            table,
+            backend="flydsl",
+            force_fp8_pv_on_fp4_kv_cache=True,
+        )
+
+
 def test_disabled_by_environment(monkeypatch, route_spy):
     monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL", "0")
     q, k, v, out, cu, used, table = _inputs((300, 129), 64)
