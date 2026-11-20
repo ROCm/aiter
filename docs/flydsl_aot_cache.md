@@ -81,7 +81,7 @@ an entry and how to invalidate it when a kernel source changes:
 | `CompiledFunction.export_to_c(dir, file_name, function_prefix="")` | Writes `<file_name>.o` and `<file_name>.h`. `dir` must exist. Byte-for-byte deterministic for the same input. |
 | `flydsl.compiler.protocol.cache_signature(jit_arg)` | Documented as "for keying user-managed caches of `flyc.compile` handles". For a torch tensor it gives `(TorchTensorJitArg, dtype, align, use_32bit_stride, shape=(-1,…), stride with the unit axis)`. |
 | `flydsl.compiler.JitArgumentRegistry.get(type(v))` | Returns the JIT-argument constructor `flyc.compile` itself uses, for building `cache_signature`. |
-| `flyc.load_module(path)` | Loads an `export_to_c` object in memory (no system linker), checks its schema and host triple, loads the GPU module on the current device (on another device at its first call there) and returns a `CompiledFunction` whose argument marshalling comes from the ABI in the object metadata. In FlyDSL since 0.5.1.dev1058 (aiter pins 0.5.1.dev1059); with an older FlyDSL every key takes the JIT path. |
+| `flyc.load_module(path)` | Loads an `export_to_c` object in memory (no system linker), checks its schema and host triple, loads the GPU module on the current device (on another device at its first call there) and returns a `CompiledFunction` whose argument marshalling comes from the ABI in the object metadata. In FlyDSL since 0.5.1.dev1058 (aiter pins 0.5.1); with an older FlyDSL every key takes the JIT path. |
 
 The object carries `SYM__metadata`, a JSON with the ABI slots, `arch`,
 `backend`, `flydsl_version`, `host_triple` and `schema_version` (3). Each
