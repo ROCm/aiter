@@ -17,6 +17,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import qsa_paged
+from aiter.ops.flydsl.kernels.qsa.indexer_key16_select import BUCKET_CAPACITY
 from aiter.ops.flydsl.qsa_paged import (
     flydsl_qsa_paged_gqa,
     flydsl_qsa_paged_gqa_supported,
@@ -2952,6 +2953,11 @@ def run_qsa_score_key16_store():
     _summarize("QSA indexer 16-bit key store", [test_qsa_score_key16_store()])
 
 
+def _sorted_rows(ids):
+    """Each row sorted. The key select leaves block order within a row open."""
+    return torch.sort(ids, dim=1).values
+
+
 def _key16_bucket_elems(keys, visible, k=512):
     """Visible blocks whose key equals the key at position ``k``."""
     work = keys.to(torch.int32)
@@ -3081,12 +3087,112 @@ def test_qsa_key16_select(case, rows, context):
     }
 
 
+@benchmark()
+def test_qsa_key16_select_bucket(case):
+    """Crafted keys that widen the boundary bucket on the seeded 32K request.
+
+    The oracle's top 100 blocks get key 200. ``rank`` gives the next 900
+    key 100 and the rest key 50: the bucket is wider than the workgroup and
+    still fits the LDS rank buffer. ``radix`` gives every block below the top
+    100 key 100, which overflows that buffer and takes the fp32 radix that
+    recomputes scores. Either way the rescore decides 412 blocks.
+    """
+    device = torch.device("cuda")
+    idx = FLASH_NEXT_INDEXER
+    rows, context = 16, 32768
+    q, k_bar, cache, table, token_to_req, qpos, slen, _n_blocks = _key16_store_inputs(
+        rows, context, device
+    )
+    n_columns = int(table.shape[1]) * _SELECT_PAGE
+    scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    rank = torch.empty_like(order)
+    rank.scatter_(
+        1, order, torch.arange(scores.shape[1], device=device).expand_as(order)
+    )
+    rest = 1000 if case == "rank" else scores.shape[1]
+    crafted = torch.where(
+        rank < 100,
+        torch.full_like(rank, 200),
+        torch.where(rank < rest, torch.full_like(rank, 100), torch.full_like(rank, 50)),
+    )
+    keys = torch.full((rows, n_columns), -1, dtype=torch.int16, device=device)
+    keys[:, : scores.shape[1]] = torch.where(
+        torch.isfinite(scores), crafted, torch.full_like(crafted, -1)
+    ).to(torch.int16)
+    bucket = int(((keys == 100).sum(dim=1)).max().item())
+    if (case == "rank") != (512 < bucket <= BUCKET_CAPACITY):
+        raise AssertionError(f"{case}: bucket {bucket} misses the path under test")
+    block_ids = torch.full(
+        (rows, idx.block_budget), 2**31 - 1, dtype=torch.int32, device=device
+    )
+    token_ids = torch.full(
+        (rows, idx.index_width), 2**31 - 1, dtype=torch.int32, device=device
+    )
+
+    def launch():
+        return qsa_paged.qsa_indexer_key16_select(
+            q,
+            cache,
+            table,
+            token_to_req,
+            qpos,
+            slen,
+            keys,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+            block_ids=block_ids,
+            token_ids=token_ids,
+        )
+
+    launch()
+    for i in range(rows):
+        reason = _indexer_row_is_packed(block_ids[i])
+        if reason is not None:
+            raise AssertionError(f"{case}: row {i} {reason}")
+    mismatch = _tie_mismatch(
+        qsa_topk_blocks(scores, idx.block_budget), block_ids, scores, _FP32_TIE_BOUND
+    )
+    err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([mismatch]),
+        rtol=0,
+        atol=0,
+        msg=f"key16 bucket {case}",
+    )
+    assert err == 0, f"{case}: set mismatch {mismatch:.2%}"
+    expanded = qsa_expand_tail(
+        block_ids, qpos, slen, token_to_req, idx.compress_ratio, idx.token_budget
+    )
+    if not torch.equal(token_ids, expanded):
+        raise AssertionError(f"{case}: token ids are not the expanded blocks")
+    _, us = run_perftest(launch, num_iters=10, num_warmup=2, use_cuda_event=True)
+    return {
+        "gfx": get_gfx_runtime(),
+        "case": case,
+        "rows": rows,
+        "columns": n_columns,
+        "bucket": bucket,
+        "key16 us": us,
+        "key16 err": err,
+    }
+
+
 def run_qsa_key16_select():
     """Boundary select and expand on the seeded 32K case and a short row."""
     rows = []
     for case, n_rows, context in (("32k", 128, 32768), ("emit", 16, 2048)):
         rows.append(test_qsa_key16_select(case, n_rows, context))
     _summarize("QSA indexer 16-bit key select", rows)
+    buckets = [test_qsa_key16_select_bucket(case) for case in ("rank", "radix")]
+    _summarize("QSA indexer 16-bit wide bucket", buckets)
 
 
 _KEY16_COLUMNS = 168 * _SELECT_PAGE
@@ -3236,7 +3342,9 @@ def test_qsa_key16_chunks():
         block_ids=head_ids,
         token_ids=head_tokens,
     )
-    if not torch.equal(block_ids[:rows_per_chunk], head_ids):
+    if not torch.equal(
+        _sorted_rows(block_ids[:rows_per_chunk]), _sorted_rows(head_ids)
+    ):
         raise AssertionError("first chunk block ids differ from its own select")
     scores = qsa_indexer_scores(
         q,
@@ -3339,7 +3447,7 @@ def test_qsa_key16_select_gate(case):
         block_ids.fill_(2**31 - 1)
         token_ids.fill_(2**31 - 1)
         _launch_key16(built, block_ids, token_ids, keys)
-        if not torch.equal(first, token_ids):
+        if not torch.equal(_sorted_rows(first), _sorted_rows(token_ids)):
             raise AssertionError("key buffer contents changed the token ids")
         keys.fill_(_KEY16_STALE)
     token_ids, us = run_perftest(
