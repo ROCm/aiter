@@ -2132,12 +2132,15 @@ def _unified_attention_gluon_kernel(
     else:
         KVLoader: gl.constexpr = AsyncGatherKVLoader
 
+    # Clamp page ids to this sequence's pages: the K/V loads are unmasked, and
+    # entries past them may name freed blocks (fault) or NaN blocks (0 * NaN).
+    seq_pages = gl.minimum((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, block_table_stride)
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
+        gl.maximum(seq_pages, 1),
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
