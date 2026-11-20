@@ -149,8 +149,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     persistent_single_task=0,
-    force_mid_compute=0,
-    linear_wg_map=0,
     rolled_drain=0,
     gemm_stage=None,
     m_align=0,
@@ -161,7 +159,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_contiguous_chunks=0,
     reuse_resident_b=0,
     defer_output_store_wait=0,
-    lds_n_partitions=1,
     ds_first_n=-1,  # -1: kernel's per-shape IGLP default
     mma_prio=0,
     # moe-specific performance
@@ -263,18 +260,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
     persistent_single_task = int(persistent_single_task)
-    force_mid_compute = int(force_mid_compute)
-    linear_wg_map = int(linear_wg_map)
     reuse_persistent_map_loads = int(reuse_persistent_map_loads)
     defer_output_store_wait = int(defer_output_store_wait)
     mma_prio = int(mma_prio)
-    lds_n_partitions = int(lds_n_partitions)
     if any(
         value not in (0, 1)
         for value in (
             persistent_single_task,
-            force_mid_compute,
-            linear_wg_map,
             reuse_persistent_map_loads,
             defer_output_store_wait,
             mma_prio,
@@ -283,8 +275,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         raise ValueError("persistent and pipeline policies must be 0 or 1")
     if persistent_single_task and not persistent_workers:
         persistent_single_task = 0
-    if lds_n_partitions not in (1, 2, 4, 8):
-        raise ValueError("lds_n_partitions must be 1, 2, 4, or 8")
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -378,13 +368,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_expert_tile_map is not None),
         int(packed_expert_map),
         persistent_single_task,
-        force_mid_compute,
-        linear_wg_map,
         int(persistent_contiguous_chunks),
         int(reuse_resident_b),
         reuse_persistent_map_loads,
         defer_output_store_wait,
-        lds_n_partitions,
         int(ds_first_n),
         _select_bool_env("AITER_FLYDSL_MMA_PRIO", mma_prio),
     )

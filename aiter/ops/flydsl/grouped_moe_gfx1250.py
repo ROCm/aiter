@@ -761,23 +761,14 @@ def _grouped_a8w4_tdm_moe(
     tdm_b_th2=None,
     lds_soa_load_interleave=0,
     lds_soa_load_interleave2=None,
-    force_mid_compute=0,
-    force_mid_compute2=0,
-    linear_wg_map=0,
-    linear_wg_map2=0,
     reuse_persistent_map_loads=0,
     reuse_persistent_map_loads2=0,
     defer_output_store_wait=0,
     defer_output_store_wait2=0,
-    gather_fuse_token_iters=0,  # grid = tokens, less workgroups. compute bound perf
     gather_setprio=0,  # sparse grids get scheduled quicker
     gather_batch_loads=0,  # batches helps prefill overlap bandwidth latency
-    lds_n_partitions=1,
-    lds_n_partitions2=1,
     ds_first_n=-1,  # -1: kernel's per-shape IGLP default
-    ds_first_n2=-1,
     mma_prio=0,
-    mma_prio2=0,
     rolled_drain=0,
     a_preshuffle=0,
     persistent_workers=0,
@@ -861,33 +852,21 @@ def _grouped_a8w4_tdm_moe(
     if any(
         value not in (0, 1)  # check if policy on
         for value in (
-            force_mid_compute,
-            force_mid_compute2,
-            linear_wg_map,
-            linear_wg_map2,
             reuse_persistent_map_loads,
             reuse_persistent_map_loads2,
             defer_output_store_wait,
             defer_output_store_wait2,
-            gather_fuse_token_iters,
             gather_setprio,
             gather_batch_loads,
             mma_prio,
-            mma_prio2,
             persistent_contiguous_tasks2,
             packed_expert_map,
             reuse_resident_b2,
         )
     ):
         raise ValueError("stage-specific pipeline and task-map values must be 0 or 1")
-    valid_lds_n_partitions = (1, 2, 4, 8)
-    if (
-        lds_n_partitions not in valid_lds_n_partitions
-        or lds_n_partitions2 not in valid_lds_n_partitions
-    ):
-        raise ValueError("stage-specific LDS N partitions must be 1, 2, 4, or 8")
-    if ds_first_n < -1 or ds_first_n2 < -1:
-        raise ValueError("stage-specific DS-first values must be nonnegative or -1")
+    if ds_first_n < -1:
+        raise ValueError("ds_first_n must be nonnegative or -1")
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider
@@ -1530,11 +1509,8 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
-            force_mid_compute=force_mid_compute,
-            linear_wg_map=linear_wg_map,
             reuse_persistent_map_loads=reuse_persistent_map_loads,
             defer_output_store_wait=defer_output_store_wait,
-            lds_n_partitions=lds_n_partitions,
             ds_first_n=ds_first_n,
             mma_prio=mma_prio,
             stage1_quant_out=1,
@@ -1591,11 +1567,8 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
-            force_mid_compute=force_mid_compute,
-            linear_wg_map=linear_wg_map,
             reuse_persistent_map_loads=reuse_persistent_map_loads,
             defer_output_store_wait=defer_output_store_wait,
-            lds_n_partitions=lds_n_partitions,
             ds_first_n=ds_first_n,
             mma_prio=mma_prio,
             persistent_workers=persistent_workers,
@@ -1659,15 +1632,10 @@ def _grouped_a8w4_tdm_moe(
         num_buffers=num_buffers2,
         persistent_workers=persistent_workers2,
         persistent_single_task=int(_stage2_single_task),
-        force_mid_compute=force_mid_compute2,
-        linear_wg_map=linear_wg_map2,
         persistent_contiguous_chunks=int(_stage2_contiguous_tasks),
         reuse_resident_b=int(_stage2_reuse_resident_b),
         reuse_persistent_map_loads=reuse_persistent_map_loads2,
         defer_output_store_wait=defer_output_store_wait2,
-        lds_n_partitions=lds_n_partitions2,
-        ds_first_n=ds_first_n2,
-        mma_prio=mma_prio2,
         m_alignment=_stage2_m_alignment,
         m_expert_tile_map=_m_expert_tile_map,
         expert_tile_m=min(tile_m, tile_m2),
@@ -1756,11 +1724,8 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
-                        force_mid_compute=force_mid_compute,
-                        linear_wg_map=linear_wg_map,
                         reuse_persistent_map_loads=reuse_persistent_map_loads,
                         defer_output_store_wait=defer_output_store_wait,
-                        lds_n_partitions=lds_n_partitions,
                         ds_first_n=ds_first_n,
                         mma_prio=mma_prio,
                         stage1_quant_out=1,
@@ -1815,11 +1780,8 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
-                        force_mid_compute=force_mid_compute,
-                        linear_wg_map=linear_wg_map,
                         reuse_persistent_map_loads=reuse_persistent_map_loads,
                         defer_output_store_wait=defer_output_store_wait,
-                        lds_n_partitions=lds_n_partitions,
                         ds_first_n=ds_first_n,
                         mma_prio=mma_prio,
                         persistent_workers=persistent_workers,
@@ -1872,15 +1834,10 @@ def _grouped_a8w4_tdm_moe(
                     num_buffers=num_buffers2,
                     persistent_workers=persistent_workers2,
                     persistent_single_task=int(_stage2_single_task),
-                    force_mid_compute=force_mid_compute2,
-                    linear_wg_map=linear_wg_map2,
                     persistent_contiguous_chunks=int(_stage2_contiguous_tasks),
                     reuse_resident_b=int(_stage2_reuse_resident_b),
                     reuse_persistent_map_loads=reuse_persistent_map_loads2,
                     defer_output_store_wait=defer_output_store_wait2,
-                    lds_n_partitions=lds_n_partitions2,
-                    ds_first_n=ds_first_n2,
-                    mma_prio=mma_prio2,
                     m_alignment=_stage2_m_alignment,
                     m_expert_tile_map=_m_expert_tile_map,
                     expert_tile_m=min(tile_m, tile_m2),
@@ -1929,7 +1886,6 @@ def _grouped_a8w4_tdm_moe(
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
-        fuse_token_iters=bool(gather_fuse_token_iters),
         setprio=bool(gather_setprio),
         batch_loads=bool(gather_batch_loads),
     )
@@ -2205,18 +2161,10 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_b_th2"), _tdm_kw["tdm_b_th"]
             )
             shared_lds_interleave = _as_int(cfg_row.get("lds_soa_load_interleave"), 0)
-            _tdm_kw["lds_soa_load_interleave"] = _as_int(
-                cfg_row.get("lds_soa_load_interleave1"), shared_lds_interleave
-            )
+            _tdm_kw["lds_soa_load_interleave"] = shared_lds_interleave
             _tdm_kw["lds_soa_load_interleave2"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave2"), shared_lds_interleave
             )
-            _tdm_kw["force_mid_compute"] = _as_int(cfg_row.get("force_mid_compute1"), 0)
-            _tdm_kw["force_mid_compute2"] = _as_int(
-                cfg_row.get("force_mid_compute2"), 0
-            )
-            _tdm_kw["linear_wg_map"] = _as_int(cfg_row.get("linear_wg_map1"), 0)
-            _tdm_kw["linear_wg_map2"] = _as_int(cfg_row.get("linear_wg_map2"), 0)
             _tdm_kw["reuse_persistent_map_loads"] = _as_int(
                 cfg_row.get("reuse_persistent_map_loads1"), 0
             )
@@ -2229,9 +2177,6 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["defer_output_store_wait2"] = _as_int(
                 cfg_row.get("defer_output_store_wait2"), 0
             )
-            _tdm_kw["gather_fuse_token_iters"] = _as_int(
-                cfg_row.get("gather_fuse_token_iters"), 0
-            )
             _tdm_kw["gather_setprio"] = _as_int(
                 cfg_row.get("gather_setprio"),
                 int(token_num <= 128),
@@ -2239,12 +2184,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["gather_batch_loads"] = _as_int(
                 cfg_row.get("gather_batch_loads"), int(token_num >= 8192)
             )
-            _tdm_kw["lds_n_partitions"] = _as_int(cfg_row.get("lds_n_partitions1"), 1)
-            _tdm_kw["lds_n_partitions2"] = _as_int(cfg_row.get("lds_n_partitions2"), 1)
             _tdm_kw["ds_first_n"] = _as_int(cfg_row.get("ds_first_n1"), -1)
-            _tdm_kw["ds_first_n2"] = _as_int(cfg_row.get("ds_first_n2"), -1)
             _tdm_kw["mma_prio"] = _as_int(cfg_row.get("mma_prio1"), 0)
-            _tdm_kw["mma_prio2"] = _as_int(cfg_row.get("mma_prio2"), 0)
             _tdm_kw["persistent_contiguous_tasks2"] = _as_int(
                 cfg_row.get("persistent_contiguous_tasks2"), 0
             )
@@ -2395,7 +2336,6 @@ def _get_compiled_gather_reduce(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     block_threads: int = 256,
-    fuse_token_iters: bool = False,
     setprio: bool = False,
     batch_loads: bool = False,
     wave_metadata: bool = False,
@@ -2413,7 +2353,6 @@ def _get_compiled_gather_reduce(
         vec_dwords,
         w_dtype,
         block_threads,
-        fuse_token_iters,
         setprio,
         batch_loads,
         wave_metadata,
@@ -2717,7 +2656,6 @@ def flydsl_moe_gather_reduce(
     num_valid_tokens: (
         torch.Tensor | None
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
-    fuse_token_iters: bool = False,
     setprio: bool = False,
     batch_loads: bool = False,
 ) -> torch.Tensor:
@@ -2777,7 +2715,6 @@ def flydsl_moe_gather_reduce(
         gather_vec,
         w_dtype,
         gather_threads,
-        bool(fuse_token_iters),
         bool(setprio),
         bool(batch_loads),
         wave_metadata,

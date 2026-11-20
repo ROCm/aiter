@@ -105,7 +105,6 @@ def build_moe_gather_reduce_module(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     block_threads: int = BLOCK_THREADS,
-    fuse_token_iters: bool = False,
     setprio: bool = False,
     batch_loads: bool = False,
     wave_metadata: bool = False,
@@ -128,7 +127,6 @@ def build_moe_gather_reduce_module(
         f"_w{w_dtype}_frlds"
         f"{'_wavemeta' if wave_metadata else ''}"
         f"{f'_bt{block_threads}' if block_threads != BLOCK_THREADS else ''}"
-        f"{'_fusediters' if fuse_token_iters else ''}"
         f"{'_prio' if setprio else ''}"
         f"{'_batchloads' if batch_loads else ''}"
     )
@@ -341,11 +339,7 @@ def build_moe_gather_reduce_module(
 
             if const_expr(setprio):
                 fx.rocdl.s_setprio(1)
-            if fuse_token_iters:
-                for iter_idx in range_constexpr(n_iters):
-                    process_iter(fx.Uint32(iter_idx))
-            else:
-                process_iter(fx.Uint32(fx.block_idx.y))
+            process_iter(fx.Uint32(fx.block_idx.y))
             if const_expr(setprio):
                 fx.rocdl.s_setprio(0)
 
@@ -370,7 +364,7 @@ def build_moe_gather_reduce_module(
             num_valid_tokens,
         )
         launcher.launch(
-            grid=(fx.Int64(num_tokens), 1 if fuse_token_iters else n_iters, 1),
+            grid=(fx.Int64(num_tokens), n_iters, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

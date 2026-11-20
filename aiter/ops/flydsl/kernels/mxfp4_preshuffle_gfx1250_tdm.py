@@ -240,13 +240,10 @@ def build_gemm_a8w4_tdm_task(
     direct_expert_map=0,
     packed_expert_map=0,
     persistent_single_task=0,
-    force_mid_compute=0,
-    linear_wg_map=0,
     persistent_contiguous_chunks=0,
     reuse_resident_b=0,
     reuse_persistent_map_loads=0,
     defer_output_store_wait=0,
-    lds_n_partitions=1,
     ds_first_n=-1,  # -1: per-shape HYPER_PARAMS default
     mma_prio=0,
 ):
@@ -323,9 +320,6 @@ def build_gemm_a8w4_tdm_task(
         assert (
             not persistent_single_task
         ), "single-task mode requires persistent workers"
-    # If tasks can be 1:1 with workgroups
-    if linear_wg_map:
-        assert cluster_m == 1 and cluster_n == 1
     # Resolve per-row settings before specializing the layout and cache key.
     assert lds_soa_load_interleave in (0, 1), "lds_soa_load_interleave must be 0 or 1"
     planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave))
@@ -418,8 +412,6 @@ def build_gemm_a8w4_tdm_task(
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
-    assert lds_n_partitions in (1, 2, 4, 8)
-    assert wmma_n_rep % lds_n_partitions == 0
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
     USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
@@ -478,7 +470,7 @@ def build_gemm_a8w4_tdm_task(
             raise ValueError("resident B is incompatible with the A-scale prologue")
         if stage1_act or stage1_quant_out or enable_ep_scatter:
             raise ValueError("resident B is only supported by local GEMM2")
-        if cluster_m != 1 or cluster_n != 1 or linear_wg_map:
+        if cluster_m != 1 or cluster_n != 1:
             raise ValueError("resident B requires the 1x1 swizzled task map")
     if ep_quant_bits not in (0, 8, 4):
         raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
@@ -631,7 +623,7 @@ def build_gemm_a8w4_tdm_task(
     )
     GROUP_ARENA_B = ceildiv(max(ARENA_B, K_PARTIAL_B), 512) * 512
     # Stages the mainloop issues before its first fence (mirrors run_mainloop).
-    _mid_compute = bool(force_mid_compute) or not (tile_m <= 32 or num_buffers <= 2)
+    _mid_compute = not (tile_m <= 32 or num_buffers <= 2)
     _pro_stages = (
         (num_buffers if next_stage_on else num_buffers - 1)
         if _mid_compute
@@ -687,8 +679,6 @@ def build_gemm_a8w4_tdm_task(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _persistent_single = "_pw1task" if persistent_single_task else ""
-    _mid_pipe = "_midpipe" if force_mid_compute else ""
-    _linear_wg_map = "_linearwg" if linear_wg_map else ""
     _packed_expert_map = "_packedemap" if packed_expert_map else ""
     _contiguous_chunks = "_contigtasks" if persistent_contiguous_chunks else ""
     _resident_b = "_residentb" if reuse_resident_b else ""
@@ -707,7 +697,6 @@ def build_gemm_a8w4_tdm_task(
         if persistent_workers and not persistent_single_task and defer_output_store_wait
         else ""
     )
-    _lds_n_partitions = f"_splitnlds{lds_n_partitions}" if lds_n_partitions > 1 else ""
     _row_align = f"_ra{ROW_ALIGNMENT}" if ROW_ALIGNMENT > tile_m else ""
     _direct_expert_map = f"_demap{expert_tile_m}" if direct_expert_map else ""
     _kname = (
@@ -720,11 +709,11 @@ def build_gemm_a8w4_tdm_task(
         f"{_mma_group}{_ds_first}{_ds_group}{_ds_wait}{_mma_prio}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_persistent_single}"
-        f"{_mid_pipe}{_linear_wg_map}{_contiguous_chunks}{_resident_b}{_drain}"
+        f"{_contiguous_chunks}{_resident_b}{_drain}"
         f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
         f"{_prefence}_earlyacc"
         f"{_reuse_map}{_defer_output_store_wait}"
-        f"{_lds_n_partitions}{_packed_expert_map}"
+        f"{_packed_expert_map}"
         f"{_direct_expert_map}{_row_align}{_malign}{_kwaves}"
         f"{f'_kg{k_grid}' if k_grid > 1 else ''}"
     )
@@ -820,17 +809,6 @@ def build_gemm_a8w4_tdm_task(
             m_tile = task_id
             blk_m = m_tile * tile_m
             blk_n = schedule_rows * tile_n
-            local_m = 0
-            local_n = 0
-            m_unit = m_tile
-            group_first_tile = m_tile
-        elif const_expr(linear_wg_map):
-            # Do not swizzle if swizzle is not worth the overhead
-            # ex: with small M
-            m_tile = bid_x // total_n_tiles
-            n_unit = bid_x - m_tile * total_n_tiles
-            blk_m = m_tile * tile_m
-            blk_n = n_unit * tile_n
             local_m = 0
             local_n = 0
             m_unit = m_tile
@@ -1684,14 +1662,6 @@ def build_gemm_a8w4_tdm_task(
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
         BACK = list(range(front_wm, wmma_m_rep))
-        N_PER_PART = wmma_n_rep // lds_n_partitions
-        N_PARTS = [
-            list(range(part * N_PER_PART, (part + 1) * N_PER_PART))
-            for part in range_constexpr(lds_n_partitions)
-        ]
-        partition_lds_n = bool(
-            lds_n_partitions > 1 and KWS == 1 and not interleaved_lds_load_on
-        )
 
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
         # REUSE fence; the prefetch reads interleave with the preceding groups.
@@ -1756,40 +1726,6 @@ def build_gemm_a8w4_tdm_task(
                         scale_a=scale_a,
                         scale_b=scale_b,
                     )
-
-        def mma_cols(wn_list, act, wt, sa_k, sb_k):
-            for wm in range_constexpr(wmma_m_rep):
-                for wn_raw in range_constexpr(len(wn_list)):
-                    wn_idx = len(wn_list) - 1 - wn_raw if (wm % 2 == 1) else wn_raw
-                    wn = wn_list[wn_idx]
-                    idx = wm * wmma_n_rep + wn
-                    scale_a = sb_k[wn if a_is_fp4 else wn // 2]
-                    scale_b = sa_k[wm // 2]
-                    if const_expr(a_is_fp4):
-                        wt_value = wt[wn].load()
-                        act_value = act[wm].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                c_frags[idx].load().ir_value(),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                            )
-                        )
-                    else:  # fp8
-                        fx.gemm(
-                            wmma_atoms[wn % 2][wm % 2],
-                            c_frags[idx],
-                            wt[wn],
-                            act[wm],
-                            c_frags[idx],
-                            scale_a=scale_a,
-                            scale_b=scale_b,
-                        )
 
         DS_A = 2 if a_is_fp4 else 4
         # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
@@ -1911,27 +1847,10 @@ def build_gemm_a8w4_tdm_task(
                     if const_expr(i < wmma_n_rep):
                         slot.b[i].store(load_b(lds_addr.b, i, ksl))
 
-        def load_lds_partition0(slot, lds_addr, ksl, kt):
-            sb_v = [load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)]
-            sa_v = [
-                load_sa(lds_addr.sa, sm, ksl, kt) for sm in range_constexpr(sa_pairs)
-            ]
-            slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
-            for wn in range_constexpr(N_PER_PART):
-                slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
-
-        def load_lds_n_partition(slot, lds_addr, ksl, part):
-            for wn in range_constexpr(part * N_PER_PART, (part + 1) * N_PER_PART):
-                slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
-
         def k_step(
             cur_rmem,
             next_rmem=None,
             load_nxt_fn=None,
-            load_part_fn=None,
             num_outstanding_tdm=None,
             issue_fn=None,
             wait_fn=None,
@@ -2005,16 +1924,7 @@ def build_gemm_a8w4_tdm_task(
                 load_nxt_fn()
             if const_expr(mma_prio):
                 rocdl.s_setprio(1)
-            if const_expr(partition_lds_n):
-                # KWS == 1 here, so no WMMA was issued around the fence.
-                assert pre_fence_mma == 0 and fence_mma == 0
-                sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-                for part in range_constexpr(lds_n_partitions):
-                    if const_expr(part > 0):
-                        load_part_fn(part)
-                    mma_cols(N_PARTS[part], cur_rmem.a, cur_rmem.b, sa_k, sb_k)
-            else:
-                emit_mma_range(pre_fence_mma + fence_mma, n_acc)
+            emit_mma_range(pre_fence_mma + fence_mma, n_acc)
             if const_expr(mma_prio):
                 rocdl.s_setprio(0)
             if const_expr(reuse_cur_rmem):
@@ -2124,10 +2034,7 @@ def build_gemm_a8w4_tdm_task(
                     rocdl.sched_mfma(tail_mfma)
 
             if const_expr(not rmem_preloaded):
-                if const_expr(partition_lds_n):
-                    load_lds_partition0(rmem_slots[0], lds_addr, 0, kt)
-                else:
-                    load_lds_data(rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load)
+                load_lds_data(rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load)
             for ksl in range_constexpr(kws):
                 is_last = ksl + 1 == kws
                 carries = is_last and next_stage_lds_addr is not None
@@ -2149,13 +2056,6 @@ def build_gemm_a8w4_tdm_task(
                     )
                 else:
                     next_rmem, load_nxt_fn = None, None
-
-                def load_part(part):
-                    load_lds_n_partition(rmem_slots[0], lds_addr, 0, part)
-
-                load_part_fn = (
-                    load_part if const_expr(partition_lds_n and ksl == 0) else None
-                )
                 # Counts do not depend on synchronization. Without a stage
                 # wait, k_step executes the same WMMAs without a barrier.
                 pre_fence_mma = ksl1_prefence_mma if ksl == 1 else 0
@@ -2166,7 +2066,6 @@ def build_gemm_a8w4_tdm_task(
                     rmem_slots[ksl % 2],
                     next_rmem,
                     load_nxt_fn,
-                    load_part_fn,
                     num_outstanding_tdm=(
                         next_stage_wait if const_expr(carries) else None
                     ),
@@ -2283,9 +2182,7 @@ def build_gemm_a8w4_tdm_task(
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-                if const_expr(
-                    (tile_m <= 32 or num_buffers <= 2) and not force_mid_compute
-                ):
+                if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
                     a_ready_gate()
                     for i in range_constexpr(num_buffers):
@@ -3346,13 +3243,10 @@ def launch_gemm_a8w4_tdm(
     direct_expert_map: Constexpr[int] = 0,
     packed_expert_map: Constexpr[int] = 0,
     persistent_single_task: Constexpr[int] = 0,
-    force_mid_compute: Constexpr[int] = 0,
-    linear_wg_map: Constexpr[int] = 0,
     persistent_contiguous_chunks: Constexpr[int] = 0,
     reuse_resident_b: Constexpr[int] = 0,
     reuse_persistent_map_loads: Constexpr[int] = 0,
     defer_output_store_wait: Constexpr[int] = 0,
-    lds_n_partitions: Constexpr[int] = 1,
     ds_first_n: Constexpr[int] = -1,  # -1: per-shape HYPER_PARAMS default
     mma_prio: Constexpr[int] = 0,
     k_grid: Constexpr[int] = 1,
@@ -3428,13 +3322,10 @@ def launch_gemm_a8w4_tdm(
         direct_expert_map=direct_expert_map,
         packed_expert_map=packed_expert_map,
         persistent_single_task=persistent_single_task,
-        force_mid_compute=force_mid_compute,
-        linear_wg_map=linear_wg_map,
         persistent_contiguous_chunks=persistent_contiguous_chunks,
         reuse_resident_b=reuse_resident_b,
         reuse_persistent_map_loads=reuse_persistent_map_loads,
         defer_output_store_wait=defer_output_store_wait,
-        lds_n_partitions=lds_n_partitions,
         ds_first_n=ds_first_n,
         mma_prio=mma_prio,
     )
