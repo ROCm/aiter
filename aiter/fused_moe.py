@@ -463,7 +463,7 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          yes        shape and dtype match; BM16 zeroes in 4B
+#     adaptive-aux sort (a4w4, atomic)          yes        shape and dtype match; BM16 zeroes in 16B
 #     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #     any path, output not 16-byte aligned      no         kernels store it as 16-byte vectors
