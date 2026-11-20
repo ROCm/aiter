@@ -1563,6 +1563,10 @@ def flydsl_kda_decode(
     Both caches require dense inner dimensions and non-overlapping slots;
     padding between slots is supported. Output batch and head rows must not
     overlap, but may be padded and in either order (batch- or heads-outer).
+    Taken by increasing stride, each of the two row dimensions must step past
+    everything the other spans.
+    ``out`` must not share memory with any input or cache; the kernel does
+    not check this.
     Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
     padding: they produce zero output and leave both caches unchanged. Slot
     zero is a live slot, as in the Triton ``fused_kda_decode``. Indices at or
