@@ -420,6 +420,20 @@ def test_fused_bf16_bmm_benchmark_cli_and_providers(monkeypatch):
         calls == [(q, w, pe, scale, 16, out)] * 2 + [(q, w, None, scale, 16, out)] * 2
     )
 
+    original_fields = bench.fields
+    monkeypatch.setattr(
+        bench, "fields", lambda args, provider: ("_", *original_fields(args, provider))
+    )
+    monkeypatch.setattr(
+        bench,
+        "make_input_gen",
+        lambda M, provider, args: lambda: (object(), *generate(M, provider, args)()),
+    )
+    expected_calls = calls.copy()
+    calls.clear()
+    bench.print_kernels(1, args, None, calls=1)
+    assert calls == expected_calls
+
     monkeypatch.setattr(bench, "make_input_gen", lambda *args: lambda: (q, w))
     with pytest.raises(ValueError):
         bench.print_kernels(1, args, None, calls=1)

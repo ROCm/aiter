@@ -41,6 +41,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
+    _run_input_generator,
 )
 from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
     D_NOPE,
@@ -210,10 +211,8 @@ def print_kernels(M, args, cat_quant, calls=4):
     """Kernels each provider launches over a few calls, to compare with the
     kernel names in a model trace. Every kernel should show up once per call."""
     for provider in args.providers:
-        inputs = dict(
-            zip(
-                fields(args, provider), make_input_gen(M, provider, args)(), strict=True
-            )
+        inputs = _run_input_generator(
+            make_input_gen(M, provider, args), fields(args, provider)
         )
         fn = make_fn(M, provider, args, cat_quant)
         fn(**inputs)
