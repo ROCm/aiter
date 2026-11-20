@@ -136,7 +136,7 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
 
 
 @functools.cache
-def _bound_reduce_exe(split_k: int, out_dtype: str):
+def _bound_reduce_exe(split_k: int, out_dtype: str, strided: bool):
     """``_reduce_exe()`` with its Constexprs bound; see ``_bound_gemm_exe``."""
     exe = _reduce_exe()
 
@@ -146,9 +146,22 @@ def _bound_reduce_exe(split_k: int, out_dtype: str):
         arg_out: fx.Pointer,
         n_out_dw: fx.Int32,
         slab_stride_dw: fx.Int32,
+        row_dw: fx.Int32,
+        ldc_dw: fx.Int32,
         stream: fx.Stream,
     ):
-        exe(arg_tmp, arg_out, n_out_dw, slab_stride_dw, stream, split_k, out_dtype)
+        exe(
+            arg_tmp,
+            arg_out,
+            n_out_dw,
+            slab_stride_dw,
+            row_dw,
+            ldc_dw,
+            stream,
+            split_k,
+            out_dtype,
+            strided,
+        )
 
     launch.compile_hints.update(exe.compile_hints)
     return launch
@@ -479,12 +492,14 @@ def flydsl_mxscale_preshuffle_gemm(
         st_arg,
     )
     _REDUCE_AOT_CACHE.launch(
-        (split_k, out_dtype, A.device),
-        lambda: _bound_reduce_exe(split_k, out_dtype),
+        (split_k, out_dtype, False, A.device),
+        lambda: _bound_reduce_exe(split_k, out_dtype, False),
         tmp_ptr,
         out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
         M * N,  # slab_stride_dw (fp32: 1 dword/elem)
+        N // 2,  # row_dw
+        N // 2,  # ldc_dw (contiguous Out)
         st_arg,
     )
     return Out

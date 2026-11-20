@@ -112,6 +112,8 @@ _FALLBACK = [
     (float("inf"), (256, 256, 128, 1, 4, 2), True),
 ]
 _SPLITS = (1, 2, 4, 8, 16)
+# M-major group sizes of the xcd_order run that a tuner times (xcd_swizzle).
+_XCD_SWIZZLES = (2, 3, 4, 6, 8)
 
 
 def bmm_config_runs(b: int, n: int, k: int, scale_args: dict, cfg: dict) -> bool:
@@ -218,6 +220,10 @@ def bmm_candidate_names(
             variant = {**cfg, "splits": splits}
             if splits > 1:
                 variant.update(xcd_order=False, xcd_swizzle=0)
+            if runs(variant):
+                out.add(bmm_kernel_name(**variant))
+        for swizzle in (0, *_XCD_SWIZZLES):
+            variant = {**cfg, "splits": 1, "xcd_order": True, "xcd_swizzle": swizzle}
             if runs(variant):
                 out.add(bmm_kernel_name(**variant))
     return sorted(out)
