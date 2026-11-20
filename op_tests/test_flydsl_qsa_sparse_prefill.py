@@ -2031,7 +2031,7 @@ def test_qsa_fp8_uniform(case, heads):
     second requests reach the bounds of compute="fp8"'s per-token V scale clamp (2**56 to
     2**60, 2**-60 to 2**-56). An eighth of the (row, head) Q vectors are zero, whose FP8
     scale is 0, and an eighth tiny (amax about 2**-121, where 240 / amax overflows FP32),
-    which quantize to 0 too."""
+    which quantize as if their amax were Q_MIN."""
     layout, _ = FP8_UNIFORM_CASES[case]
     query_lens, prefix_lens, kv_heads, selection, topk = CASES[layout]
     rows, tokens = sum(query_lens), sum(query_lens) + sum(prefix_lens)
@@ -2080,34 +2080,61 @@ def test_qsa_fp8_uniform(case, heads):
 def test_qsa_fp8_query(case, heads):
     """Against the reference on the FP8 Q the kernels compute with (fp8_query) the output
     keeps only its FP8 probability error, also for sharp scores (Q x 8): fp8_query_error
-    mean below 5% and worst below 20%, on core/residual union tiles."""
+    mean below 5% and worst below 20%, on core/residual union tiles. Tiny Q under K scales
+    that restore its scores: Q x 2**-104 with K scales x 2**104 gives the bits of Q, and
+    Q x 2**-124 with K scales x 2**124 (amax below Q_MIN, S * k_scale past FP32's range)
+    stays within FP8_TOL of the reference on sample_rows."""
     layout, _ = FP8_QUERY_CASES[case]
     query_lens, prefix_lens = CASES[layout][:2]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
     q, k8, ks, v8, vs, indices = make_fp8_inputs(layout, heads, True, generator)
     ret = {"gfx": get_gfx(), "rows": q.shape[0]}
-    for gain in (1, 8):
-        sharp = (q.float() * gain).to(dtypes.bf16)
-        out = qsa_sparse_prefill(
-            sharp,
+
+    def call(query, k_scale):
+        return qsa_sparse_prefill(
+            query,
             k8,
             v8,
             indices,
             query_lens=query_lens,
             prefix_lens=prefix_lens,
             softmax_scale=SCALE,
-            k_scale=ks,
+            k_scale=k_scale,
             v_scale=vs,
         )
+
+    outs = {}
+    for gain in (1, 8):
+        outs[gain] = call((q.float() * gain).to(dtypes.bf16), ks)
         ret["routes"] = check_routes(case, heads)
         ret[f"Q x{gain} mean err"], ret[f"Q x{gain} worst err"] = fp8_query_error(
-            out, fp8_query(), k8, ks, v8, vs, indices, query_lens, prefix_lens
+            outs[gain], fp8_query(), k8, ks, v8, vs, indices, query_lens, prefix_lens
         )
+    rows = sample_rows(query_lens)
+    expected = run_torch(
+        q, k8, v8, indices, query_lens, prefix_lens, SCALE, (ks, vs), rows
+    )
+    for exponent in (104, 124):
+        name = f"Q x2**-{exponent}"
+        tiny = call((q.float() * 2.0**-exponent).to(dtypes.bf16), ks * 2.0**exponent)
+        ret[f"{name} mean err"], ret[f"{name} worst err"] = fp8_error(
+            tiny[rows], expected
+        )
+        if exponent == 104:
+            ret[f"{name} differing"] = mismatched_bits(
+                tiny, outs[1], f"{case} H{heads} {name} vs Q: out"
+            )
     for gain in (1, 8):
         mean, worst = ret[f"Q x{gain} mean err"], ret[f"Q x{gain} worst err"]
         assert (
             mean < 0.05 and worst < 0.2
         ), f"{case} H{heads} Q x{gain}: error mean {mean:.4f}, worst {worst:.4f}"
+    assert ret["Q x2**-104 differing"] == 0, f"{case} H{heads}: Q x 2**-104 differs"
+    mean, worst = ret["Q x2**-124 mean err"], ret["Q x2**-124 worst err"]
+    assert mean < FP8_TOL[0] and worst < FP8_TOL[1], (
+        f"{case} H{heads} Q x 2**-124: FP8 error mean {mean:.4f}, worst {worst:.4f}, "
+        f"bounds {FP8_TOL}"
+    )
     return ret
 
 
@@ -2201,6 +2228,7 @@ def test_qsa_fp8_graph(case, heads):
         q, k8, ks, v8, vs, indices = make_fp8_inputs(
             growth, heads, per_token, generator
         )
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             qsa_sparse_prefill(
                 q,

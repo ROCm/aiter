@@ -887,9 +887,9 @@ P_BIAS = 4.0
 # A V scale enters as log2 and reciprocal; the clamp keeps both finite (NaN maps to the floor),
 # and its 2**120 spread keeps a row's P' / v_scale, its row sum terms, within FP32's range.
 SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
-# Q rows of amax below Q_MIN quantize to 0 like zero rows: 240 / amax overflows FP32 below
-# about 2**-120, and their scores are 0 to FP32 precision anyway.
-Q_MIN = 2.0**-100
+# Q rows of amax below Q_MIN quantize as if their amax were Q_MIN (240 / amax overflows FP32
+# below about 2**-120; Q_MIN / 240 is a normal FP32 scale): fewer FP8 bits, but nonzero.
+Q_MIN = 2.0**-118
 # Q quantization: two rows per 16-lane group (16 dims per lane and row, every row load in
 # flight at once), so QROWS rows per 256-thread CTA.
 QR = 2
@@ -980,7 +980,8 @@ def _scaled_bf16(values, inv):
 
 
 def _quantize_part(raw):
-    """16 BF16 dims of a row (16 lanes per row): FP8 words and the row scale amax / 240."""
+    """16 BF16 dims of a row (16 lanes per row): FP8 words and the row scale
+    max(amax, Q_MIN) / 240 (0 for a zero row)."""
     values = []
     for vec in raw:
         for j in range(4):
@@ -992,19 +993,21 @@ def _quantize_part(raw):
     amax = level[0]
     for shift in (1, 2, 4, 8):
         amax = _maximum(amax, fx.gpu.shuffle_xor(amax, shift, 64))
-    inverse = (amax >= fx.Float32(Q_MIN)).select(rcp(amax) * FP8_MAX, fx.Float32(0.0))
+    floor = _maximum(amax, fx.Float32(Q_MIN))
+    inverse = rcp(floor) * FP8_MAX
     words = [
         _fp8_word([values[4 * k + r] * inverse for r in range(4)]) for k in range(4)
     ]
-    return words, amax * (1.0 / FP8_MAX)
+    scale = (amax > fx.Float32(0.0)).select(floor * (1.0 / FP8_MAX), fx.Float32(0.0))
+    return words, scale
 
 
 @flyc.jit
 def quantize_rows(Q, Q8, QS, ROWS, cta):
     """Rows cta * QROWS .. + QROWS - 1 of Q (rows of 256 BF16) for a 256-thread CTA: row
-    r * 16 + (thread >> 4) of the CTA's rows per step r; FP8 rows (E4M3FNUZ, RNE; 0 for
-    rows of amax below Q_MIN) and their scales amax / 240 (0 for a zero row). Run by the
-    FP8 pack kernel's CTAs past its blocks.
+    r * 16 + (thread >> 4) of the CTA's rows per step r; FP8 rows (E4M3FNUZ, RNE) and
+    their scales amax / 240 (Q_MIN / 240 for rows of amax below Q_MIN, 0 for a zero row).
+    Run by the FP8 pack kernel's CTAs past its blocks.
     """
     tid = fx.Int32(fx.thread_idx.x)
     group, part = tid >> 4, tid & 15

@@ -540,11 +540,12 @@ def _raw_sources(env, rows, t):
         ]
     else:
         k = [rows[kg] * stride + env.k_lane for kg in range(2)]
-        v = [rows[2 + b] * stride + env.v_lane for b in range(2) for _ in range(4)]
+        v = [rows[2 + b] * stride + env.v_lane for b in range(2)]
+        # Token offsets before the mask: past it they could wrap oob into the pool.
+        v = [v[b] + tt * stride for b in range(2) for tt in range(4)]
         if env.slotted:
             k = [k_valid[kg].select(k[kg], env.oob) for kg in range(2)]
             v = [v_valid[i].select(v[i], env.oob) for i in range(8)]
-        v = [v[i] + (i % 4) * stride for i in range(8)]
     scales = []
     if env.per_token:
         # Rows of values n (block n >= 12) and 16 + n (block 1), token n % 4.
@@ -782,10 +783,11 @@ def _scores(env, k, sc, t, m_run):
     for b in range(2):
         slot = t * CHUNK + 4 * b + env.g
         for r in range(4):
-            x = s[b][r]
+            # S * (k_scale * c): S * k_scale overflows FP32 for K scales past 2**104.
+            c = env.c_scale
             if env.per_token:
-                x = x * _scale_term(sc, b, 0, r)
-            x = fx.Float32(fx.fma(x, env.c_scale, neg))
+                c = _scale_term(sc, b, 0, r) * c
+            x = fx.Float32(fx.fma(s[b][r], c, neg))
             if env.per_token:
                 x = x + _scale_term(sc, b, 1, r)
             keep = (slot < env.complete) | (

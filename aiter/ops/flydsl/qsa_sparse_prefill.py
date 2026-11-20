@@ -427,13 +427,13 @@ def flydsl_qsa_sparse_prefill(
     with FP32 dequantization scales k_scale / v_scale, both per token and KV head
     ([N,HK], with kv_slots [P,HK]) or both per tensor ([1]); K/V values are K8 * k_scale
     and V8 * v_scale. compute="fp8" (default) runs FP8 MFMA kernels: Q is quantized per
-    (query, head) row with scale amax / 240 and the probabilities in FP8 (relative output
-    error of a few percent on random data), and per-token V scales are clamped to
-    [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct rows read the
-    context repacked per call while it fits a budget, else the raw K/V. Its union
-    plans may split a short prefill's longest tasks into two key ranges merged at the
-    end, and keep only a core of an H12/H6 union tile, the rows' other blocks running
-    direct and merging by log-sum-exp; whether a task splits depends on the whole
+    (query, head) row with scale max(amax, 2**-118) / 240 and the probabilities in FP8
+    (relative output error of a few percent on random data), and per-token V scales are
+    clamped to [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct
+    rows read the context repacked per call while it fits a budget, else the raw K/V.
+    Its union plans may split a short prefill's longest tasks into two key ranges merged
+    at the end, and keep only a core of an H12/H6 union tile, the rows' other blocks
+    running direct and merging by log-sum-exp; whether a task splits depends on the whole
     call, so batch_invariant=True does not split. compute="bf16" dequantizes the
     request tokens to BF16 (each value the FP32 product rounded once) and runs the BF16
     kernels (BF16 accuracy, temporary BF16 K/V of the packed context). Workspaces are

@@ -392,12 +392,13 @@ def _gen_part2(env, ctx):
         if env.per_token:
             # A DPP instruction reading a VGPR the previous VALU wrote needs two wait states
             # (any VGPR operand): the log2(v_scale) add of a value trails its FMA by one value.
+            # S * (k_scale * c): S * k_scale overflows FP32 for K scales past 2**104.
             xs = {}
             for k in range(lo, hi + 1):
                 if k < hi:
                     b, i = divmod(k, 16)
-                    v = ctx["s_acc"][b][i] * prim.row_broadcast(ctx["sk"][b], i)
-                    xs[k] = _fma(v, c_scale, neg)
+                    c = prim.row_broadcast(ctx["sk"][b], i) * c_scale
+                    xs[k] = _fma(ctx["s_acc"][b][i], c, neg)
                     yield
                 if k > lo:
                     kk = k - 1
@@ -479,9 +480,9 @@ def _first_max(env, s_acc, scales, words):
         b, i = divmod(k, 16)
         v = s_acc[b][i]
         if env.per_token:
-            x = (
-                v * prim.row_broadcast(scales[b], i)
-            ) * env.c_scale + prim.row_broadcast(terms[b], i)
+            x = v * (
+                prim.row_broadcast(scales[b], i) * env.c_scale
+            ) + prim.row_broadcast(terms[b], i)
         else:
             x = v * env.c_scale
         vals.append(_masked(x, _keep(ws, b, i)))
