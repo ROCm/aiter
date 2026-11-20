@@ -877,6 +877,50 @@ def generate_instance_and_lookUpTable_end(working_path):
         f_h.write(heuristic_dispatch_end)
 
 
+def _instance_arches():
+    """Archs whose CK MoE instances this build must contain.
+
+    Imported here: gemm_moe_ck2stages_common puts the jit utils on sys.path
+    before chip_info can be imported.
+
+    get_gfx() is the last GPU_ARCHS entry, so a gfx942;gfx950 wheel otherwise
+    drops the gfx942 list. Tuned rows name those instances. The heuristic
+    stays on get_gfx(); this only widens the lookup.
+    """
+    from chip_info import get_gfx, get_gfx_list
+
+    listed = []
+    for arch in get_gfx_list():
+        if arch in ("gfx942", "gfx950") and arch not in listed:
+            listed.append(arch)
+    if not listed:
+        listed = [get_gfx()]
+    primary = get_gfx()
+    if primary in listed:
+        listed = [primary] + [arch for arch in listed if arch != primary]
+    return listed
+
+
+def _gfx942_only_guard(kernel_arches, build_arches):
+    """Keep a gfx942-only tile out of the gfx950 device pass.
+
+    Tiles left off the gfx950 list do not compile there. The host pass and
+    the gfx942 device pass still instantiate them, so a tuned gfx942 row can
+    take its address. gfx950 tiles are left unguarded: that list already
+    compiles and runs on gfx942, and the dual-arch heuristic uses it.
+    """
+    if "gfx950" in build_arches and kernel_arches == {"gfx942"}:
+        return (
+            (
+                "// gfx942-only instance. The gfx950 device pass does not compile this tile.\n"
+                "#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx942__) "
+                "|| defined(__gfx9_4_generic__)\n"
+            ),
+            "#endif\n",
+        )
+    return "", ""
+
+
 class ck_moe_2stage_gemm_codegen:
     def __init__(
         self,
@@ -904,34 +948,51 @@ class ck_moe_2stage_gemm_codegen:
         self.runtime_swiglu_limit = runtime_swiglu_limit
 
     def generate_instance_and_lookUpTable(self):
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.activation,
-            self.mul_routed_weight_stage == 1,
-            self.preshuffle,
-            self.splitk,
-        )
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.mul_routed_weight_stage == 2,
-            self.preshuffle,
-        )
-        kernel_list = list(gemm1_kernel_list.values()) + list(
-            gemm2_kernel_list.values()
-        )
+        build_arches = _instance_arches()
+        kernels = {}
+        tag = None
+        gemm1_element_op = None
+        gemm2_element_op = None
+        for arch in build_arches:
+            _, gemm1_kernel_list = get_gemm1_kernels_list(
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.nswizzle,
+                self.quant_type,
+                self.activation,
+                self.mul_routed_weight_stage == 1,
+                self.preshuffle,
+                self.splitk,
+                arch=arch,
+            )
+            arch_tag, gemm2_kernel_list = get_gemm2_kernels_list(
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.nswizzle,
+                self.quant_type,
+                self.mul_routed_weight_stage == 2,
+                self.preshuffle,
+                arch=arch,
+            )
+            # Heuristic dispatch follows get_gfx(), which _instance_arches puts first.
+            if tag is None:
+                tag = arch_tag
+                gemm1_element_op = next(iter(gemm1_kernel_list.values())).CDEElementOp
+                gemm2_element_op = next(
+                    reversed(gemm2_kernel_list.values())
+                ).CDEElementOp
+            for kernel in list(gemm1_kernel_list.values()) + list(
+                gemm2_kernel_list.values()
+            ):
+                kernels.setdefault(kernel.name, [kernel, set()])[1].add(arch)
+        kernel_list = list(kernels.values())
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
 
         with open(f_lookUpTable, "a") as f_lookup:
-            for kernel in kernel_list:
+            for kernel, kernel_arches in kernel_list:
                 ## generate instance
                 os.makedirs(os.path.join(self.working_path, "instances"), exist_ok=True)
                 f_instance = os.path.join(
@@ -984,7 +1045,10 @@ class ck_moe_2stage_gemm_codegen:
                             stage_instance = (
                                 "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
                             )
-                        f_ins.write(stage_instance)
+                        guard_begin, guard_end = _gfx942_only_guard(
+                            kernel_arches, build_arches
+                        )
+                        f_ins.write(guard_begin + stage_instance + guard_end)
 
                 ## generate lookUpTable
                 lookup_ele = LOOKUP_template.format(
@@ -1029,7 +1093,7 @@ class ck_moe_2stage_gemm_codegen:
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                CDEElementOp=kernel_list[0].CDEElementOp,
+                CDEElementOp=gemm1_element_op,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=str(ACT_OP_MAP[self.activation]),
@@ -1048,7 +1112,7 @@ class ck_moe_2stage_gemm_codegen:
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType=self.c_dtype,
-                CDEElementOp=kernel_list[-1].CDEElementOp,
+                CDEElementOp=gemm2_element_op,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=0,
