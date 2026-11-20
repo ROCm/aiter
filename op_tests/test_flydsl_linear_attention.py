@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import os
 import subprocess
 import sys
@@ -48,8 +49,6 @@ pytestmark = pytest.mark.skipif(
 )
 # The packed decode/verify kernel is tuned and validated on gfx950 only.
 GDN_VARLEN_GFX = ["gfx950"]
-# The fused KDA decode kernel is validated on gfx942 and gfx950.
-KDA_DECODE_GFX = ["gfx942", "gfx950"]
 _gdn_varlen_only = pytest.mark.skipif(
     get_gfx() not in GDN_VARLEN_GFX,
     reason="FlyDSL GDN packed decode/verify is validated on gfx950 only",
@@ -62,6 +61,13 @@ _MAX_PERF_ROTATIONS = 101
 # rounding boundary can land one ULP away -- a handful of such elements per
 # tensor is expected. A real correctness break moves far more than this.
 _TOL_ERR_RATIO = 1e-3
+# The pool-wide ratio above lets a whole token/head (output) or slot/head
+# (state) go missing at large batch. A region is the last ``region_dims`` axes:
+# one token/head row of the output, one slot/head 128x128 block of the state.
+# A lost region mismatches in all of its elements (ratio 1.0).
+# Measured worst region over the pytest cases (MI355X): 7.3e-3, a state slot/head
+# at batch 129; the bound is 4x that. Never above 0.25.
+_KDA_MAX_REGION_BAD = 0.03
 
 
 @dataclass
@@ -818,6 +824,7 @@ def _assert_kda_close(
     tol: dict[str, float],
     msg: str,
     tol_err_ratio: float = 0.0,
+    region_dims: int = 1,
 ) -> float:
     err = checkAllclose(
         reference.float(),
@@ -827,6 +834,12 @@ def _assert_kda_close(
         **tol,
     )
     assert err <= tol_err_ratio, f"{msg}: {err:.4%} of elements outside {tol}"
+    bad = ~torch.isclose(actual.float(), reference.float(), equal_nan=False, **tol)
+    region = math.prod(reference.shape[-region_dims:])
+    worst = bad.reshape(-1, region).float().mean(dim=-1).max().item()
+    assert (
+        worst <= _KDA_MAX_REGION_BAD
+    ), f"{msg}: a region of {region} elements has {worst:.2%} mismatches"
     return err
 
 
@@ -844,9 +857,13 @@ def _assert_kda_state_close(
 ) -> None:
     assert actual.dtype == reference.dtype, f"{msg}: dtype {actual.dtype}"
     if actual.dtype == torch.float32:
-        _assert_kda_close(reference, actual, _KDA_STATE_TOL, msg, tol_err_ratio)
+        _assert_kda_close(
+            reference, actual, _KDA_STATE_TOL, msg, tol_err_ratio, region_dims=2
+        )
         return
-    _assert_kda_close(reference, actual, _KDA_BF16_STATE_TOL, msg, tol_err_ratio)
+    _assert_kda_close(
+        reference, actual, _KDA_BF16_STATE_TOL, msg, tol_err_ratio, region_dims=2
+    )
     # One-ULP ties are rare. A store that truncates instead of rounding, or a
     # load that misreads BF16, moves a large fraction of the bits.
     mismatched = (
@@ -1018,7 +1035,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             _KDA_TRITON_TOLS,
         )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, (candidate, fuse_f_b, tols) in candidates.items():
         output_tol, state_tol, tol_err_ratio = tols
         # Both caches update in place; run_perftest rotates deep copies, which
@@ -1035,7 +1052,8 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
         )
 
         actual_inputs = _copy_kda_inputs(base_inputs)
-        actual = candidate(actual_inputs, torch.empty_like(reference))
+        # NaN fill: a row the kernel never writes fails the comparison.
+        actual = candidate(actual_inputs, torch.full_like(reference, float("nan")))
         err_out = _assert_kda_close(
             reference,
             actual,
@@ -1049,6 +1067,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             state_tol,
             f"{name}: KDA decode state ",
             tol_err_ratio,
+            region_dims=2,
         )
         assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
         flops, nbytes = _kda_decode_work(batch, fuse_f_b, base_inputs.state)
@@ -1787,7 +1806,9 @@ def test_flydsl_kda_decode_accepts_non_overlapping_write_layouts(
 
     assert actual is out
     _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
-    _assert_kda_close(reference_inputs.state, inputs.state, _KDA_STATE_TOL, "state")
+    _assert_kda_close(
+        reference_inputs.state, inputs.state, _KDA_STATE_TOL, "state", region_dims=2
+    )
     assert torch.equal(reference_inputs.conv_state, inputs.conv_state)
 
 
@@ -2314,15 +2335,7 @@ def main():
         "FlyDSL GDR decode summary (markdown):\n%s", df.to_markdown(index=False)
     )
 
-    # get_gfx() follows GPU_ARCHS, which the table's gfx column reports; with
-    # two supported arches it must also be the GPU the sweep times, or a gfx950
-    # run under GPU_ARCHS=gfx942 (or the reverse) would be labeled wrongly.
-    gfx = get_gfx()
-    if (
-        gfx in KDA_DECODE_GFX
-        and gfx == get_gfx_runtime()
-        and is_flydsl_kda_decode_supported()
-    ):
+    if is_flydsl_kda_decode_supported():
         rows = [
             test_flydsl_kda_decode(batch, conv_layout, state_dtype)
             for state_dtype, conv_layout, batch in itertools.product(
@@ -2334,7 +2347,9 @@ def main():
             pd.DataFrame(rows).to_markdown(index=False),
         )
     else:
-        aiter.logger.warning("FlyDSL KDA decode unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning(
+            "FlyDSL KDA decode unsupported on %s; skipping", get_gfx_runtime()
+        )
 
     if get_gfx() not in GDN_VARLEN_GFX:
         aiter.logger.warning(
