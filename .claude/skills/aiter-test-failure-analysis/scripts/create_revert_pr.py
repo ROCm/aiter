@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,13 @@ from typing import Any
 ROOT = Path.cwd()
 DEFAULT_ASSIGNEE = "gyohuangxin"
 REVERT_MARKER = "aiter-auto-revert"
+LOW_CONFIDENCE_MARKER = "aiter-low-confidence-culprit"
+FAST_RUNNERS = (
+    "linux-aiter-mi35x-1",
+    "linux-aiter-oci-mi300x-1",
+    "linux-aiter-do-mi350x-8",
+    "linux-aiter-do-mi350x-dpx-8",
+)
 
 
 class CommandError(RuntimeError):
@@ -84,6 +92,11 @@ def candidate_from_culprit(culprit: dict[str, Any]) -> dict[str, Any] | None:
     return candidate if isinstance(candidate, dict) else None
 
 
+def commit_pr_number(candidate: dict[str, Any]) -> str:
+    match = re.search(r"\(#([0-9]+)\)\s*$", str(candidate.get("subject") or ""))
+    return match.group(1) if match else ""
+
+
 def target_run_id(evidence: dict[str, Any]) -> str:
     target = evidence.get("target_run") or {}
     return str(target.get("id") or os.environ.get("GITHUB_RUN_ID") or "unknown")
@@ -92,6 +105,72 @@ def target_run_id(evidence: dict[str, Any]) -> str:
 def target_run_url(evidence: dict[str, Any]) -> str:
     target = evidence.get("target_run") or {}
     return str(target.get("url") or "")
+
+
+def current_workflow_run_url(repo: str) -> str:
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    return f"https://github.com/{repo}/actions/runs/{run_id}" if run_id else ""
+
+
+def evidence_profile(evidence: dict[str, Any]) -> dict[str, Any]:
+    profile = evidence.get("failure_profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def failed_job_names(evidence: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for section in ("root_failed_jobs", "failed_jobs"):
+        for job in evidence.get(section) or []:
+            name = str(job.get("name") or "")
+            if name:
+                names.append(name)
+    return names
+
+
+def fast_runner_from_evidence(evidence: dict[str, Any]) -> str:
+    for name in failed_job_names(evidence):
+        for runner in FAST_RUNNERS:
+            if runner in name:
+                return runner
+        match = re.search(r"\((linux-[^,\)]+)", name)
+        if match and match.group(1) in FAST_RUNNERS:
+            return match.group(1)
+
+    profile = evidence_profile(evidence)
+    hardware = {str(item).lower() for item in profile.get("hardware", [])}
+    categories = {str(item).lower() for item in profile.get("categories", [])}
+    tokens = {str(item).lower() for item in profile.get("tokens", [])}
+
+    if hardware & {"mi300x", "gfx942"}:
+        return "linux-aiter-oci-mi300x-1"
+    if "multigpu" in categories or "mori" in tokens:
+        return "linux-aiter-do-mi350x-8"
+    if hardware & {"mi350x", "mi35x", "gfx950"}:
+        return "linux-aiter-mi35x-1"
+    return "linux-aiter-mi35x-1"
+
+
+def fast_test_files_from_evidence(evidence: dict[str, Any]) -> list[str]:
+    profile = evidence_profile(evidence)
+    files = []
+    candidates = list(profile.get("failed_test_files", [])) or list(
+        profile.get("failed_shard_test_files", [])
+    )
+    for value in candidates:
+        path = str(value).strip()
+        if path.startswith(("op_tests/", "tests/")) and path not in files:
+            files.append(path)
+    return sorted(files)
+
+
+def fast_mori_smoke_from_evidence(evidence: dict[str, Any]) -> bool:
+    profile = evidence_profile(evidence)
+    haystack = " ".join(
+        [*failed_job_names(evidence)]
+        + [str(item) for item in profile.get("tokens", [])]
+        + [str(item) for item in profile.get("categories", [])]
+    ).lower()
+    return "mori" in haystack and ("multigpu" in haystack or "smoke" in haystack)
 
 
 def commit_subject(sha: str) -> str:
@@ -155,6 +234,31 @@ def open_revert_pr_for_sha(repo: str, sha: str) -> dict[str, Any] | None:
     return None
 
 
+def open_low_confidence_issue_for_sha(repo: str, sha: str) -> dict[str, Any] | None:
+    short = sha[:12]
+    issues = gh_json(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,body,url",
+        ],
+        timeout=120,
+    )
+    for issue in issues or []:
+        haystack = "\n".join(str(issue.get(key) or "") for key in ("title", "body"))
+        if LOW_CONFIDENCE_MARKER in haystack and (sha in haystack or short in haystack):
+            return issue
+    return None
+
+
 def git_dirty() -> bool:
     proc = run_cmd(["git", "status", "--porcelain"], timeout=60)
     return bool(proc.stdout.strip())
@@ -179,10 +283,188 @@ def push_branch(branch: str) -> None:
     run_cmd(["git", "push", "--set-upstream", "origin", branch], env=gh_env(), timeout=180)
 
 
-def create_pr(repo: str, branch: str, sha: str, run_id: str, run_url: str, assignee: str) -> str:
-    subject = commit_subject(sha)
-    title = f"Revert {sha[:12]}: {subject}"
+def commit_github_author(repo: str, sha: str) -> str:
+    try:
+        commit = gh_json(["gh", "api", f"repos/{repo}/commits/{sha}"], timeout=120)
+    except (CommandError, json.JSONDecodeError):
+        return ""
+    for key in ("author", "committer"):
+        value = commit.get(key) if isinstance(commit, dict) else None
+        login = str((value or {}).get("login") or "").strip()
+        if login:
+            return login
+    return ""
+
+
+def pull_request_author(repo: str, candidate: dict[str, Any]) -> str:
+    pr_number = commit_pr_number(candidate)
+    if not pr_number:
+        return ""
+    try:
+        pull = gh_json(["gh", "api", f"repos/{repo}/pulls/{pr_number}"], timeout=120)
+    except (CommandError, json.JSONDecodeError):
+        return ""
+    user = pull.get("user") if isinstance(pull, dict) else None
+    return str((user or {}).get("login") or "").strip()
+
+
+def responsible_login(repo: str, candidate: dict[str, Any], fallback: str) -> str:
+    sha = str(candidate.get("sha") or "")
+    return commit_github_author(repo, sha) or pull_request_author(repo, candidate) or fallback
+
+
+def assign_issue(repo: str, issue_url: str, login: str, fallback: str) -> str:
+    if not login:
+        login = fallback
+    issue_number = issue_url.rstrip("/").rsplit("/", 1)[-1]
+    for assignee in (login, fallback):
+        if not assignee:
+            continue
+        proc = run_cmd(
+            [
+                "gh",
+                "issue",
+                "edit",
+                issue_number,
+                "--repo",
+                repo,
+                "--add-assignee",
+                assignee,
+            ],
+            check=False,
+            env=gh_env(),
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            return assignee
+    return ""
+
+
+def limited_items(values: object, limit: int = 8) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values[:limit]]
+
+
+def create_low_confidence_issue(
+    repo: str,
+    candidate: dict[str, Any],
+    culprit: dict[str, Any],
+    evidence: dict[str, Any],
+    fallback_assignee: str,
+) -> tuple[str, str]:
+    sha = str(candidate.get("sha") or "")
+    short = str(candidate.get("short") or sha[:12])
+    subject = str(candidate.get("subject") or commit_subject(sha) if sha else "unknown subject")
+    run_id = target_run_id(evidence)
+    run_url = target_run_url(evidence)
+    profile = evidence_profile(evidence)
+    assignee = responsible_login(repo, candidate, fallback_assignee)
+    reasons = limited_items(culprit.get("reasons"), limit=8)
+    blockers = limited_items(culprit.get("blockers"), limit=8)
+    warnings = limited_items(culprit.get("warnings"), limit=8)
+    failed_jobs = failed_job_names(evidence)[:8]
+    failed_tests = limited_items(profile.get("failed_test_files"), limit=12)
+    failed_shard_tests = limited_items(profile.get("failed_shard_test_files"), limit=12)
+    hardware = limited_items(profile.get("hardware"), limit=8)
+    categories = limited_items(profile.get("categories"), limit=8)
+
     body_lines = [
+        f"<!-- {LOW_CONFIDENCE_MARKER}: culprit={sha} -->",
+        "",
+        "The Aiter Test failure report selected this culprit candidate with low confidence, "
+        "so the bot did not create an automatic revert PR. Please investigate whether this "
+        "commit is related to the failing Aiter Test run.",
+        "",
+        "## Candidate",
+        "",
+        f"- Commit: `{sha}`",
+        f"- Subject: {subject}",
+        f"- Confidence: `{culprit.get('confidence', '')}`",
+        f"- Auto-revert ready: `{str(culprit.get('auto_revert_ready', False)).lower()}`",
+        f"- Score: `{candidate.get('score', '-')}`; margin: `{culprit.get('score_margin', '-')}`",
+        f"- Source Aiter Test run: `{run_id}`",
+    ]
+    if run_url:
+        body_lines.append(f"- Run URL: {run_url}")
+    report_url = current_workflow_run_url(repo)
+    if report_url:
+        body_lines.append(f"- Failure report run: {report_url}")
+    if commit_pr_number(candidate):
+        body_lines.append(f"- Candidate PR: #{commit_pr_number(candidate)}")
+    if assignee:
+        body_lines.append(f"- Suggested owner: @{assignee}")
+
+    body_lines.extend(["", "## Failure Scope", ""])
+    if failed_jobs:
+        body_lines.append("- Failed jobs: " + ", ".join(f"`{item}`" for item in failed_jobs))
+    if failed_tests:
+        body_lines.append("- Failed tests: " + ", ".join(f"`{item}`" for item in failed_tests))
+    if failed_shard_tests:
+        body_lines.append(
+            "- Test files in failed shard(s), not necessarily failed: "
+            + ", ".join(f"`{item}`" for item in failed_shard_tests)
+        )
+    if hardware:
+        body_lines.append("- Hardware: " + ", ".join(f"`{item}`" for item in hardware))
+    if categories:
+        body_lines.append("- Categories: " + ", ".join(f"`{item}`" for item in categories))
+    if not any((failed_jobs, failed_tests, failed_shard_tests, hardware, categories)):
+        body_lines.append("- No structured failure scope was available.")
+
+    body_lines.extend(["", "## Report Evidence", ""])
+    for reason in reasons:
+        body_lines.append(f"- Reason: {reason}")
+    for blocker in blockers:
+        body_lines.append(f"- Blocker: {blocker}")
+    for warning in warnings:
+        body_lines.append(f"- Warning: {warning}")
+    if not any((reasons, blockers, warnings)):
+        body_lines.append("- No additional evidence was recorded.")
+
+    title = f"[Aiter Test] Low-confidence culprit candidate {short}: {subject}"
+    proc = run_cmd(
+        [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            title[:250],
+            "--body",
+            "\n".join(body_lines),
+        ],
+        env=gh_env(),
+        timeout=180,
+    )
+    issue_url = proc.stdout.strip()
+    assigned = assign_issue(repo, issue_url, assignee, fallback_assignee)
+    return issue_url, assigned
+
+
+def create_pr(
+    repo: str,
+    branch: str,
+    sha: str,
+    run_id: str,
+    run_url: str,
+    assignee: str,
+    evidence: dict[str, Any],
+) -> str:
+    subject = commit_subject(sha)
+    title = f"[bot revert] Revert {sha[:12]}: {subject}"
+    fast_runner = fast_runner_from_evidence(evidence)
+    fast_test_files = fast_test_files_from_evidence(evidence)
+    fast_mori_smoke = fast_mori_smoke_from_evidence(evidence)
+    body_lines = [
+        "<!-- aiter-revert-fast",
+        f"failed_run_id: {run_id}",
+        f"runner: {fast_runner}",
+        f"test_files: {' '.join(fast_test_files)}",
+        f"mori_smoke: {str(fast_mori_smoke).lower()}",
+        "-->",
+        "",
         f"<!-- {REVERT_MARKER}: culprit={sha} -->",
         "",
         "Auto-created from the structured Aiter Test failure culprit report.",
@@ -266,6 +548,39 @@ def main() -> int:
     if not candidate or not sha:
         append_summary(render_skip("no culprit candidate was selected", culprit))
         return 0
+    if culprit.get("confidence") == "low":
+        if args.dry_run:
+            append_summary(
+                "## Aiter Low-Confidence Culprit\n\n"
+                f"Dry run passed. The script would create an investigation issue for `{sha}` "
+                "instead of opening an automatic revert PR."
+            )
+            return 0
+        duplicate_pr = open_revert_pr_for_sha(args.repo, sha)
+        if duplicate_pr:
+            append_summary(
+                "## Aiter Low-Confidence Culprit\n\n"
+                f"Skipped: duplicate open revert PR already exists for `{sha}`.\n\n"
+                f"- PR: #{duplicate_pr.get('number')} {duplicate_pr.get('url')}"
+            )
+            return 0
+        duplicate_issue = open_low_confidence_issue_for_sha(args.repo, sha)
+        if duplicate_issue:
+            append_summary(
+                "## Aiter Low-Confidence Culprit\n\n"
+                f"Skipped: duplicate open investigation issue already exists for `{sha}`.\n\n"
+                f"- Issue: #{duplicate_issue.get('number')} {duplicate_issue.get('url')}"
+            )
+            return 0
+        issue_url, assigned = create_low_confidence_issue(args.repo, candidate, culprit, evidence, args.assignee)
+        assignment_line = f"- Assignee: @{assigned}" if assigned else "- Assignee: (assignment failed)"
+        append_summary(
+            "## Aiter Low-Confidence Culprit\n\n"
+            f"Created investigation issue for `{sha}` because the culprit report confidence is low.\n\n"
+            f"- Issue: {issue_url}\n"
+            f"{assignment_line}"
+        )
+        return 0
     if culprit.get("auto_revert_ready") is not True or culprit.get("confidence") != "high":
         append_summary(render_skip("culprit report is not high-confidence auto-revert ready", culprit, sha))
         return 0
@@ -334,7 +649,7 @@ def main() -> int:
         return 0
 
     push_branch(branch)
-    pr_url = create_pr(args.repo, branch, sha, run_id, target_run_url(evidence), args.assignee)
+    pr_url = create_pr(args.repo, branch, sha, run_id, target_run_url(evidence), args.assignee, evidence)
     append_summary(
         "## Aiter Auto-Revert\n\n"
         f"Created revert PR for `{sha}`.\n\n"
