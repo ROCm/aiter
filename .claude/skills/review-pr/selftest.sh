@@ -484,6 +484,24 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
   ( AITER_AGENT_TIMEOUT=$1 AITER_RUN_BUDGET=$2 \
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
+# A shared runner label is a nuisance, not an outage. run_one.sh treats any non-zero from
+# check_prompts.py as fatal, so making this one refuse stopped every review in the repo for
+# a day (2026-11-18, after a scheduled job adopted box308) while the thing it guards is one
+# notification that may be wrong. Pinned so it does not quietly become fatal again.
+_shared_label_rc() {  # -> check_prompts' exit code with another workflow on the same label
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"; cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/"*.y*ml "$r/.github/workflows/" 2>/dev/null
+  printf 'name: squatter\njobs:\n  x:\n    runs-on: [self-hosted, box308]\n' \
+    > "$r/.github/workflows/zz-squatter.yml"
+  python3 "$d/check_prompts.py" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$r"
+  echo $rc
+}
+t "another workflow on the review label warns, it does not stop the review" \
+  "$(_shared_label_rc)" "0"
+
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 
 echo "[watchdog]"
