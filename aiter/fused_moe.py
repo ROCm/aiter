@@ -2520,8 +2520,9 @@ def fused_moe_1stage(
     return moe_buf
 
 
-# Arches whose 1-stage asm fmoe kernels address expert weights with 32-bit
-# byte offsets (see _asm_fmoe_weights_fit_u32_offsets).
+# Arches whose asm fmoe kernels (1-stage, and the asm stage 1 of the 2-stage
+# path) address expert weights with 32-bit byte offsets (see
+# _asm_fmoe_weights_fit_u32_offsets).
 _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
 # (arch, quant type) pairs on those arches whose asm kernel was run past 4 GiB
 # and came out right (gfx950 fp8 per_1x128: experts 147-255 of E=256, 7168/2048,
@@ -2535,11 +2536,12 @@ def _asm_fmoe_weights_fit_u32_offsets(
 ):
     """Whether every byte of w1/w2 is within 4 GiB of the tensor base.
 
-    The gfx942 1-stage asm fmoe kernels and gfx950's fp8 per_Token ones address
-    the expert weights with 32-bit byte offsets, so weights past 4 GiB read
-    wrapped addresses and return garbage without faulting (e.g. 256 experts,
-    model_dim 7168, inter_dim 2048 fp8 g1u1: w1 is 7 GiB and only experts 0-145
-    come out right).
+    The gfx942 1-stage asm fmoe kernels, gfx950's fp8 per_Token and
+    AITER_XBFLOAT16 blockscale ones, and the asm stage-1 kernels of the 2-stage
+    path on both arches address the expert weights with 32-bit byte offsets, so
+    weights past 4 GiB read wrapped addresses and return garbage without
+    faulting (e.g. 256 experts, model_dim 7168, inter_dim 2048 fp8 g1u1: w1 is
+    7 GiB and only experts 0-145 come out right).
     """
     w_dtype = dtype if q_dtype_w is None else q_dtype_w
     bits = 4 if w_dtype in (dtypes.fp4x2, dtypes.i4x2) else w_dtype.itemsize * 8
@@ -4819,6 +4821,35 @@ def get_2stage_cfgs(
                 f"unsupported {unsupported}; using default heuristics"
             )
 
+    # A tuned 1-stage row takes run_1stage from the CSV, so it would bypass the
+    # 4 GiB guard of the heuristic branch below. Drop an unsafe row so that the
+    # heuristic (and its guard / raise) decides. per_1x32 FLAT rows are kept:
+    # their 32-bit wrap was never measured.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
+        and q_type != QuantType.per_1x32
+        and not _asm_fmoe_weights_fit_u32_offsets(
+            expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
+        )
+    ):
+        guard_kernel1 = str(cfg.get("kernelName1", "") or "")
+        if "xbf16" in cfg:
+            guard_xbf16 = bool(int(cfg["xbf16"]))
+        else:
+            guard_xbf16 = "blockscaleBf16" in guard_kernel1
+        if not (
+            (get_gfx_runtime(), q_type) in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
+            and not guard_xbf16
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned asm 1-stage config {guard_kernel1!r} "
+                f"for {keys}: the weights are past 4 GiB and the kernel uses 32-bit "
+                "expert offsets; using default heuristics"
+            )
+            cfg = None
+
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
@@ -5648,6 +5679,19 @@ def get_2stage_cfgs(
             activation=activation,
             quant_type=q_type,
             use_non_temporal_load=use_non_temporal_load,
+        )
+    # The asm stage-1 kernels (2-stage dispatch, 1-stage metadata returned above)
+    # wrap 32-bit expert offsets as well: none of the shipped fmoe_stage1 code
+    # objects has a 64-bit expert-offset multiply. Fail closed on oversized weights.
+    if get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX and (
+        not _asm_fmoe_weights_fit_u32_offsets(
+            expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
+        )
+    ):
+        raise NotImplementedError(
+            f"MoE weights past 4 GiB (weight dtype {q_dtype_w}) are not supported "
+            f"on {get_gfx_runtime()} with the asm stage-1 kernel: it uses 32-bit "
+            "expert offsets and would read wrapped addresses."
         )
     return MOEMetadata(
         functools.partial(

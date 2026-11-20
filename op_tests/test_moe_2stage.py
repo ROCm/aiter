@@ -37,7 +37,7 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
     rearrange_4bit_elements,
 )
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
@@ -2520,12 +2520,12 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
 
 
 def test_gfx942_asm_1stage_4gib_guard():
-    """The gfx942 and gfx950 asm 1-stage fmoe kernels wrap weight offsets at 4 GiB.
+    """The gfx942 and gfx950 asm fmoe kernels wrap weight offsets at 4 GiB.
 
     The legacy sweep only logs an accuracy warning (strict_accuracy=False), so
     this asserts the dispatch itself. It needs no multi-GiB tensors: the weight
-    size is computed from the shape, and the tuned config is bypassed so the
-    default heuristic decides.
+    size is computed from the shape. The default heuristic is exercised with the
+    tuned config bypassed; a tuned 1-stage row is injected into the config cache.
     """
     fm = aiter.fused_moe
     fits = fm._asm_fmoe_weights_fit_u32_offsets
@@ -2543,10 +2543,10 @@ def test_gfx942_asm_1stage_4gib_guard():
     # No q_dtype_w: the weights are in the model dtype (2 bytes).
     assert not fits(256, 7168, 1024, True, None, bf16)
 
-    def run_1stage(token, inter_dim, qtype, w_dtype, a_dtype=fp8, g1u1=True):
+    def dispatch(token, inter_dim, qtype, w_dtype, a_dtype=fp8, g1u1=True, tuned=False):
         fm.get_2stage_cfgs.cache_clear()
         try:
-            with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
+            with override_env("AITER_BYPASS_TUNE_CONFIG", None if tuned else "1"):
                 return fm.get_2stage_cfgs(
                     token,
                     7168,
@@ -2562,9 +2562,12 @@ def test_gfx942_asm_1stage_4gib_guard():
                     False,
                     0,
                     0,
-                ).run_1stage
+                )
         finally:
             fm.get_2stage_cfgs.cache_clear()
+
+    def run_1stage(*args, **kwargs):
+        return dispatch(*args, **kwargs).run_1stage
 
     host = fm.get_gfx_runtime()
     real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
@@ -2576,6 +2579,10 @@ def test_gfx942_asm_1stage_4gib_guard():
         (256, aiter.QuantType.per_Token),
         (256, aiter.QuantType.per_1x128),
     )
+    # The control runs the default kernels; AITER_XBFLOAT16=1 exported by the
+    # caller would turn the exempt per_1x128 case into the guarded xbf16 kernel.
+    env_stack = ExitStack()
+    env_stack.enter_context(override_env("AITER_XBFLOAT16", "0"))
     try:
         for token, qtype in cases:
             # Previous dispatch: the guard turned off for every arch.
@@ -2624,7 +2631,79 @@ def test_gfx942_asm_1stage_4gib_guard():
             else:
                 raise AssertionError("oversized non-gated weights must be rejected")
             assert run_1stage(1, 1024, ng_qtype, bf16, bf16, False)
+
+            # int8 g1u1: the 2-stage path also launches an asm stage 1, which wraps
+            # the same way, so an oversized one is rejected instead of rerouted.
+            i8 = dtypes.i8
+            i8_qtype = aiter.QuantType.per_Token
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
+            assert dispatch(256, 2048, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+            try:
+                dispatch(256, 2048, i8_qtype, i8, i8)
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError("oversized int8 g1u1 weights must be rejected")
+            assert dispatch(256, 1024, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
+
+            # A tuned 1-stage row bypasses the heuristic branch; it must not get
+            # past the guard either. Inject one row into the tuned-config cache.
+            fp8_csv = os.path.join(
+                AITER_ROOT_DIR,
+                "hsa",
+                host,
+                "fmoe",
+                "silu",
+                "fmoe_bf16_pertokenFp8_g1u1_silu.csv",
+            )
+            row_kernel = pd.read_csv(fp8_csv)["knl_name"].iloc[0]
+
+            def tuned_row_run_1stage(qtype, kernel, tuned_token=32, **row_extra):
+                row = {
+                    "block_m": 32,
+                    "ksplit": 0,
+                    "kernelName1": kernel,
+                    "kernelName2": "",
+                    "run_1stage": True,
+                    **row_extra,
+                }
+                key = (
+                    host,
+                    get_cu_num(),
+                    tuned_token,
+                    7168,
+                    2048,
+                    256,
+                    8,
+                    str(aiter.ActivationType.Silu),
+                    str(bf16),
+                    str(fp8),
+                    str(fp8),
+                    str(qtype),
+                    True,
+                    False,
+                )
+                saved_cfgs = fm.cfg_2stages
+                fm.cfg_2stages = ({key: row}, {})
+                try:
+                    return run_1stage(tuned_token, 2048, qtype, fp8, tuned=True)
+                finally:
+                    fm.cfg_2stages = saved_cfgs
+
+            per_token = aiter.QuantType.per_Token
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
+            assert tuned_row_run_1stage(per_token, row_kernel), "tuned row not used"
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+            assert not tuned_row_run_1stage(per_token, row_kernel), "tuned 7 GiB row"
+            if host == "gfx950":
+                # Exempt control: a per_1x128 non-xbf16 row keeps asm 1-stage;
+                # the same row naming the xbf16 kernel is discarded.
+                per_1x128 = aiter.QuantType.per_1x128
+                assert tuned_row_run_1stage(per_1x128, row_kernel, xbf16=0), "exempt"
+                assert not tuned_row_run_1stage(per_1x128, row_kernel, xbf16=1), "xbf16"
     finally:
+        env_stack.close()
         fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = real_gfx
         fm.get_2stage_cfgs.cache_clear()
     aiter.logger.info("moe_2stage: asm 1-stage 4 GiB guard passed")
