@@ -12,7 +12,9 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from .. import logger
 from ..jit.core import compile_ops
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported
 from ..jit.utils.chip_info import get_gfx_runtime
 
 __all__ = [
@@ -145,8 +147,9 @@ def _select_gfx1250_variant(tokens, cu, hidden=5120):
     return "gfx1250_large", 1
 
 
-# gfx1250 H=5120 asm kernels (hsa/gfx1250/mega_mhc), opt-in with
-# AITER_MEGA_MHC_ASM=1 during bring-up. Per output: (token tile, largest T).
+# gfx1250 H=5120 asm kernels (hsa/gfx1250/mega_mhc), on by default on the
+# validated 256-CU configuration; AITER_MEGA_MHC_ASM=0 keeps the HIP kernels.
+# Per output: (token tile, largest T).
 # Tiles 16/32 are one cluster of 16 split workgroups per tile, up to the T
 # whose grid fills 256 CUs once (a second round costs 4-7 us); tile 64 is the
 # persistent 16-cluster kernel and takes any T, except without post-mix, where
@@ -162,17 +165,27 @@ _ASM_TILES = {
 # RMS sum of squares the unrounded FP32 values.
 _ASM_CS = 2
 _ASM_SPLITS = 16
+# The asm grids were validated on 256 CUs (16 shader engines of 16 CUs).
+_ASM_CUS = 256
+
+
+@cache
+def _device_cus(index):
+    return torch.cuda.get_device_properties(index).multi_processor_count
 
 
 def _asm_enabled(arch, hidden):
+    """Whether the current device may run the asm kernels at all."""
     return (
         arch == "gfx1250"
         and hidden == 5120
-        and os.environ.get("AITER_MEGA_MHC_ASM", "0") == "1"
+        and os.environ.get("AITER_MEGA_MHC_ASM", "1") != "0"
         and all(
             os.environ.get(name) is None
             for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
+        and is_gfx1250_asm_supported()
+        and _device_cus(torch.cuda.current_device()) == _ASM_CUS
     )
 
 
@@ -188,6 +201,14 @@ def _select_asm_tile(tokens, out_dtype):
     return None
 
 
+def _asm_scratch_tokens(tokens):
+    """Whether some (post, pre, output) call with this T can run an asm kernel."""
+    tile = _select_asm_tile(tokens, "mxfp8")
+    return tile is not None and not (
+        tile == 64 and _ASM_PS_HIP_RANGE[0] <= tokens <= _ASM_PS_HIP_RANGE[1]
+    )
+
+
 @compile_ops("module_mega_mhc_asm", fc_name="mega_mhc_asm_available", ffi_type="ctypes")
 def _mega_mhc_gfx1250_asm_available(
     tile_tokens: int,
@@ -201,11 +222,16 @@ def _mega_mhc_gfx1250_asm_available(
 
 @cache
 def _asm_available(tile_tokens, mxfp8, scale_row_major, has_post, identity_pre):
-    return bool(
-        _mega_mhc_gfx1250_asm_available(
-            tile_tokens, mxfp8, scale_row_major, has_post, identity_pre, _ASM_CS
+    try:
+        return bool(
+            _mega_mhc_gfx1250_asm_available(
+                tile_tokens, mxfp8, scale_row_major, has_post, identity_pre, _ASM_CS
+            )
         )
-    )
+    except Exception as e:  # noqa: BLE001
+        # A module that cannot build or load must not break the default path.
+        logger.warning("mega_mhc asm kernels unavailable, using HIP: %s", e)
+        return False
 
 
 def _asm_tile(
@@ -464,7 +490,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             _asm_partial_words(tokens)
             if split_k is None
             and _asm_enabled(arch, hidden)
-            and _select_asm_tile(tokens, "mxfp8") is not None
+            and _asm_scratch_tokens(tokens)
             else 0
         )
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
@@ -614,14 +640,16 @@ def mega_mhc(
     other positive repeat counts use the generic stream kernel with the same
     pack.
 
-    AITER_MEGA_MHC_ASM=1 (gfx1250, H=5120, Sinkhorn=20, plain residual layout)
-    runs the asm kernels of hsa/gfx1250/mega_mhc instead, for BF16 and
-    both MXFP8 scale layouts at any T, when the (post, pre, output)
-    specialization is shipped; other calls keep the HIP kernels.
-    Set it before preparing the workspace, which then sizes the partials for
-    the asm kernels. They use the same pack; the collapse reads the updated
-    residual rounded to BF16 and the RMS sum of squares the unrounded FP32
-    values, so results are not bitwise equal to the HIP kernels.
+    On gfx1250 B0+ with 256 CUs and no CU mask, H=5120, Sinkhorn=20 and the
+    plain residual layout run the asm kernels of hsa/gfx1250/mega_mhc by
+    default, for BF16 and both MXFP8 scale layouts, when the (post, pre,
+    output) specialization is shipped and T is in their range (see
+    hsa/gfx1250/mega_mhc/README.md). Other calls and other GPUs keep the HIP
+    kernels, as does AITER_MEGA_MHC_ASM=0. Set the variable before preparing
+    the workspace, which sizes the partials for the asm kernels. They use the
+    same pack; the collapse reads the updated residual rounded to BF16 and the
+    RMS sum of squares the unrounded FP32 values, so results are not bitwise
+    equal to the HIP kernels.
 
     out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
     norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
