@@ -15,12 +15,16 @@ import pytest
 import torch
 
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.cache import (
     concat_and_cache_mla_seg,
     fused_qk_rope_concat_and_cache_mla_seg,
 )
 
 KV_LORA, PE_DIM, PAGE = 512, 64, 64
+# Arches with a packed fp8 convert in fp32_to_fp8_scaled_x2 (aiter_opus_plus.h);
+# elsewhere (RDNA3/3.5) it is a compile-only stub that returns zeros.
+FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250", "gfx1250-strict")
 MAX_POS = 65536
 Q_OUT_DIM = 768  # 576 written, the tail must stay untouched
 
@@ -177,3 +181,75 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     torch.cuda.synchronize()
     assert _bytes_differ(q_out, ref_q) == 0
     assert _bytes_differ(kv_cache, ref_cache) == 0
+
+
+@pytest.mark.skipif(
+    get_gfx_runtime() not in FP8_CVT_GFX, reason="needs the packed fp8 convert"
+)
+@pytest.mark.parametrize("is_neox", [True, False])
+# one head per block, and eight heads per block
+@pytest.mark.parametrize("h,t", [(1, 7), (32, 192), (128, 1536)])
+def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, h, t):
+    """Values past the fp8 range store the saturated byte, never the NaN pattern."""
+    fmax = torch.finfo(dtypes.fp8).max
+
+    def wide(*shape):
+        x = torch.randn(shape).to(dtypes.bf16)
+        # Both ends of the row, so the rope part's x and y lanes both saturate in
+        # the neox (halves) and GPT-J (interleaved) layouts.
+        for cols, sign in ((slice(0, 2), 1), (slice(2, 4), -1), (slice(-4, -2), 1)):
+            x[..., cols] = sign * 4 * fmax
+        x[..., -2:] = -4 * fmax
+        return x.cuda()
+
+    gen = torch.Generator().manual_seed(h * 100003 + t)
+    q_nope, q_pe = wide(t, h, KV_LORA), wide(t, h, PE_DIM)
+    kv_c, k_pe = wide(t, KV_LORA), wide(t, PE_DIM)
+    num_blocks = 4096
+    kv_cache = torch.zeros(
+        (num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=dtypes.fp8, device="cuda"
+    )
+    q_out = torch.zeros((t, h, Q_OUT_DIM), dtype=dtypes.fp8, device="cuda")
+    slots = _slots(t, num_blocks, False, gen)
+    positions = torch.zeros(t, dtype=torch.int64, device="cuda")
+    # identity rope: the expected bytes do not depend on rotation rounding
+    cos = torch.ones((MAX_POS, PE_DIM // 2), dtype=dtypes.bf16, device="cuda")
+    sin = torch.zeros((MAX_POS, PE_DIM // 2), dtype=dtypes.bf16, device="cuda")
+    q_scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+    k_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    valid = (slots >= 0)[:, None, None]
+    ref_q = torch.zeros_like(q_out)
+    ref_q[..., :KV_LORA] = torch.where(
+        valid, _quant(q_nope, q_scale.item()).float(), 0
+    ).to(dtypes.fp8)
+    ref_q[..., KV_LORA : KV_LORA + PE_DIM] = torch.where(
+        valid, _quant(q_pe, q_scale.item()).float(), 0
+    ).to(dtypes.fp8)
+    ref_cache = _expected_cache(
+        kv_cache, slots, _quant(kv_c, k_scale.item()), _quant(k_pe, k_scale.item())
+    )
+
+    fused_qk_rope_concat_and_cache_mla_seg(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        slots,
+        k_scale,
+        q_scale,
+        positions,
+        cos,
+        sin,
+        is_neox,
+        True,
+    )
+    torch.cuda.synchronize()
+    assert _bytes_differ(q_out, ref_q) == 0
+    assert _bytes_differ(kv_cache, ref_cache) == 0
+    nan_bytes = torch.tensor([float("nan"), -float("nan")]).to(dtypes.fp8)
+    nan_bytes = nan_bytes.view(torch.uint8).cuda()
+    for out in (q_out[..., : KV_LORA + PE_DIM], kv_cache):
+        assert not torch.isin(out.view(torch.uint8), nan_bytes).any()
