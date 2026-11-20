@@ -5301,6 +5301,16 @@ def get_2stage_cfgs(
             df = df[tags.fillna("").astype(str) == tag]
         elif "_tag" in df.columns:
             df = df[df["_tag"].fillna("") != "flydsl_fallback"]
+        # Rows with a nonzero intermediate_pad only match calls with that pad;
+        # the other rows match any pad, as before the column existed.
+        padded = {}
+        if config_file is None and "intermediate_pad" in df.columns:
+            pad = pd.to_numeric(df["intermediate_pad"], errors="coerce").fillna(0)
+            df_padded = df[pad > 0].astype({"intermediate_pad": int})
+            df = df[pad <= 0]
+            padded = df_padded.set_index(_INDEX_COLS + ["intermediate_pad"]).to_dict(
+                "index"
+            )
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -5316,7 +5326,7 @@ def get_2stage_cfgs(
         primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
 
         if config_file is not None:
-            return primary, {}
+            return primary, {}, {}
 
         # Fallback dict: disable act_type so any activation can match.
         df_fallback = df.copy()
@@ -5343,7 +5353,7 @@ def get_2stage_cfgs(
             df_fallback = df_fallback.loc[~dup_mask]
         fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
 
-        return primary, fallback
+        return primary, fallback, padded
 
     global cfg_2stages
     tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
@@ -5422,8 +5432,12 @@ def get_2stage_cfgs(
     def _lookup_cfg(c2s):
         if not c2s:
             return None
-        primary, fallback = c2s
+        primary, fallback, padded = c2s
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        if intermediate_pad and padded:
+            result = padded.get(lookup_keys + (intermediate_pad,), None)
+            if result is not None:
+                return result
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
@@ -5793,12 +5807,23 @@ def get_2stage_cfgs(
             unsupported = "prequantized activations"
         elif has_num_local_tokens and not clamped_silu:
             unsupported = "num_local_tokens"
-        elif hidden_pad or intermediate_pad:
-            unsupported = "hidden/intermediate padding"
+        elif hidden_pad:
+            unsupported = "hidden padding"
+        elif intermediate_pad and not kernel_name1.startswith("impl__flydsl_gfx942__"):
+            unsupported = "intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:
             unsupported = f"gate mode {gate_mode.value!r}"
         elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
             unsupported = f"activation {activation}"
+        if unsupported is None and intermediate_pad:
+            from aiter.ops.flydsl.fused_moe_gfx942 import intermediate_pad_reason
+
+            unsupported = intermediate_pad_reason(
+                kernel_name1.removeprefix("impl__flydsl_gfx942__"),
+                inter_dim,
+                intermediate_pad,
+                q_type == QuantType.No and q_dtype_w == dtypes.bf16,
+            )
         if unsupported is not None:
             cfg = None
             full_impl = None

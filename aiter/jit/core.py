@@ -717,6 +717,9 @@ class AITER_CONFIG:
             keys.append("gfx")
         if "_tag" in merge_df.columns:
             keys.append("_tag")
+        # fused_moe matches rows with a nonzero intermediate_pad only to that pad.
+        if "intermediate_pad" in merge_df.columns and "intermediate_pad" not in keys:
+            keys.append("intermediate_pad")
         # Only key on columns actually present in the merged frame. Most
         # families carry cu_num, but some (e.g. the mxscale batched-GEMM
         # table) key on gfx and never carry cu_num; keeping a missing column
