@@ -105,6 +105,51 @@ def _worker(tp_size, rankID, mode, shape, distributed_init_method):
     return pool_mode, ipc_offset, out
 
 
+def _groups_only_worker(tp_size, rankID, distributed_init_method):
+    from aiter.dist.parallel_state import get_dp_group, get_ep_group, get_tp_group
+    from aiter.ops.communication import destroy_dist_env, init_dist_env
+
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    torch.empty(1, device=device)  # the context first: only the init is measured
+    free = torch.cuda.mem_get_info(device)[0]
+    init_dist_env(
+        tp_size,
+        rankID,
+        distributed_init_method=distributed_init_method,
+        local_rank=rankID,
+        device_communicators=False,
+    )
+    groups = {"tp": get_tp_group(), "dp": get_dp_group(), "ep": get_ep_group()}
+    ret = (
+        sorted(n for n, g in groups.items() if g.device_communicator is not None),
+        groups["tp"].world_size,
+        groups["tp"].rank_in_group,
+        free - torch.cuda.mem_get_info(device)[0],
+    )
+    destroy_dist_env()
+    return ret
+
+
+def test_groups_without_device_communicators(tp_size):
+    """device_communicators=False gives the groups and their ranks without
+    device communicators, for a process that only needs the layout."""
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    pool = Pool(processes=tp_size)
+    rets = [
+        pool.apply_async(_groups_only_worker, args=(tp_size, i, init_method))
+        for i in range(tp_size)
+    ]
+    pool.close()
+    pool.join()
+    rets = [r.get() for r in rets]
+    for rank, (with_comm, world_size, rank_in_group, _) in enumerate(rets):
+        assert not with_comm, f"rank {rank}: device communicators on {with_comm}"
+        assert (world_size, rank_in_group) == (tp_size, rank)
+    # Device-wide, so reported rather than asserted: other processes move it.
+    return {"device_MiB_taken_by_init": [used >> 20 for *_, used in rets]}
+
+
 def test_init_dist_env(tp_size, shape, run_mode):
     if run_mode == "dirty":
         free = min(
@@ -194,3 +239,5 @@ if __name__ == "__main__":
     for run_mode in ("default", "dirty", "expandable", "raw_override"):
         ret = test_init_dist_env(args.tp_size, (128, 8192), run_mode)
         print(f"mode={run_mode}: {ret}")
+    ret = test_groups_without_device_communicators(args.tp_size)
+    print(f"device_communicators=False: {ret}")
