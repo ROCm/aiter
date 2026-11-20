@@ -305,6 +305,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     errs["num_tokens_post_padded"] = checkAllclose(
         num_tokens_post_padded_a,
         num_tokens_post_padded_b,
+        rtol=0,  # integers: the default 1% tolerance would accept a wrong count
         atol=0,
         msg="num_tokens_post_padded",
     )
@@ -328,6 +329,8 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     errs["sorted_expert_ids"] = checkAllclose(
         sorted_expert_ids_a[expert_mask],
         sorted_expert_ids_b[expert_mask],
+        rtol=0,
+        atol=0,
         msg="sorted_expert_ids",
     )
     return errs
@@ -397,15 +400,19 @@ def _check_aux_outputs(out, topk_ids, block_size, expert_mask=None):
         topk_slots.unsqueeze(0) << 24
         | torch.arange(token, dtype=topk_ids.dtype, device=topk_ids.device).unsqueeze(1)
     ).flatten()
-    # Routes to experts masked out by EP are not sorted; their slots are unused.
+    # Routes to experts masked out by EP are not sorted; their slots hold -1.
     routed = (
         torch.ones_like(expected_sorted_ids, dtype=torch.bool)
         if expert_mask is None
         else (expert_mask[topk_ids.long()] != 0).flatten()
     )
-    assert torch.equal(
-        sorted_ids[aux_reverse_sorted[routed].long()], expected_sorted_ids[routed]
-    )
+    live = aux_reverse_sorted[routed]
+    assert (
+        (live >= 0) & (live < num_tokens_post_pad)
+    ).all(), "reverse index out of range"
+    assert torch.equal(sorted_ids[live.long()], expected_sorted_ids[routed])
+    if expert_mask is not None:
+        assert (aux_reverse_sorted[~routed] == -1).all(), "masked route not -1"
 
 
 # The Opus single kernel keeps one LDS row per sub-token. With the 64 KB host-pass
