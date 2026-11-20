@@ -7,7 +7,10 @@ Validated route: BF16 paged attention on gfx950 with the linear
 ``[blocks, page, kv_heads, dim]`` KV cache, the MiMo V2.6 global attention
 geometry (Q/K 192, V/output 128, 16 query heads per KV head), page sizes 64 and
 128 and causal full attention. A uniform query length of 1 to 8 tokens per
-sequence, with or without sinks, runs through ``pa_decode``. Other query lengths (prefill and mixed
+sequence, with or without sinks, runs through the ping-pong decode kernel;
+without ``explicit``, batches below ``_MIN_AUTO_UNIFORM_WORK`` query tokens x KV
+heads x ``max_seqlen_k`` return None for Triton, which is faster there. Other
+query lengths (prefill and mixed
 batches, without sinks) split each sequence's queries into blocks of 16 that
 run as pseudo-sequences of the same kernels. Causal sliding windows, with or
 without sinks, take any query lengths: one CTA per query block and KV head
@@ -62,6 +65,11 @@ _WINDOW_QUERY_BLOCK = 8
 _GFX950_LDS_BYTES = 160 * 1024
 # Varlen pseudo-sequences the planner's LDS holds on gfx950.
 _MAX_PSEUDO_SEQS = 40000
+# Auto routing leaves uniform decode below this many query tokens x KV heads x
+# max_seqlen_k to Triton: the ping-pong kernel's fixed latency (plan refresh,
+# DMA ring fill) loses to it there, by up to 2.3x. Crossover measured on
+# MI355X with one KV head.
+_MIN_AUTO_UNIFORM_WORK = 49152
 
 
 def _sliding_window(window_size) -> int | None:
@@ -979,7 +987,8 @@ def unified_attention_flydsl(
     ``seqused_k`` holds KV lengths including
     the query tokens, as for Triton; each must be at least its query count.
     With ``explicit``, a declined configuration or an unprepared graph capture
-    raises RuntimeError naming the cause instead of returning None.
+    raises RuntimeError naming the cause instead of returning None. Without it,
+    uniform decode below ``_MIN_AUTO_UNIFORM_WORK`` also returns None.
     """
     route, reason = _route(
         q,
@@ -1012,6 +1021,12 @@ def unified_attention_flydsl(
                 "FlyDSL unified_attention does not support this configuration: "
                 f"{reason}"
             )
+        return None
+    if (
+        route == "uniform"
+        and not explicit
+        and q.shape[0] * k.shape[2] * int(max_seqlen_k) < _MIN_AUTO_UNIFORM_WORK
+    ):
         return None
     if route in ("window", "window_varlen"):
         return _unified_attention_window(

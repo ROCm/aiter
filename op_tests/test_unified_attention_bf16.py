@@ -212,6 +212,24 @@ def test_auto_selects_flydsl_and_matches_triton(page, route_spy):
     _check(triton_out, ref)
 
 
+@pytest.mark.parametrize(
+    "hkv, max_k, auto_route",
+    [(2, 3072, "uniform"), (2, 3071, "triton"), (1, 3072, "triton")],
+)
+def test_auto_leaves_small_uniform_decode_to_triton(hkv, max_k, auto_route, route_spy):
+    # 8 query tokens x 2 KV heads x 3072 is the cutoff.
+    assert flydsl_ua._MIN_AUTO_UNIFORM_WORK == 8 * 2 * 3072
+    q, k, v, out, cu, used, table = _inputs((3071, 129), 64, qlen=4, hkv=hkv)
+    _call(q, k, v, out, cu, used, table, qlen=4, max_k=max_k)
+    assert route_spy == [auto_route]
+    ref = _reference(q, k, v, used, table, 4)
+    _check(out, ref)
+    out.fill_(float("nan"))
+    _call(q, k, v, out, cu, used, table, qlen=4, max_k=max_k, backend="flydsl")
+    assert route_spy == [auto_route, "uniform"]
+    _check(out, ref)
+
+
 @pytest.mark.parametrize("qlen", [1, 2, 4])
 def test_flydsl_shorter_query_lengths(qlen, route_spy):
     q, k, v, out, cu, used, table = _inputs((4097, 129, 64), 128, qlen=qlen)
