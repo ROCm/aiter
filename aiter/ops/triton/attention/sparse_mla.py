@@ -735,15 +735,13 @@ def _forward_dsv4_640(
     extra_indptr,
     extra_indices,
     inv_rope_positions,
+    inv_rope_cos_sin_cache,
     out_mxfp8,
     use_lru_cache_partials,
 ):
-    """fp8_dsv4_mla_640 -> the gfx1250 fp8 driver, for prefill and decode alike.
+    """Run fp8_dsv4_mla_640 on the gfx1250 fp8 driver, for prefill and decode.
 
-    Prefill and decode are the same kernel: they differ only in the number of
-    query rows, and the split-K heuristic is driven by that count (it settles
-    on one split, the single-pass form, once the rows fill the GPU). So the
-    caller does not say which one it is; kv_splits=1 forces the single pass.
+    The split-K heuristic follows the row count; kv_splits=1 forces one pass.
     """
     arch = arch_info.get_arch()
     if arch not in DSV4_640_ARCHS:
@@ -758,6 +756,7 @@ def _forward_dsv4_640(
             ("return_lse", return_lse),
             ("q_scale", q_scale is not None),
             ("inv_rope_positions", inv_rope_positions is not None),
+            ("inv_rope_cos_sin_cache", inv_rope_cos_sin_cache is not None),
             ("out_mxfp8", out_mxfp8 is not None),
         )
         if asked
@@ -766,6 +765,9 @@ def _forward_dsv4_640(
         raise ValueError(
             f"{', '.join(unsupported)} is not supported for fp8_dsv4_mla_640 yet"
         )
+    if attn_sink is None:
+        # The fp8 driver always reads the sink.
+        raise ValueError("fp8_dsv4_mla_640 needs attn_sink ([H] fp32)")
     if q_rope is not None:
         # q is the packed row (fp8 NoPE + its UE8M0 scales) and q_rope its bf16
         # RoPE half, as the fused DSv4 Q producers emit them.
@@ -923,7 +925,7 @@ def sparse_mla_fwd(
             False.
         attn_sink: optional [H] f32 per-head sink: exp(sink) joins the softmax
             denominator (and the LSE) as a virtual key. None means no sink,
-            which is not the same as a zero sink.
+            which is not the same as a zero sink. fp8_dsv4_mla_640 requires it.
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
             same pass, for the SWA-window + top-k two-loop. All three together.
             Either both segments are fp8_scalar block caches (each with its own
@@ -961,9 +963,7 @@ def sparse_mla_fwd(
             query that is already packed: q is then the [C, H, 512]
             float8_e4m3fn row (NoPE with its UE8M0 scales) the fused DSv4 Q
             producers emit, and no q_scale is taken. Without it q is bf16.
-            The 640 B format serves prefill and decode through the same kernel;
-            the split-K heuristic follows the row count (kv_splits=1 forces the
-            single pass).
+            Prefill and decode use the same kernel; kv_splits=1 forces one pass.
         use_lru_cache_partials: reuse the split-K partial buffers across calls
             (an LRU of persistent buffers sized by the next power of two of C)
             instead of allocating them per call. For the packed caches
@@ -1070,6 +1070,7 @@ def sparse_mla_fwd(
             extra_indptr=extra_indptr,
             extra_indices=extra_indices,
             inv_rope_positions=inv_rope_positions,
+            inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
             out_mxfp8=out_mxfp8,
             use_lru_cache_partials=use_lru_cache_partials,
         )

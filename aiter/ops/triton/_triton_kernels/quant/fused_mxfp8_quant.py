@@ -426,9 +426,8 @@ def _v4_hca_write_index_list(
     COMP_PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Token ``t`` of a segment: its [SWA | compressed] slots as record-grid
-    rows ``base + (slot // page) * block_rows + slot % page``, at
-    ``swa_indptr[t] + comp_indptr[t]``, plus that indptr entry."""
+    """Write token ``t``'s [SWA | compressed] slots as record-grid rows, and its
+    indptr entry ``swa_indptr[t] + comp_indptr[t]``."""
     s0 = tl.load(swa_indptr_ptr + t)
     s1 = tl.load(swa_indptr_ptr + t + 1)
     c0 = tl.load(comp_indptr_ptr + t)
@@ -506,11 +505,10 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     COPY_HCA_KV_INDICES_PREFILL: tl.constexpr,
     HCP_SLOT: tl.constexpr,
 ):
-    """One program per (token, slot); slot == padded_heads is the KV row and,
-    with COPY_HCA_KV_INDICES, slot == padded_heads + 1 writes the token's HCA
-    sparse-attention index list (decode segment). With
-    COPY_HCA_KV_INDICES_PREFILL, slot == HCP_SLOT does the same for the
-    prefill segment, whose tokens start at batch row hcp_token_offset.
+    """One program per (token, slot); slot == padded_heads is the KV row.
+    Slot padded_heads + 1 (COPY_HCA_KV_INDICES) and slot HCP_SLOT
+    (COPY_HCA_KV_INDICES_PREFILL) write the HCA index lists of the decode and
+    prefill segments.
 
     Padding slots zero-fill every Q output. That is a correctness requirement,
     not tidiness: an unwritten scale byte of 0xFF is E8M0 NaN, and the decode
@@ -522,13 +520,9 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     tok = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
 
-    # ---- HCA: [SWA | compressed] slots -> rows of the record grid ---------
-    # The sparse decode reads one index list per token over the flat 640 B
-    # record grid both caches live in. A slot of either cache maps to
-    #     base + (slot // page) * block_rows + slot % page,
-    # where base (where this layer's cache starts inside a block) is the only
-    # per-layer term. Writing the list here, next to the KV insert the layer
-    # runs anyway, saves the HCA layer an index launch of its own.
+    # HCA: write each token's [SWA | compressed] slots as record-grid rows
+    # (base + (slot // page) * block_rows + slot % page). Doing it here saves
+    # the HCA layer a separate index launch.
     if COPY_HCA_KV_INDICES:  # noqa: SIM102 -- constexpr, prunes the branch
         if h == padded_heads + 1:
             if tok < hca_num_tokens:

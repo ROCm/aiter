@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 
@@ -13,6 +15,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 __all__ = [
     "fused_deepseek_v4_compress_norm_rope_store",
@@ -47,6 +50,19 @@ _FP8_MAX_FNUZ = 224.0
 
 def _v4_fp8_max(use_fnuz: bool) -> float:
     return _FP8_MAX_FNUZ if use_fnuz else _FP8_MAX_OCP
+
+
+@functools.lru_cache(maxsize=1)
+def _v4_hca_block() -> int:
+    """HCA_BLOCK, the chunk width of the HCA index copy, from the quant config.
+
+    Cached because the insert runs once per layer and step.
+    """
+    cfg_dir = resolve_config_dir("quant", "FUSED_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT")
+    cfg = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return int(
+        cfg["_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel"]["HCA_BLOCK"]
+    )
 
 
 def fused_rms_mxfp8_quant(
@@ -434,6 +450,9 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         if not 0 <= hca["num_tokens"] <= t:
             raise RuntimeError(f"hca num_tokens {hca['num_tokens']} not in [0, {t}]")
         hca_n = int(hca["num_tokens"])
+        if hca_n == 0:
+            # No program writes an empty segment, so set its indptr here.
+            hca["dst_indptr"][:1].zero_()
     else:
         hca_t, hca_n = (kv_slot_mapping,) * 6, 0
     if copy_hcp:
@@ -441,6 +460,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         off, n = int(hcp["token_offset"]), int(hcp["num_tokens"])
         if off < 0 or n < 0 or off + n > t:
             raise RuntimeError(f"hca prefill rows [{off}, {off + n}) not in [0, {t}]")
+        if n == 0:
+            hcp["dst_indptr"][:1].zero_()
         hcp_s = (n, off)
     else:
         hcp_t, hcp_s = (kv_slot_mapping,) * 6, (0, 0)
@@ -491,7 +512,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         *hca_s,
         copy_hca,
         *hca_pages,
-        128,
+        # Pruned without a segment, so any value works there.
+        _v4_hca_block() if geo is not None else 1,
         *hcp_t,
         *hcp_s,
         copy_hcp,

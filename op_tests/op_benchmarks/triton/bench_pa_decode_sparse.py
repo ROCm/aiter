@@ -148,13 +148,13 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.utils.dsv4_sparse_attn import v4_pack_2buff
 
 # DSv4 MLA head geometry: one 512-wide latent per token, of which the last 64
 # dims are the RoPE half. V is the whole row, so the output is 512 wide too.
 NOPE_DIM = 448
 ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM  # 512
-FP8_DTYPE = torch.float8_e4m3fn  # OCP e4m3 — what the asm .co consumes
 NUM_TILES = NOPE_DIM // 64  # 7 E8M0 quant groups
 
 # The asm decode kernel is dispatched per (gqa, qSeqLen); at qSeqLen=1 only
@@ -196,29 +196,9 @@ SWEEP_SHAPES = [
 
 
 # ---------------------------------------------------------------------------
-# Packing (mirrors op_tests/triton_tests/attention/test_pa_decode_sparse.py and
-# ATOM atom/model_ops/v4_kernels/v4_quant.py)
+# Packing (v4_pack_2buff is shared with the tests; mirrors ATOM
+# atom/model_ops/v4_kernels/v4_quant.py)
 # ---------------------------------------------------------------------------
-def v4_pack_2buff(x_bf16):
-    """``[..., 512]`` bf16 NoPE||RoPE -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``."""
-    lead = x_bf16.shape[:-1]
-    nope = x_bf16[..., :NOPE_DIM].float()
-    rope = x_bf16[..., NOPE_DIM:].contiguous()
-
-    tiled = nope.reshape(*lead, NUM_TILES, 64)
-    fp8_max = float(torch.finfo(FP8_DTYPE).max)
-    scale = torch.pow(
-        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
-    )
-    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(FP8_DTYPE).reshape(*lead, NOPE_DIM)
-    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
-
-    packed = torch.zeros((*lead, HEAD_DIM), dtype=torch.uint8, device=x_bf16.device)
-    packed[..., :NOPE_DIM] = nope_fp8.view(torch.uint8)
-    packed[..., NOPE_DIM : NOPE_DIM + 2 * NUM_TILES] = e8m0.repeat_interleave(2, dim=-1)
-    return packed.view(FP8_DTYPE), rope
-
-
 def v4_pack_unified(packed_2buff, rope, page):
     """2buff row + RoPE plane -> ``[nb, page, 640]`` uint8, the aligned record.
 

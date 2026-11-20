@@ -524,7 +524,7 @@ def _v4_record_grid(seed=0):
         0, 120, (rows, 448), generator=g, device="cuda", dtype=torch.uint8
     )
     grid[:, 448:462] = 120  # 2^-7
-    rope = torch.randn(rows, 64, generator=g, device="cuda") * 0.3
+    rope = torch.randn(rows, 64, generator=g, dtype=torch.float32, device="cuda") * 0.3
     grid[:, 512:] = rope.to(torch.bfloat16).view(torch.uint8)
     return grid
 
@@ -540,8 +540,9 @@ def _v4_inputs(T, max_keys, rows, seed=0):
     idx = torch.randint(
         0, rows, (int(indptr[-1]),), generator=g, device="cuda", dtype=torch.int32
     )
-    q = (torch.randn(T, _V4_H, 512, generator=g, device="cuda") * 2).to(torch.bfloat16)
-    sink = torch.randn(_V4_H, generator=g, device="cuda") * 0.5
+    q = torch.randn(T, _V4_H, 512, generator=g, dtype=torch.float32, device="cuda")
+    q = (q * 2).to(torch.bfloat16)
+    sink = torch.randn(_V4_H, generator=g, dtype=torch.float32, device="cuda") * 0.5
     return idx, indptr, q, sink
 
 
@@ -749,27 +750,46 @@ def test_dsv4_640_lru_partials_engaged():
 def test_dsv4_640_contract():
     """What the 640 B route refuses instead of decoding the wrong thing."""
     grid = _v4_record_grid(6)
-    idx, indptr, q, _sink = _v4_inputs(4, 64, grid.shape[0], seed=9)
+    idx, indptr, q, sink = _v4_inputs(4, 64, grid.shape[0], seed=9)
     qp, qr = _v4_pack(q)
     call = sparse_mla_fwd
 
     with pytest.raises(ValueError, match="kv_scale"):
         call(
-            qp, grid, indptr, idx, 0.1, q_rope=qr, kv_scale=torch.ones(1, device="cuda")
+            qp,
+            grid,
+            indptr,
+            idx,
+            0.1,
+            q_rope=qr,
+            kv_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         )
     for kw, msg in (
         ({"return_lse": True}, "return_lse"),
         ({"dot_precision": "fp8"}, "dot_precision"),
-        ({"q_scale": torch.ones(1, device="cuda")}, "q_scale"),
+        ({"q_scale": torch.ones(1, dtype=torch.float32, device="cuda")}, "q_scale"),
+        (
+            {
+                "inv_rope_cos_sin_cache": torch.ones(
+                    8, 64, dtype=torch.float32, device="cuda"
+                )
+            },
+            "inv_rope_cos_sin_cache",
+        ),
     ):
+        kw.setdefault("attn_sink", sink)
         with pytest.raises(ValueError, match=msg):
             call(qp, grid, indptr, idx, 0.1, q_rope=qr, **kw)
+    with pytest.raises(ValueError, match="attn_sink"):
+        call(qp, grid, indptr, idx, 0.1, q_rope=qr)
     with pytest.raises(ValueError, match="q_rope must be"):
-        call(qp, grid, indptr, idx, 0.1, q_rope=qr[..., :32].contiguous())
+        call(
+            qp, grid, indptr, idx, 0.1, q_rope=qr[..., :32].contiguous(), attn_sink=sink
+        )
     with pytest.raises(ValueError, match="packed float8_e4m3fn"):
-        call(q, grid, indptr, idx, 0.1, q_rope=qr)
+        call(q, grid, indptr, idx, 0.1, q_rope=qr, attn_sink=sink)
     with pytest.raises(ValueError, match="row-contiguous"):
-        call(qp, grid[::2], indptr, idx, 0.1, q_rope=qr)
+        call(qp, grid[::2], indptr, idx, 0.1, q_rope=qr, attn_sink=sink)
     bf16_extra = torch.zeros(2, 64, 512, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="pairs only with itself"):
         call(
