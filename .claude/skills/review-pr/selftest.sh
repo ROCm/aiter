@@ -469,6 +469,42 @@ PYEOF
 }
 t "audit_card accepts CSV coverage finding backed by tuning_coverage.txt"   "$(_audit_csv_coverage_backed_by_artifact)" "ok"
 
+_audit_new_coverage_kinds() {
+  python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import triage
+
+cases = [
+    (
+        "diff --git a/aiter/configs/foo_tuned.csv b/aiter/configs/foo_tuned.csv\n--- a/aiter/configs/foo_tuned.csv\n+++ b/aiter/configs/foo_tuned.csv\n@@ -1 +1 @@\n+16,64,1.0\n",
+        "⚠️ aiter/configs/foo_tuned.csv:2 adds tuned workload with no untuned input (expected aiter/configs/foo_untuned.csv). **Author must** add the untuned input.",
+        "A5 FIRE -- aiter/configs/foo_tuned.csv: NO_UNTUNED_INPUT",
+        "NO_UNTUNED_INPUT aiter/configs/foo_tuned.csv: 1 new workload rows have no untuned input (expected aiter/configs/foo_untuned.csv)",
+    ),
+    (
+        "diff --git a/aiter/configs/foo_untuned.csv b/aiter/configs/foo_untuned.csv\n--- a/aiter/configs/foo_untuned.csv\n+++ b/aiter/configs/foo_untuned.csv\n@@ -1 +1 @@\n+16,64\n",
+        "⚠️ aiter/configs/foo_untuned.csv:2 adds untuned workload absent from aiter/configs/foo_tuned.csv. **Author must** tune it.",
+        "A5 FIRE -- aiter/configs/foo_untuned.csv: UNTUNED_MISSING",
+        "UNTUNED_MISSING aiter/configs/foo_untuned.csv: 1 of 1 new untuned keys absent from aiter/configs/foo_tuned.csv",
+    ),
+    (
+        "diff --git a/aiter/configs/foo_tuned.csv b/aiter/configs/foo_tuned.csv\n--- a/aiter/configs/foo_tuned.csv\n+++ b/aiter/configs/foo_tuned.csv\n@@ -1 +0,0 @@\n-16,64,1.0\n",
+        "⚠️ aiter/configs/foo_tuned.csv:2 removes tuned workload still present in aiter/configs/foo_untuned.csv. **Author must** restore it or remove the untuned row.",
+        "A5 FIRE -- aiter/configs/foo_tuned.csv: REMOVED_TUNED",
+        "REMOVED_TUNED aiter/configs/foo_tuned.csv: 1 removed keys still present in aiter/configs/foo_untuned.csv",
+    ),
+]
+for diff, card, verdicts, cov in cases:
+    _, problems = triage.audit_card(card, verdicts, "", "", diff, tuning_coverage_text=cov)
+    if problems:
+        print(problems)
+        raise SystemExit(0)
+print("ok")
+PYEOF
+}
+t "audit_card accepts NO_UNTUNED_INPUT, UNTUNED_MISSING, and REMOVED_TUNED findings" "$(_audit_new_coverage_kinds)" "ok"
+
 echo "[mapping]"
 # MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.
 t "MAPPING.md matches \`triage.py mapping\`" \
