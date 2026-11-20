@@ -468,7 +468,8 @@ def _adaptive_moe_sort(
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          yes        shape and dtype match; BM16 zeroes in 16B
 #     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
-#     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
+#     grouped a4w4/a8w4 (gfx1250)               yes        callee writes the aligned output
+#     gfx1201 bf16 small-M direct path          yes        gets output as is, not via _kernel_output
 #     any path, output not 16-byte aligned      no         kernels store it as 16-byte vectors
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -1975,6 +1976,8 @@ def _fused_moe_impl(
         topk = herd_topk
     config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    # The overlap check below must see the caller's tensor, not this copy.
+    caller_hidden_states = hidden_states
     if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
         hidden_states = hidden_states.contiguous()
 
@@ -2019,7 +2022,7 @@ def _fused_moe_impl(
         _validate_output_buffer_no_overlap(
             output,
             (
-                ("hidden_states", hidden_states),
+                ("hidden_states", caller_hidden_states),
                 ("w1", w1),
                 ("w2", w2),
                 ("topk_weight", topk_weight),

@@ -153,7 +153,7 @@ def test_fmoe(
     output_perf=False,
     expected_kernel1: str | None = None,
 ):
-    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
+    if get_gfx_runtime() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     if actType == aiter.ActivationType.Situv2:
         beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
@@ -712,15 +712,16 @@ def test_fmoe(
         msg="ck_moe_2stages output=",
     )
     out_logits_diff = calc_diff(out2_ref, out_buf)
-    out_failed = (
-        out_ret is not out_buf
-        or out_non_finite
-        or (out_err != 0 and out_logits_diff > 0.01)
-    )
     out_msg = (
         f"output= check failed: returned buf={out_ret is out_buf}, "
         f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}"
     )
+    # Identity and finiteness are contract questions, not accuracy ones: they hold
+    # in non-strict cases too. A non-finite value is tolerated only where the call
+    # without a buffer produced the same NaN (has_nan).
+    assert out_ret is out_buf, out_msg
+    assert has_nan or not out_non_finite, out_msg
+    out_failed = out_err != 0 and out_logits_diff > 0.01
     if strict_accuracy:
         assert not out_failed, out_msg
     elif out_failed:
@@ -992,7 +993,8 @@ parser.add_argument(
     "--output-perf",
     action="store_true",
     help="Also time each case's fused_moe(output=) call and report its us, TFLOPS "
-    "and TB/s. Its accuracy is always checked; timing it doubles the timed calls.",
+    "and TB/s. Its accuracy is checked unless --kernel is given; timing it "
+    "doubles the timed calls.",
 )
 
 args = parser.parse_args()
@@ -2544,6 +2546,23 @@ def test_output_buffer_contract():
     )
     # moe_sorting zeroes output before the stages read their inputs.
     expect_raise("an output overlapping hidden_states", output=hidden)
+    if token > 1:
+        # hidden_states as a transposed view is not row-major, so fused_moe makes
+        # a contiguous copy of it; the overlap check must still see the caller's.
+        alias_pool = torch.zeros(model_dim * token, dtype=dtype)
+        alias_hidden = alias_pool.view(model_dim, token).T
+        try:
+            fused_moe(
+                alias_hidden,
+                *args[1:],
+                output=alias_pool.view(token, model_dim),
+            )
+        except RuntimeError as e:
+            assert "hidden_states" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "fused_moe accepted an output overlapping a non-row-major hidden_states"
+            )
     for name, tensor in (("w1", w1), ("w2", w2)):
         expect_raise(
             f"an output overlapping {name}",
@@ -2614,7 +2633,7 @@ def test_output_buffer_contract():
     flydsl_sorts = []
 
     def counting_flydsl_sort(*a, **kw):
-        flydsl_sorts.append(1)
+        flydsl_sorts.append(kw.get("output"))
         return real_flydsl_sort(*a, **kw)
 
     try:
@@ -2622,9 +2641,15 @@ def test_output_buffer_contract():
         fm._USE_FLYDSL_MOE_SORTING = True
         fm._flydsl_moe_sorting = counting_flydsl_sort
         flydsl_ref = fused_moe(*args)
+        # The reference call above also went through the sort; only the call
+        # with the underaligned buffer counts.
+        flydsl_sorts.clear()
         odd.fill_(float("nan"))
         assert fused_moe(*args, output=odd) is odd, "FlyDSL sort: output not returned"
         assert flydsl_sorts, "the FlyDSL sort did not run"
+        assert all(
+            sort_output is None for sort_output in flydsl_sorts
+        ), "FlyDSL sort: the underaligned output reached the sort"
         assert torch.equal(
             odd, flydsl_ref
         ), "FlyDSL sort: output does not hold the result"
@@ -3453,12 +3478,12 @@ else:
     # sweep, like the tuned-CSV validation below.
     if args.quant is not None:
         aiter.logger.info("skipping adaptive-sort in-place output test for --quant")
-    elif get_gfx() == "gfx950":
+    elif get_gfx_runtime() == "gfx950":
         test_adaptive_sort_output_in_place()
     else:
         aiter.logger.warning(
             "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
-            get_gfx(),
+            get_gfx_runtime(),
         )
     test_output_buffer_contract()
     test_swiglu_limit_guards()
