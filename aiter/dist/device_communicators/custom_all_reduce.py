@@ -2146,6 +2146,30 @@ class CustomAllreduce:
             _DISABLE_LAMPORT_ENV,
         )
 
+    def lamportAllReduceAdd(
+        self, inp: torch.Tensor, other: torch.Tensor, kernel: int = 0
+    ) -> torch.Tensor:
+        """POC, not in all_reduce_add's dispatch yet (gfx9): all-reduce of
+        inp + other with the add fused into the lamport kernel, bit for bit
+        all_reduce(inp + other). kernel 0 takes the kernel all_reduce would pick
+        for this size (raises outside the lamport ranges), 1 one-shot (up to
+        640KB), 2 two-shot (up to 2MB, whole 16B packs per rank). Every rank
+        must make the same call; neither operand needs IPC registration, so it
+        runs the same eager and in a captured graph."""
+        if not self.lamport_enabled:
+            raise RuntimeError("lamportAllReduceAdd needs the lamport path (_initLamport)")
+        if other.shape != inp.shape or other.dtype != inp.dtype:
+            raise ValueError("lamportAllReduceAdd: other must match inp's shape and dtype")
+        out = torch.empty_like(inp)
+        ops.lamportAllReduceAdd(
+            self._ptr,
+            _lamport_aligned(inp.contiguous()),
+            _lamport_aligned(other.contiguous()),
+            out,
+            kernel,
+        )
+        return out
+
     @property
     def enable_register_for_capturing(self) -> bool:
         """Whether a collective captured now binds its input directly (the
