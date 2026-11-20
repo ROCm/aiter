@@ -43,3 +43,32 @@ def test_clear_cache_clears_registered_caches():
         assert calls == [1, 1]
     finally:
         tuned._CACHES.remove(lookup)
+
+
+def test_clear_cache_recomputes_the_default_parameters(monkeypatch):
+    from aiter.moev2.segments import defaults
+
+    try:
+        monkeypatch.setenv("AITER_USE_NT", "0")
+        monkeypatch.setenv("AITER_KSPLIT", "2")
+        monkeypatch.setattr(defaults, "get_cu_num", lambda: 80)
+        tuned.clear_cache()
+        before = (
+            defaults.use_nt(1, 8, 256),
+            defaults.get_ksplit(1, 8, 256, 512, 7168),
+            defaults.get_block_size_M(256, 8, 8, 512),
+        )
+        monkeypatch.setenv("AITER_USE_NT", "1")
+        monkeypatch.setenv("AITER_KSPLIT", "4")
+        monkeypatch.setattr(defaults, "get_cu_num", lambda: 304)
+        tuned.clear_cache()
+        after = (
+            defaults.use_nt(1, 8, 256),
+            defaults.get_ksplit(1, 8, 256, 512, 7168),
+            defaults.get_block_size_M(256, 8, 8, 512),
+        )
+        assert before[:2] == (False, 2) and after[:2] == (True, 4)
+        assert (before[2], after[2]) == (128, 32)
+    finally:
+        monkeypatch.undo()
+        tuned.clear_cache()

@@ -2,10 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """AITER_MOEV2 switch and the legacy fused_moe hook."""
 
+import importlib
 import inspect
 import logging
 import pathlib
 import sys
+import threading
+import types
 
 import pytest
 
@@ -190,6 +193,85 @@ def test_torch_compile_traces_the_hooks_with_a_path_active(monkeypatch):
     assert torch.equal(compiled(*_cpu_moe_args()), marker)
 
 
+@pytest.fixture
+def gated_builtin(monkeypatch, tmp_path):
+    """A built-in path module (a4w4) that pauses until `release` once it starts, and
+    until `register` between the two steps of its `register()` call."""
+    gate = types.SimpleNamespace(
+        **{n: threading.Event() for n in ("entered", "release", "loaded", "register")}
+    )
+    monkeypatch.setitem(sys.modules, "moev2_test_gate", gate)
+    (tmp_path / "moev2_gated_builtin.py").write_text(
+        "import moev2_test_gate as gate\n"
+        "from aiter.moev2 import paths\n"
+        "gate.entered.set()\n"
+        "gate.release.wait(10)\n"
+        "PATH = paths.Path('a4w4', lambda call: True, lambda call: None)\n"
+        "paths._load_builtin()\n"
+        "gate.loaded.set()\n"
+        "gate.register.wait(10)\n"
+        "paths.register(PATH)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(paths, "_BUILTIN_MODULES", ("moev2_gated_builtin",))
+    monkeypatch.setattr(paths, "_builtin_loaded", False)
+    paths.reload()
+    yield gate
+    sys.modules.pop("moev2_gated_builtin", None)
+
+
+def _in_thread(fn):
+    out = []
+    thread = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    thread.start()
+    return thread, out
+
+
+def _names(selected):
+    return [p.name for p in selected]
+
+
+def test_a_call_during_the_first_load_waits_for_the_builtin_paths(
+    monkeypatch, gated_builtin
+):
+    _set(monkeypatch, "on")
+    first, first_out = _in_thread(paths.active)
+    assert gated_builtin.entered.wait(10)
+    second, second_out = _in_thread(paths.active)
+    second.join(0.2)
+    assert second.is_alive()
+    gated_builtin.release.set()
+    gated_builtin.register.set()
+    first.join(10)
+    second.join(10)
+    assert [_names(out) for out in first_out + second_out] == [["a4w4"], ["a4w4"]]
+    assert _names(paths.active()) == ["a4w4"]
+
+
+@pytest.mark.parametrize("pause", ["entered", "loaded"])
+def test_importing_a_builtin_module_directly_during_a_first_call(
+    monkeypatch, gated_builtin, pause
+):
+    """The call waits for the module, whether it comes before the module's register()
+    runs the loader ("entered") or between that and the registration ("loaded"); no
+    deadlock either way."""
+    _set(monkeypatch, "on")
+    importer, _ = _in_thread(lambda: importlib.import_module("moev2_gated_builtin"))
+    if pause == "loaded":
+        gated_builtin.release.set()
+    assert getattr(gated_builtin, pause).wait(10)
+    caller, caller_out = _in_thread(paths.active)
+    caller.join(0.2)
+    assert caller.is_alive()
+    gated_builtin.release.set()
+    gated_builtin.register.set()
+    importer.join(10)
+    caller.join(10)
+    assert not importer.is_alive() and not caller.is_alive()
+    assert _names(caller_out[0]) == ["a4w4"]
+    assert _names(paths.active()) == ["a4w4"]
+
+
 def test_graduation_can_be_scoped_to_archs(monkeypatch):
     _fake_path("a8w8_pt", graduated=frozenset({"gfx950"}))
     for arch, expected in (("gfx950", ["a8w8_pt"]), ("gfx942", [])):
@@ -239,8 +321,63 @@ def test_gpu_suite_runner_enables_the_selected_path(monkeypatch):
     monkeypatch.setattr(gpu_suites, "PATHS", {"a8w8_pt": (suite,)})
     monkeypatch.setattr(gpu_suites, "SHARED", ())
     monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
     assert gpu_suites.main(["--path", "a8w8_pt", "--run"]) == 0
     assert seen == [(suite.cmd, False, "a8w8_pt")]
+
+
+def test_gpu_suite_runner_runs_the_shared_suites_for_every_path(monkeypatch):
+    from moe_dispatch import gpu_suites
+
+    seen = []
+    own = {name: gpu_suites.Suite(("python3", f"{name}.py")) for name in ("a", "b")}
+    shared = gpu_suites.Suite(("python3", "shared.py"))
+
+    def run(cmd, *, check, env):
+        seen.append((cmd, env[envs.AITER_MOEV2]))
+        failed = cmd == shared.cmd and env[envs.AITER_MOEV2] == "b"
+        return type("Result", (), {"returncode": 1 if failed else 0})()
+
+    monkeypatch.setattr(gpu_suites, "PATHS", {n: (s,) for n, s in own.items()})
+    monkeypatch.setattr(gpu_suites, "SHARED", (shared,))
+    monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    assert gpu_suites.main(["--run"]) == 1
+    assert seen == [
+        (own["a"].cmd, "a"),
+        (shared.cmd, "a"),
+        (own["b"].cmd, "b"),
+        (shared.cmd, "b"),
+    ]
+
+
+def test_gpu_suite_runner_skips_suites_the_machine_cannot_run(monkeypatch, capsys):
+    from moe_dispatch import gpu_suites
+
+    seen = []
+    fits = gpu_suites.Suite(("python3", "fits.py"))
+    other_arch = gpu_suites.Suite(("python3", "gfx950_only.py"), archs=("gfx950",))
+    eight_gpus = gpu_suites.Suite(("torchrun", "multi.py"), gpus=8)
+
+    def run(cmd, *, check, env):
+        seen.append(cmd)
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(
+        gpu_suites, "PATHS", {"a": (fits, other_arch), "b": (eight_gpus,)}
+    )
+    monkeypatch.setattr(gpu_suites, "SHARED", ())
+    monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    assert gpu_suites.main(["--run"]) == 0
+    assert seen == [fits.cmd]
+    out = capsys.readouterr().out
+    assert "SKIPPED on gfx942 with 1 GPU(s): [a] python3 gfx950_only.py" in out
+    assert "SKIPPED on gfx942 with 1 GPU(s): [b] torchrun multi.py" in out
+    # A run where nothing applies fails instead of passing empty.
+    seen.clear()
+    assert gpu_suites.main(["--path", "b", "--run"]) == 1
+    assert seen == []
 
 
 def test_legacy_fused_moe_is_a_plain_function():

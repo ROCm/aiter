@@ -6,9 +6,10 @@
 same rows; `lookup` reproduces the legacy `_lookup_cfg` with its fallbacks.
 
 Every cache in v2 dispatch that depends on tuned tables, environment variables or the
-arch is declared with `@cached`, so `clear_cache()` resets all of them at once; tests call
-it after changing AITER_CONFIG_FMOE or patching the arch, and the CK tuner after it
-rewrites a table.
+arch is declared with `@cached` (the default-parameter helpers in `segments/defaults.py`
+are cleared by name), so `clear_cache()` resets all of them at once; tests call it after
+changing AITER_CONFIG_FMOE or patching the arch, and the CK tuner after it rewrites a
+table.
 """
 
 import functools
@@ -36,10 +37,14 @@ def cached(fn=None, *, maxsize=None):
 def clear_cache():
     """Clear every v2 dispatch cache and re-read the moev2 environment variables."""
     from .. import envs
+    from ..segments import defaults
 
     _LAST_READ.clear()
     for cache in _CACHES:
         cache.cache_clear()
+    # Plain lru_caches: moved verbatim from the legacy code, which shares them.
+    for helper in (defaults.get_block_size_M, defaults.use_nt, defaults.get_ksplit):
+        helper.cache_clear()
     envs.reload()
 
 
