@@ -626,6 +626,22 @@ def test_flydsl_fmha_gfx11_rejects_fp8():
         flydsl_flash_attn_func(q, q.clone(), q.clone())
 
 
+def test_flydsl_fmha_gfx11_config():
+    """Long head_dim-128 attention on gfx1151 takes the measured faster config."""
+    config = flydsl_fmha_kernels._gfx11_config
+    # Wan2.1: 12 heads; head_group is the largest divisor of num_heads up to 8.
+    assert config("gfx1151", 32760, 32760, 12, 128) == (32, 32, 6)
+    assert config("gfx1151", 38181, 38181, 56, 128) == (32, 32, 8)
+    # Short K/V, small heads, short sequences and other gfx11 targets keep the default.
+    assert config("gfx1151", 32760, 512, 12, 128) == (16, 32, None)
+    assert config("gfx1151", 4096, 4096, 8, 40) == (16, 32, None)
+    assert config("gfx1151", 1024, 1024, 8, 160) == (16, 32, None)
+    # head_dim 160 / 256 measured slower with the long config.
+    assert config("gfx1151", 8192, 8192, 16, 160) == (16, 32, None)
+    assert config("gfx1151", 8192, 8192, 8, 256) == (16, 32, None)
+    assert config("gfx1100", 32760, 32760, 12, 128) == (16, 32, None)
+
+
 @_gfx11_only
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_flydsl_fmha_gfx11_out(contiguous):

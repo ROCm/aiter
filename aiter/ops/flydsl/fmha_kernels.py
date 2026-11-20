@@ -260,6 +260,7 @@ def _get_kernel_gfx11(
     kv_tail: bool,
     num_waves: int,
     block_n: int,
+    head_group: int | None,
     token_strides: tuple[int, int, int],
     return_lse: bool,
 ):
@@ -274,6 +275,7 @@ def _get_kernel_gfx11(
         num_waves=num_waves,
         block_n=block_n,
         vt_rows=4 if block_n >= 64 else 2,
+        head_group=head_group,
         q_token_stride=token_strides[0],
         k_token_stride=token_strides[1],
         v_token_stride=token_strides[2],
@@ -309,20 +311,33 @@ def _gfx11_strides(t: torch.Tensor) -> tuple[int, int]:
     )
 
 
-def _gfx11_config(seq_q: int, head_dim: int) -> tuple[int, int]:
-    """(num_waves, block_n) for the gfx11 kernel."""
-    return 16, 32
+def _gfx11_config(
+    arch: str, seq_q: int, seq_kv: int, num_heads: int, head_dim: int
+) -> tuple[int, int, int | None]:
+    """(num_waves, block_n, head_group) for the gfx11 kernel.
+
+    On gfx1151, long head_dim-128 attention runs faster with 512-row query
+    blocks and at most 8 heads walked together, which keeps fewer K/V pages
+    live at once: 1.02x-1.10x with seq_q and seq_kv of 4096 or more. Short
+    sequences, short K/V (cross-attention), head_dim below 128 and head_dim
+    160 / 256 measured flat or slower with it, so they keep (16, 32, all heads).
+    """
+    if arch == "gfx1151" and head_dim == 128 and min(seq_q, seq_kv) >= 4096:
+        return 32, 32, max(g for g in range(1, 9) if num_heads % g == 0)
+    return 16, 32, None
 
 
 def _flydsl_flash_attn_func_gfx11(
-    q, k, v, causal, softmax_scale, stream, out, return_lse=False
+    q, k, v, causal, softmax_scale, stream, out, return_lse=False, arch=""
 ):
     """gfx11 launch; the caller has validated devices, shapes, dtypes and ``out``.
     Returns ``out``, or ``(out, lse)`` with ``return_lse`` (fp32 ``[B, H, Sq]``)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_kv = k.shape[1]
 
-    num_waves, block_n = _gfx11_config(seq_q, head_dim)
+    num_waves, block_n, head_group = _gfx11_config(
+        arch, seq_q, seq_kv, num_heads, head_dim
+    )
     with torch.cuda.device(q.device.index):
         launch_stream = (
             stream if stream is not None else torch.cuda.current_stream(q.device)
@@ -386,6 +401,7 @@ def _flydsl_flash_attn_func_gfx11(
                 kv_tail=seq_kv % block_n != 0,
                 num_waves=num_waves,
                 block_n=block_n,
+                head_group=head_group,
                 token_strides=tuple(tok for tok, _ in strides),
                 return_lse=return_lse,
             )
@@ -596,7 +612,7 @@ def flydsl_flash_attn_func(
 
     if is_gfx11:
         return _flydsl_flash_attn_func_gfx11(
-            q, k, v, causal, softmax_scale, stream, out, return_lse
+            q, k, v, causal, softmax_scale, stream, out, return_lse, arch_base
         )
 
     block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
