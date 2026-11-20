@@ -37,7 +37,7 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
     rearrange_4bit_elements,
 )
-from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
@@ -2527,6 +2527,8 @@ def test_gfx942_asm_1stage_4gib_guard():
     size is computed from the shape. The default heuristic is exercised with the
     tuned config bypassed; a tuned 1-stage row is injected into the config cache.
     """
+    from aiter.jit.core import AITER_ROOT_DIR
+
     fm = aiter.fused_moe
     fits = fm._asm_fmoe_weights_fit_u32_offsets
     bf16, fp8 = dtypes.bf16, dtypes.fp8
