@@ -3,6 +3,7 @@
 
 
 import argparse
+from unittest.mock import patch
 
 import torch
 
@@ -10,8 +11,9 @@ import aiter
 from aiter import dtypes
 from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.test_common import (
+    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -1065,6 +1067,84 @@ def test_mhc_post_pre(
     return ret
 
 
+@benchmark()
+def test_mhc_post_pre_decode_dispatch(
+    m, hidden_size, hc_mult, w_preshuffle_bf16=False, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the setting of the fused post+pre GEMM below 1024 rows.
+
+    At a row count of MHC_FUSED_DECODE_CONFIG_GFX950_256 the default call must launch
+    the fused GEMM once with that row's split count and tiles; at every other row
+    count with the setting that get_mhc_fused_post_pre_config computes. Weights and
+    mixes are random and the outputs are compared with the reference.
+    """
+    from aiter.ops import mhc as mhc_ops
+
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), "norm", gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), "norm", gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), "norm", gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), "norm", gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_mult * hidden_size), "norm", gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+        "norm_weight": fill((hidden_size,), "norm", gen, dtype=dtype),
+        "norm_eps": 1e-6,
+    }
+    refs = mhc_post_pre_ref(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+    )
+
+    launches = []
+    fused_gemm = mhc_ops.mhc_fused_post_pre_gemm_sqrsum
+
+    def record(*args, **kwargs):
+        launches.append((args[1].size(0), *args[8:11]))
+        return fused_gemm(*args, **kwargs)
+
+    with patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record):
+        outs = aiter.mhc_fused_post_pre(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            mhc_ops.mhc_shuffle_fn(fn) if w_preshuffle_bf16 else fn,
+            hc_scale,
+            hc_base,
+            w_preshuffle_bf16=w_preshuffle_bf16,
+            **extra_args,
+        )
+    row = mhc_ops._mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+    # No row: the setting that the config function computes for this row count.
+    expected = row or mhc_ops.get_mhc_fused_post_pre_config(
+        m, hidden_size, w_preshuffle_bf16
+    )
+    assert launches == [tuple(expected)], (launches, expected)
+    ret = {"split_k": expected[0], "tile_m": expected[1], "tile_k": expected[3]}
+    ret["setting"] = "table" if row else "computed"
+    for what, ref, out in zip(
+        ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
+    ):
+        err = assertAllclose(ref, out, msg=f"decode dispatch/{what}")
+        if what == "layer_input":
+            ret["err"] = err
+    return ret
+
+
 def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     from aiter.ops.mhc import (
         mhc_res_ks,
@@ -1293,3 +1373,38 @@ if not args.hc_head:
         print_json_table("mhc_post_pre summary", df)
     else:
         aiter.logger.info("mhc_post_pre: all cases skipped")
+
+
+# The table of the gfx950 decode settings: ascending row ranges below the fused bound
+# and settings that the fused GEMM has.
+for (hidden_size, _), rows in aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items():
+    last = 0
+    for m_first, m_last, split_k, tile_m, tile_k in rows:
+        assert last < m_first <= m_last < 1024, rows
+        assert tile_m in (16, 32) and tile_k in (32, 64), rows
+        assert hidden_size % (split_k * tile_k) == 0, rows
+        assert hidden_size // split_k >= 2 * tile_k, rows
+        last = m_last
+
+if get_gfx_runtime() == "gfx950" and get_cu_num() == 256:
+    # Per table row: its first and last row count, and the row counts next to them
+    # that no row lists (they keep the computed setting).
+    df = []
+    for (hidden_size, packed), rows in sorted(
+        aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items()
+    ):
+        listed = {m for m_first, m_last, *_ in rows for m in (m_first, m_last)}
+        nearby = {m for m_first, m_last, *_ in rows for m in (m_first - 1, m_last + 1)}
+        for m in sorted(listed | {m for m in nearby if 0 < m < 1024}):
+            df.append(
+                test_mhc_post_pre_decode_dispatch(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=4,
+                    w_preshuffle_bf16=packed,
+                    seed=args.seed,
+                )
+            )
+    print_json_table("mhc_post_pre decode dispatch summary", df)
+else:
+    aiter.logger.warning("skip mhc_post_pre decode dispatch cases: 256-CU gfx950 only")
