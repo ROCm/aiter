@@ -284,3 +284,27 @@ def test_flydsl_ops_live_until_destroy(monkeypatch):
     assert _FakeHeap.closed == 2
     assert m.get_handle(dict(BASE))._op is not op
     assert _FakeOp.built == 3
+
+
+def test_mori_symmetric_heap_initialises_mori_first(monkeypatch):
+    """The attention all-to-all's MoRI heap initialises mori's shmem (over the
+    registered EP group) before it reads mori's PE and npes."""
+    import sys
+    import types
+
+    from aiter.ops.flydsl import communication_ops_host_utils as heaps
+
+    calls = []
+    shmem = types.ModuleType("mori.shmem")
+    shmem.shmem_mype = lambda: calls.append("mype") or 1
+    shmem.shmem_npes = lambda: calls.append("npes") or 2
+    mori = types.ModuleType("mori")
+    mori.shmem = shmem
+    monkeypatch.setitem(sys.modules, "mori", mori)
+    monkeypatch.setitem(sys.modules, "mori.shmem", shmem)
+    monkeypatch.setattr(all2all, "ensure_mori_shmem", lambda: calls.append("init"))
+
+    heaps.MoriSymmetricHeap(rank=1, world_size=2, device="cpu", group=None)
+    assert calls[0] == "init" and calls.count("init") == 1
+    with pytest.raises(ValueError, match="MoRI"):
+        heaps.MoriSymmetricHeap(rank=0, world_size=2, device="cpu", group=None)
