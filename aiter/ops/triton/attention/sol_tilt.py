@@ -653,11 +653,12 @@ def sol_tilt_planes(
     """A rank-`rank` tilt's planes encoded in K's and V's own formats, for any recipe.
 
     k and v are K and V in the basis and units the factors are taken in, BSHD: the stored codes
-    for a per-tensor or BF16 operand, the dequantized codes for MXFP8 K (rotated, as stored), and
-    the BF16 source for a packed one, which its packer rotates. q_abs_max is sol_q_abs_max of the
-    Q in that same basis, q_x; q_descale, k_descale and v_descale take q_x, k and v to real units,
-    and Q as the kernel decodes it is q_multiplier times the real Q (mha_v4_q_multiplier for the MX
-    rows, which fold it into Q, else 1). The mean_* arguments are sol_prepare's:
+    for a per-tensor or BF16 operand, the dequantized codes for an hd128 MXFP8 K (rotated, as
+    stored), and the BF16 source for a packed one, which its packer rotates: MXFP6 and MXFP4 K, and
+    an hd256 MXFP8 K, whose packer stores its scales with the codes. q_abs_max is sol_q_abs_max of
+    the Q in that same basis, q_x; q_descale, k_descale and v_descale take q_x, k and v to real
+    units, and Q as the kernel decodes it is q_multiplier times the real Q (mha_v4_q_multiplier for
+    the MX rows, which fold it into Q, else 1). The mean_* arguments are sol_prepare's:
     the pooled K/V and their scales, and for a packed format the pooled BF16 rows it packed,
     which become plane 0 through the same packer.
 
@@ -674,18 +675,17 @@ def sol_tilt_planes(
         raise ValueError(
             f"v_format must be one of {SOL_TILT_V_FORMATS}, got {v_format!r}"
         )
-    batch, _, heads, _ = k.shape
+    batch, _, heads, d = k.shape
     if v.shape[2] != heads or q_abs_max[1].shape[1] != heads:
         raise ValueError("the tilt needs one K/V head per query head")
     k_mx = k_format in ("mxfp8", "mxfp6", "mxfp4")
+    k_packed = k_format in ("mxfp6", "mxfp4") or (k_format == "mxfp8" and d == 256)
     v_mx = v_format.endswith("_fp6_p")
     if k_mx != (mean_k_scale is not None) or v_mx != (mean_v_scale is not None):
         raise ValueError(
             "a block-scaled format needs its pooled scale, and only it takes one"
         )
-    if (k_format in ("mxfp6", "mxfp4") and mean_k_pooled is None) or (
-        v_mx and mean_v_pooled is None
-    ):
+    if (k_packed and mean_k_pooled is None) or (v_mx and mean_v_pooled is None):
         raise ValueError(
             "a packed format needs the pooled BF16 rows sol_prepare packed"
         )
@@ -750,7 +750,7 @@ def sol_tilt_planes(
         _sol_attn_pad_to_tile,
     )
 
-    if k_format == "mxfp8":
+    if k_format == "mxfp8" and not k_packed:
         data, scale = _e8m0_quantize(planes_a, mean_k.dtype)
         ext_k, k_stride = _stack_planes(mean_k, data)
         k_scale, k_scale_stride = _stack_planes(
@@ -773,16 +773,21 @@ def sol_tilt_planes(
         from aiter.ops.mha_v4_quant import (
             mxfp4_v_view,
             quantize_v_mxfp4_fp6_p,
+            quantize_v_mxfp4_fp6_p_hd256,
             quantize_v_mxfp6_fp6_p,
+            quantize_v_mxfp6_fp6_p_hd256,
         )
 
         x = torch.cat([mean_v_pooled.unsqueeze(0), b.to(torch.bfloat16)]).flatten(0, 1)
         padded = _sol_attn_pad_to_tile(x, kv_tile)
+        hd256 = x.shape[-1] == 256
         if v_format == "mxfp4_fp6_p":
-            raw, scale = quantize_v_mxfp4_fp6_p(padded)
+            quantize = quantize_v_mxfp4_fp6_p_hd256 if hd256 else quantize_v_mxfp4_fp6_p
+            raw, scale = quantize(padded)
             view = mxfp4_v_view(raw, scale, blocks)
         else:
-            view, scale = quantize_v_mxfp6_fp6_p(padded)
+            quantize = quantize_v_mxfp6_fp6_p_hd256 if hd256 else quantize_v_mxfp6_fp6_p
+            view, scale = quantize(padded)
             view = view[:, :blocks]
         ext_v, v_scale, v_stride, v_scale_stride = _plane0_of_packed(view, scale, batch)
     else:
