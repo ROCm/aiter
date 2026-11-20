@@ -191,7 +191,7 @@ Real example (PR#3266): flydsl sort replaced opus sort; reviewer: "gate flydsl b
 → `⚠️ D2: new default path needs rollback env-var for safe rollout`
 
 **D3 — hipBLASLt in shared tuning configs** 🔴
-Flag added or retuned hipBLASLt entries in shared tuning files. Saved solution indices vary
+Flag entries added or retuned to select hipBLASLt in shared tuning files. Saved solution indices vary
 across builds; a recorded kernel name does not make them portable (PR#8166).
 → `🔴 D3: hipBLASLt config must not be committed`
 
