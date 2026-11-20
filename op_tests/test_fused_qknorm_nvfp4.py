@@ -21,8 +21,6 @@ fp32 global scale given as k_scale / v_scale, 1.0 for the index key):
 
 import argparse
 import itertools
-import subprocess
-import sys
 
 import pandas as pd
 import torch
@@ -354,7 +352,8 @@ def test_write_modes(num_tokens):
     return ret
 
 
-REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed check ends the process
+# name -> (kwargs of the op call, message of the RuntimeError it raises; None: accepted)
+REJECT = {
     "good": ({}, None),
     "no index nvfp4": (
         {"index_cache_dtype": "auto"},
@@ -418,19 +417,15 @@ def run_reject(name):
 
 
 def test_reject():
-    """Each contract violation is refused with its own message; the failed check ends the
-    process, so every case runs in a child."""
+    """Each contract violation raises RuntimeError with its own message before anything
+    launches, so the cases run in this process."""
     for name, (_, msg) in REJECT.items():
-        r = subprocess.run(
-            [sys.executable, __file__, "--reject", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if msg is None:
-            assert r.returncode == 0, r.stderr[-500:]
+        try:
+            run_reject(name)
+        except RuntimeError as e:
+            assert msg is not None and msg in str(e), f"{name}: {e}"
         else:
-            assert r.returncode != 0 and msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+            assert msg is None, f"{name}: accepted"
     return "ok"
 
 
@@ -454,16 +449,10 @@ parser.add_argument(
     default=[1, 64, 8192, 32768],
     help="token counts of the nvfp4 vs mxfp4 / fp8 write timing table",
 )
-parser.add_argument(
-    "--reject", type=str, default=None, help="(child) run one refusal case"
-)
 
 
 def main():
     args = parser.parse_args()
-    if args.reject:
-        run_reject(args.reject)
-        return
     # the live GPU, not GPU_ARCHS; the mxfp4 / fp8 timing arms and the e4m3 index q need gfx950
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning(

@@ -2579,22 +2579,30 @@ def check_arg_rejects():
             pass
         else:
             raise AssertionError("supports() hid a load failure")
-    # A call that writes no fp8 (an fp8 index dtype, or an fp8 index_q_out, on a
+    # Each fp8 store is refused on gfx1100 on its own: fp8 K/V (on a skip_index_branch
+    # layer), an fp8 index cache next to a bf16 K/V, an fp8 q_out, an fp8 index_q_out. A
+    # call that writes no fp8 (an fp8 index dtype, or an fp8 index_q_out, on a
     # skip_index_branch layer) is taken on gfx1100 too.
-    no_index = ({15: None}, {"skip_index_branch": True, "index_cache_dtype": "fp8"})
+    skip = {"skip_index_branch": True}
+    no_index = ({15: None}, {**skip, "index_cache_dtype": "fp8"})
     iq8 = torch.zeros(qkv.shape[0], HEAD_DIM, dtype=dtypes.fp8, device="cuda")
+    q8 = torch.zeros_like(call.args[17], dtype=dtypes.fp8)
     for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
             check_rejects(
                 {
                     gfx: (fp8, {}, {}, msg),
-                    f"{gfx}_skip": (call, *no_index, None),
-                    f"{gfx}_skip_fp8_index_q": (
+                    f"{gfx}_fp8_kv_skip": (fp8, {15: None}, skip, msg),
+                    f"{gfx}_fp8_index": (
                         call,
-                        {15: None, 18: iq8},
-                        {"skip_index_branch": True},
-                        None,
+                        {15: fp8.args[15]},
+                        {"index_cache_dtype": "fp8"},
+                        msg,
                     ),
+                    f"{gfx}_fp8_q_out": (call, {17: q8}, {}, msg),
+                    f"{gfx}_fp8_index_q": (call, {18: iq8}, {}, msg),
+                    f"{gfx}_skip": (call, *no_index, None),
+                    f"{gfx}_skip_fp8_index_q": (call, {15: None, 18: iq8}, skip, None),
                 }
             )
     return 0
@@ -2652,7 +2660,7 @@ DEFAULT_CASES += [
     ("mxfp4_reject", "bf16", 32, 16, 64, 1),
 ]
 # gfx1250 runs 4 rows per warp from 128 rows per CU on (every mode but the fp4 caches and
-# qkv_partials): launches above that, at least 20 (token, slot) rows per token. An odd
+# fused qkv_partials): launches above that, at least 20 (token, slot) rows per token. An odd
 # token count gives the 25 and 29 slot modes (16 q / 4 kv / 4 index heads) a row count
 # that is not a multiple of 4, so the last warp has tail rows.
 if base_gfx_arch(get_gfx_runtime()) == "gfx1250":

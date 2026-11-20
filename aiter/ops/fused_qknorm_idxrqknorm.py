@@ -132,12 +132,13 @@ def fused_qknorm_idxrqknorm(
     # qkv_partials: the FP32 [num_splits (2, 4 or 8), >= num_tokens, row] split-K partials of
     #   a bf16 qkv its GEMM left unreduced, any mode. They are summed as the gfx1250 split-K
     #   GEMM's reduce kernel does (FP32, split order, one round to nearest even) and the
-    #   reduced row is written back into qkv: in the op's own pass in insert mode with every
-    #   qkv slot processed (no skip_index_branch), no fp4 cache and no fp8 q_out; by a
-    #   reduce kernel launched first otherwise.
+    #   reduced row is written back into qkv: on gfx1250 only, in the op's own pass in insert
+    #   mode with every qkv slot processed (no skip_index_branch), no fp4 cache and no fp8
+    #   q_out; by a reduce kernel launched first otherwise (off gfx1250, every call).
     # Refused arguments raise RuntimeError before anything is launched; the C++ entry
-    #   checks the dtype, layout, size and device of every tensor the kernels read or
-    #   write (not the values: slot_mapping and positions entries are the caller's).
+    #   checks the dtype, layout and device of every tensor the kernels read or write, and
+    #   the size of each but the asm_layout index_cache (its capacity is the caller's, as
+    #   are the slot_mapping and positions values).
     # check_only: run every check of the call, launch nothing; a refusal raises ValueError
     #   (see fused_qknorm_idxrqknorm_supports).
     if index_cache_dtype is None:
