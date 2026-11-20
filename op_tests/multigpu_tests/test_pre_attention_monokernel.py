@@ -52,6 +52,8 @@ def _prep(name, profile):
         return PrepSpec("rms_across_heads", "interleaved", True, profile.hadamard)
     if name == "per_head":
         return PrepSpec("rms_per_head", "rotate_half", True, profile.hadamard)
+    if name == "flux3":
+        return PrepSpec("rms_per_head", "interleaved", False, profile.hadamard)
     raise ValueError(f"unknown prep {name!r}")
 
 
@@ -116,7 +118,9 @@ def _build(profile_name, rows, heads, K, prep_name):
             else torch.ones(R, device=device)
         )
     fused = shuffle_weight(torch.cat(weights), layout=(16, 16)).contiguous()
-    columns = torch.cat([torch.cat(scales), torch.cat(biases), torch.cat(gammas)])
+    # B_scale per column: the scales, the biases with a bias, then the norm weights.
+    bias_sets = [torch.cat(biases)] if prep.bias else []
+    columns = torch.cat([torch.cat(scales), *bias_sets, torch.cat(gammas)])
     gen = torch.Generator(device=device).manual_seed(100 + rank)
     x_q, x_s = _quantize_rows(
         torch.randn(rows, K, device=device, generator=gen, dtype=torch.bfloat16)
@@ -141,7 +145,7 @@ def _build(profile_name, rows, heads, K, prep_name):
     cu = get_cu_num()
     prep_gemm = compile_int8_gemm_4w(K=K, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS)
     amax_gemm = compile_int8_gemm_4w(
-        K=K, xcd_swizzle=8, num_cu=cu, bias=True, amax=True
+        K=K, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
     )
     shuffled = [shuffle_weight(w, layout=(16, 16)).contiguous() for w in weights]
     outs = [
@@ -151,8 +155,9 @@ def _build(profile_name, rows, heads, K, prep_name):
     parts = [
         torch.full((2, rows, heads), float("nan"), device=device) for _ in range(3)
     ]
-    role_columns = [torch.cat([scales[r], biases[r], gammas[r]]) for r in range(2)]
-    role_columns.append(torch.cat([scales[2], biases[2]]))
+    role_bias = [[biases[r]] if prep.bias else [] for r in range(3)]
+    role_columns = [torch.cat([scales[r], *role_bias[r], gammas[r]]) for r in range(2)]
+    role_columns.append(torch.cat([scales[2], *role_bias[2]]))
     stream = fx.Stream(torch.cuda.current_stream())
     for role in range(2):
         _run_compiled(
@@ -426,10 +431,11 @@ def main():
         "--preps",
         type=str,
         nargs="*",
-        choices=("wan", "per_head"),
+        choices=("wan", "per_head", "flux3"),
         default=["wan"],
-        help="Q/K prep: wan (RMSNorm across heads, interleaved RoPE) or per_head "
-        "(RMSNorm per head, rotate-half RoPE)",
+        help="Q/K prep: wan (RMSNorm across heads, interleaved RoPE, bias), per_head "
+        "(RMSNorm per head, rotate-half RoPE, bias) or flux3 (RMSNorm per head, "
+        "interleaved RoPE, no bias)",
     )
     args = parser.parse_args()
     if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
