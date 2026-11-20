@@ -331,19 +331,43 @@ def build_fused_slice(world_size, nvb, nwg, nwaves, rank, hidden, num_tokens, in
     return spec
 
 
+# Optimal (nwg, nwaves) per token count M, from the full TP8 gfx950 decode sweep
+# (one_arm median+graph, best of the complete NWG x NWAVES grid incl. NWG=1,2).
+# NWG falls with M (the per-token grid barrier over NWG workgroups gets costly as
+# M grows), NWAVES rises to keep the ALU busy. Measured points:
+#   M=1,2 -> (7,2)  M=4 -> (4,4)  M=8,16 -> (2,7)  M=32,64 -> (1,7)
+# See vault decode_allm_result.txt for the numbers and the win per M.
+def select_fused_geometry(num_tokens):
+    """(nwg, nwaves) the decode sweep found optimal for ``num_tokens``."""
+    M = int(num_tokens)
+    if M <= 2:
+        return 7, 2
+    if M <= 4:
+        return 4, 4
+    if M <= 16:
+        return 2, 7
+    return 1, 7
+
+
 class FusedSliceAttnRes:
-    def __init__(self, *, group, device, rank, world_size, nvb, nwg, nwaves,
-                 hidden, num_tokens, inbox_memory="uncached", link=None):
+    def __init__(self, *, group, device, rank, world_size, nvb, hidden, num_tokens,
+                 nwg=None, nwaves=None, inbox_memory="uncached", link=None):
         self.rank = int(rank); self.world_size = int(world_size)
         self.nvb = int(nvb); self.H = int(hidden); self.M = int(num_tokens)
+        # Auto-pick the swept-optimal geometry unless the caller pins one.
+        if nwg is None or nwaves is None:
+            g, w = select_fused_geometry(num_tokens)
+            nwg = g if nwg is None else nwg
+            nwaves = w if nwaves is None else nwaves
+        self.nwg = int(nwg); self.nwaves = int(nwaves)
         link = resolve_link(link)
         inbox_flags, resolved = _resolve_inbox_flags(inbox_memory, world_size, link)
-        self.spec = build_fused_slice(world_size, nvb, nwg, nwaves, rank, hidden, num_tokens, resolved)
+        self.spec = build_fused_slice(world_size, nvb, self.nwg, self.nwaves, rank, hidden, num_tokens, resolved)
         self._eng = _StEngine(spec=self.spec, group=group, rank=self.rank,
                               world_size=self.world_size, inbox_flags=inbox_flags)
         dev = device
-        self.gpart = torch.zeros(self.M * int(nwg) * 2 * (self.nvb + 1), dtype=torch.float32, device=dev)
-        self.gsq = torch.zeros(self.M * int(nwg), dtype=torch.float32, device=dev)
+        self.gpart = torch.zeros(self.M * self.nwg * 2 * (self.nvb + 1), dtype=torch.float32, device=dev)
+        self.gsq = torch.zeros(self.M * self.nwg, dtype=torch.float32, device=dev)
         self.counter = torch.zeros(1, dtype=torch.int32, device=dev)
 
     def run(self, inp, prefix_in, bank, cw, ow, out, score_eps, out_eps):
