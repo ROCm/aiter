@@ -11,7 +11,7 @@ from torch import Tensor
 from aiter import dtypes
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from ..jit.utils.chip_info import find_tuned_cu_row, get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..plugin import route as _route
 
@@ -636,7 +636,16 @@ def get_mhc_fused_post_pre_config(
     except Exception:  # noqa: BLE001
         arch = "unknown"
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
-    policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
+    policy = (
+        find_tuned_cu_row(
+            _MHC_FUSED_POST_PRE_CONFIG,
+            lambda cu: (arch, cu),
+            arch,
+            num_cu,
+            "mhc fused post+pre",
+        )
+        or _mhc_fused_config_default
+    )
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
     if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:
         keep = _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256.get(hidden_size)
