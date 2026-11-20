@@ -1447,6 +1447,10 @@ def small_m_config(
             stage1=replace(config.stage1, sort_block_m=64),
             stage2=replace(config.stage2, block_m=64),
         )
+    if (2 * inter_dim // config.stage1.tile_n) % 4:
+        # The XCD split needs whole groups of 4 GEMM1 n-tiles. The tile_n 256 of buckets <= 8 gives
+        # V4.1-Flash (inter_dim 2304) 18 n-tiles; 128 gives 36, as every larger bucket uses.
+        config = replace(config, stage1=replace(config.stage1, tile_n=128))
     return config
 
 

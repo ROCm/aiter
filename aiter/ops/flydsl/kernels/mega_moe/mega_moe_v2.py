@@ -91,18 +91,19 @@ def small_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
+    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 / V4.1-Flash a8w4).
 
     The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
+    V4.1-Flash (5120 / 2304) uses the default small-input config unchanged; it
+    was checked against an FP32 reference and against the main path on 8x MI355X.
     """
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
         and num_cu == 256
         and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
+        and (model_dim, inter_dim) in ((7168, 3072), (5120, 2304))
         and experts == 384
         and topk == 6
         and quant == "a8w4"
