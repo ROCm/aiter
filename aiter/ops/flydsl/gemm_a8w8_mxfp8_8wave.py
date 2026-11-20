@@ -196,9 +196,13 @@ def flydsl_mxfp8_8wave_gemm(
         return Out
     # A row-major Out (unit column stride, row stride >= N) is written in
     # place; any other layout goes through a contiguous copy.
-    strided = Out.stride(1) == 1 and Out.stride(0) >= N
+    strided = (
+        Out.stride(1) == 1
+        and Out.stride(0) >= N
+        and (n_split <= 1 or Out.stride(0) % 2 == 0)
+    )
     out_c = Out if strided else Out.contiguous()
-    ldc = int(out_c.stride(0))
+    ldc = N if M == 1 else int(out_c.stride(0))
 
     scale_preshuffled = x_scale.dim() == 1
     if (w_scale.dim() == 1) != scale_preshuffled:
@@ -341,6 +345,12 @@ def _run_tail_split(
     M, K = XQ.shape
     N = WQ.shape[0]
     rows = 32 if w_scale_block == "32x32" else 1  # N-rows per w_scale row
+    n2 = N - n1
+    if n_split * M * n2 * 4 >= _I32_MAX:
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave] split workspace {n_split}x{M}x{n2} overflows "
+            "32-bit indexing"
+        )
     flydsl_mxfp8_8wave_gemm(
         XQ,
         WQ[:n1],
@@ -351,12 +361,6 @@ def _run_tail_split(
         xcd_swizzle=xcd_swizzle,
         w_scale_block=w_scale_block,
     )
-    n2 = N - n1
-    if n_split * M * n2 >= _I32_MAX:
-        raise ValueError(
-            f"[FlyDSL mxfp8 8wave] split workspace {n_split}x{M}x{n2} overflows "
-            "32-bit indexing"
-        )
     ws = torch.empty((n_split, M, n2), dtype=torch.float32, device=XQ.device)
     exe = compile_mxfp8_8wave_gemm(
         K=K,
@@ -369,7 +373,7 @@ def _run_tail_split(
     _run_compiled(
         exe,
         _as_u8(XQ.contiguous()).view(-1),
-        _as_u8(WQ[n1:]).view(-1),
+        _as_u8(WQ[n1:].contiguous()).view(-1),
         ws.view(-1),
         _as_u8(x_scale).view(-1),
         _as_u8(w_scale[n1 // rows :]).view(-1),
