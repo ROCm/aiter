@@ -2139,6 +2139,14 @@ def test_presorted_moe_std_pipelines():
         fm.moe_sorting = real_sorting
         fm.get_2stage_cfgs = real_cfgs
         fm.register_presorted_moe(None)
+    # block_m is read from the dispatch, so nothing above says which sizes ran.
+    # gfx950's shipped Kimi-K3 tables reach both; without this check a retune
+    # could silently leave the BM=32 standard path with no pipeline test.
+    if get_gfx_runtime() == "gfx950":
+        covered = {row["block_m"] for row in rows}
+        assert covered == set(
+            presorted_moe.PRESORTED_MOE_BLOCK_MS
+        ), f"standard-sort presort ran only at block_m {sorted(covered)}"
     aiter.logger.info(
         "moe_2stage presorted standard-sort pipelines (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
