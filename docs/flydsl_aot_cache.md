@@ -201,7 +201,11 @@ are found two ways, so no list has to be kept:
   `aiter/ops/flydsl/` (`os.environ.get("X")`, `os.getenv("X")`,
   `os.environ["X"]`, `"X" in os.environ`). This covers a module-level read at
   import and a read inside an `lru_cache`d function, which run before or
-  outside the build. Shared modules are not scanned: `aiter/jit/core.py` alone
+  outside the build. Only code that can feed the build is scanned: module and
+  class-body statements, functions the build called and memoized functions.
+  A host-only function the build never called, such as allocator or IPC
+  setup reading `PYTORCH_HIP_ALLOC_CONF`, is skipped, so its variable does not
+  make prebuilt entries miss. Shared modules are not scanned: `aiter/jit/core.py` alone
   names about 45 variables (`AITER_CONFIG_*`, `AITER_JIT_DIR`, …) and
   `aiter/__init__.py` names `AITER_LOG_LEVEL`, none of which changes a kernel;
 - names aiter code reads during the build, seen by the same profile hook

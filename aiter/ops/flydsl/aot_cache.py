@@ -38,8 +38,8 @@ Invalidation has two levels. The directory is named by a fingerprint of the
 toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
 ``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each entry also records the
 Python source files that ran while it was built (the factory and the trace)
-with their hashes, and the environment variables those files name or that
-aiter code read during the build, with their values. A hit whose sources or
+with their hashes, and the environment variables the build-feeding code of
+those files names or that aiter code read during the build, with their values. A hit whose sources or
 variables changed is rebuilt. Editing one kernel, or setting a variable one
 kernel reads, therefore invalidates only the entries that depend on it.
 
@@ -59,6 +59,7 @@ prebuild writes ship with the package, like its JIT modules.
 from __future__ import annotations
 
 import _collections_abc
+import ast
 import contextlib
 import dis
 import fcntl
@@ -326,14 +327,56 @@ def _file_digest(path: str) -> str | None:
         return None
 
 
+def _first_line(node) -> int:
+    """The line a function's code object starts at: its first decorator."""
+    return min([node.lineno] + [d.lineno for d in node.decorator_list])
+
+
+def _cached(node) -> bool:
+    """Whether a function is memoized, so a later call need not enter it."""
+    for d in node.decorator_list:
+        d = d.func if isinstance(d, ast.Call) else d
+        name = d.attr if isinstance(d, ast.Attribute) else getattr(d, "id", "")
+        if name in ("cache", "lru_cache"):
+            return True
+    return False
+
+
+def _build_spans(body, called, at_import=True) -> list:
+    """Line spans of ``body`` that can feed a build: statements run at import,
+    functions called in it, and memoized functions, which may have run before."""
+    spans = []
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _first_line(node) in called or _cached(node):
+                spans.append((_first_line(node), node.end_lineno))
+            else:
+                spans += _build_spans(node.body, called, False)
+        elif isinstance(node, ast.ClassDef):
+            spans += _build_spans(node.body, called, at_import)
+        elif at_import:
+            spans.append((node.lineno, node.end_lineno))
+    return spans
+
+
 @functools.cache
-def _env_names(path: str) -> frozenset:
-    """Environment variables ``path`` reads by a literal name."""
+def _env_names(path: str, called: frozenset) -> frozenset:
+    """Environment variables ``path`` reads by a literal name in the code that
+    can feed a build (``_build_spans``). Host-only functions the build never
+    called, such as an allocator or IPC setup, are skipped."""
     try:
         text = Path(path).read_text(errors="replace")
-    except OSError:
+        tree = ast.parse(text)
+    except (OSError, SyntaxError):
         return frozenset()
-    return frozenset(n for m in _ENV_NAME_RE.finditer(text) for n in m.groups() if n)
+    lines = text.splitlines()
+    return frozenset(
+        n
+        for a, b in _build_spans(tree.body, called)
+        for m in _ENV_NAME_RE.finditer("\n".join(lines[a - 1 : b]))
+        for n in m.groups()
+        if n
+    )
 
 
 # os.getenv, os.environ.get and `in` reach _Environ.__getitem__ through these.
@@ -356,9 +399,10 @@ def _subscript(frame) -> bool:
 
 
 @contextlib.contextmanager
-def _record_sources(out: set, env: set):
-    """Collect the files of every Python function called in this block, and the
-    environment variables aiter code reads in it.
+def _record_sources(out: set, env: set, calls: set):
+    """Collect the files of every Python function called in this block, the
+    ``(file, first line)`` of each, and the environment variables aiter code
+    reads in it.
 
     Run around the factory and the trace, it names the sources the generated
     code can depend on: the kernel, its helpers and any aiter code they call.
@@ -374,6 +418,7 @@ def _record_sources(out: set, env: set):
         if event != "call":
             return
         seen.add(frame.f_code.co_filename)
+        calls.add((frame.f_code.co_filename, frame.f_code.co_firstlineno))
         if frame.f_code is getitem:
             caller = frame.f_back
             by_name = True
@@ -399,16 +444,27 @@ def _record_sources(out: set, env: set):
         )
 
 
-def _entry_env(files, read) -> dict:
+def _entry_env(files, read, calls) -> dict:
     """The variables an entry built from ``files`` depends on, with their values.
 
-    Names are taken from the text of kernel code only (``aiter/ops/flydsl``).
+    Names are taken from the text of kernel code only (``aiter/ops/flydsl``),
+    and there only from code that can feed the build (``_env_names``).
     Shared modules such as ``aiter/jit/core.py`` name many variables that do
     not affect a kernel, so for them only the reads seen during the build count.
     """
     kernel_root = _tracked_root() + "ops" + os.sep + "flydsl" + os.sep
+    by_file = {}
+    for f, line in calls:
+        by_file.setdefault(f, set()).add(line)
+    called = {}
+    for f, lines in by_file.items():
+        called.setdefault(os.path.realpath(f), set()).update(lines)
     names = set(read).union(
-        *(_env_names(f) for f in files if f.startswith(kernel_root))
+        *(
+            _env_names(f, frozenset(called.get(f, ())))
+            for f in files
+            if f.startswith(kernel_root)
+        )
     )
     return {
         k: os.environ.get(k)
@@ -686,7 +742,8 @@ class FlyDSLAotCache:
         try:
             files = set(self._extra)
             read = set()
-            with _record_sources(files, read):
+            calls = set()
+            with _record_sources(files, read, calls):
                 exe = make_exe()
                 tmp_obj = _export(exe, args, tmp, sym)
             changed = _changed_since_start(files)
@@ -700,7 +757,7 @@ class FlyDSLAotCache:
             _file_digest.cache_clear()
             _env_names.cache_clear()
             sources = {_portable(f): _file_digest(f) for f in sorted(files)}
-            meta = {"sources": sources, "env": _entry_env(files, read)}
+            meta = {"sources": sources, "env": _entry_env(files, read, calls)}
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"
             sidecar = tmp / "meta.json"
