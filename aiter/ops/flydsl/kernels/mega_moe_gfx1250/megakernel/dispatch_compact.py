@@ -106,8 +106,7 @@ def produce(kc, n_mine, n_routes):
             )
         _rawbar()
         # Every segment's atomic in flight before any return is
-        # used: a loop storing each return serialized the round
-        # trips.
+        # used, so the round trips overlap.
         bases = []
         for c in range_constexpr(SEGS_PAD // (4 * WAVE)):
             i = tid + fx.Int32(c * 4 * WAVE)

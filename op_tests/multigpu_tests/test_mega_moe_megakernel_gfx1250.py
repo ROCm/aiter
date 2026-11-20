@@ -325,8 +325,9 @@ def _check_large(case, comm):
 
 def _check_resident(rank, world, comm, device):
     """compact at a decode shape: bit for bit against the staged path, and no
-    wait timed out. Built with AITER_DMK_NOTRAP and a short timeout, so a grid
-    whose CTAs are not all resident shows up as counted timeouts, not a trap."""
+    wait timed out. Built with AITER_DMK_NOTRAP (short waits that count instead
+    of trapping), so a grid whose CTAs are not all resident shows up as counted
+    timeouts, not a trap."""
     import bench_mega_moe as B
 
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
@@ -458,8 +459,8 @@ def _worker(local_rank, world, port, failures):
             print(f"[{name}] {status}", flush=True)
         dist.barrier()
     # Read when the kernel is built: this case's kernels count timed-out waits
-    # (slots.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
-    os.environ.update(AITER_DMK_NOTRAP="1", AITER_DMK_TIMEOUT_S="10")
+    # (compact.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
+    os.environ["AITER_DMK_NOTRAP"] = "1"
     config.SLOTS_TOKENS = 0  # compact alone, from the smallest step up
     name = "compact resident grid"
     try:

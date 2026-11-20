@@ -33,6 +33,7 @@ from . import dispatch_compact, dispatch_slots, protocol
 from .protocol import (
     FLAG_SPAN,
     N_TICKET,
+    NOTRAP_TIMEOUT_S,
     NOW_HZ,
     POLL_SLEEP,
     RED_ELEMS,
@@ -174,9 +175,7 @@ def make_megakernel(
     # Debug: AITER_DMK_NOTRAP=1 counts a timed-out wait in ctl[CTL_FAIL + site]
     # and goes on instead of trapping.
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
-    TIMEOUT_TICKS = int(
-        float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
-    )
+    TIMEOUT_TICKS = int((NOTRAP_TIMEOUT_S if NOTRAP else TIMEOUT_S) * NOW_HZ)
     # Plan replica dwords carry the launch's generation in the same 64-bit
     # store, so a CTA polls its replica instead of a gate CTA 0 opens after
     # them; faster for 16-row tiles only.

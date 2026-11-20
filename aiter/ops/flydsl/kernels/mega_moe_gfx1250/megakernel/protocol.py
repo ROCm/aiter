@@ -105,10 +105,11 @@ def compact_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
 
 #: Seconds a wait on another CTA or rank spins before it traps. The ranks'
 #: launches can be seconds apart (each rank JIT-compiles its own kernel before
-#: its first one), so a peer's late arrival must not look like a hang; the
-#: staged path's waits never give up at all. AITER_DMK_TIMEOUT_S overrides
-#: (read when the kernel is built, so it is part of the JIT cache key).
+#: its first one), so a peer's late arrival must not look like a hang.
 TIMEOUT_S = 120.0
+#: The same under AITER_DMK_NOTRAP, which counts a timed-out wait and goes on:
+#: a hung protocol then shows up within seconds.
+NOTRAP_TIMEOUT_S = 10.0
 NOW_HZ = 100_000_000  # _now() ticks per second
 #: s_sleep units between a GEMM2 item's g1_ready polls.
 POLL_SLEEP = 32
