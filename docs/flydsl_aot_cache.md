@@ -415,8 +415,10 @@ _PRESHUFFLE_AOT_CACHE.launch(
   tuned CSV that means one entry per unique `(N, K, tile config)`.
 
 MI308X (gfx942), FlyDSL 0.5.0.dev1039 (with `flyc.load_module`),
-`tests/test_flydsl_aot_cache.py`, each mode in a fresh process. "first ms" is the wall time of the first call of that config in the
-process.
+each mode in a fresh process (an earlier, larger version of
+`tests/test_flydsl_aot_cache.py`; the test now runs two fp8 shapes and no
+timing loop). "first ms" is the wall time of the first call of that config in
+the process.
 
 | m | n | k | qdtype | jit first ms | aot miss first ms | aot hit first ms | aot verify first ms | jit us | aot hit us | bitwise equal |
 |--:|--:|--:|:--|--:|--:|--:|--:|--:|--:|:--|

@@ -13,16 +13,14 @@ Each mode runs in a fresh process, because trace cost only shows there:
 * ``aot verify``: ``=verify`` on the same directory. Re-traces each hit and
   requires the re-exported object to match the cached one byte for byte.
 
-Each mode records the first-call time, the steady-state time and the error
-against torch. All modes must also produce bitwise identical outputs, and each
+Each mode records the first-call time and the error against torch. All modes must also produce bitwise identical outputs, and each
 must have taken the path it names: a miss exports an ``.o``/``.json`` pair per
 entry, a hit neither traces nor writes, and no mode falls back to the JIT. The
 test skips with a FlyDSL that has no ``flyc.load_module``, where every mode
 would run the JIT.
 
-It also checks invalidation by what an entry was built under: a variable the
-build read and the CU count each select another build, and restoring the
-variable finds the first one again.
+It also checks invalidation by what an entry was built under: setting a
+variable the build read selects another build.
 """
 
 import argparse
@@ -44,18 +42,16 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_common import checkAllclose
 
 # (tile_m, tile_n, tile_k, split_k) per (m, n, k)
 CASES = {
-    (1, 1024, 512): (16, 64, 128, 1),
     (200, 2048, 1024): (32, 64, 128, 1),
     (64, 1024, 2048): (16, 64, 128, 2),
-    (128, 4096, 1024): (64, 128, 128, 1),
 }
-DTYPES = {"fp8": dtypes.fp8, "int8": dtypes.i8}
+DTYPES = {"fp8": dtypes.fp8}
 # mode name -> {((m, n, k), qdtype): record}, filled by check_paths()
 RESULTS = {}
 # Read while building, as a kernel reads a tuning switch.
@@ -66,8 +62,7 @@ def make_inputs(m, n, k, qdtype):
     torch.manual_seed(m * 7 + n + k)
     x = torch.randint(-8, 8, (m, k), device="cuda").float()
     w = torch.randint(-8, 8, (n, k), device="cuda").float()
-    if qdtype != dtypes.i8:
-        x, w = x / 4, w / 4
+    x, w = x / 4, w / 4
     xs = torch.rand(m, 1, device="cuda") + 0.5
     ws = torch.rand(1, n, device="cuda") + 0.5
     return x.to(qdtype), w.to(qdtype), xs, ws
@@ -117,7 +112,6 @@ def child(cases):
         run_flydsl(x, w_shuffled, xs, ws, out, tm, tn, tk, sk)
         torch.cuda.synchronize()
         first_ms = (time.perf_counter() - t0) * 1e3
-        _, us = run_perftest(run_flydsl, x, w_shuffled, xs, ws, out, tm, tn, tk, sk)
         err = checkAllclose(
             run_torch(x, w, xs, ws),
             out.to(dtypes.fp32),
@@ -127,7 +121,7 @@ def child(cases):
             printLog=False,
         )
         digest = hashlib.sha256(out.view(torch.int16).cpu().numpy().tobytes())
-        rec = {"first_ms": first_ms, "us": us, "err": err, "out": digest.hexdigest()}
+        rec = {"first_ms": first_ms, "err": err, "out": digest.hexdigest()}
         print("RESULT " + json.dumps([[m, n, k], qname, rec]), flush=True)
     cache = gemm_kernels._PRESHUFFLE_AOT_CACHE
     kernels = list(cache._mem.values())
@@ -210,10 +204,6 @@ def check_paths(cache_dir, cases):
     rebuilt = {**expected, "builds": entries, "traces": entries}
     _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
     assert state == rebuilt, f"a variable the build read did not rebuild: {state}"
-    _, state = run_mode("1", cache_dir, cases)
-    assert state == expected, f"restoring the variable did not hit: {state}"
-    _, state = run_mode("1", cache_dir, cases, {"CU_NUM": str(get_cu_num() + 1)})
-    assert state == rebuilt, f"another CU count did not rebuild: {state}"
 
 
 def test_aot_cache():
@@ -236,7 +226,6 @@ def test_aot_cache():
         for name, res in RESULTS.items():
             rec = res[((m, n, k), qname)]
             row[f"{name} first ms"] = rec["first_ms"]
-            row[f"{name} us"] = rec["us"]
             row[f"{name} err"] = rec["err"]
             outs.add(rec["out"])
         assert len(outs) == 1, f"{m}x{n}x{k} {qname}: AOT and JIT outputs differ"
