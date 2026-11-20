@@ -291,3 +291,190 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------------------------------------
+# GEMM1 with the MXFP4 output fused (gfx1250)
+# ---------------------------------------------
+
+# GEMM1-style shapes (n = 2 * intermediate per rank, swiglu halves it).
+_OUT_MX_QUANT_SHAPES = [
+    # (n, k, n_expts_tot, n_expts_act)
+    (1024, 7168, 256, 8),  # DeepSeek-R1 TP4
+    (1536, 7168, 384, 6),  # DeepSeek-V4-Pro TP4
+    (2048, 4096, 256, 6),  # DeepSeek-V4-Flash TP2
+    (1024, 1024, 128, 4),
+]
+# alpha, limit, swiglu_add_residual
+_SWIGLU_FLAVORS = {
+    "gptoss": (1.702, 7.0, True),
+    "silu": (1.0, 7.0, False),
+}
+
+
+@pytest.mark.parametrize("n, k, n_expts_tot, n_expts_act", _OUT_MX_QUANT_SHAPES)
+@pytest.mark.parametrize("m", [16, 128, 1024, 4096])
+@pytest.mark.parametrize("do_gather", [False, True])
+@pytest.mark.parametrize("preshuffle_weights", [False, True])
+@pytest.mark.parametrize("swiglu", list(_SWIGLU_FLAVORS))
+def test_op_out_mx_quant(
+    m,
+    n,
+    k,
+    n_expts_tot,
+    n_expts_act,
+    do_gather,
+    preshuffle_weights,
+    swiglu,
+    device="cuda",
+):
+    """`out_mx_quant=True` must equal the unfused GEMM1 + `mxfp4_quant`."""
+    if get_arch() != "gfx1250":
+        pytest.skip("out_mx_quant is implemented in the gfx1250 gluon epilogue only.")
+    if not is_fp4_avail():
+        pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
+
+    torch.manual_seed(0)
+    weight_dtype = dtype_str_to_torch("float4_e2m1")
+    m, rdata, gindx, _ = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, False, device=device
+    )
+    x, w, bias, _ = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        None,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        device=device,
+    )
+    w, w_scale = downcast_to_mxfp(w, weight_dtype, axis=1)
+    w_scale = preshuffle_moe_wscale(w_scale)
+    if preshuffle_weights:
+        w = preshuffle_moe_weight(w)
+    x, x_scale = mxfp4_quant(x)
+
+    alpha, limit, add_residual = _SWIGLU_FLAVORS[swiglu]
+    common = {
+        "bias": bias,
+        "routing_data": rdata,
+        "gather_indx": gindx,
+        "swizzle_mx_scale": "GFX1250_SCALE",
+        "preshuffle_weights": preshuffle_weights,
+        "apply_swiglu": True,
+        "alpha": alpha,
+        "limit": limit,
+        "swiglu_add_residual": add_residual,
+        "backend": "gluon",
+    }
+    y = moe_gemm_a4w4(x, w, x_scale, w_scale, **common)
+    ref_q, ref_s = mxfp4_quant(y.to(torch.bfloat16))
+    fused_q, fused_s = moe_gemm_a4w4(
+        x, w, x_scale, w_scale, out_mx_quant=True, **common
+    )
+
+    assert fused_q.shape == ref_q.shape and fused_s.shape == ref_s.shape, (
+        f"fused {tuple(fused_q.shape)}/{tuple(fused_s.shape)} vs "
+        f"ref {tuple(ref_q.shape)}/{tuple(ref_s.shape)}"
+    )
+    ref = upcast_from_mxfp(ref_q, ref_s, torch.bfloat16, axis=-1)
+    fused = upcast_from_mxfp(fused_q, fused_s, torch.bfloat16, axis=-1)
+    # One e2m1 step differs where the two roundings straddle a boundary; a
+    # wrong row (or a wrong scale block) differs everywhere.
+    row_err = (ref.float() - fused.float()).abs().amax(dim=-1)
+    row_mag = ref.float().abs().amax(dim=-1).clamp_min(1e-6)
+    bad_rows = (row_err / row_mag > 0.5).nonzero().flatten()
+    assert bad_rows.numel() == 0, (
+        f"{bad_rows.numel()}/{ref.shape[0]} rows differ, first: "
+        f"{bad_rows[:8].tolist()}"
+    )
+    assert_close(ref, fused)
+
+
+# ------------------------------------------------------------------
+# gfx1250 prefill tile block_m=128 x block_n=512 with a pipelined K loop
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act",
+    [
+        (4096, 1024, 7168, 256, 8),  # DeepSeek-R1 TP4 GEMM1
+        (4096, 4096, 7168, 256, 8),
+        (4096, 2048, 7168, 256, 8),
+        (512, 1024, 1024, 8, 2),
+    ],
+)
+@pytest.mark.parametrize("out_mx_quant", [False, True])
+def test_op_prefill_bm128_bn512(
+    m, n, k, n_expts_tot, n_expts_act, out_mx_quant, device="cuda"
+):
+    """These shapes run the prefill kernel at block_m=128. Their tuned configs
+    used to be block_n=512 with num_buffers=2, a tile that gets the first 32
+    rows of every tile wrong on gfx1250. Compare against the torch reference
+    through the default (tuned) config selection, so a re-tune that brings
+    that tile back fails here."""
+    if get_arch() != "gfx1250":
+        pytest.skip("gfx1250 gluon prefill kernel only.")
+    if not is_fp4_avail():
+        pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
+
+    torch.manual_seed(0)
+    weight_dtype = dtype_str_to_torch("float4_e2m1")
+    m, rdata, gindx, _ = init_routing_data(
+        m, n_expts_tot, n_expts_act, True, False, device=device
+    )
+    assert rdata.block_m == 128, f"routing picked block_m={rdata.block_m}"
+    x, w, _, _ = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        None,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        device=device,
+    )
+    w, w_scale = downcast_to_mxfp(w, weight_dtype, axis=1)
+    w_ref = upcast_from_mxfp(w, w_scale, torch.bfloat16, axis=1)
+    w_scale = preshuffle_moe_wscale(w_scale)
+    w = preshuffle_moe_weight(w)
+    x, x_scale = mxfp4_quant(x)
+    x_ref = upcast_from_mxfp(x, x_scale, torch.bfloat16, axis=-1)
+
+    ref = moe_gemm_torch(x_ref, w_ref, None, rdata, gindx, None, None, True)
+    out = moe_gemm_a4w4(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        routing_data=rdata,
+        gather_indx=gindx,
+        swizzle_mx_scale="GFX1250_SCALE",
+        preshuffle_weights=True,
+        apply_swiglu=True,
+        out_mx_quant=out_mx_quant,
+        backend="gluon",
+    )
+    if out_mx_quant:
+        out = upcast_from_mxfp(out[0], out[1], torch.bfloat16, axis=-1)
+        ref_q, ref_s = mxfp4_quant(ref.to(torch.bfloat16))
+        ref = upcast_from_mxfp(ref_q, ref_s, torch.bfloat16, axis=-1)
+    # A wrong row is wrong everywhere; MXFP4 rounding moves a value by at most
+    # one e2m1 step of its block.
+    row_err = (out.float() - ref.float()).abs().amax(dim=-1)
+    row_mag = ref.float().abs().amax(dim=-1).clamp_min(1e-6)
+    bad_rows = (row_err / row_mag > 0.5).nonzero().flatten()
+    assert bad_rows.numel() == 0, (
+        f"{bad_rows.numel()}/{ref.shape[0]} rows differ, first: "
+        f"{bad_rows[:8].tolist()}"
+    )
+    if not out_mx_quant:
+        assert_close(ref, out)
