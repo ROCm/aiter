@@ -5,7 +5,12 @@
 import pytest
 
 from aiter.jit.utils import chip_info
-from aiter.ops.flydsl import linear_attention_prefill_kernels as gdn
+
+try:
+    from aiter.ops.flydsl import linear_attention_prefill_kernels as gdn
+except (ImportError, RuntimeError) as e:
+    # No FlyDSL >= 0.5.0, or no visible GPU for the Triton driver.
+    pytest.skip(f"chunk GDN module not importable: {e}", allow_module_level=True)
 
 SHAPE = {
     "H": 32,
