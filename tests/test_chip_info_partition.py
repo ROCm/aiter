@@ -490,6 +490,8 @@ def tuned_node(node, monkeypatch):
         (MI300X_DPX, (152, 304)),
         (MI300X_CPX, (38, 304)),
         (MI355X_DPX, (128, 256)),
+        ([MI355X_DPX_VF], (128, 256)),
+        (SECONDARY_ONLY_ID, (152, 304)),
         (MI300X_SPX, (304,)),
         (MI308X_SPX, (80,)),
         (MI300A_SPX, (228,)),
