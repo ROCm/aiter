@@ -272,7 +272,9 @@ _SCALE_PARAMS = ("x_scale_k", "w_scale_n", "w_scale_k", "x_scale_transposed")
 
 
 @functools.lru_cache(maxsize=1024)
-def _constexprs(name: str, n: int, k: int, b: int, *scale_args) -> tuple:
+def _constexprs(
+    name: str, n: int, k: int, b: int, *scale_args, fuse_quant_out: bool = False
+) -> tuple:
     """A kernel's Constexpr arguments in parameter order, the key of its
     compiled launcher. ``scale_args`` are the _SCALE_PARAMS values."""
     bound = inspect.signature(launch_bmm_a8w8_mxscale.func).bind(
@@ -282,6 +284,7 @@ def _constexprs(name: str, n: int, k: int, b: int, *scale_args) -> tuple:
         b,
         **_require_config(name),
         **dict(zip(_SCALE_PARAMS, scale_args)),
+        fuse_quant_out=fuse_quant_out,
     )
     bound.apply_defaults()
     return bound.args[_RUNTIME_PARAMS:]
@@ -338,6 +341,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     Out: Tensor,
     kernel_name: str | None = None,
     x_scale_transposed: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """``Out[m, b] = dequant(XQ[m, b]) @ dequant(WQ[b]).T``; writes into ``Out``
     and returns it. The e8m0 block edges (1x32 or 1x128 for ``x_scale``, 32x32
@@ -347,7 +351,13 @@ def run_bmm_a8w8_mxfp8_gfx950(
     also be a single row, 1x32 only.
     x_scale_transposed (B = 1, 1x128 blocks) reads ``x_scale``'s bytes
     column-major, [K / 128, M], the blockscale convention, under its
-    [M, 1, K / 128] shape; a single row takes the row-major kernel."""
+    [M, 1, K / 128] shape; a single row takes the row-major kernel.
+    ``y_scale_out`` fuses the output's group-32 MXFP8 quant into the epilogue:
+    ``Out`` is then e4m3 and ``y_scale_out`` receives the row-major
+    [M, B * N // 32] e8m0 scale bytes, as quantize_fp8 of the kernel's bf16
+    output would. The fused kernel runs one split, so a split-K kernelName
+    runs unsplit; its bf16 values may then differ from the split-K kernel's
+    by an fp32 rounding (another reduction order)."""
     if get_gfx() != "gfx950":
         raise RuntimeError(
             f"[FlyDSL gfx950 bmm] batched mxfp8 requires gfx950, got {get_gfx()}"
@@ -366,7 +376,30 @@ def run_bmm_a8w8_mxfp8_gfx950(
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx950 bmm] XQ/WQ must be 1-byte fp8 storage")
-    if Out.dtype != torch.bfloat16:
+    fuse = y_scale_out is not None
+    if fuse:
+        if Out.element_size() != 1:
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] a fused quant Out must be 1-byte e4m3, "
+                f"got {Out.dtype}"
+            )
+        if y_scale_out.device.type != "cuda" or y_scale_out.device != XQ.device:
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] y_scale_out must be on the launch GPU "
+                f"{XQ.device}, got {y_scale_out.device}"
+            )
+        if (
+            n % 32
+            or y_scale_out.element_size() != 1
+            or y_scale_out.numel() != m * b * n // 32
+            or not y_scale_out.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] fused quant needs N % 32 == 0 and a "
+                f"contiguous 1-byte y_scale_out of {m} x {b * n // 32}, got N={n}, "
+                f"{tuple(y_scale_out.shape)} {y_scale_out.dtype}"
+            )
+    elif Out.dtype != torch.bfloat16:
         raise RuntimeError(f"[FlyDSL gfx950 bmm] Out must be bf16, got {Out.dtype}")
     if not (XQ.is_contiguous() and WQ.is_contiguous() and Out.is_contiguous()):
         raise RuntimeError("[FlyDSL gfx950 bmm] XQ/WQ/Out must be contiguous")
@@ -394,11 +427,17 @@ def run_bmm_a8w8_mxfp8_gfx950(
     if kernel_name and _launch_config(kernel_name) is None:
         _warn_unrecognised(kernel_name)
         kernel_name = None
+    if fuse and not kernel_name and m > _FUSED_LARGE_M:
+        kernel_name = _FUSED_LARGE_M_KERNEL  # no flydsl row: see _FUSED_LARGE_M
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k, *scale_args)
+    if fuse:
+        name = _fused_quant_name(name, b, m, n, k, scale_args)
     cfg = _require_config(name)
     stream = torch.cuda.current_stream(XQ.device)
     partials = counters = Out
-    if cfg["splits"] > 1:
+    if fuse:
+        partials = y_scale_out  # the kernel writes the scale bytes there
+    elif cfg["splits"] > 1:
         tiles = ceildiv(m, cfg["tile_m"]) * (n // cfg["tile_n"]) * b
         if tiles > _SPLIT_COUNTERS:
             raise RuntimeError(
@@ -412,8 +451,43 @@ def run_bmm_a8w8_mxfp8_gfx950(
         )
         counters = _split_counters(XQ.device.index, stream.cuda_stream)
     tensors = (Out, XQ, WQ, x_scale, w_scale, partials, counters)
-    _launch(tensors, m, stream, _constexprs(name, n, k, b, *scale_args))
+    _launch(
+        tensors, m, stream, _constexprs(name, n, k, b, *scale_args, fuse_quant_out=fuse)
+    )
     return Out
+
+
+_FUSED_LARGE_M = 1024
+_FUSED_LARGE_M_KERNEL = BMM_MFMA_NAME_PREFIX + "_t128x256x128_w1x4_nb3_sk1_bd2_xcd"
+
+
+def _fused_quant_falls_back(name: str) -> bool:
+    cfg = _launch_config(name)
+    return (
+        cfg is not None and cfg["splits"] >= 4 and cfg["tile_m"] * cfg["tile_n"] >= 2048
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_quant_name(name: str, b: int, m: int, n: int, k: int, scale_args) -> str:
+    """The kernel a fused-quant launch runs for ``name``: the same tile at one
+    split (the quant epilogue has no split-K reduction), with xcd_swizzle
+    dropped if one split cannot take it; the heuristic's unsplit pick when the
+    tile cannot, or its tile_n leaves a 32-column group straddling two tiles."""
+    scale = dict(zip(_SCALE_PARAMS, scale_args))
+    for cfg in (
+        _require_config(name),
+        _require_config(pick_bmm_kernel_name(b, m, n, k, *scale_args)),
+    ):
+        cfg = {**cfg, "splits": 1}
+        if not xcd_swizzle_runs(cfg["xcd_swizzle"], cfg["xcd_order"], 1):
+            cfg["xcd_swizzle"] = 0
+        if cfg["tile_n"] % 32 == 0 and bmm_config_runs(b, n, k, scale, cfg):
+            return bmm_kernel_name(**cfg)
+    raise NotImplementedError(
+        f"[FlyDSL gfx950 bmm] no unsplit kernel with a 32-column tile_n runs the "
+        f"fused quant for B={b}, M={m}, N={n}, K={k}"
+    )
 
 
 __all__ = [

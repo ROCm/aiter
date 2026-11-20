@@ -284,9 +284,8 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 + offs_bn[None, :] * stride_bn
             )
 
-            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-                0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-            )
+            offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
             b_scale_ptrs = (
                 b_scales_ptr
                 + pid_head_i64 * stride_bsb_i64
@@ -297,15 +296,22 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
             for k_idx in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-                b_scales = tl.load(b_scale_ptrs)
-
                 if EVEN_K:
+                    b_scales = tl.load(b_scale_ptrs)
                     a_bf16 = tl.load(a_ptrs)
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
+                    # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                    # in e8m0, which dot_scaled propagates even where the masked-off
+                    # data is zero. Read those groups as 127, a scale of 2^0.
+                    scale_mask = offs_scale_k[None, :] < (
+                        2 * K // SCALE_GROUP_SIZE
+                        - k_idx * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                    )
+                    b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                     a_bf16 = tl.load(
                         a_ptrs,
-                        mask=offs_k_bf16[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        mask=offs_k_bf16[None, :] < 2 * K - k_idx * BLOCK_SIZE_K,
                         other=0,
                     )
                     b = tl.load(
