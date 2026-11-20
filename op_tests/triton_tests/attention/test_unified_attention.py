@@ -718,7 +718,7 @@ def _use_gfx950_length_aware_split(monkeypatch) -> None:
         for shape in [
             ((8, 2), 4, None),  # Kimi-K3 DSpark draft verify
             ((8, 2), 1, None),
-            ((8, 1), 1, "sinks"),  # GPT-OSS TP8 full-attention decode
+            ((8, 1), 1, "sinks"),  # GPT-OSS TP8 full-attention decode, uniform split
         ]
         for batch in ["skewed", "uniform", "skewed_empty"]
     ]
@@ -831,20 +831,25 @@ def test_triton_unified_attn_3d_length_aware_split(
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
-    # the split is length-aware, and the per-sequence counts (the kernels'
-    # seq_num_segments) differ from the cap the grid was sized for
     assert len(launches) == 1, "expected the 3D split-KV path"
     num_segments, _, split = launches[0]
-    assert num_segments > 1 and split is not None
-    split_budget = split.split_budget
     kv = [k for _, k in seq_lens]
-    segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
-    used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
-    assert sum(used) <= split_budget + len(kv) - 1
-    if batch != "uniform":
-        assert used[0] > max(used[1:]) and min(used) < num_segments, used
+    if num_heads[0] // num_heads[1] > 4:
+        # the kv_split entry opts in up to 4 query heads per KV head; GPT-OSS TP8
+        # (8 Q / 1 KV heads) keeps the uniform split
+        assert num_segments > 1 and split is None
     else:
-        assert len(set(used)) == 1 and used[0] < num_segments, used
+        # the split is length-aware, and the per-sequence counts (the kernels'
+        # seq_num_segments) differ from the cap the grid was sized for
+        assert num_segments > 1 and split is not None
+        split_budget = split.split_budget
+        segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
+        used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
+        assert sum(used) <= split_budget + len(kv) - 1
+        if batch != "uniform":
+            assert used[0] > max(used[1:]) and min(used) < num_segments, used
+        else:
+            assert len(set(used)) == 1 and used[0] < num_segments, used
 
     ref_output = ref_paged_attn(
         query=query,
@@ -1026,6 +1031,18 @@ def test_length_aware_split_scope(monkeypatch) -> None:
     # head 64 only
     head_32, _ = _gfx950_split(head_size=32, head_size_v=32)
     assert "SPLIT_PROGRAMS_PER_CU" not in head_32
+    # up to 4 query heads per KV head: Kimi-K3 8Q/2KV (4) and 64Q/64KV (1) opt in,
+    # GPT-OSS TP8 8Q/1KV and TP1 64Q/8KV (8) keep the uniform split
+    for group, opted_in in ((1, True), (4, True), (8, False)):
+        grouped, grouped_params = _gfx950_split(num_queries_per_kv=group)
+        assert ("SPLIT_PROGRAMS_PER_CU" in grouped) is opted_in, group
+        assert (_length_aware_split(grouped, grouped_params) is not None) is opted_in
+    for num_heads, num_kv_heads in ((8, 1), (64, 8)):
+        gpt_oss, gpt_oss_params = _gfx950_split(
+            num_queries_per_kv=num_heads // num_kv_heads, num_kv_heads=num_kv_heads
+        )
+        assert _length_aware_split(gpt_oss, gpt_oss_params) is None
+        assert gpt_oss["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
     # the kernels round sum(seq_len) up by the budget in int32
     edge = {"num_seqs": 1023, "num_kv_heads": 1}
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
