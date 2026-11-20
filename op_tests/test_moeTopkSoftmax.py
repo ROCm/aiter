@@ -1035,7 +1035,7 @@ for token in reg_tokens:
         (128, 4, dtypes.bf16, None),
         (128, 32, dtypes.fp32, None),
         (2048, 32, dtypes.bf16, None),
-        # wave32 runs the multi-wave kernel (E = 128 * waves); Kimi-K3's FP32 bias.
+        # gfx1250 runs the multi-wave kernel (E = 128 * waves); Kimi-K3's FP32 bias.
         (896, 17, dtypes.bf16, dtypes.fp32),
     ):
         ret = test_biased_grouped_topk(
@@ -1086,9 +1086,9 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
-    # wave32 topk_reg_kernel with 40 tied candidates, two slots a lane.
+    # gfx1250 topk_reg_kernel at wave32 with 40 tied candidates, two slots a lane.
     (64, 256, 8, dtypes.bf16, "softmax", True, "forty_way_tie", False),
-    # wave32 multi-wave register path: E = 128 * waves, topk <= 17 (HERD's
+    # gfx1250 multi-wave register path: E = 128 * waves, topk <= 17 (HERD's
     # top-(K + 1) for K = 16).
     (160, 896, 16, dtypes.bf16, "biased", True, "random", True),  # Kimi-K3 router
     (64, 512, 8, dtypes.bf16, "biased", False, "random", True),
@@ -1105,7 +1105,7 @@ stable_cases = [
 ]
 # Kimi-K3's FP32 bias, which the reference reads in BF16, and logits in rows of
 # a wider buffer. At E=256 the FP32 bias keeps the row off
-# biased_grouped_topk_w32_kernel, so wave32 runs topk_reg_kernel's two-slot path.
+# biased_grouped_topk_w32_kernel, so gfx1250 runs topk_reg_kernel's two-slot path.
 fp32_bias_cases = [
     (160, 896, 17, dtypes.bf16, "biased", True, "random", False),
     (64, 256, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
@@ -1117,9 +1117,9 @@ ref260_cases = [
     (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
     (64, 252, 8, dtypes.bf16, "softmax", True, "random", False),
 ]
-# Logits and bias one element past an aligned base still take the multi-wave
-# kernel, which reads them with unaligned vector loads; the last case takes its
-# fallback, which reloads the row.
+# On gfx1250, logits and bias one element past an aligned base still take the
+# multi-wave kernel, which reads them with unaligned vector loads; the last case
+# takes its fallback, which reloads the row.
 unaligned_cases = [
     ((160, 896, 17, dtypes.bf16, "biased", True, "random", False), dtypes.fp32),
     ((64, 512, 8, dtypes.bf16, "biased", True, "forty_way_tie", False), None),

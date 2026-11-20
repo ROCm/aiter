@@ -48,10 +48,11 @@
 // module_moe_asm device codegen; keep the shapes this path is meant to hit,
 // fall back to LDS for the rest. Both lists are instantiated for every target,
 // so the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
-// need 12, 24 and 28 of their own. Only biased_grouped_topk rows with one group,
-// BF16 logits and topk <= 17 at E=768 and 896 take topk_reg_mw_kernel; the
-// rest, grouped_topk among them, take LDS at wave32. Wave32 builds leave the
-// EPLs only wave64 launches empty. Override by defining
+// need 12, 24 and 28 of their own. Only biased_grouped_topk rows without a
+// group filter (topk_grp == num_expert_group), BF16 logits, a pitch of whole
+// quads and topk <= 17 at E=768 and 896 take topk_reg_mw_kernel, on gfx1250
+// only; the rest, grouped_topk among them, take LDS at wave32. Wave32 builds
+// leave the EPLs only wave64 launches empty. Override by defining
 // AITER_TOPK_REG_LAUNCH_EPLS (wave64) or AITER_TOPK_REG_LAUNCH_EPLS_W32
 // (wave32) before include.
 #ifndef AITER_TOPK_REG_LAUNCH_EPLS
@@ -440,6 +441,8 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
                                    : 0;
         }
         int rank[kSlots];
+        // Not wave32_rank_desc_dpp: this also runs at wave64, and it stops at
+        // n_cand, so the common n_cand <= WARP_SIZE row takes one warp_rank_desc.
         warp_rank_desc_slots(key, rank, n_cand);
         __builtin_amdgcn_wave_barrier();
 #pragma unroll
@@ -1083,9 +1086,10 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         return;
     }
 
-    // Fallback for more than kTopKRegCandCap candidates. Rare on random rows,
-    // but correctness depends on it, so it stays. Still register
-    // resident; it only gives up the pivot, not the VGPR-held scores.
+    // Fallback when the pivot is -inf, when fewer than topk candidates reach
+    // it, or when more than kTopKRegCandCap do. Rare on random rows, but
+    // correctness depends on it, so it stays. Still register resident; it
+    // only gives up the pivot, not the VGPR-held scores.
     float sum                  = 0.0f;
     int topk_indice            = 0;
     float topk_value           = 0.0f;
@@ -1113,8 +1117,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         const bool has_valid_candidate = max_idx >= 0;
         if(!has_valid_candidate)
         {
-            // The wave64 launcher gate enforces topk <= 32, so an unused ID in
-            // [0, 31] always exists before each synthetic round.
+            // The launcher gate enforces topk <= wave size / 2 (32 at wave64,
+            // 16 at wave32), so an unused ID in [0, 31] always exists before
+            // each synthetic round.
             const uint32_t unused          = ~selected_low_mask;
             const uint32_t unused_from_k   = unused & (~0u << k);
             const uint32_t fallback_source = unused_from_k != 0 ? unused_from_k : unused;
@@ -2719,11 +2724,12 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
     // four experts per lane, one vector load each from the BF16 logits and the
-    // BF16 or FP32 bias at any alignment. The pitch must be whole quads: that
-    // is the validated range, and it keeps other pitches on Triton, which
-    // test_exact_sigmoid_topk_matches_torch relies on (pitch E + 17).
-    // biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports, the
-    // same topk_reg_mw_args_ok, and checks the pitch below itself.
+    // BF16 or FP32 bias at any alignment. The pitch must be whole quads, the
+    // validated range; other pitches fall through to topk_reg_kernel or LDS
+    // below. biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports,
+    // the same topk_reg_mw_args_ok, and applies the same pitch term, so rows the
+    // Triton kernel takes stay on it (test_exact_sigmoid_topk_matches_torch
+    // relies on that, pitch E + 17).
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
     if(wave32 && topk_grp == num_expert_group &&

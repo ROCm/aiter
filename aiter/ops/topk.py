@@ -126,24 +126,25 @@ def _gfx1250_reg_mw_fits(
     multi-wave kernel of biased_grouped_topk_hip instead of the Triton one.
 
     The shape and dtype terms come from topk_reg_mw_supports, the same test the
-    HIP entry applies; the two terms below, the pitch and the equal output
-    strides, are the rest of it. The kernel's loads take any pointer
-    alignment, so the test reads no data_ptr(). biased_grouped_topk is an
-    opaque custom op, so torch.compile never traces this: compiled and eager
-    calls run it on the same real tensors."""
+    HIP entry applies; the pitch and the equal output strides are the rest of
+    it, checked first because they cost less than the memoised query. The
+    kernel's loads take any pointer alignment, so the test reads no
+    data_ptr(). biased_grouped_topk is an opaque custom op, so torch.compile
+    never traces this: compiled and eager calls run it on the same real
+    tensors."""
     return (
-        _reg_mw_supports_cached(
+        # Whole quads only: the validated range. Other pitches stay on Triton,
+        # which test_exact_sigmoid_topk_matches_torch relies on (pitch E + 17).
+        gating_output.stride(0) % 4 == 0
+        # The HIP op writes both outputs with the row stride of topk_ids.
+        and topk_weights.stride(0) == topk_ids.stride(0)
+        and _reg_mw_supports_cached(
             gating_output.shape[1],
             topk_ids.shape[1],
             gating_output.dtype,
             correction_bias.dtype,
             gating_output.device.index,
         )
-        # Whole quads only: the validated range. Other pitches stay on Triton,
-        # which test_exact_sigmoid_topk_matches_torch relies on (pitch E + 17).
-        and gating_output.stride(0) % 4 == 0
-        # The HIP op writes both outputs with the row stride of topk_ids.
-        and topk_weights.stride(0) == topk_ids.stride(0)
     )
 
 
