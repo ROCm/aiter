@@ -50,6 +50,7 @@ Restrictions (the caller is expected to check these and fall back):
 
 import ctypes
 import functools
+import itertools
 import math
 import os
 
@@ -952,7 +953,7 @@ def _k1_gluon_schedule() -> tuple[int, int]:
 # both accept; only the gfx1250 kernels read CPL. With a zero floor, a device
 # with no published table takes this schedule in the wide branch.
 _K2_GLUON_FALLBACK = triton.Config(
-    {"BW": 64, "CPL": 2, "MIN_BLOCKS_PER_CU": 0}, num_warps=4
+    {"BW": 64, "CPL": 2, "MIN_BLOCKS_PER_CU": 0, "waves_per_eu": 0}, num_warps=4
 )
 _UNPUBLISHED = triton.Config({})
 
@@ -967,19 +968,29 @@ def _published_gluon_schedule(name: str) -> triton.Config | None:
 
 @functools.cache
 def _k2_gluon_schedule(
-    W: int, num_segs: int, H: int, kernel: str = "k2_ab_fused_gluon"
+    W: int, num_segs: int, H: int, kernel: str = "k2_ab_fused_gluon", wide: bool = False
 ) -> triton.Config:
     """The schedule of the Gluon K2 pass ``kernel``, which does not autotune:
     ``BW``, ``num_warps``, ``waves_per_eu`` and, on gfx1250, ``CPL``, the
     chunks per TDM load. The wide tile is taken while the grid stays above the
     published blocks-per-CU floor."""
-    wide = chunk_delta_attn_tuned_config(
+    cus = get_num_sms()
+
+    def fills(cfg):
+        blocks = (W // cfg.kwargs["BW"]) * num_segs * H
+        return (
+            W % cfg.kwargs["BW"] == 0
+            and blocks >= cfg.kwargs["MIN_BLOCKS_PER_CU"] * cus
+        )
+
+    packed = _published_gluon_schedule(f"{kernel}_packed")
+    if packed is not None and fills(packed):
+        return packed
+    cfg = chunk_delta_attn_tuned_config(
         f"{kernel}_wide", _K2_GLUON_FALLBACK, backend="gluon"
     )
-    bw = wide.kwargs["BW"]
-    blocks = (W // bw) * num_segs * H
-    if W % bw == 0 and blocks >= wide.kwargs["MIN_BLOCKS_PER_CU"] * get_num_sms():
-        return wide
+    if fills(cfg) or (wide and W % cfg.kwargs["BW"] == 0):
+        return cfg
     return chunk_delta_attn_tuned_config(
         f"{kernel}_narrow", _K2_GLUON_FALLBACK, backend="gluon"
     )
@@ -1045,7 +1056,7 @@ def _scan_schedule(n_seqs: int, H: int, V: int) -> tuple[int, int]:
     return _SCAN_BV_NARROW, 4
 
 
-def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None) -> int:
+def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None, one_wave=True) -> int:
     """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
 
     The recurrence kernel gets ``n_segments * H * (V / BW)`` blocks, so with one
@@ -1060,7 +1071,8 @@ def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None) -> int:
     if override:
         val = int(override)
         return n_chunks_max if val <= 0 else val
-    blocks = n_seqs * H * max(1, V // 32)
+    wide = _published_gluon_schedule("k2_c_gluon_packed") if nchs is not None else None
+    blocks = n_seqs * H * max(1, V // (wide.kwargs["BW"] if wide else 32))
     cus = get_num_sms()
     # There has to be idle capacity to absorb the extra passes, unless the longest
     # walk outlasts the device's share of all the work (one long sequence).
@@ -1068,16 +1080,27 @@ def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None) -> int:
         nchs is None or sum(nchs) * (blocks // n_seqs) >= n_chunks_max * cus
     ):
         return n_chunks_max
-    if nchs is not None:
+    if nchs is not None and one_wave:
         # Shortest length that fits one wave of the CUs, if it pays for pass A + scan.
         P = _published_gluon_schedule("flash_kda_gluon_plan").kwargs
         lo = max(P["A8_MIN_LEN"], triton.cdiv(n_chunks_max, P["A8_MAX_SEGS"]))
-        for L in range(lo, n_chunks_max):
-            progs = sum(triton.cdiv(n, L) for n in nchs) * H
-            if progs <= cus:
-                cost = P["SEG_FIXED_STEPS"] + P["SEG_DEVICE_STEPS"] * progs / cus
-                return n_chunks_max if n_chunks_max - L <= cost else L
-        return n_chunks_max
+        lo = max(lo, round(P.get("SEG_SQRT", 0) * math.sqrt(n_chunks_max)))
+        long = P.get("PACKED_FROM_LEN")
+
+        def fit(room):
+            for L in range(lo, n_chunks_max):
+                progs = sum(triton.cdiv(n, L) for n in nchs if n > L or not long) * H
+                if progs <= room:
+                    return L, progs
+            return n_chunks_max, 0
+
+        L, progs = (
+            fit(cus) if n_chunks_max >= P.get("MIN_CHUNKS", 0) else (n_chunks_max, 0)
+        )
+        if long and long <= L < n_chunks_max:
+            L, progs = fit(2 * cus)
+        cost = P["SEG_FIXED_STEPS"] + P["SEG_DEVICE_STEPS"] * progs / cus
+        return n_chunks_max if n_chunks_max - L <= cost else L
     # And enough depth to amortize them, which no amount of idle capacity makes
     # up for.
     if n_chunks_max < _SEG_MIN_CHUNKS:
@@ -1313,6 +1336,15 @@ def _pass_a_rows(seqs, C, seg_lens, H, n_w, device):
 
 
 @functools.lru_cache(maxsize=64)
+def _scanned_segs(seg_lens, device):
+    ids, i = [], 0
+    for lens in seg_lens:
+        ids += [(-m, i + s) for s, m in enumerate(lens[:-1])]
+        i += len(lens)
+    return _upload([s for _, s in sorted(ids)], device)
+
+
+@functools.lru_cache(maxsize=64)
 def _build_segments(
     seqs: tuple[tuple[int, int], ...],
     C: int,
@@ -1528,13 +1560,12 @@ def flash_kda_fwd(
             raise ValueError("out must be contiguous")
 
     norm = out_gate is not None
-    if norm:
-        # The gate tiles are copied 16 B per lane: a token stride or base that is
-        # not 16 B aligned takes a packed copy.
-        if (
-            out_gate.stride(1) * out_gate.element_size()
-        ) % 16 or out_gate.data_ptr() % 16:
-            out_gate = out_gate.contiguous()
+    # The gate tiles are copied 16 B per lane: a token stride or base that is
+    # not 16 B aligned takes a packed copy.
+    if norm and (
+        (out_gate.stride(1) * out_gate.element_size()) % 16 or out_gate.data_ptr() % 16
+    ):
+        out_gate = out_gate.contiguous()
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
     # The gfx950 Gluon K1 workspace is read only by the Gluon K2: all Gluon or none.
@@ -1547,11 +1578,12 @@ def flash_kda_fwd(
     )
     use_gluon_k1 = use_gluon_k1 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
     use_gluon_k2 = use_gluon_k2 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
-    if checkpoint_offsets is not None:
-        if not gluon_pipeline:
-            raise NotImplementedError(
-                "FlashKDA writes prefill checkpoints only on the gfx950 Gluon path"
-            )
+    if checkpoint_offsets is not None and not (
+        gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
+    ):
+        raise NotImplementedError(
+            "FlashKDA writes prefill checkpoints only on the Gluon pass C"
+        )
     # The gfx950 Gluon K1 reads beta at its token stride; every other kernel needs
     # it packed.
     stride_beta = 0
@@ -1593,7 +1625,7 @@ def flash_kda_fwd(
                     f"cu_seqlens_cpu must be a contiguous int32/int64 CPU tensor of {N + 1}"
                 )
             bounds = list((c_int * (N + 1)).from_address(cu_seqlens_cpu.data_ptr()))
-            host_seqs = tuple(zip(bounds[:-1], bounds[1:]))
+            host_seqs = tuple(itertools.pairwise(bounds))
             host_tiles = _host_tiles(host_seqs, C, cu_seqlens.dtype, dev)
             if chunk_indices is None:
                 chunk_indices = host_tiles[0]
@@ -1635,8 +1667,9 @@ def flash_kda_fwd(
     n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
     nchs = [triton.cdiv(eos - bos, C) for bos, eos in seqs]
     if chunks_per_seg is None:
+        split = gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
         chunks_per_seg = _choose_chunks_per_seg(
-            n_chunks_max, N, H, V, nchs if gluon_pipeline else None
+            n_chunks_max, N, H, V, nchs if split else None, split
         )
     elif chunks_per_seg <= 0:
         chunks_per_seg = n_chunks_max
@@ -1781,16 +1814,16 @@ def flash_kda_fwd(
     ckpt_args = {}
     if checkpoint_offsets is not None:
         # All on the device: the kernel finds each snapshot's segment and chunk.
-        ckpt_args = dict(
-            ckpt_state=checkpoint_state,
-            ckpt_offsets=checkpoint_offsets,
-            ckpt_rows=checkpoint_state_indices,
-            ckpt_bos=(
+        ckpt_args = {
+            "ckpt_state": checkpoint_state,
+            "ckpt_offsets": checkpoint_offsets,
+            "ckpt_rows": checkpoint_state_indices,
+            "ckpt_bos": (
                 cu_seqlens
                 if cu_seqlens is not None
                 else torch.arange(0, N * T, T, device=dev)
             ),
-        )
+        }
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
     # once here instead of carrying the layout through three passes.
@@ -1883,7 +1916,8 @@ def flash_kda_fwd(
         b_seg = scratch("b_seg", (num_segs, H, K, V), b_ty)
         A_seg = scratch("A_seg", (num_segs, H, K, K), A_ty)
         if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
-            sched = _k2_gluon_schedule(V, num_segs, H)
+            seg_ids = _scanned_segs(seg_lens, dev)
+            sched = _k2_gluon_schedule(V, seg_ids.numel(), H)
             _g2.gluon_k2_ab_fused(
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
@@ -1893,6 +1927,7 @@ def flash_kda_fwd(
                 beta_raw=beta,
                 h_out_b=b_seg,
                 h_out_a=A_seg,
+                seg_ids=seg_ids,
                 seg_chunk_base=seg_chunk_base,
                 seg_nchunks=seg_nchunks,
                 seg_tok_base=seg_tok_base,
@@ -1903,10 +1938,10 @@ def flash_kda_fwd(
                 K=K,
                 V=V,
                 C=C,
-                num_segs=num_segs,
                 BW=sched.kwargs["BW"],
                 CPL=sched.kwargs["CPL"],
                 num_warps=sched.num_warps,
+                waves_per_eu=sched.kwargs["waves_per_eu"],
             )
         elif use_gluon_k2a:
             sched = _k2_gluon_schedule(V, num_segs, H)
@@ -1977,18 +2012,25 @@ def flash_kda_fwd(
     )
     if use_gluon_k2c:
         if DEVICE_ARCH == "gfx1250":
-            sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
+            sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon", wide=norm)
             arch_args = {
                 "beta_raw": beta,
                 "stride_v": stride_v,
                 "CPL": sched.kwargs["CPL"],
+                "waves_per_eu": sched.kwargs["waves_per_eu"],
             }
+            if norm:
+                arch_args.update(
+                    out_gate=out_gate, norm_weight=norm_weight, norm_eps=norm_eps
+                )
         else:
             sched = _k2c_gluon_schedule(segmented)
             bw, nx, cus = sched.kwargs["BW"], get_num_xcds(), get_num_sms()
-            norm_args = dict(
-                out_gate=out_gate, norm_weight=norm_weight, norm_eps=norm_eps
-            )
+            norm_args = {
+                "out_gate": out_gate,
+                "norm_weight": norm_weight,
+                "norm_eps": norm_eps,
+            }
             arch_args = norm_args if norm else {}
             # Copier-wave walk: both V halves of each stream must be resident at once.
             per_xcd = 2 * triton.cdiv(num_segs * H, nx)
@@ -2018,21 +2060,21 @@ def flash_kda_fwd(
                 n_fl = rmax * (num_segs + N) * H * (V // bv) * sched.num_warps
                 sflags, ep = _epoch_buf("scf", dev, n_fl, torch.int32)
                 h_in = scratch("h_in", (rmax, num_segs, H, K, V), torch.bfloat16)
-                arch_args["scf"] = dict(
-                    tab=tab,
-                    RMAX=rmax,
-                    A_seg=A_seg,
-                    b_seg=b_seg,
-                    h0=h0,
-                    NH=N * H,
-                    seq_seg_off=seq_seg_off,
-                    sflags=sflags,
-                    xepoch=ep,
-                    BV=bv,
-                    HSLAB=num_segs * H * K * V,
-                    HAS_H0=paged or h0 is not None,
-                    FSLAB=num_segs * H * (V // bv) * sched.num_warps,
-                )
+                arch_args["scf"] = {
+                    "tab": tab,
+                    "RMAX": rmax,
+                    "A_seg": A_seg,
+                    "b_seg": b_seg,
+                    "h0": h0,
+                    "NH": N * H,
+                    "seq_seg_off": seq_seg_off,
+                    "sflags": sflags,
+                    "xepoch": ep,
+                    "BV": bv,
+                    "HSLAB": num_segs * H * K * V,
+                    "HAS_H0": paged or h0 is not None,
+                    "FSLAB": num_segs * H * (V // bv) * sched.num_warps,
+                }
         _g2.gluon_k2_c(
             ws_kd=ws_kd,
             ws_qd=ws_qd,
@@ -2080,8 +2122,7 @@ def flash_kda_fwd(
             STORE_FINAL=store_final,
             **(paged_args if paged else {}),
         )
-    if norm and not gluon_pipeline:
-        # The norm on the other routes: on the output, fp32 math.
+    if norm and not use_gluon_k2c:
         o_f = o.float()
         o_f = o_f * torch.rsqrt(o_f.square().mean(-1, keepdim=True) + norm_eps)
         o.copy_(o_f * norm_weight * torch.sigmoid(out_gate.float()))
