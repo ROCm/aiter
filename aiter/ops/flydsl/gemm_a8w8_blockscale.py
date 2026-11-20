@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .aot_cache import FlyDSLAotCache
+from .gemm_tune import flydsl_gemm_a8w8_blockscale_common
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
     TILE_M,
@@ -18,7 +19,11 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernels_by_name,
 )
 
-_AOT_CACHE = FlyDSLAotCache("gemm_a8w8_blockscale")
+# _compile_gemm only reads TILE_* and kernels_by_name, so the trace never calls
+# into the module that defines them.
+_AOT_CACHE = FlyDSLAotCache(
+    "gemm_a8w8_blockscale", extra_sources=[flydsl_gemm_a8w8_blockscale_common.__file__]
+)
 
 
 def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:

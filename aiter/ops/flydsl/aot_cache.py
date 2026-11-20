@@ -101,6 +101,12 @@ _ENV_IGNORED = {
     "FLYDSL_DUMP_IR",
     "FLYDSL_DUMP_DIR",
     "FLYDSL_RUNTIME_CACHE_DIR",
+    "FLYDSL_RUNTIME_ENABLE_CACHE",
+    # The replay's --check sets it; it must look up the entries a build made.
+    "FLYDSL_RUNTIME_RUN_ONLY",
+    "AITER_FLYDSL_AOT_MAX_RETRIES",
+    "AITER_FLYDSL_AOT_TIMEOUT",
+    "AITER_FLYDSL_AOT_TRACEBACK",
     # Hashed as the arch it selects (_target_arch), so that an AOT build, which
     # sets it, and the runtime, which reads the device, share a directory.
     "FLYDSL_GPU_ARCH",
@@ -270,6 +276,13 @@ def _tracked_root() -> str:
     return str(Path(aiter.__file__).parent.resolve()) + os.sep
 
 
+def _portable(path: str) -> str:
+    """``path`` as a sidecar stores it: relative to the aiter package if inside
+    it, so entries built in a source tree still match once the package is
+    installed elsewhere (a prebuilt wheel); absolute otherwise."""
+    return path.removeprefix(_tracked_root())
+
+
 def _is_tracked(path: str) -> bool:
     if not path.endswith(".py") or path == os.path.realpath(__file__):
         return False
@@ -384,7 +397,10 @@ def _entry_env(files, read) -> dict:
 
 
 def _entry_current(meta: dict) -> bool:
-    return all(_file_digest(p) == d for p, d in meta["sources"].items()) and all(
+    root = _tracked_root()
+    sources = meta["sources"].items()
+    # os.path.join keeps an absolute path as it is.
+    return all(_file_digest(os.path.join(root, p)) == d for p, d in sources) and all(
         os.environ.get(k) == v for k, v in meta["env"].items()
     )
 
@@ -654,7 +670,7 @@ class FlyDSLAotCache:
             # files as they are on disk at this point.
             _file_digest.cache_clear()
             _env_names.cache_clear()
-            sources = {f: _file_digest(f) for f in sorted(files)}
+            sources = {_portable(f): _file_digest(f) for f in sorted(files)}
             meta = {"sources": sources, "env": _entry_env(files, read)}
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"

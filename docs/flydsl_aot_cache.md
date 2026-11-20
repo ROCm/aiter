@@ -174,8 +174,11 @@ source:
   and a process on such a GPU use the same directory;
 - every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
   `HSA_OVERRIDE_GFX_VERSION` and `COMPILE_OPT_LEVEL`. Variables that cannot
-  change code are excluded: dump dirs, the cache's own variables, and
-  `FLYDSL_GPU_ARCH`, which is hashed as the arch it selects. Otherwise an AOT
+  change code are excluded: dump dirs, the cache's own variables, the
+  FlyDSL runtime-cache switches (`FLYDSL_RUNTIME_ENABLE_CACHE`, and
+  `FLYDSL_RUNTIME_RUN_ONLY`, which the replay's `--check` sets, so it checks
+  the entries the build made), the replay's `AITER_FLYDSL_AOT_TIMEOUT` /
+  `_MAX_RETRIES` / `_TRACEBACK`, and `FLYDSL_GPU_ARCH`, which is hashed as the arch it selects. Otherwise an AOT
   build, which sets it, and the runtime, which reads the device, would use
   different directories.
 
@@ -184,7 +187,9 @@ During a miss, `make_exe()` and the trace run under `sys.setprofile`, which
 records the `co_filename` of every Python function called. Every recorded
 `.py` inside the aiter package (except `aot_cache.py` itself) is stored with
 its sha256 in the entry's sidecar `.json`, together with any
-`extra_sources`. A lookup accepts an entry only if all of those files still
+`extra_sources`. Files inside the aiter package are stored relative to it, so
+entries prebuilt in a source tree (`PREBUILD_KERNELS=1 setup.py bdist_wheel`)
+still match once the wheel is installed into `site-packages`. A lookup accepts an entry only if all of those files still
 hash the same. The per-process digest cache makes this one `sha256` per file
 per process.
 

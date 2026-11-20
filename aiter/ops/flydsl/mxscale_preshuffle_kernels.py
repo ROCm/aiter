@@ -330,8 +330,12 @@ def flydsl_mxscale_preshuffle_gemm(
     splitk_fused = splitk_fused or fused_f32
 
     st = stream if stream is not None else torch.cuda.current_stream()
-    # Launches take an fx.Stream; the compile-only stand-in's handle is 0.
-    st_arg = fx.Stream(st.cuda_stream)
+    # Launches take an fx.Stream; the compile-only stand-in's handle is 0. A
+    # caller may also pass an fx.Stream or a raw handle, as before.
+    if isinstance(st, fx.Stream):
+        st_arg = st
+    else:
+        st_arg = fx.Stream(getattr(st, "cuda_stream", st))
 
     if split_k > 1:
         # split-K legality (same constraints the tuner enforces in fits_shape):
