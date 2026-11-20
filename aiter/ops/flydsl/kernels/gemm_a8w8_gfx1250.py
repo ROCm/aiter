@@ -978,9 +978,10 @@ def launch_gemm_a8w8(
             # (amax floored at 1e-10, ceil_pow2(amax/448)).
             from aiter.ops.flydsl.kernels.quant_utils import (
                 emit_cvt_scalef32_pk8_fp8_f32,
-                emit_mx_e8m0_scale,
+                emit_mxfp8_acc_pair_to_lds,
+                emit_mxfp8_group32_scale,
+                emit_mxfp8_scale_rows_store,
             )
-            from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
             s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
             v2i32_ty = T.vec(2, T.i32)
@@ -990,16 +991,6 @@ def launch_gemm_a8w8(
             sbase_blk = (
                 bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
             ) + blk_n64 // 32
-
-            def _group_scale(amax):
-                # A 32-column group's amax -> (e8m0 ceil scale byte, its f32).
-                amax = fx.maxnumf(amax, fx.Float32(1e-10))
-                e8 = emit_mx_e8m0_scale(
-                    amax,
-                    mode=MxScaleRoundModeInt.RoundUp,
-                    dtype=MxDtypeInt.FP8_E4M3,
-                )
-                return e8, (fx.Int32(e8) << 23).bitcast(fx.Float32)
 
         if const_expr(not fuse_quant_out):
             _stage_c_tile()
@@ -1037,7 +1028,8 @@ def launch_gemm_a8w8(
             # bf16 path stores them, so the codes match quantize_fp8 of that
             # output. The e4m3 and scale bytes still go through LDS (one
             # barrier) so the global writes are the tile's TDM store and one
-            # small store per scale row.
+            # small store per scale row. The per-group step and the scale-row
+            # store are shared with the 256x256 compute kernel's epilogue.
             lds8 = fx.recast_iter(fx.Int8, base_ptr)
             gC8_base = fx.recast_iter(
                 fx.PointerType.get(fx.Int8.ir_type, arg_c.address_space), arg_c
@@ -1047,54 +1039,35 @@ def launch_gemm_a8w8(
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
                 for wp in range_constexpr(wmma_n_rep // 2):
-                    h0 = accs[wm * wmma_n_rep + 2 * wp].to(out_cls).to(fx.Float32)
-                    h1 = accs[wm * wmma_n_rep + 2 * wp + 1].to(out_cls).to(fx.Float32)
-                    amax = abs(h0[0])
-                    for t in range_constexpr(1, 8):
-                        amax = fx.maxnumf(amax, abs(h0[t]))
-                    for t in range_constexpr(8):
-                        amax = fx.maxnumf(amax, abs(h1[t]))
-                    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
-                    e8, scale_f32 = _group_scale(amax)
-                    p0 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                    emit_mxfp8_acc_pair_to_lds(
+                        accs[wm * wmma_n_rep + 2 * wp],
+                        accs[wm * wmma_n_rep + 2 * wp + 1],
+                        out_cls,
+                        lds8,
+                        row_rel,
+                        fx.Int64(wnb + wp * 32),
+                        kgrp,
+                        c8_row=C8_ROW,
+                        s8_off=S8_OFF,
+                        gn=GN,
+                        wave=WAVE,
                     )
-                    p1 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                    )
-                    gcol = fx.Int64(wnb + wp * 32)
-                    l_off = fx.Int64(row_rel) * C8_ROW + gcol + fx.Int64(kgrp * 8)
-                    fx.ptr_store(
-                        fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off)
-                    )
-                    fx.ptr_store(
-                        fx.Vector(p1).bitcast(fx.Int8),
-                        fx.add_offset(lds8, l_off + 16),
-                    )
-                    if kgrp == 0:
-                        fx.ptr_store(
-                            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
-                            fx.add_offset(
-                                lds8,
-                                fx.Int64(S8_OFF + row_rel * GN) + gcol // 32,
-                            ),
-                        )
             workgroup_barrier(use_cluster=False)
             # One row's GN scale bytes per thread: contiguous in the row-major
             # [M, (B*N)//32] scale, so each row is a single small store.
-            for rr in range_constexpr((tile_m + block - 1) // block):
-                srow_rel = fx.Int32(tid) + rr * block
-                if (srow_rel < tile_m) and (srow_rel < mn_oob):
-                    sv = fx.ptr_load(
-                        fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
-                        result_type=T.vec(GN, T.i8),
-                    )
-                    fx.ptr_store(
-                        fx.Vector(sv),
-                        fx.add_offset(
-                            s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
-                        ),
-                    )
+            emit_mxfp8_scale_rows_store(
+                lds8,
+                s8,
+                tid,
+                mn_oob,
+                blk_m64,
+                srow,
+                sbase_blk,
+                s8_off=S8_OFF,
+                gn=GN,
+                tile_m=tile_m,
+                block=block,
+            )
             c8_off = blk_m64 * ldc64 + blk_n64
             if const_expr(batched):
                 c8_off = c8_off + bz64 * fx.Int64(i32_n)
@@ -1141,7 +1114,7 @@ def launch_gemm_a8w8(
                     amax = abs(vals[0])
                     for e in range_constexpr(1, 32):
                         amax = fx.maxnumf(amax, abs(vals[e]))
-                    e8, scale_f32 = _group_scale(amax)
+                    e8, scale_f32 = emit_mxfp8_group32_scale(amax)
                     row64 = blk_m64 + fx.Int64(r)
                     c_off = row64 * ldc64 + cbase_blk + fx.Int64(j) * 32
                     for q in range_constexpr(4):
