@@ -483,6 +483,71 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
         )
         case["err"] = max(errs.values())
         progress.put(("row", case))
+
+    def expect_rejected(described, call):
+        try:
+            call()
+        except RuntimeError:
+            return
+        raise AssertionError(f"moe_sorting_opus accepted {described}")
+
+    # A shape the mp path rejects (P23 LDS 65588 B > 64 KB at 8192 experts with
+    # local ids) used to return silently with unwritten outputs.
+    progress.put(("start", {"reject": "unsupported shape", "E": 8192}))
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        1, model_dim, 8192, topk, dtype, False, padding_extra=0
+    )
+    expect_rejected(
+        "a shape the mp sort cannot run",
+        lambda: moe_sorting(
+            topk_ids,
+            topk_weights,
+            8192,
+            model_dim,
+            dtype,
+            16,
+            dispatch_policy=1,
+            return_local_topk_ids=True,
+        ),
+    )
+    # The mp path needs a workspace of moe_sorting_opus_get_workspace_size() bytes.
+    progress.put(("start", {"reject": "short workspace", "E": 819}))
+    E, block_size = 819, 16
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        1, model_dim, E, topk, dtype, False, padding_extra=0
+    )
+    padded = topk_ids.numel() + E * block_size - topk
+    padded = (padded + block_size - 1) // block_size * block_size
+    opus_outputs = (
+        torch.empty(padded, dtype=torch.int32, device="cuda"),
+        torch.empty(padded, dtype=torch.float32, device="cuda"),
+        torch.empty(padded // block_size, dtype=torch.int32, device="cuda"),
+        torch.empty(2, dtype=torch.int32, device="cuda"),
+        torch.empty((1, model_dim), dtype=dtype, device="cuda"),
+    )
+
+    def sort_with_workspace(workspace):
+        aiter.moe_sorting_opus_fwd(
+            topk_ids,
+            topk_weights,
+            *opus_outputs,
+            E,
+            block_size,
+            None,
+            None,
+            workspace,
+            1,
+        )
+
+    ws_size = aiter.moe_sorting_opus_get_workspace_size(1, E, topk, 1, device_id)
+    assert ws_size > 1, f"E={E} must take the mp path, got workspace {ws_size} B"
+    expect_rejected(
+        "a 1-byte workspace",
+        lambda: sort_with_workspace(torch.empty(1, dtype=torch.uint8, device="cuda")),
+    )
+    expect_rejected("a missing workspace", lambda: sort_with_workspace(None))
+    sort_with_workspace(torch.empty(ws_size, dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
     progress.put(("done", None))
 
 

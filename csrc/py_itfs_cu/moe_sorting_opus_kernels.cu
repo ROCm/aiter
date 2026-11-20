@@ -33,6 +33,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices,
                           std::optional<aiter_tensor_t> reverse_sorted)
 {
+    // Reached from pybind: a failed check has to surface as a RuntimeError, not abort().
+    aiter_detail::AiterThrowGuard throw_guard;
+
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
 
@@ -64,9 +67,24 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                     "reverse_sorted must be a contiguous int32 buffer for tokens * topk routes");
     }
 
+    // The mp path writes and reads this buffer, and the header only checks that it exists.
+    const int ws_bytes =
+        moe_sorting_opus_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
+    if(ws_bytes > 0)
+    {
+        AITER_CHECK(workspace.has_value() && workspace.value().device_id == topk_ids.device_id &&
+                        workspace.value().is_contiguous() &&
+                        workspace.value().numel() * workspace.value().element_size() >=
+                            static_cast<size_t>(ws_bytes),
+                    "moe_sorting_opus_fwd: workspace must be a contiguous buffer of at least ",
+                    ws_bytes,
+                    " bytes on the topk_ids device");
+    }
+
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
-    moe_sorting_opus(
+    // A negative return means the sort rejected the shape or dtype before launching anything.
+    const float rc = moe_sorting_opus(
         {
             dtype_str,
             "fp32",
@@ -94,6 +112,16 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          static_cast<int>(moe_buf.size(-1)),
          static_cast<int>(moe_buf.element_size())},
         {stream});
+    AITER_CHECK(rc >= 0,
+                "moe_sorting_opus_fwd: unsupported shape or dtype (tokens=",
+                num_tokens,
+                ", num_experts=",
+                num_experts,
+                ", topk=",
+                topk,
+                ", dispatch_policy=",
+                dispatch_policy,
+                ")");
 }
 
 namespace aiter::mxfp4_moe {
