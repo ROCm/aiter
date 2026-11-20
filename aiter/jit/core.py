@@ -1990,6 +1990,9 @@ def build_ctypes_module(md_name: str) -> str:
             d_args.get("third_party", []),
             flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
         )
+        # A fresh build under a GPU_ARCHS that omits the running arch must fail
+        # here, as the pybind path does through get_module(), not at the first launch.
+        _needs_arch_rebuild(md_name)
     return so_path
 
 
