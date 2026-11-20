@@ -64,6 +64,23 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
+#: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m:
+#: decode buckets have one m-tile per expert, so the order only decides how
+#: many XCCs read each m-tile's A. Wider tiles keep the global m-major order,
+#: whose neighbouring m-tiles of one expert share B.
+_S1F_XCC_QUEUE_MAX_TILE_M = 64
+
+
+def _s1f_xcc_queues(tile_m: int) -> int:
+    """``AITER_MEGA_S1F_XCC_QUEUE``: auto (default), 0 or 1."""
+    mode = os.environ.get("AITER_MEGA_S1F_XCC_QUEUE", "auto").strip() or "auto"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"AITER_MEGA_S1F_XCC_QUEUE must be auto, 0 or 1, got {mode!r}")
+    if mode == "auto":
+        return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
+    return int(mode)
+
+
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
@@ -75,11 +92,14 @@ _S1F_MAX_RECV = 4096
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+#: Kimi K3 (top-16) on EP8 fuses the same way: at 1024 tokens/rank 418 vs 463
+#: us/layer, at 8192 2113 vs 2159.
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
+    (8, 16): 1 << 30,
 }
 
 
@@ -358,7 +378,11 @@ class _Stage1Fusion:
             if bias is not None and bias.numel() > 0:
                 reasons.append("bias is not supported")
         act = self.d.config.recipe.compute.activation
-        if act not in (ActivationType.Silu, ActivationType.Swiglu):
+        if act not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
             reasons.append(f"activation {act} is not supported")
         if os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0") not in (
             "",
@@ -457,11 +481,29 @@ class _Stage1Fusion:
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        tdm_b_th=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        xcc_queues = _s1f_xcc_queues(tile_m)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            tdm_b_th,
+            xcc_queues,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
@@ -492,6 +534,8 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                tdm_b_th=tdm_b_th,
+                xcc_queues=xcc_queues,
             )
             self.launches[key] = launch
         return launch
@@ -504,7 +548,9 @@ class _Stage1Fusion:
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep, tdm_b_th
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -534,6 +580,7 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                tdm_b_th=tdm_b_th,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -615,7 +662,7 @@ class _Stage1Fusion:
         # The stage-1 kernel runs its own 256x256 n/k tiles.
         got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
-        if bad or stage1_act not in (1, 2) or quant_scale is None:
+        if bad or stage1_act not in (1, 2, 3) or quant_scale is None:
             raise RuntimeError(
                 "AITER_MEGA_S1F: the stage-1 kernel embeds only its variants' "
                 f"GEMM1; mismatches (got, want): {bad}, stage1_act={stage1_act}. "
@@ -649,25 +696,28 @@ class _Stage1Fusion:
                 int(contiguous_m),
                 n_tok,
                 float(swiglu_limit),
+                float(situ_beta),
+                float(situ_linear_beta),
                 fx.Stream(stream),
             )
 
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
         # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
+        keys = {(t, int(stage1_act), q, th) for t, q, th in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), int(tdm_b_th)))
         if not keys <= self.precompiled and (
             not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for t, act, q, th in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, th))
                 self._precompile(
                     launch_args,
                     tile_m=t,
                     group_m=group_m,
                     stage1_act=act,
                     quant_wmma_rep=q,
+                    tdm_b_th=th,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -676,6 +726,7 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            tdm_b_th=int(tdm_b_th),
         )
         self._run(
             launch,
