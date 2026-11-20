@@ -1,0 +1,12 @@
+{
+    "step": {
+        "max_requests_one_launch": 64,
+        "bv": 128
+    },
+    "out": {
+        "bv": 64
+    },
+    "fill": {
+        "num_warps": 4
+    }
+}
