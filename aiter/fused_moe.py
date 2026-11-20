@@ -4844,9 +4844,11 @@ def get_2stage_cfgs(
             and not guard_xbf16
         ):
             logger.warning(
-                f"[fused_moe] discarding tuned asm 1-stage config {guard_kernel1!r} "
-                f"for {keys}: the weights are past 4 GiB and the kernel uses 32-bit "
-                "expert offsets; using default heuristics"
+                "[fused_moe] discarding tuned asm 1-stage config %r for %s: the "
+                "weights are past 4 GiB and the kernel uses 32-bit expert offsets; "
+                "using default heuristics",
+                guard_kernel1,
+                keys,
             )
             cfg = None
 
