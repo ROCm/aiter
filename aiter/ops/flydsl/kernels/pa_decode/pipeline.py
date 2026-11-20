@@ -3511,6 +3511,35 @@ class Gfx1250Mxfp4Pipeline:
         first = 6 - (4 * (j // 4) + 2 * (j % 2))
         return row.shuffle(row, list(range(first, first + 8)))
 
+    def lds_store_operand(self, base, lane, op):
+        """Store an 8-dword WMMA operand in a 1 KB slot as two 16-byte halves at
+        a 16-byte lane stride: conflict-free b128 stores, where a 32-byte lane
+        stride makes each one 2-way bank-conflicted."""
+        for h in range_constexpr(2):
+            self.mem.store(
+                base + h * 512 + lane * 16,
+                fx.Vector.from_elements(
+                    [fx.Int32(op[4 * h + i]) for i in range_constexpr(4)],
+                    dtype=fx.Int32,
+                ),
+                fx.Int32,
+            )
+
+    def lds_load_operand(self, base, lane):
+        """Load an operand ``lds_store_operand`` stored."""
+        halves = [
+            self.mem.load(base + h * 512 + lane * 16, fx.Int32, 4)
+            for h in range_constexpr(2)
+        ]
+        return fx.Vector.from_elements(
+            [
+                fx.Int32(halves[h][i])
+                for h in range_constexpr(2)
+                for i in range_constexpr(4)
+            ],
+            dtype=fx.Int32,
+        )
+
     @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
@@ -3951,10 +3980,10 @@ class Gfx1250Mxfp4Pipeline:
                     packed = self.mem.fp8(probs[c])
                     words.extend([packed[0], packed[1]])
                 # Publish P'' and the rows' alpha (both halves hold it).
-                self.mem.store(
-                    t.dims_p_offset(buf, warp, m) + lane * 32,
+                self.lds_store_operand(
+                    t.dims_p_offset(buf, warp, m),
+                    lane,
                     fx.Vector.from_elements(words, dtype=fx.Int32),
-                    fx.Int32,
                 )
                 self.mem.store(
                     t.dims_alpha_offset(buf, warp, m) + lane16 * 4, alpha, fx.Float32
@@ -3986,7 +4015,7 @@ class Gfx1250Mxfp4Pipeline:
             for m in range_constexpr(tiles):
                 out = [state[m * self.STATE + 2 + i] for i in range_constexpr(8)]
                 p_ops = [
-                    self.mem.load(t.dims_p_offset(buf, p, m) + lane * 32, fx.Int32, 8)
+                    self.lds_load_operand(t.dims_p_offset(buf, p, m), lane)
                     for p in range_constexpr(4)
                 ]
                 alphas = [
@@ -4341,17 +4370,13 @@ class Gfx1250Mxfp4Pipeline:
                     )
                     words.extend([packed[0], packed[1]])
                 own_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
-                self.mem.store(
-                    ((buf * 2 + part) * 8 + pair * 4 + jj) * 1024 + lane * 32,
-                    own_ops[jj],
-                    fx.Int32,
+                self.lds_store_operand(
+                    ((buf * 2 + part) * 8 + pair * 4 + jj) * 1024, lane, own_ops[jj]
                 )
             gpu.barrier()
             other_ops = [
-                self.mem.load(
-                    ((buf * 2 + part) * 8 + (1 - pair) * 4 + jj) * 1024 + lane * 32,
-                    fx.Int32,
-                    8,
+                self.lds_load_operand(
+                    ((buf * 2 + part) * 8 + (1 - pair) * 4 + jj) * 1024, lane
                 )
                 for jj in range_constexpr(4)
             ]
