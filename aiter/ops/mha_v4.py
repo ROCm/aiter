@@ -1845,7 +1845,9 @@ def mha_v4_packed(
     four-element one, which adds the V and V-scale plane strides; the mxfp4 row's five-element one
     adds its K-scale plane stride after them. The mxfp8, bf16fp8 and bf16 rows take
     sol_tilt_scaled_params' three-element tensor: the same value shift and score multiplier, plus
-    the row's second plane stride.
+    the row's second plane stride. The head_dim 256 bf16, mxfp8, mxfp6 and mxfp4 rows take the
+    same tensors as their hd128 rows; the hd256 mxfp8 row's K is packed with its scales, so its
+    second stride is its V planes'.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     pooled = _sol_attn_triple(mean_k, mean_v, block_bitmap)

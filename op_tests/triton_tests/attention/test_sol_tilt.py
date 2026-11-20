@@ -112,7 +112,7 @@ def _plane(view, stride_bytes, index):
     return view.as_strided(view.shape, view.stride(), view.storage_offset() + step)
 
 
-def _planted_kv(batch, seqlen_k, heads, rank, seed=0):
+def _planted_kv(batch, seqlen_k, heads, rank, seed=0, head_dim=HEAD_DIM):
     """BF16 K and V in real units whose block covariance has a clear rank-`rank` part.
 
     Each token draws `rank` shared factors that drive both K and V along fixed per-head
@@ -126,16 +126,16 @@ def _planted_kv(batch, seqlen_k, heads, rank, seed=0):
 
     strength = 4.0 / torch.arange(1, rank + 1, dtype=torch.float32, device="cuda")
     z = randn(batch, seqlen_k, heads, rank) * strength
-    k_dirs = randn(heads, rank, HEAD_DIM)
-    v_dirs = randn(heads, rank, HEAD_DIM)
+    k_dirs = randn(heads, rank, head_dim)
+    v_dirs = randn(heads, rank, head_dim)
     k = torch.einsum("bshr,hrd->bshd", z, k_dirs) + 0.3 * randn(
-        batch, seqlen_k, heads, HEAD_DIM
+        batch, seqlen_k, heads, head_dim
     )
     v = torch.einsum("bshr,hrd->bshd", z, v_dirs) + 0.3 * randn(
-        batch, seqlen_k, heads, HEAD_DIM
+        batch, seqlen_k, heads, head_dim
     )
-    k = k + randn(1, 1, heads, HEAD_DIM)
-    v = v + randn(1, 1, heads, HEAD_DIM)
+    k = k + randn(1, 1, heads, head_dim)
+    v = v + randn(1, 1, heads, head_dim)
     return k.to(torch.bfloat16), v.to(torch.bfloat16)
 
 
@@ -163,6 +163,11 @@ def _mx(x):
     return codes.flatten(-2), scale, dequantized.flatten(-2).to(torch.bfloat16)
 
 
+def _k_packed(k_format, head_dim):
+    """Whether k_format's K is packed at head_dim, so its tilt planes cannot be decoded here."""
+    return k_format in PACKED_K or (k_format == "mxfp8" and head_dim == 256)
+
+
 def make_tilt_inputs(
     k_format,
     v_format,
@@ -176,20 +181,22 @@ def make_tilt_inputs(
     softmax_scale=0.125,
     q_multiplier=1.0,
     seed=0,
+    head_dim=HEAD_DIM,
 ):
     """The keyword arguments of sol_tilt_planes for one recipe, from sol_prepare's pooled K/V.
 
     K and V are planted as in _planted_kv and encoded in k_format and v_format. The factors are
     taken in the basis the kernel holds K and V in: the stored codes of a per-tensor format, the
-    dequantized MXFP8 K, and the BF16 source of a packed format. Q is BF16 in that basis.
+    dequantized MXFP8 K, and the BF16 source of a packed format (an hd256 MXFP8 K is packed). Q is
+    BF16 in that basis.
     """
-    k_real, v_real = _planted_kv(batch, seqlen_k, heads, rank, seed)
+    k_real, v_real = _planted_kv(batch, seqlen_k, heads, rank, seed, head_dim)
     q = torch.randn(
-        (batch, seqlen_q, heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+        (batch, seqlen_q, heads, head_dim), dtype=torch.bfloat16, device="cuda"
     )
     prepare = {"BLOCK_N": kv_tile}
     k_descale = v_descale = 1.0
-    if k_format in PACKED_K:
+    if _k_packed(k_format, head_dim):
         k_quant = k_basis = k_real
         prepare.update(k_source=k_real, k_packed_format=k_format)
     elif k_format == "mxfp8":
@@ -316,11 +323,19 @@ def _assert_operator(got, want, k_format, v_format):
     assert abs(scale - 1) < 0.012, f"tilt operator scale {scale}"
 
 
+@pytest.mark.parametrize("head_dim", [HEAD_DIM, 256])
 @pytest.mark.parametrize("v_format", ["e4m3", "bf16"])
 @pytest.mark.parametrize("k_format", ["e4m3", "int8", "bf16", "mxfp8"])
-def test_tilt_planes_decode_to_the_truncated_block_covariance(k_format, v_format):
+def test_tilt_planes_decode_to_the_truncated_block_covariance(
+    k_format, v_format, head_dim
+):
+    if _k_packed(k_format, head_dim):
+        pytest.skip("a packed K's planes are checked for layout instead")
     inputs = make_tilt_inputs(
-        k_format, v_format, q_multiplier=2.0 if k_format == "mxfp8" else 1.0
+        k_format,
+        v_format,
+        q_multiplier=2.0 if k_format == "mxfp8" else 1.0,
+        head_dim=head_dim,
     )
     # The operator is in real Q units, so Q's descale and multiplier cancel out of it.
     planes = sol_tilt_planes(**inputs, q_descale=0.5)
@@ -371,28 +386,35 @@ def test_tilt_planes_pad_each_mxfp8_k_scale_plane_to_a_whole_scale_tile():
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "k_format, v_format",
+    "k_format, v_format, head_dim",
     [
-        ("mxfp6", "mxfp6_fp6_p"),
-        ("mxfp6", "mxfp4_fp6_p"),
-        ("mxfp4", "mxfp4_fp6_p"),
-        ("e4m3", "mxfp6_fp6_p"),
+        ("mxfp6", "mxfp6_fp6_p", HEAD_DIM),
+        ("mxfp6", "mxfp4_fp6_p", HEAD_DIM),
+        ("mxfp4", "mxfp4_fp6_p", HEAD_DIM),
+        ("e4m3", "mxfp6_fp6_p", HEAD_DIM),
+        ("mxfp8", "e4m3", 256),
+        ("mxfp6", "mxfp6_fp6_p", 256),
+        ("mxfp4", "mxfp4_fp6_p", 256),
     ],
 )
-def test_packed_tilt_planes_keep_plane_zero_and_the_packers_backing(k_format, v_format):
+def test_packed_tilt_planes_keep_plane_zero_and_the_packers_backing(
+    k_format, v_format, head_dim
+):
     """Plane 0 is the pooled operand packed again; the planes share one allocation, and the
     last plane keeps the zeroed backing its packer reserves for the reads past its end.
     """
     with _poisoned_allocations():
-        inputs = make_tilt_inputs(k_format, v_format)
+        inputs = make_tilt_inputs(k_format, v_format, head_dim=head_dim)
         planes = sol_tilt_planes(**inputs)
     assert torch.equal(planes.mean_k, inputs["mean_k"])
     assert torch.equal(planes.mean_v, inputs["mean_v"])
-    pairs = [
-        ("mean_v", planes.mean_v, planes.v_plane_stride),
-        ("mean_v_scale", planes.mean_v_scale, planes.v_scale_plane_stride),
-    ]
-    if k_format in PACKED_K:
+    pairs = []
+    if v_format in PACKED_V:
+        pairs += [
+            ("mean_v", planes.mean_v, planes.v_plane_stride),
+            ("mean_v_scale", planes.mean_v_scale, planes.v_scale_plane_stride),
+        ]
+    if _k_packed(k_format, head_dim):
         pairs += [
             ("mean_k", planes.mean_k, planes.k_plane_stride),
             ("mean_k_scale", planes.mean_k_scale, planes.k_scale_plane_stride),
@@ -409,9 +431,13 @@ def test_packed_tilt_planes_keep_plane_zero_and_the_packers_backing(k_format, v_
         packed_slack = _bytes(packed)[stride:]
         assert slack.numel() == packed_slack.numel(), name
         assert not slack[packed_slack == 0].any(), name
-        # The V and MXFP4 K scale readers run past their last row; the MXFP6 K reader takes its
-        # scales from the records' tile tails, never from this image.
-        if name == "mean_v_scale" or (name == "mean_k_scale" and k_format == "mxfp4"):
+        # The hd128 V and MXFP4 K scale readers run past their last row; the MXFP6 K reader takes
+        # its scales from the records' tile tails, never from this image. The hd256 readers are
+        # bounded by the image.
+        reads_past = name == "mean_v_scale" or (
+            name == "mean_k_scale" and k_format == "mxfp4"
+        )
+        if reads_past and head_dim == HEAD_DIM:
             assert packed_slack.numel() and not packed_slack.any(), name
 
 
