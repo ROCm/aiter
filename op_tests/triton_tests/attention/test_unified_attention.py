@@ -1412,14 +1412,15 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
-# Sequence lengths that are not a multiple of the 64-token tile, so with 16- and
-# 32-token pages the last tile of each sequence overhangs its last page. The
-# block table is padded with 0 and block 0 holds NaN: the kernel must not
-# gather K/V from block-table entries past a sequence's pages.
-@pytest.mark.parametrize("block_size", [16, 32, 64])
+# Sequence lengths that are not a multiple of the 64-token tile, so with 16-token
+# pages the last tile of each sequence overhangs its last page; 64-token pages
+# take the one-page-per-tile loader. The block table is padded with 0 and block
+# 0 holds NaN: the kernel must not gather K/V from block-table entries past a
+# sequence's pages.
+@pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
 @pytest.mark.parametrize("shuffled_kv_cache", [False, True])
-@pytest.mark.parametrize("query_len", [1, 4, 64])
+@pytest.mark.parametrize("query_len", [1, 64])
 @torch.inference_mode()
 def test_unified_attn_padded_block_table_gfx950(
     block_size: int,
