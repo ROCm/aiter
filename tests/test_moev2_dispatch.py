@@ -79,8 +79,11 @@ def live_chip_info():
     from aiter.jit.utils import chip_info
 
     def clear():
-        chip_info.get_gfx.cache_clear()
-        chip_info.get_gfx_custom_op_core.cache_clear()
+        # A test may have replaced one of these; whatever stands in needs no clearing.
+        for name in ("get_gfx", "get_gfx_custom_op_core"):
+            cache_clear = getattr(getattr(chip_info, name), "cache_clear", None)
+            if cache_clear is not None:
+                cache_clear()
 
     clear()
     try:
@@ -551,12 +554,15 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
 
 
 def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_info):
+    """A multi-target build: get_gfx() names an arch the path declines, the GPU is one
+    it claims. Setting GPU_ARCHS would not do: `get_gfx_custom_op` caches a layer below
+    the two caches this can clear, so what it returns then depends on the environment.
+    """
     from aiter.moev2.migration import a8w8_pt
 
-    monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx1250")
-    live_chip_info.get_gfx.cache_clear()
-    live_chip_info.get_gfx_custom_op_core.cache_clear()
-    assert live_chip_info.get_gfx() == "gfx1250"
+    for module in (live_chip_info, a8w8_pt):
+        if hasattr(module, "get_gfx"):  # also catch a path that imports it for itself
+            monkeypatch.setattr(module, "get_gfx", lambda: "gfx1250")
     monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
     assert a8w8_pt.claims(_per_tensor_op_call())
 
