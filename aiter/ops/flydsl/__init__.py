@@ -97,6 +97,22 @@ _LAZY_IMPORTS = {
         ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
+    "flydsl_lm_head_gemm": (".lm_head_gemm", "flydsl_lm_head_gemm"),
+    "lm_head_gemm_preferred": (".lm_head_gemm", "lm_head_gemm_preferred"),
+    "lm_head_gemm_supported": (".lm_head_gemm", "lm_head_gemm_supported"),
+    "warmup_lm_head_gemm": (".lm_head_gemm", "warmup_lm_head_gemm"),
+    "flydsl_markov_chain_sample": (
+        ".markov_chain_sample",
+        "flydsl_markov_chain_sample",
+    ),
+    "markov_chain_sample_supported": (
+        ".markov_chain_sample",
+        "markov_chain_sample_supported",
+    ),
+    "warmup_markov_chain_sample": (
+        ".markov_chain_sample",
+        "warmup_markov_chain_sample",
+    ),
     "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
@@ -272,6 +288,8 @@ __all__ = [
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
+    "flydsl_lm_head_gemm",
+    "flydsl_markov_chain_sample",
     "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
@@ -287,7 +305,10 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "lm_head_gemm_preferred",
+    "lm_head_gemm_supported",
     "make_fp4_mqa_plan",
+    "markov_chain_sample_supported",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
     "minimax_m3_index_score_flydsl_supported",
@@ -311,6 +332,8 @@ __all__ = [
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
+    "warmup_lm_head_gemm",
+    "warmup_markov_chain_sample",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
