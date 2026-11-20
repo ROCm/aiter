@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Offline builder for the pre-compiled OPUS kernels (gfx1250 a16w16_4wave*_co, gfx950 a16w16_4wave*).
+"""Offline builder for gfx1250 and gfx950 pre-compiled kernels.
 
 ``--arch gfx1250`` (default) builds the gfx1250 4-wave CO families described
-below. ``--arch gfx950`` builds the gfx950 a16w16 4-wave family
-(``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
-``a16w16_4wave_ws``): one image per (kid, layout NT/NN/TT/TN); see ``_build_gfx950``.
+below. ``--arch gfx950`` builds one gfx950 family, chosen by ``--family``:
+``a8w8_blockscale_bpreshuffle`` (default) or ``a16w16``, the a16w16 4-wave
+family (``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
+``a16w16_4wave_ws``): one image per (kid, layout NT/NN/TT/TN); see
+``_build_a16w16_gfx950``.
 
 Why this exists
 ---------------
@@ -26,14 +28,21 @@ goes through the ordinary JIT path.
 
 Source of truth
 ---------------
-``gen_co/co_kernels.json`` -- read by ``opus_gemm_common.py`` to build the kid
-table (which drives the JIT codegen) and re-read from there by this script. One
+CO manifests are read by ``opus_gemm_common.py`` to build the kid table (which
+drives the JIT codegen) and re-read from there by this script. One
 file describes each variant's tile, cluster, launch bounds, VGPR budget, dtypes
 and device flags, so adding a variant never touches Python. Both sides spell the
 traits through ``co_traits_args()``, which is what makes the three names
 identical without any sidecar::
 
     .co filename == extern "C" symbol inside the .co == host launcher symbol
+
+gfx950 uses short image/launcher names while retaining each verified ELF symbol.
+Its manifest is
+``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``. Its images and
+build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``; the
+a16w16 4-wave images live in ``gen_co/gfx950/a16w16/``.
+The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
 ---------------------------------------
@@ -58,7 +67,7 @@ stay identical whichever toolchain is selected.
 
 gfx950::
 
-    python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 \\
+    python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 --family a16w16 \\
         --llvm-bin /path/to/amdgpu-pin-llvm/bin --fail-on-spill
 """
 
@@ -67,6 +76,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -94,6 +104,7 @@ from codegen.gen_instances_gfx1250 import (
 from opus_gemm_common import (
     a16w16_4wave_co_images,
     gfx950_a16w16_4wave_kernels_declared,
+    gfx950_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
 )
 
@@ -120,9 +131,20 @@ _PIPELINE_HEADERS = {
 # body -- they describe the kernel entry point. extern "C" is what makes the
 # symbol name predictable enough to equal the filename.
 #
+# Both architectures and the gfx950 short entry use the same kernel wrapper.
+_KERNEL_TEMPLATE = """extern "C" __global__ __launch_bounds__({lb_threads}, {lb_waves})
+{attributes}void {symbol}({kargs_name} kargs)
+{{
+#ifdef __HIP_DEVICE_COMPILE__
+    {body_func}<{body_args}>(kargs);
+#else
+    (void)kargs;
+#endif
+}}
+"""
+
 # __cluster_dims__ is defined by hip_minimal only under __gfx1250__, i.e. only
-# on the device pass; the declaration below is parsed on both, so define it for
-# the host pass too (same workaround the JIT host TU uses).
+# on the device pass; define it for the host pass too.
 _STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -152,18 +174,7 @@ _STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 
 using CoTraits = {traits_name}<{traits_args}>;
 
-extern "C" __global__ __launch_bounds__({lb_threads}, {lb_waves})
-OPUS_CO_NUM_VGPR
-__cluster_dims__({cwm}, {cwn}, 1)
-void {symbol}({kargs_name} kargs)
-{{
-#ifdef __HIP_DEVICE_COMPILE__
-    {body_func}<CoTraits>(kargs);
-#else
-    (void)kargs;
-#endif
-}}
-"""
+""" + _KERNEL_TEMPLATE
 
 _BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
 
@@ -172,7 +183,42 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
 
-def _tool(llvm_bin, name, fallback_env=None):
+def _compile(args, llvm_bin, device_flags, source, output, extra):
+    # Preserve the existing flags before the includes for each architecture.
+    entry_flags = (
+        ["-DOPUS_ENABLE_RUNTIME_QUERY=0"]
+        if args.offload_arch == "gfx950"
+        else ["-Werror=ignored-attributes"]
+    )
+    env = dict(os.environ)
+    if llvm_bin:
+        env["HIP_CLANG_PATH"] = llvm_bin
+    proc = _run(
+        [
+            *shlex.split(args.hipcc),
+            "-x",
+            "hip",
+            f"--offload-arch={args.offload_arch}",
+            "-std=c++20",
+            "-O3",
+            # Keep HIP's implicit runtime wrapper and hidden kernargs disabled.
+            "-D__HIPCC_RTC__",
+            *entry_flags,
+            f"-I{_CSRC_DIR}/include",
+            f"-I{_OPUS_GEMM_DIR}/include",
+            *device_flags,
+            *extra,
+            "-o",
+            output,
+            source,
+        ],
+        env=env,
+    )
+    if proc.stderr.strip():
+        sys.stderr.write(proc.stderr)
+
+
+def _tool(llvm_bin, name):
     """Resolve an LLVM tool, preferring the selected toolchain so the metadata
     reader and the disassembler are the same version as the compiler -- a older
     llvm-objdump cannot decode gfx1250's newer opcodes."""
@@ -180,8 +226,6 @@ def _tool(llvm_bin, name, fallback_env=None):
         cand = os.path.join(llvm_bin, name)
         if os.path.exists(cand):
             return cand
-    if fallback_env and os.environ.get(fallback_env):
-        return os.environ[fallback_env]
     found = shutil.which(name)
     if found:
         return found
@@ -220,7 +264,7 @@ def _elf_target_metadata(path, offload_arch):
     machine = int.from_bytes(header[18:20], "little")
     flags = int.from_bytes(header[48:52], "little")
     processor = flags & 0xFF
-    expected = {"gfx1250": 0x49, "gfx1250-strict": 0xEB, "gfx950": 0x4F}[offload_arch]
+    expected = {"gfx950": 0x4F, "gfx1250": 0x49, "gfx1250-strict": 0xEB}[offload_arch]
     if machine != 224 or processor != expected:
         raise SystemExit(
             f"build_co: {path} target mismatch: machine={machine}, "
@@ -244,17 +288,23 @@ def _device_link_metadata(readelf, path):
     return {"undefined_symbols": []}
 
 
-def _kernel_metadata(readelf, path, symbol):
+def _kernel_metadata(readelf, path, symbol, extra_keys=(), *, expected_symbols=None):
     """Pull (.vgpr_count, .sgpr_count, .group_segment_fixed_size,
     .kernarg_segment_size) for `symbol` out of the AMDGPU note."""
     out = _run([readelf, "--notes", path]).stdout
-    # One kernel per .co, so a flat scan is enough -- but assert that, because
-    # a second kernel would make the numbers ambiguous.
     names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
-    if names != [symbol]:
+    expected = list(expected_symbols or (symbol,))
+    if len(names) != len(expected) or set(names) != set(expected):
         raise SystemExit(
-            f"build_co: {os.path.basename(path)} should contain exactly one "
-            f"kernel named {symbol!r}, found {names!r}"
+            f"build_co: {os.path.basename(path)} should contain kernels "
+            f"{expected!r}, found {names!r}"
+        )
+    # Kernel records start at indentation two; argument records are nested.
+    if len(names) > 1:
+        out = next(
+            block
+            for block in re.split(r"(?m)^  - (?=\.)", out)[1:]
+            if re.search(rf"^\s*\.name:\s*{re.escape(symbol)}\s*$", block, re.MULTILINE)
         )
     fields = {}
     for key in (
@@ -264,12 +314,197 @@ def _kernel_metadata(readelf, path, symbol):
         "sgpr_spill_count",
         "group_segment_fixed_size",
         "kernarg_segment_size",
-    ):
-        m = re.search(rf"^\s*\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
+    ) + extra_keys:
+        m = re.search(rf"^\s*(?:-\s*)?\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
         if m is None:
             raise SystemExit(f"build_co: .{key} missing from {path} metadata")
         fields[key] = int(m.group(1))
     return fields
+
+
+_GFX950_STUB_TEMPLATE = """// Auto-generated by gen_co/build_co.py for gfx950.
+#include "gfx950/{traits_header}"
+
+#ifdef __HIP_DEVICE_COMPILE__
+#include "gfx950/{pipeline_header}"
+#endif
+
+using CoTraits = {traits_type};
+
+""" + _KERNEL_TEMPLATE
+
+
+def _check_gfx950_pin(
+    entry, path, llvm_bin, *, fail_on_spill=False, expected_symbols=None
+):
+    fields = _kernel_metadata(
+        _tool(llvm_bin, "llvm-readelf"),
+        path,
+        entry["symbol"],
+        ("agpr_count", "private_segment_fixed_size"),
+        expected_symbols=expected_symbols,
+    )
+    if any(
+        fields[key]
+        for key in (
+            "vgpr_spill_count",
+            "sgpr_spill_count",
+            "private_segment_fixed_size",
+        )
+    ):
+        message = f"register spill/scratch for {entry['symbol']}: {fields}"
+        if fail_on_spill:
+            raise ValueError(message)
+        print(f"[build_co] warning: {message}", file=sys.stderr)
+    mask = entry.get("pin_mask", 0)
+    if not mask:
+        return fields
+    asm = _run(
+        [
+            _tool(llvm_bin, "llvm-objdump"),
+            "-d",
+            "--mcpu=gfx950",
+            f"--disassemble-symbols={entry['symbol']}",
+            path,
+        ]
+    ).stdout
+    reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
+    bm, bn, bk = entry["tile"]
+    wm, wn = entry["wave_layout"]
+    a_regs = bm // (wm * 16) * (bk // 128) * 8
+    if entry["pipeline"] == "pingpong_lds":
+        a_regs = min(bm // (wm * 16), 3) * 8
+    b_regs = bn // (wn * 16) * 8
+    for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
+        if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
+            raise ValueError(
+                f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
+            )
+    if mask & 4:
+        mmas = [
+            line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")
+            for line in asm.splitlines()
+            if "v_mfma_scale_" in line
+        ]
+        seen = set()
+        if not mmas:
+            raise ValueError("pin C: no MFMA instructions")
+        for op in mmas:
+            # The first write may share a zero accumulator from initialization.
+            # Subsequent updates must keep each C/D fragment in place.
+            if not op[0].startswith("a[") or (op[0] in seen and op[0] != op[3]):
+                raise ValueError("pin C: MFMA C/D are not the same AGPRs")
+            seen.add(op[0])
+    return fields
+
+
+def build_one_gfx950(entry, args, llvm_bin, workdir):
+    symbol = entry["symbol"]
+    output = os.path.join(args.out_dir, entry["image"])
+    staged = os.path.join(workdir, entry["image"])
+    device_flags = list(entry["device_flags"]) + list(args.device_flag)
+    if entry.get("pin_variant"):
+        device_flags += ["-Werror=unknown-attributes", "-Werror=ignored-attributes"]
+    try:
+        stub_path = os.path.join(workdir, entry["name"] + ".hip")
+        traits = entry["traits"]
+        traits_type = traits["name"] + "<" + ", ".join(traits["args"]) + ">"
+        with open(stub_path, "w") as stream:
+            stream.write(
+                _GFX950_STUB_TEMPLATE.format(
+                    traits_header=entry.get(
+                        "traits_header",
+                        entry["pipeline_header"].replace("_pipeline_", "_traits_", 1),
+                    ),
+                    pipeline_header=entry["pipeline_header"],
+                    traits_type=traits_type,
+                    attributes="",
+                    kargs_name="opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
+                    body_func=entry["body_func"],
+                    body_args=", ".join(entry["body_args"]),
+                    symbol=symbol,
+                    lb_threads=entry["launch_bounds"][0],
+                    lb_waves=entry["launch_bounds"][1],
+                )
+            )
+            if entry.get("short_symbol"):
+                publication = (
+                    "CoTraits::PUBLISH_M"
+                    if entry["pipeline"] == "prefetch_b_vgpr_overlap"
+                    else "-1"
+                )
+                stream.write(
+                    "\nusing ShortCoTraits = opus_gemm_bpreshuffle_b_short_traits<CoTraits>;\n"
+                    + _KERNEL_TEMPLATE.format(
+                        attributes="",
+                        kargs_name="opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
+                        body_func="opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+                        body_args=f"ShortCoTraits, {publication}, true",
+                        symbol=entry["short_symbol"],
+                        lb_threads=entry["launch_bounds"][0],
+                        lb_waves=entry["launch_bounds"][1],
+                    )
+                )
+        print(f"[build_co] compiling {entry['image']}", flush=True)
+        _compile(args, llvm_bin, device_flags, stub_path, staged, ["--genco"])
+        _unbundle_if_needed(staged, llvm_bin, args.offload_arch)
+        image = staged
+        symbols = (
+            (symbol, entry["short_symbol"]) if entry.get("short_symbol") else (symbol,)
+        )
+        resources = _check_gfx950_pin(
+            entry,
+            image,
+            llvm_bin,
+            fail_on_spill=args.fail_on_spill,
+            expected_symbols=symbols,
+        )
+        if entry.get("short_symbol"):
+            resources["short_kernel"] = _check_gfx950_pin(
+                {**entry, "symbol": entry["short_symbol"]},
+                image,
+                llvm_bin,
+                fail_on_spill=args.fail_on_spill,
+                expected_symbols=symbols,
+            )
+            if resources["short_kernel"]["kernarg_segment_size"] != 96:
+                raise ValueError(
+                    f"gfx950 kid {entry['kid']} short loop requires a 96-byte kernel ABI"
+                )
+        if resources["kernarg_segment_size"] != 96:
+            raise ValueError(f"gfx950 kid {entry['kid']} requires a 96-byte kernel ABI")
+        target = _elf_target_metadata(image, args.offload_arch)
+        linked = _device_link_metadata(_tool(llvm_bin, "llvm-readelf"), image)
+        with open(image, "rb") as stream:
+            checksum = hashlib.sha256(stream.read()).hexdigest()
+        os.replace(staged, output)
+        record = {
+            "kid": entry["kid"],
+            "name": entry["name"],
+            "image": entry["image"],
+            "symbol": symbol,
+            "status": "ready",
+            "device_flags": device_flags,
+            "co_sha256": checksum,
+            **target,
+            **linked,
+            **resources,
+        }
+        return record
+    except subprocess.CalledProcessError as error:
+        diagnostics = (error.stdout or "") + (error.stderr or "")
+        sys.stderr.write(diagnostics)
+        if not entry.get("pin_variant"):
+            raise SystemExit(
+                f"build_co: compilation failed for gfx950 kid {entry['kid']}"
+            ) from error
+        return {
+            "kid": entry["kid"],
+            "status": "rejected",
+            "reason": diagnostics.strip(),
+        }
+    except ValueError as error:
+        return {"kid": entry["kid"], "status": "rejected", "reason": str(error)}
 
 
 def _expected_lds(k, no_pad=False):
@@ -469,13 +704,16 @@ def build_one(k, args, llvm_bin, workdir):
                 traits_args=co_traits_args(k),
                 kargs_name=KARGS_NAME_MAP[k.kernel_tag],
                 body_func=KERNEL_FUNC_MAP[k.kernel_tag],
+                body_args="CoTraits",
                 symbol=symbol,
                 lb_threads=k.BLOCK_SIZE,
                 lb_waves=k.co_min_waves_per_eu,
+                attributes=(
+                    "OPUS_CO_NUM_VGPR\n"
+                    f"__cluster_dims__({k.cluster_wg_m}, {k.cluster_wg_n}, 1)\n"
+                ),
                 want_num_vgpr=1 if k.co_num_vgpr else 0,
                 num_vgpr=k.co_num_vgpr or 0,
-                cwm=k.cluster_wg_m,
-                cwn=k.cluster_wg_n,
             )
         )
 
@@ -486,48 +724,13 @@ def build_one(k, args, llvm_bin, workdir):
         # or OCKL. Installed ROCm SDKs need not ship isa_version_1250s bitcode.
         # Keep the real strict CPU/ELF identity; verify no undefined symbols below.
         device_flags.append("-nogpulib")
-    # Everything except the output mode and the input, so the -S pass below is
-    # byte-for-byte the same compilation.
-    common = [
-        *args.hipcc.split(),
-        "-x",
-        "hip",
-        f"--offload-arch={args.offload_arch}",
-        "-std=c++20",
-        "-O3",
-        # Skips the implicit __clang_hip_runtime_wrapper.h on the host pass. It
-        # also keeps the kernel free of HIP's hidden/implicit kernargs, which is
-        # what lets the runtime launch it through HIP_LAUNCH_PARAM_BUFFER_POINTER
-        # like the hand-written asm .co files.
-        "-D__HIPCC_RTC__",
-        # A dropped placement/entry attribute is not an acceptable CO build.
-        "-Werror=ignored-attributes",
-        f"-I{_CSRC_DIR}/include",
-        f"-I{_OPUS_GEMM_DIR}/include",
-        *device_flags,
-    ]
-    env = dict(os.environ)
-    if llvm_bin:
-        env["HIP_CLANG_PATH"] = llvm_bin
 
     def run_compile(extra, out, what):
-        proc = subprocess.run(
-            [*common, *extra, "-o", out, stub_path],
-            capture_output=True,
-            text=True,
-            env=env,
-            # The failure path prints hipcc's own diagnostics before exiting;
-            # CalledProcessError would hide them behind a traceback.
-            check=False,
-        )
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stdout)
-            sys.stderr.write(proc.stderr)
-            raise SystemExit(f"build_co: hipcc failed for {symbol} ({what})")
-        if proc.stderr.strip():
-            # Warnings are worth seeing: a dropped attribute here is exactly the
-            # failure mode this whole offline path exists to avoid.
-            sys.stderr.write(proc.stderr)
+        try:
+            _compile(args, llvm_bin, device_flags, stub_path, out, extra)
+        except subprocess.CalledProcessError as error:
+            sys.stderr.write((error.stdout or "") + (error.stderr or ""))
+            raise SystemExit(f"build_co: hipcc failed for {symbol} ({what})") from None
 
     print(f"[build_co] compiling {symbol}")
     run_compile(["--genco"], out_path, "genco")
@@ -640,9 +843,9 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
-def _default_co_output_dir(arch, offload_arch):
+def _default_co_output_dir(arch, offload_arch, family):
     if arch == "gfx950":
-        return os.path.join(_HERE, "gfx950", "a16w16")
+        return os.path.join(_HERE, arch, family)
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
@@ -658,10 +861,10 @@ def _default_co_output_dir(arch, offload_arch):
 # images, chosen at runtime from the tensor strides (layout):
 # <kid symbol>_<nt|nn|tt|tn>. Each image's extern "C" entry wraps the
 # header's gemm_a16w16_4wave_body<Traits> with the traits' launch bounds.
-_GFX950_STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
+_A16W16_GFX950_STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Auto-generated by csrc/opus_gemm/gen_co/build_co.py --arch gfx950. Do not edit or commit.
+// Auto-generated by csrc/opus_gemm/gen_co/build_co.py --arch gfx950 --family a16w16. Do not edit or commit.
 #include "gfx950/opus_gemm_pipeline_a16w16_4wave_gfx950.cuh"
 
 using CoTraits = opus_gemm_a16w16_4wave_traits_gfx950<{bm}, {bn}, {a_t}, {b_t}, {splitk}>;
@@ -678,10 +881,10 @@ void {symbol}(opus_gemm_a16w16_4wave_kargs_gfx950 kargs)
 """
 
 # sizeof(opus_gemm_a16w16_4wave_kargs_gfx950): 4 pointers + 13 ints, padded to 8 bytes.
-_GFX950_KARGS_BYTES = (4 * 8 + 13 * 4 + 7) // 8 * 8
+_A16W16_GFX950_KARGS_BYTES = (4 * 8 + 13 * 4 + 7) // 8 * 8
 
 
-def _gfx950_jobs(instances):
+def _a16w16_gfx950_jobs(instances):
     jobs = []
     for kid, k in instances:
         splitk = k.kernel_tag == "a16w16_4wave_ws"
@@ -704,13 +907,13 @@ def _cpp_bool(value):
     return "true" if value else "false"
 
 
-def build_one_gfx950(job, args, llvm_bin, workdir):
+def build_one_a16w16_gfx950(job, args, llvm_bin, workdir):
     k = job["instance"]
     symbol = job["symbol"]
     stub_path = os.path.join(workdir, f"{symbol}.cc")
     with open(stub_path, "w") as f:
         f.write(
-            _GFX950_STUB_TEMPLATE.format(
+            _A16W16_GFX950_STUB_TEMPLATE.format(
                 bm=k.B_M,
                 bn=k.B_N,
                 a_t=_cpp_bool(job["a_t"]),
@@ -766,10 +969,10 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
     target_md = _elf_target_metadata(out_path, args.offload_arch)
     target_md.update(_device_link_metadata(readelf, out_path))
 
-    if md["kernarg_segment_size"] != _GFX950_KARGS_BYTES:
+    if md["kernarg_segment_size"] != _A16W16_GFX950_KARGS_BYTES:
         raise SystemExit(
             f"build_co: {symbol} kernarg mismatch: .co says "
-            f"{md['kernarg_segment_size']}, host ABI requires {_GFX950_KARGS_BYTES}"
+            f"{md['kernarg_segment_size']}, host ABI requires {_A16W16_GFX950_KARGS_BYTES}"
         )
     if md["vgpr_spill_count"] or md["sgpr_spill_count"]:
         msg = (
@@ -810,19 +1013,21 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
     return info
 
 
-def _build_gfx950(p, args, llvm_bin):
+def _build_a16w16_gfx950(p, args, llvm_bin):
     declared = gfx950_a16w16_4wave_kernels_declared
     instances = sorted(declared.items())
     if args.kids:
         try:
-            selected = {int(kid.strip()) for kid in args.kids.split(",")}
+            selected = {
+                int(kid.strip()) for token in args.kids for kid in token.split(",")
+            }
         except ValueError:
-            p.error("--kids must be a comma-separated list of integer kids")
+            p.error("--kids must contain integer kids separated by spaces or commas")
         unknown = selected - set(declared)
         if unknown:
             p.error(f"unknown gfx950 4wave kids: {sorted(unknown)}")
         instances = [(kid, k) for kid, k in instances if kid in selected]
-    jobs = _gfx950_jobs(instances)
+    jobs = _a16w16_gfx950_jobs(instances)
     if not jobs:
         raise SystemExit(
             "build_co: no gfx950 entries -- check gen_co/co_kernels_gfx950_bf16.json"
@@ -831,7 +1036,7 @@ def _build_gfx950(p, args, llvm_bin):
     workdir = tempfile.mkdtemp(prefix="opus_build_co_gfx950_")
     try:
         if n_jobs == 1:
-            built = [build_one_gfx950(j, args, llvm_bin, workdir) for j in jobs]
+            built = [build_one_a16w16_gfx950(j, args, llvm_bin, workdir) for j in jobs]
         else:
             from concurrent.futures import ThreadPoolExecutor
 
@@ -839,7 +1044,8 @@ def _build_gfx950(p, args, llvm_bin):
             with ThreadPoolExecutor(max_workers=n_jobs) as pool:
                 built = list(
                     pool.map(
-                        lambda j: build_one_gfx950(j, args, llvm_bin, workdir), jobs
+                        lambda j: build_one_a16w16_gfx950(j, args, llvm_bin, workdir),
+                        jobs,
                     )
                 )
     finally:
@@ -888,21 +1094,27 @@ def main():
     )
     p.add_argument(
         "--llvm-bin",
-        "--pin-llvm-bin",  # old spelling, kept working
         dest="llvm_bin",
-        default=os.environ.get("OPUS_CO_LLVM_BIN", os.environ.get("PIN", "")),
+        default=os.environ.get("OPUS_CO_LLVM_BIN", ""),
         help="bin/ of the LLVM build to compile with; exported as "
         "HIP_CLANG_PATH and used for llvm-readelf / llvm-objdump / "
         "clang-offload-bundler. No version is assumed or checked -- what "
         "was used is recorded in build_info.json. "
-        "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
+        "Defaults to $OPUS_CO_LLVM_BIN.",
     )
     p.add_argument(
         "--arch",
         default="gfx1250",
         choices=("gfx1250", "gfx950"),
-        help="logical runtime architecture (A0 images use a -strict storage suffix); "
-        "gfx950 builds the a16w16 4-wave family of co_kernels_gfx950_bf16.json",
+        help="logical runtime architecture (A0 images use an -a0 storage suffix)",
+    )
+    p.add_argument(
+        "--family",
+        default="a8w8_blockscale_bpreshuffle",
+        choices=("a8w8_blockscale_bpreshuffle", "a16w16"),
+        help="gfx950 only: a8w8_blockscale_bpreshuffle builds "
+        "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json, a16w16 builds the "
+        "4-wave family of co_kernels_gfx950_bf16.json",
     )
     p.add_argument(
         "--offload-arch",
@@ -949,7 +1161,8 @@ def main():
     )
     p.add_argument(
         "--kids",
-        default="",
+        nargs="+",
+        default=None,
         help="comma-separated exact CO kids to rebuild (default: all); "
         "use a separate --out-dir for a subset",
     )
@@ -957,46 +1170,54 @@ def main():
     args = p.parse_args()
 
     args.offload_arch = args.offload_arch or args.arch
-    if (args.arch == "gfx950") != (args.offload_arch == "gfx950"):
-        p.error("--arch gfx950 builds gfx950 images only (--offload-arch gfx950)")
+    if args.offload_arch != args.arch and (args.arch, args.offload_arch) != (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        p.error("--offload-arch does not match --arch")
     if not args.out_dir:
-        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
+        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch, args.family)
     os.makedirs(args.out_dir, exist_ok=True)
 
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
-    if args.arch == "gfx950":
-        _build_gfx950(p, args, llvm_bin)
+    if args.arch == "gfx950" and args.family == "a16w16":
+        _build_a16w16_gfx950(p, args, llvm_bin)
         return
 
-    instances = [
-        k
-        for k in gfx1250_4wave_co_kernels_declared.values()
-        if k.kernel_tag in _PIPELINE_HEADERS
-    ]
+    table = (
+        gfx950_co_kernels_declared
+        if args.arch == "gfx950"
+        else gfx1250_4wave_co_kernels_declared
+    )
+    selected = set(table)
     if args.kids:
         try:
-            selected = {int(kid.strip()) for kid in args.kids.split(",")}
+            selected = {
+                int(kid.strip()) for token in args.kids for kid in token.split(",")
+            }
         except ValueError:
-            p.error("--kids must be a comma-separated list of integer CO kids")
-        unknown = selected - set(gfx1250_4wave_co_kernels_declared)
+            p.error("--kids must contain integer CO kids separated by spaces or commas")
+        unknown = selected - set(table)
         if unknown:
             p.error(f"unknown CO kids: {sorted(unknown)}")
-        instances = [
-            k
-            for kid, k in gfx1250_4wave_co_kernels_declared.items()
-            if kid in selected and k.kernel_tag in _PIPELINE_HEADERS
-        ]
+    instances = [
+        entry
+        for kid, entry in table.items()
+        if kid in selected
+        and (args.arch == "gfx950" or entry.kernel_tag in _PIPELINE_HEADERS)
+    ]
     if not instances:
-        raise SystemExit(
-            "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
-        )
+        raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
+    build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 
-    workdir = tempfile.mkdtemp(prefix="opus_build_co_")
+    workdir = tempfile.mkdtemp(
+        prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None
+    )
     try:
         if jobs == 1:
-            built = [build_one(k, args, llvm_bin, workdir) for k in instances]
+            built = [build(k, args, llvm_bin, workdir) for k in instances]
         else:
             # One hipcc per entry and they share nothing but the read-only headers,
             # so this is embarrassingly parallel. A full sweep is thousands of
@@ -1007,7 +1228,7 @@ def main():
             print(f"[build_co] {len(instances)} entries on {jobs} jobs")
             with ThreadPoolExecutor(max_workers=jobs) as pool:
                 built = list(
-                    pool.map(lambda k: build_one(k, args, llvm_bin, workdir), instances)
+                    pool.map(lambda k: build(k, args, llvm_bin, workdir), instances)
                 )
             built.sort(key=lambda b: b["kid"])
     finally:
@@ -1025,6 +1246,12 @@ def main():
         ver = _run([clang, "--version"]).stdout.strip().splitlines()[0]
     except Exception:  # noqa: BLE001
         ver = "unknown"
+    common_flags = ["-D__HIPCC_RTC__", "-O3", "-std=c++20"]
+    common_flags.append(
+        "-DOPUS_ENABLE_RUNTIME_QUERY=0"
+        if args.arch == "gfx950"
+        else "-Werror=ignored-attributes"
+    )
     info = {
         "arch": args.arch,
         "offload_arch": args.offload_arch,
@@ -1035,19 +1262,18 @@ def main():
         "device_clang": ver,
         "hip_clang_path": llvm_bin,
         # Shared by every entry; the per-entry -mllvm flags are in kernels[].
-        "common_flags": [
-            "-D__HIPCC_RTC__",
-            "-O3",
-            "-std=c++20",
-            "-Werror=ignored-attributes",
-        ],
+        "common_flags": common_flags,
         "kernels": built,
     }
     info_path = os.path.join(args.out_dir, "build_info.json")
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2, sort_keys=True)
         f.write("\n")
-    print(f"[build_co] wrote {len(built)} .co + {info_path}")
+    if args.arch == "gfx950":
+        ready = sum(row["status"] == "ready" for row in built)
+        print(f"[build_co] ready={ready} rejected={len(built) - ready} + {info_path}")
+    else:
+        print(f"[build_co] wrote {len(built)} .co + {info_path}")
 
 
 if __name__ == "__main__":

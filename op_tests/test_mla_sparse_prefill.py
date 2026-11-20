@@ -9,8 +9,8 @@ one online softmax with a per-head sink. Every backend in a case runs on the
 same inputs and is checked against the same PyTorch reference, so the reported
 latencies are directly comparable.
 
-Inputs model a DSA page table: each token draws ``topk`` rows from each range,
-and the extend range is causal.
+Inputs model a DSA page table: each token draws ``topk`` prefix rows and its
+last ``window`` extend rows (pytest: ``topk`` random rows of ``[0, i]``).
 
 The ``prec`` axis picks both the input format and the backends that run:
 
@@ -21,18 +21,25 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
   (``mla_sparse_prefill_v41``): ``opus``.
 * ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
-  scales packed in a 288-byte row: ``opus``, gfx950 only.
+  scales: ``opus`` on gfx950, fused ``asm`` on gfx1250 with ``H_Q == 64``.
+  The generator's 288-byte rows are separated into contiguous data and scales
+  outside the timed call for the fixed-stride gfx1250 code object.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
-gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
-Both are gfx1250-only here and drop out of the sweep elsewhere.
+gluon kernel that takes both KV sources natively. The v4 ``asm`` needs
+``H_Q == 128``; the v4.1 ``asm`` needs ``H_Q == 64``. Both asm variants and
+triton are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
-    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 512 --window 128 0
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus asm \\
+        --prec v41_fp8 v41_fp4 --h_q 64 -n 96 192 384 768 1536 2048 3072 4096 \\
+        --total_pages 65536 1048576 --topk 512 1024 --total_tokens 128 \\
+        --num_kv_splits 1
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
+from aiter.ops.mla_sparse_prefill_v41_asm import _auto_v41_asm_splits
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -315,6 +323,36 @@ def _page_table_csr(
     return indptr, indices
 
 
+def _window_csr(
+    n: int, window: int, *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token ``i``'s extend rows: its last ``min(i + 1, window)``."""
+    lens = torch.arange(1, n + 1, dtype=torch.int64, device=device).clamp_(max=window)
+    indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0).to(torch.int32)
+    tok = torch.repeat_interleave(torch.arange(n, device=device), lens)
+    pos = torch.arange(tok.numel(), device=device) - indptr[:-1].to(torch.int64)[tok]
+    return indptr, (tok - lens[tok] + 1 + pos).to(torch.int32)
+
+
+def _extend_csr(
+    n: int,
+    total_tokens: int,
+    topk: int,
+    window: int | None,
+    *,
+    device: torch.device,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_window_csr`, or a causal ``topk`` draw if ``window`` is None."""
+    if window is None:
+        return _page_table_csr(
+            n, total_tokens, topk, causal=True, device=device, seed=seed
+        )
+    assert window == 0 or total_tokens >= n
+    return _window_csr(n, window, device=device)
+
+
 def _poison_unreferenced(
     pool_rows: int,
     indices: torch.Tensor,
@@ -356,6 +394,7 @@ def _make_inputs(
     dtype: torch.dtype,
     *,
     topk: int = 1024,
+    window: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -380,8 +419,8 @@ def _make_inputs(
     ip_p, ix_p = _page_table_csr(
         n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
     )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_e, ix_e = _extend_csr(
+        n, total_tokens, topk, window, device=device, seed=seed * 2 + 2
     )
 
     _poison_unreferenced(total_pages, ix_p, bf16=unified_kv)
@@ -406,6 +445,7 @@ def _make_inputs_fp8(
     total_tokens: int,
     *,
     topk: int = 1024,
+    window: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -453,8 +493,8 @@ def _make_inputs_fp8(
     ip_p, ix_p = _page_table_csr(
         n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
     )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_e, ix_e = _extend_csr(
+        n, total_tokens, topk, window, device=device, seed=seed * 2 + 2
     )
 
     # The fp32 copies stay clean; the reference only reads rows that were named.
@@ -512,6 +552,7 @@ def _make_inputs_v41(
     total_tokens: int,
     *,
     topk: int = 1024,
+    window: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -545,8 +586,8 @@ def _make_inputs_v41(
     ip_p, ix_p = _page_table_csr(
         n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
     )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_e, ix_e = _extend_csr(
+        n, total_tokens, topk, window, device=device, seed=seed * 2 + 2
     )
 
     # 0xFF is NaN both as e4m3 and as E8M0; an NVFP4 row is NaN through its scales.
@@ -591,11 +632,13 @@ _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
     "v4_fp8": ("opus", "asm"),
     "v41_fp8": ("opus",),
-    "v41_fp4": ("opus",),
+    "v41_fp4": ("opus", "asm"),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
 _ASM_HEADS = 128
+# The fused V4.1 code object covers all 64 heads of one query per workgroup.
+_ASM_V41_HEADS = 64
 
 # Only gfx1250's pa_prefill_sparse reads a second KV source; the rest reject it.
 _TRITON_ARCHS = ("gfx1250",) if pa_prefill_sparse is not None else ()
@@ -641,6 +684,7 @@ def run_mla_sparse_prefill(
     prec: str,
     *,
     topk: int = 1024,
+    window: int | None = None,
     backends: tuple = _BACKENDS,
     seed: int = 0,
     data_init: str = "norm",
@@ -655,7 +699,7 @@ def run_mla_sparse_prefill(
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} topk={topk} data_init={data_init} seed={seed} "
+        f"prec={prec} topk={topk} window={window} data_init={data_init} seed={seed} "
         f"num_kv_splits={num_kv_splits}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
@@ -670,6 +714,7 @@ def run_mla_sparse_prefill(
             total_pages,
             total_tokens,
             topk=topk,
+            window=window,
             seed=seed,
             data_init=data_init,
             prefix_fp4=prec == "v41_fp4",
@@ -688,6 +733,30 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
+        if (
+            prec == "v41_fp4"
+            and "asm" in wanted
+            and h == _ASM_V41_HEADS
+            and _get_gpu_arch() == "gfx1250"
+        ):
+            # Prepare separate CSA data/scale buffers before kernel timing.
+            asm_inputs = dict(kernel_inputs)
+            for key in ("unified_kv", "unified_kv_scale"):
+                tensor = asm_inputs[key]
+                asm_inputs[key] = (
+                    tensor.view(torch.uint8).contiguous().view(tensor.dtype)
+                )
+            candidates.append(
+                (
+                    "asm",
+                    lambda: mla_sparse_prefill_v41(
+                        **asm_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="asm",
+                    ),
+                )
+            )
     elif prec == "v4_fp8":
         data = _make_inputs_fp8(
             n,
@@ -695,6 +764,7 @@ def run_mla_sparse_prefill(
             total_pages,
             total_tokens,
             topk=topk,
+            window=window,
             seed=seed,
             data_init=data_init,
         )
@@ -730,6 +800,7 @@ def run_mla_sparse_prefill(
             total_tokens,
             _PREC_TO_DTYPE[prec],
             topk=topk,
+            window=window,
             seed=seed,
             data_init=data_init,
         )
@@ -794,11 +865,26 @@ def run_mla_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
             if name == "asm":
-                # Effective Q/KV reads + BF16 output writes. Packed NoPE
-                # includes scales/padding; KV is shared by K/V and all heads.
-                # Count each CSR entry, without adjusting for cache reuse.
-                bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
-                nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
+                # Effective Q/KV reads + BF16 output writes; KV is shared by
+                # K/V and all heads. Count each CSR entry without adjusting
+                # for cache reuse or adding internal partial-workspace traffic.
+                if prec == "v41_fp4":
+                    prefix_nnz = kernel_inputs["kv_indices_prefix"].numel()
+                    extend_nnz = kernel_inputs["kv_indices_extend"].numel()
+                    nbytes = (
+                        (n * h + extend_nnz) * (_V41_D + _V41_D_SCALE)
+                        + prefix_nnz * (_V41_D // 2 + _V41_D // _NVFP4_BLK)
+                        + n * h * d * 2
+                    )
+                    row["asm split"] = (
+                        _auto_v41_asm_splits(n, total_nnz, prefix_nnz=prefix_nnz)
+                        if num_kv_splits is None
+                        else num_kv_splits
+                    )
+                else:
+                    # V4 packs its NoPE scales/padding into the 512-byte row.
+                    bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
+                    nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
                 tbps = nbytes / max(lat_us * 1e-6, 1e-12) / 1e12
                 row["asm TB/s"] = round(float(tbps), 2)
 
@@ -975,8 +1061,8 @@ parser.add_argument(
     "--n_tokens",
     type=int,
     nargs="*",
-    default=[64, 1024, 4096],
-    help="number of query tokens N (default: [64, 1024, 4096])",
+    default=[1024, 4096, 16384],
+    help="number of query tokens N (default: [1024, 4096, 16384])",
 )
 parser.add_argument(
     "--h_q",
@@ -985,7 +1071,7 @@ parser.add_argument(
     default=[16, 32, 64, 128],
     help=(
         "number of query heads H_Q (default: [16, 32, 64, 128]).\n"
-        f"asm is built for H_Q={_ASM_HEADS} only and drops out elsewhere."
+        f"v4 asm needs H_Q={_ASM_HEADS}; v41_fp4 asm needs H_Q={_ASM_V41_HEADS}."
     ),
 )
 parser.add_argument(
@@ -999,8 +1085,8 @@ parser.add_argument(
     "--topk",
     type=int,
     nargs="*",
-    default=[1024, 2048],
-    help="rows each token draws from each range (default: [1024, 2048])",
+    default=[512, 1024],
+    help="prefix rows per token (default: [512, 1024]); 0 takes the whole pool",
 )
 parser.add_argument(
     "--total_pages",
@@ -1010,10 +1096,11 @@ parser.add_argument(
     help="rows in unified_kv (default: [65536, 1048576]); 0 leaves it empty",
 )
 parser.add_argument(
-    "--total_tokens",
+    "--window",
     type=int,
-    default=None,
-    help="rows in extend kv (default: matches -n)",
+    nargs="*",
+    default=[128],
+    help="extend rows per token, its last W (default: [128]); 0 leaves it empty",
 )
 parser.add_argument(
     "--prec",
@@ -1026,7 +1113,8 @@ parser.add_argument(
         "  bf16   : single-tensor Q/K/V/O kernel           -> opus, triton\n"
         "  v4_fp8 : split NoPE-fp8 / RoPE-bf16 kernel      -> opus, asm\n"
         "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus\n"
-        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> opus (gfx950)"
+        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> "
+        "opus (gfx950), asm (gfx1250 H64)"
     ),
 )
 parser.add_argument(
@@ -1065,7 +1153,10 @@ parser.add_argument(
     type=lambda s: None if s == "auto" else int(s),
     nargs="+",
     default=[None],
-    help="OPUS split-K counts: auto (the op's own choice) or 1 to 32 (default: auto)",
+    help=(
+        "split-K counts: opus auto or 1..32; v41_fp4 asm shape-based auto or 1..16 "
+        "(default: auto). v4 asm has no split-K."
+    ),
 )
 
 
@@ -1074,24 +1165,25 @@ if __name__ == "__main__":
 
     rows = []
     # product varies its last argument fastest -> this is also the row order.
-    for prec, topk, h, n, total_pages, data_init, splits in itertools.product(
+    for prec, topk, window, h, n, total_pages, data_init, splits in itertools.product(
         args.prec,
         args.topk,
+        args.window,
         args.h_q,
         args.n_tokens,
         args.total_pages,
         args.data_init,
         args.num_kv_splits,
     ):
-        total_tokens = args.total_tokens if args.total_tokens is not None else n
         row = run_mla_sparse_prefill(
             n=n,
             h=h,
             d=args.head_dim,
             total_pages=total_pages,
-            total_tokens=total_tokens,
+            total_tokens=n,
             prec=prec,
             topk=topk,
+            window=window,
             backends=tuple(args.backend),
             seed=args.seed,
             data_init=data_init,
@@ -1105,14 +1197,16 @@ if __name__ == "__main__":
     if rows:
         df = pd.DataFrame(rows)
         drop_cols = [
-            c for c in ("verify", "bench", "seed", "backends") if c in df.columns
+            c
+            for c in ("verify", "bench", "seed", "backends", "total_tokens")
+            if c in df.columns
         ]
         if drop_cols:
             df = df.drop(columns=drop_cols)
         # Column order otherwise follows whichever row first ran a backend.
         lead = [
             c
-            for c in ("prec", "topk", "data_init", "h", "n", "num_kv_splits")
+            for c in ("prec", "topk", "window", "data_init", "h", "n", "num_kv_splits")
             if c in df.columns
         ]
         rest = [c for c in df.columns if c not in lead]

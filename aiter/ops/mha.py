@@ -23,6 +23,7 @@ from ..jit.utils.mha_recipes import (
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from ..utility import dtypes
 
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
@@ -419,13 +420,15 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     seqstart_k_pad: Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    window_size_left: int = -1,
 ) -> None:
     return None
 
 
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
-# kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
+# kernel or the asymmetric D_QK=192/D_V=128 kernel; both take batch and group/varlen
+# inputs, and only D=128 implements `window_size_left`.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -446,6 +449,7 @@ def _fmha_fwd_bf16_opus_fwd(
     seqstart_k_pad: Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    window_size_left: int = -1,
 ) -> None: ...
 
 
@@ -458,6 +462,7 @@ def fmha_fwd_bf16_opus_fwd(
     out: Tensor | None = None,
     return_lse: bool = False,
     lse: Tensor | None = None,
+    window_size_left: int = -1,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
     D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
@@ -468,6 +473,10 @@ def fmha_fwd_bf16_opus_fwd(
     float32, natural log; rows that see no keys get -inf), filled when supplied and
     allocated here when `return_lse` is set. Like `out` it does not change the return
     type on its own: only `return_lse` does, and then the return is `(out, lse)`.
+
+    `window_size_left` >= 0 bounds the causal mask on the left (a query at KV
+    coordinate j sees keys [j - window_size_left, j]); -1 is plain causal. It needs
+    `causal` and is implemented by the D=128 kernel only.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
@@ -486,7 +495,16 @@ def fmha_fwd_bf16_opus_fwd(
             (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
         )
 
-    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale), lse=lse)
+    _fmha_fwd_bf16_opus_fwd(
+        q,
+        k,
+        v,
+        out,
+        bool(causal),
+        float(softmax_scale),
+        lse=lse,
+        window_size_left=int(window_size_left),
+    )
     return (out, lse) if return_lse else out
 
 
@@ -505,11 +523,12 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     seqstart_k_pad: Tensor | None = None,
     return_lse: bool = False,
     lse: Tensor | None = None,
+    window_size_left: int = -1,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D_QK=192/D_V=128
-    only). q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
-    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally and
-    handles GQA fan-out.
+    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D=128 and
+    D_QK=192/D_V=128). q/k/v are packed [total, H, D]; allocates `out`
+    ([total_q, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
+    to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
     float32, natural log), filled when supplied and allocated here when `return_lse` is
@@ -522,6 +541,9 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     seqstart_q_pad / seqstart_k_pad  : cumulative PHYSICAL row offsets (KV-padding
                                        variant); default to the real arrays when None.
     max_seqlen_q / max_seqlen_k      : upper bounds driving the grid.
+    window_size_left                 : >= 0 bounds the causal mask on the left, per
+                                       sequence; -1 is plain causal. Needs `causal`
+                                       and is implemented by the D=128 kernel only.
     """
     v_head_dim = v.size(-1)
     total_q, q_head_num = q.size(0), q.size(1)
@@ -555,6 +577,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         seqstart_k_pad if seqstart_k_pad is not None else seqstart_k,
         int(max_seqlen_q),
         int(max_seqlen_k),
+        int(window_size_left),
     )
     return (out, lse) if return_lse else out
 
@@ -2385,6 +2408,12 @@ def _flash_attn_forward(
             return False
         if not (hdim_q == 128 and hdim_v == 128):
             return False
+        # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
+        # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
+        if window_size_right not in (-1, 0):
+            return False
+        if (window_size_left >= 0 or window_size_right == 0) and not causal:
+            return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
         kv_stride = max(k.stride(1), v.stride(1))
@@ -2393,6 +2422,9 @@ def _flash_attn_forward(
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
+            return False
+        # No sliding window on this head-dim pair; only D=128 implements it.
+        if not (window_size_left == -1 and window_size_right == -1):
             return False
         # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
         # 32-bit buffer-offset limit no longer bounds the per-head KV row.
@@ -2410,10 +2442,10 @@ def _flash_attn_forward(
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)  # dense here
         ret = ret and (bias is None and alibi_slopes is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (window_size_left == -1 and window_size_right == -1)
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (not return_softmax)
+        # The window check is per head dim, so it lives in the helpers below.
         ret = ret and (
             _can_impl_fmha_fwd_hd128_bf16_opus()
             or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
@@ -2516,6 +2548,7 @@ def _flash_attn_forward(
             causal=bool(causal),
             out=out,
             lse=softmax_lse if return_lse else None,
+            window_size_left=int(window_size_left),
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -3403,19 +3436,45 @@ def _flash_attn_varlen_forward(
             ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
-    def can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    def _can_impl_fmha_fwd_hd128_bf16_opus_varlen():
+        # OPUS gfx950 group/varlen D=128 bf16 forward. Env-gated OFF by default, the same
+        # opt-in as the dense D=128 path, so enabling varlen does not silently change
+        # which backend an existing D=128 workload lands on.
+        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
+            return False
+        if not (hdim_q == 128 and hdim_v == 128):
+            return False
+        # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
+        # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
+        if window_size_right not in (-1, 0):
+            return False
+        if (window_size_left >= 0 or window_size_right == 0) and not causal:
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset. The
+        # kernel rebases per sequence, so the bound is the longest sequence.
+        return not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
+
+    def _can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT
-        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded),
-        # cross-attention (causal bottom-right aligned) and LSE ([H_q, total_q] fp32,
-        # natural log). No dropout / bias / alibi / swa / sink / quant / paged.
-        # AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK; for A/B).
+        # (no env). AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK).
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
+        if not (hdim_q == 192 and hdim_v == 128):
+            return False
+        # No window. Test the -1 sentinel, not `swa`: swa only tests > 0 and would let
+        # window_size=(0, 0) through as plain causal.
+        return window_size_left == -1 and window_size_right == -1
+
+    def can_impl_fmha_fwd_bf16_opus_varlen():
+        # Shared eligibility for the OPUS gfx950 bf16 group/varlen forward kernels.
+        # Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded), cross-attention
+        # (causal bottom-right aligned) and LSE ([H_q, total_q] fp32, natural log).
+        # No dropout / bias / alibi / sink / quant / paged. Cheapest / most-selective
+        # gates first so the per-head-dim helpers (which read env vars) are only
+        # evaluated once the common conditions already hold.
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (hdim_q == 192 and hdim_v == 128)
         ret = ret and (nhead_q % nhead_k == 0)
-        ret = ret and (not swa)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (logits_soft_cap == 0.0)
         ret = ret and (bias is None and alibi_slopes is None)
@@ -3424,6 +3483,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (block_table is None)
         ret = ret and (not return_softmax)
         ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
+        # The window check is per head dim, so it lives in the helpers below.
+        ret = ret and (
+            _can_impl_fmha_fwd_hd128_bf16_opus_varlen()
+            or _can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+        )
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -3454,10 +3518,11 @@ def _flash_attn_varlen_forward(
             return_softmax=return_softmax,
         )
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
-        # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
-        # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
-        # offsets (KV padding). When no padded arrays are given, physical == real.
+    if can_impl_fmha_fwd_bf16_opus_varlen():
+        # OPUS gfx950 group/varlen path (D=128 or D_QK=192/D_V=128, dispatched in C++ by
+        # head dim). cu_seqlens_* are the REAL cumulative lengths (masks / tile counts);
+        # cu_seqlens_*_padded are the PHYSICAL row offsets (KV padding). When no padded
+        # arrays are given, physical == real.
         softmax_lse = torch.empty(
             (nhead_q, q.size(0)) if return_lse else (0,),
             dtype=torch.float32,
@@ -3477,6 +3542,7 @@ def _flash_attn_varlen_forward(
             max_seqlen_q=int(max_seqlen_q),
             max_seqlen_k=int(max_seqlen_k),
             lse=softmax_lse if return_lse else None,
+            window_size_left=int(window_size_left),
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -4106,6 +4172,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+# Routed on the public entry: callers (vLLM's MLA prefill, SGLang's aiter
+# backend) use this name, and the gfx1250 ASM, FlyDSL, Triton and CK choices are
+# all made beneath it. A provider serves the forward only; see the docstring.
+@_route(op="flash_attn_varlen")
 def flash_attn_varlen_func(
     q,
     k,
@@ -4135,13 +4205,6 @@ def flash_attn_varlen_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
 ):
-    if block_table is not None and (
-        cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
-    ):
-        raise NotImplementedError(
-            "Paged/Split-KV attention (using block_table) does not currently support "
-            "physical sequence padding (cu_seqlens_*_padded)."
-        )
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
@@ -4197,7 +4260,28 @@ def flash_attn_varlen_func(
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
+
+    Contract for a provider:
+        Returns ``out`` alone when neither ``return_lse`` nor
+        ``return_attn_probs`` is set; otherwise a tuple of ``out``, then
+        ``softmax_lse`` (``(nheads, total_q)``, fp32) when ``return_lse``, then
+        ``S_dmask`` when ``return_attn_probs``. When ``out`` is passed the
+        result is written into it in place and that tensor is returned. The
+        result carries no autograd
+        graph, so a provider declines a call whose q, k or v requires grad
+        while grad is enabled; AITER's own path keeps the backward.
+        ``how_v3_bf16_cvt`` and ``min_seqlen_q`` tune AITER's kernels and may
+        be ignored; ``q_descale``, ``k_descale`` and ``v_descale`` come
+        together for fp8 inputs; ``block_table`` reads k and v from a paged
+        cache, and ``cu_seqlens_*_padded`` give physical row offsets.
     """
+    if block_table is not None and (
+        cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
+    ):
+        raise NotImplementedError(
+            "Paged/Split-KV attention (using block_table) does not currently support "
+            "physical sequence padding (cu_seqlens_*_padded)."
+        )
     descales = (q_descale, k_descale, v_descale)
     has_any_descale = any(descale is not None for descale in descales)
     has_all_descales = all(descale is not None for descale in descales)

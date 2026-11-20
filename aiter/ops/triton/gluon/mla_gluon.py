@@ -54,6 +54,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.plugin import route as _route
 
 # fmt: off
 @gluon.jit
@@ -859,7 +860,164 @@ def mla_gluon(
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
     and attn_sink, q_pe / k_pe are unused placeholders.
+
+    The decode mode (has_pe=True and no attn_sink) is the routed op
+    `mla_paged_decode`. An enabled kernel plugin can serve it. The prefill
+    mode always runs the Gluon kernel.
     """
+    if has_pe and attn_sink is None:
+        lse = _mla_paged_decode_routed(
+            q_nope,
+            q_pe,
+            kv_c,
+            o,
+            page_table,
+            seq_info,
+            sm_scale,
+            k_pe,
+            kv_pe_offset,
+            use_2d_view,
+            kv_scale,
+            min_kv_seq_len,
+            return_lse,
+        )
+        return o, (lse if return_lse else None)
+    return _mla_gluon_launch(
+        q_nope,
+        q_pe,
+        kv_c,
+        o,
+        page_table,
+        seq_info,
+        sm_scale,
+        k_pe,
+        kv_pe_offset,
+        use_2d_view,
+        kv_scale,
+        min_kv_seq_len,
+        return_lse,
+        has_pe,
+        attn_sink,
+    )
+
+
+def _mla_paged_decode_fake(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    o: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_info: torch.Tensor,
+    sm_scale: float,
+    k_pe: torch.Tensor | None = None,
+    kv_pe_offset: int = 512,
+    use_2d_view: bool = True,
+    kv_scale: float = 1.0,
+    min_kv_seq_len: int = 1,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    """The shape of the returned lse: see :func:`_mla_paged_decode_routed`."""
+    if not return_lse:
+        return q_nope.new_empty(0, dtype=torch.float32)
+    batch, qlen = q_nope.shape[0], q_nope.shape[1] if q_nope.dim() == 4 else 1
+    return q_nope.new_empty((batch, qlen, q_nope.shape[-2]), dtype=torch.float32)
+
+
+# Only the decode mode is routed. The op name tells the operation, not the backend.
+# The op returns lse alone, so no result aliases o: a custom op cannot return
+# Optional[Tensor], so "no lse" is an empty tensor.
+@_route(
+    op="mla_paged_decode",
+    version=1,
+    fake=_mla_paged_decode_fake,
+    mutates_args=["o"],
+)
+def _mla_paged_decode_routed(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    o: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_info: torch.Tensor,
+    sm_scale: float,
+    k_pe: torch.Tensor | None = None,
+    kv_pe_offset: int = 512,
+    use_2d_view: bool = True,
+    kv_scale: float = 1.0,
+    min_kv_seq_len: int = 1,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    """MLA decode over KV rows that a page table selects (page size 1).
+
+    This is the decode mode of :func:`mla_gluon`: ``has_pe=True`` and no
+    ``attn_sink``. The logits are ``(q_nope . k_nope + q_pe . k_pe) * sm_scale
+    * kv_scale``. The values are the first 512 columns of the KV rows, times
+    ``kv_scale``.
+
+    Args:
+        q_nope: ``[batch, nhead, 512]`` bf16. MTP: ``[batch, qlen, nhead, 512]``.
+        q_pe: ``[batch, nhead, 64]`` bf16. MTP: ``[batch, qlen, nhead, 64]``.
+        kv_c: KV rows, bf16 or fp8. Shared: ``[N, 576]``, the RoPE part at
+            column ``kv_pe_offset`` (512). Split: ``[N, 512]``.
+        o: the output, with the shape of ``q_nope``. The op writes it in place.
+        page_table: ``use_2d_view=True``: ``[batch, max_seqlen]`` KV row
+            indices. ``use_2d_view=False``: flat KV row indices of all requests.
+        seq_info: ``use_2d_view=True``: ``[batch]`` KV lengths.
+            ``use_2d_view=False``: ``[batch + 1]`` offsets into ``page_table``.
+        sm_scale: softmax scale.
+        k_pe: split mode: ``[N, 64]`` RoPE rows, with ``kv_pe_offset=0``.
+            Shared mode: None.
+        kv_pe_offset: first column of the RoPE part in its rows.
+        kv_scale: scale of the KV values. Use 1.0 for bf16 KV.
+        min_kv_seq_len: the caller promises that no request has fewer KV rows.
+            The value does not change the result.
+        return_lse: if True, also return the log-sum-exp.
+
+    MTP: query ``i`` of ``qlen`` reads the KV rows ``[0, seq_len - qlen + i]``.
+
+    Returns:
+        ``lse``. The attention is written into ``o`` in place. ``lse`` is a new
+        fp32 ``[batch, qlen, nhead]`` tensor (``qlen`` is 1 for 3-D ``q_nope``)
+        if ``return_lse`` is True, else a new empty fp32 tensor.
+    """
+    _, lse = _mla_gluon_launch(
+        q_nope,
+        q_pe,
+        kv_c,
+        o,
+        page_table,
+        seq_info,
+        sm_scale,
+        k_pe,
+        kv_pe_offset,
+        use_2d_view,
+        kv_scale,
+        min_kv_seq_len,
+        return_lse,
+        True,
+        None,
+    )
+    return lse if lse is not None else q_nope.new_empty(0, dtype=torch.float32)
+
+
+def _mla_gluon_launch(
+    q_nope,
+    q_pe,
+    kv_c,
+    o,
+    page_table,
+    seq_info,
+    sm_scale,
+    k_pe,
+    kv_pe_offset,
+    use_2d_view,
+    kv_scale,
+    min_kv_seq_len,
+    return_lse,
+    has_pe,
+    attn_sink,
+):
+    """Launch the Gluon MLA kernels. The arguments are those of :func:`mla_gluon`."""
     if k_pe is None:
         k_pe = kv_c
 
