@@ -71,6 +71,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
             dtype_str,
             "fp32",
             local_expert_mask.has_value(),
+            true,
             dispatch_policy
         },
         {topk_ids.data_ptr(),
