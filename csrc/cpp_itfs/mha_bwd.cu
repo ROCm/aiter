@@ -595,7 +595,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                 if(mt != 0 && want >= kv_blocks && kv_blocks >= 16)
                     want = (kv_blocks + 1) / 2;
             }
-            nsplit = std::clamp(want, 1u, std::max(kv_blocks, 1u));
+            // Explicit template arguments: hipify rewrites `std::max(` to `::max(`,
+            // which returns int and leaves std::clamp with mixed argument types.
+            nsplit = std::clamp<uint32_t>(want, 1u, std::max<uint32_t>(kv_blocks, 1u));
         }
 
         // ASM kernel atomically accumulates into dq_accum; require zero-init.
