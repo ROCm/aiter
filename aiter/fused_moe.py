@@ -2029,6 +2029,8 @@ def _fused_moe_impl(
                 ("num_local_tokens", num_local_tokens),
                 ("bias1", bias1),
                 ("bias2", bias2),
+                ("w1_global_scale", w1_global_scale),
+                ("w2_global_scale", w2_global_scale),
             ),
             # FHMoE passes its shared-expert weights and scales through these.
             (_stage1_extra_args, _stage2_extra_args),

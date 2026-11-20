@@ -2549,6 +2549,16 @@ def test_output_buffer_contract():
             f"an output overlapping {name}",
             output=tensor.view(-1)[: token * model_dim].view(token, model_dim),
         )
+    # The NVFP4 global scales are inputs too. The overlap check runs before the
+    # fp4x2 requirement, so a bf16 call reaches it and names the scale it hit.
+    for name in ("w1_global_scale", "w2_global_scale"):
+        out = torch.empty((token, model_dim), dtype=dtype)
+        try:
+            fused_moe(*args, output=out, **{name: out.view(dtypes.fp32)})
+        except RuntimeError as e:
+            assert f"output overlaps {name}" in str(e), str(e)
+        else:
+            raise AssertionError(f"fused_moe accepted an output overlapping {name}")
 
     # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
