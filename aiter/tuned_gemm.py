@@ -16,6 +16,7 @@
 """
 
 import functools
+import itertools
 import os
 
 import pandas as pd
@@ -33,7 +34,12 @@ from aiter import (
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx_runtime,
+    get_tuned_cu_nums,
+    log_tuned_cu_fallback,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 from aiter.plugin import route as _route
@@ -155,11 +161,14 @@ def get_GEMM_A16W16_tuned_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ):
     """Return the tuned config for this GEMM, or None if no usable row exists.
 
     Rows naming a FlyDSL kernel missing from the catalog, or an OPUS candidate
-    that no longer resolves, are skipped as if absent.
+    that no longer resolves, are skipped as if absent. At each M (exact, then
+    padded), the CU counts of get_tuned_cu_nums(cu_num, device) are tried in
+    turn.
     """
     cfg = get_GEMM_A16W16_config_()
     cu_num = get_cu_num() if cu_num is None else cu_num
@@ -177,12 +186,14 @@ def get_GEMM_A16W16_tuned_config(
     }:
         gfx = base_gfx_arch(gfx)
     warned_invalid_opus = set()
-    for gl in [None, 0, 1]:
+    for gl, tuned_cu in itertools.product(
+        (None, 0, 1), get_tuned_cu_nums(cu_num, device)
+    ):
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
             (
                 gfx,
-                cu_num,
+                tuned_cu,
                 padded_M,
                 N,
                 K,
@@ -292,6 +303,10 @@ def get_GEMM_A16W16_tuned_config(
                     continue
                 config = dict(config)
                 config["solidx"] = int(resolved.resolved_kid)
+            if tuned_cu != cu_num:
+                log_tuned_cu_fallback(
+                    AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE, gfx, cu_num, tuned_cu
+                )
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""
@@ -315,12 +330,13 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ):
     cu_num = get_cu_num() if cu_num is None else cu_num
     if gfx is None:
         gfx = get_gfx_runtime()
     config = get_GEMM_A16W16_tuned_config(
-        M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
+        M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num, device
     )
     if config is None:
         default_config = {}
@@ -527,10 +543,13 @@ def _gemm_a16w16(
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
     from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
 
-    gfx, cu_num = _device_arch_and_cu(inp_view.device)
+    torch_device = inp_view.device
+    gfx, cu_num = _device_arch_and_cu(torch_device)
+    device = torch_device.index
     if gfx not in SUPPORTED_OPUS_ARCHES:
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
+        device = None
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
@@ -542,6 +561,7 @@ def _gemm_a16w16(
         bpreshuffle=bpreshuffle,
         gfx=gfx,
         cu_num=cu_num,
+        device=device,
     )
     if config["libtype"] == "opus" and not (
         _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
