@@ -15,41 +15,23 @@ from typing import Any
 
 from typing_extensions import Self
 
+from .layout import STAGE1_RAIL_REGIONS, STAGE2_RAIL_REGIONS, _align_up
+
 logger = logging.getLogger(__name__)
 
-# Conservative guard for the tested CCO dmabuf/IOVA-zero path. This is not
-# an Ionic hardware limit or a bound on MORI shmem's ordinary-address MRs.
-MAX_CCO_RAIL_MR_BYTES = 1 << 40
+# Upper bound of one rail MR (CCO dmabuf/IOVA-zero path). A single MR of
+# ~60 GiB per GPU (K3 EP32 TPR 16384) hard-hung whole nodes; rail regions are
+# packed into windows of at most this size instead.
+MAX_CCO_RAIL_MR_BYTES = 1 << 30
 CCO_ALLOCATION_ALIGNMENT = 64 << 20
 # The local (LSA-only) window's allocation size. A second operator on the same
 # pooled communicator places it at a nonzero slot offset, where hipMemSetAccess
 # failed with invalid argument for 192 and 320 MiB but passed for 256 and 512
 # MiB (gfx950, MORI b80cbe4 and #996, GDR on or off).
 LOCAL_ALLOCATION_ALIGNMENT = 256 << 20
-STAGE1_RAIL_REGIONS = frozenset(
-    (
-        "dispatch_staging",
-        "remote_dispatch_rx",
-        "remote_chunk_ready",
-        "remote_chunk_credit",
-    )
-)
 # Read and written only by this GPU (GMM1 output, GEMM2 input): ordinary device
 # memory outside every CCO window, so it is neither LSA-mapped nor registered.
 PRIVATE_REGIONS = frozenset(("h1_output_q", "h1_output_scale"))
-STAGE2_RAIL_REGIONS = frozenset(
-    (
-        "node_accumulator",
-        "remote_partial_rx",
-        "return_group_ready",
-        "return_consumed",
-        "rail_idx",
-    )
-)
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 @dataclass(frozen=True)
@@ -101,20 +83,8 @@ class CcoBufferPlan:
     def regions(self) -> tuple[BufferRegion, ...]:
         return tuple(region for window in self.windows for region in window.regions)
 
-    def region_index(self, stage: int, name: str) -> int:
-        for index, region in enumerate(self.regions):
-            if region.stage == stage and region.name == name:
-                return index
-        raise KeyError((stage, name))
-
     @classmethod
-    def create(
-        cls,
-        stage1,
-        stage2,
-        *,
-        max_mr_bytes: int = MAX_CCO_RAIL_MR_BYTES,
-    ) -> CcoBufferPlan:
+    def create(cls, stage1, stage2) -> CcoBufferPlan:
         """Pack whole regions; reject regions that need finer MR chunking.
 
         Rail allocations have equal padded sizes, while each NIC registers
@@ -124,11 +94,9 @@ class CcoBufferPlan:
         for field in ("world_size", "gpus_per_node", "parity_depth", "num_qp"):
             if getattr(stage1, field) != getattr(stage2, field):
                 raise ValueError(f"Stage1/Stage2 {field} must agree")
-        if not CCO_ALLOCATION_ALIGNMENT <= max_mr_bytes <= MAX_CCO_RAIL_MR_BYTES:
-            raise ValueError(
-                "max_mr_bytes must be between 64 MiB and the 1 GiB CCO guard"
-            )
-        mr_limit = max_mr_bytes // CCO_ALLOCATION_ALIGNMENT * CCO_ALLOCATION_ALIGNMENT
+        mr_limit = (
+            MAX_CCO_RAIL_MR_BYTES // CCO_ALLOCATION_ALIGNMENT * CCO_ALLOCATION_ALIGNMENT
+        )
         local_regions = []
         local_end = 0
         private_regions = []
@@ -138,7 +106,7 @@ class CcoBufferPlan:
             (1, stage1, STAGE1_RAIL_REGIONS),
             (2, stage2, STAGE2_RAIL_REGIONS),
         ):
-            missing = rail_names - {r.name for r in layout.regions}
+            missing = set(rail_names) - {r.name for r in layout.regions}
             if missing:
                 raise ValueError(
                     f"Stage{stage} missing rail regions: {sorted(missing)}"
@@ -167,7 +135,8 @@ class CcoBufferPlan:
                     if offset + region.nbytes > mr_limit:
                         raise ValueError(
                             f"Stage{stage}.{region.name} needs {region.nbytes} bytes, "
-                            f"exceeding the {mr_limit}-byte MR bound; split this region into chunks"
+                            f"exceeding the {mr_limit >> 20} MiB rail MR bound; lower max_tok_per_rank "
+                            f"or set max_recv_routes_per_rank"
                         )
                     window = f"s{stage}_rail{index}"
                 elif stage == 1 and region.name in PRIVATE_REGIONS:
@@ -237,10 +206,6 @@ class CcoBufferPlan:
                 if region.stage == stage and region.name == name:
                     return region
         raise KeyError((stage, name))
-
-    @property
-    def allocation_bytes(self) -> int:
-        return sum(w.allocation_bytes for w in self.windows)
 
     def per_rank_vmm(self, *, rail: bool) -> int:
         return max(
@@ -314,7 +279,6 @@ class CcoBufferSet:
         self.plan = plan
         self.gda_context_count = gda_context_count
         self.device = torch.device("cuda", torch.cuda.current_device())
-        self.memories = {}
         self.windows = {}
         self._resources = []
         self._closed = False
@@ -335,7 +299,6 @@ class CcoBufferSet:
                 comm = rail_communicator if spec.rdma_register else local_communicator
                 mem = comm.alloc_mem(spec.allocation_bytes)
                 self._resources.append(mem)
-                self.memories[spec.name] = mem
                 win = (
                     comm.register_window(
                         mem.ptr, spec.registered_bytes, rdma_register=spec.rdma_register
@@ -463,7 +426,6 @@ class CcoBufferSet:
                     error = exc
         self._resources.clear()
         self._device_table = None
-        self.memories.clear()
         self.windows.clear()
         if error is not None:
             raise error

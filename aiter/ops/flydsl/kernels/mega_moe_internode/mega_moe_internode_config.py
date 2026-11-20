@@ -170,12 +170,6 @@ class _TuneTable:
                 self._cache_path = path
             return self._cache.get(key)
 
-    def reset(self) -> None:
-        """Drop the memoised table (tests / sweeps that rewrite the CSV in-process)."""
-        with self._lock:
-            self._cache = None
-            self._cache_path = None
-
 
 def _chip() -> tuple[str, int]:
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -253,8 +247,6 @@ def select_stage1_tile(
     quant: str = "a4w4",
     world_size: int = 16,
     gpus_per_node: int = 8,
-    gfx: str | None = None,
-    cu_num: int | None = None,
 ) -> dict:
     """Return ``{"tile_group", "split_local", "fanout_ctas_per_dest", "source"}`` for this
     shape; ``source`` is ``table`` or ``default`` (the built-in rule).  The kernel
@@ -272,10 +264,7 @@ def select_stage1_tile(
     split = default_split_local(token, topk)
     tuned = None
     try:
-        if gfx is None or cu_num is None:
-            chip_gfx, chip_cu = _chip()
-            gfx = chip_gfx if gfx is None else gfx
-            cu_num = chip_cu if cu_num is None else cu_num
+        gfx, cu_num = _chip()
         tuned = lookup_tune(
             gfx=gfx,
             cu_num=cu_num,
