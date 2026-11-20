@@ -57,6 +57,12 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942"]  # the a8w4 kernel decodes FP4 -> FP8 for the gfx942 fp8 MFMA
 EXPERT, TOPK = 896, 16  # Kimi-K3 routed experts
 BETA, LINEAR_BETA = 4.0, 25.0  # Kimi-K3 SiTUv2
+QI_MAX_TOKEN = (
+    8  # `_qi` rows (x quantised in stage 1, no pre-quantised x) only up to here
+)
+CSV = os.path.join(
+    os.path.dirname(aiter.__file__), "configs/model_configs/kimik3_a8w4_tuned_fmoe.csv"
+)
 
 
 def mxfp8_quant(x):
@@ -236,6 +242,10 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
         out_q = moe(True, *mxfp8_quant(x))()
     except ValueError as e:
         assert "quantises x itself" in str(e), e
+        assert token <= QI_MAX_TOKEN, (
+            token,
+            "pre-quantised x refused above the _qi rows",
+        )
         ret["a8w4 fp8 x"] = "refused"
     else:
         ret["a8w4 fp8 x"] = cos_diff(outs["a8w4"], out_q)
@@ -418,6 +428,24 @@ def test_gate_off_mi325x():
         raise AssertionError(f"{name} ran on {torch.cuda.get_device_name()}")
 
 
+def test_csv_qi_rows():
+    """A `_qi` stage 1 refuses pre-quantised x, so the tuned CSV may use it only for
+    M <= QI_MAX_TOKEN; above that, MXFP8 x + a1_scale from a dispatch must be accepted.
+    """
+    df = pd.read_csv(CSV)
+    df = df[df["kernelName1"].map(is_a8w4_gfx942_kernel)]
+    assert len(df), CSV
+    qi = df[df["kernelName1"].str.endswith("_qi")]
+    bad = qi[qi["token"] > QI_MAX_TOKEN]
+    assert bad.empty, bad[["token", "inter_dim", "kernelName1"]].to_string()
+    aiter.logger.info(
+        "%d gfx942 a8w4 rows, %d _qi rows, all at M <= %d",
+        len(df),
+        len(qi),
+        QI_MAX_TOKEN,
+    )
+
+
 def test_stage1_dispatch_by_name():
     """Stage 1 runs the gfx942 a8w4 kernel only for the `_g942` names: any other
     registered fp8 x fp4 stage-1 name (the gfx950 family is registered on every arch)
@@ -468,6 +496,7 @@ def main():
         128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_g942_bnt0"
     )  # BM=32 TILE_K=256
     test_stage1_dispatch_by_name()
+    test_csv_qi_rows()
     if not a8w4_gfx942_supported():
         test_gate_off_mi325x()
         aiter.logger.warning(
