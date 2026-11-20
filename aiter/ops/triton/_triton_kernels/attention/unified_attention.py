@@ -1290,3 +1290,70 @@ def unified_attention_3d_split_rebalance_kernel(
     want = _floor_div_pos(want + (PROGRAMS - 1), PROGRAMS)
     want = tl.minimum(tl.maximum(want, MIN_TILES), MAX_TILES)
     tl.store(segm_tiles_ptr, want.to(tl.int32))
+
+
+_merge_tail_splits_repr = make_kernel_repr(
+    "merge_tail_splits", ["NUM_HEADS", "HEAD_SIZE", "NUM_SPLITS", "BLOCK_Q", "BLOCK_T"]
+)
+
+
+@triton.jit(repr=_merge_tail_splits_repr)
+def merge_tail_splits(
+    out_ptr,
+    pm_ptr,  # [rows, NUM_HEADS, NUM_SPLITS] fp32 raw row max
+    pl_ptr,  # [rows, NUM_HEADS, NUM_SPLITS] fp32 exp sum
+    pacc_ptr,  # [rows, NUM_HEADS, NUM_SPLITS, HEAD_SIZE] fp32 un-normalized acc
+    cu_seqlens_ptr,
+    out_stride_0,
+    out_stride_1,
+    num_rows,
+    num_seqs,
+    tail_qblocks,
+    QK_SCALE: tl.constexpr,  # softmax scale * log2(e); partial M is raw q.k
+    NUM_HEADS: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Merge the gfx1250 2D tail-split partials into the output. Only rows of q blocks < tail_qblocks are
+    written; the main launch writes the others (grid: cdiv(num_rows, BLOCK_T))."""
+    # rows = (token, head) pairs of tokens [pid * BLOCK_T, (pid + 1) * BLOCK_T)
+    pid = tl.program_id(0)
+    R: tl.constexpr = BLOCK_T * NUM_HEADS
+    r = tl.arange(0, R)
+    tok = pid * BLOCK_T + r // NUM_HEADS
+    head = r % NUM_HEADS
+    in_range = tok < num_rows
+    # sequence of each token: number of sequence ends at or below it
+    seq = tl.zeros([R], dtype=tl.int32)
+    for i in range(num_seqs):
+        end_i = tl.load(cu_seqlens_ptr + i + 1)
+        seq += (tok >= end_i).to(tl.int32)
+    start = tl.load(cu_seqlens_ptr + seq, mask=in_range, other=0)
+    stop = tl.load(cu_seqlens_ptr + seq + 1, mask=in_range, other=0)
+    qblock = start // BLOCK_Q + seq + (tok - start) // BLOCK_Q
+    valid = in_range & (tok < stop) & (qblock < tail_qblocks)
+
+    d = tl.arange(0, HEAD_SIZE)
+    ml_base = (tok * NUM_HEADS + head) * NUM_SPLITS
+    m_max = tl.full([R], float("-inf"), dtype=tl.float32)
+    for sp in tl.static_range(NUM_SPLITS):
+        m_s = tl.load(pm_ptr + ml_base + sp, mask=valid, other=float("-inf"))
+        m_max = tl.maximum(m_max, m_s)
+    l_tot = tl.zeros([R], dtype=tl.float32)
+    acc = tl.zeros([R, HEAD_SIZE], dtype=tl.float32)
+    for sp in tl.static_range(NUM_SPLITS):
+        m_s = tl.load(pm_ptr + ml_base + sp, mask=valid, other=float("-inf"))
+        l_s = tl.load(pl_ptr + ml_base + sp, mask=valid, other=0.0)
+        w = tl.where(m_s == float("-inf"), 0.0, tl.exp2((m_s - m_max) * QK_SCALE))
+        a_s = tl.load(
+            pacc_ptr + (ml_base + sp)[:, None] * HEAD_SIZE + d[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        l_tot += w * l_s
+        acc += w[:, None] * a_s
+    o = acc / tl.where(valid, l_tot, 1.0)[:, None]
+    o_offs = tok[:, None] * out_stride_0 + head[:, None] * out_stride_1 + d[None, :]
+    tl.store(out_ptr + o_offs, o.to(out_ptr.dtype.element_ty), mask=valid[:, None])
