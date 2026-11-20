@@ -28,6 +28,27 @@ void fmha_v4_fwd(const at::Tensor& q,
                  // nullopt to write none. Only rows whose manifest lse column is 1 can fill it.
                  std::optional<at::Tensor> lse = std::nullopt);
 
+// THD sibling for BF16 operands: whole documents concatenated along the token axis, Q
+// [total_tokens, nhead_q, head_dim] and K/V [total_tokens, nhead_k, head_dim], delimited for Q and
+// K alike by int32 cu_seqlens [batch + 1], with max_seqlen the longest document. `causal` picks
+// the row whose mask column is 1.
+void fmha_v4_fwd_thd(const at::Tensor& q,
+                     const at::Tensor& k,
+                     const at::Tensor& v,
+                     // [kv_splits, total_tokens, nhead_q, head_dim]. With kv_splits > 1 every
+                     // work-group cuts its key walk into that many slices and slice i writes
+                     // out[i] and lse[i], for the caller to merge by LSE. Needs a row that
+                     // declares kv_range.
+                     at::Tensor out,
+                     const at::Tensor& cu_seqlens,
+                     int64_t max_seqlen,
+                     double softmax_scale,
+                     bool causal,
+                     int64_t kv_splits = 1,
+                     // [kv_splits, nhead_q, total_tokens] float32 and contiguous, or nullopt to
+                     // write none, which only kv_splits == 1 allows.
+                     std::optional<at::Tensor> lse = std::nullopt);
+
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
 // Builds the work table internally: longest LUT first unless AITER_MHA_V4_WORK_ORDER says
 // otherwise, and raster order when lut_count is uniform.
