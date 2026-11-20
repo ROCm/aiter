@@ -7,6 +7,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_cosine_cache_llama,
     fused_qk_rope_reshape_and_cache,
+    q_nope_prestored_supported,
     reshape_and_cache_k4v8,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -1698,3 +1699,16 @@ def test_seg_packed_mla_cache_rejects_noncontiguous():
     assert not view.is_contiguous()
     with pytest.raises(AssertionError, match="contiguous"):
         _run_seg(case, view, _SEG_PAGE, False, None)
+
+
+def test_q_nope_prestored_supported_matches_the_wrapper():
+    # The query and the wrapper's q_nope_prestored check agree: the option is
+    # accepted on gfx1250 and rejected on other archs.
+    supported = q_nope_prestored_supported()
+    assert supported == (arch_info.get_arch() in ("gfx1250", "gfx1250-strict"))
+    if supported:
+        return
+    case = _seg_case(7, 7, 8, torch.bfloat16)
+    cache = _fresh_cache(256, torch.bfloat16)
+    with pytest.raises(AssertionError, match="q_nope_prestored"):
+        _run_seg(case, cache, 0, True, None)

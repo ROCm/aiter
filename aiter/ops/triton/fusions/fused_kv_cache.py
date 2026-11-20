@@ -43,6 +43,20 @@ DEVICE_ARCH = arch_info.get_arch()
 _BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
+def q_nope_prestored_supported() -> bool:
+    """Return True when ``fused_qk_rope_cat_and_cache_mla`` accepts
+    ``q_nope_prestored=True`` on this device.
+
+    The option needs the gfx1250 Gluon head-tile kernel. Callers must also
+    keep its call limits: one KV head, pure decode (``num_decode_toks_for_zeros``
+    is 0) and one slot for each token.
+    """
+    return (
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+        and gluon_qpe_htile_kernel is not None
+    )
+
+
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -477,8 +491,7 @@ def _cat_and_cache_mla(
         # q_pe and the KV cache are bit-identical to the full-rope path.
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
         assert (
-            DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
-            and gluon_qpe_htile_kernel is not None
+            q_nope_prestored_supported()
             and b_slot == b
             and num_decode_toks_for_zeros == 0
         ), "q_nope_prestored is currently supported on gfx1250 pure-decode MLA only"
