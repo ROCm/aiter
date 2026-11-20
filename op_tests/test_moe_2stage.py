@@ -2860,6 +2860,15 @@ def test_plain_fp8_swiglu_limit_dispatch():
         # Without a limit, 64+ per_Token tokens take ASM 1-stage.
         for limit in (7.0, 5.0):
             md = dispatch(token, q, limit)
+            if md.full_impl is not None:
+                # gfx942 per_Token FP8 with no tuned CK row for this limit takes
+                # the FlyDSL whole-graph backend: it applies the clamp itself and
+                # exposes no CK stage partials, so there is no kernelName to read.
+                assert get_gfx_runtime() == "gfx942", (q, token, limit)
+                assert q is aiter.QuantType.per_Token, (q, token, limit)
+                assert md.stage1 is None and md.stage2 is None, (q, token, limit)
+                assert not md.run_1stage and int(md.ksplit or 0) == 0, (q, token, limit)
+                continue
             name = md.stage1.keywords.get("kernelName", "")
             assert md.stage1.func is fused_moe_mod.ck_moe_stage1, (q, token, limit)
             assert not md.run_1stage and int(md.ksplit or 0) == 0, (q, token, limit)
@@ -2869,7 +2878,14 @@ def test_plain_fp8_swiglu_limit_dispatch():
             md = dispatch(token, q, limit)
             assert bool(md.run_1stage) == bool(absent.run_1stage), (q, token, limit)
             assert int(md.ksplit or 0) == int(absent.ksplit or 0), (q, token, limit)
-            if not absent.run_1stage:
+            # 0.0 / +inf are "no clamp" sentinels: they must not reroute a call
+            # that runs on CK without a limit onto the FlyDSL whole-graph backend.
+            assert (md.full_impl is None) == (absent.full_impl is None), (
+                q,
+                token,
+                limit,
+            )
+            if not absent.run_1stage and absent.full_impl is None:
                 assert md.stage1.keywords["kernelName"] == (
                     absent.stage1.keywords["kernelName"]
                 ), (q, token, limit)
@@ -2913,7 +2929,12 @@ def test_plain_fp8_swiglu_limit_dispatch():
 
     for q in quant_types:
         # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        # gfx942 per_Token FP8 takes the FlyDSL whole-graph backend instead.
+        if get_gfx_runtime() == "gfx942" and q is aiter.QuantType.per_Token:
+            md = dispatch(64, q, 7.0, inter=192)
+            assert md.full_impl is not None and md.stage1 is None, q
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
         raises(
             NotImplementedError,
             "swiglu_limit",
