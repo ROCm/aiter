@@ -129,16 +129,37 @@ _LAZY_IMPORTS = {
     "flydsl_qk_norm_rope_quant": (
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_rejection_sample_standard",
     ),
     "CombineWorkspace": (".dcp_mailbox", "CombineWorkspace"),
     "GatherWorkspace": (".dcp_mailbox", "GatherWorkspace"),
     "dcp_lse_combine": (".dcp_mailbox", "dcp_lse_combine"),
     "dcp_quant_query_gather": (".dcp_mailbox", "dcp_quant_query_gather"),
     "dcp_query_gather": (".dcp_mailbox", "dcp_query_gather"),
+    "flydsl_rejection_sample_standard": (
+        ".rejection_sample",
+        "flydsl_rejection_sample_standard",
+    ),
+    "rejection_sample_standard_supported": (
+        ".rejection_sample",
+        "rejection_sample_standard_supported",
+        "router_sqrtsoftplus_topk_supported",
+        "shuffle_router_gate",
+    ),
+    "flydsl_router_sqrtsoftplus_topk": (
+        ".router_sqrtsoftplus_topk",
+        "flydsl_router_sqrtsoftplus_topk",
+    ),
+    "router_sqrtsoftplus_topk_supported": (
+        ".router_sqrtsoftplus_topk",
+        "router_sqrtsoftplus_topk_supported",
+    ),
+    "shuffle_router_gate": (".router_sqrtsoftplus_topk", "shuffle_router_gate"),
     "flydsl_rot_quant": (".kernels.rot_quant", "flydsl_rot_quant"),
     "flydsl_rot_quant_moe_sort": (
         ".kernels.rot_quant",
         "flydsl_rot_quant_moe_sort",
+        "flydsl_router_sqrtsoftplus_topk",
     ),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
@@ -308,6 +329,7 @@ __all__ = [
     "plan_pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "rejection_sample_standard_supported",
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
