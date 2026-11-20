@@ -86,6 +86,31 @@ def _pick_gfx1201_tiles(seq_len: int, head_dim: int, causal: bool) -> tuple[int,
     return 256, 64
 
 
+def _pick_gfx1201_bf16_launch(
+    batch_heads: int, seq_q: int, seq_kv: int, head_dim: int, causal: bool
+) -> tuple[int, int, int]:
+    """(BLOCK_M, BLOCK_N, LDS vector width) for the BF16/F16 kernel, measured on
+    gfx1201 (R9700) over diffusion and LLM prefill shapes."""
+    if causal:
+        # Few query tiles: the smaller tile keeps the CUs busy.
+        if batch_heads * ((seq_q + 127) // 128) < 128:
+            return 64, 32, 16
+        return (128, 64, 16) if head_dim <= 64 else (128, 32, 16)
+    if seq_kv <= 128 and head_dim <= 64:  # short cross-attention (text tokens)
+        return 256, 96, 16
+    if head_dim % 16 == 8:  # padded to the next multiple of 16 in the kernel
+        return (192, 64, 8) if head_dim > 80 else (128, 32, 8)
+    if head_dim <= 64:
+        return 128, 64, 16
+    if head_dim > 128 or seq_kv <= 128:
+        return 128, 32, 16
+    if seq_q < 2048:
+        if seq_kv < seq_q:
+            return 128, 64, 8
+        return (256, 64, 16) if head_dim <= 96 else (128, 32, 16)
+    return 256, 64, 16
+
+
 def _gfx1201_fmha_lds_bytes(head_dim: int, block_n: int, *, fp8: bool) -> int:
     """Return the exact static LDS allocation for a selected gfx1201 kernel."""
     if fp8:
@@ -288,6 +313,7 @@ def _flydsl_flash_attn_func_bf16(
     return_lse,
     block_m,
     block_n,
+    lds_vec_width,
     waves_per_eu,
     daz,
 ):
@@ -365,9 +391,13 @@ def _flydsl_flash_attn_func_bf16(
                 # the causal mask already covers them.
                 tail_mask=not causal and kv_tail,
                 kv_tail=kv_tail,
+                # FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16, when set, overrides
+                # the measured choice.
                 lds_vec_width=(
-                    16
-                    if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+                    lds_vec_width
+                    if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16") is None
+                    else 16
+                    if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16") == "1"
                     else 8
                 ),
                 token_strides=tuple(tok for tok, _ in strides),
@@ -576,7 +606,13 @@ def flydsl_flash_attn_func(
             stacklevel=2,
         )
 
-    block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
+    if is_fp8:
+        block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
+        lds_vec_width = 16
+    else:
+        block_m, block_n, lds_vec_width = _pick_gfx1201_bf16_launch(
+            batch * num_heads, seq_len_real, seq_len_kv_real, head_dim, causal
+        )
     lds_bytes = _gfx1201_fmha_lds_bytes(head_dim, block_n, fp8=is_fp8)
     if lds_bytes > _GFX1201_LDS_CAPACITY_BYTES and block_n != 32:
         # Keep the selected query tile, but fall back to the narrower KV tile
@@ -602,6 +638,7 @@ def flydsl_flash_attn_func(
             return_lse,
             block_m,
             block_n,
+            lds_vec_width,
             waves_per_eu,
             daz,
         )
