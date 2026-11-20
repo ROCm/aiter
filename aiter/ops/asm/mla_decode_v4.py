@@ -68,6 +68,7 @@ class MlaV4KernelArgsPreload(ctypes.Structure):
     """120-byte compact preload kernarg (gfx1250 DIRECT_PARAM=1 ABI)."""
 
     _pack_ = 1
+    _layout_ = "ms"
     _fields_ = [
         ("ptr_R", ctypes.c_void_p),  # 0x00 splitData (logits) FP32 (rw)
         ("ptr_Q", ctypes.c_void_p),  # 0x08 Q packed FP8 + e8m0 scale
@@ -102,6 +103,7 @@ class MlaV4KernelArgsLegacy(ctypes.Structure):
     """336-byte legacy kernarg (21 x 16-byte slots, gfx950 ABI)."""
 
     _pack_ = 1
+    _layout_ = "ms"
     _fields_ = [
         ("ptr_R", ctypes.c_void_p),  # 0:  splitData (logits) FP32 (rw)
         ("_p_r", _P2),
@@ -159,6 +161,7 @@ class MlaV4PsKernelArgs(ctypes.Structure):
     different value and some upper slot halves carry an extra field."""
 
     _pack_ = 1
+    _layout_ = "ms"
     _fields_ = [
         ("ptr_O_acc", ctypes.c_void_p),  # 0x00 workspace o_acc [2P,128,512] FP32
         ("ptr_out", ctypes.c_void_p),  # 0x08 out [N,128,512] BF16
