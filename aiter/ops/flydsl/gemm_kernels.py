@@ -659,7 +659,7 @@ def flydsl_preshuffle_gemm_a8(
         dummy_bias,
         m,
         n,
-        current_stream_arg(),
+        current_stream_arg(Out.device),
     )
     # Every tensor is a flat contiguous view, so the constexprs and the scale
     # dtypes determine the launcher's argument signature. The device keeps

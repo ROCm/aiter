@@ -65,6 +65,7 @@ import dis
 import fcntl
 import functools
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -360,27 +361,257 @@ def _build_spans(body, called, at_import=True) -> list:
 
 
 @functools.cache
-def _env_names(path: str, called: frozenset) -> frozenset:
-    """Environment variables ``path`` reads by a literal name in the code that
-    can feed a build (``_build_spans``). Host-only functions the build never
-    called, such as an allocator or IPC setup, are skipped."""
+def _parse(path: str):
+    """``(lines, tree)`` of a source file, once per build; None if unreadable."""
     try:
         text = Path(path).read_text(errors="replace")
-        tree = ast.parse(text)
-    except (OSError, SyntaxError):
-        return frozenset()
-    lines = text.splitlines()
+        return text.splitlines(), ast.parse(text)
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+def _build_text(path: str, called: frozenset) -> str:
+    """The code of ``path`` that can feed a build (``_build_spans``)."""
+    parsed = _parse(path)
+    if parsed is None:
+        return ""
+    lines, tree = parsed
+    return "\n".join(
+        "\n".join(lines[a - 1 : b]) for a, b in _build_spans(tree.body, called)
+    )
+
+
+def _env_names(path: str, called: frozenset) -> frozenset:
+    """Environment variables ``path`` reads by a literal name in the code that
+    can feed a build. Host-only functions the build never called, such as an
+    allocator or IPC setup, are skipped."""
     return frozenset(
         n
-        for a, b in _build_spans(tree.body, called)
-        for m in _ENV_NAME_RE.finditer("\n".join(lines[a - 1 : b]))
+        for m in _ENV_NAME_RE.finditer(_build_text(path, called))
         for n in m.groups()
         if n
     )
 
 
+def _module_file(name: str) -> str | None:
+    """The source of aiter module ``name``, e.g. ``aiter.ops.flydsl.x``."""
+    parts = name.split(".")
+    if parts[0] != "aiter" or not all(parts):
+        return None
+    base = os.path.join(_tracked_root(), *parts[1:])
+    for f in (base + ".py", os.path.join(base, "__init__.py")):
+        if os.path.isfile(f):
+            return f
+    return None
+
+
+def _import_base(path: str, node: ast.ImportFrom) -> str:
+    """The absolute module ``node`` imports from, in file ``path``."""
+    if node.level == 0:
+        return node.module or ""
+    rel = _portable(path)
+    if os.path.isabs(rel):
+        return ""
+    package = ["aiter"] + rel.split(os.sep)[:-1]
+    package = package[: len(package) - node.level + 1]
+    return ".".join(package + ([node.module] if node.module else []))
+
+
+def _bound_names(node) -> set:
+    """The module-level names statement ``node`` binds, not counting the
+    statements nested in it."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return {(a.asname or a.name).split(".")[0] for a in node.names}
+    return {
+        n.id
+        for c in ast.iter_child_nodes(node)
+        if not isinstance(c, (ast.stmt, ast.ExceptHandler))
+        for n in ast.walk(c)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    }
+
+
+def _module_statements(body):
+    """Statements run at import, inside ``if``/``try``/``with`` blocks too."""
+    for node in body:
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for c in ast.iter_child_nodes(node):
+            if isinstance(c, ast.ExceptHandler):
+                yield from _module_statements(c.body)
+            elif isinstance(c, ast.stmt):
+                yield from _module_statements([c])
+
+
+@functools.cache
+def _bindings(path: str) -> dict:
+    """Module-level name -> the statements of ``path`` that bind it."""
+    parsed = _parse(path)
+    out = {}
+    if parsed is not None:
+        for node in _module_statements(parsed[1].body):
+            for name in _bound_names(node):
+                out.setdefault(name, []).append(node)
+    return out
+
+
+def _binds_logger(node) -> bool:
+    """Whether ``node`` is ``x = logging.getLogger(...)``: a logger does not
+    change a kernel, and ``from aiter import logger`` would otherwise tie
+    every entry to ``aiter/__init__.py``."""
+    v = getattr(node, "value", None)
+    f = v.func if isinstance(v, ast.Call) else None
+    return (
+        isinstance(f, (ast.Attribute, ast.Name))
+        and (getattr(f, "attr", None) or getattr(f, "id", None)) == "getLogger"
+    )
+
+
+def _value_sources(path: str, name: str, seen: set) -> set:
+    """The files module-level ``name`` of ``path`` takes its value from.
+
+    A function is recorded when the build calls it, so it adds nothing unless
+    memoized: a cached call does not enter it. Any other value adds ``path``
+    and, through the names its statement reads, what it was computed from.
+    """
+    if (path, name) in seen:
+        return set()
+    seen.add((path, name))
+    nodes = _bindings(path).get(name)
+    if not nodes:
+        # Bound in a way this does not follow, e.g. a star import.
+        return {path}
+    out = set()
+    for node in nodes:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _cached(node):
+                out.add(path)
+        elif isinstance(node, ast.ImportFrom):
+            base = _import_base(path, node)
+            for a in node.names:
+                if (a.asname or a.name) == name:
+                    out |= _imported(base, a.name, seen)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if (a.asname or a.name).split(".")[0] == name:
+                    out.add(_module_file(a.name))
+        elif not _binds_logger(node):
+            out.add(path)
+            bound = _bindings(path)
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id in bound and n.id != name:
+                    out |= _value_sources(path, n.id, seen)
+    out.discard(None)
+    return out
+
+
+def _imported(module: str, name: str, seen: set) -> set:
+    """The files ``from module import name`` takes a non-function value from."""
+    f = _module_file(module)
+    if f is None:
+        return set()
+    if name == "*":
+        return {f}
+    sub = _module_file(f"{module}.{name}")
+    if sub is not None:
+        return {sub}
+    return _value_sources(f, name, seen)
+
+
+def _import_sources(files, called: dict) -> set:
+    """Aiter modules whose module-level values the code of ``files`` imports.
+
+    Reading an imported constant calls nothing, so the profile hook does not
+    see the module that defines it. Static, and on the generous side: an extra
+    file costs a rebuild when it is edited, a missing one a stale kernel.
+    """
+    out = set()
+    seen = set()
+    for path in files:
+        parsed = _parse(path)
+        if parsed is None:
+            continue
+        spans = _build_spans(parsed[1].body, frozenset(called.get(path, ())))
+        for node in ast.walk(parsed[1]):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if not any(a <= node.lineno <= b for a, b in spans):
+                continue
+            if isinstance(node, ast.Import):
+                out.update(_module_file(a.name) for a in node.names)
+                continue
+            base = _import_base(path, node)
+            for a in node.names:
+                out |= _imported(base, a.name, seen)
+    out.discard(None)
+    out = {os.path.realpath(f) for f in out}
+    return {f for f in out if _is_tracked(f)} - set(files)
+
+
+def _clear_get_gfx():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    get_gfx.cache_clear()
+
+
+def _get_gfx():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    try:
+        return get_gfx()
+    except Exception:  # noqa: BLE001  no GPU and no GPU_ARCHS
+        return None
+
+
+# Values aiter derives from the environment, kept with the variables an entry
+# depends on. get_gfx() honours GPU_ARCHS (its last arch when it names
+# several), while the fingerprint's arch is the device's or FlyDSL's target:
+# an image setting GPU_ARCHS="gfx942;gfx950" answers gfx950 on a gfx942.
+_DERIVED = {"get_gfx()": _get_gfx}
+
+
+def _calls_get_gfx(path: str) -> bool:
+    """Whether code of ``path`` that may have run before a build calls
+    get_gfx(): module-level statements and memoized functions."""
+    parsed = _parse(path)
+    if parsed is None:
+        return False
+    spans = _build_spans(parsed[1].body, frozenset())
+    for node in ast.walk(parsed[1]):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name == "get_gfx" and any(a <= node.lineno <= b for a, b in spans):
+                return True
+    return False
+
+
+def _uses_get_gfx(files, calls) -> bool:
+    """Whether the build called get_gfx(), directly or through a value
+    computed before it. Its memo is cleared before each build, so a call
+    during the build enters it and the profile hook sees it."""
+    from aiter.jit.utils import chip_info
+
+    code = inspect.unwrap(chip_info.get_gfx).__code__
+    if (code.co_filename, code.co_firstlineno) in calls:
+        return True
+    return any(_calls_get_gfx(f) for f in files)
+
+
+def _input(name: str):
+    """The current value of an entry's input: a variable or a ``_DERIVED`` one."""
+    return _DERIVED[name]() if name in _DERIVED else os.environ.get(name)
+
+
 # os.getenv, os.environ.get and `in` reach _Environ.__getitem__ through these.
-_ENV_PLUMBING = frozenset({os.__file__, _collections_abc.__file__})
+# Taken from the code objects: on Python 3.11+ both modules are frozen, and
+# their co_filename is "<frozen os>" rather than os.__file__.
+_ENV_PLUMBING = frozenset(
+    {os.getenv.__code__.co_filename, _collections_abc.Mapping.get.__code__.co_filename}
+)
 # The plumbing that reads one variable by name. copy(), items(), dict(os.environ)
 # and the like read every variable; they are not a dependency on each, and
 # recording them would write the whole environment, secrets included, into
@@ -444,7 +675,7 @@ def _record_sources(out: set, env: set, calls: set):
         )
 
 
-def _entry_env(files, read, calls) -> dict:
+def _entry_env(files, read, calls, called) -> dict:
     """The variables an entry built from ``files`` depends on, with their values.
 
     Names are taken from the text of kernel code only (``aiter/ops/flydsl``),
@@ -453,12 +684,6 @@ def _entry_env(files, read, calls) -> dict:
     not affect a kernel, so for them only the reads seen during the build count.
     """
     kernel_root = _tracked_root() + "ops" + os.sep + "flydsl" + os.sep
-    by_file = {}
-    for f, line in calls:
-        by_file.setdefault(f, set()).add(line)
-    called = {}
-    for f, lines in by_file.items():
-        called.setdefault(os.path.realpath(f), set()).update(lines)
     names = set(read).union(
         *(
             _env_names(f, frozenset(called.get(f, ())))
@@ -466,13 +691,27 @@ def _entry_env(files, read, calls) -> dict:
             if f.startswith(kernel_root)
         )
     )
-    return {
+    env = {
         k: os.environ.get(k)
         for k in sorted(names)
         if not _env_in_fingerprint(k)
         and k not in _ENV_SETUP
         and not k.startswith(_ENV_SETUP_PREFIXES)
     }
+    if _uses_get_gfx(files, calls):
+        env["get_gfx()"] = _get_gfx()
+    return env
+
+
+def _called_lines(calls) -> dict:
+    """Real path -> first lines of the functions ``calls`` holds in it."""
+    by_file = {}
+    for f, line in calls:
+        by_file.setdefault(f, set()).add(line)
+    called = {}
+    for f, lines in by_file.items():
+        called.setdefault(os.path.realpath(f), set()).update(lines)
+    return called
 
 
 def _entry_current(meta: dict) -> bool:
@@ -480,7 +719,7 @@ def _entry_current(meta: dict) -> bool:
     sources = meta["sources"].items()
     # os.path.join keeps an absolute path as it is.
     return all(_file_digest(os.path.join(root, p)) == d for p, d in sources) and all(
-        os.environ.get(k) == v for k, v in meta["env"].items()
+        _input(k) == v for k, v in meta["env"].items()
     )
 
 
@@ -743,9 +982,16 @@ class FlyDSLAotCache:
             files = set(self._extra)
             read = set()
             calls = set()
+            _clear_get_gfx()
             with _record_sources(files, read, calls):
                 exe = make_exe()
                 tmp_obj = _export(exe, args, tmp, sym)
+            # Parsed now, not from the per-process cache: the build read the
+            # files as they are on disk at this point.
+            _parse.cache_clear()
+            _bindings.cache_clear()
+            called = _called_lines(calls)
+            files |= _import_sources(files, called)
             changed = _changed_since_start(files)
             if changed:
                 raise RuntimeError(
@@ -755,9 +1001,8 @@ class FlyDSLAotCache:
             # Hashed now, not from the per-process cache: the build read the
             # files as they are on disk at this point.
             _file_digest.cache_clear()
-            _env_names.cache_clear()
             sources = {_portable(f): _file_digest(f) for f in sorted(files)}
-            meta = {"sources": sources, "env": _entry_env(files, read, calls)}
+            meta = {"sources": sources, "env": _entry_env(files, read, calls, called)}
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"
             sidecar = tmp / "meta.json"

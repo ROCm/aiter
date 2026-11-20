@@ -99,7 +99,7 @@ internals, which a FlyDSL release may move or rename without notice:
 | `flydsl.utils.env` (`env.compile.compile_only`) | Detects `COMPILE_ONLY`. |
 | `fx.Stream._is_stream_param` | Recognizes a stream argument, whose placeholder is a null stream. |
 
-Re-run `op_tests/test_flydsl_aot_cache.py` on every FlyDSL pin bump.
+Re-run `python3 -m pytest -q tests/test_flydsl_aot_cache.py` on every FlyDSL pin bump.
 
 ## 4. aiter design: `aiter/ops/flydsl/aot_cache.py`
 
@@ -193,6 +193,19 @@ still match once the wheel is installed into `site-packages`. A lookup accepts a
 hash the same. The per-process digest cache makes this one `sha256` per file
 per process.
 
+The profile hook sees calls, not reads of a module-level value: a kernel that
+does `from .common import TILE_M` and reads `TILE_M` never calls into
+`common.py`. So after the build, the imports in the code of each recorded file
+that can feed it (the same spans as the variable scan below) are resolved
+statically, and the module a non-function value comes from is recorded too,
+following re-exports and the names its statement is computed from (`BIG =
+TILE * 2` records where `TILE` comes from). `import x` records `x`. A function
+adds nothing, since the build records it when it calls it, unless it is
+memoized; a logger (`x = logging.getLogger(...)`) adds nothing either, or
+`from aiter import logger` would tie every entry to `aiter/__init__.py`. This
+over-records rather than under-records: an imported constant the kernel does
+not use costs a rebuild when its file changes, never a stale kernel.
+
 The sidecar also stores the environment variables the entry depends on, with
 their values (`null` if unset), and a lookup requires the same values. They
 are found two ways, so no list has to be kept:
@@ -227,9 +240,25 @@ config a CSV selects. Only the variables an entry's own
 files name are compared, so a switch for another kernel (`AITER_FLY_AR`, an
 MoE tuning variable) does not invalidate GEMM entries.
 
-For the preshuffle GEMM the recorded set is `gemm_kernels.py`,
-`kernels/preshuffle_gemm.py`, `kernels/kernels_common.py` and
-`ops/triton/__init__.py` (an import side effect, harmless). So:
+`GPU_ARCHS` is left to the fingerprint, but `chip_info.get_gfx()` returns its
+last arch, while the fingerprint hashes the device's. An image setting
+`GPU_ARCHS="gfx942;gfx950"` answers `gfx950` on a gfx942, so a kernel choosing
+code by `get_gfx()` would build a gfx950 variant into the gfx942 directory.
+An entry whose build calls `get_gfx()` therefore stores its value under the
+key `"get_gfx()"`, and a lookup compares it like a variable. Its memo is
+cleared before each build, so the profile hook sees the call; a value computed
+from it before the build, at module level or in a memoized function of a
+recorded file, is found by scanning that code. Hashing it into the fingerprint instead would
+make every entry miss in such an image, including those of kernels that never
+call it. The replay sets `GPU_ARCHS` to the arch it builds for, so its entries
+store that arch and a process on that device hits them. None of the converted
+launchers calls `get_gfx()` today.
+
+For the preshuffle GEMM the recorded set is `gemm_kernels.py`, the kernel
+modules it builds from (`kernels/preshuffle_gemm.py`, `splitk_epilogue.py`,
+`gemm_a16w16_gfx950_utils.py`, `kernels_common.py`, …), `jit/utils/chip_info.py`,
+and in the first build of a process the modules it imports (`ops/triton/…`,
+an import side effect, harmless). So:
 
 - editing `kernels/act.py`, or any MoE kernel, still hits every GEMM entry;
 - editing `kernels/preshuffle_gemm.py` rebuilds only the GEMM entries, and
@@ -255,7 +284,7 @@ Known holes, and how they are handled:
 
 | hole | example | mitigation |
 |---|---|---|
-| A module-level value read from a file none of whose functions run | `TILE = 64` in `consts.py`, imported by name | `setprofile` sees calls, not attribute reads. Pass the file in `extra_sources`, or run `verify` mode |
+| A module-level value reached without an import in build code | `getattr(consts, name)`, or an import inside a function the build did not call | Imports in build code are followed statically (above). Pass the file in `extra_sources`, or run `verify` mode |
 | Code outside the aiter package affects the kernel | a helper in another installed package | Pass it in `extra_sources`, or run `verify` mode |
 | The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count | Put it in `key`. `verify` mode detects it |
 | A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
@@ -367,7 +396,7 @@ not prebuilt. This predates the cache and is left to a separate change.
 ### 5.1 gfx942: `flydsl_preshuffle_gemm_a8`
 
 ```python
-key = (tuple(sorted(compile_kwargs.items())), x_scale.dtype, w_scale.dtype)
+key = (tuple(sorted(compile_kwargs.items())), x_scale.dtype, w_scale.dtype, XQ.device)
 _PRESHUFFLE_AOT_CACHE.launch(
     key, lambda: _get_compile_fn()(**compile_kwargs), *args
 )
@@ -380,7 +409,7 @@ _PRESHUFFLE_AOT_CACHE.launch(
   tuned CSV that means one entry per unique `(N, K, tile config)`.
 
 MI308X (gfx942), FlyDSL 0.5.0.dev1039 (with `flyc.load_module`),
-`op_tests/test_flydsl_aot_cache.py`, each mode in a fresh process. "first ms" is the wall time of the first call of that config in the
+`tests/test_flydsl_aot_cache.py`, each mode in a fresh process. "first ms" is the wall time of the first call of that config in the
 process.
 
 | m | n | k | qdtype | jit first ms | aot miss first ms | aot hit first ms | aot verify first ms | jit us | aot hit us | bitwise equal |
@@ -496,9 +525,9 @@ not converted.
    rank and unit-stride axis are covered by the disk digest. Include them in
    `key` too if they can vary for the same `key`, as the FlyDSL
    compiled-handle rules in `aiter/ops/flydsl/AGENTS.md` require.
-3. **Pass extra sources.** If the kernel reads module-level constants from
-   a file none of whose functions run during the trace, or uses code outside
-   the aiter package, pass those paths as `extra_sources=`.
+3. **Pass extra sources.** If the kernel uses code outside the aiter
+   package, pass those paths as `extra_sources=`. Constants imported from an
+   aiter module are recorded already.
 4. **Call `launch` unconditionally.** It handles mode `0`, the fallback
    and compile-only; the wrapper needs no branch.
 5. **Test it.** Run the op's test under `AITER_FLYDSL_AOT_CACHE=verify` once,
