@@ -89,16 +89,21 @@ def test_classifier_falls_back_without_setuptools_base_error(
 
 
 @pytest.mark.parametrize(
-    "command, kept",
+    "command, kept, prebuild",
     [
-        (["egg_info", "--egg-base", "."], True),
+        (["egg_info", "--egg-base", "."], True, False),
+        # PREBUILD_KERNELS=1 must not start the kernel prebuild in a metadata-only run.
+        (["egg_info", "--egg-base", "."], True, True),
+        (["dist_info", "--output-dir", "out"], True, True),
         # clean removes one an interrupted build left behind, as main did.
-        (["clean"], False),
+        (["clean"], False, False),
         # Help on clean runs nothing, so it removes nothing.
-        (["clean", "--help"], True),
+        (["clean", "--help"], True, False),
     ],
 )
-def test_metadata_only_run_and_an_existing_aiter_meta(tmp_path, command, kept):
+def test_metadata_only_run_and_an_existing_aiter_meta(
+    tmp_path, command, kept, prebuild
+):
     """egg_info and clean --help keep an aiter_meta/ they did not stage; clean removes it."""
     for name in (
         "setup.py",
@@ -112,7 +117,10 @@ def test_metadata_only_run_and_an_existing_aiter_meta(tmp_path, command, kept):
     (tmp_path / "aiter_meta").mkdir()
     (tmp_path / "aiter_meta" / "keep").touch()
 
+    (tmp_path / "out").mkdir()  # dist_info needs its output dir to exist
     env = dict(os.environ)
+    if prebuild:
+        env["PREBUILD_KERNELS"] = "1"
     if sys.platform == "win32":
         # The Windows ROCm probe imports aiter/jit/utils/cpp_extension.py, which
         # this copy lacks. Triton-only skips the probe; aiter_meta/ is kept either way.
