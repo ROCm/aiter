@@ -578,6 +578,21 @@ def test_q_abs_max_is_the_tile_and_head_maximum(kind, q_tile, seqlen):
     assert torch.equal(heads, tiles.amax(dim=1))
 
 
+def test_rotated_hd256_q_abs_max_rotates_each_half():
+    """The hd256 packers rotate each 128-channel half as an hd128 row."""
+    q = torch.randn((2, 600, 3, 256), dtype=torch.bfloat16, device="cuda")
+    tiles, heads = sol_q_abs_max(q, 64, rotate=True)
+
+    halves = q.unflatten(-1, (2, 128)).flatten(2, 3)
+    rotated = torch.empty_like(halves)
+    rotate_activation_hd128(rotated, halves)
+    real = rotated.view(q.shape).float().abs()
+    padded = torch.nn.functional.pad(real, (0, 0, 0, 0, 0, -q.shape[1] % 64))
+    want = padded.unflatten(1, (-1, 64)).amax(dim=2).to(torch.bfloat16)
+    torch.testing.assert_close(tiles, want, rtol=2**-7, atol=0)
+    assert torch.equal(heads, tiles.amax(dim=1))
+
+
 @pytest.mark.parametrize("kind", ["fp8", "bf16", "mxfp8", "rotated"])
 def test_q_abs_max_compiles_fullgraph_and_matches_eager(kind):
     kwargs, _ = make_q_abs_max_inputs(kind, q_tile=64)
@@ -620,17 +635,19 @@ def make_jensen_inputs(
     q_tile=SOL_ATTN_TS_QO,
     softmax_scale=0.125,
     seed=0,
+    head_dim=HEAD_DIM,
 ):
     """(keyword arguments of sol_jensen_cap, sol_prepare's output) for one K kind.
 
     kind is "fp8" (per-tensor Q and K), "bf16", or the block-scaled "mxfp8", "mxfp4" or "mxfp6" K
     with a BF16 Q. K and V are planted as in _planted_kv, by default over 8 full blocks and a short
-    one. The mask is sol_prepare's routed one at q_tile rows a tile.
+    one. The mask is sol_prepare's routed one at q_tile rows a tile. At head dim 256 an MXFP8 K is
+    packed.
     """
     seqlen_k = 8 * kv_tile + 21 if seqlen_k is None else seqlen_k
-    k_real, v_real = _planted_kv(batch, seqlen_k, heads, 2, seed)
+    k_real, v_real = _planted_kv(batch, seqlen_k, heads, 2, seed, head_dim=head_dim)
     q = 8.0 * torch.randn(
-        (batch, seqlen_q, heads, HEAD_DIM), dtype=torch.float32, device="cuda"
+        (batch, seqlen_q, heads, head_dim), dtype=torch.float32, device="cuda"
     )
     prepare = {"BLOCK_M": q_tile, "BLOCK_N": kv_tile, "k_variance": True}
     cap = {"q_descale": None, "k_descale": None}
@@ -643,7 +660,7 @@ def make_jensen_inputs(
         )
     elif kind == "bf16":
         k, q = k_real, q.to(torch.bfloat16)
-    elif kind == "mxfp8":
+    elif kind == "mxfp8" and head_dim == HEAD_DIM:
         k, prepare["k_scale"], _ = _mx(k_real)
         q = q.to(torch.bfloat16)
         cap["q_multiplier"] = 2.0
@@ -673,7 +690,7 @@ def make_jensen_inputs(
 def _jensen_reference(kind, kwargs, prep):
     """The uncapped per-block J_max in nats and the docstring's gain min(1, ln(kv_tile) / J_max)."""
     qm = kwargs["q_abs_max"][0].float()
-    if kind in PACKED_K:
+    if prep["mean_k_var_pooled"] is not None:
         var = prep["mean_k_var_pooled"].float()
     elif kind == "mxfp8":
         var = prep["mean_k_var"].float() * torch.exp2(
@@ -778,6 +795,30 @@ def test_jensen_cap_damps_each_block_to_ln_kv_tile(kind, kv_tile, masked):
     want_tail = torch.where(valid, var_scale.reshape(-1)[index], 0)
     assert torch.equal(got[..., tail], want_tail)
     assert torch.equal(got[..., : tail.start], records[..., : tail.start])
+
+
+@requires_gfx950
+@pytest.mark.parametrize("kind", ["mxfp4", "mxfp6", "mxfp8"])
+def test_hd256_jensen_cap_moves_each_block_scale_by_its_gain(kind):
+    """The hd256 MXFP6 and MXFP8 records hold their scales inline, so the capped variance is a new
+    pack; it has to carry the same scale shift the cap applies to the scale image."""
+    kwargs, prep = make_jensen_inputs(kind, kv_tile=64, head_dim=256)
+    kwargs["softmax_scale"] = 1e-6
+    var, var_scale, gain = sol_jensen_cap(**kwargs)
+    assert (gain == 1).all()
+    assert torch.equal(var_scale, prep["mean_k_var_scale"])
+    if kind != "mxfp4":
+        assert torch.equal(var, prep["mean_k_var"])
+
+    _cap_most(kind, kwargs, prep)
+    var, var_scale, gain = sol_jensen_cap(**kwargs)
+    assert (gain < 1).any() and (gain == 1).any()
+    blocks = gain.shape[1]
+    expected = prep["mean_k_var_scale"].to(torch.int32)
+    shift = torch.log2(gain).to(torch.int32)[..., None]
+    expected[:, :blocks] = (expected[:, :blocks] + shift).clamp(0, 254)
+    assert torch.equal(var_scale.to(torch.int32)[:, :blocks], expected[:, :blocks])
+    assert (var is prep["mean_k_var"]) == (kind == "mxfp4")
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])

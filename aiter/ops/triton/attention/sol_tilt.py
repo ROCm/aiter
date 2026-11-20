@@ -145,12 +145,12 @@ def sol_q_abs_max(
     reads the first and sol_tilt_factors the second; build them once and pass the pair to both.
     For the block-scaled rows the maxima are taken in the kernel's basis: q_scale, (batch, seqlen,
     heads, d / 32) E8M0, dequantizes an MXFP8 Q's codes, and rotate takes a packed row's unrotated
-    source Q through the packers' hd128 rotation.
+    source Q through the packers' rotation: hd128, on each 128-channel half at hd256.
     """
     _check_unit_stride("q", q)
     batch, seqlen, heads, d = q.shape
-    if rotate and d != 128:
-        raise ValueError(f"the packers' rotation is hd128, got head dim {d}")
+    if rotate and d not in (128, 256):
+        raise ValueError(f"the packers' rotation is hd128 or hd256, got head dim {d}")
     if q_scale is not None and (
         tuple(q_scale.shape) != (batch, seqlen, heads, d // 32)
         or q_scale.stride(-1) != 1
@@ -158,6 +158,14 @@ def sol_q_abs_max(
         raise ValueError(
             f"q_scale must be ({batch}, {seqlen}, {heads}, {d // 32}) with unit-stride groups"
         )
+    if rotate and d == 256:
+        halves = sol_q_abs_max(
+            q.unflatten(-1, (2, 128)).flatten(2, 3),
+            q_tile,
+            None if q_scale is None else q_scale.unflatten(-1, (2, -1)).flatten(2, 3),
+            rotate=True,
+        )
+        return halves[0].view(batch, -1, heads, d), halves[1].view(batch, heads, d)
     tiles = -(-seqlen // q_tile)
     out = torch.empty(batch, tiles, heads, d, dtype=torch.bfloat16, device=q.device)
     head = torch.empty(batch, heads, d, dtype=torch.bfloat16, device=q.device)
@@ -230,7 +238,9 @@ def sol_jensen_cap(
     q_multiplier, the factor its quantizer folds in. MXFP8 decodes mean_k_var by its scale; a
     packed K, whose codes are not addressable, passes sol_prepare's mean_k_var_pooled. The gain
     goes into the variance's scale bytes as 2^floor(log2 h), and for MXFP6 also into the scale
-    tails of a copy of its records, which is what that kernel reads.
+    tails of a copy of its records, which is what that kernel reads. The hd256 MXFP6 and MXFP8
+    records hold their scales inline, so their capped variance is packed again from
+    mean_k_var_pooled.
 
     Returns (mean_k_var, mean_k_var_scale, gain): the damped variance and, for a block-scaled K, its
     new scale (else None), and the per-block gain h in (0, 1] as applied, (batch, blocks, heads)
@@ -325,7 +335,18 @@ def sol_jensen_cap(
             TILE_CHUNK=32,
             HEAD_DIM=d,
         )
-    if block_scaled and mean_k_var.shape[-1] * mean_k_var.element_size() * 8 == 6 * d:
+    bits = mean_k_var.shape[-1] * mean_k_var.element_size() * 8
+    if block_scaled and d == 256 and bits in (6 * d, 8 * d):
+        from aiter.ops.triton.attention.utils import _sol_attn_pack_k_variance
+
+        if mean_k_var_pooled is None:
+            raise ValueError("an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled")
+        var, var_scale = _sol_attn_pack_k_variance(
+            mean_k_var_pooled.float() * gain.unsqueeze(-1),
+            "mxfp6" if bits == 6 * d else "mxfp8",
+            kv_tile,
+        )
+    elif block_scaled and bits == 6 * d:
         var = _refill_mxfp6_scale_tails(mean_k_var, var_scale)
     return var, var_scale, gain
 
