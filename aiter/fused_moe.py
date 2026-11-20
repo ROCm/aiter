@@ -365,8 +365,11 @@ def _kernel_output(output):
 def _adaptive_output_usable(output, M, model_dim, dtype, device):
     """Whether a caller ``output`` can be the adaptive sort's atomic moe_buf.
 
-    The BM16 sort zeroes moe_buf with 4-byte stores, so the buffer has to be
-    4-byte aligned on top of matching what fused_moe would have allocated.
+    The BM16 sort zeroes moe_buf with 16-byte stores; the only caller already
+    requires a 16-byte aligned output (``_kernel_output``), so the ``% 4``
+    check below is looser than the sort needs and is kept as it was in #7620.
+    The shape, dtype, device and contiguity checks match what fused_moe would
+    have allocated.
     """
     return (
         output is not None
