@@ -26,6 +26,8 @@ _LOG2_E4M3_MAX = math.log2(448.0)
 BN: gl.constexpr = gl.constexpr(64)  # keys per tile
 D: gl.constexpr = gl.constexpr(512)  # latent width = V width
 INV_ROPE_DIM: gl.constexpr = gl.constexpr(64)  # dims the output's inverse RoPE turns
+NOPE: gl.constexpr = gl.constexpr(448)  # q columns before the RoPE dims
+ROPE_HALF: gl.constexpr = gl.constexpr(32)  # cos_sin_cache: 32 cos then 32 sin
 
 # Triton 3.8 spells shared_memory_descriptor.reinterpret as _reinterpret and has
 # no gl.amd.hint.sched_barrier (sched_barrier falls back to an asm fence); both
@@ -105,6 +107,31 @@ def relayout(smem, layout: gl.constexpr):
     else:
         r = smem._reinterpret(smem.dtype, smem.shape, layout)
     return r
+
+
+@gluon.jit
+def swap_pairs(x, layout: gl.constexpr):
+    """x with columns 2i and 2i + 1 exchanged, in registers: a pair is two adjacent
+    elements of one lane's 16-element k run."""
+    M: gl.constexpr = x.shape[0]
+    N: gl.constexpr = x.shape[1]
+    a, b = gl.split(gl.reshape(x, [M, N // 2, 2]))
+    return gl.convert_layout(gl.reshape(gl.join(b, a), [M, N]), layout)
+
+
+@gluon.jit
+def rope_fma(x, xp, cosv, ssin):
+    """fma(x, cos, xp * sin): x_e * cos - x_o * sin (even) and x_o * cos +
+    x_e * sin (odd), contracted as the Q kernel's compiled code does."""
+    cb = gl.broadcast(cosv[None, :], x)[0]
+    sb = gl.broadcast(ssin[None, :], x)[0]
+    return gl.fma(x, cb, xp.to(gl.float32) * sb)
+
+
+@gluon.jit
+def quant_e4m3(x, inv_scale):
+    """x * inv_scale saturated to +-448 and cast to e4m3 (the Q kernel's packFp8)."""
+    return gl.minimum(gl.maximum(x * inv_scale, -E4M3_MAX), E4M3_MAX).to(gl.float8e4nv)
 
 
 @aggregate
@@ -644,7 +671,140 @@ class Program:
         return (q_dot, qr_dot), gl.convert_layout(s, cfg.ROW_L)
 
     @gluon.jit
-    def loop(self, q, kv_ptr, ix, start, n, t0, t1, c, init):
+    def rot_fp8(
+        self, x, C0: gl.constexpr, NC: gl.constexpr, layout: gl.constexpr, rs,
+        cs_base, inv_scale,
+    ):  # fmt: skip
+        """fp32 columns C0 .. C0 + NC of raw q (x, in layout): the head's RMS scale
+        rs, GPT-J RoPE on columns >= 448 (the pair partner is a second load of
+        column ^ 1), then * inv_scale, saturated and cast to e4m3. Same math as
+        fusedDeepseekV4FullCacheKernel's Q store."""
+        BLOCK_H: gl.constexpr = self.cfg.BLOCK_H
+        BLOCK_M: gl.constexpr = self.cfg.BLOCK_M
+        x = x * rs[:, None]
+        if C0 + NC > NOPE:
+            hq = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
+            cq = gl.arange(0, NC, layout=gl.SliceLayout(0, layout))
+            rope_col = (C0 + cq) >= NOPE
+            off = hq[:, None] * self.q_stride + (cq ^ 1)[None, :]
+            pm = (hq < BLOCK_H)[:, None] & rope_col[None, :]
+            xp = gl.amd.cdna4.buffer_load(self.q_ptr + C0, off, mask=pm).to(gl.float32)
+            xp = xp * rs[:, None]
+            j = (C0 + cq - NOPE) >> 1
+            cosv = gl.load(cs_base + j, mask=rope_col, other=1.0)
+            sinv = gl.load(cs_base + ROPE_HALF + j, mask=rope_col, other=0.0)
+            sinv = gl.where((cq & 1) == 0, -sinv, sinv)
+            x = rope_fma(x, xp, cosv, sinv)
+        v = gl.minimum(gl.maximum(x * inv_scale, -E4M3_MAX), E4M3_MAX)
+        return v.to(gl.float8e4nv)
+
+    @gluon.jit
+    def rope_cs(
+        self, C0: gl.constexpr, NC: gl.constexpr, layout: gl.constexpr, cs_base
+    ):
+        """(cos, signed sin) of columns C0 .. C0 + NC of q: 1 and 0 before column 448."""
+        cq = gl.arange(0, NC, layout=gl.SliceLayout(0, layout))
+        rope_col = (C0 + cq) >= NOPE
+        j = (C0 + cq - NOPE) >> 1
+        cosv = gl.load(cs_base + j, mask=rope_col, other=1.0)
+        sinv = gl.load(cs_base + ROPE_HALF + j, mask=rope_col, other=0.0)
+        sinv = gl.where((cq & 1) == 0, -sinv, sinv)
+        return cosv, sinv
+
+    @gluon.jit
+    def qraw_issue(self, pos_ptr, cs_ptr, cs_stride):
+        """Issue every global load q's fp8 operands need (raw q, the RoPE pair
+        partners, cos / sin), consuming none, so the caller can start the first
+        KV gather before the wait."""
+        cfg = self.cfg
+        gl.static_assert(cfg.ROPE_TAIL == 0, "raw q needs the rope-free geometry")
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK_MFMA, 16)
+        pos = gl.load(pos_ptr + self.row)
+        cs_base = cs_ptr + pos * cs_stride
+        if cfg.WHOLE_ROWS:
+            cosv, sinv = self.rope_cs(384, 128, q_op, cs_base)
+            xr = (
+                self.load_q(0, 128, q_op), self.load_q(128, 128, q_op),
+                self.load_q(256, 128, q_op), self.load_q(384, 128, q_op),
+                cosv, sinv,
+            )  # fmt: skip
+        else:
+            cosv, sinv = self.rope_cs(0, D, q_op, cs_base)
+            xr = (self.load_q(0, D, q_op), cosv, sinv)
+        return xr
+
+    @gluon.jit
+    def qraw_finish(self, xr, inv_scale):
+        """q_fp8's operands from qraw_issue's loads: RoPE, * 1 / q_scale,
+        saturate, e4m3."""
+        cfg = self.cfg
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK_MFMA, 16)
+        if cfg.WHOLE_ROWS:
+            x3 = xr[3].to(gl.float32)
+            r3 = rope_fma(x3, swap_pairs(x3, q_op), xr[4], xr[5])
+            q_dot = (
+                quant_e4m3(xr[0].to(gl.float32), inv_scale),
+                quant_e4m3(xr[1].to(gl.float32), inv_scale),
+                quant_e4m3(xr[2].to(gl.float32), inv_scale),
+                quant_e4m3(r3, inv_scale),
+            )
+            qr_dot = q_dot[0]
+        else:
+            x = xr[0].to(gl.float32)
+            r = rope_fma(x, swap_pairs(x, q_op), xr[1], xr[2])
+            q_dot = quant_e4m3(r, inv_scale)
+            qr_dot = q_dot
+        return q_dot, qr_dot
+
+    @gluon.jit
+    def q_raw_norm(self, pos_ptr, cs_ptr, cs_stride: gl.constexpr, inv_scale, eps):
+        """q_fp8's operands from raw wq_b output (bf16, head-major) with the
+        per-head RMS norm: norm, RoPE of the last 64 dims, fp8 cast with the static
+        per-tensor scale 1 / inv_scale. The reduction needs a row layout, so this
+        goes through convert_layout (LDS scratch aliasing the ring) and runs before
+        the ring is live. ROPE_TAIL == 0 only (RoPE inside the 512)."""
+        cfg = self.cfg
+        gl.static_assert(cfg.ROPE_TAIL == 0, "raw q needs the rope-free geometry")
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK_MFMA, 16)
+        pos = gl.load(pos_ptr + self.row)
+        cs_base = cs_ptr + pos * cs_stride
+        if cfg.WHOLE_ROWS:
+            ql: gl.constexpr = gl.BlockedLayout(
+                [1, 8], [4, 16], [cfg.NUM_WARPS, 1], [1, 0]
+            )
+            x0 = self.load_q(0, 128, ql).to(gl.float32)
+            x1 = self.load_q(128, 128, ql).to(gl.float32)
+            x2 = self.load_q(256, 128, ql).to(gl.float32)
+            x3 = self.load_q(384, 128, ql).to(gl.float32)
+            ss = gl.sum(x0 * x0, axis=1) + gl.sum(x1 * x1, axis=1)
+            ss = ss + gl.sum(x2 * x2, axis=1) + gl.sum(x3 * x3, axis=1)
+            rs = gl.rsqrt(ss * (1.0 / D) + eps)
+            q_dot = (
+                gl.convert_layout(
+                    self.rot_fp8(x0, 0, 128, ql, rs, cs_base, inv_scale), q_op
+                ),
+                gl.convert_layout(
+                    self.rot_fp8(x1, 128, 128, ql, rs, cs_base, inv_scale), q_op
+                ),
+                gl.convert_layout(
+                    self.rot_fp8(x2, 256, 128, ql, rs, cs_base, inv_scale), q_op
+                ),
+                gl.convert_layout(
+                    self.rot_fp8(x3, 384, 128, ql, rs, cs_base, inv_scale), q_op
+                ),
+            )
+            qr_dot = q_dot[0]
+        else:
+            x = self.load_q(0, D, cfg.WIDE_L).to(gl.float32)
+            rs = gl.rsqrt(gl.sum(x * x, axis=1) * (1.0 / D) + eps)
+            q_dot = gl.convert_layout(
+                self.rot_fp8(x, 0, D, cfg.WIDE_L, rs, cs_base, inv_scale), q_op
+            )
+            qr_dot = q_dot
+        return q_dot, qr_dot
+
+    @gluon.jit
+    def loop(self, q, qraw, kv_ptr, ix, start, n, t0, t1, c, init):
         """Tiles t0 .. t1 of the n-key list ix, continuing from init = (acc, m, l)
         if given. q = None loads fp8 q here, behind the first gather."""
         cfg = self.cfg
@@ -683,12 +843,18 @@ class Program:
         # r: the row ids of the next tile to gather
         n_s = gl.minimum(n, t1 * BN)
         kb = t0 * BN
+        xr = None
         if q is None:
             # its latency hides behind the list bounds -> row ids -> gather chain
-            q = self.q_fp8()
+            if qraw is None:
+                q = self.q_fp8()
+            else:
+                xr = self.qraw_issue(qraw[0], qraw[1], qraw[2])
         r = load_row_ids(ix, kb, n_s, cfg.KEY_L)
         gather_tile(cfg, kv0, rope0, kv_ptr, ix, r, cols)
         r = load_row_ids(ix, kb + BN, n_s, cfg.KEY_L)
+        if q is None:
+            q = self.qraw_finish(xr, qraw[3])
 
         # Unrolled over the two slots. An odd tile count runs one fully masked
         # tile, which reads nothing of the next split: its keys end at n_s.
@@ -711,11 +877,11 @@ class Program:
                 start + kb + (t + 1) * BN, end_s,
             )  # fmt: skip
         gl.amd.cdna4.async_copy.wait_group(0)
-        return acc, m_i, l_i
+        return acc, m_i, l_i, q
 
     @gluon.jit
     def loop_two_lists(
-        self, q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
+        self, q, qraw, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
         main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr,
         MAIN_BLOCK_LOG2: gl.constexpr, EXTRA_BLOCK_LOG2: gl.constexpr,
     ):  # fmt: skip
@@ -737,13 +903,15 @@ class Program:
         main_tiles = gl.cdiv(n_main, BN)
         u0, u1 = self.tiles(main_tiles + gl.cdiv(n_extra, BN))
         st = self.loop(
-            q, kv_ptr, (main, main, n_main), 0, n_main, gl.minimum(u0, main_tiles),
-            gl.minimum(u1, main_tiles), c, None,
+            q, qraw, kv_ptr, (main, main, n_main), 0, n_main,
+            gl.minimum(u0, main_tiles), gl.minimum(u1, main_tiles), c, None,
         )  # fmt: skip
+        q = st[3]  # raw q is prepared by the first loop, once for both
+        st = (st[0], st[1], st[2])
         if x_ks_ptr is not None:  # the first list's V in the second one's units
             st = (st[0] * (k_scale / x_scale), st[1], st[2])
-        acc, m_i, l_i = self.loop(
-            q, x_kv_ptr, (extra, extra, 0), 0, n_extra,
+        acc, m_i, l_i, _q = self.loop(
+            q, None, x_kv_ptr, (extra, extra, 0), 0, n_extra,
             gl.maximum(u0 - main_tiles, 0), gl.maximum(u1 - main_tiles, 0), c_extra,
             st,
         )  # fmt: skip
@@ -866,6 +1034,11 @@ def _sparse_mla_fp8(
     cs_stride: gl.constexpr,
     out_scale_ptr,
     os_stride0: gl.constexpr,
+    qpos_ptr,  # [C] int64 positions: q is raw bf16, RoPE'd (and normed) in-kernel
+    qcs_ptr,  # [max_pos, 64] f32 cos | sin, for q
+    qcs_stride: gl.constexpr,
+    q_eps,
+    APPLY_Q_NORM: gl.constexpr,
     num_queries,
     num_heads: gl.constexpr,
     sm_scale,
@@ -885,7 +1058,8 @@ def _sparse_mla_fp8(
 ):
     cfg = Config(BLOCK_H, gl.num_warps(), ROPE_TAIL, LAZY_LOG2, ADDR64)
     SPLIT: gl.constexpr = part_m_ptr is not None
-    Q_BF16: gl.constexpr = q_scale_ptr is None
+    Q_RAW: gl.constexpr = qpos_ptr is not None
+    Q_BF16: gl.constexpr = q_scale_ptr is None and not Q_RAW
     PAGED: gl.constexpr = main_stride is not None
     TWO_LOOPS: gl.constexpr = x_kv_ptr is not None
     pgm = Program.initialize(
@@ -906,19 +1080,33 @@ def _sparse_mla_fp8(
     if Q_BF16:
         # quantized before the ring is live, so its LDS scratch aliases the ring
         q, q_s = pgm.q_bf16()
+        qraw = None
         c = q_s * (k_scale * sm_scale_log2)
+    elif Q_RAW:
+        q_scale = gl.load(q_scale_ptr)
+        qraw = (qpos_ptr, qcs_ptr, qcs_stride, 1.0 / q_scale)
+        q = None  # prepared in the loop, behind the first gather
+        if APPLY_Q_NORM:
+            # the norm needs a row reduction: convert_layout's LDS scratch aliases
+            # the ring, so this one prepares q before the loop
+            q = pgm.q_raw_norm(qpos_ptr, qcs_ptr, qcs_stride, 1.0 / q_scale, q_eps)
+            qraw = None
+        c = gl.zeros([cfg.BLOCK_M], gl.float32, cfg.ROW_L) + (
+            q_scale * k_scale * sm_scale_log2
+        )
     else:
         q = None  # loaded by the loop
+        qraw = None
         c = gl.zeros([cfg.BLOCK_M], gl.float32, cfg.ROW_L) + (
             gl.load(q_scale_ptr) * k_scale * sm_scale_log2
         )
 
     if TWO_LOOPS:
-        if not Q_BF16:
+        if not Q_BF16 and not Q_RAW:
             # once, for both loops
             q = pgm.q_fp8()
         acc, m_i, l_i, v_scale = pgm.loop_two_lists(
-            q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
+            q, qraw, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
             main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr,
             MAIN_BLOCK_LOG2, EXTRA_BLOCK_LOG2,
         )  # fmt: skip
@@ -929,7 +1117,9 @@ def _sparse_mla_fp8(
             EXTRA_BLOCK_LOG2,
         )  # fmt: skip
         t0, t1 = pgm.tiles(gl.cdiv(end - start, BN))
-        acc, m_i, l_i = pgm.loop(q, kv_ptr, ix, start, end - start, t0, t1, c, None)
+        acc, m_i, l_i, _q = pgm.loop(
+            q, qraw, kv_ptr, ix, start, end - start, t0, t1, c, None
+        )
         v_scale = k_scale
     if not cfg.WHOLE_ROWS:
         l_i = gl.sum(l_i, axis=1)  # the deferred row sum
