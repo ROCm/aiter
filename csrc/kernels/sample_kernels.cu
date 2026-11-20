@@ -614,7 +614,10 @@ void mixed_sample_outer_exponential(aiter_tensor_t& out,
 __device__ float exponential_func_impl(float rand, float lambd)
 {
     const float a = 1.0f - std::numeric_limits<float>::epsilon() / 2;
-    const float b = std::numeric_limits<float>::epsilon() / 2;
+    // Same as at::transformation::exponential: the top bucket maps to a tiny
+    // positive sample. A positive `b` made it negative, so that token could
+    // never win the race in mixed_sample / random_sample.
+    const float b = -std::numeric_limits<float>::epsilon() / 2;
     const float c = -1.0 / lambd;
     auto log      = rand >= a ? b : logf(rand);
     return c * log;
