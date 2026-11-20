@@ -393,10 +393,13 @@ def flydsl_mxscale_preshuffle_gemm(
         out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
         M * N,  # slab_stride_dw (fp32: 1 dword/elem)
+        N // 2,  # row_dw
+        N // 2,  # ldc_dw (contiguous Out)
         st,
         split_k,
         out_dtype,
-        specialization_key=(split_k, out_dtype),
+        False,  # strided
+        specialization_key=(split_k, out_dtype, False),
     )
     return Out
 
