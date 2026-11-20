@@ -23,12 +23,15 @@ behind the same interface for callers that share buffers with mori kernels.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 import torch.distributed as dist
 
 from .dcp_mailbox.peer import PeerBuffer
+
+logger = logging.getLogger("aiter")
 
 _ALIGN = 4096
 
@@ -90,13 +93,20 @@ class IpcSymmetricAllocator:
         """Collective: once every rank's kernels are done, unmap the peers'
         allocations; once every rank has unmapped, free the own ones.
 
-        If ``group`` is already destroyed (``GroupCoordinator.destroy`` tears
-        down its process groups before its device communicator), the ranks can
-        no longer agree that the peers are done, so the memory is left to
-        process exit."""
+        ``GroupCoordinator.destroy`` closes its device communicator before it
+        destroys the process groups, so this runs with ``group`` alive. If the
+        group is gone anyway (destroyed by the caller first), the ranks can no
+        longer agree that the peers are done: the memory is left to process
+        exit, with a warning."""
         if not self._bufs:
             return
         if not _group_alive(self.group):
+            logger.warning(
+                "IpcSymmetricAllocator.close: process group already destroyed; "
+                "leaving %d IPC buffer(s) (%d bytes) mapped until process exit",
+                len(self._bufs),
+                sum(int(b.bytes.numel()) for b in self._bufs),
+            )
             self._bufs.clear()
             return
         self.barrier()
