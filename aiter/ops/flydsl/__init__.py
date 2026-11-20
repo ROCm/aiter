@@ -140,6 +140,10 @@ _LAZY_IMPORTS = {
         ".mxfp4_indexer_topk",
         "mxfp4_indexer_unsupported_reason",
     ),
+    "mxfp4_indexer_workspace_bytes": (
+        ".mxfp4_indexer_topk",
+        "mxfp4_indexer_workspace_bytes",
+    ),
     "flydsl_preshuffle_gemm_a8": (
         ".gemm_kernels",
         "flydsl_preshuffle_gemm_a8",
@@ -326,6 +330,7 @@ __all__ = [
     "minimax_m3_index_score_work_map_size",
     "mxfp4_indexer_dense_preferred",
     "mxfp4_indexer_unsupported_reason",
+    "mxfp4_indexer_workspace_bytes",
     "pa_decode",
     "pa_decode_default_workgroup_budget",
     "pa_decode_nhd_max_query_length",

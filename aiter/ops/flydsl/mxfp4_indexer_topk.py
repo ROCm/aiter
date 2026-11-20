@@ -27,14 +27,26 @@ Entry points:
 - ``mxfp4_indexer_unsupported_reason``: why a layer cannot be served (None when
   it can), so a caller falls back to ``paged_mxfp4_mqa_logits`` + top-k.
 - ``mxfp4_indexer_dense_preferred``: whether a dense or candidate-source call
-  of a given ``max_ctx`` is faster than ``paged_mxfp4_mqa_logits`` + top-k on
-  MI355X. The candidate consumer was faster at every measured size.
+  of a given ``max_ctx`` and row count is faster than
+  ``paged_mxfp4_mqa_logits`` + top-k on MI355X. The candidate consumer was
+  faster at every measured size from 16384 entries up (at 4096 entries it
+  lost with 18 and 66 rows).
+- ``mxfp4_indexer_workspace_bytes``: the scratch a call needs, for a caller
+  that passes its own ``workspace``.
 
 Supported: 32 heads x 128 dims, 64- or 128-entry pages, 1-8 rows per request
 (``next_n``), up to ``MXFP4_INDEXER_MAX_ENTRIES`` (1048576) entries a row, int32
-block tables. Every launch reads the lengths on the device: CUDA-graph safe once
-a call of the same (rows, next_n, page size, ``max_ctx`` tier, options) ran
-eagerly, which compiles the kernels and allocates the per-shape workspaces.
+block tables; a call of zero rows returns at once. Every launch reads the
+lengths on the device: CUDA-graph safe once a call of the same (next_n, page
+size, ``max_ctx`` tier, options) ran eagerly (it compiles the kernels) and,
+without ``workspace``, once a call at least as large ran eagerly (it sizes the
+shared scratch).
+
+NaN logits (a key or query with e8m0 scale 0xFF, NaN in the MX format) are
+never selected, like positions past the row's end, where a top-k over
+``paged_mxfp4_mqa_logits``' output ranks them first. A row with fewer than
+min(512, row_end) other keys then has fewer positions (and its ragged ``lens``
+entry still counts min(512, row_end)).
 
 Dispatch (``max_ctx``: the launch's static bound on a row's entries):
 
@@ -48,10 +60,10 @@ Dispatch (``max_ctx``: the launch's static bound on a row's entries):
 - ``max_ctx > 262144``: rows up to 262144 entries take the block path, longer
   rows a segmented block select + merge, then the candidate scorer and token
   select below, on a second stream beside the block select.
-- Candidate consumer: up to 160 rows (and a context above 3000 + 110 x rows
-  entries) the 16384 candidate tokens are scored by (row, 16-tile segment)
-  workgroups and a token select picks the 512 best; otherwise one workgroup a
-  row scores and selects.
+- Candidate consumer: ``max_ctx > 262144`` always, else up to 160 rows when
+  ``max_ctx`` is at least 3000 + 110 x rows entries: the 16384 candidate tokens
+  are scored by (row, 16-tile segment) workgroups and a token select picks the
+  512 best. Otherwise one workgroup a row scores and selects.
 
 Every path makes the same arithmetic on every token, so a key scores to the same
 fp32 bits on all of them and the paths agree bit for bit.
@@ -162,21 +174,39 @@ def mxfp4_indexer_unsupported_reason(
     return None
 
 
-# The bound range in which a dense / candidate-source call beat
-# paged_mxfp4_mqa_logits + top-k at 18-768 rows on MI355X. At 16384 entries and
-# below the token select's fixed cost loses to the materialised path; above
-# 262144 the long-row path pays its chain of launches even for short rows.
-DENSE_PREFERRED_CTX = (32768, BLOCK_CTX_MAX)
+# Where a dense / candidate-source call beat paged_mxfp4_mqa_logits + top-k on
+# MI355X (graph replay, 6 rows a request, rows of 0.75-1x max_ctx entries,
+# 18-768 rows measured): (largest max_ctx, fewest rows of a dense call, of a
+# source call); None: mixed or slower at the measured row counts. Dense calls
+# up to 32768 entries lose or tie (the token select's fixed cost); the source
+# layer wins there except at 16384, as its baseline adds a top-2048. Long
+# bounds need enough rows to fill the GPU. Dense at 262144 won at 6 of 7
+# measured row counts (0.96x at 126 rows).
+DENSE_PREFERRED = (
+    (8192, None, 1),
+    (16384, None, None),
+    (32768, None, 1),
+    (131072, 1, 1),
+    (262144, 1, 192),
+    (524288, 126, 96),
+    (MXFP4_INDEXER_MAX_ENTRIES, 1, 1),
+)
 
 
-def mxfp4_indexer_dense_preferred(max_ctx: int) -> bool:
-    """Whether ``flydsl_mxfp4_indexer_topk`` (dense or candidate source) is
-    expected to beat ``paged_mxfp4_mqa_logits`` + top-k for a launch bounded by
-    ``max_ctx`` entries a row. ``max_ctx`` should then be the step's own
-    longest row (rounded up), not a model-wide bound: a static bound far above
-    the rows' lengths makes the walk and select size for it."""
-    lo, hi = DENSE_PREFERRED_CTX
-    return lo < max_ctx <= hi
+def mxfp4_indexer_dense_preferred(
+    max_ctx: int, rows: int, source: bool = False
+) -> bool:
+    """Whether ``flydsl_mxfp4_indexer_topk`` of ``rows`` decode rows (with
+    ``candidates_out`` when ``source``) is expected to beat
+    ``paged_mxfp4_mqa_logits`` + top-k for a launch bounded by ``max_ctx``
+    entries a row. ``max_ctx`` should be the step's own longest row (rounded
+    up), not a model-wide bound: a static bound far above the rows' lengths
+    makes the walk and select size for it."""
+    for ctx, dense_rows, source_rows in DENSE_PREFERRED:
+        if max_ctx <= ctx:
+            least = source_rows if source else dense_rows
+            return least is not None and rows >= least
+    return False
 
 
 def _ragged_args(ragged: Mxfp4IndexerRagged | None, rows: int, device):
@@ -302,24 +332,112 @@ def _select_exe(
     )
 
 
-# Workspaces: one per (device, shape), reused by every call of that shape on the
-# stream it runs on (a graph captures their addresses).
+# Scratch. A call carves its buffers (``_plan``) from ``workspace`` when given,
+# else from one shared buffer per device that grows to the largest call seen:
+# every call on a device uses the same memory, so calls that may overlap (on
+# two streams at the same time) must each pass their own ``workspace``. A
+# buffer a CUDA graph captured is kept alive when a larger call replaces it.
+_WS_ALIGN = 256
+_SCRATCH: dict[int, torch.Tensor] = {}
+_SCRATCH_CAPTURED: set[int] = set()  # devices whose scratch a graph captured
+_RETIRED: list[torch.Tensor] = []
 
 
-@functools.cache
-def _workspace(device: torch.device, rows: int, width: int) -> torch.Tensor:
-    """Block maxima [rows, blocks + 64] or token logits [rows, tokens + 64]."""
-    return torch.empty(rows, width + 64, dtype=torch.float32, device=device)
+def _plan(rows: int, max_ctx: int, layer: str) -> list[tuple[int, int, torch.dtype]]:
+    """The scratch buffers ([rows, width] of dtype, in order) of a ``layer``
+    call: ``dense``, ``source`` (dense with ``candidates_out``) or
+    ``consumer``."""
+    f32, i32 = torch.float32, torch.int32
+    if layer == "consumer":
+        if not _candidate_split(rows, max_ctx):
+            return []
+        return [(rows, CANDIDATES * BLOCK + 64, f32)]
+    ntok = _tokens_tier(max_ctx)
+    if ntok is not None:
+        return [(rows, ntok + 64, f32)]
+    if max_ctx <= BLOCK_CTX_MAX:
+        return [(rows, _blocks_tier(max_ctx) + 64, f32)]
+    newest = layer == "source"
+    cand_blocks = CANDIDATES if newest else TOPK
+    plan = [
+        (rows, _blocks_tier(max_ctx) + 64, f32),  # block maxima
+        (rows, _merged(max_ctx, newest), i32),  # compact ids
+        (rows, _merged(max_ctx, newest), f32),  # compact maxima
+        (rows, cand_blocks * BLOCK + 64, f32),  # candidate token logits
+    ]
+    if not newest:
+        plan.append((rows, CANDIDATES, i32))  # the best blocks
+    return plan
 
 
-@functools.cache
-def _compact(device: torch.device, rows: int, entries: int):
-    """The long path's compact lists (ids, maxima) [rows, entries]: slots no
-    segment writes stay -1 / -inf."""
-    return (
-        torch.full((rows, entries), -1, dtype=torch.int32, device=device),
-        torch.full((rows, entries), float("-inf"), dtype=torch.float32, device=device),
-    )
+def _nbytes(plan) -> int:
+    total = 0
+    for rows, width, dtype in plan:
+        n = rows * width * dtype.itemsize
+        total += -(-n // _WS_ALIGN) * _WS_ALIGN
+    return total
+
+
+def mxfp4_indexer_workspace_bytes(rows: int, max_ctx: int, layer: str = "dense") -> int:
+    """Bytes of ``workspace`` a call of ``rows`` decode rows bounded by
+    ``max_ctx`` entries needs: ``layer`` ``dense`` (``flydsl_mxfp4_indexer_topk``),
+    ``source`` (the same with ``candidates_out``) or ``consumer``
+    (``flydsl_mxfp4_indexer_candidate_topk``). 0 when it needs none."""
+    if layer not in ("dense", "source", "consumer"):
+        raise ValueError(f"layer {layer!r} (dense, source or consumer)")
+    return _nbytes(_plan(rows, max_ctx, layer))
+
+
+def _scratch(device: torch.device, nbytes: int) -> torch.Tensor:
+    """The device's shared scratch, at least ``nbytes`` bytes."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    capturing = torch.cuda.is_current_stream_capturing()
+    buf = _SCRATCH.get(idx)
+    if buf is None or buf.numel() < nbytes:
+        if capturing:
+            raise RuntimeError(
+                "mxfp4 indexer: run a call of this size eagerly before graph "
+                "capture (or pass workspace=)"
+            )
+        if buf is not None:
+            # Rare (the scratch only grows) and never inside a capture: let
+            # every earlier call on any stream finish before the memory goes.
+            torch.cuda.synchronize(device)
+            if idx in _SCRATCH_CAPTURED:
+                _RETIRED.append(buf)  # a captured graph still addresses it
+        _SCRATCH_CAPTURED.discard(idx)
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _SCRATCH[idx] = buf
+    if capturing:
+        _SCRATCH_CAPTURED.add(idx)
+    return buf
+
+
+def _carve(plan, workspace: torch.Tensor | None, device) -> list[torch.Tensor]:
+    """The plan's buffers from ``workspace`` (or the shared scratch)."""
+    nbytes = _nbytes(plan)
+    if nbytes == 0:
+        return []
+    if workspace is None:
+        ws = _scratch(device, nbytes)
+    else:
+        if (
+            workspace.device != device
+            or not workspace.is_contiguous()
+            or workspace.numel() * workspace.element_size() < nbytes
+            or workspace.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"workspace must be a contiguous, 16-byte aligned tensor of >= "
+                f"{nbytes} bytes on {device} (mxfp4_indexer_workspace_bytes)"
+            )
+        ws = workspace.view(-1).view(torch.uint8)
+    out, off = [], 0
+    for rows, width, dtype in plan:
+        n = rows * width * dtype.itemsize
+        out.append(ws[off : off + n].view(dtype).view(rows, width))
+        off += -(-n // _WS_ALIGN) * _WS_ALIGN
+    return out
 
 
 @functools.cache
@@ -327,10 +445,10 @@ def _aux_stream(device: torch.device) -> torch.cuda.Stream:
     return torch.cuda.Stream(device)
 
 
-@functools.cache
-def _cand_buffer(device: torch.device, rows: int) -> torch.Tensor:
-    """The long path's best blocks [rows, 2048] int32."""
-    return torch.empty(rows, CANDIDATES, dtype=torch.int32, device=device)
+def _merged(max_ctx: int, newest: bool) -> int:
+    """Entries of the long path's compact lists a row."""
+    segments = max(1, _blocks_tier(max_ctx) // SEGB)
+    return max(4096, segments * (SOURCE_SLOTS if newest else PLAIN_SLOTS))
 
 
 def _kv_pages(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -372,9 +490,12 @@ def _check(q, q_scale, weights, kv_cache, block_table, row_ends, out, next_n, ma
     if q.shape != (rows, H, D // 2) or q.dtype != torch.uint8 or not q.is_contiguous():
         raise ValueError("q must be contiguous uint8 [rows, 32, 64]")
     if not q_scale.is_contiguous() or (
-        q_scale.numel() * q_scale.element_size() != rows * H * (D // 32)
+        (q_scale.dtype, tuple(q_scale.shape))
+        not in ((torch.uint8, (rows, H, D // 32)), (torch.int32, (rows, H)))
     ):
-        raise ValueError("q_scale must be contiguous [rows, 32, 4] uint8 bytes")
+        raise ValueError(
+            "q_scale must be contiguous uint8 [rows, 32, 4] or int32 [rows, 32]"
+        )
     if (
         weights.shape != (rows, H)
         or weights.dtype != torch.float32
@@ -426,10 +547,19 @@ def flydsl_mxfp4_indexer_block_scores(
 
     Returns ``scores`` [rows, tier + 64] fp32: block j of a row in column j, a
     block past the row's end -inf, columns past the row's blocks unspecified.
-    Allocated per (device, rows, tier) when not given.
+    Allocated when not given.
     """
     kv_cache = _kv_pages(kv_cache)
-    _check(q, q_scale, weights, kv_cache, block_table, row_ends, None, next_n, max_ctx)
+    rows = _check(
+        q, q_scale, weights, kv_cache, block_table, row_ends, None, next_n, max_ctx
+    )
+    if scores is None:
+        nb = _tokens_tier(max_ctx) if tokens else _blocks_tier(max_ctx)
+        if nb is None:
+            raise ValueError("tokens=True serves max_ctx <= 16384")
+        scores = torch.empty(rows, nb + 64, dtype=torch.float32, device=q.device)
+    if rows == 0:
+        return scores
     return _block_scores(
         q,
         q_scale,
@@ -453,19 +583,12 @@ def _block_scores(
     row_ends,
     next_n,
     max_ctx,
-    scores=None,
+    scores,
     tokens=False,
 ):
     rows = q.shape[0]
     P = kv_cache.shape[1]
-    if tokens:
-        nb = _tokens_tier(max_ctx)
-        if nb is None:
-            raise ValueError("tokens=True serves max_ctx <= 16384")
-    else:
-        nb = _blocks_tier(max_ctx)
-    if scores is None:
-        scores = _workspace(q.device, rows, nb)
+    nb = _tokens_tier(max_ctx) if tokens else _blocks_tier(max_ctx)
     if (
         scores.shape[0] < rows
         or scores.shape[1] < nb + 64
@@ -513,6 +636,7 @@ def flydsl_mxfp4_indexer_topk(
     max_ctx: int,
     candidates_out: torch.Tensor | None = None,
     ragged: Mxfp4IndexerRagged | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The 512 best keys of every decode row of a dense indexer layer.
 
@@ -535,6 +659,10 @@ def flydsl_mxfp4_indexer_topk(
             8-token blocks (the newest key's block and the 2047 best others by
             block maximum), ids ascending, -1 padded.
         ragged: optional, also the sparse attention's ragged slot lists.
+        workspace: optional scratch, a contiguous tensor of at least
+            ``mxfp4_indexer_workspace_bytes(rows, max_ctx, layer)`` bytes
+            (``layer`` "source" with ``candidates_out``, else "dense") on the
+            device; default: the device's shared scratch.
 
     Returns:
         ``out``.
@@ -547,6 +675,13 @@ def flydsl_mxfp4_indexer_topk(
     if candidates_out is not None:
         _check_candidates(candidates_out, rows, dev)
     rargs, slot_log2 = _ragged_args(ragged, rows, dev)
+    if rows == 0:
+        return out
+    bufs = _carve(
+        _plan(rows, max_ctx, "dense" if candidates_out is None else "source"),
+        workspace,
+        dev,
+    )
     P = kv_cache.shape[1]
     reqs = rows // next_n
     stream = torch.cuda.current_stream(dev)
@@ -563,6 +698,7 @@ def flydsl_mxfp4_indexer_topk(
             row_ends,
             next_n,
             max_ctx,
+            bufs[0],
             tokens=True,
         )
         _run(
@@ -583,7 +719,7 @@ def flydsl_mxfp4_indexer_topk(
         return out
     long = max_ctx > BLOCK_CTX_MAX
     scores = _block_scores(
-        q, q_scale, weights, kv_cache, block_table, row_ends, next_n, max_ctx
+        q, q_scale, weights, kv_cache, block_table, row_ends, next_n, max_ctx, bufs[0]
     )
     nb = _blocks_tier(max_ctx)
     if long:
@@ -607,6 +743,7 @@ def flydsl_mxfp4_indexer_topk(
                 slot_log2,
                 rows,
                 scores,
+                bufs[1:],
             )
     _run(
         _select_exe(
@@ -658,18 +795,21 @@ def _topk_long(
     slot_log2,
     rows,
     scores,
+    bufs,
 ):
     """Rows above the block select's entries (it leaves them alone): the best
     blocks from the walk's block maxima (512, or the source layer's candidate
-    list), then the candidate scorer and token select for those rows only."""
+    list), then the candidate scorer and token select for those rows only.
+    ``bufs``: the compact ids and maxima (every slot a merge reads is written
+    by a segment), the candidate token logits and (plain) the best blocks."""
     dev = q.device
     newest = candidates_out is not None
-    cand = candidates_out if newest else _cand_buffer(dev, rows)
+    ids2, vals2, logits = bufs[:3]
+    cand = candidates_out if newest else bufs[3]
     split_end = _blocks_tier(BLOCK_CTX_MAX) * BLOCK
     segments = max(1, _blocks_tier(max_ctx) // SEGB)
     slots = SOURCE_SLOTS if newest else PLAIN_SLOTS
-    merged = max(4096, segments * slots)
-    ids2, vals2 = _compact(dev, rows, merged)
+    merged = _merged(max_ctx, newest)
     stream = torch.cuda.current_stream(dev)
     _run(
         _blocks_exe("seg", CANDIDATES - 1 if newest else TOPK, newest, split_end),
@@ -715,6 +855,7 @@ def _topk_long(
         rargs,
         slot_log2,
         max_ctx,
+        logits,
         split_end,
         CANDIDATES if newest else TOPK,
     )
@@ -734,14 +875,15 @@ def _select_from_candidates(
     rargs,
     slot_log2,
     max_ctx,
+    logits,
     min_end=0,
     cand_blocks=CANDIDATES,
 ):
     """The 512 best tokens among the candidate blocks' tokens: scored on (row,
-    segment) workgroups, then the gathered token select; rows of at most
-    ``min_end`` entries are left alone."""
+    segment) workgroups into ``logits`` [rows, cand_blocks * 8 + 64], then the
+    gathered token select; rows of at most ``min_end`` entries are left
+    alone."""
     dev = q.device
-    logits = _workspace(dev, rows, cand_blocks * BLOCK)
     stream = torch.cuda.current_stream(dev)
     _run(
         _cand_logits_exe(next_n, kv_cache.shape[1], min_end, cand_blocks),
@@ -807,12 +949,14 @@ def flydsl_mxfp4_indexer_candidate_topk(
     next_n: int,
     max_ctx: int,
     ragged: Mxfp4IndexerRagged | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The 512 best keys among the tokens of each row's candidate blocks.
 
     ``candidates`` [rows, 2048] int32: 8-token block ids ascending, -1 padded
     (what ``flydsl_mxfp4_indexer_topk(candidates_out=...)`` writes). Other
-    arguments and ``out`` as ``flydsl_mxfp4_indexer_topk``.
+    arguments and ``out`` as ``flydsl_mxfp4_indexer_topk`` (``workspace``: at
+    least ``mxfp4_indexer_workspace_bytes(rows, max_ctx, "consumer")`` bytes).
     """
     kv_cache = _kv_pages(kv_cache)
     rows = _check(
@@ -821,7 +965,10 @@ def flydsl_mxfp4_indexer_candidate_topk(
     dev = q.device
     _check_candidates(candidates, rows, dev)
     rargs, slot_log2 = _ragged_args(ragged, rows, dev)
+    if rows == 0:
+        return out
     if _candidate_split(rows, max_ctx):
+        (logits,) = _carve(_plan(rows, max_ctx, "consumer"), workspace, dev)
         _select_from_candidates(
             q,
             q_scale,
@@ -836,6 +983,7 @@ def flydsl_mxfp4_indexer_candidate_topk(
             rargs,
             slot_log2,
             max_ctx,
+            logits,
         )
         return out
     _run(
