@@ -58,12 +58,35 @@ def _subprocess_check(script):
 
 
 @pytest.fixture(autouse=True)
-def _gfx950():
+def _gfx950(request):
     """Dispatch reads the arch, CU count and the arch's fp8; simulate an MI355."""
     from moe_dispatch import arch_sim
 
+    if "live_chip_info" in request.fixturenames:
+        yield  # that fixture's test is about the real chip-info helpers
+        return
     with arch_sim.simulated_arch("gfx950"):
         yield
+
+
+@pytest.fixture
+def live_chip_info():
+    """The real chip-info module, out of the arch simulation, with its caches reset.
+
+    `simulated_arch` replaces `get_gfx` and `get_gfx_runtime` with plain functions, so a
+    test about which of the two dispatch calls cannot run inside it.
+    """
+    from aiter.jit.utils import chip_info
+
+    def clear():
+        chip_info.get_gfx.cache_clear()
+        chip_info.get_gfx_custom_op_core.cache_clear()
+
+    clear()
+    try:
+        yield chip_info
+    finally:
+        clear()
 
 
 def test_problems_and_tuned_lookup_match_legacy_for_every_key():
@@ -527,20 +550,15 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
     assert not a8w8_pt.claims(call)
 
 
-def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch):
-    from aiter.jit.utils import chip_info
+def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_info):
     from aiter.moev2.migration import a8w8_pt
 
     monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx1250")
-    chip_info.get_gfx.cache_clear()
-    chip_info.get_gfx_custom_op_core.cache_clear()
-    try:
-        assert chip_info.get_gfx() == "gfx1250"
-        monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
-        assert a8w8_pt.claims(_per_tensor_op_call())
-    finally:
-        chip_info.get_gfx.cache_clear()
-        chip_info.get_gfx_custom_op_core.cache_clear()
+    live_chip_info.get_gfx.cache_clear()
+    live_chip_info.get_gfx_custom_op_core.cache_clear()
+    assert live_chip_info.get_gfx() == "gfx1250"
+    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
+    assert a8w8_pt.claims(_per_tensor_op_call())
 
 
 def test_tuned_cache_clear_also_resets_path_caches():
