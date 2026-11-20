@@ -12,6 +12,9 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     COMPUTE_WMMA_NAME_PREFIX as COMPUTE_NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+    MX32_SMALL_WMMA_NAME_PREFIX as SMALL_NAME_PREFIX,
+)
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
@@ -46,12 +49,21 @@ _SPLIT_K = (1, 2, 4, 8)
 _COMPUTE_PROFILES = (
     (256, 256, 128, 2, 2, 4),
     (256, 256, 128, 2, 2, 2),
+    (256, 192, 128, 2, 2, 2),
+    (192, 256, 128, 2, 2, 4),
+    (192, 256, 128, 2, 2, 2),
+    (192, 192, 128, 2, 2, 2),
     (128, 128, 128, 2, 2, 4),
+    (128, 128, 128, 2, 2, 2),
     (128, 256, 128, 2, 2, 4),
     (128, 256, 128, 2, 2, 3),
 )
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
+_COMPUTE_UNCLUSTERED = ((1, 1),)
+_NARROW_N_COMPUTE_PROFILES = ((256, 128, 128, 2, 2, 2),)
+_NARROW_N_COMPUTE_CLUSTERS = ((1, 1), (2, 1), (4, 1))
 _COMPUTE_MIN_K_PER_SPLIT = 512
+_SMALL_PROFILES = ((64, 128, 128, 2, 2, 2),)
 _PERSISTENT_N_TILES = (2, 4, 8)
 
 _CLUSTER_MIN_DIM = 8192
@@ -74,14 +86,23 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    early_a: bool = False
+    early_b: bool = False
+    fused_splitk: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
+            + (
+                "_eab"
+                if self.early_a and self.early_b
+                else ("_ea" if self.early_a else ("_eb" if self.early_b else ""))
+            )
         )
 
     @property
@@ -159,6 +180,21 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     return max(arena_bytes, total_d_bytes)
 
 
+def mxfp8_32_kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
+    """Whether a shared WMMA instance fits the shape and mx32 LDS footprint."""
+    if not kernel_fits_shape(ki, M, N, K):
+        return False
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import mx32_lds_bytes
+
+    config = {
+        "tile_m": ki.tile_m,
+        "tile_n": ki.tile_n,
+        "tile_k": ki.tile_k,
+        "num_buffers": ki.num_buffers,
+    }
+    return mx32_lds_bytes(config) <= LDS_BYTES
+
+
 def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     kl = {}
     idx = 0
@@ -198,6 +234,141 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                         persistent_n_tiles=ps,
                     )
                     idx += 1
+    # Keep the established numeric IDs above stable.  The direct B=1 path does
+    # not need multicast, and on medium/large M its cluster-free compute
+    # pipeline fills the CUs better than forcing 4+ workgroups to co-reside.
+    for sk in _SPLIT_K:
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in _COMPUTE_UNCLUSTERED:
+                for ps in (1, *_PERSISTENT_N_TILES) if sk == 1 else (1,):
+                    kl[idx] = WmmaKernelInstance(
+                        tile_m=tm,
+                        tile_n=tn,
+                        tile_k=tk,
+                        num_buffers=nb,
+                        split_k=sk,
+                        cluster_m=cm,
+                        cluster_n=cn,
+                        m_warp=mw,
+                        n_warp=nw,
+                        name_prefix=COMPUTE_NAME_PREFIX,
+                        persistent_n_tiles=ps,
+                    )
+                    idx += 1
+    # A/B TDM early merge is a strategy candidate, not the default: it helps
+    # selected wide-N occupancy regimes and can regress narrower grids. Append
+    # split_k=1, non-persistent variants so existing numeric IDs remain stable
+    # and per-shape tuning decides whether to use it.
+    for early_a, early_b in ((True, False), (False, True), (True, True)):
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=1,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    early_a=early_a,
+                    early_b=early_b,
+                )
+                idx += 1
+    # Cluster-local split-K keeps all splits of an output tile in one hardware
+    # cluster and reduces there, avoiding the global FP32 workspace reduction
+    # launch. It is a separate strategy because the larger cluster can reduce
+    # occupancy; tuning chooses it only where the locality wins.
+    for sk in _SPLIT_K:
+        if sk == 1:
+            continue
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+                if tm % sk or cm * cn * sk > 16:
+                    continue
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=sk,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    fused_splitk=True,
+                )
+                idx += 1
+    # Native 1x32 small-M split-K uses the generic row-wise K schedule.  Its
+    # per-wave WMMA geometry is only 2x4 (half_m/half_n 1x2), so it
+    # deliberately does not enter the large compute kernel's four-quadrant
+    # seed schedule.
+    for sk in _SPLIT_K:
+        if sk not in (2, 8):
+            continue
+        for tm, tn, tk, mw, nw, nb in _SMALL_PROFILES:
+            if tm % sk:
+                continue
+            kl[idx] = WmmaKernelInstance(
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                num_buffers=nb,
+                split_k=sk,
+                cluster_m=1,
+                cluster_n=1,
+                m_warp=mw,
+                n_warp=nw,
+                name_prefix=SMALL_NAME_PREFIX,
+                fused_splitk=True,
+            )
+            idx += 1
+    # Retained by the M3.1 graph-replay screen.  The generic four-owner TDM
+    # pipeline needs at least two waves; do not add one-wave variants.
+    kl[idx] = WmmaKernelInstance(
+        tile_m=16,
+        tile_n=32,
+        tile_k=512,
+        num_buffers=2,
+        split_k=4,
+        cluster_m=1,
+        cluster_n=1,
+        m_warp=1,
+        n_warp=2,
+        name_prefix=NAME_PREFIX,
+        fused_splitk=True,
+    )
+    idx += 1
+    # Keep these IDs after the established catalog. Narrow-N shapes have too
+    # few N tiles for the 192/256-column compute profiles; a 256x128 tile keeps
+    # their low-overhead pipeline while M-only clusters multicast B without
+    # padding the N grid. Early-load merging remains a per-shape strategy.
+    for tm, tn, tk, mw, nw, nb in _NARROW_N_COMPUTE_PROFILES:
+        for cm, cn in _NARROW_N_COMPUTE_CLUSTERS:
+            for early_a, early_b in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=1,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    early_a=early_a,
+                    early_b=early_b,
+                )
+                idx += 1
     return kl
 
 
@@ -211,7 +382,32 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     if ki.a_preshuffle and M % 2 != 0:
         return False
 
+    if is_small_kernel(ki):
+        profile = (
+            ki.tile_m,
+            ki.tile_n,
+            ki.tile_k,
+            ki.m_warp,
+            ki.n_warp,
+            ki.num_buffers,
+        )
+        if profile not in _SMALL_PROFILES or M < ki.tile_m:
+            return False
+        if (
+            not ki.fused_splitk
+            or ki.split_k <= 1
+            or ki.tile_m % ki.split_k
+            or ki.cluster_m != 1
+            or ki.cluster_n != 1
+            or N % ki.tile_n
+            or K % (ki.split_k * ki.tile_k)
+        ):
+            return False
+        return (K // ki.split_k) // ki.tile_k >= ki.num_buffers
+
     if is_compute_kernel(ki):
+        if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
+            return False
         profile = (
             ki.tile_m,
             ki.tile_n,
@@ -222,9 +418,21 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         )
         if M <= 0 or N <= 0 or K <= 0:
             return False
-        if profile not in _COMPUTE_PROFILES:
+        if profile not in (*_COMPUTE_PROFILES, *_NARROW_N_COMPUTE_PROFILES):
             return False
-        if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
+        if (ki.cluster_m, ki.cluster_n) not in (
+            *_COMPUTE_CLUSTERS,
+            *_COMPUTE_UNCLUSTERED,
+            *_NARROW_N_COMPUTE_CLUSTERS,
+        ):
+            return False
+        if ki.fused_splitk and (
+            ki.split_k <= 1
+            or ki.tile_m % ki.split_k
+            or ki.tile_m & (ki.tile_m - 1)
+            or (ki.m_warp * ki.n_warp * 32) % (ki.tile_n // 4)
+            or ki.cluster_m * ki.cluster_n * ki.split_k > 16
+        ):
             return False
         # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
         # must not launch when M < tile_m (cluster barrier hang on decode M).
@@ -252,6 +460,15 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         )
 
     if ki.persistent_n_tiles > 1:
+        return False
+    if ki.fused_splitk and (
+        ki.split_k <= 1
+        or ki.tile_m % ki.split_k
+        or ki.tile_m & (ki.tile_m - 1)
+        or ki.cluster_m != 1
+        or ki.cluster_n != 1
+        or ki.m_warp * ki.n_warp < 2
+    ):
         return False
     if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
         return False
@@ -296,3 +513,8 @@ def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:
     """Return whether a tuning instance targets the compute-bound kernel."""
     return kernel.name_prefix == COMPUTE_NAME_PREFIX
+
+
+def is_small_kernel(kernel: WmmaKernelInstance) -> bool:
+    """Whether an instance uses the native low-resource small-M schedule."""
+    return kernel.name_prefix == SMALL_NAME_PREFIX
