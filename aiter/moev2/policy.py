@@ -118,6 +118,15 @@ def resolve_activation_dtype(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    # gfx942 (CDNA3) has no FP4 MFMA, so an fp4x2 activation quant aborts in
+    # fused_dynamic_mx_quant_moe_sort ("not support output type: fp4x2"). The
+    # gfx950 / gfx1250 paths are arch-gated above; the Swiglu+SEPARATED large-M
+    # split and the fall-through else still resolve fp4x2 on gfx942. Mirror that
+    # gate for gfx942 by falling back to a bf16 activation (a16w4: bf16
+    # activation x MXFP4 weight), the intended gfx942 MoE path.
+    if gfx == "gfx942" and q_dtype_a == dtypes.fp4x2:
+        q_dtype_a = dtypes.bf16
+
     return q_dtype_a
 
 
