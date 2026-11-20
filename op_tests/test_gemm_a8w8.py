@@ -297,12 +297,10 @@ def test_gemm(
             weightshuffle,
             x_scale,
             w_scale,
-            None if quantDtype == dtypes.i8 else bias,
+            bias,
             dtype,
             benchmark_iters=bpreshuffle_iters,
         )
-        if quantDtype == dtypes.i8 and bias is not None:
-            c = c + bias
         err_c = checkAllclose(
             a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
         )
@@ -889,22 +887,38 @@ def run_int8_4wave_ci_correctness():
     )
     assert zero.shape == (0, n)
 
-    # Bias is deliberately caller-owned because adding it before and after
-    # BF16 conversion is not numerically interchangeable.
+    # A bias is added in FP32 before the one BF16 rounding, non-persistent and
+    # persistent, from an FP32 or a BF16 bias.
+    for shape, bias_dtype in (
+        ((17, 32, 256), torch.float32),
+        ((4352, 4608, 5120), torch.float32),
+        ((257, 272, 1024), torch.bfloat16),
+    ):
+        case = make_int8_4wave_case(shape, sum(shape) + 1)
+        bias = (torch.randn(shape[1], device="cuda") * 4).to(bias_dtype)
+        biased = aiter.gemm_a8w8_bpreshuffle(
+            case["x"], case["weight_shuffled"], case["x_scale"], case["w_scale"], bias
+        )
+        accum = F.linear(case["x"].float(), case["weight"].float())
+        expected = (accum * (case["x_scale"] * case["w_scale"]) + bias.float()).to(
+            torch.bfloat16
+        )
+        assert torch.equal(biased, expected), (shape, bias_dtype)
+
     case = make_int8_4wave_case((17, 32, 256), 7)
-    try:
-        aiter.gemm_a8w8_bpreshuffle(
+    for bias, message in (
+        (torch.zeros(31, device="cuda"), "bias of N=32"),
+        (torch.zeros(32, dtype=torch.int32, device="cuda"), "FP32, BF16 or FP16 bias"),
+    ):
+        _expect_value_error(
+            message,
+            aiter.gemm_a8w8_bpreshuffle,
             case["x"],
             case["weight_shuffled"],
             case["x_scale"],
             case["w_scale"],
-            bias=torch.zeros(32, dtype=torch.bfloat16, device="cuda"),
+            bias,
         )
-    except ValueError as error:
-        if "does not fuse bias" not in str(error):
-            raise
-    else:
-        raise AssertionError("INT8 bpreshuffle must reject fused bias")
 
     _expect_value_error(
         "BF16 output",
@@ -978,8 +992,8 @@ def run_int8_4wave_ci_correctness():
     assert torch.equal(consumed, eager.float() * 2)
     aiter.logger.info(
         "INT8 4-wave correctness: passed %d bit-exact shapes, padded K, signed "
-        "extrema up to the INT32 K limit, zero rows, contract rejections, "
-        "compile, graph and stream",
+        "extrema up to the INT32 K limit, zero rows, fused bias, contract "
+        "rejections, compile, graph and stream",
         len(cases),
     )
 
@@ -1003,15 +1017,21 @@ def run_int8_4wave_dispatch_checks():
             torch.ones((1, n), dtype=torch.float32, device="cuda"),
         )
 
-    def flydsl_launch(row_for_k, m=2, k=256, weight_k=256, cu_num=256, num_xcds=8):
+    def flydsl_launch(
+        row_for_k, m=2, k=256, weight_k=256, cu_num=256, num_xcds=8, bias=None
+    ):
         seen = {"lookups": []}
 
         def lookup(lookup_m, lookup_n, lookup_k, *_args, **_kwargs):
             seen["lookups"].append((lookup_m, lookup_n, lookup_k))
             return row_for_k(lookup_k)
 
-        def launch(XQ, WQ, x_scale, w_scale, out, config):
-            seen.update(x_shape=tuple(XQ.shape), kernel_name=config["kernelName"])
+        def launch(XQ, WQ, x_scale, w_scale, out, config, bias=None):
+            seen.update(
+                x_shape=tuple(XQ.shape),
+                kernel_name=config["kernelName"],
+                bias=bias is not None,
+            )
             return out
 
         with mock.patch.multiple(
@@ -1023,7 +1043,7 @@ def run_int8_4wave_dispatch_checks():
             get_cu_num=lambda: cu_num,
             get_cdna4_num_xcds=lambda *_args: num_xcds,
         ):
-            gemm_op_a8w8.gemm_a8w8_bpreshuffle(*operands(k, weight_k, m))
+            gemm_op_a8w8.gemm_a8w8_bpreshuffle(*operands(k, weight_k, m), bias)
         return seen
 
     # Padded weights look up their tuned row, and launch, at the physical K.
@@ -1056,6 +1076,18 @@ def run_int8_4wave_dispatch_checks():
             m, 16, 256, cu_num=256, num_xcds=8
         )
         assert seen["kernel_name"] == (kernel_name if uses_row else fallback), row
+
+    # A bias needs the 4-wave epilogue: a 4-wave row keeps its kernel, and any other
+    # FlyDSL row gives way to the 4-wave default.
+    bias = torch.zeros(16, dtype=torch.float32, device="cuda")
+    for kernel_name, uses_row in ((row_256["kernelName"], True), (generic, False)):
+        row = {"libtype": "flydsl", "splitK": 0, "kernelName": kernel_name}
+        seen = flydsl_launch(lambda k, row=row: row, bias=bias)
+        fallback = four_wave.default_4wave_kernel_name(
+            2, 16, 256, cu_num=256, num_xcds=8
+        )
+        assert seen["kernel_name"] == (kernel_name if uses_row else fallback), row
+        assert seen["bias"], row
 
     # gemm_a8w8_ASM ignores rows of other backends in the shared table.
     def asm_launch(row):

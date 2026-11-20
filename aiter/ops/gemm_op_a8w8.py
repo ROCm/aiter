@@ -184,8 +184,15 @@ def gemm_a8w8_bpreshuffle_flydsl(
     w_scale: Tensor,
     Out: Tensor,
     config: dict,
+    bias: Tensor | None = None,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
+    # Only the 4-wave INT8 epilogue adds a bias; the INT8 dispatch routes every biased
+    # call to it.
+    if bias is not None and not kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+        raise ValueError(
+            f"gemm_a8w8_bpreshuffle: bias needs a 4-wave INT8 kernel, got {kernel_name!r}"
+        )
     # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
     if is_gfx1250_family(get_gfx()):
         from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
@@ -200,7 +207,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         )
 
         return run_gemm_a8w8_bpreshuffle_4wave(
-            XQ, WQ, x_scale, w_scale, Out, kernel_name
+            XQ, WQ, x_scale, w_scale, Out, kernel_name, bias
         )
 
     if kernel_name.startswith("flydsl_bpreshuffle_8w_"):
@@ -932,9 +939,18 @@ def _check_int8_bpreshuffle_contract(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("gemm_a8w8_bpreshuffle INT8 operands must share one device")
     if bias is not None:
-        raise ValueError(
-            "gemm_a8w8_bpreshuffle INT8 does not fuse bias; add it after the GEMM"
-        )
+        if bias.numel() != N:
+            raise ValueError(
+                f"gemm_a8w8_bpreshuffle INT8 requires a bias of N={N} elements, got "
+                f"{tuple(bias.shape)}"
+            )
+        if bias.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+            raise ValueError(
+                "gemm_a8w8_bpreshuffle INT8 requires an FP32, BF16 or FP16 bias, got "
+                f"{bias.dtype}"
+            )
+        if bias.device != XQ.device:
+            raise ValueError("gemm_a8w8_bpreshuffle INT8 bias must be on XQ's device")
 
 
 def _int8_row_runs_on_flydsl(config: dict, m: int, k: int) -> bool:
@@ -999,7 +1015,8 @@ def gemm_a8w8_bpreshuffle(
             zero-padded K, which a provider reads as ``K_w`` with XQ padded.
         x_scale: fp32 per-token ``[M, 1]`` scale, or a per-tensor ``[1]``.
         w_scale: fp32 per-channel ``[N, 1]`` scale, or a per-tensor ``[1]``.
-        bias: must be ``None`` (both paths reject a bias).
+        bias: INT8 only, ``N`` elements (``[N]`` or ``[1, N]``), FP32, BF16 or FP16.
+            FP8 rejects a bias.
         dtype: output dtype; ``bf16`` or ``fp16``.
         check: AITER's own debug flag; a provider may ignore it.
 
@@ -1008,8 +1025,10 @@ def gemm_a8w8_bpreshuffle(
     shapes use the same kernel through a conservative persistent/non-persistent
     fallback policy.
 
-    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
-    callers add bias to the BF16 output after the GEMM.
+    An INT8 bias is fused into the 4-wave kernel's epilogue and added in FP32 before
+    the BF16 rounding: ``bf16(acc * x_scale * w_scale + bias)``, one rounding as in
+    the unbiased path. Every biased call runs a 4-wave kernel: the tuned row when it
+    names one, otherwise the default 4-wave variant for the shape.
 
     INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
     produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
@@ -1055,11 +1074,18 @@ def gemm_a8w8_bpreshuffle(
     #     if res is not None:
     #         return res
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y)
+    return _gemm_a8w8_bpreshuffle_into(
+        XQ, WQ, x_scale, w_scale, Y, bias if is_int8 else None
+    )
 
 
 def _gemm_a8w8_bpreshuffle_into(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    bias: Tensor | None = None,
 ) -> Tensor:
     """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
     Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
@@ -1093,6 +1119,12 @@ def _gemm_a8w8_bpreshuffle_into(
         )
     if is_int8 and config is not None and not _int8_row_runs_on_flydsl(config, m, w_k):
         config = None
+    if (
+        bias is not None
+        and config is not None
+        and not str(config.get("kernelName", "")).startswith("flydsl_bpreshuffle_4w_")
+    ):
+        config = None
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w
     # with XQ zero-padded to match.
@@ -1106,7 +1138,9 @@ def _gemm_a8w8_bpreshuffle_into(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl":
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            return gemm_a8w8_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config, bias
+            )
 
     if is_int8:
         from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
@@ -1122,6 +1156,7 @@ def _gemm_a8w8_bpreshuffle_into(
             w_scale,
             Y,
             {"kernelName": kernel_name},
+            bias,
         )
 
     if is_gfx1250_family(get_gfx()):

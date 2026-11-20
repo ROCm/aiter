@@ -131,8 +131,14 @@ def compile_4wave_gemm(
     xcd_swizzle: int = DEFAULT_XCD_SWIZZLE,
     num_cu: int = 0,
     num_xcds: int | None = None,
+    bias: bool = False,
 ):
-    """Compile and memoize one 4-wave launcher."""
+    """Compile and memoize one 4-wave launcher.
+
+    With ``bias`` the epilogue adds a per-column FP32 bias before the BF16 rounding, and
+    the launcher's column-scale operand holds the N column scales followed by the N
+    biases.
+    """
     _lazy_import()
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if int(xcd_swizzle) > 0 else 8
@@ -147,6 +153,7 @@ def compile_4wave_gemm(
         xcd_swizzle=int(xcd_swizzle),
         num_cu=int(num_cu),
         num_xcds=int(num_xcds),
+        bias=bool(bias),
     )
 
 
@@ -200,6 +207,25 @@ def _as_scale(scale: Tensor, length: int, name: str) -> Tensor:
     if flat.dtype != torch.float32:
         raise ValueError(f"[FlyDSL INT8 4wave] {name} must be FP32, got {flat.dtype}")
     return flat.contiguous()
+
+
+def _as_bias(bias: Tensor, length: int, device: torch.device) -> Tensor:
+    """The bias as FP32 ``[N]``; BF16 and FP16 biases are converted."""
+    flat = bias.reshape(-1)
+    if flat.numel() != length:
+        raise ValueError(
+            f"[FlyDSL INT8 4wave] bias must have {length} elements, got "
+            f"{tuple(bias.shape)}"
+        )
+    if flat.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"[FlyDSL INT8 4wave] bias must be FP32, BF16 or FP16, got {flat.dtype}"
+        )
+    if flat.device != device:
+        raise ValueError(
+            f"[FlyDSL INT8 4wave] bias must be on {device}, got {flat.device}"
+        )
+    return flat.to(torch.float32).contiguous()
 
 
 def _validate_runtime(
@@ -267,8 +293,13 @@ def run_gemm_a8w8_bpreshuffle_4wave(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    bias: Tensor | None = None,
 ) -> Tensor:
-    """Decode ``kernel_name`` and execute the matching cached specialization."""
+    """Decode ``kernel_name`` and execute the matching cached specialization.
+
+    ``bias`` (``N`` elements, FP32, BF16 or FP16) is added in FP32 to each column
+    before the BF16 rounding: ``Out = bf16(acc * x_scale * w_scale + bias)``.
+    """
     config = parse_4wave_kernel_name(kernel_name)
     if config is None:
         raise ValueError(
@@ -307,11 +338,14 @@ def run_gemm_a8w8_bpreshuffle_4wave(
 
     sa = _as_scale(x_scale, M, "x_scale")
     sb = _as_scale(w_scale, N, "w_scale")
+    if bias is not None:
+        sb = torch.cat((sb, _as_bias(bias, N, XQ.device)))
     executable = compile_4wave_gemm(
         K=K,
         xcd_swizzle=int(config["xcd_swizzle"]),
         num_cu=int(config["num_cu"]),
         num_xcds=int(config["num_xcds"]),
+        bias=bias is not None,
     )
     _run_compiled(
         executable,
