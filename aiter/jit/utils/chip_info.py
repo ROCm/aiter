@@ -177,6 +177,10 @@ def normalize_gpu_model(device_name: str) -> str:
 # and older copies lack these products. The IDs follow upstream libdrm's
 # data/amdgpu.ids, virtual functions included.
 _GPU_MODELS_BY_PCI_ID = {
+    0x74A1: "mi300x",
+    0x74A5: "mi325x",
+    0x74B5: "mi300x",
+    0x74B9: "mi325x",
     0x75A0: "mi350x",
     0x75A3: "mi355x",
     0x75A8: "mi350p",

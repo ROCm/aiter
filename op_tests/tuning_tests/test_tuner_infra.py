@@ -1060,6 +1060,23 @@ class TestGpuModelKey(unittest.TestCase):
         self.assertEqual(model("0x1002", "0x75a0"), "mi350x")
         self.assertIsNone(model("0x1002", "0x1234"))
 
+    def test_gfx942_products_and_their_virtual_functions_get_distinct_models(self):
+        from aiter.jit.utils import chip_info
+
+        cases = {
+            0x74A1: "mi300x",
+            0x74B5: "mi300x",
+            0x74A5: "mi325x",
+            0x74B9: "mi325x",
+        }
+        self.assertEqual(
+            {i: chip_info._GPU_MODELS_BY_PCI_ID.get(i) for i in cases}, cases
+        )
+        # The MI308 IDs are gfx942 too, but they are not an MI300X or an MI325X.
+        self.assertFalse(
+            chip_info.MI308_CHIP_IDS & chip_info._GPU_MODELS_BY_PCI_ID.keys()
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
