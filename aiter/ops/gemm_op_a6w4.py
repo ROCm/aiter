@@ -35,6 +35,7 @@ from .gemm_op_mixed_mxfp import (
     _find_mixed_mxfp_config,
     _get_device_gfx_cu,
     _load_mixed_mxfp_configs,
+    _tuned_rows_snapshot,
 )
 from .quant import quant_mxfp4_hip
 
@@ -146,6 +147,7 @@ def _get_GEMM_A6W4_config_cached(
     tuned_file: str,
     gfx: str,
     cu_num: int,
+    device_index: int | None = None,
 ) -> dict[str, object] | None:
     configs = _load_mixed_mxfp_configs(tuned_file, "A6W4")
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
@@ -159,6 +161,7 @@ def _get_GEMM_A6W4_config_cached(
         padM,
         padN,
         padK,
+        device_index,
     )
     if match is not None:
         config, match_kind, matched_shape = match
@@ -199,6 +202,7 @@ def get_GEMM_A6W4_config(
     tuned_file = os.path.abspath(
         tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_A6W4_ASM_FILE
     )
+    device_index = None
     try:
         if device is None:
             gfx, cu_num = get_gfx(), get_cu_num()
@@ -209,7 +213,7 @@ def get_GEMM_A6W4_config(
             gfx, cu_num = _get_device_gfx_cu(device_index)
     except (AssertionError, IndexError, KeyError, RuntimeError):
         return None
-    return _get_GEMM_A6W4_config_cached(M, N, K, tuned_file, gfx, cu_num)
+    return _get_GEMM_A6W4_config_cached(M, N, K, tuned_file, gfx, cu_num, device_index)
 
 
 def clear_gemm_a6w4_config_cache() -> None:
@@ -230,11 +234,7 @@ def _compiled_gemm_a6w4_configs(
         gfx, cu_num = _get_device_gfx_cu(device_index)
     except (AssertionError, IndexError, KeyError, RuntimeError):
         return ()
-    return tuple(
-        (M, N, K, str(config["kernelName"]))
-        for (config_gfx, config_cu, M, N, K), config in configs.items()
-        if config_gfx == gfx and config_cu == cu_num
-    )
+    return _tuned_rows_snapshot(configs, gfx, cu_num, device_index)
 
 
 def _select_gemm_a6w4_kernel(
