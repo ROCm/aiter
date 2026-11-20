@@ -11,7 +11,7 @@ import aiter
 import aiter.fused_moe as fm
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -21,7 +21,7 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def test_moe_sorting_opus_host_dispatch_boundaries():
-    if get_gfx() == "gfx942":
+    if get_gfx_runtime() == "gfx942":
         device_id = torch.cuda.current_device()
         expect_multi = {
             (63, 8): False,
@@ -56,7 +56,7 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
             ), f"forced multi failed for E={E}, M={token}"
         return
 
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         device_id = torch.cuda.current_device()
         assert aiter.moe_sorting_opus_get_workspace_size(1, 384, 8, 0, device_id) == 0
         assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
