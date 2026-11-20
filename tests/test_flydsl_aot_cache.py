@@ -39,13 +39,14 @@ from pathlib import Path
 
 import flydsl.compiler as flyc
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import checkAllclose, run_perftest
 
 # (tile_m, tile_n, tile_k, split_k) per (m, n, k)
 CASES = {
@@ -55,7 +56,7 @@ CASES = {
     (128, 4096, 1024): (64, 128, 128, 1),
 }
 DTYPES = {"fp8": dtypes.fp8, "int8": dtypes.i8}
-# mode name -> {((m, n, k), qdtype): record}, filled by main()
+# mode name -> {((m, n, k), qdtype): record}, filled by check_paths()
 RESULTS = {}
 # Read while building, as a kernel reads a tuning switch.
 TEST_ENV = "AITER_TEST_AOT_CACHE_VARIANT"
@@ -215,52 +216,39 @@ def check_paths(cache_dir, cases):
     assert state == rebuilt, f"another CU count did not rebuild: {state}"
 
 
-@benchmark()
-def test_aot_cache(m, n, k, qdtype):
-    ret = {}
-    outs = set()
-    for name, res in RESULTS.items():
-        rec = res[((m, n, k), qdtype)]
-        ret[f"{name} first ms"] = rec["first_ms"]
-        ret[f"{name} us"] = rec["us"]
-        ret[f"{name} err"] = rec["err"]
-        outs.add(rec["out"])
-    ret["bitwise equal"] = len(outs) == 1
-    assert ret["bitwise equal"], f"{m}x{n}x{k} {qdtype}: AOT and JIT outputs differ"
-    return ret
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--child", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "-q", "--qdtype", nargs="*", default=list(DTYPES), choices=list(DTYPES)
-    )
-    args = parser.parse_args()
-    if args.child:
-        child([(tuple(s), q) for s, q in json.loads(args.child)])
-        return
-
+def test_aot_cache():
     # The preshuffle GEMM this test drives targets gfx942 and gfx950.
     if get_gfx_runtime() not in ("gfx942", "gfx950"):
-        aiter.logger.info("FlyDSL AOT cache test skipped on %s", get_gfx_runtime())
-        return
+        pytest.skip(f"FlyDSL preshuffle GEMM does not target {get_gfx_runtime()}")
     if not hasattr(flyc, "load_module"):
-        aiter.logger.info(
-            "FlyDSL AOT cache test skipped: FlyDSL %s has no flyc.load_module, "
-            "so every mode would run the JIT",
-            getattr(sys.modules["flydsl"], "__version__", "?"),
+        pytest.skip(
+            f"FlyDSL {getattr(sys.modules['flydsl'], '__version__', '?')} has no "
+            "flyc.load_module, so every mode would run the JIT"
         )
-        return
 
-    cases = list(itertools.product(CASES, args.qdtype))
+    cases = list(itertools.product(CASES, DTYPES))
     with tempfile.TemporaryDirectory() as cache_dir:
         check_paths(cache_dir, cases)
-    df = pd.DataFrame([test_aot_cache(m, n, k, q) for (m, n, k), q in cases])
+    rows = []
+    for (m, n, k), qname in cases:
+        row = {"shape": f"{m}x{n}x{k}", "qdtype": qname}
+        outs = set()
+        for name, res in RESULTS.items():
+            rec = res[((m, n, k), qname)]
+            row[f"{name} first ms"] = rec["first_ms"]
+            row[f"{name} us"] = rec["us"]
+            row[f"{name} err"] = rec["err"]
+            outs.add(rec["out"])
+        assert len(outs) == 1, f"{m}x{n}x{k} {qname}: AOT and JIT outputs differ"
+        rows.append(row)
     aiter.logger.info(
-        "FlyDSL AOT cache summary (markdown):\n%s", df.to_markdown(index=False)
+        "FlyDSL AOT cache summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
     )
 
 
 if __name__ == "__main__":
-    main()
+    # run_mode() starts this file as a cold child process.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--child", required=True)
+    child([(tuple(s), q) for s, q in json.loads(parser.parse_args().child)])
