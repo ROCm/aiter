@@ -310,7 +310,9 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
-            int(hidden_row_stride_bytes),
+            # The dedicated EP32 kernel (mxfp4_gemm1_ep32.py) reads no hidden rows and
+            # its launcher has no row-stride argument.
+            *(() if ep32 else (int(hidden_row_stride_bytes),)),
             0 if bias is None else bias.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
         ),
