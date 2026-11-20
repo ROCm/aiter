@@ -982,9 +982,12 @@ def build_radix_topk_one_block_body(
             local_indices = fx.make_rmem_tensor(stable_sort_items_per_thread, fx.Int32)
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
-                local_indices[item] = fx.Int32(2147483647)
+                # Write the rmem tensor outside the dynamic branch (FlyDSL's
+                # rmem SSA promotion rejects writes under one).
+                local_index = fx.Int32(2147483647)
                 if pos < top_k:
-                    local_indices[item] = selected_local_indices[pos]
+                    local_index = selected_local_indices[pos]
+                local_indices[item] = local_index
             gpu.barrier()
 
             for stage in range_constexpr(len(stable_sort_sizes)):
@@ -1230,24 +1233,24 @@ def build_radix_topk_one_block_body(
 
             def scatter_step(elems, above_base, equal_base, row_indices, row_values):
                 num_elems = len(elems)
-                # Class encoding: 2 = above, 1 = equal, 0 = below.
-                classes = fx.make_rmem_tensor(num_elems, fx.Int32)
+                # Class encoding: 2 = above, 1 = equal, 0 = below. Kept as SSA
+                # values: an rmem tensor written under a dynamic branch fails
+                # FlyDSL's rmem SSA promotion.
+                classes = []
                 packed_local = 0
                 for item in range_constexpr(num_elems):
                     valid, key, _ = elems[item]
-                    classes[item] = 0
-                    if valid:
-                        above, equal = classify_prefix(
-                            key, radix_shifts, prefix_threshold, levels, key_mask
-                        )
-                        if above:
-                            classes[item] = 2
-                            packed_local = packed_local + fx.Int32(
-                                1 << _PACKED_COUNT_BITS
-                            )
-                        elif equal:
-                            classes[item] = 1
-                            packed_local = packed_local + 1
+                    above, equal = classify_prefix(
+                        key, radix_shifts, prefix_threshold, levels, key_mask
+                    )
+                    above = valid & above
+                    equal = valid & equal
+                    classes.append(
+                        above.select(fx.Int32(2), equal.select(fx.Int32(1), 0))
+                    )
+                    packed_local = packed_local + above.select(
+                        fx.Int32(1 << _PACKED_COUNT_BITS), equal.select(fx.Int32(1), 0)
+                    )
 
                 packed_prefix, packed_step_total = block_exclusive_sum(packed_local)
                 my_above = above_base + (packed_prefix >> _PACKED_COUNT_BITS)
@@ -2095,27 +2098,20 @@ def build_radix_topk_one_block_body(
                 vector_idx = step * block_threads + tid
                 if vector_idx < output_vector_count:
                     col = vector_idx * vec_width
+                    # Store each fragment once, outside dynamic branches: an
+                    # rmem tensor written under a dynamic branch fails FlyDSL's
+                    # rmem SSA promotion. Past row_len the index is -1, so the
+                    # masked form covers full, partial and empty vectors.
                     fragment = fx.make_rmem_tensor(index_fragment_layout, fx.Int32)
-                    if vector_idx < full_vector_count:
-                        index_values = [
-                            index_base + col + item for item in range_constexpr(_VEC)
-                        ]
-                        fragment.store(
-                            fx.Vector.from_elements(index_values, dtype=fx.Int32)
+                    index_values = [
+                        (col + item < row_len).select(
+                            index_base + col + item, fx.Int32(-1)
                         )
-                    else:
-                        if col < row_len:
-                            index_values = [
-                                (col + item < row_len).select(
-                                    index_base + col + item, fx.Int32(-1)
-                                )
-                                for item in range_constexpr(_VEC)
-                            ]
-                            fragment.store(
-                                fx.Vector.from_elements(index_values, dtype=fx.Int32)
-                            )
-                        else:
-                            fragment.store(fx.full(_VEC, -1, fx.Int32))
+                        for item in range_constexpr(_VEC)
+                    ]
+                    fragment.store(
+                        fx.Vector.from_elements(index_values, dtype=fx.Int32)
+                    )
                     fx.copy(
                         index_store_atom,
                         fragment,
@@ -2126,9 +2122,10 @@ def build_radix_topk_one_block_body(
                         value_fragment = fx.make_rmem_tensor(
                             value_fragment_layout, fx.Float32
                         )
+                        fragment_values = fx.full(_VEC, float("-inf"), fx.Float32)
                         if vector_idx < full_vector_count:
-                            value_fragment.store(
-                                _load_f32x4(input_vector_tiles, vector_idx)
+                            fragment_values = _load_f32x4(
+                                input_vector_tiles, vector_idx
                             )
                         else:
                             if col < row_len:
@@ -2140,15 +2137,10 @@ def build_radix_topk_one_block_body(
                                     if valid:
                                         output_value = input_row[local_col]
                                     output_values.append(output_value)
-                                value_fragment.store(
-                                    fx.Vector.from_elements(
-                                        output_values, dtype=fx.Float32
-                                    )
+                                fragment_values = fx.Vector.from_elements(
+                                    output_values, dtype=fx.Float32
                                 )
-                            else:
-                                value_fragment.store(
-                                    fx.full(_VEC, float("-inf"), fx.Float32)
-                                )
+                        value_fragment.store(fragment_values)
                         fx.copy(
                             value_store_atom,
                             value_fragment,
