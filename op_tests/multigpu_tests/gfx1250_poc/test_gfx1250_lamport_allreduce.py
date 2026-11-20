@@ -92,8 +92,6 @@ LL_AR_MAX_BYTES = 4 << 20
 # ar_2s_lamport_gfx1250's size range (ar2sMinBytes, ar2sMaxBytes), TP4/TP8 only
 AR2S_MIN_BYTES = {4: 1 << 20, 8: 512 << 10}
 AR2S_MAX_BYTES = 8 << 20
-# world sizes whose plain all-reduce never takes Lamport (_LAMPORT_AR_SKIP_WORLD_SIZES)
-LAMPORT_AR_SKIP_TP = (8,)
 
 
 def parse_size(s):
@@ -123,8 +121,7 @@ def expect_route(x, tp, cap, car_max, plain_max):
     if nbytes % 16 != 0 or nbytes > car_max:
         return "rccl"
     if (
-        tp not in LAMPORT_AR_SKIP_TP
-        and x.dtype in (torch.float16, torch.bfloat16)
+        x.dtype in (torch.float16, torch.bfloat16)
         and x.is_contiguous()
         and 0 < nbytes <= tp * cap
     ):

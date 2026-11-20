@@ -231,14 +231,6 @@ def test_gfx1250_plain_ar_gate_lamport():
     ca = _stub(ws=4, lamport_max_bytes=8 * MiB, AR_MAX=6 * MiB)
     assert ca.should_custom_plain_ar(bf16(6 * MiB))
     assert not ca.should_custom_plain_ar(bf16(6 * MiB + 16))
-    # TP8 never takes the Lamport all-reduce, even with a Lamport cap set: the
-    # meta-buffer kernels up to the plain cutoff, RCCL above it.
-    ca = _stub(ws=8, lamport_max_bytes=8 * MiB)
-    cut = ca._plain_ar_max_size
-    assert ca.select_lamport_ar(bf16(MiB)) is None
-    assert ca.select_lamport_ar(bf16(2 * cut)) is None
-    assert ca.should_custom_plain_ar(bf16(cut))
-    assert not ca.should_custom_plain_ar(bf16(cut + 16))
 
 
 def _stub(gfx1250=True, ws=4, min_size=0, lamport_max_bytes=0, **env):
