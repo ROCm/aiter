@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness and performance coverage for the single-kernel FlyDSL GDN prefill.
+"""Correctness and performance coverage for the FlyDSL GDN prefill.
 
 Each case runs ``gdn_fused_prefill_fwd`` on q/k/v taken as strided views of
 one packed projection (the layout serving stacks pass) and compares the
@@ -14,14 +14,16 @@ or track row, and slots outside the batch must stay untouched.
 from __future__ import annotations
 
 import argparse
+import itertools
 from dataclasses import dataclass
+from functools import partial
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, run_perftest
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -62,6 +64,21 @@ SHAPES = {
 }
 
 
+# TP1 Qwen3.5: Hg=16; H=16 for 0.8B/2B, H=32 for 4B/9B/35B-A3B,
+# H=48 for 27B. Qwen3.6 27B/35B-A3B and Qwen3.8-Flash-Next share these shapes.
+RDNA_SHAPES = {
+    f"qwen_h{h}_b{b}_t{t}": FusedShape((t,) * b, 16, h)
+    for h, b, t in itertools.product((16, 32, 48), (1, 8), (128, 512, 4096))
+}
+RDNA_SHAPES.update(
+    {
+        "qwen_h32_varlen": FusedShape((0, 1, 15, 16, 17, 63, 64, 65), 16, 32),
+        "qwen_h32_parallel_varlen": FusedShape((0, 1, 31, 512, 1025), 16, 32),
+        "qwen_h32_b32_precision": FusedShape((1,) * 30 + (512, 16384), 16, 32),
+    }
+)
+
+
 def _load():
     from aiter.ops.flydsl.gdn_fused_prefill import (
         gdn_fused_prefill_fwd,
@@ -71,7 +88,9 @@ def _load():
     return gdn_fused_prefill_fwd, gdn_fused_prefill_supported
 
 
-def _opt_vk_candidate(q, k, v, g, beta, cu, seq_lens, idx, backend):
+def _opt_vk_candidate(
+    q, k, v, g, beta, cu, seq_lens, idx, backend, prepare_flydsl=True
+):
     """The multi-kernel path serving stacks run today, on the same operands.
 
     ``backend`` picks the hidden-state stage: "triton", "flydsl" or "hip".
@@ -89,7 +108,8 @@ def _opt_vk_candidate(q, k, v, g, beta, cu, seq_lens, idx, backend):
         o, _ = chunk_gated_delta_rule_opt_vk(
             q=q,
             k=k,
-            v=v,
+            # The Triton prepare path needs dense V token offsets.
+            v=v if prepare_flydsl else v.contiguous(),
             g=g,
             beta=beta,
             initial_state=pool,
@@ -99,7 +119,7 @@ def _opt_vk_candidate(q, k, v, g, beta, cu, seq_lens, idx, backend):
             cu_seqlens=cu64,
             use_chunk_flydsl=backend == "flydsl",
             use_chunk_hip=backend == "hip",
-            use_prepare_flydsl=True,
+            use_prepare_flydsl=prepare_flydsl,
             state_dtype=torch.bfloat16,
             prefill_metadata=meta,
         )
@@ -108,7 +128,7 @@ def _opt_vk_candidate(q, k, v, g, beta, cu, seq_lens, idx, backend):
     return run
 
 
-def _make_inputs(shape: FusedShape, seed: int = 2026):
+def _make_inputs(shape: FusedShape, seed: int = 2026, slots: int = SLOTS):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     t, hg, h = sum(shape.seq_lens), shape.hg, shape.h
     mixed = torch.randn(t, 2 * hg * K + h * V, dtype=torch.bfloat16, generator=gen)
@@ -127,9 +147,9 @@ def _make_inputs(shape: FusedShape, seed: int = 2026):
     for length in shape.seq_lens:
         offsets.append(offsets[-1] + length)
     cu = torch.tensor(offsets, dtype=torch.int32)
-    pool = 0.05 * torch.randn(SLOTS, h, V, K, dtype=torch.bfloat16, generator=gen)
+    pool = 0.05 * torch.randn(slots, h, V, K, dtype=torch.bfloat16, generator=gen)
     n = len(shape.seq_lens)
-    idx = (torch.arange(1, n + 1, dtype=torch.int32) * 2) % SLOTS
+    idx = (torch.arange(1, n + 1, dtype=torch.int32) * 2) % slots
     nchunks = [(length + BT - 1) // BT for length in shape.seq_lens]
     # Middle chunk where there is one; even single-chunk rows track chunk 0,
     # odd ones opt out with -1.
@@ -205,11 +225,44 @@ def _assert_accurate(tag, o_errs, s_errs, max_abs):
     assert max_abs < MAX_ABS_TOL, f"{tag}: o max abs error {max_abs:.3e}"
 
 
+def _check_rdna(output, state, reference, cu, idx, rows):
+    expected, final, _ = reference
+    _assert_accurate(
+        "RDNA", *_seq_errors(output, expected, state, final, cu, idx, rows)
+    )
+    for n in rows:
+        assert (
+            checkAllclose(
+                final[n].float(),
+                state[int(idx[n])].float(),
+                rtol=1e-2,
+                atol=1e-2,
+                printLog=False,
+            )
+            == 0
+        )
+        bos, eos = int(cu[n]), int(cu[n + 1])
+        if eos > bos:
+            assert (
+                checkAllclose(
+                    expected[0, bos:eos],
+                    output[0, bos:eos].float(),
+                    rtol=1e-2,
+                    atol=MAX_ABS_TOL,
+                    printLog=False,
+                )
+                == 0
+            )
+
+
 @benchmark()
 def test_gdn_fused_prefill(name, seq_lens, hg, h):
     fwd, supported = _load()
     shape = FusedShape(tuple(seq_lens), hg, h)
-    q, k, v, g, beta, cu, pool0, idx, track_idx = _make_inputs(shape)
+    rdna = get_gfx_runtime() == "gfx1151"
+    q, k, v, g, beta, cu, pool0, idx, track_idx = _make_inputs(
+        shape, slots=max(SLOTS, 2 * len(seq_lens)) if rdna else SLOTS
+    )
     n = len(seq_lens)
     assert supported(q, k, v, g, beta, pool0), f"{name}: unexpectedly unsupported"
 
@@ -241,6 +294,16 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     assert torch.isfinite(o).all(), f"{name}: non-finite output"
     o_errs, s_errs, max_abs = _seq_errors(o, o_ref, pool, final_ref, cu, idx, range(n))
     _assert_accurate(name, o_errs, s_errs, max_abs)
+    if rdna:
+        _check_rdna(o, pool, (o_ref, final_ref, track_ref), cu, idx, range(n))
+        for i, snapshot in enumerate(track_ref):
+            if snapshot is not None:
+                assert (
+                    checkAllclose(
+                        snapshot, track[i], rtol=1e-2, atol=1e-2, printLog=False
+                    )
+                    == 0
+                )
     track_errs = [
         _rel_l2(track[i], track_ref[i]) for i in range(n) if track_ref[i] is not None
     ]
@@ -251,7 +314,7 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     ), f"{name}: track rel_l2 {err_track:.3e}"
     opted_out = [i for i in range(n) if track_ref[i] is None]
     assert torch.isnan(track[opted_out]).all(), f"{name}: wrote opted-out track rows"
-    untouched = torch.ones(SLOTS, dtype=torch.bool)
+    untouched = torch.ones(pool0.shape[0], dtype=torch.bool)
     untouched[idx.long()] = False
     assert torch.equal(pool[untouched], pool0[untouched]), f"{name}: stray writes"
 
@@ -276,7 +339,7 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
         track_chunk_idx=track_idx,
     )
     torch.cuda.synchronize()
-    touched = torch.zeros(SLOTS, dtype=torch.bool)
+    touched = torch.zeros(pool0.shape[0], dtype=torch.bool)
     touched[idx_pad[live].long()] = True
     assert torch.equal(pool[~touched], pool0[~touched]), f"{name}: padding leaked"
     assert torch.isnan(track[~live]).all(), f"{name}: padding wrote track rows"
@@ -297,9 +360,9 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
         return fwd(q, k, v, g, beta, ssm_states=pool, cache_indices=idx, cu_seqlens=cu)
 
     candidates = {"fused": fused}
-    for backend in ("triton", "flydsl"):
+    for backend in (("triton",) if rdna else ("triton", "flydsl")):
         candidates[f"opt_vk_{backend}"] = _opt_vk_candidate(
-            q, k, v, g, beta, cu, seq_lens, idx, backend
+            q, k, v, g, beta, cu, seq_lens, idx, backend, prepare_flydsl=not rdna
         )
 
     t = sum(seq_lens)
@@ -312,7 +375,7 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
         + 2 * n * h * V * K * pool0.element_size()
     )
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "tokens": t,
         # What a caller passing max_seqlen would pick.
         "gate": supported(q, k, v, g, beta, pool0, max_seqlen=max(seq_lens)),
@@ -325,8 +388,11 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     seq_errs = {}
     for cname, fn in candidates.items():
         pool = pool_ab.clone()
-        errs = _seq_errors(fn(pool), o_ref, pool, final_ref, cu, idx, range(n))
+        output = fn(pool)
+        errs = _seq_errors(output, o_ref, pool, final_ref, cu, idx, range(n))
         _assert_accurate(f"{name}: {cname}", *errs)
+        if rdna:
+            _check_rdna(output, pool, (o_ref, final_ref, track_ref), cu, idx, range(n))
         seq_errs[cname] = errs
         _, us = run_perftest(fn, pool_ab.clone(), num_iters=21, num_warmup=3)
         ret[f"{cname} us"] = us
@@ -337,13 +403,14 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     # The bf16 state copy feeding k S^T / q S^T must not drift on long
     # sequences: per sequence, o and the final state stay as accurate as the
     # multi-kernel FlyDSL path.
-    fused, multi = seq_errs["fused"], seq_errs["opt_vk_flydsl"]
+    fused = seq_errs["fused"]
+    multi = seq_errs["opt_vk_triton" if rdna else "opt_vk_flydsl"]
     for what, part in (("o", 0), ("state", 1)):
         for i, err in fused[part].items():
             bound = VS_MULTI_KERNEL_SLACK * multi[part][i]
             assert err <= bound, (
                 f"{name}: fused {what} rel_l2 {err:.3e} on sequence {i} exceeds "
-                f"multi-kernel FlyDSL {multi[part][i]:.3e}"
+                f"multi-kernel {'Triton' if rdna else 'FlyDSL'} {multi[part][i]:.3e}"
             )
     return ret
 
@@ -372,9 +439,86 @@ def _run_contract_checks():
         assert got == expect, f"{shape}: perf gate returned {got}"
 
 
+def _run_rdna_contract_checks():
+    fwd, supported = _load()
+    for length, gate in itertools.product((65, 513), (-0.011, -0.019, -0.02, -0.021)):
+        q, k, v, g, beta, cu, pool, idx, ti = _make_inputs(
+            FusedShape((length,), 16, 32)
+        )
+        g.fill_(gate)
+        beta[..., ::2], beta[..., 1::2] = 0.0, 1.0
+        q[:, :1], k[:, :1] = 0.0, 0.0
+        init = torch.zeros_like(idx, dtype=torch.bool)
+        reference = run_torch_reference(q, k, v, g, beta, cu, pool, idx, ti, init)
+        # The output scale does not enter the recurrence or snapshot state.
+        reference[0].mul_(0.17 / (K**-0.5))
+        state = pool.clone()
+        state[idx.long()] = float("nan")
+        track = torch.full((1, 32, V, K), float("nan"))
+        output = fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=state,
+            cache_indices=idx,
+            cu_seqlens=cu,
+            track_state=track,
+            track_chunk_idx=ti,
+            has_initial_state=init,
+            scale=0.17,
+        )
+        _check_rdna(output, state, reference, cu, idx, range(1))
+        assert (
+            checkAllclose(
+                reference[2][0], track[0], rtol=1e-2, atol=1e-2, printLog=False
+            )
+            == 0
+        )
+
+    for length in (4, 65, 513):
+        inputs = _make_inputs(FusedShape((length,), 16, 32))
+        q, k, v, g, beta, cu, pool, idx, _ = inputs
+        reference = run_torch_reference(*inputs)
+        state = pool.clone()
+        call = partial(
+            fwd, q, k, v, g, beta, ssm_states=state, cache_indices=idx, cu_seqlens=cu
+        )
+        call()  # Compile before capture.
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = call()
+        state.copy_(pool)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_rdna(output, state, reference, cu, idx, range(1))
+        stream = torch.cuda.Stream()
+        state.copy_(pool)
+        stream.wait_stream(torch.cuda.current_stream())
+        output = call(stream=stream)
+        stream.synchronize()
+        _check_rdna(output, state, reference, cu, idx, range(1))
+
+    q, k, v, g, beta, _, pool, idx, _ = inputs
+    empty = (q[:, :0], k[:, :0], v[:, :0], g[:, :0], beta[:, :0])
+    assert supported(*empty, pool)
+    cu = torch.tensor([0, 0], dtype=torch.int32)
+    output = fwd(
+        *empty,
+        ssm_states=pool,
+        cache_indices=idx,
+        cu_seqlens=cu,
+        has_initial_state=torch.zeros_like(idx, dtype=torch.bool),
+    )
+    assert output.numel() == 0 and torch.count_nonzero(pool[idx.long()]) == 0
+
+
 def main():
-    if get_gfx() != "gfx950":
-        aiter.logger.warning("FlyDSL fused GDN prefill needs gfx950; skipping")
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx950", "gfx1151"):
+        aiter.logger.warning("FlyDSL fused GDN prefill needs gfx950/gfx1151; skipping")
         return
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -385,21 +529,24 @@ def main():
         "--shapes",
         type=str,
         nargs="*",
-        choices=list(SHAPES),
-        default=list(SHAPES),
+        choices=list(SHAPES) + list(RDNA_SHAPES),
+        default=list(RDNA_SHAPES if gfx == "gfx1151" else SHAPES),
         help="Shape labels.",
     )
     args = parser.parse_args()
 
-    _run_contract_checks()
+    if gfx == "gfx1151":
+        _run_rdna_contract_checks()
+    else:
+        _run_contract_checks()
     rows = []
     for name in args.shapes:
-        shape = SHAPES[name]
+        shape = (RDNA_SHAPES if name in RDNA_SHAPES else SHAPES)[name]
         rows.append(
             test_gdn_fused_prefill(name, list(shape.seq_lens), shape.hg, shape.h)
         )
     aiter.logger.info(
-        "gdn_fused_prefill summary:\n%s", pd.DataFrame(rows).to_markdown()
+        "gdn_fused_prefill summary:\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
 
 
