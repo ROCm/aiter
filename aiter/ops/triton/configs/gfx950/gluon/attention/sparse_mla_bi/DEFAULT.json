@@ -1,0 +1,25 @@
+{
+    "sparse_mla_bi": {
+        "split": {
+            "block_h": 16,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "fused": {
+            "block_h": 32,
+            "num_warps": 8,
+            "waves_per_eu": 2
+        },
+        "fused_small": {
+            "block_h": 16,
+            "num_warps": 4,
+            "waves_per_eu": 2
+        },
+        "fused_small_max_heads": 16,
+        "combine": {
+            "block_h": 1,
+            "num_warps": 1
+        },
+        "fused_min_row_heads": 4096
+    }
+}
