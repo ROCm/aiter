@@ -15,13 +15,29 @@ import pytest
 import torch
 
 from aiter.jit.utils import chip_info
-from aiter.ops import batched_gemm_op_a8w8, gemm_op_a8w8
+from aiter.ops import batched_gemm_op_a8w8, gemm_op_a8w8, gemm_op_common
 
 MI300X_DPX = ("gfx942", (152, 304))
 MI300X_CPX = ("gfx942", (38, 304))
 MI355X_DPX = ("gfx950", (128, 256))
 MI300X = ("gfx942", (304,))
 MI308X = ("gfx942", (80,))
+
+
+def padded_m(m, n, k, gl):
+    """getPaddedM (csrc/py_itfs_cu/gemm_common.cu), without the GPU op."""
+    pow2 = 1 << (m - 1).bit_length()
+    if gl == 1:
+        return 8192 if m > 8192 and n > 4096 else pow2
+    if m < 16:
+        return pow2
+    grain = next((g for top, g in ((256, 16), (1024, 32), (4096, 64)) if m <= top), 128)
+    return -(-m // grain) * grain
+
+
+@pytest.fixture(autouse=True)
+def host_padded_m(monkeypatch):
+    monkeypatch.setattr(gemm_op_common, "get_padded_m", padded_m)
 
 
 @pytest.fixture
