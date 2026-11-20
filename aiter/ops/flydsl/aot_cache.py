@@ -49,7 +49,8 @@ rebuilt. Editing one kernel therefore invalidates only the entries that ran it.
   failures raise instead of falling back.
 
 ``AITER_FLYDSL_AOT_CACHE_DIR`` sets the cache root. The default is
-``~/.aiter/flydsl_aot``.
+``flydsl_aot`` in aiter's JIT directory (``get_user_jit_dir``), so entries a
+prebuild writes ship with the package, like its JIT modules.
 """
 
 from __future__ import annotations
@@ -106,9 +107,16 @@ def aot_cache_mode() -> str:
     return _MODE
 
 
+@functools.cache
+def _default_root() -> Path:
+    from aiter.jit.core import get_user_jit_dir
+
+    return Path(get_user_jit_dir()) / "flydsl_aot"
+
+
 def cache_root() -> Path:
     root = os.environ.get("AITER_FLYDSL_AOT_CACHE_DIR")
-    return Path(root) if root else Path.home() / ".aiter" / "flydsl_aot"
+    return Path(root) if root else _default_root()
 
 
 def _hash_tree(h, root: Path, patterns, *, contents: bool) -> None:
@@ -133,13 +141,43 @@ def _target_arch() -> str:
     return props.gcnArchName.split(":")[0]
 
 
+def _wheel_record(fly_root: Path) -> bytes | None:
+    """The file hashes of the FlyDSL wheel installed at ``fly_root``, if any.
+
+    Only the package's own entries: an installer adds its own files and
+    ``.pyc`` entries, which differ between installs of the same wheel.
+    """
+    from importlib.metadata import distributions
+
+    for dist in distributions(path=[str(fly_root.parent)]):
+        if dist.metadata["Name"] != "flydsl":
+            continue
+        record = dist.read_text("RECORD")
+        if record is None:
+            return None
+        lines = sorted(
+            line
+            for line in record.splitlines()
+            if line.startswith("flydsl/") and "__pycache__" not in line
+        )
+        return "\n".join(lines).encode()
+    return None
+
+
 @functools.cache
 def _toolchain_digest() -> str:
     """Hash of the FlyDSL install: its Python sources and native libraries."""
     h = hashlib.sha256()
     fly_root = Path(flydsl.__file__).parent
     _hash_tree(h, fly_root, ("*.py",), contents=True)
-    _hash_tree(h, fly_root, ("*.so", "*.a"), contents=False)
+    record = _wheel_record(fly_root)
+    if record is not None:
+        # Content hashes, so a reinstall of the same wheel (e.g. in another
+        # Docker stage) keeps the fingerprint; file mtimes would not.
+        h.update(record)
+    else:
+        # A source build has no wheel RECORD.
+        _hash_tree(h, fly_root, ("*.so", "*.so.*", "*.a"), contents=False)
     return h.hexdigest()
 
 

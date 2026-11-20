@@ -161,8 +161,11 @@ an AOT build switches arch and environment within one process. It covers everyth
 source:
 
 - the cache schema, Python `major.minor` and `platform.machine()`;
-- `flydsl.__version__`, **the contents of every FlyDSL `.py`**, and the name,
-  size and mtime of FlyDSL's native `.so`/`.a` files;
+- `flydsl.__version__`, **the contents of every FlyDSL `.py`**, and FlyDSL's
+  native libraries: their sha256 from the wheel's `RECORD`, so reinstalling
+  the same wheel (e.g. in a later Docker stage) keeps the fingerprint, or, for
+  a source build without a `RECORD`, the name, size and mtime of its
+  `.so`/`.a` files;
 - `torch.version.hip` and the target arch. That is
   `torch.cuda.get_device_properties().gcnArchName`, or FlyDSL's
   `get_rocm_arch()` when there is no device or `FLYDSL_GPU_ARCH` is set;
@@ -222,6 +225,12 @@ Modes, set with `AITER_FLYDSL_AOT_CACHE`:
   byte-compares the `.o`. A mismatch raises and names the stale entry.
   `export_to_c` is deterministic, so a mismatch always means the key or the
   fingerprint missed an input. Use it in CI and after FlyDSL bumps.
+
+The cache root is `AITER_FLYDSL_AOT_CACHE_DIR`, or by default `flydsl_aot`
+in aiter's JIT directory (`get_user_jit_dir()`: `AITER_JIT_DIR`, else
+`aiter/jit/` when writable, else `~/.aiter/jit/`). Entries a
+`PREBUILD_KERNELS` build writes therefore stay with the package tree, as its
+JIT modules do, and a container image that copies the tree carries them.
 
 ### 4.3 Launching
 
