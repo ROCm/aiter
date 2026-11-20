@@ -1626,7 +1626,10 @@ namespace py = pybind11;
           py::arg("seqstart_k_pad")   = std::nullopt, \
           py::arg("max_seqlen_q")     = 0,            \
           py::arg("max_seqlen_k")     = 0,            \
-          py::arg("window_size_left") = -1);
+          py::arg("window_size_left") = -1,           \
+          py::arg("block_table")      = std::nullopt, \
+          py::arg("num_splits")       = 1,            \
+          py::arg("sink")             = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

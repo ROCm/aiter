@@ -421,6 +421,9 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     window_size_left: int = -1,
+    block_table: Tensor | None = None,
+    num_splits: int = 1,
+    sink: Tensor | None = None,
 ) -> None:
     return None
 
@@ -428,7 +431,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
 # kernel or the asymmetric D_QK=192/D_V=128 kernel; both take batch and group/varlen
-# inputs, and only D=128 implements `window_size_left`.
+# inputs, and only D=128 implements `window_size_left`, paged / split KV and `sink`.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -450,6 +453,9 @@ def _fmha_fwd_bf16_opus_fwd(
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     window_size_left: int = -1,
+    block_table: Tensor | None = None,
+    num_splits: int = 1,
+    sink: Tensor | None = None,
 ) -> None: ...
 
 
@@ -504,6 +510,73 @@ def fmha_fwd_bf16_opus_fwd(
         float(softmax_scale),
         lse=lse,
         window_size_left=int(window_size_left),
+    )
+    return (out, lse) if return_lse else out
+
+
+def fmha_fwd_bf16_opus_paged_fwd(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    block_table: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    out: Tensor | None = None,
+    return_lse: bool = False,
+    lse: Tensor | None = None,
+    num_splits: int = 0,
+    window_size_left: int = -1,
+    sink: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
+    """OPUS gfx950 bf16 D=128 group/varlen forward over a paged KV cache. q is packed
+    [total_q, H, 128]; k_cache / v_cache are [num_blocks, 128, H_KV, 128] views of a page
+    pool (any strides with a contiguous head dim, e.g. vLLM's K and V halves of one
+    cache); block_table [num_groups, max_pages] int32 maps each group's pages, and
+    seqstart_k gives the per-group KV lengths as cumulative sums (pool offsets are not
+    used).
+
+    `window_size_left` >= 0 adds a left bound to the causal mask: the query at KV
+    position j keeps keys [j - window_size_left, j].
+
+    `sink` is an optional attention sink, one fp32 logit per query head ([H], natural
+    log). It joins the softmax denominator as a key with no value, so rows with no keys
+    get lse = sink and O = 0. A -inf logit means no sink for that head.
+
+    `num_splits` cuts each Q block's KV range into shares that run as separate
+    workgroups, with fp32 partials merged by a combine kernel: 1 is off, 0 picks
+    a count that fills idle CUs (long context, few Q blocks), up to 16.
+
+    `lse` / `return_lse` behave as in `fmha_fwd_bf16_opus_varlen_fwd`.
+    """
+    total_q, q_head_num = q.size(0), q.size(1)
+    if out is None:
+        out = torch.empty_like(q)
+    if return_lse and lse is None:
+        lse = torch.empty((q_head_num, total_q), dtype=torch.float32, device=q.device)
+    seqstart_q = seqstart_q.to(torch.int32).contiguous()
+    seqstart_k = seqstart_k.to(torch.int32).contiguous()
+    _fmha_fwd_bf16_opus_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        bool(causal),
+        float(softmax_scale),
+        lse,
+        seqstart_q,
+        seqstart_k,
+        seqstart_q,
+        seqstart_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        int(window_size_left),
+        block_table,
+        int(num_splits),
+        None if sink is None else sink.float().contiguous(),
     )
     return (out, lse) if return_lse else out
 
