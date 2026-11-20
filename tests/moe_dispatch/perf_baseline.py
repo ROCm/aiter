@@ -6,6 +6,9 @@
     python tests/moe_dispatch/perf_baseline.py --check
     python tests/moe_dispatch/perf_baseline.py --record --case dsv3_tp8_pt  # add one case
 
+An arch has a baseline only once a case in `CASES` lists it; without one, both modes
+refuse to run rather than record or check an empty set.
+
 Each case runs `op_tests/test_moe_2stage.py` in a subprocess (one per quant and shape,
 so an OOM or a crash only loses that case) and reads its result table, so inputs, weight
 layouts and timing are exactly those of the existing accuracy suite. Run on an idle GPU:
@@ -121,6 +124,36 @@ def measure(gfx, names=None):
     return results
 
 
+def _cases_problem(gfx, names=None):
+    """Why `--record` or `--check` cannot measure on `gfx`: no case runs there, or a
+    requested case does not; None when it can."""
+    archs = {case[0]: case[-1] for case in CASES}
+    if not any(gfx in case_archs for case_archs in archs.values()):
+        return (
+            f"no perf case runs on {gfx}; add {gfx} to the archs of the cases that"
+            " run there (CASES in this file), then run --record"
+        )
+    other_arch = [name for name in names or () if gfx not in archs[name]]
+    if other_arch:
+        return f"cases {other_arch} do not run on {gfx}"
+    return None
+
+
+def _check_baseline(path, gfx, names=None):
+    """The recorded timings of the cases a check measures, and the reasons it cannot
+    compare them: no baseline file, or a case with no recorded timings."""
+    wanted = names or [case[0] for case in CASES if gfx in case[-1]]
+    if not path.exists():
+        return {}, [f"no baseline {path}; record one first with --record"]
+    recorded = json.loads(path.read_text())["us"]
+    unrecorded = [name for name in wanted if name not in recorded]
+    if unrecorded:
+        cases = " ".join(f"--case {name}" for name in unrecorded)
+        message = f"no baseline in {path} for {unrecorded}"
+        return {}, [f"{message}; record them first with --record {cases}"]
+    return {name: recorded[name] for name in wanted}, []
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -140,8 +173,21 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # The repository root so `aiter` is this checkout rather than an installed copy,
+    # even one earlier on the path.
+    sys.path[:] = [str(_REPO)] + [p for p in sys.path if p != str(_REPO)]
     gfx = _gfx()
     path = GOLDEN_DIR / f"perf_{gfx}.json"
+    problem = _cases_problem(gfx, args.case)
+    if problem:
+        print(problem)
+        return 1
+    if args.check:
+        baseline, problems = _check_baseline(path, gfx, args.case)
+        if problems:
+            for line in problems:
+                print(line)
+            return 1
     results = measure(gfx, args.case)
     errors = [name for name, per_m in results.items() if "error" in per_m]
     if args.record:
@@ -155,9 +201,6 @@ def main(argv=None):
         )
         print(f"wrote {path}")
         return 0
-    baseline = json.loads(path.read_text())["us"]
-    if args.case:
-        baseline = {name: baseline[name] for name in args.case if name in baseline}
     problems = []
     for name, per_m in baseline.items():
         for m, us in per_m.items():

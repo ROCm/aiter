@@ -14,6 +14,8 @@ shapes and Python values, never tensor contents.
 
 import importlib
 import logging
+import sys
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -103,67 +105,109 @@ _BUILTIN_MODULES: tuple = ("aiter.moev2.migration.a8w8_pt",)
 
 _REGISTRY: dict[str, Path] = {}
 _builtin_loaded = False
+_loading = threading.local()
+
+# Guards _REGISTRY, _active and _generation. Never held while importing: a module holds
+# its import lock while it runs register(), so a thread importing a path module directly
+# would deadlock with a thread waiting for that module under this lock.
+_lock = threading.RLock()
 
 
 def _load_builtin():
+    """Import the built-in path modules once, in order.
+
+    A thread arriving while another imports them blocks in `import_module` until each
+    module has run, so it returns with every built-in path registered. The modules'
+    `register()` calls re-enter here on the importing thread and return at once.
+    Loading counts as done only once each module's `PATH` is registered: a module
+    imported directly runs this from its own `register()`, before its path is in.
+    """
     global _builtin_loaded
-    if not _builtin_loaded:
-        _builtin_loaded = True
+    if _builtin_loaded or getattr(_loading, "active", False):
+        return
+    _loading.active = True
+    try:
         for module in _BUILTIN_MODULES:
             importlib.import_module(module)
+    except BaseException:
+        _builtin_loaded = True
+        raise
+    finally:
+        _loading.active = False
+    with _lock:
+        _builtin_loaded = all(
+            path is not None and _REGISTRY.get(path.name) is path
+            for path in (
+                getattr(sys.modules[m], "PATH", None) for m in _BUILTIN_MODULES
+            )
+        )
 
 
 def register(path: Path):
     _load_builtin()
-    if path.name not in PLANNED:
-        raise ValueError(f"unknown moev2 path {path.name!r}; add it to PLANNED first")
-    if path.name in _REGISTRY:
-        raise ValueError(f"moev2 path {path.name!r} is already registered")
-    _REGISTRY[path.name] = path
-    reload()
+    with _lock:
+        if path.name not in PLANNED:
+            raise ValueError(
+                f"unknown moev2 path {path.name!r}; add it to PLANNED first"
+            )
+        if path.name in _REGISTRY:
+            raise ValueError(f"moev2 path {path.name!r} is already registered")
+        _REGISTRY[path.name] = path
+        reload()
 
 
 def unregister(name: str):
-    _REGISTRY.pop(name, None)
-    reload()
+    with _lock:
+        _REGISTRY.pop(name, None)
+        reload()
 
 
 def registered():
     _load_builtin()
-    return dict(_REGISTRY)
+    with _lock:
+        return dict(_REGISTRY)
 
 
 _active: tuple | None = None
+# Bumped by reload(): a selection computed across a reload is returned but not cached.
+_generation = 0
 
 
 def active() -> tuple:
     """Registered paths selected by AITER_MOEV2, in registration order."""
     global _active
-    if _active is None:
-        _active = _select()
-    return _active
+    selected = _active
+    if selected is not None:
+        return selected
+    with _lock:
+        generation = _generation
+    selected = _select()
+    with _lock:
+        if generation == _generation:
+            _active = selected
+    return selected
 
 
 def _select() -> tuple:
-    _load_builtin()
+    registry = registered()
     selection = envs.moev2_selection()
     if selection == "off":
         return ()
     if selection == "on":
-        return tuple(_REGISTRY.values())
+        return tuple(registry.values())
     if selection == "default":
-        return tuple(p for p in _REGISTRY.values() if p.graduated_here())
+        return tuple(p for p in registry.values() if p.graduated_here())
     unknown = sorted(selection - set(PLANNED))
     if unknown:
         raise ValueError(
             f"{envs.AITER_MOEV2} names unknown paths {unknown}; known: {', '.join(PLANNED)}"
         )
-    missing = sorted(selection - set(_REGISTRY))
+    missing = sorted(selection - set(registry))
     if missing:
         logger.warning(
             "%s: paths %s are not implemented yet", envs.AITER_MOEV2, missing
         )
-    return tuple(p for p in _REGISTRY.values() if p.name in selection)
+    return tuple(p for p in registry.values() if p.name in selection)
 
 
 def any_active() -> bool:
@@ -179,5 +223,7 @@ def route_to_v2(call: Mapping, entry: str = "api"):
 
 
 def reload():
-    global _active
-    _active = None
+    global _active, _generation
+    with _lock:
+        _active = None
+        _generation += 1

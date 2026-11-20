@@ -124,10 +124,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
-    # this checkout rather than an installed copy.
-    sys.path[:0] = [
-        p for p in (str(_HERE.parent), str(_HERE.parents[1])) if p not in sys.path
-    ]
+    # this checkout rather than an installed copy, even one earlier on the path.
+    front = [str(_HERE.parent), str(_HERE.parents[1])]
+    sys.path[:] = front + [p for p in sys.path if p not in front]
     from moe_dispatch import snapshot
 
     snapshot._setup()

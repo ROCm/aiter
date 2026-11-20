@@ -185,11 +185,6 @@ def run_case(path_name, case):
 
 
 def _child(args):
-    # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
-    # this checkout rather than an installed copy.
-    sys.path[:0] = [
-        p for p in (str(_HERE.parent), str(_HERE.parents[1])) if p not in sys.path
-    ]
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -217,6 +212,10 @@ def main(argv=None):
     parser.add_argument("--synth-limit", type=int, default=48)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
+    # this checkout rather than an installed copy, even one earlier on the path.
+    front = [str(_HERE.parent), str(_HERE.parents[1])]
+    sys.path[:] = front + [p for p in sys.path if p not in front]
     if args.child or not args.synth_table:
         return _child(args)
 

@@ -7,6 +7,7 @@ claims. The GPU test runs tests/moe_dispatch/gpu_differential.py for each regist
 path: same kernels on the same inputs, same outputs and log lines as legacy.
 """
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -78,6 +79,87 @@ def test_perf_baseline_rejects_partial_token_results(monkeypatch):
     monkeypatch.setattr(perf_baseline.subprocess, "run", lambda *a, **k: result)
     with pytest.raises(RuntimeError, match=r"missing=\['16'\]"):
         perf_baseline.run_case(perf_baseline.CASES[0], (1, 16))
+
+
+@pytest.fixture
+def perf_check(monkeypatch, tmp_path, capsys):
+    """Run `perf_baseline.main` on a fake gfx942 with baselines under tmp_path; the
+    measurement returns `measured` and records which cases it was asked for."""
+    from moe_dispatch import perf_baseline
+
+    measured, asked = {}, []
+
+    def measure(gfx, names=None):
+        asked.append(names)
+        return dict(measured)
+
+    monkeypatch.setattr(perf_baseline, "_gfx", lambda: "gfx942")
+    monkeypatch.setattr(perf_baseline, "GOLDEN_DIR", tmp_path)
+    monkeypatch.setattr(perf_baseline, "measure", measure)
+
+    def check(*argv, baseline=None):
+        if baseline is not None:
+            (tmp_path / "perf_gfx942.json").write_text(
+                json.dumps({"gfx": "gfx942", "us": baseline})
+            )
+        code = perf_baseline.main(["--check", *argv])
+        return code, capsys.readouterr().out
+
+    return SimpleNamespace(check=check, measured=measured, asked=asked)
+
+
+def test_perf_check_rejects_requested_cases_without_a_baseline(perf_check):
+    code, out = perf_check.check(
+        "--case", "qwen3_235b_tp8_bf16", baseline={"dsv3_tp8_pt": {"1": 10.0}}
+    )
+    assert code == 1 and perf_check.asked == []
+    assert "['qwen3_235b_tp8_bf16']" in out
+    assert "--record --case qwen3_235b_tp8_bf16" in out
+
+
+def test_perf_baseline_refuses_an_arch_without_cases(
+    perf_check, monkeypatch, tmp_path, capsys
+):
+    from moe_dispatch import perf_baseline
+
+    assert not any("gfx1250" in case[-1] for case in perf_baseline.CASES)
+    monkeypatch.setattr(perf_baseline, "_gfx", lambda: "gfx1250")
+    for mode in ("--record", "--check"):
+        assert perf_baseline.main([mode]) == 1
+        assert "no perf case runs on gfx1250" in capsys.readouterr().out
+    assert perf_check.asked == [] and not list(tmp_path.iterdir())
+
+    monkeypatch.setattr(perf_baseline, "_gfx", lambda: "gfx942")
+    assert perf_baseline.main(["--record", "--case", "dsv3_tp8_a4w4"]) == 1
+    assert "do not run on gfx942" in capsys.readouterr().out
+    assert perf_check.asked == [] and not list(tmp_path.iterdir())
+
+
+def test_perf_check_rejects_a_missing_file_and_other_arch_cases(perf_check):
+    code, out = perf_check.check("--case", "dsv3_tp8_pt")
+    assert code == 1 and "record one first" in out
+    code, out = perf_check.check("--case", "dsv3_tp8_a4w4", baseline={})
+    assert code == 1 and "do not run on gfx942" in out
+    assert perf_check.asked == []
+
+
+def test_perf_check_without_cases_needs_every_case_of_the_arch(perf_check):
+    from moe_dispatch import perf_baseline
+
+    gfx942 = [c[0] for c in perf_baseline.CASES if "gfx942" in c[-1]]
+    code, out = perf_check.check(baseline={gfx942[0]: {"1": 10.0}})
+    assert code == 1 and perf_check.asked == []
+    assert str(gfx942[1:]) in out
+
+
+def test_perf_check_compares_the_requested_cases(perf_check):
+    baseline = {"dsv3_tp8_pt": {"1": 10.0}, "qwen3_235b_tp8_bf16": {"1": 10.0}}
+    perf_check.measured["qwen3_235b_tp8_bf16"] = {"1": 10.5}
+    code, _ = perf_check.check("--case", "qwen3_235b_tp8_bf16", baseline=baseline)
+    assert code == 0 and perf_check.asked == [["qwen3_235b_tp8_bf16"]]
+    perf_check.measured["qwen3_235b_tp8_bf16"] = {"error": "boom"}
+    code, out = perf_check.check("--case", "qwen3_235b_tp8_bf16")
+    assert code == 1 and "MISSING qwen3_235b_tp8_bf16 M=1" in out
 
 
 def test_dispatch_plans_match_legacy():

@@ -10,15 +10,19 @@ suites run for every path.
     python tests/moe_dispatch/gpu_suites.py --path a8w8_pt  # commands for one path
     python tests/moe_dispatch/gpu_suites.py --path a8w8_pt --run
 
-Commands match how .github/scripts/aiter_test.sh runs each file.
+Commands match how .github/scripts/aiter_test.sh runs each file. `--run` skips, and lists,
+the suites whose archs or GPU count the machine does not have.
 """
 
 import argparse
 import os
+import pathlib
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+
+_REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -135,30 +139,60 @@ def suites_for(path):
     return PATHS[path] + SHARED
 
 
+def _device():
+    """The running GPU's arch and the number of visible GPUs."""
+    # The repository root so `aiter` is this checkout rather than an installed copy,
+    # even one earlier on the path.
+    sys.path[:] = [str(_REPO)] + [p for p in sys.path if p != str(_REPO)]
+    import torch
+
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime(), torch.cuda.device_count()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--path", choices=sorted(PATHS))
     parser.add_argument("--run", action="store_true", help="run the commands")
     args = parser.parse_args(argv)
     paths = [args.path] if args.path else list(PATHS)
-    failed = []
+    if args.run:
+        gfx, gpus = _device()
+    ran, failed, skipped = 0, [], []
+    # The full listing prints SHARED once at the end; a run needs it for every path.
+    full = args.path or args.run
     for path in paths:
         print(f"[{path}]")
-        for suite in suites_for(path) if args.path else PATHS[path]:
+        for suite in suites_for(path) if full else PATHS[path]:
             line = shlex.join(suite.cmd)
             extra = f"  # {', '.join(suite.archs)}" + (
                 f"; {suite.note}" if suite.note else ""
             )
             print(f"  {line}{extra}")
-            if args.run:
-                env = os.environ.copy()
-                env["AITER_MOEV2"] = path
-                if subprocess.run(suite.cmd, check=False, env=env).returncode != 0:
-                    failed.append(line)
-    if not args.path:
+            if not args.run:
+                continue
+            if gfx not in suite.archs or gpus < suite.gpus:
+                skipped.append(
+                    f"[{path}] {line}  # needs {', '.join(suite.archs)} and"
+                    f" {suite.gpus} GPU(s)"
+                )
+                continue
+            env = os.environ.copy()
+            env["AITER_MOEV2"] = path
+            ran += 1
+            if subprocess.run(suite.cmd, check=False, env=env).returncode != 0:
+                failed.append(f"[{path}] {line}")
+    if not full:
         print("[shared, every path]")
         for suite in SHARED:
             print(f"  {shlex.join(suite.cmd)}")
+    if args.run:
+        for line in skipped:
+            print(f"SKIPPED on {gfx} with {gpus} GPU(s): {line}")
+        if not ran:
+            print(f"no suite runs on {gfx} with {gpus} GPU(s)")
+            return 1
     for line in failed:
         print(f"FAILED: {line}")
     return 1 if failed else 0
