@@ -150,10 +150,9 @@ def vdst_fence(v):
 
 
 def ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
-    """Bytes of the arena's ``slots_ctl`` region: slot counters, then src_done,
-    comb_flag (``FLAG_SPAN`` apart), started and reserved (one line per
-    source each)."""
-    return src_off(experts_per_rank) + 2 * FLAG_SPAN + 2 * npes * FLAG_STRIDE
+    """Bytes of the arena's ``slots_ctl`` region: slot counters, then src_done
+    and comb_flag (``FLAG_SPAN`` apart), then reserved (one line per source)."""
+    return src_off(experts_per_rank) + 2 * FLAG_SPAN + npes * FLAG_STRIDE
 
 
 def epr_pad(experts_per_rank: int) -> int:

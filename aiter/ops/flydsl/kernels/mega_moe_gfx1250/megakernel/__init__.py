@@ -33,7 +33,7 @@ all-resident grid of 4-wave CTAs runs the same phases:
    order in fp32, the staged reduce's arithmetic: the output is bitwise the
    staged one.
 
-compact (``AITER_MEGAKERNEL_COMPACT``) replaces 1. with a count-first dispatch
+compact replaces 1. with a count-first dispatch
 on the staged compact layout (expert-major, each expert padded to ``tile_m``,
 sources in rank order), so its rows, m-tiles and GEMMs are the staged path's:
 
@@ -59,9 +59,6 @@ only for tokens s produced in L+1. compact sends to d only once d's X1 row of
 the same launch arrived; the staged path, which shares ``disp_out``,
 ``ep_rowmap`` and ``comb_inp``, waits for d's counts likewise.
 
-slots can also wait for every peer's ``started`` flag before sending
-(``AITER_DMK_NO_HS=0``, off by default).
-
 Modules: ``config`` (tiles, switches, admission, arena regions), ``protocol``
 (control block, entry ticket, waits and gates, plan, GEMM queue, close,
 reduce), ``dispatch_slots`` / ``dispatch_compact`` (phase 1. of each layout),
@@ -71,10 +68,8 @@ reduce), ``dispatch_slots`` / ``dispatch_compact`` (phase 1. of each layout),
 from .config import (
     compact_reason,
     compact_regions,
-    compact_tile_table,
     compact_variants,
-    read_compact,
-    read_slots_tokens,
+    read_megakernel,
     slots_reason,
     slots_regions,
 )
@@ -102,14 +97,12 @@ __all__ = [
     "SlotsMega",
     "compact_reason",
     "compact_regions",
-    "compact_tile_table",
     "compact_variants",
     "ctl_arena_bytes",
     "ctl_words",
     "epr_pad",
     "make_megakernel",
-    "read_compact",
-    "read_slots_tokens",
+    "read_megakernel",
     "slots_reason",
     "slots_regions",
 ]

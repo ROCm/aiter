@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MegaMoEGfx1250's single-kernel paths on gfx1250: slots (AITER_MEGAKERNEL_SLOTS_TOKENS)
-and compact (AITER_MEGAKERNEL_COMPACT).
+"""MegaMoEGfx1250's single-kernel paths on gfx1250 (AITER_MEGAKERNEL=1): slots
+and compact.
 
     python3 test_mega_moe_megakernel_gfx1250.py [--world N]
 
@@ -16,12 +16,12 @@ combine, with and without a fused shared expert, for each megakernel:
     switch), bit for bit and both ways round, at several token counts per
     rank, uneven across ranks;
   * the path follows the step's receive bound: slots runs the steps bounded
-    to AITER_MEGAKERNEL_SLOTS_TOKENS, compact every larger one, and a compact plan started
-    for a step slots serves is dropped;
+    to its step limit (lowered here to SMALL_TOKENS), compact every larger
+    one, and a compact plan started for a step slots serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
 
-And compact alone at a decode shape (96 experts a rank, up to 1024 tokens),
-one step on each of its kernels (COMPACT_TILES): there its queue holds more items
+And compact alone (slots off) at a decode shape (96 experts a rank, up to 1024
+tokens), one step on each of its kernels (COMPACT_TILES): there its queue holds more items
 than CTAs, so a grid that is not resident at once deadlocks; it runs with
 timed-out waits counted instead of trapping.
 """
@@ -43,8 +43,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HIDDEN, INTER, TOPK = 7168, 1024, 6
 EXPERTS_PER_RANK = 8
-# The instance's tokens per rank, and the steps the megakernel serves
-# (AITER_MEGAKERNEL_SLOTS_TOKENS): those whose receive bound is at most world * SMALL_TOKENS.
+# The instance's tokens per rank, and the steps slots serves (its step limit,
+# megakernel.config.SLOTS_TOKENS, lowered to this): those whose receive bound
+# is at most world * SMALL_TOKENS.
 MAX_TOKENS = 64
 SMALL_TOKENS = 32
 # Tokens per rank of each step: rank r runs max(1, t - r), so the ranks differ.
@@ -142,12 +143,8 @@ class _Case:
         self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
         self.slots = self.mega._ep.slots
         self.compact = self.mega._ep.compact
-        assert (
-            self.slots is not None
-        ), "AITER_MEGAKERNEL_SLOTS_TOKENS did not build slots"
-        assert (
-            self.compact is not None
-        ), "AITER_MEGAKERNEL_COMPACT did not build compact"
+        assert self.slots is not None, "AITER_MEGAKERNEL did not build slots"
+        assert self.compact is not None, "AITER_MEGAKERNEL did not build compact"
 
     def step(self, tokens, seed):
         """(x, dispatch ids, weights, logical ids) of one step on this rank."""
@@ -368,7 +365,7 @@ def _check_resident(rank, world, comm, device):
     mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
     compact = mega._ep.compact
     try:
-        assert compact is not None, "AITER_MEGAKERNEL_COMPACT did not build compact"
+        assert compact is not None, "AITER_MEGAKERNEL did not build compact"
         assert len(compact.variants) >= len(
             RES_STEPS
         ), "fewer compact kernels than steps"
@@ -423,9 +420,12 @@ def _worker(local_rank, world, port, failures):
         WORLD_SIZE=str(world),
         LOCAL_RANK=str(local_rank),
         AITER_FORCE_A8W4="0",
-        AITER_MEGAKERNEL_SLOTS_TOKENS=str(SMALL_TOKENS),
-        AITER_MEGAKERNEL_COMPACT="1",
+        AITER_MEGAKERNEL="1",
     )
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.megakernel import config
+
+    # A small slots step limit, so one small instance runs both kernels.
+    config.SLOTS_TOKENS = SMALL_TOKENS
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("gloo", rank=local_rank, world_size=world)
@@ -460,6 +460,7 @@ def _worker(local_rank, world, port, failures):
     # Read when the kernel is built: this case's kernels count timed-out waits
     # (slots.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
     os.environ.update(AITER_DMK_NOTRAP="1", AITER_DMK_TIMEOUT_S="10")
+    config.SLOTS_TOKENS = 0  # compact alone, from the smallest step up
     name = "compact resident grid"
     try:
         _check_resident(local_rank, world, comm, device)

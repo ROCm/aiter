@@ -33,8 +33,8 @@ from .protocol import (
 
 class MegaKernel:
     """A single-kernel MegaMoE bound to one MegaMoE's arena and combine:
-    ``layout="slots"`` keeps fixed expert slots (AITER_MEGAKERNEL_SLOTS_TOKENS),
-    ``layout="compact"`` the staged compact layout (AITER_MEGAKERNEL_COMPACT).
+    ``layout="slots"`` keeps fixed expert slots, ``layout="compact"`` the
+    staged compact layout.
     Each has its own control block, so they share no protocol state."""
 
     def __init__(self, config, res, device, layout="slots", variant=None, ctl=None):
@@ -333,9 +333,8 @@ class MegaKernel:
 
     def fails(self) -> list:
         """AITER_DMK_NOTRAP: timed-out waits per site (X1, send gate, source
-        flags, plan gate, g1_ready, combine flags, reduce gate, rows gate,
-        started flags)."""
-        return self.ctl[CTL_FAIL : CTL_FAIL + 9].tolist()
+        flags, plan gate, g1_ready, combine flags, reduce gate, rows gate)."""
+        return self.ctl[CTL_FAIL : CTL_FAIL + 8].tolist()
 
 
 class SlotsMega(MegaKernel):
@@ -356,7 +355,7 @@ class CompactMega(MegaKernel):
 
 
 class CompactMegaSet:
-    """One CompactMega per row of compact_tile_table(), each over its own
+    """One CompactMega per row of COMPACT_TILES, each over its own
     receive bounds (compact_variants) with its own control region; a step runs
     the one its bound falls in. They share the staged path's rows, rowmap and
     comb_inp the way compact and the staged path do: a rank writes a peer's

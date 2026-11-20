@@ -32,7 +32,6 @@ from ..s1f_stage1 import (
 from . import dispatch_compact, dispatch_slots, protocol
 from .protocol import (
     FLAG_SPAN,
-    FLAG_STRIDE,
     N_TICKET,
     NOW_HZ,
     POLL_SLEEP,
@@ -128,8 +127,7 @@ def make_megakernel(
     EPR_CH = EPR_PAD // WAVE
     SRC_OFF = src_off(EPR)
     CF_OFF = SRC_OFF + FLAG_SPAN
-    ST_OFF = SRC_OFF + 2 * FLAG_SPAN
-    RS_OFF = ST_OFF + npes * FLAG_STRIDE
+    RS_OFF = SRC_OFF + 2 * FLAG_SPAN
     MT_PER_E = CAP // TM
     MT_CAP = int(mt_cap) if COMPACT else EPR * MT_PER_E
     N1 = 2 * I
@@ -176,8 +174,6 @@ def make_megakernel(
     # Debug: AITER_DMK_NOTRAP=1 counts a timed-out wait in ctl[CTL_FAIL + site]
     # and goes on instead of trapping.
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
-    # slots' start handshake, off by default (AITER_DMK_NO_HS=0 turns it on).
-    HS = not int(os.environ.get("AITER_DMK_NO_HS", "1"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
     )
@@ -212,7 +208,6 @@ def make_megakernel(
     knob_sfx = f"_wpe{WPE}" + "".join(
         f"_{name}{val}"
         for name, val, default in (
-            ("hs", int(HS and not COMPACT), 0),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -238,7 +233,6 @@ def make_megakernel(
         GATE_R=GATE_R,
         GATE_S=GATE_S,
         H=H,
-        HS=HS,
         K=K,
         MAXR=MAXR,
         MT_PER_E=MT_PER_E,
@@ -264,7 +258,6 @@ def make_megakernel(
         SEG_CNT_W=SEG_CNT_W,
         SRC_OFF=SRC_OFF,
         SREP_W=SREP_W,
-        ST_OFF=ST_OFF,
         TIMEOUT_TICKS=TIMEOUT_TICKS,
         TM=TM,
         TRACE=TRACE,
@@ -522,8 +515,6 @@ def make_megakernel(
             kc.rsrc_ctl, kc.rsrc_actl, kc.tok = rsrc_ctl, rsrc_actl, tok
             kc.gen, kc.par, kc.tag16 = protocol.start(kc)
             protocol.bind_protocol(kc)
-            if const_expr(not COMPACT and HS):
-                dispatch_slots.start_handshake(kc)
 
             # ======================== 1. DISPATCH ========================
             rsrc_x = create_buffer_resource_from_addr(addr_x)

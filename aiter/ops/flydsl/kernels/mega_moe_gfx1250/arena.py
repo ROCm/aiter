@@ -87,7 +87,7 @@ _ARENA_REGION_ORDER = (
     # AITER_MEGA_S1F is off and the region is absent.
     "tile_flag",
     # The slots megakernel's fixed expert slots, their rowmap pairs and its
-    # control words (AITER_MEGAKERNEL_SLOTS_TOKENS); after the rest for the same reason.
+    # control words (AITER_MEGAKERNEL); after the rest for the same reason.
     "slots_rows",
     "slots_rowmap",
     "slots_ctl",

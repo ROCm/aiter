@@ -39,7 +39,6 @@ from .protocol import (
     CTL_ERR,
     CTL_TALLY,
     FLAG_STRIDE,
-    GATE_STRIDE,
     PREF_DEPTH,
     PREF_MIN_TOK,
     RT_N,
@@ -50,34 +49,15 @@ from .protocol import (
 
 
 @device_fn
-def start_handshake(kc):
-    """AITER_DMK_NO_HS=0: wait for every peer's ``started`` flag."""
-    GATE_S, ST_OFF, bid, gen, lane = kc.GATE_S, kc.ST_OFF, kc.bid, kc.gen, kc.lane
-    npes, off_ctl, open_gates, peer_va = kc.npes, kc.off_ctl, kc.open_gates, kc.peer_va
-    poll_peer_flags, rank, wave = kc.poll_peer_flags, kc.rank, kc.wave
-    # ---- start handshake (slots, AITER_DMK_NO_HS=0) ----
-    # A peer writes this rank's counters, rows and rowmap only once
-    # this launch has started (see the module docstring).
-    if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
-        if lane < fx.Int32(npes):
-            comm_ops.store_i32_global_system_monotonic(
-                peer_va(lane, off_ctl) + fx.Int64(ST_OFF + rank * FLAG_STRIDE),
-                gen,
-            )
-        poll_peer_flags(ST_OFF, 8)
-        open_gates(GATE_S, GATE_STRIDE)
-
-
-@device_fn
 def produce(kc, n_mine):
     """1. DISPATCH; returns (routes this wave produced, this rank's routes)."""
     CAP, DEST_STRIDE, E, EPR, EPR_PAD = kc.CAP, kc.DEST_STRIDE, kc.E, kc.EPR, kc.EPR_PAD
-    G, GATE_S, H, HS, K, NG = kc.G, kc.GATE_S, kc.H, kc.HS, kc.K, kc.NG
+    G, H, K, NG = kc.G, kc.H, kc.K, kc.NG
     PAYLOAD, ROW, RT_BASE = kc.PAYLOAD, kc.ROW, kc.RT_BASE
     SRC_OFF, TRACE, addr_ctl, lane = kc.SRC_OFF, kc.TRACE, kc.addr_ctl, kc.lane
     off_ctl, off_disp, off_rowmap, par = kc.off_ctl, kc.off_disp, kc.off_rowmap, kc.par
     peer_va, rank, rsrc_ids, rsrc_wts = kc.peer_va, kc.rank, kc.rsrc_ids, kc.rsrc_wts
-    rsrc_x, stamp, tok, wait_gate = kc.rsrc_x, kc.stamp, kc.tok, kc.wait_gate
+    rsrc_x, stamp, tok = kc.rsrc_x, kc.stamp, kc.tok
     wave_gid = kc.wave_gid
     # One wave per route (t, k): the token's quant is redone per route
     # (cheap next to the remote round trip) so the routes go out in
@@ -113,10 +93,6 @@ def produce(kc, n_mine):
                         dtype=T.i32,
                     )
                 )
-        # Every peer has started this launch (the row loads above
-        # are local and go out first).
-        if const_expr(HS):
-            wait_gate(GATE_S, GATE_STRIDE, 1)
         rsrc_run = create_buffer_resource_from_addr(
             peer_va(dst, off_ctl), num_records_bytes=SRC_OFF
         )

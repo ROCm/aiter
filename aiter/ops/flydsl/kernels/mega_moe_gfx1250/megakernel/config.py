@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The megakernel's host-side configuration: the GEMM tiles of each
-layout, the user-facing switches (and their pre-rename aliases), the
-admission checks, the arena regions and the row capacities."""
+"""The megakernel's host-side configuration: the switch and the step ranges,
+the GEMM tiles of each layout, the admission checks, the arena regions and
+the row capacities."""
 
 from __future__ import annotations
 
@@ -21,15 +21,13 @@ from .protocol import (
     src_off,
 )
 
-_TILE_KEYS = (
-    "tile_m",
-    "tile_n",
-    "tile_k",
-    "num_buffers",
-    "tile_n2",
-    "tile_k2",
-    "num_buffers2",
-)
+#: AITER_MEGAKERNEL=1 runs steps of up to SLOTS_TOKENS tokens per rank on
+#: slots and larger steps below COMPACT_MAX_TOKENS on compact; larger steps
+#: run the staged path. A step's size is its receive bound per rank
+#: (``recv_token_bound``, else ``world * max_tokens_per_rank``), the same on
+#: every rank, so every rank picks the same path.
+SLOTS_TOKENS = 512
+COMPACT_MAX_TOKENS = 8192
 
 #: slots' GEMM tiles: the a4w4 CSV's decode row for this shape family. The
 #: staged optimum (t16x512x128 b2 GEMM1) is slower here: its m-tiles finish
@@ -70,51 +68,21 @@ def slots_tile(max_tokens_per_rank: int) -> dict:
     return tile
 
 
-#: The user-facing switches' names before the megakernel rename, still read
-#: when the new name is unset.
-_ENV_ALIASES = {
-    "AITER_MEGAKERNEL_SLOTS_TOKENS": "AITER_MEGA_DECODE",
-    "AITER_MEGAKERNEL_COMPACT": "AITER_MEGA_LARGE",
-    "AITER_MEGAKERNEL_COMPACT_TILES": "AITER_LM_TILES",
-}
-
-
-def _env(name: str, default: str = "") -> str:
-    """The switch ``name``, else its pre-rename alias, else ``default``."""
-    v = os.environ.get(name)
-    if v is None:
-        v = os.environ.get(_ENV_ALIASES[name], default)
-    return v
-
-
-def read_slots_tokens() -> int:
-    """``AITER_MEGAKERNEL_SLOTS_TOKENS`` (formerly ``AITER_MEGA_DECODE``):
-    tokens per rank up to which a step runs the slots megakernel (0 or unset:
-    off). A step qualifies when its receive bound (``recv_token_bound``, else
-    ``world * max_tokens_per_rank``) is at most ``world`` times this, so every
-    rank picks the same path."""
-    v = _env("AITER_MEGAKERNEL_SLOTS_TOKENS")
-    return int(v) if v.strip() else 0
+def read_megakernel() -> bool:
+    return os.environ.get("AITER_MEGAKERNEL", "0").strip() in ("1", "true", "True")
 
 
 def slots_reason(config) -> str | None:
     """Why this MegaMoE cannot run the slots megakernel, or None if it can."""
-    if read_slots_tokens() <= 0:
-        return "AITER_MEGAKERNEL_SLOTS_TOKENS is off"
+    if not read_megakernel() or SLOTS_TOKENS <= 0:
+        return "AITER_MEGAKERNEL is off"
     return _mega_reason(config, slots_tile(slots_tokens(config)))
-
-
-def read_compact() -> bool:
-    """``AITER_MEGAKERNEL_COMPACT=1`` (formerly ``AITER_MEGA_LARGE``): steps the
-    slots megakernel does not serve run the compact megakernel instead of the
-    staged path."""
-    return _env("AITER_MEGAKERNEL_COMPACT").strip() in ("1", "true", "True")
 
 
 def compact_reason(config) -> str | None:
     """Why this MegaMoE cannot run the compact megakernel, or None if it can."""
-    if not read_compact():
-        return "AITER_MEGAKERNEL_COMPACT is off"
+    if not read_megakernel():
+        return "AITER_MEGAKERNEL is off"
     geo = config.geometry
     if geo.max_tokens_per_rank > 0xFFFF:
         return "X1 holds a source's rows of an expert in 16 bits"
@@ -166,13 +134,13 @@ def _mega_reason(config, t) -> str | None:
 
 
 def slots_tokens(config) -> int:
-    """Tokens per rank the megakernel serves: ``AITER_MEGAKERNEL_SLOTS_TOKENS``, at most the
-    instance's ``max_tokens_per_rank``."""
-    return min(read_slots_tokens(), int(config.geometry.max_tokens_per_rank))
+    """Tokens per rank slots serves: SLOTS_TOKENS, at most the instance's
+    ``max_tokens_per_rank``."""
+    return min(SLOTS_TOKENS, int(config.geometry.max_tokens_per_rank))
 
 
 def slots_recv_cap(config) -> int:
-    """The largest receive bound (tokens) a step may have to run the megakernel."""
+    """The largest receive bound (tokens) a step may have to run slots."""
     return config.world_size * slots_tokens(config)
 
 
@@ -219,44 +187,22 @@ COMPACT_TILES = (
         2,
     ),
 )
-#: Rows a tile table may have: each kernel has its own arena control region
+#: Rows the tile table may have: each kernel has its own arena control region
 #: (compact_ctl, compact_ctl1, ... in arena._ARENA_REGION_ORDER).
 COMPACT_MAX_KERNELS = 4
-
-
-def compact_tile_table() -> tuple:
-    """COMPACT_TILES, or AITER_MEGAKERNEL_COMPACT_TILES (formerly
-    AITER_LM_TILES) = "UPTO:tm,tn,tk,nb,tn2,tk2,nb2:CTAS;..." (UPTO 0: every
-    larger step)."""
-    table = _env("AITER_MEGAKERNEL_COMPACT_TILES")
-    if not table:
-        return COMPACT_TILES
-    rows = []
-    for entry in table.split(";"):
-        upto, tile, ctas = entry.split(":")
-        rows.append(
-            (
-                int(upto) or None,
-                dict(zip(_TILE_KEYS, (int(x) for x in tile.split(",")))),
-                int(ctas),
-            )
-        )
-    if len(rows) > COMPACT_MAX_KERNELS:
-        raise ValueError(
-            f"AITER_MEGAKERNEL_COMPACT_TILES has more than {COMPACT_MAX_KERNELS} rows"
-        )
-    return tuple(rows)
+assert len(COMPACT_TILES) <= COMPACT_MAX_KERNELS
 
 
 def compact_variants(config) -> list:
     """(recv_lo, recv_hi, tile, CTAs per CU) of each compact kernel: the rows
-    of compact_tile_table() cut to the receive bounds compact serves, from past
-    the slots megakernel's (or 0) to the instance's. A step runs the kernel whose (recv_lo,
-    recv_hi] holds its bound; every rank passes the same bound."""
+    of COMPACT_TILES cut to the receive bounds compact serves, from past
+    slots' (or 0) to below COMPACT_MAX_TOKENS per rank, at most the
+    instance's. A step runs the kernel whose (recv_lo, recv_hi] holds its
+    bound."""
     lo = slots_recv_cap(config) if slots_reason(config) is None else 0
-    top = config.max_recv
+    top = min(config.max_recv, config.world_size * COMPACT_MAX_TOKENS - 1)
     out = []
-    for upto, tile, ctas in compact_tile_table():
+    for upto, tile, ctas in COMPACT_TILES:
         if lo >= top:
             break
         hi = top if upto is None else min(top, config.world_size * int(upto))
