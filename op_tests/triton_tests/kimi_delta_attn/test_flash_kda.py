@@ -24,7 +24,6 @@ import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch as _fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
     input_guard,
@@ -35,6 +34,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     flash_kda_supported,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+from aiter.ops.triton.utils import fast_launch as _fast_launch
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
 device = "cuda"
