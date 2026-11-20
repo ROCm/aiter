@@ -509,21 +509,20 @@ def _borrow_tuned_tile(dev, key, cu_num=None):
 def _lookup_tuned_tile(key, device):
     """Tuned (tile, wgm, splitk, block_rows, pipeline) for this device, or a borrowed same-layer row.
 
-    The exact rows of the CU counts of get_tuned_cu_nums() come first, then
-    the borrowed rows of these CU counts.
+    The exact rows of the CU counts of get_tuned_cu_nums() of device come
+    first, then the borrowed rows of these CU counts.
     """
     if key is None:
         return None
     try:
         from aiter.jit.utils.chip_info import (
-            get_cu_num,
             get_gfx,
             get_tuned_cu_nums,
             log_tuned_cu_fallback,
         )
 
-        dev = (get_gfx(), get_cu_num())
-        cu_nums = get_tuned_cu_nums(dev[1], getattr(device, "index", None))
+        cu_nums = get_tuned_cu_nums(device=getattr(device, "index", None))
+        dev = (get_gfx(), cu_nums[0])
     except Exception:  # noqa: BLE001  same: degrade to the heuristic
         return None
     table = _load_tuned_table()
@@ -537,7 +536,9 @@ def _lookup_tuned_tile(key, device):
             if tuned_cu != dev[1]:
                 log_tuned_cu_fallback("conv3d_implicit", *dev, tuned_cu)
             break
-    _log_tuned_lookup(table, dev, key, hit, borrowed=borrowed)
+    _log_tuned_lookup(
+        table, dev if hit is None else tuned_dev, key, hit, borrowed=borrowed
+    )
     return hit
 
 
