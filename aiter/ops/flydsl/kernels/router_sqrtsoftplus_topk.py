@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE router for decode rows: bf16 gate GEMM, then sqrt-softplus biased top-6.
+"""MoE router for decode rows: bf16 gate GEMM, then sqrt-softplus biased top-k.
 
-Shapes: x bf16 ``[m, 5120]``, gate bf16 ``[384, 5120]``, fp32 bias ``[384]``
-(DeepSeek-V4.1-Flash). Two launches (gfx950):
+Shapes: x bf16 ``[m, 5120]``, gate bf16 ``[E, 5120]``, fp32 bias ``[E]``, with
+(E, top-k) = (384, 6) (DeepSeek-V4.1-Flash MoE layers) or (128, 3) (its DSpark
+draft layers). Two launches (gfx950):
 
 GEMM. A workgroup owns ``16 a`` tokens x ``16 b`` experts of one of ``ksp``
 k-slices. Its ``kw`` waves run MFMA 16x16x32 bf16 (gate rows as the A operand,
 x as B; both loaded straight from global memory, k contiguous per lane) over
 consecutive k-steps and are summed in wave order through LDS; the slice's fp32
-partial tile goes to a ``[ksp, m, 384]`` scratch. Workgroup ``i`` runs on XCD
+partial tile goes to a ``[ksp, m, E]`` scratch. Workgroup ``i`` runs on XCD
 ``i % 8``, which owns one of ``xm`` token slabs x ``xn`` expert slabs, so the
 XCD's L2 serves its slab's re-reads. With ``wshuf`` the gate is in the
 load-time layout ``[expert tile, k step, lane, 8]`` and a wave's weight
 fragment is one contiguous 1 KB run.
 
-Top-6. One wave per token, six consecutive experts per lane. It sums the
-``ksp`` partials in slice order, scores ``sqrt(softplus(logit))`` (``logit``
-itself above 20; fast ``exp2``, accurate ``log`` and ``sqrt``), then six rounds
-of a wave argmax over ``score + bias`` (DPP max tree; the lowest lane among
+Top-k. One wave per token, ``E / 64`` consecutive experts per lane. It sums
+the ``ksp`` partials in slice order, scores ``sqrt(softplus(logit))``
+(``logit`` itself above 20; fast ``exp2``, accurate ``log`` and ``sqrt``), then
+k rounds of a wave argmax over ``score + bias`` (DPP max tree; the lowest lane among
 equal values, so ties go to the lowest expert id). A pick's weight is
 ``(score + bias) - bias`` in fp32, as vLLM's ``topk_softplus_sqrt`` decodes it
 from its argmax key, scaled to sum ``routed_scaling_factor`` in slot order.
@@ -41,8 +42,8 @@ from .kernels_common import LOG2E
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 HIDDEN = 5120
-EXPERTS = 384
-TOPK = 6
+# Routed experts -> top-k of the supported routers.
+TOPK_OF_EXPERTS = {384: 6, 128: 3}
 _STEPS = HIDDEN // 32  # MFMA k-steps
 # A masked-off access goes to this byte offset. Every buffer here is smaller
 # (the wrapper keeps x under 1 GiB; partials are at most 16 x 65536 x 1536 B),
@@ -81,23 +82,32 @@ def _mfma_bf16(a_i32x4, b_i32x4, acc):
 
 
 def build_router_gemm_module(
-    a: int, b: int, ksp: int, kw: int, chunk: int, xm: int, xn: int, wshuf: bool
+    a: int,
+    b: int,
+    ksp: int,
+    kw: int,
+    chunk: int,
+    xm: int,
+    xn: int,
+    wshuf: bool,
+    experts: int = 384,
 ):
     """JIT launcher ``(x, w, partials, m, x_row_stride, stream)``.
 
     ``a`` x ``b`` 16x16 MFMA tiles per workgroup, k split ``ksp`` ways over
     workgroups and ``kw`` ways over a workgroup's waves, ``chunk`` k-steps
-    loaded per batch, XCD grid ``xm`` x ``xn``.
+    loaded per batch, XCD grid ``xm`` x ``xn``, ``experts`` gate rows.
     """
-    assert EXPERTS % (16 * b) == 0 and _STEPS % (ksp * kw) == 0
-    assert xm * xn == 8 and EXPERTS // (16 * b) % xn == 0
+    assert experts in TOPK_OF_EXPERTS
+    assert experts % (16 * b) == 0 and _STEPS % (ksp * kw) == 0
+    assert xm * xn == 8 and experts // (16 * b) % xn == 0
     spw = _STEPS // ksp // kw  # k-steps per wave
     assert spw % chunk == 0
     tm, tn = 16 * a, 16 * b
-    ng_total = EXPERTS // tn  # expert groups
+    ng_total = experts // tn  # expert groups
     ngx = ng_total // xn  # expert groups per XCD
     name = (
-        f"router_gemm_bf16_h{HIDDEN}_e{EXPERTS}_t{tm}x{tn}_s{ksp}_w{kw}_c{chunk}"
+        f"router_gemm_bf16_h{HIDDEN}_e{experts}_t{tm}x{tn}_s{ksp}_w{kw}_c{chunk}"
         f"_x{xm}{xn}" + ("_ws" if wshuf else "")
     )
 
@@ -108,8 +118,8 @@ def build_router_gemm_module(
     @flyc.kernel(name=name, known_block_size=[64 * kw, 1, 1])
     def kernel(
         arg_x: fx.Pointer,  # [m, 5120] bf16, row stride i32_sx (a multiple of 8)
-        arg_w: fx.Pointer,  # [384, 5120] bf16
-        arg_p: fx.Pointer,  # partials [ksp, m, 384] fp32
+        arg_w: fx.Pointer,  # [E, 5120] bf16
+        arg_p: fx.Pointer,  # partials [ksp, m, E] fp32
         i32_m: fx.Int32,
         i32_sx: fx.Int32,
     ):
@@ -142,13 +152,13 @@ def build_router_gemm_module(
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(i32_sx * 2),
             )
             wb = ptr_buf_tensor(
-                arg_w, fx.Int32, unit_elems=4, num_records_bytes=EXPERTS * HIDDEN * 2
+                arg_w, fx.Int32, unit_elems=4, num_records_bytes=experts * HIDDEN * 2
             )
             pb = ptr_buf_tensor(
                 arg_p,
                 fx.Float32,
                 unit_elems=4,
-                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (EXPERTS * 4),
+                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (experts * 4),
             )
             q = lane // 16
             sx16 = i32_sx // 8
@@ -218,7 +228,7 @@ def build_router_gemm_module(
                             pb,
                             _at(
                                 tok < i32_m,
-                                (s * i32_m + tok) * (EXPERTS // 4)
+                                (s * i32_m + tok) * (experts // 4)
                                 + (n0 + bj * 16) // 4
                                 + q,
                                 16,
@@ -253,7 +263,7 @@ def build_router_gemm_module(
                             pb,
                             _at(
                                 tok < i32_m,
-                                (s * i32_m + tok) * (EXPERTS // 4) + (n0 + e % tn) // 4,
+                                (s * i32_m + tok) * (experts // 4) + (n0 + e % tn) // 4,
                                 16,
                             ),
                             Vec.from_elements(v, fx.Float32),
@@ -300,58 +310,60 @@ def _score(x):
     return fx.Float32(fx.math.sqrt(sp))
 
 
-def build_router_topk_module(ksp: int, has_padding: bool):
+def build_router_topk_module(ksp: int, has_padding: bool, experts: int = 384):
     """JIT launcher ``(partials, bias, is_padding, topk_weights, topk_ids, m,
     scale_bits, stream)``; ``is_padding`` is read only with ``has_padding``."""
-    name = f"router_sqrtsoftplus_top{TOPK}_e{EXPERTS}_s{ksp}" + (
+    topk = TOPK_OF_EXPERTS[experts]
+    name = f"router_sqrtsoftplus_top{topk}_e{experts}_s{ksp}" + (
         "_padding" if has_padding else ""
     )
-    # Lane l holds experts 6 l .. 6 l + 5, so the lowest lane is the lowest id.
-    epl = EXPERTS // 64
+    # Lane l holds experts epl l .. epl l + epl - 1 (6 of 384, 2 of 128), so
+    # the lowest lane is the lowest id.
+    epl = experts // 64
 
     @flyc.kernel(name=name, known_block_size=[64, 1, 1])
     def kernel(
-        arg_p: fx.Pointer,  # partials [ksp, m, 384] fp32
-        arg_bias: fx.Pointer,  # [384] fp32
+        arg_p: fx.Pointer,  # partials [ksp, m, E] fp32
+        arg_bias: fx.Pointer,  # [E] fp32
         arg_pad: fx.Pointer,  # [m] bool
-        arg_w: fx.Pointer,  # [m, 6] fp32
-        arg_ids: fx.Pointer,  # [m, 6] int32
+        arg_w: fx.Pointer,  # [m, top-k] fp32
+        arg_ids: fx.Pointer,  # [m, top-k] int32
         i32_m: fx.Int32,
         i32_scale: fx.Int32,  # routed_scaling_factor (fp32 bits)
     ):
         lane = fx.thread_idx.x
         t = fx.block_idx.x
         if t < i32_m:
-            # 8 B units: two of a lane's six experts.
+            # 8 B units: two of a lane's experts.
             pb = ptr_buf_tensor(
                 arg_p,
                 fx.Float32,
                 unit_elems=2,
-                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (EXPERTS * 4),
+                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (experts * 4),
             )
             bb = ptr_buf_tensor(
-                arg_bias, fx.Float32, unit_elems=2, num_records_bytes=EXPERTS * 4
+                arg_bias, fx.Float32, unit_elems=2, num_records_bytes=experts * 4
             )
             wb = ptr_buf_tensor(
-                arg_w, fx.Float32, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
+                arg_w, fx.Float32, num_records_bytes=fx.Int64(i32_m) * (topk * 4)
             )
             ib = ptr_buf_tensor(
-                arg_ids, fx.Int32, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
+                arg_ids, fx.Int32, num_records_bytes=fx.Int64(i32_m) * (topk * 4)
             )
             neg_inf = fx.Float32(float("-inf"))
 
-            def load6(buf, unit):
+            def load_lane(buf, unit):
                 v = [
                     buf_copy_load(buf, unit + j, fx.Float32, unit_elems=2)
-                    for j in range_constexpr(3)
+                    for j in range_constexpr(epl // 2)
                 ]
                 return [fx.Float32(v[i // 2][i % 2]) for i in range_constexpr(epl)]
 
             parts = [
-                load6(pb, (p * i32_m + t) * (EXPERTS // 2) + lane * (epl // 2))
+                load_lane(pb, (p * i32_m + t) * (experts // 2) + lane * (epl // 2))
                 for p in range_constexpr(ksp)
             ]
-            bias = load6(bb, lane * (epl // 2))
+            bias = load_lane(bb, lane * (epl // 2))
             ch = []
             for i in range_constexpr(epl):
                 x = parts[0][i]
@@ -365,7 +377,7 @@ def build_router_topk_module(ksp: int, has_padding: bool):
             total = fx.Float32(0.0)
             out_id = fx.Int32(0)
             out_w = fx.Float32(0.0)
-            for k in range_constexpr(TOPK):
+            for k in range_constexpr(topk):
                 mv = ch[0]
                 bi = fx.Int32(0)
                 for i in range_constexpr(1, epl):
@@ -416,7 +428,7 @@ def build_router_topk_module(ksp: int, has_padding: bool):
                 pad = buf_copy_load(padb, t, fx.Int8) != fx.Int8(0)
                 out_w = pad.select(fx.Float32(0.0), out_w)
                 out_id = pad.select(fx.Int32(-1), out_id)
-            slot = _at(lane < TOPK, t * TOPK + lane, 4)
+            slot = _at(lane < topk, t * topk + lane, 4)
             buf_copy_store(wb, slot, out_w, fx.Float32)
             buf_copy_store(ib, slot, out_id, fx.Int32)
 
