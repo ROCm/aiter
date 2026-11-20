@@ -170,14 +170,11 @@ def gemm2_compute_pipe(
         for _ in range_constexpr(kMChunks)
     ]
 
-    all_chunks = tuple(range(kMChunks))
-
-    def read_a(kt, chunks=all_chunks):
+    def read_a(kt):
         slot = kt % aStages
         for k in range_constexpr(kHalves):
             col0 = lane_div_16 * fx.Int32(16) + fx.Int32(k * (128 if is_f8_a else 64))
-            for ci in range_constexpr(len(chunks)):
-                i = chunks[ci]
+            for i in range_constexpr(kMChunks):
                 row_off = fx.Int32(slot * slot_bytes) + (
                     lane_mod_16 + fx.Int32(i * 16)
                 ) * fx.Int32(KH_TILE_A)
@@ -304,23 +301,13 @@ def gemm2_compute_pipe(
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
 
-    # Program-order issue log of per-wave vmem instructions, for exact vmcnt waits.
-    n_b = numAccN * kHalves + nPairs + kScaleSubBlocks
-    log = []
-
     def emit_a(kt):
         if const_expr(kt < K_TILES):
             issue_a(kt)
-            log.append(("A", kt, n_row_groups))
 
     def emit_b(kt):
         if const_expr(kt < K_TILES):
             issue_b(kt)
-            log.append(("B", kt, n_b))
-
-    def after_a(kt):
-        pos = next(i for i, x in enumerate(log) if x[0] == "A" and x[1] == kt)
-        return sum(x[2] for x in log[pos + 1 :])
 
     for kt in range_constexpr(A_AHEAD):
         emit_a(kt)

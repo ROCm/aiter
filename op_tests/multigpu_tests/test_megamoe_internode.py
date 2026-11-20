@@ -290,7 +290,7 @@ def parse_args(argv=None):
     args.timing.discard("none")
     fixtures = split_choices(p, "--fixtures", args.fixtures, FIXTURES)
     # The CCO symmetric memory is pooled and only grows, so the largest window
-    # goes first: TPR descending, and eplb (route cap 1) last within a TPR.
+    # goes first: TPR descending, eplb last within a TPR.
     args.fixtures = sorted(fixtures, key=lambda f: (f == "eplb", f))
     args.tprs = sorted({int(v) for v in args.tpr_list.split(",") if v}, reverse=True)
     if not args.tprs:
@@ -1777,7 +1777,7 @@ class Runner:
                 situ_linear_beta=args.situ_linear_beta,
             )
         if "fused" in args.paths:
-            rec["fused"] = self.run_fused(shape, shared, cap, reference, fixture)
+            rec["fused"] = self.run_fused(shape, shared, reference, fixture)
         if "smallop" in args.paths:
             small = (
                 reference
@@ -1808,17 +1808,40 @@ class Runner:
         self.torch.cuda.empty_cache()
         return rec
 
-    def run_fused(self, shape, shared, cap, reference, fixture):
+    def run_fused(self, shape, shared, reference, fixture):
         from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
 
         torch, dist, args, device = self.torch, self.dist, self.args, self.device
         tokens = shared.input_rows if shared.input_rows is not None else shape.tokens
         w = shared.prepared_weights
         if self.comm is None:
-            # TPR 16384 needs a ~30 GiB window (K3/DSv4); the pool lives for the
-            # whole run, so size it for the largest TPR of the run.
-            vmm = 40 * 1024**3 if max(self.args.tprs) > 4096 else 16 * 1024**3
-            self.comm = PooledCommunicator(self.rank, EP_SIZE, per_rank_vmm=vmm)
+            from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode import (
+                build_window_layout,
+            )
+
+            # The pool lives for the whole run and TPRs run in descending
+            # order, so size it for this (largest) window: worst-case receive
+            # capacity (K3 EP32 TPR 4096 ~18 GiB) at the largest tile group.
+            need = build_window_layout(
+                model_dim=shape.hidden,
+                inter_dim=shape.inter,
+                experts=shape.experts,
+                topk=shape.topk,
+                max_tok_per_rank=shape.tokens,
+                max_recv_routes_per_rank=args.max_recv_routes_per_rank,
+                tile_group=4,
+                comm_quant=args.comm_quant,
+                quant=args.fused_quant,
+                world_size=EP_SIZE,
+            ).total_bytes
+            vmm = max(16 << 30, (need + need // 8 + (1 << 30) - 1) >> 30 << 30)
+            # Above TPR 1024 the operator places rail regions in several windows.
+            self.comm = PooledCommunicator(
+                self.rank,
+                EP_SIZE,
+                per_rank_vmm=vmm,
+                multiple_windows=max(args.tprs) > 1024,
+            )
 
         op = getattr(self, "_route_fused_op", None)
         if op is None:
@@ -1843,7 +1866,6 @@ class Runner:
                 situ_linear_beta=args.situ_linear_beta,
                 comm_quant=args.comm_quant,
                 communicator=self.comm,
-                max_routes_per_token_per_rank=cap,
                 max_recv_routes_per_rank=args.max_recv_routes_per_rank,
             )
         reuse_op = getattr(self, "reuse_route_operator", False)

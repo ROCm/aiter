@@ -54,7 +54,6 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
             "the single kernel needs Stage1 compiled with group_ready=True"
         )
     xcd_inv_off = int(stage1_launch.xcd_inv_off)
-    _sk_poll = comm2.load_i64_global_system_relaxed
     buffer_regions = stage1_launch.buffer_regions
     region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     remote_first = pipeline.remote_first
@@ -112,10 +111,7 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
                        + (gen & fx.Int64(1)) * fx.Int64(gsync["eos_plane"]))
                 if const_expr(bool(buffer_regions)):
                     eos = region_local_address(arena_ptr, region_indices[1, "h1_queue_eos"], gen & fx.Int64(1))
-                ev = fx.Int64(_sk_poll(eos))
-                while ev < gen:
-                    rocdl.s_sleep(SK_POLL)
-                    ev = fx.Int64(_sk_poll(eos))
+                comm2.spin_until_ge_i64_sleep_relaxed(eos, gen, SK_POLL)
             # One L2 invalidate per XCD and generation (MegaMoEV2 style): a
             # per-CTA buffer_inv sc1 wipes the XCD's shared L2 32 times and
             # stalls this CTA's first load ~7-12us behind it. The word holds

@@ -50,24 +50,18 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
         if const_expr(tr):
             k2.tr_init(arena_ptr, local_tokens, bx, fx.Int32(grid))
 
+        # token_ready runs only with SDMA (compile_mega_moe_stage2 checks).
         def tr_unit(lw, pre, post):
-            if const_expr(k1_kw.get("sdma", False)):
-                k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post,
-                           owner_grid=grid)
-            else:
-                k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post)
+            k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post,
+                       owner_grid=grid)
 
         def tr_tail(lw):
             # After its GEMM2 tickets: claim and reduce until every position
             # of the remote plane has been claimed.
             more = fx.Int32(1)
             while more != fx.Int32(0):
-                if const_expr(k1_kw.get("sdma", False)):
-                    more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
-                                               lw, True, owner_grid=grid))
-                else:
-                    more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
-                                               lw, True))
+                more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
+                                           lw, True, owner_grid=grid))
 
         def remote_half_done():
             if bx < fx.Int32(k2_ctas):

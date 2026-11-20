@@ -38,12 +38,25 @@ from dataclasses import dataclass
 
 import torch
 
-SPARSE_QP_TOKEN_BITS = 32
-SPARSE_QP_GENERATION_SHIFT = 32
 MAX_FUSED_TOKENS_PER_RANK = 16384
 MAX_FUSED_MODEL_DIM = 8192
 MAX_PACKED_SOURCE_CAPACITY = (1 << 24) - 1
 MAX_BUFFER_ADDRESSABLE_BYTES = 1 << 32
+# Regions the rail (GDA RDMA) reads or writes.  Each arena places them first,
+# so the NIC registers only that prefix of the window.
+STAGE1_RAIL_REGIONS = (
+    "dispatch_staging",
+    "remote_dispatch_rx",
+    "remote_chunk_ready",
+    "remote_chunk_credit",
+)
+STAGE2_RAIL_REGIONS = (
+    "node_accumulator",
+    "remote_partial_rx",
+    "return_group_ready",
+    "return_consumed",
+    "rail_idx",
+)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -182,17 +195,15 @@ class Stage1DispatchWire:
 
 
 @dataclass(frozen=True)
-class Stage1ArenaRegion:
+class ArenaRegion:
+    """One named region of a Stage1 or Stage2 arena."""
+
     name: str
     offset: int
     nbytes: int
     alignment: int
     shape: tuple[int, ...]
     dtype: torch.dtype
-
-    @property
-    def end(self) -> int:
-        return self.offset + self.nbytes
 
 
 @dataclass(frozen=True)
@@ -232,7 +243,7 @@ class Stage1ArenaLayout:
     # stores row bases for (source rank, local expert) in its arena. Intra-node
     # producers and forwarders read them through LSA, avoiding cross-device atomics
     # during payload transfer.
-    regions: tuple[Stage1ArenaRegion, ...]
+    regions: tuple[ArenaRegion, ...]
     total_bytes: int
     activation_dtype: str = "fp4"
 
@@ -251,7 +262,7 @@ class Stage1ArenaLayout:
     @property
     def route_capacity(self) -> int:
         # The explicit receive bound may be tighter than every source token
-        # sending max_routes_per_token_per_rank routes to this destination.
+        # sending all of its topk routes to this destination.
         return self.max_recv_routes_per_rank
 
     @property
@@ -285,10 +296,6 @@ class Stage1ArenaLayout:
         return self.max_route_tiles * self.block_m
 
     @property
-    def h1_n_blocks(self) -> int:
-        return (2 * self.inter) // self.block_n
-
-    @property
     def dispatch_chunks(self) -> int:
         return (
             self.max_tokens + self.wire.records_per_chunk - 1
@@ -316,7 +323,6 @@ class Stage1ArenaLayout:
         gpus_per_node: int = 8,
         topk: int = 16,
         max_tokens: int = 128,
-        max_routes_per_token_per_rank: int | None = None,
         max_recv_routes_per_rank: int | None = None,
         block_m: int = 32,
         block_n: int = 256,
@@ -336,11 +342,8 @@ class Stage1ArenaLayout:
         gpus_per_node = int(gpus_per_node)
         topk = int(topk)
         max_tokens = int(max_tokens)
-        max_routes_per_token_per_rank = (
-            topk
-            if max_routes_per_token_per_rank is None
-            else int(max_routes_per_token_per_rank)
-        )
+        # Size for the worst case: all topk routes of a token on one rank.
+        max_routes_per_token_per_rank = topk
         block_m = int(block_m)
         block_n = int(block_n)
         tile_group = int(tile_group)
@@ -387,8 +390,6 @@ class Stage1ArenaLayout:
             raise ValueError(
                 f"max_tokens must be in [1, {MAX_FUSED_TOKENS_PER_RANK}] for the fused Stage-1 ABI"
             )
-        if not 1 <= max_routes_per_token_per_rank <= topk:
-            raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
         local_experts = experts // world_size
         source_capacity = world_size * max_tokens
         if source_capacity > MAX_PACKED_SOURCE_CAPACITY:
@@ -664,14 +665,8 @@ class Stage1ArenaLayout:
         # not land, causing the October 8 TPR1024 random hang. This ordering makes
         # RDMA offsets scale with tokens rather than route capacity. Host and kernels
         # resolve offsets by name, so regions can be reordered; Stage1 still starts at 0.
-        _rdma_first = (
-            "dispatch_staging",
-            "remote_dispatch_rx",
-            "remote_chunk_ready",
-            "remote_chunk_credit",
-        )
-        _head = [sp for sp in specs if sp[0] in _rdma_first]
-        _tail = [sp for sp in specs if sp[0] not in _rdma_first]
+        _head = [sp for sp in specs if sp[0] in STAGE1_RAIL_REGIONS]
+        _tail = [sp for sp in specs if sp[0] not in STAGE1_RAIL_REGIONS]
         if int(embed_stage2_bytes) > 0:
             _head.append(
                 ("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096)
@@ -679,7 +674,7 @@ class Stage1ArenaLayout:
         specs = _head + _tail
 
         offset = 0
-        regions: list[Stage1ArenaRegion] = []
+        regions: list[ArenaRegion] = []
         for name, shape, dtype, alignment in specs:
             offset = _align_up(offset, alignment)
             numel = 1
@@ -687,7 +682,7 @@ class Stage1ArenaLayout:
                 numel *= int(dim)
             nbytes = numel * torch.empty((), dtype=dtype).element_size()
             regions.append(
-                Stage1ArenaRegion(
+                ArenaRegion(
                     name=name,
                     offset=offset,
                     nbytes=nbytes,
@@ -718,7 +713,7 @@ class Stage1ArenaLayout:
             activation_dtype=activation_dtype,
         )
 
-    def region(self, name: str) -> Stage1ArenaRegion:
+    def region(self, name: str) -> ArenaRegion:
         for item in self.regions:
             if item.name == name:
                 return item
@@ -798,20 +793,6 @@ class Stage2NodePartialWire:
 
 
 @dataclass(frozen=True)
-class Stage2ArenaRegion:
-    name: str
-    offset: int
-    nbytes: int
-    alignment: int
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-
-    @property
-    def end(self) -> int:
-        return self.offset + self.nbytes
-
-
-@dataclass(frozen=True)
 class Stage2ArenaLayout:
     """Registered-window layout used by one EP rank.
 
@@ -836,7 +817,7 @@ class Stage2ArenaLayout:
     parity_depth: int
     num_qp: int
     records_per_group: int
-    regions: tuple[Stage2ArenaRegion, ...]
+    regions: tuple[ArenaRegion, ...]
     total_bytes: int
 
     @classmethod
@@ -1023,19 +1004,12 @@ class Stage2ArenaLayout:
 
         # Place rail RDMA regions first in Stage2: source node_accumulator and targets
         # remote_partial_rx, return_group_ready, and return_consumed. See Stage1ArenaLayout.create.
-        _rdma_first = (
-            "node_accumulator",
-            "remote_partial_rx",
-            "return_group_ready",
-            "return_consumed",
-            "rail_idx",
-        )
-        specs = [sp for sp in specs if sp[0] in _rdma_first] + [
-            sp for sp in specs if sp[0] not in _rdma_first
+        specs = [sp for sp in specs if sp[0] in STAGE2_RAIL_REGIONS] + [
+            sp for sp in specs if sp[0] not in STAGE2_RAIL_REGIONS
         ]
 
         offset = 0
-        regions: list[Stage2ArenaRegion] = []
+        regions: list[ArenaRegion] = []
         for name, shape, dtype, alignment in specs:
             offset = _align_up(offset, alignment)
             numel = 1
@@ -1043,7 +1017,7 @@ class Stage2ArenaLayout:
                 numel *= int(dim)
             nbytes = numel * torch.empty((), dtype=dtype).element_size()
             regions.append(
-                Stage2ArenaRegion(
+                ArenaRegion(
                     name=name,
                     offset=offset,
                     nbytes=nbytes,
@@ -1069,7 +1043,7 @@ class Stage2ArenaLayout:
             total_bytes=_align_up(offset, 4096),
         )
 
-    def region(self, name: str) -> Stage2ArenaRegion:
+    def region(self, name: str) -> ArenaRegion:
         for item in self.regions:
             if item.name == name:
                 return item
@@ -1087,12 +1061,14 @@ class Stage2ArenaLayout:
         return off
 
 
+# Former names of ArenaRegion.
+Stage1ArenaRegion = Stage2ArenaRegion = ArenaRegion
+
 __all__ = [
     "MAX_FUSED_MODEL_DIM",
     "MAX_FUSED_TOKENS_PER_RANK",
     "MAX_PACKED_SOURCE_CAPACITY",
-    "SPARSE_QP_GENERATION_SHIFT",
-    "SPARSE_QP_TOKEN_BITS",
+    "ArenaRegion",
     "Stage1ArenaLayout",
     "Stage1ArenaRegion",
     "Stage1DispatchWire",

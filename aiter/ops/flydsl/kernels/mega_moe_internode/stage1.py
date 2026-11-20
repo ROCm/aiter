@@ -60,8 +60,6 @@ from .gemm import (
 )
 from .layout import MAX_FUSED_TOKENS_PER_RANK, Stage1ArenaLayout
 
-BM = 32
-BN = 256
 BK = 256
 CCO_TICKET = 0
 # Persistent grid.  The role split (comm / producer / compute tickets) is
@@ -108,7 +106,6 @@ def _compile_stage1(
     swiglu_limit: float | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    waves: int = 8,
     group_ready: bool = False,
     buffer_regions: tuple = (),
     lsa_peer_base: int = 0,
@@ -127,7 +124,31 @@ def _compile_stage1(
     inside that same window.  The launcher performs exactly one GPU launch.
     """
 
-    # Select the GMM1 path and its associated switches from the tune table's split_local column.
+    # The tune table's split_local column selects one of two GMM1 paths and its switches.
+    # Split: count and group local-source fan1 rows separately from remote-source
+    # fan2 rows. Sealer phase 1 seals local groups after eight local_eos values,
+    # using h1 base 0; phase 2 seals remote groups after all comm_eos values.
+    # Full groups enqueue during fanout, and each sealer phase publishes its tails.
+    # h1_local_eos orders local sealing before final permutation and remote sealing.
+    # fan2_shards: only fanout_shard < fan2_shards handles fan2, using that token
+    # stride. Other fan CTAs enter local GMM1 after fan1, using rail wait time for compute.
+    # lazy_pad: phase 1 publishes h1_local_eos without padding local tail rows;
+    # phase 2 pads them. GMM1 reads A only through bounds-checked tile_row_input.
+    # Before padding, these entries contain valid initial/previous-generation row
+    # IDs. Stage2 discards their h1 values using INVALID_SOURCE and zero weights,
+    # both installed before Stage1 completes.
+    # extra_consumers: tickets 1..COMPUTE_FIRST-1, except the finisher, also enter
+    # GMM1 after fanout. consumer_index remains a bijection over all consumers,
+    # with extra consumers appended after the original range.
+    # Without split: static_g0 fixes expert e's first group at physical group e,
+    # tiles [e*G,e*G+G). Before launch_ready, each GPU initializer sets its map,
+    # tile_expert, and map_ready, and starts tile_alloc at LE*G. Only overflow
+    # groups are claimed remotely. Even a zero-row expert owns one fully padded
+    # group with invalid sources. Seal tails in parallel over expert*SPL threads
+    # using _seal_pad_par and _seal_perm(par=True).
+    # Both paths write h1 by physical group and seal the inverse tile_src_of_dst
+    # map for Stage2's indirect A reads. Rail posting CTAs (_POST_LO.._POST_HI)
+    # post first and do not receive fanout tokens.
     split_local = bool(split_local)
     worker_blocks = WORKER_BLOCKS
     early_local_gmm = split_local
@@ -169,10 +190,8 @@ def _compile_stage1(
     GBM = BM * G
     # CTA width: 8 waves (two per SIMD, <= 256 registers each; GMM1 gives each
     # wave a 32-column slice over all rows, see _gemm1_body).
-    WAVES = int(waves)
+    WAVES = 8
     THREADS = 64 * WAVES
-    if WAVES != 8:
-        raise ValueError(f"stage1 waves must be 8, got {WAVES}")
     group_ready = bool(group_ready)
     GROUP_ROWS = BM * G
     BN = int(layout.block_n)
@@ -256,17 +275,6 @@ def _compile_stage1(
         )
     if not 0 <= int(rank) < WORLD:
         raise ValueError(f"rank must be in [0, {WORLD})")
-    if worker_blocks < ESSENTIAL_CTAS:
-        raise ValueError(
-            f"worker_blocks must be >= {ESSENTIAL_CTAS} so all progress roles are resident"
-        )
-    if worker_blocks == ESSENTIAL_CTAS:
-        # Producers retire without rejoining in the chunked full path. With
-        # zero GEMM consumers nobody would run GMM1.
-        raise ValueError(
-            "full Stage-1 requires at least one GEMM consumer after progress roles"
-        )
-
     rank = int(rank)
     local_rank = rank % GPUS_PER_NODE
     node = rank // GPUS_PER_NODE
@@ -299,31 +307,6 @@ def _compile_stage1(
 
     wire = layout.wire
     record_bytes = wire.record_bytes
-    # split_local selects between two GMM1 paths.
-    # Split: count and group local-source fan1 rows separately from remote-source
-    # fan2 rows. Sealer phase 1 seals local groups after eight local_eos values,
-    # using h1 base 0; phase 2 seals remote groups after all comm_eos values.
-    # Full groups enqueue during fanout, and each sealer phase publishes its tails.
-    # h1_local_eos orders local sealing before final permutation and remote sealing.
-    # fan2_shards: only fanout_shard < fan2_shards handles fan2, using that token
-    # stride. Other fan CTAs enter local GMM1 after fan1, using rail wait time for compute.
-    # lazy_pad: phase 1 publishes h1_local_eos without padding local tail rows;
-    # phase 2 pads them. GMM1 reads A only through bounds-checked tile_row_input.
-    # Before padding, these entries contain valid initial/previous-generation row
-    # IDs. Stage2 discards their h1 values using INVALID_SOURCE and zero weights,
-    # both installed before Stage1 completes.
-    # extra_consumers: tickets 1..COMPUTE_FIRST-1, except the finisher, also enter
-    # GMM1 after fanout. consumer_index remains a bijection over all consumers,
-    # with extra consumers appended after the original range.
-    # Without split: static_g0 fixes expert e's first group at physical group e,
-    # tiles [e*G,e*G+G). Before launch_ready, each GPU initializer sets its map,
-    # tile_expert, and map_ready, and starts tile_alloc at LE*G. Only overflow
-    # groups are claimed remotely. Even a zero-row expert owns one fully padded
-    # group with invalid sources. Seal tails in parallel over expert*SPL threads
-    # using _seal_pad_par and _seal_perm(par=True).
-    # Both paths write h1 by physical group and seal the inverse tile_src_of_dst
-    # map for Stage2's indirect A reads. Rail posting CTAs (_POST_LO.._POST_HI)
-    # post first and do not receive fanout tokens.
     F2S = int(fan2_shards)
     # With more than one remote node, fan2 takes the nodes in arrival order (see
     # the fan2 loop): EP32 TPR128 a8w4 -1.5~3.7% min-rank, a4w4 even. With one
@@ -364,8 +347,7 @@ def _compile_stage1(
     N_NONCOMPUTE = len(_NC_BASE)
     # GMM1 N width is arena.block_n (256; 128 was slower for every tested shape).
     # Count jobs using GNB.
-    GBN = BN
-    GNB = (2 * INTER) // GBN
+    GNB = (2 * INTER) // BN
 
     kh_tile = BK if A_DTYPE == "fp8" else BK // 2
     k_tiles_total = k_tiles_total_for(HIDDEN, BK)
@@ -553,7 +535,6 @@ def _compile_stage1(
         # launches this kernel once with worker_blocks CTAs.
         generation = ticket64 // fx.Int64(worker_blocks) + fx.Int64(1)
         parity = fx.Int64(generation & fx.Int64(1))
-        control_generation = generation
 
         def local_addr(name):
             address = arena_ptr + fx.Int64(off(name)) + parity * fx.Int64(plane(name))
@@ -599,7 +580,6 @@ def _compile_stage1(
         is_initializer = ticket == fx.Int32(0)
 
         is_cco = ticket == fx.Int32(CCO_TICKET)
-        is_comm = ticket < fx.Int32(COMM_CTAS)
 
         # spin_relaxed uses relaxed polling; the caller performs one acquire afterward.
         _pl32 = comm.load_i32_global_system_relaxed
@@ -608,6 +588,9 @@ def _compile_stage1(
             if L1S
             else comm.spin_until_ge_i64_system_rx
         )
+        # L1S (uncached windows): acquire clears L1 only; release only drains this wave's stores.
+        _acquire_fence = comm.invalidate_l1 if L1S else comm.fence_system_acquire
+        _release_fence = comm.publish_uncached if L1S else comm.fence_system_release
 
         def _cta_acquire():
             """Acquire for the whole CTA after polling: barrier, wave0 acquire, barrier.
@@ -618,7 +601,7 @@ def _compile_stage1(
             """
             gpu.barrier()
             if wave == fx.Int32(0):
-                (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
+                _acquire_fence()
             gpu.barrier()
 
         def peer_local_addr(name, peer):
@@ -635,13 +618,27 @@ def _compile_stage1(
             index = node - int(node > peer)
             return window_off(name) + fx.Int64(index * peer_bytes)
 
-        def _rail_post(post_qp, with_credit):
+        def _peer_addr(dest, name):
+            if const_expr(bool(buffer_regions)):
+                if const_expr(lsa_peer_base != 0):
+                    dest = dest + fx.Int32(lsa_peer_base)
+                address = region_lsa_address(
+                    arena_ptr, region_indices[1, name], parity, dest
+                )
+            else:
+                address = (
+                    arena_lsa_base
+                    + fx.Int64(dest) * arena_lsa_stride
+                    + fx.Int64(window_off(name))
+                )
+            return address
+
+        def _rail_post(post_qp):
             """Post QP post_qp's token records from one wave using rail_soa.
 
             Issue one PUT for the segment, this QP's ready words, and one doorbell without
             waiting. Save the request in remote_chunk_request[post_qp] for later reaping.
-            with_credit waits for this QP's generation g-2 credit on the same parity;
-            T0 has already waited for all credits outside this helper.
+            First wait for this QP's generation g-2 credit on the same parity.
             """
             for remote_index in range_constexpr(NODES - 1):
                 remote_node = SEND_ORDER[remote_index]
@@ -651,17 +648,16 @@ def _compile_stage1(
                         arena_ptr, region_indices[1, "dispatch_staging"], fx.Int64(0)
                     )[1]
                 comm.fence_system_release()
-                if const_expr(with_credit):  # noqa: SIM102
-                    if lane == fx.Int32(0):
-                        for cchunk in range(
-                            fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
-                        ):
-                            _spin(
-                                peer_local_addr("remote_chunk_credit", remote_node)
-                                + fx.Int64(cchunk * fx.Int32(layout.num_qp) + post_qp)
-                                * fx.Int64(8),
-                                generation - fx.Int64(2),
-                            )
+                if lane == fx.Int32(0):
+                    for cchunk in range(
+                        fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
+                    ):
+                        _spin(
+                            peer_local_addr("remote_chunk_credit", remote_node)
+                            + fx.Int64(cchunk * fx.Int32(layout.num_qp) + post_qp)
+                            * fx.Int64(8),
+                            generation - fx.Int64(2),
+                        )
                 rows = fx.Int32((MAX_TOKENS + RAIL_QPS - 1) // RAIL_QPS)
                 r0 = post_qp * rows
                 left = ntokens - r0
@@ -729,12 +725,13 @@ def _compile_stage1(
             ):
                 buffer_ops.buffer_store(fx.Int32(0), consumed, item)
             if tx == fx.Int32(0):
-                for name in ("tile_alloc",):
-                    buffer_ops.buffer_store(
-                        fx.Int32(0),
-                        buffer_ops.create_buffer_resource_from_addr(local_addr(name)),
-                        fx.Int32(0),
-                    )
+                buffer_ops.buffer_store(
+                    fx.Int32(0),
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("tile_alloc")
+                    ),
+                    fx.Int32(0),
+                )
                 if const_expr(BOUNDED_RECV):
                     buffer_ops.buffer_store(
                         fx.Int32(0),
@@ -844,48 +841,26 @@ def _compile_stage1(
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
-                (comm.publish_uncached if L1S else comm.fence_system_release)()
+                _release_fence()
                 # pub_relaxed: one fence publishes all clears, avoiding an L2 writeback per gate store.
                 _pub_st = comm.store_i64_global_system_relaxed
                 _pub_st(
                     persistent_addr("epoch_gate"),
-                    control_generation,
+                    generation,
                 )
-                _pub_st(local_addr("launch_ready"), control_generation)
+                _pub_st(local_addr("launch_ready"), generation)
         else:
             if tx == fx.Int32(0):
                 _spin(
                     persistent_addr("epoch_gate"),
-                    control_generation,
+                    generation,
                 )
             _cta_acquire()
-        # Destination placement, step 1: compute and exchange counts.
-        #
-        # Counts depend only on topk_ids, available at entry. The plan can run alongside
-        # quantization (~93us measured), leaving arithmetic offsets for payload transfer
-        # instead of per-route cross-device expert_count atomics and tile claims/spins.
-        #
-        # Inter-node traffic uses the rail. Send only counts to the same-index peer,
-        # which fans them out to eight destinations on its node. Destinations keep
-        # row bases in their own arenas, readable via LSA by local producers and rail
-        # forwarders. Remote sources need no row bases, eliminating the return rail hop.
-        #
-        # Counts need no clearing: each source owns its row and publishes generation
-        # in plan_count_ready[src]. Destinations wait for equality with generation,
-        # so stale previous-generation counts cannot satisfy the wait.
-        # A bounded producer CTA pool owns tokens in a strided schedule. At capacity
-        # 128 this matches the historical one-CTA-per-token mapping; larger capacities
-        # reuse resident CTAs for later tokens rather than growing the grid.
-        # The original split fanout used ticket as the token every iteration, writing
-        # only 128 of 512 tokens and skipping tokens 0..7. That mapping assumed MORI's
-        # 128-token, one-CTA-per-token, single-iteration shape.
-        # Four waves own four QPs. Each chunk is one aggregate PUT per QP plus a
-        # trailing ready value and one flush/doorbell. The same CTA receives the
-        # reciprocal chunk and performs selected-rank proxy fanout.
+        # T0 (CCO): per remote node, wait for its rail segment (one ready word per QP),
+        # then parse the received records' expert IDs into node_dest_slot_mask for Stage2.
         if is_cco:
-            # One wave per QP; with more waves than QPs the extra waves repeat
-            # a QP's waits (reads only).
-            qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
+            # One wave per QP; the extra waves repeat a QP's waits (reads only).
+            qp = wave % fx.Int32(layout.num_qp)
 
             for remote_index in range_constexpr(NODES - 1):
                 remote_node = RECV_ORDER[remote_index]
@@ -920,43 +895,38 @@ def _compile_stage1(
                         generation,
                     )
                 _cta_acquire()
-                gpu.barrier()
                 rx_all = buffer_ops.create_buffer_resource_from_addr(
                     peer_local_addr("remote_dispatch_rx", remote_node)
                 )
                 # agent: the 256-thread CCO CTA parses all remote tokens with a strided loop.
                 # Capacities above THREADS must process more than the first 256 records.
                 for token in range(tx, ntokens, fx.Int32(THREADS)):
-                    remote_record_available = fx.Int32(1)
                     remote_slot_mask = fx.Int32(0)
-                    if remote_record_available != fx.Int32(0):
-                        # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
-                        # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
-                        # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
-                        record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
-                            REC_I // 4
+                    # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
+                    # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
+                    # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
+                    record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
+                        REC_I // 4
+                    )
+                    for slot in range_constexpr(TOPK):
+                        expert = buffer_ops.buffer_load(
+                            rx_all,
+                            record_dword + fx.Int32(slot),
+                            vec_width=1,
+                            dtype=T.i32,
                         )
-                        for slot in range_constexpr(TOPK):
-                            expert = buffer_ops.buffer_load(
-                                rx_all,
-                                record_dword + fx.Int32(slot),
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                            valid = (expert >= fx.Int32(0)) & (
-                                expert < fx.Int32(EXPERTS)
-                            )
-                            owner = valid.select(
-                                expert // fx.Int32(LOCAL_EXPERTS),
-                                fx.Int32(0),
-                            )
-                            on_node = valid & (
-                                (owner // fx.Int32(GPUS_PER_NODE)) == fx.Int32(node)
-                            )
-                            remote_slot_mask = on_node.select(
-                                remote_slot_mask | (fx.Int32(1) << fx.Int32(slot)),
-                                remote_slot_mask,
-                            )
+                        valid = (expert >= fx.Int32(0)) & (expert < fx.Int32(EXPERTS))
+                        owner = valid.select(
+                            expert // fx.Int32(LOCAL_EXPERTS),
+                            fx.Int32(0),
+                        )
+                        on_node = valid & (
+                            (owner // fx.Int32(GPUS_PER_NODE)) == fx.Int32(node)
+                        )
+                        remote_slot_mask = on_node.select(
+                            remote_slot_mask | (fx.Int32(1) << fx.Int32(slot)),
+                            remote_slot_mask,
+                        )
                     buffer_ops.buffer_store(
                         remote_slot_mask,
                         buffer_ops.create_buffer_resource_from_addr(
@@ -979,26 +949,11 @@ def _compile_stage1(
         # Split fanout CTAs cover the eight node-local destinations. Each writes
         # both its local source rank and the aligned remote source rank directly
         # into destination expert tiles; there is no rank inbox/sort.
-        is_finisher = is_comm & (ticket == fx.Int32(local_rank))
+        is_finisher = ticket == fx.Int32(local_rank)
 
         is_sealer = (
             (ticket == fx.Int32(SEALER_SPARE)) if SEPARATE_SEALER else is_finisher
         )
-
-        def _peer_addr(dest, name):
-            if const_expr(bool(buffer_regions)):
-                if const_expr(lsa_peer_base != 0):
-                    dest = dest + fx.Int32(lsa_peer_base)
-                address = region_lsa_address(
-                    arena_ptr, region_indices[1, name], parity, dest
-                )
-            else:
-                address = (
-                    arena_lsa_base
-                    + fx.Int64(dest) * arena_lsa_stride
-                    + fx.Int64(window_off(name))
-                )
-            return address
 
         def _tr_resv_signal(dest, cnt):
             """Publish tile_ready after P2 completes for this rank's last fan CTA to dest."""
@@ -1078,6 +1033,68 @@ def _compile_stage1(
                     ) // fx.Int32(G)
                     _rq_push(None, rq_pg)
 
+        def _rq_pad_tails():
+            """Complete tail groups' arrival counts (no split_local, consumer 0 only).
+            Without split, expert_count is final once all source fan CTAs finish P2.
+            Consumer 0 adds missing rows to each tail group's arrival count, including
+            the fully padded static_g0 group for zero-row experts. Padding and real
+            arrivals update the same word; the atomic reaching GROUP_ROWS enqueues it.
+            The sealer later fills tile_row_* tails. GMM1 uses bounds-checked tile_row_input;
+            Stage2 discards padded h1 values through INVALID_SOURCE and zero weights.
+            """
+            if ticket == fx.Int32(COMPUTE_FIRST):
+                if tx == fx.Int32(0):
+                    pd_rf = fx.Int32(
+                        _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
+                    )
+                    while pd_rf < fx.Int32(GPUS_PER_NODE):
+                        _mlir_rocdl.s_sleep(127)
+                        pd_rf = fx.Int32(
+                            _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
+                        )
+                _cta_acquire()
+                for pd_e in range(tx, fx.Int32(LOCAL_EXPERTS), fx.Int32(THREADS)):
+                    pd_c = buffer_ops.buffer_load(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("expert_count")
+                        ),
+                        pd_e,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    pd_k = pd_c // fx.Int32(GROUP_ROWS)
+                    pd_r = pd_c - pd_k * fx.Int32(GROUP_ROWS)
+                    if (pd_r != fx.Int32(0)) | (pd_c == fx.Int32(0)):
+                        pd_ph = pd_e * fx.Int32(G)
+                        if pd_k != fx.Int32(0):
+                            pd_mi = pd_e * fx.Int32(
+                                max_tiles_per_expert
+                            ) + pd_k * fx.Int32(G)
+                            _spin(
+                                local_addr("expert_tile_map_ready")
+                                + fx.Int64(pd_mi) * fx.Int64(8),
+                                generation,
+                            )
+                            comm.fence_system_acquire()
+                            pd_ph = buffer_ops.buffer_load(
+                                buffer_ops.create_buffer_resource_from_addr(
+                                    local_addr("expert_tile_map")
+                                ),
+                                pd_mi,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        pd_add = fx.Int32(GROUP_ROWS) - pd_r
+                        pd_old = fx.Int32(
+                            comm.atomic_add_system(
+                                local_addr("tile_row_done")
+                                + fx.Int64(pd_ph) * fx.Int64(4),
+                                pd_add,
+                            )
+                        )
+                        if pd_old + pd_add == fx.Int32(GROUP_ROWS):
+                            _rq_push(None, pd_ph // fx.Int32(G))
+
         def _alloc_tiles_for(count):
             """Return an expert's allocated tile count, rounded up to a multiple of G."""
             n = (count + fx.Int32(BM - 1)) // fx.Int32(BM)
@@ -1132,7 +1149,7 @@ def _compile_stage1(
             for j in range_constexpr(G):
                 # claim_relaxed: one fence already publishes map/tile_expert; G release stores
                 # would each trigger a full L2 writeback.
-                (comm.store_i64_global_system_relaxed)(
+                comm.store_i64_global_system_relaxed(
                     map_ready + fx.Int64(j * 8), generation
                 )
             return base
@@ -1151,8 +1168,7 @@ def _compile_stage1(
         # When TOPK does not divide THREADS, the last THREADS-_GB_LANES threads skip P1.
         _GB_NB = min(THREADS // TOPK, GROUP_ROWS) // WAVES * WAVES
         _GB_LANES = _GB_NB * TOPK
-        # Dword distance from IDs to weights: (REC_W-REC_I) after record alignment,
-        # or TOPK in the contiguous ids_first [ids|weights] array.
+        # Dword distance from IDs to weights within a record (after record alignment).
         _GB_WDW_REC = (REC_W - REC_I) // 4
         # Arrival tickets have already been read into registers. Reuse one
         # dword of the reserved 16-dword prefix for the batch acceptance vote.
@@ -1219,10 +1235,9 @@ def _compile_stage1(
                 # Extra threads with r == _GB_NB point into the next batch and must be invalidated.
                 live = live & (tx < fx.Int32(_GB_LANES))
             rec_dw = live.select(tok, fx.Int32(0)) * fx.Int32(REC_BYTES // 4)
-            # ID dword base: REC_I in records, or token*[ids|weights] in ids_first storage.
-            # Weights follow by _gb_wdw dwords; record IDs are padded to 16B.
+            # ID dword base: REC_I within the record.
+            # Weights follow by _GB_WDW_REC dwords; record IDs are padded to 16B.
             id0 = rec_dw + fx.Int32(REC_I // 4)
-            _gb_wdw = _GB_WDW_REC
             expert = buffer_ops.buffer_load(rs, id0 + slot, vec_width=1, dtype=T.i32)
             lo = (fx.Int32(node * GPUS_PER_NODE) + dest) * fx.Int32(LOCAL_EXPERTS)
             hit = live & (expert >= lo) & (expert < lo + fx.Int32(LOCAL_EXPERTS))
@@ -1385,7 +1400,6 @@ def _compile_stage1(
                                 rs, q0 + dc, vec_width=4, dtype=T.i32
                             )
                         )
-                    sv = None
                     sv = buffer_ops.buffer_load(
                         rs,
                         ptok_c * fx.Int32(REC_BYTES // 4)
@@ -1472,7 +1486,7 @@ def _compile_stage1(
                     BM
                 ) + row_slot % fx.Int32(BM)
                 weight = buffer_ops.buffer_load(
-                    rs, id0 + fx.Int32(_gb_wdw) + slot, vec_width=1, dtype=T.f32
+                    rs, id0 + fx.Int32(_GB_WDW_REC) + slot, vec_width=1, dtype=T.f32
                 )
                 src = src_base + tok
                 input_row = src
@@ -1645,35 +1659,31 @@ def _compile_stage1(
                 )
                 # With G>1, allocated tiles round up to a multiple of G. Pad both the last
                 # real tile's tail rows and any extra empty tiles in the group.
-                real_tiles = (count + fx.Int32(BM - 1)) // fx.Int32(BM)
-                alloc_tiles = (
-                    (real_tiles + fx.Int32(G - 1)) // fx.Int32(G)
-                ) * fx.Int32(G)
+                alloc_tiles = _alloc_tiles_for(count)
                 first_pad_tile = count // fx.Int32(BM)
+                tile_map_res = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("expert_tile_map")
+                )
+                sources = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("tile_row_source")
+                )
+                inputs = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("tile_row_input")
+                )
+                weights = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("tile_row_weight")
+                )
                 for pad_tile in range(first_pad_tile, alloc_tiles, fx.Int32(1)):
-                    logical_tile = pad_tile
                     map_index = (tx + fx.Int32(EO)) * fx.Int32(
                         max_tiles_per_expert
-                    ) + logical_tile
+                    ) + pad_tile
                     _spin(
                         local_addr("expert_tile_map_ready")
                         + fx.Int64(map_index) * fx.Int64(8),
                         generation,
                     )
-                    tile_map_res = buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("expert_tile_map")
-                    )
                     physical = buffer_ops.buffer_load(
                         tile_map_res, map_index, vec_width=1, dtype=T.i32
-                    )
-                    sources = buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_row_source")
-                    )
-                    inputs = buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_row_input")
-                    )
-                    weights = buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_row_weight")
                     )
                     # Use row 0 of this expert's first tile as fallback. Extra empty tiles never
                     # received their own row 0. Here count>0; otherwise alloc_tiles is zero and
@@ -1699,12 +1709,11 @@ def _compile_stage1(
                         buffer_ops.buffer_store(fx.Int32(INVALID_SOURCE), sources, dst)
                         buffer_ops.buffer_store(fx.Float32(0.0), weights, dst)
 
-        def _seal_perm(segs, base_segs, check_tiles, publish_seg, par=False):
+        def _seal_perm(segs, check_tiles, par=False):
             """Build the expert-major permutation.
             segs concatenates map segments per expert: 0 is local/all, LE is remote.
-            base_segs precedes the whole view; with split_local and no h1_phys, remote
-            segments start after the total local tile count. For h1_phys+split_local,
-            segs=(0,LE) keeps each expert contiguous, with local groups before remote groups.
+            With split_local, segs=(0,LE) keeps each expert contiguous, with local
+            groups before remote groups.
             With par, thread (e,l) handles tiles/groups l,l+SPL,... for expert e and
             recomputes prefix sums, shortening serial load/store chains by a factor of SPL.
             """
@@ -1714,15 +1723,6 @@ def _compile_stage1(
             counts_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
-            seg_base = fx.Int32(0)
-            for bi in range_constexpr(len(base_segs)):
-                bo = base_segs[bi]
-                for e in range_constexpr(LOCAL_EXPERTS):
-                    seg_base = seg_base + _alloc_tiles_for(
-                        buffer_ops.buffer_load(
-                            counts_res, fx.Int32(bo + e), vec_width=1, dtype=T.i32
-                        )
-                    )
             sorted_e_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("tile_expert_sorted")
             )
@@ -1730,7 +1730,7 @@ def _compile_stage1(
                 local_addr("tile_src_of_dst")
             )
             if tx < fx.Int32(LOCAL_EXPERTS * PS):
-                my_base = seg_base
+                my_base = fx.Int32(0)
                 all_tiles = fx.Int32(0)
                 # range_constexpr, not a runtime loop: the accumulator is
                 # loop-carried and this package only ever carries values
@@ -1744,21 +1744,10 @@ def _compile_stage1(
                         n = _alloc_tiles_for(c)
                         my_base = my_base + (fx.Int32(e) < pe).select(n, fx.Int32(0))
                         all_tiles = all_tiles + n
-                if tx == fx.Int32(0):
-                    if const_expr(check_tiles is not None):  # noqa: SIM102
-                        # Sum ceil(ceil(count/BM)/G)*G over all segments must equal tile_alloc.
-                        # Each claim allocates exactly G tiles, so the permutation remains a bijection.
-                        if seg_base + all_tiles != check_tiles:
-                            comm.atomic_add_system(error_addr, fx.Int32(1))
-                    if const_expr(publish_seg):
-                        # Local-segment tile count, used to derive F5's local job count.
-                        buffer_ops.buffer_store(
-                            all_tiles,
-                            buffer_ops.create_buffer_resource_from_addr(
-                                local_addr("tile_alloc")
-                            ),
-                            fx.Int32(1),
-                        )
+                # Sum ceil(ceil(count/BM)/G)*G over all segments must equal tile_alloc.
+                # Each claim allocates exactly G tiles, so the permutation remains a bijection.
+                if (tx == fx.Int32(0)) & (all_tiles != check_tiles):
+                    comm.atomic_add_system(error_addr, fx.Int32(1))
                 tile_map = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("expert_tile_map")
                 )
@@ -1813,11 +1802,8 @@ def _compile_stage1(
 
         def _seal_seg1():
             """Seal split_local phase 1 after eight local_eos values confirm all local fan1.
-            Pad local groups and publish their tile count plus early_local_gmm's group
-            map and h1_local_eos. In early_local_gmm, fan CTAs with ticket>=8 call this:
-            marker 7 means local EOS complete, 8 padding complete, and 9 published.
-            Consumers use only 3/4/5/6. Otherwise the sealer calls it without markers,
-            because slots 7..9 would conflict with T0.
+            Publish the local tile count, the local tail groups, and h1_local_eos. Fan
+            ticket GPUS_PER_NODE*_SEG1_SHARD+local_rank calls this after its fan1 work.
             """
             # Phase 1: eight local_eos values mean all local rows have arrived and counts are final.
             # Seal local padding/permutation at h1 base 0, then wait for comm_eos to seal remote groups.
@@ -1830,17 +1816,13 @@ def _compile_stage1(
             _cta_acquire()
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # With h1_phys, phase 2 builds the full sorted view, local then remote per expert.
-            # Publish only the local tile count here; otherwise local tiles form a segment at base 0.
+            # Phase 2 builds the full sorted view, local then remote per expert.
+            # Publish only the local tile count here.
             if tx == fx.Int32(0):
                 _lt = fx.Int32(0)
                 _cr = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("expert_count")
                 )
-                # local_defer excludes the last D experts' local groups from the local segment.
-                # Consumers derive its bound and the remote start from tile_alloc[1], keeping
-                # group-map layout unchanged. These groups start the remote segment and share
-                # a weight read with their remote groups, which already require all weights.
                 for e in range_constexpr(LOCAL_EXPERTS):
                     _lt = _lt + _alloc_tiles_for(
                         buffer_ops.buffer_load(
@@ -1857,13 +1839,12 @@ def _compile_stage1(
             _rq_seal_tails(0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            if const_expr(early_local_gmm):  # noqa: SIM102
-                if tx == fx.Int32(0):
-                    (comm.publish_uncached if L1S else comm.fence_system_release)()
-                    # The fence already published prior writes; a release store would write back L2 again.
-                    (comm.store_i64_global_system_relaxed)(
-                        local_addr("h1_local_eos"), generation
-                    )
+            if tx == fx.Int32(0):
+                _release_fence()
+                # The fence already published prior writes; a release store would write back L2 again.
+                comm.store_i64_global_system_relaxed(
+                    local_addr("h1_local_eos"), generation
+                )
 
         dest = fx.Int32(0)
         # Shard each destination's fanout across CTAs to hide peer round trips.
@@ -1890,12 +1871,10 @@ def _compile_stage1(
                 pn_dest.select(fanout_shard - fx.Int32(1), fanout_shard),
             )
             # One CTA posts and rings each QP's doorbell, as kernel2 DBCTAS does: ticket q handles QP q.
-            if ((ticket >= fx.Int32(_POST_LO)) & (ticket < fx.Int32(_POST_HI))) & (
-                wave == fx.Int32(0)
-            ):
-                _rail_post(ticket - fx.Int32(1), True)
+            if pn_self & (wave == fx.Int32(0)):
+                _rail_post(ticket - fx.Int32(1))
             if tx == fx.Int32(0):
-                _spin(_peer_addr(dest, "launch_ready"), control_generation)
+                _spin(_peer_addr(dest, "launch_ready"), generation)
             gpu.barrier()
             for token in range(
                 fan_wshard, fx.Int32(MAX_TOKENS), fan_tstride * fx.Int32(_GB_NB)
@@ -1944,7 +1923,7 @@ def _compile_stage1(
                     if _lprev + fx.Int32(1) == fan_stride:
                         comm.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
                         comm.fence_system_release()
-                        (comm.store_i64_global_system_relaxed)(
+                        comm.store_i64_global_system_relaxed(
                             _peer_addr(dest, "comm_eos")
                             + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
                             generation,
@@ -1954,6 +1933,13 @@ def _compile_stage1(
                 # for remote fanout and stays outside the rail-post pool.
                 if ticket == fx.Int32(GPUS_PER_NODE * _SEG1_SHARD + local_rank):
                     _seal_seg1()
+            # fan2 token range for this shard: only shards below F2S take remote rows.
+            f2_stride = fx.Int32(F2S) if F2S else fan_tstride
+            f2_end = (
+                (fan_wshard < fx.Int32(F2S)).select(fx.Int32(MAX_TOKENS), fx.Int32(0))
+                if F2S
+                else fx.Int32(MAX_TOKENS)
+            )
             if const_expr(F2_DYN):
                 # Take the remote nodes in arrival order rather than RECV_ORDER:
                 # each round picks the first unprocessed node (RECV_ORDER
@@ -2026,14 +2012,6 @@ def _compile_stage1(
                                 ),
                                 f2_src,
                             )
-                    f2_stride = fx.Int32(F2S) if F2S else fan_tstride
-                    f2_end = (
-                        (fan_wshard < fx.Int32(F2S)).select(
-                            fx.Int32(MAX_TOKENS), fx.Int32(0)
-                        )
-                        if F2S
-                        else fx.Int32(MAX_TOKENS)
-                    )
                     for token in range(
                         fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)
                     ):
@@ -2067,14 +2045,6 @@ def _compile_stage1(
                             generation,
                         )
                     _cta_acquire()
-                    f2_stride = fx.Int32(F2S) if F2S else fan_tstride
-                    f2_end = (
-                        (fan_wshard < fx.Int32(F2S)).select(
-                            fx.Int32(MAX_TOKENS), fx.Int32(0)
-                        )
-                        if F2S
-                        else fx.Int32(MAX_TOKENS)
-                    )
                     for token in range(
                         fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)
                     ):
@@ -2106,7 +2076,7 @@ def _compile_stage1(
             gpu.barrier()
             # Reap this CTA's data request before publishing its shard. It must complete
             # before all consumed credits arrive, so T0's credit phase cannot poll the same QP CQ concurrently.
-            if (ticket >= fx.Int32(_POST_LO)) & (ticket < fx.Int32(_POST_HI)):
+            if pn_self:
                 if wave == fx.Int32(0):
                     post_qp = ticket - fx.Int32(1)
                     for remote_index in range_constexpr(NODES - 1):
@@ -2144,7 +2114,6 @@ def _compile_stage1(
                         local_addr("fanout_shard_done") + fx.Int64(dest) * fx.Int64(4),
                         fx.Int32(0) - fan_stride,
                     )
-                if _publish:
                     if const_expr(lite_sync):
                         # The acq_rel RMW already published this CTA's writes and acquired other shards.
                         # Only local T0 reads consumed, using a system load and acquire fence. Fan RX
@@ -2167,22 +2136,18 @@ def _compile_stage1(
                                 + fx.Int64(consume_index * 4),
                                 fx.Int32(1),
                             )
-                    (comm.store_i64_global_system_relaxed)(
+                    comm.store_i64_global_system_relaxed(
                         _peer_addr(dest, "comm_eos") + fx.Int64(local_rank) * 8,
                         generation,
                     )
 
-        # The CCO CTA is also destination role zero, so delayed-credit progress
-        # must run only after the common is_comm path above has contributed its
-        # own consumed count. Otherwise the scoreboard can reach only seven.
-
+        # T0 credits each remote chunk back to its sender once all GPUS_PER_NODE
+        # destinations' fanout has consumed it (remote_chunk_consumed).
         if is_cco:
             # One wave per QP posts its credits (a QP has one poster); the extra
             # waves of an 8-wave CTA only join the waits and barriers.
-            qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
-            qp_poster = (
-                (wave < fx.Int32(layout.num_qp)) if WAVES > layout.num_qp else None
-            )
+            qp = wave % fx.Int32(layout.num_qp)
+            qp_poster = wave < fx.Int32(layout.num_qp)
             for remote_index in range_constexpr(NODES - 1):
                 remote_node = REMOTE_NODES[remote_index]
                 for chunk in range(fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)):
@@ -2210,7 +2175,7 @@ def _compile_stage1(
                     credit_byte = peer_window_off(
                         "remote_chunk_credit", remote_node
                     ) + fx.Int64(consume_index) * fx.Int64(8)
-                    if const_expr(WAVES <= layout.num_qp):
+                    if qp_poster:
                         _rail.put_value(
                             dev_comm,
                             qp,
@@ -2223,34 +2188,13 @@ def _compile_stage1(
                         # Ring per chunk so the peer sees each credit as soon as it is
                         # earned; nothing here needs our own completion, so reap only
                         # the last request (one QP completes in order).
-                        credit_req = _rail.flush_async(
+                        credit_req_w = _rail.flush_async(
                             dev_comm,
                             qp,
                             fx.Int32(remote_node),
                         )
                         if chunk == fx.Int32(dispatch_chunks - 1):
-                            _rail.wait(dev_comm, qp, credit_req)
-                    else:
-                        if qp_poster:
-                            _rail.put_value(
-                                dev_comm,
-                                qp,
-                                fx.Int32(remote_node),
-                                window_handle("remote_chunk_credit"),
-                                credit_byte,
-                                generation,
-                                aggregate=True,
-                            )
-                            # Ring per chunk so the peer sees each credit as soon as it is
-                            # earned; nothing here needs our own completion, so reap only
-                            # the last request (one QP completes in order).
-                            credit_req_w = _rail.flush_async(
-                                dev_comm,
-                                qp,
-                                fx.Int32(remote_node),
-                            )
-                            if chunk == fx.Int32(dispatch_chunks - 1):
-                                _rail.wait(dev_comm, qp, credit_req_w)
+                            _rail.wait(dev_comm, qp, credit_req_w)
 
         # The role targeting this rank observes exactly eight EOS values; each
         # one covers a local source rank and its aligned remote source rank.
@@ -2259,7 +2203,7 @@ def _compile_stage1(
                 # Fan ticket 8+local_rank runs phase 1 after its fan1 work; see fanout.
                 # Phase 2 permutation/sortcopy reads local padding and must follow phase 1.
                 if tx == fx.Int32(0):
-                    (comm.spin_until_ge_i64_sleep_rx)(
+                    comm.spin_until_ge_i64_sleep_rx(
                         local_addr("h1_local_eos"), generation, 127
                     )
                 _cta_acquire()
@@ -2278,7 +2222,6 @@ def _compile_stage1(
                 _seal_pad_par(0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # Sealer subphases reuse T0 slots 5..7. Rank 0's sealer is T0, so omit ranks 0/8 in analysis.
             finish_scratch = fx.recast_iter(fx.Int32, lds_raw)
             if tx == fx.Int32(0):
                 tiles = buffer_ops.buffer_load(
@@ -2299,12 +2242,10 @@ def _compile_stage1(
             # rather than running a scan: the counts are one cache line
             # deep and this costs no LDS and no extra barrier.
             if const_expr(split_local):
-                _seal_perm((0, LOCAL_EXPERTS), (), tiles, False)
+                _seal_perm((0, LOCAL_EXPERTS), tiles)
                 _rq_seal_tails(LOCAL_EXPERTS)
             else:
-                _seal_perm((0,), (), tiles, False, par=True)
-            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            gpu.barrier()
+                _seal_perm((0,), tiles, par=True)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
@@ -2322,9 +2263,9 @@ def _compile_stage1(
                     ),
                     fx.Int32(0),
                 )
-                (comm.publish_uncached if L1S else comm.fence_system_release)()
+                _release_fence()
                 # The fence already published prior writes; a release store would write back L2 again.
-                (comm.store_i64_global_system_relaxed)(
+                comm.store_i64_global_system_relaxed(
                     local_addr("h1_queue_eos"), generation
                 )
 
@@ -2348,7 +2289,7 @@ def _compile_stage1(
                 wave,
                 fx.Int32(layout.input_capacity),
                 BM=GBM,
-                BN=GBN,
+                BN=BN,
                 BK=BK,
                 K=HIDDEN,
                 N_OUT=2 * INTER,
@@ -2396,65 +2337,8 @@ def _compile_stage1(
         for _xt in _XC:
             is_compute = is_compute | (ticket == fx.Int32(_xt))
         if is_compute:
-            if const_expr(not split_local):  # noqa: SIM102
-                # Without split, expert_count is final once all source fan CTAs finish P2.
-                # Consumer 0 adds missing rows to each tail group's arrival count, including
-                # the fully padded static_g0 group for zero-row experts. Padding and real
-                # arrivals update the same word; the atomic reaching GROUP_ROWS enqueues it.
-                # The sealer later fills tile_row_* tails. GMM1 uses bounds-checked tile_row_input;
-                # Stage2 discards padded h1 values through INVALID_SOURCE and zero weights.
-                if ticket == fx.Int32(COMPUTE_FIRST):
-                    if tx == fx.Int32(0):
-                        pd_rf = fx.Int32(
-                            _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
-                        )
-                        while pd_rf < fx.Int32(GPUS_PER_NODE):
-                            _mlir_rocdl.s_sleep(127)
-                            pd_rf = fx.Int32(
-                                _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
-                            )
-                    _cta_acquire()
-                    for pd_e in range(tx, fx.Int32(LOCAL_EXPERTS), fx.Int32(THREADS)):
-                        pd_c = buffer_ops.buffer_load(
-                            buffer_ops.create_buffer_resource_from_addr(
-                                local_addr("expert_count")
-                            ),
-                            pd_e,
-                            vec_width=1,
-                            dtype=T.i32,
-                        )
-                        pd_k = pd_c // fx.Int32(GROUP_ROWS)
-                        pd_r = pd_c - pd_k * fx.Int32(GROUP_ROWS)
-                        if (pd_r != fx.Int32(0)) | (pd_c == fx.Int32(0)):
-                            pd_ph = pd_e * fx.Int32(G)
-                            if pd_k != fx.Int32(0):
-                                pd_mi = pd_e * fx.Int32(
-                                    max_tiles_per_expert
-                                ) + pd_k * fx.Int32(G)
-                                _spin(
-                                    local_addr("expert_tile_map_ready")
-                                    + fx.Int64(pd_mi) * fx.Int64(8),
-                                    generation,
-                                )
-                                comm.fence_system_acquire()
-                                pd_ph = buffer_ops.buffer_load(
-                                    buffer_ops.create_buffer_resource_from_addr(
-                                        local_addr("expert_tile_map")
-                                    ),
-                                    pd_mi,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            pd_add = fx.Int32(GROUP_ROWS) - pd_r
-                            pd_old = fx.Int32(
-                                comm.atomic_add_system(
-                                    local_addr("tile_row_done")
-                                    + fx.Int64(pd_ph) * fx.Int64(4),
-                                    pd_add,
-                                )
-                            )
-                            if pd_old + pd_add == fx.Int32(GROUP_ROWS):
-                                _rq_push(None, pd_ph // fx.Int32(G))
+            if const_expr(not split_local):
+                _rq_pad_tails()
             # Claim job j and queue entry q=j//GNB. Wait for its generation marker, or
             # exit once global sealing confirms q exceeds the total groups. The mailbox
             # follows GMM1 LDS without overlapping the A ring.
@@ -2500,7 +2384,7 @@ def _compile_stage1(
                     # payload/metadata acquire remains below before GMM1.
                     rq_in = rq_st == fx.Int32(1)
                     if rq_st == fx.Int32(3):
-                        (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
+                        _acquire_fence()
                         rq_tot = fx.Int32(_pl32(local_addr("tile_alloc"))) // fx.Int32(
                             G
                         )
@@ -2514,7 +2398,7 @@ def _compile_stage1(
                         _mlir_rocdl.s_sleep(16)
                         rq_v = _rq_entry(rq_ea, rq_valid)
                         rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
-                    (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
+                    _acquire_fence()
                     fx.ptr_store(
                         Vec.from_elements(
                             [
@@ -2550,7 +2434,7 @@ def _compile_stage1(
                         local_addr("h1_queue_eos"), generation, 127
                     )
                 else:
-                    (comm.spin_until_ge_i64_sleep_rx)(
+                    comm.spin_until_ge_i64_sleep_rx(
                         local_addr("h1_queue_eos"), generation, 127
                     )
             if const_expr(gen_lds):
@@ -2647,7 +2531,6 @@ def _compile_stage1(
     launch_stage1.body = s1_body
     launch_stage1.lds_bytes = int(lds_alloc_bytes)
     launch_stage1.threads = THREADS
-    launch_stage1.waves = WAVES
     launch_stage1.grid = int(worker_blocks)
     # Single fused kernel: where GEMM2 finds the tables-final gate and the
     # per-group h1 completion words (window byte offsets, parity-0 + plane).
@@ -2662,7 +2545,6 @@ def _compile_stage1(
         if group_ready
         else None
     )
-    launch_stage1.epoch_off = int(off("epoch_gate"))
     launch_stage1.xcd_inv_off = int(off("xcd_l2_inv"))
     launch_stage1.buffer_regions = buffer_regions
     launch_stage1.group_sync_tail = 4 * GR_N

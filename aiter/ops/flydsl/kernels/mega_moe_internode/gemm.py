@@ -14,23 +14,27 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
+from flydsl.expr.typing import Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
-    batched_silu_swiglu,
     batched_situv2,
     fclamp_f32,
     fmin_f32,
     situv2_consts,
 )
-from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 
 from .. import buffer_ops
+from ..kernels_common import LOG2E
+from ..mega_moe.gemm2 import mma_one_j, scale_mma_atoms, scale_view
 from ..mxfp4_gemm_common import (
     _buffer_rsrc,
     _fabs_f32,
+    _global_i32_at,
+    _global_i32_buffer_tiles,
+    _global_scalar_tiles,
     _inline_dpp_quad_amax,
+    _layout_idx,
     _lds_ptr3,
     _lds_swizzle_mask,
     _raw,
@@ -40,6 +44,7 @@ from ..mxfp4_gemm_common import (
     k_half_for,
     k_tiles_total_for,
     kas_per_chunk_dw_for,
+    kbs_c_n1_for,
     kBS_stride_k0_dw,
     kmchunks_for,
     kStages,
@@ -51,36 +56,7 @@ from ..mxfp4_gemm_common import (
     num_n_blocks_for,
 )
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
-from .common import (
-    _e8m0_from_amax,
-    bscale_bytes_for,
-    kbs_per_expert_dw_for,
-    kbs_stride_n0_dw_for,
-)
-
-
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
-def _global_i32_at(addr_i64, idx):
-    # fx.ptr_load/add_offset for a plain scalar read -- no tiling needed, so
-    # skip the Tensor/tile/register-fragment machinery fx.copy requires.
-    return _global_i32_ptr(addr_i64)[idx]
-
-
-def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
-    ptr_ty = fx.PointerType.get(
-        numeric_cls.ir_type,
-        address_space=fx.AddressSpace.Global,
-        alignment=numeric_cls.width // 8,
-    )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    flat = fx.make_view(ptr, fx.make_layout(num_elems, 1))
-    return fx.logical_divide(flat, fx.make_layout(1, 1))
+from .common import _e8m0_from_amax
 
 
 def _scalar_store(tiles, idx, value, numeric_cls):
@@ -89,15 +65,6 @@ def _scalar_store(tiles, idx, value, numeric_cls):
     r = fx.make_rmem_tensor(reg_lay, numeric_cls)
     r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
     fx.copy(atom, r, fx.slice(tiles, (None, idx)))
-
-
-def _layout_idx(layout, *coords):
-    idx_coords = [fx.Int64(c) for c in coords]
-    flat = crd2idx(idx_coords, layout)
-    return fx.Int32(flat)
-
-
-LOG2E = 1.4426950408889634
 
 
 def _silu_mul_batch(gs, us):
@@ -118,8 +85,9 @@ def _gate_up_batch(
     """Compile-time activation epilogue for the fused A4W4 port.
 
     Keep the original SiLU implementation as the default fast path so existing
-    code objects remain bitwise stable.  SwiGLU and SiTUv2 reuse the same
-    batched transcendental helpers as AITER's generic mixed-MoE kernel.
+    code objects remain bitwise stable.  SiTUv2 reuses the batched
+    transcendental helpers of AITER's generic mixed-MoE kernel.  The host
+    accepts only ``silu`` and ``situv2``.
     """
 
     if act == "silu" and swiglu_limit is None:
@@ -135,26 +103,14 @@ def _gate_up_batch(
             [fmin_f32(g, hi) for g in gs], [fclamp_f32(u, lo, hi) for u in us]
         )
 
-    pairs = list(zip(gs, us))
-    if act in ("silu", "swiglu"):
-        limit = (
-            7.0
-            if act == "swiglu" and swiglu_limit is None
-            else float("inf") if swiglu_limit is None else float(swiglu_limit)
-        )
-        return batched_silu_swiglu(
-            pairs,
-            swiglu=act == "swiglu",
-            limit_f32=fx.Float32(limit),
-            neg_limit_f32=fx.Float32(-limit),
-            range_constexpr=range_constexpr,
-        )
     if act == "situv2":
         consts = situv2_consts(
             fx.Float32(float(situ_beta)),
             fx.Float32(float(situ_linear_beta)),
         )
-        return batched_situv2(pairs, consts=consts, range_constexpr=range_constexpr)
+        return batched_situv2(
+            list(zip(gs, us)), consts=consts, range_constexpr=range_constexpr
+        )
     raise ValueError(f"unsupported A4W4 GMM1 activation {act!r}")
 
 
@@ -205,10 +161,12 @@ def _gemm1_body_m16(
     A_ROW_BYTES = K if is_f8_a else K_HALF
     K_TILES_TOTAL = k_tiles_total_for(K, BK)
     kAS_per_chunk_dw = kas_per_chunk_dw_for(K)
-    kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)
-    kBS_per_expert_dw = kbs_per_expert_dw_for(N_OUT, K)
+    # B scales pad their K groups to eight like A scales (shuffle_scale_a16w4 /
+    # e8m0_shuffle); mxfp4_gemm_common's kbs_* truncate instead.
+    kBS_stride_n0_dw = kAS_per_chunk_dw
+    kBS_per_expert_dw = kbs_c_n1_for(N_OUT) * kBS_stride_n0_dw
     BQ_BYTES = bq_bytes_for(NE, N_OUT, K)
-    BSCALE_BYTES = bscale_bytes_for(NE, N_OUT, K)
+    BSCALE_BYTES = NE * kBS_per_expert_dw * 4
     NUM_N_BLOCKS = num_n_blocks_for(N_OUT, BN)
     inter = N_OUT // 2
     OUT_AS_PER_CHUNK_DW = kas_per_chunk_dw_for(inter)
@@ -255,25 +213,6 @@ def _gemm1_body_m16(
 
     # fx.copy's BufferCopy/BufferCopyLDS atoms take soffset as an element count,
     # not the bytes buffer_ops.buffer_load's soffset_bytes expects.
-    def _global_i32_buffer_view(addr_i64, num_bytes):
-        # make_layout's dynamic-shape leaf must be i32/i64, not fx.Index.
-        num_bytes_i64 = fx.Int64(num_bytes)
-        ptr_ty = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-        view = fx.Tensor(
-            fx.make_view(ptr, fx.make_layout(num_bytes_i64 // fx.Int64(4), 1))
-        )
-        return fx.rocdl.make_buffer_tensor(
-            view, max_size=False, num_records_bytes=num_bytes_i64
-        )
-
-    def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-        return fx.logical_divide(
-            _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-        )
-
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
     bq_reg_lay = fx.make_layout(4, 1)
@@ -1180,69 +1119,6 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
-def scale_view(
-    arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
-):
-    """View one e8m0 scale word, optionally bounded to the real buffer extent."""
-    base_dw = rocdl.readfirstlane(T.i32, base_dw)
-    i32_ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    off_i64 = fx.Int64(base_dw)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * 4)
-    shape = (4, 16, K_TILES_TOTAL, 1)
-    stride = (16, 1, k0_stride_dw, 1)
-    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, stride)))
-    if num_records_bytes is not None:
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
-    return fx.rocdl.make_buffer_tensor(view, max_size=False)
-
-
-def scale_mma_atoms(a_dtype="fp4"):
-    """Scaled-MFMA atoms for FP4 or FP8 activation and FP4 weights."""
-    elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
-    return {
-        (osa, osb): fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb
-            )
-        )
-        for osa in range(4)
-        for osb in range(4)
-    }
-
-
-def mma_one_j(
-    J,
-    in_b,
-    sa,
-    sb,
-    bq_frags_kt,
-    a_frags,
-    c_frags,
-    atoms,
-    i0=0,
-    k_halves=2,
-):
-    """Run one scaled-MFMA cluster over a 32-row A-scale group."""
-    steps = tuple(
-        (2 * k + im, k, i0 + im, bq_frags_kt[J][k])
-        for k in range(k_halves)
-        for im in range(2)
-    )
-    for osa, k, i, bJ in steps:
-        osb = 2 * k + in_b
-        fx.gemm(
-            atoms[(osa, osb)],
-            c_frags[i][J],
-            a_frags[i][k],
-            bJ,
-            c_frags[i][J],
-            scale_a=sa,
-            scale_b=sb,
-        )
-
-
 def issue_a_load_lds_dt(
     arg_aq,
     s_aq_base,
@@ -1334,7 +1210,7 @@ def gemm2_compute_v2(
     The 8-wave CTA runs two n_blocks of one m_block side by side (waves
     0-3 the n_block of ``bx_i32``, waves 4-7 the next one, which the caller
     folds into ``bx_i32`` per wave); the A tile in LDS is shared, so all 8
-    waves split its DMA (only waves 0-3 at BM 32, 8 rows per wave minimum).
+    waves split its DMA.
     """
     assert aStages == kStages + 1
     assert BK == 256, "one 256-K E8M0 scale word per K-tile"
@@ -1343,7 +1219,9 @@ def gemm2_compute_v2(
     wave_c = wave % fx.Int32(4)  # column slice within the n_block
     is_f8_a = a_dtype == "fp8"
     stream_a = is_f8_a and BM == 128
-    A_NW = min(NW, BM // (4 if is_f8_a else 8))
+    # Stage2 runs this core only at BM 128 (smaller GEMM2 tiles use gemm2_pipe),
+    # where every wave of the 8-wave CTA takes a share of the A LDS DMA.
+    assert BM // (4 if is_f8_a else 8) >= NW, "A LDS DMA needs BM / rows-per-call >= NW"
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
@@ -1391,37 +1269,20 @@ def gemm2_compute_v2(
     ]
 
     def issue_a_load_lds(slot, kt):
-        if const_expr(A_NW < NW):
-            if wave < fx.Int32(A_NW):
-                issue_a_load_lds_dt(
-                    arg_aq,
-                    s_aq_base,
-                    slot,
-                    kt,
-                    a_row,
-                    wave,
-                    lane,
-                    KH_TILE_A,
-                    K_BYTES,
-                    BM=BM,
-                    NW=A_NW,
-                    a_dtype=a_dtype,
-                )
-        else:
-            issue_a_load_lds_dt(
-                arg_aq,
-                s_aq_base,
-                slot,
-                kt,
-                a_row,
-                wave,
-                lane,
-                KH_TILE_A,
-                K_BYTES,
-                BM=BM,
-                NW=NW,
-                a_dtype=a_dtype,
-            )
+        issue_a_load_lds_dt(
+            arg_aq,
+            s_aq_base,
+            slot,
+            kt,
+            a_row,
+            wave,
+            lane,
+            KH_TILE_A,
+            K_BYTES,
+            BM=BM,
+            NW=NW,
+            a_dtype=a_dtype,
+        )
 
     def issue_a_ds_read(slot, first_m=0, count_m=kMChunks):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
@@ -1621,7 +1482,6 @@ def gemm2_compute_v2(
     ]
     nxt_bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(nPairs)]
     # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
-    cur_saf = nxt_saf = None
     cur_saf = [
         fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(kScaleSubBlocks)
     ]
