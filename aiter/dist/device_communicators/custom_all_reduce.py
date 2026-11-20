@@ -254,9 +254,9 @@ _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 # kernels, MI455X, bf16 in a CUDA graph, us an all-reduce:
 # - TP2, one tray: the one-shot is level with RCCL at 4.19 MB (16.0 vs 15.3);
 #   past 4 MiB the pull takes 26.6 at 4.59 MB, RCCL 21.9.
-# - TP4, one tray: the two-shot leads at 4.59 MB (22.2 vs 24.1), RCCL from
-#   5.73 MB (25.8 vs 26.2).
-# - TP8, two trays: the two-shot leads up to 8.39 MB (39.2 vs 43.7); past
+# - TP4, one tray: RCCL overtook the LL two-shot that ar_2s_lamport_gfx1250
+#   replaced from 5.73 MB (25.8 vs 26.2).
+# - TP8, two trays: the two-shot leads up to 8.26 MB (25.9 vs 42.8); past
 #   8 MiB the pull takes 405 at 14.68 MB, RCCL 55.
 # It never exceeds what the LL kernels take (ll_ar_max_bytes). Other world
 # sizes, and the fused AR + RMSNorm paths, keep _car_max_size. It does not cap
@@ -1547,6 +1547,11 @@ class CustomAllreduce:
             self._init_gfx1250(rank, world_size, self.max_size)
         else:
             self._init_ipc(rank, world_size, self.max_size)
+        # init_custom_ar fills this rank's gfx1250 two-shot inbox (in the meta
+        # buffer) with its sentinel; every rank's fill must land before any
+        # rank's first push, or the push is wiped and its receiver waits forever.
+        if self._is_gfx1250:
+            dist.barrier(group=self.group)
 
         self._fly_oneshot = None
         self._fly_window = None
@@ -1979,13 +1984,12 @@ class CustomAllreduce:
         # old arch: meta_size() + 2x tmp region (2-stage kernel) is GB-scale, so
         # it lands in the first regime and exports fine despite meta_size()=5504
         # (not a page multiple).
-        # gfx1250: meta_size_gfx1250(world_size) = Signal (~34 KB) + LL staging
-        # scratch (2 banks x world_size slots: 32 MiB at TP=2, 128 MiB at
-        # TP=8, see kLLScratchOffset/llScratchBytes). Even the smallest is well
-        # above 2 MB, so it lands in the always-safe coarse-grained regime; the
-        # round-up to a 2 MB multiple below is a no-op guard that also keeps the
-        # allocation 2 MB-aligned. The kernel touches the leading Signal struct
-        # (sync flags) plus the trailing scratch region (LL fast path).
+        # gfx1250: meta_size_gfx1250(world_size) is the layout described at
+        # kLLScratchOffset in custom_all_reduce_gfx1250.cuh: the Signal struct,
+        # then the LL scratch, the AR + RMSNorm shard and the two-shot's inbox.
+        # It is tens of MiB at every world size IPC serves, so it lands in the
+        # always-safe coarse-grained regime; the round-up to a 2 MB multiple
+        # below is a no-op guard that also keeps the allocation 2 MB-aligned.
         _COARSE_GRAIN = 2 * 1024 * 1024
         if self._is_gfx1250:
             meta_size = (

@@ -7,7 +7,8 @@ Each rank all-reduces its [m, n] tensor. Candidates:
   prod           tensor_model_parallel_all_reduce, the route production takes:
                  the Lamport one-shot / two-shot for fp16/bf16 up to tp x the
                  Lamport cap, else up to the plain all-reduce cutoff the LL
-                 one-shot, LL two-shot or barrier kernel, else RCCL
+                 one-shot, the meta-buffer two-shot or the barrier kernel,
+                 else RCCL
   lamport_1shot  CustomAllreduce.lamport_all_reduce: every rank pushes its whole
                  input to every peer (lamport_ar_1shot_gfx1250)
   lamport_2shot  CustomAllreduce.lamport_all_reduce(two_shot=True): a pushed
@@ -16,9 +17,10 @@ Each rank all-reduces its [m, n] tensor. Candidates:
   car            CustomAllreduce.custom_all_reduce with the Lamport cap at 0, the
                  custom kernels without Lamport, called directly (so past the
                  plain all-reduce cutoff too): the LL one-shot, at TP4/TP8 the
-                 LL two-shot from 1 MiB (TP8 512 KiB) to 8 MiB, the barrier
-                 kernel above (registered input in a graph); "car route" is the
-                 kernel it launched
+                 two-shot (ar_2s_lamport_gfx1250) from 1 MiB (TP8 512 KiB) to
+                 8 MiB in whole 16-byte packs a chunk, the barrier kernel above
+                 (registered input in a graph); "car route" is the kernel it
+                 launched
   rccl           dist.all_reduce, in place on its own buffer
 
 Without Lamport, prod is car up to the plain all-reduce cutoff and rccl above.
@@ -87,9 +89,9 @@ GRAPH_AR = [(48, 7168, True), (7, 1000, False), (288, 5120, True), (1, 8, True)]
 # restated from custom_all_reduce.py / custom_all_reduce_gfx1250.cuh
 LAMPORT_1SHOT_MAX_BYTES = {2: 9 << 20, 4: 1280 << 10}
 LL_AR_MAX_BYTES = 4 << 20
-# the LL two-shot's size range (ar2sMinBytes, ar2sMaxBytes), TP4/TP8 only
-LL2S_MIN_BYTES = {4: 1 << 20, 8: 512 << 10}
-LL2S_MAX_BYTES = 8 << 20
+# ar_2s_lamport_gfx1250's size range (ar2sMinBytes, ar2sMaxBytes), TP4/TP8 only
+AR2S_MIN_BYTES = {4: 1 << 20, 8: 512 << 10}
+AR2S_MAX_BYTES = 8 << 20
 
 
 def parse_size(s):
@@ -113,8 +115,8 @@ def lamport_off(ca):
 def expect_route(x, tp, cap, car_max, plain_max):
     """The all-reduce kernel the routing rules give, restated from where they
     live: CudaCommunicator.all_reduce, should_custom_plain_ar,
-    select_lamport_ar, then the C++ allreduce (the LL two-shot in its range,
-    the LL one-shot up to 4 MiB, else the barrier kernel)."""
+    select_lamport_ar, then the C++ allreduce (ar_2s_lamport_gfx1250 in its
+    range, the LL one-shot up to 4 MiB, else the barrier kernel)."""
     nbytes = x.numel() * x.element_size()
     if nbytes % 16 != 0 or nbytes > car_max:
         return "rccl"
@@ -133,10 +135,10 @@ def expect_route(x, tp, cap, car_max, plain_max):
 def car_route(nbytes, tp):
     """The kernel the C++ allreduce picks without Lamport."""
     if (
-        LL2S_MIN_BYTES.get(tp, LL2S_MAX_BYTES + 1) <= nbytes <= LL2S_MAX_BYTES
-        and nbytes % (8 * tp) == 0
+        AR2S_MIN_BYTES.get(tp, AR2S_MAX_BYTES + 1) <= nbytes <= AR2S_MAX_BYTES
+        and nbytes % (16 * tp) == 0
     ):
-        return "ll2s"
+        return "ar2s"
     return "ll" if nbytes <= LL_AR_MAX_BYTES else "barrier"
 
 
@@ -155,8 +157,8 @@ def launched(fn):
         name = e.name
         if m := re.search(r"lamport_ar_(1shot|2shot)_gfx1250", name):
             k = m.group(1)
-        elif "ar_2s_ll_gfx1250" in name:
-            k = "ll2s"
+        elif "ar_2s_lamport_gfx1250" in name:
+            k = "ar2s"
         elif "ar_ll_gfx1250" in name:
             k = "ll"
         elif "ar_gfx1250_naive" in name:
