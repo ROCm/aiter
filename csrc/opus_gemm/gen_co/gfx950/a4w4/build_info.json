@@ -1,0 +1,407 @@
+{
+  "arch": "gfx950",
+  "common_flags": [
+    "--cuda-device-only",
+    "-D__HIPCC_RTC__",
+    "-O3",
+    "-std=c++17",
+    "-cuid=<symbol>"
+  ],
+  "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
+  "hip_clang_path": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
+  "kernels": [
+    {
+      "co_sha256": "5d5590ce704007475e83dbfa9e31f6616924d5e6b43fb0b892e9dbff311b41cb",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 128,
+      "kid": 100,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 19,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256",
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "traits_args": "256, 256, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "b28d6a6e51142e5b5b4a09a342757dddf459f15ad050a9b22ba1b975d588926d",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 129024,
+      "kernarg_segment_size": 128,
+      "kid": 101,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 19,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x128x256",
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "traits_args": "256, 128, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "e4b44ad8850204576c8f9f44a14759ff9320f48f67d910232bad819c3b9a7ba3",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 129024,
+      "kernarg_segment_size": 128,
+      "kid": 102,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 18,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x256x256",
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "traits_args": "128, 256, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "4d0a4aedf2eb360e087c011147faa3e72901321a3967bc615c76a88c4f51b1df",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 94208,
+      "kernarg_segment_size": 128,
+      "kid": 103,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 16,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x128x256",
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "traits_args": "128, 128, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "1c4411c019a0e835a9d5875f1d14a9186a991b079d0e0157435fb130ad550a72",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 146432,
+      "kernarg_segment_size": 128,
+      "kid": 104,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 21,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_192x256x256",
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "traits_args": "192, 256, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "01ee9ad613c1f57adf9449c89a17151fb865275f5e9e342896a9a3a7c712c77d",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 146432,
+      "kernarg_segment_size": 128,
+      "kid": 105,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 21,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x192x256",
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "traits_args": "256, 192, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "c3622e7050d1b547bdcad5128e907d30ae4febfcfa0ae42539fdf33fa95a1715",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 128,
+      "kid": 110,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 14,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256_np",
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "traits_args": "256, 256, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f1dfd2209cf1b304c9a6c4930b1042d98db3b89939576d5d9e383013cb34760e",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 129024,
+      "kernarg_segment_size": 128,
+      "kid": 111,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 15,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x128x256_np",
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "traits_args": "256, 128, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "edea3f0d8bceb05838d6a38f240a39b9b0d9965fdc67405981f8c3c67a82d261",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 129024,
+      "kernarg_segment_size": 128,
+      "kid": 112,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 13,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x256x256_np",
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "traits_args": "128, 256, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "cbd4cb9e97fd98188f6a4c5cf0ff15764afb1a36d2ec5e03664cd816cd0d2d7e",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 94208,
+      "kernarg_segment_size": 128,
+      "kid": 113,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 11,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x128x256_np",
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "traits_args": "128, 128, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "50b2cd1294ee2492043d2a13476824d761c8300afc4a98c024a644171904eb75",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 146432,
+      "kernarg_segment_size": 128,
+      "kid": 114,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 13,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_192x256x256_np",
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "traits_args": "192, 256, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "8f59063e3a1ac6946f2d37259f68092bc1bfa00cb1ec1b6dbd275ed53e43252f",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 146432,
+      "kernarg_segment_size": 128,
+      "kid": 115,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 14,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x192x256_np",
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "traits_args": "256, 192, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "71a1bea0f4732f82f64ebd611a1d947b697e0f671219f5d920966e0d5a5e9620",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 128,
+      "kid": 130,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 19,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256_nob",
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "traits_args": "256, 256, 0, false",
+      "undefined_symbols": [],
+      "variant": "nob",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    }
+  ],
+  "offload_arch": "gfx950",
+  "opus_include": "/root/workspace/aiter-fyz-opus-mxfp4-ns-upstream/csrc/include",
+  "target_profile": "regular"
+}
