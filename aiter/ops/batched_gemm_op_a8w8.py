@@ -238,9 +238,10 @@ def _get_mxscale_bmm_launch_plan(
     w_scale_block: str = "128x128",
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ) -> tuple[int, int]:
     return _resolve_a8w8_mxscale_bmm_plan(
-        g, m, n, k, w_scale_block=w_scale_block, gfx=gfx, cu_num=cu_num
+        g, m, n, k, w_scale_block=w_scale_block, gfx=gfx, cu_num=cu_num, device=device
     )
 
 
@@ -260,8 +261,11 @@ def _batched_gemm_a8w8_mxscale_impl(
     w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
     from .opus._arch import _device_arch_and_cu
 
-    gfx, cu = _device_arch_and_cu(x.device)
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block, gfx, cu)
+    device = x.device
+    gfx, cu = _device_arch_and_cu(device)
+    kid, split_k = _get_mxscale_bmm_launch_plan(
+        g, m, n, k, w_scale_block, gfx, cu, device.index
+    )
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
@@ -382,6 +386,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
         bpreshuffle=True,
         gfx=gfx,
         cu_num=cu_num,
+        device=x.device.index,
     )
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
     kid = None
