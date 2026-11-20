@@ -717,7 +717,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192],
+    default=[13, 23, 512, 5200, 8192],
     help="""Context length (global KV length).
     e.g.: -c 13""",
 )
@@ -736,7 +736,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 4), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8), (96, 8), (64, 17)],
+    default=[(16, 4), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8)],
     help="""Number of heads, decode_qlen pairs.
     e.g.: -n 16,4""",
 )
@@ -767,7 +767,7 @@ parser.add_argument(
     "--cp_world_size",
     type=int,
     nargs="*",
-    default=[2, 3, 4, 7, 8],
+    default=[2, 4, 7],
     help="""cp world size (number of round-robin ranks).
     e.g.: -cpw 4""",
 )
