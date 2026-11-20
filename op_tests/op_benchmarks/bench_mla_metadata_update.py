@@ -13,6 +13,7 @@ import time
 import torch
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import decode_update_mla_metadata_v1
 from aiter.test_common import run_perftest
 from op_tests.test_mla_decode_update_metadata import (
@@ -80,7 +81,7 @@ def run_case(bs, length, iterations, legacy_only):
         host_us = (time.perf_counter() - started) * 1e6 / iterations
         torch.cuda.synchronize()
         print(
-            f"{aiter.get_gfx()} {bs=} {length=} bf16 qh16 {name}: "
+            f"{get_gfx_runtime()} {bs=} {length=} bf16 qh16 {name}: "
             f"device_us={device_us:.3f} host_enqueue_us={host_us:.3f}"
         )
 
