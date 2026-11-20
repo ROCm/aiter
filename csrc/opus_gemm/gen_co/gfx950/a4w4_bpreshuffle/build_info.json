@@ -28,6 +28,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 25,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256",
       "tile": [
         256,
@@ -58,6 +59,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 26,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256",
       "tile": [
         256,
@@ -88,6 +90,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 23,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256",
       "tile": [
         128,
@@ -118,6 +121,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 23,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256",
       "tile": [
         128,
@@ -148,6 +152,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 26,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256",
       "tile": [
         192,
@@ -178,6 +183,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 26,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256",
       "tile": [
         256,
@@ -208,6 +214,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 16,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256_np",
       "tile": [
         256,
@@ -238,6 +245,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 17,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256_np",
       "tile": [
         256,
@@ -268,6 +276,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 12,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256_np",
       "tile": [
         128,
@@ -298,6 +307,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 10,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256_np",
       "tile": [
         128,
@@ -328,6 +338,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 12,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256_np",
       "tile": [
         192,
@@ -358,6 +369,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 18,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256_np",
       "tile": [
         256,
@@ -388,6 +400,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 44,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256_sk",
       "tile": [
         256,
@@ -418,6 +431,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 36,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256_sk",
       "tile": [
         128,
@@ -448,6 +462,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 39,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256_sk",
       "tile": [
         128,
@@ -478,6 +493,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 38,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256_sk",
       "tile": [
         192,
@@ -508,6 +524,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 47,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256_sk",
       "tile": [
         256,
@@ -538,6 +555,7 @@
       "offload_arch": "gfx950",
       "sgpr_count": 106,
       "sgpr_spill_count": 28,
+      "status": "ready",
       "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256_nob",
       "tile": [
         256,

@@ -209,12 +209,38 @@ def test_gfx1250_plain_ar_gate():
     assert ca.should_custom_plain_ar(u8(64 * MiB))
 
 
-def _stub(gfx1250=True, ws=4, min_size=0, **env):
-    """A CustomAllreduce with only what the size gates read."""
+def test_gfx1250_plain_ar_gate_lamport():
+    # Above the plain all-reduce cutoff, fp16/bf16 inputs the Lamport
+    # all-reduce takes (up to world_size x its cap) stay on the custom path;
+    # everything else still goes to RCCL there.
+    def bf16(n):
+        return torch.empty(n // 2, dtype=torch.bfloat16)
+
+    for ws, cap in ((2, 16 * MiB), (4, 8 * MiB)):
+        ca = _stub(ws=ws, lamport_max_bytes=cap)
+        cut = ca._plain_ar_max_size
+        assert ca.should_custom_plain_ar(bf16(cut + 16)), ws
+        assert ca.should_custom_plain_ar(bf16(ws * cap)), ws
+        assert ca.should_custom_plain_ar(torch.empty(cut // 2 + 8, dtype=torch.half))
+        assert not ca.should_custom_plain_ar(bf16(ws * cap + 16)), ws
+        assert not ca.should_custom_plain_ar(torch.empty(cut // 4 + 4)), ws  # fp32
+        assert not ca.should_custom_plain_ar(bf16(2 * cut + 32)[::2]), ws  # strided
+        # The Lamport cap at 0 (AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE=0) turns it off
+        assert not _stub(ws=ws).should_custom_plain_ar(bf16(cut + 16)), ws
+    # AITER_CUSTOM_AR_MAX_SIZE still bounds it.
+    ca = _stub(ws=4, lamport_max_bytes=8 * MiB, AR_MAX=6 * MiB)
+    assert ca.should_custom_plain_ar(bf16(6 * MiB))
+    assert not ca.should_custom_plain_ar(bf16(6 * MiB + 16))
+
+
+def _stub(gfx1250=True, ws=4, min_size=0, lamport_max_bytes=0, **env):
+    """A CustomAllreduce with only what the size gates read; the Lamport inbox
+    off unless lamport_max_bytes sets its cap."""
     ca = CustomAllreduce.__new__(CustomAllreduce)
     s = resolve(gfx1250, ws=ws, **env)
     ca.disabled = False
     ca._is_gfx1250 = gfx1250
+    ca._lamport_max_bytes = lamport_max_bytes
     ca.world_size = ws
     ca.fully_connected = True
     ca.max_size = s.pool
