@@ -99,9 +99,15 @@ TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 # A table without it, or an empty cell, means 1 (consecutive rows).
 TUNED_BLOCK_ROWS_COLUMN = "block_r"
 # Optional gfx1250 result columns: the K loop's software pipeline, K tile
-# width and kH x kW patch reuse. A table without them, or an empty cell, leaves
-# the runtime default.
-TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll", "tile_k", "patch")
+# width, kH x kW patch reuse and the WMMA loop's fragment-load order. A table
+# without them, or an empty cell, leaves the runtime default.
+TUNED_PIPELINE_COLUMNS = (
+    "num_buffers",
+    "main_loop_unroll",
+    "tile_k",
+    "patch",
+    "b_prefetch",
+)
 _TUNED_INT_PIPELINE_COLUMNS = ("num_buffers", "tile_k")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.

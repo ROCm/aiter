@@ -8,7 +8,8 @@ Host pre-pads so the kernel always sees zeros padding. Input is NDHWC with
 C/groups aligned to 32. Dispatch lives in ``conv3d_gfx1250.py``.
 
 The software pipeline matches ``compile_gemm_a16w16`` (prologue / scf.for main
-loop / drain, bandwidth_bound or compute_bound fragment prefetch). Supports
+loop / drain, bandwidth_bound or compute_bound fragment prefetch;
+``b_prefetch`` reorders bandwidth_bound's fragment loads). Supports
 BIG_OUT (64-bit stores), split-K (fp32 atomic staging), and dyn_hw (runtime
 extents via magic reciprocal divisors).
 
@@ -64,6 +65,9 @@ from .conv3d_gfx1250_utils import (
 
 _SCHED_ALLOW_SALU = 1 << 2
 _TDMS_PER_TILE = 2  # A + B
+# b_prefetch: WMMA groups between the last read of an A fragment register and
+# the load that refills it with the next tile's fragment.
+A_ROT_LAG = 2
 
 
 class Conv3dImplicitParam1250(NamedTuple):
@@ -94,6 +98,7 @@ class Conv3dImplicitParam1250(NamedTuple):
     main_loop_unroll: bool
     tile_k: int
     patch: bool
+    b_prefetch: bool
 
 
 def make_conv3d_implicit_param_gfx1250(
@@ -124,6 +129,7 @@ def make_conv3d_implicit_param_gfx1250(
     main_loop_unroll=False,
     tile_k=TILE_K,
     patch=False,
+    b_prefetch=False,
     **_ignored,
 ):
     del _ignored  # e.g. legacy patch_reuse from older call sites
@@ -157,6 +163,7 @@ def make_conv3d_implicit_param_gfx1250(
         main_loop_unroll=bool(main_loop_unroll),
         tile_k=int(tile_k),
         patch=bool(patch),
+        b_prefetch=bool(b_prefetch) and variant == "bandwidth_bound",
     )
 
 
@@ -232,6 +239,7 @@ def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit):
         param.main_loop_unroll,
         param.tile_k,
         param.patch,
+        param.b_prefetch,
     )
     cgp = probe.c // probe.groups
     try:
@@ -382,6 +390,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
     variant = param.variant
     main_loop_unroll = param.main_loop_unroll
+    b_prefetch = param.b_prefetch
     # A lane's 8 accumulator columns are 8 consecutive NDHWC channels; with K and
     # the per-group K multiples of 8 they are 16-byte aligned and wholly in or
     # out of a channel tail, so they go out as one store (bias as two loads).
@@ -817,6 +826,53 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                         )
             return [t.load() for t in acc_ts], next_a, next_b
 
+        def wmma_tile_b_prefetch(accs_in, a_frags, b_frags, nxt_a_bases, a_off, b_off):
+            """WMMA one K tile (b_prefetch); returns the next tile's fragments too.
+
+            The next tile's B goes out before the first WMMA, into registers of
+            its own. Its A is rotated in place, A_ROT_LAG WMMA groups behind the
+            group that last read the register, so the load does not drain the
+            WMMAs still reading it (s_wait_alu depctr_va_vdst(0)).
+            """
+            next_b = [
+                load_wmma_frag(big_b_mem, None, b_off, ks, wn, b_bases, lds_k, elem_ty)
+                for ks in range_constexpr(k_wmma_steps)
+                for wn in range_constexpr(wmma_n_rep)
+            ]
+            rocdl.sched_barrier(0)
+            a_ts = [rmem_vec(f, 16, elem_ty) for f in a_frags]
+            b_ts = [rmem_vec(f, 16, elem_ty) for f in b_frags]
+            acc_ts = [rmem_vec(a, 8, fx.Float32) for a in accs_in]
+            next_a = [None] * N_A_FRAGS
+            pending = []
+
+            def load_a(ks, wm):
+                next_a[ks * wmma_m_rep + wm] = load_wmma_frag(
+                    big_a_mem, None, a_off, ks, wm, nxt_a_bases, lds_k, elem_ty
+                )
+
+            for ks in range_constexpr(k_wmma_steps):
+                for wm in range_constexpr(wmma_m_rep):
+                    a_f = a_ts[ks * wmma_m_rep + wm]
+                    for wn in range_constexpr(wmma_n_rep):
+                        idx = wm * wmma_n_rep + wn
+                        fx.gemm(
+                            wmma_atom,
+                            acc_ts[idx],
+                            b_ts[ks * wmma_n_rep + wn],
+                            a_f,
+                            acc_ts[idx],
+                        )
+                    pending.append((ks, wm))
+                    if const_expr(len(pending) > A_ROT_LAG):
+                        rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+                        load_a(*pending.pop(0))
+                        rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+            rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+            for ks, wm in pending:
+                load_a(ks, wm)
+            return [t.load() for t in acc_ts], next_a, next_b
+
         store_accs = _make_store_accs(
             y,
             bias,
@@ -859,6 +915,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             warp_m_base=warp_m_base,
             wave=wave,
             wmma_tile=wmma_tile,
+            wmma_tile_b_prefetch=wmma_tile_b_prefetch,
         )
 
     def _pack_state(accs_, a_, b_):
@@ -901,6 +958,15 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                     ca,
                     cb,
                     rotate=(p.a_bases, p.slot_a(next_buf_i32), p.slot_b(next_buf_i32)),
+                )
+            if const_expr(b_prefetch):
+                return p.wmma_tile_b_prefetch(
+                    accs_,
+                    ca,
+                    cb,
+                    p.a_bases,
+                    p.slot_a(next_buf_i32),
+                    p.slot_b(next_buf_i32),
                 )
             na = load_a_frags(next_buf_i32)
             nb = load_b_frags(next_buf_i32)
@@ -1088,6 +1154,10 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             if const_expr(variant == "compute_bound"):
                 return wmma_tile(
                     accs_, ca, cb, rotate=(pa_bases, a_off(ng, nt), p.slot_b(nbuf))
+                )
+            if const_expr(b_prefetch):
+                return p.wmma_tile_b_prefetch(
+                    accs_, ca, cb, pa_bases, a_off(ng, nt), p.slot_b(nbuf)
                 )
             na, nb = frags(ng, nt, nbuf)
             accs_, _, _ = wmma_tile(accs_, ca, cb)

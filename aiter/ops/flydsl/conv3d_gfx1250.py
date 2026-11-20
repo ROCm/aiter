@@ -17,6 +17,11 @@ import weakref
 import torch
 from flydsl.utils import env
 
+from aiter.ops.flydsl.kernels.conv.conv3d_fold_gfx1250 import (
+    compile_fold_hw_gfx1250,
+    fold_extent_gfx1250,
+    fold_fits_gfx1250,
+)
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import _as_stream
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
     BF16_BYTES,
@@ -73,10 +78,13 @@ def _shape_ncdhw(x, ndhwc):
     return n, c, d, h, w
 
 
-def _to_ndhwc(x, in_ndhwc):
+def _to_ndhwc(x, in_ndhwc, stream=None):
     if in_ndhwc:
         return x.contiguous()
-    return x.permute(0, 2, 3, 4, 1).contiguous()
+    # Tiled FlyDSL transpose; it falls back to torch where C % 8 != 0.
+    from aiter.ops.flydsl.conv_kernels import _ncdhw_to_ndhwc
+
+    return _ncdhw_to_ndhwc(x, stream)
 
 
 def _host_pad_ndhwc(x_ndhwc, pad_lo, pad_hi, mode):
@@ -103,6 +111,64 @@ def _pad_channels_ndhwc(x_ndhwc, groups, cgp):
     return x.reshape(n, d, h, w, groups * cgp).contiguous()
 
 
+def fold_hw_gfx1250(c, groups, kh, kw, sh, sw, dh, dw):
+    """True when the kH x kW window fits one padded channel tile (e.g. C=3 3x3).
+
+    The host then folds it into the channels -- channel (r * kW + s) * C + c of
+    output pixel (h, w) is input (h + r, w + s, c) -- and the kernel runs a
+    kT x 1 x 1 conv over CGP_ALIGN channels: K = kT * 32 instead of
+    kT * kH * kW * 32. It replaces the channel pad's copy with one of the same
+    size, and it needs unit H/W stride and dilation.
+    """
+    return (
+        groups == 1
+        and kh * kw > 1
+        and kh * kw * c <= CGP_ALIGN
+        and (sh, sw, dh, dw) == (1, 1, 1, 1)
+    )
+
+
+def _fold_hw_ndhwc(x_ndhwc, kh, kw):
+    """(N, D, H, W, C) zeros-padded -> (N, D, H-kH+1, W-kW+1, CGP_ALIGN)."""
+    n, d, h, w, c = x_ndhwc.shape
+    ho, wo = h - kh + 1, w - kw + 1
+    sn, sd, s_h, s_w, sc = x_ndhwc.stride()
+    window = x_ndhwc.as_strided(
+        (n, d, ho, wo, kh, kw, c), (sn, sd, s_h, s_w, s_h, s_w, sc)
+    )
+    out = x_ndhwc.new_empty((n, d, ho, wo, CGP_ALIGN))
+    used = kh * kw * c
+    out[..., :used].view(n, d, ho, wo, kh, kw, c).copy_(window)
+    out[..., used:].zero_()
+    return out
+
+
+def _fold_hw_ncdhw(x, kh, kw, ph, pw, stream):
+    """NCDHW -> zero-padded, folded NDHWC in one FlyDSL pass; None where it cannot run."""
+    n, c, d, h, w = x.shape
+    if not (
+        x.is_contiguous()
+        and x.dtype == torch.bfloat16
+        and fold_fits_gfx1250(n, c, d, h, w, kh, kw, ph, pw)
+    ):
+        return None
+    ho, wo = fold_extent_gfx1250(h, w, kh, kw, ph, pw)
+    out = torch.empty((n, d, ho, wo, CGP_ALIGN), device=x.device, dtype=x.dtype)
+    exe = compile_fold_hw_gfx1250(n, c, d, h, w, kh, kw, ph, pw)
+    _dispatch(
+        exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream
+    )
+    return out
+
+
+def _fold_hw_weight(w):
+    """(K, C, kT, kH, kW) -> (K, CGP_ALIGN, kT, 1, 1), channels (kh, kw, c)."""
+    k, c, kt, kh, kw = w.shape
+    wf = w.permute(0, 3, 4, 1, 2).reshape(k, kh * kw * c, kt)
+    wf = torch.nn.functional.pad(wf, (0, 0, 0, CGP_ALIGN - kh * kw * c))
+    return wf.reshape(k, CGP_ALIGN, kt, 1, 1).contiguous()
+
+
 _WEIGHT_CACHE = {}
 
 
@@ -112,17 +178,24 @@ def _evict_weight(key, _ref):
         del _WEIGHT_CACHE[key]
 
 
-def _prep_weight(w, k, kt, kh, kw, wc, cgp):
-    """Pack (K, C, T, R, S) → (K, T*R*S*cgp), memoized."""
+def _prep_weight(w, k, kt, kh, kw, wc, cgp, fold_hw=False):
+    """Pack (K, C, T, R, S) → (K, T*R*S*cgp), memoized.
+
+    With ``fold_hw`` the R x S window is folded into the channels first
+    (``_fold_hw_weight``) and the result is (K, T*CGP_ALIGN).
+    """
     anchor = w._base if w._base is not None else w
-    key = (w.data_ptr(), cgp)
-    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype, cgp)
+    key = (w.data_ptr(), cgp, fold_hw)
+    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype, cgp, fold_hw)
     ent = _WEIGHT_CACHE.get(key)
     if ent is not None and ent[0]() is anchor and ent[2] == stamp:
         return ent[1]
-    wsrc = (
-        torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cgp - wc)) if cgp != wc else w
-    )
+    if fold_hw:
+        wsrc, kh, kw, cgp = _fold_hw_weight(w), 1, 1, CGP_ALIGN
+    elif cgp != wc:
+        wsrc = torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cgp - wc))
+    else:
+        wsrc = w
     wk = wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cgp)
     _WEIGHT_CACHE[key] = (
         weakref.ref(anchor, functools.partial(_evict_weight, key)),
@@ -132,18 +205,26 @@ def _prep_weight(w, k, kt, kh, kw, wc, cgp):
     return wk
 
 
-def prepare_operands_gfx1250(x_ndhwc, weight, padding, groups):
+def prepare_operands_gfx1250(x_ndhwc, weight, padding, groups, *, stride, dilation):
     """Do run_conv3d_gfx1250's zeros pad, channel pad and weight pack up front.
 
     Returns ``(x, weight, packed_weight)``. Calling run_conv3d_gfx1250 on them
     with ``padding=0``, NDHWC input and ``packed_weight=packed_weight`` builds
     the same kernel param as the unprepared call, minus the per-call prep.
+    Where ``fold_hw_gfx1250`` applies, x and weight come back folded (C=32,
+    kH=kW=1), which the run then takes as is.
     """
     pad = _as_tuple3(padding, "padding")
     x = _host_pad_ndhwc(x_ndhwc.contiguous(), pad, pad, "zeros")
+    k, wc, kt, kh, kw = weight.shape
+    _, sh, sw = _as_tuple3(stride, "stride")
+    _, dh, dw = _as_tuple3(dilation, "dilation")
+    if fold_hw_gfx1250(x.shape[-1], groups, kh, kw, sh, sw, dh, dw):
+        x = _fold_hw_ndhwc(x, kh, kw)
+        weight = _fold_hw_weight(weight)
+        return x, weight, _prep_weight(weight, k, kt, 1, 1, CGP_ALIGN, CGP_ALIGN)
     cgp = _pad_cgp(x.shape[-1] // groups)
     x = _pad_channels_ndhwc(x, groups, cgp)
-    k, wc, kt, kh, kw = weight.shape
     if cgp != wc:
         weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, cgp - wc))
     weight = weight.contiguous()
@@ -310,15 +391,17 @@ def run_conv3d_gfx1250(
     variant="bandwidth_bound",
     main_loop_unroll=None,
     tile_k=None,
+    b_prefetch=None,
     packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
     out=None,  # contiguous bf16 result in output_layout, written in place
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile).
 
-    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` / ``patch_reuse`` left
-    at None take the tuned row's columns (``patch`` for ``patch_reuse``), else
-    2 buffers, no unroll, 32 channels per K tile and no patch. A ``tile_k`` that
+    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` / ``patch_reuse`` /
+    ``b_prefetch`` left at None take the tuned row's columns (``patch`` for
+    ``patch_reuse``), else 2 buffers, no unroll, 32 channels per K tile, no
+    patch and no B prefetch. A ``tile_k`` that
     cannot run here (``tile_k_unsupported_gfx1250``) falls back to 32; the patch
     path is dropped where it cannot run (``patch_unsupported_gfx1250``).
     """
@@ -353,9 +436,30 @@ def run_conv3d_gfx1250(
         "circular": "circular",
     }[padding_mode]
 
-    x_ndhwc = _to_ndhwc(x, in_ndhwc)
-    x_ndhwc = _host_pad_ndhwc(x_ndhwc, pad_lo, pad_hi, torch_pad_mode)
+    fold_hw = packed_weight is None and fold_hw_gfx1250(
+        c, groups, kh, kw, sh, sw, dh, dw
+    )
+    x_ndhwc = None
+    if (
+        fold_hw
+        and not in_ndhwc
+        and torch_pad_mode == "zeros"
+        and pad_lo[0] == pad_hi[0] == 0
+        and pad_lo[1:] == pad_hi[1:]
+    ):
+        x_ndhwc = _fold_hw_ncdhw(x, kh, kw, pad_lo[1], pad_lo[2], stream)
+    if x_ndhwc is None:
+        x_ndhwc = _to_ndhwc(x, in_ndhwc, stream)
+        x_ndhwc = _host_pad_ndhwc(x_ndhwc, pad_lo, pad_hi, torch_pad_mode)
+        if fold_hw:
+            x_ndhwc = _fold_hw_ndhwc(x_ndhwc, kh, kw)
     n, d, h, w, c = x_ndhwc.shape  # NDHWC
+    if fold_hw:
+        # The tuned lookup below keys on the caller's kH x kW.
+        tuned_kh, tuned_kw = kh, kw
+        kh = kw = 1
+    else:
+        tuned_kh, tuned_kw = kh, kw
     cgp = _pad_cgp(c // groups)
     x_ndhwc = _pad_channels_ndhwc(x_ndhwc, groups, cgp)
     c_padded = groups * cgp
@@ -383,7 +487,9 @@ def run_conv3d_gfx1250(
         return torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
 
     if packed_weight is None:
-        w_packed = _prep_weight(weight, k, kt, kh, kw, wc, cgp)
+        w_packed = _prep_weight(
+            weight, k, kt, tuned_kh, tuned_kw, weight.shape[1], cgp, fold_hw=fold_hw
+        )
     else:
         assert tuple(packed_weight.shape) == (k, kt * kh * kw * cgp), (
             f"packed_weight must be ({k}, {kt * kh * kw * cgp}), "
@@ -423,8 +529,8 @@ def run_conv3d_gfx1250(
             w0,
             k,
             kt,
-            kh,
-            kw,
+            tuned_kh,
+            tuned_kw,
             st,
             sh,
             sw,
@@ -501,6 +607,8 @@ def run_conv3d_gfx1250(
         tile_k = TILE_K
     if patch_reuse is None:
         patch_reuse = tuned_pipe.get("patch", False)
+    if b_prefetch is None:
+        b_prefetch = tuned_pipe.get("b_prefetch", False)
     use_patch = bool(patch_reuse) and (
         patch_unsupported_gfx1250(kh, kw, sh, sw, sk, min(int(num_buffers), kh * kw))
         is None
@@ -559,6 +667,7 @@ def run_conv3d_gfx1250(
         main_loop_unroll=main_loop_unroll and not use_patch,
         tile_k=tile_k,
         patch=use_patch,
+        b_prefetch=b_prefetch,
     )
     exe = compile_conv3d_implicit_gfx1250(param)
     launch_stream = torch.cuda.current_stream() if stream is None else stream
