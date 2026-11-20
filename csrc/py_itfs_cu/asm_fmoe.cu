@@ -1122,8 +1122,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 static CFG* get_blockscale_cfgs(ActivationType act, bool xquant, bool swiglu_limit = false)
 {
     if(swiglu_limit)
-        return act == ActivationType::Silu && xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu_limit
-                                                     : nullptr;
+        return act != ActivationType::Silu ? nullptr
+               : xquant                    ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu_limit
+                                           : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu_limit;
     if(act == ActivationType::Silu)
         return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu
                       : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
@@ -1182,7 +1183,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     __func__,
                     swiglu_limit != 0.f
                         ? "no fmoe_fp8_blockscale_g1u1 kernel applies swiglu_limit for this "
-                          "activation and input type"
+                          "activation"
                         : "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr = get_heuristic_kernel(inter_dim,

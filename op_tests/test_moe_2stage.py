@@ -2579,17 +2579,19 @@ def _swiglu_limit_rows(limit, rows):
         get_2stage_cfgs.cache_clear()
 
 
-# gfx950 asm 1-stage kernels that apply swiglu_limit, and the shape they are tuned at.
-_BLOCKSCALE_LIMIT_ASM_KERNELS = (
-    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128E",
-    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256E",
-)
+# gfx950 asm 1-stage kernels that apply swiglu_limit, with the (block_m, flat, xbf16)
+# of the tuned rows that name them, and the shape the tests run them at.
+_BLOCKSCALE_LIMIT_ASM_KERNELS = {
+    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128E": (1, 1, 1),
+    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256E": (1, 1, 1),
+    "_ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_limit_64x256E": (64, 0, 0),
+}
 _BLOCKSCALE_LIMIT_ASM_DIMS = (4096, 1024)
 
 
-def _blockscale_limit_asm_row(kernel):
-    row = {"block_m": 1, "ksplit": 0, "run_1stage": 1, "kernelName1": kernel}
-    return {**row, "kernelName2": "", "flat": 1, "nt": 0, "xbf16": 1}
+def _blockscale_limit_asm_row(kernel, block_m=1, flat=1, xbf16=1):
+    row = {"block_m": block_m, "ksplit": 0, "run_1stage": 1, "kernelName1": kernel}
+    return {**row, "kernelName2": "", "flat": flat, "nt": 0, "xbf16": xbf16}
 
 
 @benchmark()
@@ -2675,7 +2677,10 @@ def test_blockscale_swiglu_limit(token, swiglu_limit, asm_kernel=None):
         if asm_kernel:
             key = (get_padded_M(token), model_dim, inter_dim, experts, topk)
             key = _fmoe_row_key(*key, aiter.QuantType.per_1x128)
-            rows = {key: _blockscale_limit_asm_row(asm_kernel)}
+            row = _blockscale_limit_asm_row(
+                asm_kernel, *_BLOCKSCALE_LIMIT_ASM_KERNELS[asm_kernel]
+            )
+            rows = {key: row}
             stack.enter_context(_swiglu_limit_rows(swiglu_limit, rows))
             op = stack.enter_context(
                 mock.patch.object(
