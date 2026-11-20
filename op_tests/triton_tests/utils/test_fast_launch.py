@@ -209,7 +209,7 @@ def test_key_tells_apart_what_triton_tells_apart(
     monkeypatch, by_specialization, buffer_ops, constexprs_by_name
 ):
     """Two launches with the same key must have the same Triton cache key.
-    This also fails when a Triton upgrade changes what it specializes on."""
+    This fails if Triton distinguishes two tested variants that the key merges."""
     monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
     wrapped = fast_launch.fast_launch(
         _probe_kernel, by_specialization=by_specialization
@@ -421,7 +421,7 @@ def _chain(cls, n):
     return chain
 
 
-# A launch-enter or launch-exit hook: a value and whether Triton would call it.
+# A launch-enter or launch-exit hook: a value and whether a hook function runs.
 _LAUNCH_HOOKS = {
     "none": (lambda: None, False),
     "function": (lambda: lambda *a, **k: None, True),
@@ -649,7 +649,10 @@ def test_an_interpreted_kernel_takes_the_ordinary_path(monkeypatch):
     monkeypatch.delenv("TRITON_INTERPRET")
     wrapped = fast_launch.fast_launch(interpreted)
     gen = torch.Generator().manual_seed(0)
-    x, y = (torch.randn(256, generator=gen) for _ in range(2))
+    x, y = (
+        torch.randn(256, generator=gen, dtype=torch.float32, device="cpu")
+        for _ in range(2)
+    )
     out = torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
     with fast_launch.recording() as misses:

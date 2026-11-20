@@ -250,8 +250,8 @@ def test_alignment_is_part_of_the_key():
 def test_no_config_choice_reads_a_shape(name):
     """What lets these launchers pass key_shapes=False: no heuristic reads any
     property of an argument (it may only test it for None), and no autotuner
-    prunes or models configs from the arguments (its key holds ints and bools
-    only)."""
+    prunes or models configs from the arguments (its key holds ints, bools and
+    dtypes)."""
     wrapped = getattr(flash_kda, name)
     assert wrapped._key_shapes is False
     params = wrapped._jit.arg_names

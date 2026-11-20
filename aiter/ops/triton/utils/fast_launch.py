@@ -27,9 +27,9 @@ of positional arguments, the keyword names, and for each argument:
   and strides, which a ``@triton.heuristics`` function can read. An autotuner
   keys on the values of its ``key`` arguments and on dtypes, which the key
   already holds. ``fast_launch(kernel, key_shapes=False)`` leaves shapes and
-  strides out, for a kernel whose heuristics read none. A heuristic that reads
-  any other tensor property (``data_ptr()``, ``storage_offset()``, the device,
-  the values) is keyed in neither mode and is not supported;
+  strides out, for a kernel whose heuristics read none. A heuristic may also
+  read a tensor's dtype or 16-byte alignment; other properties (the full
+  ``data_ptr()``, ``storage_offset()``, the values) are not keyed or supported;
 * any other value: its type and value.
 
 With ``fast_launch(kernel, by_specialization=True)``, a plain ``@triton.jit``
@@ -54,7 +54,7 @@ caught on a hit; that includes a list field of a Gluon layout.
 
 import contextlib
 from collections import ChainMap, OrderedDict
-from itertools import islice, repeat
+from itertools import repeat
 from operator import itemgetter
 from typing import Any, NamedTuple
 
@@ -197,6 +197,11 @@ class _FastLaunch:
             # TRITON_INTERPRET=1: no compiled kernel to keep.
             self._disabled = True
             return
+        self._names = tuple(jit.signature.parameters)
+        self._defaults = tuple(
+            (n, () if p.kind is p.VAR_POSITIONAL else p.default)
+            for n, p in jit.signature.parameters.items()
+        )
         self._by_spec = by_specialization
         self._key_shapes = self._wrapped and key_shapes
         runtime = [not p.is_constexpr for p in jit.params]
@@ -435,18 +440,13 @@ class _FastLaunch:
 
         # Autotuning launches once per candidate config; the last one is the
         # launch that used the config it settled on.
-        a, kw = seen[-1]
-        binder = self._jit.device_caches[self._get_device()][4]
-        bound_args, _, _ = binder(*a, **kw)
-
-        names = tuple(bound_args)
-        # Arguments the call site does not pass -- defaults, and whatever the
-        # autotuner added. The key pins every non-tensor value, so these are
-        # constant for as long as this entry is the one selected.
-        items = bound_args.items()
+        _, kw = seen[-1]
+        names = self._names
+        # Defaults are fixed; autotuner and heuristic choices depend on the key
+        # (by_specialization allows neither), so omitted arguments stay constant.
         frozen = {
-            n: v
-            for n, v in (islice(items, len(args), None) if args else items)
+            n: kw.get(n, default)
+            for n, default in self._defaults[len(args) :]
             if n not in kwargs
         }
         self._cache[key] = _Entry(
@@ -484,8 +484,9 @@ def fast_launch(
     specialization classes instead of by value; it raises ``ValueError`` for a
     wrapped kernel. ``key_shapes=False`` leaves tensor shapes and strides out
     of the key of a wrapped kernel; pass it only when no ``@triton.heuristics``
-    function of the kernel reads a shape or stride. A heuristic that reads any
-    other tensor property is not supported in either mode. Launches return what
+    function of the kernel reads a shape or stride. A heuristic may also read a
+    tensor's dtype or 16-byte alignment; other properties (the full data pointer,
+    storage offset, values) are not keyed or supported. Launches return what
     ``kernel[grid](...)`` returns.
     """
     return _FastLaunch(kernel, by_specialization, key_shapes)

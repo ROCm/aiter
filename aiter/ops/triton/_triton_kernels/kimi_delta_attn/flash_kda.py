@@ -1140,7 +1140,7 @@ def _build_segments(
 
 
 # key_shapes=False: the heuristics of these kernels only test arguments for
-# None, and their autotune keys are ints and bools, so no config reads a shape.
+# None, and their autotune keys hold ints, bools and dtypes, not shapes.
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel, key_shapes=False)
 _segment_fast = fast_launch(_flash_kda_segment_kernel, key_shapes=False)
 _seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel, key_shapes=False)
