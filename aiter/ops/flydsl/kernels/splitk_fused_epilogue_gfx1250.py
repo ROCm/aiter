@@ -111,11 +111,13 @@ def emit_fused_splitk_epilogue(
     valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
     if const_expr(lean and n_oob is None):
         # The descriptor's record count drops the stores of rows past M, tail tile or not.
+        # Cap it at this stripe's reduce_m rows: the rows left to M can exceed 4 GiB.
+        stripe_rows = (valid_rows < reduce_m).select(valid_rows, fx.Int32(reduce_m))
         output_buffer = ptr_buf_tensor(
             output_base,
             elem,
             unit_elems=vec,
-            num_records_bytes=fx.Int64(valid_rows) * ldc64 * 2,
+            num_records_bytes=fx.Int64(stripe_rows) * ldc64 * 2,
         )
     if const_expr(lean):
         # Both peer stripes start at offset zero, so the descriptor needs no
