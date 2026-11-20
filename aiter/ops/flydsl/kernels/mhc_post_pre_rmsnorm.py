@@ -119,7 +119,7 @@ def _dpp_f32(v, ctrl):
     # and LLVM folds the move into the consuming op (v_add_f32_dpp). dpp_utils'
     # helpers pass the source as the old value with bound_ctrl off, which blocks
     # that fold: the ISA then has a v_mov_b32_dpp and an s_nop per use on the
-    # finisher's serial Sinkhorn chain (measured 0.6-0.7 us slower at 160 rows).
+    # finisher's serial Sinkhorn chain (0.2-0.5 us slower at 160 rows in an A/B).
     old = llvm.mlir_undef(T.i32)
     r = rocdl.update_dpp(T.i32, old, _bits(v).ir_value(), ctrl, 0xF, 0xF, True)
     return I32(r).bitcast(F32)
