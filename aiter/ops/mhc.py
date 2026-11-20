@@ -3,6 +3,7 @@
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
@@ -428,6 +429,33 @@ def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
     return min(valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk))
 
 
+# gfx950, 256 CUs, packed BF16 hi/lo projection: in this row range the fused
+# post+pre GEMM with 32-row, 64-wide tiles is faster than standalone mhc_post +
+# mhc_pre (measured on MI350X for these hidden sizes, up to the upper row count).
+# The range starts above 8 * 256 rows, where mhc_post switches to non-temporal
+# stores. With the tiles _mhc_fused_config_gfx950_256 selects otherwise, the fused
+# GEMM is slower than post + pre there.
+MHC_FUSED_PREFILL_M_MIN_GFX950 = 2049
+MHC_FUSED_PREFILL_M_MAX_GFX950 = 65536
+MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950 = (4096, 7168)
+
+
+def _mhc_fused_prefill_config_gfx950_256(m, hidden_size):
+    """(split_k, tile_m, tile_n, tile_k) of the fused GEMM at prefill row counts,
+    or None where post + pre is kept."""
+    if (
+        hidden_size not in MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950
+        or not MHC_FUSED_PREFILL_M_MIN_GFX950 <= m <= MHC_FUSED_PREFILL_M_MAX_GFX950
+    ):
+        return None
+    # 448 (hidden 7168) or 512 (hidden 4096) K elements per split; 16 splits for
+    # both below 2816 rows, where 8 would leave the grid short of two rounds.
+    split_k = 16 if hidden_size == 7168 or m < 2816 else 8
+    if hidden_size % (split_k * 64) != 0:
+        return None
+    return split_k, 32, 32, 64
+
+
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
     tile_k = 64 if m >= 2 * hidden_size else 32
     if hidden_size % tile_k != 0:
@@ -636,6 +664,10 @@ def get_mhc_fused_post_pre_config(
     except Exception:  # noqa: BLE001
         arch = "unknown"
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
+    if w_preshuffle_bf16 and not res_preshuffle and (arch, num_cu) == ("gfx950", 256):
+        prefill = _mhc_fused_prefill_config_gfx950_256(m, hidden_size)
+        if prefill is not None:
+            return prefill
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
     if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:
@@ -1034,6 +1066,196 @@ def _mhc_fused_post_pre_gluon(
     )
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_post_project_gfx950(
+    projection: Tensor,
+    sq: Tensor,
+    next_residual: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    packed_fn: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_finalize_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    projection: Tensor,
+    sq: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    repeats: int,
+) -> None: ...
+
+
+# Row counts of the gfx950 two-kernel prefill route (hidden size 7168, fused
+# RMSNorm). Below 4096 rows the fused GEMM path of mhc_fused_post_pre is as fast;
+# 16384 is the largest row count the route is validated for.
+MHC_GFX950_PREFILL_M_MIN = 4096
+MHC_GFX950_PREFILL_M_MAX = 16384
+
+
+def _mhc_post_pre_gfx950_supported(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    norm_weight: Tensor | None,
+    w_preshuffle_bf16: bool = False,
+) -> bool:
+    # The row count comes first, as in the caller.
+    m = layer_input.shape[0]
+    if not (
+        w_preshuffle_bf16 and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
+    ):
+        return False
+    # Fixed launch tuning is qualified only for an unmasked 256-CU device.
+    if (
+        norm_weight is None
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return False
+    # Other shapes, dtypes and views keep the existing dispatch.
+    expected = (
+        (layer_input, (m, 7168), torch.bfloat16),
+        (residual, (m, 4, 7168), torch.bfloat16),
+        (post_mix, (m, 4, 1) if post_mix.ndim == 3 else (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (fn, (24, 28672), torch.int32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (7168,), torch.bfloat16),
+    )
+    device = layer_input.device
+    return device.type == "cuda" and all(
+        tensor.device == device
+        and tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    )
+
+
+def _mhc_post_pre_gfx950(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    post_mult: float,
+    repeats: int,
+    norm_weight: Tensor,
+    norm_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    m = layer_input.shape[0]
+    splits = 4
+    device = layer_input.device
+    projection_pad = torch.empty((splits, m, 32), dtype=torch.float32, device=device)
+    sq = torch.empty((splits, m), dtype=torch.float32, device=device)
+    next_residual = torch.empty_like(residual)
+    # Consume the caller's explicit mhc_shuffle_fn layout on every call.
+    mhc_post_project_gfx950(
+        projection_pad,
+        sq,
+        next_residual,
+        layer_input,
+        residual,
+        fn,
+        post_mix.reshape(m, 4),
+        comb_mix,
+    )
+    # The finalizer's outputs are allocated while the producer runs.
+    post = torch.empty((m, 4, 1), dtype=torch.float32, device=device)
+    comb = torch.empty((m, 4, 4), dtype=torch.float32, device=device)
+    out = torch.empty_like(layer_input)
+    mhc_finalize_gfx950(
+        post,
+        comb,
+        out,
+        projection_pad,
+        sq,
+        scale,
+        base,
+        next_residual,
+        norm_weight,
+        rms_eps,
+        pre_eps,
+        sink_eps,
+        norm_eps,
+        post_mult,
+        repeats,
+    )
+    return post, comb, out, next_residual
+
+
+def _mhc_fused_prefill_gfx950(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    sinkhorn_repeat: int,
+    w_preshuffle_bf16: bool,
+    backend: str | None,
+    arch: str,
+) -> bool:
+    """Whether a call at or above the fused bound keeps the fused GEMM (gfx950,
+    256 CUs without a CU mask, packed weights, see
+    ``_mhc_fused_prefill_config_gfx950_256``)."""
+    if not w_preshuffle_bf16 or arch != "gfx950" or backend not in (None, "hip"):
+        return False
+    if residual_in.dim() != 3:
+        return False
+    m, hc_mult, hidden_size = residual_in.shape
+    if (
+        hc_mult != 4
+        or sinkhorn_repeat <= 0
+        or _mhc_fused_prefill_config_gfx950_256(m, hidden_size) is None
+        # The tiles are tuned for the whole device.
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+        # The fused branch asserts these shapes; post + pre reads the tensors as
+        # they are.
+        or layer_input.shape != (m, hidden_size)
+        or post_layer_mix.shape not in ((m, hc_mult), (m, hc_mult, 1))
+        or comb_res_mix.shape != (m, hc_mult, hc_mult)
+        or fn.shape != (hc_mult * (hc_mult + 2), hc_mult * hidden_size)
+    ):
+        return False
+    # The fused GEMM takes contiguous BF16 tensors; other inputs keep post + pre.
+    return layer_input.dtype == residual_in.dtype == dtypes.bf16 and all(
+        tensor.is_contiguous()
+        for tensor in (layer_input, residual_in, post_layer_mix, comb_res_mix, fn)
+    )
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
@@ -1068,7 +1290,11 @@ def mhc_fused_post_pre(
     ``force_fused``: when True, select the fused HIP path, except for the existing
     gfx950 large-M post+pre specialization with plain residuals. When False
     (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
-    ``mhc_pre`` (threshold depends on the detected GPU arch).
+    ``mhc_pre`` (threshold depends on the detected GPU arch). On gfx950 with 256
+    CUs, packed weights (``w_preshuffle_bf16=True``) keep the fused path for ``m``
+    from ``MHC_FUSED_PREFILL_M_MIN_GFX950`` to ``MHC_FUSED_PREFILL_M_MAX_GFX950``
+    and ``hidden_size`` in ``MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950``, where it is
+    the faster one with 32-row, 64-wide tiles.
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
@@ -1078,6 +1304,15 @@ def mhc_fused_post_pre(
     ``w_preshuffle_bf16=True, res_preshuffle=False``.
 
     Both flags are boolean, default to False, and are controlled independently.
+
+    On unmasked 256-CU gfx950 devices, BF16 plain-layout prefill calls with
+    hidden size 7168, four residual streams, RMSNorm, explicit
+    w_preshuffle_bf16=True and fn from mhc_shuffle_fn fuse post with projection
+    and finalize whole rows. This applies when M is between
+    ``MHC_GFX950_PREFILL_M_MIN`` and ``MHC_GFX950_PREFILL_M_MAX``. Other row
+    counts, default FP32 projection and explicit force_fused requests keep the
+    other paths. Unsupported tensor layouts and dtypes keep the existing
+    implementation.
 
     A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
     ``MHC_GLUON_POST_PRE_HIDDEN_SIZES`` runs the gfx1250 Gluon kernels
@@ -1264,8 +1499,62 @@ def _mhc_fused_post_pre_native(
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
 
+    # The row test comes first: decode and FP32 calls leave after one or two
+    # comparisons.
+    if (
+        w_preshuffle_bf16
+        and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and not res_preshuffle
+        and sinkhorn_repeat > 0
+        and _mhc_post_pre_gfx950_supported(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            w_preshuffle_bf16,
+        )
+    ):
+        return _mhc_post_pre_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+
     # At the shared bound the input is already in ordinary layout.
-    if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
+    if (
+        not force_fused
+        and not res_preshuffle
+        and m >= fused_m_upper_bound
+        and not _mhc_fused_prefill_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            sinkhorn_repeat,
+            w_preshuffle_bf16,
+            backend,
+            arch,
+        )
+    ):
         next_residual = torch.empty_like(residual_in)
         mhc_post(
             next_residual,
