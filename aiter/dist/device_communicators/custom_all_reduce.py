@@ -286,8 +286,12 @@ _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 # bytes per world size (and the cap), the two-shot above it, up to world_size x
 # the cap. The two cross at 1.25-1.375 MiB at TP4 and 9-9.5 MiB at TP2 (4x
 # gfx1250, CUDA graphs, bf16 and fp16 alike). Unmeasured world sizes take the
-# one-shot up to the cap, as the other Lamport ops do.
+# one-shot up to the cap, as the other Lamport ops do, except those below.
 _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
+# World sizes whose plain all-reduce never takes the Lamport all-reduce, even
+# with AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE set: TP8 keeps the meta-buffer
+# kernels, ar_2s_lamport_gfx1250 in its range (measured across two trays).
+_LAMPORT_AR_SKIP_WORLD_SIZES = (8,)
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -2549,10 +2553,13 @@ class CustomAllreduce:
 
     def select_lamport_ar(self, inp: torch.Tensor) -> bool | None:
         """The Lamport kernel custom_all_reduce runs for inp: None for none,
-        else whether the two-shot (above _LAMPORT_AR_1SHOT_MAX_BYTES). Like
+        else whether the two-shot (above _LAMPORT_AR_1SHOT_MAX_BYTES). None at
+        the world sizes in _LAMPORT_AR_SKIP_WORLD_SIZES. Like
         should_lamport_ar, shapes, dtypes and the cap only, so every rank
         picks the same kernel."""
-        if not self.should_lamport_ar(inp, two_shot=True):
+        if self.world_size in _LAMPORT_AR_SKIP_WORLD_SIZES or not (
+            self.should_lamport_ar(inp, two_shot=True)
+        ):
             return None
         one_shot_max = min(
             _LAMPORT_AR_1SHOT_MAX_BYTES.get(self.world_size, self._lamport_max_bytes),
