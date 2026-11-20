@@ -38,9 +38,10 @@ Invalidation has two levels. The directory is named by a fingerprint of the
 toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
 ``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each entry also records the
 Python source files that ran while it was built (the factory and the trace)
-with their hashes, and the environment variables the build-feeding code of
-those files names or that aiter code read during the build, with their values. A hit whose sources or
-variables changed is rebuilt. Editing one kernel, or setting a variable one
+and the aiter modules that code imports values from, with their hashes; the
+environment variables the build-feeding code of those files names or that
+aiter code read during the build; and ``get_gfx()`` when the build used it.
+A hit whose sources or inputs changed is rebuilt. Editing one kernel, or setting a variable one
 kernel reads, therefore invalidates only the entries that depend on it.
 
 ``AITER_FLYDSL_AOT_CACHE`` selects the mode:
@@ -89,7 +90,7 @@ from aiter import logger
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
-_SCHEMA = 4
+_SCHEMA = 5
 _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
@@ -418,44 +419,77 @@ def _import_base(path: str, node: ast.ImportFrom) -> str:
 
 
 def _bound_names(node) -> set:
-    """The module-level names statement ``node`` binds, not counting the
-    statements nested in it."""
+    """The module-level names statement ``node`` binds or mutates
+    (``X[k] = ...``, ``X.a = ...``), not counting the statements nested in it."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return {node.name}
     if isinstance(node, (ast.Import, ast.ImportFrom)):
         return {(a.asname or a.name).split(".")[0] for a in node.names}
-    return {
-        n.id
+    names = set()
+    for c in _header(node):
+        for n in ast.walk(c):
+            if not isinstance(getattr(n, "ctx", None), ast.Store):
+                continue
+            while isinstance(n, (ast.Subscript, ast.Attribute)):
+                n = n.value
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+    return names
+
+
+def _header(node) -> list:
+    """The expressions of statement ``node``, without its nested statements:
+    the condition of an ``if``, the iterable of a ``for``, an assignment."""
+    return [
+        c
         for c in ast.iter_child_nodes(node)
         if not isinstance(c, (ast.stmt, ast.ExceptHandler))
-        for n in ast.walk(c)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-    }
+    ]
 
 
-def _module_statements(body):
-    """Statements run at import, inside ``if``/``try``/``with`` blocks too."""
+def _module_statements(body, outer=()):
+    """Statements run at import, inside ``if``/``try``/``with`` blocks too,
+    each with the compound statements around it."""
     for node in body:
-        yield node
+        yield node, outer
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         for c in ast.iter_child_nodes(node):
             if isinstance(c, ast.ExceptHandler):
-                yield from _module_statements(c.body)
+                yield from _module_statements(c.body, outer + (node,))
             elif isinstance(c, ast.stmt):
-                yield from _module_statements([c])
+                yield from _module_statements([c], outer + (node,))
 
 
 @functools.cache
 def _bindings(path: str) -> dict:
-    """Module-level name -> the statements of ``path`` that bind it."""
+    """Module-level name -> ``(statement, enclosing statements)`` of ``path``
+    that bind it. ``"*"`` holds the star imports."""
     parsed = _parse(path)
     out = {}
     if parsed is not None:
-        for node in _module_statements(parsed[1].body):
+        for node, outer in _module_statements(parsed[1].body):
             for name in _bound_names(node):
-                out.setdefault(name, []).append(node)
+                out.setdefault(name, []).append((node, outer))
     return out
+
+
+def _star_files(path: str) -> list:
+    """The aiter modules ``path`` star-imports."""
+    return [
+        f
+        for node, _ in _bindings(path).get("*", ())
+        if (f := _module_file(_import_base(path, node))) is not None
+    ]
+
+
+def _defines(path: str, name: str, seen: frozenset = frozenset()) -> bool:
+    """Whether ``path`` binds ``name``, itself or through its star imports."""
+    if path in seen:
+        return False
+    if name in _bindings(path):
+        return True
+    return any(_defines(f, name, seen | {path}) for f in _star_files(path))
 
 
 def _binds_logger(node) -> bool:
@@ -470,55 +504,70 @@ def _binds_logger(node) -> bool:
     )
 
 
-def _value_sources(path: str, name: str, seen: set) -> set:
+def _value_sources(path: str, name: str, seen: set, run: bool = False) -> set:
     """The files module-level ``name`` of ``path`` takes its value from.
 
-    A function is recorded when the build calls it, so it adds nothing unless
-    memoized: a cached call does not enter it. Any other value adds ``path``
-    and, through the names its statement reads, what it was computed from.
+    A function the build calls is recorded by the profile hook, so it adds
+    nothing unless memoized (a cached call does not enter it) or ``run``: it
+    was called at import to compute a value. Any other value adds ``path`` and,
+    through the names its statement and the conditions around it read, what
+    it was computed from.
     """
-    if (path, name) in seen:
+    if (path, name, run) in seen:
         return set()
-    seen.add((path, name))
+    seen.add((path, name, run))
     nodes = _bindings(path).get(name)
     if not nodes:
-        # Bound in a way this does not follow, e.g. a star import.
-        return {path}
+        # A star re-export, or bound in a way this does not follow.
+        out = {path}
+        for f in _star_files(path):
+            if _defines(f, name):
+                out |= _value_sources(f, name, seen, run)
+        return out
     out = set()
-    for node in nodes:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _cached(node):
-                out.add(path)
-        elif isinstance(node, ast.ImportFrom):
+    for node, outer in nodes:
+        if isinstance(node, ast.ImportFrom):
             base = _import_base(path, node)
             for a in node.names:
                 if (a.asname or a.name) == name:
-                    out |= _imported(base, a.name, seen)
-        elif isinstance(node, ast.Import):
+                    out |= _imported(base, a.name, seen, run)
+            continue
+        if isinstance(node, ast.Import):
             for a in node.names:
                 if (a.asname or a.name).split(".")[0] == name:
                     out.add(_module_file(a.name))
-        elif not _binds_logger(node):
-            out.add(path)
-            bound = _bindings(path)
-            for n in ast.walk(node):
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not (run or _cached(node)):
+                continue
+            reads = [node]
+        elif isinstance(node, ast.ClassDef):
+            reads = [node]
+        elif _binds_logger(node):
+            continue
+        else:
+            reads = _header(node)
+        out.add(path)
+        bound = _bindings(path)
+        for expr in reads + [h for o in outer for h in _header(o)]:
+            for n in ast.walk(expr):
                 if isinstance(n, ast.Name) and n.id in bound and n.id != name:
-                    out |= _value_sources(path, n.id, seen)
+                    out |= _value_sources(path, n.id, seen, True)
     out.discard(None)
     return out
 
 
-def _imported(module: str, name: str, seen: set) -> set:
-    """The files ``from module import name`` takes a non-function value from."""
+def _imported(module: str, name: str, seen: set, run: bool = False) -> set:
+    """The files ``from module import name`` takes a value from."""
+    sub = _module_file(f"{module}.{name}")
+    if sub is not None:
+        return {sub}
     f = _module_file(module)
     if f is None:
         return set()
     if name == "*":
         return {f}
-    sub = _module_file(f"{module}.{name}")
-    if sub is not None:
-        return {sub}
-    return _value_sources(f, name, seen)
+    return _value_sources(f, name, seen, run)
 
 
 def _import_sources(files, called: dict) -> set:
@@ -682,6 +731,7 @@ def _entry_env(files, read, calls, called) -> dict:
     and there only from code that can feed the build (``_env_names``).
     Shared modules such as ``aiter/jit/core.py`` name many variables that do
     not affect a kernel, so for them only the reads seen during the build count.
+    ``get_gfx()`` is added as an input when the build used it (``_uses_get_gfx``).
     """
     kernel_root = _tracked_root() + "ops" + os.sep + "flydsl" + os.sep
     names = set(read).union(
@@ -1012,6 +1062,8 @@ class FlyDSLAotCache:
             os.replace(tmp_obj, stem.with_suffix(".o"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            _parse.cache_clear()
+            _bindings.cache_clear()
         self._builds += 1
         logger.info(f"[FlyDSL AOT] built {stem}.o")
         return stem

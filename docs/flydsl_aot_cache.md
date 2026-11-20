@@ -197,14 +197,19 @@ The profile hook sees calls, not reads of a module-level value: a kernel that
 does `from .common import TILE_M` and reads `TILE_M` never calls into
 `common.py`. So after the build, the imports in the code of each recorded file
 that can feed it (the same spans as the variable scan below) are resolved
-statically, and the module a non-function value comes from is recorded too,
-following re-exports and the names its statement is computed from (`BIG =
-TILE * 2` records where `TILE` comes from). `import x` records `x`. A function
-adds nothing, since the build records it when it calls it, unless it is
-memoized; a logger (`x = logging.getLogger(...)`) adds nothing either, or
+statically, and the module a non-function value comes from is recorded too.
+The resolution follows re-exports, star imports and namespace packages, and
+the names a value is computed from: its statement and the conditions around
+it (`BIG = TILE * 2` or `if FLAG: BIG = 2` records where `TILE` or `FLAG` comes
+from). A function called at import to compute a value is followed the same
+way. `import x` records `x`. A function the kernel imports adds nothing, since
+the build records it when it calls it, unless it is memoized; then its body is
+followed too. A logger (`x = logging.getLogger(...)`) adds nothing, or
 `from aiter import logger` would tie every entry to `aiter/__init__.py`. This
 over-records rather than under-records: an imported constant the kernel does
-not use costs a rebuild when its file changes, never a stale kernel.
+not use costs a rebuild when its file changes. It is static, so a value built
+by code it cannot read (`globals()[name] = ...`, `importlib`) is not followed;
+an unresolved name records the module it was looked up in.
 
 The sidecar also stores the environment variables the entry depends on, with
 their values (`null` if unset), and a lookup requires the same values. They
@@ -248,10 +253,11 @@ An entry whose build calls `get_gfx()` therefore stores its value under the
 key `"get_gfx()"`, and a lookup compares it like a variable. Its memo is
 cleared before each build, so the profile hook sees the call; a value computed
 from it before the build, at module level or in a memoized function of a
-recorded file, is found by scanning that code. Hashing it into the fingerprint instead would
-make every entry miss in such an image, including those of kernels that never
-call it. The replay sets `GPU_ARCHS` to the arch it builds for, so its entries
-store that arch and a process on that device hits them. None of the converted
+recorded file, is found by scanning that code. Hashing it into the
+fingerprint instead would make every entry miss in such an image, including
+those of kernels that never call it. The replay sets `GPU_ARCHS` to the arch
+it builds for, so its entries store that arch and a process on that device
+hits them. None of the converted
 launchers calls `get_gfx()` today.
 
 For the preshuffle GEMM the recorded set is `gemm_kernels.py`, the kernel
@@ -284,7 +290,7 @@ Known holes, and how they are handled:
 
 | hole | example | mitigation |
 |---|---|---|
-| A module-level value reached without an import in build code | `getattr(consts, name)`, or an import inside a function the build did not call | Imports in build code are followed statically (above). Pass the file in `extra_sources`, or run `verify` mode |
+| A module-level value reached without an import in build code | `getattr(consts, name)`, `globals()[name] = ...`, or an import inside a function the build did not call | Imports in build code are followed statically (above). Pass the file in `extra_sources`, or run `verify` mode |
 | Code outside the aiter package affects the kernel | a helper in another installed package | Pass it in `extra_sources`, or run `verify` mode |
 | The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count | Put it in `key`. `verify` mode detects it |
 | A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
@@ -563,6 +569,15 @@ path's). Issue 4 is in the JIT path and remains.
 - Nothing garbage-collects old fingerprint directories or source variants
   yet. Build directories (`.tmp-*`) left by a crashed process are removed
   after an hour.
-- Wire `AITER_FLYDSL_AOT_CACHE=1` into `aiter/aot/flydsl` so a wheel or
-  container image can ship prebuilt `.o` files for its tuned CSVs.
+- The prebuild replays tuned CSV rows only. A shape with no tuned row, such
+  as a batched mxfp8 GEMM that falls back to its heuristic config, is built
+  at its first call; tuning the shape adds it to the prebuild.
+- Only the launchers in §5 are converted. Other FlyDSL kernels, e.g.
+  `gemm_a16w16` (hgemm), the a8w4 `comm_fused_moe` and the gfx1250 mxfp8
+  GEMM, still trace and compile on their first call in each process.
+- A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
+  24136 rows) writes about 3790 entries, 1 GB, in about 15 minutes. Rows
+  tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to
+  that CU count's fingerprint directory, which a GPU with another count
+  does not read.
 - `.lock` files, one per digest, are not removed.
