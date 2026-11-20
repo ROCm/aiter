@@ -34,6 +34,7 @@ from aiter import (
 )
 from aiter.fused_moe import (
     AsmMoeMode,
+    _clamp_swiglu_gate_up,
     _moe_prepare_unsorted_input,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
@@ -770,9 +771,9 @@ class FmoeTuner(TunerCommon):
             type=float,
             default=None,
             help="Tune FP8 per_1x128 / per_Token / per_Tensor SiLU MoE with this "
-            "gate/up clamp. Only CK "
-            "2-stage candidates can clamp; results are tagged in a _tag column "
-            "and must go to a separate tuned file (-o).",
+            "gate/up clamp. Only CK 2-stage candidates and per_1x128 ASM 1-stage "
+            "kernels from the _silu_limit manifests can clamp; results are tagged "
+            "in a _tag column and must go to a separate tuned file (-o).",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -1782,6 +1783,7 @@ class FmoeTuner(TunerCommon):
         topk=2,
         dtype=dtypes.bf16,
         flat: AsmMoeMode | int = AsmMoeMode.SORTED,
+        swiglu_limit=None,
     ):
         if AsmMoeMode(flat).requires_host_sort:
             moe_buf = torch.zeros(
@@ -1817,6 +1819,7 @@ class FmoeTuner(TunerCommon):
             kernel_name,
             fc2_smooth_scale=fc2_smooth_scale,
             activation=activation,
+            swiglu_limit=float(swiglu_limit or 0.0),
         )
         return moe_buf
 
@@ -2969,6 +2972,7 @@ class FmoeTuner(TunerCommon):
         expert_mask=None,
         scale_blks=(128, 128),
         dtype=dtypes.bf16,
+        swiglu_limit=None,
     ):
         computeType = dtypes.fp32
         hidden_states = hidden_states.to(computeType)
@@ -3026,6 +3030,8 @@ class FmoeTuner(TunerCommon):
                 act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
                 if moeType == "g1u1":
                     gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+                    if swiglu_limit:
+                        gate, up = _clamp_swiglu_gate_up(gate, up, swiglu_limit)
                     act_out = F.silu(gate) * up
                 else:
                     act_out = F.gelu(act_input)
@@ -3171,10 +3177,17 @@ class FmoeTuner(TunerCommon):
         elif act_type == ActivationType.Gelu:
             acti_dir = "gelu"
         up = 1 if use_g1u1 else 0
+        limit = self.swiglu_limit
+        if limit and q_type != QuantType.per_1x128:
+            # Only fmoe_fp8_blockscale_g1u1 applies a runtime clamp.
+            return task_1stage
+        limit_kwargs = {"swiglu_limit": limit} if limit else {}
         quantDtype_1stage, extraInfo_1stage = self.get_1stage_file_info(
             q_type, q_dtype_a, doweight_stage1
         )
-        kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{acti_dir}{{extraInfo_1stage}}.csv"
+        # Under a clamp only the _silu_limit manifests list usable kernels.
+        manifest_act = f"{acti_dir}_limit" if limit else acti_dir
+        kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{manifest_act}{{extraInfo_1stage}}.csv"
         asm_kernels_1stage = {}
         asm_1stage_csv_path = ""
         if (
@@ -3260,7 +3273,8 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        {} if asm_mode is AsmMoeMode.SORTED else {"flat": asm_mode},
+                        ({} if asm_mode is AsmMoeMode.SORTED else {"flat": asm_mode})
+                        | limit_kwargs,
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -3304,11 +3318,11 @@ class FmoeTuner(TunerCommon):
                                 doweight_stage1,
                             )
                         ),
-                        {},
+                        limit_kwargs,
                         (None),
                         0.01,
                         1,
-                        True,
+                        limit_cosine_diff_compare if limit else True,
                     )
                 )
 
@@ -3375,7 +3389,8 @@ class FmoeTuner(TunerCommon):
                                 {}
                                 if asm_mode is AsmMoeMode.SORTED
                                 else {"flat": asm_mode}
-                            ),
+                            )
+                            | limit_kwargs,
                             (FmoeTuner.torch_moe_blockscale),
                             (
                                 [
@@ -3392,11 +3407,11 @@ class FmoeTuner(TunerCommon):
                                 (128, 128),
                                 dtype,
                             ),
-                            {},
+                            limit_kwargs,
                             (None),
                             0.01,
                             1,
-                            True,
+                            limit_cosine_diff_compare if limit else True,
                         )
                     )
 
@@ -5529,8 +5544,12 @@ class FmoeTuner(TunerCommon):
                         "--swiglu_limit supports only FP8 per_1x128 / per_Token / "
                         f"per_Tensor SiLU, got {line}"
                     )
-                # ASM, FlyDSL and Opus SiLU kernels for these quant types have no clamp.
-                print(f"--swiglu_limit={self.swiglu_limit:g}: tuning CK 2-stage only")
+                # ASM 2-stage, FlyDSL and Opus SiLU kernels for these quant types
+                # have no clamp; ASM 1-stage runs only the _silu_limit kernels.
+                print(
+                    f"--swiglu_limit={self.swiglu_limit:g}: tuning CK 2-stage and "
+                    "ASM 1-stage _silu_limit kernels only"
+                )
                 _opus_only, _tune_only = False, {"cktile"}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
@@ -5561,7 +5580,7 @@ class FmoeTuner(TunerCommon):
                         blockMs,
                     )
                 )
-            if _want("asm"):
+            if _want("asm") or self.swiglu_limit is not None:
                 task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
@@ -6262,6 +6281,8 @@ class FmoeTuner(TunerCommon):
                     nf_is_xbf16 = int(best_nf_row.get("xbf16", 0)) == 1
                     _nf_a1 = _input if nf_is_xbf16 else _a1_qt
                     _act_int = int(act_type.value)
+                    # _silu_limit kernels resolve only with a non-zero limit.
+                    _limit = float(self.swiglu_limit or 0.0)
                     # Call aiter.fmoe_fp8_blockscale_g1u1 directly with the
                     # moe_buf returned by moe_sorting -- this matches the
                     # production fused_moe path (the wrapper-based call would
@@ -6273,6 +6294,7 @@ class FmoeTuner(TunerCommon):
                         _act_int=_act_int,
                         _flat_kname=_flat_kname,
                         _input=_input,
+                        _limit=_limit,
                         _topk_ids=_topk_ids,
                         _topk_w=_topk_w,
                         _w1_qt_s=_w1_qt_s,
@@ -6308,12 +6330,14 @@ class FmoeTuner(TunerCommon):
                             _w2_scale,
                             kernelName=_flat_kname,
                             activation=_act_int,
+                            swiglu_limit=_limit,
                         )
                         return mbuf
 
                     def _nf_seq(
                         _a1_scale_t=_a1_scale_t,
                         _act_int=_act_int,
+                        _limit=_limit,
                         _nf_a1=_nf_a1,
                         _nf_kname=_nf_kname,
                         _topk_ids=_topk_ids,
@@ -6351,6 +6375,7 @@ class FmoeTuner(TunerCommon):
                             _w2_scale,
                             kernelName=_nf_kname,
                             activation=_act_int,
+                            swiglu_limit=_limit,
                         )
                         return mbuf
 

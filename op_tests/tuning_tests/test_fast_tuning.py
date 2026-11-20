@@ -851,6 +851,78 @@ class TestFmoeFlat1StageInputs(unittest.TestCase):
         self.assertEqual(seen["num_valid_ids"].numel(), 0)
 
 
+class TestFmoeSwigluLimitAsm1Stage(unittest.TestCase):
+    def test_limit_tunes_only_clamping_asm_kernels_against_clamped_reference(self):
+        import torch
+
+        from aiter import ActivationType, QuantType, dtypes
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        tuner.swiglu_limit = 10.0
+        key = (
+            "gfx950",
+            256,
+            1,  # token
+            4096,  # model_dim
+            1024,  # inter_dim
+            289,  # expert
+            9,  # topk
+            ActivationType.Silu,
+            dtypes.bf16,
+            dtypes.fp8,
+            dtypes.fp8,
+            QuantType.per_1x128,
+            True,  # use_g1u1
+            False,  # doweight_stage1
+        )
+        with (
+            mock.patch.object(gemm_moe_tune, "get_gfx", return_value="gfx950"),
+            mock.patch.object(
+                gemm_moe_tune,
+                "get_asm_dir",
+                return_value=str(REPO_ROOT / "hsa" / "gfx950"),
+            ),
+        ):
+            tasks = gemm_moe_tune.FmoeTuner.gen_1stage_asm_task(tuner, key)
+
+        names = {task[0][2] for task in tasks}
+        # Only the _silu_limit_ kernels apply the runtime clamp; others would ignore it.
+        self.assertEqual({n for n in names if "_silu_limit_" not in n}, set())
+        self.assertLessEqual(
+            {
+                "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128E",
+                "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256E",
+            },
+            names,
+        )
+        for task in tasks:
+            self.assertEqual(task[5].get("swiglu_limit"), 10.0)  # candidate
+            self.assertEqual(task[8], {"swiglu_limit": 10.0})  # reference
+            self.assertIs(task[12], gemm_moe_tune.limit_cosine_diff_compare)
+
+        seen = {}
+
+        def fake_op(*args, swiglu_limit=None, **kwargs):
+            seen["swiglu_limit"] = swiglu_limit
+
+        m, model_dim, topk = 2, 256, 3
+        with (
+            torch.device("cpu"),
+            mock.patch.object(gemm_moe_tune.aiter, "fmoe_fp8_blockscale_g1u1", fake_op),
+        ):
+            a1 = torch.zeros((m, model_dim), dtype=dtypes.bf16)
+            topk_ids = torch.zeros((m, topk), dtype=dtypes.i32)
+            topk_weights = torch.ones((m, topk), dtype=dtypes.fp32)
+            gemm_moe_tune.FmoeTuner.run_1stage_fmoe_fp8_blockscale_g1u1(
+                *(a1, a1, None, None, topk_ids, topk_weights, topk_ids, topk_ids),
+                *(None, None, None),
+                **tasks[0][5],
+            )
+        # A _silu_limit kernel resolves only with a non-zero limit at the op.
+        self.assertEqual(seen["swiglu_limit"], 10.0)
+
+
 class TestParallelMxfp4Precompile(unittest.TestCase):
     def test_uses_forkserver_pool_and_reports_failed_cache_jobs(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
