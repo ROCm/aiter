@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """IPCBufferPool exchanges IPC metadata through the default store with plain
 set/get, so any backend-free KV store works. Both tcp:// (TCPStore) and
 file:// (FileStore) init methods must be accepted, and callers such as vLLM
@@ -69,3 +69,7 @@ def test_all_gather_object_over_file_store(tmp_path):
         [{"rank": r, "step": step} for r in range(world_size)] for step in range(3)
     ]
     assert results == [expected] * world_size
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
