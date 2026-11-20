@@ -220,10 +220,11 @@ def test_partition_cu_num_is_the_hip_cu_num(node, gpus, expected):
     "gpu, expected",
     [
         (MI355X_DPX_VF, ("gfx950", 128, 256, "DPX", None, 2, True)),
-        (_vf("gfx950", 256, 0x75B3), ("gfx950", 256, None, None, None, None, False)),
-        (_vf("gfx950", 128, 0x75A8), ("gfx950", 128, None, None, None, None, False)),
-        (_vf("gfx950", 128, 0x75B8), ("gfx950", 128, None, None, None, None, False)),
-        (_vf("gfx942", 80, 0x74A2), ("gfx942", 80, None, None, None, None, False)),
+        (_vf("gfx950", 256, 0x75B3), ("gfx950", 256, 256, "SPX", None, 1, True)),
+        (_vf("gfx950", 128, 0x75A8), ("gfx950", 128, 128, "SPX", None, 1, True)),
+        (_vf("gfx950", 128, 0x75B8), ("gfx950", 128, 128, "SPX", None, 1, True)),
+        (_vf("gfx942", 80, 0x74A2), ("gfx942", 80, 80, "SPX", None, 1, True)),
+        (_vf("gfx942", 228, 0x74A0), ("gfx942", 228, 228, "SPX", None, 1, True)),
         (_vf("gfx942", 152, 0x74A2, 0xA1), ("gfx942", 152, 304, "DPX", None, 2, True)),
         (_vf("gfx942", 76, 0x74B5), ("gfx942", 76, 304, "QPX", None, 4, True)),
         (_vf("gfx942", 38, 0x74B9), ("gfx942", 38, 304, "CPX", None, 8, True)),
@@ -237,7 +238,8 @@ def test_partition_cu_num_is_the_hip_cu_num(node, gpus, expected):
 def test_partition_inferred_from_full_chip_cu_num(node, gpu, expected):
     """Without a reported mode, 1/2, 1/4 or 1/8 of the CUs of a known chip is a partition.
 
-    MI350P and MI308X are full chips with fewer CUs, so they are not partitions.
+    All of the CUs of a known chip is SPX. MI350P, MI308X and MI300A are full
+    chips with their own device IDs, so their CU counts are SPX.
     """
     node([gpu])
     assert chip_info.get_partition_info() == expected

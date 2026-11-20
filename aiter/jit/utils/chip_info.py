@@ -369,7 +369,7 @@ _FULL_CHIP_CU_NUM = {
     (0x75B3, 0x00): 256,  # MI355X VF
     (0x75B8, 0x00): 128,  # MI350P VF
 }
-_PARTITION_MODES = {2: "DPX", 4: "QPX", 8: "CPX"}
+_PARTITION_MODES = {1: "SPX", 2: "DPX", 4: "QPX", 8: "CPX"}
 
 
 def _pci_id(value) -> int | None:
@@ -385,7 +385,8 @@ def _inferred_partition(asic: dict, cu_num: int) -> tuple[str, int] | None:
     An SR-IOV VF guest, or a container that sees only a secondary partition,
     gets N/A for the mode. A compute partition has an equal share of the CUs
     of its chip, so a GPU with 1/2, 1/4 or 1/8 of the CUs of its full chip is
-    a partition. A GPU of an unknown device ID is not.
+    a partition, and a GPU with all of them is in SPX mode. A GPU of an
+    unknown device ID gets no mode.
     """
     full_cu_num = _FULL_CHIP_CU_NUM.get(
         (_pci_id(asic.get("device_id")), _pci_id(asic.get("rev_id")))
@@ -457,12 +458,12 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
             mode, num_partitions = inferred
             logger.info(
                 "GPU %s (%s, device ID %s) reports no compute partition; "
-                "%d CUs is 1/%d of the full chip, so it is in %s mode",
+                "it has %d of the %d CUs of the full chip, so it is in %s mode",
                 bdf,
                 asic.get("market_name"),
                 asic.get("device_id"),
                 cu_num,
-                num_partitions,
+                cu_num * num_partitions,
                 mode,
             )
         info = PartitionInfo(
