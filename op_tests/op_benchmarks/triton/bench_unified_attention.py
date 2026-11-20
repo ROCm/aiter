@@ -376,7 +376,7 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend, causal=True
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
@@ -412,7 +412,7 @@ def _make_unified_attention_fn(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=True,
+            causal=causal,
             window_size=window_size,
             block_table=block_table,
             softcap=0,
@@ -597,6 +597,7 @@ def run_benchmark(custom, args):
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
+            causal=not args.non_causal,
         )
 
         if args.equal_seqlen_q:
@@ -636,6 +637,7 @@ def run_benchmark(custom, args):
                 v_descale=sample["v_descale"],
                 output_scale=sample["output_scale"],
                 out_dtype=sample["output"].dtype,
+                causal=not args.non_causal,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -668,7 +670,11 @@ def run_benchmark(custom, args):
             for i in range(num_contexts):
                 sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
                 sk = seqlens_k[i].item()
-                if window is None:
+                if args.non_causal:
+                    # each query token attends to all sk keys
+                    valid = sq * sk
+                    kv_read = sk
+                elif window is None:
                     valid = sq * sk - ((sq**2 - sq) / 2)
                     kv_read = sk
                 else:
@@ -840,6 +846,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Sliding window size (default: disabled)",
+    )
+    parser.add_argument(
+        "-non_causal",
+        action="store_true",
+        help="causal=False: each query token attends to all keys of its sequence "
+        "(gfx950 Gluon only)",
     )
 
     parser.add_argument(
