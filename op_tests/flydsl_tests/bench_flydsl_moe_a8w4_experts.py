@@ -37,6 +37,7 @@ import torch
 import aiter.fused_moe as fm
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_a8w4_experts import (
     A8W4ExpertWeights,
     flydsl_moe_a8w4_experts,
@@ -137,9 +138,12 @@ def fused_moe_call(w: A8W4ExpertWeights, bf16_input: bool):
 
 
 def _row_key(n_tokens, e, topk):
+    """The key ``fused_moe``'s ``get_2stage_cfgs`` looks a tuned row up by: (gfx,
+    cu_num, padded M, model_dim, inter_dim, experts, topk, activation, dtype,
+    q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1)."""
     return (
-        "gfx950",
-        256,
+        get_gfx_runtime(),
+        get_cu_num(),
         fm.get_padded_M(n_tokens),
         H,
         I,
@@ -180,7 +184,8 @@ def candidate_pairs():
 
 
 def install_row(n_tokens, e, topk, pair):
-    """Make ``pair`` the tuned row ``fused_moe`` looks up for this count."""
+    """Make ``pair`` the tuned row ``fused_moe`` looks up for this count (benchmark only:
+    it edits ``fused_moe``'s module-level tuned table in this process)."""
     if fm.cfg_2stages is None:
         try:  # loads the tuned tables; the lookup itself may reject the shape
             fm.get_2stage_cfgs(
@@ -318,10 +323,14 @@ def main():
                         continue
                     graphs[name], o_base, pair, _ = best
                     row[name + "_pair"] = pair
+                # agreement with fused_moe over every call of the graph (the worst one)
                 row[name + "_cos"] = round(
-                    torch.nn.functional.cosine_similarity(
-                        o_ours[0].double().flatten(), o_base[0].double().flatten(), 0
-                    ).item(),
+                    min(
+                        torch.nn.functional.cosine_similarity(
+                            a.double().flatten(), b.double().flatten(), 0
+                        ).item()
+                        for a, b in zip(o_ours, o_base)
+                    ),
                     7,
                 )
             names = list(graphs)

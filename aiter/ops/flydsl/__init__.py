@@ -109,6 +109,10 @@ _LAZY_IMPORTS = {
         ".moe_a8w4_experts",
         "flydsl_moe_a8w4_experts_warmup",
     ),
+    "flydsl_moe_a8w4_experts_workspace": (
+        ".moe_a8w4_experts",
+        "flydsl_moe_a8w4_experts_workspace",
+    ),
     "moe_a8w4_experts_supported": (
         ".moe_a8w4_experts",
         "moe_a8w4_experts_supported",
@@ -292,6 +296,7 @@ __all__ = [
     "flydsl_moe_a8w4_experts",
     "flydsl_moe_a8w4_experts_rows",
     "flydsl_moe_a8w4_experts_warmup",
+    "flydsl_moe_a8w4_experts_workspace",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",

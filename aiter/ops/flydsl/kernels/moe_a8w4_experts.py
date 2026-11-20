@@ -27,11 +27,11 @@ last consumer of a counter resets it for the next call. Deadlock-free: a workgro
 ids, and each XCD dispatches its workgroups in id order. An expert with several blocks loads its weights cached
 (``hot``), so that blocks running at the same time share them in L2; a lone block streams them non-temporally.
 
-Raw ops: the loads and stores go through the legacy ``buffer_ops`` helpers (per-load cache policy, ``soffset``
-folding), the ring through ``raw_ptr_buffer_load_async_lds`` with per-lane gathered offsets, the counters through
-LLVM atomics, and the LDS through byte-addressed pointers into one shared array that the GEMM1, GEMM2 and combine
-bodies alias with different layouts. Moving them to ``fx.copy`` / ``BufferCopyLDS128b`` / ``fx.llvm.atomic_*`` is
-left for a change that shows bit-identical outputs and no loss in the benchmark.
+FlyDSL API (pinned 0.5.0): the counters use ``fx.atomic_add`` / ``fx.atomic_xchg``, the LDS typed ``fx`` pointers
+with ``fx.generic_load`` / ``fx.generic_store``, the requant ``fx.rocdl.cvt_scalef32_pk_fp8_f32`` and the sort's scan
+``fx.rocdl.update_dpp`` (the final gfx950 ISA of every kernel is unchanged by moving to them). Each remaining raw op
+carries a comment at its helper: the inline-asm MFMA (``_mfma``, ``_hold``), the buffer atomic of ``_poll``, and the
+global loads / stores and the async LDS DMA, which still use the legacy ``buffer_ops`` helpers (``_load8``, ``_dma``).
 """
 
 import functools
@@ -106,6 +106,8 @@ def _mfma(a, b, acc, sa, sb, byte, *, w_first):
 
 def _hold(xs):
     """Keep the required inline-MFMA latency before any accumulator reads."""
+    # inline asm: the MFMAs are inline asm (``_mfma``), so LLVM's hazard recognizer does not see them and inserts no
+    # wait states before the first read of their accumulators; the s_nops are those wait states.
     if len(xs) == 1:  # one output cannot be an LLVM inline-asm struct
         return [
             llvm.inline_asm(
@@ -128,14 +130,32 @@ def _hold(xs):
     return [llvm.extractvalue(T.vec(4, T.f32), v, [i]) for i in range(len(xs))]
 
 
-def _lds_ptr(base, off):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(base + off)))
+def _lds_ptr(base, off, align):
+    """Typed LDS pointer at byte address ``base + off``. The GEMM1, GEMM2 and combine bodies alias one shared array
+    with different layouts, so they address it by byte; ``align`` is the access's proven alignment.
+    """
+    ty = fx.PointerType.get(
+        T.i32, address_space=fx.AddressSpace.Shared, alignment=align
+    )
+    return fx.inttoptr(ty, fx.Int32(base + off))
+
+
+def _lds_load(base, off, dtype, count, align):
+    return fx.generic_load(_lds_ptr(base, off, align), dtype=dtype, count=count)
+
+
+def _lds_store(base, off, value, align):
+    fx.generic_store(_lds_ptr(base, off, align), value)
 
 
 def _load8(rsrc, off, soff, plane=64):
     """K [16 q, 16 q + 16) and [64 + 16 q, 80 + 16 q) of a 128-K step (lane group q) as one 8-dword MFMA operand: the
     FP8 operand layout of the scaled MFMA, which pairs with the FP4 operand's K [32 q, 32 q + 32). ``plane``: bytes
     between the two 16-byte halves."""
+    # legacy buffer_ops (as every global load / store of this file): a per-lane byte offset gathered by token, a
+    # wave-uniform ``soffset`` and a per-load cache policy (non-temporal weights, write-through stores). Moving them to
+    # ``fx.make_buffer_tensor`` + ``fx.copy`` with ``BufferCopy128b`` atoms is not done yet; it must keep the ISA (or
+    # the benchmark) unchanged.
     lo = Vec(
         buffer_ops.buffer_load(
             rsrc, off, vec_width=4, dtype=fx.Int32, soffset_bytes=soff
@@ -154,13 +174,13 @@ def _load8(rsrc, off, soff, plane=64):
 def _dma(rsrc, lds_addr, voff, soff):
     """Async ``buffer_load ... lds``: 16 bytes per lane into LDS at the wave-uniform ``lds_addr`` + 16 * lane; the
     caller closes the stage with ``asyncmark`` and waits with ``wait_asyncmark``."""
-    lds = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<3>"),
-        _raw(fx.Int32(fx.rocdl.readfirstlane(T.i32, lds_addr))),
-    )
+    # ``fx.rocdl.raw_ptr_buffer_load_async_lds`` on a legacy buffer_ops resource rather than ``fx.copy`` with a
+    # ``BufferLoadAsyncLDS128b`` atom: the source rows are gathered per lane by token id; the move to the atom is not
+    # done yet (same condition as ``_load8``).
+    lds = _lds_ptr(fx.Int32(fx.rocdl.readfirstlane(T.i32, lds_addr)), 0, 16)
     fx.rocdl.raw_ptr_buffer_load_async_lds(
         rsrc,
-        lds.result,
+        lds.llvm_ptr,
         fx.Int32(16).ir_value(),
         fx.Int32(voff).ir_value(),
         fx.Int32(soff).ir_value(),
@@ -171,8 +191,8 @@ def _dma(rsrc, lds_addr, voff, soff):
 
 def _lds_load8(base, lo_off, hi_off):
     """Two 16-byte LDS reads as one 8-dword MFMA operand."""
-    lo = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(base, lo_off), alignment=16))
-    hi = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(base, hi_off), alignment=16))
+    lo = _lds_load(base, lo_off, fx.Int32, 4, 16)
+    hi = _lds_load(base, hi_off, fx.Int32, 4, 16)
     return Vec.from_elements(
         [lo[j] for j in range(4)] + [hi[j] for j in range(4)], fx.Int32
     )
@@ -198,36 +218,15 @@ def _e8m0(amax):
 
 def _fp8(old, a, b, scale, hi):
     """v_cvt_scalef32_pk_fp8_f32: (a, b) / scale -> 2 e4m3 into the low (``hi`` False) or high half of ``old``."""
-    ty = ir.VectorType.get([2], ir.IntegerType.get_signless(16))
-    old_v = llvm.bitcast(ty, fx.as_ir_value(old))
-    res = llvm.call_intrinsic(
-        ty,
-        "llvm.amdgcn.cvt.scalef32.pk.fp8.f32",
-        [
-            old_v,
-            fx.as_ir_value(a),
-            fx.as_ir_value(b),
-            fx.as_ir_value(scale),
-            fx.Boolean(hi).ir_value(),
-        ],
-        [],
-        [],
+    res = fx.rocdl.cvt_scalef32_pk_fp8_f32(
+        T.vec(2, T.i16),
+        Vec.from_elements([fx.Int32(old)], fx.Int32).bitcast(fx.Int16).ir_value(),
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(scale),
+        hi,
     )
-    return fx.Int32(llvm.bitcast(T.i32, res))
-
-
-def _lds_atomic_add_i32(ptr, value):
-    """``old = *ptr; *ptr += value`` on an LDS i32 pointer (workgroup scope)."""
-    return fx.Int32(
-        llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.add,
-            ptr.llvm_ptr,
-            fx.Int32(value).ir_value(),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="workgroup",
-            alignment=4,
-        ).result
-    )
+    return Vec(res, (2,), fx.Int16).bitcast(fx.Int32)[0]
 
 
 _SCAN_DPP = (
@@ -242,12 +241,10 @@ _SCAN_DPP = (
 
 def _wave_incl_scan(x):
     """Inclusive prefix sum of an i32 over the 64 lanes of a wave (DPP, no LDS)."""
-    from flydsl._mlir.dialects import rocdl
-
     zero = _raw(fx.Int32(0))
     for ctrl, row_mask, bound in _SCAN_DPP:
         x = x + fx.Int32(
-            rocdl.update_dpp(T.i32, zero, _raw(x), ctrl, row_mask, 0xF, bound)
+            fx.rocdl.update_dpp(T.i32, zero, _raw(x), ctrl, row_mask, 0xF, bound)
         )
     return x
 
@@ -257,26 +254,23 @@ def _tensor_addr(t):
 
 
 def _atomic_agent(op, addr, value):
+    """``op`` (``fx.atomic_add`` / ``fx.atomic_xchg``) on the i32 counter at the global byte address ``addr``, device
+    scope, monotonic: returns the previous value."""
     ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
     ptr = fx.inttoptr(ptr_ty, fx.Int64(addr))
-    return fx.Int32(
-        llvm.AtomicRMWOp(
-            op,
-            ptr.llvm_ptr,
-            fx.Int32(value).ir_value(),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        ).result
-    )
+    return op(ptr, fx.Int32(value), syncscope=fx.rocdl.SyncScope.Agent)
 
 
 def _poll(addr):
     """Thread 0's first read of the counter at ``addr`` (device scope; the other lanes' out-of-range offset drops
     theirs), issued before the tile's loads so its latency overlaps them: ``_await`` consumes it.
     """
+    # llvm.call_intrinsic: at the 0.5.0 pin the ROCDL dialect has buffer atomics for cmpswap / fadd / fmax / smax /
+    # umin only, no i32 add, and ``fx.rocdl.BufferAtomicAdd`` is an ``fx.copy`` atom that returns nothing. A buffer
+    # atomic (not ``fx.atomic_add`` under ``if tid == 0``) lets every lane issue it without a branch: the hardware
+    # range check drops lanes 1..255.
     rsrc = buffer_ops.create_buffer_resource_from_addr(addr, num_records_bytes=8)
     off = (fx.thread_idx.x == 0).select(fx.Int32(0), fx.Int32(0x7FFFFFF0))
     return fx.Int32(
@@ -304,7 +298,7 @@ def _await(addr, need, got, nap=2):
     if fx.thread_idx.x == 0:
         while got < need:
             fx.rocdl.s_sleep(nap)
-            got = _atomic_agent(llvm.AtomicBinOp.add, addr, 0)
+            got = _atomic_agent(fx.atomic_add, addr, 0)
     fx.gpu.barrier()
 
 
@@ -313,10 +307,10 @@ def _retire(addr, consumers):
     """A consumer's last act: counts itself at ``addr + 4``; the last of ``consumers`` resets both words to 0 for the
     next call (every consumer has passed its wait, and no producer is left)."""
     if fx.thread_idx.x == 0:
-        old = _atomic_agent(llvm.AtomicBinOp.add, addr + fx.Int64(4), 1)
+        old = _atomic_agent(fx.atomic_add, addr + fx.Int64(4), 1)
         if old == consumers - 1:
-            _atomic_agent(llvm.AtomicBinOp.xchg, addr, 0)
-            _atomic_agent(llvm.AtomicBinOp.xchg, addr + fx.Int64(4), 0)
+            _atomic_agent(fx.atomic_xchg, addr, 0)
+            _atomic_agent(fx.atomic_xchg, addr + fx.Int64(4), 0)
 
 
 @flyc.jit
@@ -324,11 +318,11 @@ def _retire_block(addr, consumers, done):
     """A GEMM2 tile's last act: counts itself at ``addr + 4``; the last of the block's ``consumers`` resets both words
     and counts the block at ``done``."""
     if fx.thread_idx.x == 0:
-        old = _atomic_agent(llvm.AtomicBinOp.add, addr + fx.Int64(4), 1)
+        old = _atomic_agent(fx.atomic_add, addr + fx.Int64(4), 1)
         if old == consumers - 1:
-            _atomic_agent(llvm.AtomicBinOp.xchg, addr, 0)
-            _atomic_agent(llvm.AtomicBinOp.xchg, addr + fx.Int64(4), 0)
-            _atomic_agent(llvm.AtomicBinOp.add, done, 1)
+            _atomic_agent(fx.atomic_xchg, addr, 0)
+            _atomic_agent(fx.atomic_xchg, addr + fx.Int64(4), 0)
+            _atomic_agent(fx.atomic_add, done, 1)
 
 
 @flyc.jit
@@ -337,7 +331,7 @@ def _signal(addr):
     fx.rocdl.s_waitcnt(vmcnt=0)
     fx.gpu.barrier()
     if fx.thread_idx.x == 0:
-        _atomic_agent(llvm.AtomicBinOp.add, addr, 1)
+        _atomic_agent(fx.atomic_add, addr, 1)
 
 
 @functools.cache
@@ -530,15 +524,12 @@ def _gemm1_tile(*, kw, pf, bm, ni, nbuf, ne, signal=False, nwv=4, hot=False):
             def lds_sa(k):
                 return [
                     (
-                        fx.Int32(
-                            llvm.load(
-                                T.i32,
-                                _lds_ptr(
-                                    base,
-                                    nbuf * pitch + (mi * 16 + l16) * (H // 32) + k * 4,
-                                ),
-                                alignment=4,
-                            )
+                        _lds_load(
+                            base,
+                            nbuf * pitch + (mi * 16 + l16) * (H // 32) + k * 4,
+                            fx.Int32,
+                            None,
+                            4,
                         )
                         >> (q16 * 8)
                     )
@@ -689,25 +680,19 @@ def _gemm1_tile(*, kw, pf, bm, ni, nbuf, ne, signal=False, nwv=4, hot=False):
             )
             if const_expr(kw > 1):
                 for j in range_constexpr(nacc):
-                    llvm.StoreOp(
-                        _raw(flat[j]),
-                        _lds_ptr(base, ((wave * nacc + j) * 64 + lane) * 16),
-                        alignment=16,
-                    )
+                    _lds_store(base, ((wave * nacc + j) * 64 + lane) * 16, flat[j], 16)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
             if kk == 0:
                 vals = [Vec(v) for v in flat]
                 for k in range_constexpr(1, kw):
                     for j in range_constexpr(nacc):
-                        other = Vec(
-                            llvm.load(
-                                T.vec(4, T.f32),
-                                _lds_ptr(
-                                    base, (((nk + k * nw) * nacc + j) * 64 + lane) * 16
-                                ),
-                                alignment=16,
-                            )
+                        other = _lds_load(
+                            base,
+                            (((nk + k * nw) * nacc + j) * 64 + lane) * 16,
+                            fx.Float32,
+                            4,
+                            16,
                         )
                         vals[j] = vals[j] + other
                 for mi in range_constexpr(mr):
@@ -964,14 +949,12 @@ def _gemm2_tile(
             def lds_sa(k):
                 return [
                     (
-                        fx.Int32(
-                            llvm.load(
-                                T.i32,
-                                _lds_ptr(
-                                    base, nbuf * pitch + ((mi * KT2 + k) * 16 + l16) * 4
-                                ),
-                                alignment=4,
-                            )
+                        _lds_load(
+                            base,
+                            nbuf * pitch + ((mi * KT2 + k) * 16 + l16) * 4,
+                            fx.Int32,
+                            None,
+                            4,
                         )
                         >> (q16 * 8)
                     )
@@ -1073,15 +1056,14 @@ def _gemm2_tile(
                         [v[2] * weight, v[3] * weight], fx.Float32
                     ).to(fx.BFloat16)
                     col = wave * (16 * ni) + j * 16 + q16 * 4
-                    llvm.StoreOp(
-                        _raw(
-                            Vec.from_elements(
-                                [lo.bitcast(fx.Int32)[0], hi.bitcast(fx.Int32)[0]],
-                                fx.Int32,
-                            )
+                    _lds_store(
+                        base,
+                        (mi * 16 + l16) * row_b + col * 2,
+                        Vec.from_elements(
+                            [lo.bitcast(fx.Int32)[0], hi.bitcast(fx.Int32)[0]],
+                            fx.Int32,
                         ),
-                        _lds_ptr(base, (mi * 16 + l16) * row_b + col * 2),
-                        alignment=8,
+                        8,
                     )
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             fx.gpu.barrier()
@@ -1091,13 +1073,7 @@ def _gemm2_tile(
                 token, slot = packed & 0xFFFFFF, packed.shrui(fx.Int32(24))
                 dst = token if rows_out else token * topk + slot
                 col = tx % tpr * 8
-                v = Vec(
-                    llvm.load(
-                        T.vec(4, T.i32),
-                        _lds_ptr(base, row * row_b + col * 2),
-                        alignment=16,
-                    )
-                )
+                v = _lds_load(base, row * row_b + col * 2, fx.Int32, 4, 16)
                 buffer_ops.buffer_store(
                     v, out, (dst * H + nb * tn + col) // 2, mask=token < m, **st_kw
                 )
@@ -1560,7 +1536,7 @@ def compile_experts(
 @flyc.jit
 def _quant_tile(row, X, XQ, XS, m):
     """bf16 row ``row`` of ``X`` ``[m, 5120]`` -> e4m3 codes and row-major e8m0 per 32 columns (``_e8m0``: the rule
-    of ``reference.quantize_mxfp8``); a thread owns 8 columns, four threads one scale group.
+    of the MXFP8 quant in ``aiter.ops.flydsl.moe_a8w4_experts``'s docstring); a thread owns 8 columns, four threads one scale group.
     """
     tx = fx.thread_idx.x
     xr = buffer_ops.create_buffer_resource(
@@ -1691,7 +1667,11 @@ def compile_sort(*, block_m, max_tokens, ne, topk, quant=False):
                 count[tx] = 0
             fx.gpu.barrier()
             ranks = [
-                _lds_atomic_add_i32(count + v.select(e, fx.Int32(ne)), 1)
+                fx.atomic_add(
+                    count + v.select(e, fx.Int32(ne)),
+                    fx.Int32(1),
+                    syncscope=fx.rocdl.SyncScope.Workgroup,
+                )
                 for _, v, e, _w in pr
             ]
             fx.gpu.barrier()

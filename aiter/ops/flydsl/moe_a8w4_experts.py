@@ -18,10 +18,22 @@ quantized to MXFP8 per 32 columns (e8m0 = exponent of
 
 ``moe_a8w4_experts_supported`` is the eligibility check; callers fall back to
 ``aiter.fused_moe`` when it returns False.
+
+Ready counters: the fused launch orders its GEMM1, GEMM2 and combine workgroups
+through a counter workspace that is zero between calls (the last reader of each
+counter resets it). Calls that may run at the same time (e.g. on two streams)
+must each pass their own workspace (``flydsl_moe_a8w4_experts_workspace``):
+two such calls on one workspace add into the same counters, so a consumer can
+pass its wait early (silent wrong outputs) and the counters can be left
+non-zero, which corrupts or hangs every later call on that workspace, not only
+the overlapping ones. Without ``ready_counters`` a call uses one workspace per
+device. ``AITER_FLYDSL_MOE_A8W4_CHECK=1`` synchronizes around each eager call
+and raises if the workspace is not zero before or after it.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -29,6 +41,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.moe_a8w4_experts import (
+    COMBINE_WGS,
     NE_MAX,
     READY_STRIDE,
     TOPKS,
@@ -49,6 +62,7 @@ __all__ = [
     "flydsl_moe_a8w4_experts",
     "flydsl_moe_a8w4_experts_rows",
     "flydsl_moe_a8w4_experts_warmup",
+    "flydsl_moe_a8w4_experts_workspace",
     "moe_a8w4_experts_supported",
 ]
 
@@ -183,10 +197,15 @@ class A8W4ExpertWeights:
         )
 
 
+_X_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+_SCALE_DTYPES = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
+
+
 def _activation(x, x_scales):
     """(codes, scales, quantize): MXFP8 rows pass through, bf16 rows are quantized in the
     routing launch."""
     assert x.dim() == 2 and x.shape[1] == H and x.is_contiguous()
+    assert x.dtype in _X_DTYPES, f"x: {x.dtype}, expected one of {_X_DTYPES}"
     if x.dtype == torch.bfloat16:
         assert x_scales is None, "bf16 input takes no scales"
         dev = x.device
@@ -195,9 +214,9 @@ def _activation(x, x_scales):
             torch.empty((x.shape[0], H // 32), dtype=torch.uint8, device=dev),
             True,
         )
-    assert x.element_size() == 1, "x: MXFP8 e4m3 codes or bf16"
     assert x_scales is not None and x_scales.is_contiguous()
-    assert x_scales.element_size() == 1 and x_scales.numel() == x.shape[0] * (H // 32)
+    assert x_scales.dtype in _SCALE_DTYPES, f"x_scales: {x_scales.dtype}"
+    assert x_scales.numel() == x.shape[0] * (H // 32)
     assert x_scales.device == x.device
     return x.view(torch.uint8), x_scales.view(torch.uint8), False
 
@@ -212,7 +231,8 @@ def _sort(topk_ids, topk_weights, block_m, ne, x=None, xq=None, xs=None):
     dev = topk_ids.device
     ids = torch.empty(ms, dtype=torch.int32, device=dev)
     wts = torch.empty(ms, dtype=torch.float32, device=dev)
-    eids = torch.empty(ms // block_m, dtype=torch.int32, device=dev)
+    # + 1: a tile also reads the next block's expert (it only picks the cache policy)
+    eids = torch.empty(ms // block_m + 1, dtype=torch.int32, device=dev)
     nv = torch.empty(1, dtype=torch.int32, device=dev)
     quant = x is not None
     flat = topk_ids.contiguous().int().view(-1)
@@ -244,7 +264,7 @@ def _blocks(expert_offsets, row_weights, block_m, topk, x=None, xq=None, xs=None
     dev = row_weights.device
     ids = torch.empty(ms, dtype=torch.int32, device=dev)
     wts = torch.empty(ms, dtype=torch.float32, device=dev)
-    eids = torch.empty(ms // block_m, dtype=torch.int32, device=dev)
+    eids = torch.empty(ms // block_m + 1, dtype=torch.int32, device=dev)  # as in _sort
     nv = torch.empty(1, dtype=torch.int32, device=dev)
     quant = x is not None
     off = expert_offsets.contiguous().int()
@@ -267,12 +287,29 @@ def _blocks(expert_offsets, row_weights, block_m, topk, x=None, xq=None, xs=None
     return ids, wts, eids, nv
 
 
+_READY_WORDS = (max_blocks(MAX_TOKENS, 16, NE_MAX, max(TOPKS)) + 1) * READY_STRIDE // 4
 _ready: dict = {}
 
 
-def _ready_counters(device):
-    """The device's counters of the fused launch: zero between calls (the last consumer
-    resets them). One arena per device, so two calls must not run concurrently on it."""
+def flydsl_moe_a8w4_experts_workspace(device=None) -> torch.Tensor:
+    """A new ready-counter workspace (int32, zero) for ``ready_counters=``.
+
+    Give each stream that may run a call while another is in flight its own
+    workspace; allocate it before graph capture. It stays zero between calls.
+    """
+    return torch.zeros(_READY_WORDS, dtype=torch.int32, device=device or "cuda")
+
+
+def _ready_counters(device, ready_counters=None):
+    """The counters of the fused launch: ``ready_counters`` or the device's shared
+    workspace (see the module docstring on concurrent calls)."""
+    if ready_counters is not None:
+        assert ready_counters.dtype == torch.int32 and ready_counters.is_contiguous()
+        assert ready_counters.device == device, "ready_counters on another device"
+        assert (
+            ready_counters.numel() >= _READY_WORDS
+        ), "use flydsl_moe_a8w4_experts_workspace"
+        return ready_counters
     arena = _ready.get(device)
     if arena is None:
         if torch.cuda.is_current_stream_capturing():
@@ -280,16 +317,36 @@ def _ready_counters(device):
                 "flydsl_moe_a8w4_experts: call flydsl_moe_a8w4_experts_warmup (or run "
                 "once) before graph capture; the first call allocates the counters"
             )
-        words = (max_blocks(MAX_TOKENS, 16, NE_MAX, max(TOPKS)) + 1) * READY_STRIDE // 4
-        arena = torch.zeros(words, dtype=torch.int32, device=device)
+        arena = flydsl_moe_a8w4_experts_workspace(device)
         _ready[device] = arena
     return arena
 
 
-def _fused(xq, xs, w, topk, tid, ids, wts, eids, nv, n_rows, nmb, *, cfg, rows_out):
+def _check_counters(arena, when):
+    """``AITER_FLYDSL_MOE_A8W4_CHECK=1``: the workspace must be zero ``when``."""
+    if os.environ.get("AITER_FLYDSL_MOE_A8W4_CHECK", "0") != "1":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    torch.cuda.current_stream(arena.device).synchronize()
+    if bool(arena.any()):
+        raise RuntimeError(
+            f"flydsl_moe_a8w4_experts: ready counters not zero {when} the call: two "
+            "calls ran at the same time on one workspace (pass each stream its own "
+            "ready_counters); every later call on this workspace is unreliable"
+        )
+
+
+def _fused(
+    xq, xs, w, topk, tid, ids, wts, eids, nv, n_rows, nmb, *, cfg, rows_out, ready
+):
     bm, kw, pf1, ni, nb1, tn, pf2, nb2, hot, nwv, cw = cfg
+    # the combine workgroups of the token entry cover every token
+    assert rows_out or cw * COMBINE_WGS >= n_rows, (cw, n_rows)
     rows = ids.numel()
     dev = xq.device
+    counters = _ready_counters(dev, ready)
+    _check_counters(counters, "before")
     q = torch.empty(rows * I, dtype=torch.uint8, device=dev)
     s = torch.empty(rows * (I // 32), dtype=torch.uint8, device=dev)
     slots = torch.empty(
@@ -331,12 +388,13 @@ def _fused(xq, xs, w, topk, tid, ids, wts, eids, nv, n_rows, nmb, *, cfg, rows_o
         wts,
         eids,
         nv,
-        _ready_counters(dev),
+        counters,
         n_rows,
         rows,
         nmb,
         torch.cuda.current_stream(),
     )
+    _check_counters(counters, "after")
     return out
 
 
@@ -418,6 +476,7 @@ def flydsl_moe_a8w4_experts(
     topk_ids: torch.Tensor,
     *,
     return_slots: bool = False,
+    ready_counters: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The routed experts of each token.
 
@@ -430,15 +489,24 @@ def flydsl_moe_a8w4_experts(
         topk_weights: ``[n, topk]`` route weights (read as fp32).
         return_slots: return the route-weighted bf16 slots ``[n, topk, 5120]``
             (unfused GEMM1 / GEMM2 launches) instead of their sum.
+        ready_counters: the counter workspace
+            (``flydsl_moe_a8w4_experts_workspace``); required for calls that may
+            overlap another call on the same device (module docstring).
 
     Returns:
-        bf16 ``[n, 5120]``.
+        bf16 ``[n, 5120]`` (``n`` 0 gives an empty tensor and launches nothing).
     """
     n, topk = topk_ids.shape
     assert topk in TOPKS, f"topk {topk} not in {TOPKS}"
-    assert 1 <= n <= MAX_TOKENS, f"{n} tokens, 1..{MAX_TOKENS}"
+    assert 0 <= n <= MAX_TOKENS, f"{n} tokens, 0..{MAX_TOKENS}"
     assert x.shape[0] == n and topk_weights.shape == (n, topk)
     assert topk_ids.device == x.device and topk_weights.device == x.device
+    assert (
+        w.w13.device == x.device and w.w2.device == x.device
+    ), "weights on another device"
+    if n == 0:
+        shape = (0, topk, H) if return_slots else (0, H)
+        return torch.empty(shape, dtype=torch.bfloat16, device=x.device)
     cfg = _config(n, topk)
     bm = cfg[0]
     xq, xs, quant = _activation(x, x_scales)
@@ -451,7 +519,20 @@ def flydsl_moe_a8w4_experts(
     tid = topk_ids.contiguous().int().view(-1)
     nmb = max_blocks(n, bm, ne, topk)
     return _fused(
-        xq, xs, w, topk, tid, ids, wts, eids, nv, n, nmb, cfg=cfg, rows_out=False
+        xq,
+        xs,
+        w,
+        topk,
+        tid,
+        ids,
+        wts,
+        eids,
+        nv,
+        n,
+        nmb,
+        cfg=cfg,
+        rows_out=False,
+        ready=ready_counters,
     )
 
 
@@ -462,6 +543,8 @@ def flydsl_moe_a8w4_experts_rows(
     row_weights: torch.Tensor,
     expert_offsets: torch.Tensor,
     topk: int = 6,
+    *,
+    ready_counters: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rows already sorted by expert (an expert-parallel dispatch's receive buffer).
 
@@ -472,16 +555,25 @@ def flydsl_moe_a8w4_experts_rows(
             ``expert_offsets[e]`` .. ``expert_offsets[e + 1]``; the last entry is the
             row count (at most ``R``).
         topk: the routing's top-k; picks the dispatch tier (``R / topk`` tokens).
+        ready_counters: as in ``flydsl_moe_a8w4_experts``.
 
     Returns:
-        bf16 ``[R, 5120]``: row ``r`` = ``bf16(row_weights[r] * expert(x[r]))``; rows
-        from ``expert_offsets[-1]`` on are not written.
+        bf16 ``[R, 5120]``: row ``r`` = ``bf16(row_weights[r] * expert(x[r]))`` for
+        ``r < expert_offsets[-1]``; the rows from ``expert_offsets[-1]`` on are
+        undefined (not written; the output is allocated uninitialized). ``R`` 0
+        gives an empty tensor and launches nothing.
     """
     n = x.shape[0]
     assert topk in TOPKS
     assert row_weights.shape == (n,)
     assert expert_offsets.shape == (w.num_experts + 1,)
-    assert 1 <= n <= topk * MAX_TOKENS
+    assert 0 <= n <= topk * MAX_TOKENS
+    assert row_weights.device == x.device and expert_offsets.device == x.device
+    assert (
+        w.w13.device == x.device and w.w2.device == x.device
+    ), "weights on another device"
+    if n == 0:
+        return torch.empty((0, H), dtype=torch.bfloat16, device=x.device)
     cfg = _config(-(-n // topk), topk)
     bm = cfg[0]
     xq, xs, quant = _activation(x, x_scales)
@@ -490,7 +582,20 @@ def flydsl_moe_a8w4_experts_rows(
     )
     nmb = n // bm + min(w.num_experts, n)
     return _fused(
-        xq, xs, w, topk, ids, ids, wts, eids, nv, n, nmb, cfg=cfg, rows_out=True
+        xq,
+        xs,
+        w,
+        topk,
+        ids,
+        ids,
+        wts,
+        eids,
+        nv,
+        n,
+        nmb,
+        cfg=cfg,
+        rows_out=True,
+        ready=ready_counters,
     )
 
 
