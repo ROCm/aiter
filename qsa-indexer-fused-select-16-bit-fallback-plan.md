@@ -92,9 +92,9 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 - [x] Before the gate, time the int16 scorer alone at `p128k` and `p256k` against the fp32 scorer and the aiter#5996 whole call in one idle session, and measure the boundary bucket there. Recorded under [16-bit select budget](#16-bit-select-budget). The budget is 1901.5 µs at `p128k` and 2405.0 µs at `p256k`.
 - [x] Replace the host select with a GPU int16 select that keeps the Phase 3 rule and passes the Phase 5 set gate. The existing radix takes fp32 only, so this is its own kernel. `qsa_indexer_key16_select` now launches that kernel. `select err` is 0 on the seeded 32K case, the short row, both wide-bucket cases, and all eight set-gate cases.
-- [ ] One idle gfx950 session, probe-free, interleaved with aiter#5996, vllm#65188, and vllm#62589. Same ten cases as the master's Phase 6 matrix. Five warmup steps, ten timed steps, warm and cold.
-- [ ] Fill [Kernel gate](#kernel-gate). Apply gate 1 per case.
-- [ ] If `p128k` or `p256k` misses, record the miss and stop. Do not start serving.
+- [x] One idle gfx950 session, probe-free, interleaved with aiter#5996, vllm#65188, and vllm#62589. Same ten cases as the master's Phase 6 matrix. Five warmup steps, ten timed steps, warm and cold. `op_tests/bench_qsa_indexer_select_abc.py --key16`, bus 0000:f5:00.0.
+- [x] Fill [Kernel gate](#kernel-gate). Apply gate 1 per case. Every case misses.
+- [x] If `p128k` or `p256k` misses, record the miss and stop. Do not start serving. Both miss: 6084.9 µs against 3611.5 µs at `p128k`, and 9468.2 µs against 5734.1 µs at `p256k`. Serving does not start. gfx942 is not measured.
 - [ ] Measure gfx942. Enable this path there only for the cases where it wins.
 
 ### 7. Dispatch
@@ -106,8 +106,8 @@ Change these only by editing this section and adding a log line. Code, tests, an
 ### 8. Close or hand back
 
 - [ ] If Phase 6 passes, serving and the decode table follow the master's Phases 8 and 9, and the numbers land in this document's tables.
-- [ ] If Phase 6 misses, write the outcome in [Decision record](#decision-record). The fused select stays off. Today's indexer stays the public path.
-- [ ] Log the date.
+- [x] If Phase 6 misses, write the outcome in [Decision record](#decision-record). The fused select stays off. Today's indexer stays the public path. Recorded 2026-11-20.
+- [x] Log the date.
 
 ## Results
 
@@ -121,6 +121,7 @@ Change these only by editing this section and adding a log line. Code, tests, an
 | Phase 5 set gate | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:75:00.0 | MI355X | rocm-smi GPU 3, use 0%, no other pids |
 | Phase 6 select budget | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:65:00.0 | MI355X | rocm-smi GPU 2, use 0%, no other pids |
 | Phase 6 GPU select | 2026-11-20 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:65:00.0 | MI355X | rocm-smi GPU 2, use 0%, no other pids. One earlier grant was busy and was discarded |
+| Phase 6 kernel gate | 2026-11-20 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:f5:00.0 | MI355X | rocm-smi GPU 7, use 0%, no other pids |
 
 ### Budget
 
@@ -225,16 +226,20 @@ Median microseconds per QSA layer per step, gfx950. Margin is this path divided 
 
 | Case | 16-bit path | aiter#5996 | vllm#65188 | Faster arm | Margin | Pass |
 | --- | ---: | ---: | ---: | --- | ---: | --- |
-| p8k | | | | | | |
-| p32k | | | | | | |
-| p128k | | | | | | |
-| p256k | | | | | | |
-| two128k | | | | | | |
-| four128k | | | | | | |
-| mix3 | | | | | | |
-| mix16 | | | | | | |
-| mix64 | | | | | | |
-| mtp | | | | | | |
+| p8k | 1067.8 | 872.3 | 211.0 | vllm#65188 | 5.060 | no |
+| p32k | 2968.8 | 1632.8 | 926.8 | vllm#65188 | 3.203 | no |
+| p128k | 6084.9 | 3611.5 | 4175.7 | aiter#5996 | 1.685 | no |
+| p256k | 9468.2 | 5734.1 | 66481.2 | aiter#5996 | 1.651 | no |
+| two128k | 6254.7 | 3710.2 | 4320.6 | aiter#5996 | 1.686 | no |
+| four128k | 6380.9 | 3826.8 | 4360.2 | aiter#5996 | 1.667 | no |
+| mix3 | 6244.4 | 3762.7 | 4306.8 | aiter#5996 | 1.660 | no |
+| mix16 | 6762.3 | 4315.5 | 4329.2 | aiter#5996 | 1.567 | no |
+| mix64 | 7656.5 | 4793.8 | 4377.6 | vllm#65188 | 1.749 | no |
+| mtp | 6149.2 | 3659.2 | 4308.8 | aiter#5996 | 1.680 | no |
+
+Warm-2 medians from one interleaved session, `op_tests/bench_qsa_indexer_select_abc.py --key16`. Five warmup steps, ten timed steps. The 16-bit figure is the whole `qsa_indexer_key16_score_and_select` call, expand included. aiter#5996 is `qsa_indexer_block_ids` plus expand. The vLLM arms are the sum of their score, top-k, and expand kernels. vllm#62589 ran in the same session and is slower than the faster arm on every case. Cold 16-bit repeats stay within about 1% of these warm-2 medians. At `p8k` the rule is 1.05×. At every other case the rule is strictly faster. Every case misses. `p128k` and `p256k` are 1.685× and 1.651× aiter#5996.
+
+The score-only probe left 1901.5 µs and 2405.0 µs for a select. This whole call is 6084.9 µs and 9468.2 µs, about 4575 µs and 6500 µs past that session's int16 scorer. The select at the bench width does not fit the budget. Serving does not start, and gfx942 is not measured. `_fused_select_wins` stays false. `qsa_indexer_block_ids` stays the public path.
 
 ### Serving gate
 
@@ -256,11 +261,9 @@ No gate. Filled only if Phase 6 passes.
 
 Phase 0, 2026-11-19: the stop does not fire. At `p128k` and `p256k` the faster arm is aiter#5996, and this path is a change to that arm, so the miss is a strict improvement on its step. The baseline score stage is 2072.9 µs of 3797.3 µs (0.546) and 3905.9 µs of 5861.4 µs (0.666). That share is larger than the miss. Phase 1 is next. The 16-bit counts, 1019 rows per chunk and 17 chunks on the 16384-row cases, are the workspace formula and are not a measured win.
 
-Outcome: open. Option 1 stays a miss in the master. The 16-bit store, the GPU boundary select, and the 2-byte chunks exist, and the path passes the set gate. The kernel gate has not run.
+Outcome: miss. Option 1 stays a miss in the master. The 16-bit path passes the set gate and misses gate 1 on every case. At `p128k` it is 6084.9 µs against aiter#5996 at 3611.5 µs. At `p256k` it is 9468.2 µs against 5734.1 µs. The fused select stays off. Today's indexer stays the public path. Serving does not start.
 
-Gates met: none. Gate 5 stays closed, as the master applied it.
-
-Margins: not measured. The budget is the table under [Budget](#budget).
+Gates met: none. Gate 5 stays closed, as the master applied it. Gate 1 misses on all ten cases. The margins are in [Kernel gate](#kernel-gate).
 
 gfx942 enablement: not measured.
 
@@ -277,6 +280,8 @@ Phase 5, 2026-11-19: the int16 path passes the set gate. `select err` is 0 on al
 Phase 6 budget, 2026-11-19: build a GPU int16 select. In one idle session the int16 scorer is 0.763× and 0.777× the fp32 scorer at `p128k` and `p256k`, 1509.7 µs and 2965.5 µs. That leaves 1901.5 µs and 2405.0 µs under aiter#5996 for the select, and today's fp32 top-k takes 1431.4 µs and 1552.1 µs. The boundary bucket is at most 35 and 40 blocks. The existing radix takes fp32 only. Widening the keys back to fp32 would give back the halved buffer. So the select is a new kernel, and the shared radix stays as it is. `p32k` needs that select under about 330 µs, and `p8k` misses regardless.
 
 Phase 6 select, 2026-11-20: `qsa_indexer_key16_select` is a GPU kernel. One workgroup per row stages the keys, finds the boundary with two 8-bit passes, and rescores that bucket in fp32. On the seeded 32K case the set matches within 1.7e-6 in 45.69 µs, against 1247.49 µs for the host select it replaced. A 900-block bucket and an 8092-block bucket both match. The set gate is 0 on all eight cases, and the 1027-row chunked step is 210.41 µs. The public dispatch is unchanged. The kernel gate is next.
+
+Phase 6 gate, 2026-11-20: stop. The 16-bit whole call misses gate 1 on every case. Warm-2 `p128k` is 6084.9 µs against aiter#5996 at 3611.5 µs (1.685×), and `p256k` is 9468.2 µs against 5734.1 µs (1.651×). The closest case is `mix16` at 1.567×. `p8k` is 5.060× vllm#65188. The int16 scorer was fast enough. The full-width select is not. gfx942 is not measured. `_fused_select_wins` stays false, and `qsa_indexer_block_ids` stays the public path.
 
 Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 
@@ -298,3 +303,4 @@ Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 - 2026-11-19: Locked decision edit, approved by the user. Under Mechanism, the boundary rescore may run inside the select kernel, as long as it computes the oracle's bf16-in, fp32-accumulate formula and passes the 1.7e-6 tie gate. The Phase 3 box now says the same thing. The Phase 3 host rescore already meets it. No code changed.
 - 2026-11-19: Phase 6 select budget, gfx950, ROCm 7.2.1, bus 0000:65:00.0, rocm-smi GPU 2 at 0% with no other pids. `/tmp/key16_budget_probe.py` ran four warm, interleaved arms on the bench's `p8k`, `p32k`, `p128k`, and `p256k`, with 5 warmup and 10 timed rounds, median. Arms: the aiter#5996 whole call, expand, the fp32 scorer in 33 chunks, and the int16 scorer in 17 chunks (9 and 17 at `p8k`). The int16 scorer is 1509.7 µs at `p128k` and 2965.5 µs at `p256k`, 0.763× and 0.777× fp32. That leaves 1901.5 µs and 2405.0 µs for the select. Today's fp32 top-k, derived, is 1431.4 µs and 1552.1 µs, inside that budget. The boundary bucket is 12 / 23 / 35 and 14 / 26 / 40. The radix is fp32 only, so a GPU int16 select is next. `p32k` needs it under about 330 µs against vllm#65188, a number from another session. `p8k` misses regardless. `_fused_select_wins` stays false.
 - 2026-11-20: Phase 6 GPU select, gfx950, ROCm 7.2.1, bus 0000:65:00.0, rocm-smi GPU 2 at 0% with no other pids. One earlier grant on bus 0000:05:00.0 was busy and was discarded. `qsa_indexer_key16_select` now launches one workgroup per row. It stages the int16 keys, finds the 512th key with two 8-bit histogram passes, and rescores that bucket in fp32 from compressed K. A bucket of at most 1024 blocks is ranked in LDS. A wider one takes four more 8-bit passes over the recomputed score. `test_qsa_key16_select` matches the oracle within 1.7e-6: 45.69 µs on the seeded 32K case and 37.61 µs on the short row. `test_qsa_key16_select_bucket` matches too, at 136.19 µs for 900 blocks and 1815.30 µs for 8092. The set gate is 0 on all eight cases, 67.52 to 69.70 µs, and the 1027-row chunked step is 210.41 µs. `qsa_indexer_block_ids` is unchanged. The kernel gate is next. `_fused_select_wins` stays false.
+- 2026-11-20: Phase 6 kernel gate, gfx950, ROCm 7.2.1, bus 0000:f5:00.0, rocm-smi GPU 7 at 0% with no other pids. `op_tests/bench_qsa_indexer_select_abc.py --key16` interleaved the 16-bit whole call with aiter#5996, vllm#65188, and vllm#62589. Ten cases, five warmup steps, ten timed steps, warm and cold, probe-free. Warm-2 `p128k` is 6084.9 µs against aiter#5996 at 3611.5 µs, and `p256k` is 9468.2 µs against 5734.1 µs. Every case misses gate 1. The closest is `mix16` at 1.567×, and `p8k` is 5.060× vllm#65188. Cold stays within about 1% of warm-2. The earlier score-only probe left about 1900 µs for the select. This whole call is about 4575 µs past that session's int16 scorer at `p128k`, so the full-width select does not fit. Serving does not start. gfx942 is not measured. `_fused_select_wins` stays false. `qsa_indexer_block_ids` stays the public path.

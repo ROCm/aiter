@@ -3,6 +3,9 @@
 
 """Interleaved session for arms A, B, C, and the fused indexer.
 
+``--key16`` times the 16-bit score-and-select whole call in place of fused.
+That call includes its expand. The other three arms stay as they are.
+
 One gpuq job. Live indexer pages are filled with random bf16 before any
 arm runs, because an uninitialized pool makes top-k time depend on garbage.
 Arms alternate inside each repeat. Sparse GQA is not launched.
@@ -23,6 +26,7 @@ arms' kernels are already compiled::
 
 from __future__ import annotations
 
+import argparse
 import statistics
 import sys
 from pathlib import Path
@@ -43,6 +47,7 @@ from aiter.ops.qsa import qsa_expand_block_indices
 
 ARM_A_LABEL = "aiter#5996"
 ARM_F_LABEL = "fused"
+ARM_K_LABEL = "key16"
 
 
 def _live_pages(cases) -> int:
@@ -129,6 +134,29 @@ def _arm_fused(
     return start.elapsed_time(end) * 1000.0, 0.0, 0.0
 
 
+def _arm_key16(
+    q, index_k, table, token_to_req, positions, context, block_ids, token_ids
+):
+    """int16 score, boundary select, and expand. The whole call is ``T_step``."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    paged.qsa_indexer_key16_score_and_select(
+        q,
+        index_k,
+        table,
+        token_to_req,
+        positions,
+        context,
+        score_scale=paged._SCORE_SCALE,
+        block_ids=block_ids,
+        token_ids=token_ids,
+    )
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0, 0.0, 0.0
+
+
 def _arm_vllm(arm, q, table, token_to_req, positions, context, token_ids, decode_rows):
     probe = {"score": [], "topk": [], "expand": []}
     arm.step(q, table, token_to_req, positions, context, token_ids, decode_rows, probe)
@@ -136,7 +164,41 @@ def _arm_vllm(arm, q, table, token_to_req, positions, context, token_ids, decode
     return _us(probe["score"]), _us(probe["topk"]), _us(probe["expand"])
 
 
+def _gate(rows: list[dict], arm: str) -> None:
+    """Gate 1 on warm-2. At p8k the bar is 1.05x. At every other case it is strict."""
+    by_case: dict[str, dict[str, float]] = {}
+    for got in rows:
+        if got["repeat"] != "warm-2":
+            continue
+        by_case.setdefault(got["case"], {})[got["arm"]] = got["step"]
+    print(
+        "case | key16 | aiter#5996 | vllm#65188 | faster | margin | pass",
+        flush=True,
+    )
+    for case, steps in by_case.items():
+        if arm not in steps or ARM_A_LABEL not in steps or ARM_B_LABEL not in steps:
+            continue
+        faster_name = min((ARM_A_LABEL, ARM_B_LABEL), key=steps.__getitem__)
+        faster = steps[faster_name]
+        margin = steps[arm] / faster if faster else float("nan")
+        passed = margin <= 1.05 if case == "p8k" else steps[arm] < faster
+        print(
+            f"{case} | {steps[arm]:.1f} | {steps[ARM_A_LABEL]:.1f} | "
+            f"{steps[ARM_B_LABEL]:.1f} | {faster_name} | {margin:.3f} | "
+            f"{'yes' if passed else 'no'}",
+            flush=True,
+        )
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Probe-free interleaved indexer arms")
+    parser.add_argument(
+        "--key16",
+        action="store_true",
+        help="Time the int16 whole call instead of the fused select.",
+    )
+    args = parser.parse_args()
+    fourth = ARM_K_LABEL if args.key16 else ARM_F_LABEL
     bench._print_device()
     bench._assert_idle()
     cases = bench._cases()
@@ -153,7 +215,7 @@ def main() -> None:
     arm_b = ArmB(index_k, bench.MAX_MODEL_LEN)
     arm_c = ArmC(index_k, bench.MAX_MODEL_LEN)
     flush = torch.empty(bench.FLUSH_BYTES, dtype=torch.uint8, device="cuda")
-    order = (ARM_A_LABEL, ARM_B_LABEL, ARM_C_LABEL, ARM_F_LABEL)
+    order = (ARM_A_LABEL, ARM_B_LABEL, ARM_C_LABEL, fourth)
     rows = []
     for case in cases:
         built = bench._build(case, index_k)
@@ -172,13 +234,15 @@ def main() -> None:
         decode_rows = num_decode_rows(case)
         max_seq_len = max(req.context for req in case.requests)
         arm_b.set_max_seq_len(context, max_seq_len)
-        scratch = torch.empty(
-            paged.qsa_indexer_select_workspace_elems(
-                q.shape[0], max_seq_len, bench.PAGE
-            ),
-            dtype=torch.float32,
-            device=q.device,
-        )
+        scratch = None
+        if not args.key16:
+            scratch = torch.empty(
+                paged.qsa_indexer_select_workspace_elems(
+                    q.shape[0], max_seq_len, bench.PAGE
+                ),
+                dtype=torch.float32,
+                device=q.device,
+            )
         ids = {
             ARM_A_LABEL: (
                 block_ids,
@@ -186,7 +250,7 @@ def main() -> None:
             ),
             ARM_B_LABEL: (None, token_ids.clone()),
             ARM_C_LABEL: (None, token_ids.clone()),
-            ARM_F_LABEL: (block_ids.clone(), token_ids.clone()),
+            fourth: (block_ids.clone(), token_ids.clone()),
         }
 
         def once(
@@ -207,6 +271,17 @@ def main() -> None:
             block, tokens = ids[label]
             if label == ARM_A_LABEL:
                 return _arm_a(
+                    q,
+                    index_k,
+                    table,
+                    token_to_req,
+                    positions,
+                    context,
+                    block,
+                    tokens,
+                )
+            if label == ARM_K_LABEL:
+                return _arm_key16(
                     q,
                     index_k,
                     table,
@@ -270,7 +345,12 @@ def main() -> None:
         torch.cuda.empty_cache()
     print(
         "arm A T_score is the block-ids call and T_topk is 0; "
-        "vLLM T_step is the sum of its kernels; fused T_step is the whole call",
+        "vLLM T_step is the sum of its kernels; "
+        + (
+            "key16 T_step is the whole int16 call"
+            if args.key16
+            else "fused T_step is the whole call"
+        ),
         flush=True,
     )
     print(
@@ -284,6 +364,8 @@ def main() -> None:
             f"{got['share']:.3f}",
             flush=True,
         )
+    if args.key16:
+        _gate(rows, ARM_K_LABEL)
 
 
 if __name__ == "__main__":
