@@ -208,16 +208,19 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert (s.backend, s.fold_factor, s.supported) == (MlaBackend.FLYDSL_PS1, 4, False)
 
 
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
 def test_low_head_bf16_fp8_flydsl_backend(arch):
     # The FlyDSL low-head kernel is the only BF16-Q/FP8-KV route for these
     # shapes, so the planner takes it without AITER_MLA_DECODE_PS1_FLYDSL. The
     # KV dtype is pinned per arch: the host's dtypes.fp8 would pick asm-only.
+    kv_dtype = dtypes.defaultDtypes[arch]["fp8"]
+
     def support(heads, qlen, **kwargs):
         return get_mla_decode_shape_support(
             heads,
             qlen,
             torch.bfloat16,
-            dtypes.fp8,
+            kv_dtype,
             arch=arch,
             enable_experimental=False,
             flydsl_ps1=False,
