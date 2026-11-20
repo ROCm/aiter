@@ -30,6 +30,10 @@ WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 float8_info = torch.finfo(e4m3_dtype)
 
+# A8K4V4PT (fp4pt V: e2m1 + one fp32 scale s per token and KV head) PV: sum_t (P[m, t] * s[t]) * v[t, :], the
+# softmax row sum L taken over the unscaled P. No V upcast: P * s in fp8 (one e8m0 power of two per tile keeps it
+# in range) x e2m1 V, one scaled WMMA (V scale 1.0).
+
 
 @gluon.jit
 def apply_softcap(S, x):
@@ -113,6 +117,16 @@ class AttentionConfig:
 
     HEAD_SIZE_SPLIT: gl.constexpr
 
+    # V in e2m1 (NVFP4 V or A8K4V4PT's fp4pt V): the shuffled e2m1 page data, its second TDM op and the
+    # ds_load_tr4 repacking load
+    V_FP4: gl.constexpr
+    # A8K4V4PT: fp4pt V, e2m1 data in the NVFP4-V layout plus one fp32 scale per token at the page row's tail
+    V_FP4PT: gl.constexpr
+    # layout of the per-token fp32 scales: the columns of P
+    V_PT_SCALES_LAYOUT: gl.constexpr
+    # fp4pt: the e8m0 scales of the fp8 P operand (one power of two per tile)
+    P_SCALES_DOT_LAYOUT: gl.constexpr
+
     @gluon.constexpr_function
     def __init__(
         self,
@@ -164,10 +178,19 @@ class AttentionConfig:
         # KV_CACHE_DTYPE is the K cache's; V_CACHE_DTYPE the V cache's (A8K4V8: nvfp4 K, fp8 V)
         self.KV_CACHE_DTYPE = gl.constexpr(KV_CACHE_DTYPE)
         V_CACHE_DTYPE = V_CACHE_DTYPE or KV_CACHE_DTYPE
+        # A8K4V8 (fp8 V) and A8K4V4PT (fp4pt V) pair an NVFP4 K with another V format
         assert V_CACHE_DTYPE == KV_CACHE_DTYPE or (
-            KV_CACHE_DTYPE == "nvfp4" and V_CACHE_DTYPE == "fp8"
+            KV_CACHE_DTYPE == "nvfp4" and V_CACHE_DTYPE in ("fp8", "fp4pt")
         )
         self.V_CACHE_DTYPE = gl.constexpr(V_CACHE_DTYPE)
+        self.V_FP4 = gl.constexpr(V_CACHE_DTYPE in ("nvfp4", "fp4pt"))
+        self.V_FP4PT = gl.constexpr(V_CACHE_DTYPE == "fp4pt")
+        if self.V_FP4PT:
+            # A8K4V4PT: fp8 Q, one 128-token page per tile (the tail scales are per page row)
+            assert QUERY_DTYPE == "fp8", "A8K4V4PT needs an fp8 Q"
+            assert SHUFFLED_KV_CACHE and NUM_BLOCKS_GATHER_PER_TILE == 1
+            assert BLOCK_SIZE == 128 and TILE_SIZE == BLOCK_SIZE
+            assert not FP8_PV and HEAD_SIZE_SPLIT == 1
         # NVFP4 scales are preshuffled in groups of this many page rows (128, or the page when shorter)
         self.SCALE_PRESHUFFLE = gl.constexpr(min(128, BLOCK_SIZE))
         self.ALL_DECODE = gl.constexpr(ALL_DECODE)
@@ -254,6 +277,11 @@ class AttentionConfig:
                 # A8K4V8: QK as A8W4, PV as A8W8
                 instr_width_qk = 128 // 2  # packed
                 instr_width_pv = 64
+            elif self.V_FP4PT:
+                # A8K4V4PT: QK as A8W4; PV as a scaled 16x16x128 WMMA of fp8 P x e2m1 V (accumulator and P on
+                # the 16x16x128 layout, the packed V on a 16x16x64 one, as Q / K in the QK)
+                instr_width_qk = 128 // 2  # packed
+                instr_width_pv = 128
             else:
                 # A8W4
                 instr_width_qk = 128 // 2  # packed
@@ -394,8 +422,13 @@ class AttentionConfig:
                             instr_shape=[16, 16, 64],
                         )
                     ),
-                    # packed bytes per lane: 16 (32 fp4) for the fp8 PV, 8 (16 fp4) for the bf16 PV
-                    k_width=self.K_WIDTH if self.FP8_PV else self.K_WIDTH // 2,
+                    # packed bytes per lane: 16 (32 fp4) for the fp8 PV and the fp8 x e2m1 scaled PV, 8 (16 fp4)
+                    # for the bf16 PV
+                    k_width=(
+                        self.K_WIDTH
+                        if (self.FP8_PV or self.V_FP4PT)
+                        else self.K_WIDTH // 2
+                    ),
                 )
             )
 
@@ -441,6 +474,26 @@ class AttentionConfig:
             self.K_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.V_DOT_PACKED_LAYOUT = gl.constexpr(None)
             self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
+
+        # A8K4V4PT: the page's [BLOCK_SIZE] fp32 scales are read from LDS straight into the layout they multiply:
+        # the columns of P, the S / P tile of the QK accumulator
+        if self.V_FP4PT:
+            self.V_PT_SCALES_LAYOUT = gl.constexpr(
+                gl.SliceLayout(0, self.QK_WMMA_UNPACKED_LAYOUT)
+            )
+        else:
+            self.V_PT_SCALES_LAYOUT = gl.constexpr(None)
+        if self.V_FP4PT:
+            # one e8m0 scale per (P row, 32 keys), all set to the tile's power of two
+            self.P_SCALES_DOT_LAYOUT = gl.constexpr(
+                gl.amd.gfx1250.get_wmma_scale_layout(
+                    self.P_DOT_LAYOUT,
+                    [self.BLOCK_M, self.TILE_SIZE // 32],
+                    scale_factor=32,
+                )
+            )
+        else:
+            self.P_SCALES_DOT_LAYOUT = gl.constexpr(None)
 
         assert (
             NUM_BLOCKS_GATHER_PER_TILE == 1
@@ -866,6 +919,33 @@ class AttentionProgram:
                         ),
                         layout=cfg.V_SHARED_LAYOUT,
                     )
+                elif cfg.V_FP4PT:
+                    # A8K4V4PT: a (block, kv head) row is [BLOCK_SIZE * HEAD_SIZE / 2 B e2m1, shuffled as NVFP4 V |
+                    # BLOCK_SIZE fp32 scales, one per token]; the scales are a second descriptor on the row's
+                    # tail, in fp32 elements (the row stride, in bytes, is a multiple of 4: 128 B aligned for
+                    # 128-token pages)
+                    v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                        base=value_cache_ptr,
+                        shape=(
+                            num_blocks * cfg.NUM_KV_HEADS,
+                            cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2,
+                        ),
+                        strides=(stride_v_cache_1, 1),
+                        block_shape=(
+                            gl.constexpr(1),
+                            cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2,
+                        ),
+                        layout=cfg.V_SHARED_LAYOUT,
+                    )
+                    v_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                        base=(value_cache_ptr + cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2).to(
+                            gl.pointer_type(gl.float32), bitcast=True
+                        ),
+                        shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE),
+                        strides=(stride_v_cache_1 // 4, 1),
+                        block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE),
+                        layout=cfg.V_SHARED_LAYOUT,
+                    )
                 else:
                     v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                         base=value_cache_ptr,
@@ -959,7 +1039,8 @@ class AttentionProgram:
                 [cfg.NUM_STAGES] + k_scales_desc.block_shape,
                 layout=cfg.K_SHARED_LAYOUT,
             )
-        if cfg.V_CACHE_DTYPE == "nvfp4":
+        if cfg.V_FP4:
+            # NVFP4 V: the e4m3 block scales; fp4pt V: the page's fp32 per-token scales
             v_scales_shared = gl.allocate_shared_memory(
                 v_scales_desc.dtype,
                 [cfg.NUM_STAGES] + v_scales_desc.block_shape,
@@ -1295,7 +1376,7 @@ class AttentionProgram:
 
     @gluon.jit
     def lds_unshuffle_v(self, buffer_id):
-        if self.cfg.V_CACHE_DTYPE == "nvfp4":
+        if self.cfg.V_FP4:
             return (
                 self.v_shared.index(buffer_id)
                 .reshape(
@@ -1343,6 +1424,45 @@ class AttentionProgram:
             )
 
     @gluon.jit
+    def tdm_shared_load_v_pt_scales(self, wait_count, buffer_id):
+        # A8K4V4PT: the page's [BLOCK_SIZE] fp32 per-token scales, in the layout they multiply
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        return (
+            self.v_scales_shared.index(buffer_id)
+            .reshape((self.cfg.BLOCK_SIZE,))
+            .load(layout=self.cfg.V_PT_SCALES_LAYOUT)
+        )
+
+    @gluon.jit
+    def mask_v_pt_scales(self, s, j, seq_len):
+        # Keys past the sequence end (the last page's unwritten slots) have P = 0, but their scale is whatever the
+        # page holds: zero it, so 0 * (NaN / inf) cannot reach the accumulator. Only on the masked tiles.
+        # (Against the tile-relative bound: a per-key j * TILE_SIZE + arange would be shared with the causal mask's
+        # key offsets, and the compiler then hoists those adds out of the masked branch into every tile.)
+        keys_left = seq_len - j * self.cfg.TILE_SIZE
+        offs = gl.arange(0, self.cfg.TILE_SIZE, layout=self.cfg.V_PT_SCALES_LAYOUT)
+        return gl.where(offs < keys_left, s, 0.0)
+
+    @gluon.jit
+    def scale_p_v_pt_fp8(self, p, s):
+        # A8K4V4PT: P[:, t] * s[t] for an fp8 P, after the row sum L took the unscaled P. The scales
+        # are normalized by the tile's power of two 2^E > max s, so P * s / 2^E < 1 keeps e4m3's range; 2^E goes
+        # to the scaled WMMA as P's e8m0 scale (V's scale stays 1.0).
+        s_max = gl.max(s, axis=0)
+        e = (s_max.to(gl.int32, bitcast=True) >> 23) & 0xFF
+        e = gl.minimum(e + 1, 253)  # biased exponent of 2^E
+        s = s * ((254 - e) << 23).to(gl.float32, bitcast=True)  # s * 2^-E
+        p_scales = (
+            gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32],
+                gl.int32,
+                layout=self.cfg.P_SCALES_DOT_LAYOUT,
+            )
+            + e
+        ).to(gl.uint8)
+        return p * s[None, :], p_scales
+
+    @gluon.jit
     def tdm_shared_load_k(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
@@ -1366,7 +1486,7 @@ class AttentionProgram:
     def tdm_shared_load_v(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
-            if self.cfg.V_CACHE_DTYPE == "nvfp4":
+            if self.cfg.V_FP4:
                 return gl.amd.gfx1250.load_shared_fp4_repacked(
                     self.lds_unshuffle_v(buffer_id), layout=self.cfg.V_DOT_PACKED_LAYOUT
                 )
@@ -1427,7 +1547,8 @@ class AttentionProgram:
                 gl.amd.gfx1250.tdm.async_load(
                     self.v_desc, offsets, self.v_shared.index(buffer_id)
                 )
-                if self.cfg.V_CACHE_DTYPE == "nvfp4":
+                if self.cfg.V_FP4:
+                    # the scales: NVFP4 V's e4m3 block scales, fp4pt V's per-token fp32 tail
                     gl.amd.gfx1250.tdm.async_load(
                         self.v_scales_desc,
                         offsets,
@@ -1560,6 +1681,13 @@ class AttentionProgram:
         acc1 = acc1 * alpha_
         L = L * alpha + l_ij
         return p, L, acc0, acc1
+
+    @gluon.jit
+    def compute_pv_fp4pt(self, p, v, v_scales, acc):
+        # A8K4V4PT, P already carrying the per-token scales: fp8 P (e8m0 v_scales, P's) x the repacked e2m1 V
+        # (unit scale), one scaled WMMA.
+        p = gl.convert_layout(p.to(gl.float8e4nv), self.cfg.P_DOT_LAYOUT)
+        return gl.amd.gfx1250.wmma_scaled(p, v_scales, "e4m3", v, None, "e2m1", acc)
 
     @gluon.jit
     def compute_pv(self, p, v, v_scales, acc):
@@ -2029,7 +2157,7 @@ def e2m1_packed_to_fp(
     return y
 
 
-unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
+_unified_attention_gluon_kernel_3d_base_repr = make_kernel_repr(
     "_unified_attention_gluon_kernel_3d",
     [
         "NUM_QUERY_HEADS",
@@ -2054,6 +2182,15 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
         "USE_STORE_TDM",
     ],
 )
+
+
+def unified_attention_gluon_kernel_3d_repr(specialization):
+    """The kernel name; an fp4pt V (A8K4V4PT) is marked, so the other formats keep their names."""
+    name = _unified_attention_gluon_kernel_3d_base_repr(specialization)
+    constants = specialization.constants
+    if constants.get("V_CACHE_DTYPE") == "fp4pt":
+        name += "_V_FP4PT"
+    return name
 
 
 @gluon.jit(repr=unified_attention_gluon_kernel_3d_repr)
@@ -2128,7 +2265,7 @@ def _unified_attention_gluon_kernel_3d(
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
     FP8_PV: gl.constexpr = False,  # bool, NVFP4 KV only: PV as an FP8 WMMA
     HEAD_SIZE_SPLIT: gl.constexpr = 1,  # int, NVFP4 KV + BF16 PV only: V in head-dim pieces
-    V_CACHE_DTYPE: gl.constexpr = "",  # V cache dtype when it differs from KV_CACHE_DTYPE (the K's): A8K4V8
+    V_CACHE_DTYPE: gl.constexpr = "",  # V cache dtype when it differs from KV_CACHE_DTYPE (the K's): A8K4V8, A8K4V4PT
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2171,7 +2308,8 @@ def _unified_attention_gluon_kernel_3d(
     # TDM loads per page: data, plus the scales of an NVFP4 cache. A wait lets the loads issued after the awaited
     # one stay in flight.
     K_OPS: gl.constexpr = 2 if KV_CACHE_DTYPE == "nvfp4" else 1
-    V_OPS: gl.constexpr = 2 if V_NVFP4 else 1
+    # (fp4pt V: the e2m1 data, then the per-token fp32 tail scales)
+    V_OPS: gl.constexpr = 2 if cfg.V_FP4 else 1
 
     # Workgroup offsets
     q_block_global_idx = gl.program_id(0)
@@ -2511,7 +2649,18 @@ def _unified_attention_gluon_kernel_3d(
         else:
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
-        if V_NVFP4:
+        if cfg.V_FP4PT:
+            # A8K4V4PT: the tail scales are this page's second V op (wait K_OPS + V_OPS), the data its first.
+            # P * s after softmax_part1 summed the unscaled P into L.
+            v_pt_scales = pgm.tdm_shared_load_v_pt_scales(
+                wait_count=K_OPS + V_OPS, buffer_id=buffer_id
+            )
+            if j >= pgm.safe_tile_end:
+                v_pt_scales = pgm.mask_v_pt_scales(v_pt_scales, j, seq_len)
+            p, p_scales = pgm.scale_p_v_pt_fp8(p, v_pt_scales)
+            v = pgm.tdm_shared_load_v(wait_count=K_OPS + V_OPS, buffer_id=buffer_id)
+            acc = pgm.compute_pv_fp4pt(p, v, p_scales, acc)
+        elif V_NVFP4:
             if cfg.HEAD_SIZE_SPLIT == 2:
                 acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_split_head(
                     p,
