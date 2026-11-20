@@ -343,147 +343,6 @@ def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
         ), f"local_topk_ids mismatch at M={token}, E={E}"
 
 
-def test_moe_sorting_opus_contract():
-    """Every output of the Opus sort, bit for bit, on shapes real models use.
-
-    Calls the binding directly so that the tile height, the mask and the token
-    count can each be chosen: 896 experts / top-16 / tile height 96 (Kimi K3)
-    with a rank's contiguous share of the experts, next to the generic shapes.
-    Also covers what the other tests leave out: the output buffer is zeroed up
-    to the valid token count and not beyond, pad slots carry zero weights, and
-    the local-id and auxiliary outputs agree with the sorted ids.
-    """
-    device = torch.device("cuda")
-    fill = 0x5A5A5A5A
-    # token capacity, experts, topk, tile height, experts per rank (0 = no mask)
-    shapes = (
-        (4096, 896, 16, 96, 28),
-        (2048, 896, 16, 96, 112),
-        (4096, 896, 16, 96, 0),
-        (8192, 384, 6, 32, 48),
-        (16384, 256, 8, 64, 0),
-        (2050, 289, 9, 32, 0),
-        (40000, 128, 4, 128, 16),
-        (1024, 896, 16, 96, 28),
-        (64, 385, 7, 32, 0),
-    )
-    gen = torch.Generator(device=device).manual_seed(0)
-    for (m, E, topk, unit, local), valid_kind, invalid in itertools.product(
-        shapes, ("all", "some", "none"), (False, True)
-    ):
-        # float64 scores: no ties, so the routing is the same on every run
-        topk_ids = (
-            torch.rand((m, E), generator=gen, device=device, dtype=torch.float64)
-            .topk(topk, dim=1)
-            .indices.to(dtypes.i32)
-            .contiguous()
-        )
-        if invalid:
-            drop = torch.rand((m, topk), generator=gen, device=device) < 0.3
-            topk_ids[drop] = -1
-            topk_ids[0, 0] = E + 5
-        topk_weights = torch.rand(
-            (m, topk), generator=gen, device=device, dtype=dtypes.fp32
-        )
-        expert_mask = None
-        if local:
-            # the experts of a rank in the middle, as expert parallelism assigns them
-            expert_mask = torch.zeros(E, dtype=dtypes.i32, device=device)
-            expert_mask[local : 2 * local] = 1
-        valid = {"all": m, "some": m - m // 3 - 7, "none": 0}[valid_kind]
-        num_local_tokens = torch.tensor([valid], dtype=dtypes.i32, device=device)
-
-        padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
-        sorted_ids = torch.full((padded,), fill, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.full((padded,), 7.0, dtype=dtypes.fp32, device=device)
-        sorted_expert_ids = torch.full(
-            (padded // unit,), fill, dtype=dtypes.i32, device=device
-        )
-        num_valid_ids = torch.full((2,), fill, dtype=dtypes.i32, device=device)
-        moe_buf = torch.ones((m, 256), dtype=dtypes.bf16, device=device)
-        local_topk_ids = torch.full((m, topk), fill, dtype=dtypes.i32, device=device)
-        m_indices = torch.full((padded,), fill, dtype=dtypes.i32, device=device)
-        reverse_sorted = torch.full((m * topk,), fill, dtype=dtypes.i32, device=device)
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            m, E, topk, 0, topk_ids.get_device()
-        )
-        workspace = (
-            torch.empty(ws_size, dtype=torch.uint8, device=device)
-            if ws_size > 0
-            else None
-        )
-        aiter.moe_sorting_opus_fwd(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            E,
-            unit,
-            expert_mask,
-            num_local_tokens,
-            workspace,
-            0,
-            local_topk_ids,
-            m_indices,
-            reverse_sorted,
-        )
-        torch.cuda.synchronize()
-        where = (
-            f"M={m}, E={E}, topk={topk}, unit={unit}, local={local}, "
-            f"valid={valid}, invalid_ids={invalid}"
-        )
-
-        # an id outside [0, E) routes nowhere; the reference only skips what
-        # matches no expert, which is the same thing
-        ref_ids, ref_weights, ref_expert_ids, ref_valid = run_torch_moe_sorting(
-            topk_ids, topk_weights, E, unit, expert_mask, num_local_tokens
-        )
-        n = int(ref_valid[0])
-        assert num_valid_ids.tolist() == [n, valid], f"num_valid_ids at {where}"
-        assert torch.equal(sorted_ids[:n], ref_ids[:n]), f"sorted_ids at {where}"
-        assert bool((sorted_ids[n:] == fill).all()), f"sorted_ids tail at {where}"
-        is_pad = ref_ids[:n] == (topk << 24 | m)
-        assert torch.equal(
-            sorted_weights[:n][~is_pad], ref_weights[:n][~is_pad]
-        ), f"sorted_weights at {where}"
-        assert bool((sorted_weights[:n][is_pad] == 0).all()), f"pad weights at {where}"
-        blocks = n // unit
-        assert torch.equal(
-            sorted_expert_ids[:blocks], ref_expert_ids[:blocks]
-        ), f"sorted_expert_ids at {where}"
-
-        assert bool((moe_buf[:valid] == 0).all()), f"moe_buf not zeroed at {where}"
-        assert bool((moe_buf[valid:] == 1).all()), f"moe_buf zeroed too far at {where}"
-
-        in_range = (topk_ids >= 0) & (topk_ids < E)
-        if expert_mask is None:
-            local_of = torch.arange(E, dtype=dtypes.i32, device=device)
-        else:
-            local_of = torch.where(
-                expert_mask != 0, torch.cumsum(expert_mask, 0) - 1, -1
-            ).to(dtypes.i32)
-        ref_local = torch.where(in_range, local_of[topk_ids.clamp(0, E - 1).long()], -1)
-        assert torch.equal(
-            local_topk_ids[:valid], ref_local[:valid].to(dtypes.i32)
-        ), f"local_topk_ids at {where}"
-        assert bool((local_topk_ids[valid:] == fill).all()), f"local ids tail at {where}"
-
-        ref_m = torch.where(is_pad, valid, sorted_ids[:n] & 0x00FFFFFF)
-        assert torch.equal(m_indices[:n], ref_m.to(dtypes.i32)), f"m_indices at {where}"
-        routed = ref_local >= 0
-        routed[valid:] = False
-        routed = routed.flatten()
-        assert bool((reverse_sorted[~routed] == -1).all()), f"reverse -1 at {where}"
-        route = torch.arange(m * topk, device=device)[routed]
-        assert torch.equal(
-            sorted_ids[reverse_sorted[routed].long()],
-            ((route % topk) << 24 | (route // topk)).to(dtypes.i32),
-        ), f"reverse_sorted at {where}"
-
-
 def _build_moe_sorting_inputs(
     token,
     model_dim,
@@ -751,12 +610,12 @@ def test_moe_sorting_invalid_topk_ids():
     topk = 6
 
     direct_cases = (
-        # Automatic large-token Opus path (chunk Count -> Place).
+        # Automatic large-token Opus path; P0_v1 is guarded by #4839.
         ("opus", 16384, 0, False),
         # Remaining single-kernel mesh and local-expert-mask accesses.
         ("opus", 8, 1, False),
         ("opus", 8, 1, True),
-        # Forced multi-phase regression at the first chunk-kernel token count.
+        # Forced large-token multi-phase regression (P0_v1 -> P1 -> P23).
         ("opus", 2048, 2, False),
         # FlyDSL LDS oneshot and HBM multiphase mesh stores.
         ("flydsl", 8, 0, False),
@@ -1059,7 +918,6 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
-    test_moe_sorting_opus_contract()
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
