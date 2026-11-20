@@ -24,7 +24,7 @@ On gfx1250 (the mxfp8_32 GEMM) and gfx950 (the bmm) this file also checks
 the fused quant epilogue: ``y_scale_out`` must be byte-identical to
 quantize_fp8 of the unfused bf16 output. On gfx1250 it runs on the heuristic
 tile (M above 1024 is the compute-bound kernel) and on tuned tiles that pin
-each epilogue branch (FUSED_QUANT_TILES: one LDS-staged tile and two
+each epilogue branch (FUSED_QUANT_TILES: one LDS-staged tile and four
 accumulator tiles). gfx1250-strict runs that check and the compute
 kernelName cases alone.
 
@@ -128,15 +128,19 @@ COMPUTE_CASES = (
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
 # Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: one
-# LDS-staged tile and two accumulator tiles. One 16-column WMMA tile per warp
+# LDS-staged tile and four accumulator tiles. One 16-column WMMA tile per warp
 # (t16x64 nw4) keeps the LDS-staged quant; an even count (t32x64 nw2, t128x128
-# nw2) quantizes from the accumulators.
+# nw2, t64x32 nw1, t160x128 nw2) quantizes from the accumulators. t64x32 nw1
+# has one quant group per tile row; t160x128 has more rows than threads, so
+# its scale rows take a second pass.
 FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t64x32x512_mw4_nw1_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t160x128x256_mw2_nw2_nb3_sk1_cm1_cn1",
 )
-# M = 200 is ragged for all three tiles above; M = 48 is ragged for the two
+# M = 200 is ragged for every tile above; M = 48 is ragged for the four
 # accumulator tiles but a whole number of t16x64 tiles. Both use the DSv4.1
 # wo_a N, K.
 FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
