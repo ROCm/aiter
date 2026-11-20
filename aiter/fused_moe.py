@@ -2404,6 +2404,8 @@ def _fused_moe_impl(
         )
     prequantized_a1 = None
     prequantized_a1_scale = None
+    moe_buf_zeroed = False
+    reverse_masked = False
     # The a4w4 aux-sort families already fuse activation quantization into GEMM1,
     # so the fused sort+quant kernel has nothing left to save there.
     fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
@@ -2466,6 +2468,7 @@ def _fused_moe_impl(
         _atomic = (
             not stage2_uses_route_reduce(metadata.stage2) if _is_opus else _g2["atomic"]
         )
+        moe_buf_zeroed = _atomic and not runtime_stage2_reduce
         # The presort layout has to match both the selected kernels' tile size
         # and the block size the stages are given, which a caller's
         # block_size_M can override.
@@ -2540,6 +2543,8 @@ def _fused_moe_impl(
                 sort_reverse_sorted,
             ) = sorting_ret[:7]
             local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+            # The Opus EP aux sort initializes all reverse routes to -1.
+            reverse_masked = expert_mask is not None
     elif fused_sort_quant:
         (
             sorted_ids,
@@ -2641,6 +2646,15 @@ def _fused_moe_impl(
             kernel_bench_callable.append(("stage1", _stage1_call))
         return _return_output(_stage1_call(), output)
     else:
+        if stage2_func is _mxfp4_a4w4_stage2_fw:
+            from aiter.ops.flydsl.mxmoe_native_reduce import _OPUS_REVERSE_SOURCE
+
+            _stage2_extra_args = dict(_stage2_extra_args or {})
+            _stage2_extra_args["output_zeroed"] = moe_buf_zeroed
+            _stage2_extra_args["reverse_masked"] = reverse_masked
+            _stage2_extra_args["_ep32_reverse_source"] = (
+                _OPUS_REVERSE_SOURCE if reverse_masked else None
+            )
         ret = fused_moe_2stages(
             hidden_states,
             w1,
@@ -4137,6 +4151,9 @@ def _mxfp4_a4w4_stage2_fw(
     use_valid_token_count=False,
     expert_mask=None,
     topk_ids=None,
+    output_zeroed=False,
+    reverse_masked=False,
+    _ep32_reverse_source=None,
     **_kwargs,
 ):
 
@@ -4190,6 +4207,9 @@ def _mxfp4_a4w4_stage2_fw(
             topk_ids=topk_ids,
             reverse_sorted=reverse_sorted,
             use_valid_token_count=use_valid_token_count,
+            output_zeroed=output_zeroed,
+            reverse_masked=reverse_masked,
+            _ep32_reverse_source=_ep32_reverse_source,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -4286,6 +4306,9 @@ def _flydsl_v2_stage2_wrapper(
     reverse_sorted=None,
     use_valid_token_count=False,
     per_slot_out=None,
+    output_zeroed=False,
+    reverse_masked=False,
+    _ep32_reverse_source=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -4340,6 +4363,11 @@ def _flydsl_v2_stage2_wrapper(
     if ep32_sorted_reduce:
         epilog = "reduce"
     max_sorted = inter_states.shape[0]
+    if ep32_native:
+        if out.dtype != torch.bfloat16 or topk not in (16, 17):
+            raise ValueError("EP32 native GEMM2 requires BF16 output and top-k16/17")
+        if max_sorted % 16:
+            raise ValueError("EP32 native GEMM2 staging capacity must be padded to 16 rows")
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
@@ -4512,9 +4540,17 @@ def _flydsl_v2_stage2_wrapper(
         return out
     if ep32_sorted_reduce:
         if ep32_native:
-            from aiter.ops.flydsl.mxmoe_native_reduce import ep32_native_reduce
-            ep32_native_reduce(target, reverse_sorted, sorted_weights, expert_mask,
-                topk_ids, num_valid_ids, out, preweighted_bf16=ep32_native_bf16)
+            from aiter.ops.flydsl.mxmoe_native_reduce import (
+                _NATIVE_BF16_SOURCE,
+                _NATIVE_FP32_SOURCE,
+                ep32_native_reduce,
+            )
+            native_view = target.view(max_sorted // 16, 224, 64, 4)
+            ep32_native_reduce(native_view, reverse_sorted, sorted_weights, expert_mask,
+                topk_ids, num_valid_ids, out, preweighted_bf16=ep32_native_bf16,
+                output_zeroed=output_zeroed, reverse_masked=reverse_masked,
+                _native_source=_NATIVE_BF16_SOURCE if ep32_native_bf16 else _NATIVE_FP32_SOURCE,
+                _reverse_source=_ep32_reverse_source)
             return out
         # Remote routes were not written. Mask their reverse indices before
         # the existing gather/reduce, avoiding a clear of the staging buffer.
