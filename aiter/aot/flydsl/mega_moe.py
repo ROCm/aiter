@@ -25,7 +25,7 @@ profiles those paths support also get their kernels; the runtime's own
 eligibility checks decide which profiles that is.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3 and Kimi-K2.6)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
@@ -79,6 +79,13 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
+# Kimi-K2.6 deployment profile (EP8 / epr48, topk8, d7168 / i2048, SiLU without a
+# SwiGLU clamp), a8w4 only.
+K26_EXPERTS_PER_RANKS = (48,)
+K26_TOPK = 8
+K26_MODEL_DIM = 7168
+K26_INTER_DIM = 2048
+K26_QUANTS = ("a8w4",)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -147,9 +154,10 @@ def production_jobs(
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
 ):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
+    Kimi-K2.6.
 
-    Used by the default build so both profiles are AOT-covered and neither
+    Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
     """
     jobs = default_jobs(
@@ -167,6 +175,16 @@ def production_jobs(
         act=K3_ACT,
         situ_beta=K3_SITU_BETA,
         situ_linear_beta=K3_SITU_LINEAR_BETA,
+    )
+    jobs += default_jobs(
+        mtprs,
+        K26_EXPERTS_PER_RANKS,
+        quants=tuple(q for q in quants if q in K26_QUANTS),
+        world_size=world_size,
+        topk=K26_TOPK,
+        model_dim=K26_MODEL_DIM,
+        inter_dim=K26_INTER_DIM,
+        swiglu_limit=0.0,
     )
     return jobs
 
