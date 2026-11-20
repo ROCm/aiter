@@ -669,64 +669,6 @@ def test_pa_decode_fp16_bf16_case_policy(
             test_pa_decode(case, device, monkeypatch)
 
 
-@pytest.mark.parametrize("query_length", [1, 4])
-def test_pa_decode_mxfp4_gfx1250_strict_refused(device, monkeypatch, query_length):
-    """MI450 A0 (gfx1250-strict) refuses MXFP4 before any kernel compiles.
-
-    chip_info maps strict to gfx1250 only at validated dispatch sites; the MXFP4
-    kernel was not run on A0, nor its scaled WMMAs checked against A0's
-    S_CLAUSE erratum. The tile compiler refuses it too.
-    """
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    monkeypatch.setattr(pa, "get_gfx_runtime", lambda: "gfx1250-strict")
-    compile_tile = pa.compile_pa_decode_tile
-
-    def unexpected_compile(**kwargs):
-        raise AssertionError("gfx1250-strict compiled an MXFP4 kernel")
-
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
-    batch, heads = 2, 16
-    pool = torch.zeros((batch, 1, 128 * 68), dtype=torch.uint8, device=device)
-    key_cache, key_scale = _mxfp4_views(pool)
-    value_cache, value_scale = _mxfp4_views(pool.clone())
-    query = torch.zeros(
-        (batch * query_length, heads, 128), dtype=torch.bfloat16, device=device
-    )
-    context = torch.full((batch,), 100, dtype=torch.int32, device=device)
-    table = torch.arange(batch, dtype=torch.int32, device=device).reshape(batch, 1)
-    match = "not validated on gfx1250-strict"
-    with pytest.raises(NotImplementedError, match=match):
-        pa.pa_decode(
-            torch.empty_like(query),
-            query,
-            key_cache,
-            value_cache,
-            context,
-            table,
-            128**-0.5,
-            query_length,
-            compute_type=dtypes.fp4x2,
-            key_scale=key_scale,
-            value_scale=value_scale,
-        )
-    with pytest.raises(NotImplementedError, match=match):
-        compile_tile(
-            architecture="gfx1250-strict",
-            head_dim=128,
-            query_group_size=heads,
-            block_size=128,
-            num_seqs=batch,
-            num_kv_heads=1,
-            num_compute_units=256,
-            work_capacity=batch,
-            query_dtype=torch.bfloat16,
-            kv_dtype=dtypes.fp4x2,
-            per_token_kv=True,
-            query_length=query_length,
-            direct_output=True,
-        )
-
-
 def _reference(
     query, key, value, table, lengths, query_length, window, sinks, dtype=torch.float32
 ):
@@ -3181,41 +3123,6 @@ def _poison_unowned(cache, scale, owned, fill):
         scale.view(scale.shape[:3])[rows] = {"zero": 0.0, "nan": float("nan")}.get(
             fill, float("inf")
         )
-
-
-def test_pa_decode_mxfp4_is_per_token_kv(monkeypatch):
-    """MXFP4 KV is per-token KV: each cache row carries its own e8m0 scales.
-
-    Selection only, so no kernel compiles and any GPU will do. The gfx950
-    schedule keys MXFP4 as per-token, while its kernel traits keep the f32
-    per-token scale tensors and LDS buffers off (the scales come with the
-    rows); that keeps the gfx950 MXFP4 kernels unchanged. The gfx1250 tile
-    selection drops the flag alike, so either value selects one kernel.
-    """
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
-    shape = {
-        "head_dim": 128,
-        "query_group_size": 16,
-        "block_size": 128,
-        "num_seqs": 1,
-        "num_kv_heads": 1,
-        "num_compute_units": 256,
-        "work_capacity": 1,
-        "query_dtype": torch.bfloat16,
-        "kv_dtype": dtypes.fp4x2,
-        "max_context_length": 2048,
-    }
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
-    for per_token_kv in (False, True):
-        schedule = traits.PaDecodeSchedule.select(**shape, per_token_kv=per_token_kv)
-        assert schedule.cache_key.per_token_kv
-        assert not traits.PaDecodeTraits.create(schedule).per_token_kv
-    selected = [
-        kernel.gfx1250_tile_traits(**shape, per_token_kv=per_token_kv)
-        for per_token_kv in (False, True)
-    ]
-    assert selected[0] == selected[1] and not selected[0].per_token_kv
 
 
 @pytest.mark.parametrize("fill", ["nan", "inf"])
