@@ -4,7 +4,7 @@ from collections import namedtuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import as_ir_value, gpu, rocdl
+from flydsl.expr import as_ir_value, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
@@ -90,6 +90,72 @@ def make_sgpr_opaque(val_i32):
         is_align_stack=False,
     )
     return op.res
+
+
+# One s_prefetch_inst covers at most 32 lines of 128 B. The instruction cache is 64 KB, so only the head of a
+# kernel larger than the cap is prefetched.
+KERNEL_PREFETCH_MAX_BYTES = 56 * 1024
+_PREFETCH_CHUNK_SHIFT = 12
+_HWREG_MODE_SCALAR_PREFETCH_EN = 1 | (24 << 6)  # hwreg(HW_REG_MODE, 24, 1)
+
+
+def _kernel_code_span(func_index):
+    """(entry address, code bytes up to the end of the function).
+
+    FlyDSL has no s_getpc or code-size query; only the assembler knows where the function ends,
+    as .Lfunc_end<position of the function in its module>.
+    """
+
+    def asm(res, text, constraints="=s"):
+        return llvm_dialect.InlineAsmOp(
+            res=res,
+            operands_=[],
+            asm_string=text,
+            constraints=constraints,
+            has_side_effects=True,
+            is_align_stack=False,
+        ).res
+
+    label = f".Lkprefetch{func_index}"
+    pc = asm(T.i64, f"{label}:\ns_getpc_b64 $0")  # the address after the label
+    size = asm(T.i32, f"s_mov_b32 $0, .Lfunc_end{func_index}-{label}")
+    return fx.Int64(pc) - 4, fx.Int32(size)
+
+
+def prefetch_kernel_code(num_waves, func_index=0):
+    """Prefetch this kernel's code into the instruction cache; each wave takes every num_waves-th 4 KiB.
+
+    Code that another large kernel evicted from the CU is otherwise refetched line by line in the prologue and
+    epilogue. s_prefetch_inst is a no-op unless MODE.SCALAR_PREFETCH_EN is set, and a wave only starts with it set
+    if it is the first of its program on the WGP, so set it first.
+
+    ``func_index`` is the kernel's position among the functions of its module, in definition order.
+    """
+    # FlyDSL has no s_setreg or s_prefetch_inst wrapper, so these are the LLVM intrinsics.
+    mode_en = fx.Int32(_HWREG_MODE_SCALAR_PREFETCH_EN).ir_value()
+    llvm_dialect.call_intrinsic(
+        None, "llvm.amdgcn.s.setreg", [mode_en, fx.Int32(1).ir_value()], [], []
+    )
+    start, size = _kernel_code_span(func_index)
+    cap = fx.Int32(KERNEL_PREFETCH_MAX_BYTES)
+    span = (size < cap).select(size, cap)
+    last_line = ((span - 1) >> 7) << 7
+    wave = fx.Int32(rocdl.wave_id())
+    chunks = KERNEL_PREFETCH_MAX_BYTES >> _PREFETCH_CHUNK_SHIFT
+    for i in range_constexpr(-(-chunks // num_waves)):
+        off = (fx.Int32(i * num_waves) + wave) << _PREFETCH_CHUNK_SHIFT
+        off = (off < last_line).select(
+            off, last_line
+        )  # chunks past the end repeat the last line
+        lines = (span - off + 127) >> 7
+        lines = (lines < 32).select(lines, fx.Int32(32)) - 1
+        ptr = llvm_dialect.IntToPtrOp(
+            llvm_dialect.PointerType.get(address_space=1),
+            (start + fx.Int64(off)).ir_value(),
+        ).result
+        llvm_dialect.call_intrinsic(
+            None, "llvm.amdgcn.s.prefetch.inst.p1", [ptr, lines.ir_value()], [], []
+        )
 
 
 def _lds_ptr(lds_base_idx, byte_offset, element_type, alignment):

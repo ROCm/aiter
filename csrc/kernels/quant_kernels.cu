@@ -926,7 +926,7 @@ __global__ void initializeScale(float *d_data, int size, float value)
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16, bool check_tail = false>
-__device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
+__device__ auto data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                                                              const int32_t cols)
 {
     static constexpr int32_t vec_size_i =
@@ -1011,7 +1011,8 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
+    // Return the row vector by value. A pointer to the local vec_cur dangles after return.
+    return std::make_tuple(row_scale, vec_cur);
 }
 
 __device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
@@ -1025,7 +1026,7 @@ __device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
     return old;
   }
 
-template <typename DTYPE_I, typename DTYPE_O>
+template <typename DTYPE_I, typename DTYPE_O, bool use_atomic = true>
 __global__ void
 data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ input, const int cols)
 {
@@ -1033,8 +1034,21 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
     float row_scale = std::get<0>(res);
     if(threadIdx.x == 0)
     {
-        atomicMaxFloat(scale, row_scale);
+        if constexpr(use_atomic)
+            atomicMaxFloat(scale, row_scale);
+        else
+            scale[blockIdx.x] = row_scale;
     }
+}
+
+__global__ void reduce_per_tensor_scale(float* scale, const float* partials, int count)
+{
+    float maximum = 0.0f;
+    for(int64_t i = threadIdx.x; i < count; i += BlockSize)
+        maximum = max(maximum, partials[i]);
+    maximum = block_reduce<float, aiter::Max, BlockSize, true>(maximum, aiter::Max());
+    if(threadIdx.x == 0)
+        *scale = maximum;
 }
 
 template <typename DTYPE_I, typename DTYPE_O>
@@ -1237,7 +1251,7 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     auto res         = data_to_per_row_scale<DTYPE_I, DTYPE_O, thread_data_size>(input, cols);
     float row_scale  = std::get<0>(res);
-    DTYPE_I* vec_ptr = std::get<1>(res);
+    DTYPE_I* vec_ptr = reinterpret_cast<DTYPE_I*>(&std::get<1>(res));
 
     if(threadIdx.x == 0)
     {
@@ -1265,7 +1279,7 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
-__device__ std::tuple<float, float*>
+__device__ auto
 smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                              const float* __restrict__ smooth_scale,
                              int32_t smscale_map_idx,
@@ -1299,7 +1313,8 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
+    // Return by value. A pointer to the local smscale_cur dangles after return.
+    return std::make_tuple(row_scale, smscale_cur);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16, bool transpose_out_dim01 = false, bool has_smscale_map = false, bool has_smscale_hash = false, int max_smscale_map_hash_size = 1024>
@@ -1413,7 +1428,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         auto res = smooth_data_to_per_row_scale<float, DTYPE_O, block_size, thread_data_size>(
             input_f_ptr, smooth_scale, smscale_map_idx, cols);
         float row_scale = std::get<0>(res);
-        float* vec_ptr  = std::get<1>(res);
+        float* vec_ptr  = reinterpret_cast<float*>(&std::get<1>(res));
 
         int out_token_idx;
         if constexpr(transpose_out_dim01)
@@ -1542,63 +1557,91 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
-    dim3 block(BlockSize);
     HipDeviceGuard device_guard(input.device_id);
+    // Input, output and scale storage must be disjoint, as on the atomic path.
+    // Four-byte row boundaries keep the existing vector loads/stores in bounds.
+    // The output holds one float per row; same-stream reduction finishes before conversion.
+    // The 1024-row cutoff comes from gfx942 kernel timings, not a universal
+    // public-call latency crossover. Other architectures retain the atomic path.
+    const bool use_partials = out.is_contiguous() && rows >= 1024 && cols % 4 == 0 &&
+                              out.numel() * out.element_size() >=
+                                  static_cast<size_t>(rows) * sizeof(float) &&
+                              reinterpret_cast<uintptr_t>(out.data_ptr()) % alignof(float) == 0 &&
+                              get_device_gfx() == "gfx942";
+    dim3 block(BlockSize);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     if(out.dtype() == AITER_DTYPE_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            if(cols % 4 == 0)
+            if(use_partials)
             {
-                aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                auto* partials = reinterpret_cast<float*>(out.data_ptr());
+                aiter::data_to_scale_kernel<input_dtype, opus::fp8_t, false><<<grid, block, 0, stream>>>(
+                    partials, reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::reduce_per_tensor_scale<<<dim3(1), block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), partials, grid.x);
+            }
+            else
+            {
+                aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
+                if(cols % 4 == 0)
+                    aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                        reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                else
+                    aiter::data_to_scale_tail_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                        reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            }
+            if(cols % 4 == 0)
                 aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                     reinterpret_cast<input_dtype*>(input.data_ptr()),
                     reinterpret_cast<float*>(scale.data_ptr()),
                     cols);
-            }
             else
-            {
-                aiter::data_to_scale_tail_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
                 aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                     reinterpret_cast<input_dtype*>(input.data_ptr()),
                     reinterpret_cast<float*>(scale.data_ptr()),
                     cols);
-            }
         });
     }
     else if(out.dtype() == AITER_DTYPE_i8)
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            if(cols % 4 == 0)
+            if(use_partials)
             {
-                aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                auto* partials = reinterpret_cast<float*>(out.data_ptr());
+                aiter::data_to_scale_kernel<input_dtype, opus::i8_t, false><<<grid, block, 0, stream>>>(
+                    partials, reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::reduce_per_tensor_scale<<<dim3(1), block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), partials, grid.x);
+            }
+            else
+            {
+                aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
+                if(cols % 4 == 0)
+                    aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                        reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                else
+                    aiter::data_to_scale_tail_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                        reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            }
+            if(cols % 4 == 0)
                 aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                     reinterpret_cast<input_dtype*>(input.data_ptr()),
                     reinterpret_cast<float*>(scale.data_ptr()),
                     cols);
-            }
             else
-            {
-                aiter::data_to_scale_tail_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
                 aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                     reinterpret_cast<input_dtype*>(input.data_ptr()),
                     reinterpret_cast<float*>(scale.data_ptr()),
                     cols);
-            }
         });
     }
     else
@@ -2675,7 +2718,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         auto res = smooth_data_to_per_row_scale<float, DTYPE_O, block_size, thread_data_size>(
             input_f_ptr, smooth_scale, smscale_map_idx, cols);
         float row_scale = std::get<0>(res);
-        float* vec_ptr  = std::get<1>(res);
+        float* vec_ptr  = reinterpret_cast<float*>(&std::get<1>(res));
 
         int out_token_idx;
         if constexpr(transpose_out_dim01)
