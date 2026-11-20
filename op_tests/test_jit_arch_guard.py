@@ -208,10 +208,19 @@ def test_cold_ctypes_build_raises_when_the_build_misses_the_arch():
     names = ("get_user_jit_dir", "get_gfx_runtime", "build_module", "get_args_of_build")
     orig = {name: getattr(core, name) for name in names}
     orig_windows = core.IS_WINDOWS
-    keys = (
-        "srcs flags_extra_cc flags_extra_hip blob_gen_cmd extra_include "
-        "extra_ldflags verbose is_python_module is_standalone torch_exclude third_party"
-    ).split()
+    keys = [
+        "srcs",
+        "flags_extra_cc",
+        "flags_extra_hip",
+        "blob_gen_cmd",
+        "extra_include",
+        "extra_ldflags",
+        "verbose",
+        "is_python_module",
+        "is_standalone",
+        "torch_exclude",
+        "third_party",
+    ]
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             so_path = os.path.join(tmpdir, f"module_dummy{core.JIT_LIB_EXT}")
