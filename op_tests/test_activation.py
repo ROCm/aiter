@@ -292,6 +292,100 @@ def test_relu2_bounds(numel, dtype):
     return ret
 
 
+_GUARD = 64  # elements around a guarded tensor
+_SENTINEL = 12288.0  # exact in bf16 and fp16
+_GATE_REFS = {
+    "silu_and_mul": lambda a, b: F.silu(a) * b,
+    "gelu_and_mul": lambda a, b: F.gelu(a) * b,
+    "gelu_tanh_and_mul": lambda a, b: F.gelu(a, approximate="tanh") * b,
+}
+
+
+def _guarded(shape, dtype, fill):
+    """A tensor of ``shape`` that is a view inside a larger buffer filled with
+    ``fill``. Returns the buffer and the view."""
+    numel = math.prod(shape)
+    buf = torch.full((numel + 2 * _GUARD,), fill, dtype=dtype, device="cuda")
+    return buf, buf[_GUARD : _GUARD + numel].view(*shape)
+
+
+def _guard_changed(buf, numel, fill):
+    """How many elements around a guarded tensor no longer hold ``fill``."""
+    pad = torch.cat([buf[:_GUARD], buf[_GUARD + numel :]])
+    return int((pad != fill).sum())
+
+
+@benchmark()
+def test_gelu_fast_bounds(numel, dtype):
+    """gelu_fast on ``numel`` elements whose output sits inside a guarded buffer:
+    the result matches the reference and nothing around the output changes,
+    whether or not the tensor ends on a whole vector."""
+    ret = {
+        "numel": numel,
+        "dtype": {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, str(dtype)),
+    }
+    _, x = _guarded((1, numel), dtype, 100.0)
+    x.copy_(torch.randn(1, numel, device="cuda").to(dtype))
+    buf, out = _guarded((1, numel), dtype, _SENTINEL)
+    aiter.gelu_fast(out, x)
+    torch.cuda.synchronize()
+    changed = _guard_changed(buf, numel, _SENTINEL)
+    assert changed == 0, f"gelu_fast wrote {changed} elements outside its output"
+    ret["err"] = checkAllclose(torch_gelu_ref(x).to(dtype), out)
+    return ret
+
+
+@benchmark()
+def test_act_and_mul_row_bound(op, dtype, m, d):
+    """A gate op on [m, 2 * d] whose output sits inside a guarded buffer.
+
+    Half rows of whole 4-byte words: nothing around the output changes and,
+    where this file has a reference, the result matches it. Any other width
+    (an odd d with 16-bit elements) makes the kernel reach one element past
+    every row, so the op has to refuse the call and leave the output alone."""
+    ret = {
+        "op": op,
+        "dtype": {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, str(dtype)),
+        "M": m,
+        "d": d,
+    }
+    _, x = _guarded((m, 2 * d), dtype, 100.0)
+    x.copy_(torch.randn(m, 2 * d, device="cuda").to(dtype))
+    buf, out = _guarded((m, d), dtype, _SENTINEL)
+    call_args = [out, x]
+    if op.endswith("_bias"):
+        expert_ids = (torch.arange(m, device="cuda") % 3).to(torch.int32)
+        bias = 0.1 * torch.randn(3, 2 * d, dtype=torch.float32, device="cuda")
+        call_args += [expert_ids, bias]
+    whole_words = d * x.element_size() % 4 == 0
+    ret["whole_words"] = whole_words
+    if not whole_words:
+        try:
+            getattr(aiter, op)(*call_args)
+        except RuntimeError as e:
+            assert "whole 4-byte words" in str(e), str(e)
+        else:
+            raise AssertionError(f"{op} accepted half rows of {d} {dtype} elements")
+        torch.cuda.synchronize()
+        assert bool((out == _SENTINEL).all()), f"{op} wrote into a refused output"
+        assert _guard_changed(buf, m * d, _SENTINEL) == 0
+        ret["refused"] = True
+        ret["err"] = 0.0
+        return ret
+    getattr(aiter, op)(*call_args)
+    torch.cuda.synchronize()
+    changed = _guard_changed(buf, m * d, _SENTINEL)
+    assert changed == 0, f"{op} wrote {changed} elements outside its output"
+    ret["refused"] = False
+    ref = _GATE_REFS.get(op)
+    if ref is None:
+        ret["err"] = 0.0
+    else:
+        a, b = x.float().split([d, d], dim=-1)
+        ret["err"] = checkAllclose(ref(a, b).to(dtype), out)
+    return ret
+
+
 def _dequant_fp8_group(q, s, group_size):
     m, n = q.shape
     return (
@@ -703,3 +797,31 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("relu2_bounds summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for numel in [1, 2, 7, 8, 9, 15, 16, 17, 255, 1001, 4095, 4101]:
+        ret = test_gelu_fast_bounds(numel, dtype)
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gelu_fast_bounds summary (markdown):\n%s", df_md)
+
+df = []
+for op in [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swiglu_and_mul",
+    "silu_and_mul_bias",
+    "swiglu_and_mul_bias",
+    "gelu_and_mul_bias",
+]:
+    for dtype in args.dtype:
+        for m in [4, 257]:
+            for d in [255, 256, 1001, 1002]:
+                ret = test_act_and_mul_row_bound(op, dtype, m, d)
+                df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("act_and_mul row bound summary (markdown):\n%s", df_md)
