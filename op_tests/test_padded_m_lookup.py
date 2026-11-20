@@ -46,15 +46,10 @@ class TestGetPaddedM(unittest.TestCase):
 
 class TestA16W16PaddedWalk(unittest.TestCase):
     def _lookup(self, table, m):
-        patches = [
-            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
-            mock.patch.object(tuned, "get_gfx", lambda: GFX),
-            mock.patch.object(tuned, "get_cu_num", lambda: CU_NUM),
-        ]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
-        return tuned.get_GEMM_A16W16_tuned_config(m, N, K, False, BF16, BF16)
+        with mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table):
+            return tuned.get_GEMM_A16W16_tuned_config(
+                m, N, K, False, BF16, BF16, gfx=GFX, cu_num=CU_NUM
+            )
 
     def test_falls_back_to_m16_row(self):
         # Table tuned only at M = 1 and 16 (e.g. llama70B_bf16_tuned_gemm.csv).
