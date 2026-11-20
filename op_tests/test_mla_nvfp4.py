@@ -2,12 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Run on gfx1250: python -m pytest op_tests/test_mla_nvfp4.py -q.
 
-The NumPy oracle uses logical matrices, independently of native lane/LDS layout.
+The NumPy oracle checks the specified quantized algorithm, independently of
+native lane/LDS layout. It is an implementation check, not evidence of model
+accuracy. The primary operator accuracy reference is full FP32 softmax attention
+on original BF16 inputs in test_mla_decode_pagesize64.py::TestMlaNvfp4Page64.
 Set AITER_NVFP4_TEST_LARGE=1 to exercise both KV streams above 4 GiB (~12 GiB).
 """
 
 import math
 import os
+import struct
 
 import numpy as np
 import pytest
@@ -108,7 +112,7 @@ def gpu(x):
     return torch.from_numpy(np.ascontiguousarray(x)).to("cuda")
 
 
-def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
+def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
     lengths = np.array(lengths, np.int32)
     counts = (lengths + 63) // 64
     ptr = np.r_[0, counts.cumsum()].astype(np.int32)
@@ -150,6 +154,9 @@ def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
             cc[..., 576:] = 0
         else:
             cc[..., 512:576] = 0
+    if mode == "constant_v":
+        cc[..., :512] = 2
+        cs[..., :32] = 0x60
     q = F4[qc] * np.repeat(e4(qs), 16, axis=-1)
     c = F4[cc] * np.repeat(e4(cs), 16, axis=-1)
     for r in range(b):
@@ -173,7 +180,7 @@ def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
         "params": prepare_mla_nvfp4_params(
             device="cuda", physical_pages=p, sm_scale=scale, rebase_threshold=threshold
         ),
-        "return_lse": True,
+        "return_lse": False,
     }
     logical = {
         "q": q,
@@ -187,12 +194,11 @@ def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
     return args, logical, (out_storage, lse_storage)
 
 
-def oracle(case):
-    outputs, lses = [], []
+def quantized_algorithm_oracle(case):
+    outputs = []
     for r, length in enumerate(case["lengths"]):
         if length == 0:
             outputs.append(np.zeros((128, 512), np.float32))
-            lses.append(np.full(128, -np.inf, np.float32))
             continue
         c = case["c"][case["idx"][case["ptr"][r] : case["ptr"][r + 1]]].reshape(
             -1, 640
@@ -232,8 +238,8 @@ def oracle(case):
                 acc *= alpha[:, None]
                 anchor = new
             # Local N16 exponentials under a common N128 online anchor.
-            # Each group quantizes 6*e to FP4 and 5*w to FP8; the denominator
-            # accumulates unquantized e*w. Empty groups contribute zero.
+            # Each group quantizes 6*e to FP4 and 5*w to FP8. Both numerator
+            # and denominator use that same quantized mass. Masked groups are zero.
             # Evaluate exp2 in FP64 then round, to avoid NumPy FP32 SIMD error
             # moving a probability across an E2M1 midpoint.
             exponent = (
@@ -243,27 +249,26 @@ def oracle(case):
             local = np.exp2(exponent.astype(np.float64)).astype(np.float32)
             delta = gm - anchor[:, None]
             relative = np.exp2(delta.astype(np.float64)).astype(np.float32)
-            weights = local * relative[..., None]
-            den += weights.astype(np.float64).sum(axis=(1, 2)).astype(np.float32)
             p = (
                 F4[nearest(local * np.float32(6), F4[:8])]
                 * S8[nearest(relative * 5, S8)][..., None]
             )
+            den += p.astype(np.float64).sum(axis=(1, 2)).astype(np.float32)
             acc += (
                 p.reshape(128, 128)[:, :n].astype(np.float64)
                 @ ct[:, :512].astype(np.float64)
             ).astype(np.float32)
-        outputs.append(acc * ((np.float32(1) / den) * np.float32(1 / 2688))[:, None])
-        lses.append((np.log2(den) + anchor) * np.float32(np.log(2)))
+        outputs.append(acc * ((np.float32(1) / den) * np.float32(1 / 89.6))[:, None])
     if not outputs:
-        return np.empty((0, 128, 512), np.float32), np.empty((0, 128), np.float32)
+        return np.empty((0, 128, 512), np.float32)
     o = torch.from_numpy(np.stack(outputs)).to(torch.bfloat16).float().numpy()
-    return o, np.stack(lses)
+    return o
 
 
 def check(args, logical, guards=None):
     out, lse = mla_decode_nvfp4_fwd(**args)
-    expected, expected_lse = oracle(logical)
+    assert lse is None
+    expected = quantized_algorithm_oracle(logical)
     actual = out.float().cpu().numpy()
     if actual.size:
         assert np.isfinite(actual).all()
@@ -271,11 +276,10 @@ def check(args, logical, guards=None):
         diff = actual - expected
         assert np.sqrt(np.mean(diff.astype(np.float64) ** 2)) <= 0.003 * max(rms, 1e-8)
         assert np.max(np.abs(diff)) <= 0.025
-        np.testing.assert_allclose(lse.cpu().numpy(), expected_lse, atol=2e-4, rtol=0)
     if guards:
         assert torch.isnan(guards[0][-256:]).all()
-        assert torch.all(guards[1][-256:] == 12345)
-    return out.clone(), lse.clone()
+        assert torch.all(guards[1] == 12345)
+    return out.clone()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -289,9 +293,10 @@ def require_gpu():
 
 
 @pytest.mark.parametrize(
-    "mode", ["random", "rescale", "nope", "rope", "residual_q", "residual_k"]
+    "mode",
+    ["random", "rescale", "nope", "rope", "residual_q", "residual_k", "constant_v"],
 )
-def test_decode_oracle(mode):
+def test_decode_quantized_algorithm(mode):
     args, logical, guards = make_case(
         [
             0,
@@ -323,12 +328,27 @@ def test_decode_oracle(mode):
     expected = check(args, logical, guards)
     for _ in range(2):
         mla_decode_nvfp4_fwd(**args)
-        assert torch.equal(args["out"], expected[0])
-        assert torch.equal(args["lse"], expected[1])
+        assert torch.equal(args["out"], expected)
+        assert (args["lse"] == 12345).all()
 
 
-def test_threshold():
-    check(*make_case([1, 129, 1153, 2049], "rescale", 6.0))
+def test_threshold_and_params():
+    args, logical, guards = make_case([1, 129, 1153, 2049], "rescale")
+    decoded = struct.unpack("<fffI", args["params"].cpu().numpy().tobytes())
+    expected = struct.unpack(
+        "<fffI",
+        struct.pack("<fffI", logical["beta"], 1 / 89.6, 1.0, args["kv_nope"].shape[0]),
+    )
+    assert decoded == expected
+    check(args, logical, guards)
+
+
+def test_constant_v_normalization():
+    args, logical, guards = make_case([1, 17, 65, 129, 513, 2049], "constant_v")
+    out = check(args, logical, guards)
+    # With matching quantized numerator/denominator mass, O must preserve V.
+    expected = torch.full_like(out, 32 / 89.6)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 def test_empty_batch():
@@ -356,7 +376,7 @@ def test_native_public_and_dispatch():
             )
         )
     )
-    assert torch.equal(args["out"], expected[0])
+    assert torch.equal(args["out"], expected)
     kwargs = {
         "q": args["q_nope"],
         "kv_buffer": args["kv_nope"],
@@ -372,10 +392,10 @@ def test_native_public_and_dispatch():
         "kv_aux": args["kv_aux"],
         "nvfp4_params": args["params"],
         "nvfp4_lse": args["lse"],
-        "return_lse": True,
+        "return_lse": False,
     }
     out, lse = aiter.mla.mla_decode_fwd(**kwargs)
-    assert torch.equal(out, expected[0]) and torch.equal(lse, expected[1])
+    assert torch.equal(out, expected) and lse is None
     for change in (
         {"num_kv_splits": 2},
         {"max_seqlen_q": 2},
@@ -383,10 +403,17 @@ def test_native_public_and_dispatch():
         {"sm_scale": 0.1},
         {"return_logits": True},
         {"kv_csr_layout": "token"},
+        {"return_lse": True},
     ):
         with pytest.raises(ValueError):
             aiter.mla.mla_decode_fwd(**(kwargs | change))
-    assert mla_decode_nvfp4_fwd(**(args | {"return_lse": False}))[1] is None
+    with pytest.raises(ValueError, match="does not produce LSE"):
+        mla_decode_nvfp4_fwd(**(args | {"return_lse": True}))
+    out, lse = mla_decode_nvfp4_fwd(**(args | {"lse": None}))
+    assert torch.equal(out, expected) and lse is None
+    out, lse = aiter.mla.mla_decode_fwd(**(kwargs | {"nvfp4_lse": None}))
+    assert torch.equal(out, expected) and lse is None
+    assert (args["lse"] == 12345).all()
 
 
 def test_contracts():
@@ -410,7 +437,8 @@ def test_contracts():
         {"physical_pages": 0},
         {"sm_scale": float("nan")},
         {"rebase_threshold": 0},
-        {"rebase_threshold": 1},
+        {"rebase_threshold": 6},
+        {"rebase_threshold": float("nan")},
         {"rebase_threshold": 8},
     ):
         with pytest.raises(ValueError):
@@ -433,18 +461,19 @@ def test_stream_graph_compile():
             mla_decode_nvfp4_fwd(**args)
         graph.replay()
     torch.cuda.current_stream().wait_stream(stream)
-    assert torch.equal(args["out"], expected[0])
+    assert torch.equal(args["out"], expected)
     args["kv_indptr"].zero_()
     args["kv_last_page_lens"].zero_()
     graph.replay()
     torch.cuda.synchronize()
-    assert (args["out"] == 0).all() and torch.isneginf(args["lse"]).all()
+    assert (args["out"] == 0).all() and (args["lse"] == 12345).all()
     args, logical, _ = make_case([65])
+    args["lse"] = None
     compiled = torch.compile(mla_decode_nvfp4_fwd, fullgraph=True)
     out, lse = compiled(**args)
-    out, lse = out.clone(), lse.clone()
+    out = out.clone()
     expected = check(args, logical)
-    assert torch.equal(out, expected[0]) and torch.equal(lse, expected[1])
+    assert torch.equal(out, expected) and lse is None
 
 
 def test_quantize_q():
@@ -577,7 +606,7 @@ def test_bf16_producers_to_decode():
             device="cuda", physical_pages=3, sm_scale=0.07
         ),
         "lse": torch.empty((3, 128), device="cuda"),
-        "return_lse": True,
+        "return_lse": False,
     }
     # Existing GPU dense-to-CSR adapter; unused table entries are poisoned.
     aiter.mla.mla_decode_prepare_page_csr(
@@ -593,7 +622,7 @@ def test_bf16_producers_to_decode():
         "lengths": lengths,
         "idx": idx,
         "ptr": ptr,
-        "threshold": 6.0,
+        "threshold": 1.0,
         "beta": np.float32(0.07 * math.log2(math.e) / (6.72 * 89.6)),
     }
     check(args, logical)

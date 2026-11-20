@@ -15,7 +15,7 @@ namespace {
 struct MlaNvfp4Args
 {
     const void *qn, *qa, *cn, *ca, *indptr, *indices, *last;
-    void *out, *lse;
+    void *out, *lse; // LSE slot is reserved; O34a never accesses it.
     const void* params;
 };
 static_assert(sizeof(MlaNvfp4Args) == 80);
@@ -108,8 +108,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "indices require int32 capacity");
     tensor(out, "out", AITER_DTYPE_bf16, dev, 16);
     shape(out, "out", {b, 128, 512});
-    tensor(lse, "lse", AITER_DTYPE_fp32, dev, 4);
-    shape(lse, "lse", {b, 128});
+    if(lse)
+    {
+        tensor(lse, "lse", AITER_DTYPE_fp32, dev, 4);
+        shape(lse, "lse", {b, 128});
+    }
     tensor(params, "params", AITER_DTYPE_i32, dev, 16);
     shape(params, "params", {4});
     // CSR/params contents are a producer contract; never synchronize to read them here.
@@ -128,7 +131,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                       indices->data_ptr(),
                       last->data_ptr(),
                       out->data_ptr(),
-                      lse->data_ptr(),
+                      lse ? lse->data_ptr() : nullptr,
                       params->data_ptr()};
     size_t bytes = sizeof(args);
     kernel.launch_kernel({&args, &bytes, int(b), 1, 1, 128, 1, 1, stream});

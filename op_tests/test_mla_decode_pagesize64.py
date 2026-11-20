@@ -430,7 +430,7 @@ def _cosine_diff(actual, expected):
     return (1 - (numerator / denominator)).item()
 
 
-def _make_nvfp4_page64_case(lengths, init="randn", threshold=6.0):
+def _make_nvfp4_page64_case(lengths, init="randn", threshold=1.0):
     """Build independent BF16 histories; GPU producers write shuffled page64 KV."""
     device = "cuda"
     batch = len(lengths)
@@ -500,7 +500,7 @@ def _make_nvfp4_page64_case(lengths, init="randn", threshold=6.0):
             sm_scale=576**-0.5,
             rebase_threshold=threshold,
         ),
-        "return_lse": True,
+        "return_lse": False,
     }
     return {
         "args": args,
@@ -513,7 +513,12 @@ def _make_nvfp4_page64_case(lengths, init="randn", threshold=6.0):
 
 
 def _ref_nvfp4_page64_case(case):
-    """Full FP32 attention on original BF16 inputs, independent of FP4 packing."""
+    """Primary operator accuracy reference: standard FP32 softmax(QK^T) V.
+
+    Uses original BF16 inputs, without N128 tiling, threshold rebasing, FP4
+    probabilities or the kernel's quantized denominator. This includes input
+    and probability quantization error; full-model accuracy needs model evals.
+    """
     q, kv, lengths, ptr = (case[k] for k in ("q", "kv", "lengths", "ptr"))
     out = torch.zeros((len(lengths), 128, 512), dtype=torch.float32, device=q.device)
     lse = torch.full(
@@ -582,7 +587,7 @@ def _check_nvfp4_page64_case(case, tolerance=0.3):
         (
             "nvfp4",
             case["args"]["o"],
-            case["args"]["nvfp4_lse"],
+            None,
             case["guards"],
             tolerance,
         )
@@ -597,19 +602,23 @@ def _check_nvfp4_page64_case(case, tolerance=0.3):
         # Both formats use the same original-BF16 reference and 5% mismatch budget.
         err = checkAllclose(expected, actual, atol=tol, rtol=tol, tol_err_ratio=0.05)
         assert err <= 0.05, f"{name} output mismatch ratio {err:.3%} exceeds 5%"
-        assert torch.isfinite(lse[live]).all()
-        lse_err = 0.0
-        if live.any():
+        if lse is not None and live.any():
+            assert torch.isfinite(lse[live]).all()
             lse_err = checkAllclose(
                 expected_lse[live], lse[live], atol=tol, rtol=tol, tol_err_ratio=0.05
             )
             assert (
                 lse_err <= 0.05
             ), f"{name} LSE mismatch ratio {lse_err:.3%} exceeds 5%"
+            metrics[f"{name}_lse_err"] = lse_err
         # Absolute tolerance alone can accept all-zero outputs for long histories.
         nrms = (actual - expected).square().mean(dim=(1, 2)).sqrt() / rms
         assert (nrms <= tol).all(), f"{name} max request NRMS={nrms.max().item():.6f}"
-        assert (actual[~live] == 0).all() and torch.isneginf(lse[~live]).all()
+        assert (actual[~live] == 0).all()
+        if lse is None:
+            assert (guards[1] == 12345).all()
+        else:
+            assert torch.isneginf(lse[~live]).all()
         assert torch.isnan(guards[0][-256:]).all()
         assert (guards[1][-256:] == 12345).all()
         prefix = "mi400" if name == "nvfp4" else name
@@ -617,7 +626,6 @@ def _check_nvfp4_page64_case(case, tolerance=0.3):
             {
                 f"{prefix} cos_diff": _cosine_diff(actual, expected),
                 f"{prefix} err": err,
-                f"{name}_lse_err": lse_err,
                 f"{name}_nrms": nrms.max().item(),
                 f"{name}_max_abs": (actual - expected).abs().max().item(),
             }
@@ -641,7 +649,7 @@ def _time_page64_decode(calls):
     for name, call in calls.items():
         for _ in range(8):
             out, lse = call()
-        expected[name] = (out.clone(), lse.clone())
+        expected[name] = (out.clone(), lse.clone() if lse is not None else None)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(32):
@@ -664,7 +672,12 @@ def _time_page64_decode(calls):
             samples[name].append(start.elapsed_time(end) * 1000 / 32)
     for name in names:
         for actual, eager in zip(outputs[name], expected[name]):
-            assert torch.equal(actual, eager), f"{name} graph replay differs from eager"
+            if eager is None:
+                assert actual is None
+            else:
+                assert torch.equal(
+                    actual, eager
+                ), f"{name} graph replay differs from eager"
         aiter.logger.info("%s decode samples (us): %s", name, samples[name])
     return {name: sum(values) / len(values) for name, values in samples.items()}
 
@@ -758,7 +771,7 @@ class TestMlaNvfp4Page64:
         graph.replay()
         torch.cuda.synchronize()
         assert (case["args"]["o"] == 0).all()
-        assert torch.isneginf(case["args"]["nvfp4_lse"]).all()
+        assert (case["guards"][1] == 12345).all()
 
 
 @benchmark()
@@ -1035,7 +1048,6 @@ def _format_summary(rows):
         "mi400 final_out_finite",
         "nvfp4_nrms",
         "nvfp4_max_abs",
-        "nvfp4_lse_err",
         "fp8 us",
         "fp8 / nvfp4",
         "fp8 err",
