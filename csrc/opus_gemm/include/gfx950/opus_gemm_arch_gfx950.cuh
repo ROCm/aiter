@@ -67,7 +67,10 @@ struct OpusA8W8KidEntry
 template <typename Entry, size_t Size>
 inline const Entry* find_kid(const std::array<Entry, Size>& entries, int kid)
 {
-    const auto key = std::make_pair(opus_get_arch_info().cu_num, kid);
+    const int cu_num = opus_table_cu(entries.begin(), entries.end(),
+                                     opus_get_arch_info().cu_num,
+                                     [](const Entry& entry) { return entry.kid; });
+    const auto key = std::make_pair(cu_num, kid);
     const auto it = std::lower_bound(
         entries.begin(), entries.end(), key,
         [](const Entry& entry, std::pair<int, int> value) { return entry.kid < value; });
