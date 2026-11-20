@@ -31,6 +31,7 @@ from opus_gemm_common import (
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
+    a16w16_co_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
@@ -41,7 +42,6 @@ from opus_gemm_common import (
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
-    gfx950_a16w16_4wave_kernels_list,
     gfx1250_4wave_co_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
@@ -1392,12 +1392,12 @@ if __name__ == "__main__":
         "a16w16_clusterlaunch_tdm_splitk_fuse": gfx1250_splitk_fuse_kernels_list,
         "a16w16_4wave": {
             kid: instance
-            for kid, instance in gfx950_a16w16_4wave_kernels_list.items()
+            for kid, instance in a16w16_co_kernels_list.items()
             if instance.kernel_tag == "a16w16_4wave"
         },
         "a16w16_4wave_ws": {
             kid: instance
-            for kid, instance in gfx950_a16w16_4wave_kernels_list.items()
+            for kid, instance in a16w16_co_kernels_list.items()
             if instance.kernel_tag == "a16w16_4wave_ws"
         },
         "a16w16_4wave_co": {

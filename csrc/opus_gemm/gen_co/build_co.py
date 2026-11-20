@@ -6,7 +6,7 @@
 ``--arch gfx1250`` (default) builds the gfx1250 4-wave CO families described
 below. ``--arch gfx950`` builds one gfx950 family, chosen by ``--family``:
 ``a8w8_blockscale_bpreshuffle`` (default) or ``a16w16``, the a16w16 4-wave
-family (``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
+family (``gen_co/co_kernels_gfx950_a16w16.json``, kernel tags ``a16w16_4wave`` and
 ``a16w16_4wave_ws``): one image per (kid, layout NT/NN/TT/TN); see
 ``_build_a16w16_gfx950``.
 
@@ -103,7 +103,7 @@ from codegen.gen_instances_gfx1250 import (
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
     a16w16_4wave_co_images,
-    gfx950_a16w16_4wave_kernels_declared,
+    a16w16_co_kernels_declared,
     gfx950_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
 )
@@ -852,7 +852,7 @@ def _default_co_output_dir(arch, offload_arch, family):
 
 
 # ---------------------------------------------------------------------------
-# gfx950: a16w16 4-wave family (gen_co/co_kernels_gfx950_bf16.json)
+# gfx950: a16w16 4-wave family (gen_co/co_kernels_gfx950_a16w16.json)
 # ---------------------------------------------------------------------------
 # The pipeline needs [[clang::amdgpu_pin_agpr]] (pinned large tiles) and the
 # newer LLVM's scheduling of ds_read_b64_tr_b16 (the M/N-contiguous layouts),
@@ -1014,7 +1014,7 @@ def build_one_a16w16_gfx950(job, args, llvm_bin, workdir):
 
 
 def _build_a16w16_gfx950(p, args, llvm_bin):
-    declared = gfx950_a16w16_4wave_kernels_declared
+    declared = a16w16_co_kernels_declared
     instances = sorted(declared.items())
     if args.kids:
         try:
@@ -1030,7 +1030,7 @@ def _build_a16w16_gfx950(p, args, llvm_bin):
     jobs = _a16w16_gfx950_jobs(instances)
     if not jobs:
         raise SystemExit(
-            "build_co: no gfx950 entries -- check gen_co/co_kernels_gfx950_bf16.json"
+            "build_co: no gfx950 entries -- check gen_co/co_kernels_gfx950_a16w16.json"
         )
     n_jobs = get_worker_count_for(len(jobs), args.jobs)
     workdir = tempfile.mkdtemp(prefix="opus_build_co_gfx950_")
@@ -1114,7 +1114,7 @@ def main():
         choices=("a8w8_blockscale_bpreshuffle", "a16w16"),
         help="gfx950 only: a8w8_blockscale_bpreshuffle builds "
         "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json, a16w16 builds the "
-        "4-wave family of co_kernels_gfx950_bf16.json",
+        "4-wave family of co_kernels_gfx950_a16w16.json",
     )
     p.add_argument(
         "--offload-arch",

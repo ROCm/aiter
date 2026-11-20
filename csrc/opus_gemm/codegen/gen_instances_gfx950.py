@@ -3527,10 +3527,11 @@ _A16W16_4WAVE_DIRECT_LAUNCH = """
     AITER_CHECK(reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0,
         "@NAME@: the direct 4wave kernel needs a 16-byte aligned Y");
     kargs.split_k = 1;
-    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(kImages[layout], XQ.device_id);
-    opus_gfx950_co::launch(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n), 1,
-                                        static_cast<unsigned>(batch)),
-                           BLOCK_SIZE, kargs, stream);"""
+    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(
+        kImages[layout], std::string(kImages[layout]) + ".co", "@CO_DIR@");
+    opus_co_launch_gfx950<@KARGS_BYTES@>(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n), 1,
+                                                  static_cast<unsigned>(batch)),
+                                             dim3(BLOCK_SIZE), kargs, stream);"""
 
 _A16W16_4WAVE_WS_LAUNCH = """
     // Each split needs >= 2 K tiles; mirrored by launch_plan._plan_gfx950_4wave_split_k.
@@ -3551,10 +3552,11 @@ _A16W16_4WAVE_WS_LAUNCH = """
     kargs.split_k = split_k;
     kargs.stride_ws = static_cast<int>(padded_n);
     kargs.stride_ws_batch = static_cast<int>(padded_m * padded_n);
-    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(kImages[layout], XQ.device_id);
-    opus_gfx950_co::launch(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n * split_k), 1,
-                                        static_cast<unsigned>(batch)),
-                           BLOCK_SIZE, kargs, stream);
+    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(
+        kImages[layout], std::string(kImages[layout]) + ".co", "@CO_DIR@");
+    opus_co_launch_gfx950<@KARGS_BYTES@>(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n * split_k), 1,
+                                                  static_cast<unsigned>(batch)),
+                                             dim3(BLOCK_SIZE), kargs, stream);
 
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS = 64;
@@ -3590,9 +3592,13 @@ def gen_a16w16_4wave_instance(
     a16w16_4wave uses the five-argument direct ABI (no bias: use the _ws kids),
     a16w16_4wave_ws the workspace ABI (fp32 split-K partials, then the shared
     gfx950 splitk_reduce_kernel adds the bias and writes bf16 Y). No device
-    instantiation is emitted: each image is loaded at first use per device.
+    instantiation is emitted: each image is loaded at first use.
     """
-    from opus_gemm_common import a16w16_4wave_co_images
+    from opus_gemm_common import A16W16_CO_DIR, a16w16_4wave_co_images
+
+    A16W16_KARGS_BYTES = (
+        88  # sizeof(opus_gemm_a16w16_4wave_kargs_gfx950), as build_co.py checks
+    )
 
     workspace = k.kernel_tag == "a16w16_4wave_ws"
     images = a16w16_4wave_co_images(k)
@@ -3608,6 +3614,8 @@ def gen_a16w16_4wave_instance(
         )
         .replace("@WS_PARAM@", "\n    aiter_tensor_t &workspace," if workspace else "")
         .replace("@HOST_DTYPE@", "fp32_t" if workspace else "bf16_t")
+        .replace("@CO_DIR@", A16W16_CO_DIR)
+        .replace("@KARGS_BYTES@", str(A16W16_KARGS_BYTES))
         .replace(
             "@BIAS_HOST_VALIDATE@",
             (

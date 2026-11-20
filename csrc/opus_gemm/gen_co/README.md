@@ -100,7 +100,7 @@ is retained as historical context in [NAMED_REG_VALIDATION.md](NAMED_REG_VALIDAT
 gen_co/
 ├── co_kernels_gfx1250.json # gfx1250 source of truth (see below)
 ├── co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json
-├── co_kernels_gfx950_bf16.json
+├── co_kernels_gfx950_a16w16.json
 ├── build_co.py            # the producer
 ├── gfx950/
 │   ├── a8w8_blockscale_bpreshuffle/
@@ -129,7 +129,7 @@ host launcher append
 `gfx950/a8w8_blockscale_bpreshuffle/<launcher_name>.co`.
 The small-shape `direct_b` and `staged_b` families are generated through the JIT.
 
-The gfx950 a16w16 4-wave manifest is `gen_co/co_kernels_gfx950_bf16.json`: one
+The gfx950 a16w16 4-wave manifest is `gen_co/co_kernels_gfx950_a16w16.json`: one
 image per (kid, layout NT/NN/TT/TN) in `gfx950/a16w16/`, built with
 `build_co.py --arch gfx950 --family a16w16`.
 

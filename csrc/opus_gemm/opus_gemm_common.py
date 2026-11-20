@@ -2877,12 +2877,13 @@ assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
 )
 
 # ---- gfx950 a16w16 4-wave family (pre-built .co device images) ----------
-# gen_co/co_kernels_gfx950_bf16.json lists the kids (kid, tag, tile). Each kid has
-# one image per layout, <name>_<nt|nn|tt|tn>.co (built offline by
+# gen_co/co_kernels_gfx950_a16w16.json lists the kids (kid, tag, tile). Each kid has
+# one image per layout, gen_co/<A16W16_CO_DIR>/<name>_<nt|nn|tt|tn>.co (built offline by
 # gen_co/build_co.py --arch gfx950 --family a16w16); its launcher picks one from the tensor strides.
-CO_KERNELS_GFX950_JSON = os.path.join(
-    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_bf16.json"
+A16W16_CO_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a16w16.json"
 )
+A16W16_CO_DIR = "gfx950/a16w16"
 A16W16_4WAVE_LAYOUTS = ("nt", "nn", "tt", "tn")  # image index = A_T * 2 + B_T
 
 
@@ -2923,7 +2924,7 @@ def a16w16_4wave_co_images(instance):
 
 
 def _a16w16_4wave_images_present(instance) -> bool:
-    root = os.path.join(os.path.dirname(CO_KERNELS_GFX950_JSON), "gfx950", "a16w16")
+    root = os.path.join(os.path.dirname(A16W16_CO_JSON), A16W16_CO_DIR)
     return all(
         os.path.isfile(os.path.join(root, f"{symbol}.co"))
         for _layout, symbol in a16w16_4wave_co_images(instance)
@@ -2947,13 +2948,13 @@ def _load_a16w16_4wave_gfx950(path):
 
 # Declared kids; get_registry / get_kernel_instance drop those whose images are
 # missing at call time (as for the gfx1250 CO kids).
-gfx950_a16w16_4wave_kernels_declared = _load_a16w16_4wave_gfx950(CO_KERNELS_GFX950_JSON)
-gfx950_a16w16_4wave_kernels_list = {
+a16w16_co_kernels_declared = _load_a16w16_4wave_gfx950(A16W16_CO_JSON)
+a16w16_co_kernels_list = {
     kid: instance
-    for kid, instance in gfx950_a16w16_4wave_kernels_declared.items()
+    for kid, instance in a16w16_co_kernels_declared.items()
     if _a16w16_4wave_images_present(instance)
 }
-GFX950_A16W16_4WAVE_KIDS = frozenset(gfx950_a16w16_4wave_kernels_declared)
+GFX950_A16W16_4WAVE_KIDS = frozenset(a16w16_co_kernels_declared)
 
 # Flatten the eight BMM launcher tags into the same canonical exact-kid
 # registry used by every other OPUS family.
@@ -3384,7 +3385,7 @@ gfx950_a16w16_kernels_list = {
     **a16w16_persistent_kernels_list_4g_safe_nooob,
     **a16w16_mono_tile_kernels_list_4g_safe,
     # Declared records; get_registry drops kids whose .co images are missing.
-    **gfx950_a16w16_4wave_kernels_declared,
+    **a16w16_co_kernels_declared,
 }
 
 gfx1250_a16w16_kernels_list = {
