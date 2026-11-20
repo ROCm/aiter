@@ -405,3 +405,102 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                     D_QK, ",", D_V, ")");
     }
 }
+
+void gated_mla_fwd_bf16_opus(at::Tensor& q,
+                             at::Tensor& k_nope,
+                             at::Tensor& v,
+                             at::Tensor& k_rot,
+                             at::Tensor& gate,
+                             at::Tensor& out,
+                             std::optional<at::Tensor> lse,
+                             at::Tensor& seqstart_q,
+                             at::Tensor& seqstart_k,
+                             int max_seqlen_q,
+                             int max_seqlen_k,
+                             bool causal,
+                             float softmax_scale)
+{
+    constexpr int D_NOPE = 128, D_ROT = 64, D_V = 128;
+
+    TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
+    for (const at::Tensor* t : {&k_nope, &v, &k_rot, &gate, &out}) {
+        TORCH_CHECK(t->device() == q.device(), "gated MLA tensors must share q's device");
+        TORCH_CHECK(t->scalar_type() == at::kBFloat16, "gated MLA tensors must be bf16");
+    }
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "gated MLA tensors must be bf16");
+    TORCH_CHECK(q.dim() == 3 && k_nope.dim() == 3 && v.dim() == 3 && gate.dim() == 3 &&
+                    out.dim() == 3 && k_rot.dim() == 2,
+                "expects q/k_nope/v/gate/out [total, H, D] and k_rot [total_k, 64]");
+
+    const int H    = static_cast<int>(q.size(1));
+    const int H_KV = static_cast<int>(k_nope.size(1));
+    const int64_t total_q = q.size(0), total_k = k_nope.size(0);
+    TORCH_CHECK(q.size(2) == D_NOPE + D_ROT, "q head dim must be 192");
+    TORCH_CHECK(k_nope.size(2) == D_NOPE && v.size(2) == D_V && k_rot.size(1) == D_ROT,
+                "k_nope / v / k_rot widths must be 128 / 128 / 64");
+    TORCH_CHECK(v.size(0) == total_k && v.size(1) == H_KV && k_rot.size(0) == total_k,
+                "k_nope / v / k_rot must share total_k (and H_KV for k_nope / v)");
+    TORCH_CHECK(H_KV > 0 && H % H_KV == 0, "H must be divisible by H_KV");
+    for (const at::Tensor* t : {&gate, &out}) {
+        TORCH_CHECK(t->size(0) == total_q && t->size(1) == H && t->size(2) == D_V,
+                    "gate / out must be [total_q, H, 128]");
+    }
+    // Every row is moved with 16-byte buffer loads / stores.
+    for (const at::Tensor* t : {&q, &k_nope, &v, &k_rot, &gate, &out}) {
+        TORCH_CHECK(t->stride(-1) == 1, "gated MLA tensors must be contiguous along the head dim");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                    "gated MLA tensors must be 16-byte aligned");
+        for (int d = 0; d + 1 < t->dim(); ++d)
+            TORCH_CHECK(t->stride(d) % 8 == 0, "gated MLA row / head strides must be multiples of 8");
+    }
+
+    const int B = static_cast<int>(seqstart_q.numel()) - 1;
+    TORCH_CHECK(B > 0, "seqstart_q length must be >= 2");
+    TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0, "max_seqlen_q / max_seqlen_k must be > 0");
+    for (const at::Tensor* s : {&seqstart_q, &seqstart_k}) {
+        TORCH_CHECK(s->device() == q.device() && s->scalar_type() == at::kInt && s->dim() == 1 &&
+                        s->is_contiguous() && s->numel() == B + 1,
+                    "seqstart_q / seqstart_k must be contiguous int32 [num_seqs + 1] on q's device");
+    }
+
+    fmha_fwd_bf16_opus_args args{};
+    args.q_ptr  = q.data_ptr();
+    args.k_ptr  = k_nope.data_ptr();
+    args.v_ptr  = v.data_ptr();
+    args.o_ptr  = out.data_ptr();
+    args.gate_ptr  = gate.data_ptr();
+    args.k_rot_ptr = k_rot.data_ptr();
+    args.hdim_q = D_NOPE + D_ROT;
+    args.hdim_v = D_V;
+    args.softmax_scale = softmax_scale;
+    args.causal        = causal;
+    args.batch = B; args.seqlen_q = max_seqlen_q; args.seqlen_k = max_seqlen_k;
+    args.nhead = H; args.nhead_k = H_KV;
+
+    args.stride_q_n = static_cast<int>(q.stride(0));      args.stride_q_h = static_cast<int>(q.stride(1));
+    args.stride_k_n = static_cast<int>(k_nope.stride(0)); args.stride_k_h = static_cast<int>(k_nope.stride(1));
+    args.stride_v_n = static_cast<int>(v.stride(0));      args.stride_v_h = static_cast<int>(v.stride(1));
+    args.stride_o_n = static_cast<int>(out.stride(0));    args.stride_o_h = static_cast<int>(out.stride(1));
+    args.stride_gate_n  = static_cast<int>(gate.stride(0));
+    args.stride_gate_h  = static_cast<int>(gate.stride(1));
+    args.stride_k_rot_n = static_cast<int>(k_rot.stride(0));
+    args.stride_k_rot_h = 0;
+
+    args.seqstart_q_ptr     = reinterpret_cast<const int*>(seqstart_q.data_ptr());
+    args.seqstart_k_ptr     = reinterpret_cast<const int*>(seqstart_k.data_ptr());
+    args.seqstart_q_pad_ptr = args.seqstart_q_ptr;
+    args.seqstart_k_pad_ptr = args.seqstart_k_ptr;
+
+    if (lse.has_value()) {
+        const at::Tensor& l = *lse;
+        TORCH_CHECK(l.device() == q.device() && l.scalar_type() == at::kFloat && l.dim() == 2 &&
+                        l.size(0) == H && l.size(1) == total_q && l.stride(-1) == 1,
+                    "lse must be float32 [H, total_q], contiguous along total_q");
+        args.lse_ptr      = l.data_ptr();
+        args.stride_lse_h = static_cast<int>(l.stride(0));
+    }
+
+    HipDeviceGuard guard(q.device().index());
+    TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
+                "gated MLA OPUS fwd: the launcher rejected this shape");
+}
