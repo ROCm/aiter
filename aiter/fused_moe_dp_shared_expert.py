@@ -21,7 +21,12 @@ from aiter.jit.core import (
     bd_dir,
     mp_lock,
 )
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import (
+    find_tuned_cu_row,
+    get_cu_num,
+    get_gfx_runtime,
+    gfx_from_cu_num,
+)
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
@@ -454,7 +459,13 @@ def get_2stage_cfgs(
     def FinalFunc():
         logger.info("\033[0m")
 
-    cfg = cfg_2stages.get(keys, None)
+    cfg = find_tuned_cu_row(
+        cfg_2stages,
+        lambda cu: keys[:1] + (cu,) + keys[2:],
+        gfx,
+        cu_num,
+        "fused_moe_dp_shared_expert",
+    )
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
