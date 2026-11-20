@@ -1472,7 +1472,7 @@ def test_checkpoint_matches_prefix_state(lens, offsets, norm):
     starts = [0, *torch.tensor(lens).cumsum(0).tolist()[:-1]]
     sel = [i for i, o in enumerate(offsets) if o > 0]
     tok = torch.cat([torch.arange(starts[i], starts[i] + offsets[i]) for i in sel])
-    cut = lambda x: x[:, tok.to(device)].contiguous()  # noqa: E731
+    cut = lambda x: x[:, tok.to(device)].contiguous()
     _, ref = run_reference(
         cut(q),
         cut(k),
@@ -1546,8 +1546,7 @@ def test_checkpoint_negative_row_and_state_cache_destination():
 
 def test_checkpoints_need_the_gfx950_gluon_path():
     """Routes that cannot write checkpoints refuse them."""
-    on_gfx950 = _flash_kda.DEVICE_ARCH == "gfx950"
-    with _route(k1=False, k2=False) if on_gfx950 else contextlib.nullcontext():
+    with _route(k1=False, k2=False):
         _, kw, _ = _checkpoint_call([256])
         with pytest.raises(NotImplementedError):
             chunk_kimi_delta_attn(
@@ -1564,8 +1563,8 @@ def test_checkpoint_into_padded_vllm_state_cache():
     _skip_unless_gfx950_gluon()
     H, lens = 12, [2048, 2048, 512]
     n = len(lens)
-    args, kw, h0 = _checkpoint_call(lens, H)
-    cache, indices, storage = _paged_pool(n + 2, H, torch.zeros_like(h0[:1]), 256)
+    _, kw, h0 = _checkpoint_call(lens, H)
+    cache, _, storage = _paged_pool(n + 2, H, torch.zeros_like(h0[:1]), 256)
     cache[1 : n + 1] = h0.flip(0)
     kw.update(state_cache=cache, state_indices=torch.arange(n, 0, -1).int().cuda())
     offsets = torch.tensor([1024, 1536, 0], device=device, dtype=torch.int32)
@@ -1592,7 +1591,7 @@ def test_strided_beta_matches_packed(norm):
     """beta sliced from a wider projection, as vLLM passes it, gives the same
     result as a packed copy (the gfx950 Gluon K1 reads it in place)."""
     lens = [2136, 4608, 300]
-    args, kw, _ = _checkpoint_call(lens, norm=norm)
+    _, kw, _ = _checkpoint_call(lens, norm=norm)
     T, H = sum(lens), 12
     proj = torch.randn(T, 3 * H + 5, device=device, dtype=dtype)
     beta = proj[:, H : 2 * H].view(1, T, H)

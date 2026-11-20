@@ -1,28 +1,48 @@
 {
     "k1_prepare_gluon": {
         "num_warps": 4,
-        "waves_per_eu": 5
+        "waves_per_eu": 7
     },
     "k2_ab_fused_gluon_wide": {
         "BW": 128,
         "CPL": 2,
         "num_warps": 4,
-        "MIN_BLOCKS_PER_CU": 2
+        "MIN_BLOCKS_PER_CU": 2,
+        "waves_per_eu": 0
     },
     "k2_ab_fused_gluon_narrow": {
         "BW": 64,
         "CPL": 2,
-        "num_warps": 4
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "k2_c_gluon_packed": {
+        "BW": 128,
+        "CPL": 1,
+        "num_warps": 4,
+        "waves_per_eu": 2,
+        "MIN_BLOCKS_PER_CU": 1.0
     },
     "k2_c_gluon_wide": {
         "BW": 128,
         "CPL": 2,
         "num_warps": 4,
-        "MIN_BLOCKS_PER_CU": 0.3
+        "MIN_BLOCKS_PER_CU": 0.3,
+        "waves_per_eu": 0
     },
     "k2_c_gluon_narrow": {
         "BW": 64,
         "CPL": 2,
-        "num_warps": 4
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "flash_kda_gluon_plan": {
+        "SEG_FIXED_STEPS": 8,
+        "SEG_DEVICE_STEPS": 40,
+        "A8_MAX_SEGS": 21,
+        "A8_MIN_LEN": 5,
+        "PACKED_FROM_LEN": 64,
+        "MIN_CHUNKS": 64,
+        "SEG_SQRT": 1.4
     }
 }
