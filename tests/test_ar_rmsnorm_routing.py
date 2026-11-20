@@ -82,6 +82,7 @@ def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
         has_old_arch_fused_kernels=False,
         _is_gfx1250=True,
         _lamport_max_bytes=8 << 20,
+        _fly_rms=None,
         should_custom_ar=lambda *args: True,
         lamport_fused_ar_rms=Mock(return_value=(x, x)),
         lamport_fused_ar_rms_quant=Mock(
@@ -90,7 +91,12 @@ def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
         custom_fused_ar_rms=Mock(return_value=(x, x)),
         custom_fused_ar_rms_quant=Mock(return_value=(x, x, scale)),
     )
-    for name in ("can_fuse_ar_rms", "should_fuse_ar_rms", "should_lamport_ar_rms"):
+    for name in (
+        "can_fuse_ar_rms",
+        "should_fuse_ar_rms",
+        "should_lamport_ar_rms",
+        "should_fly_allreduce_rmsnorm",
+    ):
         setattr(ca, name, MethodType(getattr(CustomAllreduce, name), ca))
     comm = SimpleNamespace(
         ca_comm=ca,
