@@ -31,7 +31,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.build_targets import base_gfx_arch
-from ...jit.utils.chip_info import get_cu_num
+from ...jit.utils.chip_info import find_tuned_cu_row, get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import (
     get_padded_m,
@@ -150,11 +150,15 @@ def lookup_a16w16_opus_config(
     has_bias: bool,
     input_dtype: object,
     output_dtype: object,
+    device: int | None = None,
 ) -> dict | None:
-    """Return the exact-shape OPUS tuned row used by the legacy OPUS caller."""
-    key = (
-        str(arch).lower().split(":", 1)[0],
-        int(cu_num),
+    """Return the exact-shape OPUS tuned row used by the legacy OPUS caller.
+
+    A compute partition also uses the rows of its full chip
+    (get_tuned_cu_nums of device, which defaults to the current device).
+    """
+    arch = str(arch).lower().split(":", 1)[0]
+    shape = (
         int(M),
         int(N),
         int(K),
@@ -164,7 +168,14 @@ def lookup_a16w16_opus_config(
         False,
         False,
     )
-    config = _load_a16w16_opus_tuned().get(key)
+    config = find_tuned_cu_row(
+        _load_a16w16_opus_tuned(),
+        lambda cu: (arch, cu, *shape),
+        arch,
+        int(cu_num),
+        "OPUS A16W16",
+        device,
+    )
     return None if config is None else dict(config)
 
 

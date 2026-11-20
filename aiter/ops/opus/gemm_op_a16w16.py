@@ -429,7 +429,7 @@ def gemm_a16w16_opus(
         "output_dtype": Y.dtype,
     }
     if kernelId is None:
-        config = lookup_a16w16_opus_config(**lookup_args)
+        config = lookup_a16w16_opus_config(**lookup_args, device=A.device.index)
         plan = None
         if config is not None:
             plan = resolve_a16w16_tuned_candidate(
