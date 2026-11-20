@@ -20,10 +20,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
     _buffer,
     _buffer_store_words,
@@ -63,6 +63,10 @@ class SparsePlan:
     block_capacity: int
     max_blocks: int
     num_tiles: int
+    # Tiles 0 .. union_tiles - 1 are union candidates (K2 compacts them, scratch holds them).
+    # A batch-invariant plan follows them with direct-only tiles of the requests below the
+    # union planning rows: their counts and costs stay 0, so K3 publishes them direct.
+    union_tiles: int
     grid: int
     route_costs: tuple
     route_model: tuple  # platform union_fixed, union_step, row_step, route_margin
@@ -81,7 +85,7 @@ class SparsePlan:
 
 
 def _ballot(pred):
-    return fx.Int64(rocdl.ballot(fx.Int64.ir_type, pred))
+    return prim.ballot(pred)
 
 
 # gfx9 DPP controls: quad_perm xor 1 / 2 / 3, row_half_mirror (xor 7), row_mirror (xor 15).
@@ -96,13 +100,12 @@ def _lane_xor(value, mask):
             [_lane_xor(halves[0], mask), _lane_xor(halves[1], mask)], fx.Int32
         ).bitcast(fx.Int64)[0]
     if mask not in _DPP_XOR:
-        return value.shuffle_xor(mask, 64)
-    # Raw DPP (no fx wrapper): row-local moves instead of LDS-crossbar shuffles cut the
-    # latency-bound K1 by 10-14% on small calls.
-    raw = value.ir_value()
+        return fx.gpu.shuffle_xor(value, mask, 64)
+    # Row-local DPP moves instead of LDS-crossbar shuffles cut the latency-bound K1 by
+    # 10-14% on small calls.
     for control in _DPP_XOR[mask]:
-        raw = rocdl.update_dpp(fx.Int32.ir_type, raw, raw, control, 0xF, 0xF, True)
-    return fx.Int32(raw)
+        value = prim.dpp_move(value, control)
+    return value
 
 
 def _wave_reduce(value, op):
@@ -332,15 +335,13 @@ def _put(buffer, index, value):
 
 
 def _cta_sync():
-    fx.memory_fence(syncscope="workgroup")
-    rocdl.s_barrier()
-    fx.memory_fence(syncscope="workgroup")
+    fx.gpu.barrier()
 
 
 def _inclusive_scan(value, lane):
     for offset in (1, 2, 4, 8, 16, 32):
         source = ((lane - offset) & 63) * 4
-        other = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source, value))
+        other = prim.bpermute(source, value)
         value = (lane >= offset).select(value + other, value)
     return value
 
@@ -497,12 +498,7 @@ def _owned(cta, count):
 
 
 def _below(mask):
-    low = rocdl.mbcnt_lo(
-        fx.Int32.ir_type, fx.Int32(mask).ir_value(), fx.Int32(0).ir_value()
-    )
-    return fx.Int32(
-        rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
-    )
+    return prim.lanes_below(mask)
 
 
 def _count(mask):
@@ -1335,7 +1331,7 @@ def upload(array, device) -> torch.Tensor:
 
 def scratch_specs(plan: SparsePlan) -> list:
     """(field, shape, dtype) of the per-call scratch; every launch rewrites what it reads."""
-    tiles, capacity = plan.num_tiles, plan.block_capacity
+    tiles, capacity = plan.union_tiles, plan.block_capacity
     members = torch.int64 if plan.query_tile > 32 else torch.int32
     specs = [
         ("blocks", (tiles, capacity), torch.int32),
@@ -1360,46 +1356,69 @@ def wide_tile_rows(query_tile: int) -> int:
     return math.ceil(query_tile * get_cu_num() * platform().wide_tiles_per_cu)
 
 
+def _tile_rows(group, query_tile, rows, full):
+    """Union tile rows for `rows` query rows; full: one KV head and no prefix."""
+    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
+    # established tiles for prefix/ragged work and prefills too small to fill the persistent grid.
+    if group == 6 and full and query_tile >= 21 and rows >= wide_tile_rows(21):
+        return 21
+    if group == 3 and full and query_tile == 32 and rows >= wide_tile_rows(42):
+        return 42
+    return min(
+        query_tile,
+        128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
+    )
+
+
 def allocate_plan(
-    *, inputs, query_tile: int, scratch: bool = True, slotted: bool = False
+    *,
+    inputs,
+    query_tile: int,
+    scratch: bool = True,
+    slotted: bool = False,
+    min_request_rows: int | None = None,
 ) -> SparsePlan:
+    """Union plan of a layout. By default its decisions span the batch: every request's tiles
+    are union candidates, BQ21/BQ42 tiles serve only a single full prefill and K3 routes
+    over all tiles. min_request_rows makes them per request (batch-invariant): requests of at
+    least that many rows take union tiles of their own rows (the kernels compile for the
+    widest), the others direct-only tiles after them, and K3 does not route.
+    """
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
     config = platform()
     num_cus = get_cu_num()
-    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
-    # established tiles for prefix/ragged work and batches too small to fill the persistent grid.
-    full = (
-        inputs.k.shape[1] == 1
-        and len(inputs.query_lens) == 1
-        and inputs.prefix_lens[0] == 0
-    )
-    if (
-        group == 6
-        and full
-        and query_tile >= 21
-        and inputs.query_lens[0] >= wide_tile_rows(21)
-    ):
-        query_tile = 21
-    elif (
-        group == 3
-        and full
-        and query_tile == 32
-        and inputs.query_lens[0] >= wide_tile_rows(42)
-    ):
-        query_tile = 42
-    else:
-        query_tile = min(
-            query_tile,
-            128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
-        )
+    hk = inputs.k.shape[1]
     q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
-    lengths = q_lens + np.asarray(inputs.prefix_lens, dtype=np.int64)
+    prefix = np.asarray(inputs.prefix_lens, dtype=np.int64)
+    lengths = q_lens + prefix
+    if min_request_rows is None:
+        full = hk == 1 and len(q_lens) == 1 and prefix[0] == 0
+        query_tile = _tile_rows(group, query_tile, int(q_lens[0]), full)
+        union = np.ones(len(q_lens), dtype=bool)
+        rows = np.full(len(q_lens), query_tile)
+        max_blocks = _cdiv(inputs.max_seqlen_k, 4)
+    else:
+        union = q_lens >= min_request_rows
+        rows = np.array(
+            [
+                _tile_rows(group, query_tile, int(n), hk == 1 and p == 0)
+                for n, p in zip(q_lens, prefix)
+            ],
+            dtype=np.int64,
+        )
+        query_tile = int(rows[union].max())
+        rows[~union] = query_tile
+        max_blocks = _cdiv(int(lengths[union].max()), 4)
     # Equal tiles per request, larger first: a tiny last tile would route its few rows direct, after union.
-    counts = -(-q_lens // query_tile)
-    request = np.repeat(np.arange(len(q_lens)), counts)
-    index = np.arange(len(request)) - np.repeat(np.cumsum(counts) - counts, counts)
+    # Union candidate requests' tiles come first.
+    order = np.concatenate((np.flatnonzero(union), np.flatnonzero(~union)))
+    counts = -(-q_lens // rows)
+    request = np.repeat(order, counts[order])
+    index = np.arange(len(request)) - np.repeat(
+        np.cumsum(counts[order]) - counts[order], counts[order]
+    )
     base = (q_lens // np.maximum(counts, 1))[request]
     extra = (q_lens % np.maximum(counts, 1))[request]
     local = index * base + np.minimum(index, extra)
@@ -1414,15 +1433,19 @@ def allocate_plan(
         ),
         axis=1,
     )
-    max_blocks = _cdiv(inputs.max_seqlen_k, 4)
+    tiles = len(request)
+    union_tiles = int(counts[union].sum())
+    query_tiles = np.empty(int(sizes.sum()), dtype=np.int64)
+    within = np.arange(len(query_tiles)) - np.repeat(np.cumsum(sizes) - sizes, sizes)
+    query_tiles[np.repeat(metadata[:, 0], sizes) + within] = np.repeat(
+        np.arange(tiles), sizes
+    )
     # A query adds at most topk blocks and its tail block.
     capacity = _cdiv(min(max_blocks, query_tile * (inputs.topk + 1)), 16) * 16
-    tiles = len(request)
-    hk = inputs.k.shape[1]
     slices = _cdiv(query_tile * group, 128)
     tasks = tiles * hk * slices
     # A union CTA (8 waves, 64 KiB LDS) fills a CU: a larger grid only adds dispatch rounds.
-    grid = min(tasks, num_cus)
+    grid = min(union_tiles * hk * slices, num_cus)
     packed = int((-(-lengths // 4))[q_lens > 0].sum())
     # Per-layout terms of the route model: union step share per tile, direct cost per step, fixed direct cost.
     route_costs = (
@@ -1436,17 +1459,18 @@ def allocate_plan(
         blocks=None,
         membership=None,
         score_masks=None,
-        counts=torch.empty(tiles, **kwargs),
-        costs=torch.empty((tiles, 3), **kwargs),
-        active=torch.empty(tiles, **kwargs),
+        counts=torch.zeros(tiles, **kwargs),
+        costs=torch.zeros((tiles, 3), **kwargs),
+        active=torch.zeros(tiles, **kwargs),
         task_order=torch.empty(_cdiv(tasks, grid) * grid if grid else 0, **kwargs),
         direct_flag=torch.empty(2, **kwargs),
-        query_tiles=upload(np.repeat(np.arange(tiles), sizes), inputs.q.device),
+        query_tiles=upload(query_tiles, inputs.q.device),
         query_tile=query_tile,
         group_padded=group,
         block_capacity=capacity,
         max_blocks=max_blocks,
         num_tiles=tiles,
+        union_tiles=union_tiles,
         grid=grid,
         route_costs=route_costs,
         route_model=(
@@ -1456,6 +1480,7 @@ def allocate_plan(
             config.route_margin,
         ),
         union_ratio=config.union_ratio,
+        routing=min_request_rows is None,
         slotted=slotted,
     )
     if scratch:
@@ -1513,7 +1538,7 @@ def _launches(inputs, plan, stream):
         plan.union_ratio,
         dense_limit,
         lds_bytes,
-        plan.num_tiles,
+        plan.union_tiles,
         members64,
         large,
         inputs.topk,
@@ -1522,6 +1547,8 @@ def _launches(inputs, plan, stream):
     yield _compiled(_compact_launch, args, 12, (members64, large, inputs.topk)), args
     hk = inputs.k.shape[1]
     slices = _cdiv(plan.query_tile * plan.group_padded, 128)
+    # Order CTAs cover every tile (a direct-only tile publishes 0 and raises the direct flag);
+    # mask CTAs only the union tiles.
     tasks = plan.num_tiles * hk * slices
     numel = plan.task_order.numel()
     # One order CTA sorts the whole task order up to the widest variant, else chunks of it.
@@ -1552,7 +1579,7 @@ def _launches(inputs, plan, stream):
         _cdiv(numel, size),
         plan.query_tile,
         plan.block_capacity,
-        plan.num_tiles,
+        plan.union_tiles,
         plan.direct_groups,
         *plan.route_costs,
         hk,
