@@ -2,17 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FusedEPMoE (aiter.ops.flydsl.fused_ep_moe) on 8 ranks against a torch reference.
 
-    torchrun --nproc-per-node 8 op_tests/multigpu_tests/test_fused_ep_moe.py
+    python3 op_tests/multigpu_tests/test_fused_ep_moe.py      (starts torchrun itself; skips without 8 GPUs)
     torchrun --nproc-per-node 8 op_tests/multigpu_tests/test_fused_ep_moe.py --experts-per-rank 48
 
-or ``pytest op_tests/multigpu_tests/test_fused_ep_moe.py`` (launches torchrun; skipped without 8 GPUs).
+or ``pytest op_tests/multigpu_tests/test_fused_ep_moe.py``. Skips unless the GPUs are 256-CU gfx950 parts.
 
 Per experts-per-rank (48, 56, 63): uniform, skewed and all-to-rank-0 routing, bf16 and MXFP8 rows, unequal and
 empty ranks, ids that are not routed (-1 and past the last expert), up to 1024 tokens per rank. The output of every
-rank's first 24 tokens matches the reference (cosine >= 0.99999 over the output, >= 0.9999 per row, and
+rank's first and last 24 tokens matches the reference (cosine >= 0.99999 over the output, >= 0.9999 per row, and
 checkAllclose at rtol = atol = 2e-2 on >= 98 % of the elements); two runs, a run after other tokens on the same
 routes, and CUDA-graph replays with new inputs are bitwise identical to the eager run; nothing compiles after
-``prepare``.
+``prepare``. Stress (48 experts per rank, 4 tokens per rank, fixed routes so every call reuses the same arena
+rows): 64 back-to-back eager calls and 64 back-to-back graph replays, cycling 8 payloads with no synchronization in
+between, each bitwise identical to that payload's eager output, which matches the reference. Rank 0 prints a
+summary table of the reference comparisons.
 
 Reference numerics, per (token, slot) route of expert e: ``gate, up = x @ w13[e].T`` in fp32 (x the MXFP8 rows),
 ``act = silu(min(gate, 10)) * clamp(up, -10, 10)``, ``act`` quantized to MXFP8 per 32 columns (e8m0 = exponent
@@ -32,7 +35,7 @@ import torch.distributed as dist
 
 H, I, TOPK, LIMIT = 5120, 2304, 6, 10.0
 WORLD = 8
-CHECKED = 24  # tokens per rank compared with the reference (rows are independent)
+CHECKED = 24  # first and last tokens per rank compared with the reference (rows are independent)
 _GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
@@ -155,11 +158,91 @@ GRAPHS = {
 }
 
 
-def run(epr, rank, dev, errors):
+def check_rows(out, x, codes, scales, bf16, raws, tw, ids, tag, stats, errors):
+    """Compare the first and last CHECKED of ``out``'s rows with the torch reference."""
+    from aiter.test_common import checkAllclose
+
+    m = out.shape[0]
+    if not m:
+        return
+    idx = torch.tensor(
+        sorted(set(range(min(m, CHECKED))) | set(range(max(m - CHECKED, 0), m))),
+        device=out.device,
+    )
+    q, s = quantize_mxfp8(x[idx]) if bf16 else (codes[idx], scales[idx])
+    ref = run_torch(q, s, raws, tw[idx], ids[idx])
+    got = out[idx]
+    cos, row = _cos(got, ref)
+    err = checkAllclose(
+        ref.float(), got.float(), rtol=2e-2, atol=2e-2, msg=tag, printLog=False
+    )
+    stats.append({"case": tag, "rows": len(idx), "cos": cos, "row": row, "miss": err})
+    if not (cos >= 0.99999 and row >= 0.9999) or err > 0.02:
+        errors.append(
+            f"{tag}: cosine {cos:.7f}, worst row {row:.6f}, allclose miss {err:.2%}"
+        )
+    if torch.isnan(out.float()).any():
+        errors.append(f"{tag}: NaN")
+
+
+def stress(moe, w, raws, epr, rank, dev, errors, stats, kind):
+    """Back-to-back eager calls and graph replays on fixed routes (the same arena rows every call) with changing
+    payloads and no synchronization in between: each output must equal its payload's checked eager output.
+    """
+    m, npay, calls = 4, 8, 64
+    ids, tw = make_routes(m, kind, 500 + rank, dev, epr)
+    pays = [make_tokens(m, 600 + 10 * i + rank, dev)[0] for i in range(npay)]
+    eager = []
+    for x in pays:
+        eager.append(moe(x, None, w, tw, ids).clone())
+    torch.cuda.synchronize()
+    check_rows(
+        torch.cat(eager),
+        torch.cat(pays),
+        None,
+        None,
+        True,
+        raws,
+        tw.repeat(npay, 1),
+        ids.repeat(npay, 1),
+        f"epr {epr} stress {kind} ({npay} payloads x {m} tokens)",
+        stats,
+        errors,
+    )
+    outs = torch.empty((calls, m, H), dtype=torch.bfloat16, device=dev)
+    dist.barrier()
+    for i in range(calls):
+        moe(pays[i % npay], None, w, tw, ids, out=outs[i])
+    torch.cuda.synchronize()
+    bad = [i for i in range(calls) if not torch.equal(outs[i], eager[i % npay])]
+    if bad:
+        errors.append(
+            f"epr {epr} rank {rank} stress {kind}: back-to-back calls {bad[:8]} differ"
+        )
+    sx = pays[0].clone()
+    dist.barrier()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        gout = moe(sx, None, w, tw, ids)
+    torch.cuda.synchronize()
+    dist.barrier()
+    for i in range(calls):
+        sx.copy_(pays[i % npay])
+        g.replay()
+        outs[i].copy_(gout)
+    torch.cuda.synchronize()
+    bad = [i for i in range(calls) if not torch.equal(outs[i], eager[i % npay])]
+    if bad:
+        errors.append(
+            f"epr {epr} rank {rank} stress {kind}: graph replays {bad[:8]} differ"
+        )
+    del g
+
+
+def run(epr, rank, dev, errors, stats):
     from flydsl.compiler.jit_function import MlirCompiler
 
     from aiter.ops.flydsl.fused_ep_moe import FusedEPMoE, FusedEPMoEWeights
-    from aiter.test_common import checkAllclose
 
     raws = [make_experts(100 + r, dev, epr) for r in range(WORLD)]
     w = FusedEPMoEWeights.from_row_major(*raws[rank])
@@ -192,9 +275,9 @@ def run(epr, rank, dev, errors):
             out = moe(*args, w, tw, ids).clone()
             again = moe(*args, w, tw, ids)
             torch.cuda.synchronize()
-            tag = f"epr {epr} rank {rank} case {ci} {kind} {counts} {'bf16' if bf16 else 'mxfp8'}"
+            tag = f"epr {epr} case {ci} {kind} {counts} {'bf16' if bf16 else 'mxfp8'}"
             if not torch.equal(out, again):
-                errors.append(f"{tag}: two runs differ")
+                errors.append(f"{tag} rank {rank}: two runs differ")
             x2, c2, s2 = (
                 t[:m] for t in make_tokens(max(m, 1), 1000 + 77 * ci + rank, dev)
             )
@@ -203,27 +286,9 @@ def run(epr, rank, dev, errors):
             torch.cuda.synchronize()
             if not torch.equal(out, third):
                 errors.append(
-                    f"{tag}: the run after other tokens on the same routes differs"
+                    f"{tag} rank {rank}: the run after other tokens on the same routes differs"
                 )
-            k = min(m, CHECKED)
-            if k:
-                q, s = quantize_mxfp8(x[:k]) if bf16 else (codes[:k], scales[:k])
-                ref = run_torch(q, s, raws, tw[:k], ids[:k])
-                cos, row = _cos(out[:k], ref)
-                err = checkAllclose(
-                    ref.float(),
-                    out[:k].float(),
-                    rtol=2e-2,
-                    atol=2e-2,
-                    msg=tag,
-                    printLog=False,
-                )
-                if not (cos >= 0.99999 and row >= 0.9999) or err > 0.02:
-                    errors.append(
-                        f"{tag}: cosine {cos:.7f}, worst row {row:.6f}, allclose miss {err:.2%}"
-                    )
-                if torch.isnan(out.float()).any():
-                    errors.append(f"{tag}: NaN")
+            check_rows(out, x, codes, scales, bf16, raws, tw, ids, tag, stats, errors)
         for counts in GRAPHS[epr]:
             m = counts[rank]
             sx = make_tokens(max(m, 1), 5 + rank, dev)[0][:m].contiguous()
@@ -252,9 +317,43 @@ def run(epr, rank, dev, errors):
                         f"epr {epr} rank {rank}: graph {counts} replay {seed} differs from eager"
                     )
             del g
+        if epr == 48:
+            for kind in ("uniform", "hot"):
+                stress(moe, w, raws, epr, rank, dev, errors, stats, kind)
     finally:
         MlirCompiler.compile = orig
     moe.close()
+
+
+def _supported():
+    from aiter.ops.flydsl.fused_ep_moe import fused_ep_moe_supported
+
+    return fused_ep_moe_supported(
+        world_size=WORLD, model_dim=H, inter_dim=I, experts=48 * WORLD, topk=TOPK
+    )
+
+
+def _summary(stats):
+    """One row per case: the worst cosine, worst row cosine and largest allclose miss over the ranks."""
+    import pandas as pd
+
+    from aiter import logger
+
+    df = pd.DataFrame(stats)
+    df = df.groupby("case", sort=False).agg(
+        ranks=("rows", "size"),
+        rows=("rows", "sum"),
+        cosine=("cos", "min"),
+        worst_row=("row", "min"),
+        allclose_miss=("miss", "max"),
+    )
+    df["cosine"] = df["cosine"].map(lambda v: f"{v:.7f}")
+    df["worst_row"] = df["worst_row"].map(lambda v: f"{v:.6f}")
+    df["allclose_miss"] = df["allclose_miss"].map(lambda v: f"{v:.2%}")
+    logger.info(
+        "FusedEPMoE vs torch reference:\n%s",
+        df.reset_index().to_markdown(index=False, disable_numparse=True),
+    )
 
 
 def main():
@@ -271,29 +370,39 @@ def main():
         choices=sorted(CASES),
     )
     args = parser.parse_args()
+    if "RANK" not in os.environ:
+        # Plain `python3 <file>` (as CI runs it): start the 8 ranks, or skip.
+        if torch.cuda.device_count() < WORLD or shutil.which("torchrun") is None:
+            print(f"needs {WORLD} GPUs and torchrun; skipping")
+            return
+        if not _supported():
+            print(f"FusedEPMoE unsupported on {get_gfx_runtime()}; skipping")
+            return
+        cmd = ["torchrun", "--standalone", "--nproc-per-node", str(WORLD)]
+        proc = subprocess.run(
+            [*cmd, os.path.abspath(__file__), *sys.argv[1:]], check=False
+        )
+        sys.exit(proc.returncode)
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     assert world == WORLD, f"run with torchrun --nproc-per-node {WORLD}"
     local = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local)
     dev = torch.device("cuda", local)
     dist.init_process_group("gloo")
-    from aiter.ops.flydsl.fused_ep_moe import fused_ep_moe_supported
-
-    if not fused_ep_moe_supported(
-        world_size=WORLD, model_dim=H, inter_dim=I, experts=48 * WORLD, topk=TOPK
-    ):
+    if not _supported():
         if rank == 0:
             print(f"FusedEPMoE unsupported on {get_gfx_runtime()}; skipping")
         dist.destroy_process_group()
         return
-    errors = []
+    errors, stats = [], []
     for epr in args.experts_per_rank:
-        run(epr, rank, dev, errors)
+        run(epr, rank, dev, errors, stats)
         dist.barrier()
     gathered = [None] * WORLD
-    dist.all_gather_object(gathered, errors)
-    failed = [e for errs in gathered for e in errs]
+    dist.all_gather_object(gathered, (errors, stats))
+    failed = [e for errs, _ in gathered for e in errs]
     if rank == 0:
+        _summary([s for _, sts in gathered for s in sts])
         print(
             "\n".join(failed)
             if failed
@@ -309,8 +418,10 @@ def test_fused_ep_moe_8_ranks():
 
     if torch.cuda.device_count() < WORLD or shutil.which("torchrun") is None:
         pytest.skip(f"needs {WORLD} GPUs and torchrun")
-    cmd = ["torchrun", "--nproc-per-node", str(WORLD), os.path.abspath(__file__)]
-    subprocess.run(cmd, check=True, timeout=3600)
+    if not _supported():
+        pytest.skip("FusedEPMoE is not supported on this GPU")
+    cmd = ["torchrun", "--standalone", "--nproc-per-node", str(WORLD)]
+    subprocess.run([*cmd, os.path.abspath(__file__)], check=True, timeout=3600)
 
 
 if __name__ == "__main__":

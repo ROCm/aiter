@@ -14,12 +14,20 @@ MegaMoEV2 is set up as vLLM's DeepseekV4AiterMegaMoEExperts does: a fixed-slot i
 ``prev_power_of_2(FIXED_SLOT_MAX_MTPR)`` tokens and one of ``--megamoe-max-tokens`` capacity, the smallest that
 holds the call. When MegaMoEV2 accepts ``routed=True`` (fused small- and large-input routes), the instances are
 built with it and every call passes ``max_tokens`` (the tokens per rank of the call).
+
+``megamoe_small_m`` times MegaMoEV2's small-input single kernel (``forward_small_m``, built when
+``AITER_MEGA_SMALL_M=1`` and the layout is eligible) at the token counts it accepts; it is skipped elsewhere.
+
+Without ``RANK`` in the environment (``python3 <file>``) the script starts torchrun itself.
 """
 
 import argparse
 import inspect
 import json
 import os
+import shutil
+import subprocess
+import sys
 
 import torch
 import torch.distributed as dist
@@ -123,6 +131,14 @@ class MegaMoE:
         kw = {"max_tokens": max_tokens} if self.routed else {}
         return rt.forward(x, tw, ids, **kw)
 
+    def small_m_mtpr(self):
+        """The largest token count the small-input single kernel accepts (0 when it was not built)."""
+        return max(getattr(r, "small_m_mtpr", 0) for _, r in self.instances)
+
+    def small_m(self, x, tw, ids, max_tokens):
+        rt = next(r for _, r in self.instances if r.small_m_mtpr >= max_tokens)
+        return rt.forward_small_m(x, tw, ids, max_tokens=max_tokens)
+
 
 def timed(graphs, reps, dev):
     torch.cuda.synchronize()
@@ -155,7 +171,7 @@ def main():
         "--tokens",
         type=int,
         nargs="*",
-        default=[1, 16, 32, 64, 128, 192, 384, 512, 768],
+        default=[1, 16, 32, 64, 128, 192, 256, 384, 512, 768, 1024],
     )
     parser.add_argument("-r", "--routes", nargs="*", default=["uniform", "zipf", "hot"])
     parser.add_argument(
@@ -163,7 +179,7 @@ def main():
         "--impls",
         nargs="*",
         default=["megamoe", "fused"],
-        choices=["megamoe", "fused"],
+        choices=["megamoe", "megamoe_small_m", "fused"],
     )
     parser.add_argument("--megamoe-max-tokens", type=int, default=8192)
     parser.add_argument("--ninputs", type=int, default=100)
@@ -171,6 +187,15 @@ def main():
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
+    if "RANK" not in os.environ:
+        if torch.cuda.device_count() < WORLD or shutil.which("torchrun") is None:
+            print(f"needs {WORLD} GPUs and torchrun; skipping")
+            return
+        cmd = ["torchrun", "--standalone", "--nproc-per-node", str(WORLD)]
+        proc = subprocess.run(
+            [*cmd, os.path.abspath(__file__), *sys.argv[1:]], check=False
+        )
+        sys.exit(proc.returncode)
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     assert world == WORLD
     local = int(os.environ.get("LOCAL_RANK", rank))
@@ -179,13 +204,19 @@ def main():
     dist.init_process_group("cpu:gloo,cuda:nccl", device_id=dev)
     w = make_weights(rank, dev)
     impls = {}
-    if "megamoe" in args.impls:
+    small_m_mtpr = 0
+    if {"megamoe", "megamoe_small_m"} & set(args.impls):
         import mori.shmem as ms
         import torch._C._distributed_c10d as c10d
 
         c10d._register_process_group("default", dist.group.WORLD)
         ms.shmem_torch_process_group_init("default")
-        impls["megamoe"] = MegaMoE(rank, w, args.megamoe_max_tokens)
+        mega = MegaMoE(rank, w, args.megamoe_max_tokens)
+        if "megamoe" in args.impls:
+            impls["megamoe"] = mega
+        if "megamoe_small_m" in args.impls:
+            small_m_mtpr = mega.small_m_mtpr()
+            impls["megamoe_small_m"] = mega.small_m
     if "fused" in args.impls:
         from aiter.ops.flydsl.fused_ep_moe import FusedEPMoE, FusedEPMoEWeights
 
@@ -195,10 +226,11 @@ def main():
         )
         fused.prepare(fw)
         impls["fused"] = lambda x, tw, ids, max_tokens: fused(x, None, fw, tw, ids)
-    if rank == 0 and "megamoe" in impls:
-        caps = [c for c, _ in impls["megamoe"].instances]
+    if rank == 0 and {"megamoe", "megamoe_small_m"} & set(impls):
+        caps = [c for c, _ in mega.instances]
         print(
-            f"MegaMoEV2 instances {caps}, routed={impls['megamoe'].routed}", flush=True
+            f"MegaMoEV2 instances {caps}, routed={mega.routed}, small-input mtpr {small_m_mtpr}",
+            flush=True,
         )
 
     results = []
@@ -207,6 +239,8 @@ def main():
         for route in args.routes:
             xs, ws, ids = make_inputs(t, route, rank, dev, args.ninputs)
             for name, fn in impls.items():
+                if name == "megamoe_small_m" and t > small_m_mtpr:
+                    continue
                 torch.cuda.synchronize()
                 dist.barrier()
                 fn(xs[0], ws[0], ids[0], t)
@@ -242,21 +276,27 @@ def main():
             print(
                 f"\n{route}: us per call (best of the A B B A samples, max over ranks)"
             )
+            others = [n for n in impls if n != "fused"] if "fused" in impls else []
             print(
                 "| tokens/rank | "
                 + " | ".join(impls)
-                + (" | speedup |" if len(impls) == 2 else " |")
+                + "".join(f" | {n} / fused" for n in others)
+                + " |"
             )
-            print("|---" * (len(impls) + 1 + (len(impls) == 2)) + "|")
+            print("|---" * (len(impls) + 1 + len(others)) + "|")
             for t in args.tokens:
                 us = {
                     r["impl"]: r["us"]
                     for r in results
                     if r["route"] == route and r["tokens"] == t
                 }
-                row = f"| {t} | " + " | ".join(f"{us[n]:.1f}" for n in impls)
-                if len(impls) == 2:
-                    row += f" | {us['megamoe'] / us['fused']:.2f}x"
+                row = f"| {t} | " + " | ".join(
+                    f"{us[n]:.1f}" if n in us else "-" for n in impls
+                )
+                row += "".join(
+                    f" | {us[n] / us['fused']:.2f}x" if n in us else " | -"
+                    for n in others
+                )
                 print(row + " |")
         if args.out:
             with open(args.out, "w") as f:
