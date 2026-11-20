@@ -1304,12 +1304,15 @@ def run_int8_4wave_prep_correctness():
             (True, False),
         )
     ]
-    # Without a bias, then persistent at a 40-head projection.
+    # Without a bias, then persistent at Wan's 40-head and FLUX.3's 24-head projections
+    # (FLUX.3: per-head norm, interleaved RoPE, no bias).
     for m, n, k, norm, rope, bias, persistent in (
         (257, 512, 512, "rms_across_heads", "interleaved", False, False),
         (257, 512, 512, "rms_per_head", "rotate_half", False, False),
+        (257, 512, 512, "rms_per_head", "interleaved", False, False),
         (1184, 5120, 5120, "rms_across_heads", "interleaved", True, True),
         (1184, 5120, 5120, "rms_per_head", "rotate_half", True, True),
+        (576, 3072, 3072, "rms_per_head", "interleaved", False, True),
     ):
         rows.append(test_int8_4wave_prep(m, n, k, norm, rope, True, bias, persistent))
     aiter.logger.info(
