@@ -531,7 +531,7 @@ def unified_attention(
             raise ValueError(
                 "Non-causal attention does not support ALiBi or a query-query bias"
             )
-        if q.dtype == torch.uint8 or k.dtype == torch.uint8:
+        if q.dtype == torch.uint8 or k.dtype == torch.uint8 or v.dtype == torch.uint8:
             raise ValueError(
                 "Non-causal attention does not support an fp4 Q or KV cache"
             )
@@ -546,13 +546,13 @@ def unified_attention(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels.
+    if not causal:
+        backend = "triton"
     if backend == "gluon":
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels.
-    if not causal:
-        backend = "triton"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None

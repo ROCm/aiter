@@ -1133,6 +1133,7 @@ def test_unified_attn_non_causal(
         device="cuda",
     )
 
+    output.fill_(float("nan"))  # the kernels must write every row
     unified_attention(
         q=query,
         k=key_cache,
@@ -1260,6 +1261,7 @@ def test_unified_attn_non_causal_features(
 
         monkeypatch.setattr(module, name, spy)
 
+    output.fill_(float("nan"))  # the kernels must write every row
     unified_attention(
         q=query,
         k=key_cache,
@@ -1355,6 +1357,7 @@ def test_unified_attn_non_causal_no_window(
         device="cuda",
     )
 
+    output.fill_(float("nan"))  # the kernels must write every row
     unified_attention(
         q=query,
         k=key_cache,
@@ -1399,8 +1402,9 @@ def test_unified_attn_non_causal_no_window(
         ((-1, -1), "qq_bias", "query-query bias"),
         ((-1, -1), "fp4_q", "fp4 Q"),
         ((-1, -1), "fp4_kv", "fp4 Q or KV"),
+        ((-1, -1), "fp4_v", "fp4 Q or KV"),
     ],
-    ids=["left_window", "alibi", "qq_bias", "fp4_q", "fp4_kv"],
+    ids=["left_window", "alibi", "qq_bias", "fp4_q", "fp4_kv", "fp4_v"],
 )
 # a decode batch runs on the causal kernels, but it must reject them too
 @pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
@@ -1411,6 +1415,8 @@ def test_unified_attn_non_causal_rejects_unsupported(
     kv_dtype = torch.uint8 if unsupported == "fp4_kv" else torch.bfloat16
     q = torch.empty(query_len, 1, 64, dtype=q_dtype, device="cuda")
     kv = torch.empty(1, 16, 1, 64, dtype=kv_dtype, device="cuda")
+    v_dtype = torch.uint8 if unsupported == "fp4_v" else kv_dtype
+    v = torch.empty(1, 16, 1, 64, dtype=v_dtype, device="cuda")
     alibi = (
         torch.ones(1, dtype=torch.float32, device="cuda")
         if unsupported == "alibi"
@@ -1425,7 +1431,7 @@ def test_unified_attn_non_causal_rejects_unsupported(
         unified_attention(
             q=q,
             k=kv,
-            v=kv,
+            v=v,
             out=torch.empty(query_len, 1, 64, dtype=torch.bfloat16, device="cuda"),
             cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device="cuda"),
             seqused_k=torch.tensor([2], dtype=torch.int32, device="cuda"),
@@ -1442,6 +1448,90 @@ def test_unified_attn_non_causal_rejects_unsupported(
             alibi_slopes=alibi,
             qq_bias=qq_bias,
         )
+
+
+def test_unified_attn_non_causal_ignores_gluon_request(monkeypatch) -> None:
+    """A non-causal call runs Triton even when backend="gluon" and Gluon is missing."""
+    block_size = 128
+    query_len = 4
+    seq_lens = [(query_len, 1024)] * 2
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        _,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * triton.cdiv(1024, block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    monkeypatch.setattr(
+        sys.modules[unified_attention.__module__], "_is_gluon_available", lambda: False
+    )
+
+    def run(causal: bool) -> None:
+        output.fill_(float("nan"))  # the kernels must write every row
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=causal,
+            window_size=(-1, -1),
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            backend="gluon",
+        )
+
+    run(causal=False)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+    # a causal call still needs Gluon for backend="gluon"
+    with pytest.raises(AssertionError, match="Gluon backend requires"):
+        run(causal=True)
 
 
 @pytest.mark.parametrize(
