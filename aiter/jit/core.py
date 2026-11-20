@@ -1074,6 +1074,50 @@ def check_LLVM_MAIN_REVISION():
     return 554785 - 1
 
 
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
+
+
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name

@@ -2014,7 +2014,8 @@
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'",
-            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
+            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' ",
+            "'-DAITER_HIPBLASLT_HAS_W4A16=1' if check_hipblaslt_has_w4a16() else ''"
         ],
         "extra_ldflags": "['-lhipblaslt', '-lhipblas']",
         "extra_include": [
