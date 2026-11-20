@@ -718,10 +718,12 @@ def _use_gfx950_length_aware_split(monkeypatch) -> None:
         for shape in [
             ((8, 2), 4, None),  # Kimi-K3 DSpark draft verify
             ((8, 2), 1, None),
-            ((8, 1), 1, "sinks"),  # GPT-OSS TP8 full-attention decode, uniform split
         ]
         for batch in ["skewed", "uniform", "skewed_empty"]
     ]
+    # GPT-OSS TP8 full-attention decode keeps the uniform split, which does not
+    # write empty sequences, so no skewed_empty case
+    + [(batch, (8, 1), 1, "sinks", torch.int32) for batch in ["skewed", "uniform"]]
     + [("skewed_300", (8, 2), 1, None, torch.int32)]
     # the widest verify query that still fits one block of the q >= 4 entry
     + [("skewed", (8, 2), 8, None, torch.int32)]
@@ -1041,8 +1043,8 @@ def test_length_aware_split_scope(monkeypatch) -> None:
         gpt_oss, gpt_oss_params = _gfx950_split(
             num_queries_per_kv=num_heads // num_kv_heads, num_kv_heads=num_kv_heads
         )
+        assert "SPLIT_PROGRAMS_PER_CU" not in gpt_oss
         assert _length_aware_split(gpt_oss, gpt_oss_params) is None
-        assert gpt_oss["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
     # the kernels round sum(seq_len) up by the budget in int32
     edge = {"num_seqs": 1023, "num_kv_heads": 1}
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
