@@ -25,6 +25,7 @@ from .kernels.pa_decode_kernel import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
+    nvfp4_wave_tile,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -65,8 +66,17 @@ def launch_pa_decode_ps_reduce(
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    store_output: bool = True,
 ) -> None:
-    """Reduce packed partials; every sequence has at most ``max_partitions``."""
+    """Reduce packed partials; every sequence has at most ``max_partitions``.
+
+    ``quantized_output`` / ``output_scale`` (contiguous, the former with
+    ``output``'s strides) also take the MXFP8 output of the reduced rows
+    (``kernels.pa_decode.op_mxfp8``); ``store_output=False`` then skips the
+    BF16/FP16 store."""
+    quant_mx = quantized_output is not None
     props = torch.cuda.get_device_properties(output.device)
     if max_partitions > props.multi_processor_count:
         raise ImportError(
@@ -145,6 +155,12 @@ def launch_pa_decode_ps_reduce(
             and batch * per_seq * per_seq <= 2**30
         ):
             num_xcds = get_num_xcds()
+    if quant_mx and batch * (rows * kv_heads) ** 2 <= 2**30:
+        # A token's E8M0 scale row (64 bytes at GQA16 D128) takes bytes from
+        # each of its rows' CTAs. Spread over the XCDs, those partial writes
+        # of one line cost the reducer of 512 sequences 2.7 us; a contiguous
+        # run of CTAs a XCD keeps a token's CTAs in one L2.
+        num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
         architecture=arch,
@@ -160,6 +176,7 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        **({"quant_mx": True, "store_output": store_output} if quant_mx else {}),
     )
     sink_ptr = (
         flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
@@ -188,6 +205,8 @@ def launch_pa_decode_ps_reduce(
         ptr_arg(reduce_info, fx.Int32),
         -(-(1 << 30) // rows),
         -(-(1 << 30) // (rows * kv_heads)),
+        ptr_arg(quantized_output, fx.Uint8),
+        ptr_arg(output_scale, fx.Uint8),
         stream,
     )
 
@@ -522,7 +541,7 @@ def pa_decode(
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
     quantized_output: torch.Tensor = None,  # optional FP8, same shape/strides as output
-    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length, 1]
+    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length, 1], or E8M0 [.., H * D // 32]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -571,6 +590,19 @@ def pa_decode(
     ``output_scale`` past the query rows (a token bucket padded past the
     scheduled tokens) are written as FP8 zeros with a unit descale by the same
     launch, so a consumer of the whole bucket reads finite, inert rows.
+
+    An E8M0 ``output_scale`` (``dtypes.fp8_e8m0`` or uint8), shaped
+    ``[num_seqs * query_length (+ quantized_pad_rows), num_query_heads *
+    head_dim // 32]`` and contiguous, selects the MXFP8 output instead (the
+    activation of a native MXFP8 GEMM such as o_proj's): one E8M0 scale per 32
+    consecutive elements of a token's row, scales row-major, and padded rows FP8
+    zeros with E8M0 1.0 scales. The FP8 bytes and scales are bit for bit the
+    BF16/FP16 output of the same call quantized with ceil-power-of-two scales:
+    ``code = ceil_pow2(max(amax, 1e-10) / 448)``, values
+    ``e4m3(clamp(x / 2**(code - 127), +-448))`` (``kernels.pa_decode.op_mxfp8``).
+    The NVFP4 wave tile writes it in every output mode, other tiles through the
+    reducer, whose epilogue writes it too; same shape restrictions as the
+    per-token output.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -1012,6 +1044,8 @@ def pa_decode(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
         )
+    # An E8M0 scale selects the MXFP8 output (one scale per 32 elements).
+    quant_mx = quant_output and output_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
     if quant_output:
         if arch != "gfx1250":
             raise NotImplementedError("quantized PA output requires gfx1250")
@@ -1044,14 +1078,20 @@ def pa_decode(
                 f"quantized_output must use OCP FP8 ({dtypes.fp8}), "
                 f"got {quantized_output.dtype}"
             )
-        expected_scale_shape = (total_q_rows + quantized_pad_rows, 1)
+        expected_scale_shape = (
+            total_q_rows + quantized_pad_rows,
+            num_q_heads * head_dim // 32 if quant_mx else 1,
+        )
         if output_scale.shape != expected_scale_shape:
             raise ValueError(
                 f"output_scale shape {tuple(output_scale.shape)} must be "
                 f"{expected_scale_shape}"
             )
-        if output_scale.dtype != torch.float32:
-            raise TypeError(f"output_scale must be float32, got {output_scale.dtype}")
+        if output_scale.dtype not in (torch.float32, torch.uint8, dtypes.fp8_e8m0):
+            raise TypeError(
+                "output_scale must be float32 (per token) or E8M0/uint8 (MXFP8), "
+                f"got {output_scale.dtype}"
+            )
         if quantized_output.stride() != output.stride():
             raise ValueError(
                 "quantized_output strides must match output, "
@@ -1260,8 +1300,14 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    # The MXFP8 output is in the NVFP4 wave tile's epilogue and the reducer's:
+    # other tiles leave the final rows to the reducer.
+    mx_reduce_only = quant_mx and not nvfp4_wave_tile(
+        torch.float8_e4m3fn if nvfp4 else None, query_length * query_group_size
+    )
     direct_output = (
-        arch in ("gfx1250", "gfx1250-strict")
+        not mx_reduce_only
+        and arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
         and output.stride() == query.stride()
         and (
@@ -1293,6 +1339,7 @@ def pa_decode(
         if (
             arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
+            and not mx_reduce_only
             and sinks is None
             and output.stride() == query.stride()
             and 2 <= max_partitions <= CLUSTER_PARTITIONS
@@ -1307,8 +1354,10 @@ def pa_decode(
     # cluster-of-8 merge. Any other output mode the plan picks (it depends on the
     # batch and context) writes the BF16 output as usual and quantizes it after
     # with the standalone per-token kernel, which is exactly the unfused path.
-    quant_after_output = quant_output and not (
-        one_partition_output or cluster_merge == 8
+    quant_after_output = (
+        quant_output
+        and not quant_mx
+        and not (one_partition_output or cluster_merge == 8)
     )
     padded_quantized = (quantized_output, output_scale)
     if quant_after_output:
@@ -1316,6 +1365,17 @@ def pa_decode(
         if not store_output:
             # Keep the caller's BF16 buffer untouched, as the fused path does.
             output = torch.empty_like(output)
+    # The MXFP8 output takes every mode: the tile writes it with the final
+    # rows, the reducer when it writes them.
+    reduce_mx = quant_mx and not (direct_output or cluster_merge)
+    if reduce_mx:
+        quant_output = False
+    # Only the direct and cluster kernels launch CTAs for padded rows.
+    pad_after = (
+        quant_mx
+        and quantized_pad_rows > 0
+        and not (one_partition_output or cluster_merge)
+    )
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -1356,6 +1416,7 @@ def pa_decode(
                 if quant_output
                 else {}
             ),
+            **({"quant_mx": True} if quant_output and quant_mx else {}),
         )
 
     total_rows = query_length * query_group_size
@@ -1416,6 +1477,7 @@ def pa_decode(
         and arch == "gfx1250"
         and (direct_output or cluster_merge)
         and not quant_after_output
+        and not pad_after
         and exp_sums is not None
         and max_logits is not None
         and temporary_output is not None
@@ -1539,7 +1601,20 @@ def pa_decode(
                 max_partitions=max_partitions,
                 stream=s,
                 reduce_info=work_plan.reduce_info,
+                **(
+                    {
+                        "quantized_output": quantized_output,
+                        "output_scale": output_scale,
+                        "store_output": store_output,
+                    }
+                    if reduce_mx
+                    else {}
+                ),
             )
+        if pad_after:
+            rows = output.shape[0]
+            quantized_output[rows:].view(torch.uint8).zero_()
+            output_scale[rows:].view(torch.uint8).fill_(127)  # E8M0 1.0
         if quant_after_output:
             from ..quant import dynamic_per_token_scaled_quant
 

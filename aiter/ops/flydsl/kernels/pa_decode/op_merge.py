@@ -32,6 +32,7 @@ from flydsl.expr.typing import ReductionOp, T
 
 from ..pa_decode_plan import ARRIVAL_COUNTER_STRIDE
 from ..utils import rcp_f32
+from .op_mxfp8 import E8M0_ONE, GROUP, MxFp8Groups, group_code, lane_masks
 from .traits import LOG2E
 
 # Partition bound of a merged sequence; each one is an unrolled load per row.
@@ -237,7 +238,22 @@ class Gfx1250PartitionMerge:
                 target = fx.add_offset(
                     output, self.output_offset(row_ids[i], lane_elem)
                 )
-                if const_expr(rows % t.NWARP):
+                if const_expr(t.quant_mx):
+                    # Rows are wave-uniform, so the group shuffles stay in the branch.
+                    if const_expr(rows % t.NWARP):
+                        if row_ids[i] < rows:
+                            ctx.quant.store_rows(
+                                acc.to(t.q_dtype),
+                                self.output_offset(row_ids[i], lane_elem),
+                                target,
+                            )
+                    else:
+                        ctx.quant.store_rows(
+                            acc.to(t.q_dtype),
+                            self.output_offset(row_ids[i], lane_elem),
+                            target,
+                        )
+                elif const_expr(rows % t.NWARP):
                     if row_ids[i] < rows:
                         fx.ptr_store(acc.to(t.q_dtype), target)
                 else:
@@ -259,6 +275,7 @@ class Gfx1250ClusterMerge:
     other CTAs only merge. Partials sit at packed slots from ``first`` on.
     With ``quant`` each merging wave owns one row of the token and quantizes
     it after a second cluster barrier, which the other waves also reach.
+    A ``group_local`` quant (MXFP8) needs no barrier and takes any share.
     """
 
     def __init__(
@@ -271,7 +288,10 @@ class Gfx1250ClusterMerge:
         self.share = -(-t.rows // t.cluster_merge)
         self.per_wave = -(-self.share // t.NWARP)
         self.quant = quant
-        if quant is not None and (
+        # Token-wide quants exchange maxima across the cluster; group-local
+        # ones store like the BF16 output.
+        self.token_quant = quant is not None and not quant.group_local
+        if self.token_quant and (
             self.per_wave != 1 or self.share * t.cluster_merge != t.rows
         ):
             raise ValueError("quantized cluster merges need one row per wave")
@@ -283,7 +303,7 @@ class Gfx1250ClusterMerge:
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
         wave_begin = fx.Int32(fx.rocdl.wave_id()) * self.per_wave
-        if const_expr(self.quant is None):
+        if const_expr(not self.token_quant):
             if wave_begin < self.share:
                 self._merge_rows(
                     seq, part * self.share, wave_begin, first, count, capacity
@@ -379,7 +399,7 @@ class Gfx1250ClusterMerge:
                     * self.stride_q_head
                     + lane_elem
                 )
-                if const_expr(self.quant is not None):
+                if const_expr(self.token_quant):
                     # The first partition's maxima of the token's rows; this
                     # wave alone read its row's entry, before merging it.
                     self.quant.store_cluster(
@@ -393,7 +413,14 @@ class Gfx1250ClusterMerge:
                     )
                 else:
                     target = fx.recast_iter(vector, fx.add_offset(output, offset))
-                    if const_expr(share % per_wave or t.rows % t.cluster_merge):
+                    if const_expr(self.quant is not None):
+                        # Group-local quant; the guard is wave-uniform.
+                        if const_expr(share % per_wave or t.rows % t.cluster_merge):
+                            if (local[i] < share) & (row_ids[i] < t.rows):
+                                self.quant.store_rows(acc.to(t.q_dtype), offset, target)
+                        else:
+                            self.quant.store_rows(acc.to(t.q_dtype), offset, target)
+                    elif const_expr(share % per_wave or t.rows % t.cluster_merge):
                         if (local[i] < share) & (row_ids[i] < t.rows):
                             fx.ptr_store(acc.to(t.q_dtype), target)
                     else:
@@ -417,6 +444,8 @@ class Gfx1250OutputQuant:
 
     The BF16/FP16 output is written only when the caller keeps it.
     """
+
+    group_local = False
 
     def __init__(self, t, quantized_output, output_scale):
         self.t = t
@@ -569,3 +598,83 @@ class Gfx1250OutputQuant:
         )
         if tid == 0:
             scales[token] = scale
+
+
+class Gfx1250OutputMxQuant:
+    """MXFP8 output (``op_mxfp8``): E4M3 values and an E8M0 scale per 32
+    elements of a token's row, from the final values in registers.
+
+    Groups are lane-local, so every output mode stores them where it stores the
+    BF16/FP16 output, without a barrier: the wave tile's direct rows
+    (``store_cta``), merged rows (``store_rows``), and empty and padded tokens.
+    Scales are indexed by element offset / 32: the output is contiguous.
+    """
+
+    group_local = True
+
+    def __init__(self, t, quantized_output, output_scale):
+        self.t = t
+        self.groups = MxFp8Groups(quantized_output, output_scale)
+
+    @flyc.jit
+    def store_cta(self, mem, token, warp, lane, values, offsets, output):
+        """The NVFP4 wave tile's rows: lane (row, half) holds dims
+        32 warp + 16 vh + 8 half + [0, 8), so a group is the lane pair
+        (row, 0), (row, 1) of one wave."""
+        t = self.t
+        if const_expr(t.store_output):
+            for i in range_constexpr(len(values)):
+                fx.ptr_store(values[i], fx.add_offset(output, offsets[i]))
+        self.groups.store(values, offsets, (16,), t.WAVE)
+
+    @flyc.jit
+    def store_rows(self, value, offset, target):
+        """A merged row's ``head_dim / WAVE`` consecutive values a lane: a
+        group spans ``GROUP / elems`` adjacent lanes."""
+        t = self.t
+        if const_expr(t.store_output):
+            fx.ptr_store(value, target)
+        elems = t.head_dim // t.WAVE
+        self.groups.store([value], [offset], lane_masks(GROUP // elems), t.WAVE)
+
+    def _token_bytes(self, token, stride_row, stride_head):
+        t = self.t
+        per_thread = t.rows * t.head_dim // t.BLOCK_THREADS
+        tid = fx.Int32(gpu.thread_id("x"))
+        first = tid * per_thread
+        offset = (
+            fx.Int64(token) * stride_row
+            + (first // t.head_dim) * stride_head
+            + first % t.head_dim
+        )
+        target = fx.recast_iter(
+            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+            fx.add_offset(self.groups.quantized, offset),
+        )
+        zeros = [fx.Int32(0).ir_value() for _ in range_constexpr(per_thread // 4)]
+        fx.ptr_store(fx.Vector.from_elements(zeros, dtype=fx.Int32), target)
+        return offset, per_thread
+
+    @flyc.jit
+    def _token_scales(self, offset, per_thread, code):
+        scales, byte = self.groups.scales, code.to(fx.Int8)
+        if const_expr(per_thread >= GROUP):
+            for g in range_constexpr(per_thread // GROUP):
+                scales[offset // GROUP + g] = byte
+        else:
+            if (offset & (GROUP - 1)) == 0:
+                scales[offset // GROUP] = byte
+
+    @flyc.jit
+    def store_pad(self, token, stride_row, stride_head):
+        """A padded token past the query's: FP8 zeros and unit (E8M0 1.0)
+        scales, inert finite rows for a consumer of the whole padded height."""
+        offset, per_thread = self._token_bytes(token, stride_row, stride_head)
+        self._token_scales(offset, per_thread, fx.Int32(E8M0_ONE))
+
+    @flyc.jit
+    def store_zero(self, token, stride_row, stride_head):
+        """An empty token: zero values, quantized like any token (the scale of
+        the amax floor)."""
+        offset, per_thread = self._token_bytes(token, stride_row, stride_head)
+        self._token_scales(offset, per_thread, group_code(fx.Float32(0.0)))

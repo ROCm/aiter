@@ -856,6 +856,9 @@ class Gfx1250Traits:
     # NVFP4 wave pipeline (compute_dtype "nvfp4w"): page slots in each wave's
     # DMA ring; 0 elsewhere.
     nvfp4_buffers: int = 0
+    # With quant_output, MXFP8 (E8M0 scale per 32 elements, group-local, no
+    # LDS) instead of one FP32 descale per token.
+    quant_mx: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1093,6 +1096,11 @@ class Gfx1250Traits:
         return self.stats_offset + 576
 
     @property
+    def quant_lds_bytes(self):
+        # The token-wide quant's four wave maxima; MXFP8 groups need none.
+        return 16 if self.quant_output and not self.quant_mx else 0
+
+    @property
     def nvfp4_raw_page_bytes(self):
         # K payload, V payload, K scales, V scales of one (page, KV head).
         return 2 * self.block_size * (self.head_dim // 2 + self.head_dim // 16)
@@ -1100,16 +1108,16 @@ class Gfx1250Traits:
     @property
     def nvfp4_raw_offset(self):
         # Two raw NVFP4 pages, 256-byte aligned for the tensor DMA.
-        end = self.quant_offset + (16 if self.quant_output else 0)
+        end = self.quant_offset + self.quant_lds_bytes
         return (end + 255) // 256 * 256
 
     @property
     def total_bytes(self):
         if self.nvfp4_wave:
-            return self.quant_offset + (16 if self.quant_output else 0)
+            return self.quant_offset + self.quant_lds_bytes
         if self.nvfp4:
             return self.nvfp4_raw_offset + 2 * self.nvfp4_raw_page_bytes
-        return self.quant_offset + (16 if self.quant_output else 0)
+        return self.quant_offset + self.quant_lds_bytes
 
     @property
     def use_tdm(self):
