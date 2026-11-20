@@ -455,7 +455,10 @@ def shuffle_scale(
         # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
-    return shfl_scale.view(*src.shape).contiguous()
+    out = shfl_scale.view(*src.shape).contiguous()
+    # Same tag as shuffle_weight, so a consumer can check the gate/up order of the scale.
+    out.gate_up_interleave = gate_up
+    return out
 
 
 def moe_shuffle_scale(

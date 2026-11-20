@@ -447,6 +447,28 @@ def test_csv_qi_rows():
     )
 
 
+def test_relayout_refuses_gugu():
+    """The a8w4 relayouts read the separated (GGUU) a16w4 preshuffle. A gate/up
+    interleaved (GUGU) weight or scale has the same shape and dtype, so the relayout
+    must refuse it by its gate_up_interleave tag instead of producing a wrong W1."""
+    E, inter_dim, model_dim = 2, 128, 256
+    w = torch.zeros((E, inter_dim * 2, model_dim // 2), dtype=torch.uint8)
+    s = torch.zeros((E * inter_dim * 2, model_dim // 32), dtype=torch.uint8)
+    shuffle_weight_a8w4_gfx942(shuffle_weight_a16w4(w, 16, False))
+    shuffle_scale_a8w4_gfx942(shuffle_scale_a16w4(s, E, False))
+    for relayout, gugu in (
+        (shuffle_weight_a8w4_gfx942, shuffle_weight_a16w4(w, 16, True)),
+        (shuffle_scale_a8w4_gfx942, shuffle_scale_a16w4(s, E, True)),
+    ):
+        try:
+            relayout(gugu)
+        except ValueError as e:
+            assert "GUGU" in str(e), e
+        else:
+            raise AssertionError(f"{relayout.__name__} accepted a GUGU input")
+    aiter.logger.info("a8w4 gfx942 relayouts refuse GUGU weight and scale")
+
+
 def test_stage1_dispatch_by_name():
     """Stage 1 runs the gfx942 a8w4 kernel only for the `_g942` names: any other
     registered fp8 x fp4 stage-1 name (the gfx950 family is registered on every arch)
@@ -507,6 +529,7 @@ def main():
     )  # BM=32 TILE_K=256
     test_stage1_dispatch_by_name()
     test_csv_qi_rows()
+    test_relayout_refuses_gugu()
     if not a8w4_gfx942_supported():
         test_gate_off_mi325x()
         aiter.logger.warning(
