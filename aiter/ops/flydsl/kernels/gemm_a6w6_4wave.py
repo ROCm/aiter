@@ -90,15 +90,18 @@ def _set_m0(value):
     )
 
 
-def _lds_dma(instruction, voffset, base, imm):
+def _lds_dma(instruction, voffset, base, imm, nop=False):
     # FlyDSL 0.5 cannot encode the signed LDS memory-operand offset; its intrinsic
     # path reaches an LLVM assertion, and with non-negative offsets it needs two M0
     # values per operand tile, which is slower. LLVM does not count these loads in
-    # vmcnt, so the K loop waits for them explicitly.
+    # vmcnt, so the K loop waits for them explicitly. LLVM also inserts no hazard
+    # wait states before inline asm: under SGPR pressure it may restore ``base`` with
+    # v_readlane right before the load, and a VMEM read of a VALU-written SGPR needs
+    # five wait states (``nop``).
     _llvm.inline_asm(
         res=None,
         operands_=[fx.Int32(voffset).ir_value(), fx.Int64(base).ir_value()],
-        asm_string=f"{instruction} $0, $1 offset:{imm}",
+        asm_string=("s_nop 4\n" if nop else "") + f"{instruction} $0, $1 offset:{imm}",
         constraints="v,s",
         has_side_effects=True,
     )
@@ -114,7 +117,10 @@ class G2SOperand:
 
     CENTER = 3072
 
-    def __init__(self, tensor, wave_id, stage_ptrs, region, tile_row_offset, lane_id):
+    def __init__(
+        self, tensor, wave_id, stage_ptrs, region, tile_row_offset, lane_id, nop=False
+    ):
+        self.nop = nop
         self.imm = [q * 1024 - self.CENTER for q in range(LOADS_PER_REGION)]
         assert all(-4096 <= i < 4096 for i in self.imm)
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
@@ -136,6 +142,7 @@ class G2SOperand:
                 self.voffset,
                 self.base + fx.Int64(t * TILE_BYTES),
                 self.imm[q],
+                self.nop,
             )
 
         return [lambda q=q: op(q) for q in range(LOADS_PER_REGION)]
@@ -148,7 +155,10 @@ class G2SScales:
     the instruction offset (-1024 or 0) applies to both addresses.
     """
 
-    def __init__(self, a_scale, b_scale, wave_id, stage_ptrs, a_row, b_row, lane_id):
+    def __init__(
+        self, a_scale, b_scale, wave_id, stage_ptrs, a_row, b_row, lane_id, nop=False
+    ):
+        self.nop = nop
         self.bases = (
             fx.Int64(fx.ptrtoint(fx.get_iter(a_scale))),
             fx.Int64(fx.ptrtoint(fx.get_iter(b_scale))),
@@ -173,6 +183,7 @@ class G2SScales:
                 self.voffsets[k],
                 self.bases[k] + fx.Int64(t * SCALE_TILE_BYTES),
                 -SCALE_TILE_BYTES if k == 0 else 0,
+                self.nop,
             )
 
         return [lambda k=k: op(k) for k in (0, 1)]
