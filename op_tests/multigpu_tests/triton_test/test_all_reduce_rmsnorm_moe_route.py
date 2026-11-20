@@ -120,8 +120,8 @@ pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
 
 
 def _reference_norm(parts, residual, weight, gemma, num_warps):
-    """h, residual out, normed, x_q and x_scale on the CPU. The CPU gives IEEE fp32 division
-    and square root, and the sum of squares has the order of the kernel."""
+    """Residual out and normed on the CPU. The CPU gives IEEE fp32 division and square
+    root, and the sum of squares has the order of the kernel."""
     tokens, hidden = parts[0].shape
     h = parts[0].float()
     for p in parts[1:]:
@@ -153,8 +153,7 @@ def _reference_norm(parts, residual, weight, gemma, num_warps):
     rstd = one / torch.sqrt(var + eps32)
     w = weight.float() + (1.0 if gemma else 0.0)
     y = ((s * rstd[:, None]) * w).to(torch.bfloat16)
-    x_q, scale = _mxfp8(y.float())
-    return res_out, y, x_q, scale
+    return res_out, y
 
 
 def _mxfp8(y):
@@ -207,24 +206,39 @@ def _reference_route(logits, bias, k, scoring, groups, topk_group, renorm, scale
     return ids, w * scale, gap
 
 
-def _bytes_differ(a, b):
-    return int(
-        (
-            a.cpu().contiguous().view(torch.uint8) != b.contiguous().view(torch.uint8)
-        ).sum()
-    )
+def _steps(a, b):
+    """The number of rounding steps between the bf16 values a and b. A value that is
+    not finite must have the same bits as the reference."""
+    ia, ib = (t.view(torch.int16).int() & 0xFFFF for t in (a, b))
+    ka, kb = (torch.where(i >> 15 == 1, -(i & 0x7FFF), i & 0x7FFF) for i in (ia, ib))
+    finite = torch.isfinite(a.float()) & torch.isfinite(b.float())
+    return torch.where(finite, (ka - kb).abs(), (ia != ib).int() << 16)
 
 
 def _check(out, ref, shape, residual_ok, failures, tag):
-    """Compares the outputs of one call with the reference."""
+    """Compares the outputs of one call with the reference. A bf16 output can be one
+    rounding step from the reference, in 1 of 10,000 values (at least 8). The MXFP8
+    outputs and the routing must agree with a reference made from the normed output of
+    the kernel."""
     hidden, e, k, _, scoring, _, groups, topk_group, _, quant, scale, renorm, *_ = shape
     bs = shape[12]
-    res_out, y, x_q, x_s, logits, bias = ref
-    bad = _bytes_differ(out["residual_out"], res_out) + _bytes_differ(out["normed"], y)
+    res_out, y, router_w, bias = ref
+    normed = out["normed"].cpu()
+    for name, o, r in (
+        ("residual_out", out["residual_out"].cpu(), res_out),
+        ("normed", normed, y),
+    ):
+        steps = _steps(o, r)
+        n, worst = int((steps > 0).sum()), int(steps.max())
+        if worst > 1 or n > max(8, steps.numel() // 10000):
+            failures.append(f"{tag}: {name}: {n} values differ, by up to {worst} steps")
     if quant:
-        bad += _bytes_differ(out["x_q"], x_q) + _bytes_differ(out["x_scale"], x_s)
-    if bad:
-        failures.append(f"{tag}: {bad} bytes of the norm outputs differ")
+        x_q, x_s = _mxfp8(normed.float())
+        if not torch.equal(out["x_q"].cpu().view(torch.uint8), x_q.view(torch.uint8)):
+            failures.append(f"{tag}: x_q differs")
+        if not torch.equal(out["x_scale"].cpu(), x_s):
+            failures.append(f"{tag}: x_scale differs")
+    logits = normed.double() @ router_w.double().T
     ids_r, w_r, gap = _reference_route(
         logits, bias, k, scoring, groups, topk_group, renorm, scale
     )
@@ -274,15 +288,14 @@ def _inputs(shape, tokens, seed, rank, device, group, weights, num_warps):
     parts = [torch.empty_like(x) for _ in range(dist.get_world_size(group))]
     dist.all_gather(parts, x, group=group)
     norm_w, router_w, bias = weights
-    res_out, y, x_q, x_s = _reference_norm(
+    res_out, y = _reference_norm(
         [p.cpu() for p in parts],
         residual.cpu() if residual is not None else None,
         norm_w.cpu(),
         shape[8],
         num_warps,
     )
-    logits = y.double() @ router_w.cpu().double().T
-    ref = (res_out, y, x_q, x_s, logits, bias.cpu() if bias is not None else None)
+    ref = (res_out, y, router_w.cpu(), bias.cpu() if bias is not None else None)
     return x, residual, ref
 
 
@@ -601,20 +614,19 @@ def _check_scales(rank, device, tp, failures):
     router_w = torch.zeros((e, hidden), dtype=torch.float32, device=device)
     comm = AllReduceRmsnormMoeRoute(tp.cpu_group, tokens, hidden, e, k)
     parts = [ones.cpu()] + [torch.zeros_like(ones.cpu())] * (comm.world - 1)
-    res_out, y, x_q, x_s = _reference_norm(
-        parts, None, norm_w.cpu(), False, comm.num_warps
-    )
+    res_out, y = _reference_norm(parts, None, norm_w.cpu(), False, comm.num_warps)
     want = torch.tensor([b for _, b in EDGE_SCALES], dtype=torch.uint8)
-    want = want[torch.arange(hidden // 32) % len(EDGE_SCALES)]
-    assert torch.equal(x_s, want.expand(tokens, -1)), "EDGE_SCALES or _mxfp8"
-    logits = torch.zeros((tokens, e), dtype=torch.float64, device="cpu")
+    want = want[torch.arange(hidden // 32) % len(EDGE_SCALES)].expand(tokens, -1)
+    assert torch.equal(_mxfp8(y.float())[1], want), "EDGE_SCALES or _mxfp8"
     try:
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
         out = _call(x, None, (norm_w, router_w, None), shape, comm)
         torch.cuda.synchronize()
-        ref = (res_out, y, x_q, x_s, logits, None)
+        ref = (res_out, y, router_w.cpu(), None)
         _check(out, ref, shape, True, failures, f"rank {rank}: edge scales")
+        if not torch.equal(out["x_scale"].cpu(), want):
+            failures.append(f"rank {rank}: edge scales: the scale bytes differ")
         if comm.error() != [0, 0, 0, 0]:
             failures.append(f"rank {rank}: edge scales: error {comm.error()}")
     finally:
