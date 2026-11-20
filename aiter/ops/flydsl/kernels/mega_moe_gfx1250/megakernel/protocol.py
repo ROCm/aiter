@@ -81,8 +81,7 @@ FLAG_SPAN = WAVE * FLAG_STRIDE
 #: field.
 TALLY_MAXR = 2048
 TALLY_MAX = 256
-#: Routes a tally CTA aims to count (AITER_LM_TALLY_CHUNK overrides): its loops
-#: wait out a global load per pass, so fewer routes per CTA end the tally
+#: Routes a tally CTA aims to count: its loops wait out a global load per pass, so fewer routes per CTA end the tally
 #: sooner; more CTAs put more base atomics on a hot segment's line.
 TALLY_CHUNK = 128
 SEG_STRIDE = 32
@@ -111,7 +110,7 @@ def compact_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
 #: (read when the kernel is built, so it is part of the JIT cache key).
 TIMEOUT_S = 120.0
 NOW_HZ = 100_000_000  # _now() ticks per second
-#: s_sleep units between polls (AITER_DMK_POLL_SLEEP overrides).
+#: s_sleep units between a GEMM2 item's g1_ready polls.
 POLL_SLEEP = 32
 #: CTA 0 is the only poller of the peers' flags; it can poll tightly.
 LEAD_SLEEP = 1
@@ -126,8 +125,8 @@ TR_N = 28
 TR_ITEMS, TR_LAST_ITEM, TR_FIRST_G2, TR_LANDED = 24, 25, 26, 27
 RT_N = 1024
 
-#: W1 prefetch (AITER_DMK_PREFETCH_KB): the fewest tokens of a step that runs
-#: it, and the 16 B loads each lane keeps in flight (deeper ran slower).
+#: slots' W1 prefetch: the fewest tokens of a step that runs it, and the 16 B
+#: loads each lane keeps in flight.
 PREF_MIN_TOK = 32
 PREF_DEPTH = 8
 
@@ -317,8 +316,8 @@ def bind_base(kc):
 def start(kc):
     """Entry ticket -> (generation, parity, X1 tag); CTA 0 resets the next
     launch's counters."""
-    COMPACT, DELAY_US, EARLY, EPR_CH = kc.COMPACT, kc.DELAY_US, kc.EARLY, kc.EPR_CH
-    EPR_PAD, G, addr_ctl, alive = kc.EPR_PAD, kc.G, kc.addr_ctl, kc.alive
+    COMPACT, EARLY, EPR_CH, EPR_PAD = kc.COMPACT, kc.EARLY, kc.EPR_CH, kc.EPR_PAD
+    G, addr_ctl = kc.G, kc.addr_ctl
     bc, bid, is_t0, lane, rsrc_actl = kc.bc, kc.bid, kc.is_t0, kc.lane, kc.rsrc_actl
     rsrc_ctl, stamp, wave = kc.rsrc_ctl, kc.stamp, kc.wave
     stamp(0)
@@ -355,13 +354,6 @@ def start(kc):
     par = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(4))))
     tag16 = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(16))))
     other = fx.Int32(1) - par
-    if const_expr(DELAY_US):
-        d_end = _now() + fx.Int64(DELAY_US * (NOW_HZ // 1_000_000))
-        d_live = fx.Int32(1)
-        while d_live != fx.Int32(0):
-            fx.rocdl.s_sleep(32)
-            d_live = alive(d_end)
-
     stamp(1)
     # ---- CTA 0: reset the next launch's counters ----
     # The peers' slot atomics of the next launch land in

@@ -154,7 +154,7 @@ def make_megakernel(
     # compact stores one count a dword (an expert may receive past 65535 rows).
     REP_W = EPR_CH if COMPACT else max(1, EPR_CH // 2)
     SEGS_PAD = segs_pad(npes=npes, experts_per_rank=EPR)
-    SEG_CNT_W = SREP_W = MAXR = T_MAX = T_CHUNK = None
+    SEG_CNT_W = SREP_W = MAXR = T_MAX = None
     if COMPACT:
         SEG_CNT_W, SREP_W = _lay["seg_cnt"], _lay["srep"]
         if npes * SEGS_PAD * 4 > src_off(EPR) or SEGS_PAD > (1 << SEG_BITS):
@@ -163,9 +163,6 @@ def make_megakernel(
         T_MAX = min(TALLY_MAX, G - 1)
         if MAXR > T_MAX * TALLY_MAXR:
             raise ValueError("more routes per rank than the tally CTAs count")
-        T_CHUNK = int(os.environ.get("AITER_LM_TALLY_CHUNK", TALLY_CHUNK))
-        if not 1 <= T_CHUNK <= TALLY_MAXR:
-            raise ValueError(f"AITER_LM_TALLY_CHUNK must be in 1..{TALLY_MAXR}")
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
     RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
     CTL_ARENA_B = ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
@@ -179,68 +176,43 @@ def make_megakernel(
     # Debug: AITER_DMK_NOTRAP=1 counts a timed-out wait in ctl[CTL_FAIL + site]
     # and goes on instead of trapping.
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
-    # Debug: every wave idles this many us after its ticket (launch skew tests).
-    DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
     # slots' start handshake, off by default (AITER_DMK_NO_HS=0 turns it on).
     HS = not int(os.environ.get("AITER_DMK_NO_HS", "1"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
     )
-    POLL_SL = int(os.environ.get("AITER_DMK_POLL_SLEEP", POLL_SLEEP))
-    # AITER_DMK_PLAN_TAG: each plan replica dword is stored with the launch's
-    # generation in one 64-bit store, so a CTA polls its replica instead of a
-    # gate CTA 0 opens after the replicas. Faster for 16-row tiles only.
-    PLAN_TAG = (
-        0
-        if COMPACT
-        else int(os.environ.get("AITER_DMK_PLAN_TAG", "1" if TM <= 16 else "0"))
-    )
+    # Plan replica dwords carry the launch's generation in the same 64-bit
+    # store, so a CTA polls its replica instead of a gate CTA 0 opens after
+    # them; faster for 16-row tiles only.
+    PLAN_TAG = int(not COMPACT and TM <= 16)
     if REP_W * WAVE * (2 if PLAN_TAG else 1) > PLAN_SLOT:
         raise ValueError("a plan replica does not fit its slot")
-    # AITER_DMK_DEFER_SCATTER (default 1): a GEMM2 item does not wait for its
-    # EP-scatter stores; they retire under the next item, and the queue's end
-    # drains them before the close counts the CTA's units. Its separate C stage
-    # does not fit next to 64-row tiles at 2 CTAs per CU.
-    DEFER_SC = 0 if COMPACT else int(os.environ.get("AITER_DMK_DEFER_SCATTER", "1"))
-    if TM >= 64:
-        DEFER_SC = 0
-    # AITER_DMK_EARLY_PLAN (default 1): a source signals "reserved" once its
-    # slot atomics have returned, before its rows retire. CTA 0 plans from the
-    # counters as soon as every source reserved; GEMM items start and stream
-    # weights while their A owners wait for the rows-landed gate (every
-    # source's src_done).
-    EARLY = 0 if COMPACT else int(os.environ.get("AITER_DMK_EARLY_PLAN", "1"))
-    # AITER_DMK_PREFETCH_KB (default 256, 0 = off): while the plan is pending,
-    # a step of at least PREF_MIN_TOK tokens has every CTA but 0 read the first
-    # N KB of the W1 slice its first item most likely needs, so that item finds
-    # it in cache. Below PREF_MIN_TOK most guessed experts get no rows.
-    PREF_B = (
-        0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
-    )
-    PREF_B = min(PREF_B, int(tile_n) * (H // 2))
+    # slots: a GEMM2 item does not wait for its EP-scatter stores; they retire
+    # under the next item, and the queue's end drains them before the close.
+    # Its separate C stage does not fit next to 64-row tiles at 2 CTAs per CU.
+    DEFER_SC = int(not COMPACT and TM < 64)
+    # slots: a source signals "reserved" once its slot atomics returned, before
+    # its rows retire; CTA 0 plans from the counters then, and GEMM items start
+    # and stream weights while their A owners wait for the rows-landed gate.
+    EARLY = int(not COMPACT)
+    # slots: while the plan is pending, a step of at least PREF_MIN_TOK tokens
+    # has every CTA but 0 read the first 256 KB of the W1 slice its first item
+    # most likely needs.
+    PREF_B = 0 if COMPACT else min(256 * 1024, int(tile_n) * (H // 2))
     # Every CTA of the grid must be resident: a 4-wave CTA puts one wave on
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
-    # the VGPRs (compact at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
-    WPE = int(os.environ.get("AITER_DMK_WPE", str(int(ctas_per_cu))))
-    # AITER_DMK_RED_UNROLL: (token, chunk) items a reduce wave loads at once;
-    # compact's waves own several items each.
-    RED_UN_DEF = 2 if COMPACT else 1
-    RED_UN = int(os.environ.get("AITER_DMK_RED_UNROLL", str(RED_UN_DEF)))
+    # the VGPRs.
+    WPE = int(ctas_per_cu)
+    # (token, chunk) items a reduce wave loads at once; compact's waves own
+    # several items each.
+    RED_UN = 2 if COMPACT else 1
     # The reduce reads comb_inp through one resource and i32 offsets while the
-    # region fits them, else through a 64-bit base per token (slower at small
-    # steps). AITER_DMK_RED_BASE64=0/1 forces either.
-    RED_B64_DEF = int(int(max_tok_per_rank) * K * int(comb_slot_stride) >= 1 << 31)
-    RED_B64 = int(os.environ.get("AITER_DMK_RED_BASE64", str(RED_B64_DEF)))
-    knob_sfx = f"_wpe{WPE}" if WPE else ""
-    knob_sfx += "".join(
+    # region fits them, else through a 64-bit base per token.
+    RED_B64 = int(int(max_tok_per_rank) * K * int(comb_slot_stride) >= 1 << 31)
+    knob_sfx = f"_wpe{WPE}" + "".join(
         f"_{name}{val}"
         for name, val, default in (
-            ("tc", T_CHUNK if COMPACT else TALLY_CHUNK, TALLY_CHUNK),
-            ("ru", RED_UN, RED_UN_DEF),
-            ("rb", RED_B64, RED_B64_DEF),
-            ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
-            ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -254,7 +226,6 @@ def make_megakernel(
         CF_OFF=CF_OFF,
         COMPACT=COMPACT,
         DEFER_SC=DEFER_SC,
-        DELAY_US=DELAY_US,
         DEST_STRIDE=DEST_STRIDE,
         E=E,
         EARLY=EARLY,
@@ -280,7 +251,7 @@ def make_megakernel(
         PLAN_SLOT=PLAN_SLOT,
         PLAN_TAG=PLAN_TAG,
         PLAN_W=PLAN_W,
-        POLL_SL=POLL_SL,
+        POLL_SL=POLL_SLEEP,
         PREF_B=PREF_B,
         RED_CH=RED_CH,
         RED_UN=RED_UN,
@@ -298,7 +269,7 @@ def make_megakernel(
         TM=TM,
         TRACE=TRACE,
         TR_BASE=TR_BASE,
-        T_CHUNK=T_CHUNK,
+        T_CHUNK=TALLY_CHUNK,
         T_MAX=T_MAX,
         comb_slot_stride=comb_slot_stride,
         npes=npes,

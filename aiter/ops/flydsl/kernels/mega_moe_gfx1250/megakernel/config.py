@@ -55,16 +55,11 @@ SLOTS_TILE_M16 = dict(  # noqa: C408 - the builder's keyword names
 #: Tokens per rank past which the 32-row, then the 64-row tile is faster.
 SLOTS_TILE_M32_TOKENS = 64
 SLOTS_TILE_M64_TOKENS = 256
-#: Tuning: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and AITER_DMK_CTAS_PER_CU
-#: override the tile and the CTAs per CU.
-SLOTS_CTAS_PER_CU = int(os.environ.get("AITER_DMK_CTAS_PER_CU") or 2)
-_SLOTS_TILE_ENV = os.environ.get("AITER_DMK_TILE")
+SLOTS_CTAS_PER_CU = 2
 
 
 def slots_tile(max_tokens_per_rank: int) -> dict:
     """The decode tiles for an instance serving up to this many tokens."""
-    if _SLOTS_TILE_ENV:
-        return dict(zip(_TILE_KEYS, (int(x) for x in _SLOTS_TILE_ENV.split(","))))
     tile = dict(SLOTS_TILE)
     if int(max_tokens_per_rank) > SLOTS_TILE_M64_TOKENS:
         tile["tile_m"] = 64
@@ -230,20 +225,9 @@ COMPACT_MAX_KERNELS = 4
 
 
 def compact_tile_table() -> tuple:
-    """COMPACT_TILES, or its overrides. AITER_MEGAKERNEL_COMPACT_TILES
-    (formerly AITER_LM_TILES) = "UPTO:tm,tn,tk,nb,tn2,tk2,nb2:CTAS;..."
-    replaces the table (UPTO 0: every larger step). AITER_LM_TILE
-    ("tm,tn,tk,nb,tn2,tk2,nb2") and AITER_LM_CTAS_PER_CU run one tile for every
-    step (the table's first by default)."""
-    one = os.environ.get("AITER_LM_TILE")
-    cpc = os.environ.get("AITER_LM_CTAS_PER_CU")
-    if one or cpc:
-        tile = (
-            dict(zip(_TILE_KEYS, (int(x) for x in one.split(","))))
-            if one
-            else dict(COMPACT_TILES[0][1])
-        )
-        return ((None, tile, int(cpc) if cpc else COMPACT_TILES[0][2]),)
+    """COMPACT_TILES, or AITER_MEGAKERNEL_COMPACT_TILES (formerly
+    AITER_LM_TILES) = "UPTO:tm,tn,tk,nb,tn2,tk2,nb2:CTAS;..." (UPTO 0: every
+    larger step)."""
     table = _env("AITER_MEGAKERNEL_COMPACT_TILES")
     if not table:
         return COMPACT_TILES
