@@ -26,8 +26,6 @@ from aiter.ops.flydsl.linear_attention_kernels import (
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
-
 pytestmark = pytest.mark.skipif(
     not is_flydsl_kda_decode_supported(), reason="requires a gfx942 or gfx950 GPU"
 )
@@ -431,9 +429,26 @@ def test_kda_verify_padding_rows(ring):
     inp.cache_indices[1] = -1
     inp.inter_indices[3] = -1
     inp.cache_indices[4] = inp.state.shape[0]  # out of range is padding too
+    # Scratch starts nonzero, so a padding row that stores zeros (or anything)
+    # into it differs from the reference, which clones the sentinel.
+    sentinel = 3.0
+    scratch = (inp.window, inp.inter_states) if not ring else (inp.window, *inp.ring)
+    for tensor in scratch:
+        tensor.fill_(sentinel)
     out = _check(inp, 5)
     for b in (1, 3, 4):
         assert torch.count_nonzero(out[0, b * 5 : (b + 1) * 5]) == 0
+    # A padding row writes neither its line (rows 1 and 4 hold a valid one) nor
+    # its cache slot (rows 1, 3 and 4), so those still hold the sentinel.
+    lines = inp.inter_indices[[1, 4]].long()
+    assert (inp.window[lines] == sentinel).all()
+    if ring:
+        live = torch.zeros(inp.state.shape[0], dtype=torch.bool, device=_DEVICE)
+        live[inp.cache_indices[[0, 2, 5]].long()] = True
+        for tensor in inp.ring:
+            assert (tensor[~live] == sentinel).all()
+    else:
+        assert (inp.inter_states[lines] == sentinel).all()
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
@@ -997,7 +1012,7 @@ test_flydsl_kda_verify.__test__ = False
 
 
 def main():
-    if get_gfx_runtime() not in SUPPORTED_GFX:
+    if not is_flydsl_kda_decode_supported():
         aiter.logger.warning(
             "FlyDSL KDA verify unsupported on %s; skipping", get_gfx_runtime()
         )
