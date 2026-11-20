@@ -9,9 +9,15 @@ gemm_a8w8_mxfp8_bpreshuffle and checks it against an fp32 reference.
 Both gfx950 and gfx1250 read row-major x_scale [M, K/32]. gfx950 reads
 row-major w_scale [N, K/32]; gfx1250 reads 32x4 shuffled w_scale, as laid out
 by shuffle_mxfp8_bpreshuffle_scale (whose layout test_w_scale_layout checks).
+
+gfx950 also checks the OPUS a8w8_mxfp8 backend: every kid in NT / NN / TT / TN
+(split-K kids at S = 2 / 4), the public route of a libtype "opus" tuned row
+(injected, not read from the production CSVs), outputs of 4 GiB and more, and
+the shapes the launcher must reject.
 """
 
 import argparse
+import itertools
 from unittest import mock
 
 import pandas as pd
@@ -26,7 +32,7 @@ from aiter.ops import shuffle
 from aiter.ops.gemm_op_a8w8 import _get_mxfp8_bpreshuffle_config
 from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # Shapes for a gfx950 without tuned rows: DeepSeek-V3 dense projections, ragged M included.
 DEFAULT_MNK_GFX950 = [
@@ -109,6 +115,182 @@ def test_w_scale_layout(n=64, kb=16):
     aiter.logger.info("shuffle_mxfp8_bpreshuffle_scale layout: OK")
 
 
+# ---- OPUS a8w8_mxfp8 (gfx950) -------------------------------------------------
+# Ragged M / N tails, an N below every tile width, and a tile-aligned shape (the
+# only one the "nob" kid runs); M % 16 and N % 32 so every layout is legal.
+DEFAULT_OPUS_MNK = [
+    (304, 416, 768),
+    (1008, 4128, 2048),
+    (16, 128, 256),
+    (2048, 1536, 7168),
+]
+# A 4 GiB C: a 32-bit buffer range over all of C wraps here, so these need the
+# kernel's per-tile 64-bit C base (and fault or drop rows without it).
+DEFAULT_OPUS_LARGE_MNK = [(32768, 65536, 256)]
+OPUS_LAYOUTS = ["NT", "NN", "TT", "TN"]
+
+
+def opus_registry():
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    return get_registry("a8w8_mxfp8", get_gfx(), get_cu_num())
+
+
+def opus_inputs(m, n, k, layout):
+    """Quantized operands as the layout stores them: A [M, K] or the [M, K] view
+    of A stored [K, M]; B the shuffle_weight of [N, K] or of [K, N] (viewed [N, K])."""
+    x = torch.randn(m, k, dtype=dtypes.bf16)
+    w = torch.randn(n, k, dtype=dtypes.bf16)
+    xq, x_scale = per_group_quant_hip(
+        x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+    )
+    wq, w_scale = per_group_quant_hip(
+        w, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+    )
+    a = xq if layout[0] == "N" else xq.T.contiguous().T
+    b = (
+        shuffle_weight(wq, layout=(16, 16))
+        if layout[1] == "T"
+        else shuffle_weight(wq.T.contiguous(), layout=(16, 16)).T
+    )
+    return xq, x_scale, wq, w_scale, a, b
+
+
+def run_opus(a, b, y, x_scale, w_scale, kid, split_k):
+    from aiter.ops.opus import opus_gemm
+
+    return opus_gemm(
+        a,
+        b,
+        y,
+        kid=kid,
+        family="a8w8_mxfp8",
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        split_k=split_k,
+    )
+
+
+def opus_err(xq, x_scale, wq, w_scale, y):
+    """Mismatch fraction against the fp32 reference, row block by row block
+    (a 4 GiB output's reference does not fit at once); the worst block counts."""
+    m, n = y.shape
+    rows = max(1, (1 << 27) // n)
+    return max(
+        checkAllclose(
+            run_torch(xq[r : r + rows], x_scale[r : r + rows], wq, w_scale, (1, 32)),
+            y[r : r + rows].float(),
+            printLog=False,
+        )
+        for r in range(0, m, rows)
+    )
+
+
+@benchmark()
+def test_opus(m, n, k, layout, kid, split_k):
+    xq, x_scale, wq, w_scale, a, b = opus_inputs(m, n, k, layout)
+    # NaN sentinel: an element the kernel leaves unwritten fails the comparison.
+    y = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+    run_opus(a, b, y, x_scale, w_scale, kid, split_k)
+    err = opus_err(xq, x_scale, wq, w_scale, y)
+    # No rotated input copies for a multi-GiB output (each would be a full C).
+    rotate = 1 if 2 * m * n >= 1 << 31 else 0
+    _, us = run_perftest(
+        run_opus, a, b, y, x_scale, w_scale, kid, split_k, num_rotate_args=rotate
+    )
+    assert err == 0, f"OPUS kid {kid} {layout} M={m} N={n} K={k} S={split_k}: err {err}"
+    return {
+        "gfx": get_gfx(),
+        "kernel": opus_registry()[kid].name,
+        "us": round(us, 2),
+        "TFLOPS": round(2 * m * n * k / us / 1e6, 1),
+        "TB/s": round((m * k + n * k + m * n * 2) / us / 1e6, 2),
+        "err": err,
+    }
+
+
+@benchmark()
+def test_opus_route(m, n, k, kid, split_k):
+    """gemm_a8w8_mxfp8_bpreshuffle on an injected libtype "opus" row runs that kid."""
+    import aiter.ops.opus as opus_pkg
+    from aiter.ops import gemm_op_a8w8
+
+    name = opus_registry()[kid].name
+    xq, x_scale, wq, w_scale, _, b = opus_inputs(m, n, k, "NT")
+    real_config, real_opus_gemm = (
+        gemm_op_a8w8._get_mxfp8_bpreshuffle_config,
+        opus_pkg.opus_gemm,
+    )
+    launched = []
+
+    def spy(*args, **kwargs):
+        launched.append((kwargs["kid"], kwargs["split_k"]))
+        return real_opus_gemm(*args, **kwargs)
+
+    gemm_op_a8w8._get_mxfp8_bpreshuffle_config = lambda *_: ("opus", name, split_k)
+    opus_pkg.opus_gemm = spy
+    try:
+        out, us = run_gemm(xq, b, x_scale, w_scale)
+    finally:
+        gemm_op_a8w8._get_mxfp8_bpreshuffle_config = real_config
+        opus_pkg.opus_gemm = real_opus_gemm
+    assert launched and set(launched) == {(kid, split_k)}, launched
+    err = opus_err(xq, x_scale, wq, w_scale, out)
+    assert err == 0, f"public route to {name}: err {err}"
+    return {"kernel": name, "us": round(us, 2), "err": err}
+
+
+def check_opus_rejects():
+    """Inputs the launcher must refuse (a wrong result here is silent)."""
+    kids = opus_registry()
+    sk = next(kid for kid, inst in kids.items() if inst.co_variant == "sk")
+    nob = next(kid for kid, inst in kids.items() if inst.co_variant == "nob")
+    np_kid = next(kid for kid, inst in kids.items() if inst.co_variant == "np")
+    xq, x_scale, _, w_scale, _, b = opus_inputs(304, 416, 768, "NT")
+    padded = torch.empty(304, 768 + 64, dtype=xq.dtype)[:, :768]
+    padded.copy_(xq)
+    # A stored [K, M] needs M % 16; 312 % 16 = 8.
+    _, x_scale_t, _, w_scale_t, a_t, b_t = opus_inputs(312, 416, 768, "TT")
+    cases = {
+        "non-dense XQ strides": (padded, b, x_scale, w_scale, np_kid, 0),
+        "A stored [K, M] with M % 16": (a_t, b_t, x_scale_t, w_scale_t, np_kid, 0),
+        "nob kid on a ragged M": (xq, b, x_scale, w_scale, nob, 0),
+        "split_k on a non-split-K kid": (xq, b, x_scale, w_scale, np_kid, 2),
+        "K not a multiple of split_k * 256": (xq, b, x_scale, w_scale, sk, 8),
+    }
+    rows = []
+    for case, (a, bb, xs, ws, kid, split_k) in cases.items():
+        y = torch.empty(a.shape[0], bb.shape[0], dtype=dtypes.bf16)
+        try:
+            run_opus(a, bb, y, xs, ws, kid, split_k)
+            torch.cuda.synchronize()
+            rejected = False
+        except (RuntimeError, ValueError):
+            rejected = True
+        assert rejected, f"OPUS accepted: {case}"
+        rows.append({"case": case, "kid": kid, "rejected": rejected})
+    # A split-K workspace past 4 GiB: the planner must not choose it.
+    from aiter.ops.opus.gemm_op_a8w8 import a8w8_mxfp8_kid_runs
+
+    over = not a8w8_mxfp8_kid_runs(kids[sk], 8192, 65536, 1536, 2)
+    assert over, "split-K workspace over 4 GiB accepted"
+    rows.append({"case": "split-K workspace > 4 GiB", "kid": sk, "rejected": over})
+    return rows
+
+
+def opus_cases(mnks, layouts):
+    """(m, n, k, layout, kid, split_k) for every kid that runs the shape."""
+    from aiter.ops.opus.gemm_op_a8w8 import a8w8_mxfp8_kid_runs
+
+    for (m, n, k), layout, (kid, inst) in itertools.product(
+        mnks, layouts, sorted(opus_registry().items())
+    ):
+        for split_k in (2, 4) if inst.co_variant == "sk" else (0,):
+            if a8w8_mxfp8_kid_runs(inst, m, n, k, split_k, layout):
+                yield m, n, k, layout, kid, split_k
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -118,7 +300,12 @@ def tuned_shapes():
     return shapes
 
 
-if __name__ == "__main__":
+def summarize(title, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s summary (markdown):\n%s", title, df.to_markdown(index=False))
+
+
+def main():
     torch.set_default_device("cuda")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
@@ -131,11 +318,76 @@ if __name__ == "__main__":
         help="""M,N,K shapes; default: every tuned shape of this arch.
         e.g.: -mnk 512,7168,16384 1000,65536,1536""",
     )
+    parser.add_argument(
+        "--opus_mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=DEFAULT_OPUS_MNK,
+        help="gfx950 OPUS kid sweep shapes (M % 16, N % 32 keep every layout legal)",
+    )
+    parser.add_argument(
+        "--opus_large_mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=DEFAULT_OPUS_LARGE_MNK,
+        help="gfx950 OPUS shapes with a C of 4 GiB or more",
+    )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        nargs="*",
+        default=OPUS_LAYOUTS,
+        choices=OPUS_LAYOUTS,
+        help="OPUS operand layouts (first letter A, second B; T = A stored [K, M], N = B stored [K, N])",
+    )
     args = parser.parse_args()
 
     test_w_scale_layout()
     if get_gfx() not in ("gfx950", "gfx1250"):
-        print(f"skip: gfx950 / gfx1250 only, got {get_gfx()}")
-    else:
-        df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
-        aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
+        aiter.logger.warning(
+            "gemm_a8w8_mxfp8_bpreshuffle unsupported on %s; skipping", get_gfx()
+        )
+        return
+    summarize(
+        "gemm_a8w8_mxfp8_bpreshuffle",
+        [test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()],
+    )
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "%s: OPUS a8w8_mxfp8 is gfx950 only; skipping it", get_gfx()
+        )
+        return
+    torch.manual_seed(0)
+    summarize(
+        "OPUS a8w8_mxfp8 kids",
+        [test_opus(*c) for c in opus_cases(args.opus_mnk, args.layout)],
+    )
+    # The tile-aligned and the ragged-N kid of each kind, one layout per operand transpose.
+    large = [
+        c
+        for c in opus_cases(args.opus_large_mnk, ["NT", "TN"])
+        if opus_registry()[c[4]].co_variant != "sk"
+    ]
+    summarize("OPUS a8w8_mxfp8 large outputs", [test_opus(*c) for c in large])
+    kids = opus_registry()
+    # Each row must be one the kid runs (K % (split_k * 256) for split-K):
+    # the injected config skips the tuned-row check the real lookup makes.
+    route = [
+        (
+            2048,
+            1536,
+            7168,
+            next(k for k, i in kids.items() if i.co_variant == "nob"),
+            0,
+        ),
+        (304, 416, 768, next(k for k, i in kids.items() if i.co_variant == "np"), 0),
+        (304, 416, 1024, next(k for k, i in kids.items() if i.co_variant == "sk"), 2),
+    ]
+    summarize(
+        "gemm_a8w8_mxfp8_bpreshuffle OPUS route", [test_opus_route(*r) for r in route]
+    )
+    summarize("OPUS a8w8_mxfp8 rejects", check_opus_rejects())
+
+
+if __name__ == "__main__":
+    main()

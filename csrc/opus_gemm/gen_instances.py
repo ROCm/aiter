@@ -25,6 +25,7 @@ from codegen.common import (
     write_if_changed,
 )
 from opus_gemm_common import (
+    A8W8_MXFP8_TAGS,
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
@@ -290,6 +291,7 @@ INPUT_DTYPE_MAP = {
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
+    **{tag: ("fp8_t", "fp8_t") for tag in A8W8_MXFP8_TAGS},
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
@@ -870,6 +872,12 @@ class opus_gemm_codegen:
                 _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
                 "fp32_t",
             )
+            _emit_map(
+                f,
+                "GENERATE_A8W8_MXFP8_KID_DISPATCH_GFX950",
+                _rows("gfx950", A8W8_MXFP8_TAGS, "bf16_t"),
+                "bf16_t",
+            )
             for arch in SPLITK_REDUCE_ARCHES:
                 for ctype, dtype_suffix in (
                     ("bf16_t", "BF16"),
@@ -1033,7 +1041,11 @@ void
 """
         parts = [MANIFEST_HEAD]
         for k in kernels_dict.values():
-            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
+            # A8W8 MXFP8 launchers take the same arguments as the MXFP8 BMM ones.
+            if (
+                k.kernel_tag.startswith("a8w8_mxscale_bmm_")
+                or k.kernel_tag in A8W8_MXFP8_TAGS
+            ):
                 parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in SPLITK_TAGS:
                 parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
@@ -1206,9 +1218,10 @@ void
         is the preferred fast path when its constraints hold.
         """
         # Bucket present archs from splitk kids.
+        # (host rows: the launchers of pre-compiled kids launch the reduce too)
         present_archs = {
             row["splitk_reduce_arch"]
-            for row in self._device_instantiations
+            for row in (*self._device_instantiations, *self._host_instantiations)
             if row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
         }
         for row in self._device_instantiations:
@@ -1318,6 +1331,9 @@ void
             or ("flatmm_splitk" in row["kid_name"])
             or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
+        ) or any(
+            row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+            for row in self._host_instantiations
         )
         if needs_reduce_tu:
             self._emit_splitk_reduce_tu()

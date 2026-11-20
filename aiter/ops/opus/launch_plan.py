@@ -464,6 +464,7 @@ _A8W8_FAMILY = "a8w8"
 _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
+_A8W8_MXFP8_FAMILY = "a8w8_mxfp8"
 
 # Derived, not restated. This used to be a second hand-kept copy of the tag list
 # in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
@@ -504,12 +505,18 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
+    **{
+        tag: _A8W8_MXFP8_FAMILY
+        for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
+        for tag in arch_families.get(_A8W8_MXFP8_FAMILY, ())
+    },
 }
 _A8W8_FAMILY_LAYOUT = {
     _A8W8_FAMILY: "plain",
     _A8W8_BLOCKSCALE_FAMILY: "plain",
     _A8W8_BPRESHUFFLE_FAMILY: "bpreshuffle",
     _A8W8_MXSCALE_BMM_FAMILY: "mxscale_bmm",
+    _A8W8_MXFP8_FAMILY: "bpreshuffle",
 }
 _FP8_DTYPES = frozenset(
     dtype
@@ -576,7 +583,9 @@ def _validate_a8w8_public_contract(
             )
     else:
         expected_output_dtype = (
-            torch.bfloat16 if family == _A8W8_BPRESHUFFLE_FAMILY else torch.float32
+            torch.bfloat16
+            if family in (_A8W8_BPRESHUFFLE_FAMILY, _A8W8_MXFP8_FAMILY)
+            else torch.float32
         )
         if output_dtype != expected_output_dtype:
             raise ValueError(
@@ -600,6 +609,12 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8_mxscale_bmm requires x_scale and w_scale")
         if split_k == 0 and has_workspace:
             raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
+        return family
+    if family == _A8W8_MXFP8_FAMILY:
+        # Split-K kids take split_k (0 = auto) and an optional fp32 workspace; the
+        # launch plan rejects them for the other kids.
+        if not has_x_scale:
+            raise ValueError("OPUS a8w8_mxfp8 requires x_scale and w_scale")
         return family
 
     if has_workspace and not (
