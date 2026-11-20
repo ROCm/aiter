@@ -28,10 +28,9 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# The LLVM dialect is used only for inline assembly at instructions FlyDSL 0.4
-# cannot represent through its stable surface: M0 ownership, signed-offset LDS
-# DMA, the scheduled scale loads, K64 INT8 MFMA, and the accumulator hazard
-# boundary.
+# The LLVM dialect is used only for inline assembly where FlyDSL 0.5's stable
+# surface and LLVM's intrinsics fall short: M0 ownership, signed-offset LDS DMA,
+# the scheduled scale loads, K64 INT8 MFMA, and the accumulator hazard boundary.
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
@@ -275,9 +274,11 @@ class G2SGlobal:
     four M0 changes per K tile, this one two.
 
     The loads are inline asm because LLVM asserts on the intrinsic's negative
-    LDS memory-operand offset. LLVM does not count them in vmcnt, so the K
-    loop waits for them explicitly, and the epilogue's scale loads, which
-    persistent workgroups issue before the next block's, are asm as well.
+    LDS memory-operand offset, and with non-negative offsets it cannot tell
+    the stages apart: it drains vmcnt before LDS reads that follow a load.
+    LLVM does not count the asm loads in vmcnt, so the K loop waits for them
+    explicitly, and the epilogue's scale loads, which persistent workgroups
+    issue before the next block's, are asm as well.
     M0 is written by ``set_m0`` ops, placed an MFMA slot ahead of the loads
     so the write and its hazard ``s_nop`` stay off the loads' slots. LLVM
     does not see M0 in use, so nothing else in the kernel may use it.
@@ -295,7 +296,7 @@ class G2SGlobal:
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) - self.CENTER
         wave_off = wave_id * (LOADS_PER_REGION // 2) * block_stride + self.CENTER
         # M0 is written from an SGPR, so the wave-uniform LDS address is read
-        # from lane 0. FlyDSL 0.4 exports no stable readfirstlane.
+        # from lane 0. FlyDSL 0.5 exports no stable readfirstlane.
         self.m0 = [
             fx.rocdl.readfirstlane(
                 fx.Int32.ir_type,
@@ -311,7 +312,7 @@ class G2SGlobal:
     def set_m0(self, buf):
         """Point M0 at LDS buffer ``buf`` for the ``ops`` that follow.
 
-        FlyDSL 0.4 has no stable M0 setter. Remove this boundary when a setter
+        FlyDSL 0.5 has no stable M0 setter. Remove this boundary when a setter
         with an explicit post-write hazard is exported.
         """
         _llvm.inline_asm(
@@ -323,9 +324,9 @@ class G2SGlobal:
         )
 
     def _load(self, voffset, k_offset, step):
-        # FlyDSL 0.4 cannot encode this signed LDS memory-operand offset; its
-        # intrinsic path reaches an LLVM assertion. Keep the raw instruction
-        # until signed-offset global_load_lds is supported.
+        # On this signed LDS memory-operand offset, FlyDSL 0.5's global_load_lds
+        # reaches an LLVM assertion ("Negative MachineMemOperand offset"). Keep
+        # the raw instruction until signed-offset global_load_lds is supported.
         _llvm.inline_asm(
             res=None,
             operands_=[
@@ -710,11 +711,10 @@ def _mfma_i8(a, b, c):
 
     The accumulators are pinned to AGPRs like hipBLASLt's: with the LLVM
     intrinsic, the allocator keeps them in VGPRs and the operands in AGPRs,
-    leaving too few VGPRs and adding accumulator copies inside the loop.
-    FlyDSL 0.4 has no gfx950 K64 INT8 MMA atom. LLVM does not see this as an
-    MFMA, so ``_mfma_drain`` must separate the last one from any read of its
-    result outside another MFMA. Remove both boundaries together once a stable
-    K64 atom is available.
+    leaving too few VGPRs, so it spills and adds accumulator copies inside the
+    loop. LLVM does not see this as an MFMA, so ``_mfma_drain`` must separate
+    the last one from any read of its result outside another MFMA. Remove both
+    boundaries together once the intrinsic keeps the accumulators in AGPRs.
     """
     res_t = fx.Vector.make_type(4, fx.Int32)
     operands = [Vec(a).ir_value(), Vec(b).ir_value()]
@@ -1148,7 +1148,7 @@ def compile_int8_gemm_4w(
             ``wait`` (vmcnt, lgkmcnt) goes before the last MFMA so the MFMA
             pipe stays busy while the following barrier resolves.
             ``sched_barrier(0)`` keeps LLVM from moving any op off its slot;
-            FlyDSL 0.4 does not export it as a stable API.
+            FlyDSL 0.5 does not export it as a stable API.
             """
             for idx, (i, j, kk) in enumerate(mfmas):
                 if const_expr(wait is not None and idx == len(mfmas) - 1):
@@ -1264,7 +1264,7 @@ def compile_int8_gemm_4w(
             # The stable fx.barrier is gpu.barrier, which also makes prior
             # memory accesses visible and so would wait for the LDS-DMA loads
             # this schedule keeps in flight across barriers. The bare
-            # s_barrier is not a stable FlyDSL 0.4 export.
+            # s_barrier is not a stable FlyDSL 0.5 export.
             fx.rocdl.s_barrier()
             p2_placed = spread(b_hi_reads, 0, P2_READS_END)
             p2_placed += spread(p2_loads, 1, len(PHASE_MFMAS[1]) - 1)
