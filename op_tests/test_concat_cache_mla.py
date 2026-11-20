@@ -7,7 +7,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
@@ -383,7 +383,7 @@ def check_fused_rope_fp8_saturates(
 
 # Arches with a packed fp8 convert in fp32_to_fp8_scaled_x2 (aiter_opus_plus.h);
 # elsewhere (RDNA3/3.5) it is a compile-only stub that returns zeros.
-FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250", "gfx1250-strict")
 
 # (kv_lora_rank, tokens, heads, kv_heads, dtype) -> the kernel the host dispatch
 # in fused_qk_rope_concat_and_cache_mla picks for it.
@@ -905,7 +905,7 @@ def main():
         if (
             "fp8" in args.kv_dtype
             and "fp8" in args.q_dtype
-            and get_gfx() in FP8_CVT_GFX
+            and get_gfx_runtime() in FP8_CVT_GFX
         ):
             for case, (
                 rank,
