@@ -38,7 +38,6 @@ from .quant_utils import (
 )
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
-_JIT_CACHE_TAG = "attention_a2a_intranode"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 # Rows of one e4m3_pc partial-maximum tile. The tile count sets both the
@@ -133,8 +132,6 @@ def make_attention_a2a_reuse_jit(*, rank, npes, spin_timeout_iters=0):
                     syncscope=fx.rocdl.SyncScope.OneAs,
                 )
 
-    key = (rank, npes, _JIT_CACHE_TAG)
-
     @flyc.jit
     def launch(
         addr_ready_mem: fx.Int64,
@@ -142,7 +139,6 @@ def make_attention_a2a_reuse_jit(*, rank, npes, spin_timeout_iters=0):
         addr_ready_flag: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         for publish in range_constexpr(2):
             attention_a2a_reuse_barrier(
                 addr_ready_mem, addr_p2p_ready_mem, addr_ready_flag, publish == 0
@@ -2860,6 +2856,24 @@ def make_attention_a2a_completion_kernel(*, rank, npes, spin_timeout_iters=0):
     return completion
 
 
+def make_attention_a2a_flush_kernel():
+    """One system-scope release per workgroup, launched with one workgroup per XCD.
+
+    buffer_wbl2 acts on the whole L2 of the issuing XCD, whichever kernel dirtied
+    its lines, so this writes back every payload line the preceding payload
+    kernels left in that L2.
+    """
+
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def attention_a2a_l2_flush():
+        fx.memory_fence(
+            ordering=fx.AtomicOrdering.Release,
+            syncscope=fx.rocdl.SyncScope.OneAs,
+        )
+
+    return attention_a2a_l2_flush
+
+
 def make_attention_a2a_jit(
     *,
     rank,
@@ -2879,6 +2893,8 @@ def make_attention_a2a_jit(
     v4_amax=False,
     fp8_fnuz=False,
     spin_timeout_iters=0,
+    flush_l2=False,
+    n_xcd=0,
 ):
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     pc_partial = v4_output == "v" and codec == "e4m3_pc" and v4_amax
@@ -2912,31 +2928,10 @@ def make_attention_a2a_jit(
     completion = make_attention_a2a_completion_kernel(
         rank=rank, npes=npes, spin_timeout_iters=spin_timeout_iters
     )
+    flush = make_attention_a2a_flush_kernel() if flush_l2 else None
     # rank is compile-time so rank-dependent ownership (split frame, k_own_tiles,
     # last-rank padding, odd-rank scales, sender dword selection) folds; the cache
     # therefore grows with world size.
-    key = (
-        rank,
-        npes,
-        heads,
-        seq_len,
-        head_dim,
-        block_num,
-        warp_num_per_block,
-        quant,
-        codec,
-        hadamard,
-        v4_output,
-        valid_kv_len,
-        v_pack,
-        q_multiplier,
-        v4_amax,
-        fp8_fnuz,
-        spin_timeout_iters,
-        current_target().arch,
-        os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE", "0") == "1",
-        _JIT_CACHE_TAG,
-    )
 
     @flyc.jit
     def launch(
@@ -2950,7 +2945,6 @@ def make_attention_a2a_jit(
         addr_p2p_partial_ready: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         for index in range_constexpr(len(payload_kernels)):
             payload_kernels[index](
                 addr_input,
@@ -2964,6 +2958,9 @@ def make_attention_a2a_jit(
                 block=(warp_num_per_block * 64, 1, 1),
                 stream=stream,
             )
+        if const_expr(flush is not None):
+            # Stream order: after every payload workgroup, before the flag.
+            flush().launch(grid=(n_xcd, 1, 1), block=(64, 1, 1), stream=stream)
         for phase in range_constexpr(2):
             completion(
                 addr_xdb_mem, addr_p2p_xdb_mem, addr_xdb_flag, phase == 0
@@ -2976,7 +2973,6 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
     block_threads = 256
     vec = 8
     codecs = (codec,) * 3 if isinstance(codec, str) else codec
-    key = (numel, codecs, fp8_fnuz, _JIT_CACHE_TAG)
 
     @flyc.jit
     def dequant_one(
@@ -3102,7 +3098,6 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
         addr_out_v: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         attention_a2a_dequant(
             addr_q,
             addr_k,
