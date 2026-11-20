@@ -8,7 +8,6 @@ from __future__ import annotations
 import functools
 import re
 
-import flydsl.expr as fx
 import torch
 from torch import Tensor
 
@@ -16,6 +15,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
+from .aot_cache import FlyDSLAotCache
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
@@ -23,7 +23,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     gemm_a16w16,
 )
 from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import current_stream_arg
 
 __all__ = [
     "SKINNY_POLICY",
@@ -436,6 +436,9 @@ def flydsl_hgemm(
 # ---------------------------------------------------------------------------
 
 
+_PRESHUFFLE_AOT_CACHE = FlyDSLAotCache("preshuffle_gemm_a8")
+
+
 @functools.lru_cache(maxsize=1)
 def _get_compile_fn():
     """Import the preshuffle compiler on first use."""
@@ -553,7 +556,6 @@ def flydsl_preshuffle_gemm_a8(
     split_k: int = 1,
 ) -> Tensor:
     """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
-    compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
 
     m, k = XQ.shape[0], XQ.shape[-1]
@@ -610,21 +612,21 @@ def flydsl_preshuffle_gemm_a8(
         Out.element_size(),
     )
 
-    exe = compile_fn(
-        N=n,
-        K=k,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
-        use_async_copy=bool(use_async_copy),
-        waves_per_eu=wpe,
-        enable_scheduler=bool(enable_scheduler),
-        xcd_swizzle=int(xcd_swizzle),
-        lds_stage=int(lds_stage),
-        split_k=int(split_k),
-    )
+    compile_kwargs = {
+        "N": n,
+        "K": k,
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "in_dtype": in_dtype,
+        "out_dtype": out_dtype,
+        "use_async_copy": bool(use_async_copy),
+        "waves_per_eu": wpe,
+        "enable_scheduler": bool(enable_scheduler),
+        "xcd_swizzle": int(xcd_swizzle),
+        "lds_stage": int(lds_stage),
+        "split_k": int(split_k),
+    }
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
@@ -646,8 +648,7 @@ def flydsl_preshuffle_gemm_a8(
         semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
     # The layout-API launcher takes fx.Tensor args, so pass flat tensors
     # directly rather than raw pointers.
-    _run_compiled(
-        exe,
+    args = (
         workspace.view(-1),
         out_contig.view(-1),
         semaphore,
@@ -658,7 +659,20 @@ def flydsl_preshuffle_gemm_a8(
         dummy_bias,
         m,
         n,
-        fx.Stream(torch.cuda.current_stream()),
+        current_stream_arg(),
+    )
+    # Every tensor is a flat contiguous view, so the constexprs and the scale
+    # dtypes determine the launcher's argument signature. The device keeps
+    # the JIT path's handles apart; entries on disk are shared.
+    key = (
+        tuple(sorted(compile_kwargs.items())),
+        x_scale.dtype,
+        w_scale.dtype,
+        XQ.device,
+    )
+    # The compiler is imported only on a miss: importing it costs about 30 ms.
+    _PRESHUFFLE_AOT_CACHE.launch(
+        key, lambda: _get_compile_fn()(**compile_kwargs), *args
     )
     if out_contig is not Out:
         Out.copy_(out_contig)
