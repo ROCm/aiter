@@ -169,6 +169,9 @@ source:
 - `torch.version.hip` and the target arch. That is
   `torch.cuda.get_device_properties().gcnArchName`, or FlyDSL's
   `get_rocm_arch()` when there is no device or `FLYDSL_GPU_ARCH` is set;
+- the CU count, `chip_info.get_cu_num()`. It honours `CU_NUM`, which the AOT
+  dry run sets from each tuned row's `cu_num`, so a prebuild for a CU count
+  and a process on such a GPU use the same directory;
 - every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
   `HSA_OVERRIDE_GFX_VERSION` and `COMPILE_OPT_LEVEL`. Variables that cannot
   change code are excluded: dump dirs, the cache's own variables, and
@@ -185,6 +188,36 @@ its sha256 in the entry's sidecar `.json`, together with any
 hash the same. The per-process digest cache makes this one `sha256` per file
 per process.
 
+The sidecar also stores the environment variables the entry depends on, with
+their values (`null` if unset), and a lookup requires the same values. They
+are found two ways, so no list has to be kept:
+
+- names read by a literal in a recorded kernel file, one under
+  `aiter/ops/flydsl/` (`os.environ.get("X")`, `os.getenv("X")`,
+  `os.environ["X"]`, `"X" in os.environ`). This covers a module-level read at
+  import and a read inside an `lru_cache`d function, which run before or
+  outside the build. Shared modules are not scanned: `aiter/jit/core.py` alone
+  names about 45 variables (`AITER_CONFIG_*`, `AITER_JIT_DIR`, …) and
+  `aiter/__init__.py` names `AITER_LOG_LEVEL`, none of which changes a kernel;
+- names aiter code reads during the build, seen by the same profile hook
+  (`os._Environ.__getitem__` called from a tracked file). This covers a name
+  computed at runtime, e.g. `os.environ.get(name)`. Only reads of one name
+  count (`[]`, `get`, `getenv`, `in`, `setdefault`). `os.environ.copy()`,
+  `dict(os.environ)`, `items()` and the like read every variable; recording
+  them would write the whole environment, secrets included, into a sidecar
+  that ships with the package, and the entry would hit only on that machine.
+
+Variables the fingerprint owns (`AITER_FLYDSL_*`, `FLYDSL_*`, the extras) are
+left to it. So are those that describe the build rather than the code:
+`CU_NUM`, `GPU_ARCHS`, `AITER_GPU_ARCHS`, `COMPILE_ONLY`, `AITER_AOT_*`
+(`setup.py` sets `AITER_AOT_IMPORT`, the replay `AITER_AOT_REPLAY` and
+`AITER_AOT_FEATURE_GUARD`) and `AITER_CONFIG_*`, which the replay points at
+the CSVs it replays. The build sets them and the runtime does not; the
+fingerprint already hashes the arch and CU count, and the key holds the
+config a CSV selects. Only the variables an entry's own
+files name are compared, so a switch for another kernel (`AITER_FLY_AR`, an
+MoE tuning variable) does not invalidate GEMM entries.
+
 For the preshuffle GEMM the recorded set is `gemm_kernels.py`,
 `kernels/preshuffle_gemm.py`, `kernels/kernels_common.py` and
 `ops/triton/__init__.py` (an import side effect, harmless). So:
@@ -193,9 +226,10 @@ For the preshuffle GEMM the recorded set is `gemm_kernels.py`,
 - editing `kernels/preshuffle_gemm.py` rebuilds only the GEMM entries, and
   only when each is next used.
 
-Entries are stored per source version, `<digest>-<sources hash>.{o,json}`.
-Switching a file back (e.g. `git checkout` of another branch and back) finds
-the earlier build again instead of rebuilding it. Old variants are never
+Entries are stored per version of sources and variables,
+`<digest>-<variant hash>.{o,json}`. Switching a file or a variable back (e.g.
+`git checkout` of another branch and back) finds the earlier build again
+instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
@@ -208,7 +242,10 @@ Known holes, and how they are handled:
 |---|---|---|
 | A module-level value read from a file none of whose functions run | `TILE = 64` in `consts.py`, imported by name | `setprofile` sees calls, not attribute reads. Pass the file in `extra_sources`, or run `verify` mode |
 | Code outside the aiter package affects the kernel | a helper in another installed package | Pass it in `extra_sources`, or run `verify` mode |
-| The trace reads state that is neither env nor source | CU count, a global set at runtime, a config file | Put it in `key`. `verify` mode detects it |
+| The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count | Put it in `key`. `verify` mode detects it |
+| A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
+| A variable read outside the build in a shared module | a module-level `os.getenv("X")` in `aiter/jit/` | Name it in kernel code under `aiter/ops/flydsl/`, or pass it in `key`. Today's shared reads are arch, CU count and config paths, all covered |
+| A variable read only by copying the environment | `env = dict(os.environ)` then `env["X"]` | Read it by name |
 | An incomplete hand-written `key` | a forgotten constexpr | The disk digest still covers the argument types. `verify` mode re-exports and compares |
 | A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A load failure rebuilds the entry once |
 
@@ -439,7 +476,8 @@ not converted.
    `fx.Stream`. Constexprs go to the factory (`make_exe`) and into `key`.
 2. **`key` covers the specialization.** Include every constexpr, every
    tensor dtype that can vary, and any trace-time state that is not in the
-   environment or the sources. Examples: CU count, a mode global. Tensor
+   environment or the sources, e.g. a mode global. Arch, CU count and the
+   variables the kernel's files read are tracked already. Tensor
    rank and unit-stride axis are covered by the disk digest. Include them in
    `key` too if they can vary for the same `key`, as the FlyDSL
    compiled-handle rules in `aiter/ops/flydsl/AGENTS.md` require.

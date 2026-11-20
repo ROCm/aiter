@@ -35,10 +35,13 @@ does not support), ``launch`` logs a warning once and runs that key through
 way.
 
 Invalidation has two levels. The directory is named by a fingerprint of the
-toolchain (FlyDSL, HIP, Python, arch) and the code-affecting environment.
-Each entry also records the Python source files that ran while it was built
-(the factory and the trace) with their hashes; a hit whose sources changed is
-rebuilt. Editing one kernel therefore invalidates only the entries that ran it.
+toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
+``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each entry also records the
+Python source files that ran while it was built (the factory and the trace)
+with their hashes, and the environment variables those files name or that
+aiter code read during the build, with their values. A hit whose sources or
+variables changed is rebuilt. Editing one kernel, or setting a variable one
+kernel reads, therefore invalidates only the entries that depend on it.
 
 ``AITER_FLYDSL_AOT_CACHE`` selects the mode:
 
@@ -55,7 +58,9 @@ prebuild writes ship with the package, like its JIT modules.
 
 from __future__ import annotations
 
+import _collections_abc
 import contextlib
+import dis
 import fcntl
 import functools
 import hashlib
@@ -82,7 +87,7 @@ from aiter import logger
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
-_SCHEMA = 3
+_SCHEMA = 4
 _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
@@ -101,6 +106,21 @@ _ENV_IGNORED = {
     "FLYDSL_GPU_ARCH",
 }
 _ENV_EXTRA = ("HSA_OVERRIDE_GFX_VERSION", "COMPILE_OPT_LEVEL")
+# Variables that describe the build rather than the code it makes. The AOT dry
+# run sets them (CU_NUM and GPU_ARCHS to the target, hashed in the fingerprint
+# as _cu_num and _target_arch); recording them per entry would keep the
+# runtime, which leaves them unset, from hitting what the dry run built.
+# AITER_AOT_* are set by setup.py and the replay; AITER_CONFIG_* point the
+# replay at the CSV it replays, and the config it selects is in the key.
+_ENV_SETUP = {"AITER_GPU_ARCHS", "COMPILE_ONLY", "CU_NUM", "GPU_ARCHS"}
+_ENV_SETUP_PREFIXES = ("AITER_AOT_", "AITER_CONFIG_")
+# A string literal read as a variable name: os.environ.get("X"), os.getenv("X"),
+# os.environ["X"], "X" in os.environ.
+_ENV_NAME_RE = re.compile(
+    r"""(?:environ\.get|getenv|environ\.setdefault)\(\s*["']([A-Za-z_]\w*)["']"""
+    r"""|environ\[\s*["']([A-Za-z_]\w*)["']\s*\]"""
+    r"""|["']([A-Za-z_]\w*)["']\s+(?:not\s+)?in\s+os\.environ"""
+)
 
 
 def aot_cache_mode() -> str:
@@ -164,6 +184,25 @@ def _wheel_record(fly_root: Path) -> bytes | None:
     return None
 
 
+def _cu_num() -> int:
+    """CU count of the target, as the kernels' host code sees it.
+
+    ``get_cu_num`` honours ``CU_NUM``, which the AOT dry run sets per tuned row.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    try:
+        return get_cu_num()
+    except Exception:  # noqa: BLE001  no GPU and no CU_NUM: an unknown target
+        return 0
+
+
+def _env_in_fingerprint(name: str) -> bool:
+    """Whether ``fingerprint`` owns ``name``: hashes it or, if in ``_ENV_IGNORED``,
+    knows it changes no code."""
+    return name.startswith(("AITER_FLYDSL_", "FLYDSL_")) or name in _ENV_EXTRA
+
+
 @functools.cache
 def _toolchain_digest() -> str:
     """Hash of the FlyDSL install: its Python sources and native libraries."""
@@ -185,16 +224,16 @@ def fingerprint() -> str:
     """Hash of the toolchain and environment every entry depends on.
 
     It covers FlyDSL (version, Python sources, native libraries), torch HIP,
-    Python, the target arch and the code-affecting environment variables.
-    Changing any of them selects a new cache directory. Kernel sources are
+    Python, the target arch and CU count, and the ``AITER_FLYDSL_*`` /
+    ``FLYDSL_*`` environment variables. Changing any of them selects a new
+    cache directory. Kernel sources and the other variables they read are
     tracked per entry instead (``_record_sources``). Only the FlyDSL hash is
     cached: an AOT build switches arch and environment within one process.
     """
     env_items = sorted(
         (k, v)
         for k, v in os.environ.items()
-        if (k.startswith(("AITER_FLYDSL_", "FLYDSL_")) or k in _ENV_EXTRA)
-        and k not in _ENV_IGNORED
+        if _env_in_fingerprint(k) and k not in _ENV_IGNORED
     )
     parts = [
         _SCHEMA,
@@ -203,6 +242,7 @@ def fingerprint() -> str:
         flydsl.__version__,
         torch.version.hip,
         _target_arch(),
+        _cu_num(),
         _toolchain_digest(),
         env_items,
     ]
@@ -250,18 +290,64 @@ def _file_digest(path: str) -> str | None:
         return None
 
 
+@functools.cache
+def _env_names(path: str) -> frozenset:
+    """Environment variables ``path`` reads by a literal name."""
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return frozenset()
+    return frozenset(n for m in _ENV_NAME_RE.finditer(text) for n in m.groups() if n)
+
+
+# os.getenv, os.environ.get and `in` reach _Environ.__getitem__ through these.
+_ENV_PLUMBING = frozenset({os.__file__, _collections_abc.__file__})
+# The plumbing that reads one variable by name. copy(), items(), dict(os.environ)
+# and the like read every variable; they are not a dependency on each, and
+# recording them would write the whole environment, secrets included, into
+# the entry.
+_ENV_BY_NAME = frozenset({"get", "getenv", "__contains__", "setdefault"})
+
+
+def _subscript(frame) -> bool:
+    """Whether ``frame`` is at ``os.environ[...]``, not a C-level bulk read."""
+    for ins in dis.get_instructions(frame.f_code):
+        if ins.offset == frame.f_lasti:
+            return ins.opname == "BINARY_SUBSCR" or (
+                ins.opname == "BINARY_OP" and ins.argrepr == "[]"
+            )
+    return False
+
+
 @contextlib.contextmanager
-def _record_sources(out: set):
-    """Collect the files of every Python function called in this block.
+def _record_sources(out: set, env: set):
+    """Collect the files of every Python function called in this block, and the
+    environment variables aiter code reads in it.
 
     Run around the factory and the trace, it names the sources the generated
     code can depend on: the kernel, its helpers and any aiter code they call.
+    A variable read under a computed name is caught here; one read at import or
+    inside a cached function is caught only if kernel code names it
+    (``_entry_env``). Reads of the whole environment are not recorded.
     """
     seen = set()
+    reads = set()
+    getitem = os._Environ.__getitem__.__code__
 
     def prof(frame, event, _arg):
-        if event == "call":
-            seen.add(frame.f_code.co_filename)
+        if event != "call":
+            return
+        seen.add(frame.f_code.co_filename)
+        if frame.f_code is getitem:
+            caller = frame.f_back
+            by_name = True
+            while caller is not None and caller.f_code.co_filename in _ENV_PLUMBING:
+                by_name &= caller.f_code.co_name in _ENV_BY_NAME
+                caller = caller.f_back
+            if caller is frame.f_back:
+                by_name = caller is not None and _subscript(caller)
+            if caller is not None and by_name:
+                reads.add((caller.f_code.co_filename, frame.f_locals.get("key")))
 
     old = sys.getprofile()
     sys.setprofile(prof)
@@ -270,10 +356,37 @@ def _record_sources(out: set):
     finally:
         sys.setprofile(old)
         out.update(os.path.realpath(f) for f in seen if _is_tracked(f))
+        env.update(
+            k
+            for f, k in reads
+            if isinstance(k, str) and _is_tracked(os.path.realpath(f))
+        )
 
 
-def _sources_current(sources: dict) -> bool:
-    return all(_file_digest(p) == d for p, d in sources.items())
+def _entry_env(files, read) -> dict:
+    """The variables an entry built from ``files`` depends on, with their values.
+
+    Names are taken from the text of kernel code only (``aiter/ops/flydsl``).
+    Shared modules such as ``aiter/jit/core.py`` name many variables that do
+    not affect a kernel, so for them only the reads seen during the build count.
+    """
+    kernel_root = _tracked_root() + "ops" + os.sep + "flydsl" + os.sep
+    names = set(read).union(
+        *(_env_names(f) for f in files if f.startswith(kernel_root))
+    )
+    return {
+        k: os.environ.get(k)
+        for k in sorted(names)
+        if not _env_in_fingerprint(k)
+        and k not in _ENV_SETUP
+        and not k.startswith(_ENV_SETUP_PREFIXES)
+    }
+
+
+def _entry_current(meta: dict) -> bool:
+    return all(_file_digest(p) == d for p, d in meta["sources"].items()) and all(
+        os.environ.get(k) == v for k, v in meta["env"].items()
+    )
 
 
 @contextlib.contextmanager
@@ -510,11 +623,12 @@ class FlyDSLAotCache:
 
     @staticmethod
     def _find(out_dir: Path, digest: str):
-        """The stem of the variant of ``digest`` built from the current sources.
+        """The stem of the variant of ``digest`` built from the current sources
+        and environment.
 
-        An entry is stored per source version, ``<digest>-<sources hash>``, so
-        switching a kernel file back and forth (e.g. between branches) reuses
-        the earlier build instead of overwriting it.
+        An entry is stored per version of both, ``<digest>-<variant hash>``, so
+        switching a kernel file or a variable back and forth (e.g. between
+        branches) reuses the earlier build instead of overwriting it.
         """
         for sidecar in sorted(out_dir.glob(f"{digest}-*.json")):
             stem = sidecar.with_suffix("")
@@ -522,7 +636,7 @@ class FlyDSLAotCache:
                 meta = json.loads(sidecar.read_text())
             except (OSError, ValueError):
                 continue
-            if stem.with_suffix(".o").exists() and _sources_current(meta["sources"]):
+            if stem.with_suffix(".o").exists() and _entry_current(meta):
                 return stem
         return None
 
@@ -532,16 +646,18 @@ class FlyDSLAotCache:
         tmp = Path(tempfile.mkdtemp(dir=out_dir, prefix=".tmp-"))
         try:
             files = set(self._extra)
-            with _record_sources(files):
+            read = set()
+            with _record_sources(files, read):
                 exe = make_exe()
                 tmp_obj = _export(exe, args, tmp, sym)
             # Hashed now, not from the per-process cache: the build read the
             # files as they are on disk at this point.
             _file_digest.cache_clear()
+            _env_names.cache_clear()
             sources = {f: _file_digest(f) for f in sorted(files)}
-            meta = {"sources": sources}
-            src_hash = hashlib.sha256(json.dumps(sources).encode()).hexdigest()[:12]
-            stem = out_dir / f"{digest}-{src_hash}"
+            meta = {"sources": sources, "env": _entry_env(files, read)}
+            variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
+            stem = out_dir / f"{digest}-{variant}"
             sidecar = tmp / "meta.json"
             sidecar.write_text(json.dumps(meta, indent=1))
             # The object is published last; _find needs both files.

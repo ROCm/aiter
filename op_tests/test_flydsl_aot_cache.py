@@ -19,6 +19,10 @@ must have taken the path it names: a miss exports an ``.o``/``.json`` pair per
 entry, a hit neither traces nor writes, and no mode falls back to the JIT. The
 test skips with a FlyDSL that has no ``flyc.load_module``, where every mode
 would run the JIT.
+
+It also checks invalidation by what an entry was built under: a variable the
+build read and the CU count each select another build, and restoring the
+variable finds the first one again.
 """
 
 import argparse
@@ -39,7 +43,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -53,6 +57,8 @@ CASES = {
 DTYPES = {"fp8": dtypes.fp8, "int8": dtypes.i8}
 # mode name -> {((m, n, k), qdtype): record}, filled by main()
 RESULTS = {}
+# Read while building, as a kernel reads a tuning switch.
+TEST_ENV = "AITER_TEST_AOT_CACHE_VARIANT"
 
 
 def make_inputs(m, n, k, qdtype):
@@ -94,6 +100,8 @@ def child(cases):
     def counting_compile_fn():
         nonlocal traces
         traces += 1
+        os.environ.get(TEST_ENV)
+        dict(os.environ)  # a bulk read must not be recorded
         return compile_fn()
 
     gemm_kernels._get_compile_fn = counting_compile_fn
@@ -131,11 +139,12 @@ def child(cases):
     print("STATE " + json.dumps(state), flush=True)
 
 
-def run_mode(mode, cache_dir, cases):
+def run_mode(mode, cache_dir, cases, extra_env=None):
     env = {
         **os.environ,
         "AITER_FLYDSL_AOT_CACHE": mode,
         "AITER_FLYDSL_AOT_CACHE_DIR": cache_dir,
+        **(extra_env or {}),
     }
     arg = json.dumps([[list(s), q] for s, q in cases])
     proc = subprocess.run(
@@ -184,6 +193,9 @@ def check_paths(cache_dir, cases):
     sidecars = {p[: -len(".json")] for p in built if p.endswith(".json")}
     assert len(objects) == entries, f"{entries} entries, objects: {sorted(objects)}"
     assert objects == sidecars, f"unpaired entries: {sorted(objects ^ sidecars)}"
+    for p in sidecars:
+        env = json.loads(Path(p + ".json").read_text())["env"]
+        assert env == {TEST_ENV: None}, f"{p}.json records {sorted(env)}"
 
     RESULTS["aot hit"], state = run_mode("1", cache_dir, cases)
     expected = {"entries": entries, "jit": 0, "builds": 0, "traces": 0}
@@ -193,6 +205,14 @@ def check_paths(cache_dir, cases):
     RESULTS["aot verify"], state = run_mode("verify", cache_dir, cases)
     assert state["jit"] == 0 and state["builds"] == 0, f"aot verify: {state}"
     assert cache_files(cache_dir) == built, "aot verify rewrote the AOT cache"
+
+    rebuilt = {**expected, "builds": entries, "traces": entries}
+    _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
+    assert state == rebuilt, f"a variable the build read did not rebuild: {state}"
+    _, state = run_mode("1", cache_dir, cases)
+    assert state == expected, f"restoring the variable did not hit: {state}"
+    _, state = run_mode("1", cache_dir, cases, {"CU_NUM": str(get_cu_num() + 1)})
+    assert state == rebuilt, f"another CU count did not rebuild: {state}"
 
 
 @benchmark()
