@@ -1,52 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Benchmark aiter.ops.triton.conv.conv2d.
+"""Benchmark Triton Conv2D with rotating buffers and graph replay.
 
-Two modes:
-- Single-shape (pass --N --C --H --W --K --R --S [--stride ...] etc.)
-  Bench one shape and emit a single key=value result line. Useful for
-  ad-hoc one-off measurements or scripting around a specific shape.
-- Sweep (no --N). Iterates either the built-in default shape list or the
-  conv2d shapes for a model in --model-configs (default
-  utils/conv_shapes.json; pick a model with --model NAME), and prints
-  three box-drawn tables at the end:
-    1. LAYER-BY-LAYER BENCHMARK   (per-layer Tri vs Torch + correctness)
-    2. MIOpen SOLVER SUMMARY      (only when --miopen-solvers is passed)
-    3. OVERALL PERFORMANCE        (mean/median/aggregate TFLOPS, layer wins)
-
-Each shape is timed with triton.testing.do_bench against
-torch.nn.functional.conv2d as the reference backend (MIOpen on AMD), using
-F.pad before the reference convolution for nonzero padding modes,
-and a correctness check compares the Triton output against F.conv2d
-within the same tolerance model the test suite uses.
-
-The selected Triton kernel name is captured for every shape. The MIOpen
-solver name is captured only when --miopen-solvers is passed, because
-detection requires a separate subprocess with MIOPEN_LOG_LEVEL=6 (~60s
-fixed startup cost).
-
-Nonzero padding modes and --end-to-end time the public call, including padding,
-layout conversion, and activation packing. Weight packs remain cached across
-iterations. Without either option, zero-mode timings retain the legacy
-kernel-only primary metric and optional kernel+repack comparison for NCHW.
-
-No model loading at runtime — model shapes come from the pre-extracted
-conv_shapes.json: each conv layer's (N,C,H,W,K,R,S,stride,pad,dilation) was
-captured offline once per model via forward hooks, deduped, and frozen here.
+Channel-blocked routes report input packing excluded and included by default.
+Nonzero padding modes and --end-to-end time the full GPU call.
+Weight preparation is excluded. Correctness checks belong in unit tests.
+Single-shape mode emits key=value fields and a final primary metric.
 """
 
 import argparse
+import functools
 import json
 import os
-import re
 import statistics
-import subprocess
-import sys
 
 import torch
-import torch.nn.functional as F
-import triton
 
+from aiter import logger
 from aiter.ops.triton.conv._prepack import (
     clear_conv2d_weight_pack_caches,
     prepack_nchw_to_cblocked,
@@ -69,13 +39,18 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3_cblocked,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import BASE_DIR
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.conv._helpers import (
-    _winograd_tolerances,
-    dynamic_conv_tolerances,
+    generate_conv_input,
+    generate_conv_weights,
 )
 
 
@@ -94,7 +69,7 @@ def which_kernel(
 ):
     """Predict the routed kernel without launching it.
 
-    Use shared padding geometry and dispatch rules for labels and tolerances.
+    Use shared padding geometry and dispatch rules for labels.
     """
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
@@ -148,39 +123,12 @@ EDGE_CASE_SHAPES = [
 ]
 
 
-# MIOpen solver names → human-readable algorithm types (matches old suite.py).
-MIOPEN_ALGO_MAP = {
-    "ConvWinoFuryRxS<2-3>": "Winograd Fury F(2,3)",
-    "ConvBinWinogradRxSf3x2": "Winograd F(3x3,2x2) binary",
-    "GemmFwd1x1_0_1": "GEMM (no workspace)",
-    "GemmFwdRest": "GEMM fallback",
-}
-
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-
-
 def _torch_dtype(s: str) -> torch.dtype:
     if s == "fp16":
         return torch.float16
     if s == "bf16":
         return torch.bfloat16
     raise ValueError(f"unsupported dtype: {s}")
-
-
-def _check_close(got, ref, dtype, K_red, is_winograd: bool) -> bool:
-    """Tolerance-aware correctness check (same model as the pytest suite)."""
-    if is_winograd:
-        rtol, atol = _winograd_tolerances(dtype, K_red, "f4x3")
-    else:
-        rtol, atol = dynamic_conv_tolerances(dtype, K_red)
-    try:
-        torch.testing.assert_close(got.float(), ref.float(), rtol=rtol, atol=atol)
-        return True
-    except AssertionError:
-        return False
 
 
 def _kernel_type_tag(R: int, S: int, dilation: tuple) -> str:
@@ -193,140 +141,6 @@ def _kernel_type_tag(R: int, S: int, dilation: tuple) -> str:
 
 def _shape_str(N, C, H, W, K, R, S) -> str:
     return f"({N},{C},{H},{W})→{K}/{R}x{S}"
-
-
-# ----------------------------------------------------------------------------
-# MIOpen solver detection (subprocess-based, opt-in via --miopen-solvers)
-# ----------------------------------------------------------------------------
-
-
-_miopen_solver_cache: dict = {}
-
-
-def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
-    """Detect MIOpen solver per shape via a single subprocess.
-
-    Spawns Python with MIOPEN_LOG_LEVEL=6, runs F.conv2d for each shape,
-    and parses stderr for "Chosen Algorithm:" lines. SHAPE_DONE markers
-    on stderr disambiguate which "Chosen Algorithm" line belongs to which
-    shape (positional alignment is unreliable when MIOpen logs vary).
-
-    Cache populated as a side effect. Use _get_miopen_solver to read.
-    """
-
-    unique = []
-    seen = set()
-    for entry in shapes:
-        N, C, H, W, K, R, S, stride, padding, dilation = entry[:10]
-        s_h, s_w = stride if isinstance(stride, tuple) else (stride, stride)
-        p_h, p_w = padding if isinstance(padding, tuple) else (padding, padding)
-        d_h, d_w = dilation if isinstance(dilation, tuple) else (dilation, dilation)
-        key = (N, C, H, W, K, R, S, s_h, s_w, p_h, p_w, d_h, d_w)
-        if key not in seen:
-            seen.add(key)
-            unique.append(key)
-    if not unique:
-        return
-
-    dtype_str = {
-        torch.float16: "torch.float16",
-        torch.bfloat16: "torch.bfloat16",
-    }.get(dtype, "torch.float16")
-
-    lines = [
-        "import os, sys",
-        "os.environ['MIOPEN_LOG_LEVEL']='6'",
-        "import torch, torch.nn.functional as F",
-    ]
-    for i, (N, C, H, W, K, R, S, s_h, s_w, p_h, p_w, d_h, d_w) in enumerate(unique):
-        lines.append(f"# shape {i}")
-        lines.append(f"x=torch.randn({N},{C},{H},{W},device='cuda',dtype={dtype_str})")
-        lines.append(f"w=torch.randn({K},{C},{R},{S},device='cuda',dtype={dtype_str})")
-        lines.append(
-            f"F.conv2d(x,w,None,stride=({s_h},{s_w}),padding=({p_h},{p_w}),dilation=({d_h},{d_w}))"
-        )
-        lines.append("torch.cuda.synchronize()")
-        lines.append(f"sys.stderr.write('SHAPE_DONE:{i}\\n');sys.stderr.flush()")
-    script = "\n".join(lines)
-
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={**os.environ, "MIOPEN_LOG_LEVEL": "6"},
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        print(
-            f"[miopen-detect] WARNING: subprocess timed out after 120s; "
-            f"MIOpen solver column will be empty for {len(unique)} shape(s).",
-            file=sys.stderr,
-        )
-        return
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[miopen-detect] WARNING: subprocess failed ({e!r}); "
-            f"MIOpen solver column will be empty.",
-            file=sys.stderr,
-        )
-        return
-
-    if result.returncode != 0:
-        tail = "\n".join(result.stderr.strip().split("\n")[-5:])
-        print(
-            f"[miopen-detect] WARNING: subprocess exited with code "
-            f"{result.returncode}; MIOpen solver column will be empty.\n"
-            f"  Last stderr lines:\n{tail}",
-            file=sys.stderr,
-        )
-        return
-
-    pending: str | None = None
-    attributed: dict = {}
-    orphan = 0
-    shape_done_re = re.compile(r"^SHAPE_DONE:(\d+)\s*$")
-    chosen_re = re.compile(r"Chosen Algorithm:\s*(\S+)")
-    for line in result.stderr.split("\n"):
-        m = chosen_re.search(line)
-        if m:
-            pending = m.group(1).strip(" ,")
-            continue
-        m = shape_done_re.match(line)
-        if m:
-            idx = int(m.group(1))
-            if pending is not None:
-                attributed[idx] = pending
-            else:
-                orphan += 1
-            pending = None
-    for idx, solver in attributed.items():
-        _miopen_solver_cache[unique[idx]] = solver
-
-    missing = len(unique) - len(attributed)
-    if missing > 0:
-        print(
-            f"[miopen-detect] WARNING: {missing}/{len(unique)} shape(s) have no "
-            f"MIOpen solver detected ({orphan} marker(s) had no preceding "
-            f"'Chosen Algorithm' line). Common causes: MIOpen log format changed, "
-            f"MIOPEN_LOG_LEVEL was overridden, or the shape failed in the subprocess.",
-            file=sys.stderr,
-        )
-
-
-def _get_miopen_solver(N, C, H, W, K, R, S, stride, padding, dilation) -> str:
-    s_h, s_w = stride if isinstance(stride, tuple) else (stride, stride)
-    p_h, p_w = padding if isinstance(padding, tuple) else (padding, padding)
-    d_h, d_w = dilation if isinstance(dilation, tuple) else (dilation, dilation)
-    return _miopen_solver_cache.get(
-        (N, C, H, W, K, R, S, s_h, s_w, p_h, p_w, d_h, d_w), ""
-    )
-
-
-# ----------------------------------------------------------------------------
-# Per-shape bench (returns rich dict)
-# ----------------------------------------------------------------------------
 
 
 def bench_one_shape(
@@ -347,174 +161,139 @@ def bench_one_shape(
     measure_repack: bool = True,
     padding_mode: str = "zeros",
     end_to_end: bool = False,
+    bencher: RotatingBufferBench | None = None,
 ) -> dict:
-    """Time + correctness-check one shape. Returns a dict with full metadata.
+    """Time one shape with fixed weights and rotating activations.
 
-    Keys: ms_tri, ms_torch, ms_tri_e2e (or None), tflops_tri, tflops_torch,
-    tflops_tri_e2e (or None), correct, kernel_name, has_repack, flops,
-    padding_mode, timing_scope, torch_conv_layout.
-
-    Nonzero padding modes imply end_to_end: ms_tri times the public call,
-    including padding, layout conversion, and activation packing. Otherwise,
-    ms_tri retains legacy kernel-only timing; measure_repack additionally times
-    the public call for NCHW non-1x1 shapes. Weight packs remain warm in both modes.
+    Channel-blocked routes report input packing excluded and included by default.
+    Nonzero padding modes or end_to_end time padding, layout, and input packing.
+    All measurements exclude weight preparation and CPU dispatch.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available; conv2d bench requires a GPU.")
-
+    if method not in METHODS:
+        raise ValueError(f"unknown method: {method}; choices: {list(METHODS)}")
     _validate_conv2d_padding_mode(padding_mode, H, W, padding)
     end_to_end = end_to_end or padding_mode != "zeros"
-    P, Q = _out_hw(H, W, R, S, stride, padding, dilation)
-    if P < 1 or Q < 1:
-        raise ValueError(
-            f"output spatial dims < 1 for shape "
-            f"N={N} C={C} H={H} W={W} K={K} R={R} S={S} "
-            f"stride={stride} padding={padding} dilation={dilation}"
+    output_height, output_width = _out_hw(H, W, R, S, stride, padding, dilation)
+    if output_height < 1 or output_width < 1:
+        raise ValueError("output spatial dimensions must be positive")
+
+    effective_layout = "nhwc" if layout == "nhwc" or method == "nhwc" else "nchw"
+    kernel_fn = conv2d_nhwc if effective_layout == "nhwc" else METHODS[method]
+    if method in ("auto", "default", "nhwc") or effective_layout == "nhwc":
+        routed_height, routed_width, routed_padding = _conv2d_padding_geometry(
+            H, W, padding, padding_mode
         )
-
-    device = "cuda"
-    x = torch.randn((N, C, H, W), device=device, dtype=dtype)
-    w = torch.randn((K, C, R, S), device=device, dtype=dtype)
-    b = torch.randn((K,), device=device, dtype=dtype) if bias else None
-
-    if layout == "nhwc":
-        x_in = x.to(memory_format=torch.channels_last)
-        kernel_fn = conv2d_nhwc
-    else:
-        x_in = x
-        if method not in METHODS:
-            raise ValueError(f"unknown method: {method}; choices: {list(METHODS)}")
-        kernel_fn = METHODS[method]
-
-    def run_triton():
-        return kernel_fn(
-            x_in,
-            w,
-            b,
+        kernel_name = _resolve_route(
+            R,
+            S,
             stride,
-            padding,
             dilation,
-            activation="none",
-            padding_mode=padding_mode,
-        )
-
-    def prepare_torch_input():
-        if padding_mode == "zeros":
-            return x_in
-        pad_height, pad_width = padding
-        return F.pad(
-            x_in, (pad_width, pad_width, pad_height, pad_height), mode=padding_mode
-        )
-
-    torch_padding = padding if padding_mode == "zeros" else (0, 0)
-
-    def run_torch(source=None):
-        if source is None:
-            source = prepare_torch_input()
-        return F.conv2d(source, w, b, stride, torch_padding, dilation)
-
-    # One run for correctness. The routed-kernel name is queried separately via
-    # which_kernel (no global side-channel); forced --methods name the kernel
-    # directly, so for those we use the method string (its winograd/cblocked
-    # substrings drive the checks below).
-    y_tri = run_triton()
-    torch.cuda.synchronize()
-    if method in ("auto", "default", "nhwc") or layout == "nhwc":
-        kernel_name = which_kernel(
-            x_in,
-            w,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            layout="nhwc" if method == "nhwc" else layout,
-            padding_mode=padding_mode,
-        )
+            N,
+            C,
+            routed_height,
+            routed_width,
+            K,
+            effective_layout,
+            padding=routed_padding,
+        ).value
     else:
         kernel_name = method
-    is_winograd = "winograd" in kernel_name.lower() or "wino" in kernel_name.lower()
-
-    torch_input = prepare_torch_input()
-    torch_conv_layout = (
-        "nhwc"
-        if torch_input.is_contiguous(memory_format=torch.channels_last)
-        else "nchw"
-    )
-    y_ref = run_torch(torch_input)
-    del torch_input
-    correct = _check_close(
-        y_tri, y_ref, dtype, K_red=C * R * S, is_winograd=is_winograd
-    )
-
     packs_input = "cblocked" in kernel_name.lower()
-    if packs_input and not end_to_end:
-        x_blocked_pre, _ = prepack_nchw_to_cblocked(x_in, BLOCK_K)
-        cblk_fn = (
-            conv2d_winograd_f4x3_cblocked
-            if "winograd" in kernel_name.lower()
-            else conv2d_nchw_cblocked
-        )
+    has_repack = not end_to_end and measure_repack and packs_input
+    if bencher is None:
+        bencher = RotatingBufferBench()
 
-        def run_triton_kernel_only():
-            return cblk_fn(
-                x_in,
-                w,
-                b,
+    input_generator = functools.partial(
+        generate_conv_input, (N, C, H, W), dtype, effective_layout
+    )
+    weight_generator = functools.partial(
+        generate_conv_weights, (K, C, R, S), dtype, bias
+    )
+    timings = {}
+    for include_packing in ([False, True] if has_repack else [False]):
+        prepacked = packs_input and not (include_packing or end_to_end)
+        selected_fn = kernel_fn
+        if prepacked:
+            selected_fn = (
+                conv2d_winograd_f4x3_cblocked
+                if "winograd" in kernel_name.lower()
+                else conv2d_nchw_cblocked
+            )
+
+        def invoke(
+            input_tensor,
+            weight,
+            bias,
+            x_blocked=None,
+            prepacked=prepacked,
+            selected_fn=selected_fn,
+        ):
+            kwargs = {"x_blocked": x_blocked} if prepacked else {}
+            return selected_fn(
+                input_tensor,
+                weight,
+                bias,
                 stride,
                 padding,
                 dilation,
                 activation="none",
-                x_blocked=x_blocked_pre,
+                padding_mode=padding_mode,
+                **kwargs,
             )
 
-        ms_tri = triton.testing.do_bench(run_triton_kernel_only, warmup=15, rep=50)
-    else:
-        ms_tri = triton.testing.do_bench(run_triton, warmup=15, rep=50)
+        fixed_generators = [weight_generator]
+        fixed_keys = [("weight", "bias")]
+        rotating_generator = input_generator
+        rotating_keys = ("input_tensor",)
+        if prepacked:
+            fixed_generators.append(input_generator)
+            fixed_keys.append(("input_tensor",))
 
-    ms_th = triton.testing.do_bench(run_torch, warmup=15, rep=50)
+            def rotating_generator():
+                (input_tensor,) = input_generator()
+                packed_input, _ = prepack_nchw_to_cblocked(input_tensor, BLOCK_K)
+                return (packed_input,)
 
-    has_repack = (
-        not end_to_end
-        and measure_repack
-        and layout != "nhwc"
-        and not _is_1x1_conv(R, S, dilation)
-    )
-    if has_repack:
-        ms_tri_e2e = triton.testing.do_bench(run_triton, warmup=15, rep=50)
-    else:
-        ms_tri_e2e = None
+            rotating_keys = ("x_blocked",)
 
-    flops = flops_conv(N, C, K, R, S, P, Q)
-    tflops_tri = flops / (ms_tri * 1e-3) / 1e12
-    tflops_th = flops / (ms_th * 1e-3) / 1e12
-    tflops_tri_e2e = flops / (ms_tri_e2e * 1e-3) / 1e12 if ms_tri_e2e else None
+        try:
+            bencher.build_pool(
+                [rotating_generator],
+                [rotating_keys],
+                inp_gen_fixed_fns=fixed_generators,
+                inp_fixed_keys=fixed_keys,
+            )
+            timings[include_packing] = bencher.bench(invoke)
+        finally:
+            bencher.rot_bufs = None
+            clear_conv2d_weight_pack_caches()
+            torch.cuda.empty_cache()
 
+    milliseconds = timings[False]
+    milliseconds_with_packing = timings.get(True)
+    flops = flops_conv(N, C, K, R, S, output_height, output_width)
     return {
-        "ms_tri": ms_tri,
-        "ms_torch": ms_th,
-        "ms_tri_e2e": ms_tri_e2e,
-        "tflops_tri": tflops_tri,
-        "tflops_torch": tflops_th,
-        "tflops_tri_e2e": tflops_tri_e2e,
-        "correct": correct,
+        "ms_tri": milliseconds,
+        "ms_tri_e2e": milliseconds_with_packing,
+        "tflops_tri": flops / milliseconds * 1e-9,
+        "tflops_tri_e2e": (
+            flops / milliseconds_with_packing * 1e-9
+            if milliseconds_with_packing is not None
+            else None
+        ),
         "kernel_name": kernel_name,
         "has_repack": has_repack,
         "flops": flops,
+        "weight_policy": "fixed",
         "padding_mode": padding_mode,
         "timing_scope": "end_to_end" if end_to_end else "kernel",
-        "torch_conv_layout": torch_conv_layout,
     }
 
 
-# ----------------------------------------------------------------------------
-# Single-shape mode (used by bench_models.py)
-# ----------------------------------------------------------------------------
-
-
 def _format_single_shape_line(args, result: dict) -> str:
-    """Single-line key=value output for bench_models.py to parse.
-
-    Last whitespace-separated token is the primary metric value.
-    """
+    """Format key=value fields followed by the primary metric."""
     primary = result["ms_tri"] if args.metric == "time" else result["tflops_tri"]
     parts = [
         f"N={args.N}",
@@ -528,13 +307,17 @@ def _format_single_shape_line(args, result: dict) -> str:
         f"layout={args.layout}",
         f"padding_mode={result['padding_mode']}",
         f"timing_scope={result['timing_scope']}",
-        f"torch_conv_layout={result['torch_conv_layout']}",
         f"ms_tri={result['ms_tri']:.4f}",
-        f"ms_torch={result['ms_torch']:.4f}",
         f"tflops_tri={result['tflops_tri']:.4f}",
-        f"tflops_torch={result['tflops_torch']:.4f}",
-        f"correct={int(result['correct'])}",
     ]
+    parts.append("weight_policy=fixed")
+    if result["has_repack"]:
+        parts.extend(
+            [
+                f"ms_tri_e2e={result['ms_tri_e2e']:.4f}",
+                f"tflops_tri_e2e={result['tflops_tri_e2e']:.4f}",
+            ]
+        )
     if args.show_kernel_name:
         parts.append(f"kernel={result['kernel_name'] or 'unknown'}")
     parts.append(f"{primary:.4f}")
@@ -542,37 +325,29 @@ def _format_single_shape_line(args, result: dict) -> str:
 
 
 def run_single_shape(args) -> None:
-    dtype = _torch_dtype(args.dtype)
-    stride = (args.stride_h, args.stride_w)
-    padding = (args.pad_h, args.pad_w)
-    dilation = (args.dilation_h, args.dilation_w)
-    # Single-shape mode (bench_models.py consumer): skip kernel+repack timing
-    # to keep per-call cost predictable for the framework.
-    try:
-        result = bench_one_shape(
-            args.N,
-            args.C,
-            args.H,
-            args.W,
-            args.K,
-            args.R,
-            args.S,
-            stride,
-            padding,
-            dilation,
-            dtype,
-            args.method,
-            args.layout,
-            bias=not args.no_bias,
-            measure_repack=False,
-            padding_mode=args.padding_mode,
-            end_to_end=args.end_to_end,
-        )
-        print(_format_single_shape_line(args, result))
-    finally:
-        clear_conv2d_weight_pack_caches()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+    result = bench_one_shape(
+        args.N,
+        args.C,
+        args.H,
+        args.W,
+        args.K,
+        args.R,
+        args.S,
+        (args.stride_h, args.stride_w),
+        (args.pad_h, args.pad_w),
+        (args.dilation_h, args.dilation_w),
+        _torch_dtype(args.dtype),
+        args.method,
+        args.layout,
+        bias=not args.no_bias,
+        padding_mode=args.padding_mode,
+        end_to_end=args.end_to_end,
+        bencher=bencher,
+    )
+    logger.info("%s", _format_single_shape_line(args, result))
 
 
 # ----------------------------------------------------------------------------
@@ -616,158 +391,82 @@ def _box_table(headers, rows, align: list | None = None) -> str:
     return "\n".join(lines)
 
 
-def _print_layer_table(
-    layers: list, has_any_repack: bool, miopen_enabled: bool
-) -> None:
-    print("\n" + "=" * 80)
-    print("LAYER-BY-LAYER BENCHMARK")
-    print("=" * 80)
-
-    headers = ["#", "Layer", "Type", "Shape"]
-    if miopen_enabled:
-        headers.append("MIOpen Solver")
-    headers.append("Triton Kernel")
-    end_to_end = layers[0]["timing_scope"] == "end_to_end"
-    headers.append("Tri End-to-End TF/s" if end_to_end else "Tri Kernel TF/s")
+def _print_layer_table(layers: list, has_any_repack: bool) -> None:
+    logger.info("\nLAYER-BY-LAYER BENCHMARK")
+    primary_label = (
+        "GPU end-to-end"
+        if layers[0]["timing_scope"] == "end_to_end"
+        else "Packing excluded"
+    )
+    headers = ["#", "Layer", "Type", "Shape", "Triton Kernel", f"{primary_label} TF/s"]
     if has_any_repack:
-        headers.append("Tri Kernel+Repack TF/s")
-    headers.append("Torch End-to-End TF/s" if end_to_end else "Torch TF/s")
-    headers.extend(["Torch Input Layout", "Winner"])
-
+        headers.append("Packing included TF/s")
     rows = []
-    for i, lr in enumerate(layers):
-        row = [str(i), lr["name"], lr["type"], lr["shape"]]
-        if miopen_enabled:
-            row.append(lr["miopen_solver"] or "—")
-        row.append(lr["kernel_name"] or "—")
-        row.append(f"{lr['tflops_tri']:.2f}")
+    for index, layer in enumerate(layers):
+        row = [
+            str(index),
+            layer["name"],
+            layer["type"],
+            layer["shape"],
+            layer["kernel_name"],
+            f"{layer['tflops_tri']:.2f}",
+        ]
         if has_any_repack:
-            row.append(
-                f"{lr['tflops_tri_e2e']:.2f}"
-                if lr["tflops_tri_e2e"] is not None
-                else "—"
-            )
-        row.append(f"{lr['tflops_torch']:.2f}")
-        row.append(lr["torch_conv_layout"])
-        row.append("Triton" if lr["tflops_tri"] > lr["tflops_torch"] else "Torch")
+            value = layer["tflops_tri_e2e"]
+            row.append(f"{value:.2f}" if value is not None else "—")
         rows.append(row)
-
-    print(_box_table(headers, rows))
-
-
-def _print_miopen_solver_table(layers: list) -> None:
-    """Group layers by MIOpen solver, print one row per solver."""
-    from collections import OrderedDict
-
-    solver_layers: dict = OrderedDict()
-    for i, lr in enumerate(layers):
-        s = lr.get("miopen_solver") or "unknown"
-        solver_layers.setdefault(s, []).append(f"L{i}")
-
-    if not any(s != "unknown" for s in solver_layers):
-        return  # Nothing detected; skip the table entirely.
-
-    print("\n" + "=" * 80)
-    print("MIOpen SOLVER SUMMARY")
-    print("=" * 80)
-
-    rows = []
-    for solver, ls in solver_layers.items():
-        algo = MIOPEN_ALGO_MAP.get(solver, solver)
-        layer_str = ", ".join(ls)
-        if len(layer_str) > 80:
-            layer_str = ", ".join(ls[:10]) + f" ... ({len(ls)} layers total)"
-        rows.append([solver, algo, layer_str])
-    print(_box_table(("MIOpen Solver", "Algorithm Type", "Used For"), rows))
+    logger.info("\n%s", _box_table(headers, rows))
 
 
 def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
-    """Mean/median/aggregate TFLOPS, total time, layer wins."""
-    print("\n" + "=" * 80)
-    print("OVERALL PERFORMANCE")
-    print("=" * 80)
-
-    scope = "end-to-end" if layers[0]["timing_scope"] == "end_to_end" else "kernel"
-    tri_tf = [lr["tflops_tri"] for lr in layers]
-    th_tf = [lr["tflops_torch"] for lr in layers]
-    tri_ms = [lr["ms_tri"] for lr in layers]
-    th_ms = [lr["ms_torch"] for lr in layers]
-
-    # Aggregate = sum(flops) / sum(time)
-    sum_flops = sum(lr["flops"] for lr in layers)
-    sum_time_tri = sum(lr["ms_tri"] * 1e-3 for lr in layers)
-    sum_time_th = sum(lr["ms_torch"] * 1e-3 for lr in layers)
-    agg_tri = sum_flops / sum_time_tri / 1e12 if sum_time_tri else 0.0
-    agg_th = sum_flops / sum_time_th / 1e12 if sum_time_th else 0.0
-
-    n = len(layers)
-    tri_wins = sum(1 for lr in layers if lr["tflops_tri"] > lr["tflops_torch"])
-
-    rows = [
-        [
-            f"Mean TFLOPS ({scope})",
-            f"{statistics.mean(tri_tf):.2f}",
-            f"{statistics.mean(th_tf):.2f}",
-        ],
-    ]
+    logger.info("\nOVERALL PERFORMANCE")
+    total_flops = sum(layer["flops"] for layer in layers)
+    rows = []
+    primary_label = (
+        "GPU end-to-end"
+        if layers[0]["timing_scope"] == "end_to_end"
+        else "Packing excluded"
+    )
+    modes = [(primary_label, "ms_tri", "tflops_tri")]
     if has_any_repack:
-        e2e_tf = [
+        modes.append(("Packing included", "ms_tri_e2e", "tflops_tri_e2e"))
+    for label, time_key, throughput_key in modes:
+        times = [
+            layer[time_key] if layer[time_key] is not None else layer["ms_tri"]
+            for layer in layers
+        ]
+        throughputs = [
             (
-                lr["tflops_tri_e2e"]
-                if lr["tflops_tri_e2e"] is not None
-                else lr["tflops_tri"]
+                layer[throughput_key]
+                if layer[throughput_key] is not None
+                else layer["tflops_tri"]
             )
-            for lr in layers
+            for layer in layers
         ]
-        e2e_ms = [
-            lr["ms_tri_e2e"] if lr["ms_tri_e2e"] is not None else lr["ms_tri"]
-            for lr in layers
-        ]
-        sum_time_e2e = sum(t * 1e-3 for t in e2e_ms)
-        agg_tri_e2e = sum_flops / sum_time_e2e / 1e12 if sum_time_e2e else 0.0
-        e2e_wins = sum(1 for lr, ee in zip(layers, e2e_tf) if ee > lr["tflops_torch"])
+        total_ms = sum(times)
+        aggregate = total_flops / total_ms * 1e-9 if total_ms else 0.0
         rows.append(
             [
-                "Mean TFLOPS (kernel+repack)",
-                f"{statistics.mean(e2e_tf):.2f}",
-                f"{statistics.mean(th_tf):.2f}",
+                label,
+                f"{statistics.mean(throughputs):.2f}",
+                f"{statistics.median(throughputs):.2f}",
+                f"{aggregate:.2f}",
+                f"{total_ms:.4f}",
             ]
         )
-    rows.append(
-        [
-            f"Median TFLOPS ({scope})",
-            f"{statistics.median(tri_tf):.2f}",
-            f"{statistics.median(th_tf):.2f}",
-        ]
+    logger.info(
+        "\n%s",
+        _box_table(
+            (
+                "Measurement",
+                "Mean TFLOPS",
+                "Median TFLOPS",
+                "Aggregate TFLOPS",
+                "Total ms",
+            ),
+            rows,
+        ),
     )
-    if has_any_repack:
-        rows.append(
-            [
-                "Median TFLOPS (kernel+repack)",
-                f"{statistics.median(e2e_tf):.2f}",
-                f"{statistics.median(th_tf):.2f}",
-            ]
-        )
-    rows.append([f"Aggregate TFLOPS ({scope})", f"{agg_tri:.2f}", f"{agg_th:.2f}"])
-    if has_any_repack:
-        rows.append(
-            ["Aggregate TFLOPS (kernel+repack)", f"{agg_tri_e2e:.2f}", f"{agg_th:.2f}"]
-        )
-    rows.append([f"Total {scope} time (ms)", f"{sum(tri_ms):.2f}", f"{sum(th_ms):.2f}"])
-    if has_any_repack:
-        rows.append(
-            ["Total kernel+repack time (ms)", f"{sum(e2e_ms):.2f}", f"{sum(th_ms):.2f}"]
-        )
-    rows.append([f"Layer wins ({scope})", f"{tri_wins}/{n}", f"{n - tri_wins}/{n}"])
-    if has_any_repack:
-        rows.append(
-            ["Layer wins (kernel+repack)", f"{e2e_wins}/{n}", f"{n - e2e_wins}/{n}"]
-        )
-    rows.append(
-        ["Correctness", f"{sum(1 for lr in layers if lr['correct'])}/{n} passed", "—"]
-    )
-
-    print(_box_table(("Metric", "Triton", "PyTorch (MIOpen)"), rows))
 
 
 # ----------------------------------------------------------------------------
@@ -824,61 +523,57 @@ def _load_model_shapes(model_pattern: str, config_path: str) -> tuple[str, list]
 
 
 def run_sweep(args) -> None:
-    """Iterate the chosen shape set, then print three summary tables."""
+    """Measure a shape sweep and report Triton-only results."""
     dtype = _torch_dtype(args.dtype)
-
     if args.smoke:
         shapes = EDGE_CASE_SHAPES
-        print(
-            f"# Sweep source: EDGE_CASE_SHAPES ({len(shapes)} shapes) — smoke / "
-            "degenerate-path coverage, NOT representative of production workloads"
-        )
+        logger.info("Sweep source: edge cases (%s shapes)", len(shapes))
     else:
-        # Default: real-model sweep. --model picks one; absent → resnet50.
-        model_name = args.model if args.model else "resnet50"
-        try:
-            model, shapes = _load_model_shapes(model_name, args.model_configs)
-            label = f":: {model} ({len(shapes)} layers)"
-            if not args.model:
-                label += "  (default — pass --model X or --smoke to change)"
-            print(f"# Sweep source: {args.model_configs} {label}")
-        except (FileNotFoundError, ValueError) as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            sys.exit(1)
-
+        model, shapes = _load_model_shapes(args.model or "resnet50", args.model_configs)
+        logger.info(
+            "Sweep source: %s :: %s (%s layers)", args.model_configs, model, len(shapes)
+        )
     if args.batch_size is not None:
         if args.batch_size < 1:
-            print("ERROR: --batch-size must be >= 1", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError("--batch-size must be >= 1")
         shapes = [(args.batch_size,) + entry[1:] for entry in shapes]
-        print(f"# batch-size override: N={args.batch_size} on all swept shapes")
-
-    print(
-        f"# dtype={args.dtype} method={args.method} layout={args.layout} "
-        f"padding_mode={args.padding_mode} "
-        f"timing_scope={'end_to_end' if args.end_to_end or args.padding_mode != 'zeros' else 'kernel'} "
-        f"miopen_solvers={'on' if args.miopen_solvers else 'off'}"
+    logger.info(
+        "dtype=%s method=%s layout=%s padding_mode=%s timing_scope=%s "
+        "weight_policy=fixed; "
+        "GPU graph timings exclude weight preparation",
+        args.dtype,
+        args.method,
+        args.layout,
+        args.padding_mode,
+        "end_to_end" if args.end_to_end or args.padding_mode != "zeros" else "kernel",
     )
-
-    # Optional MIOpen solver detection (subprocess; ~60-120s startup)
-    if args.miopen_solvers:
-        print("# Detecting MIOpen solvers (subprocess; this can take a minute)...")
-        precompute_miopen_solvers(shapes, dtype)
-        print("# MIOpen solver detection complete.")
-
-    # Bench each shape, collect rows.
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     layers = []
     for entry in shapes:
-        N, C, H, W, K, R, S, stride, padding, dilation, name = entry
+        (
+            batch,
+            channels,
+            height,
+            width,
+            outputs,
+            rows,
+            columns,
+            stride,
+            padding,
+            dilation,
+            name,
+        ) = entry
         try:
-            r = bench_one_shape(
-                N,
-                C,
-                H,
-                W,
-                K,
-                R,
-                S,
+            result = bench_one_shape(
+                batch,
+                channels,
+                height,
+                width,
+                outputs,
+                rows,
+                columns,
                 stride,
                 padding,
                 dilation,
@@ -886,52 +581,27 @@ def run_sweep(args) -> None:
                 args.method,
                 args.layout,
                 bias=not args.no_bias,
-                measure_repack=True,
                 padding_mode=args.padding_mode,
                 end_to_end=args.end_to_end,
+                bencher=bencher,
             )
-        except Exception as e:  # noqa: BLE001
-            print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        except (RuntimeError, ValueError, AssertionError):
+            logger.exception("Failed to benchmark %s", name)
             continue
-        finally:
-            clear_conv2d_weight_pack_caches()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        miopen = (
-            _get_miopen_solver(N, C, H, W, K, R, S, stride, padding, dilation)
-            if args.miopen_solvers
-            else ""
-        )
         layers.append(
             {
                 "name": name,
-                "type": _kernel_type_tag(R, S, dilation),
-                "shape": _shape_str(N, C, H, W, K, R, S),
-                "kernel_name": r["kernel_name"],
-                "miopen_solver": miopen,
-                "tflops_tri": r["tflops_tri"],
-                "tflops_tri_e2e": r["tflops_tri_e2e"],
-                "tflops_torch": r["tflops_torch"],
-                "ms_tri": r["ms_tri"],
-                "ms_tri_e2e": r["ms_tri_e2e"],
-                "ms_torch": r["ms_torch"],
-                "correct": r["correct"],
-                "flops": r["flops"],
-                "padding_mode": r["padding_mode"],
-                "timing_scope": r["timing_scope"],
-                "torch_conv_layout": r["torch_conv_layout"],
+                "type": _kernel_type_tag(rows, columns, dilation),
+                "shape": _shape_str(
+                    batch, channels, height, width, outputs, rows, columns
+                ),
+                **result,
             }
         )
-
     if not layers:
-        print("No layers benched (all errored?).", file=sys.stderr)
-        return
-
-    has_any_repack = any(lr["ms_tri_e2e"] is not None for lr in layers)
-
-    _print_layer_table(layers, has_any_repack, miopen_enabled=args.miopen_solvers)
-    if args.miopen_solvers:
-        _print_miopen_solver_table(layers)
+        raise RuntimeError("No Conv2D shapes were benchmarked")
+    has_any_repack = any(layer["has_repack"] for layer in layers)
+    _print_layer_table(layers, has_any_repack)
     _print_overall_perf_table(layers, has_any_repack)
 
 
@@ -999,13 +669,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="include the routed Triton kernel name in single-shape output",
     )
     p.add_argument(
-        "--miopen-solvers",
-        "--miopen_solvers",
-        action="store_true",
-        help="detect MIOpen solver names via a subprocess (sweep mode only; "
-        "adds ~60-120s upfront cost)",
-    )
-    p.add_argument(
         "--smoke",
         action="store_true",
         help="sweep mode: use the EDGE_CASE_SHAPES set instead of a real model. "
@@ -1037,9 +700,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dilation-w", "--dilation_w", type=int, default=1)
 
     args = p.parse_args(argv)
-
-    if args.miopen_solvers and args.padding_mode != "zeros":
-        p.error("--miopen-solvers currently supports --padding-mode zeros only")
 
     single = [args.N, args.C, args.H, args.W, args.K, args.R, args.S]
     if any(v is not None for v in single):
