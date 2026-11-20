@@ -756,6 +756,25 @@ def find_tuned_cu_row(
     return None
 
 
+def get_tuned_cu_fallbacks() -> list[tuple[str, int, int]]:
+    """(gfx, cu_num, full_chip_cu_num) of each visible compute partition.
+
+    HIP does not report the partition, so aiter gives these to each module
+    with a tuned C++ dispatch (set_tuned_cu_fallback in
+    gemm_dispatch_utils.h) when it loads the module.
+    """
+    try:
+        gpus = _visible_gpus()
+    except Exception:  # noqa: BLE001  no GPU info: exact rows only
+        return []
+    fallbacks = set()
+    for device, info in enumerate(gpus):
+        cu_nums = _tuned_cu_nums_of_device(device)
+        if len(cu_nums) == 2:
+            fallbacks.add((info.gfx, *cu_nums))
+    return sorted(fallbacks)
+
+
 @functools.cache
 def log_tuned_cu_fallback(source: str, gfx: str, cu_num: int, tuned_cu: int):
     """Log once that source serves a gfx partition of cu_num CUs with tuned_cu rows."""

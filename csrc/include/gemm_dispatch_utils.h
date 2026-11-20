@@ -5,13 +5,16 @@
 #ifdef USE_ROCM
 
 #include "aiter_hip_common.h"
+#include <atomic>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // GemmLookupKey
@@ -102,6 +105,102 @@ inline std::string_view get_device_gfx()
 }
 
 // ---------------------------------------------------------------------------
+// get_tuned_cu_nums
+//
+// CU counts whose tuned rows serve the current device, in lookup order: the
+// device CU count, then the CU count of the full chip when the device is a
+// compute partition (DPX, QPX, CPX). HIP does not report the partition, so
+// Python publishes it. When aiter loads a module that defines
+// set_tuned_cu_fallback, it calls set_tuned_cu_fallback(gfx, cu_num,
+// full_chip_cu_num) for each visible partition (get_tuned_cu_fallbacks in
+// aiter/jit/utils/chip_info.py). An entry is keyed by gfx and CU count, so
+// each device finds its own entry. A device without an entry uses only its
+// own CU count. Each thread resolves a device once, and again after a new
+// entry, so a dispatch takes no lock.
+// ---------------------------------------------------------------------------
+struct TunedCuFallback
+{
+    std::string gfx;
+    int cu_num;
+    int full_chip_cu_num;
+};
+
+struct TunedCuFallbacks
+{
+    std::mutex mu;
+    std::vector<TunedCuFallback> entries;
+    std::atomic<int> version{0};
+};
+
+inline TunedCuFallbacks& tuned_cu_fallbacks()
+{
+    static TunedCuFallbacks fallbacks;
+    return fallbacks;
+}
+
+inline void set_tuned_cu_fallback(const std::string& gfx, int cu_num, int full_chip_cu_num)
+{
+    auto& fallbacks = tuned_cu_fallbacks();
+    std::lock_guard<std::mutex> guard(fallbacks.mu);
+    for(auto& entry : fallbacks.entries)
+    {
+        if(entry.gfx == gfx && entry.cu_num == cu_num)
+        {
+            entry.full_chip_cu_num = full_chip_cu_num;
+            fallbacks.version.fetch_add(1, std::memory_order_release);
+            return;
+        }
+    }
+    fallbacks.entries.push_back({gfx, cu_num, full_chip_cu_num});
+    fallbacks.version.fetch_add(1, std::memory_order_release);
+}
+
+struct TunedCuNums
+{
+    int cu_nums[2];
+    int size;
+
+    const int* begin() const { return cu_nums; }
+    const int* end() const { return cu_nums + size; }
+};
+
+inline TunedCuNums get_tuned_cu_nums()
+{
+    struct Resolved
+    {
+        int version = -1;
+        TunedCuNums cu_nums{};
+    };
+    thread_local std::unordered_map<int, Resolved> resolved;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    auto& fallbacks   = tuned_cu_fallbacks();
+    const int version = fallbacks.version.load(std::memory_order_acquire);
+    Resolved& cached  = resolved[device];
+    if(cached.version == version)
+        return cached.cu_nums;
+
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
+    TunedCuNums result{{cu_num, 0}, 1};
+    {
+        std::lock_guard<std::mutex> guard(fallbacks.mu);
+        for(const auto& entry : fallbacks.entries)
+        {
+            if(entry.gfx == gfx && entry.cu_num == cu_num && entry.full_chip_cu_num > 0 &&
+               entry.full_chip_cu_num != cu_num)
+            {
+                result.cu_nums[1] = entry.full_chip_cu_num;
+                result.size       = 2;
+                break;
+            }
+        }
+    }
+    cached = {version, result};
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // GemmDispatchMap
 //
 // Convenience alias for the (gfx, cu_num, M, N, K)-keyed dispatch map type.
@@ -172,5 +271,35 @@ struct BatchedGemmLookupKeyEq
 template <typename KernelFn>
 using BatchedGemmDispatchMap = std::
     unordered_map<BatchedGemmLookupKey, KernelFn, BatchedGemmLookupKeyHash, BatchedGemmLookupKeyEq>;
+
+// ---------------------------------------------------------------------------
+// find_tuned_row
+//
+// The row of the first CU count in cu_nums that has a row for this shape
+// and that accept(row) accepts, or lookup.end(). shape is the key of the map
+// without gfx and cu_num.
+// ---------------------------------------------------------------------------
+template <typename Map, typename Accept, typename... Shape>
+typename Map::const_iterator find_tuned_row_if(const Map& lookup,
+                                               const TunedCuNums& cu_nums,
+                                               Accept&& accept,
+                                               std::string_view gfx,
+                                               Shape... shape)
+{
+    for(const int cu_num : cu_nums)
+    {
+        auto it = lookup.find(typename Map::key_type{gfx, cu_num, shape...});
+        if(it != lookup.end() && accept(it->second))
+            return it;
+    }
+    return lookup.end();
+}
+
+template <typename Map, typename... Shape>
+typename Map::const_iterator
+find_tuned_row(const Map& lookup, const TunedCuNums& cu_nums, std::string_view gfx, Shape... shape)
+{
+    return find_tuned_row_if(lookup, cu_nums, [](const auto&) { return true; }, gfx, shape...);
+}
 
 #endif // USE_ROCM
