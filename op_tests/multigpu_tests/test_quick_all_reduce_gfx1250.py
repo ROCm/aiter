@@ -380,6 +380,20 @@ def test_quick_all_reduce_gfx1250(tp_size: int, regime: str) -> None:
     _run_tp_test(tp_size, regime)
 
 
+@pytest.mark.parametrize("prefetch", ("0", "1"))
+def test_pull_q4_prefetch_tp4(prefetch: str, monkeypatch) -> None:
+    """Both dispatches must pass the same tail, skew and alternating-graph oracle.
+
+    Each case creates fresh spawned workers because the HIP launcher caches the
+    opt-in environment flag on its first call.
+    """
+    reason = _skip_reason(4, "INT4")
+    if reason is not None:
+        pytest.skip(reason)
+    monkeypatch.setenv("AITER_PULL_Q4_PREFETCH", prefetch)
+    _run_tp_test(4, "INT4")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp-size", type=int, choices=TP_SIZES, nargs="*")

@@ -188,6 +188,12 @@ struct CodecQ4 : public CodecBase
         int qs = __builtin_nontemporal_load(qs_ptr);
 #endif
 
+        decode_atom(qw, qs, data);
+    }
+
+    __quickreduce_device_inline__ static void decode_atom(
+        int32_t qw, int qs, int32x4_t* __restrict__ data)
+    {
         // Unpack q4 into f16x8_t
         int32x4_t w;
         {
