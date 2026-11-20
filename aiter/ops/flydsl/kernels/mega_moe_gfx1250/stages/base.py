@@ -33,6 +33,7 @@ from ..types import Stage2ScatterContext, _from_gpu_ptr
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    topk_ids: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -330,6 +331,10 @@ class _Dispatch:
         hidden_states and 0 on bf16, else its MX rows."""
         if self._quant_payload is None:
             return hidden_states, 0
+        if token_count == 0:
+            # An idle source still consumes peer routes and joins collectives.
+            # Its quantizer has no rows; the HIP launcher rejects a zero grid.
+            return self._quant_payload[:0], self._quant_scales.data_ptr()
         # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
         # copy on the far side. Destination-independent, so the bytes are the
         # same either way; the preshuffle cannot move with it, because its
@@ -349,7 +354,11 @@ class _Dispatch:
         # it stages them, so there is no repack here.
         return payload, scale_rows.data_ptr()
 
-    def _routing(self, token_count: int) -> Routing:
+    def _routing(
+        self, token_count: int, topk_ids: torch.Tensor | None = None
+    ) -> Routing:
         return Routing(
-            token_count=token_count, reverse_source_view=self._reverse_source
+            token_count=token_count,
+            reverse_source_view=self._reverse_source,
+            topk_ids=topk_ids,
         )

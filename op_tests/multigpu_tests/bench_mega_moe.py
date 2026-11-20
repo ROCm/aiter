@@ -75,12 +75,14 @@ generated weights, never drawn independently.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -407,6 +409,93 @@ def _append_shared_columns(ids, wts, first_id, n_shared):
     return torch.cat((ids, shared_ids), dim=1), torch.cat((wts, shared_wts), dim=1)
 
 
+def _retain_bench_inputs(dist_ctx, x0, routings, metadata):
+    """Keep the same synthetic inputs across profile/time and A/B runs.
+
+    This is outside capture and timing. The original RefModel, routing
+    generator, numerical gate, and graph-replay timing are unchanged.
+    """
+    retained_dir = os.environ.get("MEGA_RETAIN_INPUTS_DIR")
+    dump_prefix = os.environ.get("MEGA_MEASURE_DUMP")
+    if not retained_dir and not dump_prefix:
+        return routings
+
+    def sha256(tensor):
+        data = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        return hashlib.sha256(data).hexdigest()
+
+    metadata = dict(metadata, rank=dist_ctx.rank, hidden_sha256=sha256(x0))
+    origin = "generated"
+    error = None
+    if retained_dir:
+        path = Path(retained_dir) / f"inputs_r{dist_ctx.rank}.pt"
+        try:
+            if path.exists():
+                retained = torch.load(path, map_location="cpu", weights_only=True)
+                if retained["metadata"] != metadata:
+                    raise ValueError(
+                        "retained benchmark inputs have different parameters/hidden"
+                    )
+                saved_routings = retained["routings"]
+                saved_hashes = [
+                    [sha256(ids), sha256(wts)] for ids, wts in saved_routings
+                ]
+                if saved_hashes != retained["routing_sha256"]:
+                    raise ValueError("retained benchmark routing checksum mismatch")
+                if len(saved_routings) != metadata["layers"] or any(
+                    tuple(ids.shape) != (x0.shape[0], metadata["topk"])
+                    or tuple(wts.shape) != tuple(ids.shape)
+                    or ids.dtype != torch.int32
+                    or wts.dtype != torch.float32
+                    for ids, wts in saved_routings
+                ):
+                    raise ValueError("retained benchmark routing shape/dtype mismatch")
+                routings = [
+                    (ids.to(x0.device), wts.to(x0.device))
+                    for ids, wts in saved_routings
+                ]
+                origin = str(path)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                saved_routings = [(ids.cpu(), wts.cpu()) for ids, wts in routings]
+                torch.save(
+                    {
+                        "metadata": metadata,
+                        "routings": saved_routings,
+                        "routing_sha256": [
+                            [sha256(ids), sha256(wts)] for ids, wts in saved_routings
+                        ],
+                    },
+                    path,
+                )
+                origin = str(path)
+        except Exception as exc:  # noqa: BLE001 -- share load errors before collectives
+            error = f"rank{dist_ctx.rank}: {exc}"
+        errors = dist_ctx.gather_objects(error)
+        if any(errors):
+            raise AssertionError("; ".join(item for item in errors if item))
+    if dump_prefix:
+        path = Path(
+            dump_prefix
+            + f"_inputs_{os.environ.get(_PASS_ENV, 'single')}_r{dist_ctx.rank}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "metadata": metadata,
+                    "origin": origin,
+                    "routing_sha256": [
+                        [sha256(ids), sha256(wts)] for ids, wts in routings
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return routings
+
+
 def shared_logical_routings(routings, E, n_shared):
     """The reference's view: routed ids as they are, the fused shared experts as
     ids E..E+n_shared-1."""
@@ -460,16 +549,45 @@ def routing_load_report(dist_ctx, routings, experts, n_shared):
     routed_slot = torch.ones(experts, dtype=torch.bool)
     for r in range(world):
         routed_slot[(r + 1) * epr - n_shared : (r + 1) * epr] = False
+    details = []
     stats = {"remote": [], "remote_ranks": [], "hot_expert": [], "busy_rank": []}
     for layer in range(len(routings)):
         load = sum(per_rank[layer][0] for per_rank in gathered).double()
         tokens = sum(per_rank[layer][3] for per_rank in gathered)
         rows_per_rank = load.view(world, epr).sum(dim=1)
         routed = load[routed_slot]
+        counts = [int(v) for v in routed.tolist()]
+        details.append(
+            {
+                "layer": layer,
+                "valid_tokens_per_rank": [p[layer][3] for p in gathered],
+                "global_valid_tokens": tokens,
+                "global_valid_routes": sum(counts),
+                "mu": float(routed.mean()),
+                "mu_local": [float(v / (epr - n_shared)) for v in rows_per_rank],
+                "min": min(counts),
+                "max": max(counts),
+                "p50": float(torch.quantile(routed, 0.5)),
+                "p90": float(torch.quantile(routed, 0.9)),
+                "p99": float(torch.quantile(routed, 0.99)),
+                "zero_experts": counts.count(0),
+                "counts": counts,
+                "counts_sha256": hashlib.sha256(
+                    json.dumps(counts).encode()
+                ).hexdigest(),
+            }
+        )
         stats["remote"].append(sum(p[layer][1] for p in gathered) / tokens)
         stats["remote_ranks"].append(sum(p[layer][2] for p in gathered) / tokens)
         stats["hot_expert"].append(float(routed.max() / routed.mean()))
         stats["busy_rank"].append(float(rows_per_rank.max() / rows_per_rank.mean()))
+    if os.environ.get("MEGA_MEASURE_DUMP"):
+        path = Path(
+            os.environ["MEGA_MEASURE_DUMP"]
+            + f"_routes_{os.environ.get(_PASS_ENV, 'single')}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(details, indent=2), encoding="utf-8")
     return {
         "remote_routes_per_token": sum(stats["remote"]) / len(stats["remote"]),
         "remote_ranks_per_token": sum(stats["remote_ranks"])
@@ -769,6 +887,7 @@ class DeviceMoEPipeline:
             w1_scale=self.w1_s,
             w2_scale=self.w2_s,
             next_topk_ids=next_ids,
+            recv_token_bound=getattr(self, "recv_token_bound", None),
             # Named per step, not inherited from construction: building the
             # reduce and running it are separate decisions now.
             combine_quant=self.combine_quant,
@@ -836,6 +955,7 @@ class DeviceMoEPipeline:
             samples.append((time.perf_counter() - t0) * 1e6)
         self.comm.barrier()
 
+        self.bench_samples = list(samples)
         samples.sort()
         return {
             "min": samples[0],
@@ -1012,16 +1132,22 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         rows.append((avg_self, name, per_call, pc_avg, avg_count))
     rows.sort(key=lambda r: (-r[0], r[1]))
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
-    # Every kernel runs a whole number of times per layer, so a count off that
-    # grid means the profiler lost records: avg_us is per recorded call and
-    # holds, the totals undercount.
+    # Check each rank separately and on the exact integer grid. Averaging
+    # counts first, or accepting a fractional-layer tolerance, can hide a
+    # missing call (e.g. 23 instead of 24). A matching grid is necessary, not
+    # sufficient: a profiler can lose a whole grid of calls or a whole key.
+    call_grid = int(per_layer_denom)
+    if call_grid <= 0 or call_grid != per_layer_denom:
+        raise ValueError("profile denominator must be a positive integer")
     complete = True
-    for avg_self, _name, _per_call, _pc_avg, avg_count in rows:
-        per_layer = avg_count / per_layer_denom if per_layer_denom else 1.0
-        if avg_self > 0 and (
-            round(per_layer) < 1 or abs(per_layer - round(per_layer)) > 0.05
-        ):
+    incomplete = []
+    for avg_self, name, _per_call, _pc_avg, _avg_count in rows:
+        if avg_self <= 0:
+            continue
+        counts = [d.get(name, (0.0, 0))[1] for d in per_rank]
+        if any(count < call_grid or count % call_grid for count in counts):
             complete = False
+            incomplete.append({"kernel": name, "rank_calls": counts})
     table_rows = []
     for _avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
         row = {
@@ -1030,6 +1156,12 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
             "calls": avg_count,
         }
         row.update({f"rank{rank}_us": value for rank, value in enumerate(per_call)})
+        row.update(
+            {
+                f"rank{rank}_calls": d.get(name, (0.0, 0))[1]
+                for rank, d in enumerate(per_rank)
+            }
+        )
         table_rows.append(row)
     return {
         "rows": table_rows,
@@ -1040,6 +1172,11 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
                 "total_self_device_us": total_self,
                 "device_us_per_layer": dev_per_layer,
                 "events_complete": complete,
+                "calls_per_layer_grid": call_grid,
+                "incomplete_kernel_counts": incomplete,
+                "rank_recorded_device_us": [
+                    sum(us for us, _count in rank.values()) for rank in per_rank
+                ],
             }
         ],
     }
@@ -1109,6 +1246,14 @@ def _emit_table(name, rows, max_col_width=120):
     Columns are capped at 100 characters by default to keep long kernel symbols
     readable in the aligned table."""
     df = pd.DataFrame([row for row in rows if row is not None])
+    # Keep nested diagnostics structured in JSON, but make display cells
+    # hashable before pandas compares columns for constant values.
+    for column in df.columns:
+        df[column] = df[column].map(
+            lambda value: (
+                json.dumps(value) if isinstance(value, (list, dict)) else value
+            )
+        )
     print(f"\n# {name}", flush=True)
     if df.empty:
         print("# (no rows)", flush=True)
@@ -1227,6 +1372,20 @@ def main():
     E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
     n_shared = args.fused_shared_experts
     ct, n_layers = args.token_per_rank, args.layers
+    rank_tokens = args.rank_tokens or [ct] * dist_ctx.world
+    if (
+        len(rank_tokens) != dist_ctx.world
+        or min(rank_tokens) < 0
+        or sum(rank_tokens) == 0
+    ):
+        raise ValueError(
+            "rank_tokens must have one nonnegative count per rank and a nonzero sum"
+        )
+    ct = max(ct, max(rank_tokens))
+    local_ct = rank_tokens[dist_ctx.rank]
+    recv_bound = args.recv_token_bound
+    if recv_bound is None and args.rank_tokens is not None:
+        recv_bound = sum(rank_tokens)
     expert_balance = (
         os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
     )
@@ -1321,7 +1480,7 @@ def main():
         data_dist=data_dist,
     )
     x0 = fill(
-        (ct, hdim),
+        (local_ct, hdim),
         data_dist,
         make_generator(1000 + dist_ctx.rank + args.seed, device=dev),
         dtype=dtypes.bf16,
@@ -1329,7 +1488,7 @@ def main():
     )
     routings = make_routings(
         n_layers,
-        ct,
+        local_ct,
         E,
         topk,
         dev,
@@ -1341,6 +1500,29 @@ def main():
         popularity_seed=_POPULARITY_SEED
         + args.seed
         + (100_000 * (dist_ctx.rank + 1) if args.routing == "zipf_rank" else 0),
+    )
+    routings = _retain_bench_inputs(
+        dist_ctx,
+        x0,
+        routings,
+        {
+            "experts": E,
+            "hidden": hdim,
+            "intermediate": idim,
+            "topk": topk,
+            "layers": n_layers,
+            "valid_tokens_per_rank": rank_tokens,
+            "physical_capacity_per_rank": ct,
+            "fused_shared_experts": n_shared,
+            "data_init": data_dist,
+            "seed": args.seed,
+            "weight_seed": _WEIGHT_SEED + args.seed,
+            "expert_balance": expert_balance,
+            "routing": args.routing,
+            "zipf_s": args.zipf_s,
+            "quant_type": args.quant_type,
+            "dispatch_wire": spec["dispatch_wire"],
+        },
     )
     ref_routings = dispatch_routings = routings
     if n_shared:
@@ -1402,10 +1584,32 @@ def main():
             stage2_fused=stage2_fused,
             combine_quant=combine_quant,
         )
+        pipe.recv_token_bound = recv_bound
         pipe.setup(x0)
         pipe.capture(x0)
         if not profile_pass:
             stats = pipe.bench(warmup=args.warmup, iters=args.iters)
+            if os.environ.get("MEGA_MEASURE_DUMP"):
+                path = Path(
+                    os.environ["MEGA_MEASURE_DUMP"] + f"_{label}_r{dist_ctx.rank}.json"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "rank": dist_ctx.rank,
+                            "layers": n_layers,
+                            "valid_tokens_per_rank": tuple(rank_tokens),
+                            "physical_capacity_per_rank": ct,
+                            "seed": args.seed,
+                            "routing": args.routing,
+                            "samples_us": pipe.bench_samples,
+                            "stats": stats,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
             # Aggregate perf across ranks (collective calls -> run on every rank,
             # and the dict is built in the same order everywhere so the
             # allreduces stay in step).
@@ -1484,6 +1688,8 @@ def main():
                     "seed": args.seed,
                     "world_size": dist_ctx.world,
                     "tokens_per_rank": ct,
+                    "valid_tokens_per_rank": tuple(rank_tokens),
+                    "recv_token_bound": recv_bound,
                     "experts": E,
                     "topk": topk,
                     "fused_shared_experts": n_shared,
@@ -1596,6 +1802,19 @@ def _parse_args():
     )
     p.add_argument(
         "-tpr", "--token_per_rank", type=int, default=128, help="tokens per rank"
+    )
+    p.add_argument(
+        "--rank_tokens",
+        nargs="+",
+        type=int,
+        default=None,
+        help="actual rows on each source rank, with no injected padding",
+    )
+    p.add_argument(
+        "--recv_token_bound",
+        type=int,
+        default=None,
+        help="static host receive bound; must not truncate received tokens",
     )
     p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
     p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")

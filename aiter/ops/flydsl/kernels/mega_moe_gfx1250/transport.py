@@ -92,7 +92,11 @@ class _EpDispatcher:
     def dispatch(self, hidden_states, topk_weights, topk_ids, **step) -> _DispatchBatch:
         """``step`` is recv_token_bound, next_topk_ids, next_recv_token_bound
         and begin_step, as the dispatch stage takes them."""
-        return self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
+        batch = self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
+        # The fused reduce must not consume a stale slot for a route the
+        # compact plan rejected, including graph padding with expert ID -1.
+        batch.routing.topk_ids = topk_ids
+        return batch
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         return self._combine.prepare(batch, quant_bits)

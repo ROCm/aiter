@@ -112,6 +112,8 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
+    # S1F has not dispatched the wire yet: its consumer owns A/scale repacking.
+    stage1_a_row_major: bool = False
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):
@@ -124,10 +126,24 @@ class Stage2ScatterContext:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:
             raise ValueError("combine_input_offset must be non-negative")
+        # fused_moe_'s custom-op schema rebuilds only the scalar scatter
+        # fields before the grouped helper restores the live compact context.
+        # Validate the dense pitch by its wire/arena geometry; compact_layout
+        # is not available at that intermediate construction boundary.
+        dense_flash_bf16 = (
+            self.combine_quant_bits == 0
+            and self.world_size == 4
+            and self.max_tokens_per_rank == 16384
+            and self.slot_stride_bytes == 10240
+        )
         if self.slot_stride_bytes <= 0 or (
             self.slot_stride_bytes & (self.slot_stride_bytes - 1)
+            and not dense_flash_bf16
         ):
-            raise ValueError("slot_stride_bytes must be a positive power of two")
+            raise ValueError(
+                "slot_stride_bytes must be a positive power of two or the "
+                "dense Flash EP4 BF16 pitch"
+            )
         if self.max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive")
         if self.world_size <= 0:

@@ -63,12 +63,17 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: VGPRs and LDS allow would hang, not just run slow.
 _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
-_S1F_GROUP_M = 8
+_S1F_GROUP_M = int(os.environ.get("AITER_MEGA_S1F_GROUP_M", "8"))
+if _S1F_GROUP_M < 1:
+    raise ValueError("AITER_MEGA_S1F_GROUP_M must be >= 1")
+_S1F_APRE_INPUT = os.environ.get("AITER_MEGA_S1F_APRE_INPUT")
+if _S1F_APRE_INPUT is not None and _S1F_APRE_INPUT not in ("0", "1"):
+    raise ValueError("AITER_MEGA_S1F_APRE_INPUT must be 0 or 1")
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
-#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
-#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
+#: Automatic steps over this bound keep dispatch + GEMM1. Explicit
+#: AITER_TDM_A_PRESHUFFLE=1 lets M256 prefill steps use the APRE S1F variant.
 _S1F_MAX_RECV = 4096
 #: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
 #: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
@@ -106,6 +111,79 @@ def read_s1f_mode() -> bool:
     if mode not in ("0", "1"):
         raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
     return mode == "1"
+
+
+def s1f_prefill_config(
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    experts_per_rank: int,
+    topk: int,
+    world_size: int,
+    recv_bound: int,
+    dispatch_wire: str,
+    stage1_fused: bool,
+    activation,
+) -> dict | None:
+    """Shared plan/GEMM defaults for the pinned Flash EP4 prefill geometry.
+
+    This uses host metadata only, including the unrounded receive bound. A
+    manual tile or APRE selection keeps the existing CSV/env path. Buffer,
+    input-layout and copy settings remain independently overridable.
+    """
+    if (
+        not stage1_fused
+        or not read_s1f_mode()
+        or dispatch_wire != "fp4"
+        or activation != ActivationType.Silu
+        or (hidden_dim, inter_dim, experts_per_rank, topk, world_size)
+        != (5120, 2304, 96, 6, 4)
+        or int(recv_bound) < 16384
+        or os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0") != "1"
+    ):
+        return None
+    manual = (
+        "AITER_TDM_A_PRESHUFFLE",
+        "AITER_GROUPED_A4W4_A_PRESHUFFLE",
+        "AITER_TDM_TILE_M",
+        "AITER_TDM_TILE_N",
+        "AITER_TDM_TILE_K",
+        "AITER_TDM_TILE_M2",
+        "AITER_TDM_TILE_N2",
+        "AITER_TDM_TILE_K2",
+        "AITER_TDM_M_WARP",
+        "AITER_TDM_N_WARP",
+        "AITER_TDM_M_WARP2",
+        "AITER_TDM_N_WARP2",
+    )
+    if any(os.environ.get(name) not in (None, "") for name in manual):
+        return None
+    return {
+        "tile_m": 256,
+        "tile_n": 256,
+        "tile_k": 256,
+        "m_warp": 2,
+        "n_warp": 2,
+        "num_buffers": 3,
+        "tile_m2": 256,
+        "tile_n2": 256,
+        "tile_k2": 256,
+        "m_warp2": 2,
+        "n_warp2": 2,
+        "num_buffer_stage2": 4,
+        "a_preshuffle": 1,
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "cluster_m2": 1,
+        "cluster_n2": 1,
+        "waves_per_tensor_tdm2": (
+            4 if os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM") is None else -1
+        ),
+        "next_stage_prefetch": 1,
+        "tdm_as_in_prologue": 0,
+        "tdm_b_th": 0,
+        "lds_soa_load_interleave": 0,
+    }
 
 
 def _s1f_cu_num() -> int:
@@ -329,12 +407,21 @@ class _Stage1Fusion:
         return reasons
 
     def _recv_too_big(self) -> bool:
-        # The receive bound is identical on every rank.
+        # The receive bound and selected alignment are identical on all ranks.
         step = getattr(self.d, "_step", None)
         return step is not None and int(step.recv_bound) > self.max_recv()
 
     def max_recv(self) -> int:
         config = self.d.config
+        step = getattr(self.d, "_step", None)
+        if (
+            step is not None
+            and int(step.align_m) == 256
+            and os.environ.get("AITER_TDM_A_PRESHUFFLE") == "1"
+        ):
+            # Explicit APRE prefill opts into the wide M256 variant. All other
+            # tile, shape, activation and hook checks still apply.
+            return 0x7FFFFFFF
         return s1f_max_recv(config.world_size, config.topk)
 
     def step_off(self) -> bool:
@@ -412,6 +499,13 @@ class _Stage1Fusion:
         payload = d._quant_payload[:token_count]
         scale_rows = d._quant_scales[:token_count]
         wire = self.wire if run else None
+        if token_count == 0:
+            scales_ptr = (
+                wire.data_ptr() + config.dispatch_token_nbytes
+                if wire is not None
+                else d._quant_scales.data_ptr()
+            )
+            return payload, scales_ptr, None
         if self.wants_fused_quant(run):
             return (
                 payload,
@@ -456,16 +550,87 @@ class _Stage1Fusion:
 
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
+    def _apre_settings(self) -> tuple[int, int]:
+        """Resolve GEMM1 buffers/input once for its validator and launcher."""
+        config = self.d.config
+        step = getattr(self.d, "_step", None)
+        tuned = (
+            s1f_prefill_config(
+                hidden_dim=config.hidden_dim,
+                inter_dim=config.geometry.inter_dim,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                world_size=config.world_size,
+                recv_bound=config.max_recv if step is None else step.recv_bound,
+                dispatch_wire=config.dispatch_wire,
+                stage1_fused=config.stage1_fused,
+                activation=config.recipe.compute.activation,
+            )
+            is not None
+        )
+        num_buffers = int(
+            os.environ.get("AITER_TDM_NUM_BUFFERS", "3" if tuned else "4")
+        )
+        if num_buffers not in (3, 4):
+            raise ValueError("APRE S1F needs three or four input buffers")
+        input_preshuffled = (
+            int(_S1F_APRE_INPUT) if _S1F_APRE_INPUT is not None else int(not tuned)
+        )
+        return num_buffers, input_preshuffled
+
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        m_warp=1,
+        n_warp=4,
+        a_preshuffled=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
+        input_preshuffled = 0
+        if a_preshuffled:
+            num_buffers, input_preshuffled = self._apre_settings()
+        config = self.d.config
+        step = getattr(self.d, "_step", None)
+        recv_bound = config.max_recv if step is None else step.recv_bound
+        # The instance's dense BF16 pitch already applies the shared pin,
+        # geometry and manual-override gate. Keep small steps on CN1 and
+        # include the paired policy in this owner's compiled-launcher cache.
+        pair_cluster_n = (
+            2
+            if (
+                a_preshuffled
+                and not input_preshuffled
+                and num_buffers == 3
+                and int(recv_bound) >= 65536
+                and config.combine_slot_stride_for(0) == 10240
+            )
+            else 1
+        )
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            m_warp,
+            n_warp,
+            a_preshuffled,
+            input_preshuffled,
+            num_buffers,
+            pair_cluster_n,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
-            num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
             launch = make_s1f_stage1(
                 rank=config.rank,
                 npes=config.world_size,
@@ -489,22 +654,44 @@ class _Stage1Fusion:
                 group_m=group_m,
                 tile_m=tile_m,
                 num_buffers=num_buffers,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                a_preshuffled=a_preshuffled,
+                a_input_preshuffled=input_preshuffled,
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                pair_cluster_n=pair_cluster_n,
             )
             self.launches[key] = launch
         return launch
 
     @staticmethod
     def _run(launch, args) -> None:
-        # Calling the @flyc.jit launcher rebuilds its cache key on every launch
-        # (~110 us/layer of host time in eager prefill). Its tensor arguments
-        # are layout-dynamic, so only their dtype and rank pick the artifact.
-        spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
+        spec = tuple(
+            (
+                str(a.device),
+                a.dtype,
+                a.dim(),
+                tuple(i for i, s in enumerate(a.stride()) if s == 1),
+            )
+            for a in args
+            if isinstance(a, torch.Tensor)
+        )
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self,
+        launch_args,
+        *,
+        tile_m,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        m_warp=1,
+        n_warp=4,
+        a_preshuffled=0,
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -534,6 +721,9 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                a_preshuffled=a_preshuffled,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -562,6 +752,7 @@ class _Stage1Fusion:
         num_buffers=3,
         out_is_f16=0,
         a_is_fp4=0,
+        a_preshuffled=0,
         stage1_act=0,
         bias=None,
         swiglu_limit=7.0,
@@ -612,8 +803,18 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        # The stage-1 kernel runs its own 256x256 n/k tiles.
-        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        if a_preshuffled:
+            apre_buffers, _ = self._apre_settings()
+            got.update(m_warp=m_warp, n_warp=n_warp, num_buffers=num_buffers)
+            want.update(
+                m_warp=2,
+                n_warp=2,
+                num_buffers=apre_buffers,
+                variant=256,
+            )
+        else:
+            # The row-major stage-1 kernel runs its own 256x256 n/k tiles.
+            got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
@@ -652,23 +853,36 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
-        # The first eager launch builds the launcher of every step bound that
-        # can run the kernel, so a bucket first seen in a graph capture does
-        # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
-        if not keys <= self.precompiled and (
-            not torch.cuda.is_current_stream_capturing()
+        # Keep main's collective warmup of every configured row-major
+        # bucket; APRE adds its own M256 specialization without applying that
+        # layout to the smaller row-major variants.
+        keys = {(t, int(stage1_act), q, 1, 4, 0) for t, q in self.launch_keys}
+        keys.add(
+            (
+                align_m,
+                int(stage1_act),
+                int(quant_wmma_rep),
+                int(m_warp) if a_preshuffled else 1,
+                int(n_warp) if a_preshuffled else 4,
+                int(a_preshuffled),
+            )
+        )
+        if (
+            not keys <= self.precompiled
+            and not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for t, act, q, mw, nw, apre in sorted(keys - self.precompiled):
                 self._precompile(
                     launch_args,
                     tile_m=t,
                     group_m=group_m,
                     stage1_act=act,
                     quant_wmma_rep=q,
+                    m_warp=mw,
+                    n_warp=nw,
+                    a_preshuffled=apre,
                 )
+                self.precompiled.add((t, act, q, mw, nw, apre))
         launch = self._launcher(
             tile_m=align_m,
             producers=producers,
@@ -676,6 +890,9 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            m_warp=int(m_warp) if a_preshuffled else 1,
+            n_warp=int(n_warp) if a_preshuffled else 4,
+            a_preshuffled=int(a_preshuffled),
         )
         self._run(
             launch,
