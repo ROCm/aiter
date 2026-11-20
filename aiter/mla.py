@@ -1505,7 +1505,9 @@ def mla_decode_fwd(
             _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
         ):
             # Natively support cases
-            pass
+            # The asm entry rejects a strided Q and OPUS reads it densely; the fold used to copy it.
+            if not q.is_contiguous():
+                q = q.contiguous()
         elif head_plan.plan == _MlaHeadPlanKind.FOLDED:
             fold_factor = head_plan.qk_batch_ratio
             nhead = head_plan.kernel_num_heads

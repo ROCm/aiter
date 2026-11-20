@@ -513,9 +513,11 @@ def _run_decode(
     cp_rank=None,
     plan_cprr=None,
     meta_view=None,
+    q_view=None,
 ):
     # plan_cprr plans the metadata for round-robin CP or not; None follows cp_rank.
-    # meta_view(work_meta_data) is what decode gets.
+    # meta_view(work_meta_data) is what decode gets; q_view(q) is the Q it gets (the
+    # dense q is still returned for the reference).
     qd = _dtype(d)
     qo, kv_indptr, last = _indptrs(bs, msq, cp_rank)
     total_q, total_kv = bs * msq, int(kv_indptr[-1].item())
@@ -540,7 +542,8 @@ def _run_decode(
         kw["g_kv_indptr"] = _indptr(KV_LENS[:bs])
         kw.update(cp_world_size=CP_WORLD_SIZE, cp_rank=cp_rank)
     _, out_lse = aiter.mla.mla_decode_fwd(
-        *(qt, kvb, o, qo, kv_indptr, kv_indices, last, msq),
+        *(qt if q_view is None else q_view(qt), kvb, o, qo, kv_indptr, kv_indices),
+        *(last, msq),
         page_size=1,
         nhead_kv=1,
         sm_scale=1.0 / dim**0.5,
@@ -604,6 +607,23 @@ def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
         assert support.native and support.supported is not False, support
         out, lse, inputs = _run_decode(96, msq, "fp8", True, cp_rank=cp_rank)
         _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+
+        # a sliced Q (a [:, :96] view of a 128-head buffer) is not contiguous: asm
+        # rejects it and OPUS reads it with a dense stride, so it is copied first
+        def sliced_q(qt):
+            wide = torch.full(
+                (qt.shape[0], 128, qt.shape[-1]), 3.0, dtype=qt.dtype, device="cuda"
+            )
+            wide[:, :96].copy_(qt)
+            view = wide[:, :96, :]
+            assert not view.is_contiguous()
+            return view
+
+        out_s, lse_s, _ = _run_decode(
+            96, msq, "fp8", True, cp_rank=cp_rank, q_view=sliced_q
+        )
+        _assert_matches_cprr_reference(out_s, lse_s, inputs, msq, cp_rank)
+        assert torch.equal(out_s, out) and torch.equal(lse_s, lse), msq
 
 
 @requires_gpu
