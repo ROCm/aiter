@@ -1,4 +1,5 @@
 #pragma once
+#include "fmha_fwd_softmax_scale.hpp"
 #include "op_gemm.hpp"
 
 // ================================================================
@@ -26,9 +27,7 @@
 // Store: 8 × buffer_store_dwordx2 (4 bf16 per store = 32 bf16 total).
 // bf16 truncation via v_perm_b32 (not RNE). Matches CK epilog pattern.
 //
-// LSE: (log2(rsum) + scale*rmax) * ln(2) == ln(rsum) + sm_scale*rmax. Both terms
-// are base-2 (amdgcn_logf -> v_log_f32 IS log2, like exp2 elsewhere); rmax is
-// unscaled (scale applied here). Stored to lse_base[m_row].
+// LSE = scale * rmax + ln(rsum). The hardware log instruction returns log2.
 //
 // epilog_store: normalize + bf16-truncate + buffer_store one M-tile of O, plus
 // the optional LSE row. Distribution assumptions: O_acc is in the TransposedC
@@ -40,23 +39,24 @@
 //     o_acc_d0/d1 : the two head-dim halves of the output accumulator (in place)
 //     rsum        : final softmax denominator for this row (sum of P)
 //     rmax        : final running max (UNSCALED; scaled here for LSE)
-//     scale       : softmax scale (log2e-based; same as softmax_exp2)
+//     scale       : natural softmax scale magnitude
 //     stride_o    : row stride of O in bf16 ELEMENTS
 //     lse_base    : LSE output base (nullptr to skip)
 //     seqlen_q    : valid query rows (row boundary guard)
 //     m_tile_idx  : which M-tile this block owns (-> absolute row)
 //     o_base      : O output base pointer (bf16)
 
-__device__ __forceinline__ void epilog_store(
-    v16f& o_acc_d0, v16f& o_acc_d1,
-    float rsum,
-    float rmax,
-    float scale,              // scale_s (log2e-based)
-    int stride_o,             // in bf16 elements
-    float* lse_base,
-    int seqlen_q,
-    int m_tile_idx,
-    __hip_bfloat16* o_base)
+template <bool Wide>
+__device__ __forceinline__ void epilog_store(v16f& o_acc_d0,
+                                             v16f& o_acc_d1,
+                                             float rsum,
+                                             float rmax,
+                                             float scale,
+                                             int stride_o, // in bf16 elements
+                                             float* lse_base,
+                                             int seqlen_q,
+                                             int m_tile_idx,
+                                             __hip_bfloat16* o_base)
 {
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
@@ -76,23 +76,12 @@ __device__ __forceinline__ void epilog_store(
     // the whole row was masked (e.g. fully out of causal range) -> emit zeros.
     float inv_sum = (rsum > 0.0f) ? 1.0f / rsum : 0.0f;
 
-    // Log-sum-exp for this row, computed as (log2(rsum) + scale*rmax) * ln(2),
-    // which equals the natural-log LSE  ln(rsum_nat) + sm_scale*rmax. The whole
-    // softmax runs in base-2: __builtin_amdgcn_logf emits v_log_f32 = LOG2 (not
-    // natural log), matching the v_exp_f32 / exp2 used everywhere else.
-    //   - rsum = Σ exp2(scale*(S - rmax)), so log2(rsum) is the base-2 log of the
-    //     denominator; scale*rmax (scale is log2e-based) is also base-2. Both terms
-    //     are in the SAME base-2 domain.
-    //   - rmax is the UNSCALED running max; `scale` is applied here.
-    //   - the trailing *ln(2) converts the summed base-2 quantity to natural units
-    //     in one step (log2(x)*ln(2) == ln(x); scale*ln(2) == sm_scale), the
-    //     convention the LSE output expects.
     // Only k_sub==0 writes — the other half holds the identical reduced value and
     // would just clobber the same address. Fully-masked rows -> -INF.
     if (lse_base && k_sub == 0 && abs_m_row < seqlen_q) {
-        float lse_val = (rsum > 0.0f)
-            ? (__builtin_amdgcn_logf(rsum) + scale * rmax) * 0.6931471805599453f
-            : -INFINITY;
+        float lse_val =
+            (rsum > 0.0f) ? aiter::fmha::softmax_lse<Wide>(rmax, scale, __builtin_amdgcn_logf(rsum))
+                          : -INFINITY;
         lse_base[abs_m_row] = lse_val;
     }
 
@@ -196,22 +185,23 @@ __device__ __forceinline__ void epilog_store(
 //     o_acc_d0/d1     : the two head-dim halves of the output accumulator (in place)
 //     rsum            : this split's softmax denominator for this row (sum of P)
 //     rmax            : this split's running max (UNSCALED; scaled here for LSE)
-//     scale           : softmax scale (log2e-based; same as epilog_store)
+//     scale           : natural softmax scale magnitude
 //     seqlen_q        : valid query rows (row boundary guard)
 //     m_tile_idx      : which M-tile this block owns (-> absolute row)
 //     scratch_o_base  : fp32 scratch base for THIS (split_idx,b,h) row-plane
 //                       (= scratch_o + (((split_idx*B+b)*Hq+h)*Sq)*64)
 //     scratch_lse_base: fp32 LSE scratch base for THIS (split_idx,b,h) row-plane
 //                       (= scratch_lse + (((split_idx*B+b)*Hq+h)*Sq))
-__device__ __forceinline__ void epilog_store_split(
-    v16f& o_acc_d0, v16f& o_acc_d1,
-    float rsum,
-    float rmax,
-    float scale,              // scale_s (log2e-based)
-    int seqlen_q,
-    int m_tile_idx,
-    float* scratch_o_base,
-    float* scratch_lse_base)
+template <bool Wide>
+__device__ __forceinline__ void epilog_store_split(v16f& o_acc_d0,
+                                                   v16f& o_acc_d1,
+                                                   float rsum,
+                                                   float rmax,
+                                                   float scale,
+                                                   int seqlen_q,
+                                                   int m_tile_idx,
+                                                   float* scratch_o_base,
+                                                   float* scratch_lse_base)
 {
     // --- Ownership math: mirrors epilog_store ---
     const int lane_id = threadIdx.x & 63;
@@ -235,14 +225,11 @@ __device__ __forceinline__ void epilog_store_split(
     // epilog_store.
     float inv_sum = (rsum > 0.0f) ? 1.0f / rsum : 0.0f;
 
-    // Per-row natural-log LSE_g for THIS split, computed exactly as epilog_store's
-    // line 94: (log2(rsum) + scale*rmax) * ln(2). Fully-empty split -> -INF, which
-    // the combine treats as weight 0. Only k_sub==0 writes (the other half holds
-    // the identical reduced value); guard the row boundary.
+    // An empty split has LSE -inf and contributes zero weight in combine.
     if (k_sub == 0 && abs_m_row < seqlen_q) {
-        float lse_val = (rsum > 0.0f)
-            ? (__builtin_amdgcn_logf(rsum) + scale * rmax) * 0.6931471805599453f
-            : -INFINITY;
+        float lse_val =
+            (rsum > 0.0f) ? aiter::fmha::softmax_lse<Wide>(rmax, scale, __builtin_amdgcn_logf(rsum))
+                          : -INFINITY;
         scratch_lse_base[abs_m_row] = lse_val;
     }
 

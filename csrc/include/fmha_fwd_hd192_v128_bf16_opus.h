@@ -16,12 +16,14 @@
 #include "fmha_fwd_hd192_v128_bf16_opus_defs.h"
 
 // Device kernel template — declared here, defined on the gfx950 device pass.
-template <class Traits>
+template <class Traits, bool Wide>
 __global__ void gqa_d192_v128_kernel(opus_gqa_d192_kargs kargs);
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
-template <class Traits>
-__global__ void gqa_d192_v128_kernel(opus_gqa_d192_kargs) {}
+template <class Traits, bool Wide = false>
+__global__ void gqa_d192_v128_kernel(opus_gqa_d192_kargs)
+{
+}
 #else
 // Pulls in opus + the full asymmetric head-dim kernel template (16-stage software
 // pipeline, stagger specialization, causal head/tail merge, group/varlen, arbitrary

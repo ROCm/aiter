@@ -5,7 +5,7 @@
 // its half of the Q block needs -- leave the non-window instances' code untouched.
 #pragma once
 
-#include <opus/opus.hpp>
+#include "fmha_fwd_bf16_opus_softmax.hpp"
 #include "fmha_fwd_hd128_bf16_opus_defs.h"
 #include <bit>
 #include <cstdint>
@@ -321,35 +321,10 @@ __device__ inline auto make_layout_rq(int warp_id, int lane_id) {
 }
 
 template<typename T, typename V>
-__device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
-    using D_ACC = typename T::D_ACC;
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
-    opus::static_for<s_len>([&](auto i) {
-        row_max = max(row_max, v_s[i.value]);
-    });
-    opus::vector_t<opus::u32_t, 2> res = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res.x), std::bit_cast<float>(res.y));
-}
-
-template<typename T, typename V>
 __device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
         v_s[i.value] -= row_max;
-    });
-}
-
-// d192-style fused scale+subtract: v_s = v_s*scale - row_max via a single FMA (fmaf), so
-// the temperature scale is applied HERE instead of pre-multiplied into Q. row_max must be
-// passed already scaled (temperature_scale * raw_max). The per-element opaque keeps each
-// fmaf on the VALU pipe for the mfma/valu interleave scheduler.
-template<typename T, typename V>
-__device__ inline void attn_scale_sub_row(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
-        asm volatile("" : "+v"(v_s[i.value]));
     });
 }
 
@@ -767,9 +742,10 @@ __device__ inline block_t locate_block(const opus_gqa_kargs& kargs, int wg_x, in
 // dispatched by gqa_d128_swa_kernel below); K/V in shared, Q in registers, Flash Attention online
 // softmax. STAGGER splits waves 0-3 / 4-7 into two mutually-exclusive inlined bodies that sit
 // one stage apart (the two share physical registers → VGPR = max, not sum). ───
-template<class Traits, bool STAGGER>
+template <class Traits, bool STAGGER, bool Wide>
 __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs kargs,
-                                                                  char* smem_buf) {
+                                                                 char* smem_buf)
+{
     using namespace opus;
     using namespace gqa_d128_swa;
     using T = opus::remove_cvref_t<Traits>;
@@ -898,10 +874,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
     constexpr index_t s_half_len = s_len / 2;
     constexpr index_t o_len = vector_traits<typename decltype(mma1)::vtype_c>::size();
 
-    // Scaling constants and online softmax state
+    // Keep the running maximum in raw QK units and the rescale threshold in log2 units.
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
 
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
@@ -958,9 +932,9 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
-            constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
             const D_ACC lse = (l_row > D_ACC(0.0f))
-                                  ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                  ? aiter::fmha::softmax_lse<Wide>(
+                                        m_row, kargs.softmax_scale, __builtin_amdgcn_logf(l_row))
                                   : -__builtin_inff();
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) +
                                        lse_batch_base +
@@ -1094,11 +1068,14 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
         // head(t): row-max, rescale, sub, exp 1st half.
         // __builtin_amdgcn_s_setprio(1);
         v_o = mma1.step_k(0_I, vs_prev.p, v_kv.v, v_o);
-        D_ACC row_max = temperature_scale * attn_row_max<T>(vs_cur.s);
+        D_ACC row_max = fmha_bf16_opus::tile_max<T>(vs_cur.s);
         // sched_barrier_pairs<1, 5, 2>();
         sched_barrier_pairs<3, 6, 2>();
         sched_barrier_pairs<1, 5, 2>();
-        bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+        const D_ACC delta =
+            aiter::fmha::scaled_difference<Wide>(row_max, m_row, kargs.softmax_scale);
+        // Adopt the first live reference even when it is close to the empty-tile seed.
+        bool below_thresh = delta <= RESCALE_THRESHOLD && (l_row > 0.0f || row_max == m_row);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max = all_below ? m_row : max(m_row, row_max);
         asm volatile("" : "+v"(row_max) ::);
@@ -1107,7 +1084,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
         v_o = mma1.step_k(1_I, vs_prev.p, v_kv.v, v_o);
         v_o = mma1.step_k(2_I, vs_prev.p, v_kv.v, v_o);
         v_o = mma1.step_k(3_I, vs_prev.p, v_kv.v, v_o);
-        attn_scale_sub_row<T>(vs_cur.s, temperature_scale, row_max);
+        fmha_bf16_opus::center_scores<Wide, 0, s_len>(vs_cur.s, row_max, kargs.softmax_scale);
         asm volatile("" : "+v"(vs_cur.s) ::);
         attn_exp2_slice<T, 0, s_half_len - 1>(vs_cur.s);
         asm volatile("" : "+v"(vs_cur.s) ::);
@@ -1116,7 +1093,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
         sched_barrier_valu_exp_pairs<1, 2, 2, 3>();
         sched_barrier_exp_pairs<5, 3, 3>();
         if (!all_below) {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            rescale_m = __builtin_amdgcn_exp2f(-max(0.0f, delta));
             scale_output_tile<T>(v_o, rescale_m);
             l_row *= rescale_m;
             m_row = row_max;
@@ -1203,8 +1180,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
                                      kargs.window_size_left, neg_inf_v, lane_id);
         s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
         stage_end();
-        m_row = temperature_scale * attn_row_max<T>(vs_cur.s);
-        attn_scale_sub_row<T>(vs_cur.s, temperature_scale, m_row);
+        m_row = fmha_bf16_opus::tile_max<T>(vs_cur.s);
+        fmha_bf16_opus::center_scores<Wide, 0, s_len>(vs_cur.s, m_row, kargs.softmax_scale);
         asm volatile("" : "+v"(vs_cur.s) ::);
         attn_exp2_slice<T, 0, s_half_len - 1>(vs_cur.s);
         asm volatile("" : "+v"(vs_cur.s) ::);
@@ -1274,11 +1251,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
             attn_mask_border_tile<T>(v_s0.s, seqlen_kv, tile_begin, neg_inf_v, lane_id);
         }
     }
-    // The softmax temperature is applied here and in each phase's softmax head
-    // (attn_scale_sub_row, one fma per element) rather than pre-multiplied into Q. m_row is
-    // in scaled units.
-    m_row = temperature_scale * attn_row_max<T>(v_s0.s);
-    attn_scale_sub_row<T>(v_s0.s, temperature_scale, m_row);
+    m_row = fmha_bf16_opus::tile_max<T>(v_s0.s);
+    fmha_bf16_opus::center_scores<Wide, 0, s_len>(v_s0.s, m_row, kargs.softmax_scale);
     asm volatile("" : "+v"(v_s0.s) ::);
     attn_exp2_slice<T, 0, s_half_len - 1>(v_s0.s);
     asm volatile("" : "+v"(v_s0.s) ::);
@@ -1357,12 +1331,15 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
 // exclusive inlined bodies share physical registers (VGPR = max, not sum). Waves 4-7 run
 // the STAGGER=true body one stage ahead of waves 0-3, so each group's MFMA overlaps the
 // other's LDS/global traffic.
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_swa_kernel(opus_gqa_kargs kargs) {
+template <class Traits, bool Wide = false>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_swa_kernel(opus_gqa_kargs kargs)
+{
     __shared__ char smem_buf[Traits::smem_size_bytes()];
     const int warp_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / Traits::WARP_SIZE);
     __builtin_amdgcn_sched_barrier(0);
-    if (warp_id / 4)    gqa_d128_swa_impl<Traits, true>(kargs, smem_buf);
+    if(warp_id / 4)
+        gqa_d128_swa_impl<Traits, true, Wide>(kargs, smem_buf);
     __builtin_amdgcn_sched_barrier(0);
-    if (!(warp_id / 4)) gqa_d128_swa_impl<Traits, false>(kargs, smem_buf);
+    if(!(warp_id / 4))
+        gqa_d128_swa_impl<Traits, false, Wide>(kargs, smem_buf);
 }

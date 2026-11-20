@@ -1,5 +1,6 @@
 #include "aiter_hip_common.h"   // aiter common HIP helpers
 #include "aiter_stream.h"       // aiter::getCurrentHIPStream (torch-free)
+#include "fmha_fwd_host_scale.hpp"
 #include "mha_native.h"
 #include "mha_native_launch.h"
 #include "runner/params.hpp"    // FmhaFwdParams, FmhaFwdSplitParams, FmhaFwdCombineParams, kM0, kBlockSize
@@ -20,9 +21,6 @@
 #endif
 
 namespace aiter {
-
-// Convert natural-e softmax scale to the base-2 form the kernel's exp2 softmax wants.
-static constexpr float kLog2e = 1.4426950408889634f;
 
 void mha_fwd_native_splitkv(
     aiter_tensor_t& q, aiter_tensor_t& k, aiter_tensor_t& v,
@@ -69,7 +67,7 @@ void mha_fwd_native_splitkv(
     base.lse = nullptr;                                          // producers write scratch_lse
     base.seqlen_q = Sq; base.seqlen_k = Sk;
     base.nhead_q  = Hq; base.nhead_k  = Hk;
-    base.scale    = static_cast<float>(softmax_scale) * kLog2e;
+    base.scale    = fmha::narrow_scale(softmax_scale);
     // BSHD strides in ELEMENTS: token=stride(1), head=stride(2), batch=stride(0).
     base.stride_q = q.stride(1); base.nhead_stride_q = q.stride(2); base.batch_stride_q = q.stride(0);
     base.stride_k = k.stride(1); base.nhead_stride_k = k.stride(2); base.batch_stride_k = k.stride(0);

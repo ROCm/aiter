@@ -1,10 +1,11 @@
 #pragma once
-#include <hip/hip_runtime.h>
-#include "runner/params.hpp"
-#include "op_lds.hpp"
-#include "op_gemm.hpp"
-#include "op_softmax.hpp"
 #include "op_epilog.hpp"
+#include "op_gemm.hpp"
+#include "op_lds.hpp"
+#include "op_softmax.hpp"
+#include "runner/params.hpp"
+#include <cfloat>
+#include <hip/hip_runtime.h>
 
 // ================================================================
 // pipeline.hpp — the per-block forward pass (heart of the kernel)
@@ -30,7 +31,7 @@
 //        GEMM0   S_acc = Q . K^T          (op_gemm: reads K from LDS, Q from reg)
 //        SOFTMAX mask -> row_max -> exp2 -> row_sum  (online; op_softmax)
 //        V STAGE DRAM -> regs -> v_perm shuffle -> LDS   (op_lds)
-//        ONLINE  rescale carried O_acc by exp2(scale*(old_max-new_max)) when the
+//        ONLINE  rescale carried O_acc by exp(scale*(old_max-new_max)) when the
 //                running max grew this tile; correct the running sum likewise
 //        GEMM1   O_acc += P . V           (op_gemm: reads V from LDS, P from reg)
 //      All while prefetching the NEXT tile's K copy and the second V half so HBM
@@ -39,12 +40,11 @@
 //                DRAM, optionally write LSE (op_epilog).
 //
 // ONLINE SOFTMAX (Milakov), carried across tiles in three scalars per row:
-//     rmax — running max of scaled scores seen so far
+//     rmax -- running max before multiplying by the scale magnitude
 //     rsum — running denominator (sum of exp2 probabilities)
 //     o_acc_d0/d1 — running numerator (sum of P.V), in TransposedC layout
-//   When a tile raises the max from rmax to m_new, every earlier contribution is
-//   too large by exp2(scale*(rmax-m_new)); we rescale o_acc and rsum by that
-//   factor BEFORE adding this tile, so the result equals a single global softmax.
+//   When a tile raises the max, multiply the earlier o_acc and rsum by
+//   exp(scale*(rmax-m_new)) before adding the new tile.
 //
 // LDS DOUBLE/TRIPLE BUFFERING via LdsSeq[] — see the constant's comment below.
 //
@@ -120,16 +120,17 @@ constexpr int LdsSeq[4] = {1, 2, 1, 0};
 //   scratch_lse : split-major fp32 LSE scratch base (IsSplit only).
 //   num_splits  : G — the KV axis is partitioned into G disjoint ranges.
 //   split_idx   : which of the G splits this block handles (0..G-1).
-template <bool HasMask, bool IsVarlen, bool IsSplit = false>
+template <bool HasMask, bool IsVarlen, bool IsSplit = false, bool Wide = false>
 __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
-                                    char* lds,
-                                    int batch_idx,
-                                    int head_idx,
-                                    int m_tile_idx,
-                                    float* scratch_o = nullptr,
-                                    float* scratch_lse = nullptr,
-                                    int num_splits = 1,
-                                    int split_idx = 0) {
+                                                    char* lds,
+                                                    int batch_idx,
+                                                    int head_idx,
+                                                    int m_tile_idx,
+                                                    float* scratch_o   = nullptr,
+                                                    float* scratch_lse = nullptr,
+                                                    int num_splits     = 1,
+                                                    int split_idx      = 0)
+{
     // ---- Thread geometry (TransposedC; see file header / op_gemm.hpp) ----
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
@@ -297,8 +298,15 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // the bf16 epilog_store. The else-branch is the EXISTING code, unchanged.
     if (num_total_loop <= 0) {
         if constexpr (IsSplit) {
-            epilog_store_split(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
-                               seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);
+            epilog_store_split<Wide>(o_acc_d0,
+                                     o_acc_d1,
+                                     0.0f,
+                                     -INFINITY,
+                                     params.scale,
+                                     seqlen_q,
+                                     m_tile_idx,
+                                     scratch_o_base,
+                                     scratch_lse_base);
         } else {
             float* lse_base = nullptr;
             if (params.lse) {
@@ -311,8 +319,16 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                         + static_cast<int64_t>(head_idx) * params.seqlen_q;
                 }
             }
-            epilog_store(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
-                         params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
+            epilog_store<Wide>(o_acc_d0,
+                               o_acc_d1,
+                               0.0f,
+                               -INFINITY,
+                               params.scale,
+                               params.stride_o,
+                               lse_base,
+                               seqlen_q,
+                               m_tile_idx,
+                               o_base);
         }
         return;
     }
@@ -328,22 +344,44 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // hands the right pair of these to each GEMM0 sub-tile. Out-of-range query rows
     // (the last M-tile's padding) load zeros so masked rows contribute nothing.
     v4i q_regs[4];
-    if (abs_m_row < seqlen_q) {
-        #pragma unroll
+    // With a zero scale, use zero Q and unit scale so padding still has weight zero.
+    const unsigned scale_bits = __builtin_bit_cast(unsigned, params.scale);
+    unsigned magnitude        = scale_bits & 0x7fffffffu;
+    if constexpr(Wide)
+        asm("" : "+v"(magnitude)); // Test the bits before FP32 flush-to-zero.
+    const bool zero_scale = Wide && magnitude == 0;
+    if(abs_m_row < seqlen_q && !zero_scale)
+    {
+#pragma unroll
         for (int kstep = 0; kstep < 4; ++kstep) {
             int hd = kstep * 16 + k_sub * 8;
             int voff = abs_m_row * q_stride_bytes + hd * 2;
             q_regs[kstep] = __builtin_amdgcn_raw_buffer_load_b128(srd_q, voff, 0, 0);
         }
-    } else {
-        #pragma unroll
+    }
+    else
+    {
+#pragma unroll
         for (int kstep = 0; kstep < 4; ++kstep)
             q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
-    // Finite rmax seed below any realizable raw score, so a real score always wins
-    // the running max; -inf would make a fully-masked row NaN instead of O=0/LSE=-inf.
-    float rmax = -1e30f;
+    // Fold a negative scale into Q before masking and taking the raw maximum.
+    if(scale_bits >> 31)
+    {
+        const int sign_bits = static_cast<int>(0x80008000u);
+#pragma unroll
+        for(int kstep = 0; kstep < 4; ++kstep)
+            q_regs[kstep] ^= sign_bits;
+    }
+    if constexpr(Wide)
+    {
+        magnitude = zero_scale ? 0x3f800000u : magnitude;
+        asm("" : "+v"(magnitude));
+    }
+    const float scale = __builtin_bit_cast(float, magnitude);
+    // The lowest finite score also leaves masked scores at -inf after centering.
+    float rmax = -FLT_MAX;
     float rsum = 0.0f;
 
     // kv_offset = absolute key row of the current tile's first key.
@@ -410,12 +448,6 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             __builtin_amdgcn_sched_barrier(0x1); // CK barrier 4 — GEMM0 exit, VALU-only
 
             // ---- SOFTMAX part 1: mask + running row max ----
-            // scale is deferred: GEMM0 emitted RAW scores; mask/max work in raw
-            // units and the scale is fused into the exp2 below (see op_softmax.hpp).
-            // softmax_mask sets out-of-bounds / causal-future entries to -INF.
-            // softmax_row_max folds this tile's masked scores into the running rmax,
-            // returning the new per-row max m_new (>= rmax).
-            float scale_s = params.scale;
             softmax_mask<HasMask>(s_acc_n0, s_acc_n1,
                                   seqlen_k, kv_offset, abs_m_row, mask_shift,
                                   m_tile_idx * kM0);
@@ -439,18 +471,12 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
             // ---- SOFTMAX part 2 + ONLINE update + GEMM1 (one scheduling region
             // so the compiler interleaves the VALU exp/pack with GEMM1's MFMA) ----
-            // exp2 turns scores into probabilities P = exp2(scale*(S - m_new)),
-            // applying the deferred scale; row_sum reduces this tile's P to l_new.
-            float scale_m = scale_s * m_new;
-            softmax_exp2(s_acc_n0, s_acc_n1, scale_s, scale_m);
+            softmax_exp2<Wide>(s_acc_n0, s_acc_n1, scale, m_new);
             float l_new = softmax_row_sum(s_acc_n0, s_acc_n1);
 
-            // ONLINE-SOFTMAX correction: if the running max grew (rmax -> m_new),
-            // every prior contribution used too-large probabilities by the factor
-            // exp2(scale*(rmax-m_new)) (in (0,1]). Rescale the carried numerator
-            // o_acc and denominator rsum by it BEFORE folding in this tile, then
-            // advance the running max. (m_new==rmax => factor 1 => no-op.)
-            float rescale = __builtin_amdgcn_exp2f(scale_s * (rmax - m_new));
+            // Reweight earlier tiles relative to the new row maximum.
+            float rescale =
+                __builtin_amdgcn_exp2f(aiter::fmha::scaled_difference<Wide>(rmax, m_new, scale));
             rescale_o_acc(o_acc_d0, o_acc_d1, rescale);
             rsum = rescale * rsum + l_new;
             rmax = m_new;
@@ -500,8 +526,15 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // this split's scratch plane via epilog_store_split; the combine pass folds the
     // G partials later. For IsSplit=false the else-branch is the bf16 epilogue.
     if constexpr (IsSplit) {
-        epilog_store_split(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
-                           seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);
+        epilog_store_split<Wide>(o_acc_d0,
+                                 o_acc_d1,
+                                 rsum,
+                                 rmax,
+                                 scale,
+                                 seqlen_q,
+                                 m_tile_idx,
+                                 scratch_o_base,
+                                 scratch_lse_base);
     } else {
         // Resolve the LSE output base for this (batch/varlen, head). For varlen the
         // LSE tensor is packed like Q (nhead_stride derived from Q's element strides
@@ -521,7 +554,15 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
         // Hand the final running numerator (o_acc), denominator (rsum) and max (rmax)
         // to the epilogue, which divides, truncates to bf16, and writes O/LSE to DRAM.
-        epilog_store(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
-                     params.stride_o, lse_base, seqlen_q, m_tile_idx, o_base);
+        epilog_store<Wide>(o_acc_d0,
+                           o_acc_d1,
+                           rsum,
+                           rmax,
+                           scale,
+                           params.stride_o,
+                           lse_base,
+                           seqlen_q,
+                           m_tile_idx,
+                           o_base);
     }
 }
