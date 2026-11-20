@@ -75,7 +75,7 @@ def _key_args(max_seqlen_k=42700, **overrides):
         "q": torch.empty((4096, 12, 192), dtype=torch.bfloat16),
         "k": torch.empty((max_seqlen_k, 12, 192), dtype=torch.bfloat16),
         "v": torch.empty((max_seqlen_k, 12, 128), dtype=torch.bfloat16),
-        "batch": 1,
+        "cu_seqlens_q": torch.tensor([0, 4096], dtype=torch.int32),
         "max_seqlen_q": 4096,
         "max_seqlen_k": max_seqlen_k,
         "min_seqlen_q": 0,

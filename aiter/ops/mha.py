@@ -4363,7 +4363,7 @@ def flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
-        batch=cu_seqlens_q.numel() - 1,
+        cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         min_seqlen_q=min_seqlen_q,

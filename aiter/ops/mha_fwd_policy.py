@@ -383,7 +383,7 @@ def _mha_fwd_tuning_key(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    batch: int,
+    cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -407,7 +407,7 @@ def _mha_fwd_tuning_key(
     values = {
         **dict(zip(TUNING_HARDWARE_FIELDS, hardware)),
         "mode": mode,
-        "batch": int(batch),
+        "batch": cu_seqlens_q.numel() - 1,
         "total_q": q.shape[0],
         "total_k": k.shape[0],
         "max_seqlen_q": int(max_seqlen_q),
