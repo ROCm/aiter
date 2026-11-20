@@ -55,13 +55,18 @@ def l2norm(x):
 
 @gluon.jit
 def mx_e8m0_scale(amax, EXP_OFFSET: gl.constexpr):
-    """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3."""
-    amax = amax.to(gl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(gl.float32, bitcast=True)
-    scale_unbiased = gl.log2(amax).floor() - EXP_OFFSET
-    scale_unbiased = gl.maximum(-127, gl.minimum(scale_unbiased, 127))
-    return (scale_unbiased.to(gl.int32) + 127).to(gl.uint8)
+    """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3.
+    Integer math only: the exponent of amax rounded to a power of two (up from
+    1.75 x 2^k), minus EXP_OFFSET, at least 0. Inf and NaN give 254. A negative amax
+    gives 254, or 0 if it rounds to -0."""
+    gl.static_assert(EXP_OFFSET >= 0)
+    bits = amax.to(gl.uint32, bitcast=True)
+    # Exponent field of |amax| after the rounding. 255 or 256 is inf or NaN.
+    e = ((bits & 0x7FFFFFFF) + 0x200000) >> 23
+    scale = gl.maximum(e.to(gl.int32) - EXP_OFFSET, 0)
+    # Inf, NaN and a negative amax that does not round to -0 give 254.
+    sat = (e >= 255) | ((bits >= 0x80000000) & (e != 0))
+    return gl.where(sat, 254, scale).to(gl.uint8)
 
 
 @gluon.jit
