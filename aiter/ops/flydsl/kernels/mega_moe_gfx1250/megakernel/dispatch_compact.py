@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The compact front end (phases 1a. to 1c. of the package docstring):
+"""compact's dispatch (phases 1a. to 1c. of the package docstring):
 tally, X1 count exchange, layout and send."""
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from ..s1f_stage1 import (
     _rawbar,
     _uniform,
 )
-from .core import (
+from .protocol import (
     AMAX_FLOOR,
     CTL_TALLY,
     GATE_STRIDE,
@@ -64,7 +64,7 @@ def produce(kc, n_mine, n_routes):
     rsrc_ctl, rsrc_ids, rsrc_wts = kc.rsrc_ctl, kc.rsrc_ids, kc.rsrc_wts
     rsrc_x, spin_end, spin_fail, stamp = kc.rsrc_x, kc.spin_end, kc.spin_fail, kc.stamp
     tag16, tid, tok, wait_gate, wave = kc.tag16, kc.tid, kc.tok, kc.wait_gate, kc.wave
-    # ======== 1. FRONT-END (compact layout) ========
+    # ======== 1. DISPATCH (compact layout) ========
     # LDS scratch in the GEMM arena (no GEMM item runs before the
     # plan gate): a tally CTA's histogram, bases and route table;
     # CTA 0's X1 matrix, send table and receive counts.

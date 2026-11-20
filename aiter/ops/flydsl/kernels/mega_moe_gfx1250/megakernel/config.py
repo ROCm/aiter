@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 from ..config import _WAVE_SIZE as WAVE
-from .core import (
+from .protocol import (
     COMPACT_SCRATCH_MAX,
     SEG_BITS,
     TALLY_MAX,
@@ -21,12 +21,20 @@ from .core import (
     src_off,
 )
 
-#: The decode GEMM tiles: the a4w4 CSV's decode row for this shape family
-#: (t16x256x256 b3 / t16x512x128 b3), which also measured best inside the
-#: megakernel at tpr 8 (t16x512x128 b2 GEMM1, the staged optimum, is 15%
-#: slower here: its m-tiles finish later, and GEMM2 waits on them). The tile
-#: does not change the bits (each output element's K order is the same for
-#: every tile), so it is a pure speed choice.
+_TILE_KEYS = (
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "num_buffers",
+    "tile_n2",
+    "tile_k2",
+    "num_buffers2",
+)
+
+#: slots' GEMM tiles: the a4w4 CSV's decode row for this shape family. The
+#: staged optimum (t16x512x128 b2 GEMM1) is slower here: its m-tiles finish
+#: later and GEMM2 waits on them. A tile never changes the bits (every output
+#: element sums K in the same order).
 SLOTS_TILE = dict(  # noqa: C408 - the builder's keyword names
     tile_m=16,
     tile_n=256,
@@ -36,46 +44,27 @@ SLOTS_TILE = dict(  # noqa: C408 - the builder's keyword names
     tile_k2=128,
     num_buffers2=3,
 )
-#: The 16-row tile's pipelines: GEMM1 with 4 stages, GEMM2 with 2 stages of
-#: K 256. With few rows an item is bound by the bytes a CTA keeps in flight,
-#: not by HBM; tpr 1-64 DEP4 us/layer: DSR1 -1.3 to -2.7, DSV4-Pro -0.2 to
-#: -2.2, DSV4.1-Flash -0.2 to -1.6. The 64-row tile's 4 stages do not fit 2
-#: CTAs per CU, and the 32-row tile was not measured, so both keep the above.
+#: Deeper pipelines for the 16-row tile: with few rows an item is bound by the
+#: bytes a CTA keeps in flight, not by HBM. The 64-row tile's 4 stages do not
+#: fit 2 CTAs per CU.
 SLOTS_TILE_M16 = dict(  # noqa: C408 - the builder's keyword names
     num_buffers=4,
     tile_k2=256,
     num_buffers2=2,
 )
-#: Past this many tokens per rank the 32-row tile wins (tpr 128: 303 vs
-#: 312 us/layer; tpr 64: 306 vs 301).
+#: Tokens per rank past which the 32-row, then the 64-row tile is faster.
 SLOTS_TILE_M32_TOKENS = 64
-#: Past this many the 64-row tile wins (V4.1-Flash DEP4, 97 experts a rank:
-#: tpr 512 172 vs 189 us/layer; tpr 256 158 vs 147).
 SLOTS_TILE_M64_TOKENS = 256
-SLOTS_CTAS_PER_CU = 2
-# Debug/tuning only: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and
-# AITER_DMK_CTAS_PER_CU override the above.
+#: Tuning: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and AITER_DMK_CTAS_PER_CU
+#: override the tile and the CTAs per CU.
+SLOTS_CTAS_PER_CU = int(os.environ.get("AITER_DMK_CTAS_PER_CU") or 2)
 _SLOTS_TILE_ENV = os.environ.get("AITER_DMK_TILE")
 
 
 def slots_tile(max_tokens_per_rank: int) -> dict:
     """The decode tiles for an instance serving up to this many tokens."""
     if _SLOTS_TILE_ENV:
-        v = [int(x) for x in _SLOTS_TILE_ENV.split(",")]
-        return dict(
-            zip(
-                (
-                    "tile_m",
-                    "tile_n",
-                    "tile_k",
-                    "num_buffers",
-                    "tile_n2",
-                    "tile_k2",
-                    "num_buffers2",
-                ),
-                v,
-            )
-        )
+        return dict(zip(_TILE_KEYS, (int(x) for x in _SLOTS_TILE_ENV.split(","))))
     tile = dict(SLOTS_TILE)
     if int(max_tokens_per_rank) > SLOTS_TILE_M64_TOKENS:
         tile["tile_m"] = 64
@@ -84,10 +73,6 @@ def slots_tile(max_tokens_per_rank: int) -> dict:
     else:
         tile.update(SLOTS_TILE_M16)
     return tile
-
-
-if os.environ.get("AITER_DMK_CTAS_PER_CU"):
-    SLOTS_CTAS_PER_CU = int(os.environ["AITER_DMK_CTAS_PER_CU"])
 
 
 #: The user-facing switches' names before the megakernel rename, still read
@@ -147,7 +132,7 @@ def compact_reason(config) -> str | None:
     if npes * segs * 4 > src_off(epr):
         return "the X1 rows do not fit the control region"
     if compact_scratch_bytes(npes=npes, experts_per_rank=epr) > COMPACT_SCRATCH_MAX:
-        return "the compact front end's LDS does not fit the GEMM arena"
+        return "compact's dispatch LDS does not fit the GEMM arena"
     variants = compact_variants(config)
     if not variants:
         return "slots serves every step of this instance"
@@ -205,25 +190,12 @@ def slots_cap(config) -> int:
     return (rows + tm - 1) // tm * tm
 
 
-_TILE_KEYS = (
-    "tile_m",
-    "tile_n",
-    "tile_k",
-    "num_buffers",
-    "tile_n2",
-    "tile_k2",
-    "num_buffers2",
-)
-
 #: compact's GEMM tile by step size: (tokens per rank up to which a step runs
 #: it, None for every larger step; the tile of both GEMMs; CTAs per CU). Each
 #: row is its own kernel with its own control block, covering the steps whose
-#: receive bound falls in its range (see compact_variants). DSR1, DSV4.1-Flash and
-#: DSV4-Pro DEP4, us/layer (64x256x128 b3 at 4 CTAs per CU -> 128x256x256 b2
-#: at 2): at 512 tokens/rank 218 -> 207, 185 -> 204, 286 -> 345; at 1024
-#: 308 -> 290, 237 -> 226, 394 -> 385; at 16384 3365 -> 2797, 1805 -> 1534,
-#: 3601 -> 2832. The small tile's ~70 KB arena fits 4 CTAs per CU, the large
-#: one's 2 (3 at 128x256x128 spill: VGPRs capped at 170, 3.8x slower).
+#: receive bound falls in its range (see compact_variants). The large tile
+#: reads each expert's weights fewer times once steps grow past 512 tokens per
+#: rank; its arena fits 2 CTAs per CU, the small tile's (~70 KB) 4.
 COMPACT_TILES = (
     (
         512,

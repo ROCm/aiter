@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The megakernel's core, shared by both layouts: the control block, the
-entry ticket, the waits and gates, the plan, the GEMM queue, the close and
-the reduce (phases 2. to 5. of the package docstring)."""
+"""The protocol both layouts share: the control block, the entry ticket, the
+waits and gates, the plan, the GEMM queue, the close and the reduce (phases
+2. to 5. of the package docstring)."""
 
 from __future__ import annotations
 
@@ -84,19 +84,18 @@ TALLY_MAX = 256
 #: Routes a tally CTA aims to count (AITER_LM_TALLY_CHUNK overrides): its loops
 #: wait out a global load per pass, so fewer routes per CTA end the tally
 #: sooner; more CTAs put more base atomics on a hot segment's line.
-#: V4.1-Flash DEP4: X1 goes out 5-6.5 us sooner than at 2048.
 TALLY_CHUNK = 128
 SEG_STRIDE = 32
 N_SREP = 16
 SEG_BITS = 10
-#: LDS the compact front end may take out of the GEMM arena on the host's
+#: LDS compact's dispatch may take out of the GEMM arena on the host's
 #: admission check (the kernel checks against the arena it actually builds;
 #: compact's default GEMM arena is ~70 KB).
 COMPACT_SCRATCH_MAX = 48 << 10
 
 
 def compact_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
-    """LDS the compact front end uses in the GEMM arena: CTA 0's X1 matrix,
+    """LDS compact's dispatch uses in the GEMM arena: CTA 0's X1 matrix,
     send table and receive counts, or a tally CTA's histogram, bases and
     route table, whichever is larger."""
     segs = segs_pad(npes=npes, experts_per_rank=experts_per_rank)
@@ -256,8 +255,8 @@ def _popc_i32(x):
 
 class KCtx:
     """The megakernel's build constants and, while its body is traced, the
-    per-thread values and protocol helpers that the core and the front ends
-    share. They read its fields into locals first: a method of it called
+    per-thread values and protocol helpers that the protocol and the dispatch
+    phases share. They read its fields into locals first: a method of it called
     inside a traced ``if`` or loop would have the DSL carry the whole object
     through that region."""
 

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""make_megakernel: the build constants, the GEMM builders, the LDS and
-the kernel body, which runs one front end (frontend_slots or
-frontend_compact) and then the core."""
+"""make_megakernel: the build constants, the GEMM builders, the LDS and the
+kernel body, which runs one layout's dispatch (dispatch_slots or
+dispatch_compact) and then the shared protocol."""
 
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ from ..s1f_stage1 import (
     SCOPE_SYS,
     _uniform,
 )
-from . import core, frontend_compact, frontend_slots
-from .core import (
+from . import dispatch_compact, dispatch_slots, protocol
+from .protocol import (
     FLAG_SPAN,
     FLAG_STRIDE,
     N_TICKET,
@@ -173,26 +173,23 @@ def make_megakernel(
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
     rep2 = get_wmma_m_rep(TM, int(tile_n2), 1, 4, "gemm2")
-    # Debug only: AITER_DMK_TRACE=1 has tid 0 of every CTA stamp the phase
-    # boundaries into the trace words after the control block.
+    # Debug: AITER_DMK_TRACE=1 stamps each CTA's phase boundaries into the
+    # trace words after the control block.
     TRACE = int(os.environ.get("AITER_DMK_TRACE", "0"))
-    # Debug only: AITER_DMK_NOTRAP=1 has a timed-out wait count itself in
-    # ctl[CTL_FAIL + site] and go on instead of trapping (with a short
-    # AITER_DMK_TIMEOUT_S, a hung protocol then shows where it stops).
+    # Debug: AITER_DMK_NOTRAP=1 counts a timed-out wait in ctl[CTL_FAIL + site]
+    # and goes on instead of trapping.
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
-    # Debug only: every wave idles this many us after its ticket (lets every
-    # rank's launch start before anyone sends).
+    # Debug: every wave idles this many us after its ticket (launch skew tests).
     DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
-    # The slots layout's start handshake is off by default; AITER_DMK_NO_HS=0 restores it.
+    # slots' start handshake, off by default (AITER_DMK_NO_HS=0 turns it on).
     HS = not int(os.environ.get("AITER_DMK_NO_HS", "1"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
     )
     POLL_SL = int(os.environ.get("AITER_DMK_POLL_SLEEP", POLL_SLEEP))
     # AITER_DMK_PLAN_TAG: each plan replica dword is stored with the launch's
-    # generation in the same 64-bit store, so a CTA polls its replica instead
-    # of a gate CTA 0 opens after the replicas. On by default for 16-row tiles
-    # (V4.1-Flash DEP4: tpr 8 -2.8, tpr 32 -1.5 us/layer; +1 to +4 past 128).
+    # generation in one 64-bit store, so a CTA polls its replica instead of a
+    # gate CTA 0 opens after the replicas. Faster for 16-row tiles only.
     PLAN_TAG = (
         0
         if COMPACT
@@ -211,13 +208,12 @@ def make_megakernel(
     # slot atomics have returned, before its rows retire. CTA 0 plans from the
     # counters as soon as every source reserved; GEMM items start and stream
     # weights while their A owners wait for the rows-landed gate (every
-    # source's src_done). V4.1-Flash DEP4: -1.8 to -3.7 us/layer.
+    # source's src_done).
     EARLY = 0 if COMPACT else int(os.environ.get("AITER_DMK_EARLY_PLAN", "1"))
     # AITER_DMK_PREFETCH_KB (default 256, 0 = off): while the plan is pending,
     # a step of at least PREF_MIN_TOK tokens has every CTA but 0 read the first
     # N KB of the W1 slice its first item most likely needs, so that item finds
-    # it in cache. V4.1-Flash DEP4: -1.4 (tpr 32) to -4.9 (tpr 128) us/layer;
-    # below 32 tokens most guessed experts get no rows and it costs.
+    # it in cache. Below PREF_MIN_TOK most guessed experts get no rows.
     PREF_B = (
         0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
     )
@@ -226,16 +222,13 @@ def make_megakernel(
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
     # the VGPRs (compact at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
     WPE = int(os.environ.get("AITER_DMK_WPE", str(int(ctas_per_cu))))
-    # AITER_DMK_RED_UNROLL: (token, chunk) items a reduce wave loads at once.
-    # Its passes wait out their loads; compact's waves own up to ~5 items each
-    # (V4.1-Flash DEP4, 2048 tokens/rank: the reduce 19 -> 14 us at 2).
+    # AITER_DMK_RED_UNROLL: (token, chunk) items a reduce wave loads at once;
+    # compact's waves own several items each.
     RED_UN_DEF = 2 if COMPACT else 1
     RED_UN = int(os.environ.get("AITER_DMK_RED_UNROLL", str(RED_UN_DEF)))
-    # The reduce reads each token's top-k slots through one comb_inp resource
-    # and i32 offsets while the region fits them; past that (~14.6k tokens x
-    # top-9) each token gets its own resource from a 64-bit base, which costs
-    # 1.3-2.7 us/layer at 256-512 tokens/rank (DSR1, DSV4-Pro DEP4).
-    # AITER_DMK_RED_BASE64=0/1 forces either (debug).
+    # The reduce reads comb_inp through one resource and i32 offsets while the
+    # region fits them, else through a 64-bit base per token (slower at small
+    # steps). AITER_DMK_RED_BASE64=0/1 forces either.
     RED_B64_DEF = int(int(max_tok_per_rank) * K * int(comb_slot_stride) >= 1 << 31)
     RED_B64 = int(os.environ.get("AITER_DMK_RED_BASE64", str(RED_B64_DEF)))
     knob_sfx = f"_wpe{WPE}" if WPE else ""
@@ -255,7 +248,7 @@ def make_megakernel(
         if val != default
     )
 
-    # The kernel's build constants, for the core and the front ends.
+    # The kernel's build constants, for the protocol and the dispatch phases.
     static = KCtx(
         CAP=CAP,
         CF_OFF=CF_OFF,
@@ -433,7 +426,7 @@ def make_megakernel(
         PLAN_B = 3 * EPR_PAD * 4
         CTRL_B = BC_B + PLAN_B
         if COMPACT and compact_scratch_bytes(npes=npes, experts_per_rank=EPR) > ARENA:
-            raise ValueError("the compact front end's LDS does not fit the GEMM arena")
+            raise ValueError("compact's dispatch LDS does not fit the GEMM arena")
         if int(ctas_per_cu) * (((ARENA + CTRL_B) + 2047) // 2048 * 2048) > 327680:
             raise ValueError(
                 f"{ctas_per_cu} CTAs of {ARENA + CTRL_B} B LDS do not fit one CU"
@@ -495,7 +488,7 @@ def make_megakernel(
             lds_end = bc + fx.Int32(BC_B)
             lds_cnt = lds_end + fx.Int32(EPR_PAD * 4)
             lds_rows = lds_cnt + fx.Int32(EPR_PAD * 4)
-            # Compact front-end scratch in the GEMM arena (CTA 0's X1 matrix,
+            # compact's dispatch scratch in the GEMM arena (CTA 0's X1 matrix,
             # send table and receive counts), unused once GEMM items start.
             ar = fx.Int32(
                 arith.index_cast(T.i32, fx.index_cast(T.index, fx.ptrtoint(arena_ptr)))
@@ -544,7 +537,7 @@ def make_megakernel(
                 addr_route=addr_route,
                 f32_swiglu_limit=f32_swiglu_limit,
             )
-            core.bind_base(kc)
+            protocol.bind_base(kc)
             peer_va, stamp = kc.peer_va, kc.stamp
 
             my_ctl = peer_va(rank, off_ctl)
@@ -556,12 +549,12 @@ def make_megakernel(
             )
             tok = fx.Int32(i32_tok)
             kc.rsrc_ctl, kc.rsrc_actl, kc.tok = rsrc_ctl, rsrc_actl, tok
-            kc.gen, kc.par, kc.tag16 = core.start(kc)
-            core.bind_protocol(kc)
+            kc.gen, kc.par, kc.tag16 = protocol.start(kc)
+            protocol.bind_protocol(kc)
             if const_expr(not COMPACT and HS):
-                frontend_slots.start_handshake(kc)
+                dispatch_slots.start_handshake(kc)
 
-            # ======================== 1. PRODUCE ========================
+            # ======================== 1. DISPATCH ========================
             rsrc_x = create_buffer_resource_from_addr(addr_x)
             rsrc_ids = create_buffer_resource_from_addr(addr_ids)
             rsrc_wts = create_buffer_resource_from_addr(addr_wts)
@@ -571,20 +564,20 @@ def make_megakernel(
             kc.rsrc_x, kc.rsrc_ids, kc.rsrc_wts = rsrc_x, rsrc_ids, rsrc_wts
             kc.wave_gid = wave_gid
             if const_expr(COMPACT):
-                n_mine = frontend_compact.produce(kc, n_mine, n_routes)
+                n_mine = dispatch_compact.produce(kc, n_mine, n_routes)
             else:
-                n_mine, n_routes = frontend_slots.produce(kc, n_mine)
+                n_mine, n_routes = dispatch_slots.produce(kc, n_mine)
             stamp(10)
             if const_expr(EARLY):
-                frontend_slots.signal_reserved(kc, n_mine, n_routes)
-            core.publish_produced(kc, n_mine, n_routes)
+                dispatch_slots.signal_reserved(kc, n_mine, n_routes)
+            protocol.publish_produced(kc, n_mine, n_routes)
             stamp(2)
             if const_expr(PREF_B):
-                frontend_slots.prefetch_w1(kc)
-            n_mt = core.plan(kc)
-            n2_done, total_units = core.gemm_queue(kc, n_mt)
-            core.close(kc, n2_done, total_units)
-            core.reduce(kc)
+                dispatch_slots.prefetch_w1(kc)
+            n_mt = protocol.plan(kc)
+            n2_done, total_units = protocol.gemm_queue(kc, n_mt)
+            protocol.close(kc, n2_done, total_units)
+            protocol.reduce(kc)
 
         kernel(
             arg_a2,

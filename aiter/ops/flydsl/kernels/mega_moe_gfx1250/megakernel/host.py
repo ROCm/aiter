@@ -21,14 +21,14 @@ from .config import (
     slots_tokens,
     wire_row,
 )
-from .core import (
+from .kernel import make_megakernel
+from .protocol import (
     CTL_ERR,
     CTL_FAIL,
     RT_N,
     TR_N,
     ctl_words,
 )
-from .kernel import make_megakernel
 
 
 class MegaKernel:
@@ -43,8 +43,6 @@ class MegaKernel:
         import torch
 
         from aiter.jit.utils.chip_info import get_cu_num
-
-        from ...tensor_shim import _run_compiled  # noqa: F401  (import check)
 
         self.config = config
         self.res = res

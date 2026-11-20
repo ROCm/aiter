@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The slots front end (phase 1. of the package docstring): one wave per
+"""slots' dispatch (phase 1. of the package docstring): one wave per
 route reserves its destination slot and writes the row there; the
 reserved signal (EARLY) and the W1 prefetch."""
 
@@ -34,7 +34,7 @@ from ..s1f_stage1 import (
     _store_i64_sys,
     _uniform,
 )
-from .core import (
+from .protocol import (
     AMAX_FLOOR,
     CTL_ERR,
     CTL_TALLY,
@@ -70,7 +70,7 @@ def start_handshake(kc):
 
 @device_fn
 def produce(kc, n_mine):
-    """1. PRODUCE; returns (routes this wave produced, this rank's routes)."""
+    """1. DISPATCH; returns (routes this wave produced, this rank's routes)."""
     CAP, DEST_STRIDE, E, EPR, EPR_PAD = kc.CAP, kc.DEST_STRIDE, kc.E, kc.EPR, kc.EPR_PAD
     G, GATE_S, H, HS, K, NG = kc.G, kc.GATE_S, kc.H, kc.HS, kc.K, kc.NG
     PAYLOAD, ROW, RT_BASE = kc.PAYLOAD, kc.ROW, kc.RT_BASE
@@ -113,10 +113,6 @@ def produce(kc, n_mine):
                         dtype=T.i32,
                     )
                 )
-        # Branch-free buffer atomic: idle lanes address past the
-        # resource and touch no memory (an add of 0 by each idle lane
-        # on one scratch word serialized ~1700 atomics per launch), and
-        # the return is waited on only at its first use.
         # Every peer has started this launch (the row loads above
         # are local and go out first).
         if const_expr(HS):
@@ -126,6 +122,8 @@ def produce(kc, n_mine):
         )
         if const_expr(TRACE):
             t_issue = _now()
+        # Branch-free buffer atomic: idle lanes address past the resource
+        # and touch no memory; the return is waited on only at its first use.
         off_l = _buffer_atomic_add_ret(
             rsrc_run,
             fx.Int32(
