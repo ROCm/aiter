@@ -1290,9 +1290,9 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
 
 @gluon.jit
 def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
-    """Double-buffered: wait for tile i, start i+2 into the buffer i vacated,
-    read i out of LDS, then the MFMAs. The scale tile is fetched first so its
-    HBM latency overlaps the wait_group."""
+    """Double-buffered: wait for tile i, read it out of LDS, score and store it,
+    then start tile i+2 into the buffer tile i vacated. The scale tile is
+    fetched ahead of the wait_group; with PAGE_PIPE, one iteration early."""
     cfg: gl.constexpr = pgm.cfg
     gl.static_assert(cfg.NUM_BUFFERS == 2, "the LDS walk assumes double buffering")
     BKV: gl.constexpr = cfg.BLOCK_KV
@@ -1310,13 +1310,22 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
 
     unroll: gl.constexpr = cfg.UNROLL if cfg.UNROLL > 1 else None
     buf: gl.int32 = 0
+    # With PAGE_PIPE kv_scale is carried: at every consume it already holds
+    # the scales of the tile at pos.
+    if cfg.PAGE_PIPE:
+        kv_scale = loader.scales(pos, pa, ga)
     for _i in tl.range(0, n_tiles - 2, loop_unroll_factor=unroll):
-        if not cfg.PAGE_PIPE:
-            pn = loader.page_token(pos + 2 * BKV)
         if not cfg.GATHER_PIPE:
             gn = loader.gather_tok(pos + 2 * BKV)
-        kv_scale = loader.scales(pos, pa, ga)
+        if not cfg.PAGE_PIPE:
+            pn = loader.page_token(pos + 2 * BKV)
+            kv_scale = loader.scales(pos, pa, ga)
         k = loader.consume(1, buf)
+        # No refill of a buffer before the tile read from it has been used:
+        # the emit goes before the issue.
+        pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos, MASKED=False)
+        if cfg.PAGE_PIPE:
+            kv_scale = loader.scales(pos + BKV, pb, gb)
         loader.issue(pos + 2 * BKV, pn, gn, buf)
         if cfg.PAGE_PIPE:
             pa, pb, pn = pb, pn, loader.page_token(pos + 3 * BKV)
@@ -1326,21 +1335,24 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
             ga, gb, gn = gb, gn, loader.gather_tok(pos + 3 * BKV)
         else:
             ga, gb = gb, gn
-        pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos, MASKED=False)
         buf = 1 - buf
         pos += BKV
 
     # Two groups are outstanding whenever n_tiles >= 2; at one tile the second
     # was issued anyway and is simply never read.
     if n_tiles > 1:
-        kv_scale = loader.scales(pos, pa, ga)
+        if not cfg.PAGE_PIPE:
+            kv_scale = loader.scales(pos, pa, ga)
         k = loader.consume(1, buf)
         pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
         pos += BKV
         buf = 1 - buf
         pa = pb
         ga = gb
-    kv_scale = loader.scales(pos, pa, ga)
+        if cfg.PAGE_PIPE:
+            kv_scale = loader.scales(pos, pa, ga)
+    if not cfg.PAGE_PIPE:
+        kv_scale = loader.scales(pos, pa, ga)
     k = loader.consume(0, buf)
     pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
 
