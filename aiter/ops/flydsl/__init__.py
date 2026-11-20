@@ -238,6 +238,19 @@ _LAZY_IMPORTS = {
         ".kernels.sparse_pa_nvfp4_prefill",
         "sparse_pa_nvfp4_prefill",
     ),
+    "flydsl_router_sqrtsoftplus_topk": (
+        ".router_sqrtsoftplus_topk",
+        "flydsl_router_sqrtsoftplus_topk",
+    ),
+    "router_sqrtsoftplus_topk_supported": (
+        ".router_sqrtsoftplus_topk",
+        "router_sqrtsoftplus_topk_supported",
+    ),
+    "router_sqrtsoftplus_topk_workspace_shape": (
+        ".router_sqrtsoftplus_topk",
+        "router_sqrtsoftplus_topk_workspace_shape",
+    ),
+    "shuffle_router_gate": (".router_sqrtsoftplus_topk", "shuffle_router_gate"),
 }
 
 __all__ = [
@@ -284,6 +297,7 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "flydsl_rot_quant",
     "flydsl_rot_quant_moe_sort",
+    "flydsl_router_sqrtsoftplus_topk",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
@@ -308,6 +322,9 @@ __all__ = [
     "plan_pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "router_sqrtsoftplus_topk_supported",
+    "router_sqrtsoftplus_topk_workspace_shape",
+    "shuffle_router_gate",
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
