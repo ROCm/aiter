@@ -42,6 +42,7 @@ class kernelInstanceGEMM1:
     Adtype: str = ""
     Bdtype: str = ""
     Cdtype: str = ""
+    PadNK: bool = False
 
     @property
     def name(self) -> str:
@@ -68,6 +69,7 @@ class kernelInstanceGEMM1:
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
             ]
+            + (["NKPad"] if self.PadNK else [])
         )
 
 
@@ -85,6 +87,7 @@ class kernelInstanceGEMM2:
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 2
+    PadNK: bool = False
 
     @property
     def name(self) -> str:
@@ -110,6 +113,7 @@ class kernelInstanceGEMM2:
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
             ]
+            + (["NKPad"] if self.PadNK else [])
         )
 
 
