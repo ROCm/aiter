@@ -15,7 +15,8 @@ BF16 [prefix + new tokens, HK, 256].
 
 Groups (Q heads per KV head) follow Qwen3.8-Flash-Next per TP rank (12/6/3 for
 TP2/4/8, where HK = 1 and H = group); HK = 2/16 cases repeat those groups over
-more KV heads. Functional cases cover one row, a short extend and chunked
+more KV heads. Cases listed in CASE_GROUPS run once, at their own group, whatever
+-g selects. Functional cases cover one row, a short extend and chunked
 prefill against long cached contexts (one whose packed KV exceeds the direct
 kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
 reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
@@ -40,18 +41,38 @@ cases using the full-prefill BQ21/BQ42 union tiles. ``shared`` selections let
 distribution, captured Qwen3.8 layers whose neighbouring rows share about half
 of their blocks (see correlated_prefill).
 
-``triton`` is SGLang's native QSA extend path, copied below and called as its
-backend does: sparse_gqa_fwd_interface_triton when no request has a prefix,
-else sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V.
+Group 16 is the most Q heads per KV head the interface accepts (BQ8 union
+tiles, a direct wave of 16 heads): ``mixed_union_raw`` batches a union request
+with direct rows reading the raw K/V (a tuple gives each request its own
+selection), and ``kv_slots_g16_hk2_ragged`` reads two KV heads through a slot
+table by packed direct. The new-scale graph cases warm a layout at the default
+scale on their own stream, then capture graphs at softmax scales no other case
+uses: the scale is a kernel argument, so capturing compiles nothing and builds
+no workspace. They replay after rewriting the indices in place (and the slot
+table, with the K/V moved to other pages), and an eager call at yet another
+scale must add no FlyDSL specialization. The batch invariance cases run each
+request alone (one of them a full H6 prefill, which also takes the BQ21 tiles)
+and all of them in one call with batch_invariant=True, and both must give the
+same bits: union planning (the row threshold) and the union tile rows are
+decided per request and K3 routes no tile by the others (packed and raw direct
+agree bit for bit). Each batch also runs in the default mode, whose decisions
+span the call, on a workspace of its own.
+
+``triton`` is SGLang's native QSA extend path, copied below under SGLang's
+Apache-2.0 license (see the notice there) and called as its backend does:
+sparse_gqa_fwd_interface_triton when no request has a prefix, else
+sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V.
 
 Usage:
     python op_tests/test_flydsl_qsa_sparse_prefill.py
     python op_tests/test_flydsl_qsa_sparse_prefill.py -c prefill_12000 -g 12 6 3
+    python op_tests/test_flydsl_qsa_sparse_prefill.py -c batch_invariance_h12
 """
 
 import argparse
-import itertools
+import importlib
 import math
+import pkgutil
 
 import numpy as np
 import pandas as pd
@@ -64,6 +85,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
+from aiter.ops.flydsl.kernels import qsa as qsa_kernels
 from aiter.ops.qsa import qsa_sparse_prefill
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -125,10 +147,18 @@ PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
     for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
 }
+# Two requests with their own selections: the shared one runs union, the random one direct.
+MIXED_CASES = {
+    # The direct rows read the raw K/V: the batch's packed KV outgrows the pack budget.
+    "mixed_union_raw": ((1024, 64), (3000, 70001), 1, ("shared", "random"), 512),
+    # The direct rows read packed K/V.
+    "mixed_union_packed": ((1001, 300), (4093, 30000), 1, ("shared", "random"), 512),
+}
 CASES = {
     **FUNCTIONAL_CASES,
     **PERF_CASES,
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
+    **MIXED_CASES,
 }
 # name -> (captured union layout, layout whose first call then grows the scratch arena:
 # its packed KV outgrows the captured layout's)
@@ -156,6 +186,8 @@ SLOT_CASES = {
         POOL_4G_ROWS,
         8_000_000 // PAGE,
     ),
+    # At group 16 (see CASE_GROUPS): a 16-head direct wave per KV head, over two KV heads.
+    "kv_slots_g16_hk2_ragged": ("hk2_ragged", None, 1),
 }
 # name -> (K/V tokens of one request, read through kv_slots): one past the
 # 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
@@ -163,7 +195,53 @@ SPAN_LIMIT_CASES = {
     "span_over_limit": ((2**32 - 2**20) // (HEAD_DIM * 2) + 1, False),
     "kv_slots_span_over_limit": ((2**32 - 2**20) // 4 + 1, True),
 }
-
+# name -> (layout, Q heads per KV head, read through kv_slots, softmax scales no other
+# case uses: one captured, one called eagerly). Union with packed direct, and through a
+# slot table union with raw direct, so that every kernel taking the scale runs.
+SCALE_CASES = {
+    "graph_new_scale_mixed_union_packed": (
+        "mixed_union_packed",
+        12,
+        False,
+        (2**-4.5, 0.0517),
+    ),
+    "graph_new_scale_kv_slots_mixed_union_raw": (
+        "mixed_union_raw",
+        3,
+        True,
+        (0.11, 0.0389),
+    ),
+}
+# name -> (Q heads per KV head, requests as (query rows, cached prefix tokens, selection)):
+# with batch_invariant=True each request alone must give the bits it gives batched.
+BATCH_CASES = {
+    # Alone, 300 rows are below the union planning rows and run direct; batched with a
+    # union request they must stay direct (by default the batch's union plan covers them).
+    # The batch reads raw K/V where the requests alone pack it, and holds an empty request.
+    "batch_invariance_h12": (
+        12,
+        (
+            (300, 517, "shared"),
+            (1024, 30000, "random"),
+            (0, 5, "shared"),
+            (64, 70001, "random"),
+            (1001, 4093, "shared"),
+        ),
+    ),
+    # Alone, the full prefill takes the BQ21 union tiles of single-request H6 prefill.
+    "batch_invariance_full_prefill_h6": (
+        6,
+        ((4096, 0, "correlated"), (17, 30000, "random")),
+    ),
+}
+# name -> Q heads per KV head: these cases run once, at this group, whatever -g selects.
+# Group 16 is the most the interface accepts (BQ8 union tiles, a 16-head direct wave).
+CASE_GROUPS = {
+    "mixed_union_raw": 16,
+    "kv_slots_g16_hk2_ragged": 16,
+    **{name: group for name, (_, group, *_) in SCALE_CASES.items()},
+    **{name: group for name, (group, *_) in BATCH_CASES.items()},
+}
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
 CORRELATED_PROFILES = (
     {
@@ -233,7 +311,8 @@ def make_indices(query_lens, prefix_lens, selection, generator, topk):
     Inputs: per-request query rows and cached prefix tokens (host ints), the
     selection mode ("shared": 32-row windows share block priorities, "random":
     per row, "correlated": correlated_prefill, one prefill with T = 512 and its own
-    seed), a CUDA generator, and T = topk blocks per row.
+    seed) or a tuple with one mode per request, a CUDA generator, and T = topk
+    blocks per row.
 
     Returns contiguous int32 [sum(query_lens), 4T + 3], one row per query in packed
     order; requests without queries add no rows. Row values are request-local token
@@ -245,18 +324,21 @@ def make_indices(query_lens, prefix_lens, selection, generator, topk):
       - the next v % 4 columns hold the causal tail tokens 4b .. v - 1;
       - all remaining columns are -1.
     """
-    if selection == "correlated":
+    modes = (selection,) * len(query_lens) if isinstance(selection, str) else selection
+    if len(modes) != len(query_lens):
+        raise ValueError("a selection tuple needs one mode per request")
+    if "correlated" in modes:
         if len(query_lens) != 1 or prefix_lens[0] or topk != 512:
             raise ValueError("correlated selections model one prefill with T = 512")
         return correlated_prefill(query_lens[0])
     rows = []
-    for count, prefix in zip(query_lens, prefix_lens):
+    for count, prefix, mode in zip(query_lens, prefix_lens, modes):
         if count == 0:
             continue
         visible = torch.arange(prefix + 1, prefix + count + 1)
         blocks = visible // 4
         width = max(int(blocks.max()), 1)
-        if selection == "shared":
+        if mode == "shared":
             priority = torch.rand((count + 31) // 32, width, generator=generator)
             priority = priority.repeat_interleave(32, 0)[:count]
         else:
@@ -306,8 +388,24 @@ def run_torch(q, k, v, indices, query_lens, prefix_lens, scale):
     return out
 
 
-# Copied unchanged from SGLang:
-# https://github.com/sgl-project/sglang/blob/f2b73d4f9b4e64415b8d775b0f811c7801f1728b/python/sglang/srt/layers/attention/qsa/sparse_attn.py#L9-L267
+# Copied unchanged from SGLang, from here through sparse_gqa_fwd_interface_triton_ck: lines
+# 9-309 of
+# https://github.com/sgl-project/sglang/blob/52fecfdf0908dca24f4c6799ff5967125cc4110e/python/sglang/srt/layers/attention/qsa/sparse_attn.py
+# That file has no license header; this is the notice of SGLang's LICENSE:
+#
+#   Copyright 2023-2024 SGLang Team
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -611,6 +709,9 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     return out
 
 
+# End of the code copied from SGLang.
+
+
 def sglang_triton(q, k, v, indices, query_lens, prefix_lens):
     """(interface, args) as SGLang's qwen_sparse_attn_backend.forward_extend calls them."""
     lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
@@ -642,6 +743,32 @@ def make_inputs(case, heads, generator):
         v.fill_(1.0)
     indices = make_indices(query_lens, prefix_lens, selection, generator, topk)
     return q, k, v, indices
+
+
+def flydsl_variants():
+    """FlyDSL specializations the QSA kernel modules hold so far, by FlyDSL's public
+    JitFunction.cache_info(); None when FlyDSL's kernel cache is disabled."""
+    total, seen = None, set()
+    for info in pkgutil.iter_modules(qsa_kernels.__path__):
+        module = importlib.import_module(f"{qsa_kernels.__name__}.{info.name}")
+        for value in vars(module).values():
+            if (
+                id(value) in seen
+                or not type(value).__module__.startswith("flydsl")
+                or not callable(getattr(value, "cache_info", None))
+            ):
+                continue
+            seen.add(id(value))
+            stats = value.cache_info()
+            if stats is not None:
+                total = (total or 0) + stats.currsize
+    return total
+
+
+def mismatched_bits(a, b, msg):
+    """Elements of BF16 a and b whose bits differ (checkAllclose logs them)."""
+    checkAllclose(a, b, rtol=0, atol=0, msg=msg)
+    return int((a.view(torch.int16) != b.view(torch.int16)).sum().item())
 
 
 @benchmark()
@@ -908,8 +1035,185 @@ def test_qsa_span_limit(case, heads):
     }
 
 
+@benchmark()
+def test_qsa_graph_new_scale(case, heads):
+    """softmax_scale is a kernel argument, not a compile-time constant. After one eager
+    call at SCALE warms the layout on a stream, graphs captured there at SCALE and at a
+    scale no other case uses replay correctly: capture fails on any kernel variant or
+    workspace it would have to build. They replay after the indices are rewritten in
+    place and, through a slot table, after the K/V move to other pages and the slots are
+    rewritten in place. An eager call at yet another new scale adds no FlyDSL
+    specialization."""
+    layout, _, slotted, (new_scale, eager_scale) = SCALE_CASES[case]
+    query_lens, prefix_lens, _, selection, topk = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(layout) * 16 + heads
+    )
+    q, k, v, first = make_inputs(layout, heads, generator)
+    second = make_indices(query_lens, prefix_lens, selection, generator, topk)
+    kwargs = {"query_lens": query_lens, "prefix_lens": prefix_lens}
+    kv = (k, v)
+    if slotted:
+        *kv, kwargs["kv_slots"] = make_pool(
+            k, v, query_lens, prefix_lens, None, 1, generator
+        )
+    indices, scales = first.clone(), (SCALE, new_scale)
+    outs = [torch.empty_like(q) for _ in scales]
+    graphs = [torch.cuda.CUDAGraph() for _ in scales]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        qsa_sparse_prefill(q, *kv, indices, out=outs[0], softmax_scale=SCALE, **kwargs)
+    with torch.cuda.stream(stream):
+        for graph, out, scale in zip(graphs, outs, scales):
+            with torch.cuda.graph(graph, stream=stream):
+                qsa_sparse_prefill(
+                    q, *kv, indices, out=out, softmax_scale=scale, **kwargs
+                )
+
+    def replay(selected, label):
+        # The graph's stream must see this stream's writes (the moved pages) first.
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            indices.copy_(selected)
+            for graph, out in zip(graphs, outs):
+                out.fill_(float("nan"))
+                graph.replay()
+        stream.synchronize()
+        errors = []
+        for out, scale in zip(outs, scales):
+            msg = f"{case} H{heads} {label} at scale {scale:.4g}"
+            eager = qsa_sparse_prefill(q, *kv, selected, softmax_scale=scale, **kwargs)
+            errors.append(mismatched_bits(eager, out, f"{msg}: graph vs eager"))
+            errors.append(
+                checkAllclose(
+                    run_torch(q, k, v, selected, query_lens, prefix_lens, scale),
+                    out.to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=f"{msg}: out",
+                )
+            )
+        return max(errors)
+
+    errors = [replay(second, "replay")]
+    if slotted:
+        # Other pages: the graph reads the slot table and the pool on every replay.
+        moved = make_pool(k, v, query_lens, prefix_lens, kv[0].shape[0], 1, generator)
+        for live, new in zip((*kv, kwargs["kv_slots"]), moved):
+            live.copy_(new)
+    errors.append(
+        replay(first, "replay after moving the pages" if slotted else "replay")
+    )
+    assert max(errors) == 0, f"{case} H{heads}: mismatch {errors}"
+
+    before = flydsl_variants()
+    qsa_sparse_prefill(q, *kv, first, softmax_scale=eager_scale, **kwargs)
+    after = flydsl_variants()
+    assert after == before, (
+        f"{case} H{heads}: softmax_scale {eager_scale} took new FlyDSL "
+        f"specializations ({before} -> {after})"
+    )
+    return {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "kv_slots": slotted,
+        "captured scales": f"{SCALE:.4g}, {new_scale:.4g}",
+        "eager scale": f"{eager_scale:.4g}",
+        "flydsl graph err": max(errors),
+        "new specializations": None if before is None else after - before,
+    }
+
+
+@benchmark()
+def test_qsa_batch_invariance(case, heads):
+    """With batch_invariant=True every request alone gives the bits it gives in one call
+    with all of the batch's requests: union planning (the row threshold) and the union
+    tile rows (BQ21/BQ42 of a single full prefill) are decided per request, K3 routes no
+    tile by the others, and packed and raw direct agree bit for bit. The one exception, a
+    batch whose union scratch exceeds its budget running direct only, takes millions of
+    rows and is not tested. The batch first runs in the default mode, whose decisions span
+    the call: it must stay within tolerance, and batch_invariant=True must not reuse its
+    workspace (its plan would change the requests' bits)."""
+    _, requests = BATCH_CASES[case]
+    generator = torch.Generator(device="cuda").manual_seed(
+        len(CASES) * 16 + list(BATCH_CASES).index(case) * 16 + heads
+    )
+    parts = []
+    for rows, prefix, selection in requests:
+        q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
+        k = torch.randn(
+            rows + prefix, 1, HEAD_DIM, generator=generator, dtype=dtypes.bf16
+        )
+        v = torch.randn(
+            rows + prefix, 1, HEAD_DIM, generator=generator, dtype=dtypes.bf16
+        )
+        if rows:
+            indices = make_indices((rows,), (prefix,), selection, generator, 512)
+        else:
+            indices = torch.empty(0, 4 * 512 + 3, dtype=dtypes.i32)
+        parts.append((q, k, v, indices))
+    query_lens = tuple(rows for rows, _, _ in requests)
+    prefix_lens = tuple(prefix for _, prefix, _ in requests)
+    q, k, v, indices = (torch.cat(tensors) for tensors in zip(*parts))
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    reference = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    default_err = checkAllclose(
+        reference,
+        qsa_sparse_prefill(q, k, v, indices, **kwargs).to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"{case} H{heads} batched, default mode: out",
+    )
+    batched = qsa_sparse_prefill(q, k, v, indices, batch_invariant=True, **kwargs)
+    err = checkAllclose(
+        reference,
+        batched.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"{case} H{heads} batched: out",
+    )
+    differing, first = [], 0
+    for part, (rows, prefix, _) in zip(parts, requests):
+        if rows:
+            out = qsa_sparse_prefill(
+                *part,
+                query_lens=(rows,),
+                prefix_lens=(prefix,),
+                softmax_scale=SCALE,
+                batch_invariant=True,
+            )
+            differing.append(
+                mismatched_bits(
+                    out,
+                    batched[first : first + rows],
+                    f"{case} H{heads} request ({rows}, {prefix}) alone vs batched: out",
+                )
+            )
+        first += rows
+    assert err == 0, f"{case} H{heads}: mismatch {err}"
+    assert not default_err, f"{case} H{heads}: default mode mismatch {default_err}"
+    assert not any(differing), (
+        f"{case} H{heads}: requests alone differ from the batch in {differing} "
+        "elements"
+    )
+    return {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "requests": len(requests),
+        "flydsl err": err,
+        "default mode err": default_err,
+        "differing elements": max(differing),
+    }
+
+
 def kv_bytes(case):
-    """K/V bytes a case allocates, pools included (graph cases stay small)."""
+    """K/V bytes a case allocates, pools included (graph and batch invariance cases
+    stay small)."""
     if case in SPAN_LIMIT_CASES:
         tokens, slotted = SPAN_LIMIT_CASES[case]
         return tokens * (4 if slotted else HEAD_DIM * 2)
@@ -928,19 +1232,46 @@ def main():
         )
         return
 
+    suites = (
+        (
+            "functional",
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
+            test_qsa_sparse_attention,
+        ),
+        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
+        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
+        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
+        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
+    )
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
     )
+    # Only names some suite runs: a layout only other rows use would run nothing.
+    runnable = {case for _, cases, _ in suites for case in cases}
+    all_cases = [
+        case
+        for case in (
+            *CASES,
+            *GRAPH_CASES,
+            *SLOT_CASES,
+            *SPAN_LIMIT_CASES,
+            *SCALE_CASES,
+            *BATCH_CASES,
+        )
+        if case in runnable
+    ]
     parser.add_argument(
         "-c",
         "--case",
         type=str,
         nargs="*",
-        choices=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
-        default=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
-        help="input layouts to run (functional, graph, kv_slots, span limit and "
-        "performance cases)",
+        choices=all_cases,
+        default=all_cases,
+        help="input layouts to run (functional, graph, kv_slots, span limit, "
+        "performance, new-scale graph and batch invariance cases)",
     )
     parser.add_argument(
         "-g",
@@ -948,21 +1279,20 @@ def main():
         type=int,
         nargs="*",
         default=[12, 6, 3],
-        help="Q heads per KV head (12/6/3 = Qwen3.8 flash next TP2/4/8, where HK = 1)",
+        help="Q heads per KV head (12/6/3 = Qwen3.8 flash next TP2/4/8, where HK = 1);\n"
+        "cases in CASE_GROUPS run once, at their own group",
     )
     args = parser.parse_args()
 
-    layouts = {**GRAPH_CASES, **SLOT_CASES}
-    for suite, cases, test in (
-        ("functional", [*FUNCTIONAL_CASES, *CONSTANT_CASES], test_qsa_sparse_attention),
-        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
-        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
-        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
-        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
-    ):
+    layouts = {**GRAPH_CASES, **SLOT_CASES, **SCALE_CASES}
+    for suite, cases, test in suites:
         df = []
         selected = [case for case in args.case if case in cases]
-        for case, group in itertools.product(selected, args.group):
+        for case, group in [
+            (c, g)
+            for c in selected
+            for g in ((CASE_GROUPS[c],) if c in CASE_GROUPS else args.group)
+        ]:
             # Rough peak: twice the K/V bytes (pools, gathered copies) plus 4 GiB of
             # reference temporaries.
             needed = 2 * kv_bytes(case) + 2**32
