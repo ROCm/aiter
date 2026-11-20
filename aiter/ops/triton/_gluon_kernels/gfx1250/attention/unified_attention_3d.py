@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
 import math
+import os
 
 import torch
 import triton.experimental.gluon.language as gl
@@ -2228,7 +2229,15 @@ def unified_attention_gluon_kernel_3d_repr(specialization):
     return name
 
 
-@gluon.jit(repr=unified_attention_gluon_kernel_3d_repr)
+# AITER_UA_FP4PT_NO_SPECIALIZE=1: num_blocks (the KV pool's page count, only the TDM descriptors' row bound) is not
+# specialized on divisibility by 16, which a served pool's count (the memory profile's, per DP rank and restart)
+# otherwise flips at random, recompiling every decode config
+@gluon.jit(
+    repr=unified_attention_gluon_kernel_3d_repr,
+    do_not_specialize=(
+        ["num_blocks"] if os.environ.get("AITER_UA_FP4PT_NO_SPECIALIZE", "0") == "1" else []
+    ),
+)
 def _unified_attention_gluon_kernel_3d(
     segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size or head_size // 2 if nvfp4]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
