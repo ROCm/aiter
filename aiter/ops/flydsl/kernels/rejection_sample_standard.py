@@ -33,8 +33,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from . import buffer_ops
-from .wave64_xor_gfx950 import xor_lane, xor_lane_i32
+from .dpp_utils import xor_lane, xor_lane_i32
 
 V = 129280  # vocabulary
 NSPEC = 5  # draft tokens per request
@@ -56,6 +55,7 @@ STATS_BYTES = MAX_REQS * NSPEC * NB * STATS_WORDS * 4
 PART_BYTES = MAX_REQS * NB * 2 * 4
 CNT_BYTES = MAX_REQS * 128  # one line per request
 WORKSPACE_BYTES = STATS_BYTES + PART_BYTES + CNT_BYTES
+TICKET_ORDERING = fx.AtomicOrdering.Monotonic
 
 
 def _fbits(b):
@@ -182,6 +182,44 @@ def _uni(v):
     return I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(v)))
 
 
+def _buffer(base, nbytes):
+    """i32 buffer tensor at byte address ``base`` with ``nbytes`` records:
+    hardware-checked, so a load past the end returns 0 and a store past it is
+    dropped. ``base`` and ``nbytes`` must be wave-uniform."""
+    ptr = fx.inttoptr(
+        fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4),
+        fx.Int64(base),
+    )
+    view = fx.make_view(ptr, fx.make_layout(1 << 30, 1))
+    buf = fx.rocdl.make_buffer_tensor(
+        fx.Tensor(view), max_size=False, num_records_bytes=fx.Int64(nbytes)
+    )
+    return fx.logical_divide(buf, fx.make_layout(1, 1))
+
+
+def _load(buf, off, n=1):
+    """``n`` (1, 2 or 4) i32 words of ``buf`` from word ``off``: one buffer load."""
+    frag = fx.make_rmem_tensor(n, I)
+    fx.copy(
+        fx.make_copy_atom(fx.rocdl.BufferCopy(32 * n), I),
+        fx.slice(buf, (None, off)),
+        frag,
+    )
+    v = Vec(frag.load())
+    return I(v[0]) if n == 1 else v
+
+
+def _store(buf, off, words):
+    """Store the i32 ``words`` (1, 2 or 4) to ``buf`` from word ``off``."""
+    frag = fx.make_rmem_tensor(len(words), I)
+    frag.store(Vec.from_elements(list(words), I))
+    fx.copy(
+        fx.make_copy_atom(fx.rocdl.BufferCopy(32 * len(words)), I),
+        frag,
+        fx.slice(buf, (None, off)),
+    )
+
+
 def _ticket_ptr(ptr_i64):
     return fx.inttoptr(
         fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4),
@@ -207,27 +245,20 @@ def build_rejection_stats(target_bf16: bool):
     ):
         tx, blk, row = fx.thread_idx.x, fx.block_idx.x, fx.block_idx.y
         smem = fx.SharedAllocator().allocate(Shared).peek()
-        lane = tx % 64
         wave = I(fx.rocdl.readfirstlane(T.i32, tx // 64))
         req = row // NSPEC
         step = row - req * NSPEC
-        idr = buffer_ops.create_buffer_resource_from_addr(
-            arg_idx, num_records_bytes=LARGE
-        )
-        tr = buffer_ops.create_buffer_resource_from_addr(
-            arg_temp, num_records_bytes=LARGE
-        )
-        slot = _uni(I(buffer_ops.buffer_load(idr, req, vec_width=1, dtype=I)))
-        temp = _uni(I(buffer_ops.buffer_load(tr, slot, vec_width=1, dtype=I))).bitcast(
-            F
-        )
+        slot = _uni(_load(_buffer(arg_idx, LARGE), req))
+        temp = _uni(_load(_buffer(arg_temp, LARGE), slot)).bitcast(F)
         greedy = temp == F(0.0)
         tbytes = 2 if target_bf16 else 4
-        xr = buffer_ops.create_buffer_resource_from_addr(
-            arg_t + I64(req * ROWS + step) * (V * tbytes), num_records_bytes=V * tbytes
-        )
-        dr = buffer_ops.create_buffer_resource_from_addr(
-            arg_d + I64(slot * NSPEC + step) * (V * 2), num_records_bytes=V * 2
+        # One buffer per row, sized to the row: the loads past column V (the
+        # last block's tail) read 0 and are replaced by -inf below.
+        xr = _buffer(arg_t + I64(req * ROWS + step) * (V * tbytes), V * tbytes)
+        # A greedy request does not read its draft row: zero records.
+        dr = _buffer(
+            arg_d + I64(slot * NSPEC + step) * (V * 2),
+            greedy.select(I(0), I(V * 2)),
         )
         x, d = [], []
         if const_expr(target_bf16):
@@ -237,23 +268,21 @@ def build_rejection_stats(target_bf16: bool):
             for q in range_constexpr(NQ // 2):
                 col = blk * BLK + q * (NT * 8) + tx * 8
                 ok = col < V
-                w = Vec(
-                    buffer_ops.buffer_load(xr, col // 2, vec_width=4, dtype=I, mask=ok)
-                )
+                w = _load(xr, col // 2, 4)
                 for k in range_constexpr(8):
                     x.append(ok.select(_unpack(I(w[k // 2]), k % 2), F(-INF)))
         else:
             for q in range_constexpr(NQ):
                 col = blk * BLK + q * (NT * 4) + tx * 4
                 ok = col < V
-                v = Vec(buffer_ops.buffer_load(xr, col, vec_width=4, dtype=I, mask=ok))
+                v = _load(xr, col, 4)
                 for k in range_constexpr(4):
                     x.append(ok.select(I(v[k]).bitcast(F), F(-INF)))
         rdraft = F(1.0) / greedy.select(F(1.0), temp)
         for q in range_constexpr(NQ // 2):
             col = blk * BLK + q * (NT * 8) + tx * 8
             ok = (col < V) & ~greedy
-            w = Vec(buffer_ops.buffer_load(dr, col // 2, vec_width=4, dtype=I, mask=ok))
+            w = _load(dr, col // 2, 4)
             for k in range_constexpr(8):
                 d.append(ok.select(_unpack(I(w[k // 2]), k % 2), F(-INF)))
 
@@ -270,7 +299,9 @@ def build_rejection_stats(target_bf16: bool):
             for e in vals[1:]:
                 m = _fmax(m, e)
             i = I(BIG)
-            if const_expr(indexed):  # noqa: SIM102 (trace-time vs runtime branch)
+            # SIM102 (on in the pinned ruff): a trace-time branch around a
+            # runtime one cannot be merged into one condition.
+            if const_expr(indexed):  # noqa: SIM102
                 if greedy:
                     for n in range_constexpr(len(vals) - 1, -1, -1):
                         i = (vals[n] == m).select(col_of(n), i)
@@ -292,9 +323,9 @@ def build_rejection_stats(target_bf16: bool):
         def fold(r):
             for m_ in (1, 2, 4, 8, 16, 32):
                 o = (
-                    xor_lane(r[0], m_, lane),
-                    xor_lane_i32(r[1], m_, lane),
-                    xor_lane(r[2], m_, lane),
+                    xor_lane(r[0], m_),
+                    xor_lane_i32(r[1], m_),
+                    xor_lane(r[2], m_),
                 )
                 r = merge(r, o)
             return r
@@ -316,19 +347,11 @@ def build_rejection_stats(target_bf16: bool):
         for w_ in range_constexpr(1, 4):
             r = merge(r, (lds(0, w_), lds(1, w_), lds(2, w_)))
             rd = merge(rd, (lds(3, w_), I(0), lds(4, w_)))
-        sr = buffer_ops.create_buffer_resource_from_addr(
-            arg_stats, num_records_bytes=LARGE
-        )
-        base = (row * NB + blk) * STATS_WORDS
-        buffer_ops.buffer_store(
-            Vec.from_elements(
-                [r[0].bitcast(I), r[2].bitcast(I), r[1], rd[0].bitcast(I)], I
-            ),
-            sr,
-            base,
-            mask=tx == 0,
-        )
-        buffer_ops.buffer_store(rd[2].bitcast(I), sr, base + 4, mask=tx == 0)
+        if tx == 0:
+            sr = _buffer(arg_stats, LARGE)
+            base = (row * NB + blk) * STATS_WORDS
+            _store(sr, base, (r[0].bitcast(I), r[2].bitcast(I), r[1], rd[0].bitcast(I)))
+            _store(sr, base + 4, (rd[2].bitcast(I),))
 
     @flyc.jit
     def launch_rejection_stats(
@@ -385,30 +408,15 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
         lane6 = (lane < ROWS).select(lane, I(ROWS - 1))
         step = (lane < NSPEC).select(lane, I(NSPEC - 1))
         row = req * ROWS + lane6
-        idr = buffer_ops.create_buffer_resource_from_addr(
-            arg_idx, num_records_bytes=LARGE
-        )
-        dsr = buffer_ops.create_buffer_resource_from_addr(
-            arg_ds, num_records_bytes=LARGE
-        )
-        psr = buffer_ops.create_buffer_resource_from_addr(
-            arg_pos, num_records_bytes=LARGE
-        )
-        wsr = buffer_ops.create_buffer_resource_from_addr(
-            arg_ws, num_records_bytes=STATS_BYTES + PART_BYTES
-        )
-        slot_raw = I(buffer_ops.buffer_load(idr, req, vec_width=1, dtype=I))
-        tk = Vec(
-            buffer_ops.buffer_load(
-                dsr, (req * ROWS + step + 1) * 2, vec_width=2, dtype=I
-            )
-        )
-        pv = Vec(buffer_ops.buffer_load(psr, row * 2, vec_width=2, dtype=I))
+        wsr = _buffer(arg_ws, STATS_BYTES + PART_BYTES)
+        slot_raw = _load(_buffer(arg_idx, LARGE), req)
+        tk = _load(_buffer(arg_ds, LARGE), (req * ROWS + step + 1) * 2, 2)
+        pv = _load(_buffer(arg_pos, LARGE), row * 2, 2)
         tmax, tsum, targ, dmax, dsum = [], [], [], [], []
         for b in range_constexpr(NB):
             off = ((req * NSPEC + step) * NB + b) * STATS_WORDS
-            s0 = Vec(buffer_ops.buffer_load(wsr, off, vec_width=4, dtype=I))
-            s1 = I(buffer_ops.buffer_load(wsr, off + 4, vec_width=1, dtype=I))
+            s0 = _load(wsr, off, 4)
+            s1 = _load(wsr, off + 4)
             tmax.append(I(s0[0]).bitcast(F))
             tsum.append(I(s0[1]).bitcast(F))
             targ.append(I(s0[2]))
@@ -418,42 +426,22 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
         valid = I(tk[1]) >= 0
         tokc = valid.select(tok, I(0))
         slot = _uni(slot_raw)
-        tr = buffer_ops.create_buffer_resource_from_addr(
-            arg_temp, num_records_bytes=LARGE
-        )
-        sdr = buffer_ops.create_buffer_resource_from_addr(
-            arg_seed, num_records_bytes=LARGE
-        )
-        temp = _uni(I(buffer_ops.buffer_load(tr, slot, vec_width=1, dtype=I))).bitcast(
-            F
-        )
-        sd = Vec(buffer_ops.buffer_load(sdr, slot * 2, vec_width=2, dtype=I))
+        temp = _uni(_load(_buffer(arg_temp, LARGE), slot)).bitcast(F)
+        sd = _load(_buffer(arg_seed, LARGE), slot * 2, 2)
         greedy = temp == F(0.0)
         temp_eff = greedy.select(F(1.0), temp)
         tbytes = 2 if target_bf16 else 4
         tgt_base = arg_t + I64(req * ROWS) * (V * tbytes)
-        tgr = buffer_ops.create_buffer_resource_from_addr(
-            tgt_base, num_records_bytes=ROWS * V * tbytes
-        )
-        dfr = buffer_ops.create_buffer_resource_from_addr(
-            arg_d + I64(slot) * (NSPEC * V * 2), num_records_bytes=NSPEC * V * 2
-        )
+        tgr = _buffer(tgt_base, ROWS * V * tbytes)
+        dfr = _buffer(arg_d + I64(slot) * (NSPEC * V * 2), NSPEC * V * 2)
         if const_expr(target_bf16):
-            tw = I(
-                buffer_ops.buffer_load(
-                    tgr, (step * V + tokc) // 2, vec_width=1, dtype=I
-                )
-            )
+            tw = _load(tgr, (step * V + tokc) // 2)
             tgt_logit = ((tokc & 1) == 0).select(
                 _unpack(tw, 0), _unpack(tw, 1)
             ) / temp_eff
         else:
-            tgt_logit = I(
-                buffer_ops.buffer_load(tgr, step * V + tokc, vec_width=1, dtype=I)
-            ).bitcast(F)
-        dw = I(
-            buffer_ops.buffer_load(dfr, (step * V + tokc) // 2, vec_width=1, dtype=I)
-        )
+            tgt_logit = _load(tgr, step * V + tokc).bitcast(F)
+        dw = _load(dfr, (step * V + tokc) // 2)
         seed_lo, seed_hi = _uni(I(sd[0])), _uni(I(sd[1]))
         u = _philox_uniform(seed_lo, seed_hi, I(pv[0]), I(pv[1]))
 
@@ -475,10 +463,7 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
             garg = (tmax[b] == gmax).select(targ[b], garg)
         drf_logit = ((tokc & 1) == 0).select(_unpack(dw, 0), _unpack(dw, 1))
         if const_expr(synthetic):
-            rr = buffer_ops.create_buffer_resource_from_addr(
-                arg_rates, num_records_bytes=NSPEC * 4
-            )
-            rate = I(buffer_ops.buffer_load(rr, step, vec_width=1, dtype=I)).bitcast(F)
+            rate = _load(_buffer(arg_rates, NSPEC * 4), step).bitcast(F)
             accept = u < rate
         else:
             samp = (tgt_logit - lse_t) > _log(u) + (drf_logit / temp - lse_d)
@@ -503,33 +488,24 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
         nlse_t = lse_t_a * F(-1.0)
         nlse_d = lse_d_a * F(-1.0)
         c0 = blk * BLK + tx * vec
-        xr = buffer_ops.create_buffer_resource_from_addr(
-            tgt_base + I64(acc) * (V * tbytes), num_records_bytes=V * tbytes
-        )
-        dr = buffer_ops.create_buffer_resource_from_addr(
+        # The resample row and, for a residual, its draft row (else zero
+        # records, so the draft loads read 0 without touching memory). The
+        # tail past column V reads 0 and is masked to -inf below.
+        xr = _buffer(tgt_base + I64(acc) * (V * tbytes), V * tbytes)
+        dr = _buffer(
             arg_d + I64(slot * NSPEC + bonus.select(I(0), acc)) * (V * 2),
-            num_records_bytes=V * 2,
+            residual.select(I(V * 2), I(0)),
         )
         bv, bi = F(-INF), I(BIG)
         for q in range_constexpr(BLK // (NT * vec)):
             col = c0 + q * (NT * vec)
             ok = col < V
             if const_expr(target_bf16):
-                xw = Vec(
-                    buffer_ops.buffer_load(xr, col // 2, vec_width=4, dtype=I, mask=ok)
-                )
-                dv = Vec(
-                    buffer_ops.buffer_load(
-                        dr, col // 2, vec_width=4, dtype=I, mask=ok & residual
-                    )
-                )
+                xw = _load(xr, col // 2, 4)
+                dv = _load(dr, col // 2, 4)
             else:
-                xv = Vec(buffer_ops.buffer_load(xr, col, vec_width=4, dtype=I, mask=ok))
-                dv = Vec(
-                    buffer_ops.buffer_load(
-                        dr, col // 2, vec_width=2, dtype=I, mask=ok & residual
-                    )
-                )
+                xv = _load(xr, col, 4)
+                dv = _load(dr, col // 2, 2)
             for k in range_constexpr(vec):
                 if const_expr(target_bf16):
                     xk = ok.select(_unpack(I(xw[k // 2]), k % 2), F(-INF))
@@ -550,8 +526,8 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
                 bv = better.select(val, bv)
                 bi = better.select(col + k, bi)
         for m in (1, 2, 4, 8, 16, 32):
-            ov = xor_lane(bv, m, lane)
-            oi = xor_lane_i32(bi, m, lane)
+            ov = xor_lane(bv, m)
+            oi = xor_lane_i32(bi, m)
             bv, bi = _comb(bv, bi, ov, oi)
         smem.red.ptr[wave] = bv.bitcast(I)
         smem.red.ptr[4 + wave] = bi
@@ -562,57 +538,55 @@ def build_rejection_resample(synthetic: bool, target_bf16: bool):
             bv, bi = _comb(
                 bv, bi, I(smem.red.ptr[w_]).bitcast(F), I(smem.red.ptr[4 + w_])
             )
-        part_at = STATS_BYTES // 4 + (req * NB + blk) * 2
-        buffer_ops.buffer_store(
-            Vec.from_elements([bv.bitcast(I), bi], I),
-            wsr,
-            part_at,
-            mask=(tx == 0) & live,
-        )
+        if (tx == 0) & live:
+            _store(wsr, STATS_BYTES // 4 + (req * NB + blk) * 2, (bv.bitcast(I), bi))
         fx.rocdl.s_waitcnt(vmcnt=0)
         fx.gpu.barrier()
         cnt_addr = arg_ws + I64(STATS_BYTES + PART_BYTES) + I64(req) * 128
+        # TICKET_ORDERING is Monotonic (no release / acquire) on purpose. The
+        # handoff the ticket orders is the partials store above and the last
+        # block's partials load below, and both sides meet in one L2: a
+        # request's NB workgroups have the same index mod 8 and workgroup w
+        # runs on XCD w % 8 (SPX; DPX and CPX split the XCDs by a divisor of
+        # 8). The vector L1 writes through, so once vmcnt(0) returns the store
+        # is in that L2, before the barrier and the atomic. The reader has no
+        # stale copy: a request's partials are one 128-byte line that only its
+        # last block reads, once per launch, and L1 is invalidated at launch.
+        # An agent-scope acq_rel adds buffer_wbl2 sc1 / buffer_inv sc1 around
+        # the atomic. Measured on MI355X (bf16 rows, ratio test, graph
+        # replay, best of 14 rounds): 20.1 -> 21.6 us at 8 requests, 35.8 ->
+        # 39.6 us at 32 and 106.4 -> 135.3 us at 128.
         if (tx == 0) & live:
             smem.red.ptr[8] = fx.atomic_add(
-                _ticket_ptr(cnt_addr), I(1), syncscope=fx.rocdl.SyncScope.Agent
+                _ticket_ptr(cnt_addr),
+                I(1),
+                syncscope=fx.rocdl.SyncScope.Agent,
+                ordering=TICKET_ORDERING,
             )
         fx.gpu.barrier()
         if (I(smem.red.ptr[8]) == NB - 1) & live & (wave == 0):
             pb = lane < NB
-            pw = Vec(
-                buffer_ops.buffer_load(
-                    wsr,
-                    STATS_BYTES // 4 + (req * NB + lane) * 2,
-                    vec_width=2,
-                    dtype=I,
-                    mask=pb,
-                )
-            )
+            # This request's NB partials; lanes past them read 0 (replaced below).
+            prt = _buffer(arg_ws + I64(STATS_BYTES + req * NB * 8), NB * 8)
+            pw = _load(prt, lane * 2, 2)
             fv = pb.select(I(pw[0]), I(NEG_INF_BITS)).bitcast(F)
             fi = pb.select(I(pw[1]), I(BIG))
             for m in (1, 2, 4, 8):
-                ov = xor_lane(fv, m, lane)
-                oi = xor_lane_i32(fi, m, lane)
+                ov = xor_lane(fv, m)
+                oi = xor_lane_i32(fi, m)
                 fv, fi = _comb(fv, fi, ov, oi)
             token = _uni(fi)
             token = (token >= V).select(I(0), token)
             lo = (lane < acc).select(tok, (lane == acc).select(token, I(-1)))
-            outr = buffer_ops.create_buffer_resource_from_addr(
-                arg_out, num_records_bytes=LARGE
-            )
-            buffer_ops.buffer_store(
-                Vec.from_elements([lo, (lo < 0).select(I(-1), I(0))], I),
-                outr,
-                (req * ROWS + lane) * 2,
-                mask=lane < ROWS,
-            )
-            nsr = buffer_ops.create_buffer_resource_from_addr(
-                arg_ns, num_records_bytes=LARGE
-            )
-            buffer_ops.buffer_store(acc + 1, nsr, req, mask=lane == 0)
-            fx.atomic_xchg(
-                _ticket_ptr(cnt_addr), I(0), syncscope=fx.rocdl.SyncScope.Agent
-            )
+            # The request's ROWS int64 tokens: lanes past them are dropped.
+            outr = _buffer(arg_out + I64(req) * (ROWS * 8), ROWS * 8)
+            _store(outr, lane * 2, (lo, (lo < 0).select(I(-1), I(0))))
+            if lane == 0:
+                _store(_buffer(arg_ns, LARGE), req, (acc + 1,))
+                # Every block has taken its ticket: reset it for the next launch.
+                fx.atomic_xchg(
+                    _ticket_ptr(cnt_addr), I(0), syncscope=fx.rocdl.SyncScope.Agent
+                )
 
     @flyc.jit
     def launch_rejection_resample(

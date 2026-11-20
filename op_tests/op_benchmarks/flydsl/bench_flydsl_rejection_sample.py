@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CUDA-graph time of the FlyDSL speculative-decoding draft-step ops against the
-paths they replace (gfx950, one GPU).
+"""CUDA-graph time of ``flydsl_rejection_sample_standard`` against the path it
+replaces, vLLM's Triton ``rejection_sample`` (gfx950, one GPU; needs vLLM).
 
-    python3 op_tests/op_benchmarks/flydsl/bench_flydsl_spec_decode_draft_ops.py
-    python3 .../bench_flydsl_spec_decode_draft_ops.py --op router --rows 16 160
+    python3 op_tests/op_benchmarks/flydsl/bench_flydsl_rejection_sample.py
+    python3 .../bench_flydsl_rejection_sample.py --reqs 8 32 --target bf16
 
-Ops and baselines (both baselines need vLLM):
-
-* ``router``: ``flydsl_router_sqrtsoftplus_topk`` (row-major and load-time gate
-  layouts) vs vLLM's ``fp32_router_gemm_dispatch`` followed by vLLM's
-  ``topk_hash_softplus_sqrt`` or by aiter's ``topk_gating(score_func="sqrtsoftplus")``.
-* ``rejection``: ``flydsl_rejection_sample_standard`` vs vLLM's Triton
-  ``rejection_sample``, with the probability-ratio test and in the synthetic
-  acceptance mode (``--mode``). ``--target bf16``: raw bf16 lm_head rows go
-  straight in; the baseline also runs the fp32 copy and ``apply_temperature``
-  vLLM needs first. ``--target fp32``: processed fp32 rows for both.
+Both the probability-ratio test and the synthetic acceptance mode (``--mode``)
+are timed. ``--target bf16``: raw bf16 lm_head rows go straight in; the
+baseline also runs the fp32 copy and ``apply_temperature`` vLLM needs first.
+``--target fp32``: processed fp32 rows for both.
 
 Each graph replays a call on up to 100 distinct inputs (a working set larger
 than the last-level cache, as in a model step); arms run in A B B A order, 7
@@ -33,13 +27,7 @@ from aiter.ops.flydsl.rejection_sample import (
     flydsl_rejection_sample_standard,
     warmup_rejection_sample_standard,
 )
-from aiter.ops.flydsl.router_sqrtsoftplus_topk import (
-    flydsl_router_sqrtsoftplus_topk,
-    shuffle_router_gate,
-    warmup_router_sqrtsoftplus_topk,
-)
 
-H = 5120
 V = 129280
 
 
@@ -87,65 +75,6 @@ def report(title, key, rows):
     for k, t in rows:
         cells = " | ".join(f"{t[c][0]:.2f} / {t[c][1]:.2f}" for c in cols)
         print(f"| {k} | {cells} |", flush=True)
-
-
-def bench_router(rows, nin=100):
-    import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401
-    from vllm import _custom_ops as ops
-
-    from aiter.ops.topk import topk_gating
-
-    warmup_router_sqrtsoftplus_topk()
-    w = (torch.randn(128, H, device="cuda") * 0.02).bfloat16()
-    ws = shuffle_router_gate(w)
-    bias = torch.randn(128, device="cuda") * 0.1
-    out = []
-    for m in rows:
-        xs = [torch.randn(m, H, device="cuda").bfloat16() for _ in range(nin)]
-        bufs = [
-            (
-                torch.empty(m, 3, device="cuda"),
-                torch.empty(m, 3, device="cuda", dtype=torch.int32),
-                torch.empty(m, 3, device="cuda", dtype=torch.int32),
-            )
-            for _ in range(nin)
-        ]
-
-        def flydsl(xs=xs, bufs=bufs):
-            for x, (tw, ti, _) in zip(xs, bufs):
-                flydsl_router_sqrtsoftplus_topk(
-                    x, w, bias, 3, 1.5, topk_weights=tw, topk_ids=ti
-                )
-
-        def flydsl_shuffled(xs=xs, bufs=bufs):
-            for x, (tw, ti, _) in zip(xs, bufs):
-                flydsl_router_sqrtsoftplus_topk(
-                    x, ws, bias, 3, 1.5, topk_weights=tw, topk_ids=ti,
-                    weight_shuffled=True,
-                )  # fmt: skip
-
-        def vllm_pair(xs=xs, bufs=bufs):
-            for x, (tw, ti, te) in zip(xs, bufs):
-                lg = torch.ops.vllm.fp32_router_gemm_dispatch(x, w, False)
-                ops.topk_hash_softplus_sqrt(
-                    tw, ti, te, lg, True, 1.5, bias, None, None, None, None, 0
-                )
-
-        def vllm_gemm_aiter_topk(xs=xs, bufs=bufs):
-            for x, (tw, ti, _) in zip(xs, bufs):
-                lg = torch.ops.vllm.fp32_router_gemm_dispatch(x, w, False)
-                topk_gating(tw, ti, lg, bias, True, 1.5, "sqrtsoftplus")
-
-        graphs = {
-            "vllm gemm + topk": graph(vllm_pair),
-            "vllm gemm + aiter topk_gating": graph(vllm_gemm_aiter_topk),
-            "flydsl": graph(flydsl),
-            "flydsl shuffled gate": graph(flydsl_shuffled),
-        }
-        out.append((m, abba(graphs, nin)))
-        del graphs
-        torch.cuda.empty_cache()
-    report("Router GEMM + sqrt-softplus top-3, 128 experts, hidden 5120", "rows", out)
 
 
 class _DraftCache:
@@ -218,9 +147,19 @@ def bench_rejection(reqs, target, synthetic):
                     tgt = tgt.float()
                     apply_temperature(tgt, eidx, temp)
                 rejection_sample(
-                    tgt, _DraftCache(dl), ds, cu, pos, idx, eidx, local_pos,
-                    temp, seed, 5, synthetic_conditional_rates=rates,
-                )  # fmt: skip
+                    tgt,
+                    _DraftCache(dl),
+                    ds,
+                    cu,
+                    pos,
+                    idx,
+                    eidx,
+                    local_pos,
+                    temp,
+                    seed,
+                    5,
+                    synthetic_conditional_rates=rates,
+                )
 
         graphs = {"vllm": graph(vllm_chain), "flydsl": graph(flydsl)}
         out.append((b, abba(graphs, n)))
@@ -236,24 +175,18 @@ def bench_rejection(reqs, target, synthetic):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument(
-        "--op", nargs="*", default=["router", "rejection"],
-        choices=["router", "rejection"],
-    )  # fmt: skip
-    ap.add_argument("--rows", type=int, nargs="*", default=None)
     ap.add_argument("--reqs", type=int, nargs="*", default=[8, 16, 32, 64, 128])
     ap.add_argument("--target", nargs="*", default=["bf16", "fp32"])
     ap.add_argument(
-        "--mode", nargs="*", default=["standard", "synthetic"],
+        "--mode",
+        nargs="*",
+        default=["standard", "synthetic"],
         choices=["standard", "synthetic"],
-    )  # fmt: skip
+    )
     args = ap.parse_args()
-    if "router" in args.op:
-        bench_router(args.rows or [5, 16, 40, 80, 160, 320, 640, 768])
-    if "rejection" in args.op:
-        for mode in args.mode:
-            for target in args.target:
-                bench_rejection(args.reqs, target, mode == "synthetic")
+    for mode in args.mode:
+        for target in args.target:
+            bench_rejection(args.reqs, target, mode == "synthetic")
 
 
 if __name__ == "__main__":

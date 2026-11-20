@@ -129,7 +129,6 @@ _LAZY_IMPORTS = {
     "flydsl_qk_norm_rope_quant": (
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
-        "flydsl_rejection_sample_standard",
     ),
     "CombineWorkspace": (".dcp_mailbox", "CombineWorkspace"),
     "GatherWorkspace": (".dcp_mailbox", "GatherWorkspace"),
@@ -143,23 +142,15 @@ _LAZY_IMPORTS = {
     "rejection_sample_standard_supported": (
         ".rejection_sample",
         "rejection_sample_standard_supported",
-        "router_sqrtsoftplus_topk_supported",
-        "shuffle_router_gate",
     ),
-    "flydsl_router_sqrtsoftplus_topk": (
-        ".router_sqrtsoftplus_topk",
-        "flydsl_router_sqrtsoftplus_topk",
+    "warmup_rejection_sample_standard": (
+        ".rejection_sample",
+        "warmup_rejection_sample_standard",
     ),
-    "router_sqrtsoftplus_topk_supported": (
-        ".router_sqrtsoftplus_topk",
-        "router_sqrtsoftplus_topk_supported",
-    ),
-    "shuffle_router_gate": (".router_sqrtsoftplus_topk", "shuffle_router_gate"),
     "flydsl_rot_quant": (".kernels.rot_quant", "flydsl_rot_quant"),
     "flydsl_rot_quant_moe_sort": (
         ".kernels.rot_quant",
         "flydsl_rot_quant_moe_sort",
-        "flydsl_router_sqrtsoftplus_topk",
     ),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
@@ -303,6 +294,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_rejection_sample_standard",
     "flydsl_rot_quant",
     "flydsl_rot_quant_moe_sort",
     "gather_kv_b_proj_flydsl",
@@ -333,6 +325,7 @@ __all__ = [
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
+    "warmup_rejection_sample_standard",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"

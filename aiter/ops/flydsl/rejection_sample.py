@@ -22,10 +22,14 @@ rows: the 5 draft steps and the bonus row):
 The target rows may be the raw bf16 lm_head output (the kernel divides by the
 request's temperature in fp32, as vLLM's ``apply_temperature``) or fp32 rows
 with the temperature already applied. The kernel's fp32 sums and hardware
-exp / log differ from Triton's in the last bits, so a decision can differ from
-vLLM's only where its margin is below ~1e-6.
+exp / log differ from Triton's in the last bits, so a decision whose margin is
+at that rounding level can go the other way. The op test compares the tokens
+with an fp64 reference (and with vLLM when it is installed) for every request
+whose smallest decision margin exceeds 1e-4; closer decisions are not checked.
 
-One workspace per device: launches on a device must be stream-ordered.
+One workspace per device: launches on a device must be stream-ordered. Call
+``warmup_rejection_sample_standard(device)`` before capturing a CUDA graph; it
+compiles the kernels and allocates the workspace outside the capture.
 """
 
 import functools
@@ -60,20 +64,28 @@ REJECTION_SAMPLE_NUM_SPEC = NSPEC
 REJECTION_SAMPLE_MAX_REQS = MAX_REQS
 
 
-@functools.cache
-def _workspace(device_index: int) -> torch.Tensor:
-    """Stats, block partials and ticket counters. Zeroed once; every launch
-    leaves its tickets at zero."""
-    return torch.zeros(
-        WORKSPACE_BYTES, dtype=torch.uint8, device=torch.device("cuda", device_index)
-    )
+# Per device: the workspace (stats, block partials, ticket counters; zeroed
+# once, and every launch leaves its tickets at zero) and the placeholder for an
+# absent ``synthetic_rates``.
+_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-@functools.cache
-def _rates_placeholder(device_index: int) -> torch.Tensor:
-    return torch.zeros(
-        NSPEC, dtype=torch.float32, device=torch.device("cuda", device_index)
-    )
+def _device_buffers(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    bufs = _buffers.get(dev.index)
+    if bufs is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Allocated here, the buffers would come from the graph's private
+            # pool and their zero-fill would be recorded in the graph.
+            raise RuntimeError(
+                "flydsl_rejection_sample_standard: call "
+                "warmup_rejection_sample_standard(device) before graph capture"
+            )
+        bufs = (
+            torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=dev),
+            torch.zeros(NSPEC, dtype=torch.float32, device=dev),
+        )
+        _buffers[dev.index] = bufs
+    return bufs
 
 
 @functools.cache
@@ -177,8 +189,8 @@ def flydsl_rejection_sample_standard(
     ):
         raise ValueError("synthetic_rates must be a contiguous fp32 [5]")
     target_bf16 = target_logits.dtype == torch.bfloat16
-    ws = _workspace(dev.index)
-    rates = synthetic_rates if synthetic else _rates_placeholder(dev.index)
+    ws, rates_placeholder = _device_buffers(dev)
+    rates = synthetic_rates if synthetic else rates_placeholder
     sampled = torch.empty((b, ROWS), dtype=torch.int64, device=dev)
     num_sampled = torch.empty(b, dtype=torch.int32, device=dev)
     stream = torch.cuda.current_stream(dev)
@@ -213,11 +225,13 @@ def flydsl_rejection_sample_standard(
 
 
 def warmup_rejection_sample_standard(device: torch.device | None = None) -> None:
-    """Compile the four variants (fp32 or bf16 target rows, ratio test or
-    synthetic) and allocate the workspace on ``device``, before graph capture."""
+    """Allocate the workspace on ``device`` and compile the four variants (fp32
+    or bf16 target rows, ratio test or synthetic). Call it before capturing a
+    CUDA graph that contains the op."""
     dev = torch.device("cuda") if device is None else torch.device(device)
     if dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
+    _device_buffers(dev)
     z = functools.partial(torch.zeros, device=dev)
     for dtype in (torch.float32, torch.bfloat16):
         args = (
