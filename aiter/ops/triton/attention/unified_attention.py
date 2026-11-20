@@ -471,9 +471,10 @@ def unified_attention(
     # output_rows[r] (every token still attends and its KV is read as usual).
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
-    # Q (times q_descale, if given) already carries softmax_scale * log2(e), applied by the
-    # producer of Q in fp32 before its one rounding. The QK WMMA results are then in the exp2
-    # units the kernels want, so they skip the per-element scale multiply. gfx1250 Gluon only.
+    # BF16 Q already carries softmax_scale * log2(e), applied by the producer of Q in fp32
+    # before its one rounding. The QK WMMA results are then in the exp2 units the kernels
+    # want, so they skip the per-element scale multiply. gfx1250 Gluon, BF16 Q only (a
+    # quantized Q keeps a runtime descale multiply, so it would gain nothing).
     q_prescaled: bool = False,
 ):
     assert causal, "Only causal attention is supported"
@@ -496,6 +497,8 @@ def unified_attention(
                 "q_prescaled is supported by the gfx1250 Gluon backend only, "
                 f"got backend={backend!r} on {DEVICE_ARCH}"
             )
+        if q.dtype != torch.bfloat16:
+            raise ValueError(f"q_prescaled takes a BF16 Q, got {q.dtype}")
         # The kernels scale QK by softmax_scale * log2(e) and read every other score term
         # (sinks, softcap, biases) through softmax_scale. With ln(2) the scale is exactly 1.0
         # in fp32, and those terms stay in the right units.
