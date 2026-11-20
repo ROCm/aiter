@@ -83,6 +83,8 @@ def make_megakernel(
     ctas_per_cu=2,
     layout="slots",
     mt_cap=None,
+    stream=False,
+    producers=64,
 ):
     """Build a megakernel; returns a ``@flyc.jit`` launcher.
 
@@ -97,8 +99,11 @@ def make_megakernel(
     ``arg_w2``, ``arg_w2_scale``, ``arg_rowmap`` (pointers), then i64
     ``arena`` (window handle), ``x``, ``ids``, ``wts``, ``out``, ``ctl``, then
     ``i32_tok`` (this rank's tokens), ``i32_rows`` (rows the GEMMs may see),
-    ``addr_route`` (compact: the route slots, i32 per route),
-    ``f32_swiglu_limit``, ``stream``.
+    ``addr_route`` (compact: the route slots, i32 per route; STREAM: its
+    scratch, config.stream_layout), ``f32_swiglu_limit``, ``stream``.
+
+    ``stream`` (compact only): the dispatch is S1F's producer pipeline
+    (config.STREAM).
     """
     COMPACT = layout == "compact"
     if layout not in ("slots", "compact"):
@@ -162,6 +167,59 @@ def make_megakernel(
         T_MAX = min(TALLY_MAX, G - 1)
         if MAXR > T_MAX * TALLY_MAXR:
             raise ValueError("more routes per rank than the tally CTAs count")
+    STREAM = bool(stream) and COMPACT
+    st_kw = {}
+    if STREAM:
+        from ..compact_plan import S1F_SHARED_FIRST
+        from ..s1f_stage1 import s1f_block_runs, s1f_flag_m, s1f_producer_lds
+        from .config import (
+            STREAM_RUN_ROWS,
+            stream_flag_rel,
+            stream_layout,
+        )
+
+        FM = s1f_flag_m(TM)
+        SUB = TM // FM
+        P = int(producers)
+        if not 1 <= P < G - 1:
+            raise ValueError(f"producers={P} must leave consumers of workers={G}")
+        TILE_CAP = (CAP + FM - 1) // FM
+        lay_s = stream_layout(
+            npes=npes,
+            experts_per_rank=EPR,
+            max_tok_per_rank=max_tok_per_rank,
+            row=ROW,
+            tile_cap=TILE_CAP,
+        )
+        mb = s1f_producer_lds(run_rows=STREAM_RUN_ROWS, row_stride=ROW)
+        TBL_OFF = (mb["end"] + 127) // 128 * 128
+        NPOS2 = lay_s["npos"]
+        RBK = int(
+            os.environ.get(
+                "AITER_MEGAKERNEL_BLOCK_RUNS", str(s1f_block_runs(max_tok_per_rank))
+            )
+        )
+        st_kw = dict(  # noqa: C408 - KCtx fields
+            GM1=int(os.environ.get("AITER_MEGAKERNEL_GM1", "32")),
+            GM2=int(os.environ.get("AITER_MEGAKERNEL_GM2", "32")),
+            FM=FM,
+            FSH=FM.bit_length() - 1,
+            SUB=SUB,
+            P=P,
+            RBK=RBK,
+            R_RUN=STREAM_RUN_ROWS,
+            TILE_CAP=TILE_CAP,
+            FLAG_OFF=off_ctl + stream_flag_rel(npes=npes, experts_per_rank=EPR),
+            SEGCAP=int(max_tok_per_rank),
+            SEND_N=lay_s["send_n"],
+            NPOS=npes * EPR,
+            NPOS2=NPOS2,
+            SF=S1F_SHARED_FIRST if S1F_SHARED_FIRST < EPR else 0,
+            TBL_OFF=TBL_OFF,
+            WIRE_B=int(max_tok_per_rank) * ROW,
+            ST_LAY=lay_s,
+        )
+        PROD_LDS = TBL_OFF + (4 * NPOS2 + 32) * 4
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
     RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
     CTL_ARENA_B = ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
@@ -207,6 +265,8 @@ def make_megakernel(
     knob_sfx = f"_wpe{WPE}" + "".join(
         f"_{name}{val}"
         for name, val, default in (
+            ("st", (st_kw["P"] * 100 + st_kw["RBK"]) if STREAM else 0, 0),
+            ("gm", (st_kw["GM1"] * 100 + st_kw["GM2"]) if STREAM else 3232, 3232),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -257,6 +317,7 @@ def make_megakernel(
         SEG_CNT_W=SEG_CNT_W,
         SRC_OFF=SRC_OFF,
         SREP_W=SREP_W,
+        STREAM=STREAM,
         TIMEOUT_TICKS=TIMEOUT_TICKS,
         TM=TM,
         TRACE=TRACE,
@@ -271,6 +332,7 @@ def make_megakernel(
         off_rowmap=off_rowmap,
         rank=rank,
         tile_n=tile_n,
+        **st_kw,
     )
 
     @flyc.jit
@@ -386,13 +448,18 @@ def make_megakernel(
         # plan's inclusive m-tile end, CTA 0's replica counts and the plan's
         # row count, a dword each.
         BC_B = 64
-        PLAN_B = 3 * EPR_PAD * 4
+        # STREAM packs the row counts into the m-tile ends and keeps CTA 0's
+        # replica counts in its dispatch scratch.
+        PLAN_B = (1 if STREAM else 3) * EPR_PAD * 4
         CTRL_B = BC_B + PLAN_B
         if COMPACT and compact_scratch_bytes(npes=npes, experts_per_rank=EPR) > ARENA:
             raise ValueError("compact's dispatch LDS does not fit the GEMM arena")
-        if int(ctas_per_cu) * (((ARENA + CTRL_B) + 2047) // 2048 * 2048) > 327680:
+        # STREAM: a producer's ring, mailboxes and segment table share the
+        # GEMM arena, which grows to hold them.
+        ARENA_LDS = max(ARENA, PROD_LDS) if STREAM else ARENA
+        if int(ctas_per_cu) * (((ARENA_LDS + CTRL_B) + 2047) // 2048 * 2048) > 327680:
             raise ValueError(
-                f"{ctas_per_cu} CTAs of {ARENA + CTRL_B} B LDS do not fit one CU"
+                f"{ctas_per_cu} CTAs of {ARENA_LDS + CTRL_B} B LDS do not fit one CU"
             )
         kname = (
             ("mega_compact" if COMPACT else "mega_slots")
@@ -442,7 +509,7 @@ def make_megakernel(
             is_t0 = tid == fx.Int32(0)
 
             smem = fx.SharedAllocator(static=False)
-            arena_ptr = smem.allocate(ARENA, 128)._ptr
+            arena_ptr = smem.allocate(ARENA_LDS, 128)._ptr
             lds_holder[0] = arena_ptr
             ctrl_ptr = smem.allocate(CTRL_B, 16)._ptr
             bc = fx.Int32(
@@ -459,6 +526,10 @@ def make_megakernel(
             l_m = ar
             l_sb = ar + fx.Int32(npes * SEGS_PAD * 4)
             l_rc = l_sb + fx.Int32(SEGS_PAD * 4)
+            l_st = l_rc + fx.Int32(EPR_PAD * 4)
+            l_scan = l_st + fx.Int32(EPR_PAD * 4)
+            if const_expr(STREAM):
+                lds_cnt = l_scan + fx.Int32(64)
 
             win = cco.CachedWindow(arena)
             win_base = win.base
@@ -478,6 +549,8 @@ def make_megakernel(
                 l_m=l_m,
                 l_sb=l_sb,
                 l_rc=l_rc,
+                l_st=l_st,
+                l_scan=l_scan,
                 win_base=win_base,
                 win_stride=win_stride,
                 arg_a2=arg_a2,
@@ -524,6 +597,13 @@ def make_megakernel(
             n_routes = tok * fx.Int32(K)
             kc.rsrc_x, kc.rsrc_ids, kc.rsrc_wts = rsrc_x, rsrc_ids, rsrc_wts
             kc.wave_gid = wave_gid
+            if const_expr(STREAM):
+                lay_s = st_kw["ST_LAY"]
+                kc.addr_send = addr_route + fx.Int64(lay_s["send"])
+                kc.addr_segt = addr_route + fx.Int64(lay_s["segt"])
+                kc.addr_tsrc = addr_route + fx.Int64(lay_s["tsrc"])
+                kc.addr_wire = addr_route + fx.Int64(lay_s["wire"])
+                kc.is_prod = (bid >= fx.Int32(1)) & (bid <= fx.Int32(st_kw["P"]))
             if const_expr(COMPACT):
                 n_mine = dispatch_compact.produce(kc, n_mine, n_routes)
             else:
@@ -531,7 +611,8 @@ def make_megakernel(
             stamp(10)
             if const_expr(EARLY):
                 dispatch_slots.signal_reserved(kc, n_mine, n_routes)
-            protocol.publish_produced(kc, n_mine, n_routes)
+            if const_expr(not STREAM):
+                protocol.publish_produced(kc, n_mine, n_routes)
             stamp(2)
             if const_expr(PREF_B):
                 dispatch_slots.prefetch_w1(kc)

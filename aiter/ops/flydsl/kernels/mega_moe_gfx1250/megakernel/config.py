@@ -209,7 +209,123 @@ def compact_variants(config) -> list:
         if hi > lo:
             out.append((lo, hi, dict(tile), int(ctas)))
             lo = hi
+    # STREAM packs the plan, which leaves the large tile room for a third
+    # stage (EP4, 2048 tokens per rank).
+    if (
+        out
+        and out[-1][2]["tile_m"] == 128
+        and stream_reason(config, *out[-1][2:]) is None
+    ):
+        out[-1][2].update(
+            STREAM_TILES.get(
+                (config.hidden_dim, config.geometry.inter_dim), STREAM_TILES[None]
+            )
+        )
+    # Tuning: AITER_MEGAKERNEL_TILE="num_buffers=3,num_buffers2=3" overrides
+    # the largest steps' kernel.
+    env = os.environ.get("AITER_MEGAKERNEL_TILE", "")
+    if env and out:
+        for kv in env.split(","):
+            k, v = kv.split("=")
+            out[-1][2][k.strip()] = int(v)
     return out
+
+
+#: compact STREAM (AITER_MEGAKERNEL_STREAM, default on): the dispatch is the
+#: S1F producer pipeline inside the kernel. Every CTA quantizes its tokens
+#: into local wire rows, ``STREAM_PRODUCERS`` CTAs ship them a run (<= 8 rows
+#: of one destination flag tile) at a time and publish a flag per (flag tile,
+#: source), and each GEMM item waits only on its own m-tile's flags.
+STREAM = os.environ.get("AITER_MEGAKERNEL_STREAM", "1") == "1"
+STREAM_PRODUCERS = int(os.environ.get("AITER_MEGAKERNEL_PRODUCERS", "128"))
+STREAM_RUN_ROWS = 8
+#: STREAM's large-tile stages by (hidden, inter): DSV4.1 Flash takes a third
+#: GEMM2 stage, DSR1 (and the rest) a third GEMM1 stage only.
+STREAM_TILES = {
+    (5120, 2304): dict(num_buffers=3, num_buffers2=3),  # noqa: C408
+    None: dict(num_buffers=3),  # noqa: C408
+}
+
+
+def _pow2_at_least(n: int, lo: int) -> int:
+    p = lo
+    while p < n:
+        p *= 2
+    return p
+
+
+def stream_flag_m(tile_m: int) -> int:
+    from ..s1f_stage1 import s1f_flag_m
+
+    return s1f_flag_m(tile_m)
+
+
+def stream_reason(config, tile, ctas_per_cu) -> str | None:
+    """Why this compact kernel cannot run STREAM, or None if it can."""
+    from ..s1f_stage1 import s1f_producer_lds
+
+    if not STREAM:
+        return "AITER_MEGAKERNEL_STREAM is off"
+    npes, tm = config.world_size, int(tile["tile_m"])
+    fm = stream_flag_m(tm)
+    if tm % fm or fm % STREAM_RUN_ROWS or (tm // fm) * npes > WAVE or npes > 16:
+        return f"tile_m={tm} / {npes} ranks: flag tiles do not fit one poll"
+    row = wire_row(config)
+    if row > 0xFFFF or config.geometry.max_tokens_per_rank > 0xFFFF:
+        return "the producer gathers 16-bit rows of a 16-bit width"
+    lds = s1f_producer_lds(run_rows=STREAM_RUN_ROWS, row_stride=row)["end"]
+    lds += stream_table_lds(config)
+    if int(ctas_per_cu) * ((lds + 4096 + 2047) // 2048 * 2048) > 327680:
+        return f"the producer ring ({lds} B) does not fit {ctas_per_cu} CTAs per CU"
+    return None
+
+
+def stream_npos(config) -> int:
+    """(destination, local expert) positions of the run order, padded to a
+    power of two of at least one per thread."""
+    return _pow2_at_least(config.world_size * config.experts_per_rank, 128)
+
+
+def stream_table_lds(config) -> int:
+    """Bytes of a producer's LDS copy of the segment table."""
+    return (4 * stream_npos(config) + 32) * 4
+
+
+def stream_layout(*, npes, experts_per_rank, max_tok_per_rank, row, tile_cap):
+    """Byte offsets of STREAM's local scratch: the send list (route ids,
+    segment s at s * max_tok_per_rank), the segment table (run starts, row
+    starts, rows and segment per run-order position, then the run count),
+    the per-flag-tile source masks and the wire rows."""
+    nseg = int(npes) * int(experts_per_rank)
+    npos = _pow2_at_least(nseg, 128)
+
+    def al(x):
+        return (x + 255) // 256 * 256
+
+    send = 0
+    segt = al(send + nseg * int(max_tok_per_rank) * 4)
+    tsrc = al(segt + (4 * npos + 32) * 4)
+    wire = al(tsrc + int(tile_cap) * 4)
+    return {
+        "send": send,
+        "send_n": nseg * int(max_tok_per_rank),
+        "segt": segt,
+        "npos": npos,
+        "tsrc": tsrc,
+        "wire": wire,
+        "bytes": al(wire + int(max_tok_per_rank) * int(row)),
+    }
+
+
+def stream_flag_rel(*, npes, experts_per_rank) -> int:
+    """STREAM's flag tiles start this far into compact's control region."""
+    b = ctl_arena_bytes(npes=npes, experts_per_rank=experts_per_rank)
+    return (b + 4095) // 4096 * 4096
+
+
+def stream_tile_cap(rows: int, tile_m: int) -> int:
+    fm = stream_flag_m(tile_m)
+    return (int(rows) + fm - 1) // fm
 
 
 def compact_ctl_region(i: int) -> str:
@@ -240,10 +356,18 @@ def compact_regions(config) -> dict:
     caps = max(compact_caps(config, hi, t["tile_m"]) for _, hi, t, _ in variants)
     rows, rowmap = compact_row_regions()
     regions = {rows: caps * wire_row(config), rowmap: (caps + 1) * 8}
-    for i in range(len(variants)):
-        regions[compact_ctl_region(i)] = ctl_arena_bytes(
+    for i, (_, hi, t, ctas) in enumerate(variants):
+        nb = ctl_arena_bytes(
             npes=config.world_size, experts_per_rank=config.experts_per_rank
         )
+        if stream_reason(config, t, ctas) is None:
+            # + STREAM's flag tiles (one FLAG_STRIDE slot each).
+            nb = stream_flag_rel(
+                npes=config.world_size, experts_per_rank=config.experts_per_rank
+            ) + 256 * stream_tile_cap(
+                compact_caps(config, hi, t["tile_m"]), t["tile_m"]
+            )
+        regions[compact_ctl_region(i)] = nb
     return regions
 
 
