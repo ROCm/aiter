@@ -44,9 +44,9 @@ ROT_MAX = 256  # rows up to which vocabulary tiles start their K loops apart
 LARGE_MTS = (8, 6, 5, 7, 4, 3)
 SUPPORTED_GFX = ("gfx950",)
 # Row ranges (inclusive) where this kernel measured faster than the stock
-# bf16 GEMM path on MI355X with the row-major weight (see the PR / benchmark
-# op_tests/op_benchmarks/flydsl/bench_lm_head_markov.py).
-PREFERRED_ROWS = ((113, 128), (496, 512))
+# bf16 GEMM path (hipBLASLt) on MI355X with the row-major weight, 1.04-1.10x
+# (op_tests/op_benchmarks/flydsl/bench_lm_head_markov.py).
+PREFERRED_ROWS = ((113, 128), (481, 512))
 
 
 def m_tile_fragments(m: int) -> int:
