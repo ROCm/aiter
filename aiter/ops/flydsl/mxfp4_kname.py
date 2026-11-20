@@ -60,7 +60,7 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce|scatter)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?"
-    r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?(?P<ep32>_ep32)?$"
+    r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?(?P<ep32>_ep32)?(?P<ldspa>_ldspa)?$"
 )
 
 
@@ -187,6 +187,15 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
         or (m.group("sbm") and int(m.group("sbm")) != int(m.group("tm")))
     ):
         return None
+    if m.group("ldspa") and (
+        m.group("a") != "fp4"
+        or m.group("out") != "bf16"
+        or m.group("epilog") != "scatter"
+    ):
+        # get_flydsl_stage2_v2_kernels makes _ldspa only for these; others are untested.
+        raise ValueError(
+            f"{name}: _ldspa needs an fp4 activation, a bf16 output and the scatter epilogue"
+        )
     return {
         "a_dtype": m.group("a"),
         "b_dtype": m.group("b"),
@@ -202,6 +211,8 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
         "spart": int(m.group("sp")) if m.group("sp") else None,
         # Dedicated EP32 A8W4 GEMM2 (kernels/mxfp4_gemm2_ep32.py).
         "ep32": bool(m.group("ep32")),
+        # _ldspa: the scatter epilogue writes C through LDS with 16-byte nt stores.
+        "scatter_lds_pairs": bool(m.group("ldspa")),
     }
 
 

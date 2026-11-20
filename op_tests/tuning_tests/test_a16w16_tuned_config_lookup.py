@@ -29,7 +29,7 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
     def _lookup(self, table):
         patches = [
             mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
-            mock.patch.object(tuned, "get_gfx", lambda: GFX),
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: GFX),
             mock.patch.object(tuned, "get_cu_num", lambda: CU_NUM),
             mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
         ]
@@ -64,6 +64,127 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(config["libtype"], "torch")
 
 
+class TestGfx1250StrictOpusRow(unittest.TestCase):
+    """A gfx1250-strict device reuses gfx1250 rows, but OPUS dispatch keeps
+    the strict id, so a row is only usable if that dispatch accepts it."""
+
+    CU = 96
+    SHAPE = (4, 2112, 7168)
+    KID, SPLIT_K = 0, 5
+
+    def setUp(self):
+        if tuned._opus_launch is None:
+            self.skipTest("OPUS is not importable")
+        from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
+
+        instance = get_kernel_instance("gfx1250", "a16w16", self.KID, cu_num=self.CU)
+        row = {
+            "libtype": "opus",
+            "solidx": self.KID,
+            "splitK": self.SPLIT_K,
+            "kernelName": instance.name,
+        }
+        key = ("gfx1250", self.CU, *self.SHAPE, False, BF16, BF16, False, False)
+        for p in (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+
+    def _lookup(self, gfx):
+        args = (*self.SHAPE, False, BF16, BF16, False, False, gfx, self.CU)
+        return (
+            tuned.get_GEMM_A16W16_tuned_config(*args),
+            tuned.get_GEMM_A16W16_config(*args),
+        )
+
+    def test_base_id_selects_the_opus_row(self):
+        tuned_config, _ = self._lookup("gfx1250")
+        self.assertEqual(
+            (tuned_config["libtype"], tuned_config["solidx"]), ("opus", self.KID)
+        )
+
+    def test_strict_id_skips_a_row_its_dispatch_rejects(self):
+        from aiter.ops.opus import dispatch
+        from csrc.opus_gemm.opus_gemm_common import KernelKey
+
+        with self.assertRaises(ValueError):
+            dispatch._resolve_contract(
+                KernelKey("a16w16", "gfx1250-strict", self.CU, self.KID),
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                "plain",
+                False,
+                False,
+                False,
+                False,
+                self.SPLIT_K,
+            )
+        tuned_config, config = self._lookup("gfx1250-strict")
+        self.assertIsNone(tuned_config)
+        self.assertEqual(config["libtype"], "triton")
+
+
+class TestOpusRowOperandLayout(unittest.TestCase):
+    """The OPUS launcher only reads K-contiguous A/B, so other layouts take the
+    backend the GEMM would use without the OPUS row (Triton on gfx1250)."""
+
+    M, N, K = 16, 4096, 512
+
+    def _backend_for(self, A, B):
+        opus_row = {"libtype": "opus", "solidx": 710, "splitK": 0, "kernelName": ""}
+        calls = []
+
+        def backend(name):
+            def run(inp, weights, *args, **kwargs):
+                calls.append(name)
+                return torch.zeros(inp.shape[0], weights.shape[0], dtype=inp.dtype)
+
+            return run
+
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config", lambda **_: opus_row),
+            mock.patch(
+                "aiter.ops.opus._arch._device_arch_and_cu",
+                lambda _device: ("gfx1250", 96),
+            ),
+            mock.patch.dict(
+                tuned.solMap, {name: backend(name) for name in ("opus", "triton")}
+            ),
+        ):
+            tuned._gemm_a16w16(A, B)
+        return calls
+
+    def _launcher_accepts(self, A, B):
+        from aiter.ops.opus.gemm_op_a16w16 import _check_a16w16_launch_layout
+
+        Y = torch.empty(1, A.shape[0], B.shape[0], dtype=A.dtype)
+        try:
+            _check_a16w16_launch_layout(A.unsqueeze(0), B.unsqueeze(0), Y)
+        except NotImplementedError:
+            return False
+        return True
+
+    def test_backend_matches_the_launcher_layout_contract(self):
+        A = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        W = torch.randn(self.N, self.K, dtype=torch.bfloat16)
+        wide = torch.randn(self.M, 2 * self.K, dtype=torch.bfloat16)
+        cases = {
+            "contiguous": (A, W, "opus"),
+            "A with padded rows": (wide[:, : self.K], W, "opus"),
+            "B transposed": (A, W.t().contiguous().t(), "triton"),
+            "A transposed": (A.t().contiguous().t(), W, "triton"),
+        }
+        for name, (a, b, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self._launcher_accepts(a, b), expected == "opus")
+                self.assertEqual(self._backend_for(a, b), [expected])
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 
@@ -82,7 +203,7 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx1250"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx1250"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
         ):
@@ -93,17 +214,20 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                 self.assertTrue(configs, (m, n, k))
                 for config in configs:
                     self.assertEqual(config["k_waves"], 1)
-                    lds = policy.gfx1250_lds_bytes(
-                        config["block_m"],
-                        config["block_n"],
-                        config["block_k"],
-                        config["stages"],
-                        config["split_k"],
+                    lds = (
+                        max(
+                            config["stages"]
+                            * (config["block_m"] + config["block_n"])
+                            * (config["block_k"] + 8),
+                            config["block_m"]
+                            * (config["block_n"] + (8 if config["interleave"] else 0)),
+                        )
+                        * 2
                     )
                     self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
                     self.assertGreaterEqual(k_tiles, config["stages"] - 1)
-                    for target_gfx in ("gfx1250", "gfx1250-strict"):
+                    for target_gfx in ("gfx1250",):
                         name = flydsl_hgemm_kernel_name(
                             dtype=torch.bfloat16,
                             out_dtype=torch.bfloat16,
@@ -116,6 +240,124 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                             {key: params[key] for key in config}, config, name
                         )
                         self.assertEqual(params["target_gfx"], target_gfx)
+
+
+class TestTdmPolicyContract(unittest.TestCase):
+    def test_names_include_schedule_and_reduction_and_reject_invalid(self):
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_hgemm_kernel_name,
+            get_flydsl_hgemm_kernel_params,
+        )
+
+        config = {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 128,
+            "stages": 2,
+            "split_k": 3,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+        }
+        names = []
+        for dtype in (torch.bfloat16, torch.float16):
+            for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+                kwargs = {
+                    "dtype": dtype,
+                    "out_dtype": dtype,
+                    "config": dict(config, policy=policy),
+                    "has_bias": True,
+                    "target_gfx": "gfx1250",
+                }
+                if dtype == torch.float16 and policy in ("tdma", "tdmia"):
+                    with self.assertRaises(ValueError):
+                        flydsl_hgemm_kernel_name(**kwargs)
+                    continue
+                name = flydsl_hgemm_kernel_name(**kwargs)
+                names.append(name)
+                parsed = get_flydsl_hgemm_kernel_params(name)
+                self.assertEqual(parsed["policy"], policy)
+                self.assertEqual(parsed["split_k_atomic"], policy in ("tdma", "tdmia"))
+                self.assertEqual(parsed["interleave"], policy in ("tdmi", "tdmia"))
+                for invalid in (
+                    name.replace("gfx1250", "gfx950"),
+                    name.replace("_w2x2x1_", "_w2x2x2_"),
+                    name.replace("x128x2_ks", "x128x1_ks"),
+                ):
+                    self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid))
+                if parsed["split_k_atomic"]:
+                    self.assertIsNone(
+                        get_flydsl_hgemm_kernel_params(name.replace("_ks3_", "_ks1_"))
+                    )
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_examples_large_policy_and_both_reductions(self):
+        from types import SimpleNamespace
+
+        from aiter.ops.flydsl import gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=32,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch.cuda, "get_device_properties", return_value=props),
+        ):
+            for dtype in (torch.bfloat16, torch.float16):
+                large = policy._gfx1250_tdm_configs(4096, 4096, 4096, dtype)
+                self.assertEqual(len(large), 2)
+                for c in large:
+                    self.assertEqual(
+                        (
+                            c["block_m"],
+                            c["block_n"],
+                            c["block_k"],
+                            c["stages"],
+                            c["m_waves"],
+                            c["n_waves"],
+                            c["split_k"],
+                            c["interleave"],
+                            c["split_k_atomic"],
+                        ),
+                        (256, 256, 128, 2, 2, 2, 1, True, False),
+                    )
+                self.assertEqual({c["group_m"] for c in large}, {0, 4})
+                small = policy._gfx1250_tdm_configs(32, 32, 256, dtype)
+                self.assertTrue(small)
+                paired = {}
+                for c in small:
+                    key = tuple(
+                        sorted(
+                            (k, v)
+                            for k, v in c.items()
+                            if k not in ("split_k_atomic", "policy")
+                        )
+                    )
+                    paired.setdefault(key, set()).add(c["split_k_atomic"])
+                for key, flags in paired.items():
+                    self.assertEqual(
+                        flags,
+                        (
+                            {False, True}
+                            if dtype == torch.bfloat16 and dict(key)["split_k"] > 1
+                            else {False}
+                        ),
+                    )
+            configs = policy._gfx1250_tdm_configs(128, 128, 768, torch.bfloat16)
+            self.assertTrue(any(c["interleave"] for c in configs))
+            self.assertTrue(
+                all(
+                    not c["interleave"]
+                    or (c["m_waves"], c["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+                    for c in configs
+                )
+            )
+            odd = policy._gfx1250_tdm_configs(128, 139, 768, torch.bfloat16)
+            self.assertTrue(odd)
+            self.assertTrue(all(not c["split_k_atomic"] for c in odd))
 
 
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
@@ -175,7 +417,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             "use_half_tile_interleaved": False,
         }
         with (
-            mock.patch.object(policy, "get_gfx", return_value="gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(
                 policy.itertools,
                 "product",
@@ -327,7 +569,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
         b = torch.empty((18432, 3072), dtype=a.dtype)[:, ::2]
         stream = SimpleNamespace(device=a.device)
         with (
-            mock.patch.object(kernels, "get_gfx", return_value="gfx950"),
+            mock.patch.object(kernels, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(
                 torch.cuda, "stream", return_value=nullcontext()
             ) as context,
@@ -376,7 +618,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             for gfx in ("gfx1250", "gfx1250-strict"):
                 with (
                     self.subTest(gfx=gfx, kernel=name),
-                    mock.patch.object(kernels, "get_gfx", return_value=gfx),
+                    mock.patch.object(kernels, "get_gfx_runtime", return_value=gfx),
                     mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
                     mock.patch.object(
                         kernels, "gemm_a16w16_gfx1250", return_value=out
