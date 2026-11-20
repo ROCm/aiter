@@ -1932,9 +1932,11 @@ def flydsl_kda_verify_with_f_b(
     4608]`` viewed through ``transpose(-1, -2)``, ``intermediate_states`` and
     the ring tensors in their stated order, and ``out`` with non-overlapping
     token and head rows. No written buffer may overlap ``conv_state``,
-    ``state`` or a weight (``f_b_weight``, ``conv_weight``, ``A_log``,
-    ``dt_bias``, ``norm_weight``). ``conv_state`` takes either conv layout; strides and byte spans
-    follow the int32 limits of :func:`flydsl_kda_decode`.
+    ``state``, a weight (``f_b_weight``, ``conv_weight``, ``A_log``,
+    ``dt_bias``, ``norm_weight``) or any other input (``f_a``, ``x``,
+    ``raw_beta``, ``output_gate``, the index tensors). ``conv_state`` takes
+    either conv layout; strides and byte spans follow the int32 limits of
+    :func:`flydsl_kda_decode`.
 
     ``num_warps`` overrides the per-workgroup wave count, one of
     ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8); by default it follows
@@ -2225,9 +2227,10 @@ def flydsl_kda_verify_with_f_b(
         ("intermediate_conv_window", intermediate_conv_window),
         ("intermediate_states", intermediate_states),
     ) + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ()))
-    # Every workgroup reads the same weights, so a store into one of them would
-    # race with the workgroups still to read it, as a store into a cache would
-    # commit early.
+    # Every workgroup reads the same weights, and each token's activations and
+    # indices are read by workgroups that may run after another one's store, so a
+    # store into any of them would race with those reads, as a store into a cache
+    # would commit early.
     _check_no_alias(
         written,
         (
@@ -2238,6 +2241,12 @@ def flydsl_kda_verify_with_f_b(
             ("A_log", A_log),
             ("dt_bias", dt_bias),
             ("norm_weight", norm_weight),
+            ("f_a", f_a),
+            ("x", x),
+            ("raw_beta", raw_beta),
+            ("output_gate", output_gate),
+            ("cache_indices", cache_indices),
+            ("intermediate_indices", intermediate_indices),
         ),
     )
     # The written buffers must not share a byte with each other either: raw_v

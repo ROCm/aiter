@@ -725,6 +725,45 @@ def test_kda_verify_rejects_ring_buffers_that_overlap(monkeypatch, written, othe
         _run(inp, 5)
 
 
+def test_kda_verify_rejects_out_over_an_activation(monkeypatch):
+    """Token t's store would land on token t + 1's gate, which a workgroup may
+    still have to read."""
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(2, 1, torch.bfloat16, False)
+    gate = torch.randn(3, _H, _D, dtype=torch.bfloat16, device=_DEVICE)
+    inp.output_gate = gate[:-1]
+    with pytest.raises(ValueError, match="must not overlap `output_gate`"):
+        _run(inp, 1, out=gate[1:].unsqueeze(0))
+
+
+def test_kda_verify_rejects_scratch_over_an_input(monkeypatch):
+    """A scratch store into an activation races with the workgroups reading it."""
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(2, 1, torch.bfloat16, False)
+    pool = torch.zeros(
+        inp.window.numel() * inp.window.element_size() * 2,
+        dtype=torch.uint8,
+        device=_DEVICE,
+    )
+    inp.x = _overlay(pool, 0, inp.x).copy_(inp.x)
+    inp.window = _overlay(pool, 0, inp.window)
+    with pytest.raises(ValueError, match="must not overlap `x`"):
+        _run(inp, 1)
+
+
+def test_kda_verify_accepts_out_beside_the_gate():
+    """Adjacent, disjoint slices of one pool are not an overlap."""
+    inp = _make_inputs(2, 1, torch.bfloat16, False)
+    pool = torch.randn(4, _H, _D, dtype=torch.bfloat16, device=_DEVICE)
+    inp.output_gate = pool[:2]
+    out = pool[2:].unsqueeze(0)
+    refs = _reference(inp, 1)
+    result = _run(inp, 1, out=out)
+    torch.cuda.synchronize()
+    assert result is out
+    _assert_matches(inp, out, refs)
+
+
 def _reject_compile(monkeypatch):
     def unexpected_compile(*args, **kwargs):
         pytest.fail("Invalid arguments must be rejected before kernel compilation.")
