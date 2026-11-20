@@ -190,9 +190,18 @@ Scope: D2 is about a **temporary rollback kill-switch** for a risky default swap
 Real example (PR#3266): flydsl sort replaced opus sort; reviewer: "gate flydsl behind env var until validated on broader workloads."
 → `⚠️ D2: new default path needs rollback env-var for safe rollout`
 
-**D3 — hipblaslt in CSV/YAML tuning config** 🔴
-Any `+` line with `hipblaslt` in a tuning file. Not persistent across Docker; causes hangs.
-→ `🔴 D3: hipblaslt config must not be committed`
+**D3 — hipBLASLt selection in shared tuning configs** 🔴
+Flag any added or retuned entry in a version-controlled shared tuning CSV or config that selects
+hipBLASLt (for example, `libtype=hipblaslt`). Do not flag unchanged legacy rows or runtime use,
+including dynamic hipBLASLt selection in an existing fallback.
+AITER saves the solution index (`solidx`) and uses it to select the kernel. That index is not
+portable across hipBLASLt builds or releases. Saving `kernelName` does not make the index
+portable: the same index can select a different kernel and give wrong results.
+Real example ([PR#8166](https://github.com/ROCm/aiter/pull/8166)): BF16 index `205437`
+selected an FP8 kernel on a different build and gave wrong results. The
+[PR#8383 review](https://github.com/ROCm/aiter/pull/8383#pullrequestreview-5992261430)
+asked the author not to add hipBLASLt rows.
+→ `🔴 D3: use a valid non-hipBLASLt candidate, or leave the workload untuned if the existing fallback supports it`
 
 **D4 — Invariant reversal without citation** 🔴
 A documented safety invariant is reversed: old comment says "must X because Y" → new code removes X claiming "X not needed" but no spec/asm/test is cited to prove Y no longer holds.
