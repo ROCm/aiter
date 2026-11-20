@@ -3044,6 +3044,7 @@ _mla_decode_fwd_kernel_non_pipelined_repr = make_kernel_repr(
         "BLOCK_M",
         "NUM_HEAD_BLOCKS",
         "NUM_SEGMENTS_PER_SEQ",
+        "PAGES_PER_BLOCK",
         "num_warps",
         "num_stages",
     ],

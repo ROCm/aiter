@@ -37,6 +37,7 @@ def input_helper(
     num_blocks: int | None,
     varlen: bool,
     device: str = "cuda",
+    seq_lens_kv: list[int] | None = None,
 ):
     """Generates the paged-KV shapes/tensors shared by the decode and prefill
     tests. ``decode_qlen > 0`` fixes the query length (decode); ``0`` lets it
@@ -45,17 +46,25 @@ def input_helper(
     ``num_blocks`` is the size of the block pool to draw (possibly repeated)
     block indices from. Pass ``None`` to instead allocate exactly as many
     blocks as needed and assign each sequence a unique set of blocks (e.g. for
-    benchmarking realistic KV cache footprint/bandwidth)."""
+    benchmarking realistic KV cache footprint/bandwidth).
+
+    ``seq_lens_kv`` sets explicit per-sequence KV lengths; it overrides
+    ``ctx_lens``/``varlen`` for the KV side."""
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device=device)
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
-    if varlen:
+    if seq_lens_kv is not None:
+        assert len(seq_lens_kv) == batch_size
+        seq_lens_kv = torch.tensor(seq_lens_kv, dtype=torch.int, device=device)
+    elif varlen:
+        seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
         for i in range(batch_size):
             seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
     else:
-        seq_lens_kv.fill_(ctx_lens)
+        seq_lens_kv = torch.full(
+            (batch_size,), ctx_lens, dtype=torch.int, device=device
+        )
     if decode_qlen > 0:
         seq_lens_qo.fill_(decode_qlen)
     else:
@@ -1134,39 +1143,31 @@ def _strided_block_cache(blocks, row_stride, first_row=0):
 
 def _paged_decode_inputs(ctx_lens, q_len, num_query_heads, block_size, page=64):
     kv_lora_rank, qk_rope_head_dim = 512, 64
-    head_dim = kv_lora_rank + qk_rope_head_dim
-    batch_size = len(ctx_lens)
-    pages_per_block = block_size // page
-    seq_lens = torch.tensor(
-        [c + q_len for c in ctx_lens], dtype=torch.int32, device="cuda"
+    cu_seqlens_q, seq_lens, max_seqlen, blocks, kv, q, _, _ = input_helper(
+        batch_size=len(ctx_lens),
+        ctx_lens=max(ctx_lens),
+        decode_qlen=q_len,
+        num_query_heads=num_query_heads,
+        num_kv_heads=1,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        num_blocks=None,
+        varlen=False,
+        seq_lens_kv=[c + q_len for c in ctx_lens],
     )
-    max_seqlen = int(seq_lens.max())
-    max_blocks = (max_seqlen + block_size - 1) // block_size
-    num_cache_blocks = batch_size * max_blocks + 3
-    blocks = torch.randperm(num_cache_blocks, dtype=torch.int32, device="cuda")
-    blocks = blocks[: batch_size * max_blocks].view(batch_size, max_blocks)
+    # Expand each block id into the ids of the pages it holds.
+    pages_per_block = block_size // page
     page_table = (
         blocks[:, :, None] * pages_per_block
-        + torch.arange(pages_per_block, dtype=torch.int32, device="cuda")
-    ).view(batch_size, -1)
-    kv = torch.randn(
-        num_cache_blocks, block_size, 1, head_dim, dtype=torch.bfloat16, device="cuda"
-    )
-    q = torch.randn(
-        batch_size * q_len,
-        num_query_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+        + torch.arange(pages_per_block, dtype=torch.int32, device=blocks.device)
+    ).view(blocks.shape[0], -1)
     return {
         "q": q.clamp_(-4, 4).to(e4m3_dtype),
         "kv": kv.clamp_(-4, 4).to(e4m3_dtype),
         "page_table": page_table,
         "seq_lens": seq_lens,
-        "cu_seqlens_q": torch.arange(
-            0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device="cuda"
-        ),
+        "cu_seqlens_q": cu_seqlens_q,
         "max_seqlen": max_seqlen,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
