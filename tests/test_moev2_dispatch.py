@@ -6,6 +6,7 @@ Per-key equality with the legacy code over the whole snapshot runs in a subproce
 (tests/moe_dispatch/key_checks.py, differential.py); the rest are unit tests.
 """
 
+import importlib
 import inspect
 import logging
 import pathlib
@@ -565,6 +566,30 @@ def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_
             monkeypatch.setattr(module, "get_gfx", lambda: "gfx1250")
     monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
     assert a8w8_pt.claims(_per_tensor_op_call())
+
+
+def test_a_module_first_imported_in_a_simulation_follows_the_later_ones(
+    monkeypatch, tmp_path, live_chip_info
+):
+    """Kernel modules load at launch, inside a simulation, and bind its fake chip-info."""
+    from moe_dispatch import arch_sim
+
+    name = "_late_chip_info_user"
+    (tmp_path / f"{name}.py").write_text(
+        "from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, name, raising=False)
+
+    with arch_sim.simulated_arch("gfx942"):
+        late = importlib.import_module(name)
+        assert (late.get_gfx_runtime(), late.get_cu_num()) == ("gfx942", 304)
+    assert late.get_cu_num is live_chip_info.get_cu_num
+    assert late.get_gfx_runtime is live_chip_info.get_gfx_runtime
+    with arch_sim.simulated_arch("gfx942_cu80"):
+        assert late.get_cu_num() == 80
+    with arch_sim.simulated_arch("gfx1201"):
+        assert late.get_gfx_runtime() == "gfx1201"
 
 
 def test_tuned_cache_clear_also_resets_path_caches():
