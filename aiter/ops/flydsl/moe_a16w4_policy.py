@@ -106,11 +106,14 @@ def get_a16w4_tuned_tiles(
     if not float(swiglu_limit) > 0.0:
         raise ValueError("silu_clamped requires swiglu_limit > 0")
 
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+    from aiter.jit.utils.chip_info import (
+        find_tuned_cu_row,
+        get_cu_num,
+        get_gfx_runtime,
+    )
 
-    key = (
-        get_gfx_runtime(),
-        get_cu_num(),
+    gfx = get_gfx_runtime()
+    shape = (
         token_num,
         model_dim,
         inter_dim,
@@ -119,4 +122,10 @@ def get_a16w4_tuned_tiles(
         topk,
         float(swiglu_limit),
     )
-    return _TUNED_TILES.get(key)
+    return find_tuned_cu_row(
+        _TUNED_TILES,
+        lambda cu: (gfx, cu, *shape),
+        gfx,
+        get_cu_num(),
+        "tuned_flydsl_moe_a16w4",
+    )
