@@ -145,6 +145,7 @@ else:
     from .ops.moe_op import *
     from .ops.moe_sorting import *
     from .ops.moe_sorting_opus import *
+    from .ops.moe_sort_mx_quant import *
     from .ops.moe_mxfp4_aux import *
     from .ops.moe_nvfp4 import NvFp4MoeWeights, moe_nvfp4, uses_fallback  # noqa: F401
     from .ops.mla_sparse_prefill import *

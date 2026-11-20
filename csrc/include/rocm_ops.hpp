@@ -1555,6 +1555,22 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("dispatch_policy")   = 0);
 
+#define MOE_SORT_MX_QUANT_PYBIND                       \
+    m.def("moe_sort_mx_quant_fwd",                     \
+          &aiter::moe_sort_mx_quant_fwd,               \
+          py::arg("hidden"),                           \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_ids"),                       \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("out"),                              \
+          py::arg("out_scale"),                        \
+          py::arg("num_experts"),                      \
+          py::arg("unit_size"),                        \
+          py::arg("moe_buf") = std::nullopt);
+
 #define MOE_SORTING_OPUS_PYBIND                        \
     m.def("moe_sorting_opus_get_workspace_size",       \
           &moe_sorting_opus_get_workspace_size,        \
