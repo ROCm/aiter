@@ -13,7 +13,8 @@ Ops and baselines (both baselines need vLLM):
   layouts) vs vLLM's ``fp32_router_gemm_dispatch`` followed by vLLM's
   ``topk_hash_softplus_sqrt`` or by aiter's ``topk_gating(score_func="sqrtsoftplus")``.
 * ``rejection``: ``flydsl_rejection_sample_standard`` vs vLLM's Triton
-  ``rejection_sample``. ``--target bf16``: raw bf16 lm_head rows go
+  ``rejection_sample``, with the probability-ratio test and in the synthetic
+  acceptance mode (``--mode``). ``--target bf16``: raw bf16 lm_head rows go
   straight in; the baseline also runs the fp32 copy and ``apply_temperature``
   vLLM needs first. ``--target fp32``: processed fp32 rows for both.
 
@@ -182,7 +183,7 @@ def _rejection_input(b, gen, bf16_target):
     return tgt, draft, ds.view(-1), pos, idx, temp, seed
 
 
-def bench_rejection(reqs, target):
+def bench_rejection(reqs, target, synthetic):
     from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         rejection_sample,
@@ -199,27 +200,35 @@ def bench_rejection(reqs, target):
         cu = (torch.arange(b + 1, device="cuda") * 6).int()
         local_pos = torch.arange(6, device="cuda").repeat(b).int()
         eidx = inputs[0][4].repeat_interleave(6)
+        rates = (
+            torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5], device="cuda")
+            if synthetic
+            else None
+        )
 
-        def flydsl(inputs=inputs):
+        def flydsl(inputs=inputs, rates=rates):
             for args in inputs:
-                flydsl_rejection_sample_standard(*args)
+                flydsl_rejection_sample_standard(*args, rates)
 
-        def vllm_chain(inputs=inputs, cu=cu, eidx=eidx, local_pos=local_pos):
+        def vllm_chain(
+            inputs=inputs, cu=cu, eidx=eidx, local_pos=local_pos, rates=rates
+        ):
             for tgt, dl, ds, pos, idx, temp, seed in inputs:
                 if bf16:
                     tgt = tgt.float()
                     apply_temperature(tgt, eidx, temp)
                 rejection_sample(
                     tgt, _DraftCache(dl), ds, cu, pos, idx, eidx, local_pos,
-                    temp, seed, 5,
+                    temp, seed, 5, synthetic_conditional_rates=rates,
                 )  # fmt: skip
 
         graphs = {"vllm": graph(vllm_chain), "flydsl": graph(flydsl)}
         out.append((b, abba(graphs, n)))
         del graphs
         torch.cuda.empty_cache()
+    mode = "synthetic acceptance" if synthetic else "ratio test"
     report(
-        f"Standard rejection sampling, 5 drafts, vocab 129280, {target} target rows",
+        f"Rejection sampling ({mode}), 5 drafts, vocab 129280, {target} target rows",
         "requests",
         out,
     )
@@ -234,12 +243,17 @@ def main():
     ap.add_argument("--rows", type=int, nargs="*", default=None)
     ap.add_argument("--reqs", type=int, nargs="*", default=[8, 16, 32, 64, 128])
     ap.add_argument("--target", nargs="*", default=["bf16", "fp32"])
+    ap.add_argument(
+        "--mode", nargs="*", default=["standard", "synthetic"],
+        choices=["standard", "synthetic"],
+    )  # fmt: skip
     args = ap.parse_args()
     if "router" in args.op:
         bench_router(args.rows or [5, 16, 40, 80, 160, 320, 640, 768])
     if "rejection" in args.op:
-        for target in args.target:
-            bench_rejection(args.reqs, target)
+        for mode in args.mode:
+            for target in args.target:
+                bench_rejection(args.reqs, target, mode == "synthetic")
 
 
 if __name__ == "__main__":
