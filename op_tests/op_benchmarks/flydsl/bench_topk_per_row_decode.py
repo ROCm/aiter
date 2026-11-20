@@ -23,9 +23,13 @@ Slices (rows 1..512, k 256..4096, stable 0/1 unless noted):
   R   buffer 128K..1M, one row full, the rest 4K, rows 8..512
   B   the cases #6329 published, k=2048
 
+--widths replaces a slice's buffer widths with any list, off the grid or past 1M
+(B only filters its own); --live replaces A2's live lengths.
+
 --bound sets the adaptive arm's max_row_len: `width` (default) is the buffer
 width, a caller that knows no tighter bound; `live` is the cell's longest live
-row. Each record carries the bound it ran with; keep the modes in separate files.
+row; a number is passed as is. Each record carries the bound it ran with; keep
+the modes in separate files.
 
   python op_tests/op_benchmarks/flydsl/bench_topk_per_row_decode.py --list
   python op_tests/op_benchmarks/flydsl/bench_topk_per_row_decode.py \\
@@ -113,11 +117,12 @@ _B_UNSTABLE = (
 )
 
 
-def _profiles(s: str, w: int, r: int) -> list[str]:
+def _profiles(s: str, w: int, r: int, live=None) -> list[str]:
     if s == "A1":
         return ["full"]
     if s == "A2":
-        ps = [f"u{n}" for n in (4096, 16384, 49152, w // 8, w // 4, w // 2) if n < w]
+        lengths = live or (4096, 16384, 49152, w // 8, w // 4, w // 2)
+        ps = [f"u{n}" for n in lengths if n < w]
     elif s == "A3":
         ps = [_mixed(r, w, p) for p in (25, 50, 80)]
     elif s == "A4":
@@ -130,8 +135,12 @@ def _profiles(s: str, w: int, r: int) -> list[str]:
     return list(dict.fromkeys(ps))
 
 
-def cells(slices, rows=None, ks=KS, stables=(0, 1), widths=None):
-    """Every cell of `slices`, filtered by the other arguments; `None` filters nothing."""
+def cells(slices, rows=None, ks=KS, stables=(0, 1), widths=None, live=None):
+    """Every cell of `slices`, filtered by the other arguments; `None` filters nothing.
+
+    `widths` replaces the slice's buffer widths, except B's, which it filters;
+    `live` replaces A2's live lengths.
+    """
     for s in slices:
         if s == "B":
             for stable in stables:
@@ -150,9 +159,9 @@ def cells(slices, rows=None, ks=KS, stables=(0, 1), widths=None):
             rs = [r for r in RAGGED_ROWS if rows is None or r in rows]
         else:
             rs = ROWS if rows is None else rows
-        for w in ws if widths is None else [w for w in ws if w in widths]:
+        for w in ws if widths is None else widths:
             for r in rs:
-                for p in _profiles(s, w, r):
+                for p in _profiles(s, w, r, live):
                     for k in ks:
                         for stable in stables:
                             if k <= w:
@@ -391,7 +400,12 @@ def run_cell(
     arms.host.clear_topk_per_row_decode_workspace_cache()
     x, sl = make_inputs(cell, seed)
     # From the host-side lengths, so reading the bound costs no device sync.
-    bound = cell.width if bound_mode == "width" else max(live_lengths(cell, seed))
+    if bound_mode == "width":
+        bound = cell.width
+    elif bound_mode == "live":
+        bound = max(live_lengths(cell, seed))
+    else:
+        bound = int(bound_mode)
     probe = torch.empty(cell.rows, cell.k, dtype=torch.int32, device="cuda")
     pick = arms.main_pick(x, sl, probe, cell)
     order = (
@@ -445,21 +459,31 @@ def run_cell(
     return recs
 
 
+def _bound_arg(s: str) -> str:
+    if s in ("width", "live") or (s.isdigit() and int(s) > 0):
+        return s
+    raise argparse.ArgumentTypeError(f"`width`, `live` or a positive number, not {s!r}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--slice", nargs="+", default=["A1", "A2", "A3", "A4", "R", "B"])
     ap.add_argument("--rows", type=int, nargs="+", default=None)
     ap.add_argument("--k", type=int, nargs="+", default=list(KS))
     ap.add_argument("--stable", type=int, nargs="+", default=[0, 1], choices=(0, 1))
-    ap.add_argument("--widths", type=int, nargs="+", default=None)
+    ap.add_argument(
+        "--widths", type=int, nargs="+", default=None, help="any, e.g. 98304 2097152"
+    )
+    ap.add_argument("--live", type=int, nargs="+", default=None, help="A2's lengths")
     ap.add_argument("--profiles", nargs="+", default=None, help="e.g. full u16384")
     ap.add_argument("--arms", nargs="+", default=list(ARMS), choices=ARMS)
     ap.add_argument("--timers", nargs="+", default=["t1", "t2"], choices=("t1", "t2"))
     ap.add_argument(
         "--bound",
-        choices=("width", "live"),
+        type=_bound_arg,
         default="width",
-        help="adaptive's max_row_len: the buffer width, or the cell's longest live row",
+        help="adaptive's max_row_len: `width`, `live` (the cell's longest live row)"
+        " or a number",
     )
     ap.add_argument("--rounds", type=int, default=1)
     # main's stable kernels run up to 2x slower on some draws; with 3 seeds two slow
@@ -471,7 +495,9 @@ def main(argv=None):
 
     todo = [
         c
-        for c in cells(args.slice, args.rows, args.k, args.stable, args.widths)
+        for c in cells(
+            args.slice, args.rows, args.k, args.stable, args.widths, args.live
+        )
         if args.profiles is None or c.profile in args.profiles
     ]
     if args.list:
