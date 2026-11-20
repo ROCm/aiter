@@ -380,8 +380,12 @@ def get_gemm1_kernels_list(
     MulRoutedWeight: bool,
     preshuffle: bool = False,
     splitk: bool = False,
+    arch: str | None = None,
 ) -> list:
-    arch = get_gfx()
+    # arch overrides get_gfx(). A gfx942;gfx950 wheel build sees only the last
+    # GPU_ARCHS entry from get_gfx(), so the caller unions one list per arch.
+    if arch is None:
+        arch = get_gfx()
     if (
         Adtype in bit16_list
         and Bdtype in bit16_list
@@ -458,8 +462,12 @@ def get_gemm2_kernels_list(
     QuantType: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    arch: str | None = None,
 ) -> list:
-    arch = get_gfx()
+    # See get_gemm1_kernels_list: pass arch so a multi-target build can emit
+    # every arch's instances, not only get_gfx()'s.
+    if arch is None:
+        arch = get_gfx()
 
     if (
         Adtype in bit16_list
