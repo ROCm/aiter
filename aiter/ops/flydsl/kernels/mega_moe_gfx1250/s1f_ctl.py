@@ -81,32 +81,28 @@ _S1F_GROUP_M = 8
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
-#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
-#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
-_S1F_MAX_RECV = 4096
-#: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
-#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
-#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
-#: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
-#: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
-_S1F_MAX_RECV_BY_SHAPE: dict = {
-    (2, 6): 1 << 30,
-    (4, 6): 1 << 30,
-    (2, 7): 1 << 30,
-    (4, 7): 1 << 30,
-}
+#: No default receive cap: a step of any width runs the stage-1 kernel.
+#: ``AITER_S1F_MAX_RECV`` can still impose one (0 leaves it uncapped). The old
+#: default was 4096, so the widest prefill steps stayed on dispatch + GEMM1.
+#: DSV4.1 Flash (top-6/7, EP2/EP4) was already uncapped. At 8192 tokens/rank:
+#: 886 vs 959 us/layer on EP2 top-6, 900 vs 1063 on EP4, 1200 vs 1405 on EP2
+#: top-7. Past 4096 tokens this compiles a few more plan widths (7 instead of
+#: 4 at 8192).
+_S1F_MAX_RECV = 1 << 30
 
 
 def s1f_max_recv(world_size: int, topk: int) -> int:
     """Widest receive bound a step can have and still run the stage-1 kernel.
 
-    ``AITER_S1F_MAX_RECV`` overrides it for every shape; 0 removes the cap.
+    There is no default cap. ``AITER_S1F_MAX_RECV`` overrides it for every
+    shape; 0 leaves it uncapped.
     """
+    del world_size, topk
     env = os.environ.get("AITER_S1F_MAX_RECV", "").strip()
     if env:
         cap = int(env)
         return cap if cap > 0 else 1 << 30
-    return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+    return _S1F_MAX_RECV
 
 
 def s1f_prefill_tile(world_size: int, topk: int, recv_bound: int) -> int:
