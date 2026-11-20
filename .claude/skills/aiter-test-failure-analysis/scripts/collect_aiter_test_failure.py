@@ -424,6 +424,7 @@ def build_failure_profile(
 ) -> dict[str, Any]:
     text_parts: list[str] = []
     failed_test_files: set[str] = set()
+    failed_shard_test_files: set[str] = set()
     hardware: set[str] = set()
     categories: set[str] = set()
     for job in failed_jobs:
@@ -436,7 +437,7 @@ def build_failure_profile(
             hardware.add(label.lower())
             categories.add("standard")
             for file_path in shard_lists.get(shard, []):
-                failed_test_files.add(file_path)
+                failed_shard_test_files.add(file_path)
         elif "multi-gpu" in name.lower():
             categories.add("multigpu")
             if "MI350" in name or "MI35" in name:
@@ -449,7 +450,7 @@ def build_failure_profile(
         test = snippet.get("test", "")
         if test.startswith("op_tests/") or test.startswith("tests/"):
             failed_test_files.add(test)
-    token_text = "\n".join(text_parts + sorted(failed_test_files))
+    token_text = "\n".join(text_parts + sorted(failed_test_files) + sorted(failed_shard_test_files))
     tokens = words_from_text(token_text)
     for special in (
         "moe",
@@ -477,6 +478,7 @@ def build_failure_profile(
     return {
         "tokens": sorted(tokens),
         "failed_test_files": sorted(failed_test_files),
+        "failed_shard_test_files": sorted(failed_shard_test_files),
         "hardware": sorted(hardware),
         "categories": sorted(categories),
     }
@@ -489,6 +491,7 @@ def score_commit(commit: dict[str, Any], profile: dict[str, Any]) -> tuple[int, 
     haystack = subject + "\n" + file_text
     tokens: set[str] = set(profile["tokens"])
     failed_files: set[str] = set(profile["failed_test_files"])
+    failed_shard_files: set[str] = set(profile.get("failed_shard_test_files", []))
     categories: set[str] = set(profile["categories"])
     hardware: set[str] = set(profile["hardware"])
     score = 0
@@ -503,6 +506,10 @@ def score_commit(commit: dict[str, Any], profile: dict[str, Any]) -> tuple[int, 
     exact = sorted(set(files) & failed_files)
     if exact:
         add(14, "changes failed test file(s): " + ", ".join(exact[:3]))
+
+    shard_matches = sorted((set(files) & failed_shard_files) - set(exact))
+    if shard_matches:
+        add(5, "changes test file(s) from failed shard(s): " + ", ".join(shard_matches[:3]))
 
     matched_tokens = sorted(token for token in tokens if token in haystack)
     if matched_tokens:
@@ -954,6 +961,7 @@ def main() -> int:
     profile: dict[str, Any] = {
         "tokens": [],
         "failed_test_files": [],
+        "failed_shard_test_files": [],
         "hardware": [],
         "categories": [],
     }
