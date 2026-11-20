@@ -10,12 +10,15 @@ Triton's own cache key, or check that a launch which needs Triton's side
 effects (hooks, global checks, config pre-hooks) still gets them.
 """
 
+import itertools
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 from triton import knobs
 from triton.compiler.compiler import make_backend
+from triton.knobs import HookChain
 from triton.runtime import driver
 from triton.runtime.jit import compute_cache_key, create_function_from_signature
 
@@ -394,26 +397,77 @@ def test_a_launch_hook_sees_every_launch():
     assert seen == [1, 1, 1]
 
 
-@pytest.mark.parametrize("case", ["pre_run_hook", "stages_hook"])
-def test_launches_that_need_the_ordinary_path_take_it(monkeypatch, case):
+def test_a_pre_run_hook_runs_on_every_launch(monkeypatch):
     wrapped = fast_launch.fast_launch(_axpy_kernel)
     x, y, out = _axpy_inputs(256)
     _axpy(wrapped, x, y, out)
-    assert wrapped._plain()
-    if case == "pre_run_hook":
-        calls = []
+    calls = []
+    monkeypatch.setattr(
+        _axpy_kernel, "pre_run_hooks", [lambda *a, **k: calls.append(1)]
+    )
+    for _ in range(2):
+        _axpy(wrapped, x, y, out)
+    assert calls == [1, 1]
+
+
+class _HookChainSubclass(HookChain):
+    pass
+
+
+def _chain(cls, n):
+    chain = cls()
+    for _ in range(n):
+        chain.add(lambda *a, **k: None)
+    return chain
+
+
+# A launch-enter or launch-exit hook: a value and whether Triton would call it.
+_LAUNCH_HOOKS = {
+    "none": (lambda: None, False),
+    "function": (lambda: lambda *a, **k: None, True),
+    "empty_chain": (lambda: _chain(HookChain, 0), False),
+    "chain": (lambda: _chain(HookChain, 1), True),
+    "empty_subclass": (lambda: _chain(_HookChainSubclass, 0), False),
+    "subclass": (lambda: _chain(_HookChainSubclass, 1), True),
+}
+
+
+def test_every_hook_state_takes_the_path_it_needs(monkeypatch):
+    """2 x 2 x 6 x 6 states of the pre-run hooks, the stages hook and the two
+    launch hooks: a launch takes the ordinary path exactly when one of them
+    would run."""
+    wrapped = fast_launch.fast_launch(_axpy_kernel)
+    x, y, out = _axpy_inputs(256)
+    _axpy(wrapped, x, y, out)
+    ((key, entry),) = wrapped._cache.items()
+    fast, ordinary = [], []
+    wrapped._cache[key] = entry._replace(run=lambda *a: fast.append(1))
+
+    class _Ordinary:
+        def __getitem__(self, grid):
+            return lambda *a, **k: ordinary.append(1)
+
+    monkeypatch.setattr(wrapped, "_kernel", _Ordinary())
+    for pre_run, stages, enter, exit_ in itertools.product(
+        (False, True), (False, True), _LAUNCH_HOOKS, _LAUNCH_HOOKS
+    ):
+        make_enter, enter_runs = _LAUNCH_HOOKS[enter]
+        make_exit, exit_runs = _LAUNCH_HOOKS[exit_]
+        hooks = [lambda *a, **k: None] if pre_run else []
+        monkeypatch.setattr(_axpy_kernel, "pre_run_hooks", hooks)
         monkeypatch.setattr(
-            _axpy_kernel, "pre_run_hooks", [lambda *a, **k: calls.append(1)]
+            knobs.runtime,
+            "add_stages_inspection_hook",
+            (lambda: ("key", "hash")) if stages else None,
         )
-    else:
-        monkeypatch.setattr(
-            knobs.runtime, "add_stages_inspection_hook", lambda: ("key", "hash")
-        )
-    assert not wrapped._plain()
-    if case == "pre_run_hook":
-        for _ in range(2):
-            _axpy(wrapped, x, y, out)
-        assert calls == [1, 1]
+        monkeypatch.setattr(knobs.runtime, "launch_enter_hook", make_enter())
+        monkeypatch.setattr(knobs.runtime, "launch_exit_hook", make_exit())
+        _axpy(wrapped, x, y, out)
+        needs_ordinary = pre_run or stages or enter_runs or exit_runs
+        state = (pre_run, stages, enter, exit_)
+        assert (ordinary, fast) == (([1], []) if needs_ordinary else ([], [1])), state
+        ordinary.clear()
+        fast.clear()
 
 
 @pytest.mark.parametrize("by_specialization", [False, True])
@@ -538,6 +592,23 @@ def test_a_heuristic_on_a_tensor_shape_is_keyed():
     assert blocks == [32, 128]
 
 
+def test_a_heuristic_on_tensor_strides_is_keyed():
+    """Two tensors that differ only in their strides."""
+    tuned = triton.heuristics(
+        {"BLOCK": lambda args: 128 if args["x_ptr"].stride(0) == 1 else 32}
+    )(_axpy_kernel)
+    wrapped = fast_launch.fast_launch(tuned)
+    grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+    x, y, out = _axpy_inputs(512)
+    for xs in (x[:256], x[::2]):
+        with fast_launch.recording() as misses:
+            wrapped[grid](xs, y, out, 64, 0.5)
+        assert misses, "new strides have to miss on a wrapped kernel"
+        torch.testing.assert_close(out[:64], x[:64] * 0.5 + y[:64], rtol=0, atol=0)
+    blocks = sorted(entry.frozen["BLOCK"] for entry in wrapped._cache.values())
+    assert blocks == [32, 128]
+
+
 @pytest.mark.parametrize("key_shapes", [True, False])
 def test_key_shapes_false_shares_an_entry_across_shapes(key_shapes):
     """For a heuristic that reads no shape, as on the flash_kda kernels."""
@@ -553,7 +624,8 @@ def test_key_shapes_false_shares_an_entry_across_shapes(key_shapes):
 
 
 def test_an_int_out_of_range_fails_only_its_own_launch():
-    """Triton raises OverflowError for that launch; the cache stays on."""
+    """`_wide_int_spec` raises OverflowError for that launch, before Triton
+    runs; the cache stays on."""
     wrapped = fast_launch.fast_launch(_axpy_kernel, by_specialization=True)
     x, y, out = _axpy_inputs(256)
     _axpy(wrapped, x, y, out)

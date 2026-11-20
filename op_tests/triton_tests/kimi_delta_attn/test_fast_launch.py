@@ -248,22 +248,22 @@ def test_alignment_is_part_of_the_key():
     ["_prepare_fast", "_segment_fast", "_seg_scan_fast", "_seg_scan_prefetch_fast"],
 )
 def test_no_config_choice_reads_a_shape(name):
-    """What lets these launchers pass key_shapes=False: no heuristic reads a
-    shape or stride, and no autotuner prunes or models configs from the
-    arguments (its key holds ints and bools only)."""
+    """What lets these launchers pass key_shapes=False: no heuristic reads any
+    property of an argument (it may only test it for None), and no autotuner
+    prunes or models configs from the arguments (its key holds ints and bools
+    only)."""
     wrapped = getattr(flash_kda, name)
     assert wrapped._key_shapes is False
     params = wrapped._jit.arg_names
-    # Same names, tensors that differ only in shape and strides.
-    a = {n: torch.empty(2, 8) for n in params}
-    b = {n: torch.empty(4, 3).t() for n in params}
     heuristics = 0
     k = wrapped._kernel
     while k is not wrapped._jit:
         if isinstance(k, Heuristics):
             heuristics += 1
-            for target, heur in k.values.items():
-                assert heur(a) == heur(b), target
+            for heur in k.values.values():
+                # Any attribute read on an object() raises.
+                heur({n: object() for n in params})
+                heur({n: None for n in params})
         if isinstance(k, Autotuner):
             assert k.early_config_prune is None and k.perf_model is None
         k = k.fn

@@ -49,12 +49,12 @@ cannot be hashed, after which the wrapper stays on the ordinary path.
 A hit checks those globals by identity against the objects seen at the last
 full check, and runs Triton's equality check only after a rebind. A global
 changed in place, which Triton's own check would catch, is therefore not
-caught on a hit. Gluon layouts are frozen dataclasses; a ``tl.constexpr`` is
-not.
+caught on a hit; that includes a list field of a Gluon layout.
 """
 
 import contextlib
 from collections import ChainMap, OrderedDict
+from itertools import islice, repeat
 from operator import itemgetter
 from typing import Any, NamedTuple
 
@@ -112,13 +112,6 @@ def recording():
         yield _MISSES
     finally:
         _MISSES = was
-
-
-def _hooked(hook) -> bool:
-    """Whether a launch hook would run. An empty ``HookChain`` does not."""
-    if isinstance(hook, HookChain):
-        return len(hook.calls) > 0
-    return hook is not None
 
 
 def _wide_int_spec(v: int) -> str:
@@ -186,9 +179,13 @@ class _FastLaunch:
         # The autotuner and any other decorator wrap the JITFunction that owns
         # the argument binder and the hooks.
         jit = kernel
+        autotuners = []
         while not isinstance(jit, (JITFunction, InterpretedFunction)):
+            if isinstance(jit, Autotuner):
+                autotuners.append(jit)
             jit = jit.fn
         self._jit = jit
+        self._autotuners = tuple(autotuners)
         self._wrapped = jit is not kernel
         if by_specialization and self._wrapped:
             raise ValueError(
@@ -225,7 +222,24 @@ class _FastLaunch:
             # error under fullgraph=True.
             if torch.compiler.is_compiling():
                 return self._kernel[grid](*args, **kwargs)
-            if self._disabled or _BYPASS or not self._plain():
+            # The ordinary path runs the hooks. An empty HookChain is no hook.
+            runtime = knobs.runtime
+            if (
+                self._disabled
+                or _BYPASS
+                or self._jit.pre_run_hooks
+                or runtime.add_stages_inspection_hook is not None
+                or (
+                    h.calls
+                    if isinstance(h := runtime.launch_enter_hook, HookChain)
+                    else h is not None
+                )
+                or (
+                    h.calls
+                    if isinstance(h := runtime.launch_exit_hook, HookChain)
+                    else h is not None
+                )
+            ):
                 return self._kernel[grid](*args, **kwargs)
             get_device = self._get_device
             if get_device is None:
@@ -279,15 +293,6 @@ class _FastLaunch:
 
         return launch
 
-    def _plain(self) -> bool:
-        """Whether nothing needs the ordinary path's side effects."""
-        return not (
-            self._jit.pre_run_hooks
-            or knobs.runtime.add_stages_inspection_hook is not None
-            or _hooked(knobs.runtime.launch_enter_hook)
-            or _hooked(knobs.runtime.launch_exit_hook)
-        )
-
     def _globals_changed(self) -> bool:
         """Whether a global the kernel read at compile time was rebound to an
         unequal value. Triton keeps deep copies, and comparing a Gluon layout
@@ -297,13 +302,13 @@ class _FastLaunch:
         seen = self._globals_seen
         if seen is not None and seen[0] is used and _same_objects(seen[1]):
             return False
-        for (name, _), (val, globals_dict) in used.items():
-            if globals_dict.get(name, _MISSING) != val:
-                return True
         groups = {}
-        for (name, _), (_, globals_dict) in used.items():
+        for (name, _), (val, globals_dict) in used.items():
+            obj = globals_dict.get(name, _MISSING)
+            if obj != val:
+                return True
             groups.setdefault(id(globals_dict), (globals_dict, []))[1].append(
-                (name, globals_dict.get(name, _MISSING))
+                (name, obj)
             )
         self._globals_seen = (
             used,
@@ -407,7 +412,7 @@ class _FastLaunch:
         """Launch the ordinary way, and keep what it worked out."""
         if _MISSES is not None:
             _MISSES.append((self._jit.__name__, key))
-        if any(isinstance(v, tuple) for v in (*args, *kwargs.values())):
+        if any(map(isinstance, (*args, *kwargs.values()), repeat(tuple))):
             # Triton specializes each item of a tuple, but the key holds the
             # tuple by value, and (2,) == (2.0,).
             self._disabled = True
@@ -431,16 +436,18 @@ class _FastLaunch:
         # Autotuning launches once per candidate config; the last one is the
         # launch that used the config it settled on.
         a, kw = seen[-1]
-        device = driver.active.get_current_device()
-        binder = self._jit.device_caches[device][4]
+        binder = self._jit.device_caches[self._get_device()][4]
         bound_args, _, _ = binder(*a, **kw)
 
-        names = tuple(bound_args.keys())
+        names = tuple(bound_args)
         # Arguments the call site does not pass -- defaults, and whatever the
         # autotuner added. The key pins every non-tensor value, so these are
         # constant for as long as this entry is the one selected.
+        items = bound_args.items()
         frozen = {
-            n: v for n, v in list(bound_args.items())[len(args) :] if n not in kwargs
+            n: v
+            for n, v in (islice(items, len(args), None) if args else items)
+            if n not in kwargs
         }
         self._cache[key] = _Entry(
             compiled,
@@ -458,12 +465,7 @@ class _FastLaunch:
     def _config_pre_hook(self) -> bool:
         """Whether an autotuner ran a config ``pre_hook`` the cached launch
         would skip."""
-        k = self._kernel
-        while k is not self._jit:
-            if isinstance(k, Autotuner) and k.best_config.pre_hook is not None:
-                return True
-            k = k.fn
-        return False
+        return any(t.best_config.pre_hook is not None for t in self._autotuners)
 
     def clear(self):
         """Drop every entry, for a caller done with a device or a shape mix."""
