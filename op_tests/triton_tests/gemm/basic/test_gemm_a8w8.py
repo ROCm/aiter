@@ -243,8 +243,7 @@ def test_gemm_fp8_ptpc_gluon_gfx1250(m, n, k, output, has_bias):
     if output:
         assert b is y
 
-    # FP8 WMMA accumulation over K=7168 gives errors up to 0.03, the same as the Triton kernel.
-    torch.testing.assert_close(a, b, atol=0.05, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

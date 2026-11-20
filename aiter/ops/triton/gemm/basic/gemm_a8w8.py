@@ -115,7 +115,6 @@ def _gemm_a8w8_ptpc_gfx1250(
         config["WARPS_N"],
         register_store,
         config["CTAS_M"],
-        config["PARTITION"],
     )
     _LOGGER.info(
         "GEMM_A8W8 [gluon/gfx1250]: x=%s w=%s kernel=%s",

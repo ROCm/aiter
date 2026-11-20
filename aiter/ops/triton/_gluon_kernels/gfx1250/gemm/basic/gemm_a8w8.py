@@ -55,7 +55,6 @@ def create_ptpc_layouts(
     warps_n=2,
     register_store=0,
     ctas_m=0,
-    partition=0,
 ):
     """BLOCK_M and BLOCK_N are cluster tiles. ctas_m is the CTA count along M (0 balances the tile)."""
     if ctas_m:
@@ -102,36 +101,6 @@ def create_ptpc_layouts(
         ),
     }
 
-    if partition:
-        assert num_ctas == 1 and kernel_type != "sliced_k", "partition needs no cluster"
-        cta_m, cta_n = BLOCK_M // ctas_m, BLOCK_N // ctas_n
-        pad_a = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, 16]], [cta_m, BLOCK_K], [1, 0]
-        )
-        pad_b = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, 16]], [cta_n, BLOCK_K], [1, 0]
-        )
-        cta_a, cta_b, cta_wmma = gl.amd.cdna5.make_partitioned_dot_layouts(
-            cta_m,
-            cta_n,
-            pad_a,
-            pad_b,
-            num_warps,
-            _WMMA_INSTR_SHAPE,
-            a_transposed=False,
-            b_transposed=True,
-        )
-        wmma_layout = gl.amd.AMDWMMALayout(
-            version=3,
-            transposed=True,
-            warp_bases=cta_wmma.warp_bases,
-            reg_bases=cta_wmma.reg_bases,
-            instr_shape=_WMMA_INSTR_SHAPE,
-            cga_layout=cga,
-        )
-        layouts["SHARED_LAYOUT_A"] = cta_a
-        layouts["SHARED_LAYOUT_B"] = cta_b
-
     if kernel_type == "sliced_k":
         cga_3d = [[0, m, n] for m, n in cga]
         wmma_layout = gl.amd.AMDWMMALayout(
@@ -171,6 +140,30 @@ def create_ptpc_layouts(
                 [[cta_n, 8]], [BLOCK_M, BLOCK_N], [1, 0], cga
             )
 
+    # The second half of K negates the smaller operand of the CTA in LDS, as int32 words,
+    # in K chunks of at most 16 words for each thread.
+    neg_b = BLOCK_N // ctas_n < BLOCK_M // ctas_m
+    cta_rows = BLOCK_N // ctas_n if neg_b else BLOCK_M // ctas_m
+    neg_layout = layouts["SHARED_LAYOUT_B" if neg_b else "SHARED_LAYOUT_A"]
+    assert all(k == 0 for _, k in neg_layout.cga_layout), "the CGA must not split K"
+    words = BLOCK_K // 4
+    chunk = min(words, max(4, 16 * 32 * num_warps // cta_rows))
+    threads_k = min(32, chunk // 4)
+    layouts["NEG_B"] = neg_b
+    layouts["NEG_WORDS"] = chunk
+    layouts["NEG_SHARED_LAYOUT"] = gl.PaddedSharedLayout.with_identity_for(
+        [[pad_interval // 4, 4]],
+        [neg_layout.shape[0], words],
+        [1, 0],
+        neg_layout.cga_layout,
+    )
+    layouts["NEG_LAYOUT"] = gl.BlockedLayout(
+        [1, 4],
+        [32 // threads_k, threads_k],
+        [num_warps, 1],
+        [1, 0],
+        neg_layout.cga_layout,
+    )
     layouts["WMMA_LAYOUT"] = wmma_layout
     layouts["OPERAND_LAYOUT_A"] = gl.DotOperandLayout(0, wmma_layout, k_width=16)
     layouts["OPERAND_LAYOUT_B"] = gl.DotOperandLayout(1, wmma_layout, k_width=16)
@@ -209,6 +202,29 @@ def _issue_stage(
         b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=not EVEN_K
     )
     return a_desc, b_desc
+
+
+@gluon.jit
+def _negate_slot(
+    a_slot,
+    b_slot,
+    NEG_B: gl.constexpr,
+    NEG_WORDS: gl.constexpr,
+    NEG_SHARED_LAYOUT: gl.constexpr,
+    NEG_LAYOUT: gl.constexpr,
+):
+    """Flip the sign bits of the FP8 slot of A, or of B, in LDS."""
+    if NEG_B:
+        slot = b_slot
+    else:
+        slot = a_slot
+    view = slot.reinterpret(
+        gl.int32, [slot.shape[0], slot.shape[1] // 4], NEG_SHARED_LAYOUT
+    )
+    for c in gl.static_range(view.shape[1] // NEG_WORDS):
+        part = view.slice(c * NEG_WORDS, NEG_WORDS, 1)
+        part.store(part.load(NEG_LAYOUT) ^ -2139062144)
+    gl.barrier()
 
 
 @gluon.jit
@@ -568,6 +584,10 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     SCALE_TDM: gl.constexpr = 0,
     GRID_2D: gl.constexpr = False,
     NUM_KSUB: gl.constexpr = 1,
+    NEG_B: gl.constexpr = False,
+    NEG_WORDS: gl.constexpr = 4,
+    NEG_SHARED_LAYOUT: gl.constexpr = None,
+    NEG_LAYOUT: gl.constexpr = None,
 ):
     """C = (A x B^T) * a_scale[:, None] * b_scale[None, :] with A [M, K] and B [N, K] in FP8.
 
@@ -645,34 +665,50 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     if NUM_CTAS > 1:
         gl.amd.gfx1250.cluster.arrive()
 
+    # The FP8 WMMA truncates its products toward -inf. The second half of K runs with one operand
+    # and the accumulator negated, so that half truncates toward +inf and the two biases cancel.
+    num_main = gl.cdiv(K_local, BLOCK_K) - (NUM_BUFFERS - 1)
+    num_first = gl.maximum(gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, num_main), 0)
     # Main loop. The cluster barrier stops a multicast load from filling a slot that a CTA still reads.
-    for _ in range(gl.cdiv(K_local, BLOCK_K) - (NUM_BUFFERS - 1)):
-        if NUM_CTAS > 1:
-            gl.amd.gfx1250.cluster.wait()
-        slot = load_idx % NUM_BUFFERS
-        a_desc, b_desc = _issue_stage(
-            a_desc,
-            b_desc,
-            a_buffer.index(slot),
-            b_buffer.index(slot),
-            BLOCK_K,
-            EVEN_K,
-            FUSED_LOAD,
-        )
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
-        load_idx += 1
-        slot = compute_idx % NUM_BUFFERS
-        accumulator = _compute_stage_in_place(
-            a_buffer.index(slot),
-            b_buffer.index(slot),
-            accumulator,
-            OPERAND_LAYOUT_A,
-            OPERAND_LAYOUT_B,
-            NUM_KSUB,
-        )
-        compute_idx += 1
-        if NUM_CTAS > 1:
-            gl.amd.gfx1250.cluster.arrive()
+    for phase in gl.static_range(2):
+        if phase == 1:
+            accumulator = -accumulator
+        for _ in range(num_first * phase, num_first + (num_main - num_first) * phase):
+            if NUM_CTAS > 1:
+                gl.amd.gfx1250.cluster.wait()
+            slot = load_idx % NUM_BUFFERS
+            a_desc, b_desc = _issue_stage(
+                a_desc,
+                b_desc,
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                BLOCK_K,
+                EVEN_K,
+                FUSED_LOAD,
+            )
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
+            load_idx += 1
+            slot = compute_idx % NUM_BUFFERS
+            if phase == 1:
+                _negate_slot(
+                    a_buffer.index(slot),
+                    b_buffer.index(slot),
+                    NEG_B,
+                    NEG_WORDS,
+                    NEG_SHARED_LAYOUT,
+                    NEG_LAYOUT,
+                )
+            accumulator = _compute_stage_in_place(
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                accumulator,
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                NUM_KSUB,
+            )
+            compute_idx += 1
+            if NUM_CTAS > 1:
+                gl.amd.gfx1250.cluster.arrive()
 
     if NUM_CTAS > 1:
         gl.amd.gfx1250.cluster.wait()
@@ -702,6 +738,14 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     for i in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS)
         slot = compute_idx % NUM_BUFFERS
+        _negate_slot(
+            a_buffer.index(slot),
+            b_buffer.index(slot),
+            NEG_B,
+            NEG_WORDS,
+            NEG_SHARED_LAYOUT,
+            NEG_LAYOUT,
+        )
         accumulator = _compute_stage_in_place(
             a_buffer.index(slot),
             b_buffer.index(slot),
@@ -711,6 +755,7 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
             NUM_KSUB,
         )
         compute_idx += 1
+    accumulator = -accumulator
 
     _scale_and_store(
         c_buffer,
@@ -787,6 +832,10 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
     SLICED_K: gl.constexpr = False,
     REDUCE_SHARED_LAYOUT: gl.constexpr = None,
     REDUCE_LAYOUT: gl.constexpr = None,
+    NEG_B: gl.constexpr = False,
+    NEG_WORDS: gl.constexpr = 4,
+    NEG_SHARED_LAYOUT: gl.constexpr = None,
+    NEG_LAYOUT: gl.constexpr = None,
 ):
     """Same result as the bandwidth_bound kernel; stage i + 1 is read from LDS during the WMMA of stage i.
 
@@ -867,6 +916,17 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
         load_idx += 1
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
     slot = compute_idx % NUM_BUFFERS
+    num_main = gl.cdiv(K_local, BLOCK_K) - NUM_BUFFERS
+    num_first = gl.maximum(gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, num_main), 0)
+    if num_first == 0:
+        _negate_slot(
+            a_buffer.index(slot),
+            b_buffer.index(slot),
+            NEG_B,
+            NEG_WORDS,
+            NEG_SHARED_LAYOUT,
+            NEG_LAYOUT,
+        )
     cur_a, cur_b = _read_stage(
         a_buffer.index(slot),
         b_buffer.index(slot),
@@ -878,34 +938,47 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
         gl.amd.gfx1250.cluster.arrive()
 
     # Main loop: WMMA of cur, refill its slot, wait, read the next stage.
-    for _ in range(gl.cdiv(K_local, BLOCK_K) - NUM_BUFFERS):
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-        # Each CTA has read the slot of cur before a multicast load fills it.
-        if NUM_CTAS > 1:
-            gl.amd.gfx1250.cluster.wait()
-        slot = load_idx % NUM_BUFFERS
-        a_desc, b_desc = _issue_stage(
-            a_desc,
-            b_desc,
-            a_buffer.index(slot),
-            b_buffer.index(slot),
-            BLOCK_K,
-            EVEN_K,
-            FUSED_LOAD,
-        )
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
-        load_idx += 1
-        slot = (compute_idx + 1) % NUM_BUFFERS
-        cur_a, cur_b = _read_stage(
-            a_buffer.index(slot),
-            b_buffer.index(slot),
-            OPERAND_LAYOUT_A,
-            OPERAND_LAYOUT_B,
-            SLICED_K,
-        )
-        compute_idx += 1
-        if NUM_CTAS > 1:
-            gl.amd.gfx1250.cluster.arrive()
+    for phase in gl.static_range(2):
+        if phase == 1:
+            # See the bandwidth_bound kernel. cur was read negated in the last phase-0 iteration.
+            accumulator = -accumulator
+        for i in range(num_first * phase, num_first + (num_main - num_first) * phase):
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            # Each CTA has read the slot of cur before a multicast load fills it.
+            if NUM_CTAS > 1:
+                gl.amd.gfx1250.cluster.wait()
+            slot = load_idx % NUM_BUFFERS
+            a_desc, b_desc = _issue_stage(
+                a_desc,
+                b_desc,
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                BLOCK_K,
+                EVEN_K,
+                FUSED_LOAD,
+            )
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
+            load_idx += 1
+            slot = (compute_idx + 1) % NUM_BUFFERS
+            if phase == 1 or i == num_first - 1:
+                _negate_slot(
+                    a_buffer.index(slot),
+                    b_buffer.index(slot),
+                    NEG_B,
+                    NEG_WORDS,
+                    NEG_SHARED_LAYOUT,
+                    NEG_LAYOUT,
+                )
+            cur_a, cur_b = _read_stage(
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                SLICED_K,
+            )
+            compute_idx += 1
+            if NUM_CTAS > 1:
+                gl.amd.gfx1250.cluster.arrive()
 
     if NUM_CTAS > 1:
         gl.amd.gfx1250.cluster.wait()
@@ -936,6 +1009,14 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS)
         slot = (compute_idx + 1) % NUM_BUFFERS
+        _negate_slot(
+            a_buffer.index(slot),
+            b_buffer.index(slot),
+            NEG_B,
+            NEG_WORDS,
+            NEG_SHARED_LAYOUT,
+            NEG_LAYOUT,
+        )
         cur_a, cur_b = _read_stage(
             a_buffer.index(slot),
             b_buffer.index(slot),
@@ -945,6 +1026,7 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
         )
         compute_idx += 1
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    accumulator = -accumulator
 
     if SLICED_K:
         # Add the K slice partials through LDS. The operand slots are dead here.
