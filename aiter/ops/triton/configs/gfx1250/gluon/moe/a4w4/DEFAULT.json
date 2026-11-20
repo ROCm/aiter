@@ -2010,7 +2010,7 @@
         "num_warps": 4
     },
     "bm128_n6144_k3072_xlarge": {
-        "block_n": 512,
+        "block_n": 256,
         "block_k": 256,
         "num_buffers": 1,
         "num_warps": 4
