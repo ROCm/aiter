@@ -147,9 +147,9 @@ def _wrapped():
 def test_entries_do_not_pin_their_inputs():
     """An entry outlives the call that made it, so it must not hold its tensors.
 
-    The binder hands back every argument bound together, which is the obvious
-    thing to keep for the grid callback and also every q, k, v and workspace of
-    whichever call arrived first, none of which any caller can then free.
+    The pre-run hook sees every argument of the launch, which is the obvious
+    thing to keep for the grid callback. Keeping all of them would also pin
+    the first call's q, k, v and workspace tensors.
     """
     for T_ in (256, 512, 1024):
         run(make_inputs(1, T_, 12))

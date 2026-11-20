@@ -67,8 +67,8 @@ from triton.runtime.autotuner import Autotuner
 from triton.runtime.interpreter import InterpretedFunction
 from triton.runtime.jit import JITFunction
 
-# `HIPBackend.is_within_2gb`: the storage size up to which buffer ops apply,
-# and the i32 range of an int argument.
+# 2 GiB - 1: the largest storage HIPBackend.is_within_2gb allows buffer ops on;
+# with _MIN_INT32, also the i32 range Triton specializes a non-constexpr int on.
 _MAX_INT32 = 2**31 - 1
 _MIN_INT32 = -(2**31)
 
@@ -158,7 +158,7 @@ class _Entry(NamedTuple):
 
     compiled: CompiledKernel
     names: tuple
-    # The parameters the call site leaves out (defaults, autotuner choices).
+    # Parameters the call site leaves out (defaults, heuristic and autotuner choices).
     frozen: dict
     run: Any
     function: Any
@@ -177,7 +177,7 @@ class _FastLaunch:
         self._cache = OrderedDict()
         self._disabled = False
         # The autotuner and any other decorator wrap the JITFunction that owns
-        # the argument binder and the hooks.
+        # the signature, the pre-run hooks and the globals the kernel reads.
         jit = kernel
         autotuners = []
         while not isinstance(jit, (JITFunction, InterpretedFunction)):

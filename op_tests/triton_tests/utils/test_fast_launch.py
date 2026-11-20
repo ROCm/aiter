@@ -64,6 +64,22 @@ def _axpy_kernel(x_ptr, y_ptr, out_ptr, n, alpha, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _defaulted_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr = 64, SCALE=2.0):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * SCALE, mask=mask)
+
+
+@triton.jit
+def _defaulted_varargs_kernel(
+    x_ptr, out_ptr, n, *rest, BLOCK: tl.constexpr = 64, SCALE=2.0
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * SCALE, mask=mask)
+
+
+@triton.jit
 def _scale_by_first_kernel(x_ptr, out_ptr, factors, n, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -365,6 +381,38 @@ def test_cached_launch_matches_ordinary_launch(by_specialization, style):
         with fast_launch.bypassed():
             want = _axpy(wrapped, x, y, torch.empty_like(out), style=style)
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("by_specialization", [False, True])
+@pytest.mark.parametrize(
+    "kernel",
+    [_defaulted_kernel, _defaulted_varargs_kernel],
+    ids=["defaults", "empty_rest"],
+)
+def test_omitted_arguments_match_ordinary_launch(kernel, by_specialization):
+    wrapped = fast_launch.fast_launch(kernel, by_specialization=by_specialization)
+    x = torch.arange(131, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+    want = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+
+    try:
+        with fast_launch.bypassed():
+            wrapped[grid](x, want, x.numel())
+    except TypeError:
+        if kernel is _defaulted_varargs_kernel:
+            pytest.skip("this Triton build rejects a plain launch with empty *rest")
+        raise
+
+    with fast_launch.recording() as misses:
+        wrapped[grid](x, out, x.numel())
+    assert len(misses) == 1
+    out.fill_(float("nan"))
+    with fast_launch.recording() as misses:
+        wrapped[grid](x, out, x.numel())
+    assert misses == [], "the second launch with omitted arguments has to hit"
+    torch.testing.assert_close(out, want, rtol=0, atol=0)
+    torch.testing.assert_close(out, x * 2.0, rtol=0, atol=0)
 
 
 def test_by_specialization_shares_an_entry_across_sizes():
