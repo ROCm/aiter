@@ -32,7 +32,6 @@ from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
-    make_fused_moe_impl_kernel_name,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -5727,22 +5726,17 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
-    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
-    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1
+    # epilogue, so it must reject ASM 1-stage and FlyDSL whole-graph rows before
+    # they resolve. gfx942 per-token FP8 rows naming an impl__flydsl_gfx942__
+    # kernel used to be exempt here: that backend clamps inaccurately, and worse
+    # the tighter the bound, so a clamped call stays on CK (ROCm/aiter#8334).
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
         and activation == ActivationType.Silu
     )
-    flydsl_gfx942_row = (
-        gfx == "gfx942"
-        and q_type == QuantType.per_Token
-        and q_dtype_w == dtypes.fp8
-        and cfg is not None
-        and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
-    )
-    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
+    if clamp_silu_limit and cfg is not None:
         cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
         if (
             cfg.get("run_1stage", False)
@@ -5806,36 +5800,13 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
-    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
-    # the default heuristics take the 1-stage kernel, which cannot apply
-    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
-    # its default config for this token count. Tuned FlyDSL rows still win.
-    if (
-        full_impl is None
-        and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
-        and clamped_silu
-        and q_type == QuantType.per_Token
-        and q_dtype_w == dtypes.fp8
-        and use_g1u1
-        and weights_shuffled
-        and gate_mode is GateMode.SEPARATED
-        and input_dtype in (None, dtypes.bf16)
-        and not (
-            doweight_stage1
-            or has_stage1_bias
-            or has_stage2_bias
-            or has_activation_scales
-            or has_stage2_scatter
-            or hidden_pad
-            or intermediate_pad
-        )
-    ):
-        from aiter.ops.flydsl.fused_moe_gfx942 import default_config
-
-        flydsl_config = default_config(token)
-        kernel_name1 = make_fused_moe_impl_kernel_name("flydsl_gfx942", flydsl_config)
-        full_impl = resolve_fused_moe_impl(kernel_name1)
-        cfg = {"block_m": int(flydsl_config.split("_", 1)[0]), "ksplit": 0}
+    # A clamped SiLU on gfx942 per-token FP8 weights used to fall back to the
+    # FlyDSL whole-graph backend here when the default heuristics picked the
+    # 1-stage kernel, which cannot apply swiglu_limit. Measured against an fp32
+    # reference on gfx942 that backend clamps inaccurately and worse the tighter
+    # the bound (max per-row relative error 0.027 unclamped, 0.050 at limit=7,
+    # 0.114 at limit=1, against 0.009 for the two-stage reference), so the clamp
+    # now stays on CK and an unsupported shape raises below (ROCm/aiter#8334).
     if is_ep and full_impl is not None:
         cfg = None
         full_impl = None
