@@ -171,6 +171,13 @@ class IpcHeap:
         return cls.alloc(size, cls._HIP_DEVICE_MALLOC_UNCACHED)
 
     @classmethod
+    def alloc_coarse_grained(cls, size: int) -> int:
+        """Coarse-grained (L2-cached) IPC-shareable device allocation. A kernel
+        must read what a peer wrote into it with ``sc0 sc1`` loads (see
+        :meth:`alloc`); data only this device writes may be read cached."""
+        return cls.alloc(size, cls._HIP_DEVICE_MALLOC_DEFAULT)
+
+    @classmethod
     def copy_host_to_device(cls, dst_ptr: int, src, nbytes: int) -> None:
         hip = cls._load_hip()
         err = hip.hipMemcpy(

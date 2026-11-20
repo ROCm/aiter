@@ -7,9 +7,10 @@ ranks of one node (DeepSeek-V4.1-Flash EP8: 48), MXFP4 weights in the ``shuffle_
 ``shuffle_scale_a16w4`` layouts MegaMoEV2 takes, MXFP8 activations (bf16 rows are quantized in the dispatch),
 clamp-SwiGLU (limit 10), at most 1024 tokens per rank. ``fused_ep_moe_supported`` is the eligibility check a
 caller uses to fall back to another MoE path; the choice must be the same on every rank of the EP group (decide
-it from the group's largest per-rank token count). On 8 x MI355X it is faster than MegaMoEV2's staged route at
-1 .. 768 tokens per rank and than its fused small-input route up to 512; MegaMoEV2's large-input route is faster
-from 768 (``op_tests/multigpu_tests/bench_fused_ep_moe.py``).
+it from the group's largest per-rank token count). On 8 x MI355X it is faster than the MegaMoEV2 path this layout
+runs (the staged one) at 1 .. 768 tokens per rank under uniform, Zipf and single-rank routing (at 768 only at
+parity under Zipf routing); at 1024 it is slower under Zipf routing, so callers fall back to MegaMoEV2 above 768
+tokens per rank (``op_tests/multigpu_tests/bench_fused_ep_moe.py``).
 
 Contract:
 
@@ -17,10 +18,11 @@ Contract:
   same order, idle ranks with 0 rows included. One instance serves every layer of a model (the weights are
   forward arguments); two calls must not run concurrently on one device.
 * ``topk_ids`` are physical expert ids, rank-major (owner = ``id // experts_per_rank``); an id outside
-  ``[0, experts_per_rank * world_size)`` (e.g. -1 padding) is not routed and contributes zero. All ranks use the
-  same ``experts_per_rank``.
+  ``[0, experts_per_rank * world_size)`` (e.g. -1 padding) is not routed and contributes zero. The routed ids of
+  one token must be distinct, as a top-k produces them (an expert's record list holds one record per source
+  token). All ranks use the same ``experts_per_rank``.
 * The kernel is persistent and its workgroups and ranks wait on each other: it needs every rank's launch to run
-  and must not share the GPU with other work that waits on it (as MegaMoEV2's fused routes).
+  and must not share the GPU with other work that waits on it (as MegaMoEV2's small-input single kernel).
 * The output is bitwise reproducible (no atomics into outputs) and the call is CUDA-graph capturable; the kernel
   resets its own counters. ``prepare(w)`` compiles every tile tier before capture.
 """
@@ -37,6 +39,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .ipc_heap import IpcHeap
 from .kernels.fused_ep_moe_a8w4 import (
     CTL_BYTES,
+    LOC_WORDS,
     NE_MAX,
     READY_STRIDE,
     TM,
@@ -125,6 +128,7 @@ def _sized_tokens(m: int, rows_hint: int | None = None) -> int:
 
 
 def _tier(n_tokens: int):
+    """The tile configuration for ``n_tokens`` (1 .. MAX_TOKENS_PER_RANK) sized tokens."""
     return next(cfg for bound, cfg in _TIERS if n_tokens <= bound)
 
 
@@ -188,15 +192,25 @@ class FusedEPMoE:
             raise ValueError(
                 f"world_size {world_size} (2, 4 or 8), experts_per_rank {experts_per_rank} (1..{NE_MAX})"
             )
+        if (rank, world_size) != (
+            dist.get_rank(group),
+            dist.get_world_size(group),
+        ):
+            raise ValueError(
+                f"rank {rank} / world_size {world_size} must be this process's rank in `group` and its size "
+                f"({dist.get_rank(group)} / {dist.get_world_size(group)})"
+            )
         device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"device {device}: expected a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self.rank, self.world_size, self.group = rank, world_size, group
         self.device, self.epr = device, experts_per_rank
         self._closed = False
         layout = pool_layout(world_size, experts_per_rank)
         with torch.cuda.device(device):
-            self._pool = IpcHeap.alloc(
-                layout["total"], IpcHeap._HIP_DEVICE_MALLOC_DEFAULT
-            )
+            self._pool = IpcHeap.alloc_coarse_grained(layout["total"])
             self._ctl = IpcHeap.alloc_uncached(CTL_BYTES)
             handles = (
                 IpcHeap.get_mem_handle_bytes(self._pool),
@@ -215,7 +229,7 @@ class FusedEPMoE:
                 self._opened += [pools[-1], ctls[-1]]
         self._pool_addrs = pools + [0] * (8 - world_size)
         self._ctl_addrs = ctls + [0] * (8 - world_size)
-        self._loc = torch.zeros(24576, dtype=torch.int32, device=device)
+        self._loc = torch.zeros(LOC_WORDS, dtype=torch.int32, device=device)
         self._ready = torch.zeros(
             (max_blocks(world_size, 16, experts_per_rank) + 1) * READY_STRIDE // 4,
             dtype=torch.int32,
@@ -266,9 +280,12 @@ class FusedEPMoE:
         Args:
             x: bf16 ``[m, 5120]`` (quantized to MXFP8 in the dispatch), or ``float8_e4m3fn`` codes with
                 ``x_scales`` uint8 / e8m0 ``[m, 160]`` (one exponent per 32 columns). ``m`` <= 1024, 0 allowed.
-            topk_ids: int32 ``[m, 6]`` physical expert ids; ``topk_weights`` fp32 ``[m, 6]``.
+            topk_ids: int32 ``[m, 6]`` physical expert ids, distinct within a row; ``topk_weights`` fp32 ``[m, 6]``.
             out: optional bf16 ``[max(m, 1), 5120]`` output.
-            rows_hint: the tiles are sized for at least this many tokens (default: from ``m``).
+            rows_hint: the tiles are sized for at least this many tokens (default: from ``m``), at most
+                ``MAX_TOKENS_PER_RANK``.
+
+        Every tensor must be on this instance's device.
         """
         if self._closed:
             raise RuntimeError("FusedEPMoE is closed")
@@ -279,8 +296,24 @@ class FusedEPMoE:
             raise ValueError(
                 f"x {tuple(x.shape)}: expected contiguous [<= {MAX_TOKENS_PER_RANK}, {H}]"
             )
-        if x.device != self.device:
-            raise ValueError(f"x on {x.device}, instance on {self.device}")
+        tensors = {
+            "x": x,
+            "x_scales": x_scales,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "out": out,
+            "w.w13": w.w13,
+            "w.w13_scale": w.w13_scale,
+            "w.w2": w.w2,
+            "w.w2_scale": w.w2_scale,
+        }
+        for name, t in tensors.items():
+            if t is not None and t.device != self.device:
+                raise ValueError(f"{name} on {t.device}, instance on {self.device}")
+        if rows_hint is not None and not 0 <= rows_hint <= MAX_TOKENS_PER_RANK:
+            raise ValueError(
+                f"rows_hint {rows_hint}: expected 0..{MAX_TOKENS_PER_RANK}"
+            )
         if tuple(topk_ids.shape) != (m, TOPK) or tuple(topk_weights.shape) != (m, TOPK):
             raise ValueError(f"topk_ids / topk_weights must be [{m}, {TOPK}]")
         quant_in = x.dtype == torch.bfloat16
