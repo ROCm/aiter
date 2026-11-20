@@ -6,13 +6,12 @@ The LDS, QK/PV MFMA and staggered pipeline come from a dense BM128/BN64 D256
 attention kernel (see sparse_prefill_common). Q/O rows and sparse masks differ.
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import rocdl
 
+from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -20,6 +19,7 @@ from .sparse_prefill_common import (
     _buffer_words,
     _copy_coordinates,
     _cross,
+    _exp,
     _exps,
     _join,
     _k_lds_address,
@@ -44,7 +44,6 @@ from .sparse_prefill_common import (
     _schedule_exps,
     _stage_end,
     _sum,
-    _target_features,
     _uniform,
     _v_lds_address,
     _v_operands,
@@ -70,7 +69,7 @@ def _kv_rows(ids, wave, hk, slotted):
     With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
     rows = []
     for slot in range(4):
-        block = fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
+        block = fx.Uint32(prim.readlane(ids, slot))
         if not slotted:
             block = block * (4 * hk * D * 2) + (wave >> 2) * 256
         rows.append(fx.Int32(block))
@@ -91,10 +90,12 @@ def _read_packet_g2s(
     extent,
     tail_tile=None,
     read=None,
+    queue=None,
 ):
     """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127.
 
-    The optional LDS read (storage, address, immediate) is issued just before it.
+    The optional LDS read (storage, address, immediate) is issued just before it, counted
+    by queue.
     """
     # Token k of a block reads SOFFSET min(row, limits[k]) + k rows: a partial final block re-reads
     # the request's last token, whose K is masked and V weighted 0; with fewer than k + 1 tokens
@@ -130,9 +131,8 @@ def _read_packet_g2s(
     else:
         row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
         soffset = _min(row, limit)
-    data = None if read is None else _load_lds(*read)
-    # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
-    rocdl.raw_ptr_buffer_load_lds(
+    data = None if read is None else queue.load(*read)
+    prim.buffer_load_lds(
         resource,
         fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
@@ -146,9 +146,7 @@ def _read_packet_g2s(
 def _read_mask_g2r(resource, tile, offset, bq):
     """Membership bits of this lane's query over the 16 keys it scores in a key tile."""
     # The next vmcnt(0) retires it before the compute stage that applies it.
-    bits = rocdl.raw_ptr_buffer_load(
-        fx.Int16.ir_type, resource, fx.Int32(offset), fx.Int32(tile * bq * 8), 0
-    )
+    bits = prim.buffer_load_i16(resource, fx.Int32(offset), fx.Int32(tile * bq * 8))
     # Only bits 0..15 are read, so the sign extension is harmless.
     return fx.Int16(bits).to(fx.Int32)
 
@@ -192,7 +190,7 @@ def _shuffle_o_r2s2r(o_lo, o_hi, inv, storages, tid):
             _load_lds(storages[part // 4], (element ^ ((read_row & 7) * 8)) * 2)
         )
     rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.sched_barrier(0)
+    prim.sched_barrier(0)
     return parts
 
 
@@ -235,7 +233,7 @@ def _body(
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     STAGGER: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
 ):
@@ -251,6 +249,9 @@ def _body(
     O = sum(P V); the output is O / l. m starts at the first row max + 1 and moves to a
     later row max + 1 only when that exceeds m + 7, rescaling O and l.
     """
+    # Kept in a VGPR: the phase loop needs every SGPR, and a scale read from an SGPR there
+    # spills SGPRs and reorders the tuned MFMA/VALU interleave (about 4% slower).
+    scale = _pin_i32(fx.Float32(SCALE_LOG2).bitcast(fx.Int32)).bitcast(fx.Float32)
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
     row_offset = ((work // HK) % slices) * 128
@@ -315,7 +316,6 @@ def _body(
                 extent,
             )
         )
-    scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
     key_tiles = (compact_len + BN - 1) // BN
     last_tile = key_tiles - 1
@@ -349,6 +349,7 @@ def _body(
     def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile):
         # 16 LDS-DMA packets; read i of the s2r plan is issued just before packet i.
         parts = [None] * 16
+        first = None if lgkm is None else lgkm.issued
         for packet in fx.range_constexpr(16):
             read, slot = None, packet
             if fx.const_expr(s2r is not None):
@@ -368,10 +369,11 @@ def _body(
                 extent,
                 tail_tile,
                 read,
+                lgkm,
             )
         if fx.const_expr(s2r is None):
             return None
-        return _lds_words(parts), lgkm.issue(16)
+        return _lds_words(parts), lgkm.ready(first, lgkm.issued - first)
 
     def read_k_g2s(rows, s2r=None, lgkm=None):
         return read_tile_g2s(gk, k_lds, rows, False, s2r, lgkm, None)
@@ -380,7 +382,7 @@ def _body(
         return read_tile_g2s(gv, v_lds, rows, True, s2r, lgkm, tail_tile)
 
     def qk(k):
-        return _qk(q, _k_operands(k))
+        return _qk(q, *_k_operands(k))
 
     def prologue():
         """Ids of tiles 0-2 and mask(0) g2r; K(0) g2s, QK(0), m and S'(0); K(1) g2s."""
@@ -415,8 +417,8 @@ def _body(
         s_hi = qk(k_hi)
         s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * scale
         row_max = _max(s_0)
-        row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
-        row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 16, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 32, 64))
         row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
@@ -518,7 +520,11 @@ def _body(
             center=(s_cur, max_cur, max_others, scale, row_max),
         )
         _schedule(32, 3, 4)
-        o_lo, o_hi, row_sum = _rescale(o_lo, o_hi, row_sum, row_max, new_max, ballot)
+        o_lo, o_hi, row_sum = _rescale(
+            (o_lo, o_hi, row_sum),
+            ballot,
+            lambda: _exp(fx.Float32(row_max) - fx.Float32(new_max)),
+        )
         _stage_end()
         return s_cur, new_max, row_sum, o_lo, o_hi, rows_cur, rows_next, rows_next2
 
@@ -530,8 +536,8 @@ def _body(
         read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile)
         p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         sum_last = _sum(p_last)
-        sum_last = sum_last + sum_last.shuffle_xor(16, 64)
-        sum_last = sum_last + sum_last.shuffle_xor(32, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 16, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 32, 64)
         row_sum = fx.Float32(row_sum) + sum_last
         p_bf16 = _pack_bf16(p_last).bitcast(fx.BFloat16)
         lgkm.wait(vmcnt=0)
@@ -602,7 +608,7 @@ def _kernel(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     SLOTTED: fx.Constexpr[bool],
 ):
     body = _body
@@ -642,7 +648,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     True,
                     SLOTTED,
                 )
@@ -666,7 +672,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     False,
                     SLOTTED,
                 )
@@ -679,6 +685,7 @@ def _launch(
     K: fx.Tensor,
     V: fx.Tensor,
     OUT: fx.Tensor,
+    SCALE_LOG2: fx.Float32,
     META: fx.Tensor,
     BLOCKS: fx.Tensor,
     MEMBERS: fx.Tensor,
@@ -694,7 +701,6 @@ def _launch(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
     SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -719,12 +725,9 @@ def _launch(
             GP,
             TASKS,
             GRID,
-            SCALE,
+            SCALE_LOG2,
             SLOTTED,
-            value_attrs={
-                "rocdl.waves_per_eu": 2,
-                "llvm.target_features": _target_features(),
-            },
+            value_attrs=prim.kernel_attrs(),
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -738,6 +741,7 @@ def _args(inputs, plan, out, stream):
         inputs.k,
         inputs.v,
         out.view(-1),
+        inputs.scale_log2,
         plan.metadata.view(-1),
         (plan.pool_blocks if plan.slotted else plan.blocks).view(-1),
         plan.score_masks.view(-1),
@@ -755,21 +759,21 @@ def _args(inputs, plan, out, stream):
         * inputs.k.shape[1]
         * ((plan.query_tile * plan.group_padded + 127) // 128),
         plan.grid,
-        inputs.scale,
         plan.slotted,
         stream,
     )
 
 
 def _compiled(inputs, args, stream):
-    key = (inputs.q.device, args[11], args[12], args[15], args[16], args[19], args[20])
+    key = (inputs.q.device, args[12], args[13], args[16], args[17], args[20])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-            compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, *args[19:21], stream
+            # Eight waves and 64 KiB LDS per CTA: two waves per SIMD, 256 VGPRs each.
+            compiled = _COMPILED[key] = flyc.compile[{"waves_per_eu": 2}](
+                _launch, *args[:19], 0, args[20], stream
             )
     return compiled
 
@@ -784,8 +788,9 @@ def run(*, inputs, plan, out):
 
 
 def launcher(*, inputs, plan, out):
-    """launch(q, k, v, out, slots) with flat Q/out and unflattened K/V; other arguments
-    prebuilt. Union reads pool rows through K3's table, so the slot table is unused here.
+    """launch(q, k, v, out, slots, scale_log2) with flat Q/out, unflattened K/V and the
+    FP32 softmax_scale * log2(e); other arguments prebuilt. Union reads pool rows through
+    K3's table, so the slot table is unused here.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
@@ -794,5 +799,5 @@ def launcher(*, inputs, plan, out):
     stream = torch.cuda.current_stream(inputs.q.device)
     args = _args(inputs, plan, out, stream)
     compiled = _compiled(inputs, args, stream)
-    tail = args[4:]
-    return lambda q, k, v, o, slots: compiled(q, k, v, o, *tail)
+    tail = args[5:]
+    return lambda q, k, v, o, slots, scale_log2: compiled(q, k, v, o, scale_log2, *tail)
