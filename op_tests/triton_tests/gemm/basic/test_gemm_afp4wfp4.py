@@ -141,6 +141,37 @@ def get_x_vals():
     return x_vals
 
 
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (1, 1536, 7168),
+        (1, 7168, 768),
+        (1, 8448, 7168),
+        (1, 7168, 4224),
+    ],
+)
+def test_small_m_short_k_gemm_afp4_wfp4(M: int, N: int, K: int):
+    """Cover small-M decode shapes, including split-K tails."""
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        _,
+        x_scales,
+        w_scales,
+        _,
+        _,
+        _,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True)
+
+    expected = run_torch(x, w, x_scales, w_scales, dtype)
+    actual = triton_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y)
+
+    assert torch.isfinite(actual).all()
+    triton.testing.assert_close(expected, actual)
+
+
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=1)
