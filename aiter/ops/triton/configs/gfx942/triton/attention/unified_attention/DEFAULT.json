@@ -195,6 +195,14 @@
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 64
     },
+    "D_RANGE_257_511.DT_any_bf16": {
+      "MIN_SEGMENTS": 8,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 32,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 32
+    },
     "any": {
       "MIN_SEGMENTS": 8,
       "SEGMENTS_PER_CU": 16,
