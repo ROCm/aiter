@@ -41,9 +41,11 @@ requires_gpu = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def _no_opus_env(monkeypatch):
     # The tests pin the default backends; AITER_MLA_USE_OPUS is read on every
-    # query and launch, so an inherited value would select OPUS instead. Tests
-    # that cover OPUS set it themselves.
+    # query and launch, so an inherited value would select OPUS instead, and an
+    # inherited AITER_ENABLE_EXPERIMENTAL would hand the folded 16-head qlen-8 plan
+    # to HK. Tests that cover OPUS set it themselves.
     monkeypatch.delenv("AITER_MLA_USE_OPUS", raising=False)
+    monkeypatch.delenv("AITER_ENABLE_EXPERIMENTAL", raising=False)
 
 
 def _dtype(name):
@@ -578,6 +580,7 @@ def _cprr_reference(qt, kvb, qo, kv_indptr, kv_indices, msq, cp_rank, v_head_dim
 
 def _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank):
     ref, ref_lse = _cprr_reference(*inputs, msq, cp_rank, KV_LORA_RANK)
+    ref = ref.to(out.dtype).float()  # the kernel stores bf16; LSE stays fp32
     err = (out.float() - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
         out.float().flatten(), ref.flatten(), dim=0

@@ -2542,9 +2542,12 @@ def _get_mla_metadata_v1_impl(
             Set it for a round-robin CP decode (mla_decode_fwd with g_kv_indptr): 96
             fp8 heads at qlen 7 and 8 are planned natively with it and folded without
             it. The mode is recorded with work_metadata_ptrs (views and deep copies
-            keep it) and mla_decode_fwd runs the head plan it records. Where the mode
-            changes the plan, mla_decode_fwd raises ValueError on a buffer without a
-            record (a clone), and on CP-planned metadata without g_kv_indptr.
+            keep it; a clone, or a deep copy of a view, has no record, and copy_ into
+            a planned buffer keeps that buffer's own record, so plan the destination
+            again instead) and mla_decode_fwd runs the head plan it records. Where
+            the mode changes the plan, mla_decode_fwd raises ValueError on a buffer
+            without a record (a clone), and on CP-planned metadata without
+            g_kv_indptr.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
