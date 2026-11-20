@@ -270,7 +270,9 @@ out = tuned_gemm.gemm_a16w16(a, w, otype=torch.bfloat16)
 assert flydsl_calls == [a.shape], f"the tuned row did not reach FlyDSL: {flydsl_calls}"
 torch.testing.assert_close(out, ref, rtol=0, atol=0)
 """
-# One budget for every child of the test, well inside CI's 10-minute tests/ step.
+# One budget for every child of the test. CI runs each tests/ file under
+# `timeout 60m` (.github/scripts/aiter_test.sh), so a hung child fails this
+# test with its output instead of killing the whole file's run.
 _BUDGET_S = 240
 
 
