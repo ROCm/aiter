@@ -153,7 +153,10 @@ def fast_runner_from_evidence(evidence: dict[str, Any]) -> str:
 def fast_test_files_from_evidence(evidence: dict[str, Any]) -> list[str]:
     profile = evidence_profile(evidence)
     files = []
-    for value in profile.get("failed_test_files", []):
+    candidates = list(profile.get("failed_test_files", [])) or list(
+        profile.get("failed_shard_test_files", [])
+    )
+    for value in candidates:
         path = str(value).strip()
         if path.startswith(("op_tests/", "tests/")) and path not in files:
             files.append(path)
@@ -362,6 +365,7 @@ def create_low_confidence_issue(
     warnings = limited_items(culprit.get("warnings"), limit=8)
     failed_jobs = failed_job_names(evidence)[:8]
     failed_tests = limited_items(profile.get("failed_test_files"), limit=12)
+    failed_shard_tests = limited_items(profile.get("failed_shard_test_files"), limit=12)
     hardware = limited_items(profile.get("hardware"), limit=8)
     categories = limited_items(profile.get("categories"), limit=8)
 
@@ -396,11 +400,16 @@ def create_low_confidence_issue(
         body_lines.append("- Failed jobs: " + ", ".join(f"`{item}`" for item in failed_jobs))
     if failed_tests:
         body_lines.append("- Failed tests: " + ", ".join(f"`{item}`" for item in failed_tests))
+    if failed_shard_tests:
+        body_lines.append(
+            "- Test files in failed shard(s), not necessarily failed: "
+            + ", ".join(f"`{item}`" for item in failed_shard_tests)
+        )
     if hardware:
         body_lines.append("- Hardware: " + ", ".join(f"`{item}`" for item in hardware))
     if categories:
         body_lines.append("- Categories: " + ", ".join(f"`{item}`" for item in categories))
-    if not any((failed_jobs, failed_tests, hardware, categories)):
+    if not any((failed_jobs, failed_tests, failed_shard_tests, hardware, categories)):
         body_lines.append("- No structured failure scope was available.")
 
     body_lines.extend(["", "## Report Evidence", ""])
@@ -545,6 +554,14 @@ def main() -> int:
                 "## Aiter Low-Confidence Culprit\n\n"
                 f"Dry run passed. The script would create an investigation issue for `{sha}` "
                 "instead of opening an automatic revert PR."
+            )
+            return 0
+        duplicate_pr = open_revert_pr_for_sha(args.repo, sha)
+        if duplicate_pr:
+            append_summary(
+                "## Aiter Low-Confidence Culprit\n\n"
+                f"Skipped: duplicate open revert PR already exists for `{sha}`.\n\n"
+                f"- PR: #{duplicate_pr.get('number')} {duplicate_pr.get('url')}"
             )
             return 0
         duplicate_issue = open_low_confidence_issue_for_sha(args.repo, sha)
