@@ -3,9 +3,19 @@
 
 """The recipe's dispatch and combine stages over one shared arena."""
 
+import contextlib
+
 import torch
 
 from .arena import SymmetricArena, _ArenaLayout
+from .megakernel import (
+    CompactMegaSet,
+    SlotsMega,
+    compact_reason,
+    compact_regions,
+    slots_reason,
+    slots_regions,
+)
 from .mori_caps import _mori_capabilities, _MoriCapabilities
 from .recipe import MegaMoEConfig, MegaMoERecipe, _stage_classes
 from .stages.base import (
@@ -31,7 +41,10 @@ def _arena_layout(config: MegaMoEConfig, caps) -> _ArenaLayout:
     ``required_vmm_bytes`` reports."""
     dispatch, combine = _stage_classes(config.recipe)
     return _ArenaLayout.merge(
-        dispatch.regions(config, caps), combine.regions(config, caps)
+        dispatch.regions(config, caps),
+        combine.regions(config, caps),
+        slots_regions(config),
+        compact_regions(config),
     )
 
 
@@ -64,10 +77,16 @@ class _EpDispatcher:
             )
         self.layout = _arena_layout(config, caps)
         self.res = _EpResources(SymmetricArena(communicator, self.layout))
+        self.slots = None
+        self.compact = None
         try:
             self.res.allocate(config, self.device)
             self._dispatch.build(self.res)
             self._combine.build(self.res)
+            if slots_reason(config) is None:
+                self.slots = SlotsMega(config, self.res, self.device)
+            if compact_reason(config) is None:
+                self.compact = CompactMegaSet(config, self.res, self.device)
         except BaseException:
             self.close()
             raise
@@ -114,6 +133,21 @@ class _EpDispatcher:
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
         self._dispatch.prefetch(topk_ids, recv_token_bound)
 
+    def megakernel_for(self, recv_token_bound):
+        """The single-kernel MegaMoE that runs a step with this bound, or None
+        (the staged path): slots first, then compact."""
+        for mk in (self.slots, self.compact):
+            if mk is not None and mk.serves(recv_token_bound):
+                return mk
+        return None
+
+    def drop_pending_plan(self) -> None:
+        """Retire a compact plan started for a step another path runs: nothing
+        reads it, and the next staged step plans its own routing. The plan ran
+        in stream order, so that step's plan may reuse its slot."""
+        if getattr(self._dispatch, "_plan_pending", False):
+            self._dispatch._plan_pending = False
+
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         self._dispatch.warmup(recv_token_bound, token_count)
 
@@ -121,6 +155,11 @@ class _EpDispatcher:
         if self._closed:
             return
         self._closed = True
+        for mk in (self.slots, self.compact):
+            if mk is not None:
+                # Diagnostics only (AITER_DMK_TRACE): never fail a close over them.
+                with contextlib.suppress(Exception):
+                    mk.report()
         try:
             # A launch still in flight (a graph replay, say) reads the window:
             # let it finish before anything it reads is freed.

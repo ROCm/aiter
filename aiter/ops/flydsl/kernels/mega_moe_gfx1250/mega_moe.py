@@ -365,6 +365,21 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
+        mk = ep.megakernel_for(recv_token_bound)
+        if mk is not None and not quant_bits and bias1 is None and bias2 is None:
+            # Every rank passes the same bound, so the ranks agree on the path.
+            # A plan an earlier staged layer started for this step is dropped.
+            ep.drop_pending_plan()
+            return mk.forward(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                recv_token_bound=recv_token_bound,
+            )
         step_kw = {}
         s1f = False
         hook = None
@@ -596,7 +611,9 @@ class MegaMoEGfx1250:
         bound's token bucket, so a captured batch whose bucket never ran eagerly
         would reach the JIT inside the capture -- which the plan refuses. A
         caller that captures a ladder of batch sizes warms every rung through
-        here first. A no-op off the compact path.
+        here first. A no-op off the compact path. Bounds a megakernel serves
+        are warmed too: a step with a quantized combine wire or biases still
+        runs the staged path.
         """
         self._ep.warmup(recv_token_bound, token_count)
 
@@ -608,8 +625,12 @@ class MegaMoEGfx1250:
         """Launch ``tdm_compact_plan`` into the current slot, in stream order.
 
         The plan only needs ``topk_ids``, so the caller may issue it before the
-        first layer's RMSNorm. A no-op off the compact path.
+        first layer's RMSNorm. A no-op off the compact path, and for a bound a
+        megakernel serves (a side-stream plan must not hold CUs while it runs;
+        a step that falls back to the staged path plans in its own forward).
         """
+        if self._ep.megakernel_for(recv_token_bound) is not None:
+            return
         self._ep.prefetch(topk_ids, recv_token_bound)
 
     # -- for callers that drive the transport themselves (ATOM's Triton experts)

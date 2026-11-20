@@ -232,6 +232,10 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    a_cache_modifier=0,
+    c_cache_modifier=0,
+    scatter_cache_policy=0,
+    defer_ep_wait=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -283,6 +287,17 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
+    - ``a_cache_modifier`` / ``c_cache_modifier`` / ``scatter_cache_policy``
+      (decode megakernel): the cache policy (gfx12 CPol, e.g. SCOPE_DEV) of the
+      A and A-scale TDM loads, of the stage-1 quantized output (its TDM store
+      and e8m0 stores), and of the EP-scatter gather stores. One kernel then
+      hands GEMM1's output to GEMM2 across XCCs, and GEMM2's rows to the
+      peers, with no kernel boundary in between.
+    - ``defer_ep_wait`` (persistent EP scatter): stage C past the input
+      stages and skip the wait after the scatter, so the remote stores retire
+      under the next tile's mainloop. The next tile's epilogue waits for them
+      before it restages C; the caller must drain tensorcnt before it counts
+      the scatter as done or exits.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -540,6 +555,10 @@ def build_gemm_a8w4_tdm_task(
         else num_buffers
     )
     C_EP_OFF = 0
+    if defer_ep_wait:
+        assert enable_ep_scatter and persistent_workers and not ep_quant_bits
+        C_EP_OFF = ((INPUT_LDS_B + 127) // 128) * 128
+        ARENA_B = max(ARENA_B, C_EP_OFF + C_STORE_B)
     # fp4 stage-1 output staging (tile_m x tile_n/4 B): the last pipeline stage
     # with defer_c_wait, so the next tile's prologue cannot overwrite it.
     C_Q_OFF = (num_buffers - 1) * PITCH if defer_c_wait else 0
@@ -596,6 +615,11 @@ def build_gemm_a8w4_tdm_task(
     _prefence += "_ab2"
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
     _malign = f"_ma{m_align}" if m_align else ""
+    _cpol = (
+        f"_cp{a_cache_modifier}x{c_cache_modifier}x{scatter_cache_policy}"
+        if a_cache_modifier or c_cache_modifier or scatter_cache_policy
+        else ""
+    )
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -608,7 +632,8 @@ def build_gemm_a8w4_tdm_task(
         f"{_interleaved_lds_load}{_persistent}{_drain}"
         f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
         f"{_prefence}_earlyacc"
-        f"{_malign}{_kwaves}"
+        f"{_malign}{_kwaves}{_cpol}"
+        f"{'_dew' if defer_ep_wait else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -868,9 +893,9 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def tiled_store(gt, tile, lds_ptr, lds_row):
+        def tiled_store(gt, tile, lds_ptr, lds_row, cache_modifier=0):
             atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
+                fx.rocdl.TensorStore(cache_modifier=cache_modifier),
                 gt,
                 fx.make_layout(tile, (lds_row, 1)),
                 tile,
@@ -1069,6 +1094,7 @@ def build_gemm_a8w4_tdm_task(
                 k_adv=16 * A_ROW_B,
                 wv=waves[0],
                 wg_mask=a_mcast_mask,
+                cache_modifier=a_cache_modifier,
             )
         else:
             add_tdm_loads(
@@ -1086,6 +1112,7 @@ def build_gemm_a8w4_tdm_task(
                 wv=waves[0],
                 pad=(A_ROW_B, LDS_PAD_A),
                 wg_mask=a_mcast_mask,
+                cache_modifier=a_cache_modifier,
             )
         add_tdm_loads(
             gB_base,
@@ -1120,6 +1147,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_KDW,
                 k_adv=0,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
                 target_jobs=as_prologue_jobs,
             )
         elif const_expr(row_major_ascale):
@@ -1138,6 +1166,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=SA_KDW,
                 k_adv=SA_KDW * 4,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
             )
         elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
@@ -1153,6 +1182,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_INNER,
                 k_adv=0,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
                 target_jobs=as_prologue_jobs,
             )
         else:
@@ -1169,6 +1199,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_INNER,
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
             )
         add_tdm_loads(
             gSB_base,
@@ -2464,6 +2495,7 @@ def build_gemm_a8w4_tdm_task(
                                 scale_rsrc,
                                 dst_byte,
                                 mask=is_kgrp0,
+                                cache_modifier=c_cache_modifier,
                             )
                             # Half-k128 tail (inter_dim % 128 == 64): one scale
                             # dword carries the e8m0 of four 32-column MX blocks,
@@ -2484,6 +2516,12 @@ def build_gemm_a8w4_tdm_task(
                             )
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
+                if const_expr(defer_ep_wait):
+                    # The previous tile's scatter may still read the C stage:
+                    # each wave retires its own, then no wave restages early.
+                    tdm_ops.tensor_wait(0)
+                    rocdl.s_barrier_signal(-1)
+                    rocdl.s_barrier_wait(-1)
                 if const_expr(enable_ep_scatter):
                     _wf_rows = _rm_weight_rows
 
@@ -2757,7 +2795,7 @@ def build_gemm_a8w4_tdm_task(
                         ),
                         global_byte_offset=_gboff,
                     )
-                    tensor_store_gather(desc)
+                    tensor_store_gather(desc, cache_policy=scatter_cache_policy)
 
                 # Let every wave issue its own groups directly. This avoids
                 # cloning every descriptor behind a wave-selection branch.
@@ -2770,16 +2808,17 @@ def build_gemm_a8w4_tdm_task(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                if const_expr(not defer_ep_wait):
+                    tdm_ops.tensor_wait(0)
             else:
 
                 def store_tile(gt, tile, lds_ptr, lds_row):
                     # A k_waves workgroup's tile belongs to group 0 alone.
                     if const_expr(k_waves > 1):
                         if k_group == 0:
-                            tiled_store(gt, tile, lds_ptr, lds_row)
+                            tiled_store(gt, tile, lds_ptr, lds_row, c_cache_modifier)
                     else:
-                        tiled_store(gt, tile, lds_ptr, lds_row)
+                        tiled_store(gt, tile, lds_ptr, lds_row, c_cache_modifier)
 
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2

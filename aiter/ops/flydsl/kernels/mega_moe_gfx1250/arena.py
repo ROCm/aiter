@@ -86,6 +86,18 @@ _ARENA_REGION_ORDER = (
     # Stage-1 flag tiles. Last, so every other region's offset stays put when
     # AITER_MEGA_S1F is off and the region is absent.
     "tile_flag",
+    # The slots megakernel's fixed expert slots, their rowmap pairs and its
+    # control words (AITER_MEGAKERNEL); after the rest for the same reason.
+    "slots_rows",
+    "slots_rowmap",
+    "slots_ctl",
+    # compact's control regions (X1 rows, peer flags), one per kernel of its
+    # tile table (megakernel.COMPACT_TILES, at most COMPACT_MAX_KERNELS); they share
+    # the staged compact rows (disp_out / ep_rowmap) and comb_inp.
+    "compact_ctl",
+    "compact_ctl1",
+    "compact_ctl2",
+    "compact_ctl3",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.
