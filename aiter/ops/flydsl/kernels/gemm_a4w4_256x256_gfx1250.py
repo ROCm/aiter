@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
 from .gfx1250_cluster import compute_mcast_masks
@@ -104,6 +105,8 @@ def launch_gemm_a4w4_256x256(
     cluster_sync_revs = 8
     # The four-quadrant software pipeline; other profiles run the sequential K-tile schedule.
     scheduled = tile_m in (192, 256) and tile_n == 256 and tile_k == 256
+    # The tail modes launched below, in the order their kernels are defined in the module.
+    tail_modes = (2, 0, -1) if scheduled else (-1,)
     FENCE_WAIT_POS = 7  # WMMAs of slack between the READY signal and its matching wait
     WMMA_M = 32
     WMMA_N = 16
@@ -185,6 +188,7 @@ def launch_gemm_a4w4_256x256(
         arg_out: fx.Pointer,
         tail_mode: Constexpr[int],
     ):
+        prefetch_kernel_code(num_waves, tail_modes.index(tail_mode))
 
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
@@ -839,25 +843,31 @@ def launch_gemm_a4w4_256x256(
         else:
             if const_expr(split_k > 1):
                 c_off_rt += fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
+            C_TILE = (tile_m, C_LDS_ROW)
             gtC = _gv(
                 fx.recast_iter(partial_elem, arg_c),
                 c_off_rt,
-                (tile_m, C_LDS_ROW),
-                (C_LDS_ROW, 1),
+                (mn_oob, tile_n),
+                (ldc64, 1),
             )
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC, [mn_oob, tile_n], strides=[ldc64, None], num_warps=num_waves
-            )
-            fx.copy(
-                atomC,
-                _view(
-                    fx.recast_iter(partial_elem, base_ptr),
-                    (tile_m, C_LDS_ROW),
-                    (C_LDS_ROW, 1),
-                ),
+            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gtC,
+                fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+                C_TILE,
+                num_warps=num_waves,
             )
-            tdm_ops.tensor_wait(0)
+            blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+            sC = _view(
+                fx.recast_iter(partial_elem, base_ptr),
+                (C_TILE, 1),
+                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+            )
+            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+            )
+            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+            rocdl.s_wait_tensorcnt(0)
 
     grid_arg = make_gemm_grid(
         i32_m,
