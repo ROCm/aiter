@@ -381,27 +381,27 @@ def warmup_chunk_kimi_delta_attn(
         T, n = sum(lens), len(lens)
         bounds = torch.tensor([0, *itertools.accumulate(lens)], dtype=torch.int32)
         width = beta_token_stride or H
-        kw = dict(
-            q=rand(1, T, H, D),
-            k=rand(1, T, H, D),
-            v=rand(1, T, H, D),
-            g=rand(1, T, H, D),
-            beta=rand(T, width)[:, :H].unsqueeze(0),
-            A_log=torch.zeros(H, dtype=torch.float32, device=device),
-            dt_bias=torch.zeros(H * D, dtype=torch.float32, device=device),
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            safe_gate=True,
-            lower_bound=-5.0,
-            state_v_first=True,
-            cu_seqlens=bounds.to(device),
-            cu_seqlens_cpu=bounds,
-            out=rand(1, T, H, D),
-            state_cache=cache,
-            state_indices=torch.arange(1, n + 1, dtype=torch.int32, device=device),
-            has_initial_state=torch.zeros(n, dtype=torch.bool, device=device),
-        )
+        kw = {
+            "q": rand(1, T, H, D),
+            "k": rand(1, T, H, D),
+            "v": rand(1, T, H, D),
+            "g": rand(1, T, H, D),
+            "beta": rand(T, width)[:, :H].unsqueeze(0),
+            "A_log": torch.zeros(H, dtype=torch.float32, device=device),
+            "dt_bias": torch.zeros(H * D, dtype=torch.float32, device=device),
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "safe_gate": True,
+            "lower_bound": -5.0,
+            "state_v_first": True,
+            "cu_seqlens": bounds.to(device),
+            "cu_seqlens_cpu": bounds,
+            "out": rand(1, T, H, D),
+            "state_cache": cache,
+            "state_indices": torch.arange(1, n + 1, dtype=torch.int32, device=device),
+            "has_initial_state": torch.zeros(n, dtype=torch.bool, device=device),
+        }
         for use_norm in {False, norm}:
             for use_ckpt in {False, checkpoints}:
                 extra = {}

@@ -369,7 +369,7 @@ def _cw_fin(cw, c, pp, pv, g, H: gl.constexpr, V: gl.constexpr, C: gl.constexpr)
 
 @gluon.jit
 def _cw_pub(cw, own0, c, C: gl.constexpr):
-    s_tail, out, xp, xepoch, prt0, w, eps, tok_base, tok_end, v_off, rr = cw
+    s_tail, _out, xp, xepoch, _prt0, _w, _eps, _tok_base, _tok_end, _v_off, rr = cw
     x = s_tail.index(c % CW_NT).load(CW_LV).to(gl.float32)
     ss = gl.sum(x * x, axis=1).to(gl.int32, bitcast=True).to(gl.int64)
     v64 = (ss & 0xFFFFFFFF) | (xepoch.to(gl.int64) << 32)
@@ -378,7 +378,7 @@ def _cw_pub(cw, own0, c, C: gl.constexpr):
 
 @gluon.jit
 def _cw_ldp(cw, c, C: gl.constexpr):
-    s_tail, out, xp, xepoch, prt0, w, eps, tok_base, tok_end, v_off, rr = cw
+    _s_tail, _out, xp, _xepoch, prt0, _w, _eps, tok_base, tok_end, _v_off, rr = cw
     cc = gl.maximum(c, 0)
     rp = gl.arange(0, C, layout=CW_LP)
     mp = (rp < (tok_end - tok_base - cc * C).to(gl.int32)) & (c >= 0)
@@ -390,7 +390,7 @@ def _cw_ldp(cw, c, C: gl.constexpr):
 
 @gluon.jit
 def _cw_ldg(cw, gate, gate_stride, g_off, c, C: gl.constexpr):
-    s_tail, out, xp, xepoch, prt0, w, eps, tok_base, tok_end, v_off, rr = cw
+    _s_tail, _out, _xp, _xepoch, _prt0, _w, _eps, tok_base, tok_end, _v_off, rr = cw
     t0 = tok_base + gl.maximum(c, 0) * C
     m = (rr < (tok_end - t0).to(gl.int32)) & (c >= 0)
     return gl.amd.cdna4.buffer_load(gate + t0 * gate_stride, g_off, mask=m[:, None])
@@ -410,7 +410,7 @@ def _cw_walk(
     V: gl.constexpr,
     C: gl.constexpr,
 ):
-    ws_kd, ws_kr, ws_gt, ws_inv_mqk, v_input, ws_qd, gate = ws
+    _ws_kd, _ws_kr, _ws_gt, ws_inv_mqk, v_input, _ws_qd, gate = ws
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq = seg
     state_cache, state_indices, has_initial_state, cache_stride = st
     norm_w, gate_stride, norm_eps, xp, xepoch = nrm
@@ -634,7 +634,7 @@ def _cw_walk(
 
 @gluon.constexpr_function
 def _vmwait(n):
-    return "s_waitcnt vmcnt(%d)\n v_mov_b32 $0, $1" % n
+    return f"s_waitcnt vmcnt({n})\n v_mov_b32 $0, $1"
 
 
 @gluon.jit
@@ -1245,7 +1245,7 @@ def k2_c_gluon(
                 )
         if not NORM:
             _issue_chunk(*nxt, 0, H, V, C, True, 12)
-    if NORM:
+    if NORM:  # noqa: SIM102
         if n_chunks > 0:
             o_n = _gnorm(o_p, _rowss_get(s_ss, MT), g_p, w_n, norm_eps, V)
             m_p = o_c_t < (tok_end - t_p).to(gl.int32)
