@@ -293,7 +293,16 @@ def _fused_flatten_mxfp8_quant_kernel(
     )
 
 
-@triton.jit
+_k3_mla_640_pack_repr = make_kernel_repr(
+    "_k3_mla_640_pack_kernel",
+    [
+        "BLOCK_SIZE",
+        "HAS_SLOTS",
+    ],
+)
+
+
+@triton.jit(repr=_k3_mla_640_pack_repr)
 def _k3_mla_640_pack_kernel(
     nope_ptr,
     rope_ptr,
@@ -334,7 +343,16 @@ def _k3_mla_640_pack_kernel(
     tl.store(dst + NOPE + ROPE + c, tail, mask=c >= n_sc)
 
 
-@triton.jit
+_k3_mla_640_gather_repr = make_kernel_repr(
+    "_k3_mla_640_gather_kernel",
+    [
+        "BLOCK_SIZE",
+        "HAS_SEQ_STARTS",
+    ],
+)
+
+
+@triton.jit(repr=_k3_mla_640_gather_repr)
 def _k3_mla_640_gather_kernel(
     src_ptr,
     dst_ptr,

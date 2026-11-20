@@ -351,8 +351,7 @@ K3_MLA_640_ROPE = 64
 
 
 def _k3_mla_640_cache(cache: torch.Tensor, what: str = "kv_cache") -> torch.Tensor:
-    """The cache as uint8 [num_blocks, block_size, 640]. It may be a strided view
-    into a packed block row; a flat [rows, 640] grid is the same with page size 1."""
+    """The cache as uint8 [num_blocks, block_size, 640]; [rows, 640] is block size 1."""
     if cache.ndim == 2:
         cache = cache.unsqueeze(1)
     if (
@@ -373,7 +372,7 @@ def _k3_mla_640_cache(cache: torch.Tensor, what: str = "kv_cache") -> torch.Tens
 
 
 def _k3_rows(x: torch.Tensor, rows: int, width: int, what: str) -> torch.Tensor:
-    """bf16 [rows, width] with unit inner stride (a view whenever x allows it)."""
+    """x as bf16 [rows, width] with unit inner stride."""
     if x.dtype != torch.bfloat16 or x.numel() != rows * width:
         raise ValueError(
             f"{what} must be bf16 with {rows} x {width} elements, got "
@@ -389,12 +388,8 @@ def k3_mla_640_concat_and_cache(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Quantize and write fp8_k3_mla_640 records (the call shape of vLLM
-    ops.concat_and_cache_mla).
-
-    kv_c [T, 512] and k_pe [T, 64] (rope already applied) are bf16; token t goes
-    to slot_mapping[t] = block * block_size + pos, a negative slot is skipped.
-    """
+    """Quantize kv_c [T, 512] and k_pe [T, 64] bf16 into fp8_k3_mla_640 records.
+    A negative slot is skipped."""
     cache = _k3_mla_640_cache(kv_cache)
     T = slot_mapping.shape[0]
     if T == 0:
@@ -418,8 +413,7 @@ def k3_mla_640_concat_and_cache(
 def k3_mla_640_q_pack(
     q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """bf16 q_nope [..., 512] and q_pe [..., 64] -> uint8 [..., 640], one
-    fp8_k3_mla_640 record per (token, head): what sparse_mla_fwd reads as q."""
+    """Pack bf16 q_nope [..., 512] and q_pe [..., 64] into uint8 [..., 640] records."""
     lead = q_nope.shape[:-1]
     rows = q_nope.numel() // K3_MLA_640_NOPE
     nope = _k3_rows(q_nope, rows, K3_MLA_640_NOPE, "q_nope")
@@ -461,21 +455,8 @@ def k3_mla_640_cp_gather_and_upconvert(
     batch_size: int,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    """Gather fp8_k3_mla_640 records and dequantize them to bf16 (the signature
-    of vLLM ops.cp_gather_and_upconvert_fp8_kv_cache).
-
-    Request r fills dst rows [workspace_starts[r], workspace_starts[r + 1]) (the
-    last one up to dst.shape[0]) with its tokens from position seq_starts[r]
-    (0 without it) on, token p read from block block_table[r, p // block_size].
-
-    Args:
-        src_cache: uint8 [num_blocks, block_size, 640].
-        dst: bf16 [total_tokens, 576] workspace: 512 nope | 64 rope.
-        block_table: int32 [num_reqs, max_blocks].
-        workspace_starts: int32 [num_reqs].
-        batch_size: num_reqs.
-        seq_starts: optional int32 [num_reqs].
-    """
+    """Gather fp8_k3_mla_640 records into bf16 dst [total_tokens, 576].
+    Request r fills dst rows from workspace_starts[r], from token seq_starts[r] on."""
     cache = _k3_mla_640_cache(src_cache, "src_cache")
     width = K3_MLA_640_NOPE + K3_MLA_640_ROPE
     if dst.dtype != torch.bfloat16 or dst.ndim != 2 or dst.shape[1] != width:

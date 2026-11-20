@@ -671,7 +671,6 @@ def _pa_decode_sparse_reduce(
     if HAS_LSE:
         LN2: gl.constexpr = 0.6931471805599453
         log_l = gl.log2(l_combined_hd) * LN2
-        # The partials are base-2 (scores pre-scaled by log2(e)); LSE is natural log.
         m_nat = m_max_hd * LN2
         gl.amd.cdna4.buffer_store(
             gl.where(l_combined_hd > 0.0, m_nat + log_l, float("-inf")),

@@ -488,22 +488,19 @@ def _forward_paged(
 
 @functools.cache
 def _k3_no_sink(num_heads, device):
-    """A sink that never contributes: exp2(-1e30 - m) is exactly 0 in the softmax
-    denominator, and it stays finite where -inf would turn into NaN."""
+    """Sink of -1e30: it adds 0 to the softmax and does not make NaN like -inf."""
     return torch.full((num_heads,), -1e30, dtype=torch.float32, device=device)
 
 
 @functools.cache
 def _k3_splits(row_programs, row_tiles, block_h):
-    """Fewest splits (<= 32, >= 2 tiles each) minimising rounds x (tiles per
-    split + 2, a split's fixed cost), with 4 // num_warps CTAs resident per CU
-    (one wave per SIMD)."""
+    """KV split count with the fewest rounds x (tiles per split + 2)."""
     programs = get_num_sms() * (64 // block_h)
-    # Prefill-sized calls fill the GPU many times over: splitting only adds the fp32
-    # partials (~R * splits * h_padded * 512 * 4 B written and re-read) and a reduce
-    # launch, which the wave count above does not price. Kimi-K3.1 at R=6154 / 2048 keys
-    # picked 2 splits (H=24) or 4 (H=12): 1 split is 1.11x / 1.07x faster end to end.
+    # Enough rows to fill the GPU: no split, no reduce.
     if row_programs >= 4 * programs:
+        return 1
+    # SOLO mode is faster from here.
+    if block_h == 32 and row_programs >= programs:
         return 1
     return min(
         (s for s in (1, 2, 4, 8, 16, 32) if s == 1 or 2 * s <= row_tiles),
@@ -528,10 +525,7 @@ def _forward_k3_640(
     return_lse=False,
     keys_per_row=None,
 ):
-    """fp8_k3_mla_640 (Kimi-K3.1) on gfx1250: prefill and decode are one kernel,
-    the DeepSeek-V4 640 B fp8 kernel with ROPE_FP8. Returns out [N, H, 512] bf16,
-    (out, lse [N, H] f32) under return_lse, or (acc, m, l) base-2 partials under
-    skip_reduce."""
+    """fp8_k3_mla_640 attention on gfx1250, one kernel for prefill and decode."""
     arch = arch_info.get_arch()
     if not arch.startswith("gfx1250"):
         raise ValueError(f"fp8_k3_mla_640 is gfx1250-only, got {arch}")
@@ -577,12 +571,14 @@ def _forward_k3_640(
     block_k = block_k or (16 if block_h == 16 else 32)
     heads_blocks = -(-num_heads // block_h)
     h_padded = heads_blocks * block_h
-    num_warps = block_h // 16
     if kv_splits is None:
         if keys_per_row is None:
             keys_per_row = -(-kv_indices.shape[0] // max(1, num_queries))
         row_tiles = max(0, int(keys_per_row)) // block_k
         kv_splits = _k3_splits(num_queries * heads_blocks, row_tiles, block_h)
+    # SOLO: one wave per workgroup.
+    solo = kv_splits == 1 and block_h == 32 and block_k == 32
+    num_warps = 1 if solo else block_h // 16
     if kv_splits == 1:
         part_m = part_l = part_acc = out
         pm_strides, pa_strides = (0, 0, 0), (0, 0, 0, 0)
@@ -644,9 +640,7 @@ def _forward_k3_640(
         NOPE_DIM=nope,
         ROPE_DIM=rope,
         GROUP_SIZE=64,
-        # Q in VGPRs only without splits: the split-K variants run out of registers
-        # with it (894-1024 VGPRs, 4-16 spilled); out of VGPRs they need 610-708, no
-        # spill, and are as fast or faster (1.08-1.10x at batch 1).
+        # Q stays in VGPRs only without splits; split-K would spill.
         Q_IN_VGPR=kv_splits == 1,
         HAS_INVALID=bool(has_invalid),
         Q_TDM=True,
@@ -658,6 +652,9 @@ def _forward_k3_640(
         ROPE_FP8=True,
         lse_ptr=lse if kv_splits == 1 else None,
         HAS_LSE=return_lse and kv_splits == 1,
+        FUSED_REC=True,
+        TAIL_MASK_ONLY=True,
+        SOLO=solo,
         num_warps=num_warps,
         num_stages=2,
         waves_per_eu=1,
@@ -673,7 +670,7 @@ def _forward_k3_640(
         part_acc,
         attn_sink,
         kv_indptr,
-        kv_indptr,  # extra_indptr: unused, the K3.1 path has no extra key stream
+        kv_indptr,  # extra_indptr: unused
         out,
         *pm_strides,
         *pm_strides,
