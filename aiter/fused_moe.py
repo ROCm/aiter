@@ -2525,7 +2525,8 @@ def fused_moe_1stage(
 _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
 # (arch, quant type) pairs on those arches whose asm kernel was run past 4 GiB
 # and came out right (gfx950 fp8 per_1x128: experts 147-255 of E=256, 7168/2048,
-# match CK 2-stage), so they keep asm 1-stage.
+# match CK 2-stage), so they keep asm 1-stage. The AITER_XBFLOAT16=1 blockscale
+# kernel is not in that run: it wraps and stays guarded.
 _ASM_FMOE_U32_WEIGHT_OFFSET_OK = (("gfx950", QuantType.per_1x128),)
 
 
@@ -4862,9 +4863,12 @@ def get_2stage_cfgs(
             if (
                 run_1stage
                 and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
-                and (get_gfx_runtime(), q_type) not in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
                 and not _asm_fmoe_weights_fit_u32_offsets(
                     expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
+                )
+                and not (
+                    (get_gfx_runtime(), q_type) in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
+                    and not run_1stage_xbf16
                 )
             ):
                 if not use_g1u1:

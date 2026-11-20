@@ -2596,6 +2596,15 @@ def test_gfx942_asm_1stage_4gib_guard():
                 before_big if exempt else False
             ), f"{qtype}: 7 GiB w1"
             assert run_1stage(token, 1024, qtype, fp8) == before_small, qtype
+            if exempt:
+                # The AITER_XBFLOAT16=1 blockscale kernel wraps (not in the run
+                # that cleared per_1x128), so it leaves asm 1-stage.
+                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
+                with override_env("AITER_XBFLOAT16", "1"):
+                    assert run_1stage(token, 2048, qtype, fp8), "xbf16 not asm"
+                    fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+                    assert not run_1stage(token, 2048, qtype, fp8), "xbf16 7 GiB w1"
+                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
             # An arch outside the guard keeps the previous dispatch at any size.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx90a",)
             assert run_1stage(token, 2048, qtype, fp8) == before_big, qtype
