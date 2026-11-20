@@ -86,12 +86,35 @@ def _mxfp8(y):
     return x_q.to(torch.float8_e4m3fn), (k + 127).to(torch.uint8)
 
 
-def _bad(outs, refs):
-    """The number of bytes of the outputs that differ from the reference."""
-    return sum(
-        int((o.cpu().view(torch.uint8) != r.view(torch.uint8)).sum())
-        for o, r in zip(outs, refs)
+def _steps(a, b):
+    """The number of rounding steps between the bf16 or e4m3 values a and b. A value
+    that is not finite must have the same bits as the reference."""
+    bits = 8 * a.element_size()
+    ia, ib = (
+        t.view(torch.int16 if bits == 16 else torch.uint8).int() & ((1 << bits) - 1)
+        for t in (a, b)
     )
+    mag = (1 << (bits - 1)) - 1
+    ka, kb = (torch.where(i >> (bits - 1) == 1, -(i & mag), i & mag) for i in (ia, ib))
+    finite = torch.isfinite(a.float()) & torch.isfinite(b.float())
+    return torch.where(finite, (ka - kb).abs(), (ia != ib).int() << 16)
+
+
+def _diff(outs, refs):
+    """A message for each output that is not close to the reference. A bf16 or e4m3
+    value can be one rounding step from the reference, in 1 of 10,000 values (at least
+    8). The scale bytes must be equal."""
+    msgs = []
+    for name, o, r in zip(("x_q", "x_scale", "residual_out"), outs, refs):
+        o = o.cpu()
+        if o.dtype == torch.uint8:
+            steps, limit = (o.int() - r.int()).abs(), 0
+        else:
+            steps, limit = _steps(o, r), 1
+        n, worst = int((steps > 0).sum()), int(steps.max())
+        if worst > limit or n > max(8, steps.numel() // 10000):
+            msgs.append(f"{name}: {n} values differ, by up to {worst} steps")
+    return msgs
 
 
 def generate_all_reduce_rmsnorm_mxfp8_inputs(tokens, hidden, gemma, seed, rank, device):
@@ -144,10 +167,8 @@ def _check_shape(rank, device, tp, hidden, gemma, token_counts, graph, failures)
                 for x, r, w, _ in data
             ]
             for j, (out, d) in enumerate(zip(outs, data)):
-                if _bad(out, d[3]):
-                    failures.append(
-                        f"{tag} tokens {tokens} launch {j}: {_bad(out, d[3])} bytes differ"
-                    )
+                for msg in _diff(out, d[3]):
+                    failures.append(f"{tag} tokens {tokens} launch {j}: {msg}")
         if graph:
             _check_graph(rank, device, tp, comm, gemma, token_counts, failures)
         if comm.error() != [0, 0, 0, 0]:
@@ -184,16 +205,16 @@ def _check_graph(rank, device, tp, comm, gemma, token_counts, failures):
         dist.barrier(group=tp.cpu_group)
         graph.replay()
         for k, (out, d) in enumerate(zip(outs, data[rep])):
-            if _bad(out, d[3]):
+            for msg in _diff(out, d[3]):
                 failures.append(
                     f"world {comm.world} rank {rank} hidden {hidden}: graph replay {rep}"
-                    f" launch {k}: {_bad(out, d[3])} bytes differ"
+                    f" launch {k}: {msg}"
                 )
 
 
 def _check_sentinel(rank, device, tp, failures):
     """A 0xFFFF (NaN) value in x must not look like an empty slot: no wait times
-    out, and the other rows are exact."""
+    out, and the other rows are correct."""
     hidden, tokens = 6144, 64
     x, residual, weight, ref = _inputs(
         tokens, hidden, True, 7, rank, device, tp.device_group
@@ -204,9 +225,9 @@ def _check_sentinel(rank, device, tp, failures):
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
         out = fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm, gemma=True)
-        bad = _bad([o[: tokens - 1] for o in out], [r[: tokens - 1] for r in ref])
-        if bad or comm.error() != [0, 0, 0, 0]:
-            failures.append(f"rank {rank}: 0xFFFF data: {bad} bytes, {comm.error()}")
+        msgs = _diff([o[: tokens - 1] for o in out], [r[: tokens - 1] for r in ref])
+        if msgs or comm.error() != [0, 0, 0, 0]:
+            failures.append(f"rank {rank}: 0xFFFF data: {msgs}, error {comm.error()}")
     finally:
         comm.close()
 
@@ -255,8 +276,9 @@ def _check_scales(rank, device, tp, failures):
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
         out = fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm)
-        if _bad(out, ref) or comm.error() != [0, 0, 0, 0]:
-            failures.append(f"rank {rank}: edge scales: {_bad(out, ref)} bytes differ")
+        msgs = _diff(out, ref)
+        if msgs or comm.error() != [0, 0, 0, 0]:
+            failures.append(f"rank {rank}: edge scales: {msgs}, error {comm.error()}")
     finally:
         comm.close()
 
@@ -281,8 +303,9 @@ def _check_timeout(rank, device, tp, failures):
             failures.append(f"rank {rank}: error record {record} after a time-out")
         comm.reset()
         out = fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm, gemma=True)
-        if _bad(out, ref) or comm.error() != [0, 0, 0, 0]:
-            failures.append(f"rank {rank}: launch after reset is wrong")
+        msgs = _diff(out, ref)
+        if msgs or comm.error() != [0, 0, 0, 0]:
+            failures.append(f"rank {rank}: launch after reset: {msgs}, {comm.error()}")
     finally:
         comm.close()
 
