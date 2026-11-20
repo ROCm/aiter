@@ -241,7 +241,22 @@ def _gfx950_gluon_supported(params: _UAParams):
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
         and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and params.kv_cache_dtype in (params.q_dtype, e4m3_dtype)
+        and params.v_cache_dtype == params.kv_cache_dtype
+        # bf16 query over an fp8 cache: the dot stays bf16 and K, V are cast
+        # up after the LDS read; the shuffled layout's K width is not checked
+        and not (params.q_dtype != params.kv_cache_dtype and params.shuffled_kv_cache)
+        # Page 64, head 64, 2 to 4 query tokens, batch under 48: the 2d gluon
+        # kernel (64-key tile, one segment, BLOCK_M 128) takes a GPU memory
+        # fault. It is not monotonic in the batch (36 and 44 ran, 40 and 46
+        # faulted). Triton does not fault. Keep the mixed dtype on Triton there.
+        and not (
+            params.q_dtype != params.kv_cache_dtype
+            and params.block_size >= 64
+            and params.head_size <= 64
+            and 1 < params.max_seqlen_q <= 4
+            and params.num_seqs < 48
+        )
     )
 
 
