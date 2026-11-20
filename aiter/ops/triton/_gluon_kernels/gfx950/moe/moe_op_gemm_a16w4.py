@@ -359,7 +359,7 @@ def _moe_gemm_a16w4_swizzle(
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+        w_scale_layout: gl.constexpr = gl.amd.cdna4.get_scaled_upcast_fp4_scale_layout(
             w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
         )
 
@@ -750,7 +750,7 @@ def _moe_gemm_a16w4_swizzle_pipelined(
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+        w_scale_layout: gl.constexpr = gl.amd.cdna4.get_scaled_upcast_fp4_scale_layout(
             w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
         )
         w_scales = gl.convert_layout(w_scales, w_scale_layout)
@@ -770,7 +770,7 @@ def _moe_gemm_a16w4_swizzle_pipelined(
     w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
     w_scales = w_scales.trans(1, 0)
-    w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+    w_scale_layout: gl.constexpr = gl.amd.cdna4.get_scaled_upcast_fp4_scale_layout(
         w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
     )
     w_scales = gl.convert_layout(w_scales, w_scale_layout)

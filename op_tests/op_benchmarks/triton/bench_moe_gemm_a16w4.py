@@ -8,6 +8,7 @@ import tempfile
 from itertools import chain
 from pathlib import Path
 
+import triton  # noqa: F401  # must be imported before torch (Triton 3.9+ ABI)
 import torch
 import triton.profiler as proton
 

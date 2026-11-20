@@ -41,7 +41,15 @@ def _warn_gluon_fallback_once():
 def _is_gluon_available():
     """Check if the gluon backend is available for the current GPU architecture."""
     try:
-        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
+        if not any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS):
+            return False
+        if "gfx950" in get_arch():
+            import triton.experimental.gluon.language as gl
+            if not hasattr(gl.amd, "get_scaled_upcast_fp4_scale_layout") and not hasattr(
+                gl.amd.cdna4, "get_scaled_upcast_fp4_scale_layout"
+            ):
+                return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -445,10 +453,11 @@ def moe_gemm_a16w4(
         if get_arch() == "gfx1250":
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
-            # Currently on gfx950, gluon kernels requires that swizzling is enabled
-            # and K % 256 == 0. Otherwise, fallback to Triton
+            # Currently on gfx950, gluon kernels requires that swizzling is enabled,
+            # K % 256 == 0, and int32-addressable tensors. Otherwise, fallback to Triton.
             mask_k_limit = K % 256
-            if mask_k_limit != 0 or swizzle_mx_scale is None:
+            _needs_int64 = should_upcast_indices(x, w, None)
+            if mask_k_limit != 0 or swizzle_mx_scale is None or _needs_int64:
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:
