@@ -844,7 +844,7 @@ def test_fmha_fwd_with_sink_varlen_asm_gate(case):
 
 
 # (hdim_q, hdim_v, is_causal, requires_grad).  A call that needs gradients goes to
-# the ASM forward only for head dims the gfx1250 ASM backward has (not D256).
+# the ASM forward only for head dims the gfx1250 ASM backward has.
 # Causal, as non-causal D64 / D128 are offered to FlyDSL first.
 _GRAD_ROUTE_CASES = [
     (128, 128, True, False),
