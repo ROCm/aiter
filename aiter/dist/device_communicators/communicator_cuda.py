@@ -57,6 +57,58 @@ def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
     )
 
 
+
+# Below the Lamport one-shot AR + RMSNorm cap, the byte ranges (low, high] where
+# the Lamport two-shot all-reduce + split norm still beats the fused one-shot, by
+# hidden size. Measured for hidden 6144 only (TP4, bf16, CUDA graphs): the fused
+# one-shot steps up past 256 and past 512 rows, the two-shot past 4 MiB.
+#   rows  192  256  320  341 | 384  512 | 544  640  682
+#   fused 15.7 16.5 21.8 22.2 | 23.0 25.1 | 33.4 38.6 39.6 us
+#   split 12.9 13.7 14.6 14.8 | 25.0 26.7 | 27.3 28.4 28.9 us
+_LAMPORT_SPLIT_AR_NORM_RANGES = {6144: ((2 << 20, 4 << 20), (6 << 20, 8 << 20))}
+
+
+def _use_lamport_split_ar_norm(comm, input_, res_inp_, weight_, out_n: int) -> bool:
+    """True if fused_allreduce_rmsnorm runs the Lamport two-shot all-reduce and
+    then the split add + RMSNorm instead of a fused kernel (gfx1250, TP4):
+
+    - above the Lamport one-shot AR + RMSNorm cap (8 MiB) and up to the
+      two-shot's world_size x that cap (32 MiB), where the fused kernel syncs
+      through the barrier. Hidden 6144 bf16 in CUDA graphs on 4x gfx1250:
+      29.0 / 34.2 / 42.6 / 56.5 / 72.6 us against 38.8 / 49.0 / 59.1 / 77.3 /
+      96.1 us at 8 / 12 / 16 / 24 / 32 MiB;
+    - under the cap, in the ranges of _LAMPORT_SPLIT_AR_NORM_RANGES.
+
+    residual_out has the same bits as the fused kernels'; out differs in the last
+    bf16 bit of about 1 value in 1e5 (the norm is the split kernel's). Shapes,
+    dtypes and the cap only, so every rank decides the same.
+    AITER_LAMPORT_SPLIT_AR_NORM=0 turns it off."""
+    ca_comm = comm.ca_comm
+    if (
+        ca_comm is None
+        or comm.world_size != 4
+        or os.environ.get("AITER_LAMPORT_SPLIT_AR_NORM", "1") != "1"
+    ):
+        return False
+    hidden = weight_.numel()
+    nbytes = input_.numel() * input_.element_size()
+    cap = ca_comm._lamport_max_bytes
+    if nbytes <= cap and not any(
+        low < nbytes <= min(high, cap)
+        for low, high in _LAMPORT_SPLIT_AR_NORM_RANGES.get(hidden, ())
+    ):
+        return False
+    return (
+        input_.dim() == 2
+        and input_.shape[-1] == hidden == out_n
+        and res_inp_.shape == input_.shape
+        and res_inp_.dtype == weight_.dtype == input_.dtype
+        and res_inp_.is_contiguous()
+        and weight_.is_contiguous()
+        and ca_comm.should_lamport_ar(input_, two_shot=True)
+    )
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
     _ar_1stage_override = {"1": True, "0": False}.get(
@@ -414,6 +466,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 *self.gluon_ar,
             )
         ca_comm = self.ca_comm
+        if x_pad_to_multiple == 0 and _use_lamport_split_ar_norm(
+            self, input_, res_inp_, weight_, out_n
+        ):
+            # Where the Lamport two-shot all-reduce and the split norm beat the
+            # fused kernels (see _use_lamport_split_ar_norm).
+            from aiter import rmsnorm2d_fwd_with_add
+
+            ar_out = ca_comm.lamport_all_reduce(input_, two_shot=True)
+            out = torch.empty_like(ar_out)
+            residual_out = torch.empty_like(ar_out)
+            rmsnorm2d_fwd_with_add(
+                out, ar_out, res_inp_, residual_out, weight_, eps, gemma_norm, 0
+            )
+            return out, residual_out
         # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
         # it beats the routes below up to its size cap (see
         # _LAMPORT_AR_RMS_MAX_BYTES).
