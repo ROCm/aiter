@@ -5,6 +5,7 @@
 import importlib
 import inspect
 import logging
+import os
 import pathlib
 import sys
 import threading
@@ -313,8 +314,9 @@ def test_gpu_suite_runner_enables_the_selected_path(monkeypatch):
 
     seen = []
 
-    def run(cmd, *, check, env):
-        seen.append((cmd, check, env[envs.AITER_MOEV2]))
+    def run(cmd, *, check, env, cwd):
+        first = env["PYTHONPATH"].split(os.pathsep)[0]
+        seen.append((cmd, check, env[envs.AITER_MOEV2], cwd, first))
         return type("Result", (), {"returncode": 0})()
 
     suite = gpu_suites.Suite(("python3", "selected_path_test.py"))
@@ -322,8 +324,32 @@ def test_gpu_suite_runner_enables_the_selected_path(monkeypatch):
     monkeypatch.setattr(gpu_suites, "SHARED", ())
     monkeypatch.setattr(gpu_suites.subprocess, "run", run)
     monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    monkeypatch.setenv("PYTHONPATH", "/elsewhere")
     assert gpu_suites.main(["--path", "a8w8_pt", "--run"]) == 0
-    assert seen == [(suite.cmd, False, "a8w8_pt")]
+    repo = gpu_suites._REPO
+    assert seen == [(suite.cmd, False, "a8w8_pt", repo, str(repo))]
+
+
+def test_gpu_suite_runner_children_import_this_checkout(monkeypatch, tmp_path):
+    """An installed aiter (here a fake on PYTHONPATH) must not stand in for the checkout."""
+    from moe_dispatch import gpu_suites
+
+    (tmp_path / "installed" / "aiter").mkdir(parents=True)
+    (tmp_path / "installed" / "aiter" / "__init__.py").write_text("")
+    script = tmp_path / "suite.py"
+    script.write_text(
+        "import importlib.util, pathlib, sys\n"
+        "origin = pathlib.Path(importlib.util.find_spec('aiter').origin)\n"
+        f"sys.exit(0 if origin.parents[1] == pathlib.Path({str(gpu_suites._REPO)!r})"
+        " and pathlib.Path.cwd() == origin.parents[1] else 1)\n"
+    )
+    suite = gpu_suites.Suite((sys.executable, str(script)))
+    monkeypatch.setattr(gpu_suites, "PATHS", {"a8w8_pt": (suite,)})
+    monkeypatch.setattr(gpu_suites, "SHARED", ())
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "installed"))
+    monkeypatch.chdir(tmp_path)
+    assert gpu_suites.main(["--path", "a8w8_pt", "--run"]) == 0
 
 
 def test_gpu_suite_runner_runs_the_shared_suites_for_every_path(monkeypatch):
@@ -333,7 +359,7 @@ def test_gpu_suite_runner_runs_the_shared_suites_for_every_path(monkeypatch):
     own = {name: gpu_suites.Suite(("python3", f"{name}.py")) for name in ("a", "b")}
     shared = gpu_suites.Suite(("python3", "shared.py"))
 
-    def run(cmd, *, check, env):
+    def run(cmd, *, check, env, cwd):
         seen.append((cmd, env[envs.AITER_MOEV2]))
         failed = cmd == shared.cmd and env[envs.AITER_MOEV2] == "b"
         return type("Result", (), {"returncode": 1 if failed else 0})()
@@ -359,7 +385,7 @@ def test_gpu_suite_runner_skips_suites_the_machine_cannot_run(monkeypatch, capsy
     other_arch = gpu_suites.Suite(("python3", "gfx950_only.py"), archs=("gfx950",))
     eight_gpus = gpu_suites.Suite(("torchrun", "multi.py"), gpus=8)
 
-    def run(cmd, *, check, env):
+    def run(cmd, *, check, env, cwd):
         seen.append(cmd)
         return type("Result", (), {"returncode": 0})()
 

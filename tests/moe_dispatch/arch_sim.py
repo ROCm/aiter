@@ -92,6 +92,22 @@ def clear_dispatch_caches():
     tuned.clear_cache()
 
 
+def _bound(module, func):
+    # Lazy modules may raise anything from __getattr__; they are not ours.
+    try:
+        return getattr(module, func, None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _unbind_fakes(fakes, originals):
+    """Point modules still bound to `fakes` back at `originals`."""
+    for module in list(sys.modules.values()):
+        for func, fake in fakes.items():
+            if _bound(module, func) is fake:
+                setattr(module, func, originals[func])
+
+
 @contextlib.contextmanager
 def _patched(obj, name, value):
     old = getattr(obj, name)
@@ -134,12 +150,7 @@ def simulated_arch(name):
     with contextlib.ExitStack() as stack:
         for module in list(sys.modules.values()):
             for func, orig in originals.items():
-                # Lazy modules may raise anything from __getattr__; they are not ours.
-                try:
-                    bound = getattr(module, func, None)
-                except Exception:  # noqa: BLE001, S112
-                    continue
-                if bound is orig:
+                if _bound(module, func) is orig:
                     stack.enter_context(_patched(module, func, fakes[func]))
         stack.enter_context(_patched(dtypes, "fp8", arch_fp8))
         stack.enter_context(_patched(fm, "fused_moe_1stage_dict", one_stage))
@@ -150,3 +161,6 @@ def simulated_arch(name):
             yield gfx, cu_num
         finally:
             clear_dispatch_caches()
+            # Modules first imported inside the block (kernel modules load at launch) bound
+            # these fakes; the scan above never saw them, and later contexts would skip them.
+            _unbind_fakes(fakes, originals)

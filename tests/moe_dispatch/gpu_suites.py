@@ -180,8 +180,14 @@ def main(argv=None):
                 continue
             env = os.environ.copy()
             env["AITER_MOEV2"] = path
+            # A script's own directory heads its sys.path, so without this `aiter` would be
+            # whatever is installed.
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(_REPO)] + [p for p in [env.get("PYTHONPATH")] if p]
+            )
             ran += 1
-            if subprocess.run(suite.cmd, check=False, env=env).returncode != 0:
+            proc = subprocess.run(suite.cmd, check=False, env=env, cwd=_REPO)
+            if proc.returncode != 0:
                 failed.append(f"[{path}] {line}")
     if not full:
         print("[shared, every path]")
