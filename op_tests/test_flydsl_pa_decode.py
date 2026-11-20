@@ -779,6 +779,29 @@ def _make_inputs(
             key[table[seq, peak // page_size].long(), :, peak % page_size] = (
                 gap / dim**0.5
             )
+    elif pattern == "sharp":
+        # Uniform Q and K give logits with std ~0.08, a nearly flat softmax that hides
+        # scale and temperature errors; x36 spreads them to std ~3.
+        query.mul_(36)
+    elif pattern == "peaked-spread":
+        # Like peaked-extreme, but the leading token sits in a sequence's last
+        # partition (seq 0, 4 tokens from the end, still visible to every MTP row),
+        # its first token (seq 1) or spread by the golden ratio. A reducer that drops
+        # or misplaces one partition's max overflows exp, and a partition that is
+        # never reduced loses the token that carries all the mass.
+        query.fill_(1.0)
+        key.zero_()
+        for seq, length in enumerate(lengths):
+            if length == 0:
+                continue
+            peak = (
+                max(length - 4, 0)
+                if seq == 0
+                else 0 if seq == 1 else int(length * ((seq * 0.6180339887) % 1.0))
+            )
+            key[table[seq, peak // page_size].long(), :, peak % page_size] = (
+                90.0 / dim**0.5
+            )
     elif pattern == "varied":
         # Uniform draws quantize to nearly one per-token scale, so a shifted
         # scale still matches the oracle. Token magnitudes spanning about a
@@ -1943,9 +1966,9 @@ _SELECT_INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tol=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(output.float(), reference, atol=tol, rtol=tol)
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -2225,6 +2248,80 @@ def _check_nhd_contracts(pa, output, arguments, options, plan, check):
         check(output)
 
 
+# Inputs and paths the cases above leave untested, each found by injecting a bug the
+# suite still passed: a reducer that drops the last live partition's max (random inputs
+# keep the softmax flat), a scale error that only a peaked softmax shows, and ATOM-style
+# padded tables called without max_context_length whose rows need 65-80 live
+# partitions (the planner's other paths stop at 64). MiniMax-M3 geometry: one KV head,
+# 16 or 8 query heads, head_dim 128.
+_GATE_GAP_KV = {
+    "bf16": {"kv_dtype": "bf16"},
+    "fp8-per-tensor": {"kv_dtype": "fp8", "scale_mode": "per-tensor"},
+    # Per-token V scales are folded into P (P * v_scale / tile max) before the FP8 PV
+    # MFMA, one more E4M3 rounding: an output one token dominates is off by up to
+    # ~3.6% (seen on gfx942 page 16). Random inputs average it out; the 2.5e-2 bound
+    # of test_pa_decode_unowned_kv_rows still fails the bugs these cases target.
+    "fp8-per-token": {"kv_dtype": "fp8", "scale_mode": "per-token", "tol": 2.5e-2},
+}
+_GATE_GAP_SPLIT = {"lengths": (8195, 4099, 1000, 257), "max_partitions": 8}
+_GATE_GAP_PADDED = [
+    # (kv, group, page, query_length, lengths, table_width)
+    ("bf16", 16, 16, 1, (100003,), 8192),
+    ("fp8-per-token", 16, 128, 4, (131071,), 1024),
+    ("fp8-per-tensor", 8, 128, 4, (70001, 129999), 1024),
+    ("bf16", 8, 16, 4, (65537, 3, 120000), 8192),
+    ("fp8-per-token", 8, 16, 1, (90001, 77777), 16384),
+    ("fp8-per-tensor", 16, 16, 1, (16411, 50000, 1, 130999), 8192),
+]
+_GATE_GAP_CASES = [
+    *[
+        (
+            f"gate-gap-{kv}-peaked-spread-q{ql}-p{page}",
+            dict(
+                _GATE_GAP_KV[kv],
+                **_GATE_GAP_SPLIT,
+                group_size=16,
+                block_size=page,
+                query_length=ql,
+                pattern="peaked-spread",
+            ),
+        )
+        for kv in _GATE_GAP_KV
+        for ql, page in ((1, 16), (4, 128))
+    ],
+    # FP8 rounds the x36 query too coarsely for the 5e-3 check; BF16 keeps it.
+    *[
+        (
+            f"gate-gap-bf16-sharp-q{ql}-p{page}",
+            dict(
+                _GATE_GAP_SPLIT,
+                group_size=16,
+                block_size=page,
+                query_length=ql,
+                pattern="sharp",
+            ),
+        )
+        for ql, page in ((1, 16), (4, 128))
+    ],
+    *[
+        (
+            f"gate-gap-padded-{kv}-g{group}-p{page}-q{ql}-b{len(lengths)}",
+            dict(
+                _GATE_GAP_KV[kv],
+                group_size=group,
+                block_size=page,
+                query_length=ql,
+                lengths=lengths,
+                table_width=width,
+                max_partitions=None,
+                max_context=None,
+                pattern="peaked-spread",
+            ),
+        )
+        for kv, group, page, ql, lengths, width in _GATE_GAP_PADDED
+    ],
+]
+
 _PA_DECODE_CASES = [
     *[
         pytest.param(
@@ -2247,6 +2344,7 @@ _PA_DECODE_CASES = [
     *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
     *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
     *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _GATE_GAP_CASES],
     *[
         pytest.param(
             {
@@ -2357,6 +2455,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster_steps": None,
             "cluster_runs": None,
             "quant": None,  # gfx1250 FP8 output path: "fused" or "fallback"
+            "tol": 5e-3,
         },
         **case,
     )
@@ -2623,7 +2722,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
         if case["ref_mean_min"]:
             assert reference.mean() > case["ref_mean_min"]
-        _check_output(out, reference)
+        _check_output(out, reference, case["tol"])
 
     launch()
     check()
@@ -2878,6 +2977,8 @@ def test_pa_decode_unowned_kv_rows(
     context is read as is. Both may hold NaN (a recycled page, a checkpoint
     image); P is zero there but 0 * NaN is NaN in PV.
     ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
+    The poisoned call leaves ``mask_unowned_kv`` at its default: the masking is
+    what callers get without asking for it.
     """
     if get_gfx_runtime() == "gfx1250":
         pytest.skip("gfx1250 pipelines still require finite unowned V rows")
@@ -2934,7 +3035,7 @@ def test_pa_decode_unowned_kv_rows(
     )
     plan = pa.plan_pa_decode(context, kv_heads, query_length=query_length)
 
-    def run(fill, mask_unowned_kv=True):
+    def run(fill, mask_unowned_kv=None):
         if kv == "mxfp4":
             (k, ks), (v, vs) = (
                 _mxfp4_views(key_pool.clone()),
@@ -2977,7 +3078,7 @@ def test_pa_decode_unowned_kv_rows(
             value_scale=vs,
             work_plan=plan,
             max_context_length=max(lengths),
-            mask_unowned_kv=mask_unowned_kv,
+            **({} if mask_unowned_kv is None else {"mask_unowned_kv": mask_unowned_kv}),
         )
         return output
 
