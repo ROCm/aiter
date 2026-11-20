@@ -167,6 +167,12 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -296,6 +302,18 @@ def _runtime_power_selection() -> bool:
     if raw not in {"power", "efficiency", "power_efficiency"}:
         return False
     return "aiter" in sys.modules
+
+
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
 
 
 class AITER_CONFIG:
@@ -818,15 +836,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -837,9 +848,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
@@ -1433,21 +1442,6 @@ def build_module(
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
-    if md_name.startswith("module_mega_mhc_stream_"):
-        # Keep source selection and host dispatch in sync for JIT and prebuild.
-        mhc_gfx1250 = any(
-            arch in ("gfx1250", "gfx1250-strict")
-            for arch in _build_archs_from_env(get_gfx)
-        )
-        if not mhc_gfx1250:
-            srcs = [
-                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
-            ]
-        flags_extra_hip = [
-            *flags_extra_hip,
-            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
-        ]
-
     for tp in third_party:
         clone_3rdparty(tp)
 
@@ -1903,6 +1897,9 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "flags_extra_hip_per_source": single_ops[
+                            "flags_extra_hip_per_source"
+                        ],
                         "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
