@@ -404,62 +404,6 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
     assert calls == [("lookup", block), ("bmm", (1, 256 // w_rows, 16), False)]
 
 
-@pytest.mark.parametrize(
-    "tile_n,waves",
-    [
-        (32, 1),
-        (32, 2),
-        (64, 1),
-        (64, 2),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
-)
-@pytest.mark.parametrize("split_k", [1, 2, 4, 8])
-def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
-    monkeypatch, tile_n, waves, split_k
-):
-    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
-
-    name = direct.mxfp8_32_smallm_1x32_kernel_name(tile_n, waves, split_k)
-    parsed = direct.parse_mxfp8_32_wmma_kernel_name(name)
-    assert parsed == {
-        "smallm_1x32": True,
-        "tile_n": tile_n,
-        "num_waves": waves,
-        "split_k": split_k,
-    }
-
-    operands = _mxscale_operands(m=64, n=256, k=1024, w_rows=1)
-    out = torch.empty((64, 256), dtype=torch.bfloat16)
-    calls = []
-
-    def run(x, w, xs, ws, output, **config):
-        calls.append((x, w, xs, ws, output, config))
-        return output
-
-    monkeypatch.setattr(direct, "_run_mxfp8_32_smallm_1x32_gfx1250", run)
-    actual = direct.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(*operands, out, name)
-    assert actual is out
-    assert calls[0][-1] == {
-        "tile_n": tile_n,
-        "num_waves": waves,
-        "split_k": split_k,
-    }
-
-
-def test_gfx1250_smallm_1x32_tile_n32_name_stays_stable():
-    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
-
-    assert (
-        direct.mxfp8_32_smallm_1x32_kernel_name(32, 2, 1)
-        == "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1"
-    )
-    with pytest.raises(ValueError, match="tile_n must"):
-        direct.mxfp8_32_smallm_1x32_kernel_name(16, 2, 1)
-
-
 def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
     from aiter.ops.flydsl.gemm_tune import (
@@ -494,6 +438,44 @@ def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
         assert (parsed["early_a"], parsed["early_b"]) == flags
     parsed = direct.parse_mxfp8_32_wmma_kernel_name(base)
     assert parsed is not None and not parsed["early_a"] and not parsed["early_b"]
+
+
+def test_gfx1250_compute_catalog_exposes_narrow_n_profiles_append_only():
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    narrow = {
+        kernel_id: instance
+        for kernel_id, instance in catalog.kernels_list.items()
+        if catalog.is_compute_kernel(instance)
+        and (
+            instance.tile_m,
+            instance.tile_n,
+            instance.tile_k,
+            instance.m_warp,
+            instance.n_warp,
+            instance.num_buffers,
+        )
+        == (256, 128, 128, 2, 2, 2)
+    }
+    assert len(narrow) == 12
+    assert min(narrow) > max(set(catalog.kernels_list) - set(narrow))
+    assert {(ki.cluster_m, ki.cluster_n) for ki in narrow.values()} == {
+        (1, 1),
+        (2, 1),
+        (4, 1),
+    }
+    assert {(ki.early_a, ki.early_b) for ki in narrow.values()} == {
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    }
+    assert all(
+        catalog.mxfp8_32_kernel_fits_shape(ki, 4096, 2944, 6144)
+        for ki in narrow.values()
+    )
 
 
 def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
@@ -1424,9 +1406,9 @@ def test_gfx1250_mxfp8_bmm_row_uses_direct_fallback_for_preshuffled_a(monkeypatc
 def test_gfx1250_mxfp8_padded_row_must_launch_at_real_m(monkeypatch):
     from aiter.ops import gemm_op_a8w8 as op
 
-    name = "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk1"
+    name = "flydsl_mxfp8_32_bpreshuffle_wmma_t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1"
     tuned = {
-        ("gfx1250", 256, 16, 32, 256, "1x32"): {
+        ("gfx1250", 256, 16, 128, 1536, "1x32"): {
             "libtype": "flydsl",
             "kernelName": name,
             "splitK": 1,
@@ -1436,10 +1418,11 @@ def test_gfx1250_mxfp8_padded_row_must_launch_at_real_m(monkeypatch):
     monkeypatch.setattr(op, "get_cu_num", lambda: 256)
     monkeypatch.setattr(op, "_load_mxfp8_bpreshuffle_tuned", lambda _path: tuned)
     monkeypatch.setattr(op, "get_padded_m", lambda *_args: 16)
+    monkeypatch.setattr(op, "_mxfp8_32_tuned_name_launchable", lambda *_args: False)
     monkeypatch.setattr(op, "_mxfp8_32_fallback_kernel_name", lambda *_args: "fallback")
     op._get_mxfp8_bpreshuffle_config.cache_clear()
     try:
-        assert op._get_mxfp8_bpreshuffle_config(15, 32, 256) == (
+        assert op._get_mxfp8_bpreshuffle_config(15, 128, 1536) == (
             "flydsl",
             "fallback",
             1,

@@ -488,7 +488,6 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
 # (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
-KERNEL_ID_BASE_GFX1250_SMALLM = 2_000_000
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
@@ -578,7 +577,7 @@ def gfx1250_candidates(m, n, k):
 
 
 def gfx1250_1x32_runs(m, n, k):
-    """Every legal direct, dedicated-small-M, and B=1 batched 1x32 candidate."""
+    """Every legal direct and B=1 batched 1x32 candidate."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
         bmm_candidates as gfx1250_bmm_candidates,
     )
@@ -588,10 +587,6 @@ def gfx1250_1x32_runs(m, n, k):
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         kernels_list,
         mxfp8_32_kernel_fits_shape,
-    )
-    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
-        MX32_SMALLM_1X32_TILE_WAVES,
-        mxfp8_32_smallm_1x32_kernel_name,
     )
 
     runs = []
@@ -606,22 +601,6 @@ def gfx1250_1x32_runs(m, n, k):
                 run_gemm_flydsl_gfx1250_1x32,
             )
         )
-
-    dedicated_index = 0
-    for tile_n, waves in sorted(MX32_SMALLM_1X32_TILE_WAVES):
-        for split_k in (1, 2, 4, 8):
-            kernel_id = KERNEL_ID_BASE_GFX1250_SMALLM + dedicated_index
-            dedicated_index += 1
-            if m % 16 or n % tile_n or k % (128 * split_k) or (k // split_k) // 128 < 2:
-                continue
-            runs.append(
-                (
-                    kernel_id,
-                    split_k,
-                    mxfp8_32_smallm_1x32_kernel_name(tile_n, waves, split_k),
-                    run_gemm_flydsl_gfx1250_1x32,
-                )
-            )
 
     for index, cfg in enumerate(gfx1250_bmm_candidates(1, m, n, k)):
         runs.append(

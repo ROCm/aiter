@@ -60,6 +60,8 @@ _COMPUTE_PROFILES = (
 )
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
 _COMPUTE_UNCLUSTERED = ((1, 1),)
+_NARROW_N_COMPUTE_PROFILES = ((256, 128, 128, 2, 2, 2),)
+_NARROW_N_COMPUTE_CLUSTERS = ((1, 1), (2, 1), (4, 1))
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _SMALL_PROFILES = ((64, 128, 128, 2, 2, 2),)
 _PERSISTENT_N_TILES = (2, 4, 8)
@@ -339,6 +341,34 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
         name_prefix=NAME_PREFIX,
         fused_splitk=True,
     )
+    idx += 1
+    # Keep these IDs after the established catalog. Narrow-N shapes have too
+    # few N tiles for the 192/256-column compute profiles; a 256x128 tile keeps
+    # their low-overhead pipeline while M-only clusters multicast B without
+    # padding the N grid. Early-load merging remains a per-shape strategy.
+    for tm, tn, tk, mw, nw, nb in _NARROW_N_COMPUTE_PROFILES:
+        for cm, cn in _NARROW_N_COMPUTE_CLUSTERS:
+            for early_a, early_b in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=1,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    early_a=early_a,
+                    early_b=early_b,
+                )
+                idx += 1
     return kl
 
 
@@ -388,11 +418,12 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         )
         if M <= 0 or N <= 0 or K <= 0:
             return False
-        if profile not in _COMPUTE_PROFILES:
+        if profile not in (*_COMPUTE_PROFILES, *_NARROW_N_COMPUTE_PROFILES):
             return False
         if (ki.cluster_m, ki.cluster_n) not in (
             *_COMPUTE_CLUSTERS,
             *_COMPUTE_UNCLUSTERED,
+            *_NARROW_N_COMPUTE_CLUSTERS,
         ):
             return False
         if ki.fused_splitk and (
