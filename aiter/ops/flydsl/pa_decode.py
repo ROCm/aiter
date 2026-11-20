@@ -10,6 +10,8 @@ K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
 (e2m1 data, e8m0 scale per 32 elements) run on gfx950, see ``pa_decode``.
 """
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -18,6 +20,11 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
+from .kernels.pa_decode.traits import (
+    d256_page64_pipe,
+    nhd_max_query_length,
+    require_nhd_pipe,
+)
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
     CLUSTER_STEP_TOKENS,
@@ -67,6 +74,130 @@ def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
             torch.cuda.current_stream(device).synchronize()  # readable from any stream
             _CONSTANT_SCALES[key] = scale
     return scale
+
+
+def _kv_fx_dtype(dtype: torch.dtype):
+    """FlyDSL type of BF16 or ``dtypes.fp8`` KV (as ``pa_decode`` requires), or None."""
+    if dtype not in (torch.bfloat16, dtypes.fp8):
+        return None
+    return torch_to_fx_dtype(dtype)
+
+
+def _default_workgroup_budget(
+    arch: str,
+    num_compute_units: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int,
+) -> int:
+    kv_fx = _kv_fx_dtype(kv_dtype)
+    one_cta_per_cu = (
+        kv_fx is not None
+        and sliding_window <= 0
+        and d256_page64_pipe(
+            arch, kv_fx, head_dim, block_size, query_length, query_group_size
+        )
+    )
+    return num_compute_units if one_cta_per_cu else 2 * num_compute_units
+
+
+def pa_decode_nhd_max_query_length(
+    device: torch.device,
+    *,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_group_size: int,
+) -> int:
+    """Longest uniform query length ``pa_decode`` takes with NHD K/V caches.
+
+    NHD caches are 4D, ``[num_blocks, block_size, num_kv_heads, head_dim]``,
+    and ``pa_decode`` selects them by ``key_cache.dim() == 4``. Returns 0 when
+    NHD cannot serve the device and configuration at all; ``pa_decode`` raises
+    ``NotImplementedError`` for any longer query, including MTP verify steps.
+    Sliding windows do not change the limit. Reads device properties only, so
+    callers can decide per layer before allocating caches or capturing graphs.
+    Per-call strides, alignment and scales are validated by ``pa_decode``.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return 0
+    arch = get_gfx_runtime()
+    kv_fx = _kv_fx_dtype(kv_dtype)
+    if kv_fx is None:
+        return 0
+    return nhd_max_query_length(arch, kv_fx, head_dim, block_size, query_group_size)
+
+
+def pa_decode_default_workgroup_budget(
+    device: torch.device,
+    *,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int = 0,
+) -> int:
+    """Untuned ``plan_pa_decode`` work budget for this device and shape.
+
+    The budget ``prepare_pa_decode_plan`` uses when no tuned result is cached:
+    the CU count for dense page-64 shapes of the gfx950 FP8 head-256 pipe,
+    packed or NHD, and twice the CU count otherwise. ``plan_pa_decode``
+    defaults to twice the CU count because it does not see the cache shape.
+    """
+    device = torch.device(device)
+    return _default_workgroup_budget(
+        get_gfx_runtime(),
+        torch.cuda.get_device_properties(device).multi_processor_count,
+        kv_dtype,
+        head_dim,
+        block_size,
+        query_length,
+        query_group_size,
+        sliding_window,
+    )
+
+
+def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
+    """Block, token and head strides; size-1 axes are never stepped, so 0."""
+    shape, stride = view.shape, view.stride()
+    return tuple(0 if shape[d] == 1 else stride[d] for d in range(3))
+
+
+def _view_span(view: torch.Tensor) -> int:
+    """Elements from the view's first element through its last, inclusive."""
+    return 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(view.shape, view.stride())
+        if size > 1
+    )
+
+
+def _fuses_quant_output(
+    tile_options: dict, *, cluster_merge: int, cluster_seqs: int
+) -> bool:
+    """Whether the gfx1250 tile quantizes the FP8 output in its epilogue.
+
+    ``tile_options`` are the ``gfx1250_tile_traits`` arguments ``pa_decode``
+    selects. A token's descale needs the max over all of its values. With one
+    KV head a CTA, or the cluster merging its tasks, holds every row of its
+    tokens, so the one-partition direct and the cluster-merge outputs quantize
+    in their epilogue. More KV heads spread a token over separate CTAs (grid
+    y); the last-arriver merge, clusters shared by several sequences
+    (``cluster_seqs > 1``) and query-split tiles are not fused.
+    """
+    return bool(
+        tile_options["num_kv_heads"] == 1
+        and (
+            (tile_options["direct_output"] and tile_options["num_partitions"] == 1)
+            or (cluster_merge and cluster_seqs == 1)
+        )
+        and gfx1250_tile_traits(**tile_options).query_splits == 1
+    )
 
 
 def launch_pa_decode_ps_reduce(
@@ -405,6 +536,7 @@ def _pa_decode_mxfp4(
             *page_head_strides,
             query.stride(0),
             query.stride(1),
+            *((0,) * 6),
             ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
             capacity,
             stream,
@@ -437,8 +569,8 @@ def _pa_decode_mxfp4(
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x] or NHD [num_blocks, 64, num_kv_heads, 256]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x] or NHD like key_cache
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -452,23 +584,39 @@ def pa_decode(
     exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
+    quantized_output: torch.Tensor = None,  # optional FP8, output's shape + quantized_pad_rows rows
+    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length + quantized_pad_rows, 1]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    store_output: bool = True,
+    quantized_pad_rows: int = 0,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
-    A non-transposed 4D key cache is not implemented.
 
     The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
     per-tensor or per-token scales, and sliding windows, with at most 32
     query rows (query_length times the GQA group size).
+
+    A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
+    [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
+    non-negative other strides, e.g. both halves of one 512-byte token row. NHD
+    requires gfx950, FP8 KV, head 256, page 64, and a uniform query_length
+    whose rows (query_length times the GQA group size) fit two 16-row M-tiles,
+    e.g. query_length 1-4 at GQA 8. Both scale modes and positive sliding
+    windows are supported. Each view must be
+    16-byte aligned with 16-byte multiple strides, its token rows must not
+    overlap, and its strides and in-page span must fit int32; heads-outermost
+    storage with several KV heads is thus limited to 2 GiB per head.
+    ``pa_decode_nhd_max_query_length`` reports the longest query a
+    configuration takes.
 
     ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
     no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
@@ -481,7 +629,33 @@ def pa_decode(
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output
     head dimensions must match.
-    ALiBi and externally quantized queries are unsupported.
+    ALiBi and externally quantized queries are unsupported. ``softmax_scale``
+    must be finite and positive, and so must FP8 ``key_scale``/``value_scale``
+    values: host scalars are checked, device tensors are not read back.
+
+    ``quantized_output`` and ``output_scale`` (gfx1250) add a per-token FP8
+    output. They must be supplied together. It is OCP FP8 in the same logical
+    layout as ``output`` with one contiguous FP32 descale per flattened query
+    token, shape ``[num_seqs * query_length, 1]``, each with
+    ``quantized_pad_rows`` extra rows (default 0); dequantization is
+    ``quantized_output.float() * output_scale``. The tile kernel's epilogue
+    quantizes the output when there is one KV head, the tile does not split
+    its query rows over CTAs, and the plan writes either the one-partition
+    direct output or a cluster merge with one sequence per cluster
+    (``cluster_seqs == 1``). Every other plan writes the BF16/FP16 output and
+    then runs the standalone per-token quant, with identical bytes: several KV
+    heads, the last-arriver direct merge, clusters shared by several sequences
+    (more than 15 sequence-KV-head pairs per 16 CUs), the reducer (sinks included) and the
+    query-split BF16 D1024/G16/MTP4 page128 tile. Calls that omit both tensors
+    retain the existing output and dispatch unchanged.
+    With the quantized output, ``store_output=False`` skips the BF16/FP16
+    store: ``output`` then only fixes the layout and its contents are left
+    unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
+    ``output_scale`` past the query rows (a token bucket padded past the
+    scheduled tokens) are written as FP8 zeros with a unit descale, so a
+    consumer of the whole bucket reads finite, inert rows. The fused epilogue
+    writes them in the PA launch; the fallback fills them with ``zero_()`` and
+    ``fill_(1.0)`` after the standalone quant.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -490,9 +664,8 @@ def pa_decode(
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
-    FlyDSL autotune to select its budget before graph capture. A cache miss uses
-    the device CU count for the gfx950 head-256 pipe shapes and twice that
-    otherwise; ``tune=True`` forces a search during preparation.
+    FlyDSL autotune to select its budget before graph capture, and documents the
+    default budget; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
     gfx1250, when sinks are absent and query/output strides match, a cap of one
@@ -569,12 +742,38 @@ def pa_decode(
             "pa_decode only supports context_partition_size=256, "
             f"got {context_partition_size}"
         )
+    quant_output = quantized_output is not None or output_scale is not None
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
+    if not isinstance(store_output, bool):
+        raise TypeError(
+            f"store_output must be a bool, got {type(store_output).__name__}"
+        )
+    if not (store_output or quant_output):
+        raise ValueError("store_output=False requires quantized_output")
+    if (
+        isinstance(quantized_pad_rows, bool)
+        or not isinstance(quantized_pad_rows, int)
+        or quantized_pad_rows < 0
+    ):
+        raise ValueError("quantized_pad_rows must be a nonnegative int")
+    if quantized_pad_rows and not quant_output:
+        raise ValueError("quantized_pad_rows requires quantized_output")
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
         )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
+    # Masked scores are scaled after masking on some paths, so a negative or
+    # zero scale would give masked tokens weight.
+    if not (math.isfinite(softmax_scale) and softmax_scale > 0):
+        raise ValueError(
+            f"softmax_scale must be finite and positive, got {softmax_scale}"
+        )
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
     sliding_window = max(sliding_window, 0)
@@ -591,7 +790,12 @@ def pa_decode(
         ("context_lengths", context_lengths),
         ("block_tables", block_tables),
     )
-    for name, tensor in required_tensors:
+    quant_tensors = (
+        (("quantized_output", quantized_output), ("output_scale", output_scale))
+        if quant_output
+        else ()
+    )
+    for name, tensor in required_tensors + quant_tensors:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(
                 f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
@@ -623,6 +827,8 @@ def pa_decode(
             )
         if sinks is not None:
             raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
+        if quant_output:
+            raise NotImplementedError("MXFP4 KV supports no quantized output")
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
@@ -644,10 +850,6 @@ def pa_decode(
             work_plan,
             max_context_length,
         )
-
-    trans_k = key_cache.dim() == 5
-    if not trans_k:
-        raise NotImplementedError("Non-transposed key cache is not implemented")
 
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
@@ -671,8 +873,21 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
+    trans_k = key_cache.dim() == 5
     trans_v = value_cache.dim() == 5
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    nhd_layout = not trans_k
+    if nhd_layout:
+        num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
+        if k_head != head_dim:
+            raise ValueError(
+                "NHD key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -690,6 +905,15 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
             f"on {arch}, got {compute_type}"
+        )
+    if nhd_layout:
+        require_nhd_pipe(
+            arch,
+            torch_to_fx_dtype(expected_kv_dtype),
+            head_dim,
+            block_size,
+            query_length,
+            num_q_heads // num_kv_heads,
         )
     vector_width = 8 if is_bf16_kv else 16
 
@@ -712,7 +936,9 @@ def pa_decode(
                 else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
-    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+    if not nhd_layout and (
+        num_hgroups != head_dim // vector_width or hgroup_width != vector_width
+    ):
         raise ValueError(
             "key_cache shape must be "
             f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
@@ -726,7 +952,51 @@ def pa_decode(
 
     if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict") and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    if trans_v:
+    # The gfx1250 launcher has no NHD stride parameters.
+    nhd_strides = () if arch in ("gfx1250", "gfx1250-strict") else (0,) * 6
+    if nhd_layout:
+        if value_cache.shape != key_cache.shape:
+            raise ValueError(
+                "NHD value_cache shape must match key_cache, "
+                f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+            )
+        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+            raise ValueError("NHD key and value head axes must be contiguous")
+        nhd_strides = _nhd_strides(key_cache) + _nhd_strides(value_cache)
+        for name, view, strides in (
+            ("key_cache", key_cache, nhd_strides[:3]),
+            ("value_cache", value_cache, nhd_strides[3:]),
+        ):
+            if any(stride < 0 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} stepped strides must be non-negative, got "
+                    f"{view.stride()}"
+                )
+            # K loads and V LDS-DMAs move 16-byte chunks.
+            if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} needs a 16-byte aligned base and block, token "
+                    f"and head strides that are multiples of 16, got data_ptr "
+                    f"{view.data_ptr():#x} and strides {view.stride()}"
+                )
+            # The V tail bound is live_tokens * token_stride bytes.
+            if strides[1] < head_dim:
+                raise ValueError(
+                    f"NHD {name} token rows must not overlap, got token stride "
+                    f"{view.stride(1)} for head_dim={head_dim}"
+                )
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        k_block, k_token, k_head, v_block, v_token, v_head = nhd_strides
+        page_span = block_size * max(k_token, v_token)
+        if max(k_block, k_head, v_block, v_head, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
+        v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // vector_width, head_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -782,6 +1052,43 @@ def pa_decode(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
         )
+    if quant_output:
+        if arch != "gfx1250":
+            raise NotImplementedError("quantized PA output requires gfx1250")
+        expected_quant_shape = (
+            output.shape[0] + quantized_pad_rows,
+            *output.shape[1:],
+        )
+        if tuple(quantized_output.shape) != expected_quant_shape:
+            raise ValueError(
+                "quantized_output shape must be output's plus quantized_pad_rows "
+                f"rows, got {tuple(quantized_output.shape)} vs "
+                f"{expected_quant_shape}"
+            )
+        if quantized_output.dtype != dtypes.fp8:
+            raise TypeError(
+                f"quantized_output must use OCP FP8 ({dtypes.fp8}), "
+                f"got {quantized_output.dtype}"
+            )
+        expected_scale_shape = (total_q_rows + quantized_pad_rows, 1)
+        if output_scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"output_scale shape {tuple(output_scale.shape)} must be "
+                f"{expected_scale_shape}"
+            )
+        if output_scale.dtype != torch.float32:
+            raise TypeError(f"output_scale must be float32, got {output_scale.dtype}")
+        if not (
+            query.is_contiguous()
+            and output.is_contiguous()
+            and quantized_output.is_contiguous()
+        ):
+            raise ValueError(
+                "quantized PA output requires contiguous query, output and "
+                "quantized_output tensors"
+            )
+        if not output_scale.is_contiguous():
+            raise ValueError("output_scale must be contiguous")
 
     if key_cache.dtype != expected_kv_dtype:
         raise TypeError(
@@ -823,6 +1130,7 @@ def pa_decode(
         ("value_cache", value_cache),
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
+        *quant_tensors,
     ):
         if tensor.device != dev:
             raise ValueError(
@@ -835,6 +1143,8 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
+        if nhd_layout and name in ("key_cache", "value_cache"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
@@ -842,6 +1152,10 @@ def pa_decode(
         if scale is None:
             return _constant_scale(dev, 1.0)
         if not isinstance(scale, torch.Tensor):
+            # Per-tensor scores are masked before the scale is applied, which
+            # needs a positive scale. Device tensors are not read back (no sync).
+            if not (math.isfinite(float(scale)) and float(scale) > 0):
+                raise ValueError(f"{name} must be finite and positive, got {scale}")
             return _constant_scale(dev, float(scale))
         if scale.numel() == 1:
             return scale.reshape(1)
@@ -1098,12 +1412,30 @@ def pa_decode(
         and bound_tiles <= 4 * cluster_merge
     )
     run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
-
-    # Bound byte offsets as well as element indices for 16-bit BF16 caches.
-    cache_extent = max(
-        key_cache.numel() * key_cache.element_size(),
-        value_cache.numel() * value_cache.element_size(),
+    # Unfused plans write the BF16 output as usual and quantize it after with
+    # the standalone per-token kernel, which is exactly the unfused path.
+    quant_after_output = quant_output and not _fuses_quant_output(
+        tile_options, cluster_merge=cluster_merge, cluster_seqs=cluster_seqs
     )
+    if quant_after_output:
+        quant_output = False
+        if not store_output:
+            # Keep the caller's BF16 buffer untouched, as the fused path does.
+            output = torch.empty_like(output)
+
+    # Bound byte offsets as well as element indices for 16-bit BF16 caches. A
+    # strided NHD view can span more bytes than numel(), and its head stride
+    # may scale with num_blocks, so measure the highest byte offset.
+    if nhd_layout:
+        cache_extent = (
+            max(_view_span(key_cache), _view_span(value_cache))
+            * key_cache.element_size()
+        )
+    else:
+        cache_extent = max(
+            key_cache.numel() * key_cache.element_size(),
+            value_cache.numel() * value_cache.element_size(),
+        )
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
@@ -1119,6 +1451,11 @@ def pa_decode(
             cluster_seqs=cluster_seqs,
             cluster_steps=cluster_steps,
             cluster_runs=cluster_runs,
+            **(
+                {"quant_output": True, "store_output": store_output}
+                if quant_output
+                else {}
+            ),
         )
 
     total_rows = query_length * query_group_size
@@ -1186,6 +1523,18 @@ def pa_decode(
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
             run_tiles,
+            (
+                ptr_arg(quantized_output, torch_to_fx_dtype(quantized_output.dtype))
+                if quant_output
+                else flyc.from_c_void_p(fx.Float8E4M3FN, 0)
+            ),
+            (
+                ptr_arg(output_scale, fx.Float32)
+                if quant_output
+                else flyc.from_c_void_p(fx.Float32, 0)
+            ),
+            # Rows of the FP8 output, padded ones included.
+            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
@@ -1222,6 +1571,7 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
+            *nhd_strides,
             # Cluster grids derive their tiles from the context lengths.
             ptr_arg(
                 (context_lengths if cluster_merge else work_plan.work_info),
@@ -1231,30 +1581,41 @@ def pa_decode(
             *merge_args,
             s,
         )
-        if direct_output or cluster_merge:
-            return
-        output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, query_group_size, head_dim
-        )
-        launch_pa_decode_ps_reduce(
-            output_5d,
-            psum,
-            pmax,
-            pout,
-            sinks,
-            output_5d.stride(0),
-            output_5d.stride(1),
-            output_5d.stride(2),
-            output_5d.stride(3),
-            pmax.stride(0),
-            pmax.stride(1),
-            pout.stride(0),
-            pout.stride(1),
-            pout.stride(2),
-            query_seq_len=query_length,
-            query_group_size=query_group_size,
-            head_size=head_dim,
-            max_partitions=max_partitions,
-            stream=s,
-            reduce_info=work_plan.reduce_info,
-        )
+        if not (direct_output or cluster_merge):
+            output_5d = output.reshape(
+                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+            )
+            launch_pa_decode_ps_reduce(
+                output_5d,
+                psum,
+                pmax,
+                pout,
+                sinks,
+                output_5d.stride(0),
+                output_5d.stride(1),
+                output_5d.stride(2),
+                output_5d.stride(3),
+                pmax.stride(0),
+                pmax.stride(1),
+                pout.stride(0),
+                pout.stride(1),
+                pout.stride(2),
+                query_seq_len=query_length,
+                query_group_size=query_group_size,
+                head_size=head_dim,
+                max_partitions=max_partitions,
+                stream=s,
+                reduce_info=work_plan.reduce_info,
+            )
+        if quant_after_output:
+            from ..quant import dynamic_per_token_scaled_quant
+
+            rows = output.shape[0]
+            dynamic_per_token_scaled_quant(
+                quantized_output[:rows].view(rows, -1),
+                output.view(rows, -1),
+                output_scale[:rows],
+            )
+            if quantized_pad_rows:
+                quantized_output[rows:].zero_()
+                output_scale[rows:].fill_(1.0)
