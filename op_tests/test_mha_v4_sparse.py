@@ -1261,6 +1261,100 @@ def test_mha_v4_sparse_empty_row_writes_zeros(q_format, v_format, kwargs):
     ), "empty row disturbed the live row"
 
 
+# Worst (batch, head, query tile) relative L2 error against the fp32 reference, per hd256 recipe:
+# about 1.5x the worst a 64-key single-block row shows, which averages away the least quantization.
+_HD256_SPARSE_TOLERANCE = {"bf16": 0.01, "mxfp8": 0.09, "mxfp6": 0.1, "mxfp4": 0.33}
+
+
+def _hd256_sparse_params():
+    def lacks(name):
+        if not _MHA_V4_SPARSE_ARCH:
+            return True
+        q_format, v_format, kwargs = SPARSE_RECIPES[name]
+        operands = _recipe_operands(q_format, v_format, kwargs)
+        return not mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+
+    return [
+        param(*SPARSE_RECIPES[name], name, skip=lacks(name), id=name)
+        for name in _HD256_SPARSE_TOLERANCE
+    ]
+
+
+def _masked_reference(q, k, v, mask, block_tile):
+    """fp32 attention over the selected blocks; (out, lse), zero and -inf where none is."""
+    q_tile, kv_tile = block_tile
+    sequence_q, heads, head_dim = q.shape[1:]
+    sequence_k = k.shape[1]
+    ratio = heads // k.shape[2]
+    kk = k.repeat_interleave(ratio, dim=2).float()
+    vv = v.repeat_interleave(ratio, dim=2).float()
+    s = torch.einsum("bqhd,bkhd->bhqk", q.float(), kk) * head_dim**-0.5
+    keep = mask.repeat_interleave(q_tile, 2).repeat_interleave(kv_tile, 3)
+    s = s.masked_fill(~keep[:, :, :sequence_q, :sequence_k], -math.inf)
+    p = torch.softmax(s, -1).nan_to_num(0.0)
+    return torch.einsum("bhqk,bkhd->bqhd", p, vv), torch.logsumexp(s, -1)
+
+
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@parametrize(("q_format", "v_format", "kwargs", "name"), _hd256_sparse_params())
+def test_mha_v4_sparse_head_dim_256_follows_the_lut(q_format, v_format, kwargs, name):
+    """hd256 block-sparse rows: all-selected is the dense row bit for bit, and a random LUT with
+    empty, one-block and two-block rows, a ragged last block, a partial query tile and GQA matches
+    the fp32 reference over exactly the selected blocks.
+    """
+    formats = (q_format, q_format, v_format)
+    operands = _recipe_operands(q_format, v_format, kwargs)
+    block_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+    assert block_tile == (256, 64)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+    q_tile, kv_tile = block_tile
+    torch.manual_seed(7)
+
+    q = torch.randn((1, 512, 2, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 1024, 2, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones((1, 2, 2, 16), device="cuda", dtype=torch.bool)
+    dense = mha_v4(q, k, v, *formats, **kwargs)
+    sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
+    torch.cuda.synchronize()
+    assert torch.equal(sparse, dense), "all-selected LUT is not the dense row"
+
+    batch, sequence_q, heads, kv_heads, sequence_k = 2, 900, 4, 2, 1000
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, kv_heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    q_tiles, kv_tiles = -(-sequence_q // q_tile), -(-sequence_k // kv_tile)
+    mask = torch.rand((batch, heads, q_tiles, kv_tiles), device="cuda") < 0.4
+    mask[0, 0, 0] = False
+    mask[0, 1, 0] = False
+    mask[0, 1, 0, 5] = True
+    mask[0, 2, 0] = False
+    mask[0, 2, 0, [0, kv_tiles - 1]] = True
+    mask[1, :, -1, -1] = True
+    out, lse = mha_v4(q, k, v, *formats, block_mask=mask, return_lse=True, **kwargs)
+    ref, ref_lse = _masked_reference(q, k, v, mask, block_tile)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out).all()
+    tol = _HD256_SPARSE_TOLERANCE[name]
+    for b, h, t in itertools.product(range(batch), range(heads), range(q_tiles)):
+        rows = slice(t * q_tile, min((t + 1) * q_tile, sequence_q))
+        got = out[b, rows, h].float()
+        if not mask[b, h, t].any():
+            assert torch.equal(got, torch.zeros_like(got)), f"empty row {b, h, t} is not zero"
+            assert (lse[b, h, rows] == -math.inf).all(), f"empty row {b, h, t} LSE"
+            continue
+        want = ref[b, rows, h]
+        err = ((got - want).norm() / want.norm()).item()
+        assert err < tol, f"{name} row {b, h, t}: relative error {err:.4f} >= {tol}"
+        lse_err = (lse[b, h, rows].float() - ref_lse[b, h, rows]).abs().max().item()
+        assert lse_err < 2 * tol, f"{name} row {b, h, t}: LSE error {lse_err:.4f}"
+
+
 @skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 def test_mha_v4_rejects_non_bool_block_mask():
     """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""

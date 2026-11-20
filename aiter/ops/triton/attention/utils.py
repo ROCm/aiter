@@ -56,8 +56,9 @@ _E8M0_GROUP = 32
 # built from the tensor the packer was given rather than from the codes it produced. The name says
 # which packer the pooled operand goes through, so it has to be the one the row reads: a V named
 # *_fp6_p is packed in the token order an FP6 P operand contracts over (AttentionPack.V_FOR_FP6_P),
-# which is the only packed V order a Sol-Attn row reads.
-SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6")
+# which is the only packed V order a Sol-Attn row reads. An MXFP8 K is packed only at head dim 256,
+# where it is 64-token records with the scales inline; at 128 its codes are addressable.
+SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6", "mxfp8")
 SOL_ATTN_PACKED_V_FORMATS = ("mxfp4_fp6_p", "mxfp6_fp6_p")
 SOL_ATTN_PACKED_FORMATS = tuple(
     dict.fromkeys(SOL_ATTN_PACKED_K_FORMATS + SOL_ATTN_PACKED_V_FORMATS)
@@ -568,19 +569,36 @@ def _sol_attn_pack_k(
     from aiter.ops.mha_v4_quant import (
         mxfp4_k_view,
         mxfp6_k_view,
+        mxfp6_k_view_hd256,
+        mxfp8_k_view_hd256,
         quantize_mxfp4_k,
+        quantize_mxfp4_k_hd256,
         quantize_mxfp6_k,
+        quantize_mxfp6_k_hd256,
+        quantize_mxfp8_k_hd256,
     )
 
     blocks = x.shape[1]
+    hd256 = x.shape[-1] == 256
+    if fmt == "mxfp8" and not hd256:
+        raise ValueError(
+            "an hd128 MXFP8 K is addressable: pool it from its codes by passing k_scale"
+        )
     padded = _sol_attn_pad_to_tile(x, BLOCK_N)
     if fmt == "mxfp4":
-        raw, scale = quantize_mxfp4_k(padded)
+        raw, scale = (quantize_mxfp4_k_hd256 if hd256 else quantize_mxfp4_k)(padded)
         return mxfp4_k_view(raw, scale[:, :blocks]), scale
-    raw, scale_raw = quantize_mxfp6_k(padded)
-    view, scale = mxfp6_k_view(
-        raw, scale_raw, padded.shape[0], padded.shape[1], padded.shape[2]
+    if fmt == "mxfp8":
+        records, scale = quantize_mxfp8_k_hd256(padded)
+        view = mxfp8_k_view_hd256(records, *padded.shape[:3])
+        return view[:, :blocks], scale
+    quantize, k_view = (
+        (quantize_mxfp6_k_hd256, mxfp6_k_view_hd256)
+        if hd256
+        else (quantize_mxfp6_k, mxfp6_k_view)
     )
+    raw, scale_raw = quantize(padded)
+    view, scale = k_view(raw, scale_raw, *padded.shape[:3])
     return view[:, :blocks], scale
 
 
@@ -617,9 +635,11 @@ def _sol_attn_pool_packed_k(
     from aiter.ops.mha_v4_quant import rotate_activation_hd128
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        rotate_activation_hd128(out, x)
-        return out
+        # hd256 packers rotate each 128-channel half on its own, as hd128 rows.
+        rows = x.reshape(*x.shape[:2], -1, 128)
+        out = torch.empty_like(rows)
+        rotate_activation_hd128(out, rows)
+        return out.view(x.shape)
 
     rotated_var = _sol_attn_block_variance(
         rotate(k_source.contiguous()).float(), BLOCK_N
@@ -644,16 +664,21 @@ def _sol_attn_pool_fp6_p_v(
     from aiter.ops.mha_v4_quant import (
         mxfp4_v_view,
         quantize_v_mxfp4_fp6_p,
+        quantize_v_mxfp4_fp6_p_hd256,
         quantize_v_mxfp6_fp6_p,
+        quantize_v_mxfp6_fp6_p_hd256,
     )
 
     pooled = _sol_attn_block_mean(v_source.float(), BLOCK_N).to(torch.bfloat16)
     blocks = pooled.shape[1]
     padded = _sol_attn_pad_to_tile(pooled, BLOCK_N)
+    hd256 = pooled.shape[-1] == 256
     if fmt == "mxfp4_fp6_p":
-        raw, scale = quantize_v_mxfp4_fp6_p(padded)
+        quantize = quantize_v_mxfp4_fp6_p_hd256 if hd256 else quantize_v_mxfp4_fp6_p
+        raw, scale = quantize(padded)
         return mxfp4_v_view(raw, scale, blocks), scale, pooled
-    view, scale = quantize_v_mxfp6_fp6_p(padded)
+    quantize = quantize_v_mxfp6_fp6_p_hd256 if hd256 else quantize_v_mxfp6_fp6_p
+    view, scale = quantize(padded)
     return view[:, :blocks], scale, pooled
 
 
