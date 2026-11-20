@@ -5,9 +5,12 @@
 KV is E4M3FNUZ on gfx942 and OCP E4M3FN on gfx950, the formats each arch's
 cvt_pk_f32_fp8 decodes.
 
-Rows are packed as qpos * H + head. Four/eight waves share one gathered KV
-slab; QK row tiles are wave-owned, PV output columns are wave-owned.
-Only scalar specializations are captured by the cached builder.
+Rows are packed as query_position * num_heads + head. All eight waves reuse
+one 32-token KV tile in LDS. During QK each wave owns a 16-row query tile;
+during PV all waves process all query rows, owning 64 output columns each.
+
+Work items and normalized split outputs follow get_mla_metadata_v1's contract.
+The KV gather uses 64-bit addresses; other buffers have exact descriptor bounds.
 """
 
 from functools import cache
@@ -18,15 +21,24 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+
 QK_DIM = 576
 V_DIM = 512
-INFO_COLS = 8
+WORK_INFO_COLS = 8
+WAVE_SIZE = 64
+MFMA_SIZE = 16
+WAVES = 8
+BLOCK_THREADS = WAVES * WAVE_SIZE
+KV_TILE_SIZE = 32
+VECTOR_BYTES = 16
+BF16_VECTOR_SIZE = VECTOR_BYTES // 2
 
-# A 576-wide Q/K row as (elem, lg, half, dc). Lane group lg reads 16 contiguous
-# columns per dc, so one 16-byte load feeds two MFMA K steps (ds_read_b128).
+# Coordinates are (element, lane_group, half, column_group). Each lane group
+# reads 16 contiguous columns per group; one 16-byte LDS load feeds two MFMAs.
 # The permuted reduction order cancels in the dot product only if Q follows the
 # same layout; the Q loads spell it out as offsets.
-QK_COLS = ((8, 4, 2, 9), (1, 16, 8, 64))
+QK_COLUMN_LAYOUT = ((8, 4, 2, 9), (1, 16, 8, 64))
 
 
 def _buffer(ptr, dtype, layout):
@@ -36,28 +48,52 @@ def _buffer(ptr, dtype, layout):
     return fx.Tensor(fx.rocdl.make_buffer_tensor(view, max_size=False))
 
 
-def _rne(v):
-    # Finite values only (probabilities and normalized outputs). Exact RNE.
-    bits = v.bitcast(fx.Uint32)
-    bits = bits + fx.Uint32(0x7FFF) + ((bits >> fx.Uint32(16)) & fx.Uint32(1))
-    return (bits >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
+def _round_to_bf16_finite(value):
+    # These probabilities/normalized outputs are finite. Native .to(BFloat16)
+    # adds NaN compare/or/select instructions per value on gfx942/0.5.0 and
+    # regressed the cold/warm panel by ~2%. Keep the finite-only RNE conversion.
+    # Add half an ULP minus one, plus the retained LSB: exact ties round to even.
+    bits = value.bitcast(fx.Uint32)
+    retained_lsb = (bits >> fx.Uint32(16)) & fx.Uint32(1)
+    rounded = bits + fx.Uint32(0x7FFF) + retained_lsb
+    return (rounded >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
 
 
 def _mfma(a, b, acc):
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    fa = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-    fb = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-    fc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-    fa.store(a)
-    fb.store(b)
-    fc.store(acc)
-    fx.mma_atom_call(mma, fc, fa, fb, fc)
-    return fc.load()
+    operand_a = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    operand_b = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    accumulator = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+    operand_a.store(a)
+    operand_b.store(b)
+    accumulator.store(acc)
+    fx.gemm(mma, accumulator, operand_a, operand_b, accumulator)
+    return accumulator.load()
 
 
-def _pack_exact(v):
+def _flatten_state(state):
+    """Loop-carried softmax/output/prefetch state as the flat list scf.for carries."""
+    output = [fragment for row in state["output"] for fragment in row]
+    return [state["row_max"], state["row_sum"]] + output + list(state["prefetch"])
+
+
+def _unflatten_state(values, row_tiles, col_tiles):
+    output_end = 2 + row_tiles * col_tiles
+    return {
+        "row_max": values[0],
+        "row_sum": values[1],
+        "output": [
+            [values[2 + row * col_tiles + col] for col in range(col_tiles)]
+            for row in range(row_tiles)
+        ],
+        "prefetch": list(values[output_end:]),
+    }
+
+
+def _pack_fp8_as_bf16(v):
     # Native unpack is FNUZ on gfx942 and OCP on gfx950; every finite value of
-    # either E4M3 format is exactly BF16.
+    # either E4M3 format is exactly BF16. Select the high halfwords directly:
+    # a general .to(BFloat16) needlessly rounds these already-exact values.
     packed = fx.rocdl.perm_b32(
         v[1].bitcast(fx.Int32), v[0].bitcast(fx.Int32), fx.Int32(0x07060302)
     )
@@ -66,7 +102,10 @@ def _pack_exact(v):
     )
 
 
-def _unhoisted(value):
+def _defer_to_use(value):
+    # No public fx operation expresses an opaque identity. A plain value lets
+    # LLVM hoist K loads or epilogue addresses into the KV loop's live set.
+    # The baseline's large-row paths need this boundary to avoid VGPR spills.
     from flydsl._mlir.dialects import llvm
 
     return fx.Int32(
@@ -80,57 +119,51 @@ def _unhoisted(value):
     )
 
 
-def _uniform(value):
+def _wave_uniform(value):
     # Scheduling metadata and wave ids are identical in all lanes of a wave.
     return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(value)))
 
 
-def _frag(v, start):
+def _mfma_fragment(v, start):
     return fx.Vector.from_elements(
         [v[start + i] for i in range_constexpr(4)], dtype=fx.BFloat16
     )
 
 
-# Eight waves for every row count. At one workgroup per CU this halves each
-# thread's share of the KV gather and each wave's PV columns; measured
-# 1.20-1.24x faster than four waves for 64 rows or fewer (H4/8/12, qlen 1-8).
-WAVES = 8
-
-
 @cache
-def _build(H, QLEN, CAUSAL, WRITE_LSE):
-    assert 1 <= H <= 16 and 1 <= QLEN <= 8 and H * QLEN <= 128
-    NT = (H * QLEN + 15) // 16
-    W = WAVES
-    THREADS = W * 64
-    CD = 32 // W
-    OWN = (NT + W - 1) // W
-    N = 32
-    LD = 584
-    LP = N + 8
+def _build(num_heads, max_seqlen_q, causal, write_final_lse):
+    assert (
+        1 <= num_heads <= 16
+        and 1 <= max_seqlen_q <= 8
+        and num_heads * max_seqlen_q <= 128
+    )
+    ROW_TILES = (num_heads * max_seqlen_q + MFMA_SIZE - 1) // MFMA_SIZE
+    PV_COL_TILES = V_DIM // (WAVES * MFMA_SIZE)
+    KV_ROW_STRIDE = QK_DIM + BF16_VECTOR_SIZE
+    PROB_ROW_STRIDE = KV_TILE_SIZE + 8
     GATHER_BYTES = 48
     GATHER_LANES = QK_DIM // GATHER_BYTES
-    # KV tokens of a tile in MFMA C-row order (i, lg, kn): the P tile and V^T.
-    TOKENS = ((4, 4, N // 16), (1, 4, 16))
-    # Wave-owned PV output columns: V^T rows (wave, cd, lr) and the matching
-    # accumulator columns (wave, cd, lg, i).
-    V_COLS = ((W, CD, 16), (V_DIM // W, 16, 1))
-    OUT_COLS = ((W, CD, 4, 4), (V_DIM // W, 16, 4, 1))
+    GATHER_CHUNKS = GATHER_BYTES // VECTOR_BYTES
+    GATHER_WAVES = KV_TILE_SIZE * GATHER_LANES // WAVE_SIZE
+    QK_COLUMN_GROUPS = QK_DIM // WAVE_SIZE
+    QK_STEPS = QK_COLUMN_GROUPS * 2
+    # Output columns are (wave, column_tile, lane_group, element).
+    OUTPUT_COLUMN_LAYOUT = ((WAVES, PV_COL_TILES, 4, 4), (V_DIM // WAVES, 16, 4, 1))
     STAT_ALPHA, STAT_MAX, STAT_SUM = range(3)
 
     @fx.struct
     class Shared:
-        kv: fx.Array[fx.BFloat16, N * LD, 16]
-        p: fx.Array[fx.BFloat16, NT * 16 * LP, 16]
-        stats: fx.Array[fx.Float32, NT * 16 * 3, 16]
-        pages: fx.Array[fx.Uint64, N, 16]
+        kv: fx.Array[fx.BFloat16, KV_TILE_SIZE * KV_ROW_STRIDE, 16]
+        p: fx.Array[fx.BFloat16, ROW_TILES * 16 * PROB_ROW_STRIDE, 16]
+        stats: fx.Array[fx.Float32, ROW_TILES * 16 * 3, 16]
+        pages: fx.Array[fx.Uint64, KV_TILE_SIZE, 16]
 
     kernel_name = (
-        f"mla_pagesize1_bf16_fp8_h{H}_q{QLEN}"
-        f"{'_causal' if CAUSAL else ''}{'_lse' if WRITE_LSE else ''}"
+        f"mla_pagesize1_bf16_fp8_h{num_heads}_q{max_seqlen_q}"
+        f"{'_causal' if causal else ''}{'_lse' if write_final_lse else ''}"
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def stage1(
         partial: fx.Pointer,
         partial_lse: fx.Pointer,
@@ -151,152 +184,208 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
         num_cus: fx.Constexpr[int],
     ):
         tid = fx.thread_idx.x
-        lane = tid % 64
-        lr = lane % 16
-        lg = lane // 16
-        wave = _uniform(tid // 64)
-        cu = fx.block_idx.x
-        q_rows = total_q * H
-        p_rows = num_partial * H
-        gq = _buffer(
+        lane = tid % WAVE_SIZE
+        lane_row = lane % MFMA_SIZE
+        lane_group = lane // MFMA_SIZE
+        wave = _wave_uniform(tid // WAVE_SIZE)
+        workgroup_id = fx.block_idx.x
+        q_rows = total_q * num_heads
+        p_rows = num_partial * num_heads
+        q_global = _buffer(
             q, fx.BFloat16, fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1))
         )
-        gp = _buffer(pages, fx.Int32, fx.make_layout(num_indices, 1))
-        gi = _buffer(indptr, fx.Int32, fx.make_layout(num_cus + 1, 1))
-        gw = _buffer(
-            info, fx.Int32, fx.make_layout((num_work, INFO_COLS), (INFO_COLS, 1))
+        page_indices = _buffer(pages, fx.Int32, fx.make_layout(num_indices, 1))
+        work_indptr = _buffer(indptr, fx.Int32, fx.make_layout(num_cus + 1, 1))
+        work_info = _buffer(
+            info,
+            fx.Int32,
+            fx.make_layout((num_work, WORK_INFO_COLS), (WORK_INFO_COLS, 1)),
         )
-        gr = _buffer(
+        partial_output = _buffer(
             partial,
             fx.Float32,
-            fx.make_layout((p_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
+            fx.make_layout(
+                (p_rows, OUTPUT_COLUMN_LAYOUT[0]), (V_DIM, OUTPUT_COLUMN_LAYOUT[1])
+            ),
         )
-        gl = _buffer(partial_lse, fx.Float32, fx.make_layout(p_rows, 1))
-        go = _buffer(
+        partial_lse_output = _buffer(partial_lse, fx.Float32, fx.make_layout(p_rows, 1))
+        final_output = _buffer(
             output,
             fx.BFloat16,
-            fx.make_layout((q_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
+            fx.make_layout(
+                (q_rows, OUTPUT_COLUMN_LAYOUT[0]), (V_DIM, OUTPUT_COLUMN_LAYOUT[1])
+            ),
         )
-        gol = _buffer(output_lse, fx.Float32, fx.make_layout(q_rows, 1))
-        g_scale = _buffer(kv_scale, fx.Float32, fx.make_layout(1, 1))
-        descale = _uniform(g_scale[0].bitcast(fx.Int32)).bitcast(fx.Float32)
-        score_scale = scale * descale * fx.Float32(1.4426950408889634)
+        final_lse_output = _buffer(output_lse, fx.Float32, fx.make_layout(q_rows, 1))
+        kv_scale_global = _buffer(kv_scale, fx.Float32, fx.make_layout(1, 1))
+        kv_descale = _wave_uniform(kv_scale_global[0].bitcast(fx.Int32)).bitcast(
+            fx.Float32
+        )
+        score_scale = scale * kv_descale * fx.Float32(LOG2E)
         shared = fx.SharedAllocator().allocate(Shared).peek()
         # One padded KV slab, viewed per access pattern: K operand rows, the
         # gather's (8 BF16, part, chunk, gather lane) stores, and V^T columns.
-        kv_k = fx.Tensor(
-            shared.kv.view(fx.make_layout((N, QK_COLS[0]), (LD, QK_COLS[1])))
-        )
-        kv_gather = fx.Tensor(
+        keys_lds = fx.Tensor(
             shared.kv.view(
                 fx.make_layout(
-                    (N, (8, GATHER_LANES, 3, 2)), (LD, (1, GATHER_BYTES, 16, 8))
+                    (KV_TILE_SIZE, QK_COLUMN_LAYOUT[0]),
+                    (KV_ROW_STRIDE, QK_COLUMN_LAYOUT[1]),
                 )
             )
         )
-        kv_v = fx.Tensor(
+        gathered_kv_lds = fx.Tensor(
             shared.kv.view(
                 fx.make_layout(
-                    (TOKENS[0], V_COLS[0]),
-                    (tuple(s * LD for s in TOKENS[1]), V_COLS[1]),
+                    (KV_TILE_SIZE, (8, GATHER_LANES, 3, 2)),
+                    (KV_ROW_STRIDE, (1, GATHER_BYTES, 16, 8)),
                 )
             )
         )
-        p_lds = fx.Tensor(
-            shared.p.view(fx.make_layout((NT * 16, TOKENS[0]), (LP, TOKENS[1])))
+        # PV is V^T @ P^T. The MFMA atom partitions V into its A operand. V is
+        # gathered element by element below: a vector load of the partition
+        # lowers to the same ds_read_u16s but schedules ~0.4% slower cold.
+        pv_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            fx.make_layout((1, 1, 1), (0, 0, 0)),
+        ).get_slice(lane)
+        values_lds = pv_mma.partition_A(
+            fx.make_view(
+                shared.kv.ptr + wave * (V_DIM // WAVES),
+                fx.make_layout((V_DIM // WAVES, KV_TILE_SIZE), (1, KV_ROW_STRIDE)),
+            )
         )
-        stats = fx.Tensor(shared.stats.view(fx.make_layout((NT * 16, 3), (3, 1))))
-        s_pages = fx.Tensor(shared.pages.view(fx.make_layout(N, 1)))
-        sk = shared.kv.ptr
-        begin = _uniform(gi[cu])
-        end = _uniform(gi[cu + 1])
-        for wi in range(begin, end, 1):
-            work = fx.Int64(wi)
-            pr = _uniform(gw[(work, 1)])
-            qs = _uniform(gw[(work, 2)])
-            qe = _uniform(gw[(work, 3)])
-            ks = _uniform(gw[(work, 4)])
-            ke = _uniform(gw[(work, 5)])
-            ko = _uniform(gw[(work, 6)])
-            qlen = qe - qs
-            M = qlen * H
-            qregs = []
-            for rt in range_constexpr(OWN):
-                r = (wave + rt * W) * 16 + lr
-                for dc in range_constexpr(9):
-                    for half in range_constexpr(2):
-                        # QK_COLS at (lg, half, dc), in 8-element units. Rows past
-                        # M point one past the end, so the load returns zero.
-                        # A QK_COLS view masking the row instead changes the KV
-                        # loop's register allocation.
-                        q_off = (
-                            (fx.Int64(qs) * H + r) * QK_DIM
-                            + dc * 64
-                            + lg * 16
-                            + half * 8
-                        ) // 8
-                        q_off = (r < M).select(
-                            q_off, fx.Int64(total_q) * H * (QK_DIM // 8)
-                        )
-                        qregs.append(gq[(q_off, None)].load())
-            init = [fx.Float32(float("-inf")) for _ in range_constexpr(OWN)]
-            init += [fx.Float32(0.0) for _ in range_constexpr(OWN)]
-            init += [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(NT * CD)]
-            if NT < W:
+        # QK owns a different row tile in each wave. Its eight scores per lane
+        # are (element, lane_group, token_tile) = element + 4*group + 16*tile.
+        # Keep this view explicit: the 0.5.0 partition_C store path hits a
+        # nested-coordinate rank assertion. PV reads its B operand through the
+        # same view; for this 16x16x16 atom the B lane map equals QK's C map,
+        # and reusing it keeps the LLVM schedule of the base kernel (~0.4%).
+        qk_probs_lds = fx.Tensor(
+            shared.p.view(
+                fx.make_layout(
+                    (ROW_TILES * MFMA_SIZE, (4, 4, KV_TILE_SIZE // MFMA_SIZE)),
+                    (PROB_ROW_STRIDE, (1, 4, MFMA_SIZE)),
+                )
+            )
+        )
+        stats = fx.Tensor(
+            shared.stats.view(fx.make_layout((ROW_TILES * 16, 3), (3, 1)))
+        )
+        page_addresses_lds = fx.Tensor(
+            shared.pages.view(fx.make_layout(KV_TILE_SIZE, 1))
+        )
+        kv_lds_ptr = shared.kv.ptr
+        work_begin = _wave_uniform(work_indptr[workgroup_id])
+        work_end = _wave_uniform(work_indptr[workgroup_id + 1])
+        for work_index in range(work_begin, work_end, 1):
+            work = fx.Int64(work_index)
+            partial_row = _wave_uniform(work_info[(work, 1)])
+            q_begin = _wave_uniform(work_info[(work, 2)])
+            q_end = _wave_uniform(work_info[(work, 3)])
+            kv_begin = _wave_uniform(work_info[(work, 4)])
+            kv_end = _wave_uniform(work_info[(work, 5)])
+            kv_tail_tokens = _wave_uniform(work_info[(work, 6)])
+            qlen = q_end - q_begin
+            active_rows = qlen * num_heads
+            query_fragments = []
+            row = wave * MFMA_SIZE + lane_row
+            for column_group in range_constexpr(QK_COLUMN_GROUPS):
+                for half in range_constexpr(2):
+                    # Match QK_COLUMN_LAYOUT in eight-element load units.
+                    # Masked rows address exactly one past the Q descriptor,
+                    # so the bounded buffer load returns zero. Retain this
+                    # flat load view: row-view masking changes register allocation.
+                    query_offset = (
+                        (fx.Int64(q_begin) * num_heads + row) * QK_DIM
+                        + column_group * 64
+                        + lane_group * 16
+                        + half * 8
+                    ) // 8
+                    query_offset = (row < active_rows).select(
+                        query_offset, fx.Int64(total_q) * num_heads * (QK_DIM // 8)
+                    )
+                    query_fragments.append(q_global[(query_offset, None)].load())
+            # FlyDSL 0.5 carries nested Python containers through runtime loops.
+            # Keep the algorithm's state named; no hand-packed SSA slot offsets.
+            loop_state = {
+                "row_max": fx.Float32(float("-inf")),
+                "row_sum": fx.Float32(0.0),
+                "output": [
+                    [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(PV_COL_TILES)]
+                    for _ in range_constexpr(ROW_TILES)
+                ],
+                "prefetch": [],
+            }
+            if ROW_TILES < WAVES:
                 # Tile zero is primed once; all lanes issue clamped loads, including
                 # the two waves whose gathered values are not stored to LDS.
-                raw = [fx.full(4, 0, fx.Uint32) for _ in range_constexpr(3)]
-                if ke > ks:
-                    tok0 = (tid % (N * GATHER_LANES)) // GATHER_LANES
-                    dc0 = tid % GATHER_LANES
-                    idx0 = (ks + tok0 < ke).select(ks + tok0, ke - 1)
-                    page0 = gp[idx0]
-                    base0 = kv + fx.Int64(page0) * QK_DIM
-                    for chunk in range_constexpr(3):
-                        raw[chunk] = fx.ptr_load(
-                            base0 + dc0 * GATHER_BYTES + chunk * 16,
+                prefetched_kv = [
+                    fx.full(4, 0, fx.Uint32) for _ in range_constexpr(GATHER_CHUNKS)
+                ]
+                if kv_end > kv_begin:
+                    first_token = (tid % (KV_TILE_SIZE * GATHER_LANES)) // GATHER_LANES
+                    first_column_group = tid % GATHER_LANES
+                    first_page_index = (kv_begin + first_token < kv_end).select(
+                        kv_begin + first_token, kv_end - 1
+                    )
+                    first_page = page_indices[first_page_index]
+                    first_address = kv + fx.Int64(first_page) * QK_DIM
+                    for chunk in range_constexpr(GATHER_CHUNKS):
+                        prefetched_kv[chunk] = fx.ptr_load(
+                            first_address
+                            + first_column_group * GATHER_BYTES
+                            + chunk * 16,
                             result_type=fx.Vector.make_type(16, fx.Uint8),
                         ).bitcast(fx.Uint32)
-                init += raw
-            result = init
-            for kb_raw, state in range(ks, ke, N, init=init):
-                kb = fx.Int32(kb_raw)
-                # NT<8: publish next-tile page bases through the original
-                # table/B1. NT=8 keeps the current-tile baseline path.
-                if tid < N:
-                    lookahead = N if NT < W else 0
-                    idx = (kb + lookahead + tid < ke).select(
-                        kb + lookahead + tid, ke - 1
+                loop_state["prefetch"] = prefetched_kv
+            carried = _flatten_state(loop_state)
+            for tile_index, carried_in in range(
+                kv_begin, kv_end, KV_TILE_SIZE, init=carried
+            ):
+                tile_start = fx.Int32(tile_index)
+                loop_state = _unflatten_state(carried_in, ROW_TILES, PV_COL_TILES)
+                # The prefetched path publishes next-tile addresses while PV
+                # consumes the current tile. At eight row tiles, load in place.
+                if tid < KV_TILE_SIZE:
+                    lookahead = KV_TILE_SIZE if ROW_TILES < WAVES else 0
+                    idx = (tile_start + lookahead + tid < kv_end).select(
+                        tile_start + lookahead + tid, kv_end - 1
                     )
-                    page = gp[idx]
+                    page = page_indices[idx]
                     fx.memref_store(
                         fx.ptrtoint(kv + fx.Int64(page) * QK_DIM).to(fx.Uint64),
-                        s_pages,
+                        page_addresses_lds,
                         tid,
                     )
                 fx.barrier()
-                gather_tid = _unhoisted(tid) if NT >= 7 else tid
-                if wave < 6:
-                    tok = gather_tid // GATHER_LANES
-                    dc = gather_tid % GATHER_LANES
-                    page_base = fx.inttoptr(kv.type, s_pages[tok]) if NT == W else kv
+                gather_tid = _defer_to_use(tid) if ROW_TILES >= 7 else tid
+                # Twelve lanes gather each token in three aligned 16-byte
+                # chunks. Six waves cover all 32 tokens; the slab is shared.
+                if wave < GATHER_WAVES:
+                    token = gather_tid // GATHER_LANES
+                    column_group = gather_tid % GATHER_LANES
+                    page_base = (
+                        fx.inttoptr(kv.type, page_addresses_lds[token])
+                        if ROW_TILES == WAVES
+                        else kv
+                    )
                     # Swap adjacent 16B BF16 writes in alternating four-lane
                     # groups. All eight 16B bank slots occur once per lane octet.
-                    swap = (dc // 4) % 2
-                    for chunk in range_constexpr(3):
-                        d = dc * GATHER_BYTES + chunk * 16
+                    swap = (column_group // 4) % 2
+                    for chunk in range_constexpr(GATHER_CHUNKS):
+                        byte_offset = column_group * GATHER_BYTES + chunk * 16
                         # Keep 64-bit addressing for production pools >4 GiB.
                         packed = (
-                            state[2 * OWN + NT * CD + chunk]
-                            if NT < W
+                            loop_state["prefetch"][chunk]
+                            if ROW_TILES < WAVES
                             else fx.ptr_load(
-                                page_base + d,
+                                page_base + byte_offset,
                                 result_type=fx.Vector.make_type(16, fx.Uint8),
                             ).bitcast(fx.Uint32)
                         )
                         for piece in range_constexpr(2):
                             part = fx.Int32(piece) ^ swap
-                            vals = []
+                            bf16_values = []
                             for word in range_constexpr(2):
                                 bits = (swap == 0).select(
                                     packed[piece * 2 + word],
@@ -308,218 +397,292 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                                             T.f32x2, bits.to(fx.Int32), bool(half)
                                         )
                                     )
-                                    pair = _pack_exact(v)
-                                    vals += [pair[0], pair[1]]
-                            kv_gather[(tok, (None, dc, chunk, part))].store(
-                                fx.Vector.from_elements(vals, dtype=fx.BFloat16)
+                                    pair = _pack_fp8_as_bf16(v)
+                                    bf16_values += [pair[0], pair[1]]
+                            gathered_kv_lds[
+                                (token, (None, column_group, chunk, part))
+                            ].store(
+                                fx.Vector.from_elements(bf16_values, dtype=fx.BFloat16)
                             )
                 fx.barrier()
-                next_max = []
-                next_sum = []
-                for rt in range_constexpr(OWN):
-                    tile = wave + rt * W
-                    r = tile * 16 + lr
-                    nm = state[rt]
-                    sm = state[OWN + rt]
-                    if tile < NT:
-                        dots = [
-                            fx.full(4, 0.0, fx.Float32)
-                            for _ in range_constexpr(N // 16)
+                tile = wave
+                row = tile * 16 + lane_row
+                row_max = loop_state["row_max"]
+                row_sum = loop_state["row_sum"]
+                if tile < ROW_TILES:
+                    score_fragments = [
+                        fx.full(4, 0.0, fx.Float32)
+                        for _ in range_constexpr(KV_TILE_SIZE // 16)
+                    ]
+                    if const_expr(ROW_TILES <= 4):
+                        # Prefetch one K pair only on the small-row path.
+                        # Scheduler fences keep just two operand sets live.
+                        key_values = [
+                            keys_lds[
+                                (token_tile * 16 + lane_row, (None, lane_group, 0, 0))
+                            ].load()
+                            for token_tile in range_constexpr(KV_TILE_SIZE // 16)
                         ]
-                        if const_expr(NT <= 4):
-                            # One K pair ahead (NT<=4 only: neutral at NT 5-6); fences bound live operands to two sets.
-                            kvals = [
-                                kv_k[(kn * 16 + lr, (None, lg, 0, 0))].load()
-                                for kn in range_constexpr(N // 16)
-                            ]
+                        fx.rocdl.sched_barrier(0)
+                        for step in range_constexpr(QK_STEPS):
+                            if const_expr(step + 1 < QK_STEPS):
+                                next_step = step + 1
+                                next_keys = [
+                                    keys_lds[
+                                        (
+                                            token_tile * 16 + lane_row,
+                                            (
+                                                None,
+                                                lane_group,
+                                                next_step % 2,
+                                                next_step // 2,
+                                            ),
+                                        )
+                                    ].load()
+                                    for token_tile in range_constexpr(
+                                        KV_TILE_SIZE // 16
+                                    )
+                                ]
                             fx.rocdl.sched_barrier(0)
-                            for step in range_constexpr(18):
-                                if const_expr(step + 1 < 18):
-                                    ns = step + 1
-                                    next_k = [
-                                        kv_k[
-                                            (kn * 16 + lr, (None, lg, ns % 2, ns // 2))
-                                        ].load()
-                                        for kn in range_constexpr(N // 16)
-                                    ]
-                                fx.rocdl.sched_barrier(0)
-                                qv = qregs[rt * 18 + step]
-                                for sub in range_constexpr(2):
-                                    for kn in range_constexpr(N // 16):
-                                        dots[kn] = _mfma(
-                                            _frag(kvals[kn], sub * 4),
-                                            _frag(qv, sub * 4),
-                                            dots[kn],
-                                        )
-                                fx.rocdl.sched_barrier(0)
-                                if const_expr(step + 1 < 18):
-                                    kvals = next_k
-                        else:
-                            for dc in range_constexpr(9):
-                                for half in range_constexpr(2):
-                                    # Prevent full-K CSE/hoisting across row tiles:
-                                    # retaining the full slab alongside Q/O spills.
-                                    kbase = _unhoisted(
-                                        fx.get_scalar(
-                                            fx.crd2idx(
-                                                (lr, (0, lg, half, dc)), kv_k.layout
-                                            )
-                                        )
+                            query_values = query_fragments[step]
+                            for sub in range_constexpr(2):
+                                for token_tile in range_constexpr(KV_TILE_SIZE // 16):
+                                    score_fragments[token_tile] = _mfma(
+                                        _mfma_fragment(key_values[token_tile], sub * 4),
+                                        _mfma_fragment(query_values, sub * 4),
+                                        score_fragments[token_tile],
                                     )
-                                    k_step = fx.Tensor(
-                                        fx.make_view(
-                                            sk + kbase,
-                                            fx.make_layout((N // 16, 8), (16 * LD, 1)),
-                                        )
-                                    )
-                                    kvals = [
-                                        k_step[(kn, None)].load()
-                                        for kn in range_constexpr(N // 16)
-                                    ]
-                                    qv = qregs[rt * 18 + dc * 2 + half]
-                                    for sub in range_constexpr(2):
-                                        for kn in range_constexpr(N // 16):
-                                            dots[kn] = _mfma(
-                                                _frag(kvals[kn], sub * 4),
-                                                _frag(qv, sub * 4),
-                                                dots[kn],
-                                            )
-                        visible_end = ke
-                        if CAUSAL:
-                            hide = qlen - 1 - r // H - ko
-                            visible_end = ke - (hide > 0).select(hide, fx.Int32(0))
-                        scores = []
-                        valid = []
-                        for kn in range_constexpr(N // 16):
-                            for i in range_constexpr(4):
-                                ok = (r < M) & (kb + kn * 16 + lg * 4 + i < visible_end)
-                                valid.append(ok)
-                                scores.append(
-                                    ok.select(
-                                        dots[kn][i] * score_scale,
-                                        fx.Float32(float("-inf")),
-                                    )
-                                )
-                        tm = scores[0]
-                        for i in range_constexpr(1, N // 4):
-                            tm = tm.maximumf(scores[i])
-                        for delta in range_constexpr(2):
-                            tm = tm.maximumf(fx.gpu.shuffle_xor(tm, 16 << delta, 64))
-                        nm = state[rt].maximumf(tm)
-                        safe = (nm > fx.Float32(float("-inf"))).select(
-                            nm, fx.Float32(0.0)
-                        )
-                        alpha = fmath.exp2(state[rt] - safe)
-                        probs = [
-                            valid[i].select(
-                                fmath.exp2(scores[i] - safe), fx.Float32(0.0)
-                            )
-                            for i in range_constexpr(N // 4)
-                        ]
-                        sm = probs[0]
-                        for i in range_constexpr(1, N // 4):
-                            sm = sm + probs[i]
-                        for delta in range_constexpr(2):
-                            sm = sm + fx.gpu.shuffle_xor(sm, 16 << delta, 64)
-                        sm = state[OWN + rt] * alpha + sm
-                        for kn in range_constexpr(N // 16):
-                            for i in range_constexpr(4):
-                                fx.memref_store(
-                                    _rne(probs[kn * 4 + i]), p_lds, (r, (i, lg, kn))
-                                )
-                        if lg == 0:
-                            fx.memref_store(alpha, stats, (r, STAT_ALPHA))
-                            fx.memref_store(nm, stats, (r, STAT_MAX))
-                            fx.memref_store(sm, stats, (r, STAT_SUM))
+                            fx.rocdl.sched_barrier(0)
+                            if const_expr(step + 1 < QK_STEPS):
+                                key_values = next_keys
                     else:
-                        nm = state[rt]
-                        sm = state[OWN + rt]
-                    next_max.append(nm)
-                    next_sum.append(sm)
-                next_raw = []
-                if NT < W:
+                        for column_group in range_constexpr(QK_COLUMN_GROUPS):
+                            for half in range_constexpr(2):
+                                # Prevent full-K CSE/hoisting across row tiles:
+                                # retaining the full slab alongside Q/O spills.
+                                key_offset = _defer_to_use(
+                                    fx.get_scalar(
+                                        fx.crd2idx(
+                                            (
+                                                lane_row,
+                                                (0, lane_group, half, column_group),
+                                            ),
+                                            keys_lds.layout,
+                                        )
+                                    )
+                                )
+                                key_step = fx.Tensor(
+                                    fx.make_view(
+                                        kv_lds_ptr + key_offset,
+                                        fx.make_layout(
+                                            (KV_TILE_SIZE // 16, 8),
+                                            (16 * KV_ROW_STRIDE, 1),
+                                        ),
+                                    )
+                                )
+                                key_values = [
+                                    key_step[(token_tile, None)].load()
+                                    for token_tile in range_constexpr(
+                                        KV_TILE_SIZE // 16
+                                    )
+                                ]
+                                query_values = query_fragments[column_group * 2 + half]
+                                for sub in range_constexpr(2):
+                                    for token_tile in range_constexpr(
+                                        KV_TILE_SIZE // 16
+                                    ):
+                                        score_fragments[token_tile] = _mfma(
+                                            _mfma_fragment(
+                                                key_values[token_tile], sub * 4
+                                            ),
+                                            _mfma_fragment(query_values, sub * 4),
+                                            score_fragments[token_tile],
+                                        )
+                    visible_end = kv_end
+                    if causal:
+                        # Bottom-right mask: query i cannot see the last
+                        # qlen-1-i tokens. A fragment before that tail hides none.
+                        hide = qlen - 1 - row // num_heads - kv_tail_tokens
+                        visible_end = kv_end - (hide > 0).select(hide, fx.Int32(0))
+                    scores = []
+                    valid = []
+                    for token_tile in range_constexpr(KV_TILE_SIZE // 16):
+                        for i in range_constexpr(4):
+                            is_visible = (row < active_rows) & (
+                                tile_start + token_tile * 16 + lane_group * 4 + i
+                                < visible_end
+                            )
+                            valid.append(is_visible)
+                            scores.append(
+                                is_visible.select(
+                                    score_fragments[token_tile][i] * score_scale,
+                                    fx.Float32(float("-inf")),
+                                )
+                            )
+                    tile_max = scores[0]
+                    for i in range_constexpr(1, KV_TILE_SIZE // 4):
+                        tile_max = tile_max.maximumf(scores[i])
+                    for delta in range_constexpr(2):
+                        tile_max = tile_max.maximumf(
+                            fx.gpu.shuffle_xor(tile_max, 16 << delta, 64)
+                        )
+                    # Online softmax uses exp2 units. When the running maximum
+                    # grows, alpha rescales BOTH the prior sum and PV output.
+                    row_max = loop_state["row_max"].maximumf(tile_max)
+                    safe_max = (row_max > fx.Float32(float("-inf"))).select(
+                        row_max, fx.Float32(0.0)
+                    )
+                    alpha = fmath.exp2(loop_state["row_max"] - safe_max)
+                    probabilities = [
+                        valid[i].select(
+                            fmath.exp2(scores[i] - safe_max), fx.Float32(0.0)
+                        )
+                        for i in range_constexpr(KV_TILE_SIZE // 4)
+                    ]
+                    row_sum = probabilities[0]
+                    for i in range_constexpr(1, KV_TILE_SIZE // 4):
+                        row_sum = row_sum + probabilities[i]
+                    for delta in range_constexpr(2):
+                        row_sum = row_sum + fx.gpu.shuffle_xor(row_sum, 16 << delta, 64)
+                    row_sum = loop_state["row_sum"] * alpha + row_sum
+                    for token_tile in range_constexpr(KV_TILE_SIZE // 16):
+                        for i in range_constexpr(4):
+                            fx.memref_store(
+                                _round_to_bf16_finite(
+                                    probabilities[token_tile * 4 + i]
+                                ),
+                                qk_probs_lds,
+                                (row, (i, lane_group, token_tile)),
+                            )
+                    if lane_group == 0:
+                        fx.memref_store(alpha, stats, (row, STAT_ALPHA))
+                        fx.memref_store(row_max, stats, (row, STAT_MAX))
+                        fx.memref_store(row_sum, stats, (row, STAT_SUM))
+                else:
+                    row_max = loop_state["row_max"]
+                    row_sum = loop_state["row_sum"]
+                next_kv_bytes = []
+                if ROW_TILES < WAVES:
                     # After the complete QK/softmax phase: never between MFMAs.
                     fx.rocdl.sched_barrier(0)
-                    pre_tid = _unhoisted(tid)
-                    pre_tok = (pre_tid % (N * GATHER_LANES)) // GATHER_LANES
-                    pre_dc = pre_tid % GATHER_LANES
-                    pre_base = fx.inttoptr(kv.type, s_pages[pre_tok])
-                    for chunk in range_constexpr(3):
-                        next_raw.append(
+                    prefetch_tid = _defer_to_use(tid)
+                    prefetch_token = (
+                        prefetch_tid % (KV_TILE_SIZE * GATHER_LANES)
+                    ) // GATHER_LANES
+                    prefetch_column_group = prefetch_tid % GATHER_LANES
+                    prefetch_address = fx.inttoptr(
+                        kv.type, page_addresses_lds[prefetch_token]
+                    )
+                    for chunk in range_constexpr(GATHER_CHUNKS):
+                        next_kv_bytes.append(
                             fx.ptr_load(
-                                pre_base + pre_dc * GATHER_BYTES + chunk * 16,
+                                prefetch_address
+                                + prefetch_column_group * GATHER_BYTES
+                                + chunk * 16,
                                 result_type=fx.Vector.make_type(16, fx.Uint8),
                             ).bitcast(fx.Uint32)
                         )
                     fx.rocdl.sched_barrier(0)
                 fx.barrier()
-                outs = []
+                next_output = []
                 # PV: A=V^T, B=P^T. All rows, disjoint column slices per wave.
-                for rt in range_constexpr(NT):
-                    r = rt * 16 + lr
-                    alpha = stats[(r, STAT_ALPHA)]
-                    for cd in range_constexpr(CD):
-                        old = state[2 * OWN + rt * CD + cd]
+                for row_tile in range_constexpr(ROW_TILES):
+                    row = row_tile * 16 + lane_row
+                    alpha = stats[(row, STAT_ALPHA)]
+                    row_output = []
+                    for column_tile in range_constexpr(PV_COL_TILES):
+                        old = loop_state["output"][row_tile][column_tile]
                         acc = old * alpha
-                        for kn in range_constexpr(N // 16):
-                            pv = p_lds[(r, (None, lg, kn))].load()
-                            vv = fx.Vector.from_elements(
+                        for token_tile in range_constexpr(KV_TILE_SIZE // 16):
+                            prob_values = qk_probs_lds[
+                                (
+                                    row_tile * 16 + lane_row,
+                                    (None, lane_group, token_tile),
+                                )
+                            ].load()
+                            value_values = fx.Vector.from_elements(
                                 [
-                                    kv_v[((i, lg, kn), (wave, cd, lr))]
+                                    values_lds[(i, column_tile, token_tile)]
                                     for i in range_constexpr(4)
                                 ],
                                 dtype=fx.BFloat16,
                             )
-                            acc = _mfma(vv, pv, acc)
-                        outs.append(acc)
-                result = yield next_max + next_sum + outs + next_raw
+                            acc = _mfma(value_values, prob_values, acc)
+                        row_output.append(acc)
+                    next_output.append(row_output)
+                carried = yield _flatten_state(
+                    {
+                        "row_max": row_max,
+                        "row_sum": row_sum,
+                        "output": next_output,
+                        "prefetch": next_kv_bytes,
+                    }
+                )
+            loop_state = _unflatten_state(carried, ROW_TILES, PV_COL_TILES)
             # Shared statistics are final after the last PV barrier. A work
             # with zero tokens never enters the loop and writes zero/-inf.
             fx.barrier()
             # Keep epilogue-only div/mod and addresses out of the KV loop's
             # live set. One opaque move per work item avoids spilling them.
-            store_tid = _unhoisted(tid)
-            store_lr = store_tid % 16
-            store_lg = (store_tid % 64) // 16
+            store_tid = _defer_to_use(tid)
+            store_lane_row = store_tid % 16
+            store_lane_group = (store_tid % 64) // 16
             store_wave = store_tid // 64
-            for rt in range_constexpr(NT):
-                r = rt * 16 + store_lr
-                if r < M:
-                    mass = fx.Float32(0.0)
-                    mx = fx.Float32(float("-inf"))
-                    if ke > ks:
-                        mass = stats[(r, STAT_SUM)]
-                        mx = stats[(r, STAT_MAX)]
-                    denom = (mass > 0).select(mass, fx.Float32(1.0))
-                    factor = descale / denom
-                    lse = (mass > 0).select(
-                        mx * fx.Float32(0.6931471805599453) + fmath.log(denom),
+            for row_tile in range_constexpr(ROW_TILES):
+                row = row_tile * 16 + store_lane_row
+                if row < active_rows:
+                    row_sum = fx.Float32(0.0)
+                    row_max = fx.Float32(float("-inf"))
+                    if kv_end > kv_begin:
+                        row_sum = stats[(row, STAT_SUM)]
+                        row_max = stats[(row, STAT_MAX)]
+                    denom = (row_sum > 0).select(row_sum, fx.Float32(1.0))
+                    factor = kv_descale / denom
+                    lse = (row_sum > 0).select(
+                        row_max * fx.Float32(0.6931471805599453) + fmath.log(denom),
                         fx.Float32(float("-inf")),
                     )
-                    qpos = r // H
-                    h = r % H
-                    if pr >= 0:
-                        out_row = fx.Int64(pr + qpos) * H + h
-                        for cd in range_constexpr(CD):
-                            acc = result[2 * OWN + rt * CD + cd]
-                            cols = (store_wave, cd, store_lg, None)
-                            gr[(out_row, cols)].store(acc * factor)
-                        if (store_wave == 0) & (store_lg == 0):
-                            fx.memref_store(lse, gl, out_row)
+                    query_position = row // num_heads
+                    head = row % num_heads
+                    if partial_row >= 0:
+                        out_row = (
+                            fx.Int64(partial_row + query_position) * num_heads + head
+                        )
+                        for column_tile in range_constexpr(PV_COL_TILES):
+                            acc = loop_state["output"][row_tile][column_tile]
+                            output_columns = (
+                                store_wave,
+                                column_tile,
+                                store_lane_group,
+                                None,
+                            )
+                            partial_output[(out_row, output_columns)].store(
+                                acc * factor
+                            )
+                        if (store_wave == 0) & (store_lane_group == 0):
+                            fx.memref_store(lse, partial_lse_output, out_row)
                     else:
-                        out_row = fx.Int64(qs + qpos) * H + h
-                        for cd in range_constexpr(CD):
-                            acc = result[2 * OWN + rt * CD + cd]
-                            cols = (store_wave, cd, store_lg, None)
+                        out_row = fx.Int64(q_begin + query_position) * num_heads + head
+                        for column_tile in range_constexpr(PV_COL_TILES):
+                            acc = loop_state["output"][row_tile][column_tile]
+                            output_columns = (
+                                store_wave,
+                                column_tile,
+                                store_lane_group,
+                                None,
+                            )
                             value = fx.Vector.from_elements(
-                                [_rne(acc[i] * factor) for i in range_constexpr(4)],
+                                [
+                                    _round_to_bf16_finite(acc[i] * factor)
+                                    for i in range_constexpr(4)
+                                ],
                                 dtype=fx.BFloat16,
                             )
-                            go[(out_row, cols)].store(value)
+                            final_output[(out_row, output_columns)].store(value)
                         # Trace-time flag around a device test: they must not be merged.
-                        if WRITE_LSE:  # noqa: SIM102
-                            if (store_wave == 0) & (store_lg == 0):
-                                fx.memref_store(lse, gol, out_row)
+                        if write_final_lse:  # noqa: SIM102
+                            if (store_wave == 0) & (store_lane_group == 0):
+                                fx.memref_store(lse, final_lse_output, out_row)
 
     return stage1
 
@@ -568,4 +731,4 @@ def launch_mla_pagesize1_bf16_fp8(
         num_partial,
         num_work,
         num_cus,
-    ).launch(grid=(num_cus, 1, 1), block=(WAVES * 64, 1, 1), stream=stream)
+    ).launch(grid=(num_cus, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
