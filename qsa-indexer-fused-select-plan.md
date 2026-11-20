@@ -4,6 +4,8 @@ Living plan for [SILOTIGER-1481](SILOTIGER-1481-description.md): stop writing th
 
 The mechanism comes from the design spike in [design-spike.md](design-spike.md). That spike picked option 1, a fused split-local top-512 followed by a split-aware merge. This plan implements that choice, gates it against the ticket's acceptance criteria, and records when the fallback applies.
 
+Closed 2026-11-20. Option 1 misses gate 1 after tuning, and the 16-bit fallback in [qsa-indexer-fused-select-16-bit-fallback-plan.md](qsa-indexer-fused-select-16-bit-fallback-plan.md) misses it too. No shape is dispatched. `qsa_indexer_block_ids` stays the public path. `_fused_select_wins` stays false.
+
 ## Locked decisions
 
 Change these only by editing this section and adding a log line. Code, tests, and the write-up follow this section as it stands.
@@ -204,16 +206,20 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 - [x] Rerun the Phase 0 bench with the fused arm added, on an idle gfx950, in one session with interleaved repeats, warm and cold.
 - [x] Apply gate 1 per case and fill the [Kernel gate](#kernel-gate) table.
 - [x] Tune the split count, tile count and candidate layout on the losing cases. Record each tuning change and its effect in [Log](#log).
-- [ ] Measure gfx942. Enable the fused path there only for the cases where it wins, and record that set.
-- [ ] If option 1 still misses gate 1 on 128K or 256K after tuning, record that in [Decision record](#decision-record) and plan the 16-bit fallback as a follow-up subtask list here.
+- [x] Measure gfx942. Enable the fused path there only for the cases where it wins, and record that set. The chosen 32 KiB state does not launch on gfx942 (Phase 1). The enabled set is empty.
+- [x] If option 1 still misses gate 1 on 128K or 256K after tuning, record that in [Decision record](#decision-record) and plan the 16-bit fallback as a follow-up subtask list here. Recorded. The follow-up is [qsa-indexer-fused-select-16-bit-fallback-plan.md](qsa-indexer-fused-select-16-bit-fallback-plan.md). It also misses gate 1: `p128k` 6084.9 µs against 3611.5 µs, `p256k` 9468.2 µs against 5734.1 µs.
 
 ### 7. Integration in aiter
+
+Does not start. No shape won gate 1, so callers stay on `qsa_indexer_block_ids`.
 
 - [ ] Route `qsa_select_paged_tokens` and `qsa_indexer_block_ids` callers to the fused path for supported shapes, behind the Phase 5 dispatch. Keep the old path for every other shape and arch.
 - [ ] Run the existing `op_tests/test_flydsl_qsa.py` suite and the new tests in full through `gpuq`.
 - [ ] Before editing `topk_per_row.py`, agree the merge order with the #5525 and #5677 owners. If the merge kernel does not need that file, record that.
 
 ### 8. Serving validation
+
+Does not start. The kernel gate missed, so there is no fused entry to wire.
 
 - [ ] Wire the fused entry into the vLLM opt-in path (`--attention-config.qwen4_exp_qsa_backend flydsl`, vllm#59437) on a vLLM checkout in `flydsl_venv`.
 - [ ] Run Qwen3.8-Flash-Next TP2 on MI355X through `gpuq --num-gpus=2`, comparing median TTFT at 32K and 128K (c1, c4, c16) against the vllm#65188 head with its prefill scorer. Also record median ITL.
@@ -222,12 +228,14 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 
 ### 9. Decode table
 
+Does not start. The kernel gate missed, so the fused design is not timed for decode.
+
 - [ ] Time 1 to 64 rows and MTP rows at 8K to 256K under graph replay with padded tables. Record scoring, selection and merge time for the fused design against the current paths. Fill the [Decode table](#decode-table).
 
 ### 10. Close
 
-- [ ] Write the outcome, the gates met, and the margins into [Decision record](#decision-record).
-- [ ] Log the date. Leave spike copies and probes out of production dispatch.
+- [x] Write the outcome, the gates met, and the margins into [Decision record](#decision-record). Written 2026-11-20. Option 1 and the 16-bit fallback both miss gate 1.
+- [x] Log the date. Leave spike copies and probes out of production dispatch. Logged. `_fused_select_wins` stays false, and the public entry is unchanged.
 
 ## Results
 
@@ -454,21 +462,21 @@ GSM8K and GPQA Diamond:
 
 Phase 0, gate 5: does not fire. The profile-only close is not taken. Phase 1 is next. The `p128k` share was read on the 65856-column pad, not the trimmed 32928-column prefix. The conclusion stands: gate 5 needs both shares under 0.15, and `p256k` is 0.334 on the 168-page table, which is the width a prefill step launches at `max_model_len`.
 
-Outcome:
+Outcome: closed, miss. Option 1 misses gate 1 after tuning: probe-free warm-2 `p128k` is 3814.2 µs against aiter#5996 at 3623.9 µs, and `p256k` is 7934.8 µs against 5845.4 µs. The 16-bit fallback also misses: `p128k` 6084.9 µs against 3611.5 µs, `p256k` 9468.2 µs against 5734.1 µs. No shape is dispatched. `_fused_select_wins` stays false. `qsa_indexer_block_ids` stays the public path. Phases 7, 8, and 9 do not start.
 
-Gates met: Gate 5 was applied on the 2026-11-12 interleaved warm-2 medians and did not fire. No acceptance gate is met yet.
+Gates met: Gate 5 was applied on the 2026-11-12 interleaved warm-2 medians and did not fire. Gate 1 is not met for option 1 or the 16-bit fallback. No acceptance gate is met.
 
 Margins: Arm A top-k-plus-expand share is 0.454 at `p128k` (1724.4 µs of 3797.3 µs) and 0.334 at `p256k` (1955.5 µs of 5861.4 µs). Gate 5 at `p128k` used that full 65856-column pad. A trimmed prefill step at 128K is 32928 columns, so 0.454 is not the trimmed-prefix share. `p256k` is the 168-page table, which trim leaves unchanged at `max_model_len`, and 0.334 is already above 0.15, so the gate does not fire on either reading. 1724.4 µs is not the trimmed-prefix budget. At `p256k` the faster arm is aiter#5996 at 5861.4 µs. Arm B's 66392.3 µs is the per-row scorer: the trimmed width makes 512-row chunks, and the MFMA tile starts at 768 rows.
 
-gfx942 enablement:
+gfx942 enablement: none. The chosen 32 KiB fused state does not launch there. The 16-bit path was not measured there, because it missed gate 1 on gfx950 and its plan stops on that miss.
 
-Fallback used (yes or no, and why):
+Fallback used: yes. [qsa-indexer-fused-select-16-bit-fallback-plan.md](qsa-indexer-fused-select-16-bit-fallback-plan.md). It misses gate 1 on every case. The margins are in that document's kernel-gate table.
 
 ## Open questions
 
 - Should decode rows of a mixed step share the prefill launch or keep a separate small launch? Phase 5 answers this by measurement. Answered 2026-11-18: keep the separate launch. Sharing the prefill tile repeats the column scan once per request id in the tile, and split was faster on mix3, mix16, mix64, and mtp. Both still lose to today's indexer, so the public entry does not take either fused launch until a measured step wins.
 - Which split count and candidate layout per context bucket? Phase 1 chose 4-byte candidates for 16 rows and the split counts in [Candidate state](#candidate-state). Phase 6 retunes a case that loses.
-- On gfx942, 16 KiB of candidates fits beside the key tile and 32 KiB does not. Whether a 16 KiB state wins there is a Phase 6 measurement.
+- On gfx942, 16 KiB of candidates fits beside the key tile and 32 KiB does not. Whether a 16 KiB state wins there is a Phase 6 measurement. Answered 2026-11-20: not pursued. The chosen state is 32 KiB, it does not launch, and both prescribed paths missed gate 1 on gfx950. A new 16 KiB design is out of scope.
 
 ## Log
 
@@ -508,3 +516,4 @@ Fallback used (yes or no, and why):
 - 2026-11-19: Phase 6 interleaved gate on `563f626507` (`samaario/qsa-parallel-merge`). Two idle gpuq sessions of `op_tests/bench_qsa_indexer_select_abc.py`, buses 0000:65:00.0 and 0000:85:00.0, five warmup and ten timed. p128k fused warm-2 is 3834.7 and 3854.2 µs against aiter#5996 at 3882.7 and 3883.4 µs. p8k fused is 251.6 and 250.6 µs against vllm#65188 at 206.7 and 207.7 µs. These were taken with the stage probe open. Superseded by the probe-free rerun below; the p128k "strictly faster" reading in this entry is withdrawn. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 6 interleaved gate, third idle session on bus 0000:65:00.0 (rocm 2), same commit, probe on. p128k fused 3837.7 / 3831.5 / 3897.5 (warm-1 / warm-2 / cold) against aiter#5996 3874.1 / 3877.7 / 3904.4. p8k warm-2 fused 249.5 against vllm#65188 206.5. Also superseded by the probe-free rerun.
 - 2026-11-19: Phase 6 probe-free interleaved rerun, one clean grant on bus 0000:75:00.0 (rocm 3), `563f626507`, idle. The probe was removed from the main pass and arm A was timed as one event pair. Fused p128k warm-2 3814.2 against aiter#5996 3623.9, so fused is 1.053× slower and the earlier p128k win is gone. Fused is not strictly faster than the faster arm at any case of 32K or more. p8k fused is 1.130× vllm#65188 (231.2 against 204.5) on the kernel-sum definition. The probe inflated fused by about 20 µs at p8k and about 15 µs at p128k, and alternating the arms adds about 18 µs more at p8k. Stage-split arm A (probe on) read 3856 µs at p128k, and whole-call arm A read 3624 µs probe-free, so the two bases are not comparable. Gate 1 is not met. The vllm arm definition (kernel sum or whole call) is open and decides the p8k verdict. `op_tests/bench_qsa_indexer_select_abc.py` now times arm A as one event pair and does not open the stage probe. Harness copy used for this run: `/tmp/abc_probefree.py`, log `/tmp/abc_probefree.log`.
+- 2026-11-20: Closed. Option 1 misses gate 1 after tuning, and the 16-bit fallback misses it too. Probe-free fused warm-2 is 3814.2 µs against aiter#5996 at 3623.9 µs at `p128k`, and 7934.8 µs against 5845.4 µs at `p256k`. The fallback's own probe-free warm-2, bus 0000:f5:00.0, is 6084.9 µs against 3611.5 µs at `p128k` and 9468.2 µs against 5734.1 µs at `p256k`. Every case misses. gfx942 stays on today's indexer: the 32 KiB fused state does not launch there, and the 16-bit path was not measured there. Phases 7, 8, and 9 do not start. `_fused_select_wins` stays false. `qsa_indexer_block_ids` stays the public path. Spike copies stay out of dispatch.
