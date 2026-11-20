@@ -632,25 +632,36 @@ def _sol_attn_pool_packed_k(
     result = (*_sol_attn_pack_k(pooled, fmt, BLOCK_N), pooled)
     if not variance:
         return result
-    from aiter.ops.mha_v4_quant import rotate_activation_hd128
-
-    def rotate(x: torch.Tensor) -> torch.Tensor:
-        # hd256 packers rotate each 128-channel half on its own, as hd128 rows.
-        rows = x.reshape(*x.shape[:2], -1, 128)
-        out = torch.empty_like(rows)
-        rotate_activation_hd128(out, rows)
-        return out.view(x.shape)
-
     rotated_var = _sol_attn_block_variance(
-        rotate(k_source.contiguous()).float(), BLOCK_N
+        _sol_attn_rotate(k_source.contiguous()).float(), BLOCK_N
     )
     return (
         *result,
-        *_sol_attn_pack_k(
-            rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
-        ),
+        *_sol_attn_pack_k_variance(rotated_var, fmt, BLOCK_N),
         rotated_var,
     )
+
+
+def _sol_attn_rotate(x: torch.Tensor) -> torch.Tensor:
+    """x through the K packers' rotation: hd128, on each 128-channel half at hd256."""
+    from aiter.ops.mha_v4_quant import rotate_activation_hd128
+
+    rows = x.reshape(*x.shape[:2], -1, 128)
+    out = torch.empty_like(rows)
+    rotate_activation_hd128(out, rows)
+    return out.view(x.shape)
+
+
+def _sol_attn_pack_k_variance(
+    rotated_var: torch.Tensor, fmt: str, BLOCK_N: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a pooled variance taken in the rotated basis through `fmt`'s K packer.
+
+    It is rotated back first, so the packer's own rotation lands it where the kernel reads it; the
+    normalized Hadamard is its own inverse.
+    """
+    unrotated = _sol_attn_rotate(rotated_var.to(torch.bfloat16).contiguous())
+    return _sol_attn_pack_k(unrotated, fmt, BLOCK_N)
 
 
 def _sol_attn_pool_fp6_p_v(
