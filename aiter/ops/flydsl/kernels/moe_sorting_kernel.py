@@ -1904,12 +1904,19 @@ def moe_sorting_flydsl(
             )
 
     if local_tokens_tensor is None:
+        # A buffer first created inside a capture must not be cached for every
+        # other graph: its zero is recorded, not executed, until that graph
+        # replays. An already-initialized eager buffer is shared as before.
         local_tokens_tensor = _dummy_local_tokens_cache.get(topk_ids.device)
         if local_tokens_tensor is None:
-            local_tokens_tensor = torch.zeros(
-                1, dtype=torch.int32, device=topk_ids.device
-            )
-            _dummy_local_tokens_cache[topk_ids.device] = local_tokens_tensor
+            from aiter.utility.graph_alloc import persistent_alloc
+
+            with persistent_alloc(topk_ids.device):
+                local_tokens_tensor = torch.zeros(
+                    1, dtype=torch.int32, device=topk_ids.device
+                )
+            if not torch.cuda.is_current_stream_capturing():
+                _dummy_local_tokens_cache[topk_ids.device] = local_tokens_tensor
 
     sub_tokens = _compute_sub_tokens(num_experts)
 
@@ -1931,8 +1938,12 @@ def moe_sorting_flydsl(
     if not has_mask:
         mask_tensor = _dummy_mask_cache.get(device)
         if mask_tensor is None:
-            mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
-            _dummy_mask_cache[device] = mask_tensor
+            from aiter.utility.graph_alloc import persistent_alloc
+
+            with persistent_alloc(device):
+                mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
+            if not torch.cuda.is_current_stream_capturing():
+                _dummy_mask_cache[device] = mask_tensor
     else:
         mask_tensor = expert_mask
 

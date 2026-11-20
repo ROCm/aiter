@@ -1271,6 +1271,12 @@ def quant_mxfp4_hip(
     return out_packed, out_scale
 
 
+def _graph_safe_empty(*size, dtype, device):
+    from aiter.utility.graph_alloc import capture_defined
+
+    return capture_defined(*size, dtype=dtype, device=device)
+
+
 def fused_dynamic_mx_quant_moe_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -1341,11 +1347,12 @@ def fused_dynamic_mx_quant_moe_sort(
     # `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12)
     # trigger OOB writes in the kernel that uses the padded stride.
     # Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the
-    # kernel (guarded by `scale_k < scaleN_valid`) and contain allocator
-    # garbage; production GEMM consumers don't read them so this is safe.
-    # Tests comparing byte-level equality must mask out those positions.
+    # kernel (guarded by `scale_k < scaleN_valid`). Under HIP-graph replay that
+    # memory keeps the previous step, so the buffer is zeroed while capturing
+    # (`_graph_safe_empty`). Eager leaves it uninitialized; tests that compare
+    # bytes must mask those columns out.
     scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
-    scale = torch.empty(
+    scale = _graph_safe_empty(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         scaleN_pad,
         dtype=dtypes.fp8_e8m0,
@@ -1357,7 +1364,7 @@ def fused_dynamic_mx_quant_moe_sort(
         or group_size != 32
     )
     if use_fused:
-        out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        out = _graph_safe_empty(M, out_cols, dtype=quant_dtype, device=input.device)
         # The routing top-k goes in explicitly: at stage1 ``input`` has only M
         # rows, from which the HIP kernel would infer a top-k of 1.
         common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
