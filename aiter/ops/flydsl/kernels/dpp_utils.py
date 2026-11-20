@@ -3,6 +3,9 @@
 
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.expr.typing import T
 
 
 def update_dpp_i32(
@@ -52,3 +55,20 @@ def dpp_xor_f32(src, offset: int, **kw):
             f"dpp_xor_f32 only supports 16-lane offsets 1, 2, 4, 8; got {offset}"
         )
     return out_i32.bitcast(T.f32)
+
+
+def permlane_swap_i32(swap, a, b):
+    """``v_permlane16_swap_b32`` / ``v_permlane32_swap_b32`` of two i32 values.
+
+    ``swap`` is ``fx.rocdl.permlane16_swap`` or ``fx.rocdl.permlane32_swap``;
+    returns the op's two results (its ``{i32, i32}`` struct) as ``fx.Int32``.
+    Raw rocdl op + ``llvm.extractvalue``: FlyDSL 0.5.0 has no typed permlane
+    swap, and ``fx.gpu.shuffle_xor`` lowers to ``ds_bpermute_b32`` (an LDS
+    round trip) or a longer select sequence instead of one VALU op.
+    """
+    pair = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    res = swap(pair, fx.as_ir_value(a), fx.as_ir_value(b), False, False)
+    return (
+        fx.Int32(llvm.extractvalue(T.i32, res, [0])),
+        fx.Int32(llvm.extractvalue(T.i32, res, [1])),
+    )

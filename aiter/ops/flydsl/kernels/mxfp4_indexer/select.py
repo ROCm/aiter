@@ -27,7 +27,6 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .. import buffer_ops
 from .common import (
     BLOCK,
     CANDIDATES,
@@ -44,11 +43,16 @@ from .common import (
     bi,
     gptr,
     key_of,
+    load,
     maxf,
     mfma_fp4,
     minf,
     not_nan,
+    sload,
+    store,
     token_logit,
+    view,
+    wave_of,
     wave_scan_incl,
     xor_lane,
 )
@@ -139,18 +143,13 @@ def compile_select(
         sm = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
         lane = tx & 63
-        wave = I(fx.rocdl.readfirstlane(T.i32, tx >> 6))
+        wave = wave_of(tx)
         col = lane & 31
         h = lane >> 5
         # workgroup w runs on XCD w % 8: a request's rows share that XCD's L2 (they read mostly the same keys)
         wg = fx.block_idx.x
         req = (wg // 8 // NN) * 8 + wg % 8
         row = req * NN + (wg // 8) % NN
-
-        def res(addr, n):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=n
-            )
 
         # Scratch words (wave sums, block reductions, bucket results) rotate through four regions: a region is not
         # written again before two barriers have passed, so none needs a barrier after its reads.
@@ -338,115 +337,75 @@ def compile_select(
 
         go = req < reqs
         if const_expr(skip_long):
-            raw_end = I(
-                buffer_ops.buffer_load(
-                    res(row_ends, I64(reqs * NN) * 4), row, vec_width=1, dtype=I
-                )
-            )
+            raw_end = load(view(row_ends, I64(reqs * NN) * 4), row)
             go = go & (raw_end <= I(NB * BLOCK))
         if go:
             # the first loads: the block maxima or candidate ids, whose latency the rest overlaps
             if const_expr(gather):
-                cr = res(candidates + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
+                cr = view(candidates + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
                 ids = [
-                    I(
-                        buffer_ops.buffer_load(
-                            cr, tx * (CANDIDATES // NT) + j, vec_width=1, dtype=I
-                        )
-                    )
+                    load(cr, tx * (CANDIDATES // NT) + j)
                     for j in range_constexpr(CANDIDATES // NT)
                 ]
             else:
-                wsr = res(
-                    scores + I64(row) * I64(scores_stride) * 4, I64(scores_stride) * 4
+                wsr = view(
+                    scores + I64(row) * I64(scores_stride) * 4,
+                    I64(scores_stride) * 4,
+                    F,
+                    4,
                 )
                 raw = [
-                    Vec(
-                        buffer_ops.buffer_load(
-                            wsr, tx * EA + qq * 4, vec_width=4, dtype=F
-                        )
-                    )
-                    for qq in range_constexpr(EA // 4)
+                    load(wsr, tx * EA + qq * 4, F, 4) for qq in range_constexpr(EA // 4)
                 ]
-            end = I(
-                buffer_ops.buffer_load(
-                    res(row_ends + I64(row) * 4, 4),
-                    0,
-                    vec_width=1,
-                    dtype=I,
-                    is_scalar=True,
-                )
-            )
+            end = sload(view(row_ends + I64(row) * 4, 4), 0)
             end = (end < I(0)).select(I(0), end)
             end = (end > I(NB * BLOCK)).select(I(NB * BLOCK), end)
             nb = (end + 7) // 8
-            orr = res(out + I64(row) * (TOPK * 4), TOPK * 4)
+            orr = view(out + I64(row) * (TOPK * 4), TOPK * 4)
 
             sm.bc.ptr[tx & 15] = I(0)
             # q, weights, this request's page ids: independent of the blocks, loaded first
-            qr = res(q + I64(row) * (H * 64), H * 64)
-            qsw = I(
-                buffer_ops.buffer_load(
-                    res(q_scale + I64(row) * (H * 4), H * 4), col, vec_width=1, dtype=I
-                )
-            )
+            qr = view(q + I64(row) * (H * 64), H * 64, unit=4)
+            qsw = load(view(q_scale + I64(row) * (H * 4), H * 4), col)
             qv = [
-                Vec(
-                    buffer_ops.buffer_load(
-                        qr, (col * 64 + kb * 32 + h * 16) // 4, vec_width=4, dtype=I
-                    )
-                )
+                load(qr, (col * 64 + kb * 32 + h * 16) // 4, unit=4)
                 for kb in range_constexpr(2)
             ]
             sa = [(qsw >> ((2 * kb + h) * 8)) & 0xFF for kb in range_constexpr(2)]
-            wr_ = res(weights + I64(row) * (H * 4), H * 4)
+            wr_ = view(weights + I64(row) * (H * 4), H * 4, F, 4)
             wv = []
             for j in range_constexpr(4):
-                v = Vec(
-                    buffer_ops.buffer_load(wr_, 8 * j + 4 * h, vec_width=4, dtype=F)
-                )
+                v = load(wr_, 8 * j + 4 * h, F, 4)
                 wv += [F(v[0]), F(v[1]), F(v[2]), F(v[3])]
-            btr = res(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
+            btr = view(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
             for qq in range_constexpr(-(-NBT // NT)):
-                sm.pg.ptr[tx + qq * NT] = I(
-                    buffer_ops.buffer_load(btr, tx + qq * NT, vec_width=1, dtype=I)
-                )
+                sm.pg.ptr[tx + qq * NT] = load(btr, tx + qq * NT)
             if const_expr(slot_log2 > 0):
                 # the ragged lists: this row starts after the rows before it, each min(512, end) long (0 when not valid)
                 rows_t = reqs * NN
-                vr = res(valid, I64(rows_t) * 4)
-                er = res(row_ends, I64(rows_t) * 4)
+                vr = view(valid, I64(rows_t) * 4)
+                er = view(row_ends, I64(rows_t) * 4)
                 before = I(0)
                 for qq in range_constexpr(MAX_ROWS // NT):
                     j_ = tx + qq * NT
-                    e_j = I(buffer_ops.buffer_load(er, j_, vec_width=1, dtype=I))
-                    v_j = I(buffer_ops.buffer_load(vr, j_, vec_width=1, dtype=I))
+                    e_j = load(er, j_)
+                    v_j = load(vr, j_)
                     ec = (e_j < I(0)).select(I(0), e_j)
                     l_j = (v_j != I(0)).select((ec > I(TOPK)).select(I(TOPK), ec), I(0))
                     before = before + (j_ < row).select(l_j, I(0))
                 _o, start = bscan(before)
-                my_valid = I(
-                    buffer_ops.buffer_load(
-                        vr, row, vec_width=1, dtype=I, is_scalar=True
-                    )
-                ) != I(0)
+                my_valid = sload(vr, row) != I(0)
                 my_len = my_valid.select((end < I(TOPK)).select(end, I(TOPK)), I(0))
-                sgr = res(
+                sgr = view(
                     slot_table + I64(req) * I64(slot_stride) * 4, I64(slot_stride) * 4
                 )
                 for qq in range_constexpr(-(-NSG // NT)):
                     i_ = tx + qq * NT
-                    sm.sg.ptr[(i_ < NSG).select(i_, I(NSG - 1))] = I(
-                        buffer_ops.buffer_load(sgr, i_, vec_width=1, dtype=I)
-                    )
-                ipr = res(indptr, I64(rows_t + 1) * 4)
-                buffer_ops.buffer_store(start, ipr, row, mask=tx == 0)
-                buffer_ops.buffer_store(
-                    start + my_len, ipr, rows_t, mask=(tx == 0) & (row == rows_t - 1)
-                )
-                buffer_ops.buffer_store(
-                    my_len, res(lens, I64(rows_t) * 4), row, mask=tx == 0
-                )
+                    sm.sg.ptr[(i_ < NSG).select(i_, I(NSG - 1))] = load(sgr, i_)
+                ipr = view(indptr, I64(rows_t + 1) * 4)
+                store(ipr, row, start, mask=tx == 0)
+                store(ipr, rows_t, start + my_len, mask=(tx == 0) & (row == rows_t - 1))
+                store(view(lens, I64(rows_t) * 4), row, my_len, mask=tx == 0)
 
             # ---- the blocks to score: ascending ids in LDS
             if const_expr(gather):
@@ -516,16 +475,14 @@ def compile_select(
                     for j in range_constexpr(EA):
                         cnt2 = cnt2 + chosen[j].select(I(1), I(0))
                     off3, total3 = bscan(cnt2)
-                    cor = res(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
+                    cor = view(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
                     c3 = I(0)
                     for j in range_constexpr(EA):
-                        buffer_ops.buffer_store(
-                            tx * EA + j, cor, off3 + c3, mask=chosen[j]
-                        )
+                        store(cor, off3 + c3, tx * EA + j, mask=chosen[j])
                         c3 = c3 + chosen[j].select(I(1), I(0))
                     for qq in range_constexpr(CANDIDATES // NT):
                         p = tx + qq * NT
-                        buffer_ops.buffer_store(I(-1), cor, p, mask=p >= total3)
+                        store(cor, p, I(-1), mask=p >= total3)
                 stotal = cab + mc
                 big = stotal > I(KB)
                 inset = [
@@ -665,21 +622,21 @@ def compile_select(
             for j in range_constexpr(EB):
                 e = tx * EB + j
                 pos_e = I(sm.bl.ptr[e >> 3]) * BLOCK + (e & 7)
-                buffer_ops.buffer_store(pos_e, orr, off + c, mask=chosen[j])
+                store(orr, off + c, pos_e, mask=chosen[j])
                 if const_expr(slot_log2 > 0):
                     slot = (I(sm.sg.ptr[pos_e >> slot_log2]) << slot_log2) | (
                         pos_e & ((1 << slot_log2) - 1)
                     )
-                    buffer_ops.buffer_store(
-                        slot,
-                        res(slots, I64(reqs * NN) * (TOPK * 4)),
+                    store(
+                        view(slots, I64(reqs * NN) * (TOPK * 4)),
                         start + off + c,
+                        slot,
                         mask=chosen[j] & my_valid,
                     )
                 c = c + chosen[j].select(I(1), I(0))
             for qq in range_constexpr(-(-TOPK // NT)):
                 p = tx + qq * NT
-                buffer_ops.buffer_store(I(-1), orr, p, mask=(p >= total) & (p < TOPK))
+                store(orr, p, I(-1), mask=(p >= total) & (p < TOPK))
 
     @flyc.jit
     def launch(

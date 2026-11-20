@@ -1,15 +1,15 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-"""Constants and FlyDSL helpers of the MXFP4 indexer kernels: the scaled MFMA, a token's logit from its accumulator,
-DPP / permlane lane exchange, the wave scan and the order-preserving fp32 keys."""
+"""Constants and FlyDSL helpers of the MXFP4 indexer kernels: buffer views, the scaled MFMA, a token's logit from its
+accumulator, DPP / permlane lane exchange, the wave scan and the order-preserving fp32 keys.
+"""
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from ..dpp_utils import permlane_swap_i32, update_dpp_i32
+from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 H = 32  # index heads
 D = 128  # index head dim
@@ -22,6 +22,48 @@ NBINS = 4096  # buckets of the select's histogram
 F, I, I64, U = fx.Float32, fx.Int32, fx.Int64, fx.Uint32
 NEG_INF = float("-inf")
 INF = float("inf")
+# A masked-off access goes to this element index: its byte offset (0x7FFFFFFC for 4-byte elements, 0x3FFFFFFE for
+# 2-byte ones) is past every view's ``nbytes``, so the hardware range check drops the store / returns 0 for the load.
+OFF_RANGE = 0x1FFFFFFF
+
+
+def view(addr, nbytes, elem=None, unit=1):
+    """Buffer tensor over the ``nbytes`` bytes at device address ``addr`` (descriptor in SGPRs, 32-bit offsets, range
+    checked). ``unit`` > 1: ``unit``-element accesses at any element offset."""
+    return ptr_buf_tensor(
+        addr,
+        elem=elem or I,
+        unit_elems=unit,
+        unit_stride=1 if unit > 1 else None,
+        num_records_bytes=nbytes,
+    )
+
+
+def load(t, index, elem=None, unit=1, mask=None):
+    """Element ``index`` of view ``t`` (``unit`` elements from it as a vector); 0 where ``mask`` is false."""
+    if mask is not None:
+        index = mask.select(index, I(OFF_RANGE))
+    v = buf_copy_load(t, index, elem or I, unit)
+    return Vec(v) if unit > 1 else (elem or I)(v)
+
+
+def store(t, index, value, elem=None, mask=None):
+    """Element ``index`` of view ``t`` = ``value``, where ``mask`` (if given) is true."""
+    if mask is not None:
+        index = mask.select(index, I(OFF_RANGE))
+    buf_copy_store(t, index, value, elem or I)
+
+
+def sload(t, index):
+    """Element ``index`` of the i32 view ``t`` by a scalar load (``index`` wave-uniform): the value lands in an SGPR."""
+    return fx.rocdl.s_buffer_load(fx.get_iter(t), index)
+
+
+def wave_of(tx):
+    """The wave of thread ``tx`` in its workgroup, wave-uniform. Raw ``rocdl.readfirstlane``: FlyDSL 0.5.0 has no typed
+    broadcast, and without ``v_readfirstlane_b32`` the compiler keeps ``tx >> 6`` in a VGPR, so every LDS and buffer
+    offset derived from it is per-lane VALU work."""
+    return I(fx.rocdl.readfirstlane(T.i32, tx >> 6))
 
 
 def bi(x):
@@ -37,26 +79,11 @@ def ushr(a, n):
 
 
 def dpp(src, ctrl, old=None, bank_mask=0xF, row_mask=0xF, bound=True):
-    """``v_mov_b32_dpp`` of an i32. FlyDSL 0.5.0 has no typed DPP operation
-    (``shuffle_xor`` lowers to ``ds_bpermute`` through LDS), so this emits
-    ``rocdl.update_dpp``; ``old`` defaults to an undefined value (raw
-    ``llvm.mlir_undef``: there is no fx undef)."""
-    o = _llvm.mlir_undef(T.i32) if old is None else fx.as_ir_value(old)
-    return I(
-        fx.rocdl.update_dpp(
-            T.i32, o, fx.as_ir_value(src), ctrl, row_mask, bank_mask, bound
-        )
-    )
-
-
-def _swap_pair(swap, a, b):
-    """``v_permlane16/32_swap`` of two i32 (no typed FlyDSL 0.5.0 API): the two
-    results, unpacked from the op's ``{i32, i32}`` struct."""
-    pair = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    res = swap(pair, fx.as_ir_value(a), fx.as_ir_value(b), False, False)
-    return I(_llvm.extractvalue(T.i32, res, [0])), I(
-        _llvm.extractvalue(T.i32, res, [1])
-    )
+    """``v_mov_b32_dpp`` of an i32 (``dpp_utils.update_dpp_i32``; FlyDSL 0.5.0 has no typed DPP operation, and
+    ``shuffle_xor`` lowers to ``ds_bpermute`` through LDS). ``old`` defaults to an undefined value, so the result does
+    not need a copy of ``src`` first (raw ``llvm.mlir_undef``: there is no fx undef)."""
+    o = _llvm.mlir_undef(T.i32) if old is None else old
+    return I(update_dpp_i32(o, src, ctrl, row_mask, bank_mask, bound))
 
 
 def xor_lane(v, m, lane):
@@ -70,7 +97,7 @@ def xor_lane(v, m, lane):
     if m == 8:
         return dpp(v, 0x128)
     op = fx.rocdl.permlane16_swap if m == 16 else fx.rocdl.permlane32_swap
-    a, b = _swap_pair(op, v, v)
+    a, b = permlane_swap_i32(op, v, v)
     return ((lane & m) != 0).select(a, b)
 
 
@@ -83,14 +110,12 @@ def wave_scan_incl(v):
 
 
 def maxf(a, b):
-    """``v_max_f32`` (``nnan``: no NaN canonicalisation around it)."""
-    fm = ir.Attribute.parse("#arith.fastmath<nnan>")
-    return F(fx.arith.maxnumf(a, b, fastmath=fm))
+    """``v_max_f32`` (``nnan``: no NaN canonicalisation around it; the operands are never NaN)."""
+    return F(fx.maxnumf(a, b, fastmath=fx.arith.FastMathFlags.nnan))
 
 
 def minf(a, b):
-    fm = ir.Attribute.parse("#arith.fastmath<nnan>")
-    return F(fx.arith.minnumf(a, b, fastmath=fm))
+    return F(fx.minnumf(a, b, fastmath=fx.arith.FastMathFlags.nnan))
 
 
 def not_nan(x):
@@ -99,14 +124,19 @@ def not_nan(x):
 
 
 def key_of(v):
-    """Order-preserving u32 key of an fp32 (as i32 bits); 0 for NaN and -inf, which no real logit maps to."""
+    """Order-preserving u32 key of an fp32 (as i32 bits); 0 for NaN and -inf, which no real logit maps to. A key of 0 is
+    never selected, so a NaN logit (a key whose e8m0 scale is 0xFF) is never among the top-512, where a top-k over
+    ``paged_mxfp4_mqa_logits``' output would rank it first."""
     b = v.bitcast(I)
     k = (b < I(0)).select(~b, b ^ I(-2147483648))
     return (not_nan(v) & (v > F(NEG_INF))).select(k, I(0))
 
 
 def gptr(addr, align=16, ty=None):
-    """Global pointer at a per-lane device address (``fx.generic_load``)."""
+    """Global pointer at a per-lane device address, for ``fx.generic_load``. The keys a select or scorer rescores are
+    gathered: each lane's page differs and the page pool can span more than 4 GiB, so neither a buffer descriptor (a
+    wave-uniform base in SGPRs, 32-bit offsets) nor a layout view of one tensor can address them; a 64-bit global load
+    is the only form."""
     ptr_ty = fx.PointerType.get(
         ty or T.i32, address_space=fx.AddressSpace.Global, alignment=align
     )
@@ -124,6 +154,7 @@ def mfma_fp4(a4, b4, acc, scale_a, scale_b, opsel_b=0):
         v, z = Vec(v), I(0)
         return Vec.from_elements([v[0], v[1], v[2], v[3], z, z, z, z], I)
 
+    # The rocdl op wrapper: FlyDSL 0.5.0's MMA atoms (fx.rocdl.MFMA) take no per-operand e8m0 scales.
     return Vec(
         fx.rocdl.mfma_scale_f32_32x32x64_f8f6f4(
             Vec.make_type(16, F),
@@ -145,7 +176,7 @@ def token_logit(acc, w):
 
 
 def _add_halves(p):
-    a, b = _swap_pair(fx.rocdl.permlane32_swap, bi(p), bi(p))
+    a, b = permlane_swap_i32(fx.rocdl.permlane32_swap, bi(p), bi(p))
     return bf(a) + bf(b)
 
 
@@ -161,5 +192,5 @@ def pair_logit(acc_a, acc_b, w):
         return (s[0] + s[1]) + (s[2] + s[3])
 
     pa, pb = partial(acc_a), partial(acc_b)
-    a, b = _swap_pair(fx.rocdl.permlane32_swap, bi(pa), bi(pb))
+    a, b = permlane_swap_i32(fx.rocdl.permlane32_swap, bi(pa), bi(pb))
     return bf(a) + bf(b)

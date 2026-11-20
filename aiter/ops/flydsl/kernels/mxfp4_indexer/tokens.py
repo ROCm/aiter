@@ -24,10 +24,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 
-from .. import buffer_ops
 from .common import (
     BLOCK,
     CANDIDATES,
@@ -37,6 +34,11 @@ from .common import (
     I,
     U,
     key_of,
+    load,
+    sload,
+    store,
+    view,
+    wave_of,
     wave_scan_incl,
     xor_lane,
 )
@@ -116,14 +118,9 @@ def compile_tokens_select(
         sm = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
         lane = tx & 63
-        wave = I(fx.rocdl.readfirstlane(T.i32, tx >> 6))
+        wave = wave_of(tx)
         row = fx.block_idx.x
         req = row // NN
-
-        def res(addr, n):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=n
-            )
 
         # scratch words (wave sums) rotate through four regions: one is not written again before two barriers passed
         turn = [0]
@@ -217,60 +214,43 @@ def compile_tokens_select(
         rows_t = reqs * NN
         go = row < rows_t
         if const_expr(min_end):
-            go = go & (
-                I(
-                    buffer_ops.buffer_load(
-                        res(row_ends, I64(rows_t) * 4), row, vec_width=1, dtype=I
-                    )
-                )
-                > I(min_end)
-            )
+            go = go & (load(view(row_ends, I64(rows_t) * 4), row) > I(min_end))
         if go:
-            lr = res(logits + I64(row) * I64(logits_stride) * 4, I64(logits_stride) * 4)
-            raw = [
-                Vec(buffer_ops.buffer_load(lr, tx * E + qq * 4, vec_width=4, dtype=F))
-                for qq in range_constexpr(E // 4)
-            ]
-            end = I(
-                buffer_ops.buffer_load(
-                    res(row_ends + I64(row) * 4, 4),
-                    0,
-                    vec_width=1,
-                    dtype=I,
-                    is_scalar=True,
-                )
+            lr = view(
+                logits + I64(row) * I64(logits_stride) * 4,
+                I64(logits_stride) * 4,
+                F,
+                4,
             )
+            raw = [load(lr, tx * E + qq * 4, F, 4) for qq in range_constexpr(E // 4)]
+            end = sload(view(row_ends + I64(row) * 4, 4), 0)
             end = (end < I(0)).select(I(0), end)
             if const_expr(not gathered):
                 end = (end > I(NTOK)).select(I(NTOK), end)
-            orr = res(out + I64(row) * (TOPK * 4), TOPK * 4)
+            orr = view(out + I64(row) * (TOPK * 4), TOPK * 4)
             if const_expr(emit_candidates):
                 # at most 2048 blocks: the candidate list is every block of the row
-                cor = res(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
+                cor = view(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
                 nb = (end + (BLOCK - 1)) // BLOCK
                 for qq in range_constexpr(CANDIDATES // NT):
                     p = tx + qq * NT
-                    buffer_ops.buffer_store((p < nb).select(p, I(-1)), cor, p)
+                    store(cor, p, (p < nb).select(p, I(-1)))
             if const_expr(slot_log2 > 0):
                 # the ragged lists: this row starts after the rows before it, each min(512, end) long (0 when not valid)
-                vr = res(valid, I64(rows_t) * 4)
-                er = res(row_ends, I64(rows_t) * 4)
+                vr = view(valid, I64(rows_t) * 4)
+                er = view(row_ends, I64(rows_t) * 4)
                 before = I(0)
                 for qq in range_constexpr(slot_rows // NT):
                     j_ = tx + qq * NT
-                    e_j = I(buffer_ops.buffer_load(er, j_, vec_width=1, dtype=I))
-                    v_j = I(buffer_ops.buffer_load(vr, j_, vec_width=1, dtype=I))
+                    e_j = load(er, j_)
+                    v_j = load(vr, j_)
                     ec = (e_j < I(0)).select(I(0), e_j)
                     l_j = (v_j != I(0)).select((ec > I(TOPK)).select(I(TOPK), ec), I(0))
                     before = before + (j_ < row).select(l_j, I(0))
                 _o, start = bscan(before)
-                my_valid = I(
-                    buffer_ops.buffer_load(
-                        vr, row, vec_width=1, dtype=I, is_scalar=True
-                    )
-                ) != I(0)
+                my_valid = sload(vr, row) != I(0)
                 my_len = my_valid.select((end < I(TOPK)).select(end, I(TOPK)), I(0))
-                sgr = res(
+                sgr = view(
                     slot_table + I64(req) * I64(slot_stride) * 4, I64(slot_stride) * 4
                 )
                 npages = (
@@ -278,28 +258,18 @@ def compile_tokens_select(
                 ) >> slot_log2  # the pages the row's positions reach
                 for qq in range_constexpr(-(-NSG // NT)):
                     i_ = tx + qq * NT
-                    sm.sg.ptr[(i_ < NSG).select(i_, I(NSG - 1))] = I(
-                        buffer_ops.buffer_load(
-                            sgr, i_, vec_width=1, dtype=I, mask=i_ < npages
-                        )
+                    sm.sg.ptr[(i_ < NSG).select(i_, I(NSG - 1))] = load(
+                        sgr, i_, mask=i_ < npages
                     )
-                ipr = res(indptr, I64(rows_t + 1) * 4)
-                buffer_ops.buffer_store(start, ipr, row, mask=tx == 0)
-                buffer_ops.buffer_store(
-                    start + my_len, ipr, rows_t, mask=(tx == 0) & (row == rows_t - 1)
-                )
-                buffer_ops.buffer_store(
-                    my_len, res(lens, I64(rows_t) * 4), row, mask=tx == 0
-                )
+                ipr = view(indptr, I64(rows_t + 1) * 4)
+                store(ipr, row, start, mask=tx == 0)
+                store(ipr, rows_t, start + my_len, mask=(tx == 0) & (row == rows_t - 1))
+                store(view(lens, I64(rows_t) * 4), row, my_len, mask=tx == 0)
 
             if const_expr(gathered):
-                gr = res(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
+                gr = view(cand_out + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
                 ids = [
-                    I(
-                        buffer_ops.buffer_load(
-                            gr, tx * (E // BLOCK) + b_, vec_width=1, dtype=I
-                        )
-                    )
+                    load(gr, tx * (E // BLOCK) + b_)
                     for b_ in range_constexpr(E // BLOCK)
                 ]
             keys = []
@@ -321,22 +291,22 @@ def compile_tokens_select(
                     (keys[j] == thr) & has_thr & (eqs < take)
                 )
                 pos = ((ids[j // BLOCK] << 3) | (j % BLOCK)) if gathered else tx * E + j
-                buffer_ops.buffer_store(pos, orr, off + c, mask=s_)
+                store(orr, off + c, pos, mask=s_)
                 if const_expr(slot_log2 > 0):
                     slot = (I(sm.sg.ptr[pos >> slot_log2]) << slot_log2) | (
                         pos & ((1 << slot_log2) - 1)
                     )
-                    buffer_ops.buffer_store(
-                        slot,
-                        res(slots, I64(rows_t) * (TOPK * 4)),
+                    store(
+                        view(slots, I64(rows_t) * (TOPK * 4)),
                         start + off + c,
+                        slot,
                         mask=s_ & my_valid,
                     )
                 c = c + s_.select(I(1), I(0))
                 eqs = eqs + (keys[j] == thr).select(I(1), I(0))
             for qq in range_constexpr(-(-TOPK // NT)):
                 p = tx + qq * NT
-                buffer_ops.buffer_store(I(-1), orr, p, mask=(p >= total) & (p < TOPK))
+                store(orr, p, I(-1), mask=(p >= total) & (p < TOPK))
 
     @flyc.jit
     def launch(

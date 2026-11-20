@@ -30,10 +30,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 
-from .. import buffer_ops
 from .common import (
     BLOCK,
     I64,
@@ -44,8 +41,13 @@ from .common import (
     U,
     bf,
     bi,
+    load,
     maxf,
     minf,
+    sload,
+    store,
+    view,
+    wave_of,
     wave_scan_incl,
     xor_lane,
 )
@@ -111,23 +113,14 @@ def compile_block_select(
         sm = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
         lane = tx & 63
-        wave = I(fx.rocdl.readfirstlane(T.i32, tx >> 6))
+        wave = wave_of(tx)
         row = fx.block_idx.x
         seg = fx.block_idx.y if SEG else I(0)
-
-        def res(addr, n):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=n
-            )
 
         def u(x):
             return x.bitcast(U)
 
-        end = I(
-            buffer_ops.buffer_load(
-                res(row_ends + I64(row) * 4, 4), 0, vec_width=1, dtype=I, is_scalar=True
-            )
-        )
+        end = sload(view(row_ends + I64(row) * 4, 4), 0)
         end = (end < I(0)).select(I(0), end)
         base = seg * SEGB if SEG else I(0)
         nb = (end + (BLOCK - 1)) // BLOCK  # blocks of the row
@@ -136,11 +129,13 @@ def compile_block_select(
         nbl = nb - base if SEG else used  # valid elements of this workgroup
         nbl = (nbl < I(0)).select(I(0), (nbl > I(NB)).select(I(NB), nbl))
         nvl = (nbl + 3) // 4
-        if const_expr(SEG):
-            sr = res(src + I64(row) * I64(src_stride) * 4, I64(src_stride) * 4)
-        else:
-            sr = res(src + I64(row) * I64(cmp_stride) * 4, I64(cmp_stride) * 4)
-        idr = res(ids + I64(row) * I64(cmp_stride) * 4, I64(cmp_stride) * 4)
+        sstride = src_stride if SEG else cmp_stride
+        srow = src + I64(row) * I64(sstride) * 4
+        sr = view(srow, I64(sstride) * 4, F)
+        sr4 = view(srow, I64(sstride) * 4, F, 4)
+        idr = view(ids + I64(row) * I64(cmp_stride) * 4, I64(cmp_stride) * 4)
+        valr = view(vals + I64(row) * I64(cmp_stride) * 4, I64(cmp_stride) * 4, F)
+        candr = view(cand_out + I64(row) * (SOURCE_SLOTS * 4), SOURCE_SLOTS * 4)
         sm.bc.ptr[tx & 31] = I(0)
         if tx < CAPM + 16:
             sm.cc.ptr[tx] = fx.Uint64(0)
@@ -154,16 +149,7 @@ def compile_block_select(
             vs = []
             for uu in range_constexpr(UN):
                 v = tx * UN + uu
-                vs.append(
-                    (
-                        v,
-                        Vec(
-                            buffer_ops.buffer_load(
-                                sr, base + v * 4, vec_width=4, dtype=F, mask=v < nvl
-                            )
-                        ),
-                    )
-                )
+                vs.append((v, load(sr4, base + v * 4, F, 4, mask=v < nvl)))
             out = []
             for v, x in vs:
                 for j in range_constexpr(4):
@@ -209,26 +195,12 @@ def compile_block_select(
                 if const_expr(SEG):
                     at = seg * SLOTS + p
                     m = (p >= total) & (p < SLOTS)
-                    buffer_ops.buffer_store(I(-1), idr, at, mask=m)
-                    buffer_ops.buffer_store(
-                        F(NEG_INF),
-                        res(vals + I64(row) * I64(cmp_stride) * 4, I64(cmp_stride) * 4),
-                        at,
-                        mask=m,
-                    )
+                    store(idr, at, I(-1), mask=m)
+                    store(valr, at, F(NEG_INF), F, mask=m)
                 else:
-                    buffer_ops.buffer_store(
-                        I(-1),
-                        res(
-                            cand_out + I64(row) * (CANDIDATES_ROW * 4),
-                            CANDIDATES_ROW * 4,
-                        ),
-                        p,
-                        mask=(p >= total) & (p < PAD),
-                    )
+                    store(candr, p, I(-1), mask=(p >= total) & (p < PAD))
 
         PAD = SOURCE_SLOTS if k > PLAIN_SLOTS else PLAIN_SLOTS
-        CANDIDATES_ROW = SOURCE_SLOTS
 
         if end > I(min_end):
             if nbl > I(0):
@@ -430,53 +402,25 @@ def compile_block_select(
                     lids = [(tx * WPT + w) * 32 + b for b in range_constexpr(32)]
                     if const_expr(SEG):
                         xs = [
-                            F(
-                                buffer_ops.buffer_load(
-                                    sr,
-                                    base + lids[b],
-                                    vec_width=1,
-                                    dtype=F,
-                                    mask=bits[b],
-                                )
-                            )
+                            load(sr, base + lids[b], F, mask=bits[b])
                             for b in range_constexpr(32)
                         ]
                     else:
                         gids = [
-                            I(
-                                buffer_ops.buffer_load(
-                                    idr, lids[b], vec_width=1, dtype=I, mask=bits[b]
-                                )
-                            )
+                            load(idr, lids[b], mask=bits[b])
                             for b in range_constexpr(32)
                         ]
                     for b in range_constexpr(32):
                         if const_expr(SEG):
                             gid = base + lids[b]
                             at = seg * SLOTS + run
-                            buffer_ops.buffer_store(gid, idr, at, mask=bits[b])
+                            store(idr, at, gid, mask=bits[b])
                             xv = xs[b]
                             if const_expr(newest):
                                 xv = (pin & (gid == pb)).select(F(INF), xv)
-                            buffer_ops.buffer_store(
-                                xv,
-                                res(
-                                    vals + I64(row) * I64(cmp_stride) * 4,
-                                    I64(cmp_stride) * 4,
-                                ),
-                                at,
-                                mask=bits[b],
-                            )
+                            store(valr, at, xv, F, mask=bits[b])
                         else:
-                            buffer_ops.buffer_store(
-                                gids[b],
-                                res(
-                                    cand_out + I64(row) * (CANDIDATES_ROW * 4),
-                                    CANDIDATES_ROW * 4,
-                                ),
-                                run,
-                                mask=bits[b],
-                            )
+                            store(candr, run, gids[b], mask=bits[b])
                         run = run + bits[b].select(I(1), I(0))
                 pad_slots(total)
             if nbl <= I(0):

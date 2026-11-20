@@ -20,7 +20,6 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .. import buffer_ops
 from .common import (
     BLOCK,
     CANDIDATES,
@@ -30,8 +29,13 @@ from .common import (
     H,
     I,
     gptr,
+    load,
     mfma_fp4,
+    sload,
+    store,
     token_logit,
+    view,
+    wave_of,
 )
 
 NW = 4  # waves a workgroup
@@ -75,62 +79,41 @@ def compile_candidate_logits(
     ):
         tx = fx.thread_idx.x
         lane = tx % 64
-        wave = I(fx.rocdl.readfirstlane(T.i32, tx // 64))
+        wave = wave_of(tx)
         col = lane % 32
         h = lane // 32
         row = fx.block_idx.y
         seg = fx.block_idx.x
         req = row // NN
 
-        def res(addr, n):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=n
-            )
-
-        end = I(
-            buffer_ops.buffer_load(
-                res(row_ends + I64(row) * 4, 4), 0, vec_width=1, dtype=I, is_scalar=True
-            )
-        )
+        end = sload(view(row_ends + I64(row) * 4, 4), 0)
         go = (
             (end > I(min_end)) if min_end else (I(0) == I(0))
         )  # min_end 0: every row, empty ones write -inf
         if go:
-            qr = res(q + I64(row) * (H * 64), H * 64)
-            qsw = I(
-                buffer_ops.buffer_load(
-                    res(q_scale + I64(row) * (H * 4), H * 4), col, vec_width=1, dtype=I
-                )
-            )
+            qr = view(q + I64(row) * (H * 64), H * 64, unit=4)
+            qsw = load(view(q_scale + I64(row) * (H * 4), H * 4), col)
             qv = [
-                Vec(
-                    buffer_ops.buffer_load(
-                        qr, (col * 64 + kb * 32 + h * 16) // 4, vec_width=4, dtype=I
-                    )
-                )
+                load(qr, (col * 64 + kb * 32 + h * 16) // 4, unit=4)
                 for kb in range_constexpr(2)
             ]
             sa = [(qsw >> ((2 * kb + h) * 8)) & 0xFF for kb in range_constexpr(2)]
-            wr = res(weights + I64(row) * (H * 4), H * 4)
+            wr = view(weights + I64(row) * (H * 4), H * 4, F, 4)
             wv = []
             for j in range_constexpr(4):
-                v = Vec(buffer_ops.buffer_load(wr, 8 * j + 4 * h, vec_width=4, dtype=F))
+                v = load(wr, 8 * j + 4 * h, F, 4)
                 wv += [F(v[0]), F(v[1]), F(v[2]), F(v[3])]
-            btr = res(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
-            cr = res(cand + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
-            sr = res(logits + I64(row) * I64(logits_stride) * 4, I64(logits_stride) * 4)
+            btr = view(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
+            cr = view(cand + I64(row) * (CANDIDATES * 4), CANDIDATES * 4)
+            sr = view(
+                logits + I64(row) * I64(logits_stride) * 4, I64(logits_stride) * 4, F
+            )
 
             for g0 in range_constexpr(0, NI, FLIGHT):
                 ids = []
                 for ti in range_constexpr(g0, g0 + FLIGHT):
                     tile = seg * tps + ti * NW + wave
-                    ids.append(
-                        I(
-                            buffer_ops.buffer_load(
-                                cr, tile * 4 + (col >> 3), vec_width=1, dtype=I
-                            )
-                        )
-                    )
+                    ids.append(load(cr, tile * 4 + (col >> 3)))
                 info = []
                 for ti, idv in zip(range_constexpr(g0, g0 + FLIGHT), ids):
                     tile = seg * tps + ti * NW + wave
@@ -142,7 +125,7 @@ def compile_candidate_logits(
                             tile,
                             pos,
                             ok,
-                            I(buffer_ops.buffer_load(btr, at, vec_width=1, dtype=I)),
+                            load(btr, at),
                         )
                     )
                 ks = []
@@ -179,10 +162,11 @@ def compile_candidate_logits(
                 for (tile, pos, ok, page), (kd0, kd1, ksw) in zip(info, ks):
                     acc = mfma_fp4(qv[0], kd0, Vec.filled(16, 0.0, F), sa[0], ksw, 0)
                     acc = mfma_fp4(qv[1], kd1, acc, sa[1], ksw, 1)
-                    buffer_ops.buffer_store(
-                        ok.select(token_logit(acc, wv), F(NEG_INF)),
+                    store(
                         sr,
                         tile * 32 + col,
+                        ok.select(token_logit(acc, wv), F(NEG_INF)),
+                        F,
                         mask=h == 0,
                     )
 

@@ -21,11 +21,26 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .. import buffer_ops
-from .common import I64, NEG_INF, F, H, I, bf, bi, dpp, maxf, mfma_fp4, pair_logit
+from .common import (
+    I64,
+    NEG_INF,
+    F,
+    H,
+    I,
+    bf,
+    bi,
+    dpp,
+    load,
+    maxf,
+    mfma_fp4,
+    pair_logit,
+    sload,
+    store,
+    view,
+    wave_of,
+)
 
 ROWS_PER_WAVE = {1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 3, 8: 4}
 
@@ -58,21 +73,16 @@ def compile_block_scores(next_n: int, page_entries: int, tokens: bool = False):
     ):
         tx = fx.thread_idx.x
         lane = tx % 64
-        wave = I(fx.rocdl.readfirstlane(T.i32, tx // 64))
+        wave = wave_of(tx)
         col = lane % 32
         h = lane // 32
         req = fx.block_idx.y
         seg = fx.block_idx.x
 
-        def res(addr, n):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=n
-            )
-
-        er = res(row_ends + I64(req) * (NN * 4), NN * 4)
+        er = view(row_ends + I64(req) * (NN * 4), NN * 4)
         ends, mx = [], I(0)
         for r in range_constexpr(NN):
-            e = I(buffer_ops.buffer_load(er, r, vec_width=1, dtype=I, is_scalar=True))
+            e = sload(er, r)
             ends.append(e)
             mx = (e > mx).select(e, mx)
         ntiles = (mx + 31) // 32
@@ -84,36 +94,28 @@ def compile_block_scores(next_n: int, page_entries: int, tokens: bool = False):
         t0 = seg * seg_tiles
         t1 = (ntiles < t0 + seg_tiles).select(ntiles, t0 + seg_tiles)
         if t0 < t1:
-            qr = res(q + I64(req) * (NN * H * 64), NN * H * 64)
-            qsr = res(q_scale + I64(req) * (NN * H * 4), NN * H * 4)
-            wr = res(weights + I64(req) * (NN * H * 4), NN * H * 4)
-            btr = res(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
-            sr = res(
+            qr = view(q + I64(req) * (NN * H * 64), NN * H * 64, unit=4)
+            qsr = view(q_scale + I64(req) * (NN * H * 4), NN * H * 4)
+            wr = view(weights + I64(req) * (NN * H * 4), NN * H * 4, F, 4)
+            btr = view(block_table + I64(req) * I64(bt_stride) * 4, I64(bt_stride) * 4)
+            sr = view(
                 scores + I64(req) * NN * I64(scores_stride) * 4,
                 I64(NN) * I64(scores_stride) * 4,
+                F,
             )
             rows, qv, sa, wv, end = [], [], [], [], []
             for r in range_constexpr(RPW):
                 rg = wave * RPW + r
                 rg = (rg < NN).select(rg, NN - 1)
                 rows.append(rg)
-                end.append(
-                    I(
-                        buffer_ops.buffer_load(
-                            er, rg, vec_width=1, dtype=I, is_scalar=True
-                        )
-                    )
-                )
-                qsw = I(buffer_ops.buffer_load(qsr, rg * H + col, vec_width=1, dtype=I))
+                end.append(sload(er, rg))
+                qsw = load(qsr, rg * H + col)
                 qv.append(
                     [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                qr,
-                                (rg * H * 64 + col * 64 + kb * 32 + h * 16) // 4,
-                                vec_width=4,
-                                dtype=I,
-                            )
+                        load(
+                            qr,
+                            (rg * H * 64 + col * 64 + kb * 32 + h * 16) // 4,
+                            unit=4,
                         )
                         for kb in range_constexpr(2)
                     ]
@@ -123,50 +125,29 @@ def compile_block_scores(next_n: int, page_entries: int, tokens: bool = False):
                 )
                 wl = []
                 for j in range_constexpr(4):
-                    v = Vec(
-                        buffer_ops.buffer_load(
-                            wr, rg * H + 8 * j + 4 * h, vec_width=4, dtype=F
-                        )
-                    )
+                    v = load(wr, rg * H + 8 * j + 4 * h, F, 4)
                     wl += [F(v[0]), F(v[1]), F(v[2]), F(v[3])]
                 wv.append(wl)
 
             def load_pair(t):
                 """K codes and scales of tiles t, t + 1 (one page: t is even)."""
                 tt = (t < t1).select(t, t1 - 1)
-                page = I(
-                    buffer_ops.buffer_load(
-                        btr, (tt * 32) // P, vec_width=1, dtype=I, is_scalar=True
-                    )
-                )
-                kr = res(kv + page.to(I64) * page_stride, page_stride)
+                page = sload(btr, (tt * 32) // P)
+                kpage = kv + page.to(I64) * page_stride
+                kr = view(kpage, page_stride, unit=4)
+                kr16 = view(kpage, page_stride, fx.Int16)
                 out = []
                 for u in range_constexpr(2):
                     g = (tt % (P // 32)) + u
-                    kd0 = Vec(
-                        buffer_ops.buffer_load(
-                            kr,
-                            (g * 2048 + h * 512 + col * 16) // 4,
-                            vec_width=4,
-                            dtype=I,
-                        )
-                    )
-                    kd1 = Vec(
-                        buffer_ops.buffer_load(
-                            kr,
-                            (g * 2048 + (2 + h) * 512 + col * 16) // 4,
-                            vec_width=4,
-                            dtype=I,
-                        )
-                    )
+                    kd0 = load(kr, (g * 2048 + h * 512 + col * 16) // 4, unit=4)
+                    kd1 = load(kr, (g * 2048 + (2 + h) * 512 + col * 16) // 4, unit=4)
                     ksw = (
                         I(
                             fx.Int16(
-                                buffer_ops.buffer_load(
-                                    kr,
+                                load(
+                                    kr16,
                                     (P * 64 + g * 128 + h * 64 + col * 2) // 2,
-                                    vec_width=1,
-                                    dtype=fx.Int16,
+                                    fx.Int16,
                                 )
                             ).to(I)
                         )
@@ -192,10 +173,11 @@ def compile_block_scores(next_n: int, page_entries: int, tokens: bool = False):
                         pair_logit(accs[0][r], accs[1][r], wv[r]), F(NEG_INF)
                     )
                     if const_expr(tokens):
-                        buffer_ops.buffer_store(
-                            v,
+                        store(
                             sr,
                             rows[r] * scores_stride + tok,
+                            v,
+                            F,
                             mask=(tok < end[r])
                             & (wave * RPW + r < NN)
                             & (t + lane // 32 < t1),
@@ -217,10 +199,11 @@ def compile_block_scores(next_n: int, page_entries: int, tokens: bool = False):
                             ),
                         )
                     )
-                    buffer_ops.buffer_store(
-                        bf(x),
+                    store(
                         sr,
                         rows[r] * scores_stride + t * 4 + lane // 8,
+                        bf(x),
+                        F,
                         mask=((lane % 8) == 0)
                         & (wave * RPW + r < NN)
                         & (t + lane // 32 < t1),
