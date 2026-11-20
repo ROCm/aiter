@@ -63,6 +63,50 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertIsNone(tuned_config)
         self.assertEqual(config["libtype"], "torch")
 
+    def _hipblaslt_lookup(self, row, live_name):
+        """Look up ``row`` with ``getHipblasltKernelName`` mocked."""
+        if isinstance(live_name, Exception):
+            lookup = mock.Mock(side_effect=live_name)
+        else:
+            lookup = mock.Mock(return_value=live_name)
+        tuned._hipblaslt_solution_matches.cache_clear()
+        self.addCleanup(tuned._hipblaslt_solution_matches.cache_clear)
+        with (
+            mock.patch.object(tuned, "getHipblasltKernelName", lookup),
+            mock.patch.object(tuned, "hipb_create_extension"),
+            mock.patch.object(tuned, "extensions_created", True),
+        ):
+            return (*self._lookup({KEY: row}), lookup)
+
+    def test_hipblaslt_row_with_another_live_kernel_is_skipped(self):
+        """A stale solution index must not run the kernel it now names."""
+        row = {"libtype": "hipblaslt", "solidx": 205437, "kernelName": "tuned_k"}
+        tuned_config, config, lookup = self._hipblaslt_lookup(row, "other_k")
+        self.assertIsNone(tuned_config)
+        self.assertEqual(config["libtype"], "torch")
+        lookup.assert_called_once_with(205437)
+
+        tuned_config, _, _ = self._hipblaslt_lookup(row, "tuned_k")
+        self.assertEqual(tuned_config, row)
+
+    def test_hipblaslt_row_without_kernel_name_is_used(self):
+        """Rows without a kernel name cannot be checked and stay usable."""
+        for name in ("", "nan", "None"):
+            with self.subTest(kernelName=name):
+                row = {"libtype": "hipblaslt", "solidx": 7, "kernelName": name}
+                tuned_config, _, lookup = self._hipblaslt_lookup(row, "other_k")
+                self.assertEqual(tuned_config, row)
+                lookup.assert_not_called()
+
+    def test_hipblaslt_row_with_unknown_solution_index_is_skipped(self):
+        """An index the installed hipBLASLt rejects is treated as stale."""
+        row = {"libtype": "hipblaslt", "solidx": 205437, "kernelName": "tuned_k"}
+        tuned_config, config, _ = self._hipblaslt_lookup(
+            row, RuntimeError("invalid solution index")
+        )
+        self.assertIsNone(tuned_config)
+        self.assertEqual(config["libtype"], "torch")
+
 
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
