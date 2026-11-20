@@ -25,18 +25,28 @@ def pair_layout(items) -> dict:
     return out
 
 
+def word_layout(items) -> dict:
+    """Lay out named arrays of 32-bit words, each 16-byte aligned."""
+    out, offset = {}, 0
+    for name, words in items:
+        offset = (offset + 15) // 16 * 16
+        out[name] = (offset, words * 4)
+        offset += words * 4
+    return out
+
+
 def pair_span(layout) -> int:
-    """Return the byte span of one parity of tagged-pair regions."""
+    """Return the byte span of one parity of mailbox regions."""
     return max(offset + size for offset, size in layout.values())
 
 
 def epoch_offset(layout) -> int:
-    """Return the untagged epoch region offset after both pair parities."""
+    """Return the epoch region offset after both mailbox parities."""
     return 2 * pair_span(layout)
 
 
 def peer_bytes(layout, ranks) -> int:
-    """Return two pair parities plus one i32 epoch slot per rank."""
+    """Return two mailbox parities plus one i32 epoch slot per rank."""
     return epoch_offset(layout) + ranks * EPOCH_BYTES
 
 
