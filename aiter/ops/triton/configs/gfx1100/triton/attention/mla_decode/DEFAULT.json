@@ -1,0 +1,27 @@
+{
+  "bfloat16": {
+    "attn": {
+      "num_warps": 2,
+      "MAX_SEGMENTS": 128,
+      "num_warps_by_block_size_block_m": {
+        "16": {
+          "16": 2,
+          "32": 4,
+          "64": 8
+        },
+        "64": {
+          "16": 4,
+          "32": 4,
+          "64": 8
+        }
+      }
+    },
+    "reduce": {
+      "num_warps": 8,
+      "num_warps_by_num_segments": {
+        "8": 1,
+        "16": 2
+      }
+    }
+  }
+}
