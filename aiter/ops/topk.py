@@ -139,7 +139,8 @@ def _gfx1250_reg_mw_fits(
             correction_bias.dtype,
             gating_output.device.index,
         )
-        # Every row is then aligned as the first one is.
+        # Whole quads only: the validated range. Other pitches stay on Triton,
+        # which test_exact_sigmoid_topk_matches_torch relies on (pitch E + 17).
         and gating_output.stride(0) % 4 == 0
         # The HIP op writes both outputs with the row stride of topk_ids.
         and topk_weights.stride(0) == topk_ids.stride(0)

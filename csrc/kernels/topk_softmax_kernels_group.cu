@@ -48,10 +48,12 @@
 // module_moe_asm device codegen; keep the shapes this path is meant to hit,
 // fall back to LDS for the rest. Both lists are instantiated for every target,
 // so the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
-// need 12, 24 and 28 of their own, and BF16 rows of E=768 and 896 (pitch % 4 == 0)
-// take topk_reg_mw_kernel. Wave32 builds leave the EPLs only wave64 launches
-// empty. Override by defining AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
-// AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32) before include.
+// need 12, 24 and 28 of their own. Only biased_grouped_topk rows with one group,
+// BF16 logits and topk <= 17 at E=768 and 896 take topk_reg_mw_kernel; the
+// rest, grouped_topk among them, take LDS at wave32. Wave32 builds leave the
+// EPLs only wave64 launches empty. Override by defining
+// AITER_TOPK_REG_LAUNCH_EPLS (wave64) or AITER_TOPK_REG_LAUNCH_EPLS_W32
+// (wave32) before include.
 #ifndef AITER_TOPK_REG_LAUNCH_EPLS
 #define AITER_TOPK_REG_LAUNCH_EPLS(X) \
     X(2)  /* E=128 */                 \
@@ -1181,7 +1183,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 
 // sigmoid(x) with the bits of the row-per-wave kernels, which round the f64
 // product -C_LOG2E * x to float. For 16-bit inputs a hi/lo split fma gives the
-// same float (checked over every bf16 and fp16 value) without the f64
+// same sigmoid bits (checked over every bf16 and fp16 value) without the f64
 // multiply, which runs at 1/32 rate on gfx1250.
 template <typename T>
 __device__ __forceinline__ float sigmoid_neg_log2e(T v)
@@ -2717,7 +2719,9 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
     // four experts per lane, one vector load each from the BF16 logits and the
-    // BF16 or FP32 bias at any alignment. The pitch must be whole quads.
+    // BF16 or FP32 bias at any alignment. The pitch must be whole quads: that
+    // is the validated range, and it keeps other pitches on Triton, which
+    // test_exact_sigmoid_topk_matches_torch relies on (pitch E + 17).
     // biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports, the
     // same topk_reg_mw_args_ok, and checks the pitch below itself.
     const int mw_waves      = num_experts / 128;
