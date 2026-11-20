@@ -57,15 +57,15 @@ def l2norm(x):
 def mx_e8m0_scale(amax, EXP_OFFSET: gl.constexpr):
     """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3.
     Integer math only: the exponent of amax rounded to a power of two (up from
-    1.75 x 2^k), minus EXP_OFFSET, at least 0. Inf and NaN give 254. A negative amax
-    gives 254, or 0 if it rounds to -0."""
+    1.75 x 2^k), minus EXP_OFFSET, at least 0. For every fp32 input, NaN included, the
+    byte is the same as with the former log2 formula."""
     gl.static_assert(EXP_OFFSET >= 0)
-    bits = amax.to(gl.uint32, bitcast=True)
-    # Exponent field of |amax| after the rounding. 255 or 256 is inf or NaN.
-    e = ((bits & 0x7FFFFFFF) + 0x200000) >> 23
+    # Round the mantissa up from 1.75. For some NaNs the add wraps or sets the sign bit.
+    r = amax.to(gl.uint32, bitcast=True) + 0x200000
+    e = (r >> 23) & 0xFF
     scale = gl.maximum(e.to(gl.int32) - EXP_OFFSET, 0)
-    # Inf, NaN and a negative amax that does not round to -0 give 254.
-    sat = (e >= 255) | ((bits >= 0x80000000) & (e != 0))
+    # +inf and values below -0 (log2 is +inf or NaN) give 254. +0 and -0 give 0.
+    sat = (r >= 0x7F800000) & (e != 0)
     return gl.where(sat, 254, scale).to(gl.uint8)
 
 
