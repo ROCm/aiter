@@ -89,7 +89,7 @@ TRAITS_HEADER_MAP = {
 
 KERNEL_FUNC_MAP = {
     # a4w4_mxfp4_nt_bpreshuffle_co: the __device__ body the gen_co stub wraps (build_co.py).
-    "a4w4_mxfp4_nt_bpreshuffle_co": "gemm_a4w4_mxfp4_nt_bpreshuffle_body",
+    "a4w4_mxfp4_nt_bpreshuffle_co": "opus_mxfp4_bpreshuffle::gemm_a4w4_mxfp4_nt_bpreshuffle_body",
     "a4w4_mxfp4_nt_bpreshuffle_small": "gemm_a4w4_mxfp4_nt_bpreshuffle_small_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
@@ -3225,6 +3225,7 @@ _A4W4_BPRESHUFFLE_KARGS = """
     kargs.k = K;
     kargs.batch = batch;
     kargs.stride_a = K / 2;  // bytes
+    kargs.stride_b = K / 2;  // bytes (shuffle_weight keeps the row-major row stride)
     kargs.stride_c = N;
     kargs.stride_a_batch = static_cast<long long>(M) * (K / 2);
     kargs.stride_b_batch = static_cast<long long>(N) * (K / 2);
