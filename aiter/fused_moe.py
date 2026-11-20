@@ -7805,15 +7805,14 @@ def ck_moe_stage1(
                     "per_1x128 / per_Token / per_Tensor have a clamped CK SiLU "
                     "epilogue (clamp before SiLU)."
                 )
-            # Split-K writes raw fp32 gate|up, clamped by silu_and_mul after the
-            # reduction below; any other launch clamps in the CK epilogue.
-            if splitk <= 1 or (kernelName and "Splitk" not in kernelName):
-                if kernelName and (
-                    "Splitk" in kernelName or "_silu_" not in kernelName
-                ):
-                    raise ValueError(
-                        "Runtime SiLU clamp requires a non-split CK SiLU kernel"
-                    )
+            if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
+                raise ValueError(
+                    "Runtime SiLU clamp requires a non-split CK SiLU kernel"
+                )
+            # A named kernel runs non-split and clamps in its epilogue. An unnamed
+            # per_1x128 split-K launch writes raw fp32 gate|up, clamped by
+            # silu_and_mul after the reduction below.
+            if kernelName:
                 splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1

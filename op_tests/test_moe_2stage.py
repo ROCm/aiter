@@ -2675,6 +2675,19 @@ def test_swiglu_limit_guards():
     q = aiter.QuantType.No
     raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
     raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
+    # Only unnamed launches split under a limit: a named Splitk kernel raises.
+    w1 = torch.empty(1, dtype=dtypes.fp8)
+    raises(
+        ValueError,
+        ck,
+        None,
+        w1,
+        *([None] * 9),
+        kernelName="gemm1_silu_Splitk",
+        splitk=4,
+        quant_type=aiter.QuantType.per_1x128,
+        **kw,
+    )
 
 
 def run_blockscale_limit_cases():
