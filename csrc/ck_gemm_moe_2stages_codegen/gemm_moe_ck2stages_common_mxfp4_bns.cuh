@@ -22,7 +22,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool RuntimeSwigluLimit>
+          bool RuntimeSwigluLimit,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -43,6 +44,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<bool> nt,
                         [[maybe_unused]] float swiglu_limit)
 {
+    static_assert(!PadK, "This kernel does not implement K padding.");
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
     using B1DataType                            = E8M0;
@@ -218,7 +220,9 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0>
+          int ActOP,
+          bool PadK,
+          bool KVec8>
 void ck_moe_stage2_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -239,6 +243,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<bool> nt,
                         [[maybe_unused]] float swiglu_limit)
 {
+    static_assert(!PadK && !KVec8, "This kernel does not implement K padding.");
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
     using B1DataType                            = E8M0;

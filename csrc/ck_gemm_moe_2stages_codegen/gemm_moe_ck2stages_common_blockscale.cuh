@@ -23,7 +23,7 @@ template <typename A0DataType,
           int ActOP,
           bool NT,
           bool RuntimeSwigluLimit>
-void ck_moe_stage1_gemm(const hipStream_t& stream,
+void ck_moe_stage1_gemm_nt(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
                         int N,
@@ -209,7 +209,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool RuntimeSwigluLimit>
+          bool RuntimeSwigluLimit,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -230,11 +231,12 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<bool> nt,
                         [[maybe_unused]] float swiglu_limit)
 {
+    static_assert(!PadK, "This kernel does not implement K padding.");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() <<
     // std::endl;
     if(nt.has_value() && nt.value())
     {
-        ck_moe_stage1_gemm<A0DataType,
+        ck_moe_stage1_gemm_nt<A0DataType,
                            B0DataType,
                            AccDataType,
                            EDataType,
@@ -272,7 +274,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     }
     else
     {
-        ck_moe_stage1_gemm<A0DataType,
+        ck_moe_stage1_gemm_nt<A0DataType,
                            B0DataType,
                            AccDataType,
                            EDataType,
@@ -366,23 +368,23 @@ template <typename A0DataType,
           bool MulRoutedWeight,
           int ActOP = 0,
           bool NT   = false>
-void ck_moe_stage2_gemm(const hipStream_t& stream,
-                        int tokens,
-                        int sorted_size,
-                        int N,
-                        int K,
-                        int topk,
-                        void*& inter_states, // [max_num_tokens_padded, k], input token
-                        void*& w1,           // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                        void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                        void*& sorted_token_ids,       // [max_num_tokens_padded]
-                        void*& sorted_expert_ids,      // [max_num_m_blocks]
-                        void*& sorted_weights,         // [max_num_tokens_padded]
-                        void*& num_valid_ids,          //[1]
-                        void*& out,                    // [m, out_dim]
-                        std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
-                        std::optional<int> splitk      // splitk
+void ck_moe_stage2_gemm_nt(const hipStream_t& stream,
+                           int tokens,
+                           int sorted_size,
+                           int N,
+                           int K,
+                           int topk,
+                           void*& inter_states, // [max_num_tokens_padded, k], input token
+                           void*& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                           void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                           void*& sorted_token_ids,       // [max_num_tokens_padded]
+                           void*& sorted_expert_ids,      // [max_num_m_blocks]
+                           void*& sorted_weights,         // [max_num_tokens_padded]
+                           void*& num_valid_ids,          //[1]
+                           void*& out,                    // [m, out_dim]
+                           std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
+                           std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
+                           std::optional<int> splitk      // splitk
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -517,7 +519,9 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP = 0>
+    int ActOP,
+    bool PadK,
+          bool KVec8>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,            // [max_num_tokens_padded, k], input token
@@ -533,9 +537,10 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<int>   splitk,    // splitk
                         std::optional<bool> nt, [[maybe_unused]] float swiglu_limit)
 {
+    static_assert(!PadK && !KVec8, "This kernel does not implement K padding.");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
     if (nt.has_value() && nt.value()) {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
+        ck_moe_stage2_gemm_nt<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
             stream,
             tokens,
             sorted_size,
@@ -554,7 +559,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
             a2_scale,
             splitk);
     } else {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
+        ck_moe_stage2_gemm_nt<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
             stream,
             tokens,
             sorted_size,
