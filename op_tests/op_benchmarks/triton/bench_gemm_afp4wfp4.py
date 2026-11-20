@@ -9,6 +9,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
+    gemm_afp4wfp4_preshuffled_scales,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -39,8 +40,14 @@ def bench_gemm_fn(
     metric: str,
     layout: str,
     preshuffle: bool,
+    preshuffle_scales: bool,
     gluon: bool,
 ):
+    if preshuffle_scales and (M < 32 or K % 256):
+        raise ValueError(
+            "--preshuffle-scales requires M >= 32 and K divisible by 256; "
+            f"got M={M}, N={N}, K={K}"
+        )
     c_dtype = torch.bfloat16
 
     _p_gen = functools.partial(
@@ -51,13 +58,11 @@ def bench_gemm_fn(
         c_dtype,
         layout=layout,
         output=True,
-        shuffle_scales_fg=preshuffle,
+        shuffle_scales_fg=preshuffle or preshuffle_scales,
         shuffle_weight_fg=preshuffle,
     )
-    # (x, w, w_shuffed, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y)
-    # gemm_afp4wfp4_preshuffle names its activation/weight kwargs x_fp4/w_preshuf;
-    # the non-preshuffle kernel uses x/w. w_shuffed/*_shuffled already collapse to the
-    # unshuffled tensors when preshuffle is False, so one mapping covers both kernels.
+    # The generator aliases each unshuffled tensor when its shuffle flag is false.
+    # Only the weight-and-scale wrapper uses the x_fp4/w_preshuf argument names.
     x_key = "x_fp4" if preshuffle else "x"
     w_key = "w_preshuf" if preshuffle else "w"
     _out_vals_keys = [x_key, "_", w_key, "_", "_", "x_scales", "w_scales", "_", "y"]
@@ -66,6 +71,8 @@ def bench_gemm_fn(
 
     if preshuffle:
         kernel_fn = functools.partial(gemm_afp4wfp4_preshuffle, dtype=c_dtype)
+    elif preshuffle_scales:
+        kernel_fn = functools.partial(gemm_afp4wfp4_preshuffled_scales, dtype=c_dtype)
     elif gluon:
         kernel_fn = functools.partial(
             triton_gemm_afp4wfp4, dtype=c_dtype, backend="gluon"
@@ -159,6 +166,7 @@ def run_model_benchmark(args):
             metric,
             args.layout,
             args.preshuffle,
+            args.preshuffle_scales,
             args.gluon,
         )
 
@@ -182,6 +190,7 @@ def run_shape_benchmark(args):
             metric,
             args.layout,
             args.preshuffle,
+            args.preshuffle_scales,
             args.gluon,
         )
 
@@ -191,19 +200,35 @@ def run_shape_benchmark(args):
 def parse_args(args: list[str] | None = None):
     parser = get_parser("MXFP4 x MXFP4 GEMM")
     parser = add_argparse_ff(parser)
-    parser.add_argument(
+    shuffle_group = parser.add_mutually_exclusive_group()
+    shuffle_group.add_argument(
         "--shuffle",
         "--preshuffle",
         action="store_true",
         dest="preshuffle",
         help="Preshuffle weight and scales (gfx1250: Gluon gemm_mxfp4_preshuffle_gfx1250; else Triton).",
     )
+    shuffle_group.add_argument(
+        "--shuffle-s",
+        "--preshuffle-scales",
+        action="store_true",
+        dest="preshuffle_scales",
+        default=False,
+        help="Preshuffle scales only, with unshuffled weights (Triton; M >= 32, K divisible by 256).",
+    )
     parser.add_argument(
         "--gluon",
         action="store_true",
         help="Use Gluon non-preshuffle kernel (ignored if --shuffle/--preshuffle is set).",
     )
-    return get_ff_args(parser, args=args)
+    parsed_args, defaults = get_ff_args(parser, args=args)
+    if parsed_args.preshuffle_scales and (
+        parsed_args.gluon or parsed_args.backend == "gluon"
+    ):
+        parser.error(
+            "--preshuffle-scales uses the Triton kernel; Gluon is not supported"
+        )
+    return parsed_args, defaults
 
 
 def main(args: list[str] | None = None) -> None:
