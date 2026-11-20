@@ -300,6 +300,8 @@ class PartitionInfo(NamedTuple):
     """Compute partition and CU counts of one logical GPU.
 
     The partition fields are None when the source cannot report them.
+    partition_inferred is True when amdsmi reports no partition and the mode
+    and number of partitions come from the CU count of the full chip.
     """
 
     gfx: str
@@ -308,6 +310,7 @@ class PartitionInfo(NamedTuple):
     compute_partition: str | None
     memory_partition: str | None
     num_partitions: int | None
+    partition_inferred: bool = False
 
 
 def _amdsmi_value(value):
@@ -346,6 +349,53 @@ def _amdsmi_partition(amdsmi, handle) -> tuple:
     return _amdsmi_value(mode) or None, _amdsmi_value(nps) or None, num_partitions
 
 
+# CU count of the full chip, by (PCI device ID, revision ID). The IDs and names
+# are from data/amdgpu.ids of libdrm. The CU counts are from the ROCm GPU
+# specifications, and 80 for MI308X.
+_FULL_CHIP_CU_NUM = {
+    (0x74A0, 0x00): 228,  # MI300A
+    (0x74A1, 0x00): 304,  # MI300X
+    (0x74A2, 0x00): 80,  # MI308X
+    (0x74A2, 0xA1): 304,  # MI300X
+    (0x74A5, 0x00): 304,  # MI325X
+    (0x74B5, 0x00): 304,  # MI300X VF
+    (0x74B6, 0x00): 80,  # MI308X
+    (0x74B6, 0xA1): 304,  # MI300X
+    (0x74B9, 0x00): 304,  # MI325X VF
+    (0x75A0, 0x00): 256,  # MI350X
+    (0x75A3, 0x00): 256,  # MI355X
+    (0x75A8, 0x00): 128,  # MI350P
+    (0x75B0, 0x00): 256,  # MI350X VF
+    (0x75B3, 0x00): 256,  # MI355X VF
+    (0x75B8, 0x00): 128,  # MI350P VF
+}
+_PARTITION_MODES = {2: "DPX", 4: "QPX", 8: "CPX"}
+
+
+def _pci_id(value) -> int | None:
+    try:
+        return int(value, 16) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _inferred_partition(asic: dict, cu_num: int) -> tuple[str, int] | None:
+    """(mode, number of partitions) of a GPU that does not report its partition.
+
+    An SR-IOV VF guest, or a container that sees only a secondary partition,
+    gets N/A for the mode. A compute partition has an equal share of the CUs
+    of its chip, so a GPU with 1/2, 1/4 or 1/8 of the CUs of its full chip is
+    a partition. A GPU of an unknown device ID is not.
+    """
+    full_cu_num = _FULL_CHIP_CU_NUM.get(
+        (_pci_id(asic.get("device_id")), _pci_id(asic.get("rev_id")))
+    )
+    if not full_cu_num or not cu_num or full_cu_num % cu_num:
+        return None
+    mode = _PARTITION_MODES.get(full_cu_num // cu_num)
+    return (mode, full_cu_num // cu_num) if mode else None
+
+
 _SYSFS_DRM = "/sys/class/drm"
 
 
@@ -367,7 +417,9 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
     of an amdgpu_xcp platform device, and KFD gives it the address of its GPU
     with the partition index as the PCI function. Only such a partition takes
     a field that it does not report from partition 0 of its GPU. Separate PCI
-    functions, for example SR-IOV VFs, never share fields.
+    functions, for example SR-IOV VFs, never share fields. A GPU that still
+    has no mode and no number of partitions gets them from the CU count of
+    its full chip (see _inferred_partition).
     """
     import amdsmi
 
@@ -398,6 +450,21 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
             fields = tuple(own or gpu for own, gpu in zip(fields, gpu_fields))
         mode, nps, num_partitions = fields
         cu_num = int(asic["num_compute_units"])
+        inferred = None
+        if mode is None and num_partitions is None:
+            inferred = _inferred_partition(asic, cu_num)
+        if inferred:
+            mode, num_partitions = inferred
+            logger.info(
+                "GPU %s (%s, device ID %s) reports no compute partition; "
+                "%d CUs is 1/%d of the full chip, so it is in %s mode",
+                bdf,
+                asic.get("market_name"),
+                asic.get("device_id"),
+                cu_num,
+                num_partitions,
+                mode,
+            )
         info = PartitionInfo(
             gfx=str(asic["target_graphics_version"]).lower(),
             cu_num=cu_num,
@@ -405,6 +472,7 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
             compute_partition=mode,
             memory_partition=nps,
             num_partitions=num_partitions,
+            partition_inferred=inferred is not None,
         )
         result.append((uuid, info))
     return result

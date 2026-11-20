@@ -16,7 +16,9 @@ class FakeAmdSmiException(Exception):
     pass
 
 
-def _gpu(gfx, cu, mode, num_partitions, nps="NPS1", bus=0, secondary_reports=False):
+def _gpu(
+    gfx, cu, mode, num_partitions, nps="NPS1", bus=0, secondary_reports=False, did=None
+):
     """The partitions of one GPU.
 
     Partition 0 owns the render node of the PCI device, the other partitions
@@ -32,6 +34,7 @@ def _gpu(gfx, cu, mode, num_partitions, nps="NPS1", bus=0, secondary_reports=Fal
             "mode": mode if i == 0 or secondary_reports else None,
             "n": num_partitions if i == 0 or secondary_reports else None,
             "nps": nps if i == 0 or secondary_reports else None,
+            "did": did,
         }
         for i in range(num_partitions or 1)
     ]
@@ -39,15 +42,18 @@ def _gpu(gfx, cu, mode, num_partitions, nps="NPS1", bus=0, secondary_reports=Fal
 
 MI300X_SPX = _gpu("gfx942", 304, "SPX", 1, bus=0x0C) + _gpu("gfx942", 304, "SPX", 1)
 MI300X_DPX = _gpu("gfx942", 152, "DPX", 2, "NPS2")
-MI300X_CPX = _gpu("gfx942", 38, "CPX", 8)
-MI355X_DPX = _gpu("gfx950", 128, "DPX", 2)
-MI308X_SPX = _gpu("gfx942", 80, "SPX", 1)
+MI300X_DPX_ID = _gpu("gfx942", 152, "DPX", 2, "NPS2", did=0x74A1)
+MI300X_CPX = _gpu("gfx942", 38, "CPX", 8, did=0x74A1)
+MI355X_DPX = _gpu("gfx950", 128, "DPX", 2, did=0x75A3)
+MI355X_SPX = _gpu("gfx950", 256, "SPX", 1, did=0x75A3)
+MI308X_SPX = _gpu("gfx942", 80, "SPX", 1, did=0x74A2)
 MI210 = _gpu("gfx90a", 104, None, None, None)
 MIXED = _gpu("gfx942", 304, "SPX", 1, bus=0x0C) + MI300X_DPX
 # A container that is given only partition 1 of a GPU.
 SECONDARY_ONLY = MI300X_DPX[1:]
 SECONDARY_ONLY_FIXED = _gpu("gfx942", 152, "DPX", 2, "NPS2", secondary_reports=True)[1:]
 SECONDARY_ONLY_COUNT = [dict(SECONDARY_ONLY[0], n=2)]
+SECONDARY_ONLY_ID = MI300X_DPX_ID[1:]
 # SR-IOV VFs that are functions 0 and 1 of one PCI bus:device. Each VF owns the
 # render node of its own PCI function. VF 1 does not report a mode.
 TWO_VFS = [
@@ -72,6 +78,29 @@ TWO_VFS = [
 ]
 
 
+def _vf(gfx, cu, did, rev=0x00, market="N/A"):
+    """An SR-IOV VF guest that reports no partition fields."""
+    bdf = "0000:8b:00.1"
+    return {
+        "gfx": gfx,
+        "cu": cu,
+        "bdf": bdf,
+        "dev": bdf,
+        "mode": None,
+        "n": None,
+        "nps": None,
+        "did": did,
+        "rev": rev,
+        "market": market,
+    }
+
+
+# The GPU of vLLM CI queue amd_mi355_dpx: amd-smi shows Platform "Linux Guest",
+# 0000:8b:00.1 "AMD Instinct MI350X VF", Partition-Mode N/A; rocminfo shows
+# gfx950, Chip ID 0x75b0, 128 CUs.
+MI355X_DPX_VF = _vf("gfx950", 128, 0x75B0, market="AMD Instinct MI350X VF")
+
+
 def fake_amdsmi(gpus, missing=()):
     """An amdsmi module whose handles are the given GPUs, in reverse handle order.
 
@@ -94,6 +123,9 @@ def fake_amdsmi(gpus, missing=()):
     }
     mod.amdsmi_get_gpu_device_bdf = lambda h: gpus[h]["bdf"]
     mod.amdsmi_get_gpu_asic_info = lambda h: {
+        "market_name": gpus[h].get("market", "N/A"),
+        "device_id": f"0x{gpus[h]['did']:04x}" if gpus[h].get("did") else "N/A",
+        "rev_id": f"0x{gpus[h].get('rev', 0):02x}",
         "num_compute_units": gpus[h]["cu"],
         "target_graphics_version": gpus[h]["gfx"],
     }
@@ -163,15 +195,18 @@ def node(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "gpus, expected",
     [
-        (MI300X_SPX, ("gfx942", 304, 304, "SPX", "NPS1", 1)),
-        (MI300X_DPX, ("gfx942", 152, 304, "DPX", "NPS2", 2)),
-        (MI300X_CPX, ("gfx942", 38, 304, "CPX", "NPS1", 8)),
-        (MI355X_DPX, ("gfx950", 128, 256, "DPX", "NPS1", 2)),
-        (MI308X_SPX, ("gfx942", 80, 80, "SPX", "NPS1", 1)),
-        (MI210, ("gfx90a", 104, None, None, None, None)),
-        (SECONDARY_ONLY, ("gfx942", 152, None, None, None, None)),
-        (SECONDARY_ONLY_FIXED, ("gfx942", 152, 304, "DPX", "NPS2", 2)),
-        (SECONDARY_ONLY_COUNT, ("gfx942", 152, 304, None, None, 2)),
+        (MI300X_SPX, ("gfx942", 304, 304, "SPX", "NPS1", 1, False)),
+        (MI300X_DPX, ("gfx942", 152, 304, "DPX", "NPS2", 2, False)),
+        (MI300X_CPX, ("gfx942", 38, 304, "CPX", "NPS1", 8, False)),
+        (MI355X_DPX, ("gfx950", 128, 256, "DPX", "NPS1", 2, False)),
+        (MI308X_SPX, ("gfx942", 80, 80, "SPX", "NPS1", 1, False)),
+        (MI210, ("gfx90a", 104, None, None, None, None, False)),
+        (SECONDARY_ONLY, ("gfx942", 152, None, None, None, None, False)),
+        (SECONDARY_ONLY_FIXED, ("gfx942", 152, 304, "DPX", "NPS2", 2, False)),
+        (SECONDARY_ONLY_COUNT, ("gfx942", 152, 304, None, None, 2, False)),
+        (MI300X_DPX_ID, ("gfx942", 152, 304, "DPX", "NPS2", 2, False)),
+        (MI355X_SPX, ("gfx950", 256, 256, "SPX", "NPS1", 1, False)),
+        (SECONDARY_ONLY_ID, ("gfx942", 152, 304, "DPX", None, 2, True)),
     ],
 )
 def test_partition_cu_num_is_the_hip_cu_num(node, gpus, expected):
@@ -182,19 +217,46 @@ def test_partition_cu_num_is_the_hip_cu_num(node, gpus, expected):
 
 
 @pytest.mark.parametrize(
+    "gpu, expected",
+    [
+        (MI355X_DPX_VF, ("gfx950", 128, 256, "DPX", None, 2, True)),
+        (_vf("gfx950", 256, 0x75B3), ("gfx950", 256, None, None, None, None, False)),
+        (_vf("gfx950", 128, 0x75A8), ("gfx950", 128, None, None, None, None, False)),
+        (_vf("gfx950", 128, 0x75B8), ("gfx950", 128, None, None, None, None, False)),
+        (_vf("gfx942", 80, 0x74A2), ("gfx942", 80, None, None, None, None, False)),
+        (_vf("gfx942", 152, 0x74A2, 0xA1), ("gfx942", 152, 304, "DPX", None, 2, True)),
+        (_vf("gfx942", 76, 0x74B5), ("gfx942", 76, 304, "QPX", None, 4, True)),
+        (_vf("gfx942", 38, 0x74B9), ("gfx942", 38, 304, "CPX", None, 8, True)),
+        (
+            _vf("gfx942", 152, 0x74A1, 0x01),
+            ("gfx942", 152, None, None, None, None, False),
+        ),
+        (_vf("gfx950", 128, 0x1234), ("gfx950", 128, None, None, None, None, False)),
+    ],
+)
+def test_partition_inferred_from_full_chip_cu_num(node, gpu, expected):
+    """Without a reported mode, 1/2, 1/4 or 1/8 of the CUs of a known chip is a partition.
+
+    MI350P and MI308X are full chips with fewer CUs, so they are not partitions.
+    """
+    node([gpu])
+    assert chip_info.get_partition_info() == expected
+
+
+@pytest.mark.parametrize(
     "missing, expected",
     [
         (
             ("amdsmi_get_gpu_accelerator_partition_profile",),
-            ("gfx942", 152, None, "DPX", "NPS2", None),
+            ("gfx942", 152, None, "DPX", "NPS2", None, False),
         ),
         (
             ("amdsmi_get_gpu_enumeration_info",),
-            ("gfx942", 152, 304, "DPX", "NPS2", 2),
+            ("gfx942", 152, 304, "DPX", "NPS2", 2, False),
         ),
         (
             ("amdsmi_get_gpu_memory_partition",),
-            ("gfx942", 152, 304, "DPX", None, 2),
+            ("gfx942", 152, 304, "DPX", None, 2, False),
         ),
     ],
 )
@@ -207,15 +269,39 @@ def test_old_amdsmi_keeps_the_fields_it_has(node, missing, expected):
 def test_vf_does_not_take_the_mode_of_another_function(node):
     """Only a secondary partition takes fields from partition 0 of its GPU."""
     node(TWO_VFS)
-    assert chip_info.get_partition_info(0) == ("gfx942", 304, 304, "SPX", "NPS1", 1)
-    assert chip_info.get_partition_info(1) == ("gfx942", 304, None, None, None, None)
+    assert chip_info.get_partition_info(0) == (
+        "gfx942",
+        304,
+        304,
+        "SPX",
+        "NPS1",
+        1,
+        False,
+    )
+    assert chip_info.get_partition_info(1) == (
+        "gfx942",
+        304,
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
 
 
 def test_partition_without_render_device_takes_no_fields(node, monkeypatch, tmp_path):
     """A partition that sysfs does not show as an amdgpu_xcp device keeps its fields."""
     node(MI300X_DPX)
     monkeypatch.setattr(chip_info, "_SYSFS_DRM", str(tmp_path / "missing"))
-    assert chip_info.get_partition_info(1) == ("gfx942", 152, None, None, None, None)
+    assert chip_info.get_partition_info(1) == (
+        "gfx942",
+        152,
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
 
 
 def test_one_amdsmi_session_per_process(node, monkeypatch):
@@ -279,7 +365,15 @@ def test_failed_rocminfo_fallback_is_not_retried(node, monkeypatch):
 def test_mixed_modes_use_the_current_device(node, monkeypatch):
     node(MIXED)
     assert chip_info.get_partition_info(0).compute_partition == "SPX"
-    assert chip_info.get_partition_info(2) == ("gfx942", 152, 304, "DPX", "NPS2", 2)
+    assert chip_info.get_partition_info(2) == (
+        "gfx942",
+        152,
+        304,
+        "DPX",
+        "NPS2",
+        2,
+        False,
+    )
     monkeypatch.setattr(chip_info, "_current_device", lambda: 1)
     assert chip_info.get_cu_num() == 152
 
@@ -314,7 +408,21 @@ def test_device_outside_visible_devices_raises(node, monkeypatch):
 def test_cu_num_env_overrides_only_the_cu_count(node, monkeypatch):
     node(MI300X_SPX)
     monkeypatch.setenv("CU_NUM", "152")
-    assert chip_info.get_partition_info() == ("gfx942", 152, 304, "SPX", "NPS1", 1)
+    assert chip_info.get_partition_info() == (
+        "gfx942",
+        152,
+        304,
+        "SPX",
+        "NPS1",
+        1,
+        False,
+    )
+
+
+def test_cu_num_env_does_not_change_the_inferred_partition(node, monkeypatch):
+    node([MI355X_DPX_VF])
+    monkeypatch.setenv("CU_NUM", "256")
+    assert chip_info.get_partition_info() == ("gfx950", 256, 256, "DPX", None, 2, True)
 
 
 ROCMINFO = """\
@@ -343,6 +451,14 @@ def test_without_amdsmi_rocminfo_gives_the_cu_count(node, monkeypatch):
     monkeypatch.setitem(sys.modules, "amdsmi", None)
     monkeypatch.setattr(chip_info, "_gpu_info_output", lambda: ROCMINFO)
     _clear_caches()
-    assert chip_info.get_partition_info() == ("gfx950", 128, None, None, None, None)
+    assert chip_info.get_partition_info() == (
+        "gfx950",
+        128,
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-c84490c587b21daa")
     assert chip_info.get_cu_num() == 128
