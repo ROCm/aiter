@@ -687,6 +687,100 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
+ASM_PF3 = "_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE"
+ASM_BSHUFFLE = "_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE"
+ASM_CLEAN = "_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE"
+ASM_BSHUFFLE_CLEAN = "_ZN5aiter48bf16gemm_fp32bf16_tn_64x64_bshuffle_splitk_cleanE"
+ASM_256 = "_ZN5aiter24bf16gemm_bf16_tn_256x256E"
+ASM_256_BPRE = "_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE"
+
+
+def _check_asm_exact(x, w, out, name, bpreshuffle, split, case):
+    """Run one asm kernel by name; every element of out must match fp32."""
+    out.fill_(float("nan"))
+    wk = shuffle_weight(w, layout=(16, 16)) if bpreshuffle else w
+    aiter.gemm_a16w16_asm(x, wk, out, None, split, name, bpreshuffle)
+    m, n = out.shape
+    wf = w.float()
+    rb = max(1, (1 << 28) // max(n, x.shape[1]))
+    bad = 0
+    for r0 in range(0, m, rb):
+        ref = F.linear(x[r0 : r0 + rb].float(), wf).to(out.dtype)
+        got = out[r0 : r0 + rb]
+        bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
+    assert bad == 0, f"asm {name} {case}: {bad} of {m * n} elements wrong"
+    aiter.logger.info(f"asm {name} {case}: exact")
+
+
+def test_asm_4gib_operands():
+    """A or out of 4 GiB or more must be exact.
+
+    Each buffer descriptor holds a 32-bit size; the kernels give every tile
+    its own 64-bit base. One kernel per separately built kind: plain-B and
+    preshuffled-B split-K, *_clean split-K and (gfx950) 256x256.
+    """
+    gfx = get_gfx()
+    if gfx not in ("gfx942", "gfx950"):
+        return
+    kernels = [(ASM_PF3, False, 1), (ASM_BSHUFFLE, True, 1)]
+    if gfx == "gfx950":
+        kernels += [(ASM_256, False, 1), (ASM_256_BPRE, True, 1)]
+    # *_clean kernels split K and need at most 1024 tiles, so only A or B
+    # can reach 4 GiB.
+    clean = [(ASM_CLEAN, False, 2), (ASM_BSHUFFLE_CLEAN, True, 2)]
+    cases = [
+        ("A", (1 << 31) // 8192 + 256, 256, 8192, dtypes.bf16, kernels),
+        ("out", 16384, (1 << 31) // 16384 + 256, 128, dtypes.bf16, kernels),
+        ("A", 32768, 64, (1 << 16) + 256, dtypes.fp32, clean),
+    ]
+    for operand, m, n, k, otype, names in cases:
+        x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+        w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+        out = torch.empty(m, n, dtype=otype, device="cuda")
+        for name, bpreshuffle, split in names:
+            case = f"{operand} > 4 GiB {(m, n, k)} {otype}"
+            _check_asm_exact(x, w, out, name, bpreshuffle, split, case)
+        del x, w, out
+
+
+def test_asm_last_tile_at_allocation_end():
+    """A ends an allocation and the last M tile has 1 row, at small K.
+
+    Each tile's descriptor covers only that tile's rows, while the kernels
+    lower its size by a fixed step for each K step they prefetch, also past
+    the end of K. The size must stop at zero there: if it wrapped, those
+    prefetches would read past the end of A, which faults (aborting the
+    process) when A ends the allocation.
+    """
+    gfx = get_gfx()
+    if gfx not in ("gfx942", "gfx950"):
+        return
+    # (name, bpreshuffle, splitK, out dtype, M tile rows, K values). Split-K
+    # with bf16 output adds bf16 partial sums, so split-K runs use FP32 output.
+    kernels = [
+        (ASM_PF3, False, 1, dtypes.bf16, 64, (64, 128)),
+        (ASM_BSHUFFLE, True, 1, dtypes.bf16, 64, (64, 128)),
+        (ASM_CLEAN, False, 2, dtypes.fp32, 64, (128,)),
+    ]
+    if gfx == "gfx950":
+        kernels += [(ASM_256, False, 1, dtypes.bf16, 256, (64, 128))]
+    # A fresh 64 MiB block is a whole caching-allocator segment, so the memory
+    # after it is normally unmapped; empty the cache so it is not cut from a
+    # larger one.
+    torch.cuda.empty_cache()
+    buf = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+    n = 256
+    for name, bpreshuffle, split, otype, tile, ks in kernels:
+        for k in ks:
+            m = tile + 1
+            x = buf[buf.numel() - m * k * 2 :].view(dtypes.bf16).view(m, k)
+            x.copy_(torch.randn(m, k, dtype=dtypes.bf16, device="cuda"))
+            w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+            out = torch.empty(m, n, dtype=otype, device="cuda")
+            case = f"A at allocation end {(m, n, k)} {otype}"
+            _check_asm_exact(x, w, out, name, bpreshuffle, split, case)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -696,13 +790,15 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "asm_4g"],
+    default=["normal", "asm_4g"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal asm_4g    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t asm_4g    # asm with A or out of 4 GiB, and A ending
+                          # an allocation with a 1-row last tile""",
 )
 parser.add_argument(
     "-d",
@@ -792,6 +888,9 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
+    elif test == "asm_4g":
+        test_asm_last_tile_at_allocation_end()
+        test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
