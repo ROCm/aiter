@@ -24,7 +24,8 @@ K loop: three LDS stages, each one K128 tile of A and of B and their scales. K t
 and tile ``t + 1``'s operands and scales are read into VGPRs, each operand after its
 register's last MFMA of tile ``t``. One barrier per tile: before it each wave waits
 for tile ``t + 1``'s loads and for its own reads of tile ``t``'s stage. The last
-three tiles load nothing, so the packed layout's guard tiles are never read.
+three tiles load nothing. Below three K tiles the prologue's loads reach into the
+packed layout's two guard tiles, whose contents are never used.
 
 The scales go through LDS, as in the ASM ``dmabig`` kernels: a scale load into
 VGPRs would be inline asm, which LLVM takes as complete when issued, and the loop
@@ -291,7 +292,8 @@ class Schedule:
         self.bar = first_last if bar is None else bar
         assert 0 <= self.bar < len(self.order)
         read_slots = {
-            max(s, self.bar) for s in list(self.last_b.values()) + list(self.last_a.values())
+            max(s, self.bar)
+            for s in list(self.last_b.values()) + list(self.last_a.values())
         }
         free = [k for k in range(self.bar + 1, len(self.order)) if k not in read_slots]
         assert len(free) >= TILE_VMEM
@@ -315,12 +317,12 @@ def compile_a6w6_gemm_4w(
     mblk_n: int = 2,
     bar: int | None = 8,
 ):
-    """``K`` is the padded contraction dimension, a multiple of 128 of at least 384.
+    """``K`` is the padded contraction dimension, a positive multiple of 128.
 
     ``xcd_swizzle`` is the M-tile group of the tile order; ``mblk_n`` and ``bar``
     select the K tile's schedule (``Schedule``).
     """
-    assert K % BLOCK_K == 0 and K >= STAGES * BLOCK_K
+    assert K % BLOCK_K == 0 and K >= BLOCK_K
     sched = Schedule(mblk_n, bar)
     K_TILES = K // BLOCK_K
     NK_PAD = K_TILES + PADK
@@ -382,12 +384,12 @@ def compile_a6w6_gemm_4w(
 
         def tile_vmem(t, stage):
             """Tile ``t``'s VMEM ops into ``stage``: A, B, then the scales."""
-            return g2s[0].ops(t, stage) + g2s[1].ops(t, stage) + g2s_scales.ops(t, stage)
+            return (
+                g2s[0].ops(t, stage) + g2s[1].ops(t, stage) + g2s_scales.ops(t, stage)
+            )
 
         def read_a(stage, i):
-            return _read_operand(
-                stage_ptrs[stage], 0, wave_m * WAVE_TILES + i, lane_id
-            )
+            return _read_operand(stage_ptrs[stage], 0, wave_m * WAVE_TILES + i, lane_id)
 
         def read_b(stage, j):
             return _read_operand(
@@ -399,7 +401,9 @@ def compile_a6w6_gemm_4w(
             return (
                 _lds_load(ptr, SCALES_OFFSET + wave_m * 512 + lane_id * 8, 8),
                 _lds_load(
-                    ptr, SCALES_OFFSET + SCALE_TILE_BYTES + wave_n * 512 + lane_id * 8, 8
+                    ptr,
+                    SCALES_OFFSET + SCALE_TILE_BYTES + wave_n * 512 + lane_id * 8,
+                    8,
                 ),
             )
 
@@ -581,6 +585,9 @@ def compile_a6w6_gemm_4w(
         # The last tile stores the output as its accumulators complete.
         for t in range_constexpr(STATIC_FROM, K_TILES):
             accs, a_ops, b_ops, scales = static_step(accs, a_ops, b_ops, scales, t)
+        # Below three K tiles, guard-tile loads may still be in flight; LDS-DMA must
+        # not land in LDS that a later workgroup owns.
+        fx.rocdl.s_waitcnt(vmcnt=0)
 
     @flyc.jit
     def launch_gemm(

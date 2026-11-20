@@ -281,6 +281,26 @@ def _a4w4_blockscale(job: dict) -> None:
     )
 
 
+def _a6w6(job: dict) -> None:
+    """MXFP6 codes and scales as quant_mxfp6_gemm packs them: flat uint8
+    buffers of 256-row tiles."""
+    from aiter.ops.gemm_op_a6w6 import gemm_a6w6, mxfp6_gemm_pack_size
+    from aiter.utility import dtypes
+
+    m, n, k = job["m"], job["n"], job["k"]
+    a, a_scale = mxfp6_gemm_pack_size(m, k)
+    b, b_scale = mxfp6_gemm_pack_size(n, k)
+    gemm_a6w6(
+        _empty(a, dtype=dtypes.u8),
+        _empty(b, dtype=dtypes.u8),
+        _empty(a_scale, dtype=dtypes.u8),
+        _empty(b_scale, dtype=dtypes.u8),
+        m,
+        n,
+        k,
+    )
+
+
 @dataclass(frozen=True)
 class Table:
     """One tuned GEMM table: the runtime's name for it (``tuned_file_name``,
@@ -362,6 +382,13 @@ TABLES = (
         ("gfx", "cu_num", "N", "K"),
         _a4w4_mxscale_bpreshuffle,
         all_rows=True,
+    ),
+    Table(
+        "a6w6_blockscale_tuned_gemm",
+        "AITER_CONFIG_GEMM_A6W6",
+        ("gfx", "cu_num", "N", "K"),
+        _a6w6,
+        kernel_prefix="flydsl_a6w6_",
     ),
 )
 _TABLES = {table.name: table for table in TABLES}

@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tune registered gfx950 MXFP6 A6W6 assembly kernels by GEMM shape."""
+"""Tune gfx950 MXFP6 A6W6 kernels by GEMM shape.
+
+The candidates are the FlyDSL 4-wave kernel's variants (tile order and K-tile
+schedule) and the registered assembly kernels. A row keeps the candidate that paired
+validation shows the most faster than the untuned default (the FlyDSL kernel's
+default variant), by at least the minimum gain; otherwise the default.
+"""
 
 import gc
 import math
@@ -21,6 +27,19 @@ from aiter.utility.mp_tuner import mp_tuner
 
 PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _MANIFEST_NAME = "f6gemm_bf16_per1x32Fp6.csv"
+_FLYDSL_PREFIX = "flydsl_a6w6_"
+# FlyDSL candidates: M-tile swizzle group by MFMA block, barrier after MFMA 8. Their
+# kernelIds start above the assembly manifest's row indices.
+FLYDSL_KERNEL_ID_BASE = 1000
+FLYDSL_VARIANTS = tuple(
+    {"xcd_swizzle": group, "mblk_n": mblk_n, "bar": 8}
+    for mblk_n in (2, 4)
+    for group in (1, 2, 3, 4, 8)
+)
+# Profiling times each candidate once, which cannot order kernels within about 2 % of
+# each other, so the gain guard re-times this many of the fastest per shape, and the
+# fastest assembly kernel wherever that is not among them.
+GUARD_CANDIDATES = 4
 _MANIFEST_COLUMNS = frozenset(
     {
         "tile_M",
@@ -132,6 +151,29 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
     return candidates
 
 
+def flydsl_candidates() -> list[tuple[int, str]]:
+    """(kernelId, kernelName) of each FlyDSL variant; every one runs any K."""
+    from aiter.ops.flydsl.gemm_a6w6_4wave import make_kernel_name
+
+    return [
+        (FLYDSL_KERNEL_ID_BASE + index, make_kernel_name(**variant))
+        for index, variant in enumerate(FLYDSL_VARIANTS)
+    ]
+
+
+def flydsl_kernel_id(kernel_name: str) -> int | None:
+    """The kernelId of a FlyDSL variant's name, or None for any other name."""
+    from aiter.ops.flydsl.gemm_a6w6_4wave import parse_kernel_name
+
+    config = parse_kernel_name(kernel_name)
+    if config is None:
+        return None
+    for index, variant in enumerate(FLYDSL_VARIANTS):
+        if variant == config:
+            return FLYDSL_KERNEL_ID_BASE + index
+    return None
+
+
 def candidate_supports_shape(
     candidate: F6GemmCandidate, M: int, N: int, K: int
 ) -> bool:
@@ -164,11 +206,12 @@ def generate_data(
     x_packed, x_scales = aiter.quant_mxfp6_gemm(x)
     w_packed, w_scales = aiter.quant_mxfp6_gemm(w)
     out = torch.empty((_ceil(M, 256), _ceil(N, 256)), dtype=dtype, device=device)
-    # Candidate kernels share the same quantized math. Use the safe production
-    # fallback as the tuning reference so large diffusion sweeps do not allocate
-    # multi-gigabyte fp32 dequantized operands/results. Independent numerical
-    # validation remains in op_tests/test_gemm_a6w6.py.
-    from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_kernel
+    # Candidate kernels share the same quantized math. Use the safe assembly
+    # fallback, an independent implementation, as the tuning reference so large
+    # diffusion sweeps do not allocate multi-gigabyte fp32 dequantized
+    # operands/results. Independent numerical validation remains in
+    # op_tests/test_gemm_a6w6.py.
+    from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_asm_kernel
 
     reference_out = torch.empty_like(out)
     aiter.gemm_a6w6_asm(
@@ -178,7 +221,7 @@ def generate_data(
         w_scales,
         reference_out,
         _ceil(K, 128),
-        _default_gemm_a6w6_kernel(M, N, K),
+        _default_gemm_a6w6_asm_kernel(M, N, K),
     )
     ref = reference_out[:M, :N].clone()
     return {
@@ -195,7 +238,20 @@ def return_reference(ref: torch.Tensor) -> torch.Tensor:
     return ref
 
 
-def run_gemm_a6w6_asm(
+def _launch(x_packed, w_packed, x_scales, w_scales, out, K, kernel_name):
+    """Run one candidate by name: a FlyDSL variant or an assembly kernel."""
+    if kernel_name.startswith(_FLYDSL_PREFIX):
+        aiter.gemm_a6w6_flydsl_out(
+            x_packed, w_packed, x_scales, w_scales, out, _ceil(K, 128), kernel_name
+        )
+    else:
+        aiter.gemm_a6w6_asm(
+            x_packed, w_packed, x_scales, w_scales, out, _ceil(K, 128), kernel_name
+        )
+    return out
+
+
+def run_gemm_a6w6(
     x_packed: torch.Tensor,
     w_packed: torch.Tensor,
     x_scales: torch.Tensor,
@@ -206,15 +262,7 @@ def run_gemm_a6w6_asm(
     K: int,
     kernel_name: str,
 ) -> torch.Tensor:
-    aiter.gemm_a6w6_asm(
-        x_packed,
-        w_packed,
-        x_scales,
-        w_scales,
-        out,
-        _ceil(K, 128),
-        kernel_name,
-    )
+    _launch(x_packed, w_packed, x_scales, w_scales, out, K, kernel_name)
     return out[:M, :N]
 
 
@@ -290,18 +338,12 @@ def benchmark_candidate_gain(
     candidate_out = torch.empty_like(default_out)
 
     def launch_default():
-        return aiter.gemm_a6w6_asm(
-            x_packed,
-            w_packed,
-            x_scales,
-            w_scales,
-            default_out,
-            padK,
-            default_kernel,
+        return _launch(
+            x_packed, w_packed, x_scales, w_scales, default_out, padK, default_kernel
         )
 
     def launch_candidate():
-        return aiter.gemm_a6w6_asm(
+        return _launch(
             x_packed,
             w_packed,
             x_scales,
@@ -406,15 +448,31 @@ class GemmA6W6Tuner(GemmCommonTuner):
         clear_gemm_a6w6_config_cache()
 
     def getKernelName(self, kernel_id):
+        # A FlyDSL variant's name carries K, so its tasks carry their names instead.
         candidate = self.candidates_by_id.get(kernel_id)
         return None if candidate is None else candidate["kernel_name"]
+
+    def _kernel_id(self, kernel_name):
+        flydsl_id = flydsl_kernel_id(kernel_name)
+        if flydsl_id is not None:
+            return flydsl_id
+        for candidate in self.candidates:
+            if candidate["kernel_name"] == kernel_name:
+                return candidate["kernel_id"]
+        raise KeyError(f"unknown A6W6 kernel {kernel_name!r}")
 
     def calculate(self, results, bpes=(0.75, 0.75, 2)):
         return super().calculate(results, bpes=bpes)
 
     def _apply_min_gain_guard(self, resultdf, args):
-        if resultdf.empty or getattr(args, "disable_gain_guard", False):
+        """One row per shape, from its profiled candidates (fastest first): of the
+        GUARD_CANDIDATES fastest and the fastest assembly kernel, the one paired
+        validation shows the most faster than the default, by at least
+        --min-gain-pct with every repeat a win; else the default."""
+        if resultdf.empty:
             return resultdf
+        if getattr(args, "disable_gain_guard", False):
+            return resultdf.groupby(["M", "N", "K"], sort=False).head(1)
 
         min_gain_pct = float(args.min_gain_pct)
         warmup = int(args.gain_guard_warmup)
@@ -429,111 +487,104 @@ class GemmA6W6Tuner(GemmCommonTuner):
 
         from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_kernel
 
-        candidates_by_name = {
-            candidate["kernel_name"]: candidate for candidate in self.candidates
-        }
-        guarded = resultdf.copy()
-        for index, row in guarded.iterrows():
-            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            candidate_kernel = str(row["kernelName"])
+        rows = []
+        for (M, N, K), group in resultdf.groupby(["M", "N", "K"], sort=False):
+            M, N, K = int(M), int(N), int(K)
             default_kernel = _default_gemm_a6w6_kernel(M, N, K)
-            if candidate_kernel == default_kernel:
-                continue
-
-            validation = None
-            try:
-                validation = benchmark_candidate_gain(
-                    M,
-                    N,
-                    K,
-                    default_kernel,
-                    candidate_kernel,
-                    warmup,
-                    iters,
-                    reps,
-                )
-                selected_kernel, gain_pct = choose_guarded_kernel(
-                    default_kernel,
-                    candidate_kernel,
-                    validation["paired_speedups"],
-                    min_gain_pct,
-                    validation["exact_match"],
-                )
-            except Exception as error:  # noqa: BLE001
-                selected_kernel = default_kernel
-                gain_pct = float("-inf")
-                logger.warning(
-                    "A6W6 gain validation failed for M=%s N=%s K=%s: %s; "
-                    "falling back to %s",
-                    M,
-                    N,
-                    K,
-                    error,
-                    default_kernel,
-                )
-
-            selected = candidates_by_name[selected_kernel]
-            guarded.at[index, "kernelId"] = selected["kernel_id"]
-            guarded.at[index, "kernelName"] = selected_kernel
-            guarded.at[index, "splitK"] = 0
-            if validation is not None:
-                selected_us = (
-                    validation["candidate_us"]
-                    if selected_kernel == candidate_kernel
-                    else validation["default_us"]
-                )
-                guarded.at[index, "us"] = round(selected_us, 4)
-                err_ratio = (
-                    float(row["errRatio"])
-                    if selected_kernel == candidate_kernel
-                    else 0.0
-                )
-                info = (
-                    (
-                        (
-                            str(row["gfx"]),
-                            int(row["cu_num"]),
-                            M,
-                            N,
-                            K,
-                        ),
-                        selected["kernel_id"],
-                        0,
-                        selected_kernel,
-                    ),
-                    selected_us,
-                    err_ratio,
-                )
-                tflops, bw = self.calculate(info)
-                guarded.at[index, "tflops"] = tflops
-                guarded.at[index, "bw"] = bw
-                if selected_kernel == default_kernel:
-                    guarded.at[index, "errRatio"] = 0.0
-
-            action = "KEEP" if selected_kernel == candidate_kernel else "FALLBACK"
-            all_pairs_win = bool(
-                validation is not None
-                and all(
-                    float(speedup) > 1.0 for speedup in validation["paired_speedups"]
-                )
+            is_asm = ~group["kernelName"].astype(str).str.startswith(_FLYDSL_PREFIX)
+            retimed = pd.concat(
+                [group.head(GUARD_CANDIDATES), group[is_asm].head(1)]
+            ).drop_duplicates("kernelName")
+            profiled_default = group.loc[group["kernelName"] == default_kernel, "us"]
+            default_us = (
+                float(profiled_default.iloc[0]) if len(profiled_default) else None
             )
+            best = None
+            for _, row in retimed.iterrows():
+                candidate_kernel = str(row["kernelName"])
+                if candidate_kernel == default_kernel:
+                    continue
+                try:
+                    validation = benchmark_candidate_gain(
+                        M,
+                        N,
+                        K,
+                        default_kernel,
+                        candidate_kernel,
+                        warmup,
+                        iters,
+                        reps,
+                    )
+                    selected_kernel, gain_pct = choose_guarded_kernel(
+                        default_kernel,
+                        candidate_kernel,
+                        validation["paired_speedups"],
+                        min_gain_pct,
+                        validation["exact_match"],
+                    )
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(
+                        "A6W6 gain validation failed for M=%s N=%s K=%s %s: %s",
+                        M,
+                        N,
+                        K,
+                        candidate_kernel,
+                        error,
+                    )
+                    continue
+                finally:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                default_us = validation["default_us"]
+                keep = selected_kernel == candidate_kernel
+                print(
+                    "[gain-guard] "
+                    f"M={M} N={N} K={K} candidate={candidate_kernel} "
+                    f"gain={gain_pct:+.3f}% threshold={min_gain_pct:.3f}% "
+                    f"{'pass' if keep else 'fail'}",
+                    flush=True,
+                )
+                if keep and (best is None or gain_pct > best[0]):
+                    best = (gain_pct, row, validation["candidate_us"])
+            if best is None:
+                first = group.iloc[0]
+                us = float(first["us"]) if default_us is None else default_us
+                rows.append(self._guarded_row(first, default_kernel, us, 0.0))
+            else:
+                _, row, us = best
+                rows.append(
+                    self._guarded_row(
+                        row, str(row["kernelName"]), us, float(row["errRatio"])
+                    )
+                )
             print(
-                "[gain-guard] "
-                f"M={M} N={N} K={K} candidate={candidate_kernel} "
-                f"gain={gain_pct:+.3f}% threshold={min_gain_pct:.3f}% "
-                f"all_pairs_win={all_pairs_win} "
-                f"action={action} selected={selected_kernel}",
+                f"[gain-guard] M={M} N={N} K={K} selected={rows[-1]['kernelName']}",
                 flush=True,
             )
-            gc.collect()
-            torch.cuda.empty_cache()
-        return guarded
+        return pd.DataFrame(rows).reset_index(drop=True).infer_objects()
+
+    def _guarded_row(self, row, kernel_name, us, err_ratio):
+        """``row`` with ``kernel_name`` selected at ``us`` microseconds."""
+        row = row.copy()
+        kernel_id = self._kernel_id(kernel_name)
+        key = (str(row["gfx"]), int(row["cu_num"]), *(int(row[k]) for k in "MNK"))
+        row["kernelId"], row["splitK"], row["kernelName"] = kernel_id, 0, kernel_name
+        row["us"], row["errRatio"] = round(us, 4), err_ratio
+        row["tflops"], row["bw"] = self.calculate(
+            ((key, kernel_id, 0, kernel_name), us, err_ratio)
+        )
+        return row
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
-        result = super().post_process(rets, args, topk, fast_mode)
-        if isinstance(result, pd.DataFrame) and topk == 1 and not fast_mode:
-            return self._apply_min_gain_guard(result, args)
-        return result
+        if topk != 1 or fast_mode:
+            return super().post_process(rets, args, topk, fast_mode)
+        rets = list(rets)
+        # Every valid candidate of each shape, fastest first, for the gain guard.
+        result = super().post_process(rets, args, len(rets), fast_mode)
+        self.topk = 1
+        if not isinstance(result, pd.DataFrame):
+            return result
+        return self._apply_min_gain_guard(result, args)
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a6w6 import gemm_a6w6
@@ -600,23 +651,19 @@ class GemmA6W6Tuner(GemmCommonTuner):
         seed = 0
         for _, row in untunedf.iterrows():
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            compatible_candidates = [
-                candidate
+            compatible_candidates = flydsl_candidates() + [
+                (candidate["kernel_id"], candidate["kernel_name"])
                 for candidate in self.candidates
                 if candidate_supports_shape(candidate, M, N, K)
             ]
-            if not compatible_candidates:
-                raise RuntimeError(f"no safe A6W6 candidate for {(M, N, K)}")
-            for candidate in compatible_candidates:
-                kernel_id = candidate["kernel_id"]
-                kernel_name = candidate["kernel_name"]
+            for kernel_id, kernel_name in compatible_candidates:
                 info = ((gfx, cu_num, M, N, K), kernel_id, 0, kernel_name)
                 tasks.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed),
-                        run_gemm_a6w6_asm,
+                        run_gemm_a6w6,
                         (gemm_keys, M, N, K, kernel_name),
                         {
                             "num_warmup": args.warmup,
@@ -652,6 +699,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
 if __name__ == "__main__":
     tuner = GemmA6W6Tuner(
         "GemmA6W6Tuner",
-        description="Tune gfx950 MXFP6 A6W6 assembly kernels",
+        description="Tune gfx950 MXFP6 A6W6 kernels (FlyDSL variants and "
+        "assembly kernels)",
     )
     tuner.run(tuner.parse_args(), False)

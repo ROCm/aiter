@@ -14,6 +14,7 @@ from aiter import logger
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_mixed_mxfp import _get_device_gfx_cu
 
@@ -36,6 +37,28 @@ _GROUPED_SWIZZLE_MAX_N = 64 * _TILE
 _BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
 _BATCHED_PACK_BLOCK_M = 64
 _BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
+# Kernel names of the FlyDSL 4-wave kernel (aiter/ops/flydsl/gemm_a6w6_4wave.py),
+# which reads the same packed operands as the ASM kernels and is bit-exact with them.
+_FLYDSL_KERNEL_PREFIX = "flydsl_a6w6_"
+
+
+def _normalize_default_backend(value: str) -> str:
+    backend = value.strip().lower() or "flydsl"
+    if backend not in {"flydsl", "asm"}:
+        # Read at import, so a typo must not make importing AITER fail.
+        logger.warning(
+            "AITER_A6W6_DEFAULT_BACKEND must be flydsl (default) or asm, got %r; "
+            "using flydsl",
+            value,
+        )
+        return "flydsl"
+    return backend
+
+
+# The kernel for shapes without a tuned row; tuned rows and kernelName pick either.
+_DEFAULT_BACKEND = _normalize_default_backend(
+    os.environ.get("AITER_A6W6_DEFAULT_BACKEND", "")
+)
 
 
 def _normalize_quant_backend(value: str) -> str:
@@ -733,8 +756,28 @@ def clear_gemm_a6w6_config_cache() -> None:
     _get_device_gfx_cu.cache_clear()
 
 
+@torch.compiler.assume_constant_result
+def _flydsl_default_kernel() -> str | None:
+    """The FlyDSL kernel's default variant, or None without FlyDSL."""
+    try:
+        from .flydsl.gemm_a6w6_4wave import make_kernel_name
+    except ImportError:
+        return None
+    return make_kernel_name()
+
+
 def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
-    """Choose a safe untuned fallback for the physical launch shape.
+    """The untuned default: the FlyDSL kernel, or the ASM fallback without FlyDSL or
+    with AITER_A6W6_DEFAULT_BACKEND=asm."""
+    if _DEFAULT_BACKEND == "flydsl":
+        name = _flydsl_default_kernel()
+        if name is not None:
+            return name
+    return _default_gemm_a6w6_asm_kernel(M, N, K)
+
+
+def _default_gemm_a6w6_asm_kernel(M: int, N: int, K: int) -> str:
+    """Choose a safe untuned ASM fallback for the physical launch shape.
 
     The optimized grouped-M kernel has compile-time swizzle bounds for short-K
     launches. Natural ordering has no such grid bound and is used outside them.
@@ -1112,7 +1155,12 @@ def gemm_a6w6_asm(
     if not kernelName:
         if out.ndim != 2:
             raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
-        kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
+        kernelName = _default_gemm_a6w6_asm_kernel(*out.shape, K)
+    if kernelName.startswith(_FLYDSL_KERNEL_PREFIX):
+        raise ValueError(
+            f"{kernelName} is a FlyDSL kernel; run it with gemm_a6w6 or "
+            "gemm_a6w6_flydsl_out"
+        )
     if out.ndim == 2 and out.numel() * out.element_size() > _MAX_BUFFER_BYTES:
         _launch_output_row_chunks(
             lambda a, a_scale, o: _gemm_a6w6_asm(
@@ -1138,6 +1186,34 @@ def gemm_a6w6_asm(
     return out
 
 
+# Only ``out`` is written, so it is the only argument declared mutable; returning
+# nothing keeps the op free of outputs that alias an input.
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def gemm_a6w6_flydsl_out(
+    A: Tensor,  # packed mxfp6 blob
+    B: Tensor,  # packed mxfp6 blob
+    A_scale: Tensor,  # packed e8m0 blob
+    B_scale: Tensor,  # packed e8m0 blob
+    out: Tensor,  # [ceil(M, 256), ceil(N, 256)] bf16
+    K: int,  # padded contraction dim consumed by the packed layout
+    kernelName: str,
+) -> None:
+    """Run the FlyDSL A6W6 kernel ``kernelName`` on packed operands into ``out``.
+
+    The operands are those of ``gemm_a6w6_asm``. Outputs over 2 GiB run in 256-row
+    chunks, as for the ASM kernels.
+    """
+    from .flydsl.gemm_a6w6_4wave import run_named_gemm_a6w6_4wave
+
+    def launch(a, a_scale, o):
+        run_named_gemm_a6w6_4wave(a, B, a_scale, B_scale, o, int(K), kernelName)
+
+    if out.numel() * out.element_size() > _MAX_BUFFER_BYTES:
+        _launch_output_row_chunks(launch, A, A_scale, out, int(K), _PACKED_TILE_BYTES)
+    else:
+        launch(A.reshape(-1), A_scale.reshape(-1), out)
+
+
 def gemm_a6w6(
     A: Tensor,  # packed mxfp6 A (from quant_mxfp6_gemm)
     B: Tensor,  # packed mxfp6 B (from quant_mxfp6_gemm)
@@ -1154,8 +1230,10 @@ def gemm_a6w6(
 
     A/B and their scales must be pre-packed with `quant_mxfp6_gemm`. M/N/K are
     the logical (unpadded) dims. Unless ``kernelName`` explicitly overrides it,
-    a shape-tuned kernel is selected before the launch is padded. The result is
-    sliced back to [M, N].
+    a shape-tuned kernel is selected before the launch is padded, and untuned
+    shapes run the FlyDSL kernel (``AITER_A6W6_DEFAULT_BACKEND=asm`` keeps the
+    ASM fallback). A ``flydsl_a6w6_*`` name runs the FlyDSL kernel, any other
+    an ASM kernel. The result is sliced back to [M, N].
     """
     if dtype != dtypes.bf16:
         raise ValueError(
@@ -1166,7 +1244,10 @@ def gemm_a6w6(
     selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName, device=A.device)
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
+    if selected_kernel.startswith(_FLYDSL_KERNEL_PREFIX):
+        gemm_a6w6_flydsl_out(A, B, A_scale, B_scale, out, padK, selected_kernel)
+    else:
+        gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
     if padM != M or padN != N:
         return out[:M, :N]
     return out
