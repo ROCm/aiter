@@ -295,6 +295,29 @@ def _is_tracked(path: str) -> bool:
 
 
 @functools.cache
+def _process_start_ns() -> int:
+    """When this process started, to a clock tick: ``/proc/self/stat`` gives it
+    in ticks since boot."""
+    with open("/proc/self/stat") as f:
+        ticks = int(f.read().rpartition(")")[2].split()[19])
+    since_boot = ticks * 10**9 // os.sysconf("SC_CLK_TCK")
+    return time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME) + since_boot
+
+
+def _changed_since_start(files) -> list:
+    """Sources modified after this process started. The process may run the code
+    it imported before the change, so an entry built now could hold the old code
+    under the new file's hash."""
+    start = _process_start_ns()
+    changed = []
+    for f in files:
+        with contextlib.suppress(OSError):
+            if os.stat(f).st_mtime_ns > start:
+                changed.append(f)
+    return changed
+
+
+@functools.cache
 def _file_digest(path: str) -> str | None:
     """Content hash of a source file, once per process; None if it is gone."""
     try:
@@ -666,6 +689,12 @@ class FlyDSLAotCache:
             with _record_sources(files, read):
                 exe = make_exe()
                 tmp_obj = _export(exe, args, tmp, sym)
+            changed = _changed_since_start(files)
+            if changed:
+                raise RuntimeError(
+                    f"{changed[0]} changed after this process started; not caching "
+                    f"a build that may hold its earlier code"
+                )
             # Hashed now, not from the per-process cache: the build read the
             # files as they are on disk at this point.
             _file_digest.cache_clear()

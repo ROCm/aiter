@@ -238,6 +238,12 @@ instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
+A process runs the code it imported, so a source edited after it started
+(`git checkout` during a test run) no longer matches what it would trace. A
+build that records such a file is not written: that key takes the JIT path
+in this process, with a warning, and the next process builds the entry from
+the new code.
+
 Recording costs about 80 ms on a miss (≈110 ms → ≈190 ms), once per entry
 per machine. A hit pays nothing for it.
 
