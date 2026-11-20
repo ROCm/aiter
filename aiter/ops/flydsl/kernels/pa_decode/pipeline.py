@@ -545,6 +545,9 @@ class PaDecodePipeline:
                     v_flat0.extend(self.kv.load_v(v_page_pf0, vh))
                 v_pf0 = fx.Vector.from_elements(v_flat0, dtype=fx.Int64)
             init_state.append(v_pf0)
+        if const_expr(self.traits.NHD_V_BUFS == 2):  # noqa: SIM102
+            if self.ctx.part_start < self.ctx.part_end:
+                self.kv.nhd_v_dma(self.ctx.part_start, 0)
         # The d256 pipe keeps its M-tiles on the single-tile schedule.
         multi_query = self.traits.M_TILES > 1 and not self.traits.D256_PIPE
         if const_expr(self.traits.single_tile_plan):
@@ -553,6 +556,17 @@ class PaDecodePipeline:
             o_final = self.tile(
                 init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
             )
+        elif const_expr(self.traits.nhd_layout):
+            # NHD DMA zero-fills the V tail, so it skips V byte masking, but a
+            # multi-tile final partial tile still needs score masking.
+            for loop_i, ostate in range(
+                self.ctx.part_start, self.ctx.part_end, 1, init=init_state
+            ):
+                next_state = self.tile(
+                    ostate, fx.Int32(loop_i), multi_query, q_ops_all, True
+                )
+                results = yield next_state
+            o_final = results
         elif const_expr(self.traits.DUAL_GROUP):
             # Group tiles part_start + 2j; only the peeled last one can hold
             # the task's tail or lie past it.
@@ -610,6 +624,7 @@ class PaDecodePipeline:
             self.traits.V_SLOT
         ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
         tok0 = tt * KV_COMPUTE_BLOCK
+        nhd_buf = (tt - self.ctx.part_start) & 1
         # Interleave MFMA with VALU/LDS or page16 V loads.
         if const_expr(
             (not self.traits.per_token_kv and multi_query) or self.traits.PAGE16_VPIPE
@@ -664,10 +679,14 @@ class PaDecodePipeline:
             )
             or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
         ):
-            v_vh_shared = [
-                self.kv.load_v(v_page_cur, vh)
-                for vh in range_constexpr(self.traits.VHE_CHUNKS)
-            ]
+            if const_expr(self.traits.nhd_layout):
+                if const_expr(self.traits.NHD_V_BUFS == 1):
+                    self.kv.nhd_v_dma(tt, 0)
+            else:
+                v_vh_shared = [
+                    self.kv.load_v(v_page_cur, vh)
+                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                ]
 
         q_scale_vec = None
         if const_expr(self.traits.M_TILES > 1 and self.traits.kv_dtype != fx.BFloat16):
@@ -726,6 +745,7 @@ class PaDecodePipeline:
             scale_bounds,
             v_vh_shared,
             q_ops_all,
+            nhd_buf,
             q_scale_vec,
             mask_tail,
             has_next,
@@ -1235,6 +1255,7 @@ class PaDecodePipeline:
         scale_bounds,
         v_vh_shared,
         q_ops_all,
+        nhd_buf,
         q_scale_vec,
         mask_tail,
         has_next=True,
@@ -1276,6 +1297,12 @@ class PaDecodePipeline:
                 self.gemm.qk(k_cur, q_ops_all, m)
                 for m in range_constexpr(self.traits.M_TILES)
             ]
+        if const_expr(self.traits.nhd_layout and self.traits.NHD_V_BUFS == 1):
+            # Finish V before the next K load joins the vmcnt chain.
+            fx.rocdl.sched_barrier(0)
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            v_vh_shared = self.kv.nhd_v_gather(0)
         v_after_qk = self.traits.DECODE_LAST_V_AFTER_QK and not has_next
         if const_expr(v_after_qk):
             # No next K to load: issue V behind QK so its latency overlaps
@@ -1367,7 +1394,12 @@ class PaDecodePipeline:
                 score_mask,
             )
             masked_chunks.append(chunks)
-        gpu.barrier()
+        if const_expr(self.traits.NHD_V_BUFS == 2):
+            self.lds.barrier_keep_dma()
+            # Every wave has finished PV(t-1), so its buffer is free.
+            self.kv.nhd_v_dma(tt1, nhd_buf ^ 1)
+        else:
+            gpu.barrier()
         v_page_next = v_page_cur
         if const_expr(late_scales):
             v_page_next = self.kv.read_v_pages()
@@ -1395,7 +1427,18 @@ class PaDecodePipeline:
             )
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
-        gpu.barrier()
+        if const_expr(self.traits.NHD_V_BUFS == 2):
+            # vmcnt retires in issue order. This tile's DMA is followed by the
+            # next tile's K loads (none on the last tile) and DMA; any other
+            # later load only makes the wait stricter.
+            fx.rocdl.sched_barrier(0)
+            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_K_LOADS + self.traits.NHD_DMAS)
+            else:
+                fx.rocdl.s_waitcnt(vmcnt=self.traits.NHD_DMAS)
+            self.lds.barrier_keep_dma()
+        else:
+            gpu.barrier()
         if const_expr(  # noqa: SIM102
             self.traits.PAGE16_VPIPE and not self.traits.PAGE16_EARLY_K
         ):
@@ -1429,6 +1472,11 @@ class PaDecodePipeline:
             corr_b.append(
                 fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg[m]), fx.Float32)
             )
+        if const_expr(self.traits.NHD_V_BUFS == 2):
+            # Issue the sums and P reads ahead of the V transposes so PV waits
+            # only for its own chunk.
+            fx.rocdl.sched_barrier(0)
+            v_vh_shared = self.kv.nhd_v_gather(nhd_buf)
         if const_expr(self.traits.STREAM_KV):
             v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
             # STREAM_V_DEPTH head chunks in flight; one fence per chunk keeps
@@ -1461,7 +1509,11 @@ class PaDecodePipeline:
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
             v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
-            if const_expr(not mask_tail and self.traits.block_size >= 64):
+            if const_expr(
+                not mask_tail
+                and self.traits.block_size >= 64
+                and not self.traits.nhd_layout
+            ):
                 # Without the tail-mask branch, the scheduler sinks page64/128 V
                 # loads next to their PV MFMAs and exposes their latency.
                 fx.rocdl.sched_barrier(0)
