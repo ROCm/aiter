@@ -53,6 +53,32 @@ def test_topk_softmax(num_tokens, num_experts, topk, need_renorm):
         ), f"Row {row}: expert sets differ"
 
 
+@pytest.mark.parametrize("num_experts", [64, 256, 512, 160])
+def test_topk_softmax_nan_rows_distinct_ids(num_experts):
+    """A row with fewer than topk valid experts must still yield topk distinct
+    ids: the fused MoE kernels queue every (token, expert) pair, weight 0 or not.
+    E=160 takes the moeTopK fallback, the others the fused kernel."""
+    topk = 8
+    torch.manual_seed(42)
+    gating_output = torch.randn(4, num_experts, dtype=torch.float32)
+    gating_output[0] = float("nan")
+    gating_output[1] = float("nan")
+    valid = list(range(5, 5 + topk - 1))
+    gating_output[1, valid] = torch.arange(topk - 1, dtype=torch.float32) + 1.0
+    gating_output[2] = float("-inf")
+    gating_output[2, 3] = 0.0
+
+    topk_weights, topk_indices = _run_topk_softmax(gating_output, topk, True)
+
+    assert topk_weights.isfinite().all()
+    for row in range(4):
+        ids = topk_indices[row].tolist()
+        assert len(set(ids)) == topk, f"Row {row}: repeated ids {ids}"
+        assert all(0 <= i < num_experts for i in ids), f"Row {row}: {ids}"
+    assert set(valid) <= set(topk_indices[1].tolist())
+    assert 3 in topk_indices[2].tolist()
+
+
 def test_topk_softmax_n_zero():
     pytest.skip(
         "topk_softmax ASM kernel does not support 0 tokens (invalid HIP launch)"
