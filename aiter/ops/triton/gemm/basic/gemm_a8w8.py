@@ -23,7 +23,190 @@ from aiter.ops.triton.utils.types import (
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250", "gfx1250-strict")
+_GLUON_PTPC_ARCHS = ("gfx1250", "gfx1250-strict")
+
+
+def _scale_stride(scale: torch.Tensor, size: int) -> int:
+    assert scale.numel() == size, f"scale has {scale.numel()} elements, expected {size}"
+    for dim, extent in enumerate(scale.shape):
+        if extent == size:
+            return scale.stride(dim)
+    return 1
+
+
+def _gemm_a8w8_ptpc_gfx1250(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    dtype: torch.dtype,
+    y: torch.Tensor | None,
+    config: dict | None,
+    skip_reduce: bool,
+) -> torch.Tensor:
+    """Launch the gfx1250 Gluon PTPC kernel: x is (M, K) FP8 and w is (N, K) FP8."""
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8 import (
+        _KERNEL_MAP,
+        _MIN_BUFFERS,
+        create_ptpc_layouts,
+    )
+
+    M, K = x.shape
+    N, _ = w.shape
+    assert (
+        x.dtype == torch.float8_e4m3fn and w.dtype == torch.float8_e4m3fn
+    ), "The gfx1250 Gluon kernel supports FP8 E4M3 inputs only"
+    assert x.stride(1) == 1 and w.stride(1) == 1, "x and w must be contiguous along K"
+
+    if config is None:
+        config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
+    kernel_type = config["kernel_type"]
+    assert (
+        kernel_type in _KERNEL_MAP
+    ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP)}"
+
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
+    num_warps = config["num_warps"]
+    num_ctas = config["num_ctas"]
+    register_store = config["REGISTER_STORE"]
+
+    # Split-K: each split does a whole number of BLOCK_K stages.
+    k_stages = triton.cdiv(K, BLOCK_K)
+    stages_per_split = triton.cdiv(k_stages, max(config["NUM_KSPLIT"], 1))
+    splitk_block_size = stages_per_split * BLOCK_K
+    num_ksplit = triton.cdiv(K, splitk_block_size)
+    if num_ksplit == 1:
+        splitk_block_size = 0
+
+    # The pipeline cannot be deeper than the number of K stages of a split.
+    num_buffers = min(config["NUM_BUFFERS"], stages_per_split)
+    if num_buffers < _MIN_BUFFERS[kernel_type]:
+        _LOGGER.warning(
+            "GEMM_A8W8 [gluon/gfx1250]: kernel_type='%s' needs NUM_BUFFERS>=%s "
+            "but K=%s, BLOCK_K=%s gives %s; uses kernel_type='bandwidth_bound'.",
+            kernel_type,
+            _MIN_BUFFERS[kernel_type],
+            K,
+            BLOCK_K,
+            num_buffers,
+        )
+        kernel_type = "bandwidth_bound"
+    # The coalesced register store has no fp32 layout. The sliced_k tile is already coalesced.
+    if register_store in (2, 3) and (kernel_type == "sliced_k" or num_ksplit > 1):
+        register_store = 1
+
+    # Split-K writes fp32 partials, then a reduce kernel adds them and the bias.
+    if num_ksplit > 1:
+        c = torch.empty((num_ksplit, M, N), dtype=torch.float32, device=x.device)
+    else:
+        c = y if y is not None else torch.empty((M, N), dtype=dtype, device=x.device)
+
+    layouts = create_ptpc_layouts(
+        kernel_type,
+        num_warps,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        num_ctas,
+        config["WARPS_N"],
+        register_store,
+        config["CTAS_M"],
+        config["PARTITION"],
+    )
+    _LOGGER.info(
+        "GEMM_A8W8 [gluon/gfx1250]: x=%s w=%s kernel=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        kernel_type,
+    )
+
+    if kernel_type == "bandwidth_bound":
+        variant_args = {"NUM_KSUB": config["NUM_KSUB"]}
+    else:
+        variant_args = {"SLICED_K": kernel_type == "sliced_k"}
+    x_scale_stride = _scale_stride(x_scale, M)
+    w_scale_stride = _scale_stride(w_scale, N)
+    grid_2d = num_ctas == 1 and num_ksplit == 1 and config["GROUP_SIZE_M"] == 0
+    if grid_2d:
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    else:
+        grid = (num_ksplit * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _KERNEL_MAP[kernel_type][grid](
+        x,
+        w,
+        c,
+        x_scale,
+        w_scale,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        c.stride(-2),
+        c.stride(-1),
+        c.stride(0) if num_ksplit > 1 else 0,
+        x_scale_stride,
+        w_scale_stride,
+        bias,
+        _scale_stride(bias, N) if bias is not None else 0,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_BUFFERS=num_buffers,
+        NUM_CTAS=num_ctas,
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        FUSED_LOAD=config["FUSED_LOAD"] if num_warps >= 2 else 0,
+        REGISTER_STORE=register_store,
+        ADD_BIAS=bias is not None and num_ksplit == 1,
+        NUM_KSPLIT=num_ksplit,
+        SPLITK_BLOCK_SIZE=splitk_block_size,
+        SCALE_TDM=(
+            config["SCALE_TDM"]
+            if num_ksplit == 1 and x_scale_stride == 1 and w_scale_stride == 1
+            else 0
+        ),
+        GRID_2D=grid_2d,
+        **variant_args,
+        num_warps=num_warps,
+        num_ctas=num_ctas,
+        waves_per_eu=config["waves_per_eu"],
+        **layouts,
+    )
+
+    if num_ksplit == 1 or skip_reduce:
+        return c
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    REDUCE_BLOCK = 32
+    _gemm_splitk_reduce_kernel[
+        (triton.cdiv(M, REDUCE_BLOCK), triton.cdiv(N, REDUCE_BLOCK))
+    ](
+        c,
+        y,
+        bias,
+        M,
+        N,
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_SIZE_M=REDUCE_BLOCK,
+        BLOCK_SIZE_N=REDUCE_BLOCK,
+        ACTUAL_KSPLIT=num_ksplit,
+        MAX_KSPLIT=triton.next_power_of_2(num_ksplit),
+        ADD_BIAS=bias is not None,
+        activation="",
+        use_activation=False,
+        KERNEL_NAME="_gemm_a8w8_ptpc_reduce_kernel",
+    )
+    return y
 
 
 def gemm_a8w8(
@@ -55,6 +238,9 @@ def gemm_a8w8(
         skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
             Enables kernel fusion with downstream operations (FP8/FP4 quantization,
             RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
+        backend (str): "triton" (default) or "gluon". On gfx1250 the gluon backend
+            runs the PTPC kernel. Its limits are: FP8 E4M3 inputs, and x and w
+            contiguous along K. N can be any size.
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -73,8 +259,6 @@ def gemm_a8w8(
     M, K = x.shape
     N, K = w.shape
 
-    w = w.T
-
     assert backend in (
         "triton",
         "gluon",
@@ -85,6 +269,12 @@ def gemm_a8w8(
             get_arch() in _GLUON_SUPPORTED_ARCHS
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         assert x.dtype == w.dtype, "Input types must be the same"
+        if get_arch() in _GLUON_PTPC_ARCHS:
+            return _gemm_a8w8_ptpc_gfx1250(
+                x, w, x_scale, w_scale, bias, dtype, y, config, skip_reduce
+            )
+
+    w = w.T
 
     if config is None:
         if backend == "gluon":
