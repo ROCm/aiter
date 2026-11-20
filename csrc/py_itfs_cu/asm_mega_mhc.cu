@@ -8,10 +8,10 @@
 // kernarg record whose first 30 DWORDs are preloaded into SGPRs. They use the
 // same packed fn (mega_mhc_shuffle_fn), inputs and outputs as the HIP kernel.
 //
-//  kind | tile  | grid (workgroups)            | partials (FP32)
-// ------+-------+------------------------------+-----------------
-//  ps   |  64   | ps_clusters * 16, persistent | 16*T*32 + 16*T
-//  ns   | 16/32 | ceil(T/tile) * 16            | 16*T*32 + 16*T
+//  kind | tile  | grid (workgroups)                          | partials (FP32)
+// ------+-------+--------------------------------------------+-----------------
+//  ps   |  64   | min(ps_clusters, ceil(T/64)) * 16, persist | 16*T*32 + 16*T
+//  ns   | 16/32 | ceil(T/tile) * 16                          | 16*T*32 + 16*T
 //
 // Each tile has BF16, MXFP8 row-major and MXFP8 M32K4 builds for every
 // (HAS_POST, IDENTITY_PRE). MXFP8 writes the BF16 norm, E4M3fn q and E8M0
@@ -27,6 +27,7 @@
 
 #include "aiter_ctypes_error.h"
 #include "asm_mega_mhc_configs.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -325,9 +326,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         return AiterAsmKernel(cfg->knl_name.c_str(), cfg->co_name.c_str());
     });
 
-    const int64_t clusters =
-        cfg->persistent ? cfg->ps_clusters : (t + cfg->tile_tokens - 1) / cfg->tile_tokens;
-    const int gdx = static_cast<int>(clusters * MHC_SPLITS);
+    // A persistent kernel steps by ps_clusters tiles per round, so only the clusters
+    // that own a tile in the first round need to launch.
+    const int64_t tiles    = (t + cfg->tile_tokens - 1) / cfg->tile_tokens;
+    const int64_t clusters = cfg->persistent ? std::min<int64_t>(cfg->ps_clusters, tiles) : tiles;
+    const int gdx          = static_cast<int>(clusters * MHC_SPLITS);
     impl_ptr->launch_kernel(
         {&args, &arg_size, gdx, 1, 1, MHC_BLOCK, 1, 1, stream, MHC_SPLITS, 1, 1});
 }
