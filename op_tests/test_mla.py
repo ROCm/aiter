@@ -3,8 +3,10 @@
 
 import argparse
 import itertools
+import math
 import random
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -934,6 +936,399 @@ def test_mla(
     return ret
 
 
+# ---- OpusMlaFlatDecode: host planner, 32mx4 stage 1, bf16 merge (gfx950) ----
+_OF_KV_LORA_RANK = 512
+_OF_DIM = _OF_KV_LORA_RANK + 64
+_OF_SLOT = 128
+_OF_KV_TILE = 32
+_OF_CP_WORLD = 8
+_OF_RANK = 3
+_OF_Q_SCALE, _OF_KV_SCALE = 0.75, 1.25
+
+
+def _of_decoder(max_batch=64):
+    from aiter.ops.opus.mla_flat import OpusMlaFlatDecode
+
+    return OpusMlaFlatDecode(max_batch=max_batch)
+
+
+def _of_ctxs(kind, seed, bs=24):
+    """Global context lengths."""
+    rng = np.random.default_rng(seed)
+    if kind == "short":
+        # a few KV tiles per request
+        return [_OF_CP_WORLD * int(x) for x in rng.integers(40, 600, size=bs)]
+    if kind == "tail":
+        # local lengths of 1-5 past a whole KV tile: a last tile shorter than the query
+        return [
+            _OF_CP_WORLD * (_OF_KV_TILE * int(rng.integers(4, 64)) + 1 + i % 5)
+            for i in range(bs)
+        ]
+    # lognormal around 66k global tokens
+    return [
+        int(min(max(66000 * math.exp(0.67 * rng.standard_normal()), 2000), 200000))
+        for _ in range(bs)
+    ]
+
+
+def _of_local_lens(ctxs, cp_rr):
+    if cp_rr:
+        return [(c - _OF_RANK + _OF_CP_WORLD - 1) // _OF_CP_WORLD for c in ctxs]
+    return [c // _OF_CP_WORLD for c in ctxs]
+
+
+def _of_indptr(lens):
+    out = np.zeros(len(lens) + 1, dtype=np.int32)
+    out[1:] = np.cumsum(lens)
+    return out
+
+
+def _of_check_plan(dec, kvp, q_lens, nhead, balance):
+    """Plan invariants on the host copy of the last plan."""
+    plan = dec._host[(dec._step - 1) & 1].numpy()
+    nwg, cap = dec.num_workers, dec.item_cap
+    wip = plan[: nwg + 1]
+    items = plan[nwg + 1 : nwg + 1 + cap * 8].reshape(cap, 8)
+    units = plan[nwg + 1 + cap * 8 :].reshape(-1, 4)
+    n_items, n_units = dec.last["items"], dec.last["units"]
+    # a request's rows are its own query tokens x heads, based at its first flat row
+    nrows = [q * nhead for q in q_lens]
+    nch = [-(-n // _OF_SLOT) for n in nrows]
+    base = (_of_indptr(q_lens) * nhead).tolist()
+    assert wip[0] == 0 and (np.diff(wip) >= 0).all() and wip[-1] == n_items
+    it = items[:n_items]
+    assert not items[n_items:].any() and not units[n_units:].any()
+    pieces = {}
+    for b, slot, q0, q1, k0, k1, _, _ in it.tolist():
+        chunk = (q0 - base[b]) // _OF_SLOT
+        assert 0 <= chunk < nch[b], "a piece is outside the request's chunks"
+        assert q0 == base[b] + chunk * _OF_SLOT and q1 == q0 + min(
+            _OF_SLOT, nrows[b] - chunk * _OF_SLOT
+        )
+        assert kvp[b] <= k0 < k1 <= kvp[b + 1]
+        if balance and k1 == kvp[b + 1]:
+            # the query's first token sees kv_end - q_len + 1 keys of the request
+            assert k0 <= kvp[b + 1] - q_lens[b], "a piece has rows that see no key"
+        pieces.setdefault((b, chunk), []).append((k0, k1, slot))
+    assert len(pieces) == sum(nch)
+    merged = {}
+    for (b, chunk), ps in pieces.items():
+        ps.sort()
+        assert ps[0][0] == kvp[b] and ps[-1][1] == kvp[b + 1]
+        assert all(
+            ps[i][1] == ps[i + 1][0] for i in range(len(ps) - 1)
+        ), "KV gap or overlap"
+        slots = sorted(p[2] for p in ps)
+        if len(ps) == 1:
+            assert slots == [-1], "an unsplit unit writes its output directly"
+        else:
+            assert slots == list(range(slots[0], slots[0] + len(ps)))
+            merged[(b, chunk)] = (slots[0], slots[-1] + 1)
+    assert n_units == len(merged)
+    got = {}
+    for s0, s1, row0, rows in units[:n_units].tolist():
+        b = int(np.searchsorted(base, row0, side="right")) - 1
+        chunk = (row0 - base[b]) // _OF_SLOT
+        assert rows == min(_OF_SLOT, nrows[b] - chunk * _OF_SLOT)
+        got[(b, chunk)] = (s0, s1)
+    assert got == merged
+    used = [s for ps in pieces.values() for _, _, s in ps if s >= 0]
+    assert len(set(used)) == len(used), "two pieces share a partial slot"
+    assert all(s < n_items for s in used), "a partial slot is out of range"
+
+
+def _of_reference(q, kv, q_lens, lens, ctxs, cp_rr):
+    """fp32 causal attention over each request's local KV, on global positions with CP."""
+    outs, lses = [], []
+    kv_at, q_at = 0, 0
+    for b, n in enumerate(lens):
+        q_len = q_lens[b]
+        qb = q[q_at : q_at + q_len].float() * _OF_Q_SCALE
+        q_at += q_len
+        k = kv[kv_at : kv_at + n].float() * _OF_KV_SCALE
+        kv_at += n
+        s = torch.einsum("thd,ld->thl", qb, k) * _OF_DIM**-0.5
+        j = torch.arange(n, device="cuda")
+        t = torch.arange(q_len, device="cuda")
+        if cp_rr:
+            vis = (j[None, :] * _OF_CP_WORLD + _OF_RANK) <= (
+                ctxs[b] - q_len + t[:, None]
+            )
+        else:
+            vis = j[None, :] <= (n - q_len + t[:, None])
+        s = s.masked_fill(~vis[:, None, :], float("-inf"))
+        lses.append(s.logsumexp(-1))
+        outs.append(torch.einsum("thl,ld->thd", s.softmax(-1), k[:, :_OF_KV_LORA_RANK]))
+    return torch.cat(outs), torch.cat(lses)
+
+
+class _OfCase:
+    def __init__(self, nhead, q_len, ctxs, cp_rr, seed=7, bucketed=True):
+        self.nhead, self.ctxs, self.cp_rr, self.bucketed = nhead, ctxs, cp_rr, bucketed
+        # q_len is one token count for the batch or one per request
+        self.q_lens = (
+            [int(q_len)] * len(ctxs)
+            if isinstance(q_len, int)
+            else [int(x) for x in q_len]
+        )
+        self.q_len = q_len
+        self.lens = _of_local_lens(ctxs, cp_rr)
+        total = sum(self.lens)
+        total_q = sum(self.q_lens)
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        self.q = torch.randn((total_q, nhead, _OF_DIM), generator=g, device="cuda").to(
+            dtypes.fp8
+        )
+        self.kv = torch.randn((total, _OF_DIM), generator=g, device="cuda").to(
+            dtypes.fp8
+        )
+        # the requests' cache rows, scattered over a larger cache
+        self.slots = torch.randperm(total + 4096, generator=g, device="cuda")[
+            :total
+        ].int()
+        self.cache = torch.zeros((total + 4096, _OF_DIM), device="cuda").to(dtypes.fp8)
+        self.cache[self.slots.long()] = self.kv
+        self.kvp = _of_indptr(self.lens)
+        self.out = torch.full(
+            (total_q, nhead, _OF_KV_LORA_RANK), float("nan"), device="cuda"
+        ).to(torch.bfloat16)
+        self.qo_indptr = torch.from_numpy(_of_indptr(self.q_lens)).cuda()
+        self.kv_indptr = torch.from_numpy(self.kvp).cuda()
+        self.g_kv_indptr = torch.from_numpy(_of_indptr(ctxs)).cuda() if cp_rr else None
+        self.cp = _OF_CP_WORLD if cp_rr else 1
+        self.q_scale = torch.tensor([_OF_Q_SCALE], device="cuda")
+        self.kv_scale = torch.tensor([_OF_KV_SCALE], device="cuda")
+
+    def plan(self, dec):
+        return dec.plan(self.kvp, self.q_len, self.nhead, self.cp, self.bucketed)
+
+    def run(self, dec, lse=None):
+        return dec(
+            self.q,
+            self.cache.view(-1, 1, 1, _OF_DIM),
+            self.out,
+            self.qo_indptr,
+            self.kv_indptr,
+            self.slots,
+            _OF_DIM**-0.5,
+            self.q_scale,
+            self.kv_scale,
+            self.g_kv_indptr,
+            self.cp,
+            _OF_RANK if self.cp_rr else 0,
+            lse=lse,
+        )
+
+    def check(self, lse):
+        torch.cuda.synchronize()
+        o_ref, lse_ref = _of_reference(
+            self.q, self.kv, self.q_lens, self.lens, self.ctxs, self.cp_rr
+        )
+        o32 = self.out.float()
+        assert not o32.isnan().any(), "some output row is NaN or was never written"
+        err = ((o32 - o_ref).abs().max() / o_ref.abs().max()).item()
+        # P is rounded to fp8 for P*V and the partials to bf16
+        assert err < 5e-2, f"O max error {err:.3e} of the reference's max"
+        lerr = (lse.float() - lse_ref).abs().max().item()
+        assert lerr < 1e-2, f"LSE max abs error {lerr:.3e}"
+
+
+_OF_SHAPES = [
+    # (heads, cp round-robin, qlen): 96 heads gathered under 8-way CP, 12 / 16 per rank without
+    *[(96, True, q) for q in (2, 4, 5, 6, 8)],
+    *[(96, False, q) for q in (4, 6)],
+    *[(h, False, q) for h in (12, 16) for q in (2, 4, 6, 8)],
+]
+
+
+def _of_qlens(kind, bs, seed, hi=8):
+    """Per-request query token counts."""
+    rng = np.random.default_rng(seed)
+    if kind == "spread":
+        return [int(x) for x in rng.integers(1, hi + 1, size=bs)]
+    if kind == "deep-few":
+        # the bucketing's target: a few requests carry the depth, the rest are one token
+        return [hi if i % 8 == 0 else 1 for i in range(bs)]
+    # one request out of step with the rest
+    return [hi if i == bs // 2 else 2 for i in range(bs)]
+
+
+_OF_RAGGED = [(96, True, 8), (96, False, 8), (16, False, 8), (12, False, 6)]
+
+
+def check_opus_flat_decode():
+    """Host planner, opus fp8 32mx4 stage 1 and bf16-partial merge. gfx950 only."""
+
+    def run_case(dec, case, balance):
+        case.plan(dec)
+        _of_check_plan(dec, case.kvp, case.q_lens, case.nhead, balance)
+        case.check(case.run(dec))
+
+    for nhead, cp_rr, q_len in _OF_SHAPES:
+        for kind in ("mixed", "short", "tail"):
+            run_case(
+                _of_decoder(),
+                _OfCase(nhead, q_len, _of_ctxs(kind, seed=5), cp_rr),
+                not cp_rr,
+            )
+
+    for cp_rr in (True, False):
+        nhead, q_len = (96, 4) if cp_rr else (12, 6)
+        for bs in (1, 2, 3, 4, 11, 32, 64):
+            run_case(
+                _of_decoder(),
+                _OfCase(nhead, q_len, _of_ctxs("mixed", seed=bs, bs=bs), cp_rr),
+                not cp_rr,
+            )
+
+    for cp_rr in (True, False):
+        nhead, q_len, bs = (96, 5, 16) if cp_rr else (16, 6, 16)
+        dec = _of_decoder()
+        cases = [
+            _OfCase(nhead, q_len, _of_ctxs(kind, seed=s, bs=bs), cp_rr, seed=s)
+            for s, kind in ((1, "mixed"), (2, "tail"), (3, "short"))
+        ]
+        rows = max(c.cache.shape[0] for c in cases)
+        g = _OfCase(nhead, q_len, cases[0].ctxs, cp_rr, seed=1)
+        g.cache = torch.zeros((rows, _OF_DIM), device="cuda").to(dtypes.fp8)
+        g.slots = torch.zeros(
+            max(c.slots.numel() for c in cases), dtype=torch.int32, device="cuda"
+        )
+        g.g_kv_indptr = (
+            torch.zeros(bs + 1, dtype=torch.int32, device="cuda") if cp_rr else None
+        )
+        lse = torch.empty(bs * q_len, nhead, dtype=torch.float32, device="cuda")
+        dec.clear()
+        g.run(dec, lse)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g.run(dec, lse)
+        for case in cases:
+            case.plan(dec)
+            g.q.copy_(case.q)
+            g.cache.zero_()
+            g.cache[: case.cache.shape[0]] = case.cache
+            g.slots.zero_()
+            g.slots[: case.slots.numel()] = case.slots
+            g.kv_indptr.copy_(case.kv_indptr)
+            if cp_rr:
+                g.g_kv_indptr.copy_(case.g_kv_indptr)
+            g.out.fill_(float("nan"))
+            graph.replay()
+            case.out.copy_(g.out)
+            case.check(lse.clone())
+
+    for nhead, cp_rr, hi in _OF_RAGGED:
+        for kind in ("spread", "deep-few", "odd-one"):
+            for bucketed in (True, False):
+                run_case(
+                    _of_decoder(),
+                    _OfCase(
+                        nhead,
+                        _of_qlens(kind, 24, seed=4, hi=hi),
+                        _of_ctxs("mixed", seed=5, bs=24),
+                        cp_rr,
+                        bucketed=bucketed,
+                    ),
+                    not cp_rr,
+                )
+
+    for bucketed in (True, False):
+        for bs in (1, 2, 3, 7, 32, 64):
+            run_case(
+                _of_decoder(),
+                _OfCase(
+                    96,
+                    _of_qlens("spread", bs, seed=bs),
+                    _of_ctxs("tail", seed=bs, bs=bs),
+                    True,
+                    bucketed=bucketed,
+                ),
+                False,
+            )
+        q_lens = [4, 0, 6, 0, 2, 5]
+        run_case(
+            _of_decoder(),
+            _OfCase(
+                16,
+                q_lens,
+                _of_ctxs("short", seed=2, bs=len(q_lens)),
+                False,
+                bucketed=bucketed,
+            ),
+            True,
+        )
+
+    for q_len in (1, 4, 8):
+        kvp = _of_indptr(_of_local_lens(_of_ctxs("mixed", seed=6, bs=32), True))
+        plans = []
+        for q, bucketed in ((q_len, True), ([q_len] * 32, True), ([q_len] * 32, False)):
+            dec = _of_decoder()
+            dec.plan(kvp, q, 96, _OF_CP_WORLD, bucketed)
+            plans.append(
+                (dec.last["items"], dec.last["units"], dec._host[0].numpy().copy())
+            )
+        for items, units, plan in plans[1:]:
+            assert (items, units) == plans[0][:2]
+            assert (
+                plan == plans[0][2]
+            ).all(), "the same batch planned two different ways"
+
+    nhead, bs, total_q = 96, 16, 64
+    dec = _of_decoder()
+    splits = [[4] * 16, [8] * 7 + [1] * 8 + [0], [2] * 12 + [10] * 4]
+    assert all(len(s) == bs and sum(s) == total_q for s in splits)
+    cases = [
+        _OfCase(nhead, s, _of_ctxs("mixed", seed=i + 1, bs=bs), True, seed=i + 1)
+        for i, s in enumerate(splits)
+    ]
+    rows = max(c.cache.shape[0] for c in cases)
+    g = _OfCase(nhead, splits[0], cases[0].ctxs, True, seed=1)
+    g.cache = torch.zeros((rows, _OF_DIM), device="cuda").to(dtypes.fp8)
+    g.slots = torch.zeros(
+        max(c.slots.numel() for c in cases), dtype=torch.int32, device="cuda"
+    )
+    lse = torch.empty(total_q, nhead, dtype=torch.float32, device="cuda")
+    dec.clear()
+    g.run(dec, lse)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g.run(dec, lse)
+    for case in cases:
+        case.plan(dec)
+        g.q.copy_(case.q)
+        g.cache.zero_()
+        g.cache[: case.cache.shape[0]] = case.cache
+        g.slots.zero_()
+        g.slots[: case.slots.numel()] = case.slots
+        g.kv_indptr.copy_(case.kv_indptr)
+        g.qo_indptr.copy_(case.qo_indptr)
+        g.g_kv_indptr.copy_(case.g_kv_indptr)
+        g.out.fill_(float("nan"))
+        graph.replay()
+        case.out.copy_(g.out)
+        case.check(lse.clone())
+
+    dec = _of_decoder()
+    with pytest.raises(ValueError, match="rows"):
+        dec.plan(_of_indptr([100, 200]), 9, 128)
+    with pytest.raises(ValueError, match="rows"):
+        dec.plan(_of_indptr([100, 200]), [2, 9], 128)
+    with pytest.raises(ValueError, match="max_batch"):
+        dec.plan(_of_indptr([100] * 65), 4, 96, _OF_CP_WORLD)
+    with pytest.raises(ValueError, match="entries"):
+        dec.plan(_of_indptr([100, 200]), [4, 4, 4], 96)
+    with pytest.raises(ValueError, match="negative"):
+        dec.plan(_of_indptr([100, 200]), [4, -1], 96)
+    case = _OfCase(16, 4, _of_ctxs("short", seed=3, bs=2), False)
+    case.plan(dec)
+    case.q = case.q.to(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="fp8"):
+        case.run(dec)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1117,6 +1512,8 @@ def main():
         aiter.logger.info("fp8 gqa16 multi-tile decode: passed")
         check_merges_only_written_splits(dtypes.fp8, nhead=16, tile=128)
         aiter.logger.info("fp8 gqa16 short-KV multi-split merge: passed")
+        check_opus_flat_decode()
+        aiter.logger.info("opus flat-row decode: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []
