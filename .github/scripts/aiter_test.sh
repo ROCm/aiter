@@ -190,10 +190,18 @@ for file in "${sharded_files[@]}"; do
                 echo "Running fused A2A at world sizes 2/4/8 with heads 8 and 40"
             } | tee -a latest_test.log
             # The default would only run ws2 / heads 8. The test spawns its own
-            # per-rank processes, so plain python3 rather than torchrun.
+            # per-rank processes, so plain python3 rather than torchrun. The
+            # second pass forces the fine-grained IPC buffers that "auto"
+            # picks on PCIe hosts, so an xGMI runner still covers that path.
             test_cmd=(
                 timeout 60m
-                python3 "$file" -w 2 4 8 --heads 8 40
+                bash -c '
+                    set -euo pipefail
+                    python3 "$1" -w 2 4 8 --heads 8 40
+                    python3 "$1" -w 2 4 8 --heads 8 --sequences 1184 \
+                        --inbox-memory finegrained
+                '
+                _ "$file"
             )
             ;;
         op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)

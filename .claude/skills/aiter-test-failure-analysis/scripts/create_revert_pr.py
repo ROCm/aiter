@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,12 @@ from typing import Any
 ROOT = Path.cwd()
 DEFAULT_ASSIGNEE = "gyohuangxin"
 REVERT_MARKER = "aiter-auto-revert"
+FAST_RUNNERS = (
+    "linux-aiter-mi35x-1",
+    "linux-aiter-oci-mi300x-1",
+    "linux-aiter-do-mi350x-8",
+    "linux-aiter-do-mi350x-dpx-8",
+)
 
 
 class CommandError(RuntimeError):
@@ -94,6 +101,64 @@ def target_run_url(evidence: dict[str, Any]) -> str:
     return str(target.get("url") or "")
 
 
+def evidence_profile(evidence: dict[str, Any]) -> dict[str, Any]:
+    profile = evidence.get("failure_profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def failed_job_names(evidence: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for section in ("root_failed_jobs", "failed_jobs"):
+        for job in evidence.get(section) or []:
+            name = str(job.get("name") or "")
+            if name:
+                names.append(name)
+    return names
+
+
+def fast_runner_from_evidence(evidence: dict[str, Any]) -> str:
+    for name in failed_job_names(evidence):
+        for runner in FAST_RUNNERS:
+            if runner in name:
+                return runner
+        match = re.search(r"\((linux-[^,\)]+)", name)
+        if match and match.group(1) in FAST_RUNNERS:
+            return match.group(1)
+
+    profile = evidence_profile(evidence)
+    hardware = {str(item).lower() for item in profile.get("hardware", [])}
+    categories = {str(item).lower() for item in profile.get("categories", [])}
+    tokens = {str(item).lower() for item in profile.get("tokens", [])}
+
+    if hardware & {"mi300x", "gfx942"}:
+        return "linux-aiter-oci-mi300x-1"
+    if "multigpu" in categories or "mori" in tokens:
+        return "linux-aiter-do-mi350x-8"
+    if hardware & {"mi350x", "mi35x", "gfx950"}:
+        return "linux-aiter-mi35x-1"
+    return "linux-aiter-mi35x-1"
+
+
+def fast_test_files_from_evidence(evidence: dict[str, Any]) -> list[str]:
+    profile = evidence_profile(evidence)
+    files = []
+    for value in profile.get("failed_test_files", []):
+        path = str(value).strip()
+        if path.startswith(("op_tests/", "tests/")) and path not in files:
+            files.append(path)
+    return sorted(files)
+
+
+def fast_mori_smoke_from_evidence(evidence: dict[str, Any]) -> bool:
+    profile = evidence_profile(evidence)
+    haystack = " ".join(
+        [*failed_job_names(evidence)]
+        + [str(item) for item in profile.get("tokens", [])]
+        + [str(item) for item in profile.get("categories", [])]
+    ).lower()
+    return "mori" in haystack and ("multigpu" in haystack or "smoke" in haystack)
+
+
 def commit_subject(sha: str) -> str:
     proc = run_cmd(["git", "show", "-s", "--format=%s", sha], timeout=60)
     return proc.stdout.strip()
@@ -105,7 +170,22 @@ def is_merge_commit(sha: str) -> bool:
 
 
 def ensure_origin_main() -> None:
-    run_cmd(["git", "fetch", "origin", "main"], timeout=180)
+    run_cmd(["git", "fetch", "--no-tags", "--depth=1", "origin", "main"], timeout=180)
+
+
+def has_commit(sha: str) -> bool:
+    proc = run_cmd(["git", "cat-file", "-e", f"{sha}^{{commit}}"], check=False, timeout=60)
+    return proc.returncode == 0
+
+
+def fetch_commit(sha: str) -> bool:
+    if has_commit(sha):
+        return True
+    run_cmd(["git", "fetch", "--no-tags", "--depth=2", "origin", sha], check=False, timeout=180)
+    if has_commit(sha):
+        return True
+    run_cmd(["git", "fetch", "--no-tags", "origin", sha], check=False, timeout=180)
+    return has_commit(sha)
 
 
 def remote_branch_exists(branch: str) -> bool:
@@ -164,10 +244,28 @@ def push_branch(branch: str) -> None:
     run_cmd(["git", "push", "--set-upstream", "origin", branch], env=gh_env(), timeout=180)
 
 
-def create_pr(repo: str, branch: str, sha: str, run_id: str, run_url: str, assignee: str) -> str:
+def create_pr(
+    repo: str,
+    branch: str,
+    sha: str,
+    run_id: str,
+    run_url: str,
+    assignee: str,
+    evidence: dict[str, Any],
+) -> str:
     subject = commit_subject(sha)
-    title = f"Revert {sha[:12]}: {subject}"
+    title = f"[bot revert] Revert {sha[:12]}: {subject}"
+    fast_runner = fast_runner_from_evidence(evidence)
+    fast_test_files = fast_test_files_from_evidence(evidence)
+    fast_mori_smoke = fast_mori_smoke_from_evidence(evidence)
     body_lines = [
+        "<!-- aiter-revert-fast",
+        f"failed_run_id: {run_id}",
+        f"runner: {fast_runner}",
+        f"test_files: {' '.join(fast_test_files)}",
+        f"mori_smoke: {str(fast_mori_smoke).lower()}",
+        "-->",
+        "",
         f"<!-- {REVERT_MARKER}: culprit={sha} -->",
         "",
         "Auto-created from the structured Aiter Test failure culprit report.",
@@ -255,10 +353,6 @@ def main() -> int:
         append_summary(render_skip("culprit report is not high-confidence auto-revert ready", culprit, sha))
         return 0
 
-    if is_merge_commit(sha):
-        append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
-        return 0
-
     duplicate = None if args.dry_run else open_revert_pr_for_sha(args.repo, sha)
     if duplicate:
         append_summary(
@@ -270,7 +364,11 @@ def main() -> int:
 
     run_id = target_run_id(evidence)
     branch = f"aiter-bot/revert-{sha[:12]}-run-{run_id}"
-    if args.dry_run:
+
+    if args.dry_run and has_commit(sha):
+        if is_merge_commit(sha):
+            append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
+            return 0
         append_summary(
             "## Aiter Auto-Revert\n\n"
             "Dry run passed. The report is high-confidence auto-revert ready, "
@@ -279,6 +377,21 @@ def main() -> int:
         return 0
 
     ensure_origin_main()
+    if not fetch_commit(sha):
+        append_summary(render_skip("culprit commit could not be fetched on the revert runner", culprit, sha))
+        return 0
+    if is_merge_commit(sha):
+        append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
+        return 0
+
+    if args.dry_run:
+        append_summary(
+            "## Aiter Auto-Revert\n\n"
+            "Dry run passed. The report is high-confidence auto-revert ready, "
+            f"`{sha}` is not a merge commit, and the script would create branch `{branch}`."
+        )
+        return 0
+
     if remote_branch_exists(branch):
         append_summary(
             "## Aiter Auto-Revert\n\n"
@@ -304,7 +417,7 @@ def main() -> int:
         return 0
 
     push_branch(branch)
-    pr_url = create_pr(args.repo, branch, sha, run_id, target_run_url(evidence), args.assignee)
+    pr_url = create_pr(args.repo, branch, sha, run_id, target_run_url(evidence), args.assignee, evidence)
     append_summary(
         "## Aiter Auto-Revert\n\n"
         f"Created revert PR for `{sha}`.\n\n"
