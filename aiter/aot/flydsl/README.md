@@ -13,6 +13,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
 | `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
+| `mega_moe_ep.py` | Fused EP MegaMoE (`MegaMoeEP`) launch variants of every deployment profile, by replaying its `prepare()` (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
@@ -110,6 +111,26 @@ variant of the profile's bundle plan.
   `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
+
+### How `mega_moe_ep.py` works
+
+`mega_moe_ep.py` follows `mega_moe.py`. For each deployment profile and max
+tokens per rank it builds the runtime's own `MegaMoeEP` inside `dry_run`, with
+FakeTensor expert weights, and calls `prepare()`: the collective serving runs
+before graph capture to load every launch variant a token count up to the
+capacity selects.
+
+- One `forward()` is replayed too, for the activation quant it launches
+  ahead of the kernel.
+- The hipIpc `SymmetricArena`, through which the engine maps its peers'
+  buffers, hands out a FakeTensor and fake peer addresses, so no GPU or
+  process group is needed.
+- Rank, world size, token count and peer addresses are launch arguments of
+  the kernel, so one job per profile serves every rank.
+- The profiles are DeepSeek-V4-Pro r0/r32/r64 (`experts_per_rank=48/52/56`,
+  A8W4 and A4W4) and Kimi-K2.6 (`experts_per_rank=48`, A8W4), each at the two
+  capacities serving builds (MTPR 512 and 8192).
+- `--check` and the process it runs in are as for `mega_moe.py`.
 
 ### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
 
@@ -234,6 +255,9 @@ python -m aiter.aot.flydsl.mega_moe
 
 # Restrict the deployment profiles when building a smaller custom image.
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
+
+# Fused EP MegaMoE (every profile at MTPR 512 and 8192)
+python -m aiter.aot.flydsl.mega_moe_ep
 ```
 
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
