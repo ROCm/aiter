@@ -282,11 +282,21 @@ def main():
         for k in ks:
             all_ok &= check_decode(4, 4096, k, 1, tie)
             all_ok &= check_decode(4, 61440, k, 1, tie)
-            # Every adaptive table holds this shape; the assert catches a refit
-            # that moves it off the kernel.
-            backend = topk.BACKEND_ADAPTIVE if k in adaptive_ks else None
+            # The stable check that reaches the adaptive kernel: 524288 at the
+            # fewest rows the card's band admits there; the assert catches a
+            # refit that moves it off the kernel.
+            bands = [
+                b for b in adaptive_ks.get(k, ()) if topk._in_bands((b,), 524288, b[2])
+            ]
+            backend = topk.BACKEND_ADAPTIVE if bands else None
             all_ok &= check_decode(
-                1, 524288, k, 1, tie, max_row_len=524288, backend=backend
+                bands[0][2] if bands else 1,
+                524288,
+                k,
+                1,
+                tie,
+                max_row_len=524288,
+                backend=backend,
             )
     # k > 2048 -> scan fallback
     for tie in ("none", "heavy"):

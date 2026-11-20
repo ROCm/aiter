@@ -768,12 +768,14 @@ def adaptive_band_cells(card):
 
 def adaptive_ragged_cells(card):
     """Per k group, a batch of 4 and of 16 rows at the bound of a band that takes
-    it, so ragged rows sit at different starts in one launch."""
+    it, so ragged rows sit at different starts in one launch; a batch no band
+    of the group takes is skipped."""
     for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
         for ks, bands in per_group.items():
             for i, batch in enumerate((4, 16)):
-                band = next(b for b in bands if b[2] <= batch <= b[3])
-                yield batch, band[0], ks[i % len(ks)], stable
+                band = next((b for b in bands if b[2] <= batch <= b[3]), None)
+                if band is not None:
+                    yield batch, band[0], ks[i % len(ks)], stable
 
 
 def test_decode_bound_gate():
@@ -817,6 +819,45 @@ def test_decode_bound_gate():
                     assert plain != topk.BACKEND_ADAPTIVE, cell
                     assert topk._decode_backend(arch, cu, *call, None) == plain, cell
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
+
+
+def test_decode_bound_rounds_up():
+    """A bound between two measured widths is gated on the next one up and
+    configured there, never past the buffer; below the narrowest it declines and
+    past the widest the widest stands in. Then every carried band admits the
+    off-grid bounds that round to it; no kernel runs."""
+    widths = topk._ADAPTIVE_WIDTHS
+    gate, config = topk.decode_adaptive_gate_width, topk.decode_adaptive_width
+    top = widths[-1]
+    for buffer, bound, gated, configured in (
+        (top, widths[0] - 1, None, widths[0] - 1),
+        (top, widths[0], widths[0], widths[0]),
+        (top, widths[0] + 1, widths[1], widths[1]),
+        (top, 98_304, 131_072, 131_072),
+        (98_304, top, 131_072, 98_304),
+        (2 * top, 1_310_720, top, top),
+        (2 * top, 2 * top, top, top),
+    ):
+        assert gate(buffer, bound) == gated, (buffer, bound)
+        assert config(buffer, bound) == configured, (buffer, bound)
+    buffer = 4 * top
+    for (arch, cu), per_emit in topk._ADAPTIVE_BANDS_BY_K_GROUP.items():
+        for stable, per_group in per_emit.items():
+            for ks, bands in per_group.items():
+                for min_w, max_w, min_r, _ in bands:
+                    # A band edge off the grid admits no rounded bound past it.
+                    assert min_w in widths and max_w in widths, bands
+                    below = max((w for w in widths if w < min_w), default=0)
+                    for bound in (below + 1, (below + min_w) // 2, min_w):
+                        cell = (arch, cu, stable, bound, min_r, ks[0])
+                        key = gate(buffer, bound)
+                        assert key == (min_w if bound >= widths[0] else None), cell
+                        got = topk._decode_backend(
+                            arch, cu, stable, buffer, min_r, ks[0], True, key
+                        )
+                        admitted = key is not None
+                        assert (got == topk.BACKEND_ADAPTIVE) == admitted, cell
+    print(f"[decode_bound_rounds_up] PASS: {len(widths)} widths")
 
 
 def test_decode_mixed_node():
@@ -3102,6 +3143,7 @@ _ADAPTIVE_TIMEOUT_S = 900
 
 def run_adaptive():
     test_decode_bound_gate()
+    test_decode_bound_rounds_up()
     test_decode_mixed_node()
     test_decode_cu_num_lowers_never_raises()
     test_decode_adaptive_two_gpus()

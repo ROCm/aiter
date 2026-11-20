@@ -76,62 +76,50 @@ BACKEND_ADAPTIVE = "adaptive"
 # 1.05x faster than the kernel the gate would pick without it, on a full buffer
 # and on a padded one bounded at its live length; with the bound at the buffer
 # width, as under graph capture, it must not be slower than that kernel. The
-# gate cannot tell these apart. Every entry assumes the caller declares
-# `max_row_len`.
+# gate cannot tell these apart. A band's width speaks for every bound that
+# rounds up to it (`decode_adaptive_gate_width`), so a bound off the grid, and a
+# buffer narrower than the rounded width, must not be slower either. Every entry
+# assumes the caller declares `max_row_len`.
+#
+# gfx942/80 was fitted before the rounding and is not refit under it. It drops
+# 20000 and below and 512K, the widths where gfx942/228's earlier entry fell
+# furthest behind once rounded.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
         True: {
             (256,): (
-                (4_096, 4_096, 128, 512),
-                (8_192, 20_000, 1, 512),
                 (32_768, 32_768, 256, 512),
                 (65_536, 65_536, 1, 8),
                 (131_072, 131_072, 1, 16),
                 (262_144, 262_144, 1, 8),
-                (524_288, 524_288, 1, 4),
                 (1_048_576, 1_048_576, 1, 2),
             ),
             (512, 1024, 2048): (
-                (4_096, 4_096, 128, 512),
-                (8_192, 20_000, 1, 512),
                 (32_768, 32_768, 1, 4),
                 (65_536, 65_536, 1, 16),
-                (524_288, 524_288, 1, 4),
             ),
             (4096,): (
-                (8_192, 20_000, 1, 512),
                 (32_768, 65_536, 128, 512),
                 (131_072, 262_144, 1, 16),
-                (524_288, 524_288, 1, 512),
                 (1_048_576, 1_048_576, 1, 16),
             ),
         },
         False: {
             (256,): (
-                (4_096, 8_192, 1, 512),
-                (16_384, 16_384, 128, 512),
-                (20_000, 20_000, 1, 4),
                 (32_768, 32_768, 128, 512),
                 (65_536, 65_536, 1, 16),
                 (131_072, 131_072, 1, 8),
                 (262_144, 262_144, 1, 4),
-                (524_288, 1_048_576, 1, 2),
+                (1_048_576, 1_048_576, 1, 2),
             ),
             (512, 1024, 2048): (
-                (4_096, 8_192, 1, 512),
-                (16_384, 20_000, 128, 512),
                 (32_768, 32_768, 1, 8),
                 (65_536, 65_536, 1, 16),
                 (131_072, 262_144, 1, 8),
-                (524_288, 524_288, 1, 4),
                 (1_048_576, 1_048_576, 1, 2),
             ),
             (4096,): (
-                (8_192, 8_192, 1, 512),
-                (16_384, 16_384, 128, 512),
-                (20_000, 20_000, 1, 4),
                 (32_768, 32_768, 128, 512),
-                (524_288, 524_288, 1, 32),
                 (1_048_576, 1_048_576, 1, 16),
             ),
         },
@@ -141,40 +129,35 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
             (256,): (
                 (4_096, 4_096, 256, 512),
                 (8_192, 20_000, 1, 512),
-                (65_536, 65_536, 1, 8),
-                (131_072, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 524_288, 1, 4),
+                (32_768, 32_768, 1, 4),
+                (65_536, 131_072, 1, 16),
+                (262_144, 524_288, 1, 8),
                 (1_048_576, 1_048_576, 1, 2),
             ),
             (512, 1024, 2048): (
-                (4_096, 4_096, 256, 512),
-                (8_192, 20_000, 1, 512),
+                (4_096, 16_384, 256, 512),
+                (20_000, 20_000, 1, 512),
                 (32_768, 32_768, 1, 4),
-                (65_536, 65_536, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 2, 4),
+                (65_536, 65_536, 1, 8),
+                (524_288, 1_048_576, 1, 4),
             ),
             (4096,): (
-                (8_192, 20_000, 1, 512),
-                (32_768, 65_536, 256, 512),
-                (131_072, 262_144, 1, 16),
-                (524_288, 524_288, 1, 512),
-                (1_048_576, 1_048_576, 1, 16),
+                (8_192, 131_072, 256, 512),
+                (262_144, 1_048_576, 1, 16),
             ),
         },
         False: {
             (256,): (
                 (4_096, 8_192, 1, 512),
-                (16_384, 16_384, 256, 512),
-                (20_000, 20_000, 1, 4),
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 1_048_576, 1, 4),
+                (16_384, 16_384, 1, 8),
+                (20_000, 32_768, 1, 4),
+                (65_536, 131_072, 1, 16),
+                (262_144, 262_144, 1, 4),
+                (524_288, 524_288, 1, 8),
+                (1_048_576, 1_048_576, 1, 4),
             ),
             (512, 1024, 2048): (
-                (4_096, 8_192, 1, 512),
-                (16_384, 16_384, 256, 512),
+                (8_192, 8_192, 1, 2),
                 (32_768, 32_768, 1, 4),
                 (65_536, 65_536, 1, 32),
                 (131_072, 131_072, 1, 16),
@@ -182,52 +165,33 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
                 (1_048_576, 1_048_576, 1, 4),
             ),
             (4096,): (
-                (8_192, 8_192, 1, 512),
-                (16_384, 20_000, 64, 512),
-                (524_288, 524_288, 1, 64),
-                (1_048_576, 1_048_576, 1, 16),
+                (8_192, 20_000, 256, 512),
+                (524_288, 1_048_576, 1, 16),
             ),
         },
     },
     ("gfx950", 256): {
         True: {
-            (256,): (
-                (8_192, 20_000, 1, 512),
-                (524_288, 524_288, 1, 8),
-            ),
             (512, 1024, 2048): (
-                (8_192, 20_000, 1, 512),
-                (524_288, 524_288, 1, 8),
+                (20_000, 20_000, 1, 128),
+                (524_288, 524_288, 1, 4),
             ),
-            (4096,): (
-                (8_192, 8_192, 1, 128),
-                (16_384, 20_000, 1, 512),
-                (131_072, 262_144, 1, 32),
-                (524_288, 524_288, 1, 512),
-                (1_048_576, 1_048_576, 1, 32),
-            ),
+            (4096,): ((262_144, 1_048_576, 1, 32),),
         },
         False: {
             (256,): (
-                (4_096, 4_096, 1, 512),
-                (8_192, 8_192, 1, 2),
-                (524_288, 524_288, 1, 4),
-                (1_048_576, 1_048_576, 1, 2),
+                (4_096, 4_096, 1, 256),
+                (8_192, 8_192, 1, 16),
+                (524_288, 1_048_576, 1, 2),
             ),
             (512, 1024, 2048): (
-                (4_096, 4_096, 1, 512),
-                (8_192, 8_192, 1, 2),
                 (131_072, 131_072, 1, 8),
                 (262_144, 262_144, 1, 4),
                 (524_288, 1_048_576, 1, 8),
             ),
             (4096,): (
-                (8_192, 8_192, 1, 64),
-                (20_000, 20_000, 1, 2),
-                (131_072, 131_072, 1, 8),
                 (262_144, 262_144, 1, 4),
-                (524_288, 524_288, 1, 64),
-                (1_048_576, 1_048_576, 1, 16),
+                (524_288, 1_048_576, 1, 16),
             ),
         },
     },
@@ -265,8 +229,9 @@ def _decode_backend(
     """Which of the four decode kernels is fastest for this shape.
 
     The two tables read different lengths and must keep doing so. The adaptive
-    bands read `adaptive_width`, the caller's bound, because that kernel is
-    configured from it; `None` means no bound was stated and declines them. The
+    bands read `adaptive_width`, the caller's bound rounded up to a measured
+    width, because that kernel is configured from it; `None` means no bound
+    was stated, or none a band can speak for, and declines them. The
     single-launch bands read the physical `width` they were fitted on, so a
     bound never moves a call between the single-launch kernel and the one-block
     path.
@@ -294,17 +259,43 @@ def _decode_backend(
     return BACKEND_DEFAULT
 
 
+# The widths the adaptive bands were measured at, ascending. A band speaks for
+# every bound that rounds up to one of its widths.
+_ADAPTIVE_WIDTHS = (
+    4_096, 8_192, 16_384, 20_000, 32_768, 65_536,
+    131_072, 262_144, 524_288, 1_048_576,
+)  # fmt: skip
+
+
+def decode_adaptive_gate_width(width: int, max_row_len: int) -> int | None:
+    """The measured width the adaptive bands are looked up at for this bound.
+
+    A bound between two measured widths takes the next one up, and the bands
+    were fitted on that rounding, so an off-grid bound is admitted only where
+    its rounded width wins. Past the widest the widest stands in: a row longer
+    than a band's width runs that band's config correctly, only past its
+    measured range. Below the narrowest there is no band to round to, and the
+    adaptive path is declined.
+    """
+    bound = min(width, max_row_len)
+    if bound < _ADAPTIVE_WIDTHS[0]:
+        return None
+    return next((w for w in _ADAPTIVE_WIDTHS if w >= bound), _ADAPTIVE_WIDTHS[-1])
+
+
 def decode_adaptive_width(width: int, max_row_len: int) -> int:
-    """The row length the adaptive path should be gated and configured on.
+    """The row length the adaptive path is configured on.
 
     A decode buffer is allocated once at the model's maximum context, so its
     physical width says what a row *could* hold and `seq_lens` says what it
     does. `seq_lens` is device-resident and this runs on the host, so the only
     way the host learns the live length is for the caller to state a bound.
 
-    Both the band lookup and `decode_adaptive_config` take this, and they must
-    take the same value: gating on one length and configuring for another is
-    how a band admits a shape that then runs the wrong kernel for it.
+    The config takes the gate's width, so an admitted shape runs the config its
+    band was measured with, but never past the buffer: a config sized beyond
+    the rows the buffer can hold launches workgroups that find nothing to read.
+    A bound the gate declines, reached only by forcing the backend, is
+    configured on itself.
 
     `top_k_per_row_decode` holds the `max_row_len` contract. It is required here:
     the gate declines the adaptive path when the caller states no bound (see
@@ -319,7 +310,8 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
         )
     if max_row_len < 1:
         raise ValueError(f"max_row_len must be positive, got {max_row_len}")
-    return min(width, max_row_len)
+    gated = decode_adaptive_gate_width(width, max_row_len)
+    return min(width, max_row_len if gated is None else gated)
 
 
 def decode_backend_for_shape(
@@ -361,6 +353,6 @@ def decode_backend_for_shape(
         (
             None
             if max_row_len is None or max_row_len < 1 or seq_lens is None
-            else decode_adaptive_width(width, max_row_len)
+            else decode_adaptive_gate_width(width, max_row_len)
         ),
     )

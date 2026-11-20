@@ -19,6 +19,7 @@ from . import topk_decode_gate as _gate
 from .topk_decode_gate import (
     _ADAPTIVE_BANDS,  # noqa: F401
     _ADAPTIVE_BANDS_BY_K_GROUP,  # noqa: F401
+    _ADAPTIVE_WIDTHS,  # noqa: F401
     _FLYDSL_TOPK_DECODE_GATES,  # noqa: F401
     _FLYDSL_TOPK_DECODE_KS,  # noqa: F401
     BACKEND_ADAPTIVE,  # noqa: F401
@@ -26,6 +27,7 @@ from .topk_decode_gate import (
     BACKEND_SINGLE,  # noqa: F401
     _decode_backend,  # noqa: F401
     _in_bands,  # noqa: F401
+    decode_adaptive_gate_width,  # noqa: F401
     decode_adaptive_width,  # noqa: F401
     decode_backend_for_shape,
 )
