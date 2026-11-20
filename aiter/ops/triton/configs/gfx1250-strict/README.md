@@ -7,7 +7,8 @@ values when it is tuned.
 ## How the tables were made
 
 Every gfx1250 family has a `DEFAULT.json` here. Shape-specific files
-(`<CONFIG_NAME>-N=...-K=....json`) are not copied.
+(`<CONFIG_NAME>-N=...-K=....json`) are not copied, except for
+fused_fp8_bmm_rope_cat_and_cache_mla.
 
 - Bucketed tables keep only the `"any"` entry (the `bm*_any` entries for
   Gluon MoE), except:
@@ -21,3 +22,7 @@ Every gfx1250 family has a `DEFAULT.json` here. Shape-specific files
   name.
 - These are exact copies, because `"any"` alone breaks them:
   - unified_attention (Triton and Gluon): some shapes give wrong results.
+  - gemm_afp4wfp4 (Triton): small M gets 256x256x256, and the fused split_cat
+    kernel that reads this table hangs in LLVM register allocation.
+  - fused_fp8_bmm_rope_cat_and_cache_mla, with its shape-specific files: small M
+    gets a single tile, which the kernel fails to compile.
