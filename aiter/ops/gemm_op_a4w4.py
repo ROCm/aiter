@@ -156,8 +156,15 @@ def get_GEMM_config(M: int, N: int, K: int):
         ):
             config = _a4w4_fallback_config(config)
         if AITER_LOG_TUNED_CONFIG:
+            tuned_cu = cu_num
+            if get_GEMM_config.has_gfx:
+                tuned_cu = next(
+                    cu
+                    for cu in get_tuned_cu_nums(cu_num)
+                    if (gfx, cu, padded_M, N, K) in get_GEMM_config.gemm_dict
+                )
             logger.info(
-                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {tuned_cu} (device cu_num = {cu_num}) in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
             )
     else:
         logger.info(
