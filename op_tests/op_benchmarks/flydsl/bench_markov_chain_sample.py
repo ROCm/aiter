@@ -1,20 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Graph-replay time of the FlyDSL lm_head GEMM and fused Markov draft sampler
-against the paths they replace (gfx950).
+"""Graph-replay time of the FlyDSL fused DSpark Markov draft sampler against the
+paths of vLLM main it replaces (gfx950).
 
-``--op lm_head``: ``flydsl_lm_head_gemm`` ([M, 5120] x [129280, 5120]^T, bf16)
-with the row-major and the shuffled weight against
-
-- ``tgemm``: ``aiter.tuned_gemm.tgemm.mm`` (this tree; the shape has no tuned
-  gfx950 row, so it resolves to its default backend),
-- ``torch``: ``F.linear`` (hipBLASLt),
-- ``vllm``: vLLM's ``rocm_unquantized_gemm_impl`` (the lm_head path of vLLM on
-  ROCm: wvSplitKrc for 10-128 rows, else ``tgemm.mm`` with
-  ``VLLM_ROCM_USE_AITER=1``), when vLLM is importable.
-
-``--op markov``: ``flydsl_markov_chain_sample`` (5 steps, 129280 x 256) against
+``flydsl_markov_chain_sample`` (5 steps, 129280 x 256) against
 
 - ``vllm_loop``: the per-step loop of vLLM's
   ``DSparkSpeculator._sample_markov_chain`` with the bias fused into
@@ -23,15 +13,20 @@ with the row-major and the shuffled weight against
 - ``vllm_fused``: vLLM's one-launch-per-step Triton Markov sampler
   (``vllm.models.deepseek_v41.amd.ops.fused_markov``, used with
   ``--monokernel`` for 1-5 requests on gfx950), for row counts it serves.
+  ``sample_sequential`` also gathers the hidden states and runs the draft
+  lm_head before its launches; this baseline issues only its launches, from
+  the base logits on, with the arguments of vLLM main 9b9bd049a (2026-11-08,
+  the last change of ``fused_markov.py``). The kernels' parameter lists are
+  asserted, so a changed signature fails instead of timing something else.
 
 Every case captures one CUDA graph of ``--sets`` calls on distinct inputs (the
-weights stay; activations / base logits are larger than the LLC together), and
-times ``--rounds`` rounds of replays in the order A B B A per candidate pair.
-The table holds the median and the minimum us per call.
+weights stay; the base logits are larger than the LLC together), and times
+``--rounds`` rounds of replays in the order A B B A per candidate pair. The
+table holds the median and the minimum us per call.
 
 Run:
-    python3 op_tests/op_benchmarks/flydsl/bench_lm_head_markov.py --op lm_head
-    python3 op_tests/op_benchmarks/flydsl/bench_lm_head_markov.py --op markov -n 8 32 64
+    python3 op_tests/op_benchmarks/flydsl/bench_markov_chain_sample.py
+    python3 op_tests/op_benchmarks/flydsl/bench_markov_chain_sample.py -n 8 32 64
 """
 
 import argparse
@@ -47,7 +42,6 @@ import torch.nn.functional as F
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl import lm_head_gemm as L
 from aiter.ops.flydsl import markov_chain_sample as MC
 
 SLOTS = 512
@@ -90,58 +84,6 @@ def time_graphs(graphs, n, rounds, replays):
             for k in (names[0], other, other, names[0]):
                 t[k].append(replay_us(graphs[k], n, replays))
     return t
-
-
-def vllm_gemm():
-    try:
-        from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
-    except Exception as e:  # noqa: BLE001
-        aiter.logger.warning("vLLM baseline unavailable: %s", e)
-        return None
-    return rocm_unquantized_gemm_impl
-
-
-def bench_lm_head(ms, sets, rounds, replays):
-    from aiter.tuned_gemm import tgemm
-
-    dev = torch.device("cuda")
-    N, K = L.N, L.K
-    w = (torch.randn(N, K, device=dev) * 0.02).to(torch.bfloat16)
-    ws = L.shuffle_weight(w)
-    L.warmup_lm_head_gemm(dev, False)
-    L.warmup_lm_head_gemm(dev, True)
-    vg = vllm_gemm()
-    rows = []
-    for m in ms:
-        count = max(4, min(sets, BUDGET // (m * K * 2 + m * N * 2)))
-        xs = [torch.randn(m, K, device=dev).to(torch.bfloat16) for _ in range(count)]
-        out = torch.empty(m, N, dtype=torch.bfloat16, device=dev)
-        ref = (xs[0].float() @ w.float().t()).to(torch.bfloat16)
-        cand = {
-            "flydsl": lambda x, out=out: L.flydsl_lm_head_gemm(x, w, out),
-            "flydsl_shuf": lambda x, out=out: L.flydsl_lm_head_gemm(
-                x, ws, out, shuffled=True
-            ),
-            "tgemm": lambda x: tgemm.mm(x, w),
-            "torch": lambda x: F.linear(x, w),
-        }
-        if vg is not None:
-            cand["vllm"] = lambda x: vg(x, w)
-        graphs = {}
-        row = {"gfx": get_gfx_runtime(), "M": m, "sets": count}
-        for name, fn in cand.items():
-            y = fn(xs[0])
-            err = (y.float() - ref.float()).abs().max().item()
-            row[f"{name} maxerr"] = err
-            graphs[name] = capture([lambda x=x, fn=fn: fn(x) for x in xs])
-        t = time_graphs(graphs, count, rounds, replays)
-        for name, v in t.items():
-            row[f"{name} us"] = statistics.median(v)
-            row[f"{name} min us"] = min(v)
-            row[f"{name} TB/s"] = (N * K * 2 + m * (K + N) * 2) / min(v) / 1e6
-        rows.append(row)
-        aiter.logger.info("%s", row)
-    return pd.DataFrame(rows)
 
 
 def vllm_loop_fn():
@@ -194,6 +136,27 @@ def vllm_fused_fn():
     except Exception as e:  # noqa: BLE001
         aiter.logger.warning("vLLM fused Markov sampler unavailable: %s", e)
         return None, 0
+
+    step_args = [
+        "prev_max_ptr", "prev_arg_ptr", "input_ids_ptr", "anchor_idx_ptr",
+        "tokens_ptr", "tokens_stride", "w1_ptr", "w2_ptr", "base_ptr",
+        "base_stride", "cache_ptr", "cache_stride0", "cache_stride1",
+        "idx_map_ptr", "idx_stride", "pos_ptr", "pos_stride", "temp_ptr",
+        "seeds_ptr", "out_max_ptr", "out_arg_ptr", "vocab", "num_blocks", "STEP",
+        "ROWS", "RANK", "BLOCK", "K_CHUNK", "BLOCKS_POW2", "USE_FP64",
+    ]  # fmt: skip
+    last_args = [
+        "prev_max_ptr", "prev_arg_ptr", "tokens_ptr", "tokens_stride",
+        "num_blocks", "STEP", "BLOCKS_POW2",
+    ]  # fmt: skip
+    if (
+        list(fm._markov_step_kernel.arg_names) != step_args
+        or list(fm._markov_last_kernel.arg_names) != last_args
+    ):
+        raise RuntimeError(
+            "vLLM's fused_markov kernels changed their parameters since "
+            "9b9bd049a; update vllm_fused_fn"
+        )
 
     def fused(base, w1, w2, ids, anchor, idx, pos, temp, seeds, cache, tokens):
         n, ns, vocab = anchor.shape[0], MC.NSPEC, MC.V
@@ -344,33 +307,6 @@ def main():
         return
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument(
-        "--op", choices=["lm_head", "markov"], nargs="*", default=["lm_head", "markov"]
-    )
-    p.add_argument(
-        "-m",
-        "--rows",
-        type=int,
-        nargs="*",
-        default=[
-            16,
-            32,
-            64,
-            96,
-            112,
-            120,
-            128,
-            160,
-            192,
-            256,
-            384,
-            480,
-            488,
-            512,
-            640,
-            768,
-        ],
-    )
-    p.add_argument(
         "-n",
         "--requests",
         type=int,
@@ -382,17 +318,11 @@ def main():
     p.add_argument("--replays", type=int, default=5)
     a = p.parse_args()
     with torch.inference_mode():
-        if "lm_head" in a.op:
-            df = bench_lm_head(a.rows, a.sets, a.rounds, a.replays)
-            aiter.logger.info(
-                "lm_head GEMM (us per call):\n%s", df.to_markdown(index=False)
-            )
-        if "markov" in a.op:
-            df = bench_markov(a.requests, a.sets, a.rounds, a.replays)
-            aiter.logger.info(
-                "Markov draft chain (us per 5-step chain):\n%s",
-                df.to_markdown(index=False),
-            )
+        df = bench_markov(a.requests, a.sets, a.rounds, a.replays)
+        aiter.logger.info(
+            "Markov draft chain (us per 5-step chain):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":

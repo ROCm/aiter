@@ -46,26 +46,20 @@ A NaN never wins; neither does a +inf logit (its residual ``y - T (y / T)`` is
 NaN). A row without a winner (every value NaN or +/-inf) gets token 0, so a
 token is always in [0, V).
 
-Raw ops: DPP / permlane swaps for the cross-lane argmax, system-scope (sc0 sc1)
-buffer loads/stores for the cross-workgroup exchange, ``s_sleep`` in the poll
-loop and LDS ``llvm.load``/``store`` of 16-byte rows. FlyDSL 0.5.0 has no typed
-wrapper with the cache-scope operand on the exchange, and the rest is the
-measured instruction sequence of this kernel.
+Memory access uses FlyDSL buffer tensors and ``fx.copy`` (``BufferCopy`` atoms
+with the cache-scope operand and soffset as atom state); a masked access moves
+its offset past the buffer's records, so the hardware bounds check reads 0 /
+drops the store. The few raw ops left say at the call why no 0.5.0 API serves.
 """
 
 import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import rocdl as _rocdl_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-
-from aiter.ops.flydsl.kernels import buffer_ops
 
 V, R, NSPEC = 129280, 256, 5  # vocabulary, Markov rank, draft steps
 TILE = 512  # vocabulary columns of a workgroup
@@ -75,10 +69,11 @@ NT = (V + TILE - 1) // TILE  # 253
 NWAVE = TILE // 64  # 8
 ESTRIDE = R * 2 + 16  # LDS bytes of an E row (padded against bank conflicts)
 BIG = 1 << 30
-AHEAD = 2  # row fragments of base logits loaded ahead
 NEG_INF = float("-inf")
-NEG_INF_BITS = -8388608
-LARGE = 0x7FFFFFF0  # buffer extent that keeps a masked offset (0x7FFFFFFF) out of range
+LARGE = 0x7FFFFFF0  # records of a buffer whose size the kernel does not bound
+# i32-word offset at or past every buffer's records: a load reads 0, a store is dropped
+OOB = LARGE // 4
+SYS = 0x11  # cache policy sc0 sc1: system scope (the cross-workgroup exchange)
 _C = [float(struct.unpack("<f", struct.pack("<f", 1.0 / k))[0]) for k in range(1, 9)]
 
 
@@ -139,47 +134,14 @@ def _noise(h0, col_c1):
         p = fx.math.fma(u, p, F(_C[k - 1]))
     series = (u * F(-1.0)) * p
     one_m = F(1.0) - u
-    direct = _log_normal(
-        F(
-            _arith.MaxNumFOp(
-                fx.as_ir_value(one_m), fx.as_ir_value(F(5.960464477539063e-08))
-            ).result
-        )
-    )
+    direct = _log_normal(F(fx.arith.maxnumf(one_m, F(5.960464477539063e-08))))
     l1 = (u < F(0.25)).select(series, direct)
     return _log_normal(l1 * F(-1.0)) * F(-1.0)
 
 
-def _dpp(src, ctrl, old=None, bank_mask=0xF):
-    o = _llvm.mlir_undef(T.i32) if old is None else fx.as_ir_value(old)
-    full = old is None and bank_mask == 0xF
-    return I(
-        _rocdl_ops.update_dpp(T.i32, o, fx.as_ir_value(src), ctrl, 0xF, bank_mask, full)
-    )
-
-
-def _swap(op, v):
-    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
-    res = op(pair_ty, fx.as_ir_value(v), fx.as_ir_value(v), False, False)
-    return I(_llvm.extractvalue(T.i32, res, [0])), I(
-        _llvm.extractvalue(T.i32, res, [1])
-    )
-
-
-def _xor_lane(v, m, upper):
-    """Lane ``l ^ m`` of the wave as an i32; ``upper``: this lane's bit m set (m = 16, 32)."""
-    if m == 1:
-        return _dpp(v, 0xB1)
-    if m == 2:
-        return _dpp(v, 0x4E)
-    if m == 4:
-        return _dpp(v, 0x104, old=_dpp(v, 0x114, bank_mask=0xA), bank_mask=0x5)
-    if m == 8:
-        return _dpp(v, 0x128)
-    a, b = _swap(
-        _rocdl_ops.permlane16_swap if m == 16 else _rocdl_ops.permlane32_swap, v
-    )
-    return upper.select(a, b)
+def _xor_lane(v, m):
+    """Lane ``l ^ m`` (m = 16, 32) of the wave as an i32 (a ``v_permlane{16,32}_swap``)."""
+    return I(fx.gpu.shuffle_xor(v, m, 64))
 
 
 def _comb(v1, i1, v2, i2):
@@ -188,10 +150,42 @@ def _comb(v1, i1, v2, i2):
     return keep.select(v1, v2), keep.select(i1, i2)
 
 
-def _lds_ptr(byte_addr):
-    return _llvm.inttoptr(
-        _ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(fx.Int64(byte_addr))
+def _words(ptr, nbytes, vec):
+    """Buffer tensor over the i32 words of global pointer ``ptr`` with ``nbytes``
+    records (hardware bounds check); a copy moves ``vec`` words from the flat
+    word offset it is sliced at."""
+    base = fx.inttoptr(
+        fx.PointerType.get(I.ir_type, fx.AddressSpace.Global, 4 * vec),
+        fx.Int64(fx.ptrtoint(ptr)),
     )
+    return fx.rocdl.make_buffer_tensor(
+        fx.make_view(base, fx.make_layout((vec, 1), (1, 1))),
+        num_records_bytes=fx.Int64(nbytes),
+    )
+
+
+def _load(view, off, vec, mask=None, cache=0, soffset=0):
+    """``vec`` i32 words at word ``off`` (+ the uniform ``soffset`` words); 0 where ``mask`` is False."""
+    if mask is not None:
+        off = mask.select(off, I(OOB))
+    frag = fx.make_rmem_tensor(vec, I)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(32 * vec, cache), I)
+    if soffset:
+        fx.copy(atom, fx.slice(view, (None, off)), frag, soffset=I(soffset))
+    else:
+        fx.copy(atom, fx.slice(view, (None, off)), frag)
+    v = Vec(frag.load())
+    return I(v[0]) if vec == 1 else v
+
+
+def _store(view, off, words, mask=None, cache=0):
+    """Store the i32 words ``words`` (a list) at word ``off``; nothing where ``mask`` is False."""
+    if mask is not None:
+        off = mask.select(off, I(OOB))
+    frag = fx.make_rmem_tensor(len(words), I)
+    frag.store(Vec.from_elements(words, I))
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(32 * len(words), cache), I)
+    fx.copy(atom, frag, fx.slice(view, (None, off)))
 
 
 def _unpack(w, k):
@@ -205,34 +199,35 @@ def _row_params(
     """(slot or -1, temperature, murmur prefix h0) of request row ``row`` at draft ``step``: the noise state of its
     draws (``h0`` is the hash after the seed, the position and the salt; only the vocab id is left to mix in).
     """
-    slot = I(
-        buffer_ops.buffer_load(
-            idr, row * i32_idxs + step * i32_idxe, vec_width=1, dtype=I, mask=rok
-        )
-    )
+    slot = _load(idr, row * i32_idxs + step * i32_idxe, 1, mask=rok)
     valid = rok & (slot >= 0)
     slot0 = valid.select(slot, I(0))
-    temp = valid.select(
-        I(buffer_ops.buffer_load(tr, slot0, vec_width=1, dtype=I)).bitcast(F), F(0.0)
-    )
-    sd = Vec(buffer_ops.buffer_load(sdr, slot0 * 2, vec_width=2, dtype=I))
+    temp = valid.select(_load(tr, slot0, 1).bitcast(F), F(0.0))
+    sd = _load(sdr, slot0 * 2, 2)
     seed_hi = I(sd[1]) ^ step  # spec_step_seed
-    pos_lo = I(
-        buffer_ops.buffer_load(
-            pr, (row * i32_poss + step) * 2, vec_width=1, dtype=I, mask=rok
-        )
-    )
+    pos_lo = _load(pr, (row * i32_poss + step) * 2, 1, mask=rok)
     h0 = _mix(_mix(_mix(I(0), I(sd[0])), seed_hi), pos_lo + i32_pos_add)
     return valid.select(slot, I(-1)), temp, h0
 
 
-SYS = 0x11  # sc0 sc1: system scope
 HALF = 16  # winners of the tiles a lane loads at once
 GB = 4  # E chunks a thread gathers at once
 
 
 def _sb():
     fx.rocdl.sched_barrier(0)
+
+
+def _poll_sleep():
+    """``s_sleep 1`` that is also a compiler memory barrier, at the top of the poll loop.
+
+    Raw inline asm on purpose: ``fx.rocdl.s_sleep`` (FlyDSL 0.5.0's only sleep)
+    has no memory effect, so nothing would stop LLVM from hoisting the poll's
+    loop-invariant loads out of the loop, which turns the poll into an endless
+    spin on stale values. It gives the same ISA today (the variant was compiled
+    and diffed); the clobber keeps that from depending on the optimizer.
+    """
+    _llvm.inline_asm(None, [], "s_sleep 1", "~{memory}", has_side_effects=True)
 
 
 def compile_markov_chain(nrf: int):
@@ -247,7 +242,7 @@ def compile_markov_chain(nrf: int):
 
     @fx.struct
     class Shared:
-        e: fx.Array[fx.Uint8, NROW * ESTRIDE, 16]
+        e: fx.Array[fx.Int32, NROW * ESTRIDE // 4, 16]
         mv: fx.Array[fx.Int32, NROW * NWAVE]
         mi: fx.Array[fx.Int32, NROW * NWAVE]
         rv: fx.Array[fx.Int32, NROW * NSL + 1]
@@ -257,25 +252,25 @@ def compile_markov_chain(nrf: int):
 
     @flyc.kernel(name=name, known_block_size=[64 * NWAVE, 1, 1])
     def kernel(
-        arg_w2: fx.Int64,  # bf16 [V, R]
-        arg_w1: fx.Int64,  # bf16 [V, R]
-        arg_ids: fx.Int64,  # input_ids: token of the anchor index at dword i32_ide * anchor
+        arg_w2: fx.Pointer,  # bf16 [V, R]
+        arg_w1: fx.Pointer,  # bf16 [V, R]
+        arg_ids: fx.Pointer,  # input_ids: token of the anchor index at dword i32_ide * anchor
         i32_ide: fx.Int32,
-        arg_anchor: fx.Int64,  # int64 [n]
-        arg_tokens: fx.Int64,  # int64 [n, i32_ts]
+        arg_anchor: fx.Pointer,  # int64 [n]
+        arg_tokens: fx.Pointer,  # int64 [n, i32_ts]
         i32_ts: fx.Int32,
-        arg_base: fx.Int64,  # bf16, row r * NSPEC + step at row stride i32_bs
+        arg_base: fx.Pointer,  # bf16, row r * NSPEC + step at row stride i32_bs
         i32_bs: fx.Int32,
-        arg_cache: fx.Int64,  # bf16 [slots, NSPEC, V]
-        arg_idx: fx.Int64,  # request slot of (r, step) at dword r * i32_idxs + step * i32_idxe; < 0: no row
+        arg_cache: fx.Pointer,  # bf16 [slots, NSPEC, V]
+        arg_idx: fx.Pointer,  # request slot of (r, step) at dword r * i32_idxs + step * i32_idxe; < 0: no row
         i32_idxs: fx.Int32,
         i32_idxe: fx.Int32,
-        arg_pos: fx.Int64,  # int64 sample position of (r, step) at r * i32_poss + step
+        arg_pos: fx.Pointer,  # int64 sample position of (r, step) at r * i32_poss + step
         i32_poss: fx.Int32,
-        arg_temp: fx.Int64,  # fp32 [slots]
-        arg_seed: fx.Int64,  # int64 [slots]
-        arg_pvi: fx.Int64,  # int32 [NSPEC, NT, NROW, 2]: tile winners (value bits, column | tag << 17)
-        arg_epoch: fx.Int64,  # int32 [1]
+        arg_temp: fx.Pointer,  # fp32 [slots]
+        arg_seed: fx.Pointer,  # int64 [slots]
+        arg_pvi: fx.Pointer,  # int32 [NSPEC, NT, NROW, 2]: tile winners (value bits, column | tag << 17)
+        arg_epoch: fx.Pointer,  # int32 [1]
         i32_n: fx.Int32,
         i32_pos_add: fx.Int32,
     ):
@@ -285,45 +280,25 @@ def compile_markov_chain(nrf: int):
         wave = I(fx.rocdl.readfirstlane(T.i32, tx // 64))
         nl = lane % 16
         gl = lane // 16
-        lds_base = I(fx.ptrtoint(smem.e.ptr))
+        # E rows: 16-byte chunks, ESTRIDE // 16 per row
+        e_lds = smem.e.view(fx.make_layout((4, NROW * ESTRIDE // 16), (1, 4)))
         v0 = tile * TILE + wave * 64
-        epr = buffer_ops.create_buffer_resource_from_addr(
-            arg_epoch, num_records_bytes=4
-        )
-        epoch = I(
-            buffer_ops.buffer_load(epr, 0, vec_width=1, dtype=I, cache_modifier=SYS)
-        )
+        epr = _words(arg_epoch, 4, 1)
+        epoch = _load(epr, 0, 1, cache=SYS)
 
         # loads in flight together: the tile's markov_w2 rows (registers), the rows' noise state, the anchor tokens
-        w2r = buffer_ops.create_buffer_resource_from_addr(
-            arg_w2, num_records_bytes=V * R * 2
-        )
+        w2r = _words(arg_w2, V * R * 2, 4)
         wv = [
             [
-                Vec(
-                    buffer_ops.buffer_load(
-                        w2r,
-                        (v0 + vf * 16 + nl) * (R // 2) + gl * 32 + kk * 4,
-                        vec_width=4,
-                        dtype=I,
-                    )
-                )
+                _load(w2r, (v0 + vf * 16 + nl) * (R // 2) + gl * 32 + kk * 4, 4)
                 for kk in range_constexpr(8)
             ]
             for vf in range_constexpr(4)
         ]
-        idr = buffer_ops.create_buffer_resource_from_addr(
-            arg_idx, num_records_bytes=LARGE
-        )
-        tr = buffer_ops.create_buffer_resource_from_addr(
-            arg_temp, num_records_bytes=LARGE
-        )
-        sdr = buffer_ops.create_buffer_resource_from_addr(
-            arg_seed, num_records_bytes=LARGE
-        )
-        pr = buffer_ops.create_buffer_resource_from_addr(
-            arg_pos, num_records_bytes=LARGE
-        )
+        idr = _words(arg_idx, LARGE, 1)
+        tr = _words(arg_temp, LARGE, 1)
+        sdr = _words(arg_seed, LARGE, 2)
+        pr = _words(arg_pos, LARGE, 1)
         for i in range_constexpr((NSPEC * NROW + 64 * NWAVE - 1) // (64 * NWAVE)):
             pidx = tx + 64 * NWAVE * i
             prow = pidx % NROW
@@ -346,30 +321,14 @@ def compile_markov_chain(nrf: int):
             smem.prm.ptr[po + 1] = tp.bitcast(I)
             smem.prm.ptr[po + 2] = h0
 
-        idsr = buffer_ops.create_buffer_resource_from_addr(
-            arg_ids, num_records_bytes=LARGE
-        )
-        anr = buffer_ops.create_buffer_resource_from_addr(
-            arg_anchor, num_records_bytes=LARGE
-        )
-        w1r = buffer_ops.create_buffer_resource_from_addr(
-            arg_w1, num_records_bytes=V * R * 2
-        )
+        idsr = _words(arg_ids, LARGE, 1)
+        anr = _words(arg_anchor, LARGE, 1)
+        w1r = _words(arg_w1, V * R * 2, 4)
         toks = []
         for i in range_constexpr(nch):
             row = (tx + (64 * NWAVE) * i) // 32
-            a = I(
-                buffer_ops.buffer_load(
-                    anr, row * 2, vec_width=1, dtype=I, mask=row < i32_n
-                )
-            )
-            toks.append(
-                I(
-                    buffer_ops.buffer_load(
-                        idsr, a * i32_ide, vec_width=1, dtype=I, mask=row < i32_n
-                    )
-                )
-            )
+            a = _load(anr, row * 2, 1, mask=row < i32_n)
+            toks.append(_load(idsr, a * i32_ide, 1, mask=row < i32_n))
 
         def gather_e(toks_, live):
             """E rows from markov_w1 into LDS, GB 16-byte chunks per thread at a time (registers)."""
@@ -378,55 +337,36 @@ def compile_markov_chain(nrf: int):
                 for i in range_constexpr(b0, min(b0 + GB, nch)):
                     row = (tx + (64 * NWAVE) * i) // 32
                     evs.append(
-                        Vec(
-                            buffer_ops.buffer_load(
-                                w1r,
-                                toks_[i] * (R // 2) + (tx % 32) * 4,
-                                vec_width=4,
-                                dtype=I,
-                                mask=(row < i32_n) & live,
-                            )
+                        _load(
+                            w1r,
+                            toks_[i] * (R // 2) + (tx % 32) * 4,
+                            4,
+                            mask=(row < i32_n) & live,
                         )
                     )
                 for i in range_constexpr(b0, min(b0 + GB, nch)):
                     row = (tx + (64 * NWAVE) * i) // 32
-                    _llvm.StoreOp(
-                        fx.as_ir_value(evs[i - b0]),
-                        _lds_ptr(lds_base + row * ESTRIDE + (tx % 32) * 16),
-                        alignment=16,
+                    fx.slice(e_lds, (None, row * (ESTRIDE // 16) + tx % 32)).store(
+                        evs[i - b0]
                     )
                 _sb()
 
         always = fx.Int32(0) == 0
         gather_e(toks, always)
-        br = buffer_ops.create_buffer_resource_from_addr(
-            arg_base, num_records_bytes=LARGE
-        )
-        cr = buffer_ops.create_buffer_resource_from_addr(
-            arg_cache, num_records_bytes=LARGE
-        )
-        pvir = buffer_ops.create_buffer_resource_from_addr(
-            arg_pvi, num_records_bytes=LARGE
-        )
-        tkr = buffer_ops.create_buffer_resource_from_addr(
-            arg_tokens, num_records_bytes=LARGE
-        )
+        br = _words(arg_base, LARGE, 2)
+        cr = _words(arg_cache, LARGE, 2)
+        pvir = _words(arg_pvi, LARGE, 2)
+        tkr = _words(arg_tokens, LARGE, 2)
         c1_lane = (v0 + gl * 4) * _i32(0xCC9E2D51)
-        upper16, upper32 = (lane & 16) != 0, (lane & 32) != 0
 
         def load_base(s, rf, live):
             brow = (rf * 16 + nl) * NSPEC + s
             return [
-                Vec(
-                    buffer_ops.buffer_load(
-                        br,
-                        (brow * i32_bs + v0 + vf * 16 + gl * 4) // 2,
-                        vec_width=2,
-                        dtype=I,
-                        mask=(rf * 16 + nl < i32_n)
-                        & (v0 + vf * 16 + gl * 4 < V)
-                        & live,
-                    )
+                _load(
+                    br,
+                    (brow * i32_bs + v0 + vf * 16 + gl * 4) // 2,
+                    2,
+                    mask=(rf * 16 + nl < i32_n) & (v0 + vf * 16 + gl * 4 < V) & live,
                 )
                 for vf in range_constexpr(4)
             ]
@@ -455,12 +395,10 @@ def compile_markov_chain(nrf: int):
         fx.rocdl.s_waitcnt(lgkmcnt=0)
         fx.gpu.barrier()  # E rows of step 0
 
-        for iv, state in range(
-            fx.Index(0), fx.Index(NSPEC), fx.Index(1), init=flat_xv(xv0)
-        ):
+        for iv, state in range(0, NSPEC, 1, init=flat_xv(xv0)):
             s = I(iv)
             carried = unflat_xv(state)
-            for rv in range(fx.Index(0), fx.Index((i32_n + 15) // 16), fx.Index(1)):
+            for rv in range(0, (i32_n + 15) // 16, 1):
                 rf = I(rv)
                 row = rf * 16 + nl
                 ld = load_base(s, rf, rf > 0)
@@ -477,11 +415,9 @@ def compile_markov_chain(nrf: int):
 
                 def read_e(kk):
                     return Vec(
-                        _llvm.load(
-                            T.vec(4, T.i32),
-                            _lds_ptr(lds_base + row * ESTRIDE + gl * 128 + kk * 16),
-                            alignment=16,
-                        )
+                        fx.slice(
+                            e_lds, (None, row * (ESTRIDE // 16) + gl * 8 + kk)
+                        ).load()
                     ).bitcast(fx.BFloat16)
 
                 acc = [Vec.filled(4, 0.0, F) for _ in range_constexpr(4)]
@@ -489,6 +425,10 @@ def compile_markov_chain(nrf: int):
                 for kk in range_constexpr(8):
                     e_next = read_e(kk + 1) if kk < 7 else e_cur
                     for vf in range_constexpr(4):
+                        # Raw MFMA: the A operands are markov_w2 rows held in registers
+                        # for all five steps, with K permuted per lane group on both
+                        # operands; there is no tensor / partition form of that for
+                        # fx.make_mma_atom + fx.gemm to take.
                         acc[vf] = Vec(
                             fx.rocdl.mfma_f32_16x16x32_bf16(
                                 Vec.make_type(4, F),
@@ -528,19 +468,12 @@ def compile_markov_chain(nrf: int):
                         _unpack(I(xr[vf][k // 2]), k % 2) + _unpack(pb[k // 2], k % 2)
                         for k in range_constexpr(4)
                     ]
-                    py = [
-                        I(
-                            fx.rocdl.cvt_pk_bf16_f32(
-                                fx.as_ir_value(sums[2 * j]),
-                                fx.as_ir_value(sums[2 * j + 1]),
-                            )
-                        )
-                        for j in range_constexpr(2)
-                    ]
-                    buffer_ops.buffer_store(
-                        Vec.from_elements(py, I),
+                    ybf = Vec.from_elements(sums, F).to(fx.BFloat16).bitcast(I)
+                    py = [I(ybf[0]), I(ybf[1])]
+                    _store(
                         cr,
                         ((slot * NSPEC + s) * V + col0) // 2,
+                        py,
                         mask=(slot >= 0) & inv,
                     )
                     for k in range_constexpr(4):
@@ -556,9 +489,8 @@ def compile_markov_chain(nrf: int):
                     bv, F(NEG_INF)
                 )  # a wave past the vocabulary: all columns invalid
                 for m in (16, 32):
-                    up = upper32 if m == 32 else upper16
-                    ov = _xor_lane(bv.bitcast(I), m, up).bitcast(F)
-                    oi = _xor_lane(bi, m, up)
+                    ov = _xor_lane(bv.bitcast(I), m).bitcast(F)
+                    oi = _xor_lane(bi, m)
                     bv, bi = _comb(bv, bi, ov, oi)
                 smem.mv.ptr[(rf * 16 + nl) * NWAVE + wave] = bv.bitcast(I)
                 smem.mi.ptr[(rf * 16 + nl) * NWAVE + wave] = bi
@@ -577,12 +509,12 @@ def compile_markov_chain(nrf: int):
                     I(smem.mi.ptr[rr_s * NWAVE + w]),
                 )
             tag = (epoch * 8 + (s + 1)) & 0x7FFF
-            buffer_ops.buffer_store(
-                Vec.from_elements([bv.bitcast(I), (bi & 0x1FFFF) | (tag << 17)], I),
+            _store(
                 pvir,
                 ((s * NT + tile) * NROW + tx) * 2,
+                [bv.bitcast(I), (bi & 0x1FFFF) | (tag << 17)],
                 mask=rr_ok,
-                cache_modifier=SYS,
+                cache=SYS,
             )
             _sb()
             live = s + 1 < NSPEC
@@ -600,24 +532,19 @@ def compile_markov_chain(nrf: int):
                 bv, bi = F(NEG_INF), I(BIG)
                 bad = fx.Int64(1)
                 while bad != 0:
-                    _llvm.inline_asm(
-                        None, [], "s_sleep 1", "~{memory}", has_side_effects=True
-                    )  # loads stay in loop
+                    _poll_sleep()
                     bv, bi = F(NEG_INF), I(BIG)
                     miss = I(0)
                     for h in range_constexpr((TPS + HALF - 1) // HALF):
                         qs = list(range(h * HALF, min((h + 1) * HALF, TPS)))
                         ents = [
-                            Vec(
-                                buffer_ops.buffer_load(
-                                    pvir,
-                                    base_dw,
-                                    vec_width=2,
-                                    dtype=I,
-                                    mask=(t_first + q * NSL < NT) if q >= QF else None,
-                                    cache_modifier=SYS,
-                                    soffset_bytes=q * NSL * NROW * 8,
-                                )
+                            _load(
+                                pvir,
+                                base_dw,
+                                2,
+                                mask=(t_first + q * NSL < NT) if q >= QF else None,
+                                cache=SYS,
+                                soffset=q * NSL * NROW * 2,
                             )
                             for q in qs
                         ]
@@ -649,12 +576,7 @@ def compile_markov_chain(nrf: int):
                     I(smem.ri.ptr[w * NROW + rr_s]),
                 )
             bi = (bi < V).select(bi, I(0))  # no winner (NaN or all -inf row): token 0
-            buffer_ops.buffer_store(
-                Vec.from_elements([bi, I(0)], I),
-                tkr,
-                (rr_s * i32_ts + s) * 2,
-                mask=rr_n,
-            )
+            _store(tkr, (rr_s * i32_ts + s) * 2, [bi, I(0)], mask=rr_n)
             smem.tok.ptr[rr_ok.select(tx, I(NROW))] = bi
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             fx.gpu.barrier()
@@ -669,29 +591,29 @@ def compile_markov_chain(nrf: int):
             fx.gpu.barrier()
             yield flat_xv(nxv0)
         if (tile == 0) & (tx == 0):
-            buffer_ops.buffer_store(epoch + 1, epr, 0, cache_modifier=SYS)
+            _store(epr, 0, [epoch + 1], cache=SYS)
 
     @flyc.jit
     def launch_markov_chain(
-        arg_w2: fx.Int64,
-        arg_w1: fx.Int64,
-        arg_ids: fx.Int64,
+        arg_w2: fx.Pointer,
+        arg_w1: fx.Pointer,
+        arg_ids: fx.Pointer,
         i32_ide: fx.Int32,
-        arg_anchor: fx.Int64,
-        arg_tokens: fx.Int64,
+        arg_anchor: fx.Pointer,
+        arg_tokens: fx.Pointer,
         i32_ts: fx.Int32,
-        arg_base: fx.Int64,
+        arg_base: fx.Pointer,
         i32_bs: fx.Int32,
-        arg_cache: fx.Int64,
-        arg_idx: fx.Int64,
+        arg_cache: fx.Pointer,
+        arg_idx: fx.Pointer,
         i32_idxs: fx.Int32,
         i32_idxe: fx.Int32,
-        arg_pos: fx.Int64,
+        arg_pos: fx.Pointer,
         i32_poss: fx.Int32,
-        arg_temp: fx.Int64,
-        arg_seed: fx.Int64,
-        arg_pvi: fx.Int64,
-        arg_epoch: fx.Int64,
+        arg_temp: fx.Pointer,
+        arg_seed: fx.Pointer,
+        arg_pvi: fx.Pointer,
+        arg_epoch: fx.Pointer,
         i32_n: fx.Int32,
         i32_pos_add: fx.Int32,
         stream: fx.Stream,

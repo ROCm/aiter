@@ -15,7 +15,10 @@ Explicit specialization (callers fall back to their own loop otherwise, see
 129280, Markov rank 256, bf16 ``markov_w1`` / ``markov_w2`` [129280, 256]
 contiguous, bf16 base logits with unit column stride, a replicated bf16 draft
 logits cache [slots, 5, 129280] (< 2 GiB), fp32 Gumbel draws (not fp64), no
-confidence head, no reduced draft vocabulary, gfx950 with >= 253 CUs.
+confidence head, no reduced draft vocabulary, no draft watermarker, no
+acceptance estimator, gfx950 with >= 253 CUs. The speculator features are
+required arguments of :func:`markov_chain_sample_supported`, so a caller states
+each one.
 
 The bias sum has the MFMA's order, so a bias can differ from another order's
 (hipBLASLt's) in its last bf16 bit; the rejection sampler verifies every draft
@@ -35,7 +38,7 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels import markov_chain_gumbel as _kernel
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 V, R, NSPEC = _kernel.V, _kernel.R, _kernel.NSPEC
 MAX_ROWS = 160  # rows of one launch; more rows run as consecutive launches
@@ -68,17 +71,8 @@ def _workspace(device: torch.device, nrf: int):
     return winners, epoch
 
 
-def markov_chain_sample_unsupported_reason(
-    markov_w1: torch.Tensor,
-    markov_w2: torch.Tensor,
-    draft_logits_cache: torch.Tensor,
-    *,
-    num_speculative_steps: int = NSPEC,
-    use_fp64_gumbel: bool = False,
-) -> str | None:
-    """Why :func:`flydsl_markov_chain_sample` cannot serve this speculator, or
-    None. Everything here is fixed at load time; the per-call tensors (base
-    logits, maps, positions) are checked by the op itself."""
+def _tensor_reason(markov_w1, markov_w2, draft_logits_cache) -> str | None:
+    """Arch and the load-time tensors (weights, cache)."""
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         return f"{gfx} is not supported (gfx950 only)"
@@ -86,36 +80,94 @@ def markov_chain_sample_unsupported_reason(
         return (
             f"needs {_kernel.NT} co-resident workgroups, the GPU has {get_cu_num()} CUs"
         )
-    if num_speculative_steps != NSPEC:
-        return f"{num_speculative_steps} draft steps (only {NSPEC})"
-    if use_fp64_gumbel:
-        return "fp64 Gumbel draws are not supported"
     for name, w in (("markov_w1", markov_w1), ("markov_w2", markov_w2)):
         if w.dtype != torch.bfloat16 or tuple(w.shape) != (V, R):
             return f"{name} must be bf16 [{V}, {R}], got {w.dtype} {tuple(w.shape)}"
         if not w.is_contiguous() or not w.is_cuda:
             return f"{name} must be a contiguous GPU tensor"
+        if w.data_ptr() % 16:
+            return f"{name} must be 16-byte aligned"
+    if markov_w2.device != markov_w1.device:
+        return "markov_w1 and markov_w2 must be on one device"
     c = draft_logits_cache
     if c.dtype != torch.bfloat16 or c.dim() != 3 or tuple(c.shape[1:]) != (NSPEC, V):
         return f"draft logits cache must be bf16 [slots, {NSPEC}, {V}]"
     if not c.is_contiguous() or c.numel() * 2 >= 1 << 31:
         return "draft logits cache must be contiguous and < 2 GiB"
+    if c.device != markov_w1.device or c.data_ptr() % 8:
+        return "draft logits cache must be 8-byte aligned, on the weights' device"
     return None
+
+
+def markov_chain_sample_unsupported_reason(
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    draft_logits_cache: torch.Tensor,
+    *,
+    num_speculative_steps: int,
+    use_fp64_gumbel: bool,
+    draft_vocab_size: int,
+    has_confidence_head: bool,
+    has_draft_watermarker: bool,
+    has_acceptance_estimator: bool,
+) -> str | None:
+    """Why :func:`flydsl_markov_chain_sample` cannot serve this speculator, or
+    None. Everything here is fixed at load time; the per-call tensors (base
+    logits, maps, positions) are checked by the op itself.
+
+    The op computes exactly the probabilistic Markov chain: every speculator
+    feature it does not compute is a required argument, so a caller cannot
+    leave one unchecked. Greedy drafting (no draft logits cache) does not
+    reach this helper; the caller keeps its own path for it.
+    """
+    if num_speculative_steps != NSPEC:
+        return f"{num_speculative_steps} draft steps (only {NSPEC})"
+    if use_fp64_gumbel:
+        return "fp64 Gumbel draws are not supported"
+    if draft_vocab_size != V:
+        return f"a draft vocabulary of {draft_vocab_size} (only the full {V})"
+    if has_confidence_head:
+        return "a confidence head is not computed"
+    if has_draft_watermarker:
+        return "a draft watermarker is not applied"
+    if has_acceptance_estimator:
+        return "an acceptance estimator is not computed"
+    return _tensor_reason(markov_w1, markov_w2, draft_logits_cache)
 
 
 def markov_chain_sample_supported(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
     draft_logits_cache: torch.Tensor,
-    **kwargs,
+    *,
+    num_speculative_steps: int,
+    use_fp64_gumbel: bool,
+    draft_vocab_size: int,
+    has_confidence_head: bool,
+    has_draft_watermarker: bool,
+    has_acceptance_estimator: bool,
 ) -> bool:
-    """Whether :func:`flydsl_markov_chain_sample` serves this speculator."""
+    """Whether :func:`flydsl_markov_chain_sample` serves this speculator (see
+    :func:`markov_chain_sample_unsupported_reason`)."""
     return (
         markov_chain_sample_unsupported_reason(
-            markov_w1, markov_w2, draft_logits_cache, **kwargs
+            markov_w1,
+            markov_w2,
+            draft_logits_cache,
+            num_speculative_steps=num_speculative_steps,
+            use_fp64_gumbel=use_fp64_gumbel,
+            draft_vocab_size=draft_vocab_size,
+            has_confidence_head=has_confidence_head,
+            has_draft_watermarker=has_draft_watermarker,
+            has_acceptance_estimator=has_acceptance_estimator,
         )
         is None
     )
+
+
+def _check(ok: bool, msg: str) -> None:
+    if not ok:
+        raise ValueError(f"[FlyDSL markov_chain_sample] {msg}")
 
 
 def flydsl_markov_chain_sample(
@@ -148,35 +200,78 @@ def flydsl_markov_chain_sample(
       pre-temperature logits ``bf16(base + bias)`` of each valid (r, s).
     - ``draft_tokens`` int64 [>= n, 5] (unit column stride).
 
+    The speculator-level eligibility (draft steps, Gumbel precision, draft
+    vocabulary, confidence head, watermarker, acceptance estimator) is the
+    caller's to check with :func:`markov_chain_sample_supported`; this op
+    checks the tensors it is given and raises ``ValueError`` on a mismatch.
+
     Every token is in [0, 129280): a row with no winner (all NaN / inf) gets
     token 0. Deterministic, graph safe, no host sync. Call
     :func:`warmup_markov_chain_sample` before graph capture.
     """
     n = anchor_idx.shape[0]
     base, cache, tokens = base_logits, draft_logits_cache, draft_tokens
-    reason = markov_chain_sample_unsupported_reason(markov_w1, markov_w2, cache)
-    if reason is not None:
-        raise ValueError(f"[FlyDSL markov_chain_sample] {reason}")
-    assert base.dtype == torch.bfloat16 and base.shape == (n * NSPEC, V)
-    assert base.stride(1) == 1 and base.stride(0) % 2 == 0
-    assert base.data_ptr() % 8 == 0
-    assert base.shape[0] * base.stride(0) * 2 < 1 << 31
-    assert input_ids.dtype in (torch.int32, torch.int64) and input_ids.is_contiguous()
-    assert anchor_idx.dtype == torch.int64 and anchor_idx.is_contiguous()
-    assert idx_map.dtype in (torch.int32, torch.int64)
-    assert idx_map.shape == (n, NSPEC) and idx_map.stride(1) == 1
-    assert sample_pos.dtype == torch.int64 and sample_pos.shape == (n, NSPEC)
-    assert sample_pos.stride(1) == 1
-    assert temperature.dtype == torch.float32 and temperature.is_contiguous()
-    assert seeds.dtype == torch.int64 and seeds.is_contiguous()
-    assert seeds.shape == temperature.shape
-    assert tokens.dtype == torch.int64 and tokens.shape[0] >= n
-    assert tokens.shape[1] == NSPEC and tokens.stride(1) == 1
+    reason = _tensor_reason(markov_w1, markov_w2, cache)
+    _check(reason is None, str(reason))
+    _check(
+        base.dtype == torch.bfloat16 and tuple(base.shape) == (n * NSPEC, V),
+        f"base_logits must be bf16 [{n * NSPEC}, {V}]",
+    )
+    _check(
+        base.stride(1) == 1 and base.stride(0) % 2 == 0 and base.data_ptr() % 8 == 0,
+        "base_logits needs unit column stride, an even row stride, 8-byte alignment",
+    )
+    _check(base.shape[0] * base.stride(0) * 2 < 1 << 31, "base_logits spans >= 2 GiB")
+    _check(
+        input_ids.dtype in (torch.int32, torch.int64) and input_ids.is_contiguous(),
+        "input_ids must be contiguous int32 / int64",
+    )
+    _check(
+        anchor_idx.dtype == torch.int64 and anchor_idx.is_contiguous(),
+        "anchor_idx must be contiguous int64",
+    )
+    _check(
+        idx_map.dtype in (torch.int32, torch.int64)
+        and tuple(idx_map.shape) == (n, NSPEC)
+        and idx_map.stride(1) == 1,
+        f"idx_map must be int32 / int64 [{n}, {NSPEC}] with unit column stride",
+    )
+    _check(
+        sample_pos.dtype == torch.int64
+        and tuple(sample_pos.shape) == (n, NSPEC)
+        and sample_pos.stride(1) == 1,
+        f"sample_pos must be int64 [{n}, {NSPEC}] with unit column stride",
+    )
+    _check(
+        temperature.dtype == torch.float32
+        and temperature.is_contiguous()
+        and seeds.dtype == torch.int64
+        and seeds.is_contiguous()
+        and seeds.shape == temperature.shape,
+        "temperature / seeds must be contiguous fp32 / int64 of one shape",
+    )
+    _check(
+        tokens.dtype == torch.int64
+        and tokens.dim() == 2
+        and tokens.shape[0] >= n
+        and tokens.shape[1] == NSPEC
+        and tokens.stride(1) == 1,
+        f"draft_tokens must be int64 [>= {n}, {NSPEC}] with unit column stride",
+    )
     dev = base.device
-    for t in (markov_w1, input_ids, anchor_idx, idx_map, sample_pos, temperature):
-        assert t.device == dev
-    for t in (seeds, cache, tokens):
-        assert t.device == dev
+    for name, t in (
+        ("markov_w1", markov_w1),
+        ("markov_w2", markov_w2),
+        ("input_ids", input_ids),
+        ("anchor_idx", anchor_idx),
+        ("idx_map", idx_map),
+        ("sample_pos", sample_pos),
+        ("temperature", temperature),
+        ("seeds", seeds),
+        ("draft_logits_cache", cache),
+        ("draft_tokens", tokens),
+    ):
+        _check(t.device == dev, f"{name} is on {t.device}, base_logits on {dev}")
     stream = torch.cuda.current_stream(dev)
     ide = input_ids.element_size() // 4
     idxe = idx_map.element_size() // 4
@@ -186,25 +281,25 @@ def flydsl_markov_chain_sample(
         winners, epoch = _workspace(dev, nrf)
         _run_compiled(
             _chain_exe(nrf),
-            markov_w2.data_ptr(),
-            markov_w1.data_ptr(),
-            input_ids.data_ptr(),
+            ptr_arg(markov_w2),
+            ptr_arg(markov_w1),
+            ptr_arg(input_ids),
             ide,
-            anchor_idx.data_ptr() + r0 * 8,
-            tokens.data_ptr() + r0 * tokens.stride(0) * 8,
+            ptr_arg(anchor_idx[r0:]),
+            ptr_arg(tokens[r0:]),
             tokens.stride(0),
-            base.data_ptr() + r0 * NSPEC * base.stride(0) * 2,
+            ptr_arg(base[r0 * NSPEC :]),
             base.stride(0),
-            cache.data_ptr(),
-            idx_map.data_ptr() + r0 * idx_map.stride(0) * idx_map.element_size(),
+            ptr_arg(cache),
+            ptr_arg(idx_map[r0:]),
             idx_map.stride(0) * idxe,
             idxe,
-            sample_pos.data_ptr() + r0 * sample_pos.stride(0) * 8,
+            ptr_arg(sample_pos[r0:]),
             sample_pos.stride(0),
-            temperature.data_ptr(),
-            seeds.data_ptr(),
-            winners.data_ptr(),
-            epoch.data_ptr(),
+            ptr_arg(temperature),
+            ptr_arg(seeds),
+            ptr_arg(winners),
+            ptr_arg(epoch),
             m,
             _POS_ADD,
             stream,
