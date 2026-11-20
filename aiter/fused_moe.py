@@ -2476,8 +2476,6 @@ def _fused_moe_impl(
                 output=output,
             )
     if herd_topk:
-        if presorted_aux:
-            presorted_moe_ignored("HERD sorts its own candidates")
         (
             sorted_ids,
             sorted_weights,

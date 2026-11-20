@@ -1984,10 +1984,18 @@ def test_presorted_moe_std_pipelines():
         ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, (64, 65, 256)),
         ("a16w4", None, {}, (1, 32, 64, 256)),
     )
-    if get_gfx() == "gfx942" or int(os.getenv("AITER_FP4x2", "1")) <= 0:
+    # a4w4 needs the running GPU to be gfx950 and a build with HIP fp4x2 quant; the
+    # build-target read (get_gfx) is the build question, get_gfx_runtime the GPU one.
+    if (
+        get_gfx_runtime() != "gfx950"
+        or get_gfx() == "gfx942"
+        or int(os.getenv("AITER_FP4x2", "1")) <= 0
+    ):
         aiter.logger.warning(
-            "build target %s has no HIP fp4x2 quant (-D__Float4_e2m1fn_x2); "
-            "skipping the a4w4 presorted standard-sort cases",
+            "running GPU %s, build target %s: a4w4 needs a gfx950 GPU and a build "
+            "with HIP fp4x2 quant (-D__Float4_e2m1fn_x2); skipping the a4w4 "
+            "presorted standard-sort cases",
+            get_gfx_runtime(),
             get_gfx(),
         )
         cases = tuple(case for case in cases if case[0] != "a4w4")
