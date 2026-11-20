@@ -86,8 +86,10 @@ _S1F_GROUP_M = 8
 #: default was 4096, so the widest prefill steps stayed on dispatch + GEMM1.
 #: DSV4.1 Flash (top-6/7, EP2/EP4) was already uncapped. At 8192 tokens/rank:
 #: 886 vs 959 us/layer on EP2 top-6, 900 vs 1063 on EP4, 1200 vs 1405 on EP2
-#: top-7. Past 4096 tokens this compiles a few more plan widths (7 instead of
-#: 4 at 8192).
+#: top-7. EP8 and EP16 run fused 8-16% faster than unfused from 1024
+#: tokens/rank up to a 131072 bound (EP8 1014 vs 1207 us/layer at 8192, EP16
+#: 1174 vs 1405). Past 4096 tokens this compiles a few more plan widths (7
+#: instead of 4 at 8192).
 _S1F_MAX_RECV = 1 << 30
 
 
@@ -180,8 +182,8 @@ def blocking_reasons(config) -> list:
     reasons = []
     if config.dispatch_wire != "fp4":
         reasons.append(f"needs the fp4 dispatch wire, got {config.dispatch_wire}")
-    if config.world_size > 8:
-        reasons.append(f"world_size {config.world_size} > 8 (8-bit source mask)")
+    if config.world_size > 16:
+        reasons.append(f"world_size {config.world_size} > 16 (16-bit source mask)")
     if config.experts_per_rank > 255:
         reasons.append(f"{config.experts_per_rank} experts per rank > 255")
     if config.max_tokens_per_rank > 0xFFFF:
