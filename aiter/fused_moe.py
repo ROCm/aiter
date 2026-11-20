@@ -2522,7 +2522,7 @@ def fused_moe_1stage(
 
 # Arches whose 1-stage asm fmoe kernels address expert weights with 32-bit
 # byte offsets (see _asm_fmoe_weights_fit_u32_offsets).
-_ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942",)
+_ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
 
 
 def _asm_fmoe_weights_fit_u32_offsets(
@@ -2530,10 +2530,10 @@ def _asm_fmoe_weights_fit_u32_offsets(
 ):
     """Whether every byte of w1/w2 is within 4 GiB of the tensor base.
 
-    The gfx942 1-stage asm fmoe kernels address the expert weights with 32-bit
-    byte offsets, so weights past 4 GiB read wrapped addresses and return
-    garbage without faulting (e.g. 256 experts, model_dim 7168, inter_dim 2048
-    fp8 g1u1: w1 is 7 GiB and only experts 0-145 come out right).
+    The gfx942 and gfx950 1-stage asm fmoe kernels address the expert weights
+    with 32-bit byte offsets, so weights past 4 GiB read wrapped addresses and
+    return garbage without faulting (e.g. 256 experts, model_dim 7168,
+    inter_dim 2048 fp8 g1u1: w1 is 7 GiB and only experts 0-145 come out right).
     """
     w_dtype = dtype if q_dtype_w is None else q_dtype_w
     bits = 4 if w_dtype in (dtypes.fp4x2, dtypes.i4x2) else w_dtype.itemsize * 8
@@ -4864,8 +4864,8 @@ def get_2stage_cfgs(
                 if not use_g1u1:
                     raise NotImplementedError(
                         "Non-gated MoE weights past 4 GiB are not supported on "
-                        "gfx942: the asm 1-stage kernel wraps 32-bit offsets and "
-                        "CK stage 1 assumes gate and up are fused."
+                        f"{get_gfx_runtime()}: the asm 1-stage kernel wraps 32-bit "
+                        "offsets and CK stage 1 assumes gate and up are fused."
                     )
                 run_1stage = False
                 run_1stage_xbf16 = False

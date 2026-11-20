@@ -2520,7 +2520,7 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
 
 
 def test_gfx942_asm_1stage_4gib_guard():
-    """The gfx942 asm 1-stage fmoe kernels wrap 32-bit weight offsets past 4 GiB.
+    """The gfx942 and gfx950 asm 1-stage fmoe kernels wrap weight offsets at 4 GiB.
 
     The legacy sweep only logs an accuracy warning (strict_accuracy=False), so
     this asserts the dispatch itself. It needs no multi-GiB tensors: the weight
@@ -2568,7 +2568,7 @@ def test_gfx942_asm_1stage_4gib_guard():
 
     host = fm.get_gfx_runtime()
     real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
-    assert "gfx942" in real_gfx, "the production guard must cover gfx942"
+    assert real_gfx == ("gfx942", "gfx950"), "the guard must cover gfx942 and gfx950"
     cases = (  # (token, quant type): the default heuristic takes asm 1-stage here
         (256, aiter.QuantType.per_Token),
         (256, aiter.QuantType.per_1x128),
@@ -2579,7 +2579,7 @@ def test_gfx942_asm_1stage_4gib_guard():
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
             before_big = run_1stage(token, 2048, qtype, fp8)
             before_small = run_1stage(token, 1024, qtype, fp8)
-            if host == "gfx942":
+            if host in real_gfx:
                 assert before_big and before_small, (
                     f"{qtype}: the default heuristic no longer takes asm 1-stage, "
                     "so this test cannot see the guard"
@@ -2595,18 +2595,23 @@ def test_gfx942_asm_1stage_4gib_guard():
         # Non-gated weights cannot take CK stage 1 (it halves w1.size(1)), so an
         # oversized one is rejected rather than rerouted.
         fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
-        if host == "gfx942":
+        if host in real_gfx:
+            # The one non-gated key in the host's 1-stage table: gfx942 takes
+            # the unquantized bf16 kernel, gfx950 the bf16 per_Token one.
+            ng_qtype = (
+                aiter.QuantType.per_Token if host == "gfx950" else aiter.QuantType.No
+            )
             try:
-                run_1stage(1, 2048, aiter.QuantType.No, bf16, bf16, False)
+                run_1stage(1, 2048, ng_qtype, bf16, bf16, False)
             except NotImplementedError:
                 pass
             else:
                 raise AssertionError("oversized non-gated weights must be rejected")
-            assert run_1stage(1, 1024, aiter.QuantType.No, bf16, bf16, False)
+            assert run_1stage(1, 1024, ng_qtype, bf16, bf16, False)
     finally:
         fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = real_gfx
         fm.get_2stage_cfgs.cache_clear()
-    aiter.logger.info("moe_2stage: gfx942 asm 1-stage 4 GiB guard passed")
+    aiter.logger.info("moe_2stage: asm 1-stage 4 GiB guard passed")
 
 
 def _quant_blockscale_weight(w):
