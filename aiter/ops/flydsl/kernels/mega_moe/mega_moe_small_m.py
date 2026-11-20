@@ -796,14 +796,20 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none"):
+    p2p_quant_type="none", pipelined=False):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
 
     Uses the absolute LDS layout of ``g2_lds_layout`` (the caller's LDS pool must start at address 0); the peer
     table at ``layout['peer']`` must be loaded by the caller. Same numerics as the stage2 kernel.
     ``row_mask``: rows past the tile's valid count are dropped here, so the plan need not pad their srcmap.
+    ``pipelined`` (BM 64 x 64 columns per wave, static inter_dim): the tile itself waits for its m-tile's GEMM1
+    ready epoch (ready_addr / ready_epoch), after issuing everything that does not read GEMM1 output (plan rows,
+    srcmap, weights of the first K-tile) and claiming the CTA's next unit (fetch_head - fetch_shard into the LDS
+    word fetch_slot); its K-loop prefetches B one K-tile ahead (gemm2_compute_v2 b_prefetch). Otherwise the
+    caller waits for the ready epoch and the fetch arguments are unused.
     """
+    assert not pipelined or (BM == 64 and BN // 4 == 64)
     assert clamp_a or not row_mask
     lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
     is_f8 = a_dtype == "fp8"
@@ -816,20 +822,41 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     def g2_tile(lds_base_i32: fx.Int32, tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, m_block: fx.Int32,
         n_block: fx.Int32, arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_tile_rows: fx.Int64,
-        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32):
+        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32,
+        ready_addr: fx.Int64, ready_epoch: fx.Int32, fetch_head: fx.Int64, fetch_shard: fx.Int32,
+        fetch_slot: fx.Int32):
     # fmt: on
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
+        m_row0 = m_block * fx.Int32(BM)
+        sort_block_idx = m_row0 // fx.Int32(SBM)
+        trb_v = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1)
         vrows = None
         if const_expr(clamp_a):
             vrows = rocdl.readfirstlane(T.i32, load_at(AddrBuffer(arg_tile_rows), m_block, fx.Int32, 1))
-        m_row0 = m_block * fx.Int32(BM)
-        for slot in range_constexpr(kStages):
-            issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A, k_bytes,
-                BM=BM, valid_rows=vrows)
-        rocdl.sched_barrier(0)
-        sort_block_idx = m_row0 // fx.Int32(SBM)
-        srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (m_row0 - sort_block_idx * fx.Int32(SBM))
+
+        def issue_a_prologue():
+            for slot in range_constexpr(kStages):
+                issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A,
+                    k_bytes, BM=BM, valid_rows=vrows)
+            rocdl.sched_barrier(0)
+
+        def fetch_then_wait_ready():
+            if tx_i32 == fx.Int32(0):
+                # Claim the CTA's next unit now; the caller reads it after its next loop barrier (ping-pong word).
+                nxt = fx.Int32(comm_ops.atomic_add_agent(fetch_head, fx.Int32(1))) - fetch_shard
+                fx.ptr_store(nxt, lds_typed_ptr(fetch_slot, T.i32, align=4))
+                comm_ops.wait_i32_until_equals(ready_addr, ready_epoch)
+            fx.barrier()
+            # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back to
+            # memory by the other XCD into lines this XCD has not cached, before it was counted: only the CU's L1
+            # can be stale.
+            comm_ops.invalidate_l1()
+            issue_a_prologue()
+
+        if const_expr(not pipelined):
+            issue_a_prologue()
+        srcmap_row_base = trb_v + (m_row0 - sort_block_idx * fx.Int32(SBM))
         if tx_i32 < fx.Int32(BM):
             sorted_pos = srcmap_row_base + tx_i32
             packed = load_at(AddrBuffer(arg_stids), sorted_pos, fx.Int32, 1)
@@ -844,7 +871,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows)
+            expert_offset=expert_offset, valid_rows=vrows, b_prefetch=pipelined,
+            pre_loop=fetch_then_wait_ready if pipelined else None)
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
@@ -957,19 +985,21 @@ def compile_mega_moe_stage1(
     g2_n_blocks = model_dim // g2_bn
     # The P2P row stores go to the uncached shmem heap; non-temporal stores there are slower (store_cm=0).
     # GEMM2 masks the padding rows of each tile itself, so the plan leaves their srcmap unwritten.
+    # BM 64 x BN 256 GEMM2 tiles of a static inter_dim run the pipelined tile (see make_g2_tile_runner).
+    G2_PIPELINED = sort_block_m == 64 and g2_bn // NUM_WAVES == 64 and inter_dim % g2_bk == 0
     g2_tile, g2_lay = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
+        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", pipelined=G2_PIPELINED,
     )
     g2_tile_cached, _ = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
+        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", pipelined=G2_PIPELINED,
     )
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
@@ -1204,6 +1234,13 @@ def compile_mega_moe_stage1(
         g2_sweights = _disp_ptr(DispatchSlot.G2_SWEIGHTS)
         g2_trb = _disp_ptr(DispatchSlot.G2_TRB)
         g2_rows = _disp_ptr(DispatchSlot.TILE_ROWS)
+        if const_expr(G2_PIPELINED):
+            # The descriptors of the pipelined tile's loads must be uniform (SGPRs), not waterfall loops.
+            def _rfl(v):
+                return fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(v).ir_value()))
+            g2_aq, g2_ascale, g2_bq, g2_bscale = _rfl(g2_aq), _rfl(g2_ascale), _rfl(g2_bq), _rfl(g2_bscale)
+            g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows = (
+                _rfl(g2_eids), _rfl(g2_stids), _rfl(g2_sweights), _rfl(g2_trb), _rfl(g2_rows))
         g2_max_m_blocks = fx.Int32(_disp_ptr(DispatchSlot.G2_MAX_M_BLOCKS))
         g2_scratch = lds_typed_ptr(fx.Int32(g2_scratch_off), T.i32, align=4)
 
@@ -1240,11 +1277,13 @@ def compile_mega_moe_stage1(
         work_shard = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
         # Equal slices of the unit space, so an m-tile count that is not a multiple of 8 does not leave one XCD a
         # whole m-tile behind. GEMM2 of an m-tile reads its GEMM1 output from the L2 of the XCD that wrote it,
-        # except in the m-tiles cut by a slice end (see _count_tile). Slice ends fall on groups of 4 n-tiles,
-        # whose output scales fill whole 256-byte blocks: no cache line of GEMM1 output is written by two XCDs.
-        assert N_TILES % 4 == 0
-        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-4)
-        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-4)) - shard_base
+        # except in the m-tiles cut by a slice end (see _count_tile). Slice ends fall on groups of 512 // tile_n
+        # n-tiles (256 output columns), whose output scales fill whole 256-byte blocks: no cache line of GEMM1 output
+        # is written by two XCDs.
+        n_group = 512 // tile_n
+        assert N_TILES % n_group == 0
+        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-n_group)
+        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-n_group)) - shard_base
 
         # The m-tiles at this XCD slice's ends that the slice cuts (-1: the end is on an m-tile boundary).
         shard_end = shard_base + shard_work
@@ -1335,36 +1374,48 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
+        g2_par = fx.Int32(0)
         while g2_active:
             fx.barrier()
-            if tid == fx.Int32(0):
-                if g2_fetch != fx.Int32(0):
-                    fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - shard_work,
-                        g2_scratch)
-            fx.barrier()
-            g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
+            if const_expr(not G2_PIPELINED):
+                if tid == fx.Int32(0):
+                    if g2_fetch != fx.Int32(0):
+                        fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - shard_work,
+                            g2_scratch)
+                fx.barrier()
+            # Pipelined tiles claim the CTA's next unit themselves, into the other of two LDS words (the first unit
+            # comes from the GEMM1 loop, in the first word).
+            cur_slot = fx.Int32(g2_scratch_off) + g2_par * fx.Int32(8)
+            nxt_slot = fx.Int32(g2_scratch_off + 8) - g2_par * fx.Int32(8)
+            g2_local = fx.Int32(fx.rocdl.readfirstlane(
+                T.i32, fx.ptr_load(lds_typed_ptr(cur_slot, T.i32, align=4)).ir_value()))
             if g2_local < g2_units:
                 g2_u = g2_base + g2_local
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
-                if tid == fx.Int32(0):
-                    comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
-                fx.barrier()
-                # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back
-                # to memory by the other XCD into lines this XCD has not cached, before it was counted: only the
-                # CU's L1 can be stale.
-                comm_ops.invalidate_l1()
+                g2_ready_addr = a_g2_ready + fx.Int64(g2_m) * fx.Int64(4)
+                if const_expr(not G2_PIPELINED):
+                    if tid == fx.Int32(0):
+                        comm_ops.wait_i32_until_equals(g2_ready_addr, gate_epoch)
+                    fx.barrier()
+                    # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written
+                    # back to memory by the other XCD into lines this XCD has not cached, before it was counted:
+                    # only the CU's L1 can be stale.
+                    comm_ops.invalidate_l1()
                 # As in GEMM1, a rank that receives many rows reads W2 through the cache.
                 if cached_w != fx.Int32(0):
                     g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
                         g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
-                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows)
+                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, g2_ready_addr, gate_epoch, g2_head,
+                        shard_work, nxt_slot)
                 else:
                     g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
                         g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
-                        fx.Int32(model_dim), fp8_rows)
+                        fx.Int32(model_dim), fp8_rows, g2_ready_addr, gate_epoch, g2_head, shard_work, nxt_slot)
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
+            if const_expr(G2_PIPELINED):
+                g2_par = fx.Int32(1) - g2_par
         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
         # the combine op's own flag values in the shared xdb slots.
         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
@@ -1461,18 +1512,23 @@ def small_m_config(
                 config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True
             ),
         )
+    if (2 * inter_dim // config.stage1.tile_n) % 4:
+        # The tile_n 256 of buckets <= 8 gives V4.1-Flash (inter_dim 2304) 18 n-tiles; the 32-row path keeps 128
+        # (36 n-tiles), as every other 32-row bucket uses.
+        config = replace(config, stage1=replace(config.stage1, tile_n=128))
     if nearest_token_bucket(max(tokens, 1)) >= _BM64_MIN_BUCKET:
         # 64-row expert tiles: at ~35+ rows per expert a 32-row tile splits every expert in two and streams its
         # weights twice.
         config = replace(
             config,
-            stage1=replace(config.stage1, sort_block_m=64),
+            # 256-column GEMM1 units: half the A re-reads and half the per-unit fixed cost of 128 columns, and the
+            # GEMM1 output of an m-tile is done in 18 instead of 36 units (real decode routing 372 -> 350 us
+            # together with the pipelined GEMM2 tile).
+            stage1=replace(config.stage1, sort_block_m=64, tile_n=256),
             stage2=replace(config.stage2, block_m=64),
         )
-    if (2 * inter_dim // config.stage1.tile_n) % 4:
-        # The XCD split needs whole groups of 4 GEMM1 n-tiles. The tile_n 256 of buckets <= 8 gives
-        # V4.1-Flash (inter_dim 2304) 18 n-tiles; 128 gives 36, as every larger bucket uses.
-        config = replace(config, stage1=replace(config.stage1, tile_n=128))
+    # The XCD split needs whole groups of 256 output columns (512 // tile_n GEMM1 n-tiles).
+    assert (2 * inter_dim // config.stage1.tile_n) % (512 // config.stage1.tile_n) == 0, config.stage1.tile_n
     return config
 
 

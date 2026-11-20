@@ -1576,6 +1576,8 @@ def gemm2_compute_v2(
     valid_rows=None,
     NW=4,
     early_b_load=False,
+    b_prefetch=False,
+    pre_loop=None,
 ):
     """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
@@ -1882,7 +1884,64 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN // NW == 64):
+    if const_expr(b_prefetch):
+        # Fully unrolled K-loop; the caller's runtime inter_dim must equal INTER_MAX. B of K-tile kt + 1 is loaded
+        # per 16-column group J right after the MFMAs of K-tile kt that free J's registers: no extra VGPRs, and
+        # ~3/4 of a K-tile for the load to land (the 1-stage path below waits a full memory latency per K-tile).
+        # LLVM makes every LDS read wait for the newest LDS DMA and VMEM returns in issue order, so the B loads
+        # follow the K-tile's A DMA (they are not forced in by the next K-tile's A ds_reads), and the scales of a
+        # K-tile are loaded before its B (a later scale would make the first MFMA wait for all of the B).
+        # pre_loop (the caller's wait for this m-tile's GEMM1 output, then its A prologue) runs after the first B
+        # loads, which only read weights, so their latency overlaps that wait. Per-accumulator MFMA order is the
+        # 1-stage path's -> bit-identical output.
+        assert BM == 64 and BN // NW == 64 and not has_pad and tilesPerScaleChunk == 1
+        KT = INTER_MAX // BK
+
+        def load_b_j(J, kt):
+            out = []
+            for half in range_constexpr(kHalves):
+                off = (bq_base_dw[J] + lane_div_16 * fx.Int32(64) + lane_mod_16 * fx.Int32(4)
+                       + fx.Int32(kt * kHalves * 256 + half * 256))
+                f = fx.make_fragment_like(frag_tmpl)
+                f.store(Vec(load_at(bq_rsrc, off, fx.Int32, 4, 2 if use_nt else 0)))
+                out.append(f)
+            return out
+
+        def load_bs(mw, kt):
+            f = fx.make_fragment_like(sc_frag_tmpl)
+            fx.copy(sc_copy_atom, bscale_views[mw][lane_div_16, lane_mod_16, fx.Int32(kt), None], f)
+            return f
+
+        if const_expr(pre_loop is None):
+            cur_sa = load_a_scale_tile(fx.Int32(0))
+        cur_bs = [load_bs(mw, 0) for mw in range_constexpr(nPairs)]
+        cur_bq = [load_b_j(J, 0) for J in range_constexpr(numAccN)]
+        if const_expr(pre_loop is not None):
+            pre_loop()
+            cur_sa = load_a_scale_tile(fx.Int32(0))
+        for kt in range_constexpr(KT):
+            gpu.barrier()
+            issue_a_ds_read(kt % aStages)
+            if const_expr(kt + kStages < KT):
+                issue_a_load_lds((kt + kStages) % aStages, kt + kStages)
+            sb_words = [Vec(cur_bs[mw].load())[0] for mw in range_constexpr(nPairs)]
+            sa_words = cur_sa
+            nxt_bq = [None] * numAccN
+            if const_expr(kt + 1 < KT):
+                rocdl.sched_barrier(0)
+                cur_sa = load_a_scale_tile(fx.Int32(kt + 1))
+                cur_bs = [load_bs(mw, kt + 1) for mw in range_constexpr(nPairs)]
+            for J in range_constexpr(numAccN):
+                rocdl.sched_barrier(0)
+                for sub in range_constexpr(kScaleSubBlocks):
+                    mma_one_j(J, J % 2, sa_words[sub], sb_words[J // 2], cur_bq, a_frags, c_frags, mma_atoms,
+                        i0=2 * sub, k_halves=kHalves)
+                rocdl.sched_barrier(0)
+                if const_expr(kt + 1 < KT):
+                    nxt_bq[J] = load_b_j(J, kt + 1)
+            if const_expr(kt + 1 < KT):
+                cur_bq = nxt_bq
+    elif const_expr(BM == 64 and BN // NW == 64):
         # BM64 with a 64-column per-wave slab (NW4 BN256 / NW8 BN512) uses the 1-stage B path.
         for kt_iv, state in range(
             fx.Int32(0),
