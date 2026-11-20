@@ -179,7 +179,9 @@ def _wheel_record(fly_root: Path) -> bytes | None:
     from importlib.metadata import distributions
 
     for dist in distributions(path=[str(fly_root.parent)]):
-        if dist.metadata["Name"] != "flydsl":
+        # An in-place upgrade can leave a dist-info with no METADATA (only
+        # REQUESTED); reading its name fails or warns on some Pythons.
+        if dist.read_text("METADATA") is None or dist.metadata["Name"] != "flydsl":
             continue
         record = dist.read_text("RECORD")
         if record is None:
