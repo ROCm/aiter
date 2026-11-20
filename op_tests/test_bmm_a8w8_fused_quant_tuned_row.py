@@ -19,8 +19,8 @@ _FLYDSL_NAME = "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1"
 _COMPUTE_NAME = (
     "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm2_cn4"
 )
-# A gfx950 row of main's tuned bmm tables.
-_FLYDSL_NAME_950 = "flydsl_bmm_mxfp8_mfma_t16x16x256_w1x1_nb6_sk4_nt_sps"
+# The gfx950 row for exactly _SHAPE_950 in the DSv4 batched preshuffle table.
+_FLYDSL_NAME_950 = "flydsl_bmm_mxfp8_mfma_t64x32x512_w2x2_nb3_sk1_nt"
 
 
 class TestFusedQuantTunedRow(unittest.TestCase):
