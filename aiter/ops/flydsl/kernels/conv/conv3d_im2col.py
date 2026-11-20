@@ -471,6 +471,18 @@ class PatchGather:
         m = fx.Int64(m)
         return ((m // self.cols) * self.pcol + m % self.cols) * self._plan.cfg.tile_k
 
+    def row_step_offset(self, rows):
+        """Patch element offset between block-local rows ``m`` and ``m + rows``,
+        as a compile-time int, or None when it depends on ``m``.
+
+        A whole number of output rows apart, two rows sit that many patch rows
+        apart wherever ``m`` is; handing the reader that constant keeps every
+        MFMA atom's read on one base register plus an immediate.
+        """
+        if rows % self.cols:
+            return None
+        return (rows // self.cols) * self.pcol * self._plan.cfg.tile_k
+
     def tap_offset(self, kh, kw):
         plan = self._plan
         return (dil(kh, plan.dh) * self.pcol + dil(kw, plan.dw)) * plan.cfg.tile_k

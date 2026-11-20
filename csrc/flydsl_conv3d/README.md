@@ -113,13 +113,26 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
     |-------|----------|----------------------|-----------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
     |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
 
-   `us`, `tflops` and `bw` are end-to-end, timed NDHWC in and out, so there is
-   no layout transpose in them. The entry point still runs the weight repack
-   before the kernel, and where C/groups is not a multiple of 8 a channel pad
-   that copies the whole input on every call -- the `C=3` input conv of both
-   VAEs. That is a constant per shape, so the ranking is unaffected, but the
-   three columns are a floor rather than a kernel figure and are not
-   comparable with another implementation's kernel-only numbers.
+   `us`, `tflops` and `bw` are the conv kernel alone, timed NDHWC in and out.
+   The timed call gets its operands prepared once per shape -- the channel pad
+   where C/groups is not a multiple of 8, the packed weight and the fp32 bias --
+   the way a deployed layer holds them, and writes into a caller-owned output
+   that is NaN-filled before each candidate. The per-call host work of the
+   entry point is therefore not in them; `--run_config` times the entry point
+   and reports it next to the table's `us`. A gfx950 split-K candidate is the
+   exception: its fp32 staging buffer is converted outside the kernel, so it is
+   timed through the entry point.
+
+   `wan22_vae_bf16_tuned_conv3d.csv` has one more column, `us_mi350x`: each
+   row's config timed on an MI350X (gfx950, 256 CU) the way the table's `us`
+   was -- the kernel alone, operands prepared once, 100 warm-up launches, then
+   the median of 6 groups of 40 back-to-back launches, median over rounds.
+   `us`, `tflops` and `bw` are MI350X numbers for the eight stride-1 rows (the
+   T=1 keys) and MI355X numbers for the three stride-2 downsampler rows. The
+   column is a record only:
+   the lookup, the AOT pass and the tuner do not read it, and a re-tune keeps
+   the old value, so re-measure it after one. The config merge carries it
+   through and fills it with 0 for the other tables' rows.
 
    gfx1250 rows also carry `block_r` (output rows of the R x C block),
    `num_buffers` (LDS ring depth, i.e. prefetch distance),
@@ -133,22 +146,17 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
    and no patch.
 
-   `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
-   tuner pins that value so the column records what ran. Every row of both VAE
-   tables is `splitK=1`, and structurally so rather than by default -- a split
-   only buys occupancy where the M/N grid alone cannot fill the device, and 75
-   of the 76 rows are already at or above the heuristic's own 3/4*CU block bar,
-   where a split can do nothing but add an fp32 staging buffer and an atomic
-   reduce. The exception is Wan's `conv_out` at 368x544 (98 blocks), which
-   `_resolve_splitk` declines on `npq < 4096`.
+   `splitK` is **not** swept. On gfx950 it is always 1: neither the tuner nor
+   the runtime picks a split on its own, so every gfx950 row is `splitK=1` and a
+   split only runs when the caller passes `splitk=` or a row asks for one. On
+   gfx1250 `_resolve_splitk_gfx1250` derives it per candidate and the tuner pins
+   that value so the column records what ran.
 
    Note that split-K cannot currently be combined with a tile that leaves a
    tail: the masked element is dropped by routing the store to the OOB
    sentinel, which needs a buffer descriptor, and the split-K atomic has none.
-   `make_output_scatter_plan` asserts on it. The heuristic cannot reach that
-   combination (it requires `npq % tile_m == 0` and `kg % tile_n == 0` before
-   splitting), so it is only reachable through an explicit `splitk=` or a
-   hand-written row.
+   `make_output_scatter_plan` asserts on it. It is only reachable through an
+   explicit `splitk=` or a hand-written row.
 
    `libtype` names the implementation the rest of the row configures, as it does
    in the GEMM tables. It is a result rather than part of the key: where a tuner
@@ -180,9 +188,9 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
    Both the AOT pass and the runtime build the compile key through
    `conv_kernels._implicit_param_from_problem`, so channel padding and field
    order cannot drift between them. `splitK` is the remaining coupling: the
-   runtime freezes the tuned row's value instead of re-deriving it, so a row
-   written without that column falls back to the CU-count heuristic and can miss
-   the AOT cache. `aiter.aot.flydsl.common.run_only_env()` makes FlyDSL raise on
+   runtime freezes the tuned row's value instead of re-deriving it; a gfx950
+   row without that column runs `splitK=1`, and a gfx1250 one falls back to the
+   CU-count heuristic and can miss the AOT cache. `aiter.aot.flydsl.common.run_only_env()` makes FlyDSL raise on
    a JIT rather than fall back, which is how to verify a row by hand after
    changing the padding, channel-padding or split-K rules.
 
@@ -266,15 +274,14 @@ Number of GPUs for parallel tuning. Default: all available.
 
 ### `--errRatio`
 Tolerable error ratio against the `torch.nn.functional.conv3d` reference
-(default 0.0, not the usual 0.05). The reference is bf16 rather than fp32 on
-purpose: the tuner needs to catch a config that computes the wrong thing, not to
-measure bf16 rounding, and a matching rounding regime puts every correct
-candidate at exactly 0. Each candidate is scored by `strict_compare`, which
-returns 1.0 on any element outside tolerance: `mp_tuner` rounds the ratio to 4
-decimals, so a plain ratio would pass thousands of wrong elements as 0.0. On
-gfx1250 the output buffer is NaN-filled before every candidate, so an element a
-kernel never writes fails it as well; gfx950 candidates allocate their own
-output and get no such check. That makes this flag a pass/fail switch: anything
+(default 0.0, not the usual 0.05). The reference is computed in fp32 (bias
+included) and rounded to bf16 once. Each candidate is scored by
+`strict_compare`, which returns 1.0 on any element outside `rtol=atol=2e-2`:
+`mp_tuner` rounds the ratio to 4 decimals, so a plain ratio would pass
+thousands of wrong elements as 0.0. The output buffer is NaN-filled before
+every candidate, so an element a kernel never writes fails it as well (a gfx950
+split-K candidate, timed through the entry point, allocates its own output and
+gets no such check). That makes this flag a pass/fail switch: anything
 below 1.0 behaves like 0.0, and 1.0 lets a wrong candidate win. Use 1.0 only to
 investigate, never for a shipped table -- `op_tests/test_flydsl_conv_implicit.py`
 fails on any mismatched element, so such a row is one that test will reject.
