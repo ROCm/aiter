@@ -217,8 +217,8 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     )
 
 
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
+def dma16(lds_addr, rs, voff, soff, nt=False, aux=None):
+    _dma(lds_addr, rs, voff, soff, 16, aux if aux is not None else (2 if nt else 0))
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
@@ -399,17 +399,17 @@ def alive(t0):
 
 
 @flyc.jit
-def spin_lds_ge(L, off, target):
+def spin_lds_ge(L, off, target, nap=0):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(0)
+        rocdl.s_sleep(nap)
         cur = lds_ld_acq(L, off)
 
 
 @flyc.jit
-def spin0(L, lane, off, target):
+def spin0(L, lane, off, target, nap=0):
     if lane == i32(0):
-        spin_lds_ge(L, off, target)
+        spin_lds_ge(L, off, target, nap)
     rocdl.sched_barrier(0)
 
 
