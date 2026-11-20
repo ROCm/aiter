@@ -248,9 +248,8 @@ def k1_prepare_gluon(
     and the contraction indices of kd, qd, kr, inv and Mqk are in perm32 order.
     With ``IS_VARLEN``, ``chunk_indices`` is a (first token, length) row per tile."""
     gl.static_assert(C == 32 and K == 128 and BC == 16)
-    if epoch is not None:
-        if (gl.program_id(0) == 0) & (gl.program_id(1) == 0):
-            gl.store(epoch, gl.load(epoch) + 1)
+    if epoch is not None and (gl.program_id(0) == 0) & (gl.program_id(1) == 0):
+        gl.store(epoch, gl.load(epoch) + 1)
     KH: gl.constexpr = K // 2
     i_t = gl.program_id(0).to(gl.int64)
     i_bh = gl.program_id(1).to(gl.int64)
