@@ -3360,9 +3360,10 @@ for _family, _arches in KERNEL_REGISTRY.items():
             {kid: inst.name for kid, inst in table.items()}
             for table in _tables.values()
         ]
-        assert all(
-            names == _named[0] for names in _named
-        ), f"the CU tables of {_family}/{_gfx} hold different kernels"
+        if any(names != _named[0] for names in _named):
+            raise RuntimeError(
+                f"the CU tables of {_family}/{_gfx} hold different kernels"
+            )
 
 
 @dataclass(frozen=True, order=True)
