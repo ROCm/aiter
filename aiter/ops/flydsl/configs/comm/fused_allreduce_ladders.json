@@ -242,10 +242,12 @@
         },
         "hidden": {
           "4096": {
-            "atoms_per_row": 2,
+            "_comment": "search-tuned (tune_fused.py, window [1536 KiB, inf): 0.972x the previous ladder)",
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
-            ]
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;lds_bufs=2;prio=1"},
+              {"min_bytes": "64 MiB", "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;poll_sleep=1;lds_bufs=2;prio=1"}
+            ],
+            "atoms_per_row": 2
           },
           "6144": {
             "atoms_per_row": 2,
@@ -254,10 +256,21 @@
             ]
           },
           "8192": {
-            "atoms_per_row": 4,
+            "_comment": "search-tuned (tune_fused.py, window [1536 KiB, inf): 0.977x the previous ladder)",
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
-            ]
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;poll_sleep=1;lds_bufs=2;prio=2"}
+            ],
+            "atoms_per_row": 4
+          },
+          "7168": {
+            "_comment": "search-tuned (tune_fused.py, window [1536 KiB, inf): 0.966x the previous ladder)",
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 4, "grid_cap": 512, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;lds_bufs=2;prio=2"},
+              {"min_bytes": "1022 KiB", "super_tile": 8, "grid_cap": 64, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;prio=2"},
+              {"min_bytes": "6132 KiB", "super_tile": 4, "grid_cap": 256, "handshake": "lamport", "knobs": "fanout=peer;lds_bufs=2;prio=1"},
+              {"min_bytes": "24570 KiB", "super_tile": 1, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full;poll_sleep=1;lds_bufs=2;prio=1"}
+            ],
+            "atoms_per_row": null
           }
         }
       },
@@ -317,16 +330,31 @@
             ]
           },
           "4096": {
-            "atoms_per_row": 2,
+            "_comment": "search-tuned (tune_fused.py, window [2 MiB, inf): 0.982x the previous ladder)",
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
-            ]
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 128, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;lds_bufs=2"},
+              {"min_bytes": "3 MiB", "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport", "knobs": "fanout=peer;lds_bufs=2;prio=1"}
+            ],
+            "atoms_per_row": 2
           },
           "8192": {
-            "atoms_per_row": 4,
+            "_comment": "search-tuned (tune_fused.py, window [2 MiB, inf): 0.976x the previous ladder)",
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
-            ]
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "handshake": "lamport", "knobs": "stripe=full;lds_bufs=2"},
+              {"min_bytes": "8 MiB", "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;lds_bufs=2"},
+              {"min_bytes": "64 MiB", "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;poll_sleep=1;lds_bufs=2;prio=2"}
+            ],
+            "atoms_per_row": 8
+          },
+          "7168": {
+            "_comment": "search-tuned (tune_fused.py, window [2 MiB, inf): 0.901x the previous ladder)",
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 8, "grid_cap": 192, "handshake": "lamport", "knobs": "stripe=full;fanout=peer;recv_order=per_source;lds_bufs=2"},
+              {"min_bytes": "3066 KiB", "super_tile": 8, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full;poll_sleep=1;recv_order=per_source;lds_bufs=2"},
+              {"min_bytes": "32760 KiB", "super_tile": 8, "grid_cap": 192, "handshake": "lamport", "knobs": "stripe=full;recv_order=per_source;lds_bufs=2"},
+              {"min_bytes": "65534 KiB", "super_tile": 1, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full;fanout=sector;recv_order=per_source;lds_bufs=2"}
+            ],
+            "atoms_per_row": null
           }
         }
       },
