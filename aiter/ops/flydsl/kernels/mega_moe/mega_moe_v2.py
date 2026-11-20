@@ -97,6 +97,9 @@ def small_m_eligible(
     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
     V4.1-Flash (5120 / 2304) uses the default small-input config unchanged; it
     was checked against an FP32 reference and against the main path on 8x MI355X.
+    Any 1..64 experts per rank (one plan lane per local expert) and top-1..8 are
+    supported: the routed 384 / top-6 MoE, vLLM's fuse_shared_expert layout of it
+    (392 / top-7) and the DSpark draft MoE (128 / top-3) were checked the same way.
     """
     return (
         enabled
@@ -104,8 +107,9 @@ def small_m_eligible(
         and num_cu == 256
         and world_size == 8
         and (model_dim, inter_dim) in ((7168, 3072), (5120, 2304))
-        and experts == 384
-        and topk == 6
+        and experts % world_size == 0
+        and 1 <= experts // world_size <= 64
+        and 1 <= topk <= 8
         and quant == "a8w4"
         and swiglu_limit == 10.0
         and act == "silu"

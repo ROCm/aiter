@@ -331,15 +331,20 @@ def emit_direct_fixed_slot_payload(
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv, fz_routed_epr,
+    cached_w_min_rows,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
     ``plan_nv = (addr, epoch)``: the local plan is published as one i64 ``epoch << 32 | num_valid`` store, so
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
+    ``fz_routed_epr``: local experts [fz_routed_epr, fz_epr) are fused shared experts, which hold every local token.
+    They count toward the cached-weight decision (``cached_w_min_rows`` received rows: their m-tiles reuse their
+    weights too) but not toward the hot-expert test or the FP8-row decision, so that they alone do not switch the
+    rank to FP8 rows.
     """
-    assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
+    assert 0 < fz_routed_epr <= fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
     rdisp = AddrBuffer(addr_disp)
 
     def dp(i):
@@ -374,10 +379,18 @@ def emit_direct_fixed_slot_finalize(
         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
         metadata_base = inclusive_tiles - num_expert_tiles
         total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
-        routed_rows = fx.Int32(
+        all_rows = fx.Int32(
             fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), fz_epr - 1)
         )
-        hot_expert = _wave_reduce_max_i32(safe_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
+        routed_count = safe_count
+        routed_rows = all_rows
+        if const_expr(fz_routed_epr < fz_epr):
+            routed_count = (lane < fx.Int32(fz_routed_epr)).select(safe_count, fx.Int32(0))
+            routed_rows = fx.Int32(
+                fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(routed_count, lane), fz_epr - 1)
+            )
+        # The rank's received rows decide cached weights; only routed experts decide FP8 rows.
+        hot_expert = _wave_reduce_max_i32(routed_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
 
         if valid_expert:
             if no_overflow:
@@ -403,7 +416,7 @@ def emit_direct_fixed_slot_finalize(
         if lane == fx.Int32(0):
             # Low 32 bits: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT / _PLAN_FP8_ROWS_BIT.
             nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
+            nv_flag = nv_flag | (hot_expert | (all_rows >= fx.Int32(cached_w_min_rows))).select(
                 fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
             )
             nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
@@ -849,7 +862,8 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return npes == 8 and experts_per_rank == 48 and cap == required_cap
+    # The plan scans one wave lane per local expert.
+    return npes == 8 and 1 <= experts_per_rank <= 64 and cap == required_cap
 
 
 # fmt: off
@@ -861,7 +875,7 @@ def compile_mega_moe_stage1(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 0.0, shared_slots: int = 0,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -911,7 +925,11 @@ def compile_mega_moe_stage1(
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
-        raise ValueError("small-input stage1 needs the 8-rank, 48-expert fixed-slot layout")
+        raise ValueError("small-input stage1 needs the 8-rank fixed-slot layout with 1..64 experts per rank")
+    # The last shared_slots local experts are fused shared experts (SmallMRuntime(shared_experts=...)).
+    assert 0 <= shared_slots < fz_epr, "the fused shared slots must leave routed experts"
+    fz_routed_epr = fz_epr - int(shared_slots)
+    cached_w_min_rows = _CACHED_W_MIN_ROWS * fz_routed_epr // _CACHED_W_REF_EXPERTS
     fz_total_experts = fz_npes * fz_epr
     # Producers load their route (expert, remote pointers, row, scales, weight) before the epoch gate and
     # quantize the bf16 input row to MXFP8. A producer wave sends pre_rounds routes (one per round) so
@@ -1115,6 +1133,7 @@ def compile_mega_moe_stage1(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
+                fz_routed_epr=fz_routed_epr, cached_w_min_rows=cached_w_min_rows,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1381,7 +1400,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
-    b_nt=-1, swiglu_limit=0.0, preload=False):
+    b_nt=-1, swiglu_limit=0.0, shared_slots=0, preload=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -1390,7 +1409,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         grid_mult=grid_mult, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
-        b_nt=b_nt, swiglu_limit=swiglu_limit,
+        b_nt=b_nt, swiglu_limit=swiglu_limit, shared_slots=shared_slots,
     )
     # preload: compile and load without dispatching (AOT bundles).
     (_preload_compiled if preload else _run_compiled)(
@@ -1405,15 +1424,18 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 _COMBINE_REDUCERS = 256
 # Token bucket from which the expert m-tile is 64 rows instead of 32.
 _BM64_MIN_BUCKET = 256
-# Routed rows a rank receives (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give way to
-# cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
-# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
+# Received rows of a 48-routed-expert rank (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give
+# way to cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
+# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688). The threshold is per routed expert
+# (~53 rows): it scales with the routed experts of the rank (853 rows for the 16 of the DSpark draft MoE, whose
+# uniform 384 / 512-token calls gain 5 / 11 us from cached weights; 300 tokens is within noise).
 _CACHED_W_MIN_ROWS = 2560
-# Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
-# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
+_CACHED_W_REF_EXPERTS = 48
+# Routed rows a rank receives (fused shared slots excluded) from which its GEMM2 sends FP8 rows (1x32 E8M0 scales,
+# the numerics of the main path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
 _FP8_ROWS_MIN_ROWS = 3584
-# Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
-# (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
+# Rows of a rank's largest routed expert from which the rank also takes both of the above: its rows sit in a few
+# experts (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
@@ -1464,7 +1486,7 @@ class SmallMRuntime:
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, swiglu_limit: float = 0.0):
+        max_tok_per_rank: int, swiglu_limit: float = 0.0, shared_experts: int = 0):
     # fmt: on
         if quant != "a8w4":
             raise ValueError("SmallMRuntime currently supports quant='a8w4' only")
@@ -1482,6 +1504,12 @@ class SmallMRuntime:
         self.epr = int(experts // world_size)
         self.topk = int(topk)
         self.mtpr = int(max_tok_per_rank)
+        # The last shared_experts local slots of every rank hold fused shared experts (vLLM's fuse_shared_expert:
+        # every token adds a weight-1 route to its own rank's slot). They hold every local token, so the plan keeps
+        # them out of the hot-expert test and the FP8-row decision.
+        if not 0 <= shared_experts < self.epr:
+            raise ValueError(f"shared_experts={shared_experts} must leave routed experts (experts/rank {self.epr})")
+        self.shared_slots = int(shared_experts)
         self.swiglu_limit = float(swiglu_limit)
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
@@ -1682,7 +1710,8 @@ class SmallMRuntime:
             mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
-            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit, preload=preload)
+            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
+            shared_slots=self.shared_slots, preload=preload)
         # fmt: on
 
     def preload_aot_bundle(self):
