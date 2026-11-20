@@ -721,8 +721,8 @@ def _use_gfx950_length_aware_split(monkeypatch) -> None:
         ]
         for batch in ["skewed", "uniform", "skewed_empty"]
     ]
-    # GPT-OSS TP8 full-attention decode keeps the uniform split, which does not
-    # write empty sequences, so no skewed_empty case
+    # GPT-OSS TP8 full-attention decode keeps the uniform split, whose reduce stores
+    # NaN for a kv_len 0 row (as on main), so no skewed_empty case
     + [(batch, (8, 1), 1, "sinks", torch.int32) for batch in ["skewed", "uniform"]]
     + [("skewed_300", (8, 2), 1, None, torch.int32)]
     # the widest verify query that still fits one block of the q >= 4 entry
@@ -805,7 +805,12 @@ def test_triton_unified_attn_3d_length_aware_split(
     launch_3d = module._unified_attention_3d_triton
 
     def spy(params, *args):
-        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, length-aware split
+        segm_max = args[1]
+        if args[5] is not None:
+            # the length-aware kernel must write every slot a sequence uses
+            segm_max.fill_(float("nan"))
+        # NUM_SEGMENTS, TILE_SIZE, length-aware split, the partial maxima
+        launches.append((*args[3:], segm_max))
         return launch_3d(params, *args)
 
     monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
@@ -834,7 +839,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     )
 
     assert len(launches) == 1, "expected the 3D split-KV path"
-    num_segments, _, split = launches[0]
+    num_segments, tile_size, split, segm_max = launches[0]
     kv = [k for _, k in seq_lens]
     if num_heads[0] // num_heads[1] > 4:
         # the kv_split entry opts in up to 4 query heads per KV head; GPT-OSS TP8
@@ -852,6 +857,20 @@ def test_triton_unified_attn_3d_length_aware_split(
             assert used[0] > max(used[1:]) and min(used) < num_segments, used
         else:
             assert len(set(used)) == 1 and used[0] < num_segments, used
+
+        # read back which slots the 3D kernel wrote: the buffer is allocated
+        # [tokens, heads, NUM_SEGMENTS] but the length-aware kernel stores it
+        # slot-major [segment, token, head]
+        num_tokens, num_query_heads = query.shape[0], query.shape[1]
+        written = ~segm_max.reshape(num_segments, num_tokens, num_query_heads).isnan()
+        row = 0
+        for (q_len, _), kv_i, used_i in zip(seq_lens, kv, used):
+            tiles_per_segment = max(triton.cdiv(kv_i, used_i * tile_size), 1)
+            active = triton.cdiv(kv_i, tiles_per_segment * tile_size)
+            rows = slice(row, row + q_len)
+            assert written[:active, rows].all(), (kv_i, active)
+            assert not written[active:, rows].any(), (kv_i, active)
+            row += q_len
 
     ref_output = ref_paged_attn(
         query=query,
