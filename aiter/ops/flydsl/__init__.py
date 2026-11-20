@@ -99,6 +99,20 @@ _LAZY_IMPORTS = {
     ),
     "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
+    "A8W4ExpertWeights": (".moe_a8w4_experts", "A8W4ExpertWeights"),
+    "flydsl_moe_a8w4_experts": (".moe_a8w4_experts", "flydsl_moe_a8w4_experts"),
+    "flydsl_moe_a8w4_experts_rows": (
+        ".moe_a8w4_experts",
+        "flydsl_moe_a8w4_experts_rows",
+    ),
+    "flydsl_moe_a8w4_experts_warmup": (
+        ".moe_a8w4_experts",
+        "flydsl_moe_a8w4_experts_warmup",
+    ),
+    "moe_a8w4_experts_supported": (
+        ".moe_a8w4_experts",
+        "moe_a8w4_experts_supported",
+    ),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
     "flydsl_pa_mqa_logits_fp4": (
@@ -243,6 +257,7 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "A8W4ExpertWeights",
     "CombineWorkspace",
     "DenseGemmConfig",
     "FlyQuickAllReduce",
@@ -274,6 +289,9 @@ __all__ = [
     "flydsl_hstu_attention_fwd",
     "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
+    "flydsl_moe_a8w4_experts",
+    "flydsl_moe_a8w4_experts_rows",
+    "flydsl_moe_a8w4_experts_warmup",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
@@ -302,6 +320,7 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "moe_a8w4_experts_supported",
     "pa_decode",
     "pa_decode_default_workgroup_budget",
     "pa_decode_nhd_max_query_length",
