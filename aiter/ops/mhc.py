@@ -605,6 +605,18 @@ _MHC_FUSED_POST_PRE_CONFIG = {
 }
 
 
+# gfx950, 256 CUs, FP32 fn, m <= 1024, keyed by hidden_size: m ranges that keep the
+# policy's tile_m=32. Elsewhere tile_m=16 at the policy's split_k measured faster for
+# the complete call (MI355X). Each range is one (split_k, ceil(m/32)) segment of the
+# policy. Other hidden sizes and packed BF16 fn keep the policy. tile_m does not
+# change the outputs.
+_MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256 = {
+    4096: ((97, 128), (993, 1024)),
+    5120: ((481, 512), (993, 1024)),
+    7168: ((97, 103), (481, 512), (993, 1024)),
+}
+
+
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_config(
     m: int,
@@ -626,6 +638,10 @@ def get_mhc_fused_post_pre_config(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:
+        keep = _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256.get(hidden_size)
+        if keep is not None and not any(lo <= m <= hi for lo, hi in keep):
+            tile_m = 16
     if (
         w_preshuffle_bf16
         and res_preshuffle
