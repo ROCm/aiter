@@ -806,6 +806,28 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
         assert not bad, f"CK moe_sorting mismatch at {case}: {bad}"
         case["err"] = max(errs.values())
         progress.put(("row", case))
+
+    # CK's mp path rejects num_experts > 16371 (P23 LDS over 64 KB); the binding
+    # used to drop that return value and hand back unwritten outputs.
+    reject_E = 20000
+    progress.put(("start", {"reject": "unsupported shape", "E": reject_E}))
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        1, model_dim, reject_E, topk, dtype, False, padding_extra=0
+    )
+    try:
+        moe_sorting(
+            topk_ids,
+            topk_weights,
+            reject_E,
+            model_dim,
+            dtype,
+            16,
+            dispatch_policy=1,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("CK moe_sorting accepted a shape it rejects")
     progress.put(("done", None))
 
 

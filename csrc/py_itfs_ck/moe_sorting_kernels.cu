@@ -49,7 +49,8 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
         ws_ptr = ws.data_ptr();
     }
 
-    moe_sorting(
+    // A negative return means CK rejected the shape or dtype before launching anything.
+    const float rc = moe_sorting(
         {
             dtype_str,                     // index_type
             "fp32",                        // weight_type; // currently always float
@@ -74,4 +75,14 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
          static_cast<int>(moe_buf.size(-1)),
          static_cast<int>(moe_buf.itemsize())},
         {stream});
+    TORCH_CHECK(rc >= 0,
+                "moe_sorting_fwd: CK rejected the shape or dtype (tokens=",
+                num_tokens,
+                ", num_experts=",
+                num_experts,
+                ", topk=",
+                topk,
+                ", dispatch_policy=",
+                dispatch_policy,
+                ")");
 }
