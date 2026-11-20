@@ -140,6 +140,10 @@ def test_table_tiles_pin_k_loop():
         "flydsl_bmm_mxfp8_32_wmma_t64x96x256_mw2_nw1_nb4_sk1_cm1_cn1_pl",
         # 32 columns per wave
         "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw1_nw4_nb4_sk1_cm1_cn1_pl",
+        # 128 columns per wave
+        "flydsl_bmm_mxfp8_32_wmma_t64x256x256_mw2_nw2_nb3_sk1_cm1_cn1_pl",
+        # tile_n 192 (64 per wave, but not a tile the op test runs)
+        "flydsl_bmm_mxfp8_32_wmma_t64x192x256_mw2_nw3_nb3_sk1_cm1_cn1_pl",
         # the mxfp8_128 family
         "flydsl_bmm_mxfp8_128_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
     ],

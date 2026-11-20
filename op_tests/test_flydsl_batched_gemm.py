@@ -707,7 +707,9 @@ def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
     # Same sign and adjacent magnitude codes (e4m3 bytes are sign-magnitude).
     sign_differs = ((a ^ r) & 0x80) != 0
     magnitude_far = ((a & 0x7F) - (r & 0x7F)).abs() > 1
-    far = int(((a != r) & (sign_differs | magnitude_far)).sum())
+    # 0x7F / 0xFF are NaN: next to 448 they are not a one-step code.
+    nan_code = ((a & 0x7F) == 0x7F) | ((r & 0x7F) == 0x7F)
+    far = int(((a != r) & (sign_differs | magnitude_far | nan_code)).sum())
     print(
         f"gate_up silu M={m} N2={n2} K={k} limit={limit} {name}: scale mismatch "
         f"{scale_bad}/{m * inter // 32}, e4m3 mismatch {code_bad}/{m * inter} "

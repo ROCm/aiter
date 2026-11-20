@@ -759,7 +759,9 @@ _E8M0_STORAGE = (torch.float8_e8m0fnu, torch.uint8)
 
 def gate_up_silu_kernel_ok(name: str | None) -> bool:
     """Whether a batched mxfp8_32 kernelName can run the fused SiLU epilogue:
-    split-K/cluster 1 and 64-column multiples per tile and per wave."""
+    split-K/cluster 1, tile_n 128 or 256 and 64 columns per wave -- the tile
+    shapes of the table, the only ones the gfx1250 op test runs (wider waves or
+    a 192-column tile take epilogue code that has not run on gfx1250)."""
     cfg = parse_bmm_mx32_kernel_name(name) if name else None
     if cfg is None:
         return False
@@ -767,8 +769,8 @@ def gate_up_silu_kernel_ok(name: str | None) -> bool:
         cfg["split_k"] == 1
         and cfg["cluster_m"] == 1
         and cfg["cluster_n"] == 1
-        and cfg["tile_n"] % 64 == 0
-        and (cfg["tile_n"] // cfg["n_warp"]) % 64 == 0
+        and cfg["tile_n"] in (128, 256)
+        and cfg["tile_n"] // cfg["n_warp"] == 64
     )
 
 
@@ -883,9 +885,12 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
     ``silu_and_mul(gemm_out, swiglu_limit)`` on the bf16 GEMM output, with the
     same clamp (the clamped gate rounded to bf16, as silu_and_mul does). The
     epilogue's exp/rcp can round a bf16 activation to the neighbour of
-    silu_and_mul's; that moves an e4m3 code by one step where it crosses a
-    rounding midpoint (the op test requires the scales to match exactly and
-    allows only such isolated one-step codes). ``swiglu_limit`` follows
+    silu_and_mul's. That moves its e4m3 code by one step where it crosses a
+    rounding midpoint; where the activation is its 32-column group's max and
+    sits on 448 * 2**k, it moves the group's e8m0 scale by one instead (448 vs
+    450: 127 vs 128), and with it all 32 codes. The op test requires the
+    scales to match and allows only isolated one-step codes on its data.
+    ``swiglu_limit`` follows
     silu_and_mul (see ``gate_up_silu_limit``).
 
     ``kernel_name`` None picks the tile from ``XQ``'s row count; past

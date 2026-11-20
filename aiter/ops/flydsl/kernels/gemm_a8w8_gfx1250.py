@@ -1321,7 +1321,9 @@ def launch_gemm_a8w8(
             # The plain-GEMM epilogues therefore bit-match quantize_fp8 of the
             # bf16 output. The fuse_act_mul one quantizes its own SwiGLU
             # values, which can sit one bf16 step from silu_and_mul's (exp/rcp
-            # rounding), so an e4m3 code can differ by one step there.
+            # rounding): an e4m3 code can differ by one step there, or, where
+            # that value is its group's max on 448 * 2**k, the group's e8m0
+            # scale by one (and so all 32 codes).
             from aiter.ops.flydsl.kernels.quant_utils import (
                 emit_cvt_scalef32_pk8_fp8_f32,
                 emit_mx_e8m0_scale,
