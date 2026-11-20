@@ -2185,6 +2185,12 @@ def attention_loop_tensor_subtile_split(
     PEEK_RECENT: gl.constexpr = False,
     L_FROM_BF16: gl.constexpr = False,
     CHECK_EVERY: gl.constexpr = 0,
+    BALANCED: gl.constexpr = False,
+    WMMA_ROWSUM: gl.constexpr = False,
+    ROWSUM_PIN: gl.constexpr = False,
+    SEED_MASK: gl.constexpr = False,
+    Q_SCALE_FOLD: gl.constexpr = False,
+    UNROLL2: gl.constexpr = False,
 ):
     """Reordered pipeline with tensor-register K/V subtile splitting.
 
@@ -2201,6 +2207,19 @@ def attention_loop_tensor_subtile_split(
     up by exactly 64 log2 units (acc, L and the in-flight p scaled by 2^-64, a power of two, so no rounding), so
     gradual growth never reaches the rerun; a row past 2^100 at a check is not rescaled and reruns at the end.
 
+    Fixed-max loop options (BF16 / FP16 only, all off by default; see the attn_2d config for where they are on):
+    BALANCED: each stage computes a quarter of the tile's exp2 (P1 halves in stages 1 and 2, P0 halves in 3
+    and 4) instead of half a tile in stages 1 and 4, so the exp2 work spreads over all four WMMA groups.
+    WMMA_ROWSUM (with BALANCED or alone, CHECK_EVERY == 0): L sums the bf16 P on the matrix core, as
+    accL += P x ones[TILE, 16], instead of a VALU row sum. ROWSUM_PIN puts a sched_barrier after that WMMA.
+    SEED_MASK: the epilogue (and the sliding-window first iteration) mask the QK seed (-inf where masked)
+    before the QK WMMA instead of masking the QK result after it.
+    Q_SCALE_FOLD: the fixed-max QK WMMAs use bf16(Q * scale * log2(e)), so their results are already in log2
+    units. The caller's rerun (running max) uses the original Q.
+    UNROLL2 (two buffers, no sliding-window peel): the steady loop runs in pairs of tiles with the buffer
+    indices as constants in each half and a sched_barrier after each half; a 0-or-1-trip loop takes an odd
+    tile.
+
     Per iter (one WMMA + one softmax slice per stage):
         stage 1: QK-0 + SM1-A
         stage 2: QK-1 + SM1-B
@@ -2212,6 +2231,12 @@ def attention_loop_tensor_subtile_split(
     MERGE_EPI_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
 
     QK_scale = pgm.QK_scale
+    # the fixed-max loop options run on BF16 / FP16 Q and KV only
+    FM_OPT: gl.constexpr = FIXED_MAX and not cfg.Q_FP8 and not cfg.KV_FP8 and not cfg.KV_NVFP4
+    BAL: gl.constexpr = BALANCED and FM_OPT
+    ROWSUM: gl.constexpr = WMMA_ROWSUM and FM_OPT and CHECK_EVERY == 0
+    SMASK: gl.constexpr = SEED_MASK and FM_OPT
+    QFOLD: gl.constexpr = Q_SCALE_FOLD and FM_OPT
 
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile j     ( j   %N)
@@ -2355,6 +2380,17 @@ def attention_loop_tensor_subtile_split(
             )
             - gl.convert_layout(M, gl.SliceLayout(1, cfg.qk_layout))[:, None]
         )
+        if ROWSUM:
+            # accL += P (bf16) x ones[TILE, 16]: every column is the row sum of the bf16 P the PV WMMA uses
+            accL = gl.zeros([cfg.BLOCK_M, 16], dtype=gl.float32, layout=cfg.pv_layout)
+            ones_b = gl.full([cfg.TILE_SIZE, 16], 1.0, q.dtype, layout=cfg.v_layout)
+        if QFOLD:
+            q_mma = (pgm.q.to(gl.float32) * QK_scale).to(pgm.q.dtype)
+            qk_seed = qk_seed * QK_scale
+        else:
+            q_mma = pgm.q
+    # QK results of the fixed-max WMMAs are in log2 units already when Q carries the scale
+    QK_scale_fixed = 1.0 if QFOLD else QK_scale
     # Sliding window: when the rows of a program span at most one tile of window starts, the window-masked tiles
     # are a subset of {tile_start, tile_start + 1}, so only the first loop iteration (which scores tile j + 1)
     # can need the mask. That iteration is peeled into its own 0-or-1-trip loop, so the main loop body has no
@@ -2363,6 +2399,11 @@ def attention_loop_tensor_subtile_split(
         (cfg.BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV <= cfg.TILE_SIZE
     )
     NUM_PH: gl.constexpr = 2 if PEEL_SWA else 1
+    UNR: gl.constexpr = UNROLL2 and FIXED_MAX and cfg.NUM_BUFFERS == 2 and not PEEL_SWA
+    # Sliding window: V's wait / barrier / LDS read go in front of the QK-0 WMMAs, which then hide the LDS latency
+    # (full attention keeps the original order).
+    V_FIRST: gl.constexpr = cfg.SLIDING_WINDOW > 0
+    NUM_SEG: gl.constexpr = 2 if UNR else 1
     loop_hi = tile_end - 3
     peel_hi = gl.minimum(pgm.tile_start + 1, loop_hi)
     for PH in gl.static_range(NUM_PH):
@@ -2376,168 +2417,236 @@ def attention_loop_tensor_subtile_split(
         else:
             ph_lo = pgm.tile_start
             ph_hi = loop_hi
-        for j in range(ph_lo, ph_hi):
-            next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
-
-            if MERGE_LOOP_TDM_WAITS:
-                gl.amd.gfx1250.tdm.async_wait(1)
-            k0_s, k1_s = pgm.split_subtile(k)
-            if cfg.KV_NVFP4:
-                ks0, ks1 = pgm.split_k_scales(k_scales)
-
-            # --- S1: QK sub 0 + SM1-A ---
-            # Sliding window: V's wait / barrier / LDS read go in front of the QK-0 WMMAs, which then hide the
-            # LDS latency (full attention keeps the original order).
-            V_FIRST: gl.constexpr = cfg.SLIDING_WINDOW > 0
-            if not V_FIRST:
-                if FIXED_MAX:
-                    qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, qk_seed)
-                elif cfg.KV_NVFP4:
-                    qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+        # UNROLL2: segment 0 runs the pairs, segment 1 the odd tile. With two buffers the rotation has period 2
+        # and is (0, 1, 0) at loop entry, so a pair's halves use (0, 1, 0) and (1, 0, 1) as constants and the
+        # runtime buffer ids are (0, 1, 0) again after the pairs.
+        for SEG in gl.static_range(NUM_SEG):
+            if UNR:
+                pair_hi = ph_lo + (ph_hi - ph_lo) // 2 * 2
+                if SEG == 0:
+                    seg_lo = ph_lo
+                    seg_hi = pair_hi
                 else:
-                    qk0 = pgm.compute_qk_subtile(k0_s)
-            if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
-                kv_loader.load_k_to_shared(
-                    next3_physical_block_idx,
-                    buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
-                )
-                kv_loader.load_v_to_shared(
-                    next2_physical_block_idx, buffer_id=buf_tile_next2
-                )
-            v = kv_loader.load_v_from_shared(
-                later="KV",
-                wait_count=2,
-                buffer_id=buf_tile_cur,
-                target_dtype=q.dtype,
-                skip_wait=MERGE_LOOP_TDM_WAITS,
-            )
-            if V_FIRST:
-                if FIXED_MAX:
-                    qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, qk_seed)
-                elif cfg.KV_NVFP4:
-                    qk0 = pgm.compute_qk_subtile(k0_s, ks0)
-                else:
-                    qk0 = pgm.compute_qk_subtile(k0_s)
-            p1 = gl.exp2(qk1_shifted)
-            if not FIXED_MAX:
-                acc0 = acc0 * alpha[:, None]
-                acc1 = acc1 * alpha[:, None]
-
-            v0_s, v1_s = pgm.split_subtile(v)
-            if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
-                # N=2: K store must land after K ds_load so the prior ds_read has drained
-                kv_loader.load_k_to_shared(
-                    next3_physical_block_idx,
-                    buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
-                )
-
-            # --- S2: QK sub 1 + SM1-B ---
-            if FIXED_MAX:
-                qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, qk_seed)
-            elif cfg.KV_NVFP4:
-                qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+                    seg_lo = pair_hi
+                    seg_hi = ph_hi
             else:
-                qk1 = pgm.compute_qk_subtile(k1_s)
-            p = pgm.concat_subtile(p0, p1)
-            if FIXED_MAX and L_FROM_BF16:
-                p = p.to(q.dtype)
-                L = L + gl.sum(p.to(gl.float32), 1)
-            else:
-                l_ij = gl.sum(p, 1)
-                if FIXED_MAX:
-                    L = L + l_ij
-                else:
-                    L = L * alpha + l_ij
-                p = p.to(q.dtype)
-            k = kv_loader.load_k_from_shared(
-                later="VK",
-                wait_count=2,
-                buffer_id=buf_tile_next2,
-                target_dtype=q.dtype,
-                skip_wait=MERGE_LOOP_TDM_WAITS,
-            )
-            if cfg.KV_NVFP4:
-                k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next2)
+                seg_lo = ph_lo
+                seg_hi = ph_hi
+            for j0 in range(seg_lo, seg_hi, 2 if (UNR and SEG == 0) else 1):
+                for H in gl.static_range(2 if (UNR and SEG == 0) else 1):
+                    j = j0 + H
+                    if UNR and SEG == 0:
+                        b_cur = H
+                        b_nxt = 1 - H
+                        b_nxt2 = H
+                    else:
+                        b_cur = buf_tile_cur
+                        b_nxt = buf_tile_next
+                        b_nxt2 = buf_tile_next2
+                    next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
+                    if FIXED_MAX:
+                        seed0 = qk_seed
+                        seed1 = qk_seed
+                        if SMASK and (not PEEL_SWA or PH == 0):
+                            # tile j + 1's window mask goes into the QK seeds
+                            seed0, seed1 = pgm.apply_window_mask_qk_subtiles(qk_seed, qk_seed, j + 1)
 
-            # --- S3: PV sub 0 + SM0-A ---
-            acc0 = pgm.compute_pv(p, v0_s, acc0)
-            if not PEEL_SWA:
-                qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
-            elif PH == 0:
-                # only the peeled first iteration (tile tile_start + 1) can cut through a row's window start
-                qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
-            if FIXED_MAX:
-                m_ij_scaled = m_fixed_scaled
-            else:
-                qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
-                qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-                qk = pgm.concat_subtile(qk0, qk1)
-                m = reduce_max_prop_nan(qk, -1)
-                m_ij = elementwise_max_prop_nan(M, m)
-                m_ij_scaled = m_ij * QK_scale
-                m_diff_scaled = M * QK_scale - m_ij_scaled
-                M = m_ij
-                alpha = gl.exp2(m_diff_scaled)
-            if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
-                kv_loader.load_v_to_shared(
-                    next2_physical_block_idx, buffer_id=buf_tile_next2
-                )
+                    if MERGE_LOOP_TDM_WAITS:
+                        gl.amd.gfx1250.tdm.async_wait(1)
+                    k0_s, k1_s = pgm.split_subtile(k)
+                    if cfg.KV_NVFP4:
+                        ks0, ks1 = pgm.split_k_scales(k_scales)
 
-            # --- S4: PV sub 1 + SM0-B ---
-            acc1 = pgm.compute_pv(p, v1_s, acc1)
-            if FIXED_MAX:
-                qk0_shifted = (
-                    gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
-                    * QK_scale
-                )
-                qk1_shifted = (
-                    gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-                    * QK_scale
-                )
-            else:
-                qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-                qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
-            p0 = gl.exp2(qk0_shifted)
-            if FIXED_MAX and CHECK_EVERY > 0:  # noqa: SIM102
-                # uniform across the program (j is), so the cross-warp reduction and its barrier are safe here
-                if (j - pgm.tile_start) % CHECK_EVERY == CHECK_EVERY - 1:
-                    # rows past 2^100 (or inf / NaN) are left alone: L only grows, so the final check still reruns
-                    # them; this keeps L <= 2^100 over every window that passes, which bounds acc as in the plain loop
-                    big = (L > 18446744073709551616.0) & (L <= 1.2676506002282294e30)
-                    if gl.sum(gl.where(big, 1, 0), axis=0) > 0:
-                        f = gl.where(big, 5.421010862427522e-20, 1.0)
-                        sh = gl.where(big, 64.0, 0.0)
-                        acc0 = acc0 * f[:, None]
-                        acc1 = acc1 * f[:, None]
-                        L = L * f
-                        p0 = p0 * f[:, None]
-                        qk1_shifted = qk1_shifted - sh[:, None]
-                        m_fixed_scaled = m_fixed_scaled + sh
-                        M = M + sh / QK_scale
-                        qk_seed = (
-                            qk_seed
-                            - gl.convert_layout(
-                                sh / QK_scale, gl.SliceLayout(1, cfg.qk_layout)
-                            )[:, None]
+                    # --- S1: QK sub 0 + SM1-A ---
+                    if not V_FIRST:
+                        if FIXED_MAX:
+                            qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+                        elif cfg.KV_NVFP4:
+                            qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+                        else:
+                            qk0 = pgm.compute_qk_subtile(k0_s)
+                    if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
+                        kv_loader.load_k_to_shared(
+                            next3_physical_block_idx,
+                            buffer_id=b_cur if cfg.NUM_BUFFERS == 3 else b_nxt,
+                        )
+                        kv_loader.load_v_to_shared(
+                            next2_physical_block_idx, buffer_id=b_nxt2
+                        )
+                    v = kv_loader.load_v_from_shared(
+                        later="KV",
+                        wait_count=2,
+                        buffer_id=b_cur,
+                        target_dtype=q.dtype,
+                        skip_wait=MERGE_LOOP_TDM_WAITS,
+                    )
+                    if V_FIRST:
+                        if FIXED_MAX:
+                            qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+                        elif cfg.KV_NVFP4:
+                            qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+                        else:
+                            qk0 = pgm.compute_qk_subtile(k0_s)
+                    if BAL:
+                        q1a, q1b = pgm.split_subtile(qk1_shifted)
+                        p1a = gl.exp2(q1a)
+                        p0_lp = p0.to(q.dtype)
+                    else:
+                        p1 = gl.exp2(qk1_shifted)
+                    if not FIXED_MAX:
+                        acc0 = acc0 * alpha[:, None]
+                        acc1 = acc1 * alpha[:, None]
+
+                    v0_s, v1_s = pgm.split_subtile(v)
+                    if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
+                        # N=2: K store must land after K ds_load so the prior ds_read has drained
+                        kv_loader.load_k_to_shared(
+                            next3_physical_block_idx,
+                            buffer_id=b_cur if cfg.NUM_BUFFERS == 3 else b_nxt,
                         )
 
-            next2_physical_block_idx, next3_physical_block_idx = (
-                next3_physical_block_idx,
-                next4_physical_block_idx,
-            )
-            if cfg.NUM_BUFFERS == 3:
-                buf_tile_cur, buf_tile_next, buf_tile_next2 = (
-                    buf_tile_next,
-                    buf_tile_next2,
-                    buf_tile_cur,
-                )
-            else:
-                buf_tile_cur, buf_tile_next, buf_tile_next2 = (
-                    buf_tile_next,
-                    buf_tile_cur,
-                    buf_tile_next,
-                )
+                    # --- S2: QK sub 1 + SM1-B ---
+                    if FIXED_MAX:
+                        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
+                    elif cfg.KV_NVFP4:
+                        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+                    else:
+                        qk1 = pgm.compute_qk_subtile(k1_s)
+                    if BAL:
+                        p1b = gl.exp2(q1b)
+                        p1 = pgm.concat_subtile(p1a, p1b)
+                        p = pgm.concat_subtile(p0_lp, p1.to(q.dtype))
+                        if ROWSUM:
+                            accL = gl.amd.gfx1250.wmma(gl.convert_layout(p, cfg.p_layout), ones_b, accL)
+                            if ROWSUM_PIN:
+                                gl.amd.hint.sched_barrier()
+                        elif L_FROM_BF16:
+                            L = L + gl.sum(p.to(gl.float32), 1)
+                        else:
+                            L = L + gl.sum(pgm.concat_subtile(p0, p1), 1)
+                    elif ROWSUM:
+                        p = pgm.concat_subtile(p0, p1).to(q.dtype)
+                        accL = gl.amd.gfx1250.wmma(gl.convert_layout(p, cfg.p_layout), ones_b, accL)
+                        if ROWSUM_PIN:
+                            gl.amd.hint.sched_barrier()
+                    elif FIXED_MAX and L_FROM_BF16:
+                        p = pgm.concat_subtile(p0, p1).to(q.dtype)
+                        L = L + gl.sum(p.to(gl.float32), 1)
+                    else:
+                        p = pgm.concat_subtile(p0, p1)
+                        l_ij = gl.sum(p, 1)
+                        if FIXED_MAX:
+                            L = L + l_ij
+                        else:
+                            L = L * alpha + l_ij
+                        p = p.to(q.dtype)
+                    k = kv_loader.load_k_from_shared(
+                        later="VK",
+                        wait_count=2,
+                        buffer_id=b_nxt2,
+                        target_dtype=q.dtype,
+                        skip_wait=MERGE_LOOP_TDM_WAITS,
+                    )
+                    if cfg.KV_NVFP4:
+                        k_scales = kv_loader.load_k_scales_from_shared(buffer_id=b_nxt2)
 
+                    # --- S3: PV sub 0 + SM0-A ---
+                    acc0 = pgm.compute_pv(p, v0_s, acc0)
+                    if SMASK:
+                        pass  # masked through the seeds
+                    elif not PEEL_SWA:
+                        qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
+                    elif PH == 0:
+                        # only the peeled first iteration (tile tile_start + 1) can cut through a row's window start
+                        qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
+                    if BAL:
+                        qs0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True) * QK_scale_fixed
+                        qs0a, qs0b = pgm.split_subtile(qs0)
+                        p0a = gl.exp2(qs0a)
+                    if FIXED_MAX:
+                        m_ij_scaled = m_fixed_scaled
+                    else:
+                        qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+                        qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+                        qk = pgm.concat_subtile(qk0, qk1)
+                        m = reduce_max_prop_nan(qk, -1)
+                        m_ij = elementwise_max_prop_nan(M, m)
+                        m_ij_scaled = m_ij * QK_scale
+                        m_diff_scaled = M * QK_scale - m_ij_scaled
+                        M = m_ij
+                        alpha = gl.exp2(m_diff_scaled)
+                    if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
+                        kv_loader.load_v_to_shared(
+                            next2_physical_block_idx, buffer_id=b_nxt2
+                        )
+
+                    # --- S4: PV sub 1 + SM0-B ---
+                    acc1 = pgm.compute_pv(p, v1_s, acc1)
+                    if BAL:
+                        qk1_shifted = (
+                            gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+                            * QK_scale_fixed
+                        )
+                        p0b = gl.exp2(qs0b)
+                        p0 = pgm.concat_subtile(p0a, p0b)
+                    else:
+                        if FIXED_MAX:
+                            qk0_shifted = (
+                                gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+                                * QK_scale_fixed
+                            )
+                            qk1_shifted = (
+                                gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+                                * QK_scale_fixed
+                            )
+                        else:
+                            qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+                            qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+                        p0 = gl.exp2(qk0_shifted)
+                    if FIXED_MAX and CHECK_EVERY > 0:  # noqa: SIM102
+                        # uniform across the program (j is), so the cross-warp reduction and its barrier are safe here
+                        if (j - pgm.tile_start) % CHECK_EVERY == CHECK_EVERY - 1:
+                            # rows past 2^100 (or inf / NaN) are left alone: L only grows, so the final check still reruns
+                            # them; this keeps L <= 2^100 over every window that passes, which bounds acc as in the plain loop
+                            big = (L > 18446744073709551616.0) & (L <= 1.2676506002282294e30)
+                            if gl.sum(gl.where(big, 1, 0), axis=0) > 0:
+                                f = gl.where(big, 5.421010862427522e-20, 1.0)
+                                sh = gl.where(big, 64.0, 0.0)
+                                acc0 = acc0 * f[:, None]
+                                acc1 = acc1 * f[:, None]
+                                L = L * f
+                                p0 = p0 * f[:, None]
+                                qk1_shifted = qk1_shifted - sh[:, None]
+                                m_fixed_scaled = m_fixed_scaled + sh
+                                M = M + sh / QK_scale
+                                qk_seed = (
+                                    qk_seed
+                                    - gl.convert_layout(
+                                        sh / QK_scale, gl.SliceLayout(1, cfg.qk_layout)
+                                    )[:, None]
+                                )
+
+                    next2_physical_block_idx, next3_physical_block_idx = (
+                        next3_physical_block_idx,
+                        next4_physical_block_idx,
+                    )
+                    if UNR and SEG == 0:
+                        gl.amd.hint.sched_barrier()
+                    elif cfg.NUM_BUFFERS == 3:
+                        buf_tile_cur, buf_tile_next, buf_tile_next2 = (
+                            buf_tile_next,
+                            buf_tile_next2,
+                            buf_tile_cur,
+                        )
+                    else:
+                        buf_tile_cur, buf_tile_next, buf_tile_next2 = (
+                            buf_tile_next,
+                            buf_tile_cur,
+                            buf_tile_next,
+                        )
+
+    if ROWSUM:
+        L = L + gl.convert_layout(gl.max(accL, 1), L.type.layout)
     # ---- Epilogue (3 remaining tiles: L=tile_end-3, L+1, L+2) ----
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(1)
@@ -2552,7 +2661,14 @@ def attention_loop_tensor_subtile_split(
 
     # --- S1: QK sub 0 for L+1 + SM1-A for L ---
     if FIXED_MAX:
-        qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, qk_seed)
+        seed0 = qk_seed
+        seed1 = qk_seed
+        if SMASK:
+            if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+                seed0 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_2, 0)
+                seed1 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_2, 1)
+            seed0, seed1 = pgm.apply_window_mask_qk_subtiles(seed0, seed1, epilogue_t_2)
+        qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
     elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
@@ -2562,7 +2678,7 @@ def attention_loop_tensor_subtile_split(
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
 
-    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end and not SMASK:
         qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
     v_wait: gl.constexpr = 2
     v = kv_loader.load_v_from_shared(
@@ -2575,14 +2691,15 @@ def attention_loop_tensor_subtile_split(
 
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
     if FIXED_MAX:
-        qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, qk_seed)
+        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
     elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
         qk1 = pgm.compute_qk_subtile(k1_s)
-    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
-        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
-    qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, epilogue_t_2)
+    if not SMASK:
+        if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+            qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+        qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, epilogue_t_2)
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
     if FIXED_MAX:
@@ -2620,8 +2737,8 @@ def attention_loop_tensor_subtile_split(
     # --- S4: PV sub 1 for L + SM0-B for L+1 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     if FIXED_MAX:
-        qk0_shifted = qk0 * QK_scale
-        qk1_shifted = qk1 * QK_scale
+        qk0_shifted = qk0 * QK_scale_fixed
+        qk1_shifted = qk1 * QK_scale_fixed
     else:
         qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
         qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
@@ -2644,7 +2761,12 @@ def attention_loop_tensor_subtile_split(
 
     # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
     if FIXED_MAX:
-        qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, qk_seed)
+        seed0 = qk_seed
+        seed1 = qk_seed
+        if SMASK:
+            seed0 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 0)
+            seed1 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 1)
+        qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
     elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
@@ -2655,11 +2777,12 @@ def attention_loop_tensor_subtile_split(
     p1_next = gl.exp2(qk1_shifted)
     p = pgm.concat_subtile(p0_next, p1_next)
 
-    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+    if not SMASK:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
     if FIXED_MAX:
-        qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, qk_seed)
+        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
     elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
@@ -2670,7 +2793,8 @@ def attention_loop_tensor_subtile_split(
     else:
         L = L * alpha + l_ij
     p = p.to(q.dtype)
-    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
+    if not SMASK:
+        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
     v0_s, v1_s = pgm.split_subtile(v)
 
@@ -2697,8 +2821,8 @@ def attention_loop_tensor_subtile_split(
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     if FIXED_MAX:
-        qk0_shifted = qk0 * QK_scale
-        qk1_shifted = qk1 * QK_scale
+        qk0_shifted = qk0 * QK_scale_fixed
+        qk1_shifted = qk1 * QK_scale_fixed
     else:
         qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
         qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
@@ -2888,6 +3012,16 @@ def _unified_attention_gluon_kernel_2d(
     FM_PEEK_RECENT: gl.constexpr = True,
     FM_L_FROM_BF16: gl.constexpr = False,
     FM_CHECK_EVERY: gl.constexpr = 0,
+    # fixed-max loop options (loop variant 2, BF16 / FP16; see attention_loop_tensor_subtile_split), set by the
+    # attn_2d config and off by default
+    FM_BALANCED: gl.constexpr = False,
+    FM_WMMA_ROWSUM: gl.constexpr = False,
+    FM_ROWSUM_PIN: gl.constexpr = False,
+    FM_SEED_MASK: gl.constexpr = False,
+    FM_Q_SCALE_FOLD: gl.constexpr = False,
+    FM_UNROLL2: gl.constexpr = False,
+    # the rerun (running max) reloads Q instead of keeping it live through the fixed-max loop
+    FM_RERUN_RELOAD_Q: gl.constexpr = False,
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
@@ -3257,6 +3391,12 @@ def _unified_attention_gluon_kernel_2d(
             FM_PEEK,
             FM_L_FROM_BF16,
             FM_CHECK_EVERY,
+            BALANCED=FM_BALANCED,
+            WMMA_ROWSUM=FM_WMMA_ROWSUM,
+            ROWSUM_PIN=FM_ROWSUM_PIN,
+            SEED_MASK=FM_SEED_MASK,
+            Q_SCALE_FOLD=FM_Q_SCALE_FOLD,
+            UNROLL2=FM_UNROLL2,
         )
         if FIXED_MAX:
             # L <= 2^100 bounds every p by 2^100 (fp32 / bf16 reach 2^128, so P, L and acc stay finite for
@@ -3270,16 +3410,57 @@ def _unified_attention_gluon_kernel_2d(
                 L_ok = L_ok & ((L >= 8.673617379884035e-19) | ~valid_pv)
             n_overflow = gl.sum(gl.where(L_ok, 0, 1), axis=0)
             if n_overflow > 0:
-                M, L, acc = attention_loop_tensor_subtile_split(
-                    pgm,
-                    kv_loader,
-                    q,
-                    M_init,
-                    L_init,
-                    acc0,
-                    acc1,
-                    False,
-                )
+                if FM_RERUN_RELOAD_Q:
+                    # reloading Q here (a rare path) frees the registers that kept the original Q live through the
+                    # fixed-max loop, which only reads its own copy (folded with FM_Q_SCALE_FOLD)
+                    q_re = load_q(
+                        cfg,
+                        query_ptr,
+                        q_offs,
+                        query_mask,
+                        cur_batch_in_all_start_index,
+                        kv_head_idx,
+                        cur_batch_query_len,
+                        q_block_local_idx,
+                        query_stride_0,
+                        USE_TDM_LOAD=USE_TDM_LOAD,
+                    )
+                    pgm_re = AttentionProgram(
+                        cfg,
+                        q_re,
+                        pgm.key_cache_ptr,
+                        pgm.value_cache_ptr,
+                        pgm.output_ptr,
+                        pgm.tile_start,
+                        pgm.tile_end,
+                        pgm.safe_tile_end,
+                        pgm.window_mask_tile_end,
+                        pgm.query_mask_qk,
+                        pgm.context_len_q_pos_qk,
+                        pgm.QK_scale,
+                        pgm.out_scale,
+                    )
+                    M, L, acc = attention_loop_tensor_subtile_split(
+                        pgm_re,
+                        kv_loader,
+                        q_re,
+                        M_init,
+                        L_init,
+                        acc0,
+                        acc1,
+                        False,
+                    )
+                else:
+                    M, L, acc = attention_loop_tensor_subtile_split(
+                        pgm,
+                        kv_loader,
+                        q,
+                        M_init,
+                        L_init,
+                        acc0,
+                        acc1,
+                        False,
+                    )
 
     if NUM_SPLITS > 1:
         # Split-KV: emit un-reduced partials; the reduction happens separately.

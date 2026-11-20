@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import json
 import os
 from typing import NamedTuple
 
@@ -1247,6 +1248,22 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
             and params.max_seqlen_k >= override["min_kv"]
         ):
             config.update(override["config"])
+    long_kv = config.pop("LONG_KV_OVERRIDE", None)
+    if (
+        long_kv
+        and os.environ.get("AITER_UA_2D_LONG_KV", "1") == "1"
+        and params.max_seqlen_k >= long_kv["min_kv"]
+        and _2d_full_causal_prefill(params, output_gate)
+    ):
+        # Causal full-attention prefill over a long key range: one wave per SIMD with the fixed-max loop
+        # options (FM_*), which the entry tunes for the shapes where it beats the default.
+        config.update(long_kv["config"])
+    env_cfg = os.environ.get("AITER_UA_2D_CONFIG")
+    if env_cfg:
+        # tuning / debugging: JSON merged into the resolved attn_2d config
+        config.update(json.loads(env_cfg))
+    # fixed-max loop options, passed to the kernel as they are
+    fm_options = {k: config.pop(k) for k in list(config) if k.startswith("FM_")}
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -1377,6 +1394,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
         GATE=output_gate is not None,
         enable_fp_fusion=True,
+        **fm_options,
     )
     tail_qblocks = 0
     if _2d_tail_split_ok(params, output_gate, loop_variant):
@@ -1407,17 +1425,15 @@ _TAIL_MIN_PREFIX = 32768
 _tail_ws: dict = {}
 
 
-def _2d_tail_split_ok(params: _UAParams, output_gate, loop_variant) -> bool:
+def _2d_full_causal_prefill(params: _UAParams, output_gate) -> bool:
+    """Causal BF16 / FP16 prefill with full attention (no window, sinks, gate or scales)."""
     return (
-        os.environ.get("AITER_UA_2D_TAIL_SPLIT", "1") == "1"
-        and not params.all_decode
+        not params.all_decode
         and not params.spec_decode
-        and params.max_seqlen_k - params.max_seqlen_q >= _TAIL_MIN_PREFIX
         and params.causal
         and params.sliding_window == 0
         and params.sinks is None
         and output_gate is None
-        and loop_variant == 2
         and params.q.dtype in (torch.bfloat16, torch.float16)
         and params.k.dtype == params.q.dtype
         and params.out.dtype == params.q.dtype
@@ -1425,6 +1441,15 @@ def _2d_tail_split_ok(params: _UAParams, output_gate, loop_variant) -> bool:
         and params.k_descale is None
         and params.v_descale is None
         and params.output_scale is None
+    )
+
+
+def _2d_tail_split_ok(params: _UAParams, output_gate, loop_variant) -> bool:
+    return (
+        os.environ.get("AITER_UA_2D_TAIL_SPLIT", "1") == "1"
+        and params.max_seqlen_k - params.max_seqlen_q >= _TAIL_MIN_PREFIX
+        and loop_variant == 2
+        and _2d_full_causal_prefill(params, output_gate)
     )
 
 
