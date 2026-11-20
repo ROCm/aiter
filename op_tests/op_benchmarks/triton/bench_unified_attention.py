@@ -6,7 +6,10 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import (
+    UnifiedAttentionPartials,
+    unified_attention,
+)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -376,12 +379,19 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size,
+    shuffled_kv_cache,
+    equal_seqlen_q,
+    fp8_pv,
+    backend,
+    skip_reduce=False,
+    segm_tiles=None,
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
     Argument names match a rotating-buffer pool entry's keys (``**_``
-    absorbs the ones the kernel call does not need).
+    absorbs the ones the kernel call does not need). skip_reduce and
+    segm_tiles (gfx1250 split rebalance) leave only the attention kernel.
     """
 
     def kernel_fn(
@@ -402,7 +412,7 @@ def _make_unified_attention_fn(
         softmax_scale,
         **_,
     ):
-        unified_attention(
+        return unified_attention(
             q=q,
             k=k,
             v=v,
@@ -425,9 +435,40 @@ def _make_unified_attention_fn(
             shuffled_kv_cache=shuffled_kv_cache,
             equal_seqlen_q=equal_seqlen_q,
             backend=backend,
+            skip_reduce=skip_reduce,
+            segm_tiles=segm_tiles,
         )
 
     return kernel_fn
+
+
+def _partials_bytes(entry, partials, num_query_heads):
+    """Bytes the split-KV attention kernel writes: for each (query token, query
+    head) of a sequence, one segm_output row, segm_max and segm_expsum for each
+    segment that covers KV. A segment past the sequence's KV writes nothing.
+    """
+    seg_out = partials.segm_output
+    num_segments = seg_out.shape[2]
+    tile = partials.tile_size
+    row_bytes = (
+        seg_out.shape[-1] * seg_out.element_size()
+        + partials.segm_max.element_size()
+        + partials.segm_expsum.element_size()
+    )
+    rebalance_tiles = (
+        int(partials.segm_tiles.item()) if partials.segm_tiles is not None else None
+    )
+    cu_q = entry["cu_seqlens_q"].tolist()
+    total = 0
+    for i, seq_len in enumerate(entry["seqused_k"].tolist()):
+        tiles = triton.cdiv(seq_len, tile)
+        if tiles == 0:
+            continue
+        # the kernel's tiles_per_segment: the rebalance's, else an even split
+        per_segment = rebalance_tiles or triton.cdiv(seq_len, num_segments * tile)
+        live = triton.cdiv(tiles, per_segment)
+        total += (cu_q[i + 1] - cu_q[i]) * num_query_heads * live * row_bytes
+    return total
 
 
 def _mode_label(args):
@@ -591,24 +632,40 @@ def run_benchmark(custom, args):
             inp_gen_fixed_fns=[fixed_gen],
             inp_fixed_keys=[_UA_FIXED_FIELDS],
         )
-        kernel_fn = _make_unified_attention_fn(
+        make_fn = functools.partial(
+            _make_unified_attention_fn,
             window_size,
             args.shuffled_kv_cache,
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
         )
+        full_fn = make_fn()
 
         if args.equal_seqlen_q:
             assert (
                 seqlens_q == seqlens_q[0]
             ).all(), "-equal_seqlen_q needs equal query lengths"
 
+        sample = rot_bufs[0]
+        # The attention kernel alone: one untimed skip_reduce call gives the
+        # split's partials and, on gfx1250, the split rebalance's segm_tiles.
+        # The timed calls take that segm_tiles, so they skip the rebalance kernel.
+        partials = None
+        kernel_fn = full_fn
+        if args.only_bench_attn:
+            assert (
+                args.sliding_window is None
+            ), "--only_bench_attn counts the partials without a sliding window"
+            result = make_fn(skip_reduce=True)(**sample)
+            if isinstance(result, UnifiedAttentionPartials):
+                partials = result
+                kernel_fn = make_fn(skip_reduce=True, segm_tiles=result.segm_tiles)
+
         ms = bencher.bench(kernel_fn)
 
-        sample = rot_bufs[0]
         if args.test:
-            kernel_fn(**sample)
+            full_fn(**sample)
             ref_q, ref_q_descale = sample["q"], sample["q_descale"]
             # the NVFP4 reference values already carry the q descale
             if args.nvfp4:
@@ -713,7 +770,10 @@ def run_benchmark(custom, args):
                     else D_HEAD_V * entry["v"].element_size()
                 )
             )
-            o_bytes = total_q * HQ * D_HEAD_V * entry["output"].element_size()
+            if partials is None:
+                o_bytes = total_q * HQ * D_HEAD_V * entry["output"].element_size()
+            else:
+                o_bytes = _partials_bytes(entry, partials, HQ)
             return flops, q_bytes + k_bytes + v_bytes + o_bytes
 
         # Every pool entry shares the same sequence lengths, so each carries
@@ -840,6 +900,17 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Sliding window size (default: disabled)",
+    )
+
+    parser.add_argument(
+        "--only_bench_attn",
+        "-only_bench_attn",
+        action="store_true",
+        default=False,
+        help="Time only the attention kernel: skip the reduce and reuse the "
+        "gfx1250 split rebalance's segm_tiles from an untimed call; bytes count "
+        "the partials it writes. Default: split rebalance + attention + reduce, "
+        "with end-to-end bytes",
     )
 
     parser.add_argument(
