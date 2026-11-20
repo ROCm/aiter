@@ -11,9 +11,10 @@ ops the kernels would otherwise emit inline.
 
 The four E8M0 scale-rounding modes mirror PyTorch torchao's
 ``ScaleCalculationMode`` (``torchao/prototype/mx_formats/config.py``) 1:1
-and are dtype-agnostic across the whole MX format family
-(mxfp4 / mxfp6 / mxfp8 / mxint8) -- only the ``target_max_pow2`` /
-``max_pos`` / ``mbits`` constants differ between dtypes. This matches both
+and are dtype-agnostic -- only the ``target_max_pow2`` / ``max_pos`` /
+``mbits`` constants differ between dtypes. ``_DTYPE_CFG`` defines them for
+fp4 (e2m1) and fp8 (e4m3 / e4m3fnuz) only; another MX dtype needs its own
+entry there before :func:`emit_mx_e8m0_scale` accepts it. This matches both
 PyTorch torchao's and the HIP-side ``MxScaleRoundMode`` design (see
 ``csrc/include/mx_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
 
@@ -248,7 +249,9 @@ def emit_mxfp8_scale_rows_store(
 ):
     """Copy a tile's e8m0 scale rows from LDS (``gn`` bytes per row at
     ``s8_off``, as :func:`emit_mxfp8_acc_pair_to_lds` writes them) to the
-    row-major scale ``s8``: one row per thread, a single ``gn``-byte store at
+    row-major scale ``s8``. Each thread copies whole scale rows (rows ``tid``,
+    ``tid + block``, ...); a row's ``gn`` bytes are contiguous in the
+    row-major scale, so each row is one small store at
     ``(row0 + row) * srow + sbase``. Rows at or past ``mn_oob`` (the valid M
     rows of the tile) are skipped. Call after the barrier that follows the
     LDS writes."""
@@ -360,7 +363,9 @@ def emit_f32_to_e2m3_native(first, second, scale):
 def emit_amax_e8m0_native_scale(
     all_vals, *, wave_size, dtype=_D.FP8_E4M3, amax_gain=None
 ):
-    """Like :func:`emit_amax_e8m0_recip` but returns the *forward* scale
+    """Reduce ``all_vals`` to the block amax (a max tree, then one
+    ``shuffle_xor(16)`` with the peer lane), derive the E8M0 scale with
+    :func:`emit_mx_e8m0_scale` and return the *forward* scale
     ``2^(e8m0-127)`` needed by native gfx1250 ``v_cvt_scalef32_pk8_*``
     instructions (HW divides by the scale internally).
 

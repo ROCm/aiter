@@ -1053,8 +1053,9 @@ def launch_gemm_a8w8(
                         wave=WAVE,
                     )
             workgroup_barrier(use_cluster=False)
-            # One row's GN scale bytes per thread: contiguous in the row-major
-            # [M, (B*N)//32] scale, so each row is a single small store.
+            # Each thread copies whole scale rows (rows tid, tid + block, ...);
+            # a row's GN bytes are contiguous in the row-major [M, (B*N)//32]
+            # scale, so each row is one small store.
             emit_mxfp8_scale_rows_store(
                 lds8,
                 s8,
