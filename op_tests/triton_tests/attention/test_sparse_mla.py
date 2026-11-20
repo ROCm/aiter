@@ -608,13 +608,9 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
 
 
 def test_fp8_dots_keep_the_softmax_tail():
-    """Each query's first key scores 9 above the other 2047, which carry a fifth
-    of the output at p ~ 1e-4 each, below both e4m3 encodings' smallest
-    subnormal unless P_SCALE lifts p before the PV dot; split-K is off so one
-    program quantizes every tail p after the max.
+    """Tail probabilities near 1e-4 must survive fp8 PV dots on the generic kernel.
 
-    has_invalid holds both archs on the generic kernel, which gfx950 would
-    otherwise skip for the custom fp8 kernel; every index here is valid.
+    has_invalid keeps gfx950 off its custom fp8 kernel.
     """
     arch = arch_info.get_arch()
     if arch not in FP8_SCALAR_ARCHS:

@@ -7,9 +7,8 @@ Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
 
-On an arch that takes the fp8_scalar cache the plot has three series: the bf16
-cache with bf16 dots, the fp8 cache with bf16 dots, and the fp8 cache with fp8
-dots. Elsewhere only the bf16 cache is run.
+Archs with an fp8_scalar cache run three series.
+Other archs run only the bf16 cache.
 
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
