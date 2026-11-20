@@ -663,8 +663,14 @@ def gemm_afp8wfp8_preshuffle(
     w_scale_block_size: tuple[int, int] = (1, 32),
     x_format: str | None = None,
     w_format: str | None = None,
+    residual: torch.Tensor | None = None,
+    ssq: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
+    residual / ssq (both or neither; the folded post-attention norm): y = bf16(bf16(X @ W^T) + residual) and
+    ssq[m, j] = the fp32 sum of squares of row m of (bf16(X @ W^T) + residual) over output tile j's columns; ssq
+    is (M, >= cdiv(N, BLOCK_SIZE_N)) fp32, the config is forced to one CTA a tile (see residual_ssq_tiles).
+
     gfx1250 (gluon) MXFP8 GEMM: Y = X @ W^T with fp8 e4m3 X and W and standard MX
     1x32 e8m0 block scales on both operands (one scale per 32 elements along K).
 
@@ -748,6 +754,9 @@ def gemm_afp8wfp8_preshuffle(
         )
     else:
         config = copy.deepcopy(config)
+    if residual is not None:
+        config = dict(config)
+        config.update(residual_ssq_config(M))
     for key in ("SCALE_MODE", "A_DATA_PRESHUFFLE"):
         if key in config:
             raise ValueError(
@@ -894,8 +903,49 @@ def gemm_afp8wfp8_preshuffle(
         W_SCALE_BK=w_block[1],
         **config,
         **layouts,
+        **(
+            {}
+            if residual is None
+            else {
+                "res_ptr": residual,
+                "ssq_ptr": ssq,
+                "stride_res_m": residual.stride(0),
+                "stride_ssq_m": ssq.stride(0),
+                "RES_SSQ": 1,
+            }
+        ),
     )
     return y
+
+
+def residual_ssq_config(M: int) -> dict:
+    """The one-CTA-a-tile decode config of the residual + sum-of-squares epilogue (M < 32):
+    AITER_GEMM_RES_SSQ_CONFIG = "BLOCK_SIZE_N,num_warps,NUM_BUFFERS,B2B_WMMA" (default
+    32,2,6,0: measured best of 32/64/128 columns in the 40-layer verify graph)."""
+    import os
+
+    bn, nw, nb, b2b = (
+        int(v)
+        for v in os.environ.get("AITER_GEMM_RES_SSQ_CONFIG", "32,2,6,0").split(",")
+    )
+    assert M < 32, "the residual + ssq epilogue is a decode (M < 32) path"
+    return {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": bn,
+        "BLOCK_SIZE_K": 512,
+        "num_warps": nw,
+        "NUM_BUFFERS": nb,
+        "num_ctas": 1,
+        "GROUP_M": 1,
+        "B2B_WMMA": b2b,
+        "NUM_KSUB": 1,
+        "EPI_SPLIT": 1,
+    }
+
+
+def residual_ssq_tiles(M: int, N: int) -> int:
+    """Columns of the ssq output: the number of N tiles of residual_ssq_config."""
+    return triton.cdiv(N, residual_ssq_config(M)["BLOCK_SIZE_N"])
 
 
 def _fp8_format(t: torch.Tensor) -> str:
