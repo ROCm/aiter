@@ -3,7 +3,6 @@ from typing import Literal
 import torch
 import triton
 
-import aiter
 from aiter.ops.triton._triton_kernels.fusions.activation import (
     _act_mul_and_dynamic_fp8_group_quant_kernel,
     _act_mul_and_dynamic_mxfp4_quant_kernel,
@@ -16,8 +15,9 @@ from aiter.ops.triton.utils.config_utils import (
     select_leq_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-fp8_dtype = aiter.dtypes.fp8
+fp8_dtype = get_fp8_e4m3_dtype()
 
 _LOGGER = AiterTritonLogger()
 

@@ -7,6 +7,10 @@ import re
 import subprocess
 import sys
 
+# The siblings below are imported as top-level modules, which only resolves once
+# this directory is on sys.path. aiter.jit.core adds it, but chip_info is also
+# imported without jit.core (AITER_TRITON_ONLY=1, aiter.ops.triton).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_targets import (
     GFX_MAP,
     _parse_gpu_archs_env,
