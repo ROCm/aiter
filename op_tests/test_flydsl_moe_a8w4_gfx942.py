@@ -503,12 +503,16 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("a8w4 gfx942 MoE unsupported on %s; skipping", get_gfx())
         return
-    # Every gfx942, MI300X CI runners included: kernel numerics covering each
-    # distinct tile family in kimik3_a8w4_tuned_fmoe.csv, and dispatch by name.
-    # _qi (small M, x quantised in-kernel), moe_sort, bnt0, BM=32 and TILE_K=256.
-    test_stage1_kernel(
-        1, "flydsl_moe1_afp8_wfp4_bf16_t16x32x256_g942_kw2_qi"
-    )  # _qi TILE_K=256
+    # Every gfx942, MI300X CI runners included: the numerics of every stage-1 kernel
+    # in kimik3_a8w4_tuned_fmoe.csv (checked against the CSV below), and dispatch by
+    # name. Tile families: _qi (x quantised in-kernel), moe_sort, bnt0, BM=32, TILE_K=256.
+    tested = set()
+
+    def stage1(token, name, **kw):
+        test_stage1_kernel(token, f"flydsl_moe1_afp8_wfp4_bf16_{name}", **kw)
+        tested.add(f"flydsl_moe1_afp8_wfp4_bf16_{name}")
+
+    stage1(1, "t16x32x256_g942_kw2_qi")  # the M = 1 decode shape
     # _qi with full M tiles (16 real rows), every _qi variant of the CSV
     for name in (
         "t16x32x256_g942_kw2_qi",
@@ -517,16 +521,19 @@ def main():
         "t16x128x128_g942_qi",
         "t16x64x128_g942_qi",
     ):
-        test_stage1_kernel(16, f"flydsl_moe1_afp8_wfp4_bf16_{name}", E=2, topk=2)
-    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")  # moe_sort
-    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_g942")  # TILE_K=256
-    test_stage1_kernel(
-        128, "flydsl_moe1_afp8_wfp4_bf16_t16x128x128_g942_bnt0_kw2"
-    )  # bnt0
-    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x128_g942")  # BM=32
-    test_stage1_kernel(
-        128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_g942_bnt0"
-    )  # BM=32 TILE_K=256
+        stage1(16, name, E=2, topk=2)
+    stage1(16, "t16x64x128_g942_kw2")  # moe_sort
+    stage1(16, "t16x128x256_g942")  # TILE_K=256
+    stage1(128, "t16x128x128_g942_kw2")
+    stage1(128, "t16x128x128_g942_bnt0_kw2")  # bnt0
+    stage1(128, "t32x128x128_g942")  # BM=32
+    stage1(128, "t32x128x128_g942_bnt0")  # BM=32 bnt0
+    stage1(128, "t32x128x256_g942_bnt0")  # BM=32 TILE_K=256
+    df = pd.read_csv(CSV)
+    in_csv = set(df["kernelName1"][df["kernelName1"].map(is_a8w4_gfx942_kernel)])
+    assert (
+        in_csv <= tested
+    ), f"CSV stage-1 kernels not checked: {sorted(in_csv - tested)}"
     test_stage1_dispatch_by_name()
     test_csv_qi_rows()
     test_relayout_refuses_gugu()
