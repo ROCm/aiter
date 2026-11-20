@@ -62,7 +62,7 @@ jobs:
           retention-days: 7
 
   auto_revert:
-    name: Auto-create high-confidence revert PR
+    name: Handle culprit report
     needs: report
     if: ${{ needs.report.result == 'success' }}
     runs-on: [self-hosted, box308-pr-revert]
@@ -83,7 +83,7 @@ jobs:
           name: aiter-test-failure-report-${{ github.run_id }}
           path: ${{ runner.temp }}/aiter-test-failure-report
 
-      - name: Auto-create high-confidence revert PR
+      - name: Create revert PR or low-confidence issue
         env:
           AITER_TEST_FAILURE_WORKDIR: ${{ runner.temp }}/aiter-test-failure-report
         run: .claude/skills/aiter-test-failure-analysis/scripts/create_revert_pr.py --repo "${GITHUB_REPOSITORY}"

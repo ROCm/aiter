@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
 from .gfx1250_cluster import compute_mcast_masks
@@ -104,6 +105,8 @@ def launch_gemm_a4w4_256x256(
     cluster_sync_revs = 8
     # The four-quadrant software pipeline; other profiles run the sequential K-tile schedule.
     scheduled = tile_m in (192, 256) and tile_n == 256 and tile_k == 256
+    # The tail modes launched below, in the order their kernels are defined in the module.
+    tail_modes = (2, 0, -1) if scheduled else (-1,)
     FENCE_WAIT_POS = 7  # WMMAs of slack between the READY signal and its matching wait
     WMMA_M = 32
     WMMA_N = 16
@@ -185,6 +188,7 @@ def launch_gemm_a4w4_256x256(
         arg_out: fx.Pointer,
         tail_mode: Constexpr[int],
     ):
+        prefetch_kernel_code(num_waves, tail_modes.index(tail_mode))
 
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
