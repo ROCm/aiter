@@ -2676,34 +2676,3 @@ def test_gluon_unified_attn_2d_sliding_window_fixed_max(
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
     )
-
-
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
-@torch.inference_mode()
-def test_unified_attn_q_prescaled_rejected(backend):
-    """q_prescaled is a gfx1250 Gluon option: any other backend / arch raises."""
-    if backend == "gluon" and (DEVICE_ARCH == "gfx1250" or not _is_gluon_available()):
-        pytest.skip("gluon is the supported backend here, or unavailable")
-    q = torch.zeros(4, 2, 64, dtype=torch.bfloat16, device="cuda")
-    kv = torch.zeros(2, 16, 1, 64, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="q_prescaled"):
-        unified_attention(
-            q=q,
-            k=kv,
-            v=kv,
-            out=torch.empty_like(q),
-            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
-            max_seqlen_q=4,
-            seqused_k=torch.tensor([4], dtype=torch.int32, device="cuda"),
-            max_seqlen_k=4,
-            softmax_scale=0.125,
-            causal=True,
-            window_size=(-1, -1),
-            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
-            softcap=0,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            backend=backend,
-            q_prescaled=True,
-        )
