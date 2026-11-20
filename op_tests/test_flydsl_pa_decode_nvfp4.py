@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import benchmark
 
 PAGE = 128
 D = 128
@@ -425,3 +426,338 @@ def test_pa_decode_nvfp4_fp8_output(
     tile = compile_tile(**compiled[-1])
     traits = [t for t, v in kernels._GFX1250_PA_DECODE_CACHE.items() if v is tile]
     assert traits and traits[0].compute_dtype == want, (traits, want)
+
+
+# --- MXFP8 output (o_proj's native MXFP8 input) ---------------------------------
+#
+# An E8M0 ``output_scale`` [rows, H * D / 32] selects it. The bytes must equal the
+# split path the model ran before: the BF16 PA output of the same call, then the
+# group-32 quant ATOM's MXFP8 o_proj applies to it (``atom.model_ops.blockscale.
+# quantize_fp8``): ceil-power-of-two E8M0 scales of max(amax, 1e-10) / 448.
+
+
+def mxfp8_reference(x):
+    """[rows, K] BF16/FP16 -> (E4M3 bytes [rows, K], E8M0 bytes [rows, K / 32])."""
+    rows, k = x.shape
+    groups = x.float().view(rows, k // 32, 32)
+    amax = groups.abs().amax(-1).clamp_min(1e-10)
+    bits = (amax * torch.tensor(1.0 / 448.0, dtype=torch.float32)).view(torch.int32)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).int()
+    reciprocal = ((254 - code).clamp_min(0) << 23).view(torch.float32)
+    q = (groups * reciprocal[..., None]).clamp(-448.0, 448.0)
+    q = q.to(torch.float8_e4m3fn).view(torch.uint8).view(rows, k)
+    return q, code.to(torch.uint8)
+
+
+def _split_quant_kernel():
+    """The split path's standalone quant: a copy of ATOM's ``quantize_fp8_kernel``
+    (one launch, 32 groups a program), timed as the kernel the fusion removes."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def quantize_fp8_kernel(X, Y, S, SIZE):
+        groups = tl.program_id(0) * 32 + tl.arange(0, 32)
+        offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+        x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x), 1), 1e-10)
+        bits = (amax * (1.0 / 448.0)).to(tl.uint32, bitcast=True)
+        code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.uint32)
+        reciprocal = (tl.maximum(254 - code.to(tl.int32), 0) << 23).to(
+            tl.float32, bitcast=True
+        )
+        q = tl.minimum(tl.maximum(x * reciprocal[:, None], -448.0), 448.0)
+        tl.store(Y + offsets, q.to(tl.float8e4nv), offsets < SIZE)
+        tl.store(S + groups, code.to(tl.uint8), groups < SIZE // 32)
+
+    def quantize(x, y, s):
+        quantize_fp8_kernel[(triton.cdiv(x.numel(), 1024),)](x, y, s, x.numel())
+
+    return quantize
+
+
+# Every output mode the plan can pick, as ATOM's sparse PA plans them: prefill
+# rows one partition (direct), decode rows a cluster of 8 while they fit one
+# resident wave of clusters, else the default split (clusters shared by several
+# rows, or the reducer). The other cluster sizes and the last-arriver merge come
+# from short contexts and one slot per row.
+MXFP8_CASES = {
+    "direct-prefill": (2048, {"max_partitions": 1, "max_len": 1024}, "direct"),
+    "direct-decode": (32, {"max_partitions": 1}, "direct"),
+    "cluster8-c4-mtp8": (8, {"max_partitions": 8, "workgroup_budget": 64}, "cluster8"),
+    "cluster8-c24-mtp8": (
+        192,
+        {"max_partitions": 8, "workgroup_budget": 1536},
+        "cluster8",
+    ),
+    "cluster4-short": (
+        64,
+        {"max_partitions": 8, "workgroup_budget": 512, "max_len": 1024},
+        "cluster4",
+    ),
+    "last-arriver-merge": (8, {"max_partitions": 8, "workgroup_budget": 1}, "merge"),
+    # 512 rows exceed one resident wave of clusters: four rows a cluster of 8.
+    "shared-cluster-c64-mtp8": (
+        512,
+        {"max_partitions": 2, "workgroup_budget": 1024},
+        "cluster2x4",
+    ),
+    "shared-cluster3-c64-mtp8": (
+        512,
+        {"max_partitions": 3, "workgroup_budget": 1536},
+        "cluster3x4",
+    ),
+    "shared-cluster8": (
+        300,
+        {"max_partitions": 8, "workgroup_budget": 4096},
+        "cluster8x2",
+    ),
+    # Past two sequences a cluster of 8: the reducer.
+    "reducer-np8": (600, {"max_partitions": 8, "workgroup_budget": 4800}, "reduce"),
+}
+
+
+def _mode(kwargs):
+    if kwargs.get("cluster_merge"):
+        shared = kwargs.get("cluster_seqs", 1)
+        return f"cluster{kwargs['cluster_merge']}" + (
+            f"x{shared}" if shared > 1 else ""
+        )
+    if kwargs.get("direct_output"):
+        return "direct" if kwargs.get("num_partitions") == 1 else "merge"
+    return "reduce"
+
+
+@pytest.mark.parametrize("store_output", [True, False], ids=["store", "quantonly"])
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("case", list(MXFP8_CASES))
+def test_pa_decode_nvfp4_mxfp8_output(
+    case, query_dtype, store_output, device, monkeypatch
+):
+    """E8M0 ``output_scale``: the MXFP8 bytes and scales equal the BF16 (FP16)
+    output of the same call quantized group-32 as the split path does, in every
+    output mode (the wave tile's epilogue, its merges, the reducer's); padded
+    rows are FP8 zeros with E8M0 1.0 scales."""
+    from aiter.utility import dtypes
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    rows, plan_kwargs, mode = MXFP8_CASES[case]
+    plan_kwargs = dict(plan_kwargs)
+    max_len = plan_kwargs.pop("max_len", None)
+    topk = 16
+    num_pages = rows * topk + 8
+    cache = make_cache(num_pages, 1, device)
+    table, lengths = sparse_rows(rows, topk, num_pages, device, 1, max_len)
+    poison_tails(cache, table, lengths)
+    kp, ks, vp, vs = cache
+    g = torch.Generator(device=device).manual_seed(4)
+    query = torch.randn(rows, 16, D, device=device, generator=g).to(query_dtype)
+    # Outputs of very different magnitude per head, as o_proj inputs have.
+    query[:, ::5] *= 8
+    plan = pa.plan_pa_decode(lengths, 1, **plan_kwargs)
+    common = {"key_scale": ks, "value_scale": vs, "work_plan": plan}
+    bound = max_len or topk * PAGE
+
+    reference_out = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        reference_out, query, kp, vp, lengths, table, D**-0.5, 1,
+        max_context_length=bound, **common,
+    )  # fmt: skip
+    ref_q, ref_s = mxfp8_reference(reference_out.view(rows, -1))
+    split_q = torch.empty(rows, 16 * D, dtype=dtypes.fp8, device=device)
+    split_s = torch.empty(rows, 16 * D // 32, dtype=torch.uint8, device=device)
+    _split_quant_kernel()(reference_out.view(rows, -1), split_q, split_s)
+    assert torch.equal(split_q.view(torch.uint8), ref_q), "reference != split quant"
+    assert torch.equal(split_s, ref_s), "reference != split quant scales"
+
+    compiled = []
+    compile_tile = pa.compile_pa_decode_tile
+
+    def spy(**kwargs):
+        compiled.append(kwargs)
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", spy)
+    pad = 5
+    for _ in range(2):  # the second call takes the recorded-launch path
+        output = torch.full_like(query, float("nan"))
+        quantized = torch.full(
+            (rows + pad, 16, D), 0x7F, dtype=torch.uint8, device=device
+        ).view(dtypes.fp8)
+        scales = torch.full(
+            (rows + pad, 16 * D // 32), 0xFF, dtype=torch.uint8, device=device
+        ).view(dtypes.fp8_e8m0)
+        pa.pa_decode(
+            output, query, kp, vp, lengths, table, D**-0.5, 1,
+            max_context_length=bound, quantized_output=quantized,
+            output_scale=scales, store_output=store_output,
+            quantized_pad_rows=pad, **common,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        got_q = quantized[:rows].view(rows, -1).view(torch.uint8)
+        got_s = scales[:rows].view(torch.uint8)
+        bad = (got_q != ref_q).sum().item()
+        assert bad == 0, f"{bad} FP8 bytes differ"
+        assert torch.equal(got_s, ref_s), "E8M0 scales differ"
+        pad_bytes = quantized[rows:].view(torch.uint8)
+        assert torch.equal(pad_bytes, torch.zeros_like(pad_bytes))
+        assert (scales[rows:].view(torch.uint8) == 127).all()
+        if store_output:
+            assert torch.equal(output, reference_out), "BF16 output differs"
+    got_mode = _mode(compiled[-1])
+    assert got_mode == mode, (got_mode, mode)
+    assert bool(compiled[-1].get("quant_mx")) == (mode != "reduce")
+
+
+def test_pa_decode_mxfp8_rejects(device):
+    """A wrongly shaped E8M0 scale is refused."""
+    from aiter.utility import dtypes
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    kp, ks, vp, vs = make_cache(8, 1, device)
+    lengths = torch.full((2,), 256, dtype=torch.int32, device=device)
+    table = torch.arange(4, dtype=torch.int32, device=device).reshape(2, 2)
+    query = torch.randn(2, 16, D, device=device, dtype=torch.bfloat16)
+    plan = pa.plan_pa_decode(lengths, 1)
+    with pytest.raises(ValueError):
+        pa.pa_decode(
+            torch.empty_like(query), query, kp, vp, lengths, table, 0.1, 1,
+            key_scale=ks, value_scale=vs, work_plan=plan,
+            quantized_output=torch.empty_like(query, dtype=dtypes.fp8),
+            output_scale=torch.empty(2, 16, dtype=dtypes.fp8_e8m0, device=device),
+        )  # fmt: skip
+
+
+# (rows, max_partitions, workgroup_budget): MiniMax-M3.1 TP4 sparse layers as ATOM
+# plans them (top-16 blocks a row, so the context length beyond the window does
+# not matter). Decode rows are DSpark K7 verify tokens (8 a request).
+# None: ATOM's default split (``get_recommended_splits``) and budget.
+BENCH_SHAPES = {
+    "c4-decode-bs1": (8, 8, 64),
+    "c64-decode-bs24": (192, 8, 1536),
+    "c64-decode-bs64": (512, None, None),
+    # The traced c64 step: three partitions a row, merged by the reducer.
+    "c64-decode-bs64-np3": (512, 3, 1536),
+    "prefill-2048": (2048, 1, None),
+    "prefill-4536": (4536, 1, None),
+}
+
+
+@benchmark()
+def bench_mxfp8_output(shape, rows, query_dtype=torch.bfloat16):
+    """The MXFP8-output PA against the split path it replaces (BF16 PA, then
+    the group-32 quant) and the BF16 PA alone; the fused bytes must equal the
+    split path's."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+    from aiter.test_common import run_perftest
+    from aiter.utility import dtypes
+
+    _, max_partitions, budget = BENCH_SHAPES[shape]
+    device = torch.device("cuda")
+    if max_partitions is None:
+        max_partitions = get_recommended_splits(rows, 1)
+    topk = 16
+    num_pages = rows * topk + 8
+    kp, ks, vp, vs = make_cache(num_pages, 1, device)
+    table, lengths = sparse_rows(rows, topk, num_pages, device, 1)
+    lengths.fill_(topk * PAGE)  # decode and long-prefix rows attend a full window
+    query = torch.randn(rows, 16, D, device=device).to(query_dtype)
+    plan = pa.plan_pa_decode(
+        lengths,
+        1,
+        max_partitions=max_partitions,
+        **({} if budget is None else {"workgroup_budget": budget}),
+        # ATOM raises the planner's batch bound for long prefills.
+        **({"max_batch_size": 8192} if rows > 4096 else {}),
+    )
+    common = {
+        "key_scale": ks,
+        "value_scale": vs,
+        "work_plan": plan,
+        "max_context_length": topk * PAGE,
+    }
+    output = torch.empty_like(query)
+    quantized = torch.empty(rows, 16, D, dtype=dtypes.fp8, device=device)
+    scales = torch.empty(rows, 16 * D // 32, dtype=dtypes.fp8_e8m0, device=device)
+    split_q = torch.empty(rows, 16 * D, dtype=dtypes.fp8, device=device)
+    split_s = torch.empty(rows, 16 * D // 32, dtype=torch.uint8, device=device)
+    quantize = _split_quant_kernel()
+
+    def pa_bf16():
+        pa.pa_decode(output, query, kp, vp, lengths, table, D**-0.5, 1, **common)
+
+    def split():
+        pa_bf16()
+        quantize(output.view(rows, -1), split_q, split_s)
+
+    def fused():
+        pa.pa_decode(
+            output, query, kp, vp, lengths, table, D**-0.5, 1,
+            quantized_output=quantized, output_scale=scales, store_output=False,
+            **common,
+        )  # fmt: skip
+
+    candidates = {"pa_bf16": pa_bf16, "split": split, "fused": fused}
+    ret = {"gfx": get_gfx_runtime()}
+    # KV bytes the rows read (payload + scales) plus the output written.
+    kv_bytes = rows * topk * PAGE * 2 * (D // 2 + D // 16)
+    for name, fn in candidates.items():
+        _, us = run_perftest(fn)
+        out_bytes = rows * 16 * D * (2 if name == "pa_bf16" else 1)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = (kv_bytes + out_bytes) / us / 1e6
+    split()
+    fused()
+    torch.cuda.synchronize()
+    bad = quantized.view(rows, -1).view(torch.uint8) != split_q.view(torch.uint8)
+    err = bad.float().mean().item()
+    err += (scales.view(torch.uint8) != split_s).float().mean().item()
+    assert err == 0, f"fused MXFP8 differs from the split path ({err:.2e})"
+    ret["fused err"] = err
+    return ret
+
+
+def main():
+    import argparse
+
+    import pandas as pd
+
+    import aiter
+
+    if get_gfx_runtime() != "gfx1250":
+        aiter.logger.warning("NVFP4 pa_decode runs on gfx1250; skipping")
+        return
+    parser = argparse.ArgumentParser(description="NVFP4 PA MXFP8 output vs split")
+    parser.add_argument(
+        "--shape", nargs="*", default=list(BENCH_SHAPES), choices=list(BENCH_SHAPES)
+    )
+    args = parser.parse_args()
+    from aiter.ops.flydsl.kernels import pa_decode_kernel as kernels
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    original = kernels.compile_pa_decode_tile
+    compiled = []
+
+    def spy(**kwargs):
+        compiled.append(kwargs)
+        return original(**kwargs)
+
+    df = []
+    for shape in args.shape:
+        compiled.clear()
+        pa.compile_pa_decode_tile = spy
+        try:
+            row = bench_mxfp8_output(shape, BENCH_SHAPES[shape][0])
+        finally:
+            pa.compile_pa_decode_tile = original
+        # The mode of the MXFP8 call: a tile with the epilogue, else the reducer.
+        mx = [k for k in compiled if k.get("quant_mx")]
+        row["mode"] = _mode(mx[-1]) if mx else "reduce"
+        df.append(row)
+    df = pd.DataFrame(df)
+    aiter.logger.info("NVFP4 PA MXFP8 output summary:\n%s", df.to_markdown(index=False))
+
+
+if __name__ == "__main__":
+    main()

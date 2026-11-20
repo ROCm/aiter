@@ -1506,6 +1506,9 @@ class Gfx1250Traits:
     # NVFP4 wave pipeline (compute_dtype "nvfp4w"): page slots in each wave's
     # DMA ring; 0 elsewhere.
     nvfp4_buffers: int = 0
+    # With quant_output, MXFP8 (E8M0 scale per 32 elements, group-local, no
+    # LDS) instead of one FP32 descale per token.
+    quant_mx: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1842,7 +1845,7 @@ class Gfx1250Traits:
 
     @property
     def quant_bytes(self):
-        if not self.quant_output:
+        if not self.quant_output or self.quant_mx:
             return 0
         return self.m_tiles * 16 // self.quant_unit * self.NWARP * 4
 
