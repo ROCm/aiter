@@ -5806,14 +5806,20 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
-    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
-    # the default heuristics take the 1-stage kernel, which cannot apply
-    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
-    # its default config for this token count. Tuned FlyDSL rows still win.
+    # A clamped SiLU on gfx942 per-token FP8 with no FlyDSL row in use.
+    # CK's runtime-limit stage-1 applies that clamp on per-token-quantized
+    # activations whenever it can (FP8, inter_dim a multiple of 128); the
+    # clamp override below forces that 2-stage kernel instead of ASM 1-stage.
+    # The gfx942 whole-graph default must not take those calls: its batch-1
+    # and decode epilogues clamp BF16 activations, so the error against the
+    # per-token reference grows as the limit tightens. It remains the path
+    # where CK rejects the shape (inter_dim 576). A tuned FlyDSL row still wins.
+    ck_can_clamp_silu = q_dtype_a == dtypes.fp8 and inter_dim % 128 == 0
     if (
         full_impl is None
         and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
         and clamped_silu
+        and not ck_can_clamp_silu
         and q_type == QuantType.per_Token
         and q_dtype_w == dtypes.fp8
         and use_g1u1
