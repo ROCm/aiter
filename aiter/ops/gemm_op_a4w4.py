@@ -15,9 +15,13 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import (
+    get_cu_num,
+    get_tuned_cu_nums,
+    log_tuned_cu_fallback,
+)
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..ops.gemm_op_common import get_padded_m
+from ..ops.gemm_op_common import find_padded_m_row, find_tuned_row, get_padded_m
 from ..utility import dtypes
 
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
@@ -130,27 +134,38 @@ def get_GEMM_config(M: int, N: int, K: int):
             get_GEMM_config.has_gfx = False
     gfx = get_gfx()
     cu_num = get_cu_num()
-    padded_M = M
-    config = None
-    for gl in [None, 0, 1]:
-        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        key = (
-            (gfx, cu_num, padded_M, N, K)
-            if get_GEMM_config.has_gfx
-            else (cu_num, padded_M, N, K)
+    if get_GEMM_config.has_gfx:
+        config, padded_M = find_tuned_row(
+            get_GEMM_config.gemm_dict,
+            lambda cu, pm: (gfx, cu, pm, N, K),
+            gfx,
+            cu_num,
+            M,
+            N,
+            K,
+            tuned_file,
         )
-        config = get_GEMM_config.gemm_dict.get(key, None)
-        if config is not None:
-            # New backends are qualified at exact M; keep the old bucket choice.
-            if padded_M != M and str(config["kernelName"]).startswith(
-                ("triton_", "flydsl_")
-            ):
-                config = _a4w4_fallback_config(config)
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+    else:
+        config, padded_M = find_padded_m_row(
+            get_GEMM_config.gemm_dict, lambda pm: (cu_num, pm, N, K), M, N, K
+        )
+    if config is not None:
+        # New backends are qualified at exact M; keep the old bucket choice.
+        if padded_M != M and str(config["kernelName"]).startswith(
+            ("triton_", "flydsl_")
+        ):
+            config = _a4w4_fallback_config(config)
+        if AITER_LOG_TUNED_CONFIG:
+            tuned_cu = cu_num
+            if get_GEMM_config.has_gfx:
+                tuned_cu = next(
+                    cu
+                    for cu in get_tuned_cu_nums(cu_num)
+                    if (gfx, cu, padded_M, N, K) in get_GEMM_config.gemm_dict
                 )
-            break
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {tuned_cu} (device cu_num = {cu_num}) in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+            )
     else:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
@@ -244,14 +259,19 @@ def _a4w4_mxscale_config(M: int, N: int, K: int) -> tuple[str, str] | None:
         k[0] for k in rows if isinstance(k, tuple) and k
     }:
         gfx = base_gfx_arch(gfx)
+    cu_nums = get_tuned_cu_nums(cu_num)
     for gl in (None, 0, 1):
-        row = rows.get(
-            (gfx, cu_num, M if gl is None else get_padded_m(M, N, K, gl), N, K)
-        )
-        if row is not None and (
-            row[0] != "flydsl" or a4w4_kernel_launchable(row[1], M, N, K)
-        ):
-            return row
+        padded_m = M if gl is None else get_padded_m(M, N, K, gl)
+        for tuned_cu in cu_nums:
+            row = rows.get((gfx, tuned_cu, padded_m, N, K))
+            if row is not None and (
+                row[0] != "flydsl" or a4w4_kernel_launchable(row[1], M, N, K)
+            ):
+                if tuned_cu != cu_num:
+                    log_tuned_cu_fallback(
+                        "a4w4_mxscale_bpreshuffle", gfx, cu_num, tuned_cu
+                    )
+                return row
     name = flydsl_a4w4_fallback_kernel(M, N, K, cu_num)
     if name is None:
         return None
