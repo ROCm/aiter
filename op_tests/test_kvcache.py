@@ -12,6 +12,58 @@ from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 MAX_TOKEN_SUPPORTED = 16384
+CACHE_NAMES = ["k_cache", "v_cache", "k_scale", "v_scale"]
+
+
+def random_bytes(shape, dtype, device):
+    """Random bytes, so a slot the kernel never writes does not hold the value
+    the reference puts there."""
+    *lead, last = shape
+    raw = torch.randint(
+        0, 256, (*lead, last * dtype.itemsize), dtype=torch.uint8, device=device
+    )
+    return raw.view(dtype)
+
+
+def token_rows(name, t, asm_layout, num_heads, head_size):
+    """One row per slot, in the layout run_torch indexes with slot_mapping."""
+    if name == "k_cache":
+        return t.permute(0, 3, 1, 2, 4).reshape(-1, num_heads, head_size)
+    if name == "v_cache":
+        order = (0, 2, 4, 1, 3) if asm_layout else (0, 3, 1, 2)
+        return t.permute(*order).reshape(-1, num_heads, head_size)
+    if asm_layout:
+        return t.permute(0, 2, 1).reshape(-1, num_heads)
+    return t.permute(1, 0).reshape(-1, num_heads)
+
+
+def check_caches(out_ref, out_a, initial, slot_mapping, asm_layout, kvhead, head_size):
+    """Compare the slots in slot_mapping numerically, and require every other
+    slot to keep its initial bytes. Comparing the whole tensor would divide a
+    wrong write by up to MAX_TOKEN_SUPPORTED slots per batch."""
+    for name, ref, out, init in zip(CACHE_NAMES, out_ref, out_a, initial):
+        if ref is None:
+            continue
+        ref_rows, out_rows, init_rows = (
+            token_rows(name, t, asm_layout, kvhead, head_size) for t in (ref, out, init)
+        )
+        checkAllclose(
+            ref_rows[slot_mapping].to(dtypes.fp32),
+            out_rows[slot_mapping].to(dtypes.fp32),
+            msg=f"{name} written slots {tuple(ref.shape)}",
+        )
+        untouched = torch.ones(
+            out_rows.shape[0], dtype=torch.bool, device=out_rows.device
+        )
+        untouched[slot_mapping] = False
+        checkAllclose(
+            init_rows[untouched].view(torch.uint8).to(dtypes.fp32),
+            out_rows[untouched].view(torch.uint8).to(dtypes.fp32),
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{name} untouched slots, bytes",
+        )
 
 
 @perftest()
@@ -159,11 +211,12 @@ def test_reshape_and_cache(
     )
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
     device = key.device
-    k_cache = torch.empty(k_cache_shape, dtype=DType_KVCache, device=device)
-    v_cache = torch.empty(v_cache_shape, dtype=DType_KVCache, device=device)
+    k_cache = random_bytes(k_cache_shape, DType_KVCache, device)
+    v_cache = random_bytes(v_cache_shape, DType_KVCache, device)
+    k_scale = v_scale = None
     if quantCfg:
-        k_scale = torch.empty(kv_scale_shape, device=key.device)
-        v_scale = torch.empty_like(k_scale)
+        k_scale = random_bytes(kv_scale_shape, dtypes.fp32, device)
+        v_scale = random_bytes(kv_scale_shape, dtypes.fp32, device)
         quantCfg["k_scale"] = k_scale.clone()
         quantCfg["v_scale"] = v_scale.clone()
     slot_mapping = torch.tensor(
@@ -212,15 +265,15 @@ def test_reshape_and_cache(
     ret["us_prefill"] = us_a
 
     print(f"prefill part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
-    names = ["k_cache", "v_cache", "k_scale", "v_scale"]
-    for i, el in enumerate(out_ref):
-        if el is None:
-            continue
-        checkAllclose(
-            el.to(dtypes.fp32),
-            out_a[i].to(dtypes.fp32),
-            msg=f"{names[i]} {el.shape}",
-        )
+    check_caches(
+        out_ref,
+        out_a,
+        (k_cache, v_cache, k_scale, v_scale),
+        slot_mapping,
+        asm_layout,
+        kvhead,
+        head_size,
+    )
 
     # ##################################################### decode part
     qkv = torch.randn(bs, qhead + 2 * kvhead, head_size, dtype=DType_KV, device="cuda")
@@ -267,15 +320,15 @@ def test_reshape_and_cache(
     ret["us_decode"] = us_a
 
     print(f"decode part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
-    names = ["k_cache", "v_cache", "k_scale", "v_scale"]
-    for i, el in enumerate(out_ref):
-        if el is None:
-            continue
-        checkAllclose(
-            el.to(dtypes.fp32),
-            out_a[i].to(dtypes.fp32),
-            msg=f"{names[i]} {el.shape}",
-        )
+    check_caches(
+        out_ref,
+        out_a,
+        (k_cache, v_cache, k_scale, v_scale),
+        slot_mapping,
+        asm_layout,
+        kvhead,
+        head_size,
+    )
     print(
         f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=} {DType_Slot=}"
     )
