@@ -379,6 +379,8 @@ def _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id) -> dict | 
         # Taps are loaded as contiguous [dim, 4] rows
         or not weight.is_contiguous()
         or x.stride(0) != 1
+        # The kernel assumes stride_x > 0; broadcast (stride 0) x takes the 2D path
+        or x.stride(1) < 1
         # State must hold x exactly
         or conv_states.dtype not in (x.dtype, torch.float32)
         or dim != 2 * k_dim + v_dim

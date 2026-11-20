@@ -5,8 +5,7 @@
 
 Compares the sliding-window path with the 2D-tiled kernel (AITER_CONV1D_SPLIT_QKV_WINDOW=0), called as vLLM calls
 it (block_m=8, prebuilt schedule). The default cases are Kimi-K3 TP8 prefill steps (q, k, v = 1536 channels each).
-Times are CUDA-graph replays without a cache flush, so x can stay in the last-level cache, as after the projection
-GEMM in the model.
+Times come from RotatingBufferBench: CUDA-graph replays over a rotating pool of inputs.
 
 Usage examples
 --------------
@@ -18,20 +17,37 @@ python bench_causal_conv1d_prefill.py --k-dim 3072 --v-dim 3072 --row-stride 122
 import itertools
 import os
 import types
+from functools import partial
 
 import torch
-import triton
 
 import aiter.ops.triton.gated_delta_net.causal_conv1d_prefill as conv_prefill
 from aiter import logger
 from aiter.ops.prefill_batch_metadata import build_causal_conv_prefill_metadata
 from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_triton_tile_fn
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.gated_delta_net.test_causal_conv1d_prefill import (
+    WIDTH,
+    _make_inputs,
+)
 
-DEVICE = "cuda"
 DTYPE = torch.bfloat16
-WIDTH = 4
 BLOCK_M = 8
+INPUT_KEYS = [
+    "x",
+    "weight",
+    "conv_states",
+    "query_start_loc",
+    "cache_indices",
+    "has_initial_state",
+]
 
 DEFAULT_CASES = {
     "one continuing chunk, row stride 6288": ([7680], [True], 6288),
@@ -42,20 +58,33 @@ DEFAULT_CASES = {
 }
 
 
-def _make_inputs(seqlens, has_init, k_dim, v_dim, row_stride):
-    dim = 2 * k_dim + v_dim
-    T = sum(seqlens)
-    n = len(seqlens)
-    torch.manual_seed(0)
-    proj = torch.randn((T, row_stride), dtype=DTYPE, device=DEVICE)
-    query_start_loc = torch.tensor(
-        [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
+def _gen_inputs(seqlens, has_init, k_dim, v_dim, row_stride):
+    # Conv states in [slot, dim, cols] with unit dim stride, as vLLM stores them.
+    return _make_inputs(
+        seqlens,
+        has_init,
+        k_dim,
+        v_dim,
+        row_extra=row_stride - (2 * k_dim + v_dim),
+        state_cols=WIDTH - 1 + 4,
+        sd_layout=True,
+        n_slots=2 * len(seqlens),
+        pad_seqs=(),
+        w_dtype=torch.float32,
+        state_dtype=DTYPE,
+        seed=0,
     )
+
+
+def _prebuilt_metadata(seqlens):
     # vLLM passes a plain object with a prebuilt nums_dict schedule (usable in graph capture).
+    query_start_loc = torch.tensor(
+        [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device="cuda"
+    )
     grid = build_causal_conv_prefill_metadata(
         seqlens, query_start_loc=query_start_loc, block_sizes=(BLOCK_M,)
     ).get_chunk_grid(BLOCK_M)
-    metadata = types.SimpleNamespace(
+    return types.SimpleNamespace(
         nums_dict={
             BLOCK_M: {
                 "tot": grid.total_chunks,
@@ -64,31 +93,11 @@ def _make_inputs(seqlens, has_init, k_dim, v_dim, row_stride):
             }
         }
     )
-    return {
-        "x": proj[:, :dim].t(),
-        "weight": torch.randn((dim, WIDTH), dtype=torch.float32, device=DEVICE) * 0.5,
-        "bias": None,
-        "conv_states": torch.randn(
-            (2 * n, WIDTH - 1 + 4, dim), dtype=DTYPE, device=DEVICE
-        ).transpose(1, 2),
-        "query_start_loc": query_start_loc,
-        "k_dim": k_dim,
-        "v_dim": v_dim,
-        "cache_indices": torch.arange(n, dtype=torch.int32, device=DEVICE),
-        "has_initial_state": torch.tensor(has_init, dtype=torch.bool, device=DEVICE),
-        "block_m": BLOCK_M,
-        "metadata": metadata,
-        "preserve_input_dtype": True,
-    }
 
 
-def _time_us(inputs, window):
+def _time_us(bencher, fn, window):
     os.environ["AITER_CONV1D_SPLIT_QKV_WINDOW"] = "1" if window else "0"
-    causal_conv1d_split_qkv_triton_tile_fn(**inputs)  # compile outside the capture
-    ms = triton.testing.do_bench_cudagraph(
-        lambda: causal_conv1d_split_qkv_triton_tile_fn(**inputs), rep=100
-    )
-    return ms * 1e3
+    return bencher.bench(fn) * 1e3
 
 
 def run(args):
@@ -97,6 +106,9 @@ def run(args):
     else:
         cases = DEFAULT_CASES
     dim = 2 * args.k_dim + args.v_dim
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     logger.info(
         "%-40s %12s %12s %8s %10s",
         "case",
@@ -106,15 +118,25 @@ def run(args):
         "TB/s",
     )
     for name, (seqlens, has_init, row_stride) in cases.items():
-        inputs = _make_inputs(
-            seqlens, has_init, args.k_dim, args.v_dim, max(row_stride, dim)
+        gen = partial(
+            _gen_inputs, seqlens, has_init, args.k_dim, args.v_dim, max(row_stride, dim)
         )
-        old_us = _time_us(inputs, window=False)
+        pool = bencher.build_pool([gen], [INPUT_KEYS])
+        fn = partial(
+            causal_conv1d_split_qkv_triton_tile_fn,
+            bias=None,
+            k_dim=args.k_dim,
+            v_dim=args.v_dim,
+            block_m=BLOCK_M,
+            metadata=_prebuilt_metadata(seqlens),
+            preserve_input_dtype=True,
+        )
+        old_us = _time_us(bencher, fn, window=False)
         os.environ["AITER_CONV1D_SPLIT_QKV_WINDOW"] = "1"
         window_config = conv_prefill._window_config(
-            inputs["x"],
-            inputs["weight"],
-            inputs["conv_states"],
+            pool[0]["x"],
+            pool[0]["weight"],
+            pool[0]["conv_states"],
             args.k_dim,
             args.v_dim,
             conv_prefill.PAD_SLOT_ID,
@@ -122,7 +144,7 @@ def run(args):
         if window_config is None:
             logger.info("%-40s %12.2f %12s", name, old_us, "n/a (2D)")
             continue
-        new_us = _time_us(inputs, window=True)
+        new_us = _time_us(bencher, fn, window=True)
         # x read once and q/k/v written once; weights and conv states are small.
         nbytes = 2 * sum(seqlens) * dim * DTYPE.itemsize
         logger.info(

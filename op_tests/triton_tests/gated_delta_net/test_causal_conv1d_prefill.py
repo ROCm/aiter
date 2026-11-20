@@ -369,3 +369,22 @@ def test_token_contiguous_x_uses_2d_kernel(monkeypatch):
     for got, ref in ((q, q_r), (k, k_r), (v, v_r)):
         torch.testing.assert_close(got.float()[valid], ref[valid], atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(conv_states, st_r, atol=0, rtol=0)
+
+
+def test_broadcast_x_skips_window_kernel(monkeypatch):
+    # x with token stride 0 breaks the window kernel's stride_x > 0 assumption.
+    monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", "1")
+    k_dim = v_dim = 1536
+    dim = 3 * k_dim
+    x = torch.randn((dim, 1), dtype=torch.bfloat16, device="cuda").expand(dim, 128)
+    weight = torch.randn((dim, WIDTH), dtype=torch.float32, device="cuda")
+    conv_states = torch.randn(
+        (2, WIDTH - 1, dim), dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)
+    assert x.stride() == (1, 0)
+    assert (
+        conv_prefill._window_config(
+            x, weight, conv_states, k_dim, v_dim, conv_prefill.PAD_SLOT_ID
+        )
+        is None
+    )
