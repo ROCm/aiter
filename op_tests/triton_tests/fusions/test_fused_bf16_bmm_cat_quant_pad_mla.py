@@ -373,3 +373,53 @@ def test_fused_bf16_bmm_nope_only_rejects(invalid, monkeypatch):
     )
     with pytest.raises(AssertionError):
         fused_bf16_bmm_cat_quant_pad_mla(q_nope, w_uk_t, None, q_scale, heads, out=out)
+
+
+def test_fused_bf16_bmm_benchmark_cli_and_providers(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from op_tests.op_benchmarks.triton import (
+        bench_fused_bf16_bmm_cat_quant_pad_mla as bench,
+    )
+
+    assert bench.parse_args([]).providers == ["unfused", "fused"]
+    assert bench.parse_args(["--rope-cache"]).providers == [
+        "unfused",
+        "fused_rope_cache",
+    ]
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--rope-cache", "--providers", "fused_nope_only"])
+    args = bench.parse_args(
+        ["--providers", "fused", "fused_nope_only", "--print-kernels"]
+    )
+    q, w, pe, scale, out = (object() for _ in range(5))
+    calls = []
+
+    def generate(M, provider, args):
+        values = (
+            (q, w, scale, out)
+            if provider == "fused_nope_only"
+            else (q, w, pe, scale, out)
+        )
+        return lambda: values
+
+    def record(q_nope, w_uk_t, q_pe, q_scale, heads, **kwargs):
+        calls.append((q_nope, w_uk_t, q_pe, q_scale, heads, kwargs["out"]))
+
+    monkeypatch.setattr(bench, "make_input_gen", generate)
+    monkeypatch.setattr(bench, "fused_bf16_bmm_cat_quant_pad_mla", record)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.profiler,
+        "profile",
+        lambda **kwargs: nullcontext(SimpleNamespace(events=lambda: ())),
+    )
+    bench.print_kernels(1, args, None, calls=1)
+    assert (
+        calls == [(q, w, pe, scale, 16, out)] * 2 + [(q, w, None, scale, 16, out)] * 2
+    )
+
+    monkeypatch.setattr(bench, "make_input_gen", lambda *args: lambda: (q, w))
+    with pytest.raises(ValueError):
+        bench.print_kernels(1, args, None, calls=1)
