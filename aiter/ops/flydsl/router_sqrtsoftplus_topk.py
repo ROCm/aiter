@@ -17,6 +17,8 @@ differ only where the 6th and 7th ``score + bias`` are within a few ulp.
 
 import struct
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 
 from ...jit.utils.chip_info import get_gfx_runtime
@@ -27,11 +29,14 @@ from .kernels.router_sqrtsoftplus_topk import (
     build_router_gemm_module,
     build_router_topk_module,
 )
-from .kernels.tensor_shim import _run_compiled, current_stream_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 _SUPPORTED_GFX = ("gfx950",)
 # The fp32 partials ``[ksp, m, 384]`` (ksp <= 16) use 32-bit byte offsets.
 _MAX_ROWS = 65536
+# x's buffer view spans ``m * row_stride * 2`` bytes; keeping it under 1 GiB
+# leaves the kernels' 32-bit offsets (and their out-of-bound marker) clear.
+_MAX_X_BYTES = 1 << 30
 # Rows the tile table was tuned for. Above it the op is still correct, but a
 # hipBLASLt GEMM + ``topk_gating`` is as fast or faster, so the eligibility
 # helper declines.
@@ -43,31 +48,31 @@ TUNED_MAX_ROWS = 768
 # ``xm x xn``. The fastest of a random sweep on MI355X at each bound.
 _TILES = (
     (16, (1, 1, 8, 1, 10, 1, 8)),
-    (32, (2, 1, 8, 2, 10, 1, 8)),
-    (48, (1, 2, 5, 4, 8, 2, 4)),
-    (64, (2, 1, 5, 1, 8, 2, 4)),
+    (32, (1, 1, 5, 1, 8, 2, 4)),
+    (48, (2, 3, 16, 1, 5, 2, 4)),
+    (64, (2, 3, 16, 1, 5, 2, 4)),
     (96, (3, 3, 16, 1, 5, 1, 8)),
-    (128, (2, 3, 16, 1, 5, 2, 4)),
-    (192, (3, 3, 8, 2, 5, 1, 8)),
-    (256, (2, 4, 5, 8, 4, 8, 1)),
-    (384, (3, 3, 8, 1, 5, 2, 4)),
-    (512, (2, 3, 2, 4, 5, 8, 1)),
-    (768, (3, 6, 8, 2, 2, 2, 4)),
+    (128, (2, 6, 16, 1, 2, 4, 2)),
+    (192, (3, 3, 8, 1, 5, 2, 4)),
+    (256, (4, 2, 5, 2, 1, 4, 2)),
+    (384, (3, 3, 4, 4, 5, 8, 1)),
+    (512, (2, 6, 8, 1, 4, 8, 1)),
+    (768, (3, 4, 5, 1, 4, 8, 1)),
 )
 _LARGE = (4, 3, 1, 4, 5, 8, 1)
 # The same for the gate in the load-time layout of ``shuffle_router_gate``.
 _TILES_SHUFFLED = (
     (16, (1, 1, 8, 1, 10, 1, 8)),
-    (32, (1, 2, 8, 4, 5, 2, 4)),
+    (32, (1, 2, 10, 2, 8, 2, 4)),
     (48, (1, 3, 10, 4, 4, 1, 8)),
-    (64, (1, 2, 10, 2, 8, 2, 4)),
-    (96, (3, 2, 8, 1, 5, 2, 4)),
-    (128, (2, 3, 8, 4, 5, 4, 2)),
-    (192, (2, 4, 5, 2, 4, 4, 2)),
-    (256, (2, 3, 4, 4, 5, 8, 1)),
-    (384, (3, 2, 8, 1, 5, 2, 4)),
-    (512, (2, 3, 4, 2, 5, 8, 1)),
-    (768, (3, 3, 8, 1, 5, 8, 1)),
+    (64, (1, 2, 5, 1, 8, 4, 2)),
+    (96, (1, 3, 8, 1, 2, 2, 4)),
+    (128, (1, 3, 8, 1, 1, 4, 2)),
+    (192, (1, 3, 5, 1, 8, 4, 2)),
+    (256, (2, 4, 5, 1, 4, 8, 1)),
+    (384, (3, 3, 8, 1, 5, 8, 1)),
+    (512, (4, 3, 4, 1, 4, 2, 4)),
+    (768, (3, 6, 4, 1, 2, 2, 4)),
 )
 
 _gemm_launchers: dict = {}
@@ -118,6 +123,11 @@ def shuffle_router_gate(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _x_row_stride(x) -> int:
+    # One row reads only its own 5120 elements, whatever its stride says.
+    return x.stride(0) if x.shape[0] > 1 else HIDDEN
+
+
 def _unsupported_reason(x, weight, bias, is_padding) -> str | None:
     if get_gfx_runtime() not in _SUPPORTED_GFX:
         return f"needs one of {_SUPPORTED_GFX}, running on {get_gfx_runtime()}"
@@ -126,23 +136,29 @@ def _unsupported_reason(x, weight, bias, is_padding) -> str | None:
     m = x.shape[0]
     if m > _MAX_ROWS:
         return f"at most {_MAX_ROWS} rows, got {m}"
-    # A lane loads eight consecutive k (one dwordx4) of a row.
-    if x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:
-        return "x needs unit column stride, a row stride divisible by 8, 16 B alignment"
-    if m * x.stride(0) * x.element_size() >= 2**31:
-        return "x spans 2 GiB or more (32-bit buffer offsets)"
+    # A lane loads eight consecutive k (one dwordx4) of a row. Rows must not
+    # overlap: a zero (expanded) or short row stride would read other rows.
+    if x.stride(1) != 1 or x.data_ptr() % 16:
+        return "x needs unit column stride and 16 B alignment"
+    if m > 1 and (x.stride(0) < HIDDEN or x.stride(0) % 8):
+        return f"x row stride must be >= {HIDDEN} and divisible by 8"
+    if m * _x_row_stride(x) * x.element_size() > _MAX_X_BYTES:
+        return "x spans more than 1 GiB (32-bit buffer offsets)"
     if (
         weight.shape != (EXPERTS, HIDDEN)
         or weight.dtype != torch.bfloat16
         or not weight.is_contiguous()
+        or weight.data_ptr() % 16
     ):
-        return f"weight must be contiguous bf16 [{EXPERTS}, {HIDDEN}]"
+        return f"weight must be contiguous, 16 B aligned bf16 [{EXPERTS}, {HIDDEN}]"
     if bias.shape != (EXPERTS,) or bias.dtype != torch.float32:
         return f"bias must be fp32 [{EXPERTS}]"
-    if not bias.is_contiguous():
-        return "bias must be contiguous"
+    # Each lane loads its six biases as three 8 B pairs.
+    if not bias.is_contiguous() or bias.data_ptr() % 8:
+        return "bias must be contiguous and 8 B aligned"
     tensors = [x, weight, bias]
     if is_padding is not None:
+        # Read one byte per row: any offset view of a bool [m] works.
         if (
             is_padding.shape != (m,)
             or is_padding.dtype != torch.bool
@@ -207,8 +223,9 @@ def flydsl_router_sqrtsoftplus_topk(
 
     Returns:
         ``(topk_weights, topk_ids)`` in descending ``score + bias`` order.
-        CUDA-graph safe, no atomics, bitwise repeatable; the first call of
-        each row bucket compiles its kernels.
+        CUDA-graph safe, no atomics, bitwise repeatable. The first call of
+        each row bucket compiles its kernels: call
+        :func:`router_sqrtsoftplus_topk_warmup` before graph capture.
     """
     reason = _unsupported_reason(x, weight, bias, is_padding)
     if reason is not None:
@@ -229,31 +246,75 @@ def flydsl_router_sqrtsoftplus_topk(
     ):
         if t.shape != shape or t.dtype != dtype or not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous {dtype} {list(shape)}")
+        # The GEMM stores four fp32 partials (16 B) per access.
+        if name == "partials" and t.data_ptr() % 16:
+            raise ValueError("partials must be 16 B aligned")
         if t.device != dev:
             raise ValueError(f"{name} must be on {dev}")
     if m:
         stream = current_stream_arg()
-        # Raw-address launchers: only the device changes a handle.
+        # Untyped-pointer launchers: only the device changes a handle.
         _run_compiled(
             _gemm_launcher(tile, weight_shuffled),
-            x.data_ptr(),
-            weight.data_ptr(),
-            partials.data_ptr(),
+            ptr_arg(x),
+            ptr_arg(weight),
+            ptr_arg(partials),
             m,
-            x.stride(0),
+            _x_row_stride(x),
             stream,
             specialization_key=dev.index,
         )
         _run_compiled(
             _topk_launcher(ksp, is_padding is not None),
-            partials.data_ptr(),
-            bias.data_ptr(),
-            0 if is_padding is None else is_padding.data_ptr(),
-            topk_weights.data_ptr(),
-            topk_ids.data_ptr(),
+            ptr_arg(partials),
+            ptr_arg(bias),
+            (
+                flyc.from_c_void_p(fx.Uint8, 0)
+                if is_padding is None
+                else ptr_arg(is_padding)
+            ),
+            ptr_arg(topk_weights),
+            ptr_arg(topk_ids),
             m,
             struct.unpack("<i", struct.pack("<f", float(routed_scaling_factor)))[0],
             stream,
             specialization_key=dev.index,
         )
     return topk_weights, topk_ids
+
+
+def router_sqrtsoftplus_topk_warmup(
+    device: torch.device | int | str | None = None,
+    weight_shuffled: bool = False,
+    with_padding: bool = False,
+    max_rows: int = TUNED_MAX_ROWS,
+) -> None:
+    """Compile (and run once, on zeros) the kernels of every row bucket up to
+    ``max_rows`` for this gate layout and padding flag, so that no call made
+    under CUDA-graph capture compiles. Call it once per device before
+    capture with the arguments the model will use (``with_padding`` when it
+    passes ``is_padding``)."""
+    dev = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device is None
+        else (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else torch.device(device)
+        )
+    )
+    bounds = [b for b, _ in (_TILES_SHUFFLED if weight_shuffled else _TILES)]
+    rows = [b for b in bounds if b <= max_rows]
+    if max_rows > bounds[-1]:
+        rows.append(bounds[-1] + 1)  # the large-row tile
+    elif max_rows not in rows:
+        rows.append(max_rows)
+    with torch.cuda.device(dev):
+        weight = torch.zeros((EXPERTS, HIDDEN), dtype=torch.bfloat16, device=dev)
+        bias = torch.zeros(EXPERTS, dtype=torch.float32, device=dev)
+        for m in rows:
+            x = torch.zeros((m, HIDDEN), dtype=torch.bfloat16, device=dev)
+            pad = torch.zeros(m, dtype=torch.bool, device=dev) if with_padding else None
+            flydsl_router_sqrtsoftplus_topk(
+                x, weight, bias, is_padding=pad, weight_shuffled=weight_shuffled
+            )

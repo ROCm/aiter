@@ -250,6 +250,10 @@ _LAZY_IMPORTS = {
         ".router_sqrtsoftplus_topk",
         "router_sqrtsoftplus_topk_workspace_shape",
     ),
+    "router_sqrtsoftplus_topk_warmup": (
+        ".router_sqrtsoftplus_topk",
+        "router_sqrtsoftplus_topk_warmup",
+    ),
     "shuffle_router_gate": (".router_sqrtsoftplus_topk", "shuffle_router_gate"),
 }
 
@@ -323,6 +327,7 @@ __all__ = [
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
     "router_sqrtsoftplus_topk_supported",
+    "router_sqrtsoftplus_topk_warmup",
     "router_sqrtsoftplus_topk_workspace_shape",
     "shuffle_router_gate",
     "sparse_pa_nvfp4_decode",

@@ -24,6 +24,10 @@ equal values, so ties go to the lowest expert id). A pick's weight is
 ``(score + bias) - bias`` in fp32, as vLLM's ``topk_softplus_sqrt`` decodes it
 from its argmax key, scaled to sum ``routed_scaling_factor`` in slot order.
 Padding rows get id -1 and weight 0.
+
+Global memory goes through buffer-resource views (``ptr_buf_tensor``) and
+``fx.copy`` atoms (``buf_copy_load`` / ``buf_copy_store``); the views' byte
+bounds make out-of-range loads return 0 and out-of-range stores no-ops.
 """
 
 import flydsl.compiler as flyc
@@ -32,14 +36,18 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from . import buffer_ops
 from .dpp_utils import update_dpp_i32
+from .kernels_common import LOG2E
+from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 HIDDEN = 5120
 EXPERTS = 384
 TOPK = 6
 _STEPS = HIDDEN // 32  # MFMA k-steps
-_LOG2E = 1.4426950408889634
+# A masked-off access goes to this byte offset. Every buffer here is smaller
+# (the wrapper keeps x under 1 GiB; partials are at most 16 x 65536 x 1536 B),
+# so the hardware bound check drops the store or returns 0 for the load.
+_OOB_BYTES = 0x7FFFFFF0
 # quad_perm [1,0,3,2], quad_perm [2,3,0,1], row_half_mirror, row_mirror,
 # row_bcast 15, row_bcast 31: after these the wave max is in lane 63.
 _DPP_MAX_TREE = (0xB1, 0x4E, 0x141, 0x140, 0x142, 0x143)
@@ -50,6 +58,26 @@ _KERNARG_PRELOAD_HINTS = {
         "amdgpu-kernarg-preload-count": 16,
     }
 }
+
+
+def _at(valid, index, unit_bytes):
+    """``index`` (in ``unit_bytes`` units) where ``valid``, else past the
+    buffer's bound."""
+    return valid.select(index, fx.Int32(_OOB_BYTES // unit_bytes))
+
+
+def _mfma_bf16(a_i32x4, b_i32x4, acc):
+    """``acc + A B`` of one MFMA 16x16x32 bf16 on this lane's operands (eight
+    bf16 of k each, as four dwords)."""
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+    a = fx.make_rmem_tensor(8, fx.BFloat16)
+    a.store(Vec(a_i32x4).bitcast(fx.BFloat16))
+    b = fx.make_rmem_tensor(8, fx.BFloat16)
+    b.store(Vec(b_i32x4).bitcast(fx.BFloat16))
+    c = fx.make_rmem_tensor(4, fx.Float32)
+    c.store(acc)
+    fx.gemm(atom, c, a, b, c)
+    return Vec(c.load())
 
 
 def build_router_gemm_module(
@@ -77,25 +105,20 @@ def build_router_gemm_module(
     class Shared:
         part: fx.Array[fx.Float32, kw * tm * tn]
 
-    def mfma(wv, xv, acc):
-        av = Vec(wv).bitcast(fx.BFloat16)
-        bv = Vec(xv).bitcast(fx.BFloat16)
-        return Vec(
-            fx.rocdl.mfma_f32_16x16x32_bf16(
-                Vec.make_type(4, fx.Float32), [av, bv, acc, 0, 0, 0]
-            )
-        )
-
     @flyc.kernel(name=name, known_block_size=[64 * kw, 1, 1])
     def kernel(
-        arg_x: fx.Int64,  # [m, 5120] bf16, row stride i32_sx
-        arg_w: fx.Int64,  # [384, 5120] bf16
-        arg_p: fx.Int64,  # partials [ksp, m, 384] fp32
+        arg_x: fx.Pointer,  # [m, 5120] bf16, row stride i32_sx (a multiple of 8)
+        arg_w: fx.Pointer,  # [384, 5120] bf16
+        arg_p: fx.Pointer,  # partials [ksp, m, 384] fp32
         i32_m: fx.Int32,
         i32_sx: fx.Int32,
     ):
         tx, bid = fx.thread_idx.x, fx.block_idx.x
         lane = tx % 64
+        # Raw rocdl: FlyDSL has no wave-uniform cast. Without it the wave's
+        # k-step base and the operand offsets built on it stay per-lane VALU
+        # math: the 32x64 tile with kw=2 grows by 64 v_add_u32 and 34
+        # v_lshl_or_b32 (gfx950 ISA, FlyDSL 0.5.0).
         wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n_mg = (i32_m + tm - 1) // tm
         mgs = (n_mg + xm - 1) // xm  # token groups per slab
@@ -111,51 +134,52 @@ def build_router_gemm_module(
             m0 = mg * tm
             n0 = ng * tn
             part = fx.SharedAllocator().allocate(Shared).peek().part.ptr
-            xr = buffer_ops.create_buffer_resource_from_addr(
-                arg_x, num_records_bytes=fx.Int64(i32_m) * fx.Int64(i32_sx * 2)
+            # 16 B units: eight bf16 of k (one MFMA operand) or four fp32.
+            xb = ptr_buf_tensor(
+                arg_x,
+                fx.Int32,
+                unit_elems=4,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(i32_sx * 2),
             )
-            wr = buffer_ops.create_buffer_resource_from_addr(
-                arg_w, num_records_bytes=EXPERTS * HIDDEN * 2
+            wb = ptr_buf_tensor(
+                arg_w, fx.Int32, unit_elems=4, num_records_bytes=EXPERTS * HIDDEN * 2
+            )
+            pb = ptr_buf_tensor(
+                arg_p,
+                fx.Float32,
+                unit_elems=4,
+                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (EXPERTS * 4),
             )
             q = lane // 16
+            sx16 = i32_sx // 8
             rows = [m0 + ai * 16 + lane % 16 for ai in range_constexpr(a)]
             nrow = [n0 + bj * 16 + lane % 16 for bj in range_constexpr(b)]
 
             def load(step):
-                k0 = step * 32 + q * 8
+                k16 = step * 4 + q  # k = 32 step + 8 q
                 xs = [
-                    Vec(
-                        buffer_ops.buffer_load(
-                            xr,
-                            (rows[ai] * i32_sx + k0) >> 1,
-                            vec_width=4,
-                            dtype=fx.Int32,
-                            mask=rows[ai] < i32_m,
-                        )
+                    buf_copy_load(
+                        xb,
+                        _at(rows[ai] < i32_m, rows[ai] * sx16 + k16, 16),
+                        fx.Int32,
+                        unit_elems=4,
                     )
                     for ai in range_constexpr(a)
                 ]
                 if const_expr(wshuf):
                     ws = [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                wr,
-                                (((n0 // 16 + bj) * _STEPS + step) * 64 + lane) * 4,
-                                vec_width=4,
-                                dtype=fx.Int32,
-                            )
+                        buf_copy_load(
+                            wb,
+                            ((n0 // 16 + bj) * _STEPS + step) * 64 + lane,
+                            fx.Int32,
+                            unit_elems=4,
                         )
                         for bj in range_constexpr(b)
                     ]
                 else:
                     ws = [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                wr,
-                                (nrow[bj] * HIDDEN + k0) >> 1,
-                                vec_width=4,
-                                dtype=fx.Int32,
-                            )
+                        buf_copy_load(
+                            wb, nrow[bj] * (HIDDEN // 8) + k16, fx.Int32, unit_elems=4
                         )
                         for bj in range_constexpr(b)
                     ]
@@ -167,32 +191,41 @@ def build_router_gemm_module(
             ]
             base = (s * kw + wave) * spw
             nch = spw // chunk
+            # Each load batch is fenced off (sched_barrier) so it issues ahead
+            # of the MFMAs of the batch before it. The 16 B copy atoms load
+            # i128 values, which the gfx950 scheduler otherwise sinks next to
+            # their MFMAs, losing the prefetch (up to 3.6 us at 768 rows).
             cur = [load(base + j) for j in range_constexpr(chunk)]
+            fx.rocdl.sched_barrier(0)
             for c in range_constexpr(nch):
                 nxt = None
                 if c + 1 < nch:
                     nxt = [
                         load(base + (c + 1) * chunk + j) for j in range_constexpr(chunk)
                     ]
+                    fx.rocdl.sched_barrier(0)
                 for j in range_constexpr(chunk):
                     xs, ws = cur[j]
                     for ai in range_constexpr(a):
                         for bj in range_constexpr(b):
-                            acc[ai][bj] = mfma(ws[bj], xs[ai], acc[ai][bj])
+                            acc[ai][bj] = _mfma_bf16(ws[bj], xs[ai], acc[ai][bj])
                 cur = nxt
-            pr = buffer_ops.create_buffer_resource_from_addr(
-                arg_p,
-                num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (EXPERTS * 4),
-            )
             if const_expr(kw == 1):
                 for ai in range_constexpr(a):
                     for bj in range_constexpr(b):
                         tok = rows[ai]
-                        buffer_ops.buffer_store(
+                        buf_copy_store(
+                            pb,
+                            _at(
+                                tok < i32_m,
+                                (s * i32_m + tok) * (EXPERTS // 4)
+                                + (n0 + bj * 16) // 4
+                                + q,
+                                16,
+                            ),
                             acc[ai][bj],
-                            pr,
-                            (s * i32_m + tok) * EXPERTS + n0 + bj * 16 + q * 4,
-                            mask=tok < i32_m,
+                            fx.Float32,
+                            unit_elems=4,
                         )
             else:
                 for ai in range_constexpr(a):
@@ -216,18 +249,23 @@ def build_router_gemm_module(
                                 for i in range_constexpr(4)
                             ]
                         tok = m0 + e // tn
-                        buffer_ops.buffer_store(
+                        buf_copy_store(
+                            pb,
+                            _at(
+                                tok < i32_m,
+                                (s * i32_m + tok) * (EXPERTS // 4) + (n0 + e % tn) // 4,
+                                16,
+                            ),
                             Vec.from_elements(v, fx.Float32),
-                            pr,
-                            (s * i32_m + tok) * EXPERTS + n0 + e % tn,
-                            mask=tok < i32_m,
+                            fx.Float32,
+                            unit_elems=4,
                         )
 
     @flyc.jit
     def launch_router_gemm(
-        arg_x: fx.Int64,
-        arg_w: fx.Int64,
-        arg_p: fx.Int64,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_p: fx.Pointer,
         i32_m: fx.Int32,
         i32_sx: fx.Int32,
         stream: fx.Stream,
@@ -253,7 +291,11 @@ def _dpp_keep(v, ctrl):
 def _score(x):
     """sqrt(softplus(x)), ``x`` itself above 20; fast exp2 (``__expf``),
     accurate log and sqrt, as vLLM's ``topk_softplus_sqrt``."""
-    e = fx.Float32(fx.rocdl.exp2(T.f32, (x * fx.Float32(_LOG2E)).ir_value()))
+    # Raw rocdl: fx.math.exp2 lowers to llvm.exp2.f32, which gfx950 codegen
+    # wraps in a denormal range fix-up (v_cmp, two v_cndmask, v_add_f32 and
+    # v_ldexp_f32 around each v_exp_f32; +42 instructions in this kernel).
+    # vLLM's __expf is the bare v_exp_f32, which the bitwise match needs.
+    e = fx.Float32(fx.rocdl.exp2(T.f32, (x * fx.Float32(LOG2E)).ir_value()))
     sp = (x > fx.Float32(20.0)).select(x, fx.math.log(fx.Float32(1.0) + e))
     return fx.Float32(fx.math.sqrt(sp))
 
@@ -269,48 +311,47 @@ def build_router_topk_module(ksp: int, has_padding: bool):
 
     @flyc.kernel(name=name, known_block_size=[64, 1, 1])
     def kernel(
-        arg_p: fx.Int64,  # partials [ksp, m, 384] fp32
-        arg_bias: fx.Int64,  # [384] fp32
-        arg_pad: fx.Int64,  # [m] bool
-        arg_w: fx.Int64,  # [m, 6] fp32
-        arg_ids: fx.Int64,  # [m, 6] int32
+        arg_p: fx.Pointer,  # partials [ksp, m, 384] fp32
+        arg_bias: fx.Pointer,  # [384] fp32
+        arg_pad: fx.Pointer,  # [m] bool
+        arg_w: fx.Pointer,  # [m, 6] fp32
+        arg_ids: fx.Pointer,  # [m, 6] int32
         i32_m: fx.Int32,
         i32_scale: fx.Int32,  # routed_scaling_factor (fp32 bits)
     ):
         lane = fx.thread_idx.x
         t = fx.block_idx.x
         if t < i32_m:
-            lr = buffer_ops.create_buffer_resource_from_addr(
+            # 8 B units: two of a lane's six experts.
+            pb = ptr_buf_tensor(
                 arg_p,
+                fx.Float32,
+                unit_elems=2,
                 num_records_bytes=fx.Int64(ksp) * fx.Int64(i32_m) * (EXPERTS * 4),
             )
-            br = buffer_ops.create_buffer_resource_from_addr(
-                arg_bias, num_records_bytes=EXPERTS * 4
+            bb = ptr_buf_tensor(
+                arg_bias, fx.Float32, unit_elems=2, num_records_bytes=EXPERTS * 4
             )
-            wr = buffer_ops.create_buffer_resource_from_addr(
-                arg_w, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
+            wb = ptr_buf_tensor(
+                arg_w, fx.Float32, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
             )
-            ir_ = buffer_ops.create_buffer_resource_from_addr(
-                arg_ids, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
+            ib = ptr_buf_tensor(
+                arg_ids, fx.Int32, num_records_bytes=fx.Int64(i32_m) * (TOPK * 4)
             )
             neg_inf = fx.Float32(float("-inf"))
 
-            def load6(rsrc, off):
+            def load6(buf, unit):
                 v = [
-                    Vec(
-                        buffer_ops.buffer_load(
-                            rsrc, off + 2 * j, vec_width=2, dtype=fx.Float32
-                        )
-                    )
+                    buf_copy_load(buf, unit + j, fx.Float32, unit_elems=2)
                     for j in range_constexpr(3)
                 ]
                 return [fx.Float32(v[i // 2][i % 2]) for i in range_constexpr(epl)]
 
             parts = [
-                load6(lr, (p * i32_m + t) * EXPERTS + lane * epl)
+                load6(pb, (p * i32_m + t) * (EXPERTS // 2) + lane * (epl // 2))
                 for p in range_constexpr(ksp)
             ]
-            bias = load6(br, lane * epl)
+            bias = load6(bb, lane * (epl // 2))
             ch = []
             for i in range_constexpr(epl):
                 x = parts[0][i]
@@ -331,18 +372,24 @@ def build_router_topk_module(ksp: int, has_padding: bool):
                     take = ch[i] > mv
                     mv = take.select(ch[i], mv)
                     bi = take.select(fx.Int32(i), bi)
+                # Raw rocdl (DPP): the stable gpu.shuffle_xor butterfly lowers
+                # to four ds_swizzle_b32 and two v_permlane*_swap per round,
+                # with LDS waits (+24 ds_swizzle, +27 s_waitcnt per kernel);
+                # this tree is six v_mov_b32_dpp per round.
                 r = mv
                 for ctrl in _DPP_MAX_TREE:
                     d = _dpp_keep(r.bitcast(fx.Int32), ctrl).bitcast(fx.Float32)
                     r = (d > r).select(d, r)
-                vmax = fx.Int32(
-                    fx.rocdl.readlane(T.i32, r.bitcast(fx.Int32), fx.Int32(63))
-                ).bitcast(fx.Float32)
+                vmax = fx.Float32(fx.gpu.shuffle_idx(r, fx.Int32(63), 64))
+                # Raw rocdl (ballot): FlyDSL has no wave vote.
                 win = fx.Int32(
                     fx.math.cttz(fx.Int64(fx.rocdl.ballot(T.i64, mv == vmax))).to(
                         fx.Int32
                     )
                 )
+                # Raw rocdl (readlane): gpu.shuffle_idx from a runtime lane
+                # lowers to ds_bpermute_b32 (+12 ds_bpermute, +15 s_waitcnt
+                # per kernel); the constant lane 63 above becomes v_readlane.
                 idx = win * epl + fx.Int32(fx.rocdl.readlane(T.i32, bi, win))
                 bsel = bias[0]
                 for i in range_constexpr(1, epl):
@@ -360,27 +407,26 @@ def build_router_topk_module(ksp: int, has_padding: bool):
                 total, fx.Float32(1.0)
             )
             out_w = out_w * factor
-            keep = lane < TOPK
             if const_expr(has_padding):
-                pr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_pad, num_records_bytes=(i32_m + 3) // 4 * 4
+                # One byte per row (torch.bool): no alignment or length
+                # assumption beyond the m bytes of is_padding.
+                padb = ptr_buf_tensor(
+                    arg_pad, fx.Int8, num_records_bytes=fx.Int64(i32_m)
                 )
-                word = fx.Int32(
-                    buffer_ops.buffer_load(pr, t // 4, vec_width=1, dtype=fx.Int32)
-                )
-                pad = ((word >> ((t % 4) * 8)) & 0xFF) != 0
+                pad = buf_copy_load(padb, t, fx.Int8) != fx.Int8(0)
                 out_w = pad.select(fx.Float32(0.0), out_w)
                 out_id = pad.select(fx.Int32(-1), out_id)
-            buffer_ops.buffer_store(out_w, wr, t * TOPK + lane, mask=keep)
-            buffer_ops.buffer_store(out_id, ir_, t * TOPK + lane, mask=keep)
+            slot = _at(lane < TOPK, t * TOPK + lane, 4)
+            buf_copy_store(wb, slot, out_w, fx.Float32)
+            buf_copy_store(ib, slot, out_id, fx.Int32)
 
     @flyc.jit
     def launch_router_topk(
-        arg_p: fx.Int64,
-        arg_bias: fx.Int64,
-        arg_pad: fx.Int64,
-        arg_w: fx.Int64,
-        arg_ids: fx.Int64,
+        arg_p: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_pad: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_ids: fx.Pointer,
         i32_m: fx.Int32,
         i32_scale: fx.Int32,
         stream: fx.Stream,
