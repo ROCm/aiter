@@ -40,6 +40,7 @@ so what follows is the map, not the manual.**
 | `siblings.txt` | a variant of a changed function still carrying a changed line | A1's sibling is in the same file, not another file |
 | `flydsl_bounds.txt` | FlyDSL buffer/descriptor bounds not tied to the tensor's real extent | B2 is `tl.load` without a mask and FlyDSL has no `tl`, so this class had no rule at all |
 | `aot_pairing.txt` | new ops-side contracts `aiter/aot/flydsl/` was not taught | #4397 wired stage2 into AOT and missed stage1; it drifted for 32 commits |
+| `tuning_coverage.txt` | new tuned CSV workloads missing from their untuned input, and formats needing manual review | existing gaps are not newly introduced; an unknown format is not a clean check |
 | `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |
 | `twins.txt` | which existing file each new file was copied from | the defect is the *asymmetry* between them, not the copy |
 | `test_quality.txt` | assertion count, tolerances, shapes of added tests | zero assertions may mean a helper asserts — read before firing |
@@ -52,8 +53,15 @@ so what follows is the map, not the manual.**
 | `reviewers.txt` | this PR's reviewers + the changed paths' authors — the Step 7.8 routing roster | a design question routed to someone who has never touched the code |
 | `evidence.txt` | how a removed guard is handled on head — **only written when a guard or signature changed** | prose telling you to grep was read and not acted on (#5143) |
 
-A `SKIPPED:` artifact means that axis was **not checked** — say so rather than reading
-silence as clean. A forensic that ran and found nothing says so in words.
+A `SKIPPED:` artifact or `UNVERIFIED` item means that axis or file was **not checked** —
+say so rather than reading silence as clean. A forensic that ran and found nothing says so
+in words.
+
+**Tuning workload coverage:** For each newly added workload-specific tuned entry, require
+its full workload key in the applicable untuned input or a documented exception. Check
+`tuning_coverage.txt` even when no tuning family was derived. Confirm the selected input
+is authoritative before flagging a missing candidate; another input may cover it. Review
+unverified formats manually. Do not flag unchanged legacy entries or generic defaults.
 
 **Read `$WORK/rules_expanded.txt` — it is the full text of exactly the rules in
 `$WORK/rules.txt`, and it is the rule list for this review.** They are derived from paths, added/deleted

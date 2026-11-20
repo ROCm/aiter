@@ -399,6 +399,13 @@ dispatch_host='diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
 t "a host-side activation branch selects A4 via dispatch-change" \
   "$(rules_of "$dispatch_host" dispatch-change | grep -ow A4)" "A4"
 
+echo "[tuning coverage]"
+if python3 "$S/tuning_coverage_test.py"; then
+  t "tuning coverage scanner" "ok" "ok"
+else
+  t "tuning coverage scanner" "failed" "ok"
+fi
+
 # Every rule id derive() can emit must be registered in ALL_RULES. It is read by the
 # derivation-failed, diff-too-large and underivable fallbacks -- the moments the full
 # catalogue matters most -- and by the rules=N/M denominator. B8 and D12 reached main
