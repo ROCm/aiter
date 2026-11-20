@@ -5,8 +5,9 @@
 msa_gfx950_gluon_kernel        k4v8 cache (MXFP4 K + fp8 V): BLOCK_M = 16 * BLOCK_Q
                                rows per program; BLOCK_Q == 1 walks a row's own
                                picks, BLOCK_Q > 1 a row group's page sort_topk
-msa_gfx950_gluon_k4v4_kernel   k4v4 cache (K and V MXFP4): transposed form,
-                               4 waves with independent softmax state
+msa_gfx950_gluon_k4v4pt_kernel k4v4pt cache (MXFP4 K + e2m1 V with an fp32 scale
+                               per token), decode: one row per program; needs a
+                               Triton with gl.amd.cdna4.load_shared_fp4_repacked
 
 The cache layouts are documented in aiter/ops/triton/_triton_kernels/attention/msa.py.
 K (and the k4v8 V) are stored in aiter's (16, 16) preshuffle, the MFMA operand
@@ -567,6 +568,11 @@ def msa_gfx950_gluon_kernel(
         MRG_SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[D, 8]], [NUM_WARPS, BLOCK_M, D], [2, 1, 0])
         MRG_LD: gl.constexpr = gl.BlockedLayout([NUM_WARPS, 1, 8], [1, 4, 16], [1, NUM_WARPS, 1], [2, 1, 0])
+        # The merge buffer reuses the K / V buffers' LDS: drain this wave's last
+        # (unused) prefetch and wait for every wave to leave the page loop first.
+        if KV_LDS:
+            gl.amd.cdna4.async_copy.wait_group(0)
+        gl.barrier()
         mrg = gl.allocate_shared_memory(gl.float16, [NUM_WARPS, BLOCK_M, D], MRG_SH)
         _ws_merge_store(mrg, 0, m_t0, l_t0, acc_t0)
         _ws_merge_store(mrg, 1, m_t1, l_t1, acc_t1)
@@ -841,195 +847,192 @@ def msa_gfx950_gluon_reduce_split_rebalance_kernel(
     )  # fmt: skip
 
 
-V4_BYTES = gl.constexpr(128 * 128 // 2)
+# ---------------------------------------------------------------------------
+# k4v4pt decode. Record per (page, KV head), 17,408 B (block 128, head dim 128):
+#   [K e2m1 128 x 64 B, preshuffled as k4v8 | Ks E8M0 128 x 4 | V e2m1 128 x 64 B
+#    packed along D (low nibble first) | Vs fp32 128, one per token]
+# QK = mfma_scaled(MXFP8 Q, Qs, MXFP4 K, Ks). P is scaled by Vs along the keys
+# while fp32, then e4m3: P' = P * Vs[t] * (P_SCALE / max_t Vs) (the per-page
+# factor max Vs / P_SCALE keeps e4m3 in range and rides on O's per-row
+# rescale). PV = mfma_scaled(e4m3 P', e2m1 V) with no scales, V read from LDS
+# packed along the keys by load_shared_fp4_repacked (ds_read_b64_tr_b4).
+# ---------------------------------------------------------------------------
+
+K4V4PT_V_OFF = gl.constexpr(K_BYTES + KS_BYTES)  # 8704
+K4V4PT_VS_OFF = gl.constexpr(K_BYTES + KS_BYTES + 128 * 128 // 2)  # 16896
+K4V4PT_RECORD_BYTES = gl.constexpr(K_BYTES + KS_BYTES + 128 * 128 // 2 + 128 * 4)  # 17408
 
 
-_msa_gfx950_gluon_k4v4_kernel_repr = make_kernel_repr(
-    "msa_gfx950_gluon_k4v4_kernel",
-    ['SPLITS', 'DECODE_QL', 'TOPK', 'NUM_HEADS'],
+_msa_gfx950_gluon_k4v4pt_kernel_repr = make_kernel_repr(
+    "msa_gfx950_gluon_k4v4pt_kernel",
+    ["NSEG", "DECODE_QL", "TOPK", "NUM_HEADS", "NUM_WARPS"],
 )
 
 
-@gluon.jit(repr=_msa_gfx950_gluon_k4v4_kernel_repr)
-def msa_gfx950_gluon_k4v4_kernel(
-    q8_ptr,  # e4m3 [rows, NUM_HEADS, D] (one MXFP8 term, unscaled)
+@gluon.jit(repr=_msa_gfx950_gluon_k4v4pt_kernel_repr)
+def msa_gfx950_gluon_k4v4pt_kernel(
+    q8_ptr,  # e4m3 [rows, NUM_HEADS, D] (MXFP8 terms)
     qs_ptr,  # u8 E8M0 [rows, NUM_HEADS, D / 32]
-    cache_u8_ptr,
-    topk_ptr,
+    cache_ptr,  # u8 k4v4pt records [pages, Hkv, K4V4PT_RECORD_BYTES]
+    topk_ptr,  # [Hkv, rows, TOPK] int32 logical blocks, -1 = none
     block_table_ptr,
     seq_lens_ptr,
-    query_req_ptr,
-    query_pos_ptr,
-    out_ptr,
-    part_o_ptr,
-    part_ml_ptr,
+    out_ptr,  # bf16 [rows, NUM_HEADS, D] (NSEG = 1)
+    ws_ptr,  # NSEG > 1: fp32 [part_o | part_ml | seg_count (int32)], as k4v8's
     qk_scale_log2,
+    seg_pages,  # pages a segment covers (split rebalance)
     stride_page,
-    stride_head,
     stride_tk_h,
-    stride_tk_t,
     stride_bt,
     stride_ot,
-    stride_oh,
     NUM_HEADS: gl.constexpr,
     TOPK: gl.constexpr,
-    SPLITS: gl.constexpr,
+    NSEG: gl.constexpr,
     DECODE_QL: gl.constexpr,
+    P_SCALE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
-    """MSA, one query row x the 16 heads of one KV head x one split, 4 waves
-    with independent softmax state (the native NVFP4 kernel's structure):
+    """One program: a decode row's 16 heads of one KV head, one segment of its
+    compacted picks (split rebalance, as k4v8; NSEG > 1 writes partials for
+    msa_gfx950_gluon_reduce_split_rebalance_kernel with v_scale 1).
 
-      S^T = K Q^T          mfma_scaled 16x16x128, keys on M, warps along keys:
-                           wave w computes its own 32 keys (64 r + 16 w + ...)
-      O^T_w += V_w^T P_w^T batched mfma 16x16x32 over the wave dim, P^T taken
-                           from the accumulators as they are (asserted)
+    Every K / Ks / V / Vs byte goes HBM -> LDS by async copy into double buffers;
+    two commit groups a page, [K, Ks + Vs] then [V]. Page j:
+      wait_group(1): page j's K / scales in   barrier (every wave's copies of it;
+        every wave done with page j - 1, so its buffer can be refilled)
+      issue page j + 1's two groups
+      LDS: K (unshuffling view), Ks, Vs; QK, mask, softmax, P' (e4m3)
+      wait_group(2): page j's V in   barrier
+      LDS: V packed along the keys (ds_read_b64_tr_b4); PV
+    The copies are not wave-local (the transposed V read takes 8 B of every
+    token's row), hence the barriers."""
+    BLOCK_M: gl.constexpr = 16
+    MFMA: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 128], True, [1, NUM_WARPS])
+    A_OP: gl.constexpr = gl.DotOperandLayout(0, MFMA, 16)
+    B_OP: gl.constexpr = gl.DotOperandLayout(1, MFMA, 16)
+    Q_SCL: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(A_OP, [BLOCK_M, NUM_SCALES])
+    K_SCL: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(B_OP, [PAGE, NUM_SCALES])
+    ROW: gl.constexpr = gl.SliceLayout(1, MFMA)
+    COL: gl.constexpr = gl.SliceLayout(0, MFMA)
+    VEC: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    FLAT1: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    FLAT2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    CP16: gl.constexpr = gl.BlockedLayout([1, 16], [1, 64], [NUM_WARPS, 1], [1, 0])  # [8, 1024], 16 B lanes
+    CP4: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [2, NUM_WARPS // 2], [1, 0])  # [2, 512], 4 B lanes
 
-    Each wave keeps its own running max / sum / O^T over its keys of every
-    page; the waves combine once, after the walk. Nothing crosses waves per
-    page. k4v4: K and V MXFP4; V converts with a unit scale (the hardware
-    scaled convert takes one scale per byte, and a byte holds two keys with
-    their own E8M0 scales), times its key's scale; P is bf16.
-    """
-    NW: gl.constexpr = 4
-    QK: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 128], False, [NW, 1])
-    PV3: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 32], False, [NW, 1, 1])
-    KA: gl.constexpr = gl.DotOperandLayout(0, QK, 16)
-    QB: gl.constexpr = gl.DotOperandLayout(1, QK, 16)
-    VA3: gl.constexpr = gl.DotOperandLayout(0, PV3, 8)
-    VSRC3: gl.constexpr = gl.DotOperandLayout(0, PV3, 4)
-    PB3: gl.constexpr = gl.DotOperandLayout(1, PV3, 8)
-    K_SCL: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(KA, [PAGE, NUM_SCALES])
-    Q_SCL: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(QB, [HG, NUM_SCALES])
-    S3: gl.constexpr = (
-        gl.zeros([PAGE, HG], gl.float32, QK)
-        .reshape([2, NW, 4, 4, HG]).permute((1, 2, 0, 3, 4)).reshape([NW, 32, HG]).type.layout
-    )
-    WH: gl.constexpr = gl.SliceLayout(1, S3)  # [wave, head]
-    OWH: gl.constexpr = gl.SliceLayout(1, PV3)
-    V4: gl.constexpr = gl.zeros([NW, D, 32], gl.bfloat16, VA3).reshape([NW, 4, 32, 32]).type.layout
-    SC: gl.constexpr = gl.SliceLayout(2, V4)  # [wave, scale group, kappa]
-    VEC: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
-    PER: gl.constexpr = TOPK // SPLITS
-
-    row = gl.program_id(0)
+    grp = gl.num_programs(0) - 1 - gl.program_id(0)
     g = gl.program_id(1)
     sid = gl.program_id(2)
-    if DECODE_QL > 0:
-        req = row // DECODE_QL
-        pos = gl.load(seq_lens_ptr + req) - DECODE_QL + row % DECODE_QL
-    else:
-        req = gl.load(query_req_ptr + row)
-        pos = gl.load(query_pos_ptr + row)
-    req = req.to(gl.int64)
 
-    head0 = row.to(gl.int64) * NUM_HEADS + g * HG
-    qd = gl.arange(0, D, layout=gl.SliceLayout(1, QB))[:, None]
-    qn = gl.arange(0, HG, layout=gl.SliceLayout(0, QB))[None, :]
-    q_t = gl.load(q8_ptr + (head0 + qn) * D + qd)
-    sn = gl.arange(0, HG, layout=gl.SliceLayout(1, Q_SCL))[:, None]
-    sg = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, Q_SCL))[None, :]
-    q_sc = gl.load(qs_ptr + (head0 + sn) * NUM_SCALES + sg)
+    qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, A_OP))[:, None]
+    qd = gl.arange(0, D, layout=gl.SliceLayout(0, A_OP))[None, :]
+    q = gl.load(q8_ptr + (grp.to(gl.int64) * NUM_HEADS + g * HG + qm) * D + qd)
+    sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_SCL))[:, None]
+    ss = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, Q_SCL))[None, :]
+    qs = gl.load(qs_ptr + (grp.to(gl.int64) * NUM_HEADS + g * HG + sm) * NUM_SCALES + ss)
 
-    kn = gl.arange(0, PAGE, layout=gl.SliceLayout(1, KA))[:, None]
-    kb = gl.arange(0, D // 2, layout=gl.SliceLayout(0, KA))[None, :]
-    k_offs = _shuffled(kb, kn, D // 2)
-    kst = gl.arange(0, PAGE, layout=gl.SliceLayout(1, K_SCL))[:, None]
-    ksg = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, K_SCL))[None, :]
-    ks_offs = K_BYTES + kst * NUM_SCALES + ksg
-    V_OFF: gl.constexpr = K_BYTES + KS_BYTES
-    vw = gl.arange(0, NW, layout=gl.SliceLayout(1, gl.SliceLayout(2, VSRC3)))[:, None, None]
-    vdd = gl.arange(0, D, layout=gl.SliceLayout(0, gl.SliceLayout(2, VSRC3)))[None, :, None]
-    vc = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(1, VSRC3)))[None, None, :]
-    v_offs = V_OFF + (vw * D + vdd) * 16 + vc
-    cw = gl.arange(0, NW, layout=gl.SliceLayout(1, gl.SliceLayout(2, SC)))[:, None, None]
-    cg = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, SC)))[None, :, None]
-    ck = gl.arange(0, 32, layout=gl.SliceLayout(0, gl.SliceLayout(1, SC)))[None, None, :]
-    vs_offs = V_OFF + V4_BYTES + (cw * 4 + cg) * 32 + ck
-    unit_sc = gl.full([NW, D, 32], 127, gl.uint8, VA3)
-    tok = gl.arange(0, PAGE, layout=gl.SliceLayout(1, QK))
-    head_off = g * stride_head
+    # copy sources (byte offsets inside a record) and the LDS double buffers
+    blk_src = (
+        gl.arange(0, 8, layout=gl.SliceLayout(1, CP16))[:, None] * 1024
+        + gl.arange(0, 1024, layout=gl.SliceLayout(0, CP16))[None, :]
+    )
+    srow = gl.arange(0, 2, layout=gl.SliceLayout(1, CP4))[:, None]
+    s_src = gl.where(srow == 0, K_BYTES, K4V4PT_VS_OFF) + gl.arange(0, 512, layout=gl.SliceLayout(0, CP4))[None, :]
+    k_smem = gl.allocate_shared_memory(gl.uint8, [2, 8, 1024], FLAT2)
+    v_smem = gl.allocate_shared_memory(gl.uint8, [2, 8, 1024], FLAT2)
+    s_smem = gl.allocate_shared_memory(gl.uint8, [2, 2, 512], FLAT2)  # [buf, Ks | Vs]
+    tok_n = gl.arange(0, PAGE, layout=COL)
+    head_off = g * K4V4PT_RECORD_BYTES
 
-    jj = gl.arange(0, PER, layout=VEC)
-    blks = gl.load(topk_ptr + g * stride_tk_h + row.to(gl.int64) * stride_tk_t + sid * PER + jj)
+    # the row's picks for this segment, compacted: safe ones first, the diagonal last
+    pos = gl.load(seq_lens_ptr + grp // DECODE_QL) - DECODE_QL + grp % DECODE_QL
+    req = (grp // DECODE_QL).to(gl.int64)
+    jj = gl.arange(0, TOPK, layout=VEC)
+    blks = gl.load(topk_ptr + g * stride_tk_h + grp.to(gl.int64) * TOPK + jj)
     valid = (blks >= 0) & (blks * PAGE <= pos)
     pages = gl.load(block_table_ptr + req * stride_bt + gl.where(valid, blks, 0), mask=valid, other=0)
     diag = valid & (blks == pos // PAGE)
     safe = valid & (blks != pos // PAGE)
     n_safe = gl.sum(safe.to(gl.int32), axis=0)
-    rank = gl.where(
-        safe,
-        gl.associative_scan(safe.to(gl.int32), 0, _add) - 1,
-        gl.where(diag, n_safe, -1),
-    )
-    nvalid = n_safe + gl.sum(diag.to(gl.int32), axis=0)
-    b_cur, p_cur = _nth_valid(rank, blks, pages, 0, nvalid)
-    b_nxt, p_nxt = _nth_valid(rank, blks, pages, 1, nvalid)
+    rank = gl.where(safe, gl.associative_scan(safe.to(gl.int32), 0, _add) - 1, gl.where(diag, n_safe, -1))
+    n_pages = n_safe + gl.sum(diag.to(gl.int32), axis=0)
+    j0 = sid * seg_pages
+    j_end = gl.minimum(n_pages, j0 + seg_pages)
+    n_iter = gl.maximum(j_end - j0, 0)
+    b_cur, p_cur = _nth_valid(rank, blks, pages, j0, j_end)
+    b_nxt, p_nxt = _nth_valid(rank, blks, pages, j0 + 1, j_end)
+
+    # page j0 into buffer 0: [K, Ks + Vs], then [V]
     base = p_cur.to(gl.int64) * stride_page + head_off
-    k_c = gl.load(cache_u8_ptr + base + k_offs)
-    ks_c = gl.load(cache_u8_ptr + base + ks_offs)
-    v_c = gl.load(cache_u8_ptr + base + v_offs)
-    vs_c = gl.load(cache_u8_ptr + base + vs_offs)
+    gl.amd.cdna4.async_copy.global_load_to_shared(k_smem.index(0), cache_ptr + base + blk_src)
+    gl.amd.cdna4.async_copy.global_load_to_shared(s_smem.index(0), cache_ptr + base + s_src)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.global_load_to_shared(v_smem.index(0), cache_ptr + base + K4V4PT_V_OFF + blk_src)
+    gl.amd.cdna4.async_copy.commit_group()
 
-    m3 = gl.full([NW, HG], float("-inf"), gl.float32, WH)
-    l3 = gl.zeros([NW, HG], gl.float32, WH)
-    o3 = gl.zeros([NW, D, HG], gl.float32, PV3)
-    for j in range(nvalid):
-        b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j + 2, nvalid)
+    m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, ROW)
+    l_i = gl.zeros([BLOCK_M], gl.float32, ROW)
+    acc = gl.zeros([BLOCK_M, D], gl.float32, MFMA)
+    f_acc = 1.0  # O is held in units of the last page's max Vs / P_SCALE
+    buf = 0
+    for j in range(n_iter):
+        b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j0 + j + 2, j_end)
+        gl.amd.cdna4.async_copy.wait_group(1)  # page j's K / scales (its V may still be in flight)
+        gl.barrier()  # every wave's: K / scales of page j landed, page j - 1 consumed
         nbase = p_nxt.to(gl.int64) * stride_page + head_off
-        k_n = gl.load(cache_u8_ptr + nbase + k_offs)
-        ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
-        v_n = gl.load(cache_u8_ptr + nbase + v_offs)
-        vs_n = gl.load(cache_u8_ptr + nbase + vs_offs)
+        gl.amd.cdna4.async_copy.global_load_to_shared(k_smem.index(1 - buf), cache_ptr + nbase + blk_src)
+        gl.amd.cdna4.async_copy.global_load_to_shared(s_smem.index(1 - buf), cache_ptr + nbase + s_src)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.global_load_to_shared(v_smem.index(1 - buf), cache_ptr + nbase + K4V4PT_V_OFF + blk_src)
+        gl.amd.cdna4.async_copy.commit_group()
 
-        s = gl.zeros([PAGE, HG], gl.float32, QK)
-        s = gl.amd.cdna4.mfma_scaled(k_c, ks_c, "e2m1", q_t, q_sc, "e4m3", s)
-        if j == n_safe:  # the diagonal block: mask keys after pos
-            s = gl.where((b_cur * PAGE + tok <= pos)[:, None], s, float("-inf"))
-        # wave w's 32 keys, in the kappa order its PV consumes
-        s3 = s.reshape([2, NW, 4, 4, HG]).permute((1, 2, 0, 3, 4)).reshape([NW, 32, HG])
-        m_new = gl.maximum(m3, gl.max(s3, axis=1) * qk_scale_log2)
-        m_use = gl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = gl.exp2(m3 - m_use)
-        p3 = gl.exp2(s3 * qk_scale_log2 - m_use[:, None, :])
-        p3 = p3.to(gl.bfloat16)
-        l3 = l3 * alpha + gl.sum(p3.to(gl.float32), axis=1)
-        v3 = gl.amd.cdna4.scaled_upcast(v_c, unit_sc, gl.bfloat16, axis=2)
-        v3 = gl.convert_layout(v3, VA3, assert_trivial=True)
-        sc = (vs_c.to(gl.int16) << 7).to(gl.bfloat16, bitcast=True)  # 2^(s - 127)
-        v3 = (v3.reshape([NW, 4, 32, 32]) * gl.expand_dims(sc, 2)).reshape([NW, D, 32])
-        v3 = gl.convert_layout(v3, VA3, assert_trivial=True)
-        p3 = gl.convert_layout(p3, PB3, assert_trivial=True)
-        o3 = o3 * gl.convert_layout(alpha, OWH)[:, None, :]
-        o3 = gl.amd.cdna4.mfma(v3, p3, o3)
-        m3 = m_new
+        k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_k_view(k_smem.index(buf)), B_OP)
+        sb = s_smem.index(buf)
+        ks_c = sb.reinterpret(gl.uint8, [PAGE, NUM_SCALES], FLAT2).load(K_SCL)
+        vs_c = sb.reinterpret(gl.float32, [2, PAGE], FLAT1).index(1).load(COL)
 
-        k_c = k_n
-        ks_c = ks_n
-        v_c = v_n
-        vs_c = vs_n
+        s = gl.zeros([BLOCK_M, PAGE], gl.float32, MFMA)
+        s = gl.amd.cdna4.mfma_scaled(q, qs, "e4m3", k_c, ks_c, "e2m1", s)
+        if j0 + j == n_safe:  # the diagonal block: mask the keys after pos
+            s = gl.where((b_cur * PAGE + tok_n <= pos)[None, :], s, float("-inf"))
+        m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
+        alpha = gl.exp2(m_i - m_new)
+        p = gl.exp2(s * qk_scale_log2 - m_new[:, None])
+        l_i = l_i * alpha + gl.sum(p, axis=1)
+        # P * Vs along the keys while fp32, in units of the page's max Vs / P_SCALE
+        vmax = gl.max(vs_c, axis=0)
+        p8 = (p * (vs_c * (P_SCALE / vmax))[None, :]).to(gl.float8e4nv)
+        f_new = vmax / P_SCALE
+        acc = acc * (alpha * (f_acc / f_new))[:, None]
+
+        gl.amd.cdna4.async_copy.wait_group(2)  # page j's V (page j + 1's two groups in flight)
+        gl.barrier()  # every wave's V copy of page j
+        v_op = gl.amd.cdna4.load_shared_fp4_repacked(v_smem.index(buf).reshape([PAGE, D // 2]), B_OP)
+        acc = gl.amd.cdna4.mfma_scaled(gl.convert_layout(p8, A_OP), None, "e4m3", v_op, None, "e2m1", acc)
+        f_acc = f_new
+        m_i = m_new
+        buf = 1 - buf
         b_cur = b_nxt
         b_nxt = b_nxt2
         p_nxt = p_nxt2
+    gl.amd.cdna4.async_copy.wait_group(0)  # the last (unused) prefetch
 
-    # Combine the waves once: rescale each to the common max and sum.
-    m_all = gl.max(m3, axis=0)
-    m_all_u = gl.where(m_all == float("-inf"), 0.0, m_all)
-    wgt = gl.exp2(m3 - m_all_u[None, :])
-    l_all = gl.sum(wgt * l3, axis=0)
-    o = gl.sum(o3 * gl.convert_layout(wgt, OWH)[:, None, :], axis=0)  # [D, HG]
-    OL: gl.constexpr = gl.SliceLayout(0, PV3)
-    od = gl.arange(0, D, layout=gl.SliceLayout(1, OL))[:, None]
-    on = gl.arange(0, HG, layout=gl.SliceLayout(0, OL))[None, :]
-    l_o = gl.convert_layout(l_all, gl.SliceLayout(0, OL))
-    if SPLITS == 1:
-        inv_l = gl.where(l_o > 0, 1.0 / l_o, 0.0)
-        gl.store(
-            out_ptr + row.to(gl.int64) * stride_ot + (g * HG + on) * stride_oh + od,
-            (o * inv_l[None, :]).to(gl.bfloat16),
-        )
+    om = gl.arange(0, BLOCK_M, layout=ROW)[:, None]
+    od = gl.arange(0, D, layout=COL)[None, :]
+    if NSEG == 1:
+        o = acc * gl.where(l_i > 0, f_acc / l_i, 0.0)[:, None]
+        gl.store(out_ptr + grp.to(gl.int64) * stride_ot + (g * HG + om) * D + od, o.to(gl.bfloat16))
     else:
-        part = (g * gl.num_programs(0) + row).to(gl.int64) * SPLITS + sid
-        gl.store(part_o_ptr + part * (HG * D) + on * D + od, o)
-        hh = gl.arange(0, HG, layout=gl.SliceLayout(0, OL))
-        gl.store(part_ml_ptr + part * (HG * 2) + hh * 2, gl.convert_layout(m_all, gl.SliceLayout(0, OL)))
-        gl.store(part_ml_ptr + part * (HG * 2) + hh * 2 + 1, l_o)
+        n_prog = gl.num_programs(0).to(gl.int64) * gl.num_programs(1)
+        n_part = n_prog * NSEG
+        part_ml = ws_ptr + n_part * (BLOCK_M * D)
+        seg_count = (part_ml + n_part * (BLOCK_M * 2)).to(gl.pointer_type(gl.int32), bitcast=True)
+        pair = (g * gl.num_programs(0) + grp).to(gl.int64)
+        if sid == 0:
+            gl.store(seg_count + pair, n_pages)
+        if n_iter > 0:
+            part = pair * NSEG + sid
+            mm = gl.arange(0, BLOCK_M, layout=ROW)
+            gl.store(ws_ptr + part * (BLOCK_M * D) + om * D + od, acc * f_acc)
+            gl.store(part_ml + part * (BLOCK_M * 2) + mm * 2, m_i)
+            gl.store(part_ml + part * (BLOCK_M * 2) + mm * 2 + 1, l_i)

@@ -57,14 +57,6 @@ def _v_offsets(t, d, D: tl.constexpr):
 
 
 @triton.jit
-def _wave_kappa(t):
-    """(wave, kappa) of page key t in the k4v4 V layout: the per-wave kernel's
-    S^T MFMA gives wave w the tiles 16 w and 64 + 16 w, so key
-    t = 64 r + 16 w + 4 j + e is wave w's kappa = 8 j + 4 r + e."""
-    return (t // 16) % 4, 8 * ((t // 4) % 4) + 4 * (t // 64) + t % 4
-
-
-@triton.jit
 def _mxfp8_quant(x, M: tl.constexpr, D: tl.constexpr):
     """fp32 [M, D] -> (e4m3 [M, D], E8M0 [M, D/32], the dequantized fp32).
     The scale is the smallest power of two that fits the block max in e4m3."""
@@ -545,32 +537,41 @@ def msa_sort_topk_kernel(
 
 
 # ---------------------------------------------------------------------------
-# k4v4 KV cache: K and V both MXFP4, one record per (page, KV head):
+# k4v4pt KV cache: MXFP4 K, V e2m1 with one fp32 scale per token. One record per
+# (page, KV head), 17,408 B:
 #   [0, 8192)       K, MXFP4, preshuffled (as k4v8)
 #   [8192, 8704)    K scales, E8M0 [t, D/32] (as k4v8)
-#   [8704, 16896)   V, MXFP4 of each token (E8M0 per 32 head dims), per wave:
-#                   [wave][d][kappa / 2], the even kappa in the low nibble
-#   [16896, 17408)  V scales, E8M0 [wave][d / 32][kappa]
-# (wave, kappa) of key t: _wave_kappa, the order the S^T accumulators hold.
+#   [8704, 16896)   V, e2m1 packed along D: byte j of token t holds d = 2j (low
+#                   nibble), 2j + 1
+#   [16896, 17408)  V scales, fp32 [t] = max_d |V[t, d]| * fp32(1 / 6) (1 for a zero row)
 # ---------------------------------------------------------------------------
-V4_BYTES = PAGE * HEAD_DIM // 2
-V4S_BYTES = PAGE * HEAD_DIM // 32
-RECORD4_BYTES = K_BYTES + KS_BYTES + V4_BYTES + V4S_BYTES
+K4V4PT_V_BYTES = PAGE * HEAD_DIM // 2
+K4V4PT_VS_BYTES = PAGE * 4
+K4V4PT_RECORD_BYTES = K_BYTES + KS_BYTES + K4V4PT_V_BYTES + K4V4PT_VS_BYTES
 
 
-_msa_k4v4_store_kernel_repr = make_kernel_repr(
-    "msa_k4v4_store_kernel",
+@triton.jit
+def _e2m1_code(x):
+    """Round-to-nearest-even e2m1 code (sign in bit 3) of x, |x| <= 6."""
+    a = tl.abs(x)
+    mag = ((a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+           + (a >= 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32)
+           + (a > 5.0).to(tl.int32))
+    return mag | ((x < 0) | ((x == 0) & (1.0 / x < 0))).to(tl.int32) << 3
+
+
+_msa_k4v4pt_store_kernel_repr = make_kernel_repr(
+    "msa_k4v4pt_store_kernel",
     ['BLOCK_T'],
 )
 
 
-@triton.jit(repr=_msa_k4v4_store_kernel_repr)
-def msa_k4v4_store_kernel(
+@triton.jit(repr=_msa_k4v4pt_store_kernel_repr)
+def msa_k4v4pt_store_kernel(
     k_ptr,
     v_ptr,
     slot_ptr,
     cache_u8_ptr,
-    cache_i32_ptr,
     num_tokens,
     stride_kt,
     stride_kh,
@@ -582,11 +583,12 @@ def msa_k4v4_store_kernel(
     D: tl.constexpr,
     K_BYTES: tl.constexpr,
     KS_BYTES: tl.constexpr,
-    V4_BYTES: tl.constexpr,
+    V_BYTES: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    """K / V of BLOCK_T tokens of one KV head into their k4v4 slots (-1 skips).
-    Two tokens share each V byte, so V nibbles go in with 32-bit atomics."""
+    """K / V of BLOCK_T tokens of one KV head into their k4v4pt slots (-1 skips).
+    K as k4v8 (MXFP4, preshuffled); V per token: scale max |V| * fp32(1 / 6), the
+    round-to-nearest-even e2m1 codes of V / scale packed two a byte along D."""
     pid = tl.program_id(0)
     h = tl.program_id(1)
     offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -622,21 +624,17 @@ def msa_k4v4_store_kernel(
         mask=ok[:, None],
         other=0.0,
     ).to(tl.float32)
-    v_fp4, v_sc = _mxfp4_quant_op(v, D, BLOCK_T, 32)
-    lo, hi = v_fp4 & 0xF, v_fp4 >> 4  # dims 2c, 2c + 1
-    codes = tl.join(lo, hi).reshape(BLOCK_T, D).to(tl.int32)
-    w, kap = _wave_kappa(t)
-    w = w[:, None]
-    kap = kap[:, None]
-    vbase = base[:, None] + K_BYTES + KS_BYTES
-    byte = vbase + (w * D + offs_d[None, :]) * 16 + kap // 2
-    shift = (byte % 4) * 8 + (kap % 2) * 4
-    word = cache_i32_ptr + byte // 4
-    m2 = ok[:, None] & (offs_d[None, :] >= 0)
-    tl.atomic_and(word, ~(0xF << shift), mask=m2, sem="relaxed")
-    tl.atomic_or(word, codes << shift, mask=m2, sem="relaxed")
+    amax = tl.max(tl.abs(v), axis=1)
+    # scale = max |V| * fp32(1 / 6) (one multiply, the same in torch); V / scale
+    # correctly rounded (tl's / is approximate), so the bytes match a torch reference
+    vs = tl.where(amax > 0, amax * 0.16666666666666666, 1.0)
+    codes = _e2m1_code(tl.math.div_rn(v, tl.broadcast_to(vs[:, None], v.shape))).reshape(BLOCK_T, D // 2, 2)
+    lo, hi = tl.split(codes)
+    vbase = base + K_BYTES + KS_BYTES
     tl.store(
-        cache_u8_ptr + vbase + V4_BYTES + (w * (D // 32) + offs_g[None, :]) * 32 + kap,
-        v_sc,
+        cache_u8_ptr + vbase[:, None] + t[:, None] * (D // 2) + offs_b[None, :],
+        (lo | (hi << 4)).to(tl.uint8),
         mask=ok[:, None],
     )
+    vs_ptr = (cache_u8_ptr + vbase + V_BYTES + t * 4).to(tl.pointer_type(tl.float32), bitcast=True)
+    tl.store(vs_ptr, vs, mask=ok)

@@ -35,10 +35,9 @@ from aiter.ops.triton._triton_kernels.attention.msa import (
     msa_reduce_kernel,
     msa_q_mxfp8_kernel,
     msa_sort_topk_kernel,
-    RECORD4_BYTES,
-    V4_BYTES,
-    V4S_BYTES,
-    msa_k4v4_store_kernel,
+    K4V4PT_RECORD_BYTES,
+    K4V4PT_V_BYTES,
+    msa_k4v4pt_store_kernel,
 )
 
 __all__ = [
@@ -51,6 +50,10 @@ __all__ = [
     "msa_fwd",
     "msa_decode_splits",
     "msa_workspace",
+    "K4V4PT_RECORD_BYTES",
+    "msa_k4v4pt_alloc",
+    "msa_k4v4pt_store",
+    "msa_k4v4pt_dequant",
 ]
 
 _FP8 = torch.float8_e4m3fn  # gfx950 fp8 is OCP e4m3
@@ -274,15 +277,19 @@ def msa_fwd(
     workspace: the split partials and arrival counters, grown on demand and
     reused across calls (a module-level one per device by default). Size it
     with msa_workspace() before CUDA graph capture.
+    kv_format: "k4v8" (default) or "k4v4pt" (msa_k4v4pt_store's cache: MXFP4 K,
+    e2m1 V with an fp32 scale per token; decode only, MXFP8 q, bf16 out; needs
+    a Triton with gl.amd.cdna4.load_shared_fp4_repacked).
     """
-    if kv_format == "k4v4":
-        # K and V MXFP4 (msa_k4v4_store), the per-wave Gluon kernel; v_scale unused
-        return _k4v4_fwd(
+    if kv_format == "k4v4pt":
+        # MXFP4 K + e2m1 V with an fp32 scale per token (msa_k4v4pt_store); decode
+        # only, the Gluon msa_gfx950_gluon_k4v4pt_kernel; v_scale unused
+        return _k4v4pt_fwd(
             q, q_scale, kv_cache, topk, block_table, sm_scale, seq_lens,
-            decode_query_len, query_req, query_pos, out, kv_splits, q_mode,
+            decode_query_len, query_req, out, kv_splits, q_mode,
         )  # fmt: skip
     if kv_format != "k4v8":
-        raise ValueError(f"kv_format must be 'k4v8' or 'k4v4', got {kv_format!r}")
+        raise ValueError(f"kv_format must be 'k4v8' or 'k4v4pt', got {kv_format!r}")
     _check_cache(kv_cache)
     if backend == "gluon":
         return _gluon_fwd(
@@ -691,39 +698,35 @@ def _gluon_fwd(
     return out if out_mxfp8 is None else out_mxfp8
 
 
-# ----------------------------------------------------------------- k4v4 cache
+# ----------------------------------------------------------------- k4v4pt cache
 
 
-def msa_k4v4_alloc(num_pages: int, num_kv_heads: int, device) -> torch.Tensor:
-    """A zeroed k4v4 cache (K and V MXFP4), uint8 [pages, kv_heads, RECORD4_BYTES]."""
+def msa_k4v4pt_alloc(num_pages: int, num_kv_heads: int, device) -> torch.Tensor:
+    """A zeroed k4v4pt cache, uint8 [pages, kv_heads, K4V4PT_RECORD_BYTES]."""
     return torch.zeros(
-        (num_pages, num_kv_heads, RECORD4_BYTES), dtype=torch.uint8, device=device
+        (num_pages, num_kv_heads, K4V4PT_RECORD_BYTES), dtype=torch.uint8, device=device
     )
 
 
-def msa_k4v4_store(k, v, kv_cache, slot_mapping) -> None:
-    """Quantize k / v ([tokens, kv_heads, 128]) into their k4v4 slots."""
-    if kv_cache.dtype != torch.uint8 or kv_cache.shape[2] != RECORD4_BYTES:
-        raise ValueError("kv_cache must be uint8 [pages, kv_heads, RECORD4_BYTES]")
+def msa_k4v4pt_store(k, v, kv_cache, slot_mapping) -> None:
+    """Quantize k / v ([tokens, kv_heads, 128]) into their k4v4pt slots: K MXFP4
+    (as k4v8), V per token: scale max |V| * fp32(1 / 6), e2m1 codes of V / scale."""
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[2] != K4V4PT_RECORD_BYTES:
+        raise ValueError("kv_cache must be uint8 [pages, kv_heads, K4V4PT_RECORD_BYTES]")
     n = k.shape[0]
     if n == 0:
         return
     block_t = 16
-    msa_k4v4_store_kernel[(triton.cdiv(n, block_t), k.shape[1])](
-        k, v, slot_mapping, kv_cache, kv_cache.view(torch.int32), n,
+    msa_k4v4pt_store_kernel[(triton.cdiv(n, block_t), k.shape[1])](
+        k, v, slot_mapping, kv_cache, n,
         k.stride(0), k.stride(1), v.stride(0), v.stride(1),
         kv_cache.stride(0), kv_cache.stride(1),
         PAGE=PAGE, D=HEAD_DIM, K_BYTES=K_BYTES, KS_BYTES=KS_BYTES,
-        V4_BYTES=V4_BYTES, BLOCK_T=block_t, num_warps=4,
+        V_BYTES=K4V4PT_V_BYTES, BLOCK_T=block_t, num_warps=4,
     )  # fmt: skip
 
 
-def _wave_kappa_torch(t: torch.Tensor):
-    """(wave, kappa) of page key t in the k4v4 V layout."""
-    return (t // 16) % 4, 8 * ((t // 4) % 4) + 4 * (t // 64) + t % 4
-
-
-def msa_k4v4_dequant(kv_cache: torch.Tensor):
+def msa_k4v4pt_dequant(kv_cache: torch.Tensor):
     """Reference unpack: fp32 K and V, each [pages, kv_heads, PAGE, 128]."""
     P, H, _ = kv_cache.shape
     k, _ = msa_k4v8_dequant(
@@ -734,35 +737,35 @@ def msa_k4v4_dequant(kv_cache: torch.Tensor):
         1.0,
     )
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=kv_cache.device)
-    vb = kv_cache[..., K_BYTES + KS_BYTES : K_BYTES + KS_BYTES + V4_BYTES]
-    vb = vb.reshape(P, H, 4, HEAD_DIM, 16)
-    codes = torch.stack([vb & 0xF, vb >> 4], -1).reshape(P, H, 4, HEAD_DIM, 32)  # [w, d, kap]
-    w, kap = _wave_kappa_torch(torch.arange(PAGE, device=kv_cache.device))
-    vals = lut[codes.long()][:, :, w, :, kap]  # [t, P, H, d]
-    sc = kv_cache[..., K_BYTES + KS_BYTES + V4_BYTES :].reshape(P, H, 4, HEAD_DIM // 32, 32)
-    sc = torch.exp2(sc.float() - 127.0)[:, :, w, :, kap]  # [t, P, H, g]
-    v = vals.reshape(PAGE, P, H, HEAD_DIM // 32, 32) * sc[..., None]
-    return k, v.reshape(PAGE, P, H, HEAD_DIM).permute(1, 2, 0, 3).contiguous()
+    v0 = K_BYTES + KS_BYTES
+    vb = kv_cache[..., v0 : v0 + K4V4PT_V_BYTES].reshape(P, H, PAGE, HEAD_DIM // 2)
+    codes = torch.stack([vb & 0xF, vb >> 4], -1).reshape(P, H, PAGE, HEAD_DIM)
+    vs = kv_cache[..., v0 + K4V4PT_V_BYTES :].contiguous().view(torch.float32).reshape(P, H, PAGE)
+    return k, lut[codes.long()] * vs[..., None]
 
 
-def _k4v4_fwd(
+_K4V4PT_P_SCALE = 256.0
+_K4V4PT_ONE = {}  # the reduce's v_scale (1), per device
+
+
+def _k4v4pt_fwd(
     q, q_scale, kv_cache, topk, block_table, sm_scale, seq_lens, dql,
-    query_req, query_pos, out, kv_splits, q_mode,
+    query_req, out, kv_splits, q_mode,
 ):  # fmt: skip
     from aiter.ops.triton._gluon_kernels.gfx950.attention.msa import (
-        msa_gfx950_gluon_k4v4_kernel,
+        msa_gfx950_gluon_k4v4pt_kernel,
+        msa_gfx950_gluon_reduce_split_rebalance_kernel,
     )
 
-    rec = RECORD4_BYTES
-    if kv_cache.dtype != torch.uint8 or kv_cache.ndim != 3 or kv_cache.shape[2] != rec:
-        raise ValueError(f"kv_cache must be k4v4 uint8 [pages, kv_heads, {rec}]")
+    rec = K4V4PT_RECORD_BYTES
+    if kv_cache.dtype != torch.uint8 or kv_cache.ndim != 3 or kv_cache.shape[2] != rec or kv_cache.stride(2) != 1:
+        raise ValueError(f"kv_cache must be k4v4pt uint8 [pages, kv_heads, {rec}]")
+    if seq_lens is None or query_req is not None:
+        raise NotImplementedError("the k4v4pt attend is decode only (seq_lens + decode_query_len)")
     if q_mode != "mxfp8":
-        raise ValueError("the k4v4 attend takes one MXFP8 Q term (q_mode='mxfp8')")
+        raise ValueError("the k4v4pt attend takes one MXFP8 Q term (q_mode='mxfp8')")
     rows = q.shape[0]
     num_kv_heads = kv_cache.shape[1]
-    decode = seq_lens is not None
-    if decode == (query_req is not None):
-        raise ValueError("pass seq_lens + decode_query_len (decode) or query_req + query_pos")
     n_topk = topk.shape[2]
     dev = q.device
     if q_scale is not None:
@@ -781,62 +784,39 @@ def _k4v4_fwd(
                 q, q8, qs, 1.0, pairs, num_heads, q.stride(0), q.stride(1),
                 D=HEAD_DIM, QT=1, BLOCK=64, num_warps=4,
             )  # fmt: skip
-    hg = num_heads // num_kv_heads
-    if hg != 16 or num_heads % num_kv_heads:
-        raise ValueError("the k4v4 attend needs 16 query heads per KV head")
+    if num_heads != num_kv_heads * 16:
+        raise ValueError("the k4v4pt attend needs 16 query heads per KV head")
+    if topk.dtype != torch.int32 or topk.stride(2) != 1 or topk.stride(1) != n_topk:
+        raise ValueError("topk must be int32 [kv_heads, rows, TOPK], rows contiguous")
     if out is None:
         out = torch.empty((rows, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=dev)
+    elif out.dtype != torch.bfloat16 or out.stride(-1) != 1 or out.stride(-2) != HEAD_DIM:
+        raise ValueError("out must be bf16 [rows, H, 128] with contiguous heads")
     if rows == 0:
         return out
-    if kv_splits is None:
-        kv_splits = msa_gluon_splits(rows * num_kv_heads, n_topk, _cus(dev)) if decode else 1
-    if kv_splits < 1 or kv_splits & (kv_splits - 1) or n_topk % kv_splits:
-        raise ValueError("kv_splits must be a power of two dividing TOPK")
-    vs = torch.ones(1, dtype=torch.float32, device=dev)
-    if kv_splits > 1:
-        n = num_kv_heads * rows * kv_splits
-        part_o = torch.empty((n, 16, HEAD_DIM), dtype=torch.float32, device=dev)
-        part_ml = torch.empty((n, 16, 2), dtype=torch.float32, device=dev)
+    # split rebalance as k4v8 decode: segments of seg_pages picks, ~2 waves of CUs
+    if kv_splits is not None:
+        if kv_splits < 1:
+            raise ValueError("kv_splits must be positive")
+        seg_pages = triton.cdiv(n_topk, kv_splits)
     else:
-        part_o = part_ml = out
-    msa_gfx950_gluon_k4v4_kernel[(rows, num_kv_heads, kv_splits)](
-        q8, qs, kv_cache, topk, block_table,
-        seq_lens if decode else query_req, query_req if not decode else seq_lens,
-        query_pos if not decode else seq_lens, out, part_o, part_ml,
-        sm_scale * 1.4426950408889634, kv_cache.stride(0), kv_cache.stride(1),
-        topk.stride(0), topk.stride(1), block_table.stride(0), out.stride(0),
-        out.stride(1), NUM_HEADS=num_heads, TOPK=n_topk, SPLITS=kv_splits,
-        DECODE_QL=dql if decode else 0, num_warps=4,
+        seg_pages = msa_seg_pages(rows * num_kv_heads, n_topk, n_topk, _cus(dev))
+    nseg = triton.cdiv(n_topk, seg_pages)
+    st_ = torch.cuda.current_stream(dev).cuda_stream
+    n_pair = rows * num_kv_heads
+    ws = _gws(dev, st_, "split", n_pair * nseg * 16 * (HEAD_DIM + 2) + n_pair, torch.float32) if nseg > 1 else out
+    msa_gfx950_gluon_k4v4pt_kernel[(rows, num_kv_heads, nseg)](
+        q8, qs, kv_cache, topk, block_table, seq_lens, out, ws, sm_scale * 1.4426950408889634,
+        seg_pages, kv_cache.stride(0), topk.stride(0), block_table.stride(0), out.stride(0),
+        NUM_HEADS=num_heads, TOPK=n_topk, NSEG=nseg, DECODE_QL=dql, P_SCALE=_K4V4PT_P_SCALE,
+        NUM_WARPS=4, num_warps=4,
     )  # fmt: skip
-    if kv_splits > 1:
-        msa_reduce_kernel[(rows, num_kv_heads)](
-            part_o, part_ml, out, vs, rows, out.stride(0), out.stride(1),
-            BLOCK_M=16, HG=hg, D=HEAD_DIM, SPLITS=kv_splits, num_warps=4,
-        )  # fmt: skip
-    return out
-    if kv_splits is None:
-        kv_splits = msa_gluon_splits(rows * num_kv_heads, n_topk, _cus(dev)) if decode else 1
-    if kv_splits < 1 or kv_splits & (kv_splits - 1) or n_topk % kv_splits:
-        raise ValueError("kv_splits must be a power of two dividing TOPK")
-    if kv_splits > 1:
-        n = num_kv_heads * rows * kv_splits
-        part_o = torch.empty((n, 16, HEAD_DIM), dtype=torch.float32, device=dev)
-        part_ml = torch.empty((n, 16, 2), dtype=torch.float32, device=dev)
-    else:
-        part_o = part_ml = out
-    msa_gfx950_gluon_k4v4_kernel[(rows, num_kv_heads, kv_splits)](
-        q8, qs, kv_cache, topk, block_table,
-        seq_lens if decode else query_req, query_req if not decode else seq_lens,
-        query_pos if not decode else seq_lens, out, part_o, part_ml,
-        sm_scale * 1.4426950408889634, kv_cache.stride(0), kv_cache.stride(1),
-        topk.stride(0), topk.stride(1), block_table.stride(0), out.stride(0),
-        out.stride(1), NUM_HEADS=num_heads, TOPK=n_topk, SPLITS=kv_splits,
-        DECODE_QL=dql if decode else 0, num_warps=1,
-    )  # fmt: skip
-    if kv_splits > 1:
-        ones = torch.ones(1, dtype=torch.float32, device=dev)
-        msa_reduce_kernel[(rows, num_kv_heads)](
-            part_o, part_ml, out, ones, rows, out.stride(0), out.stride(1),
-            BLOCK_M=16, HG=hg, D=HEAD_DIM, SPLITS=kv_splits, num_warps=4,
+    if nseg > 1:
+        one = _K4V4PT_ONE.get(dev)
+        if one is None:
+            one = _K4V4PT_ONE[dev] = torch.ones(1, dtype=torch.float32, device=dev)
+        msa_gfx950_gluon_reduce_split_rebalance_kernel[(rows, num_kv_heads)](
+            ws, out, out, out, one, rows, seg_pages, out.stride(0),
+            BLOCK_M=16, NSEG=nseg, NUM_HEADS=num_heads, NUM_WARPS=4, OUT_MX=False, num_warps=4,
         )  # fmt: skip
     return out
