@@ -130,14 +130,8 @@ def test_exact_sigmoid_topk_matches_torch(
         device="cuda",
     )
 
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(
-        logits,
-        bias,
-        weights,
-        ids,
-    )
     # A pitch of experts + 17 keeps biased_grouped_topk on the Triton kernel.
-    assert not topk_ops._gfx1250_reg_mw_fits(logits, bias, weights, ids)
+    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
     topk_ops.biased_grouped_topk(
         logits,
         bias,
@@ -216,7 +210,8 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     ids_buf = torch.full((rows, stride), -7, dtype=torch.int32, device="cuda")
     weights, ids = weights_buf[:, :topk], ids_buf[:, :topk]
 
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
+    # biased_grouped_topk sends these rows to the HIP multi-wave kernel.
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
     topk_ops._gfx1250_exact_sigmoid_topk(
         logits, bias, weights, ids, need_renorm, 2.5, num_valid_rows
     )
@@ -233,8 +228,7 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     assert torch.equal(ids, hip_ids)
     torch.testing.assert_close(weights, hip_weights, atol=1e-6, rtol=1e-6)
 
-    # The public entry sends these rows to the HIP multi-wave kernel.
-    assert topk_ops._gfx1250_reg_mw_fits(logits, bias, weights, ids)
+    # The public entry gives the HIP kernel's bits.
     weights.fill_(-7.0)
     ids.fill_(-7)
     topk_ops.biased_grouped_topk(
@@ -244,6 +238,34 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     assert torch.equal(weights, hip_weights)
     assert torch.all(ids_buf[:, topk:] == -7)
     assert torch.all(weights_buf[:, topk:] == -7.0)
+
+
+@pytest.mark.parametrize(
+    "experts,weights_pitch",
+    [
+        (512, 9),  # The HIP op writes both outputs with the row stride of ids.
+        (900, 8),  # No multi-wave instance; contiguous rows.
+    ],
+)
+def test_exact_sigmoid_topk_triton_route(experts, weights_pitch, monkeypatch):
+    """Rows of whole quads that the multi-wave kernel cannot take stay on the
+    Triton kernel, with the reference's ids and weights."""
+    torch.manual_seed(experts + weights_pitch)
+    rows, topk = 32, 8
+    logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    weights = torch.full((rows, weights_pitch), -7.0, device="cuda")[:, :topk]
+    ids = torch.full((rows, topk), -7, dtype=torch.int32, device="cuda")
+
+    def no_hip(*args):
+        raise AssertionError("biased_grouped_topk took the HIP kernel")
+
+    monkeypatch.setattr(topk_ops, "biased_grouped_topk_hip", no_hip)
+    topk_ops.biased_grouped_topk(logits, bias, weights, ids, 1, 1, True, 2.5)
+
+    expected_weights, expected_ids = _torch_reference(logits, bias, topk, True, 2.5)
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
 
 
 def _unaligned_copy(t: torch.Tensor, pad: int) -> torch.Tensor:
@@ -286,8 +308,9 @@ def test_exact_sigmoid_topk_unaligned_base(experts, topk, rows, case, bias_dtype
         )
 
     weights, ids = outputs()
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(u_logits, u_bias, weights, ids)
-    assert topk_ops._gfx1250_reg_mw_fits(u_logits, u_bias, weights, ids)
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
+        u_logits, u_bias, weights, ids
+    )
     topk_ops.biased_grouped_topk(u_logits, u_bias, weights, ids, 1, 1, True, 2.5)
 
     aligned_w, aligned_ids = outputs()
@@ -320,7 +343,9 @@ def test_exact_sigmoid_topk_compiled_call(unaligned):
         logits, bias = _unaligned_copy(logits, 4), _unaligned_copy(bias, 0)
     eager_w = torch.full((64, 17), -7.0, dtype=torch.float32, device="cuda")
     eager_ids = torch.full((64, 17), -7, dtype=torch.int32, device="cuda")
-    assert topk_ops._gfx1250_reg_mw_fits(logits, bias, eager_w, eager_ids)
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
+        logits, bias, eager_w, eager_ids
+    )
     topk_ops.biased_grouped_topk(logits, bias, eager_w, eager_ids, 1, 1, True, 2.5)
 
     weights, ids = torch.empty_like(eager_w), torch.empty_like(eager_ids)

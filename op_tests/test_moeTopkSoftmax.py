@@ -1103,12 +1103,17 @@ stable_cases = [
     (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
     (1, 896, 17, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
 ]
-# Kimi-K3's FP32 bias, which the reference reads in BF16, and logits in rows of
-# a wider buffer. At E=256 the FP32 bias keeps the row off
+# Kimi-K3's FP32 bias, which the reference reads in the logits dtype, and logits
+# in rows of a wider buffer. At E=256 the FP32 bias keeps the row off
 # biased_grouped_topk_w32_kernel, so gfx1250 runs topk_reg_kernel's two-slot path.
+# Only the register paths take a bias of another dtype, so the FP16 rows check
+# that gfx1250 launches topk_reg_kernel at wave32 EPL 6, 16 and 32.
 fp32_bias_cases = [
     (160, 896, 17, dtypes.bf16, "biased", True, "random", False),
     (64, 256, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 192, 8, dtypes.fp16, "biased", True, "random", False),
+    (64, 512, 16, dtypes.fp16, "biased", False, "random", False),
+    (64, 1024, 4, dtypes.fp16, "biased", True, "forty_way_tie", False),
 ]
 # References padded to 260 experts, which take the LDS kernel at either wave
 # size (E + 4 would take topk_reg_kernel at wave64, not for E=128 at wave32).
