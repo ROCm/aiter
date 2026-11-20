@@ -12,8 +12,10 @@ Seam (post-mix seam with carried pre gate, DeepSeek-V4.1 decode):
   flydsl            flydsl_mhc_post_pre_rmsnorm
   flydsl_mega_mhc   aiter.ops.flydsl.flydsl_mega_mhc
   hip_mega_mhc      aiter.ops.mega_mhc.mega_mhc (pre-packed fn)
-  ``mxfp8+aux`` adds the auxiliary hidden state (mean of the four new streams): the
-  existing paths need an ``aiter.mhc_post`` and a ``mean`` launch for it.
+  ``mxfp8+aux`` adds the auxiliary hidden state (mean of the four new streams). The
+  existing paths get it from a second launch: ``*+mean`` is the mean of the seam's
+  own residual_out (the cheapest form), ``*+post+mean`` a separate ``aiter.mhc_post``
+  plus the mean (what a model that taps the residual before the seam runs).
 
 Tail (post-mix + collapse + final RMSNorm). ``post`` writes the layer input only,
 ``post+keep`` also the new residual R' (the existing paths always write it), and
@@ -125,11 +127,15 @@ def bench_seam(T, mode, x, wts, cfg):
     od = "bf16" if mode == "bf16" else "mxfp8"
     aux = mode.endswith("aux")
 
-    def served_aux(i):
-        # the existing aux path: a separate post-mix and mean of the four streams
+    def post_mean(i):
+        # a separate post-mix and mean of the four streams
         r = torch.empty_like(R[i])
         aiter.mhc_post(r, y[i], R[i], pm, cm)
         r.mean(dim=1)
+
+    def mean_of_out(i):
+        # mean of the four streams of the seam's own residual_out
+        RO[i].mean(dim=1)
 
     def fly(i):
         return flydsl_mhc_post_pre_rmsnorm(
@@ -137,26 +143,35 @@ def bench_seam(T, mode, x, wts, cfg):
             residual_out=RO[i], out_dtype=od, aux_mean=aux,
         )  # fmt: skip
 
-    def fly_mega(i):
+    def fly_mega(i, extra=None):
         out = flydsl_mega_mhc(
             R[i], fn, sc, base, *gates, pre, y[i], pm, cm, w, EPS,
             residual_out=RO[i], out_dtype=od,
         )  # fmt: skip
-        if aux:
-            served_aux(i)
+        if extra is not None:
+            extra(i)
         return out
 
-    def hip_mega(i):
+    def hip_mega(i, extra=None):
         out = mega_mhc(
             R[i], fn_hip, sc, base, *gates, pre, y[i], pm, cm, w, EPS,
             residual_out=RO[i], w_preshuffle_bf16=True, out_dtype=od,
             scale_row_major=od == "mxfp8",
         )  # fmt: skip
-        if aux:
-            served_aux(i)
+        if extra is not None:
+            extra(i)
         return out
 
-    cands = {"flydsl": fly, "flydsl_mega_mhc": fly_mega, "hip_mega_mhc": hip_mega}
+    if aux:
+        cands = {
+            "flydsl": fly,
+            "flydsl_mega_mhc+mean": lambda i: fly_mega(i, mean_of_out),
+            "hip_mega_mhc+mean": lambda i: hip_mega(i, mean_of_out),
+            "flydsl_mega_mhc+post+mean": lambda i: fly_mega(i, post_mean),
+            "hip_mega_mhc+post+mean": lambda i: hip_mega(i, post_mean),
+        }
+    else:
+        cands = {"flydsl": fly, "flydsl_mega_mhc": fly_mega, "hip_mega_mhc": hip_mega}
     return _row("seam", mode, T, measure(cands, *cfg))
 
 
@@ -196,7 +211,7 @@ def main():
         "--tokens",
         type=int,
         nargs="*",
-        default=[16, 32, 64, 128, 192, 256, 384, 512, 768],
+        default=[16, 32, 64, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096],
     )
     p.add_argument("--ops", nargs="*", default=["seam", "tail"])
     p.add_argument("--graph_calls", type=int, default=50)

@@ -12,10 +12,18 @@ Tables:
   test_mhc_post_collapse_rmsnorm the tail (``flydsl_mhc_post_collapse_rmsnorm``) with
                                  and without post-mix, keep_residual and aux_mean.
   test_mhc_seam_dispatch         every split-K configuration the dispatch picks
-                                 (1 ... 4096 rows, and with a CU mask: no split-K)
-                                 against the reference.
+                                 (1 ... 4096 rows) against the reference, also with
+                                 the bounded wait forced to hand off at once.
+  test_mhc_seam_rules            the supported / preferred / config helpers (CU mask,
+                                 rows past the aux range, spill-free configs) and the
+                                 warm-up helper.
+  test_mhc_seam_concurrent       seams on two streams at once, each grid at the CU
+                                 count, so their split-K waits compete for CUs.
   test_mhc_seam_edges            zero rows, rows scaled by 2^-3 ... 2^3, partial row
                                  block, empty batch.
+
+Only the new kernels' checks fail the test; the Mega-MHC timings on the same inputs
+report their mismatch ratio without failing it.
 
 MXFP8 codes and E8M0 bytes must equal the reference quantization of the kernel's
 own bf16 output to the bit.
@@ -215,8 +223,9 @@ def _err(want, got, msg, rtol, atol):
     )
 
 
-def check_seam(name, out, ref, mode, out_dtype, aux_mean):
-    """Worst mismatch ratio of all seam outputs against the reference."""
+def check_seam(name, out, ref, mode, out_dtype, aux_mean, gate=True):
+    """Worst mismatch ratio of all seam outputs against the reference; with ``gate``
+    a mismatch fails the test."""
     r_o, post_o, comb_o, li, pre_o = out[:5]
     norm = li[0] if out_dtype == "mxfp8" else li
     errs = []
@@ -242,7 +251,7 @@ def check_seam(name, out, ref, mode, out_dtype, aux_mean):
         own = r_o.float().mean(1).bfloat16()
         errs.append(_err(own, out[5], f"{name}: mean ", 1.6e-2, 1e-5))
     err = max(errs)
-    if err > 0:
+    if err > 0 and gate:
         _FAILURES.append(name)
     return err
 
@@ -338,7 +347,13 @@ def test_mhc_post_pre_rmsnorm(T, mode, out_dtype, aux_mean):
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = _seam_traffic(T, mode, out_dtype, aux_mean) / us / 1e6
         ret[f"{name} err"] = check_seam(
-            name, out, ref, mode, out_dtype, aux_mean and name == "flydsl"
+            name,
+            out,
+            ref,
+            mode,
+            out_dtype,
+            aux_mean and name == "flydsl",
+            gate=name == "flydsl",
         )
     if T:
         fly = candidates["flydsl"]
@@ -436,9 +451,19 @@ def test_mhc_post_collapse_rmsnorm(T, mode, keep_residual, aux_mean):
     return ret
 
 
+def _handoffs(device):
+    """Hand-offs counted so far in the split-K scratch of the current stream."""
+    from aiter.ops.flydsl import mhc_post_rmsnorm_kernels as mk
+
+    _, ctrl = mk._SCRATCH.get(device, torch.cuda.current_stream(device).stream_id)
+    return int(ctrl.view(-1, mk._CTRL_INTS)[:, 2].sum())
+
+
 @benchmark()
-def test_mhc_seam_dispatch(T, cu_masked):
-    """Each dispatch configuration (split count, waves) against the reference."""
+def test_mhc_seam_dispatch(T, spin):
+    """Each dispatch configuration (split count, waves) against the reference.
+    ``spin`` 0: every waiting split hands its columns to the last arrival, which
+    must give the same bits as the normal path."""
     from aiter.ops.flydsl import flydsl_mhc_pack_fn, flydsl_mhc_post_pre_rmsnorm
     from aiter.ops.flydsl import mhc_post_rmsnorm_kernels as mk
 
@@ -446,15 +471,150 @@ def test_mhc_seam_dispatch(T, cu_masked):
     ref = seam_ref(d, "post")
     args, kw = seam_call(d, "post")
     packed = (*args[:1], flydsl_mhc_pack_fn(d["fn"]), *args[2:])
-    cu = mk._cu_num(d["residual"].device)
-    ks, waves = mk._seam_config(T, cu, cu_masked)
-    with mock.patch.object(mk, "_cu_masked", lambda: cu_masked):
-        out = flydsl_mhc_post_pre_rmsnorm(*packed, out_dtype="mxfp8", **kw)
-    err = check_seam(f"dispatch T={T} ks={ks}", out, ref, "post", "mxfp8", False)
-    in_cus = -(-T // 16) * ks <= cu or ks == 1
+    dev = d["residual"].device
+    cu = mk._cu_num(dev)
+    ks, waves, stage = mk._seam_config(T, cu)
+    normal = flydsl_mhc_post_pre_rmsnorm(
+        *packed, out_dtype="mxfp8", aux_mean=True, **kw
+    )
+    n0 = _handoffs(dev)
+    with mock.patch.object(mk, "_SEAM_SPIN", spin):
+        out = flydsl_mhc_post_pre_rmsnorm(
+            *packed, out_dtype="mxfp8", aux_mean=True, **kw
+        )
+    torch.cuda.synchronize()
+    handoffs = _handoffs(dev) - n0
+    err = check_seam(
+        f"dispatch T={T} ks={ks} spin={spin}", out, ref, "post", "mxfp8", 1
+    )
+    same = _same(normal, out)
+    if not same:
+        _FAILURES.append(f"dispatch T={T} spin={spin}: differs from the normal path")
+    in_cus = mk._xcd_fits(-(-T // 16), ks, cu) or ks == 1
     if not in_cus:
-        _FAILURES.append(f"dispatch T={T}: grid exceeds the CU count")
-    return {"splits": ks, "waves": waves, "err": err, "grid within CUs": in_cus}
+        _FAILURES.append(f"dispatch T={T}: real workgroups exceed an XCD's CUs")
+    return {
+        "splits": ks,
+        "waves": waves,
+        "stage x1": stage,
+        "hand-offs": handoffs,
+        "err": err,
+        "bitwise = normal path": same,
+        "real WGs within XCD CUs": in_cus,
+    }
+
+
+@benchmark()
+def test_mhc_seam_rules():
+    """supported / preferred / config helpers, and the warm-up helper."""
+    from aiter.ops.flydsl import mhc_post_rmsnorm_kernels as mk
+    from aiter.ops.flydsl import warmup_flydsl_mhc_post_pre_rmsnorm
+
+    preferred = mk.flydsl_mhc_post_pre_rmsnorm_preferred
+    supported = mk.flydsl_mhc_post_pre_rmsnorm_supported
+
+    bad = []
+
+    def expect(cond, what):
+        if not cond:
+            bad.append(what)
+
+    expect(supported(4096, H, 4) and supported(0, H, 4), "supported 0 / 4096")
+    expect(not supported(4097, H, 4), "supported 4097")
+    expect(not supported(16, 7168, 4) and not supported(16, H, 8), "supported shape")
+    # the rule without a CU mask, whatever this process runs under
+    with mock.patch.object(mk, "_cu_masked", lambda: False):
+        expect(preferred(16, aux_mean=True), "aux preferred at 16")
+        expect(preferred(mk._AUX_PREFERRED_MAX, aux_mean=True), "aux preferred at max")
+        for t in (0, mk._AUX_PREFERRED_MAX + 1, 2048, 4096):
+            expect(not preferred(t, aux_mean=True), f"aux not preferred at {t}")
+        expect(preferred(129) and preferred(256), "plain preferred 129 / 256")
+        expect(not preferred(128) and not preferred(257), "plain preferred bounds")
+    with mock.patch.dict("os.environ", {"HSA_CU_MASK": "0:0-63"}):
+        expect(supported(256, H, 4), "supported under a CU mask")
+        expect(not preferred(256) and not preferred(16, True), "preferred, CU mask")
+    cu = mk._cu_num(torch.device("cuda"))
+    for t in range(1, 4097, 16):
+        ks, waves, stage = mk._seam_config(t, cu)
+        cpw = mk._CHUNKS // ks // waves
+        expect(mk._CHUNKS % (ks * waves) == 0, f"config T={t}: chunk split")
+        expect(waves < 16 or cpw == 1, f"config T={t}: 16 waves own > 1 chunk")
+        expect(stage == (cpw > mk._STAGE_CHUNKS), f"config T={t}: stage")
+        expect(mk._xcd_fits(-(-t // 16), ks, cu) or ks == 1, f"config T={t}: XCD")
+    # warm-up on a fresh stream, then capture without an eager call on it
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        cfgs = warmup_flydsl_mhc_post_pre_rmsnorm(300, out_dtype="mxfp8", aux_mean=True)
+    want = {mk._seam_config(b * 16, cu) for b in range(1, 20)}
+    expect(set(cfgs) == want, f"warm-up configs {cfgs}")
+    from aiter.ops.flydsl import flydsl_mhc_pack_fn, flydsl_mhc_post_pre_rmsnorm
+
+    d = make_inputs(200, seed=5)
+    args, kw = seam_call(d, "post")
+    packed = (*args[:1], flydsl_mhc_pack_fn(d["fn"]), *args[2:])
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = flydsl_mhc_post_pre_rmsnorm(*packed, out_dtype="mxfp8", **kw)
+    g.replay()
+    torch.cuda.synchronize()
+    eager = flydsl_mhc_post_pre_rmsnorm(*packed, out_dtype="mxfp8", **kw)
+    expect(_same(out, eager), "replay after warm-up")
+    if bad:
+        _FAILURES.append(f"rules: {bad}")
+    return {"checks failed": len(bad), "warm-up configs": len(cfgs)}
+
+
+@benchmark()
+def test_mhc_seam_concurrent(T):
+    """Two seams on two streams at once, 50 launches each, each grid at the CU
+    count: their waits compete for CUs and must still finish with exact results."""
+    from aiter.ops.flydsl import flydsl_mhc_pack_fn, flydsl_mhc_post_pre_rmsnorm
+    from aiter.ops.flydsl import mhc_post_rmsnorm_kernels as mk
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    calls, want = [], []
+    for i, s in enumerate(streams):
+        d = make_inputs(T, seed=40 + i)
+        args, kw = seam_call(d, "post")
+        packed = (*args[:1], flydsl_mhc_pack_fn(d["fn"]), *args[2:])
+        with torch.cuda.stream(s):
+            want.append(
+                [t.clone() for t in _flat(flydsl_mhc_post_pre_rmsnorm(*packed, **kw))]
+            )
+        calls.append((packed, kw))
+    torch.cuda.synchronize()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    n0 = 0
+    for s in streams:
+        with torch.cuda.stream(s):
+            n0 += _handoffs(dev)
+    outs = [None, None]
+    for _ in range(50):
+        for i, s in enumerate(streams):
+            with torch.cuda.stream(s):
+                outs[i] = flydsl_mhc_post_pre_rmsnorm(*calls[i][0], **calls[i][1])
+    torch.cuda.synchronize()
+    n1 = 0
+    for s in streams:
+        with torch.cuda.stream(s):
+            n1 += _handoffs(dev)
+    ok = all(
+        all(
+            torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            for a, b in zip(w, _flat(o))
+        )
+        for w, o in zip(want, outs)
+    )
+    if not ok:
+        _FAILURES.append(f"concurrent T={T}")
+    ks = mk._seam_config(T, mk._cu_num(dev))[0]
+    return {
+        "splits": ks,
+        "WGs per seam": -(-T // 16) * ks,
+        "hand-offs": n1 - n0,
+        "ok": ok,
+    }
 
 
 @benchmark()
@@ -565,9 +725,9 @@ def main():
         "--dispatch_tokens",
         type=int,
         nargs="*",
-        default=[1, 128, 129, 256, 257, 384, 385, 512, 513, 816, 832, 2048, 4096],
-    )
-    parser.add_argument("--cu_masked", type=int, nargs="*", default=[0, 1])
+        default=[1, 128, 129, 256, 257, 384, 385, 512, 513, 816, 832, 1024, 1025,
+                 2048, 2049, 4096],
+    )  # fmt: skip
     args = parser.parse_args()
 
     summarize(
@@ -595,9 +755,13 @@ def main():
     summarize(
         "mhc seam dispatch",
         [
-            test_mhc_seam_dispatch(T, bool(m))
-            for T, m in itertools.product(args.dispatch_tokens, args.cu_masked)
+            test_mhc_seam_dispatch(T, spin)
+            for T, spin in itertools.product(args.dispatch_tokens, [None, 0])
         ],
+    )
+    summarize("mhc seam rules", [test_mhc_seam_rules()])
+    summarize(
+        "mhc seam concurrent", [test_mhc_seam_concurrent(T) for T in (128, 816, 2048)]
     )
     summarize(
         "mhc seam edges",

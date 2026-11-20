@@ -8,9 +8,10 @@ projection, Sinkhorn gates, collapse with the carried pre gate, RMSNorm), with
 optional fused MXFP8 output and the mean of the four new streams (the auxiliary
 hidden state a speculative draft reads). Same arguments as ``flydsl_mega_mhc`` and
 ``aiter.ops.mega_mhc.mega_mhc`` except that ``fn`` comes pre-packed by
-``flydsl_mhc_pack_fn``. Tuned for decode row counts (16 ... 768); see
-``flydsl_mhc_post_pre_rmsnorm_supported`` for the shapes it takes and
-``flydsl_mhc_post_pre_rmsnorm_preferred`` for where it is faster than Mega-MHC.
+``flydsl_mhc_pack_fn``. Tuned for decode row counts; see
+``flydsl_mhc_post_pre_rmsnorm_supported`` for the shapes it takes,
+``flydsl_mhc_post_pre_rmsnorm_preferred`` for where it is faster than Mega-MHC and
+``warmup_flydsl_mhc_post_pre_rmsnorm`` to compile the variants before capture.
 
 ``flydsl_mhc_post_collapse_rmsnorm``: the step-end tail of the mHC residual in one
 launch (post-mix of the last sub-layer, collapse with the carried pre gate, final
@@ -36,6 +37,7 @@ __all__ = [
     "flydsl_mhc_post_pre_rmsnorm_preferred",
     "flydsl_mhc_post_pre_rmsnorm_supported",
     "prepare_flydsl_mhc_post_pre_rmsnorm",
+    "warmup_flydsl_mhc_post_pre_rmsnorm",
 ]
 
 _GFX = ("gfx950",)
@@ -52,9 +54,18 @@ _OUT_DTYPES = ("bf16", "mxfp8")
 _CU_MASK_ENV = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
 
 # (row blocks of 16 at most, split count, waves per workgroup), from graph-replay
-# sweeps at 16 ... 768 rows on MI355X (256 CUs). Past the table: the largest split
-# of 1 / 2 / 4 that keeps blocks * splits within the CU count.
-_TUNED = ((8, 20, 8), (16, 16, 10), (24, 10, 16), (32, 8, 5), (51, 5, 8))
+# sweeps on MI355X (256 CUs, 8 XCDs). Past the table: the largest split of 4 / 2 / 1
+# that fits the XCD bound below, 8 waves. Every entry compiles without scratch
+# (private_segment_fixed_size 0) for all 16 variants: 16-wave workgroups get only
+# 128 VGPRs and spill once a wave owns more than one chunk, so none is used.
+_TUNED = ((8, 20, 8), (16, 16, 10), (24, 10, 8), (32, 8, 5), (48, 5, 8))
+# Workgroup b runs on XCD b % 8 (the kernel's split-K mapping relies on it).
+_XCDS = 8
+# A wave owning more chunks than this stages x1 in the output instead of registers.
+_STAGE_CHUNKS = 8
+# Bounded wait of a split-K workgroup before it hands off: None is the kernel's
+# DIST_SPIN (1024 polls). Tests set 0 to force the hand-off path.
+_SEAM_SPIN = None
 
 
 def _require(cond: bool, msg: str, exc: type = ValueError) -> None:
@@ -74,30 +85,47 @@ def _cu_masked() -> bool:
     return any(os.environ.get(e) for e in _CU_MASK_ENV)
 
 
-def _seam_config(m: int, cu_num: int, cu_masked: bool) -> tuple[int, int]:
-    """(split count, waves) for ``m`` rows.
+def _xcd_fits(blocks: int, ks: int, cu_num: int) -> bool:
+    """Every real workgroup of ``blocks`` row blocks x ``ks`` splits has a CU of its
+    XCD: row block b and all its splits run on XCD b % 8."""
+    return -(-blocks // _XCDS) * ks <= cu_num // _XCDS
 
-    Split-K workgroups of a row block wait for the block's last arrival, so every
-    split must be resident: ``blocks * splits`` stays within the CU count, and
-    with a CU mask (residency unknown) the kernel runs unsplit.
+
+def _seam_config(m: int, cu_num: int) -> tuple[int, int, bool]:
+    """(split count, waves, stage x1) for ``m`` rows.
+
+    Split-K workgroups of a row block wait for the block's last arrival. The wait
+    is bounded (a split that waits too long hands its columns to the last arrival
+    and exits), so residency is a speed matter, not a correctness one. For speed
+    every real workgroup gets a CU at once: a row block and all its splits run on
+    one XCD, so the bound is per XCD (``_xcd_fits``), not ``blocks * splits <= CUs``
+    (51 blocks x 5 splits fit the CU count but put 35 workgroups on 3 of the XCDs'
+    32 CUs: 816 rows took 54 us instead of 39 us with 4 splits). The grid is padded to
+    whole groups of 8 row blocks; padding workgroups exit at once.
     """
     blocks = -(-m // _BLOCK_M)
-    if cu_masked:
-        return 1, 16
-    for bound, ks, waves in _TUNED:
+    ks = waves = None
+    for bound, k, w in _TUNED:
         if blocks <= bound:
-            if blocks * ks <= cu_num:
-                return ks, waves
+            if _xcd_fits(blocks, k, cu_num):
+                ks, waves = k, w
             break
-    ks = max(k for k in (1, 2, 4) if blocks * k <= cu_num or k == 1)
-    return ks, 8 if ks > 1 else 16
+    if ks is None:
+        ks = max(k for k in (1, 2, 4) if k == 1 or _xcd_fits(blocks, k, cu_num))
+        waves = 8
+    return ks, waves, _CHUNKS // ks // waves > _STAGE_CHUNKS
 
 
 def flydsl_mhc_post_pre_rmsnorm_supported(
     num_tokens: int, hidden_size: int, hc_mult: int, device=None
 ) -> bool:
     """True when ``flydsl_mhc_post_pre_rmsnorm`` takes this shape on this GPU:
-    gfx950, hc_mult 4, hidden 5120, 0 <= num_tokens <= 4096."""
+    gfx950, hc_mult 4, hidden 5120, 0 <= num_tokens <= 4096.
+
+    A CU mask (``HSA_CU_MASK`` / ``ROC_GLOBAL_CU_MASK``) does not change the answer:
+    the split-K wait is bounded, so the kernel stays correct with fewer CUs, but
+    it was not tuned for that (``flydsl_mhc_post_pre_rmsnorm_preferred`` is False).
+    """
     del device  # aiter assumes a homogeneous node
     return (
         get_gfx_runtime() in _GFX
@@ -107,10 +135,15 @@ def flydsl_mhc_post_pre_rmsnorm_supported(
     )
 
 
-# Rows where the plain seam beats both Mega-MHC kernels (MI355X, CUDA-graph replay of
-# the post-mix seam, bf16 and mxfp8 output): 6-15 % faster at 160 ... 256 rows, within
-# 2 % at 16 ... 128 rows, 11-25 % slower from 288 rows.
+# Measured on MI355X, CUDA-graph replay of the post-mix seam with carried pre gate,
+# bf16 and mxfp8 output, against HIP mega_mhc and flydsl_mega_mhc.
+# Plain seam: faster than both at 129 ... 256 rows (4-7 %), within 5 % (mostly
+# faster) at 16 ... 128 rows, slower from 288 rows.
 _PREFERRED_TOKENS = (129, 256)
+# aux_mean seam: faster than the cheapest alternative (a Mega-MHC seam plus the
+# stream mean of its residual_out) up to this many rows (1.04x at 1024 rows,
+# 0.85x at 1152).
+_AUX_PREFERRED_MAX = 1024
 
 
 def flydsl_mhc_post_pre_rmsnorm_preferred(
@@ -118,13 +151,15 @@ def flydsl_mhc_post_pre_rmsnorm_preferred(
 ) -> bool:
     """Measured dispatch rule against ``mega_mhc`` / ``flydsl_mega_mhc`` on gfx950.
 
-    With ``aux_mean`` the alternative is a Mega-MHC seam plus a separate post-mix and
-    mean launch, which this kernel beats at every supported row count; without it,
-    prefer this kernel for 129 ... 256 rows. Callers must also check
+    Without ``aux_mean``: 129 ... 256 rows. With ``aux_mean`` the alternative is a
+    Mega-MHC seam plus the mean of its ``residual_out``: 1 ... 1024 rows. False
+    under a CU mask (not tuned there). Callers must also check
     ``flydsl_mhc_post_pre_rmsnorm_supported``.
     """
+    if _cu_masked():
+        return False
     if aux_mean:
-        return 0 < num_tokens <= MHC_POST_PRE_RMSNORM_MAX_TOKENS
+        return 0 < num_tokens <= _AUX_PREFERRED_MAX
     return _PREFERRED_TOKENS[0] <= num_tokens <= _PREFERRED_TOKENS[1]
 
 
@@ -170,8 +205,10 @@ class _Scratch:
     """Per-(device, stream) split-K scratch, allocated at full size once.
 
     The counters are zeroed at allocation and re-arm themselves in the kernel, so
-    graph replays and back-to-back launches need no memset. Calls sharing a
-    stream run serially; seams on two streams use separate scratch.
+    graph replays and back-to-back launches need no memset. Calls sharing a stream
+    run serially and share it; seams on two streams use separate scratch, and may
+    overlap: a split that cannot get its block finished in time hands off instead
+    of waiting.
     """
 
     def __init__(self):
@@ -207,16 +244,85 @@ class _Scratch:
 _SCRATCH = _Scratch()
 
 
+def _device_of(device):
+    device = torch.device("cuda") if device is None else torch.device(device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def prepare_flydsl_mhc_post_pre_rmsnorm(device=None) -> None:
     """Allocate the seam's split-K scratch on the current stream of ``device``.
 
     Needed once per stream before CUDA-graph capture on that stream (one eager seam
-    call does the same). Weight independent.
+    call, or ``warmup_flydsl_mhc_post_pre_rmsnorm``, does the same). Weight
+    independent.
     """
-    device = torch.device("cuda") if device is None else torch.device(device)
-    if device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    device = _device_of(device)
     _SCRATCH.get(device, torch.cuda.current_stream(device).stream_id)
+
+
+def warmup_flydsl_mhc_post_pre_rmsnorm(
+    max_tokens: int,
+    *,
+    out_dtype: str = "bf16",
+    aux_mean: bool = False,
+    has_post: bool = True,
+    identity_pre: bool = False,
+    sinkhorn_repeat: int = 20,
+    device=None,
+) -> list[tuple[int, int, bool]]:
+    """Compile (and run once, on zero inputs) every split configuration the seam
+    picks for 1 ... ``max_tokens`` rows of one variant, on the current stream.
+
+    Each configuration and variant is a separate kernel that otherwise compiles on
+    its first call; call this before CUDA-graph capture, once per variant the model
+    captures (``sinkhorn_repeat`` is a compile-time constant too). Also prepares the
+    stream's split-K scratch. Returns the (split count, waves, stage x1)
+    configurations it compiled.
+    """
+    _require(
+        not torch.cuda.is_current_stream_capturing(),
+        "warm up before CUDA-graph capture",
+        RuntimeError,
+    )
+    _require(
+        0 <= max_tokens <= MHC_POST_PRE_RMSNORM_MAX_TOKENS,
+        f"max_tokens must be in [0, {MHC_POST_PRE_RMSNORM_MAX_TOKENS}]",
+    )
+    device = _device_of(device)
+    cu = _cu_num(device)
+    rows = {}
+    for blocks in range(1, -(-max_tokens // _BLOCK_M) + 1):
+        rows.setdefault(
+            _seam_config(blocks * _BLOCK_M, cu), min(blocks * _BLOCK_M, max_tokens)
+        )
+    if not rows:
+        prepare_flydsl_mhc_post_pre_rmsnorm(device)
+        return []
+    T = max(rows.values())
+    with torch.no_grad():
+        z = torch.zeros(T, _N, _H, dtype=torch.bfloat16, device=device)
+        fn_packed = torch.zeros(
+            _N, _CHUNKS, 3, 4, 16, 8, dtype=torch.bfloat16, device=device
+        )
+        sc = torch.zeros(3, device=device)
+        base = torch.zeros(_N_MIX, device=device)
+        w = torch.zeros(_H, dtype=torch.bfloat16, device=device)
+        pre = torch.zeros(T, _N, device=device)
+        y = torch.zeros(T, _H, dtype=torch.bfloat16, device=device)
+        pm = torch.zeros(T, _N, 1, device=device)
+        cm = torch.zeros(T, _N, _N, device=device)
+        rout = torch.empty_like(z)
+        for t in rows.values():
+            post = (y[:t], pm[:t], cm[:t]) if has_post else (None, None, None)
+            flydsl_mhc_post_pre_rmsnorm(
+                z[:t], fn_packed, sc, base, 1e-6, 1e-6, 1e-6, 1.0,
+                sinkhorn_repeat, None if identity_pre else pre[:t], *post, w, 1e-6,
+                residual_out=rout[:t] if has_post else None,
+                out_dtype=out_dtype, aux_mean=aux_mean,
+            )  # fmt: skip
+    return list(rows)
 
 
 def _check_post(T, H, sublayer_out, post_layer_mix, comb_res_mix):
@@ -322,15 +428,17 @@ def flydsl_mhc_post_pre_rmsnorm(
         ``residual``.
 
     Calls on one stream share a split-K scratch and must run serially. Before CUDA
-    graph capture on a stream, call ``prepare_flydsl_mhc_post_pre_rmsnorm`` or one
-    eager seam on it. Split-K workgroups of a row block wait for each other, which
-    needs them resident at once: with ``HSA_CU_MASK`` / ``ROC_GLOBAL_CU_MASK`` set
-    the kernel runs without split-K.
+    graph capture on a stream, call ``warmup_flydsl_mhc_post_pre_rmsnorm`` (compiles
+    the variants too), ``prepare_flydsl_mhc_post_pre_rmsnorm`` or one eager seam on
+    it. Split-K workgroups of a row block wait for the block's last arrival for a
+    bounded time and then hand their columns to it, so the kernel completes even
+    when they are not all resident (CU masks, concurrent kernels), only slower.
     """
     from aiter.ops.flydsl.kernels.mhc_post_pre_rmsnorm import (
+        DIST_SPIN,
         compile_mhc_post_pre_rmsnorm,
     )
-    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
     _require(out_dtype in _OUT_DTYPES, f"out_dtype must be one of {_OUT_DTYPES}")
     T = _check_residual(residual)
@@ -423,36 +531,49 @@ def flydsl_mhc_post_pre_rmsnorm(
 
     stream = torch.cuda.current_stream(device)
     part, ctrl = _SCRATCH.get(device, stream.stream_id)
-    ks, waves = _seam_config(T, _cu_num(device), _cu_masked())
+    ks, waves, stage = _seam_config(T, _cu_num(device))
+    spin = DIST_SPIN if _SEAM_SPIN is None else _SEAM_SPIN
     launcher = compile_mhc_post_pre_rmsnorm(
-        ks, waves, has_post, ident_pre, quant, aux_mean, int(sinkhorn_repeat)
+        ks,
+        waves,
+        has_post,
+        ident_pre,
+        quant,
+        aux_mean,
+        int(sinkhorn_repeat),
+        stage,
+        spin,
     )
-    dummy = residual.data_ptr()
 
     def ptr(t):
-        return dummy if t is None else t.data_ptr()
+        return ptr_arg(residual if t is None else t)
 
     _run_compiled(
         launcher,
-        residual.data_ptr(),
-        fn_packed.data_ptr(),
-        ptr(sublayer_out),
-        ptr(post_layer_mix),
-        ptr(comb_res_mix),
-        ptr(pre_mix),
-        hc_scale.data_ptr(),
-        hc_base.data_ptr(),
-        norm_weight.data_ptr(),
-        residual_out.data_ptr(),
-        post.data_ptr(),
-        comb.data_ptr(),
-        next_pre.data_ptr(),
-        norm.data_ptr(),
-        ptr(codes),
-        ptr(scales),
-        ptr(mean),
-        part.data_ptr(),
-        ctrl.data_ptr(),
+        *[
+            ptr(t)
+            for t in (
+                residual,
+                fn_packed,
+                sublayer_out,
+                post_layer_mix,
+                comb_res_mix,
+                pre_mix,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                residual_out,
+                post,
+                comb,
+                next_pre,
+                norm,
+                codes,
+                scales,
+                mean,
+                part,
+                ctrl,
+            )
+        ],
         T,
         _f32_bits(rms_eps),
         _f32_bits(hc_pre_eps),
@@ -502,7 +623,7 @@ def flydsl_mhc_post_collapse_rmsnorm(
     from aiter.ops.flydsl.kernels.mhc_post_collapse_rmsnorm import (
         compile_mhc_post_collapse_rmsnorm,
     )
-    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
     T = _check_residual(residual)
     _require(T * _N * _H * 2 < 2**31, "residual must stay below 2 GiB")
@@ -541,22 +662,26 @@ def flydsl_mhc_post_collapse_rmsnorm(
     out = torch.empty(T, _H, dtype=torch.bfloat16, device=device)
     mean = torch.empty(T, _H, dtype=torch.bfloat16, device=device) if aux_mean else None
     if T:
-        dummy = out.data_ptr()
 
         def ptr(t):
-            return dummy if t is None else t.data_ptr()
+            return ptr_arg(out if t is None else t)
 
         _run_compiled(
             compile_mhc_post_collapse_rmsnorm(has_post, keep, aux_mean),
-            residual.data_ptr(),
-            ptr(sublayer_out),
-            ptr(post_layer_mix),
-            ptr(comb_res_mix),
-            pre_mix.data_ptr(),
-            norm_weight.data_ptr(),
-            ptr(residual_out),
-            out.data_ptr(),
-            ptr(mean),
+            *[
+                ptr(t)
+                for t in (
+                    residual,
+                    sublayer_out,
+                    post_layer_mix,
+                    comb_res_mix,
+                    pre_mix,
+                    norm_weight,
+                    residual_out,
+                    out,
+                    mean,
+                )
+            ],
             T,
             _f32_bits(norm_eps),
             torch.cuda.current_stream(device),

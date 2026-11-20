@@ -123,6 +123,10 @@ _LAZY_IMPORTS = {
         ".mhc_post_rmsnorm_kernels",
         "prepare_flydsl_mhc_post_pre_rmsnorm",
     ),
+    "warmup_flydsl_mhc_post_pre_rmsnorm": (
+        ".mhc_post_rmsnorm_kernels",
+        "warmup_flydsl_mhc_post_pre_rmsnorm",
+    ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
@@ -343,6 +347,7 @@ __all__ = [
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
     "sparse_pa_nvfp4_prefill",
+    "warmup_flydsl_mhc_post_pre_rmsnorm",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"

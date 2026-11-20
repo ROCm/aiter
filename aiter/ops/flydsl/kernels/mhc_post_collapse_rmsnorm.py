@@ -30,15 +30,19 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import AITER_FLYDSL_KERNARG_PRELOAD
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 H = 5120
 N_STREAMS = 4
-ROW_DW = H // 2  # dwords of one bf16 row
-NTHR = H // 8  # one lane per 8 columns
+U_ROW = H // 8  # 16 B units of one bf16 row
+NTHR = H // 8  # one lane per 8 columns (one 16 B unit)
 WAVES = NTHR // 64
-KERNARG_PRELOAD_COUNT = 16
 
 # DPP controls: row_shr:n = 0x110 + n, row_bcast:15 = 0x142, row_bcast:31 = 0x143
 DPP_ROW_SHR = 0x110
@@ -47,10 +51,13 @@ DPP_ROW_BCAST31 = 0x143
 
 
 def _dpp_f32(v, ctrl, row_mask=0xF, old=None):
+    # rocdl.update_dpp with bound_ctrl (0 for an invalid source lane) and, without
+    # ``old``, an undef old value: every lane of an enabled row is written and LLVM
+    # can fold the move into the consuming add (v_add_f32_dpp). dpp_utils' helpers
+    # pass the source as the old value with bound_ctrl off, which blocks the fold
+    # (an extra v_mov_b32_dpp + s_nop per use in the ISA) and has no row_shr /
+    # row_bcast patterns.
     if old is None:
-        # No fx spelling of an undef operand. With bound_ctrl every lane of an enabled
-        # row is written (0 for an invalid source), so the old value is dead and need
-        # not be materialized.
         old_v = llvm.mlir_undef(T.i32)
     else:
         old_v = fx.Float32(old).bitcast(fx.Int32).ir_value()
@@ -77,16 +84,8 @@ def _unpack8(v):
 
 
 def _pack8(vals):
-    """Eight fp32 values -> four dwords of bf16 (round to nearest even)."""
-    return [
-        fx.Int32(
-            rocdl.cvt_pk_bf16_f32(
-                fx.Float32(vals[2 * i]).ir_value(),
-                fx.Float32(vals[2 * i + 1]).ir_value(),
-            )
-        )
-        for i in range(4)
-    ]
+    """Eight fp32 -> four dwords of bf16 (round to nearest even, v_cvt_pk_bf16_f32)."""
+    return Vec(Vec.from_elements(vals, fx.Float32).to(fx.BFloat16)).bitcast(fx.Int32)
 
 
 @functools.cache
@@ -111,50 +110,54 @@ def compile_mhc_post_collapse_rmsnorm(has_post: bool, keep_residual: bool, mean:
     def kernel(
         i32_m: fx.Int32,
         i32_eps: fx.Int32,
-        arg_res: fx.Int64,  # [m, 4, H] bf16
-        arg_y: fx.Int64,  # [m, H] bf16
-        arg_pm: fx.Int64,  # [m, 4] f32
-        arg_cm: fx.Int64,  # [m, 4, 4] f32
-        arg_pre: fx.Int64,  # [m, 4] f32
-        arg_nw: fx.Int64,  # [H] bf16
-        arg_rout: fx.Int64,  # [m, 4, H] bf16
-        arg_out: fx.Int64,  # [m, H] bf16
-        arg_mean: fx.Int64,  # [m, H] bf16
+        arg_res: fx.Pointer,  # [m, 4, H] bf16
+        arg_y: fx.Pointer,  # [m, H] bf16
+        arg_pm: fx.Pointer,  # [m, 4] f32
+        arg_cm: fx.Pointer,  # [m, 4, 4] f32
+        arg_pre: fx.Pointer,  # [m, 4] f32
+        arg_nw: fx.Pointer,  # [H] bf16
+        arg_rout: fx.Pointer,  # [m, 4, H] bf16
+        arg_out: fx.Pointer,  # [m, H] bf16
+        arg_mean: fx.Pointer,  # [m, H] bf16
     ):
         tx = fx.thread_idx.x
         row = fx.block_idx.x
         lane = tx % 64
+        # wave index in an SGPR (no fx spelling of a wave-uniform value)
         wave = fx.Int32(rocdl.readfirstlane(T.i32, tx // 64))
         smem = fx.SharedAllocator().allocate(Shared).peek()
         part = smem.part.ptr
         m64 = fx.Int64(i32_m)
 
-        def rsrc(addr, nbytes):
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr, num_records_bytes=nbytes
+        def v16(ptr, nbytes):  # 16 B units, exact size
+            return ptr_buf_tensor(ptr, fx.Int32, unit_elems=4, num_records_bytes=nbytes)
+
+        def vf4(ptr, nbytes):  # 4 x fp32 units
+            return ptr_buf_tensor(
+                ptr, fx.Float32, unit_elems=4, num_records_bytes=nbytes
             )
 
-        def ldf(r, off, n):
-            v = buffer_ops.buffer_load(r, off, vec_width=n, dtype=fx.Float32)
-            return Vec(v) if n > 1 else fx.Float32(v)
+        def ld16(t, u):
+            return buf_copy_load(t, u, fx.Int32, 4)
 
-        def ld4(r, off):
-            return Vec(buffer_ops.buffer_load(r, off, vec_width=4, dtype=fx.Int32))
+        def st16(t, u, v):
+            buf_copy_store(t, u, v, fx.Int32, 4)
 
-        rr = rsrc(arg_res, m64 * (N_STREAMS * H * 2))
-        nwr = rsrc(arg_nw, H * 2)
-        outr = rsrc(arg_out, m64 * (H * 2))
-        qv = ldf(rsrc(arg_pre, m64 * 16), row * 4, 4)
+        res_t = v16(arg_res, m64 * (N_STREAMS * H * 2))
+        qv = buf_copy_load(vf4(arg_pre, m64 * 16), row, fx.Float32, 4)
         rs = [
-            ld4(rr, row * (N_STREAMS * ROW_DW) + s * ROW_DW + tx * 4)
+            ld16(res_t, row * (N_STREAMS * U_ROW) + s * U_ROW + tx)
             for s in range_constexpr(N_STREAMS)
         ]
-        w = _unpack8(ld4(nwr, tx * 4))
+        w = _unpack8(ld16(v16(arg_nw, H * 2), tx))
         if fx.const_expr(has_post):
-            yv = _unpack8(ld4(rsrc(arg_y, m64 * (H * 2)), row * ROW_DW + tx * 4))
-            pv = ldf(rsrc(arg_pm, m64 * 16), row * 4, 4)
-            cmr = rsrc(arg_cm, m64 * 64)
-            cv = [ldf(cmr, row * 16 + 4 * h, 4) for h in range_constexpr(N_STREAMS)]
+            yv = _unpack8(ld16(v16(arg_y, m64 * (H * 2)), row * U_ROW + tx))
+            pv = buf_copy_load(vf4(arg_pm, m64 * 16), row, fx.Float32, 4)
+            cm_t = vf4(arg_cm, m64 * 64)
+            cv = [
+                buf_copy_load(cm_t, row * 4 + h, fx.Float32, 4)
+                for h in range_constexpr(N_STREAMS)
+            ]
             f = [_unpack8(r) for r in rs]
             pk = []
             for j in range_constexpr(N_STREAMS):
@@ -166,26 +169,18 @@ def compile_mhc_post_collapse_rmsnorm(has_post: bool, keep_residual: bool, mean:
                     vals.append(a)
                 pk.append(_pack8(vals))
             if fx.const_expr(keep_residual):
-                ror = rsrc(arg_rout, m64 * (N_STREAMS * H * 2))
+                rout_t = v16(arg_rout, m64 * (N_STREAMS * H * 2))
                 for j in range_constexpr(N_STREAMS):
-                    buffer_ops.buffer_store(
-                        Vec.from_elements(pk[j], fx.Int32),
-                        ror,
-                        row * (N_STREAMS * ROW_DW) + j * ROW_DW + tx * 4,
-                    )
+                    st16(rout_t, row * (N_STREAMS * U_ROW) + j * U_ROW + tx, pk[j])
         else:
-            pk = [[fx.Int32(r[k]) for k in range(4)] for r in rs]
+            pk = rs
         gf = [_unpack8(p) for p in pk]
         if fx.const_expr(mean):
             mv = [
                 ((gf[0][e] + gf[1][e]) + gf[2][e] + gf[3][e]) * fx.Float32(0.25)
                 for e in range_constexpr(8)
             ]
-            buffer_ops.buffer_store(
-                Vec.from_elements(_pack8(mv), fx.Int32),
-                rsrc(arg_mean, m64 * (H * 2)),
-                row * ROW_DW + tx * 4,
-            )
+            st16(v16(arg_mean, m64 * (H * 2)), row * U_ROW + tx, _pack8(mv))
         x1v = []
         for e in range_constexpr(8):
             a = qv[0] * gf[0][e]
@@ -204,24 +199,24 @@ def compile_mhc_post_collapse_rmsnorm(has_post: bool, keep_residual: bool, mean:
         for i in range_constexpr(1, WAVES):
             ss = ss + part[i]
         eps = i32_eps.bitcast(fx.Float32)
-        # v_rsq_f32: the precision the reference contract was validated with
+        # v_rsq_f32 directly: fx.math.rsqrt lowers to an IEEE-accurate sqrt + divide
+        # sequence (~25 VALU ops on gfx950); the reference contract was validated
+        # with the bare instruction
         rstd = fx.Float32(rocdl.rsq(T.f32, (ss * fx.Float32(1.0 / H) + eps).ir_value()))
         yp = _pack8([(x1[e] * rstd) * w[e] for e in range_constexpr(8)])
-        buffer_ops.buffer_store(
-            Vec.from_elements(yp, fx.Int32), outr, row * ROW_DW + tx * 4
-        )
+        st16(v16(arg_out, m64 * (H * 2)), row * U_ROW + tx, yp)
 
     @flyc.jit
     def launch(
-        arg_res: fx.Int64,
-        arg_y: fx.Int64,
-        arg_pm: fx.Int64,
-        arg_cm: fx.Int64,
-        arg_pre: fx.Int64,
-        arg_nw: fx.Int64,
-        arg_rout: fx.Int64,
-        arg_out: fx.Int64,
-        arg_mean: fx.Int64,
+        arg_res: fx.Pointer,
+        arg_y: fx.Pointer,
+        arg_pm: fx.Pointer,
+        arg_cm: fx.Pointer,
+        arg_pre: fx.Pointer,
+        arg_nw: fx.Pointer,
+        arg_rout: fx.Pointer,
+        arg_out: fx.Pointer,
+        arg_mean: fx.Pointer,
         i32_m: fx.Int32,
         i32_eps: fx.Int32,
         stream: fx.Stream,
@@ -244,7 +239,7 @@ def compile_mhc_post_collapse_rmsnorm(has_post: bool, keep_residual: bool, mean:
     launch.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         }
     }
     return launch
