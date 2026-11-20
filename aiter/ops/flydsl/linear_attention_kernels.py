@@ -1112,8 +1112,12 @@ def _env_padding_slot(name: str) -> int | None:
 
 # A slot the debug check treats as padding, like a negative index: the kernel
 # still decodes it, but the caller reserves it for rows whose results it drops.
-_KDA_SLOT_CHECK_PADDING_SLOT = _env_padding_slot(
-    "AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"
+# Parsed only when the check is on, so a malformed value cannot break importing
+# this module, which also hosts the GDR decode ops.
+_KDA_SLOT_CHECK_PADDING_SLOT = (
+    _env_padding_slot("AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT")
+    if _KDA_SLOT_CHECK
+    else None
 )
 
 
