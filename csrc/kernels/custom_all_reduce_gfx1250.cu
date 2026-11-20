@@ -110,9 +110,9 @@ int64_t meta_size(int64_t world_size)
     return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes(ws) + aiter::kArRmsShardBytes);
 }
 
-// The largest all-reduce the LL kernels take at this world size: the one-shot
-// up to kLLArMaxBytes, the two-shot up to ar2sMaxBytes. Larger ones take the
-// naive kernels. The Python default cutoff for plain all-reduce stays at or
+// The largest all-reduce the meta-buffer kernels take at this world size: the
+// LL one-shot up to kLLArMaxBytes, the Lamport two-shot up to ar2sMaxBytes.
+// Larger ones take the naive kernels. The Python default cutoff for plain all-reduce stays at or
 // below it.
 int64_t ll_ar_max_bytes(int64_t world_size)
 {

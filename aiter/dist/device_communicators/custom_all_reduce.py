@@ -250,15 +250,16 @@ _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 
 # gfx1250 plain all-reduce cutoff (bytes) per world size while
 # AITER_CUSTOM_AR_MAX_SIZE is unset: CudaCommunicator.all_reduce runs the custom
-# kernels up to it and RCCL above it. It is about where RCCL overtakes the LL
-# kernels, MI455X, bf16 in a CUDA graph, us an all-reduce:
+# kernels up to it and RCCL above it. It is about where RCCL overtakes the
+# meta-buffer kernels (the LL one-shot, the two-shot), MI455X, bf16 in a CUDA
+# graph, us an all-reduce:
 # - TP2, one tray: the one-shot is level with RCCL at 4.19 MB (16.0 vs 15.3);
 #   past 4 MiB the pull takes 26.6 at 4.59 MB, RCCL 21.9.
 # - TP4, one tray: RCCL overtook the LL two-shot that ar_2s_lamport_gfx1250
 #   replaced from 5.73 MB (25.8 vs 26.2).
 # - TP8, two trays: the two-shot leads up to 8.26 MB (25.9 vs 42.8); past
 #   8 MiB the pull takes 405 at 14.68 MB, RCCL 55.
-# It never exceeds what the LL kernels take (ll_ar_max_bytes). Other world
+# It never exceeds what those kernels take (ll_ar_max_bytes). Other world
 # sizes, and the fused AR + RMSNorm paths, keep _car_max_size. It does not cap
 # the inputs the Lamport all-reduce takes (_LAMPORT_AR_1SHOT_MAX_BYTES). See
 # CustomAllreduce.should_custom_plain_ar.
@@ -1987,7 +1988,7 @@ class CustomAllreduce:
         # gfx1250: meta_size_gfx1250(world_size) is the layout described at
         # kLLScratchOffset in custom_all_reduce_gfx1250.cuh: the Signal struct,
         # then the LL scratch, the AR + RMSNorm shard and the two-shot's inbox.
-        # It is tens of MiB at every world size IPC serves, so it lands in the
+        # It is 48 to 194 MiB (TP2 to TP8), so it lands in the
         # always-safe coarse-grained regime; the round-up to a 2 MB multiple
         # below is a no-op guard that also keeps the allocation 2 MB-aligned.
         _COARSE_GRAIN = 2 * 1024 * 1024

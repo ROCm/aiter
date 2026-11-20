@@ -419,7 +419,7 @@ _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 # call to the next. 3.91 MB ends in a partial wave of packs (lanes that only
 # re-arm) at both world sizes, 7.81 MB at TP8. fp32, so that the expected bits
 # depend on the order the ranks are summed in (see rank_order).
-_LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168, 545 * 1792, 545 * 3584]
+_AR2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168, 545 * 1792, 545 * 3584]
 
 # gfx1250 all-reduces whose output is their input (fp32 elements): 0.36 MB,
 # 0.79 MB, 1.57 MB, 3.67 MB and 3.91 MB. At TP2 and TP6 all five take the
@@ -502,10 +502,11 @@ def _allreduce_mixed_size_regression(
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
     # With vary_inputs, rounds cycle through x, -x, 2x and -2x (all exact). A
     # re-arm missed leaves a pack the line it got two calls back (the LL
-    # kernels' two banks) or three (the two-shot's three buffers). For a pack
-    # one size alone reaches, that is 2 or 3 rounds back, another of the four
-    # variants, so a stale line never carries the bits now expected; a pack that
-    # several sizes reach gets another size's line.
+    # kernels' two banks) or three (the two-shot's three buffers). That is
+    # another size's line where two or four sizes reach the pack; the same
+    # size's from 1 round back where three do, or from 2 or 3 rounds back where
+    # one does: another of the four variants. So a stale line never carries the
+    # bits now expected.
     variants = [(inputs, refs)]
     if vary_inputs:
         for factor in (-1, 2, -2):
@@ -597,7 +598,7 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
             os.environ[env] = saved
 
 
-def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
+def test_allreduce_2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
     # Mixing the two-shot with the one-shot LL, and two-shot launches of
     # different block sizes, must neither accept a stale line nor overwrite a
     # slower peer's unread one, and both must sum the ranks in order 0..n-1.
@@ -606,7 +607,7 @@ def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
         return
     _run_mixed_size_regression(
         tp_size,
-        _LL2S_GFX1250_MIXED_SIZES,
+        _AR2S_GFX1250_MIXED_SIZES,
         iterations,
         "gfx1250 two-shot",
         1,
@@ -878,8 +879,8 @@ parser.add_argument(
     "--regression",
     action="store_true",
     help="run only the correctness checks: tail (eager and graph), LL128 and "
-    "gfx1250 LL mixed sizes, gfx1250 LL in place, and the plain all-reduce "
-    "cutoff",
+    "gfx1250 LL mixed sizes, the gfx1250 two-shot mixed sizes, gfx1250 in "
+    "place, the two-shot's sentinel payload, and the plain all-reduce cutoff",
 )
 parser.add_argument(
     "--iterations",
@@ -920,7 +921,7 @@ if __name__ == "__main__":
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
-            test_allreduce_ll2s_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_2s_gfx1250_mixed_size_regression(args.tp_size)
             test_allreduce_ll_gfx1250_inplace_regression(args.tp_size)
             test_allreduce_2s_gfx1250_sentinel_payload(args.tp_size)
             test_allreduce_plain_cutoff(args.tp_size)

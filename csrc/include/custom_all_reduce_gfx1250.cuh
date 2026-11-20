@@ -262,9 +262,9 @@ constexpr size_t ar2sScratchBytes(int ngpus)
 // The inbox starts on a 2 MiB boundary of the meta buffer, and so of memory
 // where the buffer's base is one: the meta buffer is an allocation of its own
 // on every transport. Started where the shard ends, 258 KiB past a boundary
-// (the Signal struct's 264192 bytes), the TP8 two-shot took 6.7 us longer at
-// 7.81 MB (33.2 vs 26.1 us, MI455X). A base off a boundary costs that time, not
-// correctness.
+// (the Signal struct's 264192 bytes), the TP8 two-shot took 7.1 us longer at
+// 7.81 MB (33.2 vs 26.1 us, MI455X, in a prototype where the offset was the
+// only change). A base off a boundary costs that time, not correctness.
 constexpr size_t kAr2sAlign = (size_t)2 * 1024 * 1024;
 constexpr size_t ar2sScratchOffset(int ngpus)
 {
@@ -329,7 +329,7 @@ DINLINE void ll_load_b128(
 }
 
 // A 16-byte Lamport line, one store or load at system scope as the LL lines
-// above (lamport_ar_rmsnorm_gfx1250, ar_2s_lamport_gfx1250).
+// above: every Lamport kernel moves its lines with these.
 using lamport_u32x4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
 
 DINLINE void lamport_store_b128(void* dst, lamport_u32x4 v)
@@ -541,7 +541,7 @@ __global__ void __launch_bounds__(1024, 1) ar_ll_gfx1250(
 // pushed after it loaded the pack; send reads no other pack of recvbuff.
 //
 // The inboxes come in as scalar arguments, not a table, as for
-// lamport_ar_add_gfx1250: a table would be loaded before the first push.
+// lamport_ar_1shot_gfx1250: a table would be loaded before the first push.
 constexpr uint32_t kAr2sSentinel = 0xffffffffu;
 
 DINLINE lamport_u32x4 ar2s_canonical(lamport_u32x4 v)
@@ -4051,10 +4051,10 @@ public:
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-        // LL small-message fast lane: bytes <= kLLArMaxBytes route to the
-        // flag-in-data kernel, which reads input locally and pushes to the
-        // shared peer scratch — no registered peer-input table (_input_dp) is
-        // needed, so branch before get_buffer_RD.
+        // The two-shot (use_2s) and the LL one-shot (use_ll) read the input in
+        // place and push it into the peers' inboxes in the meta buffer, so they
+        // need no registered peer-input table (_input_dp): branch before
+        // get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
         if(use_2s(bytes))
         {
