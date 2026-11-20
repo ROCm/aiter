@@ -21,6 +21,7 @@ import os
 import pickle
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, ClassVar, NamedTuple
 
 import torch
@@ -48,7 +49,7 @@ from .rocm_version import get_rocm_version
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
+    from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
     _FLY_IMPORT_OK = True
@@ -4022,7 +4023,27 @@ class CustomAllreduce:
             hadamard_rotate=hadamard_rotate,
         )
 
-    def close(self):
+    def _sync_peers_before_free(self):
+        # gfx1250 two-stage fused AR + RMSNorm has no end barrier, so a slower
+        # peer's stage 2 may still read this rank's meta buffer after this
+        # stream drains. Free it only after every rank has synchronized. The
+        # barrier is bounded (60 s) and skipped once the group is gone, but
+        # torch.cuda.synchronize is not: close() can still hang if a peer died
+        # in the middle of a collective.
+        try:
+            if not dist.is_initialized():
+                return
+            dist.get_rank(self.group)  # raises once the group is destroyed
+            torch.cuda.synchronize(self.device)
+            dist.monitored_barrier(self.group, timeout=timedelta(seconds=60))
+        except Exception as e:  # noqa: BLE001 - close() and __del__ never raise
+            logger.warning("custom allreduce: no teardown barrier (%s)", e)
+
+    def close(self, sync_peers=True):
+        # sync_peers=False from __del__: a collective on cpu_group at an
+        # arbitrary GC point could mismatch what the peers run on it.
+        if sync_peers and self._is_gfx1250 and getattr(self, "_ptr", 0):
+            self._sync_peers_before_free()
         # Not gated on self.disabled: the one-shots hold IPC inboxes opened
         # against every peer, and those handles have to be released before the
         # process group goes away regardless of the slot's state.
@@ -4048,4 +4069,4 @@ class CustomAllreduce:
             pool.close()
 
     def __del__(self):
-        self.close()
+        self.close(sync_peers=False)
