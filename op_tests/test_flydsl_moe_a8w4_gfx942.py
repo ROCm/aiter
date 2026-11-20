@@ -265,16 +265,17 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
     return ret
 
 
-def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
+def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512, E=8, topk=4):
     """The stage-1 kernel alone against torch on x rounded to MXFP8, on any gfx942.
 
     The MI325X-only gate is about speed, so the numerics are checked on MI300X too (the
-    CI runners), bypassing it. Kept to a few seconds: 8 experts / top 4, one kernel per
-    x_layout, and model_dim 1536 instead of Kimi-K3's 3584 (the K loop is unrolled, so
-    compile time grows with it); like 3584 it leaves k_wave 4 an odd number of K tiles
-    per wave (3 vs 7), so the odd-tail path is still covered.
+    CI runners), bypassing it. Kept to a few seconds: few experts, and model_dim 1536
+    instead of Kimi-K3's 3584 (the K loop is unrolled, so compile time grows with it);
+    like 3584 it leaves k_wave 4 an odd number of K tiles per wave (3 vs 7), so the
+    odd-tail path is still covered. With E = topk every expert gets every token, so
+    token = tile_m fills each M tile with real rows (the `_qi` A swizzle and per-row
+    x-scale slots are the identity on row 0 alone).
     """
-    E, topk = 8, 4
     p = get_flydsl_kernel_params(kernel_name)
     tile_m = p["tile_m"]
     assert is_a8w4_gfx942_kernel(p), kernel_name
@@ -486,6 +487,15 @@ def main():
     test_stage1_kernel(
         1, "flydsl_moe1_afp8_wfp4_bf16_t16x32x256_g942_kw2_qi"
     )  # _qi TILE_K=256
+    # _qi with full M tiles (16 real rows), every _qi variant of the CSV
+    for name in (
+        "t16x32x256_g942_kw2_qi",
+        "t16x64x128_g942_kw2_qi",
+        "t16x32x128_g942_kw2_qi",
+        "t16x128x128_g942_qi",
+        "t16x64x128_g942_qi",
+    ):
+        test_stage1_kernel(16, f"flydsl_moe1_afp8_wfp4_bf16_{name}", E=2, topk=2)
     test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")  # moe_sort
     test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_g942")  # TILE_K=256
     test_stage1_kernel(
