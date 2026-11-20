@@ -46,9 +46,36 @@ def _torch_hip_version() -> str | None:
     return getattr(version, "hip", None)
 
 
+def _windows_runtime_names() -> tuple[str, ...]:
+    """Base names a loaded Windows HIP runtime can have, torch's first."""
+    names = ("amdhip64_7.dll", "amdhip64_6.dll")
+    torch_hip = _torch_hip_version()
+    if torch_hip:
+        torch_dll = f"amdhip64_{torch_hip.split('.')[0]}.dll"
+        names = (torch_dll, *(n for n in names if n != torch_dll))
+    return names
+
+
+def _windows_loaded_module(name: str) -> int:
+    """Handle of a module already loaded under base name `name`, or 0.
+
+    GetModuleHandleW is the Windows counterpart of RTLD_NOLOAD: it never loads.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
+    kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    return kernel32.GetModuleHandleW(name) or 0
+
+
 def _loaded_hip_runtime() -> ctypes.CDLL | None:
     """The HIP runtime already loaded into this process, e.g. torch's."""
     if sys.platform == "win32":
+        # Opening by name or path can load a second runtime beside torch's, e.g.
+        # the display driver's amdhip64.dll from System32 when no ROCm root is set.
+        for name in _windows_runtime_names():
+            handle = _windows_loaded_module(name)
+            if handle:
+                return ctypes.CDLL(name, handle=handle)
         return None
     for name in _library_names():
         try:
@@ -62,9 +89,9 @@ def _loaded_hip_runtime() -> ctypes.CDLL | None:
 def load_hip_runtime() -> ctypes.CDLL:
     """Load the HIP runtime, or raise OSError reporting why each candidate failed.
 
-    Binds to the copy already loaded into the process when there is one (Linux
-    only), so the handle shares torch's runtime instead of loading a second one
-    by name. The choice is cached, so call this after torch has initialized HIP.
+    Binds to the copy already loaded into the process when there is one, so the
+    handle shares torch's runtime instead of loading a second one by name. The
+    choice is cached, so call this after torch has initialized HIP.
     """
     loaded = _loaded_hip_runtime()
     if loaded is not None:
