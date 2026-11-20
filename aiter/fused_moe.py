@@ -2523,6 +2523,10 @@ def fused_moe_1stage(
 # Arches whose 1-stage asm fmoe kernels address expert weights with 32-bit
 # byte offsets (see _asm_fmoe_weights_fit_u32_offsets).
 _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
+# (arch, quant type) pairs on those arches whose asm kernel was run past 4 GiB
+# and came out right (gfx950 fp8 per_1x128: experts 147-255 of E=256, 7168/2048,
+# match CK 2-stage), so they keep asm 1-stage.
+_ASM_FMOE_U32_WEIGHT_OFFSET_OK = (("gfx950", QuantType.per_1x128),)
 
 
 def _asm_fmoe_weights_fit_u32_offsets(
@@ -2530,10 +2534,11 @@ def _asm_fmoe_weights_fit_u32_offsets(
 ):
     """Whether every byte of w1/w2 is within 4 GiB of the tensor base.
 
-    The gfx942 and gfx950 1-stage asm fmoe kernels address the expert weights
-    with 32-bit byte offsets, so weights past 4 GiB read wrapped addresses and
-    return garbage without faulting (e.g. 256 experts, model_dim 7168,
-    inter_dim 2048 fp8 g1u1: w1 is 7 GiB and only experts 0-145 come out right).
+    The gfx942 1-stage asm fmoe kernels and gfx950's fp8 per_Token ones address
+    the expert weights with 32-bit byte offsets, so weights past 4 GiB read
+    wrapped addresses and return garbage without faulting (e.g. 256 experts,
+    model_dim 7168, inter_dim 2048 fp8 g1u1: w1 is 7 GiB and only experts 0-145
+    come out right).
     """
     w_dtype = dtype if q_dtype_w is None else q_dtype_w
     bits = 4 if w_dtype in (dtypes.fp4x2, dtypes.i4x2) else w_dtype.itemsize * 8
@@ -4857,6 +4862,7 @@ def get_2stage_cfgs(
             if (
                 run_1stage
                 and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
+                and (get_gfx_runtime(), q_type) not in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
                 and not _asm_fmoe_weights_fit_u32_offsets(
                     expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
                 )

@@ -2569,6 +2569,9 @@ def test_gfx942_asm_1stage_4gib_guard():
     host = fm.get_gfx_runtime()
     real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
     assert real_gfx == ("gfx942", "gfx950"), "the guard must cover gfx942 and gfx950"
+    # gfx950 fp8 per_1x128 was run past 4 GiB and is right, so it keeps asm 1-stage.
+    ok_pairs = fm._ASM_FMOE_U32_WEIGHT_OFFSET_OK
+    assert ok_pairs == (("gfx950", aiter.QuantType.per_1x128),), ok_pairs
     cases = (  # (token, quant type): the default heuristic takes asm 1-stage here
         (256, aiter.QuantType.per_Token),
         (256, aiter.QuantType.per_1x128),
@@ -2584,10 +2587,14 @@ def test_gfx942_asm_1stage_4gib_guard():
                     f"{qtype}: the default heuristic no longer takes asm 1-stage, "
                     "so this test cannot see the guard"
                 )
-            # The guard on for this arch: oversized weights leave asm 1-stage,
-            # weights that fit keep the previous dispatch.
+            # The guard on for this arch: oversized weights leave asm 1-stage
+            # (unless the pair is known right past 4 GiB), weights that fit keep
+            # the previous dispatch.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
-            assert not run_1stage(token, 2048, qtype, fp8), f"{qtype}: 7 GiB w1"
+            exempt = (host, qtype) in ok_pairs
+            assert run_1stage(token, 2048, qtype, fp8) == (
+                before_big if exempt else False
+            ), f"{qtype}: 7 GiB w1"
             assert run_1stage(token, 1024, qtype, fp8) == before_small, qtype
             # An arch outside the guard keeps the previous dispatch at any size.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx90a",)
