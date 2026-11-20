@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import json
+import math
 import os
 from typing import NamedTuple
 
@@ -470,6 +471,10 @@ def unified_attention(
     # output_rows[r] (every token still attends and its KV is read as usual).
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
+    # Q (times q_descale, if given) already carries softmax_scale * log2(e), applied by the
+    # producer of Q in fp32 before its one rounding. The QK WMMA results are then in the exp2
+    # units the kernels want, so they skip the per-element scale multiply. gfx1250 Gluon only.
+    q_prescaled: bool = False,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -485,6 +490,16 @@ def unified_attention(
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
+    if q_prescaled:
+        if not (backend == "gluon" and IS_DEVICE_ARCH_GFX12):
+            raise ValueError(
+                "q_prescaled is supported by the gfx1250 Gluon backend only, "
+                f"got backend={backend!r} on {DEVICE_ARCH}"
+            )
+        # The kernels scale QK by softmax_scale * log2(e) and read every other score term
+        # (sinks, softcap, biases) through softmax_scale. With ln(2) the scale is exactly 1.0
+        # in fp32, and those terms stay in the right units.
+        softmax_scale = math.log(2.0)
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]

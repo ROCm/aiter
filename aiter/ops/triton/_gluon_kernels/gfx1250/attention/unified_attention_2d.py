@@ -2189,7 +2189,6 @@ def attention_loop_tensor_subtile_split(
     WMMA_ROWSUM: gl.constexpr = False,
     ROWSUM_PIN: gl.constexpr = False,
     SEED_MASK: gl.constexpr = False,
-    Q_SCALE_FOLD: gl.constexpr = False,
     UNROLL2: gl.constexpr = False,
 ):
     """Reordered pipeline with tensor-register K/V subtile splitting.
@@ -2214,8 +2213,6 @@ def attention_loop_tensor_subtile_split(
     accL += P x ones[TILE, 16], instead of a VALU row sum. ROWSUM_PIN puts a sched_barrier after that WMMA.
     SEED_MASK: the epilogue (and the sliding-window first iteration) mask the QK seed (-inf where masked)
     before the QK WMMA instead of masking the QK result after it.
-    Q_SCALE_FOLD: the fixed-max QK WMMAs use bf16(Q * scale * log2(e)), so their results are already in log2
-    units. The caller's rerun (running max) uses the original Q.
     UNROLL2 (two buffers, no sliding-window peel): the steady loop runs in pairs of tiles with the buffer
     indices as constants in each half and a sched_barrier after each half; a 0-or-1-trip loop takes an odd
     tile.
@@ -2236,7 +2233,6 @@ def attention_loop_tensor_subtile_split(
     BAL: gl.constexpr = BALANCED and FM_OPT
     ROWSUM: gl.constexpr = WMMA_ROWSUM and FM_OPT and CHECK_EVERY == 0
     SMASK: gl.constexpr = SEED_MASK and FM_OPT
-    QFOLD: gl.constexpr = Q_SCALE_FOLD and FM_OPT
 
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile j     ( j   %N)
@@ -2384,13 +2380,6 @@ def attention_loop_tensor_subtile_split(
             # accL += P (bf16) x ones[TILE, 16]: every column is the row sum of the bf16 P the PV WMMA uses
             accL = gl.zeros([cfg.BLOCK_M, 16], dtype=gl.float32, layout=cfg.pv_layout)
             ones_b = gl.full([cfg.TILE_SIZE, 16], 1.0, q.dtype, layout=cfg.v_layout)
-        if QFOLD:
-            q_mma = (pgm.q.to(gl.float32) * QK_scale).to(pgm.q.dtype)
-            qk_seed = qk_seed * QK_scale
-        else:
-            q_mma = pgm.q
-    # QK results of the fixed-max WMMAs are in log2 units already when Q carries the scale
-    QK_scale_fixed = 1.0 if QFOLD else QK_scale
     # Sliding window: when the rows of a program span at most one tile of window starts, the window-masked tiles
     # are a subset of {tile_start, tile_start + 1}, so only the first loop iteration (which scores tile j + 1)
     # can need the mask. That iteration is peeled into its own 0-or-1-trip loop, so the main loop body has no
@@ -2460,7 +2449,7 @@ def attention_loop_tensor_subtile_split(
                     # --- S1: QK sub 0 + SM1-A ---
                     if not V_FIRST:
                         if FIXED_MAX:
-                            qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+                            qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, seed0)
                         elif cfg.KV_NVFP4:
                             qk0 = pgm.compute_qk_subtile(k0_s, ks0)
                         else:
@@ -2482,7 +2471,7 @@ def attention_loop_tensor_subtile_split(
                     )
                     if V_FIRST:
                         if FIXED_MAX:
-                            qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+                            qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, seed0)
                         elif cfg.KV_NVFP4:
                             qk0 = pgm.compute_qk_subtile(k0_s, ks0)
                         else:
@@ -2507,7 +2496,7 @@ def attention_loop_tensor_subtile_split(
 
                     # --- S2: QK sub 1 + SM1-B ---
                     if FIXED_MAX:
-                        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
+                        qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, seed1)
                     elif cfg.KV_NVFP4:
                         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
                     else:
@@ -2560,7 +2549,7 @@ def attention_loop_tensor_subtile_split(
                         # only the peeled first iteration (tile tile_start + 1) can cut through a row's window start
                         qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
                     if BAL:
-                        qs0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True) * QK_scale_fixed
+                        qs0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True) * QK_scale
                         qs0a, qs0b = pgm.split_subtile(qs0)
                         p0a = gl.exp2(qs0a)
                     if FIXED_MAX:
@@ -2585,7 +2574,7 @@ def attention_loop_tensor_subtile_split(
                     if BAL:
                         qk1_shifted = (
                             gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-                            * QK_scale_fixed
+                            * QK_scale
                         )
                         p0b = gl.exp2(qs0b)
                         p0 = pgm.concat_subtile(p0a, p0b)
@@ -2593,11 +2582,11 @@ def attention_loop_tensor_subtile_split(
                         if FIXED_MAX:
                             qk0_shifted = (
                                 gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
-                                * QK_scale_fixed
+                                * QK_scale
                             )
                             qk1_shifted = (
                                 gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-                                * QK_scale_fixed
+                                * QK_scale
                             )
                         else:
                             qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
@@ -2668,7 +2657,7 @@ def attention_loop_tensor_subtile_split(
                 seed0 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_2, 0)
                 seed1 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_2, 1)
             seed0, seed1 = pgm.apply_window_mask_qk_subtiles(seed0, seed1, epilogue_t_2)
-        qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+        qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, seed0)
     elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
@@ -2691,7 +2680,7 @@ def attention_loop_tensor_subtile_split(
 
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
     if FIXED_MAX:
-        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
+        qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, seed1)
     elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
@@ -2737,8 +2726,8 @@ def attention_loop_tensor_subtile_split(
     # --- S4: PV sub 1 for L + SM0-B for L+1 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     if FIXED_MAX:
-        qk0_shifted = qk0 * QK_scale_fixed
-        qk1_shifted = qk1 * QK_scale_fixed
+        qk0_shifted = qk0 * QK_scale
+        qk1_shifted = qk1 * QK_scale
     else:
         qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
         qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
@@ -2766,7 +2755,7 @@ def attention_loop_tensor_subtile_split(
         if SMASK:
             seed0 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 0)
             seed1 = pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 1)
-        qk0 = gl.amd.gfx1250.wmma(q_mma, k0_s, seed0)
+        qk0 = gl.amd.gfx1250.wmma(pgm.q, k0_s, seed0)
     elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
@@ -2782,7 +2771,7 @@ def attention_loop_tensor_subtile_split(
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
     if FIXED_MAX:
-        qk1 = gl.amd.gfx1250.wmma(q_mma, k1_s, seed1)
+        qk1 = gl.amd.gfx1250.wmma(pgm.q, k1_s, seed1)
     elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
@@ -2821,8 +2810,8 @@ def attention_loop_tensor_subtile_split(
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     if FIXED_MAX:
-        qk0_shifted = qk0 * QK_scale_fixed
-        qk1_shifted = qk1 * QK_scale_fixed
+        qk0_shifted = qk0 * QK_scale
+        qk1_shifted = qk1 * QK_scale
     else:
         qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
         qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
@@ -3018,7 +3007,6 @@ def _unified_attention_gluon_kernel_2d(
     FM_WMMA_ROWSUM: gl.constexpr = False,
     FM_ROWSUM_PIN: gl.constexpr = False,
     FM_SEED_MASK: gl.constexpr = False,
-    FM_Q_SCALE_FOLD: gl.constexpr = False,
     FM_UNROLL2: gl.constexpr = False,
     # the rerun (running max) reloads Q instead of keeping it live through the fixed-max loop
     FM_RERUN_RELOAD_Q: gl.constexpr = False,
@@ -3395,7 +3383,6 @@ def _unified_attention_gluon_kernel_2d(
             WMMA_ROWSUM=FM_WMMA_ROWSUM,
             ROWSUM_PIN=FM_ROWSUM_PIN,
             SEED_MASK=FM_SEED_MASK,
-            Q_SCALE_FOLD=FM_Q_SCALE_FOLD,
             UNROLL2=FM_UNROLL2,
         )
         if FIXED_MAX:
@@ -3411,8 +3398,7 @@ def _unified_attention_gluon_kernel_2d(
             n_overflow = gl.sum(gl.where(L_ok, 0, 1), axis=0)
             if n_overflow > 0:
                 if FM_RERUN_RELOAD_Q:
-                    # reloading Q here (a rare path) frees the registers that kept the original Q live through the
-                    # fixed-max loop, which only reads its own copy (folded with FM_Q_SCALE_FOLD)
+                    # reloading Q here (a rare path) instead of keeping it live through the fixed-max loop
                     q_re = load_q(
                         cfg,
                         query_ptr,

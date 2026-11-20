@@ -2422,13 +2422,16 @@ def _prefill_2d_run(
     num_blocks=8192,
     sliding_window=None,
     attn_2d_config=None,
+    q_prescaled=False,
 ):
     """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64, causal
     attention, full or with a sliding window) and return (2D kernel launches, output,
     reference).
     key_bump = (start, stop, amplitude): keys of sequence 0 at positions [start, stop)
     and every query get a shared direction, so those keys score far above the others.
-    attn_2d_config: entries that replace the attn_2d table's config."""
+    attn_2d_config: entries that replace the attn_2d table's config.
+    q_prescaled: Q is passed as bf16(Q * scale * log2(e)), as its producer would write it,
+    and the reference uses that Q divided back in fp32."""
     from aiter.ops.triton.attention import unified_attention as ua_mod
 
     (
@@ -2467,6 +2470,11 @@ def _prefill_2d_run(
         key_cache_orig = k.to(torch.bfloat16)
         query = (query.float() + amplitude * u).to(torch.bfloat16)
     key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+    query_ref = query
+    if q_prescaled:
+        q_factor = scale * 1.4426950408889634
+        query = (query.float() * q_factor).to(torch.bfloat16)
+        query_ref = query.float() / q_factor
     block_table = block_tables
     max_seqlen_k = max_kv_len
     if long_max_seqlen_k:
@@ -2516,12 +2524,13 @@ def _prefill_2d_run(
             sinks=None,
             shuffled_kv_cache=True,
             backend="gluon",
+            q_prescaled=q_prescaled,
         )
     finally:
         ua_mod.get_unified_attention_config = table_config
         kernel_2d.pre_run_hooks.remove(hook)
     ref_output = ref_paged_attn(
-        query=query,
+        query=query_ref,
         key_cache=key_cache_orig,
         value_cache=value_cache_orig,
         query_lens=[x[0] for x in seq_lens],
@@ -2546,8 +2555,11 @@ def _prefill_2d_run(
     ],
 )
 @pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@pytest.mark.parametrize("q_prescaled", [False, True])
 @torch.inference_mode()
-def test_gluon_unified_attn_2d_fixed_max(seq_lens, key_bump, long_max_seqlen_k):
+def test_gluon_unified_attn_2d_fixed_max(
+    seq_lens, key_bump, long_max_seqlen_k, q_prescaled
+):
     """gfx1250 Gluon 2D loop variant 2, full attention: the steady loop keeps a fixed
     reference max per row and reruns a program with the running max when a row's
     exp sum overflows. key_bump puts the largest scores away from the reference tiles.
@@ -2555,7 +2567,7 @@ def test_gluon_unified_attn_2d_fixed_max(seq_lens, key_bump, long_max_seqlen_k):
     if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
         pytest.skip("gfx1250 Gluon only")
     launched, output, ref_output = _prefill_2d_run(
-        seq_lens, key_bump, long_max_seqlen_k
+        seq_lens, key_bump, long_max_seqlen_k, q_prescaled=q_prescaled
     )
     if max(x[0] for x in seq_lens) >= 1024:
         assert any(x["LOOP_VARIANT"] == 2 for x in launched)
@@ -2645,9 +2657,10 @@ def test_gluon_unified_attn_2d_sliding_window_loop_variants(
     ],
 )
 @pytest.mark.parametrize("sliding_window", [128, 2048])
+@pytest.mark.parametrize("q_prescaled", [False, True])
 @torch.inference_mode()
 def test_gluon_unified_attn_2d_sliding_window_fixed_max(
-    seq_lens, key_bump, sliding_window
+    seq_lens, key_bump, sliding_window, q_prescaled
 ):
     """gfx1250 Gluon 2D loop variant 2 with a sliding window: the steady loop keeps a
     fixed reference max per row from the window's first two tiles, and reruns a program
@@ -2655,7 +2668,7 @@ def test_gluon_unified_attn_2d_sliding_window_fixed_max(
     if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
         pytest.skip("gfx1250 Gluon only")
     launched, output, ref_output = _prefill_2d_run(
-        seq_lens, key_bump, sliding_window=sliding_window
+        seq_lens, key_bump, sliding_window=sliding_window, q_prescaled=q_prescaled
     )
     if max(x[1] for x in seq_lens) >= 2048:
         assert [x["LOOP_VARIANT"] for x in launched] == [2]
@@ -2663,3 +2676,34 @@ def test_gluon_unified_attn_2d_sliding_window_fixed_max(
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_unified_attn_q_prescaled_rejected(backend):
+    """q_prescaled is a gfx1250 Gluon option: any other backend / arch raises."""
+    if backend == "gluon" and (DEVICE_ARCH == "gfx1250" or not _is_gluon_available()):
+        pytest.skip("gluon is the supported backend here, or unavailable")
+    q = torch.zeros(4, 2, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(2, 16, 1, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="q_prescaled"):
+        unified_attention(
+            q=q,
+            k=kv,
+            v=kv,
+            out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=4,
+            seqused_k=torch.tensor([4], dtype=torch.int32, device="cuda"),
+            max_seqlen_k=4,
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            backend=backend,
+            q_prescaled=True,
+        )

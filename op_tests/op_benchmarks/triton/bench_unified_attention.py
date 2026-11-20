@@ -376,7 +376,7 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend, q_prescaled=False
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
@@ -425,6 +425,7 @@ def _make_unified_attention_fn(
             shuffled_kv_cache=shuffled_kv_cache,
             equal_seqlen_q=equal_seqlen_q,
             backend=backend,
+            q_prescaled=q_prescaled,
         )
 
     return kernel_fn
@@ -569,6 +570,20 @@ def run_benchmark(custom, args):
             args.out_scale,
             args.nvfp4,
         )
+        if args.q_prescaled:
+            # Q as its producer would write it: scaled by softmax_scale * log2(e) before the
+            # rounding (here from the bf16 draw, so the reference below is exact)
+            assert not (any_fp8 or any_nvfp4), "-q_prescaled takes a BF16 / FP16 Q"
+            q_factor = D_HEAD**-0.5 * 1.4426950408889634
+            q_idx = _UA_POOL_FIELDS.index("q")
+            base_gen = pool_gen
+
+            def pool_gen():
+                entry = list(base_gen())
+                q = entry[q_idx]
+                entry[q_idx] = (q.to(torch.float32) * q_factor).to(q.dtype)
+                return tuple(entry)
+
         fixed_gen = functools.partial(
             _make_ua_cache,
             HK,
@@ -597,6 +612,7 @@ def run_benchmark(custom, args):
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
+            q_prescaled=args.q_prescaled,
         )
 
         if args.equal_seqlen_q:
@@ -610,6 +626,8 @@ def run_benchmark(custom, args):
         if args.test:
             kernel_fn(**sample)
             ref_q, ref_q_descale = sample["q"], sample["q_descale"]
+            if args.q_prescaled:
+                ref_q = sample["q"].to(torch.float32) / q_factor
             # the NVFP4 reference values already carry the q descale
             if args.nvfp4:
                 ref_q, ref_q_descale = (
@@ -848,6 +866,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
+    )
+    parser.add_argument(
+        "-q_prescaled",
+        action="store_true",
+        default=False,
+        help="Q carries softmax_scale * log2(e) (unified_attention q_prescaled; gfx1250 Gluon)",
     )
 
     return parser.parse_args(args=args)
