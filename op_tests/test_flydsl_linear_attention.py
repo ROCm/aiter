@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 
 import pandas as pd
@@ -1484,6 +1487,23 @@ def test_flydsl_kda_decode_slot_check_padding_slot(
     monkeypatch.setenv(env, "zero")
     with pytest.raises(ValueError, match=f"{env} must be a slot index"):
         linear_attention_kernels._env_padding_slot(env)
+
+
+def test_flydsl_kda_decode_padding_slot_env_ignored_when_check_off() -> None:
+    # A malformed debug value must not break importing the module that also
+    # hosts flydsl_gdr_decode while the slot check is off.
+    env = dict(os.environ)
+    env["AITER_KDA_DECODE_SLOT_CHECK"] = "0"
+    env["AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"] = "none"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode",
+        ],
+        env=env,
+        check=True,
+    )
 
 
 @_requires_kda
