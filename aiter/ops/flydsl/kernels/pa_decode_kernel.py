@@ -88,6 +88,7 @@ from .pa_decode.op_merge import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     Gfx1250ClusterMerge,
+    Gfx1250OutputMxQuant,
     Gfx1250OutputQuant,
 )
 from .pa_decode.pipeline import (
@@ -208,6 +209,7 @@ def _pa_decode_tile_kernel_name(
     wave_partials=False,
     wave_pairs=False,
     wave_dims=False,
+    quant_mx=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -231,7 +233,8 @@ def _pa_decode_tile_kernel_name(
     if cluster_merge:
         name += f"_cluster{cluster_merge}"
     if quant_output:
-        name += "_quant" if store_output else "_quantonly"
+        tag = "_mxfp8" if quant_mx else "_quant"
+        name += tag if store_output else f"{tag}only"
     if fuse_tasks > 1:
         name += f"_fuse{fuse_tasks}"
     if wave_partials:
@@ -279,6 +282,7 @@ def compile_pa_decode_tile(
     wave_pairs: bool = False,
     wave_dims: bool = False,
     kv_scale_dtype: torch.dtype | None = None,
+    quant_mx: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -290,6 +294,10 @@ def compile_pa_decode_tile(
     ``kv_scale_dtype=torch.float8_e4m3fn`` with an fp4x2/uint8 ``kv_dtype`` selects
     NVFP4 (gfx1250 only): E4M3 block scales of 16 values instead of MXFP4's E8M0
     of 32.
+    ``quant_mx`` (with ``quant_output``) writes the MXFP8 output (``op_mxfp8``)
+    instead of the per-token FP8 one. Only the NVFP4 wave tile has it; it takes
+    every gfx1250 output mode that writes final rows (direct, last-arriver and
+    cluster merges, clusters shared by several sequences included).
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
 
@@ -398,8 +406,11 @@ def compile_pa_decode_tile(
                 wide_fp8_page128=False,
                 wide_bf16_page128=False,
                 narrow_fp8_page16=False,
+                quant_mx=quant_mx,
             )
         )
+    if quant_mx:
+        raise ValueError("quant_mx (MXFP8 output) requires the NVFP4 wave tile")
     if architecture in ("gfx1250", "gfx1250-strict"):
         if not trans_k:
             raise NotImplementedError("NHD pa_decode requires gfx950")
@@ -1243,11 +1254,25 @@ def compile_gfx1250_pa_decode(t):
             f"{CLUSTER_PARTITIONS} CTAs over page16 decode rows without a "
             f"sliding window and {CLUSTER_STEP_TOKENS}-token steps"
         )
-    if t.quant_output and (
-        not (t.direct_output or t.cluster_merge)
-        or t.merge_partitions
-        or t.query_splits != 1
-        or t.cluster_seqs != 1
+    if t.quant_mx and not (
+        t.quant_output
+        and t.nvfp4_wave
+        and t.query_splits == 1
+        and (t.direct_output or t.merge_partitions or t.cluster_merge)
+    ):
+        raise ValueError(
+            "quant_mx requires quant_output, the NVFP4 wave tile and an output "
+            "mode that writes final rows"
+        )
+    if (
+        t.quant_output
+        and not t.quant_mx
+        and (
+            not (t.direct_output or t.cluster_merge)
+            or t.merge_partitions
+            or t.query_splits != 1
+            or t.cluster_seqs != 1
+        )
     ):
         raise ValueError(
             "quant_output requires the direct or cluster_merge output, one "
@@ -1286,6 +1311,7 @@ def compile_gfx1250_pa_decode(t):
         wave_partials=t.wave_partials,
         wave_pairs=t.wave_pairs,
         wave_dims=t.wave_dims,
+        quant_mx=t.quant_mx,
     )
     if t.nvfp4_wave and t.nvfp4_buffers != 3:
         kernel_name += f"_ring{t.nvfp4_buffers}"
@@ -1324,7 +1350,9 @@ def compile_gfx1250_pa_decode(t):
 
         # Optional FP8 output; the pipelines and cluster merge write it from
         # the final values in registers.
-        quant = Gfx1250OutputQuant(t, quantized_output, output_scale)
+        quant = (Gfx1250OutputMxQuant if t.quant_mx else Gfx1250OutputQuant)(
+            t, quantized_output, output_scale
+        )
 
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.
@@ -1754,9 +1782,17 @@ def compile_gfx1250_pa_decode(t):
             # every CTA reaches the barrier, and only split sequences merge.
             Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).sync()
             if count > 1:
-                Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).merge(
-                    seq, part, first, count, capacity
-                )
+                # Only the group-local MXFP8 output quantizes these merges.
+                Gfx1250ClusterMerge(
+                    t,
+                    pmax,
+                    psum,
+                    pout,
+                    output,
+                    sq_row,
+                    sq_head,
+                    quant if t.quant_mx else None,
+                ).merge(seq, part, first, count, capacity)
             elif (count == 0) & (part == 0) & present:
                 zero_output(seq, output)
         elif const_expr(t.cluster_merge):
@@ -1827,7 +1863,7 @@ def compile_gfx1250_pa_decode(t):
             grid_x = ((sequences + t.cluster_seqs - 1) // t.cluster_seqs) * (
                 t.cluster_seqs * t.cluster_merge
             )
-            if const_expr(t.quant_output):
+            if const_expr(t.quant_output and t.cluster_seqs == 1):
                 # One cluster per t.cluster_merge padded FP8 rows past the
                 # sequences' tokens.
                 pads = quant_rows - sequences * t.query_length
