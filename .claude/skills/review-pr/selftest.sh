@@ -429,6 +429,46 @@ PYEOF
 }
 t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
 
+toml_diff='diff --git a/aiter/configs/foo_tuned.toml b/aiter/configs/foo_tuned.toml
+new file mode 100644
+--- /dev/null
++++ b/aiter/configs/foo_tuned.toml
+@@ -0,0 +1,2 @@
++[workload]
++M = 16
+'
+t "a tuning .toml file derives A5 (not infra-only)"   "$(rules_of "$toml_diff" tuning-config | grep -ow A5)" "A5"
+
+json_diff='diff --git a/aiter/tuning/foo.json b/aiter/tuning/foo.json
+new file mode 100644
+--- /dev/null
++++ b/aiter/tuning/foo.json
+@@ -0,0 +1,1 @@
++{}
+'
+t "a tuning/*.json file derives A5" "$(rules_of "$json_diff" tuning-config | grep -ow A5)" "A5"
+
+
+_audit_csv_coverage_backed_by_artifact() {
+  python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import triage
+diff = """diff --git a/aiter/configs/bf16_tuned_gemm.csv b/aiter/configs/bf16_tuned_gemm.csv
+--- a/aiter/configs/bf16_tuned_gemm.csv
++++ b/aiter/configs/bf16_tuned_gemm.csv
+@@ -1,1 +1,2 @@
+ gfx,M,N,K,us
++gfx950,16,64,128,1.0
+"""
+card = "⚠️ aiter/configs/bf16_tuned_gemm.csv:2 adds workload absent from aiter/configs/bf16_untuned_gemm.csv. **Author must** add the untuned workload."
+cov = "MISSING aiter/configs/bf16_tuned_gemm.csv: 1 of 1 new keys absent from aiter/configs/bf16_untuned_gemm.csv"
+_, problems = triage.audit_card(card, "", "", "", diff, tuning_coverage_text=cov)
+print("ok" if not problems else problems)
+PYEOF
+}
+t "audit_card accepts CSV coverage finding backed by tuning_coverage.txt"   "$(_audit_csv_coverage_backed_by_artifact)" "ok"
+
 echo "[mapping]"
 # MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.
 t "MAPPING.md matches \`triage.py mapping\`" \

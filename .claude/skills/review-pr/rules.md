@@ -50,6 +50,12 @@ FP self-check: a new branch that is fully gated by `if constexpr(NewFeature)` an
 Real examples: PR#5708 narrowed `enable_bias` from `_needs_swiglu_bias_support()` to `activation == Swiglu && _needs_swiglu_bias_support()` — could have regressed Situv2 bias on Opus/FlyDSL paths (analyzed as safe, but not tested). PR#5985 widened `kStoreTakesDivisor` to include `fp16_t` — broke the reciprocal scale on gfx942 fp16 MXFP8 quant (scale_err=55/56 groups), because the software convert path expected the reciprocal but received the raw divisor. PR#5914 added optional fp8 Q output to fused_qk_norm_rope kernel using a runtime pointer check (`if (q_out_fp8 != nullptr)`) instead of a template parameter — VGPR usage rose from 96 to 98 at head_size=512, crossing an allocation granule and dropping occupancy from 5 to 4 waves/SIMD for every existing caller passing nullptr; fixed by introducing a `HAS_Q_FP8` template parameter so the non-fp8 instantiation is byte-identical to the original.
 → `🔴/⚠️ A4: new [feature] branch added to [kernel] — shared [code/constant] changed, verify existing [paths] are not regressed`
 
+**A5 — Tuned workload missing from untuned input** ⚠️
+Where an applicable untuned input exists, every newly added workload-specific tuned entry must have its full workload key in that input (or a documented exception).
+**Evidence:** `$WORK/tuning_coverage.txt` reports `MISSING` (new keys absent from the matched untuned CSV), `COVERED`, or `SKIPPED:` (operational failure). Unpaired or unsupported tuning types/formats are omitted rather than flagged.
+FP self-check: confirm the selected untuned input is authoritative before flagging a missing candidate (another input may cover it), and never flag unchanged legacy entries already present at merge base, generic defaults, or tuning types/formats that have no untuned input.
+→ `⚠️ A5: [tuned file:line] adds workload [key] absent from [untuned input] — add the untuned workload or document the exception`
+
 ---
 
 ### B — Silent Bypass

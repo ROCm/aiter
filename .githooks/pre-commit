@@ -41,6 +41,7 @@ done
 
 # do the formatting
 for file in $files; do
+    case "$file" in .claude/*.py) continue ;; esac
     if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.cuh$|\.hpp$|\.cpp$|\.cl$|\.h\.in$|\.hpp\.in$|\.cpp\.in$|\.py$'; then
         sed -i -e 's/[[:space:]]*$//' "$file" # Remove whitespace at end of lines
         sed -i -e '$a\' "$file" # Add missing newline to end of file
@@ -75,6 +76,7 @@ fi
 
 if command -v black >/dev/null; then
     for file in $files; do
+    case "$file" in .claude/*.py) continue ;; esac
     [[ -L $file ]] && continue
        if [[ -e $file ]] && echo $file | grep -Eq '\.py$'; then
             echo "black $file"

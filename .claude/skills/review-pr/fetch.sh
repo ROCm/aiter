@@ -931,10 +931,12 @@ git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
 # Compare the PR's new workload keys with the matching head-side untuned input.
 # The checker reads Git blobs, not PR code or the reviewer's working tree.
 if ! python3 "$SKILLS_ROOT/review-pr/tuning_coverage.py" \
-    "$PROJECT_ROOT" "$BASE_SHA" "$HEAD_SHA" | tee "$WORK/tuning_coverage.txt"; then
-  echo "SKIPPED: tuning coverage checker failed; review these files manually" \
-    | tee -a "$WORK/tuning_coverage.txt"
+    "$PROJECT_ROOT" "$BASE_SHA" "$HEAD_SHA" > "$WORK/tuning_coverage.txt"; then
+  grep -q '^SKIPPED:' "$WORK/tuning_coverage.txt" 2>/dev/null \
+    || echo "SKIPPED: tuning coverage checker failed; review these files manually" \
+      >> "$WORK/tuning_coverage.txt"
 fi
+cat "$WORK/tuning_coverage.txt"
 # Day-old worktrees are finished reviews; drop them, or this accumulates 182M each. Scoped
 # to this box's scratch base (${TMPDIR:-/tmp}) so a user worktree merely named review-pr-*
 # elsewhere is never force-removed.

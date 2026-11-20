@@ -4,6 +4,7 @@ applyTo: "**/*.csv,**/*.json,**/*.yaml,**/*.yml,**/*.toml"
 
 # Tuning workload coverage
 
-For each newly added workload-specific tuned entry, check that its full workload
-key is in the applicable untuned input. Ask for the missing input or a documented
-exception. Do not flag unchanged legacy entries or generic defaults.
+Where an applicable untuned input exists, check that each newly added
+workload-specific tuned entry has its full workload key in that input, or ask
+for a documented exception. Do not flag unchanged legacy entries, generic
+defaults, or tuning types/formats that have no untuned input.
