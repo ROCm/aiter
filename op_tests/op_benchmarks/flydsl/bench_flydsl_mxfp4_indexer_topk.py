@@ -27,7 +27,7 @@ Request i of N has ``ctx * (spread + (1 - spread) * (i + 0.5) / N)`` entries.
 cache pool larger than the last-level cache are captured in one graph; the
 time per call is the median over rounds of replays, rounds ordered A B B A.
 
-    python3 op_tests/flydsl_tests/bench_flydsl_mxfp4_indexer_topk.py \\
+    python3 op_tests/op_benchmarks/flydsl/bench_flydsl_mxfp4_indexer_topk.py \\
         --mode dense --ctx 65536 131072 --reqs 3 11 32 64 128
 """
 
