@@ -1684,9 +1684,9 @@ _PIPE_CASES = [
         },
     ),
 ]
-# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row, an e4m3 or a
-# bf16 query. Plan-free runs one task per row; unequal 32-element blocks make a
-# block/scale mix-up visible.
+# MXFP4 K/V on gfx950/gfx1250: head_dim 128, page 128, one query token a row, an
+# e4m3 or a bf16 query. Plan-free runs one task per row; unequal 32-element blocks
+# make a block/scale mix-up visible.
 _E4M3 = torch.float8_e4m3fn
 _MXFP4_SWEEP = (1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048)
 _MXFP4_BASE = {
@@ -1746,6 +1746,31 @@ _MXFP4_CASES = [
             },
         )
         for partitions in (1, 2, 3, 8)
+    ],
+    # Default-plan decode of one M-tile: clusters that run in one round split
+    # their waves by dims (one and two tiles a CTA at 4k and 8k, a part-filled
+    # M-tile at G8); 64 tiles take one-tile tasks and the reducer.
+    *[
+        (
+            (
+                f"mxfp4-decode-g{group}-{length // 1024}k-"
+                f"{'dims' if cluster else 'reducer'}"
+            ),
+            {
+                **_MXFP4_BASE,
+                "group_size": group,
+                "query_dtype": torch.bfloat16,
+                "cluster": cluster,
+                "dims": bool(cluster),
+                "lengths": (length,),
+            },
+        )
+        for group, length, cluster in (
+            (16, 4096, 16),
+            (16, 8192, 16),
+            (8, 4096, 16),
+            (16, 16384, 0),
+        )
     ],
     *[
         (
@@ -1850,6 +1875,183 @@ _MXFP4_CASES = [
         for mode in ("reducer", "direct", "plan-free")
     ],
 ]
+# gfx1250 MXFP4 also takes MTP (a CTA keeps query positions / query_splits x heads
+# rows, at most 64), sliding windows and explicit query splits. Lengths below the
+# query length leave early positions without tokens; 0 is an empty sequence.
+_MXFP4_GFX1250_CASES = [
+    *[
+        (
+            f"mxfp4-mtp{query_length}-g{group}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": query_length,
+                "group_size": group,
+                "lengths": (0, 1, query_length, 255, 256, 257, 1027),
+            },
+        )
+        # MTP5 x G8 / G12: one split of 40 / 60 rows, the last M-tile part-filled.
+        for query_length, group in (
+            (2, 16),
+            (3, 16),
+            (4, 16),
+            (4, 8),
+            (3, 4),
+            (4, 1),
+            (5, 8),
+            (5, 12),
+        )
+    ],
+    *[
+        (
+            f"mxfp4-mtp4-e4m3-np{partitions}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": _E4M3,
+                "query_length": 4,
+                "max_partitions": partitions,
+                "lengths": (4, 300, 2049, 5000),
+            },
+        )
+        for partitions in (1, 3, 8)
+    ],
+    *[
+        (
+            f"mxfp4-window{window}-mtp{query_length}{'-plan-free' if free else ''}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": query_length,
+                "window": window,
+                "plan_free": free,
+                "max_partitions": None if free else 7,
+                "lengths": (0, 1, 255, 256, 257, 1027, 4097),
+            },
+        )
+        for window, query_length, free in (
+            (1, 1, False),
+            (64, 1, True),
+            (257, 1, False),
+            (257, 4, False),
+            (100, 4, True),
+            (1000, 2, False),
+        )
+    ],
+    *[
+        (
+            f"mxfp4-mtp4-qs{splits}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": 4,
+                "query_splits": splits,
+                "window": 300,
+                "max_partitions": 3,
+                "lengths": (4, 257, 1027, 4097),
+            },
+        )
+        for splits in (1, 2, 4)
+    ],
+    # Enough tiles that a CTA runs two plan slots (fuse_tasks), and more
+    # sequences than resident clusters: adjacent tiles of a sequence fuse,
+    # pairs across sequences (and empty ones) run apart. Over 40 rows the
+    # tasks run whole on wave pairs instead; G8 x MTP5 (40 rows) fuses.
+    *[
+        (
+            (
+                f"mxfp4-mtp{qlen}-g{group}-{'pairs' if pairs else 'fused'}"
+                f"{'-window' if window else ''}"
+            ),
+            {
+                **_MXFP4_BASE,
+                "group_size": group,
+                "query_dtype": torch.bfloat16,
+                "query_length": qlen,
+                "window": window,
+                "fused": not pairs,
+                "pairs": pairs,
+                "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 32,
+            },
+        )
+        for qlen, group, pairs, windows in (
+            (4, 16, True, (0, 300)),
+            (5, 8, False, (0, 300)),
+            # Partly filled M-tiles on wave pairs: 48 rows leave the last
+            # pair's second M-tile empty, 60 rows fill it partly.
+            (3, 16, True, (0,)),
+            (5, 12, True, (0,)),
+        )
+        for window in windows
+    ],
+    # A table-capacity length bound (as ATOM passes) compiles the fusing
+    # kernel, but the plan's 56 live tasks fit one round, so each CTA runs one
+    # slot.
+    (
+        "mxfp4-mtp5-g8-fused-loose-bound",
+        {
+            **_MXFP4_BASE,
+            "group_size": 8,
+            "query_dtype": torch.bfloat16,
+            "query_length": 5,
+            "fused": True,
+            "pairs": False,
+            "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 4,
+            "table_width": 1024,
+            "max_context": 1024 * 128,
+        },
+    ),
+    # Long contexts behind a window: the window bounds the tiles, so the call
+    # neither fuses nor launches the reducer.
+    (
+        "mxfp4-mtp4-window4096-long",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "window": 4096,
+            "fused": False,
+            "cluster": 16,
+            "lengths": (32768, 30001, 4100),
+        },
+    ),
+    # Split-row MTP whose clusters give each CTA 8 tiles runs whole: one
+    # 4-M-tile CTA a sequence and KV head, 4-CTA clusters of 8k contexts.
+    (
+        "mxfp4-mtp4-whole-cluster",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "kv_heads": 4,
+            "cluster": 4,
+            "splits": 1,
+            "lengths": (8192, 8000, 7937, 8192) * 4,
+        },
+    ),
+    (
+        "mxfp4-mtp4-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "max_partitions": 7,
+            "capture": True,
+            "lengths": (2048, 700, 2048, 33),
+        },
+    ),
+    (
+        "mxfp4-mtp2-window-kv2",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "kv_heads": 2,
+            "group_size": 8,
+            "query_length": 2,
+            "window": 300,
+            "lengths": (2, 299, 300, 301, 1025),
+        },
+    ),
+]
 _INVALID_CASES = [
     ("fp16-query", NotImplementedError, "BF16 KV requires bfloat16 queries"),
     ("plain-v", ValueError, "BF16 KV requires the vectorized 5D value_cache layout"),
@@ -1919,7 +2121,14 @@ _MXFP4_INVALID_CASES = [
     # A windowed plan is refused with one partition (served without it) and more.
     ("windowed-plan-1", ValueError, "sliding_window must match work_plan"),
     ("windowed-plan-2", ValueError, "sliding_window must match work_plan"),
+    # gfx1250 only: 5 positions x 16 heads exceed a CTA's 64 rows (5 has no split),
+    # and a windowed plan must match the query length.
+    ("rows-over-64", NotImplementedError, "at most 64 query rows"),
+    ("windowed-plan-query-length", ValueError, "query_length must match work_plan"),
 ]
+# MXFP4 refusals that hold on one architecture only.
+_MXFP4_GFX950_ONLY_INVALID = ("sliding-window", "query-length-2", "oversized-task")
+_MXFP4_GFX1250_ONLY_INVALID = ("rows-over-64", "windowed-plan-query-length")
 # name -> (arch FlyDSL reports, kv_dtype, query_dtype) of a PaDecodeSchedule.select call.
 _SELECT_INVALID = {
     "mxfp4-on-gfx942": ("gfx942", dtypes.fp4x2, torch.bfloat16),
@@ -1930,7 +2139,7 @@ _SELECT_INVALID = {
     "unmapped-kv": ("gfx950", torch.complex64, torch.bfloat16),
 }
 _SELECT_INVALID_CASES = [
-    ("mxfp4-on-gfx942", ValueError, "MXFP4 PA decode requires gfx950"),
+    ("mxfp4-on-gfx942", ValueError, "takes MXFP4 KV only on gfx950"),
     ("fp8-query-fp8-kv", ValueError, "An FP8 query needs MXFP4 KV"),
     ("fp8-query-bf16-kv", ValueError, "BF16 KV requires a BF16 query"),
     (
@@ -1943,9 +2152,14 @@ _SELECT_INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tol=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(output.float(), reference, atol=tol, rtol=tol)
+
+
+# gfx1250 MXFP4 runs PV in FP8 with an E4M3 P (3 mantissa bits), as the FP8 KV
+# path does: rows with few tokens keep P's rounding (a 3-token row: 6-8%).
+_MXFP4_GFX1250_TOL = 1.5e-2
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -2086,6 +2300,15 @@ def _check_unsupported_mxfp4(invalid, error, match, device):
     elif invalid == "misaligned-scale":
         ks = ks.as_strided(ks.shape, ks.stride(), ks.storage_offset() - 1)
         options["key_scale"] = ks
+    elif invalid == "rows-over-64":
+        query_length = 5
+        query = query.repeat_interleave(5, 0)
+        output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
+    elif invalid == "windowed-plan-query-length":
+        options["sliding_window"] = 256
+        options["work_plan"] = pa.plan_pa_decode(
+            context, 1, sliding_window=256, query_length=2
+        )
     elif invalid.startswith("windowed-plan"):
         options["work_plan"] = pa.plan_pa_decode(
             context, 1, max_partitions=int(invalid[-1]), sliding_window=256
@@ -2247,6 +2470,7 @@ _PA_DECODE_CASES = [
     *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
     *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
     *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_GFX1250_CASES],
     *[
         pytest.param(
             {
@@ -2353,6 +2577,11 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "query_splits": None,
+            "fused": None,
+            "pairs": None,
+            "dims": None,
+            "splits": None,
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
@@ -2361,8 +2590,19 @@ def _run_pa_decode_case(case, device, monkeypatch):
         **case,
     )
     arch = get_gfx_runtime()
-    if case["kv_dtype"] == "mxfp4" and arch != "gfx950":
-        pytest.skip("MXFP4 pa_decode runs on gfx950")
+    if case["kv_dtype"] == "mxfp4" and arch not in ("gfx950", "gfx1250"):
+        pytest.skip("MXFP4 pa_decode runs on gfx950 and gfx1250")
+    if case["invalid_kind"] == "mxfp4" and (
+        (arch == "gfx1250" and case["invalid_input"] in _MXFP4_GFX950_ONLY_INVALID)
+        or (arch == "gfx950" and case["invalid_input"] in _MXFP4_GFX1250_ONLY_INVALID)
+    ):
+        pytest.skip(f"MXFP4 on {arch} does not refuse {case['invalid_input']}")
+    if (
+        case["kv_dtype"] == "mxfp4"
+        and arch == "gfx950"
+        and (case["query_length"] > 1 or case["window"] or case["query_splits"])
+    ):
+        pytest.skip("gfx950 MXFP4 takes one query token without a window")
     if (
         arch != "gfx1250"
         and case["kv_dtype"] == "bf16"
@@ -2550,6 +2790,8 @@ def _run_pa_decode_case(case, device, monkeypatch):
     compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
+        if case["query_splits"]:
+            kwargs["query_splits"] = case["query_splits"]
         compile_kwargs.append(kwargs)
         return compile_tile(**kwargs)
 
@@ -2623,7 +2865,15 @@ def _run_pa_decode_case(case, device, monkeypatch):
             assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
         if case["ref_mean_min"]:
             assert reference.mean() > case["ref_mean_min"]
-        _check_output(out, reference)
+        _check_output(
+            out,
+            reference,
+            (
+                _MXFP4_GFX1250_TOL
+                if case["kv_dtype"] == "mxfp4" and arch == "gfx1250"
+                else 5e-3
+            ),
+        )
 
     launch()
     check()
@@ -2667,6 +2917,22 @@ def _run_pa_decode_case(case, device, monkeypatch):
         assert (padded[:, query.shape[1] :] == 7.0).all()
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
+    else:
+        # MXFP4 KV is per-token KV: its e8m0 bytes are each row's scales.
+        assert compile_kwargs and all(k["per_token_kv"] for k in compile_kwargs)
+        if case["fused"] is not None:
+            fused = any(k.get("fuse_tasks") == 2 for k in compile_kwargs)
+            assert fused == case["fused"], compile_kwargs[-1]
+        if case["pairs"] is not None and arch == "gfx1250":
+            pairs = any(k.get("wave_pairs") for k in compile_kwargs)
+            assert pairs == case["pairs"], compile_kwargs[-1]
+        if case["splits"] is not None and arch == "gfx1250":
+            assert compile_kwargs[-1]["query_splits"] == case["splits"]
+        if case["dims"] is not None and arch == "gfx1250":
+            dims = any(k.get("wave_dims") for k in compile_kwargs)
+            assert dims == case["dims"], compile_kwargs[-1]
+        if case["cluster"] is not None and arch == "gfx1250":
+            assert compile_kwargs[-1]["cluster_merge"] == case["cluster"]
     if case["nhd_contracts"]:
         _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["quant"] and arch == "gfx1250":
@@ -2879,13 +3145,14 @@ def test_pa_decode_unowned_kv_rows(
     image); P is zero there but 0 * NaN is NaN in PV.
     ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
     """
-    if get_gfx_runtime() == "gfx1250":
-        pytest.skip("gfx1250 pipelines still require finite unowned V rows")
+    if get_gfx_runtime() == "gfx1250" and kv != "mxfp4":
+        pytest.skip("gfx1250 FP8/BF16 pipelines still require finite unowned V rows")
     if kv == "mxfp4" and (
-        get_gfx_runtime() != "gfx950"
-        or (block_size, query_length, head_dim) != (128, 1, 128)
+        get_gfx_runtime() not in ("gfx950", "gfx1250")
+        or (block_size, head_dim) != (128, 128)
+        or (get_gfx_runtime() == "gfx950" and query_length != 1)
     ):
-        pytest.skip("MXFP4 pa_decode: gfx950, page 128, head_dim 128, one query token")
+        pytest.skip("MXFP4 pa_decode: page 128, head_dim 128; gfx950 one query token")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
     lengths = tuple(max(n, query_length) for n in (1, 17, 255, 257, 1000))
