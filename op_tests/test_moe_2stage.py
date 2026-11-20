@@ -1942,11 +1942,12 @@ def test_presorted_moe_std_sort_layout():
 def test_presorted_moe_std_pipelines():
     """FlyDSL pipelines without the aux sort run on a registered presort.
 
-    Kimi-K3 TP=8 (E=896, top-16, model_dim 3584, inter_dim 384): the shipped
-    A4W4 table runs BM=32 FlyDSL kernels at 65-256 tokens (BM=16 aux-sort ones
-    at 64), and A16W4 runs BM=32 (heuristic) to 32 tokens and BM=16 FlyDSL
-    kernels from 33, none with the aux sort. presorted_moe_block_m must report
-    each pipeline's block_m. For each, a presort in moe_sorting's layout must replace the sort
+    Kimi-K3 TP=8 (E=896, top-16, model_dim 3584, inter_dim 384): the pipeline
+    and block_m that get_2stage_cfgs selects depend on the arch (gfx950 runs
+    A4W4 BM=32 FlyDSL kernels at 65-256 tokens, BM=16 aux-sort ones at 64),
+    so each block_m is read from the dispatch under test. presorted_moe_block_m
+    must report it, and it must be one of PRESORTED_MOE_BLOCK_MS. For each
+    pipeline, a presort in moe_sorting's layout must replace the sort
     (no moe_sorting call) and give fused_moe's own result: bit-identical when the
     selected GEMM2 runs the route-reduce epilogue, whose summation order is
     fixed, and within atomic-accumulation noise otherwise. Pad rows of plain M are taken too. A stale output is zeroed
@@ -1977,10 +1978,11 @@ def test_presorted_moe_std_pipelines():
         "quant_type": aiter.QuantType.per_1x32,
         "activation": aiter.ActivationType.Situv2,
     }
-    # (name, A4W4 env, extra kwargs, {token: block_m fused_moe must select})
+    # (name, A4W4 env, extra kwargs, tokens); each block_m is what get_2stage_cfgs
+    # selects on this arch, read back from the call under test.
     cases = (
-        ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, {64: 16, 65: 32, 256: 32}),
-        ("a16w4", None, {}, {1: 32, 32: 32, 64: 16, 256: 16}),
+        ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, (64, 65, 256)),
+        ("a16w4", None, {}, (1, 32, 64, 256)),
     )
     if get_gfx() == "gfx942" or int(os.getenv("AITER_FP4x2", "1")) <= 0:
         aiter.logger.warning(
@@ -2029,7 +2031,7 @@ def test_presorted_moe_std_pipelines():
             with override_env("AITER_SITUV2_A8W4", None), override_env(
                 "AITER_SITUV2_A4W4", a4w4
             ):
-                for token, block_m in tokens.items():
+                for token in tokens:
                     what = f"{name} token={token}"
                     hidden = torch.randn((token, model_dim), dtype=dtype) / 10
                     gating = torch.randn((token, E), dtype=dtype)
@@ -2039,7 +2041,10 @@ def test_presorted_moe_std_pipelines():
                     own, sorted_ = run(call)
                     metadata = selected[-1]
                     assert sorted_, f"{what}: fused_moe did not sort"
-                    assert int(metadata.block_m) == block_m, f"{what}: {metadata}"
+                    block_m = int(metadata.block_m)
+                    assert (
+                        block_m in presorted_moe.PRESORTED_MOE_BLOCK_MS
+                    ), f"{what}: {metadata}"
                     # What a caller's router asks before building the sort.
                     got = fm.presorted_moe_block_m(metadata)
                     assert got == block_m, f"{what}: presorted_moe_block_m={got}"
@@ -3479,7 +3484,7 @@ else:
         aiter.logger.warning(
             "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
         )
-    if args.quant is None and get_gfx_runtime() == "gfx950":
+    if args.quant is None and get_gfx_runtime() in ("gfx942", "gfx950"):
         test_presorted_moe_std_pipelines()
 case_iter = itertools.chain(*_case_iters)
 
