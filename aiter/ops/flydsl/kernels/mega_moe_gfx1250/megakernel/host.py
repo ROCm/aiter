@@ -11,6 +11,7 @@ import os
 
 from .config import (
     SLOTS_CTAS_PER_CU,
+    STREAM_PRODUCERS,
     compact_caps,
     compact_ctl_region,
     compact_row_regions,
@@ -19,6 +20,9 @@ from .config import (
     slots_recv_cap,
     slots_tile,
     slots_tokens,
+    stream_layout,
+    stream_reason,
+    stream_tile_cap,
     wire_row,
 )
 from .kernel import make_megakernel
@@ -59,9 +63,25 @@ class MegaKernel:
             self.cap = rows
             self.mt_cap = rows // t["tile_m"]
             self.regions = (*compact_row_regions(), ctl)
-            self.route = torch.empty(
-                geo.max_tokens_per_rank * config.topk, dtype=torch.int32, device=device
-            )
+            self.stream_why = stream_reason(config, t, compact_ctas)
+            self.stream = self.stream_why is None
+            if self.stream:
+                lay = stream_layout(
+                    npes=config.world_size,
+                    experts_per_rank=epr,
+                    max_tok_per_rank=geo.max_tokens_per_rank,
+                    row=self.row,
+                    tile_cap=stream_tile_cap(rows, t["tile_m"]),
+                )
+                self.route = torch.zeros(
+                    lay["bytes"] // 4, dtype=torch.int32, device=device
+                )
+            else:
+                self.route = torch.empty(
+                    geo.max_tokens_per_rank * config.topk,
+                    dtype=torch.int32,
+                    device=device,
+                )
         else:
             cap = self.cap = slots_cap(config)
             t = self.tile = slots_tile(slots_tokens(config))
@@ -70,6 +90,7 @@ class MegaKernel:
             self.mt_cap = epr * (cap // t["tile_m"])
             self.regions = ("slots_rows", "slots_rowmap", "slots_ctl")
             self.route = None
+            self.stream = False
         self.rows = rows
         from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
@@ -147,6 +168,8 @@ class MegaKernel:
                 ctas_per_cu=self.ctas_per_cu,
                 layout=self.layout,
                 mt_cap=self.mt_cap,
+                stream=self.stream,
+                producers=STREAM_PRODUCERS,
                 **self.tile,
             )
             self._act_key = stage1_act
@@ -259,6 +282,11 @@ class MegaKernel:
         torch.cuda.synchronize()
         tr = self.ctl[self._ctl_words : self._ctl_words + 2 * TR_N * self.workers]
         tr = tr.view(torch.int64).view(self.workers, TR_N)
+        dump = os.environ.get("AITER_DMK_TRACE_DUMP", "")
+        if dump:
+            torch.save(
+                tr.cpu(), f"{dump}_r{self.config.rank}_{self.layout}_{self._traced}.pt"
+            )
         tr = tr.cpu().double()
         t0 = tr[:, 0].min()
         rel = (tr - t0) / 100.0  # steady counter: 100 MHz -> us

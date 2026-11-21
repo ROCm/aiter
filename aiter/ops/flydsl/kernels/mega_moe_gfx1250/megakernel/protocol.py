@@ -52,6 +52,10 @@ CTL_QHEAD = 4096  # + 32 * parity: the GEMM work queue head
 CTL_ERR = 5120  # routes dropped for a full expert slot (never expected)
 CTL_FAIL = 5121  # + wait site: AITER_DMK_NOTRAP's timed-out waits (debug)
 CTL_TALLY = 5248  # + 32 * parity: compact layout, tally CTAs done
+#: compact STREAM: the producers' run-block claim head and the CTAs that
+#: quantized their tokens into the local wire rows (+ 32 * parity each).
+CTL_PHEAD = 5376
+CTL_QDONE = 5504
 #: Per m-tile: g1_cnt at word 0 and g1_ready at word 32, each on its own
 #: 128 B line, so the ready polls do not queue the completion atomics.
 CTL_G1 = 6144
@@ -98,7 +102,8 @@ def compact_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
     send table and receive counts, or a tally CTA's histogram, bases and
     route table, whichever is larger."""
     segs = segs_pad(npes=npes, experts_per_rank=experts_per_rank)
-    lead = (int(npes) + 1) * segs * 4 + epr_pad(experts_per_rank) * 4
+    # + STREAM's per-expert starts and its scan words.
+    lead = (int(npes) + 1) * segs * 4 + 3 * epr_pad(experts_per_rank) * 4 + 64
     tally = 2 * segs * 4 + TALLY_MAXR * 4
     return max(lead, tally)
 
@@ -122,8 +127,10 @@ GATE_SLEEP = 32
 #: planned, GEMM1 done, GEMM2 done, combine flags seen, end. Slots 24-26 hold
 #: the CTA's GEMM item count, its last item's start and its first GEMM2
 #: item's start; slot 27 CTA 0's every-row-landed time (EARLY).
-TR_N = 28
+TR_N = 30
 TR_ITEMS, TR_LAST_ITEM, TR_FIRST_G2, TR_LANDED = 24, 25, 26, 27
+#: STREAM: a producer CTA's pipeline start and end.
+TR_PROD0, TR_PROD1 = 28, 29
 RT_N = 1024
 
 #: slots' W1 prefetch: the fewest tokens of a step that runs it, and the 16 B
@@ -317,7 +324,7 @@ def start(kc):
     """Entry ticket -> (generation, parity, X1 tag); CTA 0 resets the next
     launch's counters."""
     COMPACT, EARLY, EPR_CH, EPR_PAD = kc.COMPACT, kc.EARLY, kc.EPR_CH, kc.EPR_PAD
-    G, addr_ctl = kc.G, kc.addr_ctl
+    G, STREAM, addr_ctl = kc.G, kc.STREAM, kc.addr_ctl
     bc, bid, is_t0, lane, rsrc_actl = kc.bc, kc.bid, kc.is_t0, kc.lane, kc.rsrc_actl
     rsrc_ctl, stamp, wave = kc.rsrc_ctl, kc.stamp, kc.wave
     stamp(0)
@@ -383,6 +390,16 @@ def start(kc):
                 + other * fx.Int32(32),
                 cache_modifier=SCOPE_DEV,
             )
+        if const_expr(STREAM):  # noqa: SIM102 - preserve DSL staging
+            if lane < fx.Int32(2):
+                buffer_store(
+                    fx.Int32(0),
+                    rsrc_ctl,
+                    fx.Int32(CTL_PHEAD)
+                    + lane * fx.Int32(CTL_QDONE - CTL_PHEAD)
+                    + other * fx.Int32(32),
+                    cache_modifier=SCOPE_DEV,
+                )
         rocdl.s_wait_storecnt(0)
     return gen, par, tag16
 
@@ -395,6 +412,7 @@ def bind_protocol(kc):
     PLAN_SLOT, PLAN_TAG, PLAN_W, REP_W = kc.PLAN_SLOT, kc.PLAN_TAG, kc.PLAN_W, kc.REP_W
     TM, alive, bc, bid, gen, lane = kc.TM, kc.alive, kc.bc, kc.bid, kc.gen, kc.lane
     lds_cnt, lds_end, lds_rows, npes = kc.lds_cnt, kc.lds_end, kc.lds_rows, kc.npes
+    PACK = kc.STREAM
     rsrc_actl, rsrc_ctl, spin_end = kc.rsrc_actl, kc.rsrc_ctl, kc.spin_end
     spin_fail, stamp, wave = kc.spin_fail, kc.stamp, kc.wave
 
@@ -585,8 +603,15 @@ def bind_protocol(kc):
             c_ = cnts[j]
             mt = (c_ + fx.Int32(TM - 1)) // fx.Int32(TM)
             incl = _wave32_inclusive_scan_i32(mt, lane) + carry
-            comm_ops.store_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4)), incl)
-            comm_ops.store_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4)), c_)
+            if const_expr(PACK):
+                # end << 8 | (rows of the last m-tile - 1).
+                comm_ops.store_i32_lds(
+                    fx.Int64(lds_end + e_ * fx.Int32(4)),
+                    (incl << fx.Int32(8)) | ((c_ - fx.Int32(1)) & fx.Int32(TM - 1)),
+                )
+            else:
+                comm_ops.store_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4)), incl)
+                comm_ops.store_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4)), c_)
             carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
         if lane == fx.Int32(0):
             comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
@@ -632,7 +657,8 @@ def plan(kc):
     """2. PLAN: every CTA's LDS plan; returns the m-tile count."""
     CAP, COMPACT, EARLY, EPR, EPR_CH = kc.CAP, kc.COMPACT, kc.EARLY, kc.EPR, kc.EPR_CH
     EPR_PAD, GATE_P, GATE_R, GATE_S = kc.EPR_PAD, kc.GATE_P, kc.GATE_R, kc.GATE_S
-    PLAN_TAG, RS_OFF, SRC_OFF, bc = kc.PLAN_TAG, kc.RS_OFF, kc.SRC_OFF, kc.bc
+    PLAN_TAG, RS_OFF, SRC_OFF, STREAM = kc.PLAN_TAG, kc.RS_OFF, kc.SRC_OFF, kc.STREAM
+    bc = kc.bc
     bid, follower_plan, lane = kc.bid, kc.follower_plan, kc.lane
     lead_plan_lds, lead_plan_replicas = kc.lead_plan_lds, kc.lead_plan_replicas
     open_gates, par, poll_peer_flags = kc.open_gates, kc.par, kc.poll_peer_flags
@@ -644,13 +670,15 @@ def plan(kc):
     # control block and opens each CTA's own gate line. compact laid
     # the plan out from X1 and published it with the send gates: the
     # gate opened here only tells GEMM1's A owners the rows landed.
+    # STREAM has no rows-landed gate: GEMM items wait on their tiles' flags.
     if bid == fx.Int32(0):
         if const_expr(COMPACT):
-            if wave == fx.Int32(0):
-                poll_peer_flags(SRC_OFF, 2)
-                stamp(14)
-                open_gates(GATE_P, GATE_STRIDE)
-                stamp(17)
+            if const_expr(not STREAM):  # noqa: SIM102 - preserve DSL staging
+                if wave == fx.Int32(0):
+                    poll_peer_flags(SRC_OFF, 2)
+                    stamp(14)
+                    open_gates(GATE_P, GATE_STRIDE)
+                    stamp(17)
         else:
             if wave == fx.Int32(0):
                 # EARLY: the counters are final once every source
@@ -716,9 +744,74 @@ def gemm_queue(kc, n_mt):
     f32_swiglu_limit, g1_task, g2_task = kc.f32_swiglu_limit, kc.g1_task, kc.g2_task
     gen, i32_rows, is_t0, lane = kc.gen, kc.i32_rows, kc.is_t0, kc.lane
     lds_end, lds_rows, meta1_holder = kc.lds_end, kc.lds_rows, kc.meta1_holder
+    # STREAM packs each expert's last m-tile rows into its plan end.
+    PSH = 8 if kc.STREAM else 0
     meta2_holder, par, ready1_holder = kc.meta2_holder, kc.par, kc.ready1_holder
     ready2_holder, rsrc_ctl, spin_end = kc.ready2_holder, kc.rsrc_ctl, kc.spin_end
     spin_fail, stamp, wait_gate = kc.spin_fail, kc.stamp, kc.wait_gate
+    STREAM, npes = kc.STREAM, kc.npes
+    if const_expr(STREAM):
+        P, SUB, TILE_CAP = kc.P, kc.SUB, kc.TILE_CAP
+        is_prod, peer_va, rank = kc.is_prod, kc.peer_va, kc.rank
+        rsrc_flag = create_buffer_resource_from_addr(
+            peer_va(rank, kc.FLAG_OFF), num_records_bytes=TILE_CAP * FLAG_STRIDE
+        )
+        rsrc_tsrc = create_buffer_resource_from_addr(
+            kc.addr_tsrc, num_records_bytes=TILE_CAP * 4
+        )
+        # Lane (flag tile j of the m-tile, source s): j * npes + s.
+        f_sub = lane // fx.Int32(npes)
+        f_src = lane - f_sub * fx.Int32(npes)
+        f_on = lane < fx.Int32(SUB * npes)
+    else:
+        P = 0
+
+    def wait_tiles(i):
+        """STREAM: every source with rows in plan m-tile i's flag tiles has
+        published this launch's flag (its rows and rowmap pairs landed)."""
+        tau = i * fx.Int32(SUB) + f_sub
+        tau = fx.Int32((f_on & (tau < fx.Int32(TILE_CAP))).select(tau, fx.Int32(0)))
+        msk = fx.Int32(
+            buffer_load(
+                rsrc_tsrc,
+                tau,
+                vec_width=1,
+                dtype=T.i32,
+                mask=f_on,
+                cache_modifier=SCOPE_DEV,
+            )
+        )
+        need = f_on & (((msk >> f_src) & fx.Int32(1)) != fx.Int32(0))
+        fw = tau * fx.Int32(FLAG_STRIDE // 4) + f_src
+        cur = fx.Int32(
+            buffer_load(
+                rsrc_flag,
+                fw,
+                vec_width=1,
+                dtype=T.i32,
+                mask=f_on,
+                cache_modifier=SCOPE_SYS | (1 << 31),
+            )
+        )
+        bad = fx.Int32(ballot(T.i32, need & (cur != gen)))
+        t_end = spin_end()
+        live = fx.Int32(1)
+        while (bad != fx.Int32(0)) & (live != fx.Int32(0)):
+            fx.rocdl.s_sleep(POLL_SL)
+            cur = fx.Int32(
+                buffer_load(
+                    rsrc_flag,
+                    fw,
+                    vec_width=1,
+                    dtype=T.i32,
+                    mask=f_on,
+                    cache_modifier=SCOPE_SYS | (1 << 31),
+                )
+            )
+            bad = fx.Int32(ballot(T.i32, need & (cur != gen)))
+            live = alive(t_end)
+        if bad != fx.Int32(0):
+            spin_fail(7)
 
     def decode_mtile(i):
         """(expert, GEMM m-tile index, valid rows) of plan m-tile i: the
@@ -728,20 +821,32 @@ def gemm_queue(kc, n_mt):
             e_j = lane + fx.Int32(j * WAVE)
             end_j = fx.Int32(
                 comm_ops.load_i32_lds(fx.Int64(lds_end + e_j * fx.Int32(4)))
-            )
+            ) >> fx.Int32(PSH)
             e_ = e_ + _popc_i32(
                 fx.Int32(ballot(T.i32, (e_j < fx.Int32(EPR)) & (end_j <= i)))
             )
         e_ = _uniform(e_)
         e_prev = fx.Int32((e_ > fx.Int32(0)).select(e_ - fx.Int32(1), e_))
-        prev = fx.Int32(comm_ops.load_i32_lds(fx.Int64(lds_end + e_prev * fx.Int32(4))))
+        prev = fx.Int32(
+            comm_ops.load_i32_lds(fx.Int64(lds_end + e_prev * fx.Int32(4)))
+        ) >> fx.Int32(PSH)
         prev = _uniform(fx.Int32((e_ > fx.Int32(0)).select(prev, fx.Int32(0))))
         jt = i - prev
-        cnt = _uniform(
-            fx.Int32(comm_ops.load_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4))))
-        )
-        rows = cnt - jt * fx.Int32(TM)
-        rows = fx.Int32((rows > fx.Int32(TM)).select(fx.Int32(TM), rows))
+        if const_expr(PSH):
+            pk = _uniform(
+                fx.Int32(comm_ops.load_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4))))
+            )
+            rows = fx.Int32(
+                (i == (pk >> fx.Int32(PSH)) - fx.Int32(1)).select(
+                    (pk & fx.Int32(TM - 1)) + fx.Int32(1), fx.Int32(TM)
+                )
+            )
+        else:
+            cnt = _uniform(
+                fx.Int32(comm_ops.load_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4))))
+            )
+            rows = cnt - jt * fx.Int32(TM)
+            rows = fx.Int32((rows > fx.Int32(TM)).select(fx.Int32(TM), rows))
         # Compact: experts start on a tile, so plan m-tile i is GEMM
         # m-tile i; slots: expert e's tiles start at e * MT_PER_E.
         gidx = i if COMPACT else e_ * fx.Int32(MT_PER_E) + jt
@@ -770,7 +875,61 @@ def gemm_queue(kc, n_mt):
     U1 = n_mt * fx.Int32(NT1)
     U = U1 + n_mt * fx.Int32(NT2)
     bc_next = fx.Int64(bc + fx.Int32(12))
+    # STREAM: the producers (CTAs 1..P) are still shipping rows when the
+    # queue starts, so the other CTAs take the static items and a producer
+    # joins with a claim.
+    SQ = G - P
     u = bid
+    # STREAM: both queues start at the shared-first experts' m-tiles, whose
+    # rows the producers ship first (and never leave the rank).
+    if const_expr(STREAM and kc.SF):
+        m_sh = _uniform(
+            fx.Int32(
+                comm_ops.load_i32_lds(
+                    fx.Int64(lds_end + fx.Int32((EPR - 1 - kc.SF) * 4))
+                )
+            )
+            >> fx.Int32(PSH)
+        )
+        m_sh = fx.Int32((m_sh >= n_mt).select(fx.Int32(0), m_sh))
+
+    def order(w, NT, GM):
+        # S1F's order: GM m-tiles a group, m fastest inside, so the items
+        # running at once share a weight slice.
+        if const_expr(GM <= 1):
+            m = w // fx.Int32(NT)
+            n = w - m * fx.Int32(NT)
+        else:
+            k = w // fx.Int32(GM * NT)
+            base = k * fx.Int32(GM)
+            gsz = n_mt - base
+            gsz = fx.Int32((gsz > fx.Int32(GM)).select(fx.Int32(GM), gsz))
+            r = w - k * fx.Int32(GM * NT)
+            n = r // gsz
+            m = base + r - n * gsz
+        return m, n
+
+    def rot(i):
+        if const_expr(STREAM and kc.SF):
+            j = i + m_sh
+            return fx.Int32((j >= n_mt).select(j - n_mt, j))
+        return i
+
+    if const_expr(STREAM):
+        u = fx.Int32((bid == fx.Int32(0)).select(fx.Int32(0), bid - fx.Int32(P)))
+        if is_prod:
+            if is_t0:
+                old_q = _buffer_atomic_add_ret(
+                    rsrc_ctl,
+                    fx.Int32(CTL_QHEAD * 4) + par * fx.Int32(128),
+                    1,
+                    SCOPE_DEV,
+                )
+                comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + old_q)
+            rocdl.s_wait_dscnt(0)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+            u = _uniform(comm_ops.load_i32_lds(bc_next))
     n2_done = fx.Int32(0)
     n_items = fx.Int32(0)
     while u < U:
@@ -788,10 +947,23 @@ def gemm_queue(kc, n_mt):
             SCOPE_DEV,
         )
         if u < U1:
-            i = u // fx.Int32(NT1)
-            n = u - i * fx.Int32(NT1)
+            i, n = order(u, NT1, kc.GM1 if STREAM else 1)
+            i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
-            if const_expr(COMPACT or EARLY):
+            if const_expr(STREAM):
+                first_item = n_items == fx.Int32(1)
+
+                def a_ready1(i=i, first=first_item):
+                    # The m-tile's rows have landed: only A owners wait,
+                    # the W1 prologue streams meanwhile.
+                    wait_tiles(i)
+                    if const_expr(TRACE):  # noqa: SIM102 - preserve DSL staging
+                        if first:
+                            stamp(8)
+                    stamp(11)
+
+                set_meta1((e_, rows), a_ready1)
+            elif const_expr(COMPACT or EARLY):
 
                 def a_ready1():
                     # The rows of every rank have landed (CTA 0 saw
@@ -843,10 +1015,15 @@ def gemm_queue(kc, n_mt):
                     stamp(TR_FIRST_G2)
             n2_done = n2_done + fx.Int32(1)
             v = u - U1
-            i = v // fx.Int32(NT2)
-            n = v - i * fx.Int32(NT2)
+            i, n = order(v, NT2, kc.GM2 if STREAM else 1)
+            i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
-            if const_expr(COMPACT or EARLY):
+            if const_expr(STREAM):
+                # GEMM2's epilogue loads its rows' rowmap pairs before
+                # a_ready: every wave waits for the m-tile's flags first
+                # (set long since, but by another CTA's GEMM1 item).
+                wait_tiles(i)
+            elif const_expr(COMPACT or EARLY):
                 # GEMM2's epilogue loads its rows' rowmap pairs before
                 # a_ready, and compact / EARLY start the queue before
                 # the peers' rows land: every wave waits for them
@@ -887,7 +1064,7 @@ def gemm_queue(kc, n_mt):
                 n,
             )
         if is_t0:
-            comm_ops.store_i32_lds(bc_next, fx.Int32(G) + claim)
+            comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + claim)
         rocdl.s_wait_dscnt(0)
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)

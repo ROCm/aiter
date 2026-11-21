@@ -135,6 +135,13 @@ def _compact_gemm_tiles(
         m_warp2 = m_warp if ov_mw2 is None else ov_mw2
     tile_m2 = tile_m if tile_m2 is None else tile_m2
     m_warp2 = m_warp if m_warp2 is None else m_warp2
+    if ov_m is None and config.dispatch_wire == "fp4":
+        from ..s1f_ctl import s1f_prefill_tile
+
+        # The stage-1 kernel widens GEMM1 (and so the plan alignment) to its
+        # prefill tile; fused_moe's own GEMM1 tile is then clamped below it.
+        bound = config.max_recv if recv_bound is None else int(recv_bound)
+        tile_m = max(tile_m, s1f_prefill_tile(config.world_size, config.topk, bound))
     return int(tile_m), int(tile_m2), int(m_warp2)
 
 
