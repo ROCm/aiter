@@ -678,6 +678,8 @@ def _length_aware_seq_lens(batch: str, query_len: int):
             # padded slots of a CUDA graph batch have no KV
             short = [0 if i % 8 == 0 else kv for i, kv in enumerate(short)]
         return [(query_len, 120_000)] + [(query_len, kv) for kv in short]
+    if batch == "single_8k":
+        return [(query_len, 8192)]
     return [(query_len, 8192)] * 32
 
 
@@ -737,8 +739,10 @@ def _use_gfx950_length_aware_split(monkeypatch) -> None:
     # the length-aware split does not exclude these inputs
     + [
         ("skewed", (8, 2), 4, option, torch.int32)
-        for option in ("shuffled_kv_cache", "softcap", "qq_bias")
-    ],
+        for option in ("shuffled_kv_cache", "softcap", "qq_bias", "sinks")
+    ]
+    # one sequence of 1 KV head per query head takes the shortest ITEM_RUN
+    + [("single_8k", (64, 64), 1, None, torch.int32)],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_3d_length_aware_split(
@@ -858,8 +862,10 @@ def test_triton_unified_attn_3d_length_aware_split(
         segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
         used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
         assert sum(used) <= split_budget + len(kv) - 1
-        if batch != "uniform":
+        if batch.startswith("skewed"):
             assert used[0] > max(used[1:]) and min(used) < num_segments, used
+        elif batch == "single_8k":
+            assert used[0] > 1, used
         else:
             assert len(set(used)) == 1 and used[0] < num_segments, used
 
