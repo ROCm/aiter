@@ -330,11 +330,12 @@ if _HAVE_TRITON:
         kv = (t * 128 + k * 64)[:, None] + kt  # [BN,32] kv-in-tile
         if CLAMP_TAIL:
             kv = tl.minimum(kv, sk - 1)
+        # 64-bit: a strided view of a few rows can still put a later batch past 2^31 elements.
         voff = (
-            bb[:, None] * stride_vb
-            + kv * stride_vs
-            + hh[:, None] * stride_vh
-            + d_row[:, None] * stride_vd
+            bb.to(tl.int64)[:, None] * stride_vb
+            + kv.to(tl.int64) * stride_vs
+            + hh.to(tl.int64)[:, None] * stride_vh
+            + d_row.to(tl.int64)[:, None] * stride_vd
         )
         vals = tl.load(v_ptr + voff, mask=m[:, None], other=0.0).to(tl.float32)
 
