@@ -1060,7 +1060,15 @@ def derive(files, title="", raw_diff=""):
                 for p, f in files.items())
     if repin:
         hit("submodule-repin", "HK20")
-    if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
+    def _is_tuning_toml(p):
+        pl = p.lower()
+        return pl.endswith(".toml") and (
+            "tuned" in pl
+            or any(part in {"config", "configs", "model_configs", "tuning"}
+                   for part in pathlib.PurePosixPath(pl).parts)
+        )
+    if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg"))
+                     or (p.endswith(".toml") and not _is_tuning_toml(p))
                      or "/docs/" in p for p in paths):
         return t or [("infra-only", "NONE")]
     # Pure submodule / version-pointer bump: subproject commit lines and nothing else
@@ -1080,8 +1088,9 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
         hit("new-routing-value", "A4 B4 C4")
     if any(p.endswith((".csv", ".yaml", ".yml")) or
-           (p.endswith(".json") and ("config" in p or "tuned" in p)) for p in paths):
-        hit("tuning-config", "D3 HK4")
+           (p.endswith(".json") and ("config" in p or "tuned" in p or "tuning" in p)) or
+           _is_tuning_toml(p) for p in paths):
+        hit("tuning-config", "D3 HK4 A5")
     if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend|activation)", add, re.M):
         hit("dispatch-change", "A4 B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
@@ -1226,7 +1235,7 @@ UNREACHABLE_BY_DESIGN = {
     "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
-ALL_RULES = ("A1 A2 A3 A4 B1 B2 B3 B4 B5 B6 B7 B8 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 "
+ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B3 B4 B5 B6 B7 B8 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 "
              "D8 D10 D10b D13 D14 E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
              "T1 T2 T3 T4 T5 T6 T8 D11 D12 HK12 HK12b HK20 HK10 HK11 HK4 HK5 HK6 HK7 HK8 "
              "HK9 STEP4")
@@ -1491,7 +1500,7 @@ def expected_rules(rules_text):
 # boundary, `gemm_a8w8_blockscale_cktile_common.cuh` matched as `...common.cu`, a file the
 # PR changes read as one it does not. `=` belongs in the class because tuned-config names
 # carry it -- `gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json` matched as `1024.json`.
-CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh))"
+CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|toml|csv|cpp|hip|py|cu|cc|co|h|md|sh))"
                       r"(?![\w])(?::(\d+))?")
 
 
@@ -2363,7 +2372,7 @@ def backdated_artifacts(*paths):
 
 
 def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text,
-               late_text="", answers_path=None):
+               late_text="", answers_path=None, tuning_coverage_text=""):
     """Every finding in the card must trace back to something already adjudicated.
 
     The three gates before this one check that the work happened. None of them checks
@@ -2393,7 +2402,8 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                                        and re.search(rf"(?<![\w/]){re.escape(p)}(?![\w/])",
                                                      m.group(2))]
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
-                          + "\n" + (answers_text or ""))
+                          + "\n" + (answers_text or "")
+                          + "\n" + (tuning_coverage_text or ""))
     problems = []
     findings = []
     for line in (card_text or "").splitlines():
@@ -2436,7 +2446,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # `torch.cu` and `x.contiguous.cuda()` as `x.contiguous.cu`. Those are the
             # two most ordinary words in a HIP review, so the gate produced a citation
             # complaint about a path nobody wrote.
-            r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh)(?![\w]))",
+            r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|toml|csv|cpp|hip|py|cu|cc|co|h|md|sh)(?![\w]))",
             text)]
         def _is_touched(c):
             # NOT lstrip("./"): it strips every leading dot and slash, so
@@ -2742,7 +2752,7 @@ if __name__ == "__main__":
               "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
               "       triage.py independent <independent.txt> <card.md>\n"
               "       triage.py design <design.txt> <card.md> <reviewers.txt> <pr_meta.json> [diff]\n"
-              "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff> [late_findings]", file=sys.stderr)
+              "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff> [late_findings] [tuning_coverage]", file=sys.stderr)
         raise SystemExit(2)
 
     if mode == "independent":
@@ -2880,7 +2890,8 @@ if __name__ == "__main__":
             raise SystemExit(1)
         findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6),
                                         _read(7),
-                                        sys.argv[5] if len(sys.argv) > 5 else None)
+                                        sys.argv[5] if len(sys.argv) > 5 else None,
+                                        _read(8))
         if not findings and not problems:
             print("CARD: no findings, and no verdict fired")
             raise SystemExit(0)
