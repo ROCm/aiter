@@ -1543,6 +1543,8 @@ def test_mha_v4_kv_splits_auto_shrinks_a_partial_last_round():
         assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True) == 5
         fp8 = AttentionFormat.FP8
         assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True, q_format=fp8) == 4
+        fp4 = AttentionFormat.FP4_E2M1
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True, q_format=fp4) == 5
         # Whole rounds gain nothing that pays for the merge.
         assert mha_v4_kv_splits(1, 16384, 4, 16384) == 1
         assert mha_v4_kv_splits(1, 8192, 48, 8192) == 1
@@ -1774,16 +1776,22 @@ def test_mha_v4_kv_splits_auto_cost_model_compiles():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
-def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
+@parametrize(
+    "formats",
+    [
+        param((AttentionFormat.BF16,) * 3, id="BF16"),
+        param((AttentionFormat.FP8,) * 3, id="FP8"),
+    ],
+)
+def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence(formats):
     """Auto under a dynamic sequence: one graph for every length, each split as eager picks.
 
     A DiT's sequence follows its prompt, so a compiled model sees many key lengths. Traced, the
     pick and the range lengths guard on the length, and the pick's arithmetic on its symbolic
-    size breaks the graph.
+    size breaks the graph. A caller's `out` is filled by a copy from the compiled split.
     """
     torch._dynamo.reset()
     torch.manual_seed(63)
-    bf16 = (AttentionFormat.BF16,) * 3
     counter = torch._dynamo.testing.CompileCounterWithBackend("inductor")
     compiled = torch.compile(mha_v4, backend=counter, fullgraph=True, dynamic=True)
     picks = set()
@@ -1792,9 +1800,16 @@ def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
         q = torch.randn((1, length, 3, 128), device="cuda", dtype=torch.bfloat16)
         k = torch.randn_like(q)
         v = torch.randn_like(q)
-        picks.add(mha_v4_kv_splits(1, length, 3, length, q.device, ragged=True))
-        eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
-        assert torch.equal(eager, compiled(q, k, v, *bf16, kv_splits="auto")), length
+        picks.add(
+            mha_v4_kv_splits(
+                1, length, 3, length, q.device, ragged=True, q_format=formats[0]
+            )
+        )
+        eager = mha_v4(q, k, v, *formats, kv_splits="auto")
+        out = torch.full_like(q, float("nan"))
+        result = compiled(q, k, v, *formats, out=out, kv_splits="auto")
+        assert result.data_ptr() == out.data_ptr(), length
+        assert torch.equal(eager, out), length
     assert len(picks) > 1
     assert counter.frame_count == 1
 

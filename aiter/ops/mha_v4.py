@@ -360,8 +360,10 @@ _MHA_V4_MIN_KV_SPLIT_TOKENS = 512
 _MHA_V4_PARTIAL_ROUND_FLOOR = 0.40
 # The merge per split and output row of one head, in keys of a work-group's KV loop.
 _MHA_V4_MERGE_KEYS_PER_ROW = 0.00645
-# The 8-bit Q/K rows walk a key faster than BF16's, so the same merge is worth more of their keys.
+# INT8 and FP8 Q/K rows walk a key faster than BF16's, so the same merge is worth more of their
+# keys. Only those were measured; other formats keep BF16's merge.
 _MHA_V4_MERGE_SCALE_8BIT_QK = 1.5
+_MHA_V4_MERGE_8BIT_QK_FORMATS = (AttentionFormat.INT8, *_FP8_FORMATS)
 # Past batch 1 the queries are copied once per split, about a merge's traffic again.
 _MHA_V4_MERGE_SCALE_BATCHED = 2.0
 # The merge unrolls over the count, and no measured shape gained past 6.
@@ -2150,7 +2152,7 @@ def mha_v4_kv_splits(
             _MHA_V4_MAX_AUTO_KV_SPLITS, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS
         )
         merge = _MHA_V4_MERGE_KEYS_PER_ROW * batch * query_length * query_heads
-        if q_format != AttentionFormat.BF16:
+        if q_format in _MHA_V4_MERGE_8BIT_QK_FORMATS:
             merge *= _MHA_V4_MERGE_SCALE_8BIT_QK
         if batch > 1:
             merge *= _MHA_V4_MERGE_SCALE_BATCHED
