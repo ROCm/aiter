@@ -2,37 +2,46 @@
   "fwd": {
     "dropout_or_fp32": {
       "BLOCK_M": 32,
-      "BLOCK_N": 32,
+      "BLOCK_N": 16,
       "PRELOAD_V": false,
       "waves_per_eu": 1,
-      "num_warps": 2,
+      "num_warps": 8,
       "num_ctas": 1,
       "num_stages": 1
     },
     "default": {
-      "BLOCK_M": 64,
-      "BLOCK_N": 32,
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
       "PRELOAD_V": false,
-      "waves_per_eu": 1,
-      "num_warps": 4,
+      "waves_per_eu": 2,
+      "num_warps": 8,
       "num_ctas": 1,
-      "num_stages": 2
+      "num_stages": 1
     },
     "pe": {
-      "BLOCK_M": 256,
-      "BLOCK_N": 64,
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
       "PRELOAD_V": true,
-      "waves_per_eu": 1,
+      "waves_per_eu": 2,
       "num_warps": 8,
       "num_ctas": 1,
       "num_stages": 1
     },
     "pe_dropout_or_fp32": {
-      "BLOCK_M": 256,
-      "BLOCK_N": 64,
+      "BLOCK_M": 64,
+      "BLOCK_N": 16,
       "PRELOAD_V": true,
-      "waves_per_eu": 1,
+      "waves_per_eu": 2,
       "num_warps": 8,
+      "num_ctas": 1,
+      "num_stages": 2
+    },
+    "small_head": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
+      "PRELOAD_V": false,
+      "waves_per_eu": 1,
+      "num_warps": 4,
       "num_ctas": 1,
       "num_stages": 1
     }
