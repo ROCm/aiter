@@ -2254,6 +2254,31 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     assert cosine > 0.998
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd128 BF16 XCD relabel")
+@parametrize(
+    ("v_format", "bound"),
+    [
+        param(AttentionFormat.BF16, 0.01, id="bf16"),
+        # FP8 V alone costs about 0.04 against float32 attention.
+        param(AttentionFormat.FP8, 0.1, id="bf16fp8"),
+    ],
+)
+def test_mha_v4_bf16_hd128_xcd_relabel_matches_attention(v_format, bound):
+    # 8 heads x 2 Q tiles: the kernel relabels its work-groups per XCD.
+    torch.manual_seed(46)
+    q = torch.randn((1, 300, 8, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 384, 8, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out = mha_v4(q, k, v, AttentionFormat.BF16, AttentionFormat.BF16, v_format)
+    torch.cuda.synchronize()
+
+    reference = _dense_reference(q.float(), k.float(), v.float(), k.shape[1])
+    error = ((out.float() - reference).norm() / reference.norm()).item()
+    # A work-group on the wrong (Q tile, head) leaves whole rows wrong or unwritten.
+    assert error < bound, error
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
 def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     torch.manual_seed(41)
