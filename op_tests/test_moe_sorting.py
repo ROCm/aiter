@@ -833,9 +833,17 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
     """Child process for test_moe_sorting_ck_large_expert_no_hang."""
     set_moe_sorting_backend("ck")
     _check_routing_exact_controls()
-    for E, block_size, has_expert_mask, token in itertools.product(
-        CK_LDS_FALLBACK_EXPERTS, (16, 32, 64), (False, True), (1, 64)
-    ):
+    # M=2048 is where CK's multi-phase sort changes launch scheme (clearing the
+    # workspace, then P0_v1 + P1 + P23), so test both sides of it at one block size.
+    cases = itertools.chain(
+        itertools.product(
+            CK_LDS_FALLBACK_EXPERTS, (16, 32, 64), (False, True), (1, 64)
+        ),
+        itertools.product(
+            CK_LDS_FALLBACK_EXPERTS, (32,), (False, True), (2047, 2048, 4096)
+        ),
+    )
+    for E, block_size, has_expert_mask, token in cases:
         case = {
             "gfx": get_gfx_runtime(),
             "E": E,
