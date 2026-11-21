@@ -72,8 +72,9 @@ def launch_gemm_a8w8(
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
 ):
-    # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
-    # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
+    # fuse_quant_out: the output is group-32 MXFP8-quantized in the epilogue
+    # instead of written as bf16, from the accumulators rounded to bf16 when
+    # wmma_n_rep is even, else from the bf16 C tile staged in LDS. arg_c carries the e4m3 [M,B,N]
     # output and arg_scale_out the row-major [M, (B*N)//32] e8m0 scale -- the
     # (x, x_scale) pair a downstream native-quant GEMM reads, so the standalone
     # quantize_fp8 after this GEMM is removed. Batched mxfp8_32 only.

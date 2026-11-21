@@ -486,8 +486,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     ``w_scale_32x32`` selects the raw ``[B, N//32, K//32]`` block scale; else
     w_scale is the n32k4-shuffled 1x32 ``[B, N, K//32]`` (see module doc).
 
-    ``y_scale_out``: when given, the GEMM quantizes its bf16 C tile to e4m3 in
-    the epilogue instead of writing bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
+    ``y_scale_out``: when given, the epilogue writes the output group-32
+    MXFP8-quantized (e4m3) instead of bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
     buffer and ``y_scale_out`` the row-major ``[M, (B*N)//32]`` e8m0 scale, the
     ``(x, x_scale)`` pair a downstream native-quant GEMM reads. Bit-matches a
     standalone ATOM ``quantize_fp8`` of the bf16 output.

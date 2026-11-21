@@ -13,7 +13,8 @@ import unittest
 from unittest.mock import patch
 
 _LOOKUP = "aiter.ops.batched_gemm_op_a8w8.lookup_mxscale_bmm_config"
-_SHAPE = (8, 48, 1024, 4096, "32x32", "gfx1250", 256)
+# A CU count other than _SHAPE_950's, so the lookup must get the caller's.
+_SHAPE = (8, 48, 1024, 4096, "32x32", "gfx1250", 80)
 _SHAPE_950 = (8, 48, 1024, 4096, "32x32", "gfx950", 256)
 _FLYDSL_NAME = "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1"
 _COMPUTE_NAME = (
