@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Single-kernel Gated DeltaNet chunked prefill on gfx950 (FlyDSL).
+"""Gated DeltaNet chunked prefill on gfx950/gfx1151 (FlyDSL).
 
-One launch replaces the l2norm, prepare, hidden-state and output stages of the
+The gfx1151 launcher lives in :mod:`.gdn_fused_prefill_rdna`. On gfx950, one
+launch replaces the l2norm, prepare, hidden-state and output stages of the
 chunked prefill: every workgroup keeps its slice of the recurrent state on chip
 across the sequence's 64-token chunks, so the per-chunk states ``h`` never
 reach HBM. The pool state is updated in place. The kernel can also write the
@@ -40,6 +41,12 @@ def _is_gfx950() -> bool:
         return get_gfx_runtime() == "gfx950"
     except Exception:  # noqa: BLE001
         return False
+
+
+def _is_gfx1151() -> bool:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx1151"
 
 
 @functools.cache
@@ -95,7 +102,9 @@ def gdn_fused_prefill_supported(
 ) -> bool:
     """Whether :func:`gdn_fused_prefill_fwd` serves these operands.
 
-    Supported: gfx950; bf16 q/k [1, T, Hg, 128] and v [1, T, H, 128] with
+    gfx1151 operand checks are delegated to :mod:`.gdn_fused_prefill_rdna`.
+
+    Supported on gfx950: bf16 q/k [1, T, Hg, 128] and v [1, T, H, 128] with
     contiguous heads (token stride free, e.g. views of a packed projection);
     fp32 g/beta [1, T, H] with unit head stride; a contiguous bf16 state pool
     [slots, H, 128, 128]; H % Hg == 0; q/k/v/g/beta/o spans under 4 GiB
@@ -105,6 +114,10 @@ def gdn_fused_prefill_supported(
     False where the multi-kernel path is expected to be faster, i.e. unless
     ``max_seqlen <= 1024 or H * T >= 24 * max_seqlen``.
     """
+    if _is_gfx1151():
+        from .gdn_fused_prefill_rdna import gdn_fused_prefill_supported as supported
+
+        return supported(q, k, v, g, beta, ssm_states, max_seqlen=max_seqlen)
     if not (_token_major(q, _KD) and _token_major(k, _KD) and _token_major(v, _VD)):
         return False
     T, Hg = q.shape[1], q.shape[2]
@@ -162,6 +175,8 @@ def gdn_fused_prefill_fwd(
 ) -> torch.Tensor:
     """Varlen GDN chunked prefill (BT=64) with in-kernel q/k l2norm.
 
+    gfx1151 uses :mod:`.gdn_fused_prefill_rdna` with the same serving interface.
+
     Args:
         q, k: [1, T, Hg, 128] bf16, un-normalized.
         v: [1, T, H, 128] bf16.
@@ -194,6 +209,24 @@ def gdn_fused_prefill_fwd(
         ``[cu_seqlens[0], cu_seqlens[-1])`` and the rows of padded sequences
         are left uninitialized.
     """
+    if _is_gfx1151():
+        from .gdn_fused_prefill_rdna import gdn_fused_prefill_fwd as fwd
+
+        return fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+            has_initial_state=has_initial_state,
+            scale=scale,
+            stream=stream,
+        )
     if not gdn_fused_prefill_supported(q, k, v, g, beta, ssm_states):
         raise ValueError(
             "gdn_fused_prefill_fwd: unsupported operands "
