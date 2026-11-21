@@ -5,8 +5,6 @@ import argparse
 import itertools
 import math
 import os
-import subprocess
-import sys
 import tempfile
 from functools import partial
 from unittest import mock
@@ -17,6 +15,7 @@ import torch
 import aiter
 import aiter.ops.fused_qknorm_idxrqknorm as op
 from aiter import dtypes
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
@@ -1723,10 +1722,14 @@ def run_fused_qknorm_idxrqknorm(
     index_dtype: str | None = None,
     q_dtype: torch.dtype | None = None,
     index_pages: torch.Tensor | None = None,
+    qkv_partials: torch.Tensor | None = None,
 ):
     """kv_dtype="mxfp4", index_dtype ("auto", "fp8", "mxfp4"), q_dtype (e4m3) and
-    index_pages (an mxfp4 index cache to write into) override what `mode` implies."""
+    index_pages (an mxfp4 index cache to write into) override what `mode` implies.
+    With qkv_partials the op reduces qkv from them, into a qkv that starts all NaN."""
     qkv = case["qkv"].clone()
+    if qkv_partials is not None:
+        qkv.fill_(float("nan"))
     if mode == "inplace":
         aiter.fused_qknorm_idxrqknorm(
             qkv,
@@ -1839,6 +1842,7 @@ def run_fused_qknorm_idxrqknorm(
         v_scale=v_scale,
         asm_layout=use_asm_layout,
         skip_index_branch="skip_index" in mode,
+        qkv_partials=qkv_partials,
     )
     call()  # `call` is returned too: the op alone, on these buffers, for timing
     return (
@@ -1891,6 +1895,12 @@ def test_fused_qknorm_idxrqknorm(
         return {"err": check_mxfp4_scale_rule(num_tokens)}
     if mode == "mxfp4_reject":
         return {"err": check_mxfp4_reject()}
+    if mode in PARTIALS_MODES:
+        return check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim)
+    if mode == "qkv_partials_reject":
+        return {"err": check_qkv_partials_reject()}
+    if mode == "arg_reject":
+        return {"err": check_arg_rejects()}
 
     case = make_case(
         dtype=dtype,
@@ -2101,11 +2111,59 @@ MXFP4_MODES = {
 }
 MXFP4 = [*MXFP4_MODES, "mxfp4_scale_rule", "mxfp4_reject"]
 ROW_BYTES = {"auto": 2 * HEAD_DIM, "fp8": HEAD_DIM, "mxfp4": 68}
-# AITER_CHECK aborts the process instead of raising: a contract violation runs in a child
-REJECT_CHILD = (
-    "import sys, torch, aiter; a, kw = torch.load(sys.argv[1]); "
-    "aiter.fused_qknorm_idxrqknorm(*a, **kw); torch.cuda.synchronize()"
-)
+
+
+def call_edited(call, edits: dict, kwargs: dict, copy: bool = False):
+    """``call`` (an op call, a partial) with {positional index: replacement} and kwargs
+    applied; with ``copy`` on copies of its tensors, which it returns."""
+    args = [edits.get(i, a) for i, a in enumerate(call.args)]
+    kwargs = {**call.keywords, **kwargs}
+    if copy:
+        args = [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+        kwargs = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in kwargs.items()
+        }
+    call.func(*args, **kwargs)
+    torch.cuda.synchronize()
+    return [t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)]
+
+
+def stderr_of(fn):
+    """fn() and what it wrote to file descriptor 2 (the C++ side's std::cerr)."""
+    with tempfile.TemporaryFile() as f:
+        saved = os.dup(2)
+        os.dup2(f.fileno(), 2)
+        try:
+            ret = fn()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        f.seek(0)
+        return ret, f.read()
+
+
+def check_rejects(cases: dict):
+    """name -> (op call, {positional index: replacement}, kwargs, expected message): each
+    call must raise RuntimeError with that message, before launching anything (None: must
+    succeed), and fused_qknorm_idxrqknorm_supports must say so beforehand, quietly."""
+    for name, (call, edits, kwargs, msg) in cases.items():
+        args = [edits.get(i, a) for i, a in enumerate(call.args)]
+        supported, err = stderr_of(
+            partial(
+                aiter.fused_qknorm_idxrqknorm_supports,
+                *args,
+                **{**call.keywords, **kwargs},
+            )
+        )
+        assert supported == (msg is None), f"{name}: supports() said {supported}"
+        assert not err, f"{name}: supports() wrote {err!r}"
+        try:
+            call_edited(call, edits, kwargs)
+        except RuntimeError as e:
+            assert msg is not None and msg in str(e), f"{name}: {e}"
+        else:
+            assert msg is None, f"{name}: accepted"
 
 
 def check_bytes(actual, expected, msg: str):
@@ -2323,24 +2381,13 @@ def check_mxfp4_reject():
             "with the same num_pages and a contiguous last dim",
         ),
     }
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, (call, edits, kwargs, msg) in cases.items():
-            args = [edits.get(i, a) for i, a in enumerate(call.args)]
-            path = os.path.join(tmp, name)
-            torch.save((args, {**call.keywords, **kwargs}), path)
-            cmd = [sys.executable, "-c", REJECT_CHILD, path]
-            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if msg is None:
-                assert r.returncode == 0, r.stderr[-500:]
-            else:
-                assert r.returncode != 0, name
-                assert msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+    check_rejects(cases)
     # Where opus converts to fp4/fp8 as zeros the wrapper raises: fake the arch
     for call, gfx, msg in (
         (page16, "gfx942", "gfx950"),
         (kv, "gfx942", "gfx950"),
         (kv_only, "gfx942", "gfx950"),  # an mxfp4 main K/V alone is refused too
-        (q8, "gfx1100", "fp8 q_out"),
+        (q8, "gfx1100", "requires one of"),
     ):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
             try:
@@ -2349,6 +2396,215 @@ def check_mxfp4_reject():
                 assert msg in str(e), e
             else:
                 raise AssertionError(f"accepted on {gfx}: {call.keywords}")
+    return 0
+
+
+# qkv_partials: the fp32 [splits, >= num_tokens, row] split-K partials of a bf16 qkv that the
+# gfx1250 split-K GEMM left unreduced. The judge is this op on the reduced qkv: with the
+# partials every output, qkv included, must match it bit for bit (any NaN matching any NaN).
+# mode -> the insert mode it runs in: M3's page-16 fp8 per-token K/V, bf16 K/V, page 128.
+PARTIALS_MODES = {
+    "qkv_partials": "asm_layout_fp8_pertoken",
+    "qkv_partials_bf16": "asm_layout",
+    "qkv_partials_page128": "insert",
+}
+
+
+def reduce_partials(partials: torch.Tensor) -> torch.Tensor:
+    """The GEMM's reduce kernel (gemm_a8w8_splitk_reduce), on the CPU: fp32 adds in split
+    order with denormals kept, then one round to nearest even to bf16."""
+    p = partials.cpu()
+    acc = p[0].clone()
+    for split in p[1:]:
+        acc += split
+    return acc.to(torch.bfloat16).to(partials.device)
+
+
+def make_partials(splits: int, rows: int, row: int, inf_row: int | None):
+    """Random partials plus columns whose partials, running sums or sums are subnormal,
+    or whose sums overflow, are NaN or bf16 ties: where the op's denormal-flushing
+    arithmetic could part from the reduce kernel's. The overflow and NaN columns go in
+    token inf_row only (none if None), so every other token's heads normalize to finite
+    values that are compared bit for bit."""
+    p = torch.randn(splits, rows, row, device="cuda") * 4
+    tiny = torch.finfo(torch.float32).tiny
+    edges = [
+        (1.5 * tiny, -tiny),  # subnormal sum of normal partials
+        (3e-39, 1e-39),  # subnormal partials
+        (1.0, 2.0**-8),  # tie, rounds down to the even 1.0
+        (1.0 + 2.0**-7, 2.0**-8),  # tie, rounds up to the even 1 + 2^-6
+        # a subnormal partial after the first: flushed, the sum would round to even
+        torch.tensor([0x00808000, 1], dtype=torch.int32).view(torch.float32).tolist(),
+        # a subnormal running sum the next split makes normal again: flushed, the
+        # sum would be tiny, not 1.5 tiny
+        (1.5 * tiny, -tiny, tiny),
+        (3.3e38, 3.3e38),  # overflow to inf
+        (float("inf"), float("-inf")),  # NaN
+    ]
+    for c, sums in enumerate(edges):
+        if c >= 6 and inf_row is None:
+            continue
+        cols = slice(c, None, 61)  # a few columns of every head
+        tokens = slice(None) if c < 6 else slice(inf_row, inf_row + 1)
+        p[:, tokens, cols] = 0.0
+        for s, v in enumerate(sums[:splits]):
+            p[s, tokens, cols] = v
+    return p
+
+
+def bits(t: torch.Tensor) -> torch.Tensor:
+    """t's bit pattern, every NaN alike (the reference rounds on the CPU)."""
+    ints = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    i = t.contiguous().view(ints[t.element_size()])
+    return i.masked_fill(t.float().isnan(), -1) if t.is_floating_point() else i
+
+
+def check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim):
+    """A sparse layer (one index head) and a dense one, 2 / 4 / 8 splits, q to q_out and
+    in place; the partials hold 3 rows more than num_tokens (a longer split stride)."""
+    base = PARTIALS_MODES[mode]
+    run = partial(
+        run_fused_qknorm_idxrqknorm,
+        mode=base,
+        use_index_slot_mapping=True,
+        use_fp8_kv_cache="fp8" in base,
+    )
+    ret = {"gfx": get_gfx_runtime()}
+    for niq, splits in itertools.product((1, 0), (2, 4, 8)):
+        case = make_case(
+            dtype=dtype,
+            num_tokens=num_tokens,
+            block_size=block_size,
+            num_kv_heads=1,
+            num_index_heads=niq,
+            rotary_dim=rotary_dim,
+        )
+        # The last token takes the overflow / NaN sums (a single token takes none).
+        inf_row = num_tokens - 1 if num_tokens > 1 else None
+        partials = make_partials(splits, num_tokens + 3, case["qkv"].shape[1], inf_row)
+        partials = partials[:, :num_tokens]
+        case["qkv"] = reduce_partials(partials)
+        (*want, ref_call), _ = run(case)
+        (*got, call), _ = run(case, qkv_partials=partials)
+        if niq:  # and q in place: q_out (positional 17) None
+            nan_qkv = torch.full_like(case["qkv"], float("nan"))
+            for c, outs, qkv in (
+                (ref_call, want, case["qkv"].clone()),
+                (call, got, nan_qkv),
+            ):
+                c.func(qkv, *c.args[1:17], None, *c.args[18:], **c.keywords)
+                outs.append(qkv)
+        for i, (g, w) in enumerate(zip(got, want)):
+            if isinstance(g, torch.Tensor):
+                msg = f"{mode} niq={niq} {splits} splits, output {i}"
+                assert torch.equal(bits(g), bits(w)), msg
+        if niq:
+            _, ret[f"{splits} splits us"] = run_perftest(call, num_iters=50)
+            _, ret["reduced qkv us"] = run_perftest(ref_call, num_iters=50)
+    return {**ret, "err": 0}
+
+
+def check_qkv_partials_reject():
+    """A call whose mode does not sum the partials in the op's own pass (no insert, the
+    index branch skipped, an e4m3 q_out) reduces them first: every output matches the call
+    on the reduced qkv bit for bit. Partials the op cannot read are refused ("good" shows
+    the harness is sound)."""
+    case = make_case(
+        dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
+    )
+    p = make_partials(2, 4, case["qkv"].shape[1], inf_row=3)
+    case["qkv"] = reduce_partials(p)
+    run = partial(run_fused_qknorm_idxrqknorm, use_index_slot_mapping=True)
+    call = run(case, mode="asm_layout", use_fp8_kv_cache=False, qkv_partials=p)[0][-1]
+    fp8_q = torch.zeros(4, 16 * HEAD_DIM, dtype=dtypes.fp8, device="cuda")
+    unfused = {
+        "not_insert": ({13: None, 14: None, 15: None}, {}),
+        "skip_index_branch": ({15: None}, {"skip_index_branch": True}),
+        "fp8_q_out": ({17: fp8_q}, {}),
+    }
+    for name, (edits, kw) in unfused.items():
+        nan_qkv = torch.full_like(case["qkv"], float("nan"))
+        got = call_edited(call, {**edits, 0: nan_qkv}, kw, copy=True)
+        want = call_edited(
+            call, {**edits, 0: case["qkv"]}, {**kw, "qkv_partials": None}, copy=True
+        )
+        for i, (g, w) in enumerate(
+            zip(got, want)
+        ):  # got's last, the partials, unpaired
+            assert torch.equal(bits(g), bits(w)), f"{name}: output {i}"
+    unaligned = torch.zeros(p.numel() + 1, device="cuda")[1:].view(p.shape)
+    bad = {
+        "3_splits": ({}, {"qkv_partials": p[[0, 1, 1]]}),
+        "fp16_partials": ({}, {"qkv_partials": p.half()}),
+        "short_rows": ({}, {"qkv_partials": p[:, :3]}),
+        "unaligned": ({}, {"qkv_partials": unaligned}),
+    }
+    cases = {k: (call, e, kw, "qkv_partials") for k, (e, kw) in bad.items()}
+    check_rejects({"good": (call, {}, {}, None), **cases})
+    return 0
+
+
+def check_arg_rejects():
+    """Arguments the op refuses raise before launching, so a caller need not pre-check
+    them: head_dim, rotary_dim, qkv / positions / cache layout and dtype, and the arch
+    (faked) for fp8 stores; gfx1250-strict counts as gfx1250."""
+    case = make_case(
+        dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
+    )
+    run = partial(run_fused_qknorm_idxrqknorm, case, use_index_slot_mapping=True)
+    call = run(mode="asm_layout", use_fp8_kv_cache=False)[0][-1]
+    fp8 = run(mode="asm_layout_fp8_pertoken", use_fp8_kv_cache=True)[0][-1]
+    qkv, w, pos, kc = call.args[0], call.args[1], call.args[4], call.args[13]
+    wide = torch.zeros(qkv.shape[0], qkv.shape[1] + HEAD_DIM, dtype=qkv.dtype).cuda()
+    cos12 = call.args[3][:, :12].contiguous()
+    cases = {
+        "good": ({}, None),
+        "head_dim_64": ({1: w[:64], 2: w[:64]}, "must have 128 elements"),
+        "rotary_dim_12": ({3: cos12, 7: 12}, "rotary_dim must be a positive multiple"),
+        "qkv_strided": ({0: wide[:, : qkv.shape[1]]}, "qkv must be contiguous"),
+        "positions_int32": ({4: pos.int()}, "positions must be contiguous int64"),
+        "positions_2d": ({4: pos.view(-1, 1)}, "positions must be 1D"),
+        "cache_4d": ({13: kc.flatten(-2)}, "kv_cache_k must be [num_blocks"),
+        "cache_dtype": ({13: kc.half(), 14: call.args[14].half()}, "dtype must match"),
+        "qkv_fp32": ({0: qkv.float()}, "qkv must be bf16 or fp16"),
+    }
+    check_rejects({k: (call, e, {}, msg) for k, (e, msg) in cases.items()})
+    # Only a refusal answers False: a build or load failure of the module raises.
+    with mock.patch.object(
+        op, "_fused_qknorm_idxrqknorm_hip", side_effect=RuntimeError("load failed")
+    ):
+        try:
+            aiter.fused_qknorm_idxrqknorm_supports(*call.args, **call.keywords)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("supports() hid a load failure")
+    # Each fp8 store is refused on gfx1100 on its own: fp8 K/V (on a skip_index_branch
+    # layer), an fp8 index cache next to a bf16 K/V, an fp8 q_out, an fp8 index_q_out. A
+    # call that writes no fp8 (an fp8 index dtype, or an fp8 index_q_out, on a
+    # skip_index_branch layer) is taken on gfx1100 too.
+    skip = {"skip_index_branch": True}
+    no_index = ({15: None}, {**skip, "index_cache_dtype": "fp8"})
+    iq8 = torch.zeros(qkv.shape[0], HEAD_DIM, dtype=dtypes.fp8, device="cuda")
+    q8 = torch.zeros_like(call.args[17], dtype=dtypes.fp8)
+    for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
+        with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
+            check_rejects(
+                {
+                    gfx: (fp8, {}, {}, msg),
+                    f"{gfx}_fp8_kv_skip": (fp8, {15: None}, skip, msg),
+                    f"{gfx}_fp8_index": (
+                        call,
+                        {15: fp8.args[15]},
+                        {"index_cache_dtype": "fp8"},
+                        msg,
+                    ),
+                    f"{gfx}_fp8_q_out": (call, {17: q8}, {}, msg),
+                    f"{gfx}_fp8_index_q": (call, {18: iq8}, {}, msg),
+                    f"{gfx}_skip": (call, *no_index, None),
+                    f"{gfx}_skip_fp8_index_q": (call, {15: None, 18: iq8}, skip, None),
+                }
+            )
     return 0
 
 
@@ -2375,7 +2631,24 @@ DEFAULT_CASES = [
     ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "fp16", 19, 16, 96, 4),
+    (
+        "asm_layout_fp8_pertoken",
+        "bf16",
+        13,
+        16,
+        96,
+        0,
+    ),  # a dense layer: no index operands
     ("asm_layout_fp8_pertoken_uint8", "bf16", 17, 16, 64, 4),
+]
+DEFAULT_CASES += [
+    # qkv_partials (num_index_heads is not a parameter: each case runs 1 and 0)
+    ("qkv_partials", "bf16", 1, 16, 64, 1),
+    ("qkv_partials", "bf16", 64, 16, 64, 1),
+    ("qkv_partials_bf16", "bf16", 17, 16, 128, 1),
+    ("qkv_partials_page128", "bf16", 33, 128, 96, 1),
+    ("qkv_partials_reject", "bf16", 4, 16, 64, 1),
+    ("arg_reject", "bf16", 4, 16, 64, 1),
 ]
 DEFAULT_CASES += [
     (mode, dtype_name, num_tokens, 16 if mode.startswith("asm_layout") else 128, 64, 1)
@@ -2386,13 +2659,34 @@ DEFAULT_CASES += [
     ("mxfp4_scale_rule", "bf16", 4096, 128, 64, 1),
     ("mxfp4_reject", "bf16", 32, 16, 64, 1),
 ]
-# the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one)
+# gfx1250 runs 4 rows per warp from 128 rows per CU on (every mode but the fp4 caches and
+# fused qkv_partials): launches above that, at least 20 (token, slot) rows per token. An odd
+# token count gives the 25 and 29 slot modes (16 q / 4 kv / 4 index heads) a row count
+# that is not a multiple of 4, so the last warp has tail rows.
+if base_gfx_arch(get_gfx_runtime()) == "gfx1250":
+    multi_row_tokens = (
+        128 * torch.cuda.get_device_properties(0).multi_processor_count + 19
+    ) // 20 | 1
+    DEFAULT_CASES += [
+        (mode, dtype_name, multi_row_tokens, block_size, 64, niq)
+        for mode, dtype_name, block_size, niq in (
+            ("insert", "bf16", 16, 4),
+            ("insert", "fp16", 16, 4),
+            ("asm_layout", "bf16", 16, 4),
+            ("asm_layout_fp8_pertoken", "bf16", 16, 4),
+            ("inplace", "bf16", 16, 0),
+            ("inplace", "bf16", 16, 4),
+            ("q_fp8_out", "bf16", 128, 1),
+        )
+    ]
+# the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one).
+# The e4m3 q_out runs wherever opus converts to fp8, the fp4 caches on gfx950 only.
 if get_gfx_runtime() != "gfx950":
+    q_fp8 = ["q_fp8_out"] if base_gfx_arch(get_gfx_runtime()) in op._FP8_CVT_GFX else []
     aiter.logger.warning(
-        "mxfp4 caches and the e4m3 q_out are tested on gfx950 only, not %s: skipping",
-        get_gfx_runtime(),
+        "mxfp4 caches are tested on gfx950 only, not %s: skipping", get_gfx_runtime()
     )
-    DEFAULT_CASES = [case for case in DEFAULT_CASES if case[0] not in MXFP4]
+    DEFAULT_CASES = [c for c in DEFAULT_CASES if c[0] not in MXFP4 or c[0] in q_fp8]
 
 l_mode = [
     "insert",
@@ -2407,6 +2701,9 @@ l_mode = [
     "asm_layout_fp8_pertoken",
     "asm_layout_fp8_pertoken_uint8",
     *MXFP4,
+    *PARTIALS_MODES,
+    "qkv_partials_reject",
+    "arg_reject",
 ]
 l_dtype = ["fp16", "bf16"]
 
@@ -2544,6 +2841,7 @@ if args.minimax_benchmark:
 
 df = []
 mxfp4_rows = []
+partials_rows = []
 for (
     mode,
     dtype_name,
@@ -2560,7 +2858,10 @@ for (
         rotary_dim=rotary_dim,
         num_index_heads=num_index_heads,
     )
-    (mxfp4_rows if mode in MXFP4 else df).append(ret)
+    if mode in MXFP4:
+        mxfp4_rows.append(ret)
+    else:
+        (partials_rows if mode.startswith("qkv_partials") else df).append(ret)
 
 df = pd.DataFrame(df)
 if args.minimax_tp4:
@@ -2592,4 +2893,9 @@ else:
         df_md = pd.DataFrame(mxfp4_rows).to_markdown(index=False)
         aiter.logger.info(
             "fused_qknorm_idxrqknorm mxfp4 summary (markdown):\n%s", df_md
+        )
+    if partials_rows:
+        df_md = pd.DataFrame(partials_rows).to_markdown(index=False)
+        aiter.logger.info(
+            "fused_qknorm_idxrqknorm qkv_partials summary (markdown):\n%s", df_md
         )
