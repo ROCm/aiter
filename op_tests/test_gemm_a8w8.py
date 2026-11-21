@@ -18,8 +18,10 @@ from aiter import (
 from aiter.jit.core import AITER_CONFIGS, get_module
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
+from aiter.utility.error_bound import check_error_bound, gemm_error_bound
 from aiter.utility.fp4_utils import e8m0_to_f32
 
 try:
@@ -58,6 +60,11 @@ def gemm_perftest(func):
     return wrapper
 
 
+# Architectures whose default fp8 kernels have been measured against
+# gemm_error_bound. Tuned kernels keep the 1e-2 checks: they may split K.
+ERROR_BOUND_GFX = ("gfx942",)
+
+
 _TUNED_SHAPES_CACHE = None
 
 
@@ -91,15 +98,18 @@ def is_shape_tuned(
     return (m, n, k, str(q_dtype_w)) in _TUNED_SHAPES_CACHE[tuned_file]
 
 
-def reference_gemm(
-    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
-):
+def dequant(x, weight, x_scale, w_scale, quant_mode="per-token"):
     # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
     if quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled"):
         x_scale = e8m0_to_f32(x_scale).repeat_interleave(32, dim=1)
         w_scale = e8m0_to_f32(w_scale).repeat_interleave(32, dim=1)
-    x = x.to(dtypes.fp32) * x_scale
-    weight = weight.to(dtypes.fp32) * w_scale
+    return x.to(dtypes.fp32) * x_scale, weight.to(dtypes.fp32) * w_scale
+
+
+def reference_gemm(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
+):
+    x, weight = dequant(x, weight, x_scale, w_scale, quant_mode)
     out = F.linear(x, weight)
     if bias is not None:
         out = out.to(bias) + bias
@@ -256,6 +266,10 @@ def test_gemm(
 
     # Correctness sweeps need one reference output, not a reference benchmark.
     a = reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode)
+    # The bound covers x @ weight.T without bias, which is how fp8 runs here.
+    bound = None
+    if quantDtype == dtypes.fp8 and get_gfx() in ERROR_BOUND_GFX:
+        bound = gemm_error_bound(*dequant(x, weight, x_scale, w_scale, quant_mode), a)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only.
     # run_gemm_ck_bpreshuffle is gated by quantDtype/quant_mode below.
     if skip_ck or quant_mode != "per-token":
@@ -275,6 +289,14 @@ def test_gemm(
                 tol_err_ratio=1.0,
                 printLog=False,
             )
+        elif (
+            bound is not None
+            and get_GEMM_config_with_quant_type(
+                m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+            )
+            is None
+        ):
+            err_b = check_error_bound(a, b, bound, msg="ck: ")
         else:
             err_b = checkAllclose(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
@@ -302,9 +324,20 @@ def test_gemm(
         )
         if quantDtype == dtypes.i8 and bias is not None:
             c = c + bias
-        err_c = checkAllclose(
-            a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+        bpreshuffle_tuned = get_GEMM_config_with_quant_type(
+            m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
         )
+        if bound is not None and bpreshuffle_tuned is None:
+            err_c = check_error_bound(a, c, bound, msg="ck bpreshuffle: ")
+        else:
+            err_c = checkAllclose(
+                a,
+                c,
+                msg="ck bpreshuffle: ",
+                rtol=1e-2,
+                atol=1e-2,
+                catastrophic_check=True,
+            )
     else:
         avg_c = None
         err_c = None
@@ -347,14 +380,17 @@ def test_gemm(
             quant_mode=quant_mode,
             bpreshuffle=False,
         )
-        err_hipb = assertAllclose(
-            a,
-            hipb,
-            msg=f"hipmm {quant_mode}: ",
-            rtol=1e-2,
-            atol=1e-2,
-            catastrophic_check=True,
-        )
+        if bound is not None:
+            err_hipb = check_error_bound(a, hipb, bound, msg=f"hipmm {quant_mode}: ")
+        else:
+            err_hipb = assertAllclose(
+                a,
+                hipb,
+                msg=f"hipmm {quant_mode}: ",
+                rtol=1e-2,
+                atol=1e-2,
+                catastrophic_check=True,
+            )
 
     avg_gelu = None
     err_gelu = None
@@ -378,14 +414,17 @@ def test_gemm(
             bpreshuffle=True,
         )
         # e = e + bias
-        err_e = checkAllclose(
-            a,
-            e,
-            msg="hipmm bpreshuffle: ",
-            rtol=1e-2,
-            atol=1e-2,
-            catastrophic_check=True,
-        )
+        if bound is not None:
+            err_e = check_error_bound(a, e, bound, msg="hipmm bpreshuffle: ")
+        else:
+            err_e = checkAllclose(
+                a,
+                e,
+                msg="hipmm bpreshuffle: ",
+                rtol=1e-2,
+                atol=1e-2,
+                catastrophic_check=True,
+            )
 
         if should_test_hipb_gelu(dtype, m, n, k, quantDtype):
             hipb_bias = torch.rand([n], dtype=dtype, device="cuda") * 10
