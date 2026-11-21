@@ -17,7 +17,7 @@ from aiter.ops.triton.utils.shuffle import (
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Archs with gemm_a16w4 configs.
-SUPPORTED_ARCHS = ("gfx942", "gfx1100")
+SUPPORTED_ARCHS = ("gfx942", "gfx1100", "gfx1201")
 
 
 # Output tolerances (atol, rtol) for outputs with a standard deviation of about 1.
