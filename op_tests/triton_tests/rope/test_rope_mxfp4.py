@@ -251,13 +251,16 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("preshuffle", [1, 0])
 @pytest.mark.skipif(
-    arch_info.get_arch() != "gfx950",
-    reason="paged MXFP4 MQA logits is gfx950 only",
+    not (arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()),
+    reason="paged MXFP4 MQA logits needs MXFP4 support",
 )
-def test_round_trip_through_logits(page_size):
+def test_round_trip_through_logits(page_size, preshuffle):
     """Keys written by the cache op and a query from the quant op score as the
     dequantized values do: the writer and paged_mxfp4_mqa_logits agree."""
+    if preshuffle and not arch_info.is_cdna4():
+        pytest.skip("a preshuffled cache needs the Gluon kernel")
     torch.manual_seed(0)
     batch, next_n, num_heads, ctx = 2, 2, 32, 3 * page_size - 5
     per_seq = -(-ctx // page_size)
@@ -271,7 +274,7 @@ def test_round_trip_through_logits(page_size):
     cos_sin = _cos_sin(4096)
     w = torch.ones(HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
     _, cache = _paged_pool(num_pages, page_size, 256, fill=0)
-    shuffle = _shuffle(num_heads, page_size)
+    shuffle = _shuffle(num_heads, page_size) if preshuffle else None
     k_norm_rope_mxfp4_cache(
         k,
         positions,
@@ -298,6 +301,7 @@ def test_round_trip_through_logits(page_size):
         ctx_lens,
         block_table,
         per_seq * page_size,
+        preshuffle=preshuffle,
     )
 
     vals, scales = _read_back(cache, page_size, shuffle)
