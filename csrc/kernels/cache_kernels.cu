@@ -42,15 +42,16 @@ __device__ __forceinline__ decltype(auto) fp32_to_fp8_scaled_keep_nan_x2(const S
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
     defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     float ca = a, cb = b;
-    asm volatile("v_med3_f32 %0, %0, %2, %3\n"
-                 "v_med3_f32 %1, %1, %2, %3"
-                 : "+v"(ca), "+v"(cb)
-                 : "v"(lo), "v"(hi));
-    // Bit test, not isnan: the JIT build uses -ffast-math, which folds isnan to false.
+    // Not volatile: the result depends only on the operands, so the compiler may schedule it.
+    asm("v_med3_f32 %0, %0, %2, %3\n"
+        "v_med3_f32 %1, %1, %2, %3"
+        : "+v"(ca), "+v"(cb)
+        : "v"(lo), "v"(hi));
+    // Integer bit test rather than isnan, so NaN stays NaN even if fast-math flags are added.
     ca = (__builtin_bit_cast(uint32_t, a) & 0x7fffffffu) > 0x7f800000u ? a : ca;
     cb = (__builtin_bit_cast(uint32_t, b) & 0x7fffffffu) > 0x7f800000u ? b : cb;
     int w;
-    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(ca), "v"(cb));
+    asm("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(ca), "v"(cb));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
 #else
     // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
@@ -2774,16 +2775,30 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                             bool exchange) {
         using o_t = std::remove_pointer_t<decltype(out_tag)>;
         using o_vec_t = opus::vector_t<o_t, VEC>;
-        auto cvt = [](float r, float s) -> o_t {
-            // Saturate a value past the fp8 range (a bare cast turns it into NaN);
-            // a NaN stays NaN.
-            if constexpr(std::is_same_v<o_t, opus::fp8_t>)
-                return aiter::fp32_to_fp8_scaled_keep_nan_x2(fp32x2_t{r, r}, s)[0];
-            else
-                return static_cast<o_t>(r);
+        // Rotated values, converted in pairs at the end. fp8 saturates a value past
+        // the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        float rv[VEC];
+        auto convert = [&]() {
+            o_vec_t v;
+#pragma unroll
+            for(int k = 0; k < VEC / 2; ++k)
+            {
+                if constexpr(std::is_same_v<o_t, opus::fp8_t>)
+                {
+                    const auto p = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                        fp32x2_t{rv[2 * k], rv[2 * k + 1]}, inv_scale);
+                    v[2 * k]     = p[0];
+                    v[2 * k + 1] = p[1];
+                }
+                else
+                {
+                    v[2 * k]     = static_cast<o_t>(rv[2 * k]);
+                    v[2 * k + 1] = static_cast<o_t>(rv[2 * k + 1]);
+                }
+            }
+            return v;
         };
         const int d0 = chunk * VEC;
-        o_vec_t vout;
         if constexpr(IS_NEOX)
         {
             // The partner chunk is the one lane chunk^HALF/VEC already loaded
@@ -2815,8 +2830,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float yv = static_cast<float>(y[i]);
                 const float cv = static_cast<float>(o.c[i]);
                 const float sv = static_cast<float>(o.s[i]);
-                const float r  = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
-                vout[i]        = cvt(r, inv_scale);
+                rv[i]          = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
             }
         }
         else
@@ -2828,11 +2842,11 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float b  = static_cast<float>(o.x[2 * k + 1]);
                 const float cv = static_cast<float>(o.c[k]);
                 const float sv = static_cast<float>(o.s[k]);
-                vout[2 * k]     = cvt(a * cv - b * sv, inv_scale);
-                vout[2 * k + 1] = cvt(b * cv + a * sv, inv_scale);
+                rv[2 * k]       = a * cv - b * sv;
+                rv[2 * k + 1]   = b * cv + a * sv;
             }
         }
-        return vout;
+        return convert();
     };
     auto rope_pe_emit = [&](const PeOperands& o, auto* out_ptr, int row_off, int extent,
                             float inv_scale, int chunk, bool active) {
