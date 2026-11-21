@@ -1096,15 +1096,6 @@ def _moe_gemm_a8w4_decode(
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-    if Quant_static_scale is not None or HAS_MX_OUT:
-        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
-        )
-    else:
-        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
-        )
-
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
@@ -1674,53 +1665,37 @@ def _moe_gemm_a8w4_decode(
         #
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
-        # Delivered by TDM scatter through LDS, not by per-thread global stores.
-        #
-        # This matters ONLY because the destination is remote: ~3/4 of these rows
-        # land in a peer's HBM over xGMI, where transaction shape dominates.
-        # Per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile as many
-        # small independent writes; TDM moves whole rows, 8 per instruction with
-        # int32 indices. Measured on a4w4 at the same shape: 271us -> 104us.
-        #
-        # Build the row offsets DIRECTLY in the layout async_scatter wants. If the
-        # arange auto-resolves and `dst` is converted afterwards it feeds two
-        # conflicting consumers and the compiler cannot pick a layout
-        # ("'tt.make_range' op Failed to infer return type").
-        THREADS_PER_WARP: gl.constexpr = 32
-        NUM_WARPS: gl.constexpr = gl.num_warps()
-        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
-        idx_base: gl.constexpr = gl.BlockedLayout(
-            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
+        # Scatter the rows from registers, not through an LDS tile and TDM: the
+        # TDM scatter could read stale LDS from the aliased w_buffer slot.
+        # Convert to a row-contiguous layout first, so each store instruction
+        # writes whole cache lines of one row instead of 32 bytes of 16 rows.
+        # The row index sits in the 32-bit buffer offset; the wrapper rejects a
+        # Y window whose last byte does not fit.
+        STORE_TPW_N: gl.constexpr = min(32, OUT_BLOCK_N // 8)
+        STORE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[32 // STORE_TPW_N, STORE_TPW_N],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
         )
-        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
-        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
+        out_s = gl.convert_layout(out, STORE_LAYOUT)
+        offs_m_d = BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
+        )
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
         )
-        # Rows this rank must not deliver, and the tile's padding rows, are aimed
-        # at Y_ROWS -- the first row past the window -- so the bounds check drops
-        # them instead of a mask doing it.
-        dst = gl.where(dst >= 0, dst, Y_ROWS)
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
+        # Rows this rank must not deliver, and the tile's padding rows, have a
+        # negative dst and the mask drops them.
+        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
         )
-        y_buffer.store(out)
-        # Rows are addressed by index, so the descriptor carries only the column
-        # position; no start_m bias applies, dst is already absolute.
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=Y,
-            shape=(Y_ROWS, yN),
-            strides=(stride_y_m, stride_y_n),
-            block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SHARED_LAYOUT_Y,
+        gl.amd.gfx1250.buffer_store(
+            out_s,
+            Y,
+            dst[:, None] * stride_y_m + offs_n_d[None, :] * stride_y_n,
+            mask=(dst >= 0)[:, None] & (offs_n_d < yN)[None, :],
         )
-        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
-        )
-        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
-        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         # Store the accumulator straight from registers. The tile used to go
         # registers -> LDS (ds_store) -> TDM store; on gfx1250 that TDM store
@@ -2619,53 +2594,37 @@ def _moe_gemm_a8w4_prefill(
         #
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
-        # Delivered by TDM scatter through LDS, not by per-thread global stores.
-        #
-        # This matters ONLY because the destination is remote: ~3/4 of these rows
-        # land in a peer's HBM over xGMI, where transaction shape dominates.
-        # Per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile as many
-        # small independent writes; TDM moves whole rows, 8 per instruction with
-        # int32 indices. Measured on a4w4 at the same shape: 271us -> 104us.
-        #
-        # Build the row offsets DIRECTLY in the layout async_scatter wants. If the
-        # arange auto-resolves and `dst` is converted afterwards it feeds two
-        # conflicting consumers and the compiler cannot pick a layout
-        # ("'tt.make_range' op Failed to infer return type").
-        THREADS_PER_WARP: gl.constexpr = 32
-        NUM_WARPS: gl.constexpr = gl.num_warps()
-        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
-        idx_base: gl.constexpr = gl.BlockedLayout(
-            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
+        # Scatter the rows from registers, not through an LDS tile and TDM: the
+        # TDM scatter could read stale LDS from the aliased w_buffer slot.
+        # Convert to a row-contiguous layout first, so each store instruction
+        # writes whole cache lines of one row instead of 32 bytes of 16 rows.
+        # The row index sits in the 32-bit buffer offset; the wrapper rejects a
+        # Y window whose last byte does not fit.
+        STORE_TPW_N: gl.constexpr = min(32, OUT_BLOCK_N // 8)
+        STORE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[32 // STORE_TPW_N, STORE_TPW_N],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
         )
-        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
-        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
+        out_s = gl.convert_layout(out, STORE_LAYOUT)
+        offs_m_d = BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
+        )
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
         )
-        # Rows this rank must not deliver, and the tile's padding rows, are aimed
-        # at Y_ROWS -- the first row past the window -- so the bounds check drops
-        # them instead of a mask doing it.
-        dst = gl.where(dst >= 0, dst, Y_ROWS)
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
+        # Rows this rank must not deliver, and the tile's padding rows, have a
+        # negative dst and the mask drops them.
+        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
         )
-        y_buffer.store(out)
-        # Rows are addressed by index, so the descriptor carries only the column
-        # position; no start_m bias applies, dst is already absolute.
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=Y,
-            shape=(Y_ROWS, yN),
-            strides=(stride_y_m, stride_y_n),
-            block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SHARED_LAYOUT_Y,
+        gl.amd.gfx1250.buffer_store(
+            out_s,
+            Y,
+            dst[:, None] * stride_y_m + offs_n_d[None, :] * stride_y_n,
+            mask=(dst >= 0)[:, None] & (offs_n_d < yN)[None, :],
         )
-        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
-        )
-        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
-        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         # TDM Store: accumulator → shared memory → global memory
         Y += start_m.to(index_type) * stride_y_m
