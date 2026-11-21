@@ -1786,6 +1786,83 @@ def test_flydsl_kda_decode_rejects_unsafe_write_layouts(
 
 
 @_requires_kda
+@pytest.mark.parametrize(
+    "fused_f_b, name",
+    [
+        (fused_f_b, name)
+        for fused_f_b in (False, True)
+        for name in ("x", "conv_state", "state", "output_gate")
+    ]
+    + [(False, "raw_g"), (True, "f_a"), (True, "f_b_weight")],
+)
+def test_flydsl_kda_decode_rejects_out_overlapping_an_input(
+    monkeypatch: pytest.MonkeyPatch, fused_f_b: bool, name: str
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("An aliased out must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_decode_kernel", unexpected_compile
+    )
+    batch = 2
+    # A BF16 state, so that it can back the BF16 out as well.
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch, state_dtype=dtypes.bf16)
+    if name == "f_a":
+        # Strided rows of a pool large enough to back out.
+        f_a = torch.randn((batch, 1536), dtype=torch.bfloat16, device=_KDA_DEVICE)[
+            :, :_KDA_DIM
+        ]
+    pool = {"f_a": f_a, "f_b_weight": f_b_weight}.get(name)
+    if pool is None:
+        pool = getattr(inputs, name)
+    # A dense out laid over the first bytes of that input.
+    out = torch.as_strided(pool, (1, batch, _KDA_HEADS, _KDA_DIM), (0, 1536, 128, 1))
+    with pytest.raises(ValueError, match=f"`out` must not overlap `{name}`"):
+        if fused_f_b:
+            _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
+        else:
+            _run_kda(inputs, out=out)
+
+
+@_requires_kda
+@pytest.mark.parametrize(
+    "fused_f_b, neighbor",
+    [(False, "output_gate"), (False, "raw_g"), (True, "output_gate")],
+)
+def test_flydsl_kda_decode_accepts_out_interleaved_with_an_input(
+    fused_f_b: bool, neighbor: str
+) -> None:
+    batch = 2
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
+    # Per token, one pool row holds the input and the next one holds out: the
+    # byte ranges interleave but share nothing.
+    pool = torch.empty(
+        (batch, 2, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
+    )
+    # NaN fill: an out row the kernel never writes fails the comparison.
+    pool[:, 1].fill_(float("nan"))
+    if neighbor == "output_gate":
+        pool[:, 0].copy_(inputs.output_gate)
+        inputs.output_gate = pool[:, 0]
+    else:
+        pool[:, 0].copy_(inputs.raw_g[0])
+        inputs.raw_g = pool[:, 0].unsqueeze(0)
+    out = pool[:, 1].unsqueeze(0)
+    reference_inputs = _copy_kda_inputs(inputs)
+    reference = _kda_reference(reference_inputs)
+    if fused_f_b:
+        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
+    else:
+        actual = _run_kda(inputs, out=out)
+    torch.cuda.synchronize()
+
+    assert actual is out
+    _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
+
+
+@_requires_kda
 @pytest.mark.parametrize("fused_f_b", [False, True])
 @pytest.mark.parametrize("padding", [0, 7])
 @pytest.mark.parametrize("trailing_padding", [0, 17])
