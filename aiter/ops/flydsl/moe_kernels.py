@@ -3432,6 +3432,19 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 _TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
+def token_multidest_quant_enabled() -> bool:
+    """AITER_FLYDSL_TOKEN_MULTIDEST_QUANT (default on).
+
+    The quant dispatch and the TP prefill route gate, which must agree with it,
+    both read the switch here.
+    """
+    return os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
     """Whether the routing takes the token-multidest quant path.
 
@@ -3475,6 +3488,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    route_expert_bits: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3487,6 +3501,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        route_expert_bits=route_expert_bits,
     )
 
 
@@ -3619,6 +3634,13 @@ def flydsl_moe_fused_quant_preshuffle(
     swiglu_limit: float = float("inf"),
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    # TP prefill route resolved here (token-multidest path only): rows are
+    # ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum``, the
+    # destination is ``route_starts[expert] + slot``, and the resolved rows are
+    # written to ``route_rows_out`` (same shape as ``topids_to_rows``).
+    route_starts: torch.Tensor | None = None,
+    route_expert_bits: int = 0,
+    route_rows_out: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3648,6 +3670,8 @@ def flydsl_moe_fused_quant_preshuffle(
         )
     if payload_preshuffled and row_major_scale:
         raise ValueError("A-preshuffled payload requires M16K4 scales")
+    if route_starts is not None and topids_to_rows is None:
+        raise ValueError("route_starts needs topids_to_rows")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3777,9 +3801,21 @@ def flydsl_moe_fused_quant_preshuffle(
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-            in ("1", "true", "True")
+            and token_multidest_quant_enabled()
         )
+        # Checked before any launch: every other branch reads topids_to_rows
+        # as final rows and would ignore the (slot, expert) encoding.
+        route_in_quant = route_starts is not None
+        if route_in_quant and (
+            not use_token_multidest
+            or row_to_token is not None
+            or route_rows_out is None
+            or route_expert_bits <= 0
+        ):
+            raise ValueError(
+                "route_starts needs the token-multidest quant without a "
+                "row_to_token map, route_rows_out and route_expert_bits"
+            )
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
@@ -3824,6 +3860,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                route_expert_bits=int(route_expert_bits) if route_in_quant else 0,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(
@@ -3834,6 +3871,14 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                # Without the route these two are compiled out and never
+                # read; the route map stands in so nothing is allocated.
+                ptr_arg(
+                    route_starts.reshape(-1) if route_in_quant else topids_to_rows_i32
+                ),
+                ptr_arg(
+                    route_rows_out.reshape(-1) if route_in_quant else topids_to_rows_i32
+                ),
                 current_stream_arg(),
             )
             return out_payload, out_scale
