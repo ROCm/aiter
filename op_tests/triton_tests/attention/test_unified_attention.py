@@ -1450,10 +1450,10 @@ def test_unified_attn_non_causal_rejects_unsupported(
         )
 
 
-def test_unified_attn_non_causal_ignores_gluon_request(monkeypatch) -> None:
+@pytest.mark.parametrize("query_len", [4, 1])  # 1: the decode case
+def test_unified_attn_non_causal_ignores_gluon_request(monkeypatch, query_len) -> None:
     """A non-causal call runs Triton even when backend="gluon" and Gluon is missing."""
     block_size = 128
-    query_len = 4
     seq_lens = [(query_len, 1024)] * 2
     (
         query,

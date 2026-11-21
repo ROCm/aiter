@@ -639,7 +639,6 @@ def run_benchmark(custom, args):
                 v_descale=sample["v_descale"],
                 output_scale=sample["output_scale"],
                 out_dtype=sample["output"].dtype,
-                causal=0 if args.non_causal else 1,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -875,6 +874,10 @@ def main(args: list[str] | None = None) -> None:
         args.sliding_window = None
     if args.non_causal and args.sliding_window is not None:
         raise ValueError("-non_causal does not support -sliding_window.")
+    if args.non_causal and args.test:
+        raise ValueError(
+            "-non_causal does not support -test; test_unified_attention.py checks accuracy."
+        )
 
     if args.fp8_pv and not (args.nvfp4 or args.nvfp4_kv):
         raise ValueError(

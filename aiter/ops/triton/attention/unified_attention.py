@@ -519,7 +519,8 @@ def unified_attention(
     Limits:
         Non-causal attention does not support a sliding window, ALiBi, a
         query-query bias or an fp4 q or cache. The Gluon kernels are
-        causal-only, so non-causal calls run the Triton kernels.
+        causal-only, so non-causal calls run the Triton kernels, except a
+        decode batch (max_seqlen_q == 1), which keeps Gluon where available.
     """
     # Checked before the decode case below turns causal on, so a decode batch
     # rejects them too; raised rather than asserted, so python -O keeps them.
@@ -537,6 +538,7 @@ def unified_attention(
             )
     ALL_DECODE = int(max_seqlen_q) == 1
     # A decode query sees all keys either way, so it keeps the causal kernels.
+    non_causal = not causal
     causal = causal or ALL_DECODE
 
     if backend is None:
@@ -546,8 +548,9 @@ def unified_attention(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
-    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels.
-    if not causal:
+    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels;
+    # a non-causal decode batch keeps Gluon where it is available.
+    if not causal or (non_causal and not _is_gluon_available()):
         backend = "triton"
     if backend == "gluon":
         assert (
