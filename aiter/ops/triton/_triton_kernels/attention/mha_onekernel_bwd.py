@@ -1772,7 +1772,7 @@ def bwd_kernel_noncausal(
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config():
-    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+def _get_config(arch: str):
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton", arch=arch)
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     return config["bkwd_onekernel"]
