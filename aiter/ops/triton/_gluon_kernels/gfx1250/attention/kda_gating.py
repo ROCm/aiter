@@ -463,7 +463,11 @@ def kda_gating_kernel(
     With ``INPLACE_VEC > 0``, a one-token program whose write slot is its read
     slot uses the ``INPLACE_*`` layout and cache policy. An in-place store
     goes to the lines that its load brought in, and a fork store goes to lines
-    that nothing reads. Both paths compute the same values.
+    that nothing reads. The other one-token programs, and all of them when
+    ``INPLACE_VEC`` is 0, compute the sigmoids with ``fast_sigmoid``
+    (``fast_dividef``). The ``INPLACE_*`` config uses the IEEE divide when
+    ``INPLACE_FAST_DIV`` is False, so the two configs can give results that
+    are different in the last bits.
     """
     NV: gl.constexpr = V // BV
     pid = gl.program_id(0)
@@ -567,80 +571,51 @@ def kda_gating_kernel(
             )
         else:
             tok = bos.to(gl.int64)
-            if (INPLACE_VEC > 0) and (slot_out == slot_in):
-                _one_token(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    a_ptr,
-                    b_ptr,
-                    o_ptr,
-                    state_ptr,
-                    tok,
-                    slot_in,
-                    slot_out,
-                    i_h,
-                    i_hv,
-                    i_v,
-                    exp_alog,
-                    dt_bias_ptr,
-                    stride_q_tok,
-                    stride_k_tok,
-                    stride_v_tok,
-                    stride_a_tok,
-                    stride_b_tok,
-                    stride_o_tok,
-                    stride_slot,
-                    lower_bound,
-                    scale,
-                    K,
-                    V,
-                    BV,
-                    INPLACE_TK,
-                    INPLACE_VEC,
-                    NUM_WARPS,
-                    INPLACE_LOAD_CACHE,
-                    INPLACE_STORE_CACHE,
-                    INPLACE_GATE_DIST,
-                    INPLACE_BURST,
-                    INPLACE_FAST_DIV,
-                )
-            else:
-                _one_token(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    a_ptr,
-                    b_ptr,
-                    o_ptr,
-                    state_ptr,
-                    tok,
-                    slot_in,
-                    slot_out,
-                    i_h,
-                    i_hv,
-                    i_v,
-                    exp_alog,
-                    dt_bias_ptr,
-                    stride_q_tok,
-                    stride_k_tok,
-                    stride_v_tok,
-                    stride_a_tok,
-                    stride_b_tok,
-                    stride_o_tok,
-                    stride_slot,
-                    lower_bound,
-                    scale,
-                    K,
-                    V,
-                    BV,
-                    TK,
-                    VEC,
-                    NUM_WARPS,
-                    LOAD_CACHE,
-                    STORE_CACHE,
-                    GATE_DIST,
-                )
+            # The loop is unrolled at compile time, so each config gets its own
+            # code. USE_FORK = 0 is the INPLACE_* config. It is first because
+            # the compiler puts an LDS barrier before the second copy: it does
+            # not know that only one copy runs. Keep the test in the if: in a
+            # local variable, the constexpr False of INPLACE_VEC = 0 becomes a
+            # tensor, and the INPLACE_* copy is then compiled.
+            for USE_FORK in gl.static_range(2):
+                if ((INPLACE_VEC > 0) and (slot_out == slot_in)) != (USE_FORK == 1):
+                    _one_token(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        a_ptr,
+                        b_ptr,
+                        o_ptr,
+                        state_ptr,
+                        tok,
+                        slot_in,
+                        slot_out,
+                        i_h,
+                        i_hv,
+                        i_v,
+                        exp_alog,
+                        dt_bias_ptr,
+                        stride_q_tok,
+                        stride_k_tok,
+                        stride_v_tok,
+                        stride_a_tok,
+                        stride_b_tok,
+                        stride_o_tok,
+                        stride_slot,
+                        lower_bound,
+                        scale,
+                        K,
+                        V,
+                        BV,
+                        TK if USE_FORK else INPLACE_TK,
+                        VEC if USE_FORK else INPLACE_VEC,
+                        NUM_WARPS,
+                        LOAD_CACHE if USE_FORK else INPLACE_LOAD_CACHE,
+                        STORE_CACHE if USE_FORK else INPLACE_STORE_CACHE,
+                        GATE_DIST if USE_FORK else INPLACE_GATE_DIST,
+                        False if USE_FORK else INPLACE_BURST,
+                        True if USE_FORK else INPLACE_FAST_DIV,
+                    )
 
 
 def get_kda_gating_config(num_seq_heads: int, multi_token: bool) -> dict:
@@ -649,10 +624,7 @@ def get_kda_gating_config(num_seq_heads: int, multi_token: bool) -> dict:
     ``num_seq_heads`` is the number of sequences times the number of value
     heads. A spec-verify or other 2D slot table uses the ``multi_token`` table.
     """
-    # Both compiler targets use this kernel's gfx1250 configuration tree.
-    cfg_dir = resolve_config_dir(
-        "attention", "KDA_GATING", backend="gluon", arch="gfx1250"
-    )
+    cfg_dir = resolve_config_dir("attention", "KDA_GATING", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     table = tuned["multi_token" if multi_token else "one_token"]
     return select_leq_config(table, num_seq_heads, prefix="SEQ_HEADS_LEQ_")

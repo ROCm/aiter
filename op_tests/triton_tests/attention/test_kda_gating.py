@@ -10,15 +10,22 @@ import torch
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.attention.kda_gating import kda_gating_decode, supports
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton import arch_info
 
 pytestmark = pytest.mark.skipif(
-    get_arch() not in ("gfx1250", "gfx1250-strict"), reason="gfx1250 only"
+    arch_info.get_arch() != "gfx1250", reason="gfx1250 only"
 )
 
 H = 12
 K = 128
 SPEC_WIDTH = 8
+K3_SETUP = {
+    "lower_bound": -5.0,
+    "state_dtype": torch.float32,
+    "head_k_dim": K,
+    "head_v_dim": K,
+    "act_dtype": torch.bfloat16,
+}
 
 
 def _inputs(
@@ -349,14 +356,13 @@ def test_output_may_be_none_or_have_the_shape_of_v(given):
     ids=["kimi-k3", "no-lower-bound", "bf16-state", "k64", "v64", "fp32-activations"],
 )
 def test_supports_checks_the_model_setup(change):
-    setup = {
-        "lower_bound": -5.0,
-        "state_dtype": torch.float32,
-        "head_k_dim": K,
-        "head_v_dim": K,
-        "act_dtype": torch.bfloat16,
-    }
-    assert supports(**(setup | change)) is (change == {})
+    assert supports(**(K3_SETUP | change)) is (change == {})
+
+
+def test_supports_needs_gfx1250_config_tables(monkeypatch):
+    # The config tables are keyed by the exact arch, and gfx1250-strict has none.
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250-strict")
+    assert supports(**K3_SETUP) is False
 
 
 def test_cuda_graph_replay_uses_updated_slots():
