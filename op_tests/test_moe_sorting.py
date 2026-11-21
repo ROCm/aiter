@@ -221,7 +221,7 @@ def _assert_routing_exact(ref, out, topk, num_rows, case):
     _ids_b, weights_b, experts_b, count_b = out[:4]
     live = ids_a != (topk << 24 | num_rows)
     used = experts_a != -1
-    assert torch.equal(count_b[:1], count_a[:1]), f"num_valid_ids at {case}"
+    assert torch.equal(count_b, count_a), f"token counts at {case}"
     assert torch.equal(experts_b[used], experts_a[used]), f"expert ids at {case}"
     assert torch.equal(weights_b[live], weights_a[live]), f"sorted weights at {case}"
 
@@ -249,6 +249,7 @@ def _check_routing_exact_controls():
         2, torch.tensor([7, 801, -1], dtype=torch.int32)
     ), "expert id passed"
     assert rejected(3, torch.tensor([257, 5], dtype=torch.int32)), "count passed"
+    assert rejected(3, torch.tensor([256, 6], dtype=torch.int32)), "second count passed"
 
 
 def run_torch_moe_sorting(
