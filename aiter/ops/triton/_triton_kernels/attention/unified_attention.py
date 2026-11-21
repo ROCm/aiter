@@ -273,6 +273,8 @@ def kernel_unified_attention_2d(
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    # The last tile can run past the sequence; keep its block-table reads inside the table.
+    last_block_idx = tl.maximum(max_seq_prefix_len - 1, 0) // BLOCK_SIZE
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -413,7 +415,9 @@ def kernel_unified_attention_2d(
             )
         else:
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr
+                + block_table_offset
+                + tl.minimum(seq_offset // BLOCK_SIZE, last_block_idx)
             ).to(tl.int64)
 
             v_offset = (
@@ -782,6 +786,8 @@ def kernel_unified_attention_3d(
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    # The last tile can run past the sequence; keep its block-table reads inside the table.
+    last_block_idx = tl.maximum(max_seq_prefix_len - 1, 0) // BLOCK_SIZE
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -839,7 +845,9 @@ def kernel_unified_attention_3d(
             )
         else:
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr
+                + block_table_offset
+                + tl.minimum(seq_offset // BLOCK_SIZE, last_block_idx)
             ).to(tl.int64)
 
             v_offset = (
