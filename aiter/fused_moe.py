@@ -1039,14 +1039,21 @@ def _stage2_uses_fp8_route_output(
     """Return whether runtime reduce output uses packed FP8 value/scale rows."""
     if stage2_fp8 is None:
         stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    if not stage2_fp8 or return_per_slot:
-        return False
-    if not _stage2_honors_runtime_reduce_override(stage2):
+    if return_per_slot or not _stage2_honors_runtime_reduce_override(stage2):
         return False
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
     assert parsed is not None
+    if not stage2_fp8 and parsed.get("route_out_dtype") != "fp8":
+        return False
     return parsed.get("b_dtype") in ("fp4", "fp8")
+
+
+def _flydsl_v2_stage2_fp8_route_out(cfg: dict | None) -> bool:
+    """Return whether a parsed v2 GEMM2 name writes FP8 route rows."""
+    if cfg is None or cfg["epilog"] != "reduce":
+        return False
+    return cfg["out_dtype"] == "fp8" or _flydsl_stage2_fp8_enabled()
 
 
 def _flydsl_route_output_nbytes(
@@ -3692,6 +3699,7 @@ def _flydsl_stage2_wrapper(
         topk_ids=topk_ids,
         skip_dropped_routes=skip_dropped_routes,
         use_valid_token_count=use_valid_token_count,
+        fp8_route_out=parsed.get("route_out_dtype") == "fp8",
         fused_shared_w2=fused_shared_w2,
         fused_shared_w2_scale=fused_shared_w2_scale,
         shared_inter_bf16=shared_inter_bf16,
@@ -4342,9 +4350,21 @@ def _flydsl_v2_stage2_wrapper(
             f"(model_dim={model_dim_runtime}, topk={topk})"
         )
     target = out
-    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
-    if _s2_fp8_inter:
-        _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
+    if cfg["out_dtype"] not in ("bf16", "fp8") or (
+        cfg["out_dtype"] == "fp8" and epilog != "reduce"
+    ):
+        raise ValueError(
+            f"FlyDSL v2 GEMM2 {kernelName}: out_dtype must be bf16, or fp8 "
+            "with epilog='reduce'"
+        )
+    _s2_fp8_inter = _flydsl_v2_stage2_fp8_route_out(cfg) and sorted_weights is not None
+    if _s2_fp8_inter and topk_weights is None:
+        if cfg["out_dtype"] == "fp8":
+            raise ValueError(
+                f"FlyDSL v2 GEMM2 {kernelName} applies the route weights in the "
+                "reduction and requires topk_weights"
+            )
+        _s2_fp8_inter = False
     # AITER_MXFP4_INTERMEDIATE: the same deferred-weight route rows, values in MXFP4.
     _s2_fp4_inter = (
         not _s2_fp8_inter
@@ -4391,7 +4411,7 @@ def _flydsl_v2_stage2_wrapper(
 
             if model_dim_runtime % FP8OUT_SCALE_BLK_MIN != 0:
                 raise ValueError(
-                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
+                    "FP8 route output requires model_dim to be divisible "
                     f"by {FP8OUT_SCALE_BLK_MIN}"
                 )
             _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
@@ -7103,7 +7123,15 @@ def fused_moe_2stages(
     if (
         uses_flydsl_v2_stage2
         and not doweight_stage1
-        and (_flydsl_stage2_fp8_enabled() or _mxfp4_intermediate_enabled())
+        and (
+            _flydsl_v2_stage2_fp8_route_out(
+                parse_flydsl_v2_gemm2_kernel(
+                    stage2_keywords.get("kernelName")
+                    or stage2_keywords.get("kernelName2", "")
+                )
+            )
+            or _mxfp4_intermediate_enabled()
+        )
     ):
         # FP8/FP4 route-output reduction applies the route weights after GEMM2.
         extra_stage2_args["topk_weights"] = topk_weights
