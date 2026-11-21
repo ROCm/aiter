@@ -433,12 +433,14 @@ def test_mha_forward_out_dtype_rejected(IMPL: str, OUT_DTYPE: torch.dtype, ERROR
 
 
 @pytest.mark.parametrize(
-    "FP8, VARLEN, CAUSAL, HEAD_SZ, OUT_DTYPE",
+    "FP8, VARLEN, CAUSAL, HEAD_SZ, OUT_DTYPE, IMPL, STRIDED",
     [
-        (True, True, True, 256, torch.bfloat16),
-        (True, False, False, 128, None),
-        (False, True, False, 128, None),
-        (False, False, True, 64, torch.float16),
+        (True, True, True, 256, torch.bfloat16, "default", False),
+        (True, False, False, 128, None, "default", False),
+        (False, True, False, 128, None, "default", True),
+        (False, False, True, 64, torch.float16, "default", False),
+        (False, True, True, 128, None, "dao_ai", False),
+        (False, False, False, 128, None, "dao_ai", True),
     ],
 )
 def test_mha_forward_out(
@@ -447,6 +449,8 @@ def test_mha_forward_out(
     CAUSAL: bool,
     HEAD_SZ: int,
     OUT_DTYPE: torch.dtype,
+    IMPL: str,
+    STRIDED: bool,
     dtype=torch.bfloat16,
 ):
     """out= is written in place and matches the allocated output bit for bit."""
@@ -469,7 +473,9 @@ def test_mha_forward_out(
         q, descales["descale_q"] = quantize_fp8_per_bh(q, fp8_dtype, cu_seqlens)
         k, descales["descale_k"] = quantize_fp8_per_bh(k, fp8_dtype, cu_seqlens)
         v, descales["descale_v"] = quantize_fp8_per_bh(v, fp8_dtype, cu_seqlens)
-    kwargs = {} if OUT_DTYPE is None else {"out_dtype": OUT_DTYPE}
+    kwargs = {"implementation": IMPL}
+    if OUT_DTYPE is not None:
+        kwargs["out_dtype"] = OUT_DTYPE
 
     def forward(**extra):
         return _flash_attn_forward(
@@ -495,7 +501,13 @@ def test_mha_forward_out(
         )[:2]
 
     ref, ref_lse = forward()
-    buf = torch.full_like(ref, float("nan"))
+    if STRIDED:
+        wide = ref.shape[:-1] + (2 * ref.shape[-1],)
+        buf = torch.full(wide, float("nan"), dtype=ref.dtype, device="cuda")
+        buf = buf[..., : ref.shape[-1]]
+        assert not buf.is_contiguous(), "strided case must use a non-contiguous out"
+    else:
+        buf = torch.full_like(ref, float("nan"))
     res, lse = forward(out=buf)
     assert res.data_ptr() == buf.data_ptr(), "output was not written into out"
     assert torch.equal(buf, ref), "out= output differs from the allocated output"
