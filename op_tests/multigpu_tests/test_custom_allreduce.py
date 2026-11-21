@@ -411,21 +411,34 @@ _LL128_MIXED_SIZES = {
 # owning block (16, 32 and 1 blocks) from one call to the next.
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
-# Back-to-back gfx1250 messages at TP4 and TP8 that alternate the two-shot
-# kernel (1.15, 4.59, 3.91 and 7.81 MB of fp32) with the one-shot LL (0.36 MB).
-# Each kernel keeps its own scratch and round state. The two-shot takes them in
-# blocks of 3 x 64, 2 x 256, 3 x 128 and 2 x 256 threads at TP8 (3 x 128,
-# 2 x 512, 2 x 256 and 2 x 512 at TP4), so a pack's owning block changes from one
-# call to the next. 3.91 MB ends in a partial wave of packs (lanes that only
-# re-arm) at both world sizes, 7.81 MB at TP8. fp32, so that the expected bits
-# depend on the order the ranks are summed in (see rank_order).
-_AR2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168, 545 * 1792, 545 * 3584]
+# Back-to-back gfx1250 messages (fp32 elements) on the Lamport two-shot, fused
+# and split, and the LL one-shot: 1.15, 0.36, 4.59, 3.91 and 7.81 MB, and 2.62
+# and 6.39 MB, whose numel is 4 mod 8, so no world size cuts them into whole
+# 16-byte packs a chunk (ragged chunks). fp32 takes the LL one-shot only at TP2
+# up to 1 MiB (0.36 MB) and the two-shot everywhere else: split at TP2 from 2 to
+# 4 MiB (2.62 and 3.91 MB), at TP4 from 4 to 8 MiB (4.59, 6.39 and 7.81 MB) and
+# at TP8 from 256 KiB to 4 MiB (0.36, 1.15, 2.62 and 3.91 MB), fused elsewhere.
+# The LL kernel keeps its own scratch and state; the split and fused two-shot
+# share the Lamport inbox and its rounds, split in blocks of 3 x 32 to 2 x 480
+# lanes and fused in blocks of 256 and 512, so a pack's owning block changes
+# from one call to the next. A chunk ends in a partial wave of packs (lanes that
+# only re-arm) for the ragged sizes everywhere, for 3.91 MB at TP4 and TP8, and
+# for 0.36 and 7.81 MB at TP8. fp32, so that the expected bits depend on the
+# order the ranks are summed in (see rank_order).
+_AR2S_GFX1250_MIXED_SIZES = [
+    40 * 7168,
+    25 * 3584,
+    160 * 7168,
+    545 * 1792,
+    545 * 3584,
+    655_364,
+    1_597_444,
+]
 
 # gfx1250 all-reduces whose output is their input (fp32 elements): 0.36 MB,
-# 0.79 MB, 1.57 MB, 3.67 MB and 3.91 MB. At TP2 and TP6 all five take the
-# one-shot LL, with 256-thread and 512-thread waves and with 2 and 4 packets a
-# sender. At TP4 and TP8 the larger ones take the two-shot (ar2sMinBytes); the
-# last ends in a partial wave of packs there.
+# 0.79 MB, 1.57 MB, 3.67 MB and 3.91 MB. All five take the one-shot LL (the
+# meta-buffer path has no two-shot), with 256-thread and 512-thread waves and
+# with 2 and 4 packets a sender.
 _LL_GFX1250_INPLACE_SIZES = [25 * 3584, 192 * 1024, 384 * 1024, 896 * 1024, 545 * 1792]
 
 
@@ -501,12 +514,13 @@ def _allreduce_mixed_size_regression(
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
     # With vary_inputs, rounds cycle through x, -x, 2x and -2x (all exact). A
-    # re-arm missed leaves a pack the line it got two calls back (the LL
-    # kernels' two banks) or three (the two-shot's three buffers). That is
-    # another size's line where two or four sizes reach the pack; the same
-    # size's from 1 round back where three do, or from 2 or 3 rounds back where
-    # one does: another of the four variants. So a stale line never carries the
-    # bits now expected.
+    # missed re-arm leaves a pack the line it got d calls back: d = 2 for the LL
+    # one-shot's two banks, 3 for the two-shot's reduce-scatter (three buffers),
+    # 1 for its all-gather (re-armed as it is read). Where k sizes reach the
+    # pack, that is the same size's line from d / k rounds back when k divides
+    # d, and another size's line otherwise. One to three rounds back is another
+    # of the four variants, so a stale line never carries the bits now
+    # expected.
     variants = [(inputs, refs)]
     if vary_inputs:
         for factor in (-1, 2, -2):
@@ -599,11 +613,11 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
 
 
 def test_allreduce_2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
-    # Mixing the two-shot with the one-shot LL, and two-shot launches of
-    # different block sizes, must neither accept a stale line nor overwrite a
-    # slower peer's unread one, and both must sum the ranks in order 0..n-1.
-    # The two-shot runs at TP4 and TP8 only (ar2sMaxBytes).
-    if not _is_gfx1250() or tp_size not in (4, 8):
+    # Mixing the Lamport two-shot, fused and split, with the one-shot LL, and
+    # two-shot launches of different block sizes and ragged chunks, must neither
+    # accept a stale line nor overwrite a slower peer's unread one, and both
+    # must sum the ranks in order 0..n-1.
+    if not _is_gfx1250() or tp_size not in (2, 4, 8):
         return
     _run_mixed_size_regression(
         tp_size,
@@ -633,9 +647,9 @@ def test_allreduce_ll_gfx1250_inplace_regression(tp_size, iterations=200):
     )
 
 
-# Two-shot sizes at TP4 and TP8 (fp32 elements): 1.15 MB runs three wave
-# groups, 4.59 MB two.
-_AR2S_GFX1250_SENTINEL_SIZES = [40 * 7168, 160 * 7168]
+# Lamport two-shot sizes (fp32 elements): 2.75 MB, split at TP2 and TP8 and
+# fused at TP4, and 6.42 MB, split at TP4 and fused at TP2 and TP8.
+_AR2S_GFX1250_SENTINEL_SIZES = [96 * 7168, 224 * 7168]
 
 
 def _allreduce_2s_sentinel_payload(rank, tp_size, distributed_init_method):
@@ -689,7 +703,7 @@ def _allreduce_2s_sentinel_payload(rank, tp_size, distributed_init_method):
 def test_allreduce_2s_gfx1250_sentinel_payload(tp_size):
     # A payload word with the bits of the two-shot's sentinel must neither
     # stall its receiver nor reach the ranks as different NaNs.
-    if not _is_gfx1250() or tp_size not in (4, 8):
+    if not _is_gfx1250() or tp_size not in (2, 4, 8):
         return
     torch.multiprocessing.spawn(
         _allreduce_2s_sentinel_payload,
