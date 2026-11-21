@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import itertools
 import math
 import os
 import re
@@ -349,11 +350,26 @@ def _moe_prepare_unsorted_input(
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
 
 
+def _kernel_output(output):
+    """Return ``output`` if the MoE kernels may write it in place, else None.
+
+    The kernels that write the caller's buffer cast it to a 16-byte vector type:
+    the CK, Opus, FlyDSL and adaptive sorts and the a4w4 stage1 zero moe_buf
+    with int4/dwordx4 stores, and the reduce epilogues store 16 bytes per lane.
+    Atomic GEMM2 adds 4-byte atomics, which fault at an odd bf16 element. Any
+    other buffer is replaced by a fresh one, and _return_output copies back.
+    """
+    return None if output is None or output.data_ptr() % 16 else output
+
+
 def _adaptive_output_usable(output, M, model_dim, dtype, device):
     """Whether a caller ``output`` can be the adaptive sort's atomic moe_buf.
 
-    The BM16 sort zeroes moe_buf with 4-byte stores, so the buffer has to be
-    4-byte aligned on top of matching what fused_moe would have allocated.
+    The BM16 sort zeroes moe_buf with 16-byte stores; the only caller already
+    requires a 16-byte aligned output (``_kernel_output``), so the ``% 4``
+    check below is looser than the sort needs and is kept as it was in #7620.
+    The shape, dtype, device and contiguity checks match what fused_moe would
+    have allocated.
     """
     return (
         output is not None
@@ -450,9 +466,11 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          yes        if 4-byte aligned (BM16 zeroes in 4B)
+#     adaptive-aux sort (a4w4, atomic)          yes        shape and dtype match; BM16 zeroes in 16B
 #     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
-#     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
+#     grouped a4w4/a8w4 (gfx1250)               yes        callee writes the aligned output
+#     gfx1201 bf16 small-M direct path          yes        gets output as is, not via _kernel_output
+#     any path, output not 16-byte aligned      no         kernels store it as 16-byte vectors
 #
 # Not in-place => _return_output copies, so the contract holds either way;
 # only the saving is lost.
@@ -473,15 +491,67 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
-def _validate_output_buffer_no_overlap(output, hidden_states):
-    if output is None:
+def _address_span(tensor):
+    """Return the [start, end) byte range a strided tensor can touch.
+
+    nbytes counts logical elements only, so a strided view such as pool[::2]
+    would under-report its reach; kernels that honor the strides read up to
+    the last element's address. The interval is conservative: it also covers
+    the gaps between strided elements. torch rejects negative strides, so no
+    element sits below data_ptr().
+    """
+    start = tensor.data_ptr()
+    if tensor.is_contiguous():
+        return (start, start + tensor.nbytes) if tensor.nbytes else None
+    if tensor.numel() == 0:
+        return None
+    reach = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return start, start + (reach + 1) * tensor.element_size()
+
+
+def _validate_output_buffer_no_overlap(output, inputs, extra_args=()):
+    """Raise if output shares a byte with any tensor the MoE stages read.
+
+    inputs is a sequence of (name, tensor or None) pairs. The tensor values of
+    the extra_args dicts count too: FHMoE passes its shared-expert weights and
+    scales there, none nested in a container. output must be contiguous, as
+    _validate_output_buffer_metadata enforces.
+    """
+    start = output.data_ptr()
+    end = start + output.nbytes
+    if start == end:
         return
-    # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if bytes_overlap(output, hidden_states):
-        raise RuntimeError(
-            "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
-            "reads it"
+    if any(extra_args):
+        inputs = itertools.chain(
+            inputs,
+            (
+                (name, value)
+                for args in extra_args
+                if args
+                for name, value in args.items()
+                if isinstance(value, torch.Tensor)
+            ),
         )
+    # Every eager fused_moe(output=) call runs this, so one pass clears each
+    # input with the cheapest test first. An input starting at or past output's
+    # end cannot reach it (see _address_span), nor can a contiguous one ending at
+    # or before output's start. Strided inputs and possible hits take the span.
+    for name, tensor in inputs:
+        if tensor is None:
+            continue
+        ptr = tensor.data_ptr()
+        if ptr < end and (ptr + tensor.nbytes > start or not tensor.is_contiguous()):
+            span = _address_span(tensor)
+            # Accumulate mode zeroes the output rows at sort time, before the
+            # stages read any input, and atomic GEMM2 then writes into them while
+            # still reading.
+            if span is not None and span[1] > start:
+                raise RuntimeError(
+                    f"output overlaps {name}, which moe_sorting zeroes before the "
+                    "MoE stages read it"
+                )
 
 
 def _return_output(ret, output):
@@ -879,8 +949,16 @@ def moe_sorting(
     accumulate=True,
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
+    # [M, model_dim] buffer to use as moe_buf. The kernels store it as 16-byte
+    # vectors, so it must be 16-byte aligned; fused_moe passes _kernel_output's.
     output=None,
 ):
+    if output is not None and output.data_ptr() % 16:
+        # Fail here rather than fault or corrupt memory in the kernel's store.
+        raise ValueError(
+            "moe_sorting(output=) must be 16-byte aligned, got data_ptr "
+            f"{output.data_ptr():#x}; pass _kernel_output(output) and copy back"
+        )
     asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
@@ -1233,8 +1311,8 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
     # Optional [M, model_dim] destination for the result, to save the caller a
-    # copy. Must be contiguous, match shape/dtype/device and not overlap
-    # hidden_states, or the call raises; when given it is what gets returned.
+    # copy. Must be contiguous, match shape/dtype/device and not overlap any
+    # input tensor, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
@@ -1692,7 +1770,7 @@ def fused_moe_(
     Returns a new ``[M, model_dim]`` tensor of ``dtype`` (``hidden_states``'
     dtype when None), ``M = topk_ids.shape[0]``, ``model_dim = w2.shape[1]``.
     Given ``output`` -- contiguous, of exactly that shape, dtype and device, not
-    overlapping ``hidden_states`` -- the result is written into it and
+    overlapping any input tensor -- the result is written into it and
     ``output`` itself is returned. Nothing else is written through the
     arguments, except under the stage-2 scatter below.
 
@@ -1898,6 +1976,8 @@ def _fused_moe_impl(
         topk = herd_topk
     config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    # The overlap check below must see the caller's tensor, not this copy.
+    caller_hidden_states = hidden_states
     if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
         hidden_states = hidden_states.contiguous()
 
@@ -1935,7 +2015,33 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    # The paths below hand the kernels kernel_output, which is output unless its
+    # alignment rules it out (then _return_output copies their result over).
+    kernel_output = None
+    if output is not None:
+        _validate_output_buffer_no_overlap(
+            output,
+            (
+                ("hidden_states", caller_hidden_states),
+                ("w1", w1),
+                ("w2", w2),
+                ("topk_weight", topk_weight),
+                ("topk_ids", topk_ids),
+                ("expert_mask", expert_mask),
+                ("w1_scale", w1_scale),
+                ("w2_scale", w2_scale),
+                ("a1_scale", a1_scale),
+                ("a2_scale", a2_scale),
+                ("num_local_tokens", num_local_tokens),
+                ("bias1", bias1),
+                ("bias2", bias2),
+                ("w1_global_scale", w1_global_scale),
+                ("w2_global_scale", w2_global_scale),
+            ),
+            # FHMoE passes its shared-expert weights and scales through these.
+            (_stage1_extra_args, _stage2_extra_args),
+        )
+        kernel_output = _kernel_output(output)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     if (w1_global_scale is not None or w2_global_scale is not None) and (
@@ -2054,7 +2160,7 @@ def _fused_moe_impl(
             stage2_scatter=stage2_scatter,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
-            output=output,
+            output=kernel_output,
         )
 
     if grouped_a8w4_out is not None:
@@ -2448,7 +2554,7 @@ def _fused_moe_impl(
             None,
             None,
             accumulate=not runtime_stage2_reduce,
-            output=output,
+            output=kernel_output,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
         )
@@ -2495,12 +2601,12 @@ def _fused_moe_impl(
             sort_m_indices = presorted["m_indices"]
             sort_reverse_sorted = presorted["reverse_sorted"]
             if _atomic and not runtime_stage2_reduce:
-                # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
-                # output at an odd bf16 element, so such an output gets a fresh
-                # moe_buf and _return_output copies back.
-                in_place = output is not None and output.data_ptr() % 4 == 0
+                # kernel_output is None when output is too underaligned for the
+                # kernels' vector stores (see _kernel_output); a fresh moe_buf
+                # then stands in and _return_output copies back.
+                in_place = kernel_output is not None
                 moe_buf = (
-                    output
+                    kernel_output
                     if in_place
                     else torch.empty(
                         (M, model_dim), dtype=dtype, device=topk_ids.device
@@ -2512,7 +2618,7 @@ def _fused_moe_impl(
                 if not (
                     in_place
                     and presorted.get("moe_buf_zeroed")
-                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+                    and int(presorted.get("moe_buf_ptr", 0)) == kernel_output.data_ptr()
                 ):
                     moe_buf.zero_()
             else:
@@ -2534,7 +2640,7 @@ def _fused_moe_impl(
                 return_local_topk_ids=need_local_topk_ids,
                 accumulate=_atomic and not runtime_stage2_reduce,
                 output_aux=metadata.output_aux,
-                output=output,
+                output=kernel_output,
             )
             (
                 sorted_ids,
@@ -2569,7 +2675,7 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
-        sort_output = output if asm_mode.requires_host_sort else None
+        sort_output = kernel_output if asm_mode.requires_host_sort else None
         if asm_mode is AsmMoeMode.POST_REDUCE:
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
@@ -2606,8 +2712,8 @@ def _fused_moe_impl(
             local_topk_ids = None
         if asm_mode is AsmMoeMode.POST_REDUCE:
             moe_buf = (
-                output
-                if output is not None
+                kernel_output
+                if kernel_output is not None
                 else torch.empty((M, model_dim), dtype=dtype, device=topk_ids.device)
             )
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
@@ -2692,7 +2798,7 @@ def _fused_moe_impl(
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
             deterministic=deterministic,
-            output=output,
+            output=kernel_output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
