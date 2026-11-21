@@ -2542,6 +2542,8 @@ def test_gfx942_asm_1stage_4gib_guard():
     # A 4-bit weight counts half a byte per element, so a shape that is 7 GiB
     # in fp8 is 3.5 GiB packed.
     assert fits(256, 7168, 2048, True, dtypes.fp4x2, bf16)
+    # torch.uint32 is eight packed int4 weights.
+    assert fits(256, 7168, 2048, True, torch.uint32, bf16)
     # No q_dtype_w: the weights are in the model dtype (2 bytes).
     assert not fits(256, 7168, 1024, True, None, bf16)
 
@@ -2752,11 +2754,14 @@ def test_gfx942_asm_1stage_4gib_guard():
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
             assert not tuned_row_run_1stage(per_token, row_kernel), "tuned 7 GiB row"
             if host == "gfx950":
-                # Exempt control: a per_1x128 non-xbf16 row keeps asm 1-stage;
-                # the same row naming the xbf16 kernel is discarded.
+                # The heuristic exempts per_1x128 (checked above for the kernel it
+                # selects), but a tuned row can name any blockscale kernel, so it is
+                # discarded whatever its xbf16 flag says, or when it has none.
                 per_1x128 = aiter.QuantType.per_1x128
-                assert tuned_row_run_1stage(per_1x128, row_kernel, xbf16=0), "exempt"
-                assert not tuned_row_run_1stage(per_1x128, row_kernel, xbf16=1), "xbf16"
+                for extra in ({"xbf16": 0}, {"xbf16": 1}, {}):
+                    assert not tuned_row_run_1stage(
+                        per_1x128, row_kernel, **extra
+                    ), f"tuned 7 GiB per_1x128 row kept: {extra}"
     finally:
         env_stack.close()
         fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = real_gfx

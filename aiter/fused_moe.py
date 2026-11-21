@@ -2527,7 +2527,8 @@ _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
 # (arch, quant type) pairs on those arches whose asm kernel was run past 4 GiB
 # and came out right (gfx950 fp8 per_1x128: experts 147-255 of E=256, 7168/2048,
 # match CK 2-stage), so they keep asm 1-stage. The AITER_XBFLOAT16=1 blockscale
-# kernel is not in that run: it wraps and stays guarded.
+# kernel is not in that run: it wraps and stays guarded. Only the kernel the
+# default heuristic selects was run, so a tuned row is never exempt.
 _ASM_FMOE_U32_WEIGHT_OFFSET_OK = (("gfx950", QuantType.per_1x128),)
 
 
@@ -2552,7 +2553,9 @@ def _asm_fmoe_weights_fit_u32_offsets(
     7 GiB and only experts 0-145 come out right).
     """
     w_dtype = dtype if q_dtype_w is None else q_dtype_w
-    bits = 4 if w_dtype in (dtypes.fp4x2, dtypes.i4x2) else w_dtype.itemsize * 8
+    # torch.uint32 is eight packed int4 weights (see q_dtype_w handling in get_2stage_cfgs)
+    four_bit = (dtypes.fp4x2, dtypes.i4x2, torch.uint32)
+    bits = 4 if w_dtype in four_bit else w_dtype.itemsize * 8
     w1_bytes = expert * (2 if use_g1u1 else 1) * inter_dim * model_dim * bits // 8
     w2_bytes = expert * model_dim * inter_dim * bits // 8
     return max(w1_bytes, w2_bytes) <= 1 << 32
@@ -4832,9 +4835,13 @@ def get_2stage_cfgs(
     # A tuned 1-stage row takes run_1stage from the CSV, so it would bypass the
     # 4 GiB guard of the heuristic branch below. Drop an unsafe row so that the
     # heuristic (and its guard / raise) decides. per_1x32 FLAT rows are kept:
-    # their 32-bit wrap was never measured.
+    # their 32-bit wrap was never measured. The per_1x128 exemption of the
+    # heuristic is not applied to a tuned row: it was measured for the kernel the
+    # heuristic selects, and a row can name another one (e.g. the 32x256 blockscale
+    # variants multiply the expert id by the w1 stride in 32 bits).
     if (
         cfg is not None
+        and not bypass_tuned_config
         and cfg.get("run_1stage", False)
         and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
         and q_type != QuantType.per_1x32
@@ -4842,27 +4849,18 @@ def get_2stage_cfgs(
             expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
         )
     ):
-        guard_kernel1 = str(cfg.get("kernelName1", "") or "")
-        if "xbf16" in cfg:
-            guard_xbf16 = bool(int(cfg["xbf16"]))
-        else:
-            guard_xbf16 = "blockscaleBf16" in guard_kernel1
-        if not (
-            (get_gfx_runtime(), q_type) in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
-            and not guard_xbf16
-        ):
-            # Non-gated weights cannot fall back to CK stage 1 (it assumes gate
-            # and up are fused), and the heuristic would pick it at 256+ tokens.
-            if not use_g1u1:
-                raise _non_gated_past_4gib_error()
-            logger.warning(
-                "[fused_moe] discarding tuned asm 1-stage config %r for %s: the "
-                "weights are past 4 GiB and the kernel uses 32-bit expert offsets; "
-                "using default heuristics",
-                guard_kernel1,
-                keys,
-            )
-            cfg = None
+        # Non-gated weights cannot fall back to CK stage 1 (it assumes gate and
+        # up are fused), and the heuristic would pick it at 256+ tokens.
+        if not use_g1u1:
+            raise _non_gated_past_4gib_error()
+        logger.warning(
+            "[fused_moe] discarding tuned asm 1-stage config %r for %s: the "
+            "weights are past 4 GiB and the kernel uses 32-bit expert offsets; "
+            "using default heuristics",
+            str(cfg.get("kernelName1", "") or ""),
+            keys,
+        )
+        cfg = None
 
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
