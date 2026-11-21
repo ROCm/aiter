@@ -279,6 +279,21 @@ def test_padding_slot_leaves_state_untouched():
     assert torch.equal(state[untouched], state_before[untouched])
 
 
+def test_single_sequence_index_views():
+    """At batch 1, a column of a [batch, k] slot table is contiguous whatever
+    its stride, so the entry check accepts it."""
+    inputs = make_inputs([300], 512, 4, torch.bfloat16, "token_major")
+    # Mid-row column with different neighbours, so reading any other element
+    # (a lost storage offset) changes the result.
+    for name, other in (("cache_indices", PAD_SLOT_ID), ("has_initial_state", False)):
+        table = torch.full((1, 4), other, dtype=inputs[name].dtype)
+        table[:, 2] = inputs[name]
+        inputs[name] = table[:, 2]
+        assert inputs[name].is_contiguous() and inputs[name].stride() == (4,)
+    err = check_against_reference(inputs, "strided index views")
+    assert err <= _TOL_ERR_RATIO
+
+
 @pytest.mark.parametrize("layout", ["token_major", "channel_major"])
 def test_new_token_count_reuses_kernel(layout):
     """x/out strides are launch arguments, so a new token count must neither
