@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Python wrappers for FP8 block-wise quantization kernels."""
 
+import functools
 import math
 
 import torch
@@ -31,14 +32,16 @@ _BLOCK_SIZE = 128
 
 
 def _no_slp_once_used() -> dict:
-    # LLVM's SLP vectorizer (llvm a9a6edb5935c, in Triton's LLVM since triton#12236) also
-    # seeds from single-use values and packs the software f32 -> fp8 conversion into
-    # <2 x float> / <4 x i8> vectors that gfx950 has to unpack again: +6% instructions
-    # and 4-9% slower blockwise and weight quant. Turn that seeding off for these two
-    # kernels only; the other quant kernels are not affected, and turning it off
-    # globally costs other kernels 10-19%. Triton builds without llvm_cl_opts reject
-    # unknown launch options, so probe for it. Only measured on gfx950, so the launches
-    # apply it through _no_slp_once_used_on_gfx950().
+    # Workaround for AMD-Triton/triton-tickets#2129. LLVM's SLP vectorizer (llvm
+    # a9a6edb5935c, in Triton's LLVM since triton#12236) also seeds from single-use
+    # values and packs the software f32 -> fp8 e4m3fnuz conversion into <2 x float> /
+    # <4 x i8> vectors that gfx950 has to unpack again: +161 VALU in the blockwise
+    # kernel and 4-9% slower blockwise and weight quant. Only fnuz takes that software
+    # path on gfx950 (OCP e4m3fn uses the hardware convert), so only fnuz launches get
+    # it; turning it off globally costs other kernels 10-19%. Remove once the pinned
+    # LLVM's SLP cost model stops packing this conversion (re-check with
+    # bench_quant_fp8_blockwise on gfx950). Triton builds without llvm_cl_opts reject
+    # unknown launch options, so probe for it.
     try:
         from triton.backends.amd.compiler import HIPOptions
     except ImportError:
@@ -48,14 +51,14 @@ def _no_slp_once_used() -> dict:
     return {"llvm_cl_opts": "slp-vectorize-once-used=false"}
 
 
-_NO_SLP_ONCE_USED = _no_slp_once_used()
-
-
-def _no_slp_once_used_on_gfx950() -> dict:
-    # Checked at launch, not import, so importing this module never probes the GPU.
-    if not _NO_SLP_ONCE_USED or arch_info.get_arch() != "gfx950":
-        return {}
-    return _NO_SLP_ONCE_USED
+@functools.cache
+def _fnuz_quant_launch_params(block_size: int, quant_dtype: torch.dtype) -> dict:
+    # Launch kwargs for the blockwise and weight kernels, resolved once per
+    # (block_size, quant_dtype); callers unpack them and never mutate the dict.
+    params = _launch_params(block_size)
+    if quant_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() == "gfx950":
+        params = {**params, **_no_slp_once_used()}
+    return params
 
 
 def _launch_params(block_size: int) -> dict:
@@ -135,8 +138,7 @@ def quant_fp8_blockwise(
         FP8_MAX=fp8_max,
         AXIS=axis,
         DUAL=False,
-        **_launch_params(block_size),
-        **_no_slp_once_used_on_gfx950(),
+        **_fnuz_quant_launch_params(block_size, quant_dtype),
     )
     return x_fp8, scales
 
@@ -246,8 +248,7 @@ def quant_fp8_blockwise_for_weight(
         N,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
-        **_launch_params(block_size),
-        **_no_slp_once_used_on_gfx950(),
+        **_fnuz_quant_launch_params(block_size, quant_dtype),
     )
     return w_fp8, scales
 
