@@ -29,6 +29,7 @@ from aiter.ops.attention import (
     _mla_decode_launch_plan,
     _mla_head_fold,
     _mla_planned_cp_round_robin,
+    _mla_planned_native_96h_cp,
     _MlaBackendId,
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1464,15 +1465,21 @@ def mla_decode_fwd(
         )
         has_scales = q_scale is not None and kv_scale is not None
         cp_launch = g_kv_indptr is not None
+        # The AITER_MLA_NATIVE_96H_CP opt-in the metadata was planned with, so
+        # toggling it after planning cannot change the head plan (a clone has no
+        # record and reads the env).
+        planned_native = _mla_planned_native_96h_cp(work_meta_data)
         head_plan, max_splits = _mla_decode_launch_plan(
-            *plan_shape, cp_launch, has_scales
+            *plan_shape, cp_launch, has_scales, planned_native
         )
         # Where round-robin CP changes the head plan (96 fp8 heads at qlen 7 and 8
         # on gfx950), the metadata's planned CP mode decides it, not g_kv_indptr.
         # An unknown mode (a clone) fails closed: either plan could be wrong.
         planned_cprr = _mla_planned_cp_round_robin(work_meta_data)
         if planned_cprr is not cp_launch:
-            other, _ = _mla_decode_launch_plan(*plan_shape, not cp_launch, has_scales)
+            other, _ = _mla_decode_launch_plan(
+                *plan_shape, not cp_launch, has_scales, planned_native
+            )
             if _mla_head_fold(other) != _mla_head_fold(head_plan):
                 if planned_cprr is not False:
                     why = (

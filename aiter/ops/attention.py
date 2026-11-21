@@ -1594,11 +1594,14 @@ def _mla_decode_launch_plan(
     cp_world_size: int,
     cp_round_robin: bool,
     has_scales: bool,
+    native_96h_cp: bool | None = None,
 ) -> tuple[_MlaHeadPlan, int]:
     """mla_decode_fwd's persistent gate: the head plan and the split bound.
 
     It runs on every eager step, so it reads the env flags as raw strings and
     leaves parsing, the arch and both C++ rules to one cache lookup.
+    native_96h_cp=None reads AITER_MLA_NATIVE_96H_CP; mla_decode_fwd passes the
+    opt-in get_mla_metadata_v1 recorded with the metadata instead.
     """
     env = _os.environ
     return _mla_decode_launch_plan_cached(
@@ -1615,7 +1618,11 @@ def _mla_decode_launch_plan(
         torch.cuda.current_device(),
         env.get("AITER_ENABLE_EXPERIMENTAL", ""),
         env.get("AITER_MLA_DECODE_PS1_FLYDSL", ""),
-        env.get("AITER_MLA_NATIVE_96H_CP", ""),
+        (
+            env.get("AITER_MLA_NATIVE_96H_CP", "")
+            if native_96h_cp is None
+            else str(int(bool(native_96h_cp)))
+        ),
         env.get("AITER_MLA_USE_OPUS", ""),
         env.get("AITER_MLA_DECODE_PS1_ASM", "1"),
     )
@@ -2172,7 +2179,9 @@ def _mla_metadata_head_plan(
     fast_mode: bool,
     intra_batch_mode: bool,
     cp_round_robin: bool = False,
+    native_96h_cp: bool | None = None,
 ) -> _MlaHeadPlan:
+    # native_96h_cp=None reads AITER_MLA_NATIVE_96H_CP.
     return _mla_decode_head_plan_cached(
         int(num_head_qo),
         max(1, int(max_seqlen_qo)),
@@ -2183,7 +2192,7 @@ def _mla_metadata_head_plan(
         _mla_resolve_arch(None),
         env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
         env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
-        _mla_native_96h_cp_enabled(),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         512,
         1,
         1,
@@ -2572,7 +2581,9 @@ def _get_mla_metadata_v1_impl(
             slower than the fold at long context); otherwise they fold. The mode is recorded with work_metadata_ptrs (views and deep copies
             keep it; a clone, or a deep copy of a view, has no record, and copy_ into
             a planned buffer keeps that buffer's own record, so plan the destination
-            again instead) and mla_decode_fwd runs the head plan it records. Where
+            again instead) and mla_decode_fwd runs the head plan it records. The
+            opt-in is recorded the same way, so changing AITER_MLA_NATIVE_96H_CP
+            after planning does not change how decode or the update read it. Where
             the mode changes the plan, mla_decode_fwd raises ValueError on a buffer
             without a record (a clone), and on CP-planned metadata without
             g_kv_indptr.
@@ -2604,7 +2615,8 @@ def _get_mla_metadata_v1_impl(
 
 
 class _MlaPlannedCp:
-    """The is_cp_round_robin get_mla_metadata_v1 planned a work_metadata_ptrs with.
+    """The is_cp_round_robin and AITER_MLA_NATIVE_96H_CP opt-in get_mla_metadata_v1
+    planned a work_metadata_ptrs with: together they fix its head layout.
 
     One cell per buffer, kept on its storage (keyed by data pointer, so views
     share it) and on the planned tensor (so copy.deepcopy snapshots it, and a
@@ -2616,6 +2628,7 @@ class _MlaPlannedCp:
 
     def __init__(self) -> None:
         self.is_cp_round_robin: bool | None = None
+        self.native_96h_cp: bool | None = None
 
 
 _MLA_PLANNED_CP_ATTR = "_aiter_mla_planned_cp"
@@ -2658,12 +2671,15 @@ def _mla_planned_cp_cell(
 
 
 def _mla_record_planned_cp_round_robin(
-    work_metadata_ptrs: torch.Tensor, is_cp_round_robin: bool | None
+    work_metadata_ptrs: torch.Tensor,
+    is_cp_round_robin: bool | None,
+    native_96h_cp: bool | None = None,
 ) -> None:
     cell = _mla_planned_cp_cell(work_metadata_ptrs, create=True)
     cell.is_cp_round_robin = (
         None if is_cp_round_robin is None else bool(is_cp_round_robin)
     )
+    cell.native_96h_cp = None if native_96h_cp is None else bool(native_96h_cp)
 
 
 def _mla_planned_cp_round_robin(
@@ -2674,6 +2690,16 @@ def _mla_planned_cp_round_robin(
         return None
     cell = _mla_planned_cp_cell(work_metadata_ptrs, create=False)
     return None if cell is None else cell.is_cp_round_robin
+
+
+def _mla_planned_native_96h_cp(
+    work_metadata_ptrs: torch.Tensor | None,
+) -> bool | None:
+    """The AITER_MLA_NATIVE_96H_CP opt-in these buffers were planned with, or None."""
+    if work_metadata_ptrs is None:
+        return None
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=False)
+    return None if cell is None else cell.native_96h_cp
 
 
 def _mla_head_fold(plan: _MlaHeadPlan) -> tuple[int, int]:
@@ -2739,6 +2765,9 @@ def get_mla_metadata_v1(
 
     # Forget the previous plan's mode first, so a failed replan leaves it unknown.
     _mla_record_planned_cp_round_robin(work_metadata_ptrs, None)
+    # The C++ planner reads AITER_MLA_NATIVE_96H_CP itself; record the value it sees,
+    # so a later toggle cannot make decode or the update disagree with the plan.
+    native_96h_cp = _mla_native_96h_cp_enabled()
     _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
@@ -2768,8 +2797,10 @@ def get_mla_metadata_v1(
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
     # mla_decode_fwd and decode_update_mla_metadata_v1 read this back: for some
-    # shapes the head plan, folded or native, depends on round-robin CP.
-    _mla_record_planned_cp_round_robin(work_metadata_ptrs, is_cp_round_robin)
+    # shapes the head plan, folded or native, depends on round-robin CP and the opt-in.
+    _mla_record_planned_cp_round_robin(
+        work_metadata_ptrs, is_cp_round_robin, native_96h_cp
+    )
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -2938,9 +2969,10 @@ def decode_update_mla_metadata_v1(
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
     Every request's KV grows by 1 - num_reject_tokens (default 1) tokens.
     The head plan is the one without round-robin CP, so where CP changes that
-    plan (96 fp8 heads at qlen 7 and 8 on gfx950) it raises ValueError on
-    metadata get_mla_metadata_v1 planned with is_cp_round_robin=True, and on
-    metadata with no recorded mode (a clone).
+    plan (96 fp8 heads at qlen 7 and 8 on gfx950, with the AITER_MLA_NATIVE_96H_CP
+    opt-in recorded at planning) it raises ValueError on metadata
+    get_mla_metadata_v1 planned with is_cp_round_robin=True, and on metadata
+    with no recorded mode (a clone, which reads the opt-in from the env).
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2950,13 +2982,23 @@ def decode_update_mla_metadata_v1(
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
     plan_args = (num_heads_per_head_k, max_seqlen_qo, dtype_q, dtype_kv)
+    # The opt-in the metadata was planned with, not the current env (None for a
+    # clone, which falls back to the env).
+    native_96h_cp = _mla_planned_native_96h_cp(work_metadata_ptrs)
     head_plan = _mla_metadata_head_plan(
-        *plan_args, fast_mode=True, intra_batch_mode=False
+        *plan_args,
+        fast_mode=True,
+        intra_batch_mode=False,
+        native_96h_cp=native_96h_cp,
     )
     planned_cprr = _mla_planned_cp_round_robin(work_metadata_ptrs)
     if planned_cprr is not False:
         cp_plan = _mla_metadata_head_plan(
-            *plan_args, fast_mode=True, intra_batch_mode=False, cp_round_robin=True
+            *plan_args,
+            fast_mode=True,
+            intra_batch_mode=False,
+            cp_round_robin=True,
+            native_96h_cp=native_96h_cp,
         )
         if _mla_head_fold(cp_plan) != _mla_head_fold(head_plan):
             planned = (

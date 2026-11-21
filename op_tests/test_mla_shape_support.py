@@ -21,6 +21,7 @@ from aiter.ops.attention import (
     _mla_decode_head_plan,
     _mla_decode_launch_plan,
     _mla_planned_cp_round_robin,
+    _mla_planned_native_96h_cp,
     decode_update_mla_metadata_v1,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
@@ -614,10 +615,12 @@ def _run_decode(
     plan_cprr=None,
     meta_view=None,
     q_view=None,
+    after_plan=None,
 ):
     # plan_cprr plans the metadata for round-robin CP or not; None follows cp_rank.
     # meta_view(work_meta_data) is what decode gets; q_view(q) is the Q it gets (the
-    # dense q is still returned for the reference).
+    # dense q is still returned for the reference). after_plan() runs between
+    # planning and decode.
     qd = _dtype(d)
     qo, kv_indptr, last = _indptrs(bs, msq, cp_rank)
     total_q, total_kv = bs * msq, int(kv_indptr[-1].item())
@@ -638,6 +641,8 @@ def _run_decode(
         kw.update(zip(names, meta))
         if meta_view is not None:
             kw["work_meta_data"] = meta_view(kw["work_meta_data"])
+    if after_plan is not None:
+        after_plan()
     if cp_rank is not None:
         kw["g_kv_indptr"] = _indptr(KV_LENS[:bs])
         kw.update(cp_world_size=CP_WORLD_SIZE, cp_rank=cp_rank)
@@ -877,6 +882,43 @@ def test_replanned_deep_copy_keeps_its_mode_for_the_next_copy(
     assert _mla_planned_cp_round_robin(wmd) is first
 
 
+def test_planned_opt_in_is_recorded_with_the_mode(monkeypatch):
+    # get_mla_metadata_v1 records the AITER_MLA_NATIVE_96H_CP opt-in it planned
+    # with next to is_cp_round_robin: views and deep copies keep it, a clone has
+    # none, a toggle after planning does not change it, and a replan or a failed
+    # replan replaces it.
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
+    wmd = torch.zeros(2, dtype=torch.uint64)
+    idx = torch.zeros(3, dtype=torch.int32)
+
+    def plan(work_metadata_ptrs):
+        aiter.get_mla_metadata_v1(
+            *(idx, idx, idx, 96, 1, False, work_metadata_ptrs, *(idx,) * 5),
+            is_cp_round_robin=True,
+        )
+
+    assert _mla_planned_native_96h_cp(wmd) is None
+    monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    plan(wmd)
+    monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP")
+    snapshot = copy.deepcopy(wmd)
+    for t in (wmd, wmd[:], snapshot, snapshot[:]):
+        assert _mla_planned_native_96h_cp(t) is True
+    assert _mla_planned_native_96h_cp(wmd.clone()) is None
+    plan(wmd[:])
+    assert _mla_planned_native_96h_cp(wmd) is False
+    assert _mla_planned_native_96h_cp(snapshot) is True
+
+    def failing_impl(*args, **kwargs):
+        raise RuntimeError("planner failed")
+
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", failing_impl)
+    monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    with pytest.raises(RuntimeError, match="planner failed"):
+        plan(wmd)
+    assert _mla_planned_native_96h_cp(wmd) is None
+
+
 def test_planned_cp_mode_does_not_follow_an_offset_slice(monkeypatch):
     # A view finds its base's record only at the base's own address: an offset
     # slice such as workspace[2:4] is another buffer, with no record until it is
@@ -946,6 +988,82 @@ def test_decode_update_rejects_cp_metadata_only_where_cp_changes_the_head_plan()
             assert rejected and why in str(e), (n, msq, clone, e)
         else:
             assert not rejected, (n, msq, clone)
+
+
+def _set_native_96h_cp(monkeypatch, on):
+    if on:
+        monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    else:
+        monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+
+
+@requires_gpu
+@pytest.mark.parametrize("planned_native", [True, False])
+def test_decode_keeps_the_planned_opt_in_after_a_toggle(monkeypatch, planned_native):
+    # get_mla_metadata_v1 plans 96 fp8 heads at qlen 7 and 8 under round-robin CP
+    # natively or folded by AITER_MLA_NATIVE_96H_CP at planning time; toggling it
+    # before decode must not run the other head plan on those descriptors.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    folds = []
+    fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
+
+    def counting_fold(*args):
+        folds.append(args)
+        return fold_seqlen_indptr(*args)
+
+    monkeypatch.setattr(aiter.mla, "_fold_seqlen_indptr", counting_fold)
+    cp_rank = 3
+    for msq in (7, 8):
+        folds.clear()
+        _set_native_96h_cp(monkeypatch, planned_native)
+        out, lse, inputs = _run_decode(
+            *(96, msq, "fp8", True),
+            cp_rank=cp_rank,
+            after_plan=lambda: _set_native_96h_cp(monkeypatch, not planned_native),
+        )
+        assert bool(folds) is not planned_native, (msq, planned_native)
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+
+
+@requires_gpu
+@pytest.mark.parametrize("planned_native", [True, False])
+def test_decode_update_keeps_the_planned_opt_in_after_a_toggle(
+    monkeypatch, planned_native
+):
+    # The incremental update rewrites descriptors with the fold. On CP metadata
+    # planned natively it must refuse even once the opt-in is cleared; on CP
+    # metadata planned folded it must update as without the opt-in, even once it
+    # is set.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    bs, n, qd = 2, 96, dtypes.fp8
+
+    def update(meta, msq):
+        qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
+        decode_update_mla_metadata_v1(
+            *(qo, kv_indptr, last, n, 1, True, *meta),
+            max_seqlen_qo=msq,
+            dtype_q=qd,
+            dtype_kv=qd,
+        )
+        torch.cuda.synchronize()
+
+    for msq in (7, 8):
+        _set_native_96h_cp(monkeypatch, planned_native)
+        _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
+        _set_native_96h_cp(monkeypatch, not planned_native)
+        if planned_native:
+            with pytest.raises(ValueError, match="is_cp_round_robin=True"):
+                update(meta, msq)
+            continue
+        update(meta, msq)
+        # the same update without the toggle writes the same descriptors
+        _set_native_96h_cp(monkeypatch, False)
+        _, _, ref = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
+        update(ref, msq)
+        for got, want in zip(meta[1:], ref[1:]):
+            assert torch.equal(got, want), msq
 
 
 @requires_gpu
