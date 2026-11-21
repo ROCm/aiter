@@ -57,13 +57,13 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     return x, weight, bias_tensor, out_dtype, y
 
 
-# DSv4.1 router GEMM: TN layout only, so it is not in get_shapes().
-# The M values are the lowest and highest M of each tuned gfx1250 bucket.
-_DSV41_ROUTER_X_VALS = [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768)]
-
-
 # Test plain BF16 GEMMs - the most common types.
-@pytest.mark.parametrize("M, N, K", get_shapes() + _DSV41_ROUTER_X_VALS)
+# N=384, K=5120 is the DSv4.1 router GEMM (TN layout only): the lowest and the
+# highest M of each tuned gfx1250 Gluon bucket.
+@pytest.mark.parametrize(
+    "M, N, K",
+    get_shapes() + [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768)],
+)
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
