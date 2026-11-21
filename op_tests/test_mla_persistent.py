@@ -2067,6 +2067,86 @@ def check_fp8_gqa16_multi_tile_batch(
     )
 
 
+def check_split_buffer_covers_plan() -> None:
+    """The persistent split buffers are sized from the planner's q tile, not
+    max_seqlen_q. Every partial row the plan assigns must fit in them. Native
+    plans also run mixed q lengths, where short requests take the widest tiles."""
+    qk_head_dim, batch_size = 576, 8
+    one = torch.ones(1, dtype=torch.float)
+    num_cases = 0
+    for nhead, qlen, dtype in (
+        (16, 1, dtypes.bf16),
+        (16, 4, dtypes.bf16),
+        (32, 3, dtypes.fp8),
+        (32, 4, dtypes.fp8),
+        (32, 9, dtypes.fp8),
+        (64, 1, dtypes.fp8),
+        (96, 2, dtypes.fp8),
+        (128, 2, dtypes.fp8),
+        (128, 9, dtypes.fp8),
+    ):
+        support = aiter.get_mla_decode_shape_support(nhead, qlen, dtype, dtype)
+        if not support.planner_accepts or support.supported is False:
+            continue
+        for varlen in (False, True) if support.fold_factor == 1 else (False,):
+            seq_lens_qo = torch.full((batch_size,), qlen, dtype=torch.int)
+            if varlen:
+                seq_lens_qo[1:] = torch.randint(1, qlen + 1, (batch_size - 1,))
+            seq_lens_kv = torch.randint(qlen + 512, 8192, (batch_size,))
+            qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+            kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+            qo_indptr[1:] = torch.cumsum(seq_lens_qo, 0)
+            kv_indptr[1:] = torch.cumsum(seq_lens_kv, 0)
+            num_kv = int(kv_indptr[-1])
+            q = torch.randn((int(qo_indptr[-1]), nhead, qk_head_dim)).to(dtype)
+            metadata = _make_mla_metadata(
+                qo_indptr,
+                kv_indptr,
+                torch.ones(batch_size, dtype=torch.int),
+                nhead,
+                1,
+                dtype,
+                dtype,
+                1,
+                qlen,
+                -1 if varlen else qlen,
+                -1,
+            )
+            scales = {"q_scale": one, "kv_scale": one} if dtype == dtypes.fp8 else {}
+            logits, _ = aiter.mla.mla_decode_fwd(
+                q,
+                torch.randn((num_kv, 1, 1, qk_head_dim)).to(dtype),
+                torch.empty((q.size(0), nhead, 512), dtype=torch.bfloat16),
+                qo_indptr,
+                kv_indptr,
+                torch.randperm(num_kv, dtype=torch.int),
+                torch.ones(batch_size, dtype=torch.int),
+                qlen,
+                sm_scale=1.0 / 24,
+                **scales,
+                **metadata,
+            )
+            num_works = int(metadata["work_indptr"][-1])
+            works = metadata["work_info_set"][:num_works].long()
+            split = works[:, 1] >= 0
+            assert split.any(), f"{nhead=} {qlen=}: the plan has no split work"
+            planned_rows = int(
+                (works[split, 1] + works[split, 3] - works[split, 2]).max()
+            )
+            name = f"{nhead=} {qlen=} {dtype=} {varlen=}"
+            assert planned_rows <= logits.size(0), (
+                f"{name}: plan writes {planned_rows} partial rows, "
+                f"buffer has {logits.size(0)}"
+            )
+            if support.kernel_num_heads * 2 > 128:
+                assert logits.size(0) == metadata["reduce_partial_map"].size(0), (
+                    f"{name}: one-row q tiles need one partial row per split, "
+                    f"got {logits.size(0)} rows"
+                )
+            num_cases += 1
+    assert num_cases > 0, "no persistent MLA decode shape ran on this arch"
+
+
 _HEADS = 16
 _KV_LEN = 2048
 _KV_LORA_RANK = 512
@@ -2530,6 +2610,8 @@ def main():
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
     test_mla_v1_0_kv_tail()
     aiter.logger.info("v1_0 KV tail end-to-end: passed")
+    check_split_buffer_covers_plan()
+    aiter.logger.info("persistent split buffer covers the plan: passed")
     if get_gfx() == "gfx950":
         check_fp8_gqa16_multi_tile_batch(1)
         check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
