@@ -411,8 +411,11 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
+# H=32 and 64 take the single-pass kernel (H=64 as two head groups), H=16
+# mla_gluon. T=16384 with 512 slots per row gives an 8 GiB pool, so KV offsets
+# need 64 bits.
 @pytest.mark.parametrize("T", [1024, 16384])
-@pytest.mark.parametrize("H", [64])
+@pytest.mark.parametrize("H", [16, 32, 64])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("prefix_len", [255, 512])
 def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
@@ -496,6 +499,20 @@ def _inject_invalid_slots(indices, num_kv):
     )
 
 
+def _ragged_rows(T, max_len, num_kv, dev):
+    """Valid slot lists of 1..max_len slots per row, with every 7th row empty
+    and the row after it short (1..16 slots). Returns (lens, indptr, indices)."""
+    lens = torch.randint(1, max_len + 1, (T,), device=dev)
+    lens[::7] = 0  # empty rows: output is 0 (sink only)
+    lens[1::7] = torch.randint(1, 17, (lens[1::7].numel(),), device=dev)  # short rows
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    return lens, indptr, indices
+
+
 # DSv4.1-Flash TP4: H=16 per rank, D=512, top-512 + 128 SWA = 640 slots.
 # Lengths vary per row so the last BLOCK_K tile is usually partial.
 # H=32 exercises the autotuned launch; H<=16 the gfx942 pinned config, in
@@ -520,14 +537,7 @@ def test_pa_prefill_sparse_single_source(H, dtype, with_sink):
     q = torch.randn(T, H, D, dtype=dtype, device=dev)
     kv = torch.randn(num_kv, D, dtype=dtype, device=dev)
     sink = torch.randn(H, dtype=torch.float32, device=dev) if with_sink else None
-    lens = torch.randint(1, max_len + 1, (T,), device=dev)
-    lens[::7] = 0  # empty rows: output is 0 (sink only)
-    lens[1::7] = torch.randint(1, 17, (lens[1::7].numel(),), device=dev)  # short rows
-    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
-    indptr[1:] = lens.cumsum(0)
-    indices = torch.randint(
-        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
-    )
+    lens, indptr, indices = _ragged_rows(T, max_len, num_kv, dev)
     # Every other row keeps only valid slots; the rest get invalid ones.
     flat_row = torch.repeat_interleave(torch.arange(T, device=dev), lens)
     with_invalid = indices.clone()
@@ -554,6 +564,40 @@ def test_pa_prefill_sparse_single_source(H, dtype, with_sink):
         out=out,
     )
     assert ret is out
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# gfx950 single-pass kernel: partial last tiles, short rows, and empty rows,
+# which must write zeros into the NaN-filled out, also at softmax_scale=0,
+# where a masked score times the scale must not become NaN. mla_gluon sees 64
+# CUs here, as under a CU_NUM setting or a compute partition: at H=32 it would
+# run each of these calls in one key split and leave the empty rows unwritten,
+# and at H=64 it would assert, T not being a multiple of 64.
+@pytest.mark.parametrize("scale", [512**-0.5, 0.0], ids=["scaled", "zero-scale"])
+@pytest.mark.parametrize("with_sink", [True, False])
+@pytest.mark.parametrize("H", [32, 64])
+@pytest.mark.parametrize("T", [300, 48])
+def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink, scale, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("covers the gfx950 single-pass branch")
+    monkeypatch.setattr("aiter.ops.triton.gluon.mla_gluon.get_num_sms", lambda: 64)
+
+    D, max_len, num_kv, dev = 512, 640, 4096, "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    # Sinks near the rows' log-denominators, so that a wrong sink moves the
+    # output past the tolerance.
+    sink = torch.randn(H, dtype=torch.float32, device=dev) + 5 if with_sink else None
+    _, indptr, indices = _ragged_rows(T, max_len, num_kv, dev)
+
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, scale
+    )
+    out = torch.full_like(q, float("nan"))
+    pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale, out=out)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
