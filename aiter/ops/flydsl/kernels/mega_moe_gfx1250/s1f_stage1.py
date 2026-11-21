@@ -166,6 +166,20 @@ def s1f_flag_m(tile_m: int) -> int:
     return FLAG_M_SMALL
 
 
+def s1f_apre_op_stores(payload_bytes: int, scale_bytes: int, run_rows: int) -> int:
+    """VMEM stores one packed-A (a_preshuffled) storer op issues: its payload
+    and scale chunks over the run's lane groups, then the rowmap store."""
+    pay_iters = (int(payload_bytes) // 16) // (WAVE // int(run_rows))
+    sc_iters = (int(run_rows) * (int(scale_bytes) // 16) + WAVE - 1) // WAVE
+    return pay_iters + sc_iters + 1
+
+
+def s1f_apre_fits(payload_bytes: int, scale_bytes: int, run_rows: int) -> bool:
+    """Whether a packed-A op's stores (plus 3 in flight) fit the 6-bit
+    storecnt wait field; DSR1's 7168-wide rows do not (56 payload stores)."""
+    return s1f_apre_op_stores(payload_bytes, scale_bytes, run_rows) + 3 <= 63
+
+
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
 #: has at most FLAG_M / run_rows = 8 runs, so a block of >= 8 runs always holds
 #: a piece start; the claimer owns the pieces that START in its block and
@@ -1445,13 +1459,13 @@ def make_s1f_stage1(
     PAY_ITERS = PAY_CHUNKS // (WAVE // R)
     SC_ITERS = (R * SC_CHUNKS + WAVE - 1) // WAVE
     # VMEM store instructions per op: payload, scales, then the rowmap store.
-    OP_STORES = (PAY_ITERS + SC_ITERS + 1) if APRE else 1
+    OP_STORES = s1f_apre_op_stores(payload_bytes, scale_bytes, R) if APRE else 1
     if APRE:
         if compact_cap % 16 or PAY_CHUNKS % (WAVE // R):
             raise ValueError("packed A needs M16 rows and whole lane groups")
         if APRE_SCALE_OFF + compact_cap * scale_bytes > compact_cap * row_stride:
             raise ValueError("packed A and its e8m0 rows overflow disp_out")
-        if OP_STORES + 3 > 63:
+        if not s1f_apre_fits(payload_bytes, scale_bytes, R):
             raise ValueError("an op's stores overflow the storecnt wait field")
         # buffer_store drops a masked lane by rewriting its offset to
         # 0x7FFFFFFF, which is only out of range when num_records stays at or

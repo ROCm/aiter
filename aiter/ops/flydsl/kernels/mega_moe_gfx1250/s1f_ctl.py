@@ -495,6 +495,19 @@ class _Stage1Fusion:
 
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
+    def _gemm_opts(self, tile_m: int) -> dict:
+        """_S1F_GEMM_OPTS for this tile, without packed A where its storer
+        ops overflow the storecnt wait field (DSR1's 7168-wide rows)."""
+        from .s1f_stage1 import PLAN_RUN_ROWS, s1f_apre_fits
+
+        opts = dict(_S1F_GEMM_OPTS.get(int(tile_m), {}))
+        config = self.d.config
+        if opts.get("a_preshuffled") and not s1f_apre_fits(
+            config.dispatch_token_nbytes, config.dispatch_scale_nbytes, PLAN_RUN_ROWS
+        ):
+            opts["a_preshuffled"] = 0
+        return opts
+
     def _launcher(
         self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
     ):
@@ -534,7 +547,7 @@ class _Stage1Fusion:
                 ctas_per_cu=ctas_per_cu,
                 m_warp=m_warp,
                 n_warp=n_warp,
-                **_S1F_GEMM_OPTS.get(tile_m, {}),
+                **self._gemm_opts(tile_m),
             )
             self.launches[key] = launch
         return launch
@@ -695,7 +708,7 @@ class _Stage1Fusion:
             stream = torch.cuda.current_stream()
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok, tile=align_m):
-            packed = _S1F_GEMM_OPTS.get(int(tile), {}).get("a_preshuffled", 0)
+            packed = self._gemm_opts(tile).get("a_preshuffled", 0)
             return (
                 out,
                 ptr_arg(a),
