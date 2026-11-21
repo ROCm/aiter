@@ -809,6 +809,7 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if activation_bf16 and act != "silu_clamped":
@@ -875,6 +876,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            stage2_skips_inter_pad=stage2_skips_inter_pad,
         )
     else:
         raise ValueError(
@@ -1655,6 +1657,7 @@ def _flydsl_moe_stage1_impl(
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
+    stage2_skips_inter_pad: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1958,6 +1961,8 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+        if stage2_skips_inter_pad and inter_dim_pad > 0:
+            compile_kwargs["stage2_skips_inter_pad"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -2144,6 +2149,7 @@ def flydsl_moe_stage1(
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2160,6 +2166,10 @@ def flydsl_moe_stage1(
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    stage2_skips_inter_pad (v2_output_layout only): the consuming v2 stage2
+    skips the inter_dim padding, so output columns past the unpadded width
+    rounded up to 32 may be left unwritten.
 
     Returns:
         Basic:                      out
@@ -2206,6 +2216,7 @@ def flydsl_moe_stage1(
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=shared_tile,
+        stage2_skips_inter_pad=stage2_skips_inter_pad,
     )
 
 
