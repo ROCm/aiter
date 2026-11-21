@@ -1240,7 +1240,7 @@ def test_stage1_prefetch_is_bitwise(token, tile_m, tile_n, tile_k, k_wave, prefe
     assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
 
 
-def _pack_mxfp4_reference(weight):
+def _pack_mxfp4_reference(weight, gate_up=False):
     experts, rows, columns = weight.shape
     packed, scales = _quantize_mxfp4_by_expert(weight)
     packed = packed.view(experts, rows, columns // 2)
@@ -1254,8 +1254,8 @@ def _pack_mxfp4_reference(weight):
             ).reshape(rows, columns)
         )
     return (
-        shuffle_weight_a16w4(packed, 16, False),
-        shuffle_scale_a16w4(scales.flatten(0, 1), experts, False),
+        shuffle_weight_a16w4(packed, 16, gate_up),
+        shuffle_scale_a16w4(scales.flatten(0, 1), experts, gate_up),
         dequantized,
     )
 
@@ -1273,6 +1273,126 @@ def _moe_reference(hidden, weight1, weight2, routing_ids, routing_weights, round
             intermediate[token_ids, slots].float() @ weight2[expert].float().T
         ) * routing_weights[token_ids, slots, None]
     return contributions.sum(dim=1).to(hidden.dtype)
+
+
+@_SKIP
+def test_moe_experts_past_4gib_of_weights():
+    """Experts past 4 GiB of w1/w2 (Kimi-K3.1 TP1: 9.9 GB w1, 4.9 GB w2) read their own
+    weights. Only the routed tail experts carry data; the preshuffles are expert-major.
+    """
+    token, model_dim, inter_dim, experts, topk, tail = 64, 3584, 3072, 896, 8, 16
+    assert experts * model_dim * inter_dim // 2 > 2**32  # w2, so w1 too
+    torch.manual_seed(29)
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    weight1 = torch.randn(
+        (tail, 2 * inter_dim, model_dim), dtype=dtypes.bf16, device="cuda"
+    )
+    weight2 = torch.randn(
+        (tail, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda"
+    )
+    packed1, scales1, reference1 = _pack_mxfp4_reference(weight1)
+    packed2, scales2, reference2 = _pack_mxfp4_reference(weight2)
+
+    def at_tail(tensor, *shape):
+        rows = tensor.view(torch.uint8).reshape(tail, -1)
+        full = torch.zeros((experts, rows.shape[1]), dtype=torch.uint8, device="cuda")
+        full[-tail:] = rows
+        return full.view(*shape)
+
+    local_ids = torch.stack(
+        [torch.randperm(tail, device="cuda")[:topk] for _ in range(token)]
+    ).to(torch.int32)
+    routing_weights = torch.rand((token, topk), device="cuda")
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    actual = flydsl_a16w4_moe(
+        hidden_states=hidden,
+        w1=at_tail(packed1, experts, 2 * inter_dim, model_dim // 2),
+        w2=at_tail(packed2, experts, model_dim, inter_dim // 2),
+        w1_scale=at_tail(scales1, experts * 2 * inter_dim, model_dim // 32),
+        w2_scale=at_tail(scales2, experts * model_dim, inter_dim // 32),
+        topk_ids=local_ids + (experts - tail),
+        topk_weights=routing_weights,
+        swiglu_limit=10.0,
+    )
+    reference = _moe_reference(
+        hidden, reference1, reference2, local_ids, routing_weights, False
+    )
+    _check_moe_output(reference.float(), actual, "a16w4 experts past 4 GiB")
+
+
+@_SKIP
+def test_stage1_guinterleave_experts_past_4gib_of_weights():
+    """GUGU stage 1 with W1 past 4 GiB: W1 is indexed per expert, its scales globally."""
+    token, model_dim, inter_dim, experts, topk, tail, block_m = (
+        64,
+        3584,
+        3072,
+        896,
+        8,
+        16,
+        32,
+    )
+    assert experts * 2 * inter_dim * model_dim // 2 > 2**32
+    torch.manual_seed(37)
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    weight = torch.randn(
+        (tail, 2 * inter_dim, model_dim), dtype=dtypes.bf16, device="cuda"
+    )
+    packed, scales, reference_weight = _pack_mxfp4_reference(weight, gate_up=True)
+
+    def at_tail(tensor):
+        rows = tensor.view(torch.uint8).reshape(tail, -1)
+        full = torch.zeros((experts, rows.shape[1]), dtype=torch.uint8, device="cuda")
+        full[-tail:] = rows
+        return full
+
+    local_ids = torch.stack(
+        [torch.randperm(tail, device="cuda")[:topk] for _ in range(token)]
+    ).to(torch.int32)
+    routing_weights = torch.full((token, topk), 1.0 / topk, device="cuda")
+    sorted_ids, _, sorted_experts, cumsum, _ = moe_sorting(
+        local_ids + (experts - tail),
+        routing_weights,
+        experts,
+        model_dim,
+        dtypes.bf16,
+        block_m,
+    )
+    output = torch.empty(
+        (sorted_experts.numel() * block_m, inter_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    flydsl_a16w4_gemm1(
+        a_bf16=hidden,
+        w1_u8=at_tail(packed),
+        w1_scale_u8=at_tail(scales),
+        sorted_expert_ids=sorted_experts,
+        cumsum_tensor=cumsum,
+        m_indices=sorted_ids,
+        inter_sorted_bf16=output,
+        n_tokens=token,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        tile_m=block_m,
+        tile_n=128,
+        tile_k=256,
+        act="silu_clamped",
+        swiglu_limit=10.0,
+        w_layout="guinterleave",
+    )
+    torch.cuda.synchronize()
+    packed_ids = sorted_ids[: int(cumsum[0])].long()
+    token_ids, slots = packed_ids & 0x00FFFFFF, packed_ids >> 24
+    valid = token_ids < token
+    reference = _stage1_reference(hidden, reference_weight, local_ids, 10.0, False)
+    _check_moe_output(
+        reference[token_ids[valid], slots[valid]].float(),
+        output[: int(cumsum[0])][valid],
+        "a16w4 guinterleave stage 1 past 4 GiB",
+    )
 
 
 @benchmark()
