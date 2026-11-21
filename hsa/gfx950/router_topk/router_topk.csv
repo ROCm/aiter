@@ -1,0 +1,9 @@
+knl_name,co_name,m,dim,num_experts,num_shared_experts,topk,grid,threads
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m1E,router_topk_bf16_e512s1_k8192_top10_m1.co,1,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m2E,router_topk_bf16_e512s1_k8192_top10_m2.co,2,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m3E,router_topk_bf16_e512s1_k8192_top10_m3.co,3,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m4E,router_topk_bf16_e512s1_k8192_top10_m4.co,4,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m5E,router_topk_bf16_e512s1_k8192_top10_m5.co,5,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m6E,router_topk_bf16_e512s1_k8192_top10_m6.co,6,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m7E,router_topk_bf16_e512s1_k8192_top10_m7.co,7,8192,512,1,10,129,256
+_ZN5aiter38router_topk_bf16_e512s1_k8192_top10_m8E,router_topk_bf16_e512s1_k8192_top10_m8.co,8,8192,512,1,10,129,256
