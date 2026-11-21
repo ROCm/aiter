@@ -907,3 +907,49 @@ def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
         )
         lses.append((m + torch.log(denom)).detach())
     return torch.stack(outs, dim=0), torch.stack(lses, dim=0)
+
+
+def sparse_mla_ref(q, kv, topk_indices, scale, kv_lora_rank=512, attn_sink=None):
+    """fp32 reference forward for sparse MLA where V is narrower than Q/K.
+
+    The absorbed MLA of DeepSeek-V3.2, GLM-5.x and Kimi-K3.1 DSA. All heads share one KV row per
+    token. K is the full ``kv`` row (latent | rope). V is the first ``kv_lora_rank`` columns.
+    ``attn_sink`` adds to the softmax denominator only. ``topk_indices == -1`` is masked out.
+    With ``kv_lora_rank == kv.shape[-1]`` this is ``sparse_mla_dsv4_ref``.
+
+    Differentiable in ``q``, ``kv`` and ``attn_sink``, so autograd through it gives the
+    backward reference. It loops over tokens in Python, so use small shapes.
+
+    Args:
+        q:            [T, H, D_qk] float32
+        kv:           [num_kv, D_qk] float32
+        topk_indices: [T, TOPK] int, -1 marks a masked slot
+        scale:        softmax scale
+        kv_lora_rank: V width
+        attn_sink:    [H] float32 or None
+
+    Returns:
+        ``(o, lse)``. ``o`` is [T, H, kv_lora_rank] float32 with grad. ``lse`` is [T, H]
+        float32, detached, natural log, sink-inclusive. A row with only -1 indices gets
+        ``o = 0`` and ``lse = -inf``.
+    """
+    outs, lses = [], []
+    for t in range(q.shape[0]):
+        idx = topk_indices[t].long()
+        valid = idx != -1
+        k = kv[idx.clamp(min=0)]
+        k = torch.where(valid[:, None], k, torch.zeros_like(k))
+        s = (q[t] @ k.t()) * scale
+        s = torch.where(valid[None, :], s, torch.full_like(s, float("-inf")))
+        row_max = s.max(dim=1).values
+        m = row_max if attn_sink is None else torch.maximum(row_max, attn_sink)
+        p = torch.where(valid[None, :], torch.exp(s - m[:, None]), torch.zeros_like(s))
+        denom = p.sum(dim=1)
+        if attn_sink is not None:
+            denom = denom + torch.exp(attn_sink - m)
+        outs.append(
+            (p @ k[:, :kv_lora_rank])
+            / torch.where(denom > 0, denom, torch.ones_like(denom))[:, None]
+        )
+        lses.append((m + torch.log(denom)).detach())
+    return torch.stack(outs, dim=0), torch.stack(lses, dim=0)
