@@ -684,12 +684,6 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
         }
     }
 
-    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
-    // state panel before any wave overwrites it with gated values.
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    __syncthreads();
-#endif
-
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
     float g_scale[4];
@@ -701,6 +695,7 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
             use_exp2);
     }
 
+    _B16x4 gated_vec[NUM_BV_TILES];
     for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
         const int lane_v = global_v_base + bv * 16 + v_idx;
         const bf16_t* u_col = overlap2_u_col_ptr<IS_VARLEN>(
@@ -710,7 +705,6 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
             v_new_col = overlap2_v_new_col_ptr<IS_VARLEN>(
                 v_new_bf16, i_n, H, i_h, T_flat, token_base, lane_v);
         }
-        _B16x4 gated_vec{};
 #pragma unroll
         for (int reg = 0; reg < 4; ++reg) {
             const int row = row_base_local + reg;
@@ -718,9 +712,15 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
             if constexpr (SAVE_NEW_VALUE) {
                 v_new_col[row * V_DIM] = float_to_bf16(value);
             }
-            gated_vec[reg] = bf16_to_bits(float_to_bf16(value * g_scale[reg]));
+            gated_vec[bv][reg] = bf16_to_bits(float_to_bf16(value * g_scale[reg]));
         }
-        store_shared2_bvp<BV_P>(gated_v_panel, gated_row_block, bv * 16 + v_idx, gated_vec);
+    }
+
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+    __syncthreads();
+    for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
+        store_shared2_bvp<BV_P>(gated_v_panel, gated_row_block, bv * 16 + v_idx, gated_vec[bv]);
     }
 
     if (has_next_full) {
@@ -790,8 +790,11 @@ __device__ __forceinline__ void run_gemm2_fulltile_bvp(
         }
     }
 
+    // All waves must finish reading gated_v_panel, h_transpose_buf and the
+    // k/w panels before the panel writes below or the next chunk's
+    // stage_hstate_bvp_vk_lds overwrite them.
+    __syncthreads();
     if (has_next_full) {
-        __syncthreads();
         write_k_panels_to_lds(k_next_preloaded, k_panel0, k_panel1);
         write_w_panels_to_lds(w_next, w_panel0, w_panel1);
     }
@@ -975,12 +978,6 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     }
     write_k_panels_to_lds(k_data, k_panel0, k_panel1);
 
-    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
-    // state panel before any wave overwrites it with gated values.
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    __syncthreads();
-#endif
-
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
     float g_scale[4];
@@ -994,6 +991,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
             : 0.0f;
     }
 
+    _B16x4 gated_vec[NUM_BV_TILES];
     for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
         const int lane_v = global_v_base + bv * 16 + v_idx;
         const bf16_t* u_col = overlap2_u_col_ptr<IS_VARLEN>(
@@ -1003,7 +1001,6 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
             v_new_col = overlap2_v_new_col_ptr<IS_VARLEN>(
                 v_new_bf16, i_n, H, i_h, T_flat, token_base, lane_v);
         }
-        _B16x4 gated_vec{};
         for (int reg = 0; reg < 4; ++reg) {
             const int row = row_base_local + reg;
             bf16_t gated = zero_val;
@@ -1014,9 +1011,15 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
                 }
                 gated = float_to_bf16(value * g_scale[reg]);
             }
-            gated_vec[reg] = bf16_to_bits(gated);
+            gated_vec[bv][reg] = bf16_to_bits(gated);
         }
-        store_shared2_bvp<BV_P>(gated_v_panel, gated_row_block, bv * 16 + v_idx, gated_vec);
+    }
+
+    // gated_v_panel aliases h_state_panel1. All waves must finish reading the
+    // state panel before any wave overwrites it with gated values.
+    __syncthreads();
+    for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
+        store_shared2_bvp<BV_P>(gated_v_panel, gated_row_block, bv * 16 + v_idx, gated_vec[bv]);
     }
     __syncthreads();
 
