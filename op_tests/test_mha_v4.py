@@ -820,20 +820,20 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
     )
 
 
-# LSE itself is gfx950-only, so the gfx942 arm of this pair never had a path to pass.
-@skipif(
-    get_gfx() != "gfx950",
-    reason="gfx950 LSE",
-)
+# gfx942 stores LSE on every dense row it has, but has no MX rows.
+_GFX950_ONLY = get_gfx() != "gfx950"
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     "recipe,head_dim",
     [
         ("fp8", 128),
-        ("mxfp8", 128),
-        ("mxfp4", 128),
-        ("mxfp4", 256),
-        ("mxfp6", 256),
-        ("mxfp8", 256),
+        param("mxfp8", 128, skip=_GFX950_ONLY),
+        param("mxfp4", 128, skip=_GFX950_ONLY),
+        param("mxfp4", 256, skip=_GFX950_ONLY),
+        param("mxfp6", 256, skip=_GFX950_ONLY),
+        param("mxfp8", 256, skip=_GFX950_ONLY),
     ],
 )
 def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
@@ -1153,6 +1153,10 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
     # global_load_lds_dword is the bulk K-tile stage into LDS, not a scale fetch; it is bounded
     # by the FP4 K/V slack the producers still reserve.
     gather = re.compile(r"\bglobal_load_(?:dword|ubyte)\b")
+    # A load issued under a lane predicate reads only the lanes that pass it: the Sol-Attn LUT
+    # stage masks exec to the row's entry count. Only full-exec loads can overshoot.
+    narrow_exec = re.compile(r"\bs_mov_b64 exec, vcc\b|\bs_and_saveexec_b64\b")
+    restore_exec = re.compile(r"\bs_mov_b64 exec, -1\b|\bs_or_b64 exec, exec\b")
     offenders = {}
     for name in co_names:
         # gfx942 names its objects with an MI300/ prefix; gfx950 does not.
@@ -1166,7 +1170,14 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             text=True,
             check=True,
         ).stdout
-        hits = len(gather.findall(listing))
+        hits, masked = 0, False
+        for line in listing.splitlines():
+            if narrow_exec.search(line):
+                masked = True
+            elif restore_exec.search(line):
+                masked = False
+            elif gather.search(line) and not masked:
+                hits += 1
         if hits:
             offenders[name] = hits
     assert not offenders, (
@@ -1239,8 +1250,7 @@ def test_mha_v4_mx_v_scale_backing_storage_covers_the_64x64_gather(
     )
 
 
-# _check_lse_capable rejects every non-gfx950 arch before the recipe is looked at.
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 validation")
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
     with expect_raises(ValueError, match="matching Q and K formats"):
@@ -1254,27 +1264,32 @@ def test_mha_v4_rejects_unsupported_contracts():
         )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "scale_modes"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, None),
-        (AttentionFormat.BF16, AttentionFormat.FP8, None),
-        (AttentionFormat.INT8, AttentionFormat.FP8, None),
-        (AttentionFormat.FP8, AttentionFormat.FP8, None),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6, None),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, None),
-        (
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+        (AttentionFormat.BF16, native_fp8_format(), None),
+        (AttentionFormat.INT8, native_fp8_format(), None),
+        (native_fp8_format(), native_fp8_format(), None),
+        param(native_fp8_format(), AttentionFormat.MXFP6, None, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, None, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP6_E2M3, native_fp8_format(), None, skip=_GFX950_ONLY),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None, skip=_GFX950_ONLY
+        ),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, None, skip=_GFX950_ONLY
+        ),
+        param(
+            native_fp8_format(),
+            native_fp8_format(),
             (
                 AttentionScaleMode.E8M0_PER_1X32,
                 AttentionScaleMode.E8M0_PER_1X32,
                 AttentionScaleMode.F32_PER_TENSOR,
             ),
+            skip=_GFX950_ONLY,
         ),
     ],
 )
@@ -1318,16 +1333,16 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     assert error.mean().item() < 0.05, error.mean().item()
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
-        (AttentionFormat.BF16, AttentionFormat.FP8),
-        (AttentionFormat.INT8, AttentionFormat.FP8),
-        (AttentionFormat.FP8, AttentionFormat.FP8),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.BF16, native_fp8_format()),
+        (AttentionFormat.INT8, native_fp8_format()),
+        (native_fp8_format(), native_fp8_format()),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, skip=_GFX950_ONLY),
     ],
 )
 @parametrize("gqa_ratio", [2, 4])
@@ -1372,7 +1387,7 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     assert error < 0.25, error
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "max_spread"),
     [
@@ -1380,11 +1395,15 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
         (AttentionFormat.BF16, native_fp8_format(), 0.05),
         (AttentionFormat.INT8, native_fp8_format(), 0.05),
         (native_fp8_format(), native_fp8_format(), 0.75),
-        (native_fp8_format(), AttentionFormat.MXFP6, 0.75),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35),
-        (AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35),
+        param(native_fp8_format(), AttentionFormat.MXFP6, 0.75, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35, skip=_GFX950_ONLY),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35, skip=_GFX950_ONLY
+        ),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35, skip=_GFX950_ONLY
+        ),
     ],
 )
 def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_spread):
@@ -1432,9 +1451,9 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
 
 _KV_SPLIT_FORMATS = [
     (AttentionFormat.BF16,) * 3,
-    (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
-    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
-    (AttentionFormat.FP8,) * 3,
+    (AttentionFormat.BF16, AttentionFormat.BF16, native_fp8_format()),
+    (AttentionFormat.INT8, AttentionFormat.INT8, native_fp8_format()),
+    (native_fp8_format(),) * 3,
 ]
 
 
@@ -1446,7 +1465,7 @@ def _patched_cu_count(cus):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 @parametrize("formats", _KV_SPLIT_FORMATS)
 @parametrize("splits", [2, 3, 4])
 @parametrize(
@@ -1576,7 +1595,7 @@ def test_mha_v4_kv_splits_follow_the_lse_gate():
     """The ranges merge by their LSE, so where the LSE gate refuses, auto is 1 and a count raises."""
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
     bf16 = (AttentionFormat.BF16,) * 3
-    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
+    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx000"):
         recipe = mha_v4_module._resolve_raw_recipe(
             *bf16, None, None, None, sparse=False
         )
@@ -1585,7 +1604,7 @@ def test_mha_v4_kv_splits_follow_the_lse_gate():
             mha_v4_module._resolve_kv_splits("auto", recipe, *bf16, q, q, False, False)
             == 1
         )
-        with expect_raises(NotImplementedError, match="not validated on gfx942"):
+        with expect_raises(NotImplementedError, match="not implemented on gfx000"):
             mha_v4(q, q, q, *bf16, kv_splits=2)
 
 
@@ -1686,7 +1705,7 @@ def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
         mha_v4(q, q, q, *formats, **kwargs)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
     """The bound is inclusive: a count leaving exactly one KV tile per range still splits."""
     torch.manual_seed(67)
@@ -1700,25 +1719,26 @@ def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
     torch.testing.assert_close(out, mha_v4(q, q, q, *bf16), atol=2e-2, rtol=2e-2)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 def test_mha_v4_kv_splits_need_a_divisor_without_per_batch_key_lengths():
     """Every recipe kv_splits takes has per-batch key lengths on gfx950, so a row without them is
-    simulated: its last range has no way to end short, and a count must divide the keys.
+    simulated there: its last range has no way to end short, and a count must divide the keys.
+    gfx942's FP8 dense row really has none, so there the patch changes nothing.
     """
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
-    formats = (AttentionFormat.FP8,) * 3
+    formats = (native_fp8_format(),) * 3
     with patched_attr(mha_v4_module, "_varlen_capable", lambda *formats: False):
         with expect_raises(ValueError, match="divide the key length"):
             mha_v4(q, q, q, *formats, kv_splits=3)
         assert mha_v4(q, q, q, *formats, kv_splits=4).shape == q.shape
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 @parametrize(
     "formats",
     [
         param((AttentionFormat.BF16,) * 3, id="BF16"),
-        param((AttentionFormat.FP8,) * 3, id="FP8"),
+        param((native_fp8_format(),) * 3, id="FP8"),
     ],
 )
 def test_mha_v4_kv_splits_compile_parity(formats):
@@ -1738,21 +1758,16 @@ def test_mha_v4_kv_splits_compile_parity(formats):
     assert torch.equal(eager[1], compiled[1])
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
-def test_mha_v4_lse_is_gated_off_gfx950():
-    """gfx942 carries the epilogue, but its exported value has never been measured.
+def test_mha_v4_lse_is_gated_off_unsupported_architectures():
+    """The architecture gate admits both deployed MHA v4 targets and rejects everything else."""
+    q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    A wrong LSE passes every output test, because O never reads it, so presence of the store is
-    not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
-    """
-    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
-        q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
-        formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
-
-        with expect_raises(NotImplementedError, match="not validated on gfx942"):
-            mha_v4(q, q, q, *formats, return_lse=True)
-
-        assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
+    with (
+        patched_attr(mha_v4_module, "get_gfx", lambda: "gfx000"),
+        expect_raises(NotImplementedError, match="not implemented on gfx000"),
+    ):
+        mha_v4(q, q, q, *formats, return_lse=True)
 
 
 @parametrize(
@@ -2220,7 +2235,9 @@ def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
     assert torch.count_nonzero(out[:, :, :2]) > 0
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 BF16-FP8 validation"
+)
 @parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     torch.manual_seed(sequence_q + sequence_k)
@@ -2243,7 +2260,7 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.FP8,
+        native_fp8_format(),
     )
     torch.cuda.synchronize()
 
@@ -3375,9 +3392,12 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 per-batch key lengths"
+)
+@parametrize("fp8_v", [False, True], ids=["bf16", "bf16fp8"])
 @parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
-def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
+def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths, fp8_v):
     torch.manual_seed(41)
     batch, sequence, heads = len(lengths), 512, 4
     q = torch.randn((batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
@@ -3391,7 +3411,7 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        native_fp8_format() if fp8_v else AttentionFormat.BF16,
         seqlens_k=seqlens_k,
     )
     torch.cuda.synchronize()
@@ -3664,8 +3684,8 @@ def check_varlen_capable_objects(arch="gfx950"):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@parametrize("arch", ["gfx950"])
+@skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
+@parametrize("arch", ["gfx942", "gfx950"])
 def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
     check_varlen_capable_objects(arch)
 
@@ -3716,8 +3736,8 @@ def check_lse_capable_objects(arch="gfx950"):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@parametrize("arch", ["gfx950"])
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx942", "gfx950"])
 def test_mha_v4_lse_capable_rows_load_the_lse_kernarg(arch):
     check_lse_capable_objects(arch)
 
