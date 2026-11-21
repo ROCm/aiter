@@ -44,8 +44,7 @@ def test_preshuffle_flat_buffers_stay_below_4gib():
 @pytest.mark.parametrize(
     "m, n, k, kernel_name, backend",
     [
-        # Kimi-K3's 6144x7168 M=8192 row, which padded-M lookup returns for
-        # every M > 8192.
+        # A 4-wave FlyDSL row at N=6144, K=7168 (not read from the tuned table).
         (65536, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
         (65537, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
         # Past M=174592 the bf16 output, padded to 256 rows, reaches 2 GiB and
@@ -467,15 +466,16 @@ def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(device, backend, mnk):
     assert ret["a8w8_bpreshuffle err"] <= TOL_ERR_RATIO, ret
 
 
-# (case id, tuned FlyDSL kernelName, (m, n, k, w_k)) per (gfx, cu_num) table: Kimi-K3
+# (case id, tuned FlyDSL kernelName, (m, n, k, w_k)) per (gfx, cu_num) table: tuned
 # FlyDSL rows the launcher rejects, so gemm_a8w8_bpreshuffle_flydsl hands them to CK.
 _FLYDSL_CK_FALLBACK_CASES = {
     ("gfx950", 256): [
-        # M=65537 > PRESHUFFLE_M_MAX takes the M=8192 row through padded-M lookup.
+        # M=65537 > PRESHUFFLE_M_MAX takes the 5120x5120 M=8192 row through
+        # padded-M lookup (M > 8192 with N > 4096 pads to 8192).
         (
             "m-above-max",
-            "flydsl_bpreshuflle_128x256x128_F8_F8_B16_1x2x4x2_default",
-            (65537, 6144, 7168, 7168),
+            "flydsl_bpreshuflle_256x128x128_F8_F8_B16_1x2x0x2_default",
+            (65537, 5120, 5120, 5120),
         ),
         # The logical-K _ks7 row on a weight padded to K=8192, which 7 does not divide.
         (
