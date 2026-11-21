@@ -89,6 +89,7 @@ from codegen.gen_instances_gfx1250 import (
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
+    MXFP8_DIRECTION_PATTERN,
     gfx950_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
 )
@@ -353,18 +354,46 @@ def _check_gfx950_pin(
             path,
         ]
     ).stdout
-    reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
-    bm, bn, bk = entry["tile"]
-    wm, wn = entry["wave_layout"]
-    a_regs = bm // (wm * 16) * (bk // 128) * 8
-    if entry["pipeline"] == "pingpong_lds":
-        a_regs = min(bm // (wm * 16), 3) * 8
-    b_regs = bn // (wn * 16) * 8
-    for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
-        if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
-            raise ValueError(
-                f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
-            )
+    if MXFP8_DIRECTION_PATTERN.search(entry["name"]):
+        # NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
+        # every MFMA A / B operand must be an AGPR range that an LDS read filled.
+        reads = {
+            reg
+            for first, last in re.findall(r"\bds_read\w*\s+a\[(\d+):(\d+)\]", asm)
+            for reg in range(int(first), int(last) + 1)
+        }
+        mmas = [
+            re.split(r",\s*", line.split("//", 1)[0].strip().split(None, 1)[1])
+            for line in asm.splitlines()
+            if "v_mfma_scale_" in line
+        ]
+        if not mmas:
+            raise ValueError("pin A/B: no MFMA instructions")
+        for bit, index, operand in ((1, 1, "A"), (2, 2, "B")):
+            if not mask & bit:
+                continue
+            for op in mmas:
+                match = re.fullmatch(r"a\[(\d+):(\d+)\]", op[index])
+                if match is None:
+                    raise ValueError(f"pin {operand}: MFMA operand is not in AGPRs")
+                first, last = map(int, match.groups())
+                if not set(range(first, last + 1)).issubset(reads):
+                    raise ValueError(
+                        f"pin {operand}: MFMA AGPRs were not loaded from LDS"
+                    )
+    else:
+        reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
+        bm, bn, bk = entry["tile"]
+        wm, wn = entry["wave_layout"]
+        a_regs = bm // (wm * 16) * (bk // 128) * 8
+        if entry["pipeline"] == "pingpong_lds":
+            a_regs = min(bm // (wm * 16), 3) * 8
+        b_regs = bn // (wn * 16) * 8
+        for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
+            if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
+                raise ValueError(
+                    f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
+                )
     if mask & 4:
         mmas = [
             line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")

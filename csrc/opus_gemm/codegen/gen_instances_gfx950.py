@@ -4,7 +4,7 @@
 
 import os
 
-from opus_gemm_common import OpusGemmInstance
+from opus_gemm_common import MXFP8_DIRECTION_PATTERN, OpusGemmInstance
 
 from codegen.common import (
     WARP_SIZE,
@@ -3229,6 +3229,46 @@ void {name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
 """
 
 
+def _mxfp8_direction_arguments(direction):
+    """Host checks / kargs of an NN / TT / TN CO (direction: "NN", "TT" or "TN").
+
+    The first letter is A, the second B: T = stored M/N-contiguous ([K,M] / [K,N])."""
+    a_strides = ("1", "m") if direction[0] == "T" else ("k", "1")
+    b_strides = ("k", "1") if direction[1] == "T" else ("1", "n")
+    sfb_strides = ("k / 128", "1") if direction[1] == "T" else ("1", "n / 128")
+    stride_a = "m" if direction[0] == "T" else "k"
+    stride_b = "k" if direction[1] == "T" else "n"
+    stride_sfb = "k / 128" if direction[1] == "T" else "n / 128"
+    return f"""
+    AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3) && WQ.dim() == XQ.dim() && Y.dim() == XQ.dim() &&
+                (XQ.dim() == 2 || (XQ.size(0) == 1 && WQ.size(0) == 1 && Y.size(0) == 1)), "requires GEMM batch=1");
+    const int64_t m = XQ.size(-2), n = WQ.size(-2), k = XQ.size(-1);
+    AITER_CHECK(m > 0 && n > 0 && k > 0 && m <= INT32_MAX && n <= INT32_MAX && k <= INT32_MAX &&
+                WQ.size(-1) == k && Y.size(-2) == m && Y.size(-1) == n && Y.is_contiguous(), "matrix shape/output layout differs");
+    AITER_CHECK(XQ.stride(-2) == {a_strides[0]} && XQ.stride(-1) == {a_strides[1]} &&
+                WQ.stride(-2) == {b_strides[0]} && WQ.stride(-1) == {b_strides[1]},
+                "{direction} CO expects XQ strides ({a_strides[0]}, {a_strides[1]}) and WQ strides ({b_strides[0]}, {b_strides[1]}); got (",
+                XQ.stride(-2), ", ", XQ.stride(-1), ") and (", WQ.stride(-2), ", ", WQ.stride(-1), ")");
+    const auto e8m0 = [](const aiter_tensor_t& tensor) {{
+        return tensor.dtype() == AITER_DTYPE_fp8_e8m0 || tensor.dtype() == AITER_DTYPE_u8;
+    }};
+    AITER_CHECK(e8m0(x_scale) && e8m0(w_scale) && x_scale.dim() == 2 && w_scale.dim() == 2 &&
+                x_scale.size(0) == m && x_scale.size(1) == k / 128 &&
+                (x_scale.is_contiguous() || (x_scale.stride(0) == 1 && (k == 128 || x_scale.stride(1) == m))) &&
+                w_scale.size(0) == n / 128 && w_scale.size(1) == k / 128 &&
+                (n == 128 || w_scale.stride(0) == {sfb_strides[0]}) && (k == 128 || w_scale.stride(1) == {sfb_strides[1]}),
+                "{direction} CO expects E8M0 scales: x_scale [M,K/128] with column-major bytes (contiguous, as per_group_quant_hip(transpose_scale=True) emits, or a strides (1,M) view), w_scale [N/128,K/128] strides ({sfb_strides[0]}, {sfb_strides[1]})");
+    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args{{}};
+    args.ptr_a = XQ.data_ptr(); args.ptr_b = WQ.data_ptr(); args.ptr_c = Y.data_ptr();
+    args.m = m; args.n = n; args.k = k; args.batch = 1;
+    args.stride_a = {stride_a}; args.stride_b = {stride_b}; args.stride_c = n;
+    args.stride_a_batch = m * k; args.stride_b_batch = n * k; args.stride_c_batch = int(uint64_t(m) * n);
+    args.ptr_sfa = x_scale.data_ptr(); args.ptr_sfb = w_scale.data_ptr();
+    args.stride_sfa = m; args.stride_sfb = {stride_sfb};
+    args.stride_sfa_batch = m * (k / 128); args.stride_sfb_batch = (n / 128) * (k / 128);
+"""
+
+
 def gen_mxscale_bpreshuffle_instance(
     cg,
     k,
@@ -3239,11 +3279,15 @@ def gen_mxscale_bpreshuffle_instance(
 ):
     workspace_extra = ""
     split_k = 1
+    arguments = _BPRESHUFFLE_ARGUMENTS
     if k.bpreshuffle_co is not None:
         if any(row["kid_name"] == k.name for row in cg._host_instantiations):
             return
         entry = k.bpreshuffle_co
         symbol = entry["symbol"]
+        direction = MXFP8_DIRECTION_PATTERN.search(k.name)
+        if direction:
+            arguments = _mxfp8_direction_arguments(direction[1].upper())
         grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
         # Some COs bake shape-dependent strides into the device code. Enforce
         # their manifest contract here, including for direct exact-kid callers.
@@ -3444,7 +3488,7 @@ struct {alias} : {entry["traits"]} {{}};
         host_header=host_header,
         name=k.name,
         workspace_extra=workspace_extra,
-        arguments=_BPRESHUFFLE_ARGUMENTS,
+        arguments=arguments,
         body=body,
     )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), source)

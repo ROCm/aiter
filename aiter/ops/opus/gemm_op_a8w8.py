@@ -8,10 +8,13 @@
 # make it add a dummy CUDA Tensor to every raw launch, which is observable host
 # overhead on short BMM kernels.
 
+import re
+
 import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
+    MXFP8_DIRECTION_PATTERN,
     a8w8_mxscale_bpreshuffle_supports_shape,
     bpreshuffle_workspace_bytes,
     get_registry,
@@ -397,6 +400,117 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     return Y
 
 
+# ---- MXFP8 NN / TT / TN (gfx950 CO kids) ------------------------------------
+
+
+def _mxfp8_direction(XQ: Tensor, WQ: Tensor) -> str | None:
+    """Storage of logical XQ [M, K] / WQ [N, K] as the kernel names spell it.
+
+    First letter A, second B. A "N" is stored [M, K] (strides (K, 1)), A "T"
+    [K, M] (strides (1, M)); B "T" is stored [N, K] (strides (K, 1)), B "N"
+    [K, N] (strides (1, N)). Returns "NN", "TT", "TN", "NT" or None.
+    """
+    (M, K), N = XQ.shape, WQ.shape[0]
+    if XQ.stride() == (K, 1):
+        a = "N"
+    elif XQ.stride() == (1, M):
+        a = "T"
+    else:
+        return None
+    if WQ.stride() == (K, 1):
+        b = "T"
+    elif WQ.stride() == (1, N):
+        b = "N"
+    else:
+        return None
+    return a + b
+
+
+def _select_mxfp8_direction_kid(
+    direction: str, M: int, N: int, K: int, arch: str, cu_num: int
+) -> int | None:
+    """Pick a supported NN / TT / TN kid for the shape.
+
+    256x128 tiles for N not a multiple of 256 or up to 2048 x 2048 outputs
+    (more tiles to fill the CUs), else 256x256; GroupM 16 from M = 16384;
+    PadM only when M is not a multiple of 256.
+    """
+    want_bn = 256 if N % 256 == 0 and M * N > 2048 * 2048 else 128
+    want_group_m = 16 if M >= 16384 else 0
+    best = None
+    for kid, instance in get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num).items():
+        match = MXFP8_DIRECTION_PATTERN.search(instance.name)
+        if match is None or match[1].upper() != direction:
+            continue
+        if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
+            continue
+        group_m = re.search(r"_gm(\d+)", instance.name)
+        rank = (
+            instance.B_N != want_bn,
+            (int(group_m[1]) if group_m else 0) != want_group_m,
+            instance.m_align != instance.B_M,
+            kid,
+        )
+        if best is None or rank < best[0]:
+            best = (rank, kid)
+    return None if best is None else best[1]
+
+
+def gemm_a8w8_blockscale_bpreshuffle_opus(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """gfx950 MXFP8 1x128 blockscale GEMM for NN / TT / TN operand storage.
+
+    Computes Y[M, N] = XQ[M, K] @ WQ[N, K]^T on logical shapes; the storage is
+    read from the strides (see ``_mxfp8_direction``), so pass the transposed
+    view of a [K, M] A or of a [K, N] B, never a copy. WQ is the
+    ``shuffle_weight(layout=(16, 16))`` of its own storage. x_scale is the
+    E8M0 [M, K/128] scale with column-major bytes; w_scale the E8M0
+    [N/128, K/128] scale stored like WQ ([N/128, K/128] for B "T",
+    [K/128, N/128] for B "N"). Output is BF16.
+
+    ``kernelId`` runs that kid (56-85); otherwise one is picked by shape.
+    NT operands belong to ``gemm_a8w8_blockscale_bpreshuffle``.
+    """
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError("gemm_a8w8_blockscale_bpreshuffle_opus expects 2D XQ / WQ")
+    if dtype != torch.bfloat16:
+        raise ValueError("gemm_a8w8_blockscale_bpreshuffle_opus writes BF16 only")
+    direction = _mxfp8_direction(XQ, WQ)
+    if direction is None or direction == "NT":
+        raise ValueError(
+            f"gemm_a8w8_blockscale_bpreshuffle_opus serves NN / TT / TN storage; got "
+            f"XQ strides {tuple(XQ.stride())}, WQ strides {tuple(WQ.stride())}"
+            + (" (NT: use gemm_a8w8_blockscale_bpreshuffle)" if direction else "")
+        )
+    M, K = map(int, XQ.shape)
+    N = int(WQ.shape[0])
+    if out is None:
+        out = torch.empty((M, N), dtype=dtype, device=XQ.device)
+    elif tuple(out.shape) != (M, N) or out.dtype != dtype:
+        raise ValueError(
+            f"out must be {dtype} [{M}, {N}], got {out.dtype} {tuple(out.shape)}"
+        )
+    if kernelId is None:
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+        kernelId = _select_mxfp8_direction_kid(direction, M, N, K, arch, cu_num)
+        if kernelId is None:
+            raise ValueError(
+                f"no {direction} MXFP8 kernel supports M={M}, N={N}, K={K} on {arch} "
+                "(M % 16, N % 128 and K % 128 must be 0)"
+            )
+    return _launch_a8w8_blockscale_bpreshuffle_gemm(
+        XQ, WQ, x_scale, w_scale, out, kid=int(kernelId)
+    )
+
+
 def _validate_a8w8_mxscale_bmm_tensors(
     XQ: Tensor,
     WQ: Tensor,
@@ -779,5 +893,6 @@ def _mxscale_bmm_workspace(
 __all__ = [
     "bmm_a8w8_mxscale_opus",
     "bmm_a8w8_mxscale_opus_bpreshuffle",
+    "gemm_a8w8_blockscale_bpreshuffle_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
 ]
