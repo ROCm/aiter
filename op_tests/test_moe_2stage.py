@@ -1554,8 +1554,8 @@ def test_presorted_moe_hook():
     presorted, and "own err" (diff vs the own sort on the timed routing) for both
     presorted calls. Its eager summed kernel time does not rank the two presorted
     calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
-    contract: a reused-address moe_buf is zeroed, an output that is not 16-byte
-    aligned is copied back while a 16-byte-aligned one is used in place, and a registration
+    contract: a reused-address moe_buf is zeroed, a 2- or 4-byte-aligned output
+    is copied back while a 16-byte-aligned one is used in place, and a registration
     that does not match the call is ignored and still consumed, so it never
     leaks into a later call, even when fused_moe exits before sorting.
     """
@@ -1799,10 +1799,10 @@ def test_presorted_moe_hook():
         assert handed and out is stale, "presort did not allocate its own moe_buf"
         check_close(ref, out, "reused-address moe_buf was not zeroed")
 
-        # An output that is not 16-byte aligned cannot be the atomic moe_buf (the
-        # zeroing kernels store 16 bytes at a time, GEMM2's 4-byte atomics fault at
-        # an odd bf16 element): fused_moe uses a fresh one and copies back. A
-        # 16-byte-aligned one is used in place. Offsets are bf16 elements.
+        # The kernels store moe_buf as 16-byte vectors (and GEMM2's 4-byte atomics
+        # fault at an odd bf16 element), so an output below 16-byte alignment gets
+        # a fresh moe_buf and fused_moe copies back. A 16-byte-aligned one is used
+        # in place.
         real_return = fm._return_output
         copies = []
 
