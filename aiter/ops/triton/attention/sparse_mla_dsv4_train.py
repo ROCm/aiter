@@ -82,9 +82,7 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     fwd_cfg = get_tuned_kernel_config(
         "attention", "SPARSE_MLA_DSV4_TRAIN", "_sparse_mla_fwd_kernel", _FWD_FALLBACK
     )
-    BLOCK_H_fwd = fwd_cfg.kwargs["BLOCK_H"]
-    BLOCK_K_fwd = fwd_cfg.kwargs["BLOCK_K"]
-    grid = (N, triton.cdiv(H, BLOCK_H_fwd))
+    grid = (N, triton.cdiv(H, fwd_cfg.kwargs["BLOCK_H"]))
 
     _sparse_mla_fwd_kernel[grid](
         q,
@@ -107,8 +105,8 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
         scale,
         HAS_ATTN_SINK=has_sink,
         BLOCK_D=BLOCK_D,
-        BLOCK_H=BLOCK_H_fwd,
-        BLOCK_K=BLOCK_K_fwd,
+        # All tuned keys go to the launch, also compiler options such as matrix_instr_nonkdim.
+        **fwd_cfg.kwargs,
         num_warps=fwd_cfg.num_warps,
         num_stages=fwd_cfg.num_stages,
     )
