@@ -105,6 +105,145 @@ def _take_output_epilogue(
     return epi
 
 
+class MoeSharedFold:
+    """A shared expert pending for the next grouped MoE call's GEMMs (see
+    ``moe_shared_expert_fold``)."""
+
+    __slots__ = ("weights", "scale", "consumed")
+
+    def __init__(self, weights: dict, scale: float):
+        self.weights = weights
+        self.scale = float(scale)
+        self.consumed = False
+
+
+_SHARED_FOLD_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_shared_expert_fold(weights: dict, scale: float = 1.0):
+    """Fold a shared MXFP8 expert into the grouped MoE call run inside the block:
+    ``out = routed * scale + shared(x)``, the shared expert taken as one more
+    expert every token routes to with weight 1.
+
+    ``weights`` is ``prepare_shared_fold_weights``'s dict. Its gate/up tiles run
+    in the routed GEMM1 launch (FP8 x FP8 on the MXFP8 copy of the input the A1
+    quant writes, SwiGLU and the MXFP8 quant in the epilogue), its down tiles in
+    the routed GEMM2 launch (BF16 rows), and the gather-reduce adds them after
+    the routed scale, each step rounded to BF16 as ``routed * scale + shared``.
+    Not bitwise the separate shared MLP: no BF16 rounding of the gate/up and
+    SwiGLU outputs before the quant, and its own K order.
+
+    Yields the fold; ``consumed`` says whether a call took it. A call that
+    cannot (prefill tiles, EP, other MoE paths) leaves it, and the caller runs
+    the shared expert itself. Python-side state: eager code only (an opaque
+    custom op), not under torch.compile tracing.
+    """
+    fold = MoeSharedFold(weights, scale)
+    prev = getattr(_SHARED_FOLD_TLS, "value", None)
+    _SHARED_FOLD_TLS.value = fold
+    try:
+        yield fold
+    finally:
+        _SHARED_FOLD_TLS.value = prev
+
+
+def prepare_shared_fold_weights(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> dict:
+    """A shared expert's MXFP8 weights in the fold's layouts, once at load.
+
+    In: ``w13`` E4M3 ``[2I, D]`` (gate rows, then up rows), ``w2`` E4M3
+    ``[D, I]``, their e8m0 scales per 1x32 along K, row-major. Out: W13 rows
+    interleaved gate/up (the routed GUGU order) with K row-major, W2 as is, both
+    scales n32k4 (``shuffle_scale_n32k4``) -- a bit-exact permutation.
+    """
+    from aiter.ops.shuffle import shuffle_scale_n32k4
+
+    two_i, d = w13.shape
+    i = two_i // 2
+    if (
+        w13.element_size() != 1
+        or w2.shape != (d, i)
+        or w13_scale.shape != (two_i, d // 32)
+        or w2_scale.shape != (d, i // 32)
+    ):
+        raise ValueError(
+            "shared fold weights: FP8 w13 [2I, D], w2 [D, I] with row-major "
+            "1x32 e8m0 scales"
+        )
+    w13i = w13.view(torch.uint8).view(2, i, d).permute(1, 0, 2).reshape(two_i, d)
+    # Every tensor owns its storage: a caller may still shuffle the source
+    # parameters in place afterwards (ATOM's linears do, after this runs).
+    return {
+        "w13": w13i.clone(memory_format=torch.contiguous_format),
+        "w13_scale": shuffle_scale_n32k4(
+            w13_scale.view(torch.uint8).reshape(1, two_i, d // 32),
+            1,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        .reshape(-1)
+        .clone(),
+        "w2": w2.view(torch.uint8).clone(memory_format=torch.contiguous_format),
+        "w2_scale": shuffle_scale_n32k4(
+            w2_scale.view(torch.uint8).reshape(1, d, i // 32), 1
+        )
+        .reshape(-1)
+        .clone(),
+        "inter_dim": i,
+        "model_dim": d,
+    }
+
+
+def _shared_fold_tile(token_num: int, stage: int, waves: int):
+    """(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) of the shared tiles
+    in a routed launch of ``waves`` waves per workgroup, or None to not fold."""
+    override = os.environ.get(f"AITER_MOE_SHARED_FOLD_TILE{stage}")
+    if override:
+        tile = tuple(int(v) for v in override.split("x"))
+        return tile if tile[3] * tile[4] == waves else None
+    # Measured with the M3.1 TP4 decode routed configs (2-wave workgroups,
+    # T 64-256, gfx1250): two waves along M, 64 columns. GEMM1 64x64 adds
+    # 1.3-2.4 us to the routed launch, GEMM2 64x64 at T <= 64 0.7 us and 32x64
+    # above 1.5-2.9 us; wider N tiles or more stages raise the launch's VGPR /
+    # LDS and slow the occupancy-bound routed GEMM2 (3-stage 64x128 GEMM1
+    # tiles: +17 us at T 192-256).
+    if waves != 2:
+        return None
+    if stage == 1:
+        return (64, 64, 128, 2, 1, 2)
+    return (64, 64, 128, 2, 1, 2) if token_num <= 64 else (32, 64, 128, 2, 1, 2)
+
+
+@functools.cache
+def _log_shared_fold_once(token_num: int, tile1: tuple, tile2: tuple) -> None:
+    logger.info(
+        "[grouped-moe] shared expert folded into the routed GEMMs: tokens=%d "
+        "gemm1 tile=%s gemm2 tile=%s",
+        token_num,
+        "x".join(map(str, tile1)),
+        "x".join(map(str, tile2)),
+    )
+
+
+def _take_shared_fold(token_num, model_dim, inter_dim, dtype) -> MoeSharedFold | None:
+    fold = getattr(_SHARED_FOLD_TLS, "value", None)
+    if fold is None or fold.consumed:
+        return None
+    w = fold.weights
+    if (
+        w.get("model_dim") != model_dim
+        or w.get("inter_dim") != inter_dim
+        or dtype not in (torch.bfloat16,)
+    ):
+        return None
+    return fold
+
+
 def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
     _MEGA_DISPATCH_TLS.ctx = ctx
 
@@ -1301,6 +1440,119 @@ def _grouped_a8w4_tdm_moe(
     _a1_wire_stride = (
         int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
+    # Shared expert fold: its tiles ride both routed GEMM launches, its input is
+    # the MXFP8 copy the A1 quant writes, its output the gather-reduce addend.
+    _fold = None
+    _fold_tiles = None
+    if (
+        not _is_ep
+        and not enable_ep_scatter
+        and not _compact
+        and not herd_topk
+        and not _prequantized
+        and not a_preshuffled
+        and mxfp8_copy_out is None
+        and hidden_states.dtype == torch.bfloat16
+        and activation == ActivationType.Swiglu
+        and _b1 is None
+        and _b2 is None
+        and int(k_waves1) == 1
+        and int(k_waves2) == 1
+        and not _as_bool(os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False)
+    ):
+        _fold = _take_shared_fold(token_num, model_dim, inter_dim, dtype)
+    if _fold is not None:
+        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+            SharedFoldTiles,
+            _select_cluster_m,
+            _select_cluster_n,
+        )
+
+        _t1 = _shared_fold_tile(token_num, 1, m_warp * n_warp)
+        _t2 = _shared_fold_tile(token_num, 2, m_warp2 * n_warp2)
+        _unclustered = all(
+            _select_cluster_n((n + tn - 1) // tn, cn) == 1
+            and _select_cluster_m(cm, 1, act) == 1
+            for n, tn, cn, cm, act in (
+                (two_inter, tile_n, cluster_n, cluster_m, stage1_act),
+                (model_dim, tile_n2, cluster_n2, cluster_m2, 0),
+            )
+        )
+        if (
+            _t1 is not None
+            and _t2 is not None
+            and _unclustered
+            and two_inter % _t1[1] == 0
+            and model_dim % _t2[1] == 0
+            and model_dim % _t1[2] == 0
+            and inter_dim % _t2[2] == 0
+        ):
+            _fold.consumed = True
+            _fold_tiles = (_t1, _t2)
+            _log_shared_fold_once(int(token_num), tuple(_t1), tuple(_t2))
+        else:
+            _fold = None
+    if _fold is not None:
+        _t1, _t2 = _fold_tiles
+        _sh_rep2 = get_wmma_m_rep(_t2[0], _t2[1], _t2[3], _t2[4], "shared gemm2")
+        get_wmma_m_rep(_t1[0], _t1[1], _t1[3], _t1[4], "shared gemm1")
+        _sh_align = max(_t1[0], _t2[0], 16 * _sh_rep2)
+        _sh_cap = _tdm_align_up(token_num, _sh_align)
+        # Rows past token_num: the A rows are clamped to the live rows, the
+        # row-major A scales are read whole, so both are allocated to the cap.
+        _sh_xq = torch.empty((_sh_cap, model_dim), dtype=torch.uint8, device=device)
+        _sh_xs = torch.empty(
+            (_sh_cap, model_dim // 32), dtype=torch.uint8, device=device
+        )
+        mxfp8_copy_out = (_sh_xq[:token_num], _sh_xs[:token_num])
+        _sh_hq = torch.empty((_sh_cap, inter_dim), dtype=torch.uint8, device=device)
+        _sh_hs = torch.empty(
+            (_sh_cap // _sh_rep2, (inter_dim + 127) // 128 * 4 * _sh_rep2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        _sh_out = torch.empty((_sh_cap, model_dim), dtype=dtype, device=device)
+        _fw = _fold.weights
+        _shared_fold1 = SharedFoldTiles(
+            out=_sh_hq,
+            a=_sh_xq,
+            w=_fw["w13"],
+            a_scale=_sh_xs,
+            w_scale=_fw["w13_scale"],
+            quant_scale=_sh_hs,
+            rows=token_num,
+            cap=_sh_cap,
+            tile_m=_t1[0],
+            tile_n=_t1[1],
+            tile_k=_t1[2],
+            m_warp=_t1[3],
+            n_warp=_t1[4],
+            num_buffers=_t1[5],
+            quant_wmma_rep=_sh_rep2,
+            row_major_ascale=1,
+        )
+        _shared_fold2 = SharedFoldTiles(
+            out=_sh_out,
+            a=_sh_hq,
+            w=_fw["w2"],
+            a_scale=_sh_hs,
+            w_scale=_fw["w2_scale"],
+            quant_scale=None,
+            rows=token_num,
+            cap=_sh_cap,
+            tile_m=_t2[0],
+            tile_n=_t2[1],
+            tile_k=_t2[2],
+            m_warp=_t2[3],
+            n_warp=_t2[4],
+            num_buffers=_t2[5],
+            quant_wmma_rep=1,
+            row_major_ascale=0,
+        )
+        _fold_kw1 = {"shared_fold": _shared_fold1}
+        _fold_kw2 = {"shared_fold": _shared_fold2}
+    else:
+        _fold_kw1 = _fold_kw2 = {}
     if mxfp8_copy_out is not None and (
         (_compact and _prequantized) or _fuse_ep_route_quant
     ):
@@ -1452,6 +1704,7 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
+            **_fold_kw1,
         )
     else:
         # Raw GEMM1 writes both gate/up columns when activation moves to quant.
@@ -1547,6 +1800,7 @@ def _grouped_a8w4_tdm_moe(
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
+        **_fold_kw2,
     )
 
     if kernel_bench_callable is not None:
@@ -1636,6 +1890,7 @@ def _grouped_a8w4_tdm_moe(
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
                         **_situ_kw,
+                        **_fold_kw1,
                     ),
                 )
             )
@@ -1719,6 +1974,7 @@ def _grouped_a8w4_tdm_moe(
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
+                    **_fold_kw2,
                 ),
             )
         )
@@ -1748,18 +2004,28 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
-    # A caller's pending `* scale + addend` (shared expert add) rides along.
-    epi = None if _is_ep else _take_output_epilogue(token_num, model_dim, moe_out.dtype)
-    if epi is not None and epi.before is not None:
-        epi.before()
+    if _fold is not None:
+        # The folded shared expert is the addend, after the routed scale.
+        addend, addend_scale = _sh_out[:token_num], _fold.scale
+    else:
+        # A caller's pending `* scale + addend` (shared expert add) rides along.
+        epi = (
+            None
+            if _is_ep
+            else _take_output_epilogue(token_num, model_dim, moe_out.dtype)
+        )
+        if epi is not None and epi.before is not None:
+            epi.before()
+        addend = None if epi is None else epi.addend
+        addend_scale = 1.0 if epi is None else epi.scale
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
-        addend=None if epi is None else epi.addend,
-        addend_scale=1.0 if epi is None else epi.scale,
+        addend=addend,
+        addend_scale=addend_scale,
     )
     return moe_out
 
