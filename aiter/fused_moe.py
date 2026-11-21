@@ -1770,7 +1770,7 @@ def fused_moe_(
     Returns a new ``[M, model_dim]`` tensor of ``dtype`` (``hidden_states``'
     dtype when None), ``M = topk_ids.shape[0]``, ``model_dim = w2.shape[1]``.
     Given ``output`` -- contiguous, of exactly that shape, dtype and device, not
-    overlapping ``hidden_states`` -- the result is written into it and
+    overlapping any input tensor -- the result is written into it and
     ``output`` itself is returned. Nothing else is written through the
     arguments, except under the stage-2 scatter below.
 

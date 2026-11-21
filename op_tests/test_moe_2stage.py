@@ -121,6 +121,35 @@ def parse_num_expert_activated():
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
+# Two runs of one kernel path differ by atomic-accumulation noise (~1e-7 per row in
+# 1 - cosine); a wrong, zeroed or half-written row differs by order 1.
+_OUTPUT_ROW_TOL = 1e-2
+
+
+def _output_corruption(plain, out, row_tol=_OUTPUT_ROW_TOL):
+    """Why `out`, a fused_moe(output=) result, differs from `plain`, the same call
+    without output=, or "" when it does not.
+
+    Batch-wide metrics hide a single bad row (zeroing one of 4096 equal-energy rows
+    moves logits_diff by 1e-4), so rows are compared one by one. A row may be
+    non-finite only where `plain` is, which is how the known K-pad NaN shows up.
+    """
+    out_bad = ~out.isfinite().all(-1)
+    plain_bad = ~plain.isfinite().all(-1)
+    if (out_bad & ~plain_bad).any():
+        return f"non-finite rows {torch.where(out_bad & ~plain_bad)[0].tolist()[:8]}"
+    ok = ~(out_bad | plain_bad)
+    x, y = plain.double()[ok], out.double()[ok]
+    denom = (x * x + y * y).sum(-1)
+    diff = torch.where(
+        denom > 0, 1 - 2 * (x * y).sum(-1) / denom, torch.zeros_like(denom)
+    )
+    if diff.numel() and diff.max() > row_tol:
+        row = torch.where(ok)[0][diff.argmax()].item()
+        return f"row {row} differs from the call without output= by {diff.max():.3g}"
+    return ""
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -150,7 +179,6 @@ def test_fmoe(
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
     output_offset=0,
-    output_perf=False,
     expected_kernel1: str | None = None,
 ):
     if get_gfx_runtime() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -710,20 +738,28 @@ def test_fmoe(
         out2_ref.to(dtypes.fp32),
         out_buf.to(dtypes.fp32),
         msg="ck_moe_2stages output=",
+        tol_err_ratio=1.0 if asm_flat_mxfp4 else 0.05,
     )
+    out_corruption = _output_corruption(out2_ck, out_buf)
     out_logits_diff = calc_diff(out2_ref, out_buf)
     out_msg = (
         f"output= check failed: returned buf={out_ret is out_buf}, "
-        f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}"
+        f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}, "
+        f"vs call without output=: {out_corruption or 'same'}"
     )
-    # Identity and finiteness are contract questions, not accuracy ones: they hold
-    # in non-strict cases too. A non-finite value is tolerated only where the call
-    # without a buffer produced the same NaN (has_nan).
+    # Identity, finiteness and agreement with the call without a buffer are
+    # contract questions, not accuracy ones: they hold in non-strict cases too,
+    # row by row. A non-finite row is tolerated only where that call produced the
+    # same NaN (has_nan).
     assert out_ret is out_buf, out_msg
     assert has_nan or not out_non_finite, out_msg
+    assert not out_corruption, out_msg
     out_failed = out_err != 0 and out_logits_diff > 0.01
     if strict_accuracy:
         assert not out_failed, out_msg
+        assert (
+            not asm_flat_mxfp4 or out_logits_diff < 2e-3
+        ), f"{out_msg} (asm FLAT MXFP4: logits_diff must be < 2e-3)"
     elif out_failed:
         logger.warning("accuracy check failed (non-strict): %s", out_msg)
     ret = {
@@ -732,12 +768,9 @@ def test_fmoe(
         "output err": out_err,
         "output logits_diff": float(out_logits_diff),
     }
-    if not output_perf:
-        return ret
-    # Time the output= call too (--output-perf; it doubles the timed calls of a
-    # sweep): it is how the serving layer calls fused_moe, and writing into the
-    # caller's buffer is what saves the copy. Checked above, as the timed calls
-    # overwrite out_buf and may run on rotated copies of it.
+    # Time the output= call too: it is how the serving layer calls fused_moe, and
+    # writing into the caller's buffer is what saves the copy. Checked above, as
+    # the timed calls overwrite out_buf and may run on rotated copies of it.
     _, out_us = run_perftest(
         fused_moe,
         input,
@@ -987,14 +1020,6 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
-)
-
-parser.add_argument(
-    "--output-perf",
-    action="store_true",
-    help="Also time each case's fused_moe(output=) call and report its us, TFLOPS "
-    "and TB/s. Its accuracy is checked unless --kernel is given; timing it "
-    "doubles the timed calls.",
 )
 
 args = parser.parse_args()
@@ -2454,7 +2479,6 @@ def test_adaptive_sort_output_in_place():
                         use_g1u1=True,
                         check_aot_cache=False,
                         output_offset=output_offset,
-                        output_perf=True,
                     )
                 )
                 case = f"token={token} output_offset={output_offset}"
@@ -2481,6 +2505,23 @@ def test_adaptive_sort_output_in_place():
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
+    # Negative controls for the row-wise check test_fmoe applies to output=.
+    good = torch.randn((4096, 64), dtype=dtypes.bf16)
+    assert not _output_corruption(good, good.clone())
+    zeroed = good.clone()
+    zeroed[1234] = 0
+    assert "row 1234" in _output_corruption(good, zeroed), "a zeroed row passed"
+    nan_out = good.clone()
+    nan_out[7, 3] = float("nan")
+    assert "non-finite" in _output_corruption(good, nan_out), "an extra NaN passed"
+    nan_plain = good.clone()
+    nan_plain[7, 5] = float("nan")
+    assert not _output_corruption(nan_plain, nan_plain.clone()), "a shared NaN failed"
+    new_nan = nan_plain.clone()
+    new_nan[9, 5] = float("nan")
+    assert "non-finite" in _output_corruption(
+        nan_plain, new_nan
+    ), "a new NaN row passed"
     token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
     dtype = dtypes.bf16
     hidden = torch.randn((token, model_dim), dtype=dtype) / 10
@@ -2509,7 +2550,7 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT and grouped gfx1250 paths, which cannot
+    # in_place=False stands in for FLAT and underaligned-output paths, which cannot
     # take the caller's buffer and must copy their result into it.
     for in_place in (True, False):
         try:
@@ -3574,7 +3615,6 @@ for kwargs, extras in case_iter:
                 **kwargs,
                 kernel_bench=args.kernel,
                 ref_dtype=args.ref_dtype,
-                output_perf=args.output_perf,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(
