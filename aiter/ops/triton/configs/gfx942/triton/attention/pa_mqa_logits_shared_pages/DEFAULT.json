@@ -1,0 +1,9 @@
+{
+    "_pa_mqa_logits_shared_pages_kernel": {
+        "BLOCK_M": 128,
+        "TILE": 256,
+        "TILES_PER_PROGRAM": 8,
+        "num_warps": 4,
+        "num_stages": 2
+    }
+}
