@@ -288,6 +288,22 @@ class _NotServed(AssertionError):
     """The backend asked for does not serve the shape on this device."""
 
 
+# `sampled` runs its stable mode under tie='low' and deterministic, a build of
+# its own. Forced through `_only_backend`, which hides backends from the untied
+# dispatch only, deterministic reaches it.
+_SAMPLED_MODES = ({}, {"deterministic": True})
+_ROUTED_MODES = ({}, {"tie": "low"}, {"deterministic": True})
+
+
+def _mode_tag(mode):
+    return "".join(f" {k}={v}" for k, v in mode.items())
+
+
+def _in_row(idx, n):
+    """Every index a column of the row: checked before a gather would fault."""
+    return bool(((idx >= 0) & (idx < n)).all())
+
+
 @contextmanager
 def _only_backend(backend):
     """Hide every backend but `backend` from the entry's untied dispatch."""
@@ -308,7 +324,7 @@ def _only_backend(backend):
         ts._choose.cache_clear()
 
 
-def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
+def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None, **mode):
     """Call one backend through the entry by hiding the others from it.
 
     Asserts that the entry really used it. It did not, once: the dispatch tail
@@ -330,7 +346,7 @@ def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
         picked = ts.topk_select_backend(rows, width, k, served, device=dev)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
-        return topk_select(x, k, end=end, output_idx=output_idx)[1]
+        return topk_select(x, k, end=end, output_idx=output_idx, **mode)[1]
 
 
 # One shape per route, each forced onto the backend named.
@@ -359,47 +375,50 @@ def test_strided_layouts():
     `end` as dense, and all of them returned plausible tensors.
     """
     failures, not_served = [], set()
-    for backend, m, n, k, dtype in _STRIDED_ROUTES:
-        for layout in ("input", "input+end", "output", "end"):
-            torch.manual_seed(0)
-            x = torch.randn(m, n, dtype=dtype)
-            if layout.startswith("input"):
-                x = torch.zeros(m, n + 64, dtype=dtype)[:, :n].copy_(x)
-            ragged = layout in ("input+end", "end")
-            lens = (
-                torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
-                if ragged
-                else torch.full((m,), n, dtype=dtypes.i32)
+    for (backend, m, n, k, dtype), layout, mode in itertools.product(
+        _STRIDED_ROUTES, ("input", "input+end", "output", "end"), _SAMPLED_MODES
+    ):
+        if mode and backend != "sampled":
+            continue
+        torch.manual_seed(0)
+        x = torch.randn(m, n, dtype=dtype)
+        if layout.startswith("input"):
+            x = torch.zeros(m, n + 64, dtype=dtype)[:, :n].copy_(x)
+        ragged = layout in ("input+end", "end")
+        lens = (
+            torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+            if ragged
+            else torch.full((m,), n, dtype=dtypes.i32)
+        )
+        end = None
+        if ragged:
+            end = lens if layout == "input+end" else torch.stack([lens, lens], 1)[:, 0]
+        guard, out = None, None
+        if layout == "output":
+            guard = torch.full((m, k + 32), -7, dtype=dtypes.i32)
+            out = guard[:, :k]
+        label = f"{backend} {m}x{n} k={k} {dtype} strided {layout}{_mode_tag(mode)}"
+        try:
+            idx = _run_single_backend(
+                x, lens, k, backend, end=end, output_idx=out, **mode
             )
-            end = None
-            if ragged:
-                end = (
-                    lens
-                    if layout == "input+end"
-                    else torch.stack([lens, lens], 1)[:, 0]
-                )
-            guard, out = None, None
-            if layout == "output":
-                guard = torch.full((m, k + 32), -7, dtype=dtypes.i32)
-                out = guard[:, :k]
-            label = f"{backend} {m}x{n} k={k} {dtype} strided {layout}"
-            try:
-                idx = _run_single_backend(x, lens, k, backend, end=end, output_idx=out)
-                torch.cuda.synchronize()
-            except _NotServed:
-                # A route this device does not have, e.g. stream at these widths
-                # on gfx942; reported below rather than counted as a failure.
-                not_served.add(f"{backend} {m}x{n} k={k} {layout}")
-                continue
-            except Exception as e:  # noqa: BLE001
-                failures.append(f"{label}: {type(e).__name__}: {e}")
-                continue
-            if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
-                failures.append(f"{label}: wrong selection")
-            if guard is not None and not (
-                bool((guard[:, k:] == -7).all()) and idx.data_ptr() == out.data_ptr()
-            ):
-                failures.append(f"{label}: not written into output_idx in place")
+            torch.cuda.synchronize()
+        except _NotServed:
+            # A route this device does not have, e.g. stream at these widths
+            # on gfx942; reported below rather than counted as a failure.
+            not_served.add(f"{backend} {m}x{n} k={k} {layout}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{label}: {type(e).__name__}: {e}")
+            continue
+        if not _in_row(idx, n):
+            failures.append(f"{label}: an index outside the row")
+        elif not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+            failures.append(f"{label}: wrong selection")
+        if guard is not None and not (
+            bool((guard[:, k:] == -7).all()) and idx.data_ptr() == out.data_ptr()
+        ):
+            failures.append(f"{label}: not written into output_idx in place")
     for label in failures:
         aiter.logger.error("STRIDED LAYOUT FAILED: %s", label)
     if not_served:
@@ -431,28 +450,27 @@ def test_row_pitch():
         "column slice, pitch n+64": torch.randn(m, n + 64)[:, :n],
     }
     failures = []
-    for layout, x in layouts.items():
+    for (layout, x), ragged, mode in itertools.product(
+        layouts.items(), (False, True), _ROUTED_MODES
+    ):
         rows = x.shape[0]
-        for ragged in (False, True):
-            lens = (
-                torch.randint(k, n + 1, (rows,), dtype=dtypes.i32)
-                if ragged
-                else torch.full((rows,), n, dtype=dtypes.i32)
-            )
-            label = f"{layout}{', ragged' if ragged else ''}"
-            try:
-                idx = topk_select(x, k, end=lens if ragged else None)[1]
-                torch.cuda.synchronize()
-            except Exception as e:  # noqa: BLE001
-                failures.append(f"{label}: {type(e).__name__}: {e}")
-                continue
-            ordered = idx.sort(dim=1).values
-            if not bool((ordered[:, 0] >= 0).all()) or bool(
-                (ordered[:, 1:] == ordered[:, :-1]).any()
-            ):
-                failures.append(f"{label}: an index is -1 or repeated")
-            elif not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
-                failures.append(f"{label}: wrong selection")
+        lens = (
+            torch.randint(k, n + 1, (rows,), dtype=dtypes.i32)
+            if ragged
+            else torch.full((rows,), n, dtype=dtypes.i32)
+        )
+        label = f"{layout}{', ragged' if ragged else ''}{_mode_tag(mode)}"
+        try:
+            idx = topk_select(x, k, end=lens if ragged else None, **mode)[1]
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{label}: {type(e).__name__}: {e}")
+            continue
+        ordered = idx.sort(dim=1).values
+        if not _in_row(idx, n) or bool((ordered[:, 1:] == ordered[:, :-1]).any()):
+            failures.append(f"{label}: an index is outside the row or repeated")
+        elif not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+            failures.append(f"{label}: wrong selection")
     for label in failures:
         aiter.logger.error("ROW PITCH FAILED: %s", label)
     return failures
@@ -680,7 +698,7 @@ _LAUNCH_SHAPES = (
 _GRAPH_ROWS = tuple(range(1, 11))
 
 
-def _capture_at_row_counts(n, k, capture):
+def _capture_at_row_counts(n, k, capture, mode=None):
     """One graph per row count in `_GRAPH_ROWS`, each over its own buffers.
 
     Every call is warmed on the capture stream first: the first one compiles,
@@ -692,11 +710,11 @@ def _capture_at_row_counts(n, k, capture):
         out = torch.empty(m, k, dtype=dtypes.i32)
         capture.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture):
-            topk_select(x, k, output_idx=out)
+            topk_select(x, k, output_idx=out, **(mode or {}))
         torch.cuda.current_stream().wait_stream(capture)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture):
-            topk_select(x, k, output_idx=out)
+            topk_select(x, k, output_idx=out, **(mode or {}))
         graphs.append((graph, x, out))
     return graphs
 
@@ -713,20 +731,26 @@ def test_full_rows_graphs():
     """
     failures = []
     capture = torch.cuda.Stream()
-    for backend, n, k in _LAUNCH_SHAPES:
-        tag = f"{backend} n={n} k={k}"
+    sampled = tuple(("sampled", 131072, 1024, mode) for mode in _SAMPLED_MODES)
+    for backend, n, k, *mode in _LAUNCH_SHAPES + sampled:
+        mode = mode[0] if mode else {}
+        tag = f"{backend} n={n} k={k}{_mode_tag(mode)}"
         missed = [m for m in _GRAPH_ROWS if not _serves(backend, m, n, k, False)]
         if missed:
+            if backend == "sampled" and get_gfx() != "gfx950":
+                continue
             failures.append(f"{tag}: not dispatched to {backend} at m={missed}")
             continue
         with _only_backend(backend):
-            graphs = _capture_at_row_counts(n, k, capture)
+            graphs = _capture_at_row_counts(n, k, capture, mode)
         for graph, x, out in graphs:
             x.copy_(torch.randn_like(x))
             out.fill_(-2)
             graph.replay()
             full = torch.full((x.shape[0],), n, dtype=dtypes.i32)
-            if not torch.equal(_sorted_values(x, out), run_torch(x, full, k)):
+            if not _in_row(out, n) or not torch.equal(
+                _sorted_values(x, out), run_torch(x, full, k)
+            ):
                 failures.append(f"{tag} m={x.shape[0]}: graph replay")
         torch.cuda.synchronize()
 
@@ -936,6 +960,8 @@ _NAN_ROUTES = (
     ("decode", 4, 32768, 2048, False),
     ("sampled", 64, 32768, 2048, False),
     ("sampled", 64, 32768, 2048, True),
+    ("sampled", 64, 32768, 2048, False, {"deterministic": True}),
+    ("sampled", 64, 32768, 2048, True, {"deterministic": True}),
     ("plain", 600, 6000, 2048, False),  # register copy, 512 threads
     ("plain", 64, 4500, 2048, False),  # register copy, 11+11+10 bits
     ("plain", 8, 4096, 2048, False),  # register copy, 4 per lane
@@ -1011,8 +1037,9 @@ def test_nan_order():
     distinct, and no unselected live element ranked above a selected one.
     """
     failures, not_served = [], []
-    for backend, m, n, k, ragged in _NAN_ROUTES:
-        tag = f"{backend} {m}x{n} k={k}{' end' if ragged else ''}"
+    for backend, m, n, k, ragged, *mode in _NAN_ROUTES:
+        mode = mode[0] if mode else {}
+        tag = f"{backend} {m}x{n} k={k}{' end' if ragged else ''}{_mode_tag(mode)}"
         if ragged:
             g = torch.Generator(device="cuda").manual_seed(n + m)
             ends = torch.randint(
@@ -1023,7 +1050,7 @@ def test_nan_order():
         x = _nan_rows(m, n, k, ends, seed=m * n + k)
         try:
             idx = _run_single_backend(
-                x, ends, k, backend, end=ends if ragged else None
+                x, ends, k, backend, end=ends if ragged else None, **mode
             ).long()
         except _NotServed:
             # The routes are gfx950 shapes; elsewhere some are not served.
@@ -1072,6 +1099,8 @@ _CROSS_DEVICE_SHAPES = (
     (64, 2048, 2048),
     (64, 2050, 2048),
 )
+# The `sampled` shape, also in its stable mode.
+_CROSS_DEVICE_STABLE = {(64, 131072, 1024)}
 
 
 def test_cross_device():
@@ -1090,15 +1119,17 @@ def test_cross_device():
     return failures
 
 
-def _on_current_failures(m, n, k, when):
+def _on_current_failures(m, n, k, when, mode=None):
     x = torch.randn(m, n, dtype=dtypes.fp32)
     lens = torch.full((m,), n, dtype=dtypes.i32)
     try:
-        idx = topk_select(x, k)[1]
+        idx = topk_select(x, k, **(mode or {}))[1]
         torch.cuda.synchronize()
     except Exception as e:  # noqa: BLE001
         return [f"{m}x{n} k={k} on the current GPU {when}: {type(e).__name__}: {e}"]
-    if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+    if not _in_row(idx, n) or not torch.equal(
+        _sorted_values(x, idx), run_torch(x, lens, k)
+    ):
         return [f"{m}x{n} k={k} on the current GPU {when}: wrong selection"]
     return []
 
@@ -1108,9 +1139,11 @@ def _cross_device_failures():
     home = torch.cuda.current_device()
     other = (home + 1) % torch.cuda.device_count()
     on = torch.device("cuda", other)
-    for m, n, k in _CROSS_DEVICE_SHAPES:
+    for (m, n, k), mode in itertools.product(_CROSS_DEVICE_SHAPES, _ROUTED_MODES):
+        if mode and (m, n, k) not in _CROSS_DEVICE_STABLE:
+            continue
         torch.manual_seed(m * n + k)
-        failures += _on_current_failures(m, n, k, "before")
+        failures += _on_current_failures(m, n, k, "before", mode)
         x = torch.randn(m, n, dtype=dtypes.fp32, device=on)
         off = torch.arange(m, dtype=dtypes.i32, device=on) * n
         for ragged in (False, True):
@@ -1131,8 +1164,9 @@ def _cross_device_failures():
             )
             for opts in options:
                 label = f"{m}x{n} k={k}{' end' if ragged else ''} {sorted(opts)}"
+                label += _mode_tag(mode)
                 try:
-                    v, i = topk_select(x, k, end=end, **opts)
+                    v, i = topk_select(x, k, end=end, **opts, **mode)
                     torch.cuda.synchronize(on)
                 except Exception as e:  # noqa: BLE001
                     failures.append(f"{label}: {type(e).__name__}: {e}")
@@ -1151,7 +1185,9 @@ def _cross_device_failures():
                 ):
                     failures.append(f"{label}: not written to output_idx")
                 local = i - off.view(m, 1) if "output_idx_offset" in opts else i
-                if not torch.equal(_sorted_values(x, local), ref):
+                if not _in_row(local, n) or not torch.equal(
+                    _sorted_values(x, local), ref
+                ):
                     failures.append(f"{label}: wrong selection")
                 elif v is not None and not torch.equal(v, x.gather(1, local.long())):
                     failures.append(f"{label}: values do not pair with idx")
@@ -1161,7 +1197,7 @@ def _cross_device_failures():
                     (i[:, :-1] <= i[:, 1:]).all()
                 ):
                     failures.append(f"{label}: indices not ascending")
-        failures += _on_current_failures(m, n, k, "after")
+        failures += _on_current_failures(m, n, k, "after", mode)
     return failures
 
 
