@@ -50,6 +50,17 @@ is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_sma
 chunks per GEMM2 unit. Fields set explicitly take precedence; unset ones use the per-batch
 tuned configs (configs/mega_moe_tp_tuned.csv, ``AITER_CONFIG_MEGA_MOE_TP``; inside its tuned
 range), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
+
+Small-M (fp8 comm, fp4 activations, up to 256 global tokens): the small-M kernel
+(kernels/mega_moe_tp/smallm.py) splits GEMM1 (inter blocks, evenly over the CTAs, the
+intermediate exported) from GEMM2 (output column shares over the full inter dim: contiguous
+w2 rows, one partial row per route) and evens the bytes per CTA. Its per-batch launch
+configs (row tile, CTAs, ar two-shot all-reduce) come from configs/mega_moe_tp_sm_tuned.csv
+(``AITER_CONFIG_MEGA_MOE_TP_SM``); ar batches from 64 tokens all-reduce in two shots
+(reduce-scatter, then the owners' rows to every rank). AITER_MEGAMOE_TP_SMALLM=0 disables it, "all" runs it from 1 token; batches from an
+explicit lb_min on stay on the LB schedule. A fused-tail forward of a small-M batch the LB
+schedule takes runs it there (as before; its y then differs in rounding from the plain
+forward's).
 """
 
 from __future__ import annotations
@@ -73,6 +84,7 @@ from .kernels.mega_moe_tp.mega_moe_tp_config import PAD
 ERR_BIGM = 32
 
 __all__ = [
+    "shuffle_weight_mega_fp8",
     "COMM_MODES",
     "ERR_BIGM",
     "MegaMoeTP",
@@ -82,6 +94,19 @@ __all__ = [
 ]
 
 _ACTS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+
+
+def shuffle_weight_mega_fp8(w: torch.Tensor) -> torch.Tensor:
+    """An MXFP8 (e4m3) weight [N, K] (N % 16 == 0, K % 128 == 0) in the order the fused
+    kernel's MXFP8 B loaders take: [N / 16][K / 128][half][lane][16 B], lane = 16 q + r
+    holding row r's K bytes 64 half + 16 q .. + 16 of the k-step (the fp8 MFMA operand: a
+    lane's 8 dwords are K 16 q .. + 16 and 64 + 16 q .. + 16). The scales:
+    fp4_utils.e8m0_shuffle of [N, K / 32], as MXFP4's."""
+    N, K = w.shape[-2:]
+    if N % 16 or K % 128:
+        raise ValueError(f"shuffle_weight_mega_fp8: need N % 16 == 0, K % 128 == 0: {N} {K}")
+    u = w.reshape(-1, N, K).view(torch.uint8).view(-1, N // 16, 16, K // 128, 2, 4, 16)
+    return u.permute(0, 1, 3, 4, 5, 2, 6).contiguous().view(w.shape).view(w.dtype)
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -113,10 +138,16 @@ class MegaMoeTPConfig:
     linear_beta: float | None = None
     swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
-    comm_dtype: str = "fp8"
+    # "bf16" (default: lossless collectives), "fp8" / "int8" (quantized wire: the big-M path's
+    # int8 / int4 reduce-scatter and int8 y gather per its tuned rows)
+    comm_dtype: str = "bf16"
     ar_gather: str = "auto"
     schedule: str = "dynamic"
+    # "fp4" (a4w4), "fp8", "bf16" (a16w4: two MXFP8 terms, the small-M schedule only), or
+    # "auto": a16w4 for the batches below a16_max_tokens global tokens (as aiter fused_moe's
+    # decode: bf16 activations), a4w4 for the rest (and the big-M path)
     act_dtype: str = "fp4"
+    a16_max_tokens: int = 256
     lb_min: int | None = None
     lb_mt: int | str | None = None
     lb_mt_small: int | None = None
@@ -147,7 +178,19 @@ class MegaMoeTP:
         w2_scale: torch.Tensor,
         group=None,
         device: torch.device | None = None,
+        w1_shared: torch.Tensor | None = None,
+        w1_shared_scale: torch.Tensor | None = None,
+        w2_shared: torch.Tensor | None = None,
+        w2_shared_scale: torch.Tensor | None = None,
     ):
+        """w1_shared ... : the shared expert (the last one, cfg.experts - 1) as MXFP8
+        (shuffle_weight_mega_fp8 + e8m0_shuffle) while the routed ones (w1 / w2: experts - 1
+        of them) are MXFP4; else every expert is MXFP4 in w1 / w2."""
+        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
+        if any(t is not None for t in shared) and any(t is None for t in shared):
+            raise ValueError("MegaMoeTP: the shared expert's four MXFP8 tensors, or none")
+        shared = None if w1_shared is None else shared
+        self.shared = shared
         if cfg.activation not in _ACTS:
             raise ValueError(f"MegaMoeTP: unsupported activation {cfg.activation}")
         if not mega_moe_tp_supported():
@@ -163,10 +206,11 @@ class MegaMoeTP:
         # the shapes the big-M kernel takes: H % 256, < 512 routed experts (+ the last one,
         # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
         big_ok = (
-            cfg.activation in (ActivationType.Swiglu, ActivationType.Silu)
-            and cfg.act_dtype == "fp4"
+            cfg.activation
+            in (ActivationType.Swiglu, ActivationType.Silu, ActivationType.Situv2)
+            and cfg.act_dtype in ("fp4", "auto")
             and cfg.model_dim % 256 == 0
-            and 0 < cfg.experts - 1 < 512
+            and 0 < cfg.experts - 1 < 1024
             and cfg.topk - 1 <= 64
             and cfg.inter_dim % 128 == 0
         )
@@ -190,9 +234,10 @@ class MegaMoeTP:
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
-        # default threshold: the small engine holds what it can, big-M takes the rest
-        fit = (big_ok and bmin is None) or cfg.fit_max_local
-        self.engine = MegaMoeTPEngine(
+        # the small engine holds what it can, big-M takes the rest (an explicit
+        # bigm_min_tokens above the small engine's capacity: lowered to it, below)
+        fit = (big_ok and bmin != 0) or cfg.fit_max_local
+        self._engine_kw = dict(
             rank=cfg.rank,
             world_size=cfg.world_size,
             model_dim=cfg.model_dim,
@@ -211,10 +256,12 @@ class MegaMoeTP:
             ),
             swiglu_limit=cfg.swiglu_limit,
             comm_mode=cfg.comm_mode,
-            comm_dtype=cfg.comm_dtype,
+            # ("int8": the big-M kernel's; the small engine runs its 8-bit (FP8) path, the
+            # small-M schedule)
+            comm_dtype="fp8" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
             ar_gather=cfg.ar_gather,
             schedule=cfg.schedule,
-            act_dtype=cfg.act_dtype,
+            act_dtype="fp4" if cfg.act_dtype == "auto" else cfg.act_dtype,
             lb={
                 "min": cfg.lb_min,
                 "mt": cfg.lb_mt,
@@ -228,9 +275,34 @@ class MegaMoeTP:
             group=group,
             device=device,
             fit_max_local=fit,
+            shared=shared,
         )
-        if big_ok and bmin is None and self.engine.mmax < cfg.max_local_tokens:
-            self.bigm_m = self.engine.mmax + 1
+        self.engine = MegaMoeTPEngine(**self._engine_kw)
+        if big_ok and bmin != 0 and self.engine.mmax < small_max:
+            lim = self.engine.mmax + 1
+            self.bigm_m = min(self.bigm_m, lim) if self.bigm_m else lim
+        # (act_dtype "auto") the a16w4 small engine of the batches below a16_max_tokens
+        # global tokens (its own buffers / arena: an engine's activation format is fixed)
+        self.engine16 = None
+        self.a16_local = 0  # local token counts below this run engine16
+        if cfg.act_dtype == "auto":
+            self.a16_local = -(-cfg.a16_max_tokens // cfg.world_size)
+            m16 = min(small_max, self.a16_local - 1)
+            if m16 >= 1:
+                self.engine16 = MegaMoeTPEngine(
+                    **{**self._engine_kw, "max_local_tokens": m16, "act_dtype": "bf16",
+                       "fit_max_local": True}
+                )
+
+    def _eng(self, local_tokens: int):
+        """the small engine of this local token count (act_dtype "auto": a16w4 below
+        a16_max_tokens global tokens)"""
+        if self.engine16 is not None and local_tokens < self.a16_local:
+            return self.engine16
+        return self.engine
+
+    def _engines(self):
+        return [self.engine] + ([self.engine16] if self.engine16 is not None else [])
 
     def forward(
         self,
@@ -272,7 +344,8 @@ class MegaMoeTP:
             if tail is not None and bf16:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
-        return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+        eng = self._eng(self._local(x_local.shape[0]))
+        return eng(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     def _local(self, rows: int) -> int:
         """local tokens of a forward of these input rows (ar: replicated, rows / tp per rank)"""
@@ -298,7 +371,8 @@ class MegaMoeTP:
             out = torch.empty_like(x)
         xs, tw, ids = xs.contiguous(), tw.contiguous(), ids.contiguous()
         if M == tp * m:  # (moe copies every rank's rows into out)
-            self.bigm().moe(xs, tw, ids, out=out, gather=True)
+            full = (x.contiguous(), topk_weights.contiguous(), topk_ids.contiguous())
+            self.bigm().moe(xs, tw, ids, out=out, gather=True, full=full)
         else:
             # (a shader copy: copy_ of the arena may run on an SDMA engine)
             _kcopy(out, self.bigm().moe(xs, tw, ids, gather=True)[:M])
@@ -349,8 +423,28 @@ class MegaMoeTP:
                 device=a["device"],
                 act=cfg.activation.name.lower(),
                 ygather=cfg.comm_mode == "ar",
-                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
-                opts={"AITER_BIGM_R8": "0"} if cfg.comm_dtype == "bf16" else None,
+                shared=self.shared,
+                situ=(
+                    cfg.beta if cfg.beta is not None else 1.0,
+                    cfg.linear_beta if cfg.linear_beta is not None else 1.0,
+                ),
+                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise) and a
+                # bf16 reduce-scatter (int8 / int4 otherwise)
+                opts=(
+                    {"AITER_BIGM_R8": "0", "AITER_BIGM_EB": "1", "AITER_BIGM_E4": "0"}
+                    if cfg.comm_dtype == "bf16"
+                    # "int8": the reduce-scatter (and the ar y gather) as int8 rows + an f32
+                    # scale per 32 (deterministic); the route rows per the tuned rows (mode
+                    # "<mode>_int8": bf16, R8 MXFP8 or I8R int8)
+                    else (
+                        {
+                            "AITER_BIGM_EB": "0",
+                            "AITER_BIGM_YG8": "1",
+                        }
+                        if cfg.comm_dtype == "int8"
+                        else None
+                    )
+                ),
             )
         return self._bigm
 
@@ -363,12 +457,21 @@ class MegaMoeTP:
         w1_scale: torch.Tensor,
         w2: torch.Tensor,
         w2_scale: torch.Tensor,
+        w1_shared: torch.Tensor | None = None,
+        w1_shared_scale: torch.Tensor | None = None,
+        w2_shared: torch.Tensor | None = None,
+        w2_shared_scale: torch.Tensor | None = None,
     ) -> None:
-        """Run the next forwards on another layer's weights of the same shape."""
-        self.engine.set_weights(w1, w1_scale, w2, w2_scale)
+        """Run the next forwards on another layer's weights of the same shape (and the same
+        shared expert format)."""
+        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
+        shared = None if w1_shared is None else shared
+        for eng in self._engines():
+            eng.set_weights(w1, w1_scale, w2, w2_scale, shared)
+        self.shared = shared
         self._bigm_args.update(w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale)
         if self._bigm is not None:
-            self._bigm.set_weights(w1, w1_scale, w2, w2_scale)
+            self._bigm.set_weights(w1, w1_scale, w2, w2_scale, shared=shared)
 
     def prepare(
         self,
@@ -389,8 +492,10 @@ class MegaMoeTP:
         ar = self.cfg.comm_mode == "ar"
         btail = (tail or tail_bf16) and not ar  # (the ar big-M path has no tail)
         small = [t for t in ts if not self._big(t)]
-        if small:
-            self.engine.prepare(small, tail, tail_bf16, warmup)
+        for eng in self._engines():
+            mine = [t for t in small if self._eng(t) is eng]
+            if mine:
+                eng.prepare(mine, tail, tail_bf16, warmup)
         hi = max([self.cfg.max_local_tokens, *ts])
         if not self._big(hi):
             return
@@ -438,14 +543,14 @@ class MegaMoeTP:
         """forward(tail=...) runs for this local token count."""
         if self._big(local_tokens):
             return self.cfg.comm_mode == "ag_rs"
-        return self.engine.tail_ok(local_tokens)
+        return self._eng(local_tokens).tail_ok(local_tokens)
 
     def launch_config(self, local_tokens: int) -> LaunchCfg | None:
         """The small engine's launch config of this local token count; None: the batch
         runs the big-M kernel (see bigm_plan)."""
         if self._big(local_tokens):
             return None
-        return self.engine.config(local_tokens)
+        return self._eng(local_tokens).config(local_tokens)
 
     def bigm_plan(self, local_tokens: int):
         """The big-M kernel's plan of this local token count: ((chunk weights),
@@ -459,6 +564,8 @@ class MegaMoeTP:
         """Sticky watchdog bits (nonzero: a launch timed out) as a device tensor (no
         sync): the small engine's, | ERR_BIGM for a big-M one."""
         e = self.engine.error_flag()
+        if self.engine16 is not None:
+            e = e | self.engine16.error_flag()
         if self._bigm is None:
             return e
         return e | (self._bigm.error_flag() * ERR_BIGM)
@@ -466,6 +573,8 @@ class MegaMoeTP:
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
         e = self.engine.poll_errors()
+        if not e and self.engine16 is not None:
+            e = self.engine16.poll_errors()
         if not e and self._bigm is not None:
             e = self._bigm.poll_errors()
         return e
@@ -477,16 +586,19 @@ class MegaMoeTP:
             raise RuntimeError(
                 "MegaMoeTP: a big-M wait on a peer gave up (results invalid)"
             )
-        self.engine.check_errors()
+        for eng in self._engines():
+            eng.check_errors()
 
     def clear_errors(self) -> None:
-        self.engine.clear_errors()
+        for eng in self._engines():
+            eng.clear_errors()
         if self._bigm is not None:
             self._bigm.clear_errors()
 
     def reset(self) -> None:
         """Collective: restart the cross-rank state (after a timeout / desync)."""
-        self.engine.reset()
+        for eng in self._engines():
+            eng.reset()
         if self._bigm is not None:
             self._bigm.reset()
 
@@ -496,4 +608,5 @@ class MegaMoeTP:
         if self._bigm is not None:
             self._bigm.close()
             self._bigm = None
-        self.engine.arena.close()
+        for eng in self._engines():
+            eng.arena.close()

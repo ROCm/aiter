@@ -217,8 +217,8 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     )
 
 
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
+def dma16(lds_addr, rs, voff, soff, nt=False, aux=None):
+    _dma(lds_addr, rs, voff, soff, 16, aux if aux is not None else (2 if nt else 0))
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
@@ -367,12 +367,15 @@ def widen(v4):
 
 
 # Scaled MFMA with per-lane E8M0 scales read from LDS: no MMA-atom form.
-def mfma(a4, b4, cacc, sa, sb, b8=False):
+def mfma(a4, b4, cacc, sa, sb, b8=False, opa=0, opb=0, a8=False):
+    """opa / opb: the byte of sa / sb that holds the scale (opsel); a8: the first (weight)
+    operand MXFP8 (8 dwords, e4m3) instead of MXFP4"""
+    ax = a4 if a8 else widen(a4)
     bx = b4 if b8 else widen(b4)
     return fx.Vector(
         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             _ty(V4F),
-            [widen(a4), bx, cacc, 4, 0 if b8 else 4, 0, i32(sa), 0, i32(sb)],
+            [ax, bx, cacc, 0 if a8 else 4, 0 if b8 else 4, opa, i32(sa), opb, i32(sb)],
         )
     )
 
@@ -399,17 +402,17 @@ def alive(t0):
 
 
 @flyc.jit
-def spin_lds_ge(L, off, target):
+def spin_lds_ge(L, off, target, nap=0):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(0)
+        rocdl.s_sleep(nap)
         cur = lds_ld_acq(L, off)
 
 
 @flyc.jit
-def spin0(L, lane, off, target):
+def spin0(L, lane, off, target, nap=0):
     if lane == i32(0):
-        spin_lds_ge(L, off, target)
+        spin_lds_ge(L, off, target, nap)
     rocdl.sched_barrier(0)
 
 
