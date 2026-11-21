@@ -179,6 +179,11 @@ def fused_compress_attn(
         from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
         from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
+        mx_fp8_dtype = (
+            MxDtypeInt.FP8_E4M3_FNUZ
+            if fp8_dtype == torch.float8_e4m3fnuz
+            else MxDtypeInt.FP8_E4M3
+        )
         n_groups_q = nope_dim // quant_group_size
         if k_rope_buff is None:
             raise ValueError("group_quant=True requires k_rope_buff")
@@ -253,7 +258,7 @@ def fused_compress_attn(
             amax = grp.abs().amax(-1, keepdim=True).clamp_min(1e-12)  # [ng,1]
             e8m0 = (
                 f32_to_mx_e8m0_scale(
-                    amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+                    amax, mode=MxScaleRoundModeInt.RoundUp, dtype=mx_fp8_dtype
                 )
                 .view(torch.uint8)
                 .reshape(n_groups_q)
