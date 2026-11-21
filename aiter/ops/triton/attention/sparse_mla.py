@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
+import re
 
 import torch
 import triton
@@ -706,6 +708,169 @@ def _sparse_mla_fwd_gfx950_fp8(
     return out, lse
 
 
+# 64-head fp8 decode (_gluon_kernels/gfx950/attention/sparse_mla_fp8_h64_*.py):
+# 576-wide rows, at most 2048 indices per query row.
+_H64_HEADS = 64
+_H64_ROW = 576
+_H64_TOPK = 2048
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_supported() -> tuple[bool, str]:
+    """Cached probe: can this Triton compile the 64-head fp8 decode kernels?
+
+    They use the Gluon dialect of Triton 3.8. Some ROCm 3.7 builds have an older
+    Gluon that imports but does not compile them, so the gate is a version
+    check, as in ``fused_gdn_prefill_qkvz._gluon_supported``.
+    """
+    version = triton.__version__
+    matched = re.match(r"(\d+)\.(\d+)", version or "")
+    if matched is None or (int(matched.group(1)), int(matched.group(2))) < (3, 8):
+        return False, f"Triton >= 3.8 required for this Gluon dialect, got {version}"
+    return True, ""
+
+
+def _h64_decode_config(q, cache, block_size, kv_indices) -> dict | None:
+    """The "_sparse_mla_fp8_h64" config for this call, or None if the 64-head
+    fp8 decode kernels do not take it. Host metadata only: safe under graph
+    capture.
+
+    The kernels read q as a contiguous [C, 64, 576] tensor, the cache as flat
+    576 B rows, and C * 2048 indices as one 2048-wide window per row from
+    kv_indptr[row]. Only the row counts in the config run. Any cache size is
+    taken: see _h64_cache_forms for how the kernels address it.
+    """
+    C, H, row = q.shape
+    if H != _H64_HEADS or row != _H64_ROW or not q.is_contiguous():
+        return None
+    if kv_indices.numel() != C * _H64_TOPK:
+        return None
+    if block_size != 1 or cache.ndim != 2 or cache.stride() != (row, 1):
+        return None
+    if cache.numel() == 0:
+        return None
+    cfg = _h64_rows().get(f"M_{C}")
+    if cfg is None or not _gluon_supported()[0]:
+        return None
+    return cfg
+
+
+def _h64_cache_forms(kv) -> tuple[bool, bool]:
+    """(buffer_cache, narrow_ok) for the cache the 64-head kernels address.
+
+    buffer_cache: the whole cache lies within buffer_load's signed 32-bit
+    offset range, so the kernels gather with buffer loads. Otherwise they
+    gather with 64-bit global offsets.
+    narrow_ok: in the global arm, the "small" kernel's NARROW_FORM 1 and 2
+    (rows 2 and 8) form slot * 576 in uint32, which needs the cache to span
+    under 2**32 B. Past that the host selects the clamped int64 form
+    (NARROW_FORM 0), as the pack these kernels come from does.
+    """
+    span = max_addressable_bytes(kv)
+    return span < 2**31 - 1, span < 2**32
+
+
+@functools.lru_cache(maxsize=1)
+def _h64_rows() -> dict:
+    """The "_sparse_mla_fp8_h64" entries of the running arch's config."""
+    cfg_dir = resolve_config_dir("attention", "SPARSE_MLA", backend="gluon")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")["_sparse_mla_fp8_h64"]
+
+
+def _sparse_mla_fwd_gfx950_fp8_h64(
+    q, q_scale, cache, kv_scale, kv_indptr, kv_indices, softmax_scale, out, cfg
+):
+    """64-head fp8 decode: one partials launch and one merge launch, with the
+    per-row knobs of cfg (see _h64_decode_config). Returns out."""
+    C = q.shape[0]
+    dev = q.device
+    kv = cache.view(torch.float8_e4m3fn)
+    kv_scale = kv_scale.reshape(1).to(torch.float32).contiguous()
+    out = _check_out(out, q, 512)
+    buffer_cache, narrow_ok = _h64_cache_forms(kv)
+    pc, mc = cfg["partials"], cfg["merge"]
+    if not buffer_cache and not narrow_ok and pc.get("NARROW_FORM"):
+        pc = {**pc, "NARROW_FORM": 0}
+    args = (q, kv, kv_indices, kv_indptr)
+    scales = (float(softmax_scale), q_scale, kv_scale)
+    out_args = (out, kv_scale, out.stride(0), out.stride(1))
+    f32 = torch.float32
+    if cfg["kernel"] == "small":
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8_h64_small import (
+            _attention_partials,
+            _merge_head_groups,
+        )
+
+        splits = _H64_TOPK // pc["KEY_BLOCK"]
+        groups = _H64_HEADS // pc["HEAD_BLOCK"]
+        if pc["STATS_IN_PARTIAL"]:
+            partial = torch.empty(
+                (C * _H64_HEADS * splits * 514,), dtype=f32, device=dev
+            )
+            stats = None
+        else:
+            partial = torch.empty((C, _H64_HEADS, splits, 512), dtype=f32, device=dev)
+            stats = torch.empty((C, _H64_HEADS, splits, 2), dtype=f32, device=dev)
+        if pc["FLAT_ROWS"]:
+            grid = (C * groups * splits,)
+        elif pc["SPLIT_MAJOR_GRID"]:
+            grid = (C, splits, groups)
+        else:
+            grid = (C, groups, splits)
+        _attention_partials[grid](
+            *args, partial, stats, *scales,
+            ROWS=C, SPLITS=splits, BUFFER_CACHE=buffer_cache, **pc,
+        )  # fmt: skip
+        _merge_head_groups[(C, groups, 512 // mc["VALUE_BLOCK"])](
+            partial, stats, *out_args,
+            ROWS=C, SPLITS=splits, HEAD_BLOCK=pc["HEAD_BLOCK"],
+            SPLIT_INNER_SCRATCH=pc["SPLIT_INNER_SCRATCH"],
+            GROUP_STATISTICS=pc["GROUP_STATISTICS"], PRUNE_EMPTY=not buffer_cache,
+            STATS_IN_PARTIAL=pc["STATS_IN_PARTIAL"], **mc,
+        )  # fmt: skip
+        return out
+
+    if cfg["kernel"] == "split":
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8_h64_split import (
+            _attention_merge,
+            _attention_split,
+        )
+
+        record = pc["RECORD_VALUE"]
+        record_args = {"RECORD_VALUE": record, "PACKED_STATS": pc["PACKED_STATS"]}
+    else:
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8_h64_panel import (
+            _attention_merge,
+            _attention_split,
+        )
+
+        record = pc["RECORD_WIDTH"]
+        record_args = {
+            "RECORD_WIDTH": record,
+            "COLOR_STEP": pc["COLOR_STEP"],
+            "PACK_STATS": pc["PACK_STATS"],
+        }
+    tile, splits = pc["HEAD_TILE"], pc["SPLITS"]
+    groups = _H64_HEADS // tile
+    partial = torch.empty((C, groups, splits, record * tile), dtype=f32, device=dev)
+    if pc.get("PACK_STATS"):
+        stats = partial
+    else:
+        stats = torch.empty((C, groups, splits, 2, tile), dtype=f32, device=dev)
+    shape = {"HEADS": _H64_HEADS, "VALUE": 512}
+    _attention_split[(C, groups, splits)](
+        *args, partial, stats, *scales,
+        WIDTH=_H64_ROW, TOPK=_H64_TOPK, CACHE_BUFFER=buffer_cache,
+        allow_flush_denorm=True, **shape, **pc,
+    )  # fmt: skip
+    _attention_merge[(C, _H64_HEADS // mc["MERGE_HEADS"], 512 // mc["BC"])](
+        partial, stats, *out_args,
+        SPLITS=splits, RECORD_HEADS=tile, allow_flush_denorm=True,
+        **shape, **record_args, **mc,
+    )  # fmt: skip
+    return out
+
+
 def sparse_mla_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -784,7 +949,11 @@ def sparse_mla_fwd(
         skip_reduce: with split-K active, return (part_acc, part_m, part_l)
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
-            False.
+            False. On gfx950, a 64-head decode with fp8 q, an fp8_scalar
+            cache, fp8 dots and C * 2048 indices (a -1-padded [C, 2048] top-k
+            table) runs dedicated kernels for the C in the
+            "_sparse_mla_fp8_h64" config. There, no row may hold more than
+            2048 indices.
         attn_sink: optional [H] f32 per-head sink: exp(sink) joins the softmax
             denominator (and the LSE) as a virtual key. None means no sink,
             which is not the same as a zero sink.
@@ -960,6 +1129,32 @@ def sparse_mla_fwd(
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
 
     epilogue = inv_rope_positions is not None or out_mxfp8 is not None
+    # gfx950's 64-head fp8 decode for a top-k table with -1 sentinels.
+    if (
+        arch == "gfx950"
+        and fmt == "fp8_scalar"
+        and fp8_dots
+        and q_is_fp8
+        and has_invalid
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and kv_splits is None
+        and not (skip_reduce or return_lse or has_sink or has_extra or epilogue)
+    ):
+        cfg = _h64_decode_config(q, cache, block_size, kv_indices)
+        if cfg is not None:
+            out = _sparse_mla_fwd_gfx950_fp8_h64(
+                q,
+                q_scale,
+                cache,
+                kv_scale,
+                kv_indptr,
+                kv_indices,
+                softmax_scale,
+                out,
+                cfg,
+            )
+            return out, None
     # gfx950's fp8 kernel, where it can address the caches. -1 sentinels and
     # skip_reduce run the generic one, and the epilogue needs the rope inside the
     # row.

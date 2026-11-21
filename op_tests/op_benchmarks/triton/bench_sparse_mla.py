@@ -12,6 +12,8 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 1 --num_tokens 8192
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 64 --metric bandwidth
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
+  python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_heads 64 \
+      --num_seqs 1 2 4 8 12 16 24 32 --has_invalid
 """
 
 import torch
@@ -92,13 +94,21 @@ def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, d_qk=D_QK):
 
 
 def build_case(
-    num_seqs, num_tokens, num_heads, context, topk, d_qk=D_QK, device="cuda"
+    num_seqs,
+    num_tokens,
+    num_heads,
+    context,
+    topk,
+    d_qk=D_QK,
+    device="cuda",
+    padded=False,
 ):
     """Build one launch the way vLLM's sparse-MLA path lays it out.
 
     Every sequence owns its own slice of the pool, so there is no cross-request
     KV sharing to inflate the cache hit rate. Per-token KV length is
-    min(pos + 1, topk), which is what the index converter emits.
+    min(pos + 1, topk), which is what the index converter emits. padded: each
+    token's list is a topk-wide row padded with -1 (has_invalid=True).
     """
     torch.manual_seed(0)
     gen = torch.Generator(device=device).manual_seed(1)
@@ -127,8 +137,11 @@ def build_case(
                 )  # everything fits
             else:
                 sel = torch.randperm(pos + 1, generator=gen, device=device)[:topk]
-            rows.append((sel + base).to(torch.int32))
-            lens.append(sel.numel())
+            row = (sel + base).to(torch.int32)
+            if padded:
+                row = torch.cat([row, row.new_full((topk - row.numel(),), -1)])
+            rows.append(row)
+            lens.append(row.numel())
 
     indices = torch.cat(rows)
     indptr = torch.zeros(len(lens) + 1, dtype=torch.int32, device=device)
@@ -198,7 +211,13 @@ def run_benchmark(args):
         rope = args.qk_rope_head_dim
         d_qk = KV_LORA_RANK + rope
         q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
-            num_seqs, num_tokens, num_heads, context, topk, d_qk=d_qk
+            num_seqs,
+            num_tokens,
+            num_heads,
+            context,
+            topk,
+            d_qk=d_qk,
+            padded=args.has_invalid,
         )
         sm_scale = d_qk**-0.5
         out = torch.empty(
@@ -228,6 +247,7 @@ def run_benchmark(args):
                 qk_rope_head_dim=rope,
                 q_scale=q_scale,
                 dot_precision=dots,
+                has_invalid=args.has_invalid,
                 out=out,
             )
 
@@ -275,6 +295,11 @@ def main():
         type=int,
         default=QK_ROPE_HEAD_DIM,
         help="appended rope width; 0 is the rope-free geometry",
+    )
+    parser.add_argument(
+        "--has_invalid",
+        action="store_true",
+        help="pass each token's indices as a topk-wide row padded with -1",
     )
     parser.add_argument(
         "--no_flush_l2",
