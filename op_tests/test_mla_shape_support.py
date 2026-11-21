@@ -159,6 +159,7 @@ def test_default_96_heads_fold_at_qlen_7_and_8(monkeypatch):
     ).native
 
 
+@requires_gpu
 def test_default_launch_plan_folds_96_heads_under_cprr(monkeypatch):
     # mla_decode_fwd's launch plan takes the fold unless the env opts in, and
     # follows the env var at call time.
@@ -573,6 +574,7 @@ def test_default_metadata_info_sizes_96_heads_for_the_fold(monkeypatch):
         assert on[4][0] == (bs * msq, 2), on
 
 
+@requires_gpu
 def test_metadata_info_sizes_96_heads_for_both_plans():
     # 96 fp8 heads at qlen 7 and 8 run a qo tile per token under round-robin CP
     # and 6 one-tile pseudo-batches without it. get_mla_metadata_info_v1 cannot
@@ -723,12 +725,15 @@ def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
 
 
 @requires_gpu
-def test_default_96_head_cprr_decode_takes_the_fold(monkeypatch):
+@pytest.mark.parametrize("backend", [MlaBackend.ASM, MlaBackend.OPUS])
+def test_default_96_head_cprr_decode_takes_the_fold(monkeypatch, backend):
     # Without the opt-in, round-robin CP at qlen 7 and 8 runs main's folded path
     # (planned with or without is_cp_round_robin) and matches the reference.
     if get_gfx() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    if backend is MlaBackend.OPUS:
+        monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
     folds = []
     fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
 

@@ -92,18 +92,13 @@ enum class OpusA8W8Route
     kNone,
 };
 
-// Opt-in AITER_MLA_NATIVE_96H_CP: 96 fp8 heads at qlen 7 and 8 stay native under round-robin CP.
-inline bool opus_native_96h_cp_enabled()
-{
-    const char* v = std::getenv("AITER_MLA_NATIVE_96H_CP");
-    return v != nullptr && std::atoi(v) != 0;
-}
-
 inline OpusA8W8Route opus_a8w8_route(int nhead, int max_seqlen_q)
 {
     const int q = max_seqlen_q;
+    // 96 heads up to qlen 8 is kernel capability; the planner (AITER_MLA_NATIVE_96H_CP)
+    // decides whether they arrive unfolded.
     if((nhead == 32 && q >= 4) || (nhead == 64 && q >= 2) || nhead == 128 ||
-       (nhead == 96 && (q <= 6 || (q <= 8 && opus_native_96h_cp_enabled()))) || (nhead == 16 && q > 4) || (nhead == 12 && nhead * q <= 128))
+       (nhead == 96 && q <= 8) || (nhead == 16 && q > 4) || (nhead == 12 && nhead * q <= 128))
         return OpusA8W8Route::k32mx4;
     if((nhead == 16 && (q == 3 || q == 4)) || (nhead == 32 && (q == 2 || q == 3)) ||
        (nhead == 64 && q == 1))

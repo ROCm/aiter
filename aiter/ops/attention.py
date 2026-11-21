@@ -2341,7 +2341,7 @@ def get_mla_metadata_info_v1(
         5. Shape of reduce_final_map followed by its scalar type.
         6. Shape of reduce_partial_map followed by its scalar type.
     """
-    # Sizing is a pure function of the arguments, the arch and two env flags;
+    # Sizing is a pure function of the arguments, the arch and three env flags;
     # cache it, since callers can ask on every step.
     return _mla_metadata_info_v1_cached(
         int(batch_size),
