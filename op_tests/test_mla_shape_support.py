@@ -194,6 +194,13 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(32, 4, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     assert support(32, 4, flydsl_ps1=True).fold_factor == 1
     assert support(16, 5, flydsl_ps1=True).backend is MlaBackend.ASM
+    # Past 128 rows, 32/64 heads take the query as several planner qo tiles
+    # (64 x 4 -> two 2-row tiles) up to qlen 8, unfolded and on FlyDSL JIT (no
+    # code object at those head counts); qlen 9 is past the kernel's bound.
+    for n, q in ((64, 3), (64, 4), (64, 8), (32, 5), (32, 8)):
+        s = support(n, q, flydsl_ps1=True)
+        assert (s.backend, s.fold_factor) == (MlaBackend.FLYDSL_PS1, 1), (n, q)
+    assert support(64, 9, flydsl_ps1=True).backend is MlaBackend.ASM
     bf16 = torch.bfloat16
     for n in (64, 128):
         s = get_mla_decode_shape_support(
@@ -227,11 +234,10 @@ def test_decode_num_heads(monkeypatch):
         )
 
     # A head count that runs is kept; one that does not pads to the next that
-    # does: PS1 takes a multi-token query at 16/32/64 heads only while it fits
-    # one qo tile (16 and 32 heads up to qlen 4, 64 heads up to qlen 2), and
-    # 96 heads at any qlen.
-    assert [heads(16, q) for q in (1, 4, 5)] == [16, 16, 96]
-    assert [heads(64, q) for q in (2, 3, 9)] == [64, 96, 96]
+    # does: 16 heads take a multi-token query on PS1 only up to qlen 4, 32/64
+    # up to qlen 8 as several qo tiles, 96 at any qlen.
+    assert [heads(16, q) for q in (1, 4, 5)] == [16, 16, 32]
+    assert [heads(64, q) for q in (2, 8, 9)] == [64, 64, 96]
     assert heads(65, 1) == 96
     # A folded PS1 route does not run: fast_mode=False folds 64 heads by 4 and
     # 96 by 6, so the first unfolded count is 128.
