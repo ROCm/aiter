@@ -1037,6 +1037,15 @@ class TunerCommon:
             "cu_num": self.get_cu_num,
         }
 
+    def _rows_for_this_gpu(self, tunedf):
+        """``tunedf``'s rows keyed on this GPU, on every field ``_live_hardware``
+        names that the table has."""
+        for field, resolve in self._live_hardware().items():
+            if field in tunedf.columns:
+                live = _key_text(resolve())
+                tunedf = tunedf[tunedf[field].map(_key_text) == live]
+        return tunedf
+
     def _hardware_mismatch(self, row) -> str:
         """Why ``row`` cannot be verified here, or "": the child keys on its own
         device, as serving does, so a row keyed on other hardware would miss."""
@@ -2004,12 +2013,7 @@ class TunerCommon:
         if args.run_config and run_config_file:
             tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
-                cu = self.get_cu_num()
-                gfx = self.get_gfx()
-                if "gfx" in tunedf.columns:
-                    tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
-                if "cu_num" in tunedf.columns:
-                    tunedf = tunedf[tunedf["cu_num"] == cu]
+                tunedf = self._rows_for_this_gpu(tunedf)
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True
                 )
