@@ -40,6 +40,16 @@ groups of the MFMA output. Two permlane32 swaps and one permlane16 swap reduce
 four tiles at once and leave group ``g`` holding tile ``g``'s total, which is
 key ``4 l + g`` (page 8) or ``16 g + l`` (page 64): one dword store covers the
 wave's 64 keys.
+
+Options (off by default; head_dim 128, 64-slot pages, plane output):
+
+- abs_epilogue: sum_h w_h relu(s_h) = 1/2 sum_h w_h |s_h| + q' . k with
+  q' = 1/2 sum_h w_h q_h: one v_fma_f32 with |s| a source modifier a
+  (row, key, head) instead of an add and an fma. q' . k comes off
+  ABS_LIN_MFMAS extra MFMAs a tile on FP4 residual pieces of q' (`_abs_q_lin`),
+  so it is approximate (typically ~1e-6 of the row maximum).
+- tile_max: also store each row's 16-key tile maxima (group g's 16 lanes are
+  one tile), for a top-k that skips tiles below its k-th best.
 """
 
 from __future__ import annotations
@@ -50,6 +60,8 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from flydsl.expr import math as fmath
@@ -77,6 +89,12 @@ _DROPPED_KEY = 1 << 28
 # buffer cache_modifier: nontemporal (streams past the caches)
 CM_NT = 2
 SUPPORTED_PAGE_SIZES = (8, 64)
+# abs_epilogue: extra MFMAs a tile for q' . k (4 FP4 pieces of q' each; one
+# MFMA's pieces are too coarse for the top-k), and the rows a wave can hold
+# (A row 4 p + r is piece p of row r)
+ABS_LIN_MFMAS = 2
+ABS_MAX_ROWS_PER_WAVE = 4
+TILE_MAX_KEYS = 16
 
 
 def page_bytes(page_size: int, head_dim: int) -> tuple[int, int]:
@@ -139,6 +157,111 @@ def pack_q_scales(q_e8m0: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(qe, (0, qs_pad - m_tiles)).contiguous()
 
 
+@triton.jit
+def _e2m1_val(c):
+    m = c & 7
+    man = (m & 1).to(tl.float32)
+    e = m >> 1
+    v = tl.where(e == 0, man * 0.5, (1.0 + man * 0.5) * (1 << tl.maximum(e - 1, 0)))
+    return tl.where((c & 8) != 0, -v, v)
+
+
+@triton.jit
+def _e2m1_code(x):
+    """The nearest e2m1 code of x, |x| <= 6."""
+    a = tl.abs(x)
+    cd = (
+        (a >= 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32)
+        + (a >= 1.25).to(tl.int32) + (a >= 1.75).to(tl.int32)
+        + (a >= 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32)
+        + (a >= 5.0).to(tl.int32)
+    )  # fmt: skip
+    return tl.where((x < 0) & (cd > 0), cd | 8, cd)
+
+
+@triton.jit
+def _pow2(e):
+    return ((e + 127) << 23).to(tl.float32, bitcast=True)
+
+
+# rows varies with the caller's row chunk: unspecialized, so one compile serves all
+@triton.jit(do_not_specialize=["rows"])
+def _abs_q_lin_kernel(
+    q_ptr,
+    qs_ptr,
+    w_ptr,
+    ql_ptr,
+    qls_ptr,
+    rows,
+    half_scale,
+    H: tl.constexpr,
+    QS_ROW: tl.constexpr,
+    NP: tl.constexpr,
+    RB: tl.constexpr,
+):
+    """RB rows a program: q' as even / odd element planes [RB, 4 blocks, 16],
+    then NP pieces, piece p the FP4 rounding of what pieces 0 .. p-1 left."""
+    r1 = tl.program_id(0).to(tl.int64) * RB + tl.arange(0, RB)
+    live = r1 < rows
+    r, lv = r1[:, None, None], live[:, None, None]
+    c = tl.arange(0, 4)[None, :, None]
+    i = tl.arange(0, 16)[None, None, :]
+    ev = tl.zeros((RB, 4, 16), dtype=tl.float32)
+    od = tl.zeros((RB, 4, 16), dtype=tl.float32)
+    # unrolled 8 heads deep, not H: compiles in ~1.7 s, not 20-75 s; same sum order
+    for h in tl.range(H, loop_unroll_factor=8):
+        byt = tl.load(q_ptr + (r * H + h) * 64 + c * 16 + i, mask=lv, other=0)
+        byt = byt.to(tl.int32)
+        # pack_q_scales: [rows, 4 (block), 16 (head % 16), QS_ROW / 64]
+        sc = tl.load(
+            qs_ptr + r * QS_ROW + c * (QS_ROW // 4) + (h % 16) * (QS_ROW // 64) + h // 16,
+            mask=lv, other=0,
+        ).to(tl.int32)  # fmt: skip
+        w = tl.load(w_ptr + r * H + h, mask=lv, other=0).to(tl.float32)
+        f = w * half_scale * (sc << 23).to(tl.float32, bitcast=True)
+        ev += _e2m1_val(byt & 15) * f
+        od += _e2m1_val(byt >> 4) * f
+    c1 = tl.arange(0, 4)[None, :]
+    for p in tl.static_range(NP):
+        amax = tl.maximum(tl.max(tl.abs(ev), axis=2), tl.max(tl.abs(od), axis=2))
+        # the least exponent with amax <= 6 * 2**ex: amax's exponent - 2, + 1
+        # when its mantissa is over 1.5
+        bits = amax.to(tl.int32, bitcast=True)
+        ex = ((bits >> 23) & 255) - 129 + ((bits & 0x7FFFFF) > 0x400000).to(tl.int32)
+        ex = tl.maximum(tl.minimum(ex, 126), -126)
+        ce = _e2m1_code(ev * _pow2(-ex)[:, :, None])
+        co = _e2m1_code(od * _pow2(-ex)[:, :, None])
+        ev -= _e2m1_val(ce) * _pow2(ex)[:, :, None]
+        od -= _e2m1_val(co) * _pow2(ex)[:, :, None]
+        tl.store(
+            ql_ptr + (r * NP + p) * 64 + c * 16 + i, (ce | (co << 4)).to(tl.uint8),
+            mask=lv,
+        )  # fmt: skip
+        tl.store(
+            qls_ptr + (r1[:, None] * NP + p) * 4 + c1, (ex + 127).to(tl.uint8),
+            mask=live[:, None],
+        )  # fmt: skip
+
+
+def _abs_q_lin(q_fp4, q_scale, weights, weight_scale):
+    """abs_epilogue's q' = 1/2 weight_scale sum_h w_h q_h of each row as
+    4 * ABS_LIN_MFMAS FP4 pieces: [rows, pieces, 64] u8 e2m1 (element 2 i the
+    low nibble) and [rows, pieces, 4] u8 e8m0, one a 32-element block."""
+    rows, heads, _ = q_fp4.shape
+    qs = q_scale.view(torch.uint8).reshape(rows, -1)
+    assert qs.shape[1] == 64 * -(-heads // (4 * MFMA_M)) * 4, qs.shape
+    pieces = 4 * ABS_LIN_MFMAS
+    ql = torch.empty((rows, pieces, 64), dtype=torch.uint8, device=q_fp4.device)
+    qls = torch.empty((rows, pieces, 4), dtype=torch.uint8, device=q_fp4.device)
+    if rows:
+        rb = 16
+        _abs_q_lin_kernel[(triton.cdiv(rows, rb),)](
+            q_fp4, qs, weights, ql, qls, rows, 0.5 * weight_scale,
+            H=heads, QS_ROW=qs.shape[1], NP=pieces, RB=rb, num_warps=4,
+        )  # fmt: skip
+    return ql, qls
+
+
 def _permlane_swap(swap, x, y):
     """v_permlane{32,16}_swap on f32 registers -> (x', y')."""
     pair = swap(
@@ -197,6 +320,19 @@ def _addr_i32_buffer(addr, width=1, records=None):
         return fx.rocdl.make_buffer_tensor(fx.make_view(it, lay))
     return fx.rocdl.make_buffer_tensor(
         fx.make_view(it, lay), max_size=False, num_records_bytes=fx.Int64(records)
+    )
+
+
+def _f32_window(addr, n):
+    """f32 buffer-tensor of ``n`` elements at ``addr``: a store past them is
+    dropped."""
+    return fx.rocdl.make_buffer_tensor(
+        fx.make_view(
+            fx.inttoptr(fx.PointerType.get(T.f32, fx.AddressSpace.Global, 4), addr),
+            fx.make_layout((n, 1), (1, 1)),
+        ),
+        max_size=False,
+        num_records_bytes=n * fx.Int32(4),
     )
 
 
@@ -320,6 +456,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     wave_min_steps: int = 2,
     pages_per_block: int = 1,
     packed_out: bool = False,
+    abs_epilogue: bool = False,
+    tile_max: bool = False,
 ):
     """The MQA as a GEMM: M a sequence's query rows (query_start_loc's, any
     count, 0 included) times the heads, cut into tiles of ``tile_m`` (whole
@@ -329,8 +467,12 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     ``rows_per_wave`` rows a wave. ``pages_per_block``: a block-table entry
     names that many consecutive pages (its first's id divided by it).
     ``packed_out``: row r's logits at element ``out_offsets[r]`` of a flat out
-    rather than at ``r * stride_out``."""
+    rather than at ``r * stride_out``. ``abs_epilogue`` / ``tile_max``: the
+    module docstring's options; tile maxima rows are stride_out / 16 apart."""
     assert page_size in SUPPORTED_PAGE_SIZES, page_size
+    assert not (abs_epilogue or tile_max) or (
+        page_size == STEP_KEYS and not packed_out
+    ), "abs_epilogue / tile_max: 64-slot pages, plane output"
     assert heads % MFMA_M == 0 and heads // MFMA_M <= 8, heads
     assert head_dim % 128 == 0, head_dim
     assert tile_m % heads == 0, (tile_m, heads)
@@ -340,6 +482,12 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128
     rows = rows_per_wave
+    assert not abs_epilogue or (rows <= ABS_MAX_ROWS_PER_WAVE and k_tiles == 1), (
+        "abs_epilogue: head_dim 128, at most 4 rows a wave (prefill plan)",
+        rows,
+        head_dim,
+    )
+    lin_mfmas = ABS_LIN_MFMAS if abs_epilogue else 0
     row_groups = tile_rows // rows
     assert num_warps % row_groups == 0, (num_warps, row_groups)
     # waves walking a row group's keys, each taking every streams-th step
@@ -368,7 +516,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     row_item_words = (
         [4] * (k_tiles * m_tiles) + [1] * (k_tiles * qs_dw)
         + ([1, 1] if weights_bf16 else [4]) * m_tiles
-    ) * rows  # fmt: skip
+    ) * rows + [4, 1] * lin_mfmas  # fmt: skip
     rows_lds_bytes = row_groups * sum(row_item_words) * WARP_SIZE * 4
 
     @flyc.kernel
@@ -390,6 +538,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         batch: Int32,
         base_slots: Int32,  # the grid's workgroups, at least one a sequence
         max_steps: Int32,  # steps of max_seq_len
+        ql_ptr: fx.Int64,  # [rows, 4 lin_mfmas, 64] u8 q' pieces (abs_epilogue)
+        qls_ptr: fx.Int64,  # [rows, 4 lin_mfmas, 4] u8 their e8m0 scales
+        tmax_ptr: fx.Int64,  # [rows, stride_out / 16] f32 (tile_max)
     ):
         # Raw addresses, and every argument read before anything else: LLVM
         # loads an argument where it is first used, so arguments met along
@@ -399,6 +550,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             out_ptr, q_ptr, qs_ptr, kv_ptr, kvs_ptr, bt_ptr, w_ptr, ends_ptr,
             qsl_ptr, stride_out, weight_scale, last_page, batch,
             base_slots, max_steps, *((off_ptr,) if packed_out else ()),
+            *((ql_ptr, qls_ptr) if lin_mfmas else ()),
+            *((tmax_ptr,) if tile_max else ()),
         )  # fmt: skip
         tid = gpu.thread_idx.x
         # (one allocator a kernel: the workgroup's shared assignment and rows)
@@ -595,6 +748,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         q_bt = _addr_i32_buffer(q_ptr, width=4)
         qs_bt = _addr_i32_buffer(qs_ptr)
         w_bt = _addr_i32_buffer(w_ptr, width=1 if weights_bf16 else 4)
+        if fx.const_expr(lin_mfmas > 0):
+            ql_bt = _addr_i32_buffer(ql_ptr, width=4)
+            qls_bt = _addr_i32_buffer(qls_ptr)
         n0 = (warp % row_groups) * rows
 
         def seq_rows(seq, tile):
@@ -640,6 +796,13 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                             raw.append(fx.Int32(w_bt[head0 // 2 + i]))
                     else:
                         raw.append(_load_vec4_i32(w_bt, head0))
+            if fx.const_expr(lin_mfmas > 0):
+                # extra MFMA j, A row l = 4 p + r: piece 4 j + p of row r
+                row_l = row_of(first, count, n0 + (l & fx.Int32(3)))
+                for j in range_constexpr(lin_mfmas):
+                    piece = row_l * fx.Int32(4 * lin_mfmas) + fx.Int32(4 * j) + (l >> 2)
+                    raw.append(_load_vec4_i32(ql_bt, piece * fx.Int32(16) + g * 4))
+                    raw.append(fx.Int32(qls_bt[piece]))
             return raw
 
         def read_row_ends(seq, tile):
@@ -1048,6 +1211,13 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         half = weight_scale * 0.5
                         w_r.append([w4[e] * half for e in range(4)])
                     w_lane.append(w_r)
+                ql_ops, ql_scales = [], []
+                raw = (rows_raw if streams == 1 else lds_rows)[rows * per_row :]
+                for j in range_constexpr(lin_mfmas):
+                    frag = fx.make_rmem_tensor(4, fx.Int32)
+                    frag.store(fx.Vector(raw[2 * j]))
+                    ql_ops.append(frag)
+                    ql_scales.append(fx.Int32(raw[2 * j + 1]) >> (g * fx.Int32(8)))
 
                 # ---- each row's exclusive key bound, and the wave's walk ----
                 # Read after every load above is out: the walk length waits on these
@@ -1093,22 +1263,19 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         if packed_out
                         else fx.Int64(row0 + r) * fx.Int64(stride_out)
                     )
-                    row_addr = out_ptr + first * 4
-                    out_wins.append(
-                        fx.rocdl.make_buffer_tensor(
-                            fx.make_view(
-                                fx.inttoptr(
-                                    fx.PointerType.get(
-                                        T.f32, fx.AddressSpace.Global, 4
-                                    ),
-                                    row_addr,
-                                ),
-                                fx.make_layout((ends[r], 1), (1, 1)),
-                            ),
-                            max_size=False,
-                            num_records_bytes=ends[r] * fx.Int32(4),
+                    out_wins.append(_f32_window(out_ptr + first * 4, ends[r]))
+
+                tm_wins = []
+                if fx.const_expr(tile_max):
+                    # a row's ceil(end / 16) tiles
+                    tm_stride = fx.Int64(stride_out >> fx.Int32(4))
+                    tm_wins = [
+                        _f32_window(
+                            fx.Int64(tmax_ptr) + fx.Int64(row0 + r) * tm_stride * 4,
+                            (ends[r] + fx.Int32(TILE_MAX_KEYS - 1)) >> fx.Int32(4),
                         )
-                    )
+                        for r in range(rows)
+                    ]
 
                 zero4 = fx.full(4, 0.0, fx.Float32)
 
@@ -1144,12 +1311,28 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                                 )
                             acc_r.append(acc)
                         accs.append(acc_r)
+                    if fx.const_expr(lin_mfmas > 0):
+                        acc = fx.make_rmem_tensor(4, fx.Float32)
+                        acc.store(zero4)
+                        for j in range_constexpr(lin_mfmas):
+                            fx.gemm(
+                                mfma_atom,
+                                acc,
+                                ql_ops[j],
+                                b_frags[0],
+                                acc,
+                                scale_a=ql_scales[j],
+                                scale_b=kv_scales[0],
+                            )
+                        accs.append(acc)
                     rocdl.s_setprio(0)
                     return accs
 
                 def head_sums(accs):
                     """sum_h w_h relu(logit_h) over this lane's heads, every row: one
                     fma chain per row, which is also the lane's fold over its heads."""
+                    if fx.const_expr(abs_epilogue):
+                        return head_sums_abs(accs)
                     sums = []
                     for r in range_constexpr(rows):
                         total = None
@@ -1166,21 +1349,49 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         sums.append(total)
                     return sums
 
+                def head_sums_abs(accs):
+                    """q' . k + sum_h w_h/2 |s_h| a row, one v_fma_f32 a head. The
+                    first read of an MFMA result is compiled, so LLVM places the
+                    MFMA -> VALU waits; the asm rest is element-major over the rows,
+                    as an asm op reading the previous one's result costs an s_nop."""
+                    lin = fx.Vector(accs[rows].load())
+                    totals = [fx.Float32(lin[r]) for r in range(rows)]
+                    logits = [
+                        [fx.Vector(accs[r][mi].load()) for mi in range(m_tiles)]
+                        for r in range(rows)
+                    ]
+                    for mi in range_constexpr(m_tiles):
+                        for e in range_constexpr(4):
+                            for r in range_constexpr(rows):
+                                w, x = w_lane[r][mi][e], logits[r][mi][e]
+                                if fx.const_expr(e == 0):
+                                    a = fx.Float32(fmath.absf(fx.Float32(x)))
+                                    totals[r] = fx.Float32(fmath.fma(a, w, totals[r]))
+                                else:
+                                    totals[r] = _vop(
+                                        "v_fma_f32 $0, |$1|, $2, $3", x, w, totals[r]
+                                    )
+                    return totals
+
                 def compute_step(kv, kvs, st, after_mfmas):
                     # A tile's sums follow its own MFMAs: the first rows' products are
                     # done by the time the last rows' are issued. Holding a second
                     # tile's accumulators, to overlap one tile's sums with the next
                     # one's MFMAs, measured no faster and costs the registers that let
-                    # a 6-row wave prefetch two steps at two waves a SIMD.
-                    per_tile = []
-                    for nt in range_constexpr(TILES):
-                        accs = tile_mfmas(kv, kvs, nt)
+                    # a 6-row wave prefetch two steps at two waves a SIMD. The |s|
+                    # epilogue's sums are short enough to go behind the next tile's.
+                    ahead = 1 if abs_epilogue else 0
+                    per_tile, accs = [], []
+                    for nt in range_constexpr(TILES + ahead):
+                        if nt < TILES:
+                            accs.append(tile_mfmas(kv, kvs, nt))
                         if nt == TILES - 1:
                             # the step's keys are read: their registers can refill
                             rocdl.sched_barrier(0)
                             after_mfmas()
                             rocdl.sched_barrier(0)
-                        per_tile.append(head_sums(accs))
+                        if nt >= ahead:
+                            per_tile.append(head_sums(accs[nt - ahead]))
                     # group g holds tile g: key 4 l + g lane-major, 16 g + l tile-major
                     if fx.const_expr(lane_major):
                         key = st * fx.Int32(STEP_KEYS) + l * 4 + g
@@ -1195,6 +1406,20 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         x, y = _permlane_swap(rocdl.permlane16_swap, lo, hi)
                         total = _add(x, y)  # group g: tile g
                         store_logit(out_wins[r], key, total)
+                        if fx.const_expr(tile_max):
+                            # max over the group's 16 lanes (one DPP row): xor 1,
+                            # xor 2, then the half-row and row mirrors
+                            v = total
+                            for ctrl in (
+                                "quad_perm:[1,0,3,2]",
+                                "quad_perm:[2,3,0,1]",
+                                "row_half_mirror",
+                                "row_mirror",
+                            ):
+                                v = _vop(
+                                    f"s_nop 1\n\tv_max_f32_dpp $0, $1, $2 {ctrl}", v, v
+                                )
+                            store_logit(tm_wins[r], key >> fx.Int32(4), v)
 
                 # whole trips in the loop, the last count % depth steps after it: a
                 # trip's steps past the walk would be computed and dropped
@@ -1309,6 +1534,8 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     wave_min_steps: int,
     pages_per_block: int,
     packed_out: bool = False,
+    abs_epilogue: bool = False,
+    tile_max: bool = False,
 ):
     kfn, row_groups = build_pa_mqa_logits_fp4_rowgroup_module(
         page_size=page_size,
@@ -1327,6 +1554,8 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         wave_min_steps=wave_min_steps,
         pages_per_block=pages_per_block,
         packed_out=packed_out,
+        abs_epilogue=abs_epilogue,
+        tile_max=tile_max,
     )
     block_threads = num_warps * WARP_SIZE
 
@@ -1348,12 +1577,15 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         batch: fx.Int32,
         base_slots: fx.Int32,
         max_steps: fx.Int32,
+        ql: fx.Int64,
+        qls: fx.Int64,
+        tmax: fx.Int64,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
         kfn(
             out, off, q, qs, kv, kvs, bt, w, ends, qsl, stride_out,
-            weight_scale, last_page, batch, base_slots, max_steps,
+            weight_scale, last_page, batch, base_slots, max_steps, ql, qls, tmax,
         ).launch(
             grid=(fx.Int64(grid_x), 1, 1),
             block=(block_threads, 1, 1),
@@ -1549,12 +1781,14 @@ def make_fp4_mqa_plan(
     kv_nt: bool | None = None,
     wave_min_steps: int = 2,
     out_nt: bool = False,
+    prefill: bool = False,
 ) -> Fp4MqaPlan:
     """The launch for ``num_seqs`` sequences of at most ``max_qlen`` query
     rows, ``num_rows`` in all, of ``heads`` heads against keys on
     ``page_size``-row pages up to ``max_seq_len``: the M tile from
     TILE_ROWS, the rest defaulted from the shape (the default_* functions)
-    unless given."""
+    unless given. ``prefill`` (long prompts, and abs_epilogue): at most
+    ABS_MAX_ROWS_PER_WAVE rows a wave in 4-wave workgroups."""
     assert page_size in SUPPORTED_PAGE_SIZES, page_size
     tile_rows = next((t for t in TILE_ROWS if t >= max_qlen), TILE_ROWS[-1])
     # the M tiles there can be
@@ -1562,6 +1796,13 @@ def make_fp4_mqa_plan(
         1,
         min(num_seqs * -(-max_qlen // tile_rows), -(-num_rows // tile_rows) + num_seqs),
     )
+    if prefill:
+        # at most 256 (row, head) pairs a wave: 128 heads at 3-4 rows spill
+        cap = min(ABS_MAX_ROWS_PER_WAVE, 256 // heads)
+        rows_per_wave = rows_per_wave or max(
+            r for r in range(1, cap + 1) if tile_rows % r == 0
+        )
+        num_warps = num_warps or 4
     rows = rows_per_wave or default_rows_per_wave(tile_rows, heads, tiles, max_seq_len)
     # a workgroup holds every row group of its tile; light waves go alone
     # (see default_workgroups)
@@ -1619,6 +1860,8 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     weight_scale: float = 1.0,
     out: torch.Tensor | None = None,
     out_offsets: torch.Tensor | None = None,
+    abs_epilogue: bool = False,
+    out_tile_max: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Logits of every query row against its sequence's keys, from 8- or
@@ -1645,6 +1888,11 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
                     element out_offsets[r] (each row as long as its bound;
                     the caller keeps the spans apart). Starts on a 256-byte
                     boundary store as fast as the plane's rows.
+    abs_epilogue    score with the |s| epilogue (module docstring; a plan of
+                    at most ABS_MAX_ROWS_PER_WAVE rows a wave, e.g. prefill=True)
+    out_tile_max    [rows, out.stride(0) / 16] f32: also each row's 16-key
+                    tile maxima, a row's last partial tile including the keys
+                    past its bound
 
     Work is shared out by length, a long sequence's M tiles getting more
     workgroups than a short one's, by each workgroup from the lengths: no
@@ -1686,6 +1934,8 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         wave_min_steps=plan.wave_min_steps,
         pages_per_block=plan.pages_per_block,
         packed_out=out_offsets is not None,
+        abs_epilogue=abs_epilogue,
+        tile_max=out_tile_max is not None,
     )
     if out_offsets is not None:
         assert out is not None and out.dim() == 1 and out.is_contiguous()
@@ -1704,8 +1954,18 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         assert out.shape[0] >= num_rows and out.shape[1] >= plan.max_seq_len
         assert out.stride(1) == 1
         stride_out = out.stride(0)
+    if out_tile_max is not None:
+        assert out_tile_max.dtype == torch.float32 and out_tile_max.stride(1) == 1
+        assert out_tile_max.stride(0) * TILE_MAX_KEYS == stride_out
+        assert out_tile_max.shape[0] >= num_rows
+        assert out_tile_max.shape[1] * TILE_MAX_KEYS >= plan.max_seq_len
     for t in (q_fp4, q_scale):
         assert t.is_contiguous(), "the kernel addresses its operands as dense"
+    ql, qls = (
+        _abs_q_lin(q_fp4, q_scale, weights[:num_rows], weight_scale)
+        if abs_epilogue
+        else (None, None)
+    )
     _run_compiled(
         launcher,
         out.data_ptr(),
@@ -1724,6 +1984,9 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         batch,
         plan.workgroups,
         -(-plan.max_seq_len // STEP_KEYS),
+        0 if ql is None else ql.data_ptr(),
+        0 if qls is None else qls.data_ptr(),
+        0 if out_tile_max is None else out_tile_max.data_ptr(),
         plan.workgroups,
         stream or torch.cuda.current_stream(),
     )
