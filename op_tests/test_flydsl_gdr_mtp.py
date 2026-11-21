@@ -23,6 +23,8 @@ from aiter.ops.flydsl.linear_attention_kernels import (
     _SUPPORTED_DTYPES,
     _flydsl_gdr_mtp_supported,
     flydsl_gdr_mtp,
+    flydsl_gdr_mtp_hybrid,
+    flydsl_gdr_mtp_rtp,
     flydsl_gdr_mtp_sglang,
 )
 from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
@@ -600,6 +602,41 @@ def test_chain_matches_upstream_across_dtypes(dtype, use_qk_l2norm):
 
 def test_chain_matches_upstream_with_bf16_state():
     _check_chain_case(4, 4, "mixed", state_dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("record_only", [False, True])
+def test_hybrid_request_records_replay_each_checkpoint(record_only):
+    p = _make_problem(2, 3, seed=42, pool_slots=10)
+    # The second row is graph padding. Use request row 3 for batch row 0.
+    reads = torch.tensor([8, 0], device=DEVICE, dtype=torch.int32)
+    rows = torch.tensor([3, 0], device=DEVICE, dtype=torch.int32)
+    inputs = (p.q, p.k, p.v, p.a, p.b, p.dt_bias, p.A_log)
+    expected, actual = torch.empty_like(p.v), torch.empty_like(p.v)
+    checkpoints, pool = p.pool.clone(), p.pool.clone()
+    records = torch.full((4, 3, p.num_v_heads, 3, 128), -2.0, device=DEVICE)
+    flydsl_gdr_mtp_rtp(*inputs, checkpoints, expected, reads, p.chain_indices)
+    flydsl_gdr_mtp_hybrid(
+        *inputs,
+        pool,
+        actual,
+        reads,
+        p.chain_indices,
+        records,
+        record_indices=rows,
+        record_only=record_only,
+    )
+    torch.testing.assert_close(actual[0], expected[0])
+    assert actual[1].count_nonzero() == 0
+    assert (records[:3] == -2).all()
+    state = p.pool[8]
+    for token, slot in enumerate(p.chain_indices[0]):
+        k, u, decay = records[3, token].unbind(1)
+        state = state * decay[:, :1, None] + u[:, :, None] * k[:, None, :]
+        torch.testing.assert_close(state, checkpoints[slot], atol=1e-5, rtol=1e-5)
+    expected_pool = p.pool.clone()
+    if not record_only:
+        expected_pool[p.chain_indices[0, -1]] = checkpoints[p.chain_indices[0, -1]]
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
 
 
 def test_chain_skips_the_null_block():

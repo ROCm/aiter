@@ -585,7 +585,7 @@ def _run_decode(
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
         topk_ids,
         topk_weight,
-        problem.experts,
+        expert_mask.numel() if expert_mask is not None else problem.experts,
         problem.model_dim,
         hidden_states.dtype,
         config.BLOCK_M,
@@ -695,6 +695,29 @@ def run_flydsl_moe_gfx942(
                 f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
             )
     config = Config.from_string(config_string)
+    if expert_mask is not None:
+        # Sorting consumes global routing ids; GEMMs consume local expert ids.
+        # Batch-1/direct and prefill have different routing contracts.
+        if (
+            config.use_prefill
+            or config.use_batch1_algorithm
+            or not 2 <= hidden_states.shape[0] <= 256
+            or w1.dtype != torch.float8_e4m3fnuz
+            or quant_type != QuantType.per_Token
+        ):
+            raise NotImplementedError(
+                "EP requires sorted gfx942 per-token FP8 decode (2..256 rows)"
+            )
+        if (
+            expert_mask.ndim != 1
+            or expert_mask.dtype != torch.int32
+            or expert_mask.device != hidden_states.device
+            or not expert_mask.is_contiguous()
+            or expert_mask.numel() < w1.shape[0]
+        ):
+            raise ValueError(
+                "EP requires a contiguous device int32 binary expert mask"
+            )
     is_bf16 = (
         w1.dtype == torch.bfloat16
         and w2.dtype == torch.bfloat16
@@ -707,7 +730,6 @@ def run_flydsl_moe_gfx942(
     )
     if (
         hidden_states.dtype != torch.bfloat16
-        or expert_mask is not None
         or activation not in (ActivationType.Silu, ActivationType.Swiglu)
         or not (is_bf16 or is_fp8)
     ):

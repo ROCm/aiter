@@ -31,14 +31,19 @@ _gemm_a16w16_repr = make_kernel_repr(
 )
 
 
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
-        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
-        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
-    }
-)
+_a16w16_heuristics_1 = {
+    "EVEN_K": lambda args: (
+        (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+    ),
+    "EVEN_MN": lambda args: (
+        (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0)
+    ),
+}
+
+
+@triton.heuristics(_a16w16_heuristics_1)
 @triton.jit(
     repr=_gemm_a16w16_repr,
     do_not_specialize=["M", "N"],

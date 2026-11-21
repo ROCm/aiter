@@ -28,6 +28,8 @@ __all__ = [
     "flydsl_gdn_decode_varlen",
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
+    "flydsl_gdr_mtp_hybrid",
+    "flydsl_gdr_mtp_rtp",
     "flydsl_gdr_mtp_sglang",
 ]
 
@@ -766,6 +768,8 @@ def _mtp_launch(
     has_tree,
     disable_state_update,
     stream,
+    compact_record=False,
+    record_pool_rows=0,
 ):
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
@@ -833,6 +837,9 @@ def _mtp_launch(
                 has_tree,
                 disable_state_update,
                 min_live_slot=min_live_slot,
+                separate_read=(mode == MTP_MODE_CHAIN and inter_indices is not None),
+                compact_record=compact_record,
+                record_pool_rows=record_pool_rows,
                 **kwargs_,
             )
 
@@ -1304,3 +1311,140 @@ def flydsl_gdn_decode_varlen(
             specialization_key=key,
         )
     return out
+
+
+def _mtp_contiguous_reads(indices):
+    # Torch considers singleton views contiguous even with a non-unit stride.
+    # FlyDSL dynamic memrefs require a unit-stride axis; this view preserves
+    # the same single element and adds no device copy on the graph path.
+    result = indices.contiguous()
+    if result.stride(0) != 1:
+        result = result.as_strided(result.shape, (1,))
+    return result
+
+
+def flydsl_gdr_mtp_rtp(
+    query,
+    key,
+    value,
+    a,
+    b,
+    dt_bias,
+    A_log,
+    state,
+    out,
+    read_indices,
+    write_indices,
+    use_qk_l2norm=True,
+    stream=None,
+):
+    """Chain verify with independent read slots and a checkpoint per candidate."""
+    _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out)
+    _require_index("read_indices", read_indices, query, dims=1)
+    _require_index(
+        "write_indices",
+        write_indices,
+        query,
+        dims=2,
+        layout="[batch, token]",
+        covers=True,
+    )
+    _mtp_launch(
+        mode=MTP_MODE_CHAIN,
+        query=query,
+        key=key,
+        value=value,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        A_log=A_log,
+        state=state,
+        out=out,
+        state_indices=write_indices.contiguous(),
+        num_accepted=None,
+        inter_indices=_mtp_contiguous_reads(read_indices),
+        parent_tokens=None,
+        inter_buffer=None,
+        use_qk_l2norm=use_qk_l2norm,
+        min_live_slot=0,
+        has_tree=False,
+        disable_state_update=False,
+        stream=_mtp_stream(query, stream),
+    )
+
+
+def flydsl_gdr_mtp_hybrid(
+    q,
+    k,
+    v,
+    a,
+    b,
+    bias,
+    alog,
+    state,
+    out,
+    reads,
+    writes,
+    record,
+    record_indices=None,
+    record_only=False,
+):
+    """Save FP32 records; optionally omit every persistent SSM write."""
+    _mtp_common_checks(q, k, v, a, b, bias, alog, state, out)
+    if state.dtype != torch.float32 or state.shape[-2:] != (128, 128):
+        raise ValueError("Hybrid replay requires FP32 128x128 state")
+    indexed = record_indices is not None
+    if type(record_only) is not bool or (record_only and not indexed):
+        raise ValueError(
+            "Record-only verify requires a bool flag and request-owned indexed records"
+        )
+    expected_record_shape = (
+        (record.size(0) if indexed and record.ndim else q.size(0)),
+        q.shape[1],
+        v.shape[-2],
+        3,
+        128,
+    )
+    if (
+        record.shape != expected_record_shape
+        or record.dtype != torch.float32
+        or not record.is_contiguous()
+        or record.device != q.device
+    ):
+        raise ValueError("Invalid hybrid replay record buffer")
+    if indexed:
+        _require_index("record_indices", record_indices, q, dims=1)
+        if (
+            record_indices.shape != (q.shape[0],)
+            or not record_indices.is_contiguous()
+            or record.shape[0] < 1
+        ):
+            raise ValueError(
+                "Indexed hybrid records require contiguous request-pool row IDs"
+            )
+    _require_index("reads", reads, q, dims=1)
+    _require_index("writes", writes, q, dims=2, layout="[batch, token]", covers=True)
+    _mtp_launch(
+        mode=MTP_MODE_CHAIN,
+        query=q,
+        key=k,
+        value=v,
+        a=a,
+        b=b,
+        dt_bias=bias,
+        A_log=alog,
+        state=state,
+        out=out,
+        state_indices=writes,
+        num_accepted=None,
+        inter_indices=_mtp_contiguous_reads(reads),
+        parent_tokens=_mtp_contiguous_reads(record_indices) if indexed else None,
+        inter_buffer=record,
+        use_qk_l2norm=True,
+        min_live_slot=1 if indexed else 0,
+        has_tree=False,
+        disable_state_update=record_only,
+        stream=_mtp_stream(q, None),
+        compact_record=True,
+        record_pool_rows=record.shape[0] if indexed else 0,
+    )
