@@ -142,8 +142,14 @@ def _run_in_hang_guard(worker, args, label):
                 kind, payload = progress.get(timeout=1.0)
             except queue.Empty:
                 if not proc.is_alive():
-                    break
-                continue
+                    # The child may have queued its last messages and exited
+                    # between the get and this check: drain them before giving up.
+                    try:
+                        kind, payload = progress.get(timeout=1.0)
+                    except queue.Empty:
+                        break
+                else:
+                    continue
             deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
             if kind == "start":
                 current = payload
@@ -804,6 +810,11 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
         errs = _compare_moe_sorting_outputs(ref, out, topk, token)
         bad = {name: err for name, err in errs.items() if err}
         assert not bad, f"CK moe_sorting mismatch at {case}: {bad}"
+        # The comparator's 1% rtol would accept a count of 257 for 256 or expert
+        # id 801 for 800; both steer the GEMM, so compare them exactly here.
+        assert torch.equal(out[3][:1], ref[3][:1]), f"num_valid_ids at {case}"
+        used = ref[2] != -1
+        assert torch.equal(out[2][used], ref[2][used]), f"expert ids at {case}"
         case["err"] = max(errs.values())
         progress.put(("row", case))
 
@@ -824,8 +835,8 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
             16,
             dispatch_policy=1,
         )
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        assert "CK rejected" in str(exc), f"unexpected RuntimeError: {exc}"
     else:
         raise AssertionError("CK moe_sorting accepted a shape it rejects")
     progress.put(("done", None))
