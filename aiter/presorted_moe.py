@@ -22,11 +22,18 @@ def aux_sort_capacity(M, topk, num_experts, block_m):
     return (routes + active * (block_m - 1) + block_m - 1) // block_m * block_m
 
 
+def _span_nbytes(t):
+    """Bytes from t's first element to one past its last; nbytes if contiguous."""
+    if t.numel() == 0:
+        return 0
+    last = sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
+
+
 def bytes_overlap(a, b):
-    return (
-        a.data_ptr() < b.data_ptr() + b.nbytes
-        and b.data_ptr() < a.data_ptr() + a.nbytes
-    )
+    a_end = a.data_ptr() + _span_nbytes(a)
+    b_end = b.data_ptr() + _span_nbytes(b)
+    return a.data_ptr() < b_end and b.data_ptr() < a_end
 
 
 # Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
