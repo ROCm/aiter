@@ -26,6 +26,16 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
                   const float routed_scaling_factor            = 1.,
                   std::optional<aiter_tensor_t> num_valid_rows = std::nullopt);
 
+// Whether biased_grouped_topk runs this shape and these dtypes (AiterDtype ids)
+// on topk_reg_mw_kernel, given topk_grp == num_expert_group and a row pitch
+// that is a multiple of 4. gfx1250 only. device_id < 0 asks about the current
+// device.
+bool topk_reg_mw_supports(int64_t num_experts,
+                          int64_t topk,
+                          int64_t gating_dtype,
+                          int64_t bias_dtype,
+                          int64_t device_id = -1);
+
 void moe_fused_gate(const aiter_tensor_t& input,
                     const aiter_tensor_t& bias,
                     const aiter_tensor_t& topk_weights,
