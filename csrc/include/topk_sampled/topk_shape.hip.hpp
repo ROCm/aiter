@@ -78,15 +78,15 @@ __host__ inline int geometry_k_ragged(int K, int N) { return K < N ? K : N; }
 
 // gfx950 occupancy inputs for the small_n launch geometry. SMALL_N_STATIC_LDS is
 // the kernel's static __shared__ footprint, read off .group_segment_fixed_size
-// with the dynamic row buffer excluded.
+// with the dynamic row buffer excluded. The CU count is not among them: gfx950
+// ships with 256 and 128 CUs, so it comes from the device as cu.
 constexpr int LDS_BYTES_PER_CU    = 160 * 1024;
-constexpr int CU_COUNT            = 256;
 constexpr int TARGET_WAVES_PER_CU = 32;
-// phase_b blocks resident across the GPU at once: its staging LDS and its waves
-// each allow four per CU.
-constexpr int PB_RESIDENT_BLOCKS =
-    CU_COUNT * std::min(LDS_BYTES_PER_CU / ((PB_BLOCK / WAVE_SIZE) * WSTAGE_CAP_COOP * 8),
-                        TARGET_WAVES_PER_CU / (PB_BLOCK / WAVE_SIZE));
+// phase_b blocks resident on one CU at once: its staging LDS and its waves
+// each allow four.
+constexpr int PB_BLOCKS_PER_CU =
+    std::min(LDS_BYTES_PER_CU / ((PB_BLOCK / WAVE_SIZE) * WSTAGE_CAP_COOP * 8),
+             TARGET_WAVES_PER_CU / (PB_BLOCK / WAVE_SIZE));
 
 // Static __shared__ footprints, read off .group_segment_fixed_size with the
 // dynamic buffer excluded. Used only to estimate LDS-limited residency.
@@ -94,7 +94,7 @@ constexpr int SMALL_N_STATIC_LDS = 5280;
 constexpr int PHASE_A_STATIC_LDS = 5144;
 constexpr int PHASE_C_STATIC_LDS = 5408;
 
-static inline int grid_blocks_per_cu(int M) { return std::max(1, (M + CU_COUNT - 1) / CU_COUNT); }
+static inline int grid_blocks_per_cu(int M, int cu) { return std::max(1, (M + cu - 1) / cu); }
 
 // Whether a select kernel can take block_select_lds_wide's buffers (a 12-bit
 // digit on the filtered passes, one pass fewer) without losing residency: the
@@ -104,9 +104,10 @@ static inline int grid_blocks_per_cu(int M) { return std::max(1, (M + CU_COUNT -
 //   m=128  n=131072  -2.98us   m=256 n=262144  -1.64   m=64 n=1048577 -1.24
 //   m=1024 n=262144 +11.56us   m=4096 n=131072 +30.56  m=4096 n=1048576 +30.38
 // The losses are residency, and this is the condition that avoids them.
-static inline bool wide_select_fits(int M, int lds_bytes, int wide_bytes)
+static inline bool wide_select_fits(int M, int cu, int lds_bytes, int wide_bytes)
 {
-    const int resident = std::min(grid_blocks_per_cu(M), std::max(1, LDS_BYTES_PER_CU / lds_bytes));
+    const int resident =
+        std::min(grid_blocks_per_cu(M, cu), std::max(1, LDS_BYTES_PER_CU / lds_bytes));
     return resident * (lds_bytes + wide_bytes) <= LDS_BYTES_PER_CU;
 }
 
@@ -115,12 +116,12 @@ static inline int lds_allocated_bytes(int bytes)
 {
     return ((bytes + LDS_ALLOC_GRANULE - 1) / LDS_ALLOC_GRANULE) * LDS_ALLOC_GRANULE;
 }
-static inline bool wide_select_fits_allocated(int M, int lds_bytes, int wide_bytes)
+static inline bool wide_select_fits_allocated(int M, int cu, int lds_bytes, int wide_bytes)
 {
     const int base_alloc = lds_allocated_bytes(lds_bytes);
     const int wide_alloc = lds_allocated_bytes(lds_bytes + wide_bytes);
     const int resident =
-        std::min(grid_blocks_per_cu(M), std::max(1, LDS_BYTES_PER_CU / base_alloc));
+        std::min(grid_blocks_per_cu(M, cu), std::max(1, LDS_BYTES_PER_CU / base_alloc));
     return resident * wide_alloc <= LDS_BYTES_PER_CU;
 }
 
@@ -205,10 +206,10 @@ static inline int small_n_threads_from_table(int M, int N)
     return (int)kSmallNWaves[mi][ni] * WAVE_SIZE;
 }
 
-static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap_waves)
+static inline int occupancy_block_threads(int M, int cu, int lds_per_block, int load_cap_waves)
 {
     const int lds_blocks = std::max(1, LDS_BYTES_PER_CU / std::max(1, lds_per_block));
-    const int g          = grid_blocks_per_cu(M);
+    const int g          = grid_blocks_per_cu(M, cu);
     const int bound      = std::min(lds_blocks, g);
     // Ceiling division, then round UP to a power of two. Truncating twice is what
     // made this formula undershoot: at bound=7 the integer divide turns 4.57 into
@@ -293,6 +294,7 @@ struct ShapeParams
     int coop_g;
     bool keys_only_c;
     bool geom_ok;
+    int cu; // the device's CU count the plan was sized for
 };
 
 static inline int align_sample_s(int s)
@@ -546,22 +548,23 @@ static inline int coop_bucket_of(int N)
 constexpr int COOP_TARGET_BLOCKS      = 1024;
 constexpr int COOP_MIN_VEC4_PER_BLOCK = 256;
 
-// phase_b's time steps with the rounds of PB_RESIDENT_BLOCKS its grid takes, so
-// the best G is periodic in M with period PB_RESIDENT_BLOCKS / G, finer than any
-// table row. The table's G is a base; of G/2, G and 2G the shape runs the one
+// phase_b's time steps with the rounds of cu * PB_BLOCKS_PER_CU resident blocks
+// its grid takes, so the best G is periodic in M with that count / G, finer than
+// any table row. The table's G is a base; of G/2, G and 2G the shape runs the one
 // with the cheapest rounds x (a block's fixed cost + its chunk of float4 loads),
 // plus a fifth of a chunk once blocks start staggered over several rounds.
 constexpr int COOP_BLOCK_COST_N4   = 1000;
 constexpr double COOP_STAGGER_TAIL = 0.2;
-static inline double coop_rounds_cost(int M, int n4, int g)
+static inline double coop_rounds_cost(int M, int cu, int n4, int g)
 {
-    const long rounds = ((long)M * g + PB_RESIDENT_BLOCKS - 1) / PB_RESIDENT_BLOCKS;
+    const long resident = (long)cu * PB_BLOCKS_PER_CU;
+    const long rounds   = ((long)M * g + resident - 1) / resident;
     const long chunk  = (n4 + g - 1) / g;
     return (double)(rounds * (COOP_BLOCK_COST_N4 + chunk)) +
            (rounds > 1 ? COOP_STAGGER_TAIL * chunk : 0.0);
 }
 
-static inline int coop_g_from_table(int M, int N, int max_g)
+static inline int coop_g_from_table(int M, int cu, int N, int max_g)
 {
     if(M < 1 || N < (1 << COOP_N_LOG2_BASE))
         return -1;
@@ -575,18 +578,18 @@ static inline int coop_g_from_table(int M, int N, int max_g)
     const int n4   = N / FP32_EPT;
     int g          = base;
     for(const int c : {base / 2, base * 2})
-        if(c >= 1 && c <= max_g && coop_rounds_cost(M, n4, c) < coop_rounds_cost(M, n4, g))
+        if(c >= 1 && c <= max_g && coop_rounds_cost(M, cu, n4, c) < coop_rounds_cost(M, cu, n4, g))
             g = c;
     return g;
 }
 
-static inline int choose_coop_g(int M, int N, int n4_per_row, int block)
+static inline int choose_coop_g(int M, int cu, int N, int n4_per_row, int block)
 {
     const int max_g = std::max(1, n4_per_row / block);
     if(N <= N_LDS_MAX)
         return 1;
     int g;
-    const int t = coop_g_from_table(M, N, max_g);
+    const int t = coop_g_from_table(M, cu, N, max_g);
     if(t > 0)
     {
         g = t;
@@ -607,9 +610,10 @@ static inline int choose_coop_g(int M, int N, int n4_per_row, int block)
 // A per-region radix scan form (rep vs wave0) was tried and bought nothing:
 // once coop_g > 1 reaches M=4096 N=131072, the two forms are indistinguishable.
 
-static inline ShapeParams derive_shape_params(int M, int N, int K)
+static inline ShapeParams derive_shape_params(int M, int N, int K, int cu)
 {
     ShapeParams p{};
+    p.cu = cu;
     const bool small_n_fits =
         (N * (int)sizeof(uint32_t)) <= (LDS_BYTES_PER_BLOCK_MAX - SMALL_N_STATIC_LDS);
     const bool small_n_wins =
@@ -685,7 +689,7 @@ static inline ShapeParams derive_shape_params(int M, int N, int K)
     const double eff_margin = std::min((double)margin, cap_margin);
     const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
     const int cap           = derive_cap(
-        K, margin, S, N, grid_blocks_per_cu(M) > 1 ? CAP_ROOM_SIGMA_KEYS_ONLY : CAP_ROOM_SIGMA);
+        K, margin, S, N, grid_blocks_per_cu(M, cu) > 1 ? CAP_ROOM_SIGMA_KEYS_ONLY : CAP_ROOM_SIGMA);
 
     p.S      = S;
     p.margin = margin;
@@ -695,11 +699,11 @@ static inline ShapeParams derive_shape_params(int M, int N, int K)
     // re-reads every index from global inside the gather, which ATT puts at
     // 22-25% of a small-M phase_c block.
     // cap 8192 with indices is 64 KB + static + two wide buffers ~ 106 KB.
-    p.keys_only_c = cap > PHASE_C_CAP && grid_blocks_per_cu(M) > 1;
+    p.keys_only_c = cap > PHASE_C_CAP && grid_blocks_per_cu(M, cu) > 1;
     p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
 
     const int n4 = N / FP32_EPT;
-    p.coop_g     = choose_coop_g(M, N, n4, PB_BLOCK);
+    p.coop_g     = choose_coop_g(M, cu, N, n4, PB_BLOCK);
     p.path       = p.coop_g > 1 && M <= 256 ? PATH_DECODE : PATH_PREFILL;
     return p;
 }
