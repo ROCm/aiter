@@ -490,7 +490,9 @@ CASES = [
     ("gfx1250", 8, 32, 512, public.dtypes.fp8, 0.0, "row_strided", True, "opus"),
     ("gfx950", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, "opus"),
     ("gfx942", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
-    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", False, None),
+    ("gfx1250-strict", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, None),
 ]
 
 

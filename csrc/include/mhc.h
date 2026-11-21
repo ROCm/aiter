@@ -82,4 +82,26 @@ void mhc_fused_post_pre_gemm_sqrsum(
     // Independent compute and residual-layout controls.
     int w_preshuffle_bf16           = 0,
     int res_preshuffle              = 0); // shuffled residuals require gfx1250
+// gfx950 decode route of mhc_fused_post_pre with fused RMSNorm (mhc_post_pre_gram.cu):
+// four BF16 residual streams, 20 Sinkhorn iterations. partials is scratch; its first
+// dimension is the number of hidden slabs of the producer.
+void mhc_post_pre_gram_gfx950(aiter_tensor_t& post,          // (m, 4, 1)
+                              aiter_tensor_t& comb,          // (m, 4, 4)
+                              aiter_tensor_t& out,           // (m, hidden_size)
+                              aiter_tensor_t& next_residual, // (m, 4, hidden_size)
+                              aiter_tensor_t& partials,      // (split_k, m, 48)
+                              aiter_tensor_t& layer_input,   // (m, hidden_size)
+                              aiter_tensor_t& residual_in,   // (m, 4, hidden_size)
+                              aiter_tensor_t& post_mix,      // (m, 4)
+                              aiter_tensor_t& comb_mix,      // (m, 4, 4)
+                              aiter_tensor_t& fn,            // (24, 4 * hidden_size) fp32 or packed
+                              aiter_tensor_t& hc_scale,      // (3)
+                              aiter_tensor_t& hc_base,       // (24)
+                              aiter_tensor_t& weight,        // (hidden_size)
+                              float rms_eps,
+                              float pre_eps,
+                              float sink_eps,
+                              float norm_eps,
+                              float post_mult,
+                              int parts = 4); // hidden segments of a row in the finisher
 } // namespace aiter
