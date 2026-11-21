@@ -17,6 +17,9 @@ TILE_M = 256
 TILE_N = 256
 TILE_K = 128
 KERNEL_PREFIX = "flydsl_blockscale_8w_"
+# The kernel's workgroup swizzle assumes 8 XCDs of 32 CUs; it is validated only
+# on the 256-CU MI350X/MI355X, not on smaller gfx950 parts such as MI350P.
+VALIDATED_CU_NUM = 256
 
 
 @dataclass(frozen=True)
@@ -45,8 +48,12 @@ def lds_bytes(K: int) -> int:
     return 8 * 16896 + 2 * 512 * 4
 
 
-def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
-    if gfx != "gfx950" or M <= 0 or N <= 0 or K < 256 or K % 256:
+def kernel_fits_shape(
+    ki: kernelInstance, M: int, N: int, K: int, gfx: str, cu_num: int
+) -> bool:
+    if gfx != "gfx950" or cu_num != VALIDATED_CU_NUM:
+        return False
+    if M <= 0 or N <= 0 or K < 256 or K % 256:
         return False
     if N % (16 if ki.preshuffle_b else 8):
         return False

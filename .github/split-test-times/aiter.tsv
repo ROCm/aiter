@@ -34,6 +34,7 @@ op_tests/test_flydsl_fp8_paged_mqa_logits.py	10
 op_tests/test_flydsl_fp8_quant.py	4
 op_tests/test_flydsl_gather_kv_b_proj.py	6
 op_tests/test_flydsl_gdr_mtp.py	39
+op_tests/test_flydsl_gemm_a8w8_blockscale.py	25
 op_tests/test_flydsl_hc_mix.py	10
 op_tests/test_flydsl_herd.py	8
 op_tests/test_flydsl_hgemm.py	13
