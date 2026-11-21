@@ -295,14 +295,24 @@ def _gfx950_gluon_supported(params: _UAParams):
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
-    if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
+    if params.all_decode:
         return params
+    if q_rows <= 128 and params.sliding_window <= 0:
+        # one query block per sequence; count that grid only while the
+        # padded count leaves the launch unsplit
+        config = get_unified_attention_config("kv_split", params, backend="gluon")
+        if _split_launch_config(config)[0] > 1:
+            return params
+        return params._replace(num_2d_prgms=params.num_seqs * params.num_kv_heads)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:
         block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
+    if params.max_seqlen_q <= block_q:
+        # the launch shrinks to one query block per sequence (ONE_Q_BLOCK)
+        num_q_blocks = params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
@@ -1021,6 +1031,21 @@ def _reject_nvfp4_kv_on_triton(params: _UAParams):
         )
 
 
+def _gfx942_one_q_block(params: _UAParams, block_q: int) -> bool:
+    """One program per sequence when the query fits in one Triton block.
+
+    gfx942 only. The padded grid is ``num_tokens // BLOCK_Q + num_seqs``, and
+    the prologue index ``start // BLOCK_Q + seq`` assumes those empty slots.
+    q=1 is already one block through ``ALL_DECODE``. The constexpr stays off
+    on every other arch, including the gfx950 gluon kernel.
+    """
+    return (
+        DEVICE_ARCH == "gfx942"
+        and not params.all_decode
+        and int(params.max_seqlen_q) <= int(block_q)
+    )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
@@ -1038,7 +1063,8 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1093,6 +1119,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
@@ -1116,7 +1143,8 @@ def _unified_attention_3d_triton(
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1172,6 +1200,7 @@ def _unified_attention_3d_triton(
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
@@ -1677,11 +1706,18 @@ def _unified_attention_gfx950(
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
 
+    # every sequence fits one query block: launch exactly one per sequence.
+    # This trusts max_seqlen_q. An underestimate drops query rows (the
+    # previous grid covered them). Checking the lengths would sync the device.
+    one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)
     else:
-        total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
+        if one_q_block:
+            total_query_blocks = params.num_seqs
+        else:
+            total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
         grid = (params.num_kv_heads, total_query_blocks)
     if NUM_SEGMENTS > 1:
         grid = grid + (NUM_SEGMENTS,)
@@ -1753,6 +1789,7 @@ def _unified_attention_gfx950(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
