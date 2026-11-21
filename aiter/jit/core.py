@@ -777,7 +777,7 @@ class AITER_CONFIG:
                 f"when merging '{merge_name}'."
             )
 
-        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0, "tdm_b_th2": -1}
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
             for c in df.columns:

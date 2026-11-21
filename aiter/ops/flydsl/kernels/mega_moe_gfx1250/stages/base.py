@@ -33,6 +33,7 @@ from ..types import Stage2ScatterContext, _from_gpu_ptr
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    source_topk_ids: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
