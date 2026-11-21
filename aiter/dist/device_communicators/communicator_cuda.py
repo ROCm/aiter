@@ -797,10 +797,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        # This one-shot has its own measured crossover, so it uses the plain
-        # Gluon all-reduce's 4 MiB eligibility bound rather than the Lamport
-        # per-token cutoff.
-        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=False):
+        # The Gluon AR + RMSNorm + MXFP8 one-shot takes up to
+        # _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot can take the
+        # call: above that the Lamport fused AR + RMSNorm and a separate MXFP8
+        # quant are faster (hidden 6144, TP4, CUDA graphs, 4x MI455X: 18.4 /
+        # 19.5 / 25.9 / 26.2 us against 25.7 / 26.1 / 28.4 / 28.7 us at 192 /
+        # 256 / 320 / 341 rows; level at 128-160 rows). Without the Lamport
+        # path it keeps the plain Gluon all-reduce's 4 MiB bound.
+        ca_comm = self.ca_comm
+        lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
+            input_, res_inp_, weight_, hidden
+        )
+        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport):
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,
             )
