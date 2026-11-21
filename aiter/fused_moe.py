@@ -72,6 +72,8 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
 )
 from aiter.plugin import route as _route
 from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
+    PRESORTED_MOE_BLOCK_M,
+    PRESORTED_MOE_BLOCK_MS,
     aux_sort_capacity,
     bytes_overlap,
     drop_presort_after,
@@ -1795,6 +1797,80 @@ def fused_moe_(
     )
 
 
+# FlyDSL stage 1 kernel families (A4W4 and A16W4 with MXFP4 weights) the standard-sort
+# presort is tested on; other families fall back to the host sort.
+_STD_PRESORT_STAGE1_FAMILIES = ("flydsl_moe1_afp4_wfp4", "flydsl_moe1_abf16_wfp4")
+
+
+def _standard_presort_unsupported(metadata, asm_mode, need_local_topk_ids):
+    """Why a pipeline without the aux sort cannot take a registered presort, or "".
+
+    Only the FlyDSL two-stage pipelines are enabled: they read the four standard
+    sort outputs and size their grids from the tensors' shapes, so a presort in
+    moe_sorting's layout stands in for its sort.
+    """
+    if metadata.run_1stage or asm_mode is not AsmMoeMode.SORTED:
+        return "the selected MoE pipeline is not a two-stage one on a host sort"
+    if need_local_topk_ids:
+        return "the selected MoE pipeline needs local topk ids from its sort"
+    stage1 = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2 = getattr(metadata.stage2, "func", metadata.stage2)
+    if stage1 is not _flydsl_stage1_wrapper or stage2 not in (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_wrapper,
+    ):
+        return "the selected MoE pipeline is not a FlyDSL two-stage one"
+    kernel = getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
+    if not str(kernel).startswith(_STD_PRESORT_STAGE1_FAMILIES):
+        return "the selected FlyDSL stage 1 kernel family has no presort coverage"
+    return ""
+
+
+def presorted_moe_block_m(metadata):
+    """The block_m a registered presort must have for the pipeline ``metadata``
+    (from ``get_2stage_cfgs``) to take it, or None when it takes none.
+
+    A caller's router uses this to build its sort only where fused_moe will
+    consume it. The call can still ignore a matching presort: with expert_mask
+    or num_local_tokens, a block_size_M other than metadata.block_m, the HERD
+    or fused decode sort+quant paths, or when fused_moe re-resolves the config.
+    """
+    if metadata.full_impl is not None:
+        return None
+    block_m = int(metadata.block_m)
+    if metadata.output_aux:
+        return block_m if block_m == PRESORTED_MOE_BLOCK_M else None
+    if _standard_presort_unsupported(metadata, AsmMoeMode(metadata.flat), False):
+        return None
+    return block_m if block_m in PRESORTED_MOE_BLOCK_MS else None
+
+
+def _presorted_moe_buf(presorted, output, accumulate, shape, dtype, device):
+    """The moe_buf a presorted call hands its stages, as moe_sorting would.
+
+    An accumulating GEMM2 needs a zeroed [M, model_dim] destination; a reducing
+    one gets an empty buffer.
+    """
+    if not accumulate:
+        return torch.empty((0, 0), dtype=dtype, device=device)
+    # The zeroing kernels write 16-byte vectors from moe_buf and atomic GEMM2 uses
+    # 4-byte atomics (an output at an odd bf16 element faults), so an output that is
+    # not 16-byte aligned gets a fresh moe_buf and _return_output copies back. The
+    # same rule as the 16-byte rule of fused_moe's other kernel destinations (#6485).
+    in_place = output is not None and output.data_ptr() % 16 == 0
+    moe_buf = output if in_place else torch.empty(shape, dtype=dtype, device=device)
+    # Skip the zeroing only if the caller zeroed this exact output. A buffer
+    # allocated here can reuse a freed block at the same address, so always
+    # zero it.
+    if not (
+        in_place
+        and presorted.get("moe_buf_zeroed")
+        and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+    ):
+        moe_buf.zero_()
+    return moe_buf
+
+
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -2323,8 +2399,8 @@ def _fused_moe_impl(
         metadata.run_1stage or metadata.full_impl is not None
     ):
         raise RuntimeError("_stage2_override requires a two-stage MoE config")
-    if presorted_aux and not metadata.output_aux:
-        presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
+    if presorted_aux and metadata.full_impl is not None:
+        presorted_moe_ignored("the selected MoE pipeline runs its own implementation")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -2429,6 +2505,26 @@ def _fused_moe_impl(
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
     fused_compact_scale = False
+    # A pipeline without the aux sort reads only moe_sorting's standard outputs.
+    std_presort = None
+    if presorted_aux and not (herd_topk or metadata.output_aux or fused_sort_quant):
+        reason = _standard_presort_unsupported(metadata, asm_mode, need_local_topk_ids)
+        if reason:
+            presorted_moe_ignored(reason)
+        else:
+            std_presort = match_presorted_moe(
+                presorted_aux,
+                topk_ids,
+                topk_weight,
+                block_m=metadata.block_m,
+                num_experts=global_E,
+                topk=topk,
+                aux_sort=False,
+                stage_block_m=block_size_M,
+                expert_mask=expert_mask,
+                num_local_tokens=num_local_tokens,
+                output=output,
+            )
     if herd_topk:
         (
             sorted_ids,
@@ -2494,29 +2590,14 @@ def _fused_moe_impl(
             num_valid_ids = presorted["num_valid_ids"]
             sort_m_indices = presorted["m_indices"]
             sort_reverse_sorted = presorted["reverse_sorted"]
-            if _atomic and not runtime_stage2_reduce:
-                # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
-                # output at an odd bf16 element, so such an output gets a fresh
-                # moe_buf and _return_output copies back.
-                in_place = output is not None and output.data_ptr() % 4 == 0
-                moe_buf = (
-                    output
-                    if in_place
-                    else torch.empty(
-                        (M, model_dim), dtype=dtype, device=topk_ids.device
-                    )
-                )
-                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
-                # if the caller zeroed this exact output. A buffer allocated here
-                # can reuse a freed block at the same address, so always zero it.
-                if not (
-                    in_place
-                    and presorted.get("moe_buf_zeroed")
-                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
-                ):
-                    moe_buf.zero_()
-            else:
-                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            moe_buf = _presorted_moe_buf(
+                presorted,
+                output,
+                _atomic and not runtime_stage2_reduce,
+                (M, model_dim),
+                dtype,
+                topk_ids.device,
+            )
             local_topk_ids = None
         else:
             # BM16's adaptive sort already emits routes and zeroes the output
@@ -2547,6 +2628,10 @@ def _fused_moe_impl(
             ) = sorting_ret[:7]
             local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
+        if presorted_aux:
+            presorted_moe_ignored(
+                "the selected MoE pipeline sorts and quantizes in one kernel"
+            )
         (
             sorted_ids,
             sorted_weights,
@@ -2566,6 +2651,20 @@ def _fused_moe_impl(
             accumulate=not runtime_stage2_reduce,
             compact_scale=fused_compact_scale,
             num_local_tokens=num_local_tokens,
+        )
+        local_topk_ids = None
+    elif std_presort is not None:
+        sorted_ids = std_presort["sorted_token_ids"]
+        sorted_weights = std_presort["sorted_weights"]
+        sorted_expert_ids = std_presort["sorted_expert_ids"]
+        num_valid_ids = std_presort["num_valid_ids"]
+        moe_buf = _presorted_moe_buf(
+            std_presort,
+            output,
+            not runtime_stage2_reduce,
+            (M, model_dim),
+            dtype,
+            topk_ids.device,
         )
         local_topk_ids = None
     else:
