@@ -68,6 +68,7 @@ def _generate_pool_inputs(
     rope_dim,
     cache_dtype,
     reuse_freqs_front_part,
+    token_major_q=False,
 ):
     dtype = torch.bfloat16
     device = "cuda"
@@ -93,6 +94,11 @@ def _generate_pool_inputs(
             transpose_bm=True,
         )
         q_pe = torch.randn((T, QH, rope_dim), dtype=dtype, device=device)
+        if token_major_q:
+            # Views of one (T, QH, nope + rope) tensor, as the fp4 inputs above.
+            q = torch.randn((T, QH, nope_dim + rope_dim), dtype=dtype, device=device)
+            q_nope, q_pe = q.split((nope_dim, rope_dim), dim=-1)
+            q_nope = q_nope.transpose(0, 1)
 
     _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
         1,
@@ -134,13 +140,14 @@ def _generate_pool_inputs(
 
 
 def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
-    dtype = torch.bfloat16
     # Default BMM shape (N x K), from the unit tests: fp4 512 x 128, fp8 128 x 512.
     test_n, test_k = (512, 128) if args.bmm == "fp4" else (128, 512)
     kv_lora_rank = args.kv_lora_rank or test_n
     nope_dim = args.qk_nope_dim or test_k
     rope_dim = args.rope_dim
     cache_dtype = str_to_torch_dtype[args.cache_dtype]
+    q_out_dtype = str_to_torch_dtype[args.q_out_dtype]
+    num_decode = T if args.num_decode_toks is None else args.num_decode_toks
 
     _p_gen = functools.partial(
         _generate_pool_inputs,
@@ -153,6 +160,7 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
         rope_dim,
         cache_dtype,
         args.reuse_freqs_front_part,
+        args.q_layout == "token-major",
     )
     rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
     kv_cache = rot_bufs[0]["kv_cache"]
@@ -161,15 +169,16 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
         kernel_fn = functools.partial(
             fused_fp4_bmm_rope_cat_and_cache_mla,
             is_neox=args.neox,
-            num_decode_toks_for_zeros=T,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
         )
     else:
         kernel_fn = functools.partial(
             fused_fp8_bmm_rope_cat_and_cache_mla,
             group_size=128,
             is_neox=args.neox,
-            q_out_dtype=dtype,
-            num_decode_toks_for_zeros=T,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
         )
 
     ms = bencher.bench(kernel_fn)
@@ -187,7 +196,10 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
     else:
         w_bytes = QH * kv_lora_rank * nope_dim
     q_bytes = T * QH * (nope_dim + rope_dim) * elem
-    q_out_bytes = T * QH * (kv_lora_rank + rope_dim + rope_dim + kv_lora_rank) * elem
+    q_out_bytes = (
+        T * QH * (kv_lora_rank + rope_dim) * (torch.finfo(q_out_dtype).bits // 8)
+        + num_decode * QH * (rope_dim + kv_lora_rank) * elem
+    )
     k_bytes = T * KH * (kv_lora_rank + 2 * rope_dim) * elem
     cache_bytes = T * KH * (kv_lora_rank + rope_dim) * kv_cache.element_size()
     mem = w_bytes + q_bytes + q_out_bytes + k_bytes + cache_bytes
@@ -275,6 +287,27 @@ def parse_args(args: list[str] | None = None):
         help="KV cache dtype",
     )
     parser.add_argument(
+        "--q-out-dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp8e4m3"],
+        help="Concatenated query output dtype",
+    )
+    parser.add_argument(
+        "--num-decode-toks",
+        type=int,
+        default=None,
+        help="Number of decode outputs; unset: T, 0: no decode outputs",
+    )
+    parser.add_argument(
+        "--q-layout",
+        type=str,
+        default="head-major",
+        choices=["head-major", "token-major"],
+        help="fp8 q_nope layout: a dense (QH, T, P) tensor, or a view of a "
+        "(T, QH, P + rope) tensor as serving code gives",
+    )
+    parser.add_argument(
         "--neox", action="store_true", default=False, help="NeoX-style RoPE"
     )
     parser.add_argument(
@@ -303,6 +336,10 @@ def parse_args(args: list[str] | None = None):
         help="Write performance results to CSV file",
     )
     parsed_args = parser.parse_args(args=args)
+    if parsed_args.num_decode_toks is not None and not (
+        0 <= parsed_args.num_decode_toks <= min(parsed_args.T)
+    ):
+        parser.error("--num-decode-toks must be between 0 and each T")
     for name in ("rope_dim", "kv_lora_rank"):
         if (getattr(parsed_args, name) or 2) < 2:
             parser.error(f"--{name.replace('_', '-')} must be >= 2")

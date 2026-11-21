@@ -6,6 +6,10 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.rope.rope import (
+    _get_gptj_rotated_x,
+    _get_neox_rotated_x,
+)
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
@@ -1040,6 +1044,493 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 )
 
 
+_fused_fp8_bmm_rope_prefill_repr = make_kernel_repr(
+    "_fused_fp8_bmm_rope_prefill_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "K_TAIL",
+        "N_INNER",
+        "M_PER_CTA",
+        "LDB",
+        "ROPE_BLOCK_T",
+        "IL_R",
+        "NUM_XCDS",
+        "ILB_NUM",
+        "ILB_DEN",
+        "XCD_COLOC",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_K_SCALE",
+        "cache_modifier",
+    ],
+)
+
+
+@triton.jit
+def _fp8_quant_group(x, DTYPE_MAX: tl.constexpr, b_ptr):
+    """Quantize each row of one K group to FP8. Return the values and the row scales."""
+    one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+    m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)[:, None]
+    s = m.to(tl.float32) * one_over_DTYPE_MAX
+    r = 1.0 / s
+    xq = tl.clamp(x * r, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+    return xq, s
+
+
+@triton.jit
+def _fp8_mma_store(
+    a0q,
+    s0,
+    a1q,
+    s1,
+    b0,
+    b1,
+    b_scale,
+    c_ptrs,
+    c_mask,
+    ROWS: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Multiply two quantized K groups by one weight chunk and store the result."""
+    acc = tl.zeros((ROWS, BLOCK_SIZE_N), dtype=tl.float32)
+    acc = tl.fma(tl.dot(a0q, b0), s0, acc)
+    acc = tl.fma(tl.dot(a1q, b1), s1, acc)
+    acc = acc * b_scale
+    c_val = acc.to(c_ptrs.dtype.element_ty)
+    # The weight chunk is in permuted column order. Put the columns back.
+    c_val = tl.reshape(
+        tl.permute(
+            tl.reshape(c_val, (ROWS, BLOCK_SIZE_N // 64, 4, 4, 4)),
+            (0, 1, 3, 2, 4),
+        ),
+        (ROWS, BLOCK_SIZE_N),
+    )
+    tl.store(c_ptrs, c_val, mask=c_mask)
+
+
+# The token count changes from call to call. Do not compile again for it.
+@triton.jit(
+    repr=_fused_fp8_bmm_rope_prefill_repr,
+    do_not_specialize=["M", "bmm_programs", "grid_mn"],
+)
+def _fused_fp8_bmm_rope_prefill_kernel(
+    a_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    q_pe_ptr,
+    k_nope_ptr,
+    k_pe_ptr,
+    pos_ptr,
+    cos_ptr,
+    sin_ptr,
+    k_pe_out_ptr,
+    kv_cache_ptr,
+    slot_mapping_ptr,
+    k_scale_ptr,
+    M,
+    QH,
+    bmm_programs,
+    grid_mn,
+    num_pid_n,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    q_pe_stride_b,
+    q_pe_stride_h,
+    q_pe_stride_d,
+    k_nope_stride_b,
+    k_nope_stride_d,
+    k_pe_stride_b,
+    k_pe_stride_d,
+    pos_stride_b,
+    cos_stride_b,
+    cos_stride_d,
+    k_pe_out_stride_b,
+    k_pe_out_stride_d,
+    kv_cache_stride_b,
+    kv_cache_stride_d,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    K_TAIL: tl.constexpr,
+    N_INNER: tl.constexpr,
+    M_PER_CTA: tl.constexpr,
+    LDB: tl.constexpr,
+    ROPE_BLOCK_T: tl.constexpr,
+    BLOCK_QH: tl.constexpr,
+    IL_R: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    ILB_NUM: tl.constexpr,
+    ILB_DEN: tl.constexpr,
+    XCD_COLOC: tl.constexpr,
+    REUSE_FREQS_FRONT_PART: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    BLOCK_D_nope: tl.constexpr,
+    BLOCK_D_pe: tl.constexpr,
+    BLOCK_D_HALF_pe: tl.constexpr,
+    HAVE_K_SCALE: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    cache_modifier: tl.constexpr = None,
+):
+    """
+    Pure-prefill variant of the fused FP8 BMM + RoPE + KV-cache kernel.
+
+    Each projection program quantizes its two query K groups one time. It uses
+    them again for N_INNER chunks of output columns. The kernel supports one KV
+    head, no decode outputs and one cache slot for each token.
+
+    Grid structure:
+    - pid < bmm_programs: projection tiles of BLOCK_SIZE_M * M_PER_CTA rows and
+      BLOCK_SIZE_N * N_INNER columns, for each head
+    - pid >= bmm_programs: RoPE and KV-cache writes for ROPE_BLOCK_T tokens
+
+    IL_R, ILB_NUM, ILB_DEN and XCD_COLOC set the order of the programs. The
+    order does not change the result.
+    """
+
+    tl.static_assert(K_TAIL > 0, "the prefill kernel needs a K tail group")
+    tl.static_assert(BLOCK_SIZE_N % 64 == 0, "BLOCK_SIZE_N must be a multiple of 64")
+
+    pid = tl.program_id(0)
+    tl.assume(pid >= 0)
+
+    rope_start = bmm_programs
+    nr = tl.cdiv(M, ROPE_BLOCK_T)
+
+    # Interleave projection and rotary work while preserving each group of IDs.
+    if ILB_NUM > 0:
+        NBu = bmm_programs // NUM_XCDS
+        NRi = tl.minimum(nr // NUM_XCDS, (NBu * ILB_NUM) // ILB_DEN)
+        T = NBu + NRi
+        if pid < T * NUM_XCDS:
+            u = pid // NUM_XCDS
+            gl = pid % NUM_XCDS
+            a = (u * NRi) // T
+            b = ((u + 1) * NRi) // T
+            pid = tl.where(
+                b > a, rope_start + a * NUM_XCDS + gl, (u - a) * NUM_XCDS + gl
+            )
+        else:
+            r = pid - T * NUM_XCDS
+            nb_left = bmm_programs - NBu * NUM_XCDS
+            pid = tl.where(
+                r < nb_left,
+                NBu * NUM_XCDS + r,
+                rope_start + NRi * NUM_XCDS + (r - nb_left),
+            )
+    elif IL_R > 0:
+        ng = tl.minimum(bmm_programs // (IL_R * NUM_XCDS), nr // NUM_XCDS)
+        GP: tl.constexpr = (IL_R + 1) * NUM_XCDS
+        if pid < ng * GP:
+            gi = pid // GP
+            gr = pid % GP
+            gj = gr // NUM_XCDS
+            gl = gr % NUM_XCDS
+            pid = tl.where(
+                gj == IL_R,
+                rope_start + gi * NUM_XCDS + gl,
+                (gi * IL_R + gj) * NUM_XCDS + gl,
+            )
+        else:
+            r = pid - ng * GP
+            nb_left = bmm_programs - ng * IL_R * NUM_XCDS
+            pid = tl.where(
+                r < nb_left,
+                ng * IL_R * NUM_XCDS + r,
+                rope_start + ng * NUM_XCDS + (r - nb_left),
+            )
+    # Group the heads and rotary tiles that write the same query rows.
+    if XCD_COLOC:
+        if pid < bmm_programs:
+            full_mn = (grid_mn // NUM_XCDS) * NUM_XCDS
+            if pid < QH * full_mn:
+                xu = pid // NUM_XCDS
+                pid = (xu % QH) * grid_mn + (xu // QH) * NUM_XCDS + pid % NUM_XCDS
+            else:
+                xv = pid - QH * full_mn
+                xrem = grid_mn - full_mn
+                pid = (xv // xrem) * grid_mn + full_mn + xv % xrem
+        else:
+            RPM: tl.constexpr = (BLOCK_SIZE_M * M_PER_CTA) // ROPE_BLOCK_T
+            rho = pid - rope_start
+            if rho < (nr // (NUM_XCDS * RPM)) * (NUM_XCDS * RPM):
+                xs = rho // NUM_XCDS
+                rho = ((xs // RPM) * NUM_XCDS + rho % NUM_XCDS) * RPM + xs % RPM
+            pid = rope_start + rho
+
+    if pid < bmm_programs:
+        stride_ab_i64 = tl.cast(stride_ab, tl.int64)
+        stride_am_i64 = tl.cast(stride_am, tl.int64)
+        stride_ak_i64 = tl.cast(stride_ak, tl.int64)
+        stride_bb_i64 = tl.cast(stride_bb, tl.int64)
+        stride_bk_i64 = tl.cast(stride_bk, tl.int64)
+        stride_bn_i64 = tl.cast(stride_bn, tl.int64)
+        stride_cb_i64 = tl.cast(stride_cb, tl.int64)
+        stride_cm_i64 = tl.cast(stride_cm, tl.int64)
+        stride_cn_i64 = tl.cast(stride_cn, tl.int64)
+
+        tl.assume(stride_ab_i64 > 0)
+        tl.assume(stride_am_i64 > 0)
+        tl.assume(stride_ak_i64 > 0)
+        tl.assume(stride_bb_i64 > 0)
+        tl.assume(stride_bk_i64 > 0)
+        tl.assume(stride_bn_i64 > 0)
+        tl.assume(stride_cb_i64 > 0)
+        tl.assume(stride_cm_i64 > 0)
+        tl.assume(stride_cn_i64 > 0)
+
+        pid_head = pid // grid_mn
+        pid_tile = pid % grid_mn
+        pid_m = pid_tile // num_pid_n
+        pid_n = pid_tile % num_pid_n
+
+        pid_head_i64 = tl.cast(pid_head, tl.int64)
+
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+        tl.assume(pid_head_i64 >= 0)
+
+        ROWS: tl.constexpr = BLOCK_SIZE_M * M_PER_CTA
+        m_start = pid_m * ROWS
+        n_start = pid_n * (BLOCK_SIZE_N * N_INNER)
+
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_kt = tl.arange(0, K_TAIL)
+        # The last row tile reads the last row again. The store mask drops it.
+        offs_am = tl.minimum(tl.arange(0, ROWS), M - 1 - m_start)
+        # Read the weight columns in the order that the store permutation expects.
+        ph = tl.arange(0, BLOCK_SIZE_N // 64)[:, None, None, None] * 64
+        pj = tl.arange(0, 4)[None, :, None, None] * 4
+        pg = tl.arange(0, 4)[None, None, :, None] * 16
+        pe = tl.arange(0, 4)[None, None, None, :]
+        offs_bn = tl.reshape(ph + pj + pg + pe, (BLOCK_SIZE_N,))
+
+        a_base = (
+            a_ptr
+            + pid_head_i64 * stride_ab_i64
+            + tl.cast(m_start, tl.int64) * stride_am_i64
+        )
+        a0_ptrs = a_base + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        a1_ptrs = (a_base + BLOCK_SIZE_K * stride_ak_i64) + (
+            offs_am[:, None] * stride_am + offs_kt[None, :] * stride_ak
+        )
+        b_base = (
+            b_ptr
+            + pid_head_i64 * stride_bb_i64
+            + tl.cast(n_start, tl.int64) * stride_bn_i64
+        )
+        b0_ptrs = b_base + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        b1_ptrs = (b_base + BLOCK_SIZE_K * stride_bk_i64) + (
+            offs_kt[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        )
+        b_step = BLOCK_SIZE_N * stride_bn_i64
+
+        offs_cm = tl.arange(0, ROWS)
+        offs_cn = tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            c_ptr
+            + pid_head_i64 * stride_cb_i64
+            + tl.cast(m_start, tl.int64) * stride_cm_i64
+            + tl.cast(n_start, tl.int64) * stride_cn_i64
+        ) + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+        c_mask = offs_cm[:, None] < M - m_start
+        c_step = BLOCK_SIZE_N * stride_cn_i64
+
+        if LDB:
+            # Load the query groups first, then one weight chunk for each step.
+            a0 = tl.load(a0_ptrs, cache_modifier=".cg")
+            a1 = tl.load(a1_ptrs, cache_modifier=".cg")
+            b_scale = tl.load(b_scale_ptr)
+            a0q, s0 = _fp8_quant_group(a0, DTYPE_MAX, b_ptr)
+            a1q, s1 = _fp8_quant_group(a1, DTYPE_MAX, b_ptr)
+            for n_i in range(N_INNER):
+                b0 = tl.load(b0_ptrs + n_i * b_step, cache_modifier=cache_modifier)
+                b1 = tl.load(b1_ptrs + n_i * b_step)
+                _fp8_mma_store(
+                    a0q,
+                    s0,
+                    a1q,
+                    s1,
+                    b0,
+                    b1,
+                    b_scale,
+                    c_ptrs + n_i * c_step,
+                    c_mask,
+                    ROWS,
+                    BLOCK_SIZE_N,
+                )
+        else:
+            # Load each weight chunk one step before its use.
+            b0_next = tl.load(b0_ptrs, cache_modifier=cache_modifier)
+            b1_next = tl.load(b1_ptrs)
+            a0 = tl.load(a0_ptrs, cache_modifier=".cg")
+            a1 = tl.load(a1_ptrs, cache_modifier=".cg")
+            b_scale = tl.load(b_scale_ptr)
+            a0q, s0 = _fp8_quant_group(a0, DTYPE_MAX, b_ptr)
+            a1q, s1 = _fp8_quant_group(a1, DTYPE_MAX, b_ptr)
+            for n_i in tl.static_range(N_INNER):
+                b0 = b0_next
+                b1 = b1_next
+                if n_i + 1 < N_INNER:
+                    b0_ptrs += b_step
+                    b1_ptrs += b_step
+                    b0_next = tl.load(b0_ptrs, cache_modifier=cache_modifier)
+                    b1_next = tl.load(b1_ptrs)
+                _fp8_mma_store(
+                    a0q,
+                    s0,
+                    a1q,
+                    s1,
+                    b0,
+                    b1,
+                    b_scale,
+                    c_ptrs,
+                    c_mask,
+                    ROWS,
+                    BLOCK_SIZE_N,
+                )
+                c_ptrs += c_step
+
+    # Process all query heads and the KV head for a block of tokens.
+    else:
+        pid_adjusted = pid - rope_start
+        offs_t = pid_adjusted * ROPE_BLOCK_T + tl.arange(0, ROPE_BLOCK_T)
+        t_mask = offs_t < M
+        offs_t64 = offs_t.to(tl.int64)
+        offs_h = tl.arange(0, BLOCK_QH).to(tl.int64)
+        d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
+        dk_nope_offs = tl.arange(0, BLOCK_D_nope).to(tl.int64)
+
+        if REUSE_FREQS_FRONT_PART:
+            if IS_NEOX:
+                d_cos_offs = tl.where(
+                    (d_pe_offs >= BLOCK_D_HALF_pe) & (d_pe_offs < BLOCK_D_pe),
+                    d_pe_offs - BLOCK_D_HALF_pe,
+                    d_pe_offs,
+                ).to(d_pe_offs.dtype)
+            else:
+                d_cos_offs = d_pe_offs // 2
+        else:
+            d_cos_offs = d_pe_offs
+
+        if IS_NEOX:
+            rot_mask = (d_pe_offs < BLOCK_D_HALF_pe)[None, :]
+        else:
+            rot_mask = (d_pe_offs % 2 == 0)[None, :]
+
+        pos = tl.load(pos_ptr + offs_t64 * pos_stride_b, mask=t_mask, other=0)
+        pid_slot = tl.load(slot_mapping_ptr + offs_t64, mask=t_mask, other=-1).to(
+            tl.int64
+        )
+        q_base = (
+            q_pe_ptr
+            + offs_t64[:, None, None] * q_pe_stride_b
+            + offs_h[None, :, None] * q_pe_stride_h
+        )
+        q_mask = t_mask[:, None, None]
+        x = tl.load(
+            q_base + d_pe_offs[None, None, :] * q_pe_stride_d,
+            mask=q_mask,
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        k_pe_base = k_pe_ptr + offs_t64[:, None] * k_pe_stride_b
+        kx = tl.load(
+            k_pe_base + d_pe_offs[None, :] * k_pe_stride_d,
+            mask=t_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        k_nope = tl.load(
+            k_nope_ptr
+            + offs_t64[:, None] * k_nope_stride_b
+            + dk_nope_offs[None, :] * k_nope_stride_d,
+            mask=t_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        if HAVE_K_SCALE:
+            k_scale_rcprl = (1 / tl.load(k_scale_ptr)).to(tl.float32)
+        else:
+            k_scale_rcprl = 1.0
+        cos_offs = pos[:, None] * cos_stride_b + d_cos_offs[None, :] * cos_stride_d
+        cos = tl.load(
+            cos_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
+        )
+        sin = tl.load(
+            sin_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
+        )
+
+        QROWS: tl.constexpr = ROPE_BLOCK_T * BLOCK_QH
+        x2 = tl.reshape(x, (QROWS, BLOCK_D_pe))
+        if IS_NEOX:
+            x_rot = _get_neox_rotated_x(
+                x2, rot_mask, QROWS, BLOCK_D_pe, BLOCK_D_HALF_pe
+            )
+        else:
+            x_rot = _get_gptj_rotated_x(
+                x2, rot_mask, QROWS, BLOCK_D_pe, BLOCK_D_HALF_pe
+            )
+        x_rot = tl.reshape(x_rot, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_pe))
+        q_pe = x * cos[:, None, :] + x_rot * sin[:, None, :]
+
+        q_out_ptrs = (
+            c_ptr
+            + offs_t64[:, None, None] * stride_cm
+            + offs_h[None, :, None] * stride_cb
+            + (d_pe_offs[None, None, :] + BLOCK_D_nope) * stride_cn
+        )
+        tl.store(q_out_ptrs, q_pe.to(c_ptr.dtype.element_ty), mask=q_mask)
+
+        kv_mask = (t_mask & (pid_slot >= 0))[:, None]
+        if IS_NEOX:
+            kx_rot = _get_neox_rotated_x(
+                kx, rot_mask, ROPE_BLOCK_T, BLOCK_D_pe, BLOCK_D_HALF_pe
+            )
+        else:
+            kx_rot = _get_gptj_rotated_x(
+                kx, rot_mask, ROPE_BLOCK_T, BLOCK_D_pe, BLOCK_D_HALF_pe
+            )
+        k_pe = kx * cos + kx_rot * sin
+
+        tl.store(
+            k_pe_out_ptr
+            + offs_t64[:, None] * k_pe_out_stride_b
+            + d_pe_offs[None, :] * k_pe_out_stride_d,
+            k_pe.to(k_pe_out_ptr.dtype.element_ty),
+            mask=kv_mask,
+        )
+
+        k_nope_scaled = (k_nope.to(tl.float32) * k_scale_rcprl).to(
+            kv_cache_ptr.dtype.element_ty
+        )
+        k_pe_scaled = (k_pe.to(tl.float32) * k_scale_rcprl).to(
+            kv_cache_ptr.dtype.element_ty
+        )
+        kv_base = kv_cache_ptr + pid_slot[:, None] * kv_cache_stride_b
+        tl.store(
+            kv_base + dk_nope_offs[None, :] * kv_cache_stride_d,
+            k_nope_scaled,
+            mask=kv_mask,
+            cache_modifier=".cs",
+        )
+        tl.store(
+            kv_base + (d_pe_offs[None, :] + BLOCK_D_nope) * kv_cache_stride_d,
+            k_pe_scaled,
+            mask=kv_mask,
+            cache_modifier=".cs",
+        )
+
+
 def _get_fp4_config(
     M: int,
     N: int,
@@ -1068,3 +1559,8 @@ def _get_fp8_config(
         N,
         K,
     )
+
+
+def _get_fp8_prefill_config(M: int, N: int, K: int):
+    # Own config family: the pure-prefill kernel has its own tile and grid keys.
+    return get_gemm_config("FUSED-FP8-BMM-ROPE-PREFILL", M, N, K)
