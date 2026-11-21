@@ -1665,29 +1665,22 @@ def _moe_gemm_a8w4_decode(
         #
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
-        # Delivered by TDM scatter through LDS, not by per-thread global stores.
-        #
-        # This matters ONLY because the destination is remote: ~3/4 of these rows
-        # land in a peer's HBM over xGMI, where transaction shape dominates.
-        # Per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile as many
-        # small independent writes; TDM moves whole rows, 8 per instruction with
-        # int32 indices. Measured on a4w4 at the same shape: 271us -> 104us.
-        #
-        # Build the row offsets DIRECTLY in the layout async_scatter wants. If the
-        # arange auto-resolves and `dst` is converted afterwards it feeds two
-        # conflicting consumers and the compiler cannot pick a layout
-        # ("'tt.make_range' op Failed to infer return type").
-        # Scatter the rows straight from registers. The tile used to go
-        # registers -> LDS (ds_store) -> TDM scatter, and that scatter can read
-        # stale LDS from the aliased w_buffer slot, which put garbage up to
-        # ~1e38 into one row of a tile. The non-scatter branch below carries the
-        # same fix.
-        # A scatter has no common tile origin, so the whole destination row
-        # index sits in the buffer offset. The wrapper rejects a Y window whose
-        # last byte does not fit the 32-bit voffset.
-        OUT_LAYOUT: gl.constexpr = out.type.layout
+        # Scatter the rows from registers, not through an LDS tile and TDM: the
+        # TDM scatter could read stale LDS from the aliased w_buffer slot.
+        # Convert to a row-contiguous layout first, so each store instruction
+        # writes whole cache lines of one row instead of 32 bytes of 16 rows.
+        # The row index sits in the 32-bit buffer offset; the wrapper rejects a
+        # Y window whose last byte does not fit.
+        STORE_TPW_N: gl.constexpr = min(32, OUT_BLOCK_N // 8)
+        STORE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[32 // STORE_TPW_N, STORE_TPW_N],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
+        )
+        out_s = gl.convert_layout(out, STORE_LAYOUT)
         offs_m_d = BLOCK_M * block_id + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT)
+            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
         )
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
@@ -1695,10 +1688,10 @@ def _moe_gemm_a8w4_decode(
         # Rows this rank must not deliver, and the tile's padding rows, have a
         # negative dst and the mask drops them.
         offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(
-            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
         )
         gl.amd.gfx1250.buffer_store(
-            out,
+            out_s,
             Y,
             dst[:, None] * stride_y_m + offs_n_d[None, :] * stride_y_n,
             mask=(dst >= 0)[:, None] & (offs_n_d < yN)[None, :],
@@ -2601,29 +2594,22 @@ def _moe_gemm_a8w4_prefill(
         #
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
-        # Delivered by TDM scatter through LDS, not by per-thread global stores.
-        #
-        # This matters ONLY because the destination is remote: ~3/4 of these rows
-        # land in a peer's HBM over xGMI, where transaction shape dominates.
-        # Per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile as many
-        # small independent writes; TDM moves whole rows, 8 per instruction with
-        # int32 indices. Measured on a4w4 at the same shape: 271us -> 104us.
-        #
-        # Build the row offsets DIRECTLY in the layout async_scatter wants. If the
-        # arange auto-resolves and `dst` is converted afterwards it feeds two
-        # conflicting consumers and the compiler cannot pick a layout
-        # ("'tt.make_range' op Failed to infer return type").
-        # Scatter the rows straight from registers. The tile used to go
-        # registers -> LDS (ds_store) -> TDM scatter, and that scatter can read
-        # stale LDS from the aliased w_buffer slot, which put garbage up to
-        # ~1e38 into one row of a tile. The non-scatter branch below carries the
-        # same fix.
-        # A scatter has no common tile origin, so the whole destination row
-        # index sits in the buffer offset. The wrapper rejects a Y window whose
-        # last byte does not fit the 32-bit voffset.
-        OUT_LAYOUT: gl.constexpr = out.type.layout
+        # Scatter the rows from registers, not through an LDS tile and TDM: the
+        # TDM scatter could read stale LDS from the aliased w_buffer slot.
+        # Convert to a row-contiguous layout first, so each store instruction
+        # writes whole cache lines of one row instead of 32 bytes of 16 rows.
+        # The row index sits in the 32-bit buffer offset; the wrapper rejects a
+        # Y window whose last byte does not fit.
+        STORE_TPW_N: gl.constexpr = min(32, OUT_BLOCK_N // 8)
+        STORE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[32 // STORE_TPW_N, STORE_TPW_N],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
+        )
+        out_s = gl.convert_layout(out, STORE_LAYOUT)
         offs_m_d = BLOCK_M * block_id + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT)
+            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
         )
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
@@ -2631,10 +2617,10 @@ def _moe_gemm_a8w4_prefill(
         # Rows this rank must not deliver, and the tile's padding rows, have a
         # negative dst and the mask drops them.
         offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(
-            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
         )
         gl.amd.gfx1250.buffer_store(
-            out,
+            out_s,
             Y,
             dst[:, None] * stride_y_m + offs_n_d[None, :] * stride_y_n,
             mask=(dst >= 0)[:, None] & (offs_n_d < yN)[None, :],
