@@ -92,6 +92,62 @@ def test_split_k_out_needs_four_byte_alignment():
         run_backend("asm_sk4", x, w, x_scale, w_scale, wide[:, 1 : N + 1])
 
 
+@pytest.mark.parametrize("row_padded", [False, True])
+@pytest.mark.parametrize("dispatch", [False, True])
+def test_pre_zeroed_split_k_out(monkeypatch, row_padded, dispatch):
+    m = 32
+    x, w, x_scale, w_scale = make_inputs(m)
+    ref = torch.empty(m, N, dtype=dtypes.bf16, device="cuda")
+    run_backend("asm_sk4", x, w, x_scale, w_scale, ref)
+    width = N + PAD if row_padded else N
+    storage = torch.full((m, width), SENTINEL, dtype=dtypes.bf16, device="cuda")
+    out = storage[:, :N]
+    if dispatch:
+        asm_row = {"libtype": "asm", "splitK": 4, "kernelName": ASM_KERNEL}
+        monkeypatch.setattr(gemm_mod, "get_CKGEMM_config", lambda *args, **kw: asm_row)
+
+    def launch():
+        if dispatch:
+            return gemm_mod.gemm_a8w8_blockscale_bpreshuffle(
+                x, w, x_scale, w_scale, dtypes.bf16, out=out, out_zeroed=True
+            )
+        return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
+            x,
+            w,
+            out,
+            x_scale,
+            w_scale,
+            splitK=4,
+            kernelName=ASM_KERNEL,
+            out_zeroed=True,
+        )
+
+    out.zero_()
+    launch()
+    torch.testing.assert_close(out.float(), ref.float(), atol=0.5, rtol=0.02)
+    assert bool((storage[:, N:] == SENTINEL).all()), "cleared output padding"
+    # Deliberately violate the contract to prove the explicit flag skips clearing.
+    out.fill_(SENTINEL)
+    launch()
+    assert float((out.float() - ref.float()).mean()) > 6.0
+
+
+def test_pre_zeroed_split_k_still_checks_alignment():
+    x, w, x_scale, w_scale = make_inputs(32)
+    wide = torch.zeros(32, N + 2, dtype=dtypes.bf16, device="cuda")
+    with pytest.raises(RuntimeError, match="4-byte aligned"):
+        aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
+            x,
+            w,
+            wide[:, 1 : N + 1],
+            x_scale,
+            w_scale,
+            splitK=4,
+            kernelName=ASM_KERNEL,
+            out_zeroed=True,
+        )
+
+
 def test_fp16_fallback_warns_once_per_shape(monkeypatch):
     asm_row = {"libtype": "asm", "splitK": 4, "kernelName": ASM_KERNEL}
     monkeypatch.setattr(gemm_mod, "get_CKGEMM_config", lambda *args, **kwargs: asm_row)
