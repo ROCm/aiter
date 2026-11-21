@@ -1357,8 +1357,6 @@ def test_compress_norm_rope_store_matches_reference(
     3 apart, so a scale stored for the wrong group still fails.
     """
     _skip_without_fp8()
-    if launcher == "two_stage" and overlap:
-        pytest.skip("the two-stage split is the no-overlap path only")
     dev = "cuda"
     hd = _COMPRESSOR_BASE_CFG["head_dim"]
     cfg = {
