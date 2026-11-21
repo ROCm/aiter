@@ -5,14 +5,18 @@ import pytest
 import torch
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.attention.dao_ai import fwd_prefill
 from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
     ANY_FP8_ARCHS,
+    GpuArch,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
+    flash_attn_func,
     flash_attn_varlen_fp8_func,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
@@ -99,6 +103,143 @@ def test_mha(
     )
 
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
+
+
+@pytest.mark.parametrize("SEQLEN", [64, 300])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_strided_qkv(SEQLEN: int, HEAD_SZ: int, CAUSAL: bool):
+    # q, k and v are views into one packed fp8 qkv tensor, so their seqlen stride is
+    # (q heads + 2 * kv heads) * head dim. The output must equal the output for
+    # contiguous copies bit for bit.
+    BATCH, NUM_Q_HEADS, NUM_K_HEADS = 2, 8, 2
+    torch.manual_seed(20)
+    qkv = torch.randn(
+        (BATCH, SEQLEN, NUM_Q_HEADS + 2 * NUM_K_HEADS, HEAD_SZ),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(get_fp8_e4m3_dtype())
+    q, k, v = qkv.split([NUM_Q_HEADS, NUM_K_HEADS, NUM_K_HEADS], dim=2)
+    assert not k.is_contiguous() and not v.is_contiguous()
+    q_descale, k_descale, v_descale = (
+        torch.rand((BATCH, NUM_K_HEADS), device="cuda", dtype=torch.float32) + 0.5
+        for _ in range(3)
+    )
+
+    strided_out = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    contiguous_out = flash_attn_func(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    torch.testing.assert_close(strided_out, contiguous_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("PACKED", [True, False])
+@pytest.mark.parametrize("HEAD_SZ_V", [128, 64])
+def test_fp8_to_fp16_kv(PACKED: bool, HEAD_SZ_V: int):
+    # The conversion of the software-emulated fp8 path must be exact, also on
+    # the strided halves of a packed kv tensor and with a seqlen that is not a
+    # multiple of the block.
+    BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ = 2, 300, 3, 128
+    torch.manual_seed(20)
+    if PACKED and HEAD_SZ_V == HEAD_SZ:
+        kv = (
+            torch.randn((BATCH, SEQLEN, 2, NUM_K_HEADS, HEAD_SZ), device="cuda") * 64
+        ).to(get_fp8_e4m3_dtype())
+        k, v = kv[:, :, 0], kv[:, :, 1]
+    elif PACKED:
+        pytest.skip("a packed kv tensor has one head size")
+    else:
+        k, v = (
+            (torch.randn((BATCH, SEQLEN, NUM_K_HEADS, d), device="cuda") * 64).to(
+                get_fp8_e4m3_dtype()
+            )
+            for d in (HEAD_SZ, HEAD_SZ_V)
+        )
+    k16, v16 = fwd_prefill._fp8_to_fp16_kv(k, v)
+    assert k16.dtype == v16.dtype == torch.float16
+    torch.testing.assert_close(k16, k.to(torch.float16), atol=0, rtol=0)
+    torch.testing.assert_close(v16, v.to(torch.float16), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("DESCALE", ["fp32", "fp16_large"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_sw_emulated_path(monkeypatch, DESCALE: str, CAUSAL: bool):
+    # Forces the path for archs with software-emulated fp8, so it also runs on archs
+    # with fp8 hardware. The arch name and its configs stay real. "fp16_large" has
+    # fp16 descales whose q * k product exceeds the fp16 range.
+    monkeypatch.setattr(
+        GpuArch, "supports_sw_emulated_fp8", property(lambda self: True)
+    )
+    calls = []
+    to_fp16 = fwd_prefill._fp8_to_fp16_kv
+    monkeypatch.setattr(
+        fwd_prefill,
+        "_fp8_to_fp16_kv",
+        lambda k, v: calls.append((k, v)) or to_fp16(k, v),
+    )
+
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 2, 300, 8, 2, 128
+    torch.manual_seed(20)
+    # q and k shrink with the large descales, so the scores stay in a usual range
+    qk_scale, descale_dtype, descale_value = {
+        "fp32": (1.0, torch.float32, None),
+        "fp16_large": (2.0**-6, torch.float16, 256.0),
+    }[DESCALE]
+    q, k, v = (
+        (
+            torch.randn((BATCH, SEQLEN, n, HEAD_SZ), device="cuda", dtype=torch.float32)
+            * scale
+        ).to(get_fp8_e4m3_dtype())
+        for n, scale in (
+            (NUM_Q_HEADS, qk_scale),
+            (NUM_K_HEADS, qk_scale),
+            (NUM_K_HEADS, 1.0),
+        )
+    )
+    if descale_value is None:
+        q_descale, k_descale, v_descale = (
+            torch.rand((BATCH, NUM_K_HEADS), device="cuda") + 0.5 for _ in range(3)
+        )
+    else:
+        q_descale, k_descale, v_descale = (
+            torch.full((BATCH, NUM_K_HEADS), value, device="cuda", dtype=descale_dtype)
+            for value in (descale_value, descale_value, 1.0)
+        )
+
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    assert len(calls) == 1, "the software-emulated fp8 path did not run"
+
+    group = NUM_Q_HEADS // NUM_K_HEADS
+    q_ref = q.float() * q_descale.float().repeat_interleave(group, 1)[:, None, :, None]
+    k_ref = k.float() * k_descale.float()[:, None, :, None]
+    v_ref = v.float() * v_descale.float()[:, None, :, None]
+    torch_out, _, _ = attention_ref(q_ref, k_ref, v_ref, causal=CAUSAL)
+
+    assert torch.isfinite(triton_out).all()
+    torch.testing.assert_close(triton_out.float(), torch_out, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])
