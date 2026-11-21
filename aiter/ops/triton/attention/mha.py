@@ -645,6 +645,7 @@ def _flash_attn_forward(
     config: dict[str, any] | None = None,
     out_dtype: torch.dtype | None = None,
     implementation: Literal["default", "dao_ai"] | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor | None, int, int, torch.Tensor | None
 ]:
@@ -671,7 +672,17 @@ def _flash_attn_forward(
         raise ValueError(
             f"out_dtype must be float32, bfloat16 or float16, got {out_dtype}"
         )
-    o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=out_dtype, device=q.device)
+    o_shape = q.shape[:-1] + v.shape[-1:]
+    if out is None:
+        o = torch.zeros(o_shape, dtype=out_dtype, device=q.device)
+    else:
+        # Rows past cu_seqlens_q[-1] keep the caller's values.
+        if out.shape != o_shape or out.dtype != out_dtype or out.device != q.device:
+            raise ValueError(
+                f"out must be {tuple(o_shape)} {out_dtype} on {q.device}, "
+                f"got {tuple(out.shape)} {out.dtype} on {out.device}"
+            )
+        o = out
     if is_varlen:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
