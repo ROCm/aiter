@@ -33,6 +33,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices,
                           std::optional<aiter_tensor_t> reverse_sorted)
 {
+    aiter_detail::AiterThrowGuard throw_guard;
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
 
@@ -64,6 +65,15 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                     "reverse_sorted must be a contiguous int32 buffer for tokens * topk routes");
     }
 
+    const int ws_needed = moe_sorting_opus_get_workspace_size(
+        num_tokens, num_experts, topk, dispatch_policy, topk_ids.device_id);
+    AITER_CHECK(ws_needed == 0 ||
+                    (workspace.has_value() &&
+                     workspace.value().numel() * workspace.value().element_size() >=
+                         static_cast<size_t>(ws_needed)),
+                "moe_sorting_opus_fwd: this shape needs a workspace of at least ",
+                ws_needed,
+                " bytes");
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     moe_sorting_opus(
