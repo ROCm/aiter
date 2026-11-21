@@ -1,0 +1,16 @@
+{
+    "default": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 32,
+        "num_stages": 1,
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "large_head_or_fp32": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 16,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    }
+}
