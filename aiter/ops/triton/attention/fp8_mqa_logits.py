@@ -8,6 +8,11 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -24,6 +29,7 @@ if TRITON_GE_36:
         elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
+                _gluon_fp8_mqa_logits_rowgroup_kernel,
             )
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
@@ -92,6 +98,13 @@ def _gfx942_tile_fits_lds(
     # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
     lds_bytes = occupancy * num_stages * block_kv * head_size
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
+
+def _gfx1250_launch_config(seq_len_kv: int, num_heads: int, head_size: int) -> dict:
+    cfg_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    shape = table.get(f"H{num_heads}_D{head_size}", table["any"])
+    return select_leq_config(shape, seq_len_kv, prefix="KV_LEQ_")
 
 
 def fp8_mqa_logits(
@@ -348,11 +361,54 @@ def fp8_mqa_logits(
             }
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
-            loop_variant = 1
-            waves_per_eu = 1
-            num_chains = 8 if USE_FOLDED_REDUCTION else 0
-            num_warps = 4
-            block_kv = 128
+            cfg = _gfx1250_launch_config(seq_len_kv, num_heads, head_size)
+            rg = cfg.get("rowgroup")
+            if rg and seq_len >= max(rg["BLOCK_M"], rg["MIN_ROWS"]):
+                _gluon_fp8_mqa_logits_rowgroup_kernel[
+                    (triton.cdiv(seq_len, rg["BLOCK_M"]),)
+                ](
+                    Q,
+                    KV,
+                    kv_scales,
+                    weights,
+                    cu_starts,
+                    cu_ends,
+                    logits,
+                    out_offsets,
+                    seq_len=seq_len,
+                    seq_len_kv=seq_len_kv,
+                    NUM_HEADS=num_heads,
+                    HEAD_SIZE=head_size,
+                    stride_q_s=stride_q_s,
+                    stride_q_h=stride_q_h,
+                    stride_q_d=stride_q_d,
+                    stride_kv_s=stride_kv_s,
+                    stride_kv_d=stride_kv_d,
+                    stride_w_s=stride_w_s,
+                    stride_w_h=stride_w_h,
+                    stride_logits_s=stride_logits_s,
+                    stride_logits_k=stride_logits_k,
+                    BLOCK_M=rg["BLOCK_M"],
+                    BLOCK_KV=rg["BLOCK_KV"],
+                    NUM_WARPS=rg["NUM_WARPS"],
+                    WARPS_M=rg["WARPS_M"],
+                    USE_BUFFER_LOAD=use_buffer_load,
+                    USE_BUFFER_STORE=use_buffer_store,
+                    EXACT_ROWS=clean_logits or packed,
+                    PACKED=packed,
+                    num_warps=rg["NUM_WARPS"],
+                    waves_per_eu=(
+                        rg["waves_per_eu_exact"]
+                        if (clean_logits or packed)
+                        else rg["waves_per_eu"]
+                    ),
+                )
+                return logits
+            loop_variant = cfg["LOOP_VARIANT"]
+            waves_per_eu = cfg["waves_per_eu"]
+            num_chains = cfg["NUM_CHAINS"] if USE_FOLDED_REDUCTION else 0
+            num_warps = cfg["NUM_WARPS"]
+            block_kv = cfg["BLOCK_KV"]
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
