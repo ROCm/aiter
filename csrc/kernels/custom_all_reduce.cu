@@ -163,9 +163,11 @@ static bool lamportSkipsCopyIn(fptr_t _fa, const void* inp, AiterDtype dtype, in
     return fa->lamportDispatch(numel, 2, use_new) != aiter::LamportKernel::none;
 }
 
+// addend / addend_stage are either both null or both set (see all_reduce_add).
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
                         int64_t numel, AiterDtype dtype,
-                        bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr)
+                        bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr,
+                        const void* addend = nullptr, void* addend_stage = nullptr)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -175,12 +177,23 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         fa->allreduce<opus::fp32_t>(stream,
                              reinterpret_cast<opus::fp32_t*>(inp),
                              reinterpret_cast<opus::fp32_t*>(out),
-                             numel, use_new, is_broadcast_reg_outptr);
+                             numel, use_new, is_broadcast_reg_outptr,
+                             reinterpret_cast<const opus::fp32_t*>(addend),
+                             reinterpret_cast<opus::fp32_t*>(addend_stage));
         break;
     }
     case AITER_DTYPE_fp16: {
         if(useFp8Quant(dtype, numel, open_fp8_quant))
         {
+            if(addend != nullptr)
+            {
+                fa->add_inputs<opus::fp16_t>(stream,
+                                             reinterpret_cast<const opus::fp16_t*>(inp),
+                                             reinterpret_cast<const opus::fp16_t*>(addend),
+                                             reinterpret_cast<opus::fp16_t*>(addend_stage),
+                                             numel);
+                inp = addend_stage;
+            }
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
                                         reinterpret_cast<opus::fp16_t*>(inp),
                                         reinterpret_cast<opus::fp16_t*>(out),
@@ -191,7 +204,9 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
             fa->allreduce<opus::fp16_t>(stream,
                                 reinterpret_cast<opus::fp16_t*>(inp),
                                 reinterpret_cast<opus::fp16_t*>(out),
-                                numel, use_new, is_broadcast_reg_outptr);
+                                numel, use_new, is_broadcast_reg_outptr,
+                                reinterpret_cast<const opus::fp16_t*>(addend),
+                                reinterpret_cast<opus::fp16_t*>(addend_stage));
         }
         break;
     }
@@ -200,7 +215,9 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         fa->allreduce<opus::bf16_t>(stream,
                                       reinterpret_cast<opus::bf16_t*>(inp),
                                       reinterpret_cast<opus::bf16_t*>(out),
-                                      numel, use_new);
+                                      numel, use_new, false,
+                                      reinterpret_cast<const opus::bf16_t*>(addend),
+                                      reinterpret_cast<opus::bf16_t*>(addend_stage));
         break;
     }
 #endif
@@ -558,6 +575,42 @@ void all_reduce(fptr_t _fa,
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
+}
+
+void all_reduce_add(fptr_t _fa,
+                    const aiter_tensor_t& inp,
+                    const aiter_tensor_t& addend,
+                    const aiter_tensor_t& out,
+                    bool use_new, bool open_fp8_quant,
+                    int64_t reg_inp_ptr, int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    if(addend.dtype() != inp.dtype() || addend.numel() != inp.numel() ||
+       out.dtype() != inp.dtype() || out.numel() != inp.numel())
+        throw std::runtime_error(
+            "all_reduce_add: addend and out must match inp dtype and numel");
+    if(reinterpret_cast<uintptr_t>(inp.data_ptr()) % 16 != 0 ||
+       reinterpret_cast<uintptr_t>(addend.data_ptr()) % 16 != 0)
+        throw std::runtime_error("all_reduce_add: inp and addend must be 16-byte aligned");
+    // The registered input buffer stages inp + addend for the paths without a
+    // fused add, so it is required even when inp is registered.
+    if(reg_inp_ptr == 0)
+        throw std::runtime_error("all_reduce_add: requires the registered input buffer");
+    if(inp.numel() * inp.element_size() > reg_inp_bytes)
+        throw std::runtime_error("registered buffer is too small to contain the input");
+
+    _all_reduce(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
+                use_new, open_fp8_quant, /*is_broadcast_reg_outptr=*/false,
+                addend.data_ptr(), (void*)reg_inp_ptr);
+}
+
+bool all_reduce_one_shot(fptr_t _fa, const aiter_tensor_t& inp, bool registered_input)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    // Same broadcast flag as all_reduce -> _all_reduce (bf16 never broadcasts).
+    bool is_broadcast_reg_outptr = registered_input && inp.dtype() != AITER_DTYPE_bf16;
+    return fa->runs_one_shot(inp.numel() * inp.element_size(), inp.element_size(),
+                             is_broadcast_reg_outptr);
 }
 
 void reduce_scatter(fptr_t _fa,

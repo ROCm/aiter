@@ -560,6 +560,16 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                 \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_add",                                                          \
+          &aiter::all_reduce_add,                                                    \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("addend"),                                                         \
+          py::arg("out"),                                                            \
+          py::arg("use_new"),                                                        \
+          py::arg("open_fp8_quant"),                                                 \
+          py::arg("reg_inp_ptr"),                                                    \
+          py::arg("reg_inp_bytes"));                                                 \
     m.def("all_reduce_residual",                                                     \
           &aiter::all_reduce_residual,                                               \
           py::arg("_fa"),                                                            \
@@ -568,6 +578,11 @@ namespace py = pybind11;
           py::arg("residual"),                                                       \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_one_shot",                                                     \
+          &aiter::all_reduce_one_shot,                                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("registered_input"));                                              \
     m.def("reduce_scatter",                                                          \
           &aiter::reduce_scatter,                                                    \
           py::arg("_fa"),                                                            \
