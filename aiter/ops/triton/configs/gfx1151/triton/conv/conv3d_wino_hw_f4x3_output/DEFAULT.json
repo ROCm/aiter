@@ -1,0 +1,25 @@
+{
+    "any": {
+        "BLOCK_K": 256,
+        "num_stages": 1,
+        "num_warps": 8
+    },
+    "shapes": {
+        "N=1,C=160,D=6,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 128,
+            "num_stages": 1,
+            "num_warps": 8
+        },
+        "N=1,C=320,D=3,H=90,W=162,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 128,
+            "num_stages": 1,
+            "num_warps": 8,
+            "waves_per_eu": 2
+        },
+        "N=1,C=320,D=6,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 128,
+            "num_stages": 1,
+            "num_warps": 8
+        }
+    }
+}
