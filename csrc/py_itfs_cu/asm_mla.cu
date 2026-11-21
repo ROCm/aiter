@@ -275,6 +275,13 @@ struct MlaAsmDecodeCfg
     std::string kernel;
 };
 
+// Opt-in AITER_MLA_NATIVE_96H_CP: 96 fp8 heads at qlen 7 and 8 stay native under round-robin CP.
+static bool mla_native_96h_cp_enabled()
+{
+    const char* v = std::getenv("AITER_MLA_NATIVE_96H_CP");
+    return v != nullptr && std::atoi(v) != 0;
+}
+
 static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
                                             const std::string& q_type,
                                             const std::string& kv_type,
@@ -438,7 +445,8 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
                    || (gqa_ratio == 128)
-                   || (gqa_ratio == 96 && max_seqlen_q <= 8))){
+                   || (gqa_ratio == 96 && (max_seqlen_q <= 6
+                       || (has_cprr && max_seqlen_q <= 8 && mla_native_96h_cp_enabled()))))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         s_MQA = gqa_ratio;

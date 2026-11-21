@@ -2443,6 +2443,7 @@ namespace py = pybind11;
           py::arg("arch"),                               \
           py::arg("enable_experimental"),                \
           py::arg("flydsl_ps1"),                         \
+          py::arg("native_96h_cp"),                      \
           py::arg("v_head_dim"),                         \
           py::arg("page_size"),                          \
           py::arg("cp_world_size"),                      \

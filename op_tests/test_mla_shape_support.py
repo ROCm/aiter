@@ -39,6 +39,17 @@ requires_gpu = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
+def _native_96h_cp_env(request, monkeypatch):
+    # The native 96-head qlen 7/8 route is opt-in (AITER_MLA_NATIVE_96H_CP). The
+    # tests of that route run with it set; test_default_* tests run without it, and
+    # the opt-in tests set or clear it themselves.
+    if request.node.name.startswith("test_default"):
+        monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    else:
+        monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+
+
+@pytest.fixture(autouse=True)
 def _no_opus_env(monkeypatch):
     # The tests pin the default backends; AITER_MLA_USE_OPUS is read on every
     # query and launch, so an inherited value would select OPUS instead, and an
@@ -98,6 +109,66 @@ def test_planner_verdict():
     assert _fold("gfx942", "fp8", 64, 2) == 4
     assert _fold("gfx942", "bf16", 128) == 8
     assert _fold("gfx1250", "fp8", 64) == 4
+
+
+def test_default_96_heads_fold_at_qlen_7_and_8(monkeypatch):
+    # Default (no AITER_MLA_NATIVE_96H_CP): main's plan. 96 fp8 heads fold x6 at
+    # qlen 7 and 8, with or without round-robin CP, and stay native up to qlen 6.
+    monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    for cprr in (False, True):
+        folds = [
+            _fold("gfx950", "fp8", 96, q, cp_round_robin=cprr) for q in range(1, 10)
+        ]
+        assert folds == [1] * 6 + [6] * 3, (cprr, folds)
+        s = get_mla_decode_shape_support(
+            96, 8, torch.float8_e4m3fn, torch.float8_e4m3fn, arch="gfx950", **_cp(cprr)
+        )
+        assert not s.native and s.fold_factor == 6, s
+    # Opting in moves only the round-robin CP qlen 7/8 plans; the kwarg overrides
+    # the env var in both directions.
+    on = {"native_96h_cp": True}
+    for q, cprr, native in (
+        (7, True, True),
+        (8, True, True),
+        (9, True, False),
+        (7, False, False),
+        (8, False, False),
+    ):
+        s = get_mla_decode_shape_support(
+            96,
+            q,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            arch="gfx950",
+            **on,
+            **_cp(cprr),
+        )
+        assert s.native is native, (q, cprr, s)
+    monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    assert get_mla_decode_shape_support(
+        96, 8, torch.float8_e4m3fn, torch.float8_e4m3fn, arch="gfx950", **_cp(True)
+    ).native
+    assert not get_mla_decode_shape_support(
+        96,
+        8,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        arch="gfx950",
+        native_96h_cp=False,
+        **_cp(True),
+    ).native
+
+
+def test_default_launch_plan_folds_96_heads_under_cprr(monkeypatch):
+    # mla_decode_fwd's launch plan takes the fold unless the env opts in, and
+    # follows the env var at call time.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    args = (96, 8, dtypes.fp8, dtypes.fp8, True, False, 1, CP_WORLD_SIZE, True, True)
+    assert _mla_decode_launch_plan(*args)[0].plan == attention._MlaHeadPlanKind.FOLDED
+    monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    assert _mla_decode_launch_plan(*args)[0].plan == attention._MlaHeadPlanKind.NATIVE
 
 
 def test_gfx942_96_heads_stay_folded():
@@ -480,6 +551,28 @@ def test_planner_fold_agreement():
 
 
 @requires_gpu
+def test_default_metadata_info_sizes_96_heads_for_the_fold(monkeypatch):
+    # Without the opt-in the buffers are main's: no qo tile per token for qlen 7/8.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    for bs, msq in itertools.product((1, 56), (7, 8)):
+        kw = {
+            "is_sparse": False,
+            "fast_mode": True,
+            "num_kv_splits": MAX_SPLIT_PER_BATCH,
+            "intra_batch_mode": False,
+            "max_split_per_batch": MAX_SPLIT_PER_BATCH,
+        }
+        off = aiter.get_mla_metadata_info_v1(bs, msq, 96, dtypes.fp8, dtypes.fp8, **kw)
+        monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+        on = aiter.get_mla_metadata_info_v1(bs, msq, 96, dtypes.fp8, dtypes.fp8, **kw)
+        monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP")
+        # the fold: 6 pseudo-batches of msq one-tile qo tiles each
+        assert off[4][0] == (bs * 6 * msq, 2), off
+        assert on[4][0] == (bs * msq, 2), on
+
+
 def test_metadata_info_sizes_96_heads_for_both_plans():
     # 96 fp8 heads at qlen 7 and 8 run a qo tile per token under round-robin CP
     # and 6 one-tile pseudo-batches without it. get_mla_metadata_info_v1 cannot
@@ -627,6 +720,35 @@ def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
         )
         _assert_matches_cprr_reference(out_s, lse_s, inputs, msq, cp_rank)
         assert torch.equal(out_s, out) and torch.equal(lse_s, lse), msq
+
+
+@requires_gpu
+def test_default_96_head_cprr_decode_takes_the_fold(monkeypatch):
+    # Without the opt-in, round-robin CP at qlen 7 and 8 runs main's folded path
+    # (planned with or without is_cp_round_robin) and matches the reference.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
+    folds = []
+    fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
+
+    def counting_fold(*args):
+        folds.append(args)
+        return fold_seqlen_indptr(*args)
+
+    monkeypatch.setattr(aiter.mla, "_fold_seqlen_indptr", counting_fold)
+    cp_rank = 3
+    for msq, plan_cprr in itertools.product((7, 8), (True, False)):
+        folds.clear()
+        out, lse, inputs = _run_decode(
+            96, msq, "fp8", True, cp_rank=cp_rank, plan_cprr=plan_cprr
+        )
+        assert folds, (msq, plan_cprr)
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+    # qlen 6 is native either way
+    folds.clear()
+    _run_decode(96, 6, "fp8", True, cp_rank=cp_rank)
+    assert not folds
 
 
 @requires_gpu

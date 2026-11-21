@@ -27,6 +27,9 @@ struct MlaPlannerFlags
 {
     bool enable_experimental;
     bool flydsl_ps1;
+    // Opt-in (AITER_MLA_NATIVE_96H_CP): run 96 fp8 heads at qlen 7 and 8 natively under
+    // round-robin CP. Off, they fold as before.
+    bool native_96h_cp;
 };
 
 struct MlaDecodeHeadPlan
@@ -172,12 +175,12 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
-        // 96 heads at qlen 7 and 8 run natively only under round-robin CP. There the
-        // fold's copy and index kernels add about 0.1 ms a call, so native is faster
-        // up to 64K tokens of global context at any batch size. Without CP the fold
-        // is faster from batch 16 up.
+        // 96 heads at qlen 7 and 8 run natively only when opted in (native_96h_cp) and
+        // under round-robin CP. Off by default: at 350K tokens of context the native
+        // route measured 0.35x (qlen 7) and 0.59x (qlen 8) of the fold at batch 1.
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
-         ((max_seqlen_qo <= 6) || (cp_round_robin && (max_seqlen_qo <= 8)))) ||
+         ((max_seqlen_qo <= 6) ||
+          (flags.native_96h_cp && cp_round_robin && (max_seqlen_qo <= 8)))) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 12) &&
          ((num_heads * max_seqlen_qo) <= 128)) ||
         hk_mtp_experimental;

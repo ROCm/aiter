@@ -1321,6 +1321,7 @@ def get_mla_decode_head_plan_v1(
     arch: str,
     enable_experimental: int,
     flydsl_ps1: int,
+    native_96h_cp: int,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -1382,6 +1383,10 @@ _MlaHeadPlan = _namedtuple(
 )
 
 
+def _mla_native_96h_cp_enabled() -> bool:
+    return env_flag_atoi("AITER_MLA_NATIVE_96H_CP")
+
+
 def _mla_opus_enabled() -> bool:
     return env_flag_atoi("AITER_MLA_USE_OPUS")
 
@@ -1422,7 +1427,7 @@ def _mla_shape_dtype(dtype: torch.dtype) -> tuple[int, str]:
 def _mla_cpp_gpu_arch(device_index: int) -> str:
     bf16 = _aiter_dtype_ids["bf16"]
     plan = get_mla_decode_head_plan_v1(
-        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 512, 1, 1, *(False,) * 4
+        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 0, 512, 1, 1, *(False,) * 4
     )
     return plan[0]
 
@@ -1444,6 +1449,7 @@ def _mla_decode_head_plan_cached(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -1466,6 +1472,7 @@ def _mla_decode_head_plan_cached(
             arch,
             int(enable_experimental),
             int(flydsl_ps1),
+            int(native_96h_cp),
             v_head_dim,
             page_size,
             cp_world_size,
@@ -1496,6 +1503,7 @@ def _mla_decode_head_plan(
     arch: str | None = None,
     enable_experimental: bool | None = None,
     flydsl_ps1: bool | None = None,
+    native_96h_cp: bool | None = None,
 ) -> _MlaHeadPlan:
     # mla_decode_fwd calls this on every eager step: resolve the env flags and
     # the arch here and leave everything else to one cache lookup.
@@ -1517,6 +1525,7 @@ def _mla_decode_head_plan(
             if flydsl_ps1 is None
             else bool(flydsl_ps1)
         ),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         int(v_head_dim),
         int(page_size),
         int(cp_world_size),
@@ -1538,6 +1547,7 @@ def _mla_decode_head_plan_by_dtype(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -1561,6 +1571,7 @@ def _mla_decode_head_plan_by_dtype(
         arch,
         enable_experimental,
         flydsl_ps1,
+        native_96h_cp,
         v_head_dim,
         page_size,
         cp_world_size,
@@ -1604,6 +1615,7 @@ def _mla_decode_launch_plan(
         torch.cuda.current_device(),
         env.get("AITER_ENABLE_EXPERIMENTAL", ""),
         env.get("AITER_MLA_DECODE_PS1_FLYDSL", ""),
+        env.get("AITER_MLA_NATIVE_96H_CP", ""),
         env.get("AITER_MLA_USE_OPUS", ""),
         env.get("AITER_MLA_DECODE_PS1_ASM", "1"),
     )
@@ -1624,6 +1636,7 @@ def _mla_decode_launch_plan_cached(
     device_index: int,
     experimental: str,
     flydsl_ps1: str,
+    native_96h_cp: str,
     use_opus: str,
     use_ps1_asm: str,
 ) -> tuple[_MlaHeadPlan, int]:
@@ -1644,6 +1657,7 @@ def _mla_decode_launch_plan_cached(
         arch=arch,
         enable_experimental=_atoi_flag(experimental),
         flydsl_ps1=_atoi_flag(flydsl_ps1),
+        native_96h_cp=_atoi_flag(native_96h_cp),
     )
     # A byte KV buffer (3-buffer layout) is sized as fp8, like its callers do.
     if kv_dtype in (torch.int8, torch.uint8):
@@ -1765,6 +1779,7 @@ def _get_mla_decode_shape_support_cached(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     use_opus: bool,
     use_ps1_asm: bool,
 ) -> MlaDecodeShapeSupport:
@@ -1780,6 +1795,7 @@ def _get_mla_decode_shape_support_cached(
         arch,
         enable_experimental,
         flydsl_ps1,
+        native_96h_cp,
         v_head_dim,
         page_size,
         cp_world_size,
@@ -1950,6 +1966,7 @@ def get_mla_decode_shape_support(
     arch: str | None = None,
     enable_experimental: bool | None = None,
     flydsl_ps1: bool | None = None,
+    native_96h_cp: bool | None = None,
 ) -> MlaDecodeShapeSupport:
     """Report how mla_decode_fwd will run an MLA decode shape, without launching.
 
@@ -1971,7 +1988,9 @@ def get_mla_decode_shape_support(
     arch=None uses the current device's arch; an explicit arch needs no device,
     but asm availability is only known for arches compiled into the build.
     enable_experimental and flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL
-    and AITER_MLA_DECODE_PS1_FLYDSL env vars. Results are cached; call
+    and AITER_MLA_DECODE_PS1_FLYDSL env vars. native_96h_cp defaults to
+    AITER_MLA_NATIVE_96H_CP (off): 96 fp8 heads at qlen 7 and 8 are native only
+    when it is set and cp_round_robin is True, and fold otherwise. Results are cached; call
     get_mla_decode_shape_support.cache_clear() after changing env vars.
 
     Raises TypeError for a non-int count or a non-torch.dtype, and ValueError
@@ -2030,6 +2049,7 @@ def get_mla_decode_shape_support(
             if flydsl_ps1 is None
             else bool(flydsl_ps1)
         ),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         _mla_opus_enabled(),
         _mla_ps1_asm_enabled(),
     )
@@ -2163,6 +2183,7 @@ def _mla_metadata_head_plan(
         _mla_resolve_arch(None),
         env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
         env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
+        _mla_native_96h_cp_enabled(),
         512,
         1,
         1,
@@ -2267,9 +2288,13 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo == 96
-            # qlen 7 and 8 are native only under round-robin CP; the fold that
-            # runs without it is sized from its own plan.
-            and effective_seqlen_qo <= 8
+            # qlen 7 and 8 are native only when AITER_MLA_NATIVE_96H_CP opts in
+            # (and under round-robin CP); the fold that runs otherwise is sized
+            # from its own plan.
+            and (
+                effective_seqlen_qo <= 6
+                or (effective_seqlen_qo <= 8 and _mla_native_96h_cp_enabled())
+            )
         )
         or (
             get_gfx() == "gfx950"
@@ -2332,6 +2357,7 @@ def get_mla_metadata_info_v1(
         _mla_resolve_arch(None),
         env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
         env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
+        _mla_native_96h_cp_enabled(),
     )
 
 
@@ -2350,6 +2376,7 @@ def _mla_metadata_info_v1_cached(
     _arch: str,
     _enable_experimental: bool,
     _flydsl_ps1: bool,
+    _native_96h_cp: bool,
 ):
     if is_sparse or num_head_qo < 1:
         assert num_head_qo % 4 == 0
@@ -2539,9 +2566,10 @@ def _get_mla_metadata_v1_impl(
         max_split_per_batch: Cap on KV splits per batch. -1 means unbounded (default -1).
         intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
         is_cp_round_robin: Context-parallel round-robin work assignment (default False).
-            Set it for a round-robin CP decode (mla_decode_fwd with g_kv_indptr): 96
-            fp8 heads at qlen 7 and 8 are planned natively with it and folded without
-            it. The mode is recorded with work_metadata_ptrs (views and deep copies
+            Set it for a round-robin CP decode (mla_decode_fwd with g_kv_indptr). 96
+            fp8 heads at qlen 7 and 8 are planned natively only with it AND the
+            AITER_MLA_NATIVE_96H_CP=1 opt-in (off by default: the native route is
+            slower than the fold at long context); otherwise they fold. The mode is recorded with work_metadata_ptrs (views and deep copies
             keep it; a clone, or a deep copy of a view, has no record, and copy_ into
             a planned buffer keeps that buffer's own record, so plan the destination
             again instead) and mla_decode_fwd runs the head plan it records. Where
