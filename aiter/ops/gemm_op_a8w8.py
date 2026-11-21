@@ -1058,19 +1058,10 @@ def gemm_a8w8_bpreshuffle(
     return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y)
 
 
-def _gemm_a8w8_bpreshuffle_into(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
-) -> Tensor:
-    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
-    Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
-    the same kernel."""
-    m = XQ.shape[0]
-    n = WQ.shape[0]
-    k = XQ.shape[-1]
-    w_k = WQ.shape[-1]
-    dtype = Y.dtype
+def _bpreshuffle_config(XQ: Tensor, WQ: Tensor) -> dict | None:
+    """The tuned row _gemm_a8w8_bpreshuffle_into dispatches on, or None."""
+    m, n, k, w_k = XQ.shape[0], WQ.shape[0], XQ.shape[-1], WQ.shape[-1]
     is_int8 = XQ.dtype == dtypes.i8
-
     q_dtype = dtypes.i8 if is_int8 else dtypes.fp8
     # INT8 kernel names encode the physical K specialization, so padded
     # weights must resolve against the effective launch K. Preserve the
@@ -1093,6 +1084,23 @@ def _gemm_a8w8_bpreshuffle_into(
         )
     if is_int8 and config is not None and not _int8_row_runs_on_flydsl(config, m, w_k):
         config = None
+    return config
+
+
+def _gemm_a8w8_bpreshuffle_into(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
+) -> Tensor:
+    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
+    Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
+    the same kernel."""
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    dtype = Y.dtype
+    is_int8 = XQ.dtype == dtypes.i8
+
+    config = _bpreshuffle_config(XQ, WQ)
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w
     # with XQ zero-padded to match.
@@ -1152,6 +1160,165 @@ def _gemm_a8w8_bpreshuffle_into(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+# Split-K reduction left to the consumer (gfx1250 PTPC bpreshuffle).
+#
+# At decode sizes the tuned gfx1250 GEMM splits K: the 16-row tiles alone would
+# put one workgroup on each of N/tile_n of the 256 CUs. The standalone kernel that
+# then sums the fp32 partials into bf16 moves little data and costs a launch and a
+# memory round trip. A deferred output skips it: the bf16 [M, N] tensor shares its
+# allocation with the unreduced [split_k, M, N] partials, and its consumer, which
+# reads each element once anyway, sums them as gemm_a8w8_splitk_reduce does (fp32,
+# split order, one round-to-nearest-even) and writes the reduced row back, so it
+# sees, and leaves behind, exactly what the two-kernel path produces.
+#
+# Allocation address of a deferred output -> (split_k, M, N, the allocation). The
+# entry holds the allocation, so no other tensor can start at that address while
+# it is listed. An output nobody claims (a forward that skips its consumer) stays
+# until _SPLITK_DEFERRED_MAX newer ones are listed; the oldest is then finished
+# with the standalone reduce and dropped.
+_SPLITK_DEFERRED: dict[int, tuple[int, int, int, Tensor]] = {}
+_SPLITK_DEFERRED_MAX = 64
+
+
+def _splitk_partials_offset(m: int, n: int) -> int:
+    """Byte offset of the partials behind a deferred bf16 [m, n] output."""
+    return -(-m * n * 2 // 256) * 256
+
+
+def _splitk_views(entry) -> tuple[Tensor, Tensor]:
+    """The bf16 [M, N] output and fp32 [split_k, M, N] partials of a table entry."""
+    split_k, m, n, buf = entry
+    off = _splitk_partials_offset(m, n)
+    y = buf[: m * n * 2].view(dtypes.bf16).view(m, n)
+    return y, buf[off : off + split_k * m * n * 4].view(torch.float32).view(
+        split_k, m, n
+    )
+
+
+def gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch() -> bool:
+    """Whether gemm_a8w8_bpreshuffle_splitk_deferred can leave a split-K reduction
+    to the consumer on this GPU at all. When False it always returns
+    gemm_a8w8_bpreshuffle's output, so a caller can keep its plain path."""
+    return is_gfx1250_family(get_gfx())
+
+
+def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
+    """(kernelName, split_k) when gemm_a8w8_bpreshuffle would run the gfx1250
+    PTPC GEMM with split_k > 1 for this call and M <= max_m, else None. Anything
+    else goes through gemm_a8w8_bpreshuffle and its input checks."""
+    if (
+        XQ.dim() != 2
+        or WQ.dim() != 2
+        or dtype != dtypes.bf16
+        or XQ.dtype != dtypes.fp8
+        or WQ.dtype != dtypes.fp8
+        # A padded-K weight takes the padded-XQ path; leave it to the plain GEMM.
+        or not 0 < XQ.shape[0] <= max_m
+        or WQ.shape[1] != XQ.shape[1]
+    ):
+        return None
+    config = _bpreshuffle_config(XQ, WQ)
+    # _gemm_a8w8_bpreshuffle_into hands a flydsl row to gemm_a8w8_bpreshuffle_flydsl,
+    # which runs run_gemm_a8w8_bpreshuffle_gfx1250 on gfx1250.
+    if (
+        config is None
+        or config["libtype"] != "flydsl"
+        or not gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch()
+    ):
+        return None
+    from .flydsl.bpreshuffle_gemm_gfx1250 import parse_wmma_kernel_name
+
+    name = str(config.get("kernelName", ""))
+    cfg = parse_wmma_kernel_name(name)
+    if cfg is None or cfg["split_k"] not in (2, 4, 8):
+        return None
+    return name, cfg["split_k"]
+
+
+def gemm_a8w8_bpreshuffle_splitk_deferred(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    max_m: int = 64,
+) -> Tensor:
+    """gemm_a8w8_bpreshuffle that may leave its split-K reduction to the consumer.
+
+    When the tuned kernel for this call is the gfx1250 PTPC GEMM with split_k in
+    (2, 4, 8) and M <= max_m, the returned bf16 [M, N] tensor is NOT written yet:
+    its allocation also holds the fp32 partials. Before anything reads it, pass
+    ``splitk_partials(Y)`` to a consumer that reduces them as it reads Y, or call
+    ``reduce_splitk_partials(Y)``. Any other call returns
+    gemm_a8w8_bpreshuffle's output. Same kernel, same partials either way, so the
+    finished tensor is bitwise what gemm_a8w8_bpreshuffle returns. Eager only: the
+    hand-off is host state, so a graph must capture producer and consumer together.
+    """
+    deferred = _splitk_deferrable(XQ, WQ, dtype, max_m)
+    if deferred is None:
+        return gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype=dtype)
+    from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
+
+    kernel_name, split_k = deferred
+    m, n = XQ.shape[0], WQ.shape[0]
+    nbytes = _splitk_partials_offset(m, n) + split_k * m * n * 4
+    entry = (split_k, m, n, torch.empty(nbytes, dtype=torch.uint8, device=XQ.device))
+    Y, partials = _splitk_views(entry)
+    run_gemm_a8w8_bpreshuffle_gfx1250(
+        XQ, WQ, x_scale, w_scale, Y, kernel_name, partials=partials
+    )
+    if len(_SPLITK_DEFERRED) >= _SPLITK_DEFERRED_MAX:
+        oldest = _SPLITK_DEFERRED.pop(next(iter(_SPLITK_DEFERRED)))
+        reduce_splitk_partials(*_splitk_views(oldest))
+    _SPLITK_DEFERRED[Y.data_ptr()] = entry
+    return Y
+
+
+def splitk_partials(y: Tensor) -> Tensor | None:
+    """Claim the unreduced fp32 [split_k, M, N] partials of ``y``, an output (or a
+    leading row slice of one) of gemm_a8w8_bpreshuffle_splitk_deferred, or None
+    when ``y`` already holds its values. Raises for any other view of a deferred
+    output. The claimer must leave ``y`` reduced: hand the partials to a consumer
+    that writes the row back, or to reduce_splitk_partials."""
+    storage = y.untyped_storage()
+    entry = _SPLITK_DEFERRED.get(storage.data_ptr())
+    if entry is None:
+        return None
+    _, m, n, buf = entry
+    if (
+        y.data_ptr() != buf.data_ptr()
+        or y.dtype != dtypes.bf16
+        or y.dim() != 2
+        or y.shape[0] > m
+        or y.shape[1] != n
+        or y.stride() != (n, 1)
+    ):
+        raise ValueError(
+            "splitk_partials: a deferred split-K output is claimed whole or as a "
+            f"leading row slice ({m}, {n}) bf16, got {y.dtype} {tuple(y.shape)} "
+            f"strides={tuple(y.stride())} at byte offset "
+            f"{y.data_ptr() - buf.data_ptr()}"
+        )
+    return _splitk_views(_SPLITK_DEFERRED.pop(storage.data_ptr()))[1]
+
+
+def reduce_splitk_partials(y: Tensor, partials: Tensor | None = None) -> Tensor:
+    """Finish a deferred split-K output in place with the standalone reduce kernel
+    (the one gemm_a8w8_bpreshuffle runs); ``partials`` are its claimed partials,
+    claimed here when None. A tensor that holds its values is returned as is."""
+    if partials is None:
+        partials = splitk_partials(y)
+        if partials is None:
+            return y
+    from .flydsl.bpreshuffle_gemm_gfx1250 import reduce_splitk_partials_gfx1250
+
+    _, m, n = partials.shape
+    full = torch.empty(0, dtype=y.dtype, device=y.device)
+    full.set_(y.untyped_storage(), 0, (m, n), (n, 1))
+    reduce_splitk_partials_gfx1250(partials, full)
+    return y
 
 
 # Only ``out`` is written, so it is the only argument declared mutable; the
