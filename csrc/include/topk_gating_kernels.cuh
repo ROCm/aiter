@@ -401,11 +401,14 @@ __global__ void topk_gating_kernel_opt(
             vals[i] += static_cast<float>(correction_bias[e]);
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
-        // push NaN to the bottom so it is simply excluded.
+        // push NaN to the bottom. -FLT_MAX, not -INFINITY: an exhausted lane
+        // bids -INFINITY, and an invalid expert must outbid it, or a row with
+        // fewer than topk valid experts repeats an id. Repeated ids are not
+        // inert even at weight 0: the fused MoE kernels queue every pair.
         // fmaxf: v_max_f32 is IEEE maxNum, so it returns the non-NaN operand.
         // NOTE: folded away under -ffast-math (-ffinite-math-only), which aiter
         // does not use; if that changes, test the exponent/mantissa bits.
-        vals[i] = fmaxf(vals[i], -INFINITY);
+        vals[i] = fmaxf(vals[i], -FLT_MAX);
     }
 
     if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
@@ -537,9 +540,9 @@ __global__ void topk_gating_kernel_opt_multiwave(
             vals[i] += static_cast<float>(correction_bias[e]);
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
-        // push NaN to the bottom so it is simply excluded.
+        // push NaN to the bottom, above an exhausted lane; see opt kernel.
         // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
-        vals[i] = fmaxf(vals[i], -INFINITY);
+        vals[i] = fmaxf(vals[i], -FLT_MAX);
     }
 
     if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
@@ -748,7 +751,7 @@ __global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_
             idxs[g][i]  = i * C + G * lane_id + g;
             if(correction_bias != nullptr)
                 vals[g][i] += static_cast<float>(bias[i][g]);
-            vals[g][i] = fmaxf(vals[g][i], -INFINITY);
+            vals[g][i] = fmaxf(vals[g][i], -FLT_MAX); // NaN to the bottom; see opt kernel
         }
     }
 #pragma unroll
@@ -944,9 +947,9 @@ __global__ void topk_gating_kernel_opt_n(
             vals[i] += static_cast<float>(correction_bias[e]);
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
-        // push NaN to the bottom so it is simply excluded.
+        // push NaN to the bottom, above an exhausted lane; see opt kernel.
         // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
-        vals[i] = fmaxf(vals[i], -INFINITY);
+        vals[i] = fmaxf(vals[i], -FLT_MAX);
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -1095,7 +1098,8 @@ void topk_gating_kernel_prefill(
                 // experts are lost.  The other kernels scrub NaN at load for the
                 // same reason; softmax does its own below.
                 // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
-                row_chunk[elt] = ::isnan(row_chunk[elt]) ? -INFINITY : row_chunk[elt];
+                // -FLT_MAX, not -INFINITY: a cleared winner is -INFINITY; see opt kernel.
+                row_chunk[elt] = ::isnan(row_chunk[elt]) ? -FLT_MAX : row_chunk[elt];
                 // NaN weight -> 0 so it cannot poison the renorm sum; see opt
                 // kernel. Softmax needs no equivalent: it overwrites row_orig
                 // with normalized probabilities below.
@@ -1174,8 +1178,9 @@ void topk_gating_kernel_prefill(
                 row_chunk[i] += static_cast<float>(correction_bias[lane_in_group * VPT + i]);
             // A NaN expert's probability is 0.0, same as a genuinely low
             // finite expert's -- bias alone could otherwise win it a slot.
-            // Force it back below any real selection score.
-            if(is_nan[i]) row_chunk[i] = -INFINITY;
+            // Force it back below any real selection score, but above the
+            // -INFINITY that clears a winner; see opt kernel.
+            if(is_nan[i]) row_chunk[i] = -FLT_MAX;
         }
     }
 
@@ -1291,6 +1296,7 @@ __global__ void topk_gating_kernel(
             {
                 if(correction_bias != nullptr)
                     gating[i] += static_cast<float>(correction_bias[e * vec_size + i]);
+                gating[i] = fmaxf(gating[i], -FLT_MAX); // NaN to the bottom; see opt kernel
             }
         }
         scores_vec[e] = gating;
@@ -1302,6 +1308,7 @@ __global__ void topk_gating_kernel(
         {
             if(correction_bias != nullptr)
                 scores[e] += static_cast<float>(correction_bias[e]);
+            scores[e] = fmaxf(scores[e], -FLT_MAX);
         }
     }
     __syncthreads();
@@ -1347,9 +1354,10 @@ __global__ void topk_gating_kernel(
                 scores[e] += static_cast<float>(correction_bias[e]);
             // A NaN expert's probability is 0.0, same as a genuinely low
             // finite expert's -- bias alone could otherwise win it a slot.
-            // Force it back below any real selection score.
+            // Force it back below any real selection score, but above the
+            // -INFINITY that clears a winner; see opt kernel.
             if(::isnan(static_cast<float>(input_ptr[e])))
-                scores[e] = -INFINITY;
+                scores[e] = -FLT_MAX;
         }
         __syncthreads();
     }
@@ -1374,10 +1382,10 @@ __global__ void topk_gating_kernel(
         if(correction_bias != nullptr)
             max_val -= static_cast<float>(correction_bias[max_idx]);
         scores[max_idx] = -INFINITY;
-        // -Inf here means the row ran out of valid experts and this slot elected
-        // a sentinel (either a NaN scrubbed at load or an already-taken expert).
+        // -FLT_MAX or -Inf here means the row ran out of valid experts and this
+        // slot elected a sentinel (a NaN scrubbed at load, or a masked expert).
         // Weight it 0 rather than -Inf; see opt kernel for why the sum matters.
-        if(!::isfinite(max_val))
+        if(!::isfinite(max_val) || max_val <= -FLT_MAX)
             max_val = 0.0f;
         if(static_cast<int>(threadIdx.x) == k)
         {
@@ -1485,6 +1493,7 @@ __global__ void topk_gating_kernel_smem_n(
             {
                 if(correction_bias != nullptr)
                     gating[i] += static_cast<float>(correction_bias[e * vec_size + i]);
+                gating[i] = fmaxf(gating[i], -FLT_MAX); // NaN to the bottom; see opt kernel
             }
         }
         scores_vec[e] = gating;
@@ -1496,6 +1505,7 @@ __global__ void topk_gating_kernel_smem_n(
         {
             if(correction_bias != nullptr)
                 scores[e] += static_cast<float>(correction_bias[e]);
+            scores[e] = fmaxf(scores[e], -FLT_MAX);
         }
     }
     __syncthreads();  // both groups must finish writing before K-merge reads
@@ -1539,9 +1549,10 @@ __global__ void topk_gating_kernel_smem_n(
                 scores[e] += static_cast<float>(correction_bias[e]);
             // A NaN expert's probability is 0.0, same as a genuinely low
             // finite expert's -- bias alone could otherwise win it a slot.
-            // Force it back below any real selection score.
+            // Force it back below any real selection score, but above the
+            // -INFINITY that clears a winner; see opt kernel.
             if(::isnan(static_cast<float>(input_ptr[e])))
-                scores[e] = -INFINITY;
+                scores[e] = -FLT_MAX;
         }
         __syncthreads();
     }
@@ -1579,7 +1590,7 @@ __global__ void topk_gating_kernel_smem_n(
 
         // Sentinel elected because the row ran out of valid experts; see the
         // other smem kernel.
-        if(!::isfinite(max_val))
+        if(!::isfinite(max_val) || max_val <= -FLT_MAX)
             max_val = 0.0f;
 
         if(lane_in_row == k)

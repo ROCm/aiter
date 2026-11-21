@@ -299,10 +299,12 @@ def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
     are real inputs rather than one being a theoretical variant of the other.
     Row 1 is short by exactly one slot and must weight precisely its valid
     experts: an id set, so a sentinel that either takes a slot or duplicates a
-    real expert fails. Only weights are checked on the dead rows, because the
-    sentinel ids there are allowed to repeat -- a zero weight makes them inert.
-    Reuses the sweep's token count to keep the same dispatch path as the
-    measured case.
+    real expert fails. Every row must also hold topk distinct ids, dead rows
+    included: a zero weight does not make a repeated id inert, because the
+    fused MoE kernels still queue every (token, expert) pair, and the
+    persistent-queue ones (EMSORT) size each expert's queue for at most one
+    entry per token. Reuses the sweep's token count to keep the same dispatch
+    path as the measured case.
     """
     gating_output = _make_gating(num_experts, num_tokens, dtype)
     gating_output[0, :] = float("nan")  # no valid expert at all
@@ -334,6 +336,9 @@ def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
     if not topk_weights.isfinite().all().item():
         return False
     if ((topk_ids < 0) | (topk_ids >= num_experts)).any().item():
+        return False
+    sorted_ids = topk_ids.sort(dim=-1).values
+    if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any().item():
         return False
     for row in dead_rows:
         if (topk_weights[row] != 0.0).any().item():
