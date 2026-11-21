@@ -20,4 +20,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("ctx"), py::arg("inp"), py::arg("res_inp"), py::arg("w"),
           py::arg("out"), py::arg("res_out"), py::arg("rows"), py::arg("hidden"),
           py::arg("eps"), py::arg("gemma_norm"));
+    m.def("ar2s_rms_ex", &aiter::ar2s_rms_ex,
+          py::arg("ctx"), py::arg("inp"), py::arg("res_inp"), py::arg("w"),
+          py::arg("out"), py::arg("res_out"), py::arg("out_q"), py::arg("out_s"),
+          py::arg("rows"), py::arg("hidden"), py::arg("eps"), py::arg("gemma_norm"),
+          py::arg("fp8_out"), py::arg("sp_residual"), py::arg("aux_residual"),
+          py::arg("grid") = 0);
 }

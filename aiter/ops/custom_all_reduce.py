@@ -763,3 +763,24 @@ def ar2s_rms_gfx1250(
     eps: float,
     gemma_norm: bool,
 ) -> None: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_ex", develop=True)
+def ar2s_rms_ex_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    out_q: int,
+    out_s: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    fp8_out: bool,
+    sp_residual: bool,
+    aux_residual: bool,
+    grid: int = 0,
+) -> None: ...

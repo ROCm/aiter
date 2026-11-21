@@ -90,6 +90,12 @@ _AR2S_RMS_MIN_BYTES = int(
 _AR2S_RMS_MAX_TOTAL_BYTES = int(
     os.environ.get("AITER_AR2S_RMS_MAX_TOTAL", str(288 << 20))
 )
+# fused_allreduce_rmsnorm_mxfp8_quant in that range: ar2s quantizes to MXFP8
+# in its own epilogue (bit-identical to ar2s + per_1x32_mx_quant_hip) instead
+# of writing bf16 for a separate quant kernel. AITER_AR2S_MXFP8=0 keeps the two.
+# Off by default: measured level with ar2s + per_1x32_mx_quant_hip (14336 rows, TP4: 318.7 vs 317.7 us), the
+# quant only moves into ar2s's latency-bound phase 3. Kept for the sequence-parallel path, where it does pay.
+_AR2S_MXFP8 = os.environ.get("AITER_AR2S_MXFP8", "0") != "0"
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -796,6 +802,73 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
+    # ---- sequence-parallel residual (ar2s_rms_ex sp_residual), prefill sizes ----
+    # The residual stream lives on its owner rows only (CustomAllreduce.ar2s_sp_own_rows: chunk `rank`
+    # of every ar2s launch); the normed output is whole and bit-identical to the replicated path's.
+    # Every call of a forward has the same rows, so every call takes the same branch: below the ar2s
+    # range they all run the replicated path, whose whole residual is a valid superset.
+    def ar2s_sp_eligible(self, input_: torch.Tensor, weight_: torch.Tensor) -> bool:
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not getattr(ca_comm, "_ar2s_ctx", 0):
+            return False
+        hidden = weight_.numel()
+        return (
+            input_.dim() == 2
+            and input_.dtype == torch.bfloat16
+            and input_.shape[-1] == hidden
+            and hidden % 512 == 0
+            and hidden <= 8192
+            and input_.numel() * input_.element_size() >= _AR2S_RMS_MIN_BYTES
+        )
+
+    def sp_fused_allreduce_rmsnorm(
+        self, input_, res_inp_, weight_, eps, gemma_norm=False
+    ):
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                eps,
+                gemma_norm,
+                sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm
+        )
+
+    def sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        self, input_, res_inp_, weight_, eps, gemma_norm=False
+    ):
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                eps,
+                gemma_norm,
+                fp8_out=True,
+                sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm_mxfp8_quant(
+            input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm
+        )
+
+    def sp_allreduce_add_residual(self, input_, res_inp_, weight_):
+        """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual
+        (the residual_out the next replicated AR + norm would write)."""
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                0.0,
+                False,
+                sp_residual=True,
+                aux_residual=True,
+            )
+        return self.all_reduce(input_) + res_inp_
+
     def fused_allreduce_rmsnorm_mxfp8_quant(
         self,
         input_: torch.Tensor,
@@ -851,6 +924,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 calls=calls,
             )
 
+        # Prefill sizes: ar2s writes the MXFP8 bytes itself (the bf16 out it
+        # would hand per_1x32_mx_quant_hip below is never written).
+        total_bytes = input_.numel() * input_.element_size()
+        if (
+            _AR2S_MXFP8
+            and _AR2S_RMS_MIN_BYTES <= total_bytes <= _AR2S_RMS_MAX_TOTAL_BYTES
+            and hidden % 512 == 0
+            and ca_comm is not None
+            and ca_comm.should_ar2s_rms(input_, res_inp_, weight_, _AR2S_RMS_MIN_BYTES)
+        ):
+            return ca_comm.ar2s_fused_ar_rms_ex(
+                input_, res_inp_, weight_, eps, gemma_norm, fp8_out=True
+            )
         normed, res_out = self.fused_allreduce_rmsnorm(
             input_,
             res_inp_,

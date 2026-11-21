@@ -33,4 +33,25 @@ void ar2s_rms(fptr_t ctx,
               int64_t hidden,
               double eps,
               bool gemma_norm);
+// ar2s_rms with options: fp8_out writes MXFP8 (E4M3 [rows, hidden] at out_q, row-major E8M0
+// [rows, hidden / 32] at out_s; out is not written); sp_residual keeps the residual of each
+// rank's own chunk only (rows [rank * R, rank * R + R), R = ceil(rows / world)): res_inp is
+// read and res_out written there alone, while out (or out_q / out_s) is whole on every rank.
+// aux_residual (with sp_residual, bf16): no norm, the whole residual_out on every rank (out unused).
+void ar2s_rms_ex(fptr_t ctx,
+                 int64_t inp,
+                 int64_t res_inp,
+                 int64_t w,
+                 int64_t out,
+                 int64_t res_out,
+                 int64_t out_q,
+                 int64_t out_s,
+                 int64_t rows,
+                 int64_t hidden,
+                 double eps,
+                 bool gemma_norm,
+                 bool fp8_out,
+                 bool sp_residual,
+                 bool aux_residual,
+                 int64_t grid); // > 0: cap the blocks of this call (same on every rank)
 } // namespace aiter

@@ -2211,6 +2211,96 @@ class CustomAllreduce:
             )
         return out, res_out
 
+    def ar2s_fused_ar_rms_ex(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        fp8_out: bool = False,
+        sp_residual: bool = False,
+        aux_residual: bool = False,
+        grid: int = 0,
+    ):
+        """ar2s_fused_ar_rms with options. ``fp8_out``: return (E4M3 out,
+        residual_out, row-major E8M0 scale [rows, hidden // 32]), the bytes of
+        per_1x32_mx_quant_hip(fp8, e8m0) over the bf16 out, without writing it.
+        ``sp_residual``: each rank reads ``res_inp`` and writes residual_out
+        only on the rows it owns (``ar2s_sp_own_rows``); the normed out is whole
+        on every rank and bit-identical to the replicated path's.
+        ``aux_residual`` (with ``sp_residual``, bf16): no norm; returns the whole
+        residual_out ``all_reduce(inp) + res_inp`` on every rank from a
+        sequence-parallel ``res_inp`` (only its own rows read), the bits the
+        replicated path writes to residual_out. Rows beyond one launch are split as
+        ar2s_fused_ar_rms splits them."""
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        res_out = torch.empty_like(inp)
+        if aux_residual:
+            assert sp_residual and not fp8_out
+            out = out_q = out_s = None
+        elif fp8_out:
+            out = None
+            out_q = torch.empty((rows, hidden), dtype=fp8, device=inp.device)
+            out_s = torch.empty(
+                (rows, hidden // 32), dtype=torch.uint8, device=inp.device
+            )
+        else:
+            out = torch.empty_like(inp)
+            out_q = out_s = None
+        for s, e in self.ar2s_launch_rows(rows, hidden):
+            ops.ar2s_rms_ex_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                0 if out is None else out[s:e].data_ptr(),
+                res_out[s:e].data_ptr(),
+                0 if out_q is None else out_q[s:e].data_ptr(),
+                0 if out_s is None else out_s[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+                fp8_out,
+                sp_residual,
+                aux_residual,
+                grid,
+            )
+        if aux_residual:
+            return res_out
+        if fp8_out:
+            from aiter.utility.dtypes import fp8_e8m0
+
+            return out_q, res_out, out_s.view(fp8_e8m0)
+        return out, res_out
+
+    def ar2s_launch_rows(self, rows: int, hidden: int) -> list[tuple[int, int]]:
+        """The [start, end) row ranges of the balanced launches ar2s splits
+        ``rows`` into (one when they fit one inbox)."""
+        mr = self._ar2s_max_rows.get(hidden)
+        if mr is None:
+            mr = self._ar2s_max_rows[hidden] = ops.ar2s_rms_max_rows_gfx1250(
+                self._ar2s_ctx, hidden
+            )
+        n_launch = -(-rows // mr)
+        step = -(-rows // n_launch)
+        return [(s, min(rows, s + step)) for s in range(0, rows, step)]
+
+    def ar2s_sp_own_rows(self, rows: int, hidden: int) -> list[tuple[int, int]]:
+        """The rows whose residual this rank keeps under ``sp_residual``: in
+        each launch, chunk ``rank`` of ceil(launch rows / world) rows."""
+        own = []
+        for s, e in self.ar2s_launch_rows(rows, hidden):
+            r = -(-(e - s) // self.world_size)
+            a, b = s + self.rank * r, min(e, s + (self.rank + 1) * r)
+            if a < b:
+                own.append((a, b))
+        return own
+
     # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
     # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above
     # _init_lamport_ar_rms.
