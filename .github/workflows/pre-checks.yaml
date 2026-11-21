@@ -55,6 +55,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Run Black
         uses: psf/black@stable
+        with:
+          version: "26.10.1"
 
   ruff:
     name: Check Code Style with Ruff
@@ -89,4 +91,4 @@ jobs:
             -name="ruff" \
             -reporter="${REVIEWDOG_REPORTER}" \
             -filter-mode="${REVIEWDOG_FILTER_MODE}" \
-            -fail-on-error=true
+            -fail-level=any
