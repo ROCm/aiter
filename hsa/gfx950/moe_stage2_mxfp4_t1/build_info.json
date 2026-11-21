@@ -1,0 +1,18 @@
+{
+  "generator": "gen_t1g2.py",
+  "clang": "AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)",
+  "commands": [
+    "clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -c <name>.s -o <name>.o",
+    "ld.lld -shared <name>.o -o <name>.co"
+  ],
+  "kernels": {
+    "t1g2_v2n_bm128": {
+      "source_sha1": "03c4fcc03c6e969c6022cbaf49b4941daeffd52c",
+      "co_sha256": "6c7a6b67a23c631edefa8b02e0817088f658f320850ae985aa6667e09d09db01"
+    },
+    "t1g2_v4g8_bm128": {
+      "source_sha1": "34005548c54f8074a1352a530326a198f8ec800a",
+      "co_sha256": "4f24a1d1851073426dd1c99717eeb8f6a590907f9c2288c81b3ae7f6465d6491"
+    }
+  }
+}
