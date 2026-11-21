@@ -915,11 +915,13 @@ def main():
     if "fused_qk" in args.case:
         # The check writes fp8 to both q_out and the KV cache, so it needs both
         # dtype filters to include fp8 and an arch that converts to fp8.
-        if (
-            "fp8" in args.kv_dtype
-            and "fp8" in args.q_dtype
-            and get_gfx_runtime() in FP8_CVT_GFX
-        ):
+        gfx = get_gfx_runtime()
+        if "fp8" in args.kv_dtype and "fp8" in args.q_dtype and gfx not in FP8_CVT_GFX:
+            aiter.logger.warning(
+                "skipping the fp8 rope saturation check on %s: no packed fp8 convert",
+                gfx,
+            )
+        elif "fp8" in args.kv_dtype and "fp8" in args.q_dtype:
             for case, (
                 rank,
                 tokens,

@@ -187,9 +187,6 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     assert _bytes_differ(kv_cache, ref_cache) == 0
 
 
-@pytest.mark.skipif(
-    get_gfx_runtime() not in FP8_CVT_GFX, reason="needs the packed fp8 convert"
-)
 @pytest.mark.parametrize("is_neox", [True, False])
 # NaN in the rope inputs must stay NaN, not the saturated byte
 @pytest.mark.parametrize("rope_nan", [False, True])
@@ -198,10 +195,14 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
 def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, rope_nan, h, t):
     """Values past the fp8 range store the saturated byte, never the NaN pattern;
     a NaN rope input stores NaN."""
+    # Checked here, not in a skipif, so importing the module needs no GPU.
+    if get_gfx_runtime() not in FP8_CVT_GFX:
+        pytest.skip("needs the packed fp8 convert")
     fmax = torch.finfo(dtypes.fp8).max
+    gen = torch.Generator().manual_seed(h * 100003 + t)
 
     def wide(*shape):
-        x = torch.randn(shape).to(dtypes.bf16)
+        x = torch.randn(shape, generator=gen).to(dtypes.bf16)
         # Both ends of the row, so the rope part's x and y lanes both saturate in
         # the neox (halves) and GPT-J (interleaved) layouts.
         for cols, sign in ((slice(0, 2), 1), (slice(2, 4), -1), (slice(-4, -2), 1)):
@@ -209,7 +210,6 @@ def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, rope_nan, h, 
         x[..., -2:] = -4 * fmax
         return x.cuda()
 
-    gen = torch.Generator().manual_seed(h * 100003 + t)
     q_nope, q_pe = wide(t, h, KV_LORA), wide(t, h, PE_DIM)
     kv_c, k_pe = wide(t, KV_LORA), wide(t, PE_DIM)
     if rope_nan:
