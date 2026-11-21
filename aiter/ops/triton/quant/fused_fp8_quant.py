@@ -1,4 +1,4 @@
-from functools import cache
+from functools import cache, lru_cache
 
 import torch
 import triton
@@ -14,6 +14,12 @@ from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_group_quant_kernel,
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
+)
+from aiter.ops.triton.utils.config_utils import (
+    USE_LRU_CACHE,
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -996,6 +1002,21 @@ def fused_reduce_rms_fp8_group_quant(
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 
 
+_SILU_MUL_STATIC_QUANT_CONFIG_NAME = "FUSED_SILU_MUL_FP8_STATIC_QUANT"
+
+
+@lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def _get_silu_mul_fp8_static_quant_config(M: int, N: int) -> dict | None:
+    """Return the tuned config for (M, N), or None if this arch has no file for N."""
+    cfg_dir = resolve_config_dir("quant", _SILU_MUL_STATIC_QUANT_CONFIG_NAME)
+    tuned = load_config_json(
+        f"{cfg_dir}/{_SILU_MUL_STATIC_QUANT_CONFIG_NAME}-N={N}.json", required=False
+    )
+    if tuned is None:
+        return None
+    return select_leq_config(tuned, M, prefix="M_LEQ_")
+
+
 def fused_silu_mul_fp8_per_tensor_static_quant(
     inp,
     inp_scale,
@@ -1012,22 +1033,32 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
 
     Returns:
     - out_fp8: The output matrix with shape (M, N).
+
+    Uses FUSED_SILU_MUL_FP8_STATIC_QUANT-N={N}.json for this arch if it exists.
     """
     M, N2 = inp.shape
     assert N2 % 2 == 0
     N = N2 // 2
-    BLOCK_SIZE_N = triton.next_power_of_2(N)
 
     out_fp8 = torch.empty((M, N), dtype=dtype_quant, device=inp.device)
 
-    if BLOCK_SIZE_N <= 512:
-        num_warps = 1
-    elif BLOCK_SIZE_N <= 2048:
-        num_warps = 4
-    elif BLOCK_SIZE_N <= 4096:
-        num_warps = 8
+    # No tuned file: one program per row.
+    config = _get_silu_mul_fp8_static_quant_config(M, N)
+    if config is None:
+        BLOCK_SIZE_N = triton.next_power_of_2(N)
+        STORE_CACHE_MODIFIER = ""
+        if BLOCK_SIZE_N <= 512:
+            num_warps = 1
+        elif BLOCK_SIZE_N <= 2048:
+            num_warps = 4
+        elif BLOCK_SIZE_N <= 4096:
+            num_warps = 8
+        else:
+            num_warps = 16
     else:
-        num_warps = 16
+        BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
+        STORE_CACHE_MODIFIER = config["STORE_CACHE_MODIFIER"]
+        num_warps = config["num_warps"]
 
     DTYPE_MAX = (
         torch.finfo(out_fp8.dtype).max
@@ -1035,7 +1066,8 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         else torch.iinfo(out_fp8.dtype).max
     )
 
-    _fused_silu_mul_fp8_per_tensor_static_quant_kernel[(M,)](
+    grid = (M, triton.cdiv(N, BLOCK_SIZE_N))
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel[grid](
         inp,
         out_fp8,
         inp_scale,
@@ -1049,6 +1081,7 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         SILU_CONVERT_TO_INP_TYPE=silu_convert_to_inp_type,
+        STORE_CACHE_MODIFIER=STORE_CACHE_MODIFIER,
         num_warps=num_warps,
     )
 
