@@ -1,0 +1,188 @@
+name: DCO Signoff
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-signoff:
+    name: Check commit sign-offs
+    runs-on: ubuntu-latest
+
+    steps:
+      # pull_request_target lets this workflow comment on fork PRs.
+      # Keep this API-only; do not checkout or execute PR-provided code here.
+      - name: Verify every PR commit has Signed-off-by
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const commentMarker = "<!-- aiter-dco-signoff-check -->";
+
+            const findExistingComment = async () => {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: pull_number,
+                per_page: 100,
+              });
+
+              return comments.find((comment) => {
+                return (
+                  comment.user?.login === "github-actions[bot]" &&
+                  comment.body?.startsWith(commentMarker)
+                );
+              });
+            };
+
+            const truncate = (value, maxLength = 300) => {
+              return value.length > maxLength
+                ? `${value.slice(0, maxLength - 3)}...`
+                : value;
+            };
+
+            const textForDisplay = (value) => {
+              return truncate(
+                String(value)
+                  .replace(/[\u0000-\u001F\u007F]/g, " ")
+                  .replace(/\s+/g, " ")
+                  .trim()
+              );
+            };
+
+            const escapeHtml = (value) => {
+              return textForDisplay(value)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/@/g, "@\u200B");
+            };
+
+            const escapeMarkdownCell = (value) => {
+              return escapeHtml(value)
+                .replace(/\\/g, "\\\\")
+                .replace(/\|/g, "\\|")
+                .replace(/`/g, "\\`")
+                .replace(/\[/g, "\\[")
+                .replace(/\]/g, "\\]")
+                .replace(/\(/g, "\\(")
+                .replace(/\)/g, "\\)")
+                .replace(/\*/g, "\\*")
+                .replace(/_/g, "\\_")
+                .replace(/~/g, "\\~");
+            };
+
+            const upsertComment = async (body) => {
+              const existingComment = await findExistingComment();
+
+              if (existingComment) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existingComment.id,
+                  body,
+                });
+                return;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pull_number,
+                body,
+              });
+            };
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+
+            const signoffPattern = /^Signed-off-by:\s+.+\s+<[^<>]+@[^<>]+>\s*$/im;
+            const missing = commits.filter((item) => {
+              return !signoffPattern.test(item.commit.message);
+            });
+
+            if (missing.length === 0) {
+              core.info(`All ${commits.length} commit(s) include a Signed-off-by line.`);
+
+              const existingComment = await findExistingComment();
+              if (existingComment) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existingComment.id,
+                });
+              }
+
+              return;
+            }
+
+            const rows = missing.map((item) => {
+              const sha = item.sha.slice(0, 12);
+              const subject = item.commit.message.split(/\r?\n/, 1)[0] || "(no subject)";
+              const author = item.commit.author;
+              const authorText = author
+                ? `${author.name} <${author.email}>`
+                : "(unknown author)";
+
+              core.error(
+                `Commit ${sha} is missing a Signed-off-by line: ${textForDisplay(subject)}`
+              );
+              return [sha, subject, authorText];
+            });
+
+            const missingRows = rows.map(([sha, subject, author]) => {
+              return `| \`${escapeMarkdownCell(sha)}\` | ${escapeMarkdownCell(subject)} | ${escapeMarkdownCell(author)} |`;
+            });
+
+            const commentBody = [
+              commentMarker,
+              "### DCO sign-off check failed",
+              "",
+              "Every commit in this PR must include a `Signed-off-by: Name <email>` line.",
+              "",
+              "Use `git commit -s` for new commits, or `git commit --amend -s` / `git rebase --signoff` to update existing commits.",
+              "",
+              "| Commit | Subject | Author |",
+              "| --- | --- | --- |",
+              ...missingRows,
+            ].join("\n");
+
+            await upsertComment(commentBody);
+
+            await core.summary
+              .addHeading("DCO sign-off check failed")
+              .addRaw(
+                "Every commit in this PR must include a `Signed-off-by: Name <email>` line.\n\n"
+              )
+              .addRaw(
+                "Use `git commit -s` for new commits, or `git commit --amend -s` / `git rebase --signoff` to update existing commits.\n\n"
+              )
+              .addTable([
+                [
+                  { data: "Commit", header: true },
+                  { data: "Subject", header: true },
+                  { data: "Author", header: true },
+                ],
+                ...rows.map(([sha, subject, author]) => {
+                  return [sha, escapeHtml(subject), escapeHtml(author)];
+                }),
+              ])
+              .write();
+
+            core.setFailed(
+              `${missing.length} of ${commits.length} commit(s) are missing a Signed-off-by line.`
+            );
