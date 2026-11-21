@@ -26,6 +26,39 @@
 
 namespace aiter {
 
+// fp32x2 -> fp8x2 like fp32_to_fp8_scaled_x2, but a NaN stays NaN (v_med3_f32 would
+// turn it into the lower clamp bound). Infinity and finite overflow still saturate.
+// ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_and_b32 / v_cmp_lt_u32 / v_cndmask_b32 x2 + v_cvt_pk_fp8_f32
+template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+__device__ __forceinline__ decltype(auto) fp32_to_fp8_scaled_keep_nan_x2(const S& s, float inverted_scale)
+{
+    fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
+#if defined(__gfx942__)
+    constexpr float hi = 240.0f, lo = -240.0f;
+#else
+    constexpr float hi = 448.0f, lo = -448.0f;
+#endif
+    float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
+    float ca = a, cb = b;
+    // Not volatile: the result depends only on the operands, so the compiler may schedule it.
+    asm("v_med3_f32 %0, %0, %2, %3\n"
+        "v_med3_f32 %1, %1, %2, %3"
+        : "+v"(ca), "+v"(cb)
+        : "v"(lo), "v"(hi));
+    // Integer bit test rather than isnan, so NaN stays NaN even if fast-math flags are added.
+    ca = (__builtin_bit_cast(uint32_t, a) & 0x7fffffffu) > 0x7f800000u ? a : ca;
+    cb = (__builtin_bit_cast(uint32_t, b) & 0x7fffffffu) > 0x7f800000u ? b : cb;
+    int w;
+    asm("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(ca), "v"(cb));
+    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
+    (void)a; (void)b; (void)lo; (void)hi; return fp8x2_t{};
+#endif
+}
+
 // slot_mapping arrives as int64 from the torch stacks -- vLLM allocates it as
 // torch.int64 and SGLang's out_cache_loc is likewise int64 -- and as int32 from
 // JAX front ends, which emit 32-bit integers unless jax_enable_x64 is set at
@@ -2232,10 +2265,13 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
     float f32_cos = static_cast<float>(cos);
     float f32_sin = static_cast<float>(sin);
     if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-        arr_out[x_index] = opus::cast<cache_t>(
-                (f32_x * f32_cos - f32_y * f32_sin) * inv_scale);
-        arr_out[y_index] = opus::cast<cache_t>(
-                (f32_y * f32_cos + f32_x * f32_sin) * inv_scale);
+        // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+            fp32x2_t{f32_x * f32_cos - f32_y * f32_sin,
+                     f32_y * f32_cos + f32_x * f32_sin},
+            inv_scale);
+        arr_out[x_index] = rot[0];
+        arr_out[y_index] = rot[1];
     } else {
         arr_out[x_index] = opus::cast<cache_t>((f32_x * f32_cos - f32_y * f32_sin));
         arr_out[y_index] = opus::cast<cache_t>((f32_y * f32_cos + f32_x * f32_sin));
@@ -2456,10 +2492,13 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
         const int64_t token_head = kv_cache_offset;
         cache_t* kv_cache_rot = kv_cache + token_head;
         if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-          kv_cache_rot[x_index] = opus::cast<opus::fp8_t>(
-               (fp32_k_x * fp32_cos - fp32_k_y * fp32_sin) * inv_kscale);
-          kv_cache_rot[y_index] = opus::cast<opus::fp8_t>(
-               (fp32_k_y * fp32_cos + fp32_k_x * fp32_sin) * inv_kscale);
+          // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+          const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+              fp32x2_t{fp32_k_x * fp32_cos - fp32_k_y * fp32_sin,
+                       fp32_k_y * fp32_cos + fp32_k_x * fp32_sin},
+              inv_kscale);
+          kv_cache_rot[x_index] = rot[0];
+          kv_cache_rot[y_index] = rot[1];
         } else {
           kv_cache_rot[x_index] = static_cast<cache_t>((fp32_k_x * fp32_cos - fp32_k_y * fp32_sin));
           kv_cache_rot[y_index] = static_cast<cache_t>((fp32_k_y * fp32_cos + fp32_k_x * fp32_sin));
@@ -2473,8 +2512,13 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
     float f32_x = static_cast<float>(x);
     float f32_y = static_cast<float>(y);
     if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-        q_out_rot[x_index] = opus::cast<opus::fp8_t>((f32_x * fp32_cos - f32_y * fp32_sin) * inv_qscale);
-        q_out_rot[y_index] = opus::cast<opus::fp8_t>((f32_y * fp32_cos + f32_x * fp32_sin) * inv_qscale);
+        // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+            fp32x2_t{f32_x * fp32_cos - f32_y * fp32_sin,
+                     f32_y * fp32_cos + f32_x * fp32_sin},
+            inv_qscale);
+        q_out_rot[x_index] = rot[0];
+        q_out_rot[y_index] = rot[1];
     } else {
         q_out_rot[x_index] = static_cast<query_t>((f32_x * fp32_cos - f32_y * fp32_sin));
         q_out_rot[y_index] = static_cast<query_t>((f32_y * fp32_cos + f32_x * fp32_sin));
@@ -2769,14 +2813,30 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                             bool exchange) {
         using o_t = std::remove_pointer_t<decltype(out_tag)>;
         using o_vec_t = opus::vector_t<o_t, VEC>;
-        auto cvt = [](float r, float s) -> o_t {
-            if constexpr(std::is_same_v<o_t, opus::fp8_t>)
-                return opus::cast<o_t>(r * s);
-            else
-                return static_cast<o_t>(r);
+        // Rotated values, converted in pairs at the end. fp8 saturates a value past
+        // the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        float rv[VEC];
+        auto convert = [&]() {
+            o_vec_t v;
+#pragma unroll
+            for(int k = 0; k < VEC / 2; ++k)
+            {
+                if constexpr(std::is_same_v<o_t, opus::fp8_t>)
+                {
+                    const auto p = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                        fp32x2_t{rv[2 * k], rv[2 * k + 1]}, inv_scale);
+                    v[2 * k]     = p[0];
+                    v[2 * k + 1] = p[1];
+                }
+                else
+                {
+                    v[2 * k]     = static_cast<o_t>(rv[2 * k]);
+                    v[2 * k + 1] = static_cast<o_t>(rv[2 * k + 1]);
+                }
+            }
+            return v;
         };
         const int d0 = chunk * VEC;
-        o_vec_t vout;
         if constexpr(IS_NEOX)
         {
             // The partner chunk is the one lane chunk^HALF/VEC already loaded
@@ -2808,8 +2868,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float yv = static_cast<float>(y[i]);
                 const float cv = static_cast<float>(o.c[i]);
                 const float sv = static_cast<float>(o.s[i]);
-                const float r  = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
-                vout[i]        = cvt(r, inv_scale);
+                rv[i]          = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
             }
         }
         else
@@ -2821,11 +2880,11 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float b  = static_cast<float>(o.x[2 * k + 1]);
                 const float cv = static_cast<float>(o.c[k]);
                 const float sv = static_cast<float>(o.s[k]);
-                vout[2 * k]     = cvt(a * cv - b * sv, inv_scale);
-                vout[2 * k + 1] = cvt(b * cv + a * sv, inv_scale);
+                rv[2 * k]       = a * cv - b * sv;
+                rv[2 * k + 1]   = b * cv + a * sv;
             }
         }
-        return vout;
+        return convert();
     };
     auto rope_pe_emit = [&](const PeOperands& o, auto* out_ptr, int row_off, int extent,
                             float inv_scale, int chunk, bool active) {
@@ -3421,10 +3480,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float f32_cos = static_cast<float>(cos);
           float f32_sin = static_cast<float>(sin);
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-              q_out_rope[x_index] = opus::cast<opus::fp8_t>(
-                      (f32_x * f32_cos - f32_y * f32_sin) * inverted_qscale);
-              q_out_rope[y_index] = opus::cast<opus::fp8_t>(
-                      (f32_y * f32_cos + f32_x * f32_sin) * inverted_qscale);
+              // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+              const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                  fp32x2_t{f32_x * f32_cos - f32_y * f32_sin,
+                           f32_y * f32_cos + f32_x * f32_sin},
+                  inverted_qscale);
+              q_out_rope[x_index] = rot[0];
+              q_out_rope[y_index] = rot[1];
           } else {
               q_out_rope[x_index] = static_cast<query_t>(f32_x * f32_cos - f32_y * f32_sin);
               q_out_rope[y_index] = static_cast<query_t>(f32_y * f32_cos + f32_x * f32_sin);
@@ -3765,8 +3827,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float k_rot_y = ky * f32_cos + kx * f32_sin;
           
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            k_out[x_idx] = opus::cast<opus::fp8_t>(k_rot_x * inverted_kscale);
-            k_out[y_idx] = opus::cast<opus::fp8_t>(k_rot_y * inverted_kscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{k_rot_x,
+                         k_rot_y},
+                inverted_kscale);
+            k_out[x_idx] = rot[0];
+            k_out[y_idx] = rot[1];
           } else {
             k_out[x_idx] = static_cast<cache_t>(k_rot_x);
             k_out[y_idx] = static_cast<cache_t>(k_rot_y);
@@ -3782,8 +3849,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float q_rot_y = qy * f32_cos + qx * f32_sin;
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            q_out_ptr[x_idx] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
-            q_out_ptr[y_idx] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{q_rot_x,
+                         q_rot_y},
+                inverted_qscale);
+            q_out_ptr[x_idx] = rot[0];
+            q_out_ptr[y_idx] = rot[1];
           } else {
             q_out_ptr[x_idx] = static_cast<query_t>(q_rot_x);
             q_out_ptr[y_idx] = static_cast<query_t>(q_rot_y);
@@ -3819,8 +3891,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float qy = static_cast<float>(q_in[y_idx]);
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            q_out_ptr[x_idx] = opus::cast<opus::fp8_t>((qx * f32_cos - qy * f32_sin) * inverted_qscale);
-            q_out_ptr[y_idx] = opus::cast<opus::fp8_t>((qy * f32_cos + qx * f32_sin) * inverted_qscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{qx * f32_cos - qy * f32_sin,
+                         qy * f32_cos + qx * f32_sin},
+                inverted_qscale);
+            q_out_ptr[x_idx] = rot[0];
+            q_out_ptr[y_idx] = rot[1];
           } else {
             q_out_ptr[x_idx] = static_cast<query_t>(qx * f32_cos - qy * f32_sin);
             q_out_ptr[y_idx] = static_cast<query_t>(qy * f32_cos + qx * f32_sin);
@@ -4072,8 +4149,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float k_rot_y = ky * f32_cos + kx * f32_sin;
           
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            k_out[x_idx] = opus::cast<opus::fp8_t>(k_rot_x * inverted_kscale);
-            k_out[y_idx] = opus::cast<opus::fp8_t>(k_rot_y * inverted_kscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{k_rot_x,
+                         k_rot_y},
+                inverted_kscale);
+            k_out[x_idx] = rot[0];
+            k_out[y_idx] = rot[1];
           } else {
             k_out[x_idx] = static_cast<cache_t>(k_rot_x);
             k_out[y_idx] = static_cast<cache_t>(k_rot_y);
@@ -4089,8 +4171,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float q_rot_y = qy * f32_cos + qx * f32_sin;
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            q_out_ptr[x_idx] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
-            q_out_ptr[y_idx] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{q_rot_x,
+                         q_rot_y},
+                inverted_qscale);
+            q_out_ptr[x_idx] = rot[0];
+            q_out_ptr[y_idx] = rot[1];
           } else {
             q_out_ptr[x_idx] = static_cast<query_t>(q_rot_x);
             q_out_ptr[y_idx] = static_cast<query_t>(q_rot_y);
@@ -4126,8 +4213,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float qy = static_cast<float>(q_in[y_idx]);
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            q_out_ptr[x_idx] = opus::cast<opus::fp8_t>((qx * f32_cos - qy * f32_sin) * inverted_qscale);
-            q_out_ptr[y_idx] = opus::cast<opus::fp8_t>((qy * f32_cos + qx * f32_sin) * inverted_qscale);
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
+                fp32x2_t{qx * f32_cos - qy * f32_sin,
+                         qy * f32_cos + qx * f32_sin},
+                inverted_qscale);
+            q_out_ptr[x_idx] = rot[0];
+            q_out_ptr[y_idx] = rot[1];
           } else {
             q_out_ptr[x_idx] = static_cast<query_t>(qx * f32_cos - qy * f32_sin);
             q_out_ptr[y_idx] = static_cast<query_t>(qy * f32_cos + qx * f32_sin);
