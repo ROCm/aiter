@@ -47,6 +47,20 @@ def balanced_score(token, E, topk, dtype):
     return score
 
 
+def tuning_routing(inp, E, topk):
+    """Top-k routing for ``inp``, as the tuner times candidates.
+
+    Random unless TUNE_MOE_EXPERT_BALANCE=true, which gives every expert
+    exactly token * topk / E rows.
+    """
+    token = inp.shape[0]
+    if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":
+        score = balanced_score(token, E, topk, dtypes.bf16)
+    else:
+        score = torch.randn((token, E), dtype=dtypes.bf16)
+    return fused_topk(inp, score.to(inp.device), topk, True)
+
+
 def quant_a_fp8(x):
     return per_1x32_f8_scale_f8_quant(
         x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -263,8 +277,7 @@ def gen(
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
-    score = balanced_score(token, E, topk, dtypes.bf16)
-    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    topk_weights, topk_ids = tuning_routing(inp, E, topk)
 
     w1_qt, w1_scale = quant_w(w1, b_dtype)
     w2_qt, w2_scale = quant_w(w2, b_dtype)
