@@ -11,9 +11,10 @@ ops the kernels would otherwise emit inline.
 
 The four E8M0 scale-rounding modes mirror PyTorch torchao's
 ``ScaleCalculationMode`` (``torchao/prototype/mx_formats/config.py``) 1:1
-and are dtype-agnostic across the whole MX format family
-(mxfp4 / mxfp6 / mxfp8 / mxint8) -- only the ``target_max_pow2`` /
-``max_pos`` / ``mbits`` constants differ between dtypes. This matches both
+and are dtype-agnostic -- only the ``target_max_pow2`` / ``max_pos`` /
+``mbits`` constants differ between dtypes. ``_DTYPE_CFG`` defines them for
+fp4 (e2m1) and fp8 (e4m3 / e4m3fnuz) only; another MX dtype needs its own
+entry there before :func:`emit_mx_e8m0_scale` accepts it. This matches both
 PyTorch torchao's and the HIP-side ``MxScaleRoundMode`` design (see
 ``csrc/include/mx_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
 
@@ -34,9 +35,11 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import rocdl
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from aiter.utility.mx_types import (
@@ -184,6 +187,87 @@ def emit_mx_e8m0_scale(
     )
 
 
+def emit_mxfp8_group32_scale(amax):
+    """E8M0 scale of one 32-value MXFP8 (e4m3) group, as ATOM ``quantize_fp8``
+    computes it: amax floored at 1e-10, then RoundUp (ceil_pow2(amax / 448)).
+
+    Returns ``(e8m0, scale_f32)``: the biased exponent (i32 IR value, stored
+    as one byte) and the f32 ``2^(e8m0 - 127)`` the scaled fp8 conversion
+    divides by.
+    """
+    amax = fx.maxnumf(amax, fx.Float32(1e-10))
+    e8 = emit_mx_e8m0_scale(amax, mode=_M.RoundUp, dtype=_D.FP8_E4M3)
+    return e8, (fx.Int32(e8) << 23).bitcast(fx.Float32)
+
+
+@flyc.jit
+def emit_mxfp8_acc_pair_to_lds(
+    acc0, acc1, out_cls, lds8, row_rel, gcol, kgrp, *, c8_row, s8_off, gn, wave
+):
+    """Group-32 MXFP8 quant of one 32-column group held in two adjacent 16x16
+    WMMA accumulator tiles, written to LDS for the tile's e4m3 TDM store.
+
+    A lane holds 8 consecutive columns of one row per 16x16 tile (``kgrp * 8``),
+    so a 32-column group is ``acc0`` and ``acc1`` across lanes l and l^16 and
+    its amax is one ``shuffle_xor(16)``. The values are first rounded to
+    ``out_cls``, as the bf16 store does, so the codes match ``quantize_fp8``
+    of that output. The e4m3 bytes go to ``row_rel * c8_row + gcol + kgrp * 8``
+    (``acc1`` 16 bytes on) in the int8 LDS view ``lds8``; lanes with
+    ``kgrp == 0`` write the e8m0 byte to ``s8_off + row_rel * gn + gcol // 32``.
+    ``gcol`` is the group's first column in the tile (i64), ``gn`` the groups
+    per tile row and ``wave`` the wave size.
+    """
+    v2i32_ty = T.vec(2, T.i32)
+    h0 = acc0.to(out_cls).to(fx.Float32)
+    h1 = acc1.to(out_cls).to(fx.Float32)
+    amax = abs(h0[0])
+    for t in range_constexpr(1, 8):
+        amax = fx.maxnumf(amax, abs(h0[t]))
+    for t in range_constexpr(8):
+        amax = fx.maxnumf(amax, abs(h1[t]))
+    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, wave))
+    e8, scale_f32 = emit_mxfp8_group32_scale(amax)
+    p0 = emit_cvt_scalef32_pk8_fp8_f32(
+        h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+    )
+    p1 = emit_cvt_scalef32_pk8_fp8_f32(
+        h1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+    )
+    l_off = fx.Int64(row_rel) * c8_row + gcol + fx.Int64(kgrp * 8)
+    fx.ptr_store(fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off))
+    fx.ptr_store(fx.Vector(p1).bitcast(fx.Int8), fx.add_offset(lds8, l_off + 16))
+    if kgrp == 0:
+        fx.ptr_store(
+            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
+            fx.add_offset(lds8, fx.Int64(s8_off + row_rel * gn) + gcol // 32),
+        )
+
+
+@flyc.jit
+def emit_mxfp8_scale_rows_store(
+    lds8, s8, tid, mn_oob, row0, srow, sbase, *, s8_off, gn, tile_m, block
+):
+    """Copy a tile's e8m0 scale rows from LDS (``gn`` bytes per row at
+    ``s8_off``, as :func:`emit_mxfp8_acc_pair_to_lds` writes them) to the
+    row-major scale ``s8``. Each thread copies whole scale rows (rows ``tid``,
+    ``tid + block``, ...); a row's ``gn`` bytes are contiguous in the
+    row-major scale, so each row is one small store at
+    ``(row0 + row) * srow + sbase``. Rows at or past ``mn_oob`` (the valid M
+    rows of the tile) are skipped. Call after the barrier that follows the
+    LDS writes."""
+    for rr in range_constexpr((tile_m + block - 1) // block):
+        srow_rel = fx.Int32(tid) + rr * block
+        if (srow_rel < tile_m) and (srow_rel < mn_oob):
+            sv = fx.ptr_load(
+                fx.add_offset(lds8, fx.Int64(s8_off + srow_rel * gn)),
+                result_type=T.vec(gn, T.i8),
+            )
+            fx.ptr_store(
+                fx.Vector(sv),
+                fx.add_offset(s8, (row0 + fx.Int64(srow_rel)) * srow + sbase),
+            )
+
+
 def emit_f32_to_e2m1(qx_f32):
     """Convert a scaled f32 value to FP4 (E2M1) as a 4-bit unsigned nibble.
 
@@ -279,7 +363,9 @@ def emit_f32_to_e2m3_native(first, second, scale):
 def emit_amax_e8m0_native_scale(
     all_vals, *, wave_size, dtype=_D.FP8_E4M3, amax_gain=None
 ):
-    """Like :func:`emit_amax_e8m0_recip` but returns the *forward* scale
+    """Reduce ``all_vals`` to the block amax (a max tree, then one
+    ``shuffle_xor(16)`` with the peer lane), derive the E8M0 scale with
+    :func:`emit_mx_e8m0_scale` and return the *forward* scale
     ``2^(e8m0-127)`` needed by native gfx1250 ``v_cvt_scalef32_pk8_*``
     instructions (HW divides by the scale internally).
 

@@ -72,8 +72,9 @@ def launch_gemm_a8w8(
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
 ):
-    # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
-    # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
+    # fuse_quant_out: the output is group-32 MXFP8-quantized in the epilogue
+    # instead of written as bf16, from the accumulators rounded to bf16 when
+    # wmma_n_rep is even, else from the bf16 C tile staged in LDS. arg_c carries the e4m3 [M,B,N]
     # output and arg_scale_out the row-major [M, (B*N)//32] e8m0 scale -- the
     # (x, x_scale) pair a downstream native-quant GEMM reads, so the standalone
     # quantize_fp8 after this GEMM is removed. Batched mxfp8_32 only.
@@ -958,17 +959,42 @@ def launch_gemm_a8w8(
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
-        for wm in range_constexpr(wmma_m_rep):
-            row_rel = wmb + wm * 16 + lane16
-            for wn in range_constexpr(wmma_n_rep):
-                col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(out_cls)
-                fx.ptr_store(
-                    h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
-                )
-        workgroup_barrier(use_cluster=False)
+
+        def _stage_c_tile():
+            # Write the [tile_m, tile_n] C tile to LDS as out_cls.
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                for wn in range_constexpr(wmma_n_rep):
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    h = accs[wm * wmma_n_rep + wn].to(out_cls)
+                    fx.ptr_store(
+                        h.bitcast(fx.Int8),
+                        base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
+                    )
+            workgroup_barrier(use_cluster=False)
+
+        if const_expr(fuse_quant_out):
+            # Shared by the two group-32 MXFP8 quant epilogues below; both
+            # emit e4m3 + the e8m0 ceil scale, bit-matching ATOM `quantize_fp8`
+            # (amax floored at 1e-10, ceil_pow2(amax/448)).
+            from aiter.ops.flydsl.kernels.quant_utils import (
+                emit_cvt_scalef32_pk8_fp8_f32,
+                emit_mxfp8_acc_pair_to_lds,
+                emit_mxfp8_group32_scale,
+                emit_mxfp8_scale_rows_store,
+            )
+
+            s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
+            v2i32_ty = T.vec(2, T.i32)
+            GN = tile_n // 32  # quant groups per row (constexpr)
+            n32_64 = fx.Int64(i32_n) // 32
+            srow = ldc64 // 32  # scale row stride = (B*N)//32
+            sbase_blk = (
+                bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
+            ) + blk_n64 // 32
+
         if const_expr(not fuse_quant_out):
+            _stage_c_tile()
             c_off_rt = blk_m64 * ldc64 + blk_n64
             if const_expr(batched):
                 c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
@@ -994,31 +1020,85 @@ def launch_gemm_a8w8(
             )
             fx.copy(atomC, tCs[None, 0], tCg[None, 0])
             rocdl.s_wait_tensorcnt(0)
+        elif const_expr(wmma_n_rep % 2 == 0):
+            # Quantize from the accumulators. A lane holds 8 consecutive
+            # columns of one row per 16x16 tile (kgrp*8), so a 32-column group
+            # is two adjacent tiles across lanes l and l^16 and its amax needs
+            # only one shuffle_xor(16); the bf16 tile is not staged in LDS.
+            # The values are rounded to the output dtype first, exactly as the
+            # bf16 path stores them, so the codes match quantize_fp8 of that
+            # output. The e4m3 and scale bytes still go through LDS (one
+            # barrier) so the global writes are the tile's TDM store and one
+            # small store per scale row. The per-group step and the scale-row
+            # store are shared with the 256x256 compute kernel's epilogue.
+            lds8 = fx.recast_iter(fx.Int8, base_ptr)
+            gC8_base = fx.recast_iter(
+                fx.PointerType.get(fx.Int8.ir_type, arg_c.address_space), arg_c
+            )
+            C8_ROW = tile_n + 16
+            S8_OFF = tile_m * C8_ROW
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                for wp in range_constexpr(wmma_n_rep // 2):
+                    emit_mxfp8_acc_pair_to_lds(
+                        accs[wm * wmma_n_rep + 2 * wp],
+                        accs[wm * wmma_n_rep + 2 * wp + 1],
+                        out_cls,
+                        lds8,
+                        row_rel,
+                        fx.Int64(wnb + wp * 32),
+                        kgrp,
+                        c8_row=C8_ROW,
+                        s8_off=S8_OFF,
+                        gn=GN,
+                        wave=WAVE,
+                    )
+            workgroup_barrier(use_cluster=False)
+            # Each thread copies whole scale rows (rows tid, tid + block, ...);
+            # a row's GN bytes are contiguous in the row-major [M, (B*N)//32]
+            # scale, so each row is one small store.
+            emit_mxfp8_scale_rows_store(
+                lds8,
+                s8,
+                tid,
+                mn_oob,
+                blk_m64,
+                srow,
+                sbase_blk,
+                s8_off=S8_OFF,
+                gn=GN,
+                tile_m=tile_m,
+                block=block,
+            )
+            c8_off = blk_m64 * ldc64 + blk_n64
+            if const_expr(batched):
+                c8_off = c8_off + bz64 * fx.Int64(i32_n)
+            C8_TILE = (tile_m, C8_ROW)
+            gtC8 = _gv(gC8_base, c8_off, (mn_oob, tile_n), (ldc64, 1))
+            atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
+                gtC8,
+                fx.make_layout(C8_TILE, (C8_ROW, 1)),
+                C8_TILE,
+                num_warps=num_waves,
+            )
+            blkC8 = fx.zipped_divide(coordC8, C8_TILE)[None, (0, None)]
+            sC8 = _lv(lds8, (C8_TILE, 1), ((C8_ROW, 1), tile_m * C8_ROW))
+            tC8s, tC8g = fx.rocdl.cdna5.tdm_partition(
+                atomC8, wave, fx.make_layout(num_waves, 1), sC8, blkC8
+            )
+            fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
+            rocdl.s_wait_tensorcnt(0)
         else:
+            _stage_c_tile()
             # Group-32 MXFP8 quant epilogue. The whole [tile_m, tile_n] C tile
             # is already staged in LDS as bf16 (out_cls); re-read 32 contiguous
             # columns per group in one thread -- no cross-lane reduction, since
-            # tile_n % 32 == 0 keeps each group inside this tile -- then emit
-            # e4m3 + the e8m0 ceil scale, bit-matching ATOM `quantize_fp8`
-            # (amax floored at 1e-10, ceil_pow2(amax/448)).
-            from aiter.ops.flydsl.kernels.quant_utils import (
-                emit_cvt_scalef32_pk8_fp8_f32,
-                emit_mx_e8m0_scale,
-            )
-            from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
-
+            # tile_n % 32 == 0 keeps each group inside this tile.
             lds_bf = fx.recast_iter(out_cls, base_ptr)
             c8 = fx.recast_iter(fx.Int8, arg_c)
-            s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
-            v2i32_ty = T.vec(2, T.i32)
-            GN = tile_n // 32  # quant groups per row (constexpr)
             TOT = tile_m * GN
             GPT = (TOT + block - 1) // block
-            n32_64 = fx.Int64(i32_n) // 32
-            srow = ldc64 // 32  # scale row stride = (B*N)//32
-            sbase_blk = (
-                bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
-            ) + blk_n64 // 32
             cbase_blk = (
                 bz64 * fx.Int64(i32_n) if const_expr(batched) else fx.Int64(0)
             ) + blk_n64
@@ -1036,13 +1116,7 @@ def launch_gemm_a8w8(
                     amax = abs(vals[0])
                     for e in range_constexpr(1, 32):
                         amax = fx.maxnumf(amax, abs(vals[e]))
-                    amax = fx.maxnumf(amax, fx.Float32(1e-10))
-                    e8 = emit_mx_e8m0_scale(
-                        amax,
-                        mode=MxScaleRoundModeInt.RoundUp,
-                        dtype=MxDtypeInt.FP8_E4M3,
-                    )
-                    scale_f32 = (fx.Int32(e8) << 23).bitcast(fx.Float32)
+                    e8, scale_f32 = emit_mxfp8_group32_scale(amax)
                     row64 = blk_m64 + fx.Int64(r)
                     c_off = row64 * ldc64 + cbase_blk + fx.Int64(j) * 32
                     for q in range_constexpr(4):
