@@ -175,7 +175,10 @@ def produce(kc, n_mine, n_routes):
                     )
                 )
                 buffer_store(slot, rsrc_route, r0 + i, cache_modifier=SCOPE_DEV)
-        rocdl.s_wait_storecnt(0)
+        if const_expr(not STREAM):
+            # STREAM: the send list is read past GATE_R only, which opens once
+            # every CTA counted itself in CTL_QDONE after its own store wait.
+            rocdl.s_wait_storecnt(0)
         _rawbar()
         if is_t0:
             old_t = fx.Int32(
