@@ -90,6 +90,7 @@ from .kernels.comm.quick_allreduce_ring import (
 from .kernels.comm.transport import (
     ATOMS,
     WAVE,
+    WORLD,
     has_release_fence,
 )
 from .kernels.tensor_shim import _run_compiled
@@ -535,8 +536,8 @@ class FlyQuickAllReduce:
             Int32(num_tiles),
             Int64(inp_ptr),
             Int64(out_ptr),
-            Int64(int(eng._gpu_peer_ptrs)),
-            Int64(int(eng._colors)),
+            *(Int64(p) for p in eng.peer_args(WORLD)),
+            Int64(eng.colors_ptr()),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
             *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
@@ -1300,8 +1301,8 @@ class FlyQuickAllReduceRMSNorm:
             Int32(num_tiles),
             Int64(inp_ptr),
             Int64(out_ptr),
-            Int64(int(eng._gpu_peer_ptrs)),
-            Int64(int(eng._colors)),
+            *(Int64(p) for p in eng.peer_args(WORLD)),
+            Int64(eng.colors_ptr()),
             Int32(self._grid_x(num_tiles, spec["super_tile"], eng.grid)),
             Int64(res_in_ptr),
             Int64(res_out_ptr),

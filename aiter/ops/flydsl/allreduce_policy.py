@@ -642,7 +642,7 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #
 #   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #           Block 512 from 4 MiB.
-#         gfx950: one b256 rung per TP.
+#         gfx950: a b64 ST=1 rung below 2 MiB, then one b256 rung per TP.
 #           - TP2 ST=1 cap512
 #           - TP4 ST=1 cap1024
 #           - TP8 ST=8 cap384:
@@ -664,14 +664,18 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # Below 2 MiB block 64 (4x the workgroups of block 256) is 3-12% faster.
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=1, grid_cap=512, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=1, grid_cap=1024, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=8, grid_cap=384, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
