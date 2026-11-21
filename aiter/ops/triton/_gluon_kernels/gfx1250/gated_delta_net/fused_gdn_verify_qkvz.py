@@ -1063,6 +1063,27 @@ def _store_split(xh_lds, xm_lds, xl_lds, rows, R0: gl.constexpr):
 
 
 @gluon.jit
+def _load_replay_keys(
+    base,
+    committed,
+    stride: gl.constexpr,
+    K: gl.constexpr,
+    CAP_P2: gl.constexpr,
+    layout: gl.constexpr,
+    dst,
+):
+    """Fill one head tile, zeroing rows beyond the committed cursor."""
+    desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=base,
+        shape=[committed, K],
+        strides=[stride, 1],
+        block_shape=[CAP_P2, K],
+        layout=layout,
+    )
+    gl.amd.gfx1250.tdm.async_load(desc, [0, 0], dst)
+
+
+@gluon.jit
 def _project_head(
     xh_lds,
     xm_lds,
@@ -1077,6 +1098,8 @@ def _project_head(
     V: gl.constexpr,
     CAP_P2: gl.constexpr,
     NW: gl.constexpr,
+    shared_gram=None,
+    REGISTER_REPLAY: gl.constexpr = False,
 ):
     """P = X S0 of one head into ``p_h`` [16, V], S0 = d C + K_rec^T diag(w) U_rec:
     the checkpoint ``c_h``, the records ``k_h`` and ``u_h``, the weights ``w_h`` and
@@ -1089,7 +1112,10 @@ def _project_head(
     b32: gl.constexpr = gl.DotOperandLayout(1, mma32, 2)
     KC: gl.constexpr = 32
     acc = gl.zeros([16, V], gl.float32, mma16)
-    gram = gl.zeros([16, CAP_P2], gl.float32, mma16)
+    if shared_gram is None:
+        gram = gl.zeros([16, CAP_P2], gl.float32, mma16)
+    else:
+        gram = shared_gram
     for kc in gl.static_range(K // KC):
         x_hi = xh_lds.slice(kc * KC, KC, dim=1).load(a16)
         x_mid = xm_lds.slice(kc * KC, KC, dim=1).load(a16)
@@ -1098,19 +1124,32 @@ def _project_head(
         acc = gl.amd.gfx1250.wmma(x_lo, c_b, acc)
         acc = gl.amd.gfx1250.wmma(x_mid, c_b, acc)
         acc = gl.amd.gfx1250.wmma(x_hi, c_b, acc)
-        kr_b = k_h.slice(kc * KC, KC, dim=1).permute([1, 0]).load(b16)
-        gram = gl.amd.gfx1250.wmma(x_lo, kr_b, gram)
-        gram = gl.amd.gfx1250.wmma(x_mid, kr_b, gram)
-        gram = gl.amd.gfx1250.wmma(x_hi, kr_b, gram)
+        if shared_gram is None:
+            kr_b = k_h.slice(kc * KC, KC, dim=1).permute([1, 0]).load(b16)
+            gram = gl.amd.gfx1250.wmma(x_lo, kr_b, gram)
+            gram = gl.amd.gfx1250.wmma(x_mid, kr_b, gram)
+            gram = gl.amd.gfx1250.wmma(x_hi, kr_b, gram)
     # (X K_rec^T) diag(w) U_rec: the records past the cursor are zero rows.
     gram = gram * w_h.load(gl.SliceLayout(0, mma16))[None, :]
+    if REGISTER_REPLAY:
+        residual = gl.convert_layout(u_h, b32)
+    else:
+        residual = u_h.load(b32)
     rec = gl.amd.gfx1250.wmma(
         gl.convert_layout(gram, a32),
-        u_h.load(b32).to(gl.float32),
+        residual.to(gl.float32),
         gl.zeros([16, V], gl.float32, mma32),
     )
     decay = gl.max(d_h.load(gl.BlockedLayout([CAP_P2], [32], [NW], [0])), 0)
-    p_h.store(decay * acc + gl.convert_layout(rec, mma16))
+    projection = decay * acc + gl.convert_layout(rec, mma16)
+    if REGISTER_REPLAY:
+        # Only the first eight WMMA rows carry k or q projections.
+        halves = gl.permute(gl.reshape(projection, (2, 8, V)), (1, 2, 0))
+        pair: gl.constexpr = gl.BlockedLayout([1, 1, 2], [1, 32, 1], [NW, 1, 1], [1, 0, 2])
+        lower, _ = gl.split(gl.convert_layout(halves, pair))
+        p_h.store(lower)
+    else:
+        p_h.store(projection)
 
 
 @gluon.jit
@@ -1125,6 +1164,21 @@ def _flush_block(kt_b, uw_b, rows, decay, NW: gl.constexpr):
         kt_b.load(a32).to(gl.float32), uw_b, gl.zeros([RB, V], gl.float32, mma32)
     )
     s0 = decay * rows.load(mma32).to(gl.float32) + s0
+    rows.store(s0.to(rows.dtype))
+
+
+@gluon.jit
+def _flush_block16(kt_b, uw_b, rows, decay, NW: gl.constexpr):
+    """_flush_block by bf16 WMMA: ``kt_b`` the block's [RB, 2 * CAP] view of the record
+    keys twice, ``uw_b`` the operand of W U as [hi; lo] bf16 rows."""
+    RB: gl.constexpr = rows.shape[0]
+    V: gl.constexpr = rows.shape[1]
+    mma16: gl.constexpr = _wmma_layout(NW, 32)
+    a16: gl.constexpr = gl.DotOperandLayout(0, mma16, 8)
+    s0 = gl.amd.gfx1250.wmma(
+        kt_b.load(a16), uw_b, gl.zeros([RB, V], gl.float32, mma16)
+    )
+    s0 = decay * rows.load(mma16).to(gl.float32) + s0
     rows.store(s0.to(rows.dtype))
 
 
@@ -1168,6 +1222,51 @@ def _mx32_store(
     else:
         s_off = row * KG + gcol
     gl.store(OutScale + s_off, expo.to(gl.uint8), mask=live)
+
+
+@gluon.jit
+def _verify_dot4(coefficients, values, result_layout: gl.constexpr):
+    """Reproduce the reference eight-wave FP32 reduction for four tokens."""
+    terms = coefficients[:, :, :, None] * values[:, None, :, :]
+    t = gl.permute(terms, (0, 1, 3, 2))
+    pairs = gl.reshape(t, (terms.shape[0], terms.shape[1], terms.shape[3], 2, 2))
+    even, odd = gl.split(pairs)
+    p0, p2 = gl.split(even)
+    p1, p3 = gl.split(odd)
+    return gl.convert_layout((p0 + p2) + (p1 + p3), result_layout)
+
+
+@gluon.jit
+def _load_replay_residual(base, committed, stride, layout: gl.constexpr):
+    row = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))[:, None]
+    col = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))[None, :]
+    return gl.load(base + row * stride + col, mask=row < committed, other=0)
+
+
+@gluon.jit
+def _verify_fold_residual(uw, key_head, decay_head, ckpt_blocks, uw2_lds, kr2_lds, h,
+                          CAP_P2: gl.constexpr, NB: gl.constexpr, RB: gl.constexpr,
+                          NW: gl.constexpr, uw_layout: gl.constexpr, one_layout: gl.constexpr,
+                          b16: gl.constexpr):
+    uw_hi = uw.to(gl.bfloat16)
+    uw2_lds.slice(0, CAP_P2, dim=0).store(uw_hi)
+    uw2_lds.slice(CAP_P2, CAP_P2, dim=0).store(
+        (uw - uw_hi.to(gl.float32)).to(gl.bfloat16)
+    )
+    k_h = key_head.load(uw_layout)
+    kr2_lds.slice(0, CAP_P2, dim=0).store(k_h)
+    kr2_lds.slice(CAP_P2, CAP_P2, dim=0).store(k_h)
+    decay_h = gl.max(decay_head.load(one_layout), 0)
+    gl.barrier()
+    uw_b = uw2_lds.load(b16)
+    for rb in gl.static_range(NB):
+        _flush_block16(
+            kr2_lds.slice(rb * RB, RB, dim=1).permute([1, 0]),
+            uw_b,
+            ckpt_blocks.index(h * NB + rb),
+            decay_h,
+            NW,
+        )
 
 
 _verify_chunk_mat_repr = make_kernel_repr(
@@ -1230,6 +1329,9 @@ def _fused_gdn_verify_chunk_mat(
     OUT_MX32: gl.constexpr = False,
     N32K4: gl.constexpr = False,
     OutScale=None,
+    FLUSH_BF16: gl.constexpr = False,
+    GROUPED_REPLAY: gl.constexpr = False,
+    REGISTER_REPLAY: gl.constexpr = False,
 ):
     """The verify step of _fused_gdn_verify_chunk with the window in matrix form.
 
@@ -1266,6 +1368,9 @@ def _fused_gdn_verify_chunk_mat(
     conv_slot = gl.load(ConvIndices + seq * conv_index_stride)
     accepted = gl.load(NumAccepted + seq)
     valid = (tokens > 0) & (slot != PAD_SLOT_ID) & (conv_slot != PAD_SLOT_ID)
+    if not valid:
+        # A padded sequence (graph padding) or an empty window changes nothing.
+        return
     tokens = gl.where(valid, tokens, 0)
     bos = gl.where(valid, bos, 0)
     slot = gl.where(valid, slot, 0).to(gl.int64)
@@ -1279,8 +1384,9 @@ def _fused_gdn_verify_chunk_mat(
     VW: gl.constexpr = min(NW // RATIO, V // 32)
     SV: gl.constexpr = V // (32 * VW)
     gl.static_assert(SV * 32 * VW == V, "V over the lanes of VW waves")
+    cols_per_lane: gl.constexpr = 1 if REGISTER_REPLAY else SV
     L4: gl.constexpr = gl.BlockedLayout(
-        [1, T_P2, T_P2, SV], [1, 1, 1, 32], [NW // VW, 1, 1, VW], [3, 2, 1, 0]
+        [1, T_P2, T_P2, cols_per_lane], [1, 1, 1, 32], [NW // VW, 1, 1, VW], [3, 2, 1, 0]
     )
     MAT: gl.constexpr = gl.SliceLayout(3, L4)  # [RATIO, t, i]
     ROWT: gl.constexpr = gl.SliceLayout(2, L4)  # [RATIO, t, v]
@@ -1332,15 +1438,28 @@ def _fused_gdn_verify_chunk_mat(
         [[K, 8]], [16, K], [1, 0]
     )
     zeros_x: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [NW, 1], [1, 0])
-    x_lds = gl.allocate_shared_memory(
-        gl.float32, [16, K], x_shared, gl.zeros([16, K], gl.float32, layout=zeros_x)
-    )
-    zeros_xs = gl.zeros([16, K], gl.bfloat16, layout=zeros_x)
-    xh_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
-    xm_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
-    xl_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
+    if REGISTER_REPLAY:
+        # The conv phase overwrites all eight live rows before any load.
+        x_lds = gl.allocate_shared_memory(gl.float32, [16, K], x_shared)
+        xh_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared)
+        xm_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared)
+        xl_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared)
+        x_lds.slice(8, 8, dim=0).store(gl.full((8, K), 0, gl.float32, layout=zeros_x))
+        zeros_upper = gl.full((8, K), 0, gl.bfloat16, layout=zeros_x)
+        xh_lds.slice(8, 8, dim=0).store(zeros_upper)
+        xm_lds.slice(8, 8, dim=0).store(zeros_upper)
+        xl_lds.slice(8, 8, dim=0).store(zeros_upper)
+    else:
+        x_lds = gl.allocate_shared_memory(
+            gl.float32, [16, K], x_shared, gl.zeros([16, K], gl.float32, layout=zeros_x)
+        )
+        zeros_xs = gl.zeros([16, K], gl.bfloat16, layout=zeros_x)
+        xh_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
+        xm_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
+        xl_lds = gl.allocate_shared_memory(gl.bfloat16, [16, K], xs_shared, zeros_xs)
     # Phase 1 loads: the conv operands (q|k channels, then the heads' v channels).
-    conv_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NW], [0])
+    channels_per_lane: gl.constexpr = 2 if GROUPED_REPLAY and (NW == 8 or REGISTER_REPLAY) else 1
+    conv_layout: gl.constexpr = gl.BlockedLayout([channels_per_lane], [32], [NW], [0])
     cq = gl.arange(0, 2 * K, layout=conv_layout)
     qk_channel = gl.where(cq < K, kgroup * K + cq, KH * K + kgroup * K + cq - K)
     cv = gl.arange(0, RATIO * V, layout=conv_layout)
@@ -1436,29 +1555,55 @@ def _fused_gdn_verify_chunk_mat(
         [[K, 8]], [CAP_P2, K], [1, 0]
     )
     kr_heads = gl.allocate_shared_memory(
-        RecordK.dtype.element_ty, [RATIO, CAP_P2, K], rec_shared
+        RecordK.dtype.element_ty,
+        [1 if GROUPED_REPLAY else RATIO, CAP_P2, K],
+        rec_shared,
     )
-    ur_heads = gl.allocate_shared_memory(
-        RecordU.dtype.element_ty, [RATIO, CAP_P2, V], rec_shared
-    )
-    for h in range(RATIO):
-        head = group * RATIO + h
-        kr_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=RecordK + slot * rk_slot_stride + head * rk_head_stride,
-            shape=[committed, K],
-            strides=[rk_pos_stride, 1],
-            block_shape=[CAP_P2, K],
-            layout=rec_shared,
+    if GROUPED_REPLAY:
+        _load_replay_keys(
+            RecordK + slot * rk_slot_stride + group * RATIO * rk_head_stride,
+            committed,
+            rk_pos_stride,
+            K,
+            CAP_P2,
+            rec_shared,
+            kr_heads.index(0),
         )
-        ur_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=RecordU + slot * ru_slot_stride + head * ru_head_stride,
-            shape=[committed, V],
-            strides=[ru_pos_stride, 1],
-            block_shape=[CAP_P2, V],
-            layout=rec_shared,
+    if REGISTER_REPLAY:
+        gl.static_assert(GROUPED_REPLAY and UNROLL_HEADS and FLUSH_BF16)
+        gl.static_assert((CAP_P2, K, V, T_P2, RATIO, NW) == (16, 128, 128, 4, 2, 4))
+        replay_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [NW, 1], [1, 0])
+        residual_heads = ()
+        for h in gl.static_range(RATIO):
+            residual = _load_replay_residual(
+                RecordU + slot * ru_slot_stride + (group * RATIO + h) * ru_head_stride,
+                committed, ru_pos_stride, replay_layout,
+            )
+            residual_heads += (residual,)
+    else:
+        ur_heads = gl.allocate_shared_memory(
+            RecordU.dtype.element_ty, [RATIO, CAP_P2, V], rec_shared
         )
-        gl.amd.gfx1250.tdm.async_load(kr_desc, [0, 0], kr_heads.index(h))
-        gl.amd.gfx1250.tdm.async_load(ur_desc, [0, 0], ur_heads.index(h))
+        for h in range(RATIO):
+            head = group * RATIO + h
+            ur_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=RecordU + slot * ru_slot_stride + head * ru_head_stride,
+                shape=[committed, V],
+                strides=[ru_pos_stride, 1],
+                block_shape=[CAP_P2, V],
+                layout=rec_shared,
+            )
+            if not GROUPED_REPLAY:
+                _load_replay_keys(
+                    RecordK + slot * rk_slot_stride + head * rk_head_stride,
+                    committed,
+                    rk_pos_stride,
+                    K,
+                    CAP_P2,
+                    rec_shared,
+                    kr_heads.index(h),
+                )
+            gl.amd.gfx1250.tdm.async_load(ur_desc, [0, 0], ur_heads.index(h))
     # Record weights w_j = exp(sum of the gates after j) and the checkpoint's decay
     # d = exp(sum of the committed gates), per head into LDS for the loops.
     g_rec = gl.where(rl < committed, g_rec, 0.0)
@@ -1537,9 +1682,34 @@ def _fused_gdn_verify_chunk_mat(
     mma32: gl.constexpr = _wmma_layout(NW, 4)
     a32: gl.constexpr = gl.DotOperandLayout(0, mma32, 2)
     b32: gl.constexpr = gl.DotOperandLayout(1, mma32, 2)
-    p_lds = gl.allocate_shared_memory(gl.float32, [RATIO, 16, V], rows_shared)
+    P_ROWS: gl.constexpr = 8 if REGISTER_REPLAY else 16
+    p_lds = gl.allocate_shared_memory(gl.float32, [RATIO, P_ROWS, V], rows_shared)
     gl.amd.gfx1250.tdm.async_wait(0)
     gl.barrier()
+    if GROUPED_REPLAY:
+        _conv_state_store(qk_ops, T_MAX, valid, tokens, conv_width_stride)
+        _conv_state_store(v_ops, T_MAX, valid, tokens, conv_width_stride)
+        kt = gl.arange(0, T_P2, layout=gl.SliceLayout(1, norm_layout))[:, None]
+        ki = gl.arange(0, K, layout=gl.SliceLayout(0, norm_layout))[None, :]
+        for head_offset in gl.static_range(RATIO):
+            key_dst = (
+                RecordK
+                + slot * rk_slot_stride
+                + (group * RATIO + head_offset) * rk_head_stride
+            )
+            gl.store(
+                key_dst + (first + kt) * rk_pos_stride + ki,
+                k_rows.to(RecordK.dtype.element_ty),
+                mask=kt < tokens,
+            )
+        gl.store(
+            RecordG
+            + slot * rg_slot_stride
+            + g_head * rg_head_stride
+            + (first + gt) * rg_pos_stride,
+            g,
+            mask=g_live,
+        )
     # The window's Gram X X^T by f32 WMMA: k_t . k_i in rows t, columns i, and
     # q_t . k_i in rows T_P2 + t.
     xx = gl.amd.gfx1250.wmma(
@@ -1548,6 +1718,30 @@ def _fused_gdn_verify_chunk_mat(
         gl.zeros([16, 16], gl.float32, mma32),
     )
     xx_lds = gl.allocate_shared_memory(gl.float32, [16, 16], rows_shared, xx)
+    if GROUPED_REPLAY:
+        # Both value heads consume the same committed normalized key rows.
+        # Compute their Gram matrix once in the exact stock accumulation order.
+        shared_a16: gl.constexpr = gl.DotOperandLayout(0, _wmma_layout(NW, 32), 8)
+        shared_b16: gl.constexpr = gl.DotOperandLayout(1, _wmma_layout(NW, 32), 8)
+        gram = gl.zeros([16, CAP_P2], gl.float32, _wmma_layout(NW, 32))
+        for kc in gl.static_range(K // 32):
+            kb = (
+                kr_heads.index(0)
+                .slice(kc * 32, 32, dim=1)
+                .permute([1, 0])
+                .load(shared_b16)
+            )
+            gram = gl.amd.gfx1250.wmma(
+                xl_lds.slice(kc * 32, 32, dim=1).load(shared_a16), kb, gram
+            )
+            gram = gl.amd.gfx1250.wmma(
+                xm_lds.slice(kc * 32, 32, dim=1).load(shared_a16), kb, gram
+            )
+            gram = gl.amd.gfx1250.wmma(
+                xh_lds.slice(kc * 32, 32, dim=1).load(shared_a16), kb, gram
+            )
+    else:
+        gram = None
     if UNROLL_HEADS:
         # The heads unrolled, so that their WMMA chains (and the Gram's) interleave;
         # each product sums in the same order, so the results are the loop's bits.
@@ -1557,8 +1751,8 @@ def _fused_gdn_verify_chunk_mat(
                 xm_lds,
                 xl_lds,
                 ckpt_heads.index(hu),
-                kr_heads.index(hu),
-                ur_heads.index(hu),
+                kr_heads.index(0 if GROUPED_REPLAY else hu),
+                residual_heads[hu] if REGISTER_REPLAY else ur_heads.index(hu),
                 w_lds.index(hu),
                 d_lds.index(hu),
                 p_lds.index(hu),
@@ -1566,6 +1760,8 @@ def _fused_gdn_verify_chunk_mat(
                 V,
                 CAP_P2,
                 NW,
+                gram,
+                REGISTER_REPLAY,
             )
     else:
         for h in range(RATIO):
@@ -1589,24 +1785,57 @@ def _fused_gdn_verify_chunk_mat(
         # at a time, back into the LDS rows it came from and out by TDM. Right after
         # P (the last reader of C), so the store overlaps the window.
         uw_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [NW, 1], [1, 0])
-        uw_lds = gl.allocate_shared_memory(gl.float32, [CAP_P2, V], rows_shared)
-        for h in range(RATIO):
-            gl.barrier()
-            w_h = w_lds.index(h).load(gl.SliceLayout(1, uw_layout))
-            u_h = ur_heads.index(h).load(uw_layout)
-            uw_lds.store(u_h.to(gl.float32) * w_h[:, None])
-            decay_h = gl.max(d_lds.index(h).load(one_layout), 0)
-            gl.barrier()
-            uw_b = uw_lds.load(b32)
-            k_h = kr_heads.index(h)
-            for rb in gl.static_range(NB):
-                _flush_block(
-                    k_h.slice(rb * RB, RB, dim=1).permute([1, 0]),
-                    uw_b,
-                    ckpt_blocks.index(h * NB + rb),
-                    decay_h,
-                    NW,
-                )
+        if FLUSH_BF16:
+            # K_rec^T (W U) as one bf16 WMMA a tile: [K_rec^T | K_rec^T] [hi; lo],
+            # with W U = hi + lo to 2^-17 (the checkpoint is bf16).
+            mma16: gl.constexpr = _wmma_layout(NW, 32)
+            b16: gl.constexpr = gl.DotOperandLayout(1, mma16, 8)
+            rec2_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                [[K, 8]], [2 * CAP_P2, K], [1, 0]
+            )
+            uw2_lds = gl.allocate_shared_memory(
+                gl.bfloat16, [2 * CAP_P2, V], rec2_shared
+            )
+            kr2_lds = gl.allocate_shared_memory(
+                RecordK.dtype.element_ty, [2 * CAP_P2, K], rec2_shared
+            )
+            if REGISTER_REPLAY:
+                for h in gl.static_range(RATIO):
+                    gl.barrier()
+                    w_h = w_lds.index(h).load(gl.SliceLayout(1, uw_layout))
+                    uw = gl.convert_layout(residual_heads[h], uw_layout).to(gl.float32) * w_h[:, None]
+                    _verify_fold_residual(
+                        uw, kr_heads.index(0 if GROUPED_REPLAY else h), d_lds.index(h),
+                        ckpt_blocks, uw2_lds, kr2_lds, h, CAP_P2, NB, RB, NW, uw_layout, one_layout, b16,
+                    )
+            else:
+                for h in range(RATIO):
+                    gl.barrier()
+                    w_h = w_lds.index(h).load(gl.SliceLayout(1, uw_layout))
+                    uw = ur_heads.index(h).load(uw_layout).to(gl.float32) * w_h[:, None]
+                    _verify_fold_residual(
+                        uw, kr_heads.index(0 if GROUPED_REPLAY else h), d_lds.index(h),
+                        ckpt_blocks, uw2_lds, kr2_lds, h, CAP_P2, NB, RB, NW, uw_layout, one_layout, b16,
+                    )
+        else:
+            uw_lds = gl.allocate_shared_memory(gl.float32, [CAP_P2, V], rows_shared)
+            for h in range(RATIO):
+                gl.barrier()
+                w_h = w_lds.index(h).load(gl.SliceLayout(1, uw_layout))
+                u_h = ur_heads.index(h).load(uw_layout)
+                uw_lds.store(u_h.to(gl.float32) * w_h[:, None])
+                decay_h = gl.max(d_lds.index(h).load(one_layout), 0)
+                gl.barrier()
+                uw_b = uw_lds.load(b32)
+                k_h = kr_heads.index(0 if GROUPED_REPLAY else h)
+                for rb in gl.static_range(NB):
+                    _flush_block(
+                        k_h.slice(rb * RB, RB, dim=1).permute([1, 0]),
+                        uw_b,
+                        ckpt_blocks.index(h * NB + rb),
+                        decay_h,
+                        NW,
+                    )
         gl.barrier()
         gl.amd.gfx1250.tdm.async_store(ckpt_desc, [0, 0], ckpt_lds)
     tt = gl.arange(0, T_P2, layout=gl.SliceLayout(0, VT))[None, :]
@@ -1624,7 +1853,7 @@ def _fused_gdn_verify_chunk_mat(
     l_k = gl.where(i3 < t3, gamma * dot_kk[None, :, :], 0.0)
     l_q = gl.where(i3 <= t3, gamma * dot_qk[None, :, :], 0.0)
     # P rows k_t S0 and q_t S0, and v, as [RATIO, t, v].
-    p3 = p_lds.reinterpret(gl.float32, [RATIO, 16, V], flat3)
+    p3 = p_lds.reinterpret(gl.float32, [RATIO, P_ROWS, V], flat3)
     p_k = p3.slice(0, T_P2, dim=1).load(ROWT)
     p_q = p3.slice(T_P2, T_P2, dim=1).load(ROWT)
     v3 = conv_v.reinterpret(gl.bfloat16, [T_P2, RATIO, V], flat3).permute([1, 0, 2])
@@ -1639,14 +1868,31 @@ def _fused_gdn_verify_chunk_mat(
     u = beta_r * rhs
     for _ in range(tokens - 1):
         u_i = gl.convert_layout(u, ROWI)
-        u = beta_r * (rhs - gl.sum(l_k[:, :, :, None] * u_i[:, None, :, :], 2))
+        if REGISTER_REPLAY:
+            delta = _verify_dot4(l_k, u_i, ROWT)
+        else:
+            delta = gl.sum(l_k[:, :, :, None] * u_i[:, None, :, :], 2)
+        u = beta_r * (rhs - delta)
         u = gl.where(u_live, u, 0.0)
     u_i = gl.convert_layout(u, ROWI)
-    readout = decay * p_q + gl.sum(l_q[:, :, :, None] * u_i[:, None, :, :], 2)
+    if REGISTER_REPLAY:
+        delta_q = _verify_dot4(l_q, u_i, ROWT)
+    else:
+        delta_q = gl.sum(l_q[:, :, :, None] * u_i[:, None, :, :], 2)
+    readout = decay * p_q + delta_q
     # Phase 4: the gated RMSNorm of the readout (rounded to bf16 first); the output
     # [t, RATIO * V] and the records u [RATIO, t, V] into LDS for TDM stores.
     core = readout.to(gl.bfloat16).to(gl.float32)
-    rms = gl.rsqrt(gl.sum(core * core, 2) / V + eps)
+    if REGISTER_REPLAY:
+        # Preserve stock rounding with one wave per 32-column partial sum.
+        parts: gl.constexpr = gl.BlockedLayout(
+            [1, T_P2, 1, 1], [1, 1, 1, 32], [NW // VW, 1, VW, 1], [3, 2, 1, 0]
+        )
+        core4 = gl.convert_layout(gl.reshape(core, (RATIO, T_P2, 4, 32)), parts)
+        partial = gl.sum(core4 * core4, 3)
+        rms = gl.convert_layout(gl.rsqrt(gl.sum(partial, 2) / V + eps), VR)
+    else:
+        rms = gl.rsqrt(gl.sum(core * core, 2) / V + eps)
     normalized = core * rms[:, :, None] * weight * _silu_fast(z.to(gl.float32))
     # OUT_MX32 keeps the bf16 output in LDS and quantizes it after the barrier below.
     o_dtype: gl.constexpr = gl.bfloat16 if OUT_MX32 else Output.dtype.element_ty
@@ -1706,37 +1952,38 @@ def _fused_gdn_verify_chunk_mat(
         layout=flat3,
     )
     gl.amd.gfx1250.tdm.async_store(u_desc, [0, 0, 0], u_lds)
-    for h in range(RATIO):
-        k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=RecordK
-            + slot * rk_slot_stride
-            + (group * RATIO + h) * rk_head_stride
-            + first * rk_pos_stride,
-            shape=[tokens, K],
-            strides=[rk_pos_stride, 1],
-            block_shape=[T_P2, K],
-            layout=rows_shared,
+    if not GROUPED_REPLAY:
+        for h in range(RATIO):
+            k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=RecordK
+                + slot * rk_slot_stride
+                + (group * RATIO + h) * rk_head_stride
+                + first * rk_pos_stride,
+                shape=[tokens, K],
+                strides=[rk_pos_stride, 1],
+                block_shape=[T_P2, K],
+                layout=rows_shared,
+            )
+            gl.amd.gfx1250.tdm.async_store(k_desc, [0, 0], keys_lds)
+        if SPLIT > 1:
+            _conv_state_store(
+                qk_ops,
+                T_MAX,
+                valid & qk_owner,
+                gl.where(qk_owner, tokens, 0),
+                conv_width_stride,
+            )
+        else:
+            _conv_state_store(qk_ops, T_MAX, valid, tokens, conv_width_stride)
+        _conv_state_store(v_ops, T_MAX, valid, tokens, conv_width_stride)
+        gl.store(
+            RecordG
+            + slot * rg_slot_stride
+            + g_head * rg_head_stride
+            + (first + gt) * rg_pos_stride,
+            g,
+            mask=g_live,
         )
-        gl.amd.gfx1250.tdm.async_store(k_desc, [0, 0], keys_lds)
-    if SPLIT > 1:
-        _conv_state_store(
-            qk_ops,
-            T_MAX,
-            valid & qk_owner,
-            gl.where(qk_owner, tokens, 0),
-            conv_width_stride,
-        )
-    else:
-        _conv_state_store(qk_ops, T_MAX, valid, tokens, conv_width_stride)
-    _conv_state_store(v_ops, T_MAX, valid, tokens, conv_width_stride)
-    gl.store(
-        RecordG
-        + slot * rg_slot_stride
-        + g_head * rg_head_stride
-        + (first + gt) * rg_pos_stride,
-        g,
-        mask=g_live,
-    )
     gl.amd.gfx1250.tdm.async_wait(0)
     # Keeps the checkpoint rows allocated to the end: the flush's TDM store reads
     # them while the window runs, so no later buffer or scratch may take them. The

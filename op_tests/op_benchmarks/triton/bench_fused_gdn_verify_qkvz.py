@@ -6,6 +6,13 @@ ReplaySSM state (gfx1250), in us per call. The calls rotate over copies of the s
 pools, as the layers of a model do, so that no call reads the state from the cache.
 
     python3 bench_fused_gdn_verify_qkvz.py
+    # Compare with and without --grouped-replay-keys using the same shared keys.
+    # Select the four-wave candidate for an unsplit Qwen-geometry batch.
+    export AITER_GDN_VERIFY_MATRIX=1 AITER_GDN_VERIFY_CHUNK_WARPS=8
+    export AITER_GDN_VERIFY_UNROLL=1 AITER_GDN_VERIFY_LDS_OPT=1
+    export AITER_GDN_VERIFY_FLUSH_BF16=1
+    python3 bench_fused_gdn_verify_qkvz.py --num-k-heads 16 --batch 129
+    python3 bench_fused_gdn_verify_qkvz.py --num-k-heads 16 --batch 129 --grouped-replay-keys
     # Qwen3.5-35B-A3B with DP attention: 16 key heads, 32 value heads
     python3 bench_fused_gdn_verify_qkvz.py --num-k-heads 16 --batch 1,16,64,192
 """
@@ -32,15 +39,18 @@ from op_tests.triton_tests.gated_delta_net.test_fused_gdn_verify_qkvz import (
 )
 
 
-def bench_one(num_k_heads, ratio, seqs, window, cap, rotate):
+def bench_one(num_k_heads, ratio, seqs, window, cap, rotate, grouped_replay_keys=False):
     layer = make_layer(num_k_heads, num_k_heads * ratio, seed=1)
     num_slots = 2 * seqs + 16
-    pools = make_pools(layer, window, cap, seed=2, num_slots=num_slots)
+    pools = make_pools(
+        layer, window, cap, seed=2, num_slots=num_slots, grouped_keys=True
+    )
     step = make_step(layer, seqs, window, seed=3, num_slots=num_slots)
     commit(pools, step, cap)
     out = torch.empty((step.n, layer.vh, V), dtype=torch.bfloat16, device="cuda")
     args = op_args(layer, step, pools, out)
     kwargs = dict(max_query_len=window, scale=K**-0.5, norm_eps=EPS, **args)
+    kwargs["grouped_replay_keys"] = grouped_replay_keys
     # The first timing of new inputs is too high. Run once and drop it.
     run_perftest(fused_gdn_verify_qkvz, **kwargs, num_rotate_args=rotate)
     _, us = run_perftest(fused_gdn_verify_qkvz, **kwargs, num_rotate_args=rotate)
@@ -59,6 +69,11 @@ def main():
     parser.add_argument(
         "--rotate", type=int, default=30, help="copies of the state pools"
     )
+    parser.add_argument(
+        "--grouped-replay-keys",
+        action="store_true",
+        help="let the kernel reuse the key shared by each group of value heads",
+    )
     args = parser.parse_args()
     if get_arch() != "gfx1250":
         logger.warning("fused_gdn_verify_qkvz runs on gfx1250 only, got %s", get_arch())
@@ -66,7 +81,13 @@ def main():
     results = []
     for seqs in (int(b) for b in args.batch.split(",")):
         us = bench_one(
-            args.num_k_heads, args.ratio, seqs, args.window, args.cache_len, args.rotate
+            args.num_k_heads,
+            args.ratio,
+            seqs,
+            args.window,
+            args.cache_len,
+            args.rotate,
+            args.grouped_replay_keys,
         )
         results.append({"seqs": seqs, "us": round(us, 2)})
     logger.info(

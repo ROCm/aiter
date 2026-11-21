@@ -151,6 +151,7 @@ def fused_gdn_verify_qkvz(
     pad_slot_id: int = PAD_SLOT_ID,
     out_scale: torch.Tensor | None = None,
     out_scale_rows: int | None = None,
+    grouped_replay_keys: bool = False,
 ) -> torch.Tensor:
     """One speculative-verify step of a Gated DeltaNet layer on ReplaySSM state.
 
@@ -200,6 +201,9 @@ def fused_gdn_verify_qkvz(
             ``R < 32``). Rows of padded sequences, rows past ``tokens`` and the n32k4 pad
             rows are not written. Chunk-form kernel and its matrix form only: check
             ``fused_gdn_verify_mx32_supported`` first.
+
+        grouped_replay_keys: The caller guarantees identical committed key rows for
+            all value heads of each key head. Independent state pools use the default.
 
     Returns:
         ``out``.
@@ -280,6 +284,7 @@ def fused_gdn_verify_qkvz(
     # AITER_GDN_VERIFY_COMPACT=1 selects its compact form and
     # AITER_GDN_VERIFY_MATRIX=1 its matrix form (experiments, off by default).
     chunk_warps = _chunk_warps(seqs)
+    bf16_flush = os.environ.get("AITER_GDN_VERIFY_FLUSH_BF16")
     if chunk_warps and _chunk_kernel_fits(
         head_k_dim, head_v_dim, ratio, max_query_len, cap, chunk_warps
     ):
@@ -296,6 +301,9 @@ def fused_gdn_verify_qkvz(
             and os.environ.get("AITER_GDN_VERIFY_UNROLL", "0") == "1"
         ):
             tile_args = {"UNROLL_HEADS": True}
+        # Keep FP32 checkpoint products unless the caller requests the BF16 flush.
+        if kernel is _fused_gdn_verify_chunk_mat and bf16_flush == "1":
+            tile_args["FLUSH_BF16"] = True
         # AITER_GDN_VERIFY_SPLIT=2: the matrix form with the value heads of a key
         # head over that many programs, at up to the config's split_max_seqs
         # sequences and with its split_num_warps waves (an experiment, off by
@@ -330,6 +338,21 @@ def fused_gdn_verify_qkvz(
             "N32K4": scale_rows >= 32,
             "OutScale": out_scale,
         }
+    if (
+        grouped_replay_keys
+        and kernel is _fused_gdn_verify_chunk_mat
+        and tile_args.get("UNROLL_HEADS", False)
+        and grid_split == 1
+        and (ratio, max_query_len, cap, head_k_dim, head_v_dim) == (2, 4, 16, 128, 128)
+    ):
+        tile_args["GROUPED_REPLAY"] = True
+        if (
+            num_warps == 8
+            and bf16_flush in (None, "1")
+            and os.environ.get("AITER_GDN_VERIFY_LDS_OPT", "0") == "1"
+        ):
+            num_warps = 4
+            tile_args.update(FLUSH_BF16=True, REGISTER_REPLAY=True)
     kernel[(seqs * k_heads * grid_split,)](
         query_start_loc,
         slot_idx,

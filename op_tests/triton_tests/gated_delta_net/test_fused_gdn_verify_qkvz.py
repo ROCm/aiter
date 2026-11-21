@@ -73,7 +73,7 @@ def make_layer(kh, vh, seed, param_dtype=torch.float32, conv_bias=False):
     )
 
 
-def make_pools(layer, window, cap, seed, num_slots=SLOTS):
+def make_pools(layer, window, cap, seed, num_slots=SLOTS, grouped_keys=False):
     """ReplaySSM pools as a serving stack binds them: the conv windows stored as
     [slot, width, channels] and passed transposed, and K-major checkpoints."""
     torch.manual_seed(seed)
@@ -82,6 +82,9 @@ def make_pools(layer, window, cap, seed, num_slots=SLOTS):
     record_k = torch.nn.functional.normalize(
         torch.randn((n, vh, cap, K), dtype=torch.float32, device="cuda"), dim=-1
     )
+    if grouped_keys:
+        ratio = vh // layer.kh
+        record_k = record_k[:, ::ratio].repeat_interleave(ratio, dim=1)
     return {
         "conv": torch.randn((n, window + 2, layer.qkv), **bf16),
         "ckpt": torch.randn((n, vh, K, V), **bf16) * 0.1,
@@ -164,11 +167,15 @@ def op_args(layer, step, pools, out):
     }
 
 
-def run_op(layer, step, pools):
+def run_op(layer, step, pools, grouped_replay_keys=False):
     out = torch.empty((step.n, layer.vh, V), dtype=torch.bfloat16, device="cuda")
     args = op_args(layer, step, pools, out)
     fused_gdn_verify_qkvz(
-        max_query_len=step.window, scale=K**-0.5, norm_eps=EPS, **args
+        max_query_len=step.window,
+        scale=K**-0.5,
+        norm_eps=EPS,
+        grouped_replay_keys=grouped_replay_keys,
+        **args,
     )
     return out.double()
 
@@ -340,6 +347,27 @@ def test_fused_gdn_verify_flush_boundaries(kh, vh):
     truth, expected = reference(layer, step, pools, cap)
     check_output(run_op(layer, step, pools), truth)
     check_pools(pools, expected)
+
+
+def test_fused_gdn_verify_grouped_replay(monkeypatch):
+    """Grouped replay must preserve each value head's residuals and checkpoint."""
+    _requires_gfx1250()
+    monkeypatch.setenv("AITER_GDN_VERIFY_LDS_OPT", "1")
+    monkeypatch.delenv("AITER_GDN_VERIFY_FLUSH_BF16", raising=False)
+    window, cap = 4, 16
+    layer = make_layer(4, 8, seed=81)
+    pools = make_pools(layer, window, cap, seed=82, num_slots=8, grouped_keys=True)
+    slots = torch.arange(5, device="cuda", dtype=torch.int32)
+    pools["wp"][:5] = torch.tensor([0, 1, 8, 9, 12], device="cuda", dtype=torch.int32)
+    for i in range(3):
+        step = make_step(
+            layer, 5, window, seed=83 + i, slots=slots, lengths=[4, 2, 0, 3, 1]
+        )
+        step.accepted = torch.minimum(step.accepted, step.cu.diff()).clamp_min(1)
+        truth, expected = reference(layer, step, pools, cap)
+        check_output(run_op(layer, step, pools, grouped_replay_keys=True), truth)
+        check_pools(pools, expected)
+        commit(pools, step, cap)
 
 
 def test_fused_gdn_verify_reads_an_empty_cursor():
