@@ -12,8 +12,9 @@ Usage:
     python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
     python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 7680 --causal  # gfx950 MLA prefill
     python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 128 --seqlen_k 16384  # key split
+    python bench_mha_fp8.py --varlen --shared_pe --q_heads 24 --batch 4 --seqlen_q 2048 --causal
 
-``--varlen`` benchmarks ``mha_varlen_fwd`` (gfx950) with packed q/k ``[T, H, head_dim +
+``--varlen`` benchmarks ``mha_varlen_fwd`` (gfx950/gfx1250) with packed q/k ``[T, H, head_dim +
 pe_dim]`` and v ``[T, H, head_dim]``. A non-causal call also writes the LSE, as an MLA
 context chunk does.
 """
@@ -32,7 +33,9 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
 )
 from op_tests.triton_tests.attention.test_mha_fp8_e2e import (
+    _cu,
     generate_mha_varlen_fp8_inputs,
+    generate_varlen_pe_fp8_inputs,
     init_qkv,
 )
 
@@ -41,6 +44,16 @@ MHA_VARLEN_KEYS = [
     "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
     "q_descale", "k_descale", "v_descale", "out", "lse",
 ]  # fmt: skip
+SHARED_PE_KEYS = [
+    "q",
+    "k",
+    "v",
+    "k_pe",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "out",
+    "lse",
+]
 
 
 def generate_mha_fwd_inputs(b, hq, hk, sq, sk, d, device):
@@ -49,8 +62,33 @@ def generate_mha_fwd_inputs(b, hq, hk, sq, sk, d, device):
     return q, k, v, q_scale, k_scale, v_scale, o
 
 
-def bench_case(bencher, b, hq, hk, sq, sk, d, d_pe, causal, varlen, device):
-    if varlen:
+def generate_shared_pe_inputs(b, hq, hk, sq, sk, device):
+    q, k, v, k_pe = generate_varlen_pe_fp8_inputs(
+        [sq] * b, [sk] * b, hq, hk, device=device
+    )
+    out = torch.empty((b * sq, hq, v.shape[-1]), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((hq, b * sq), dtype=torch.float32, device=device)
+    cu_q, cu_k = _cu([sq] * b, device), _cu([sk] * b, device)
+    return q, k, v, k_pe, cu_q, cu_k, out, lse
+
+
+def bench_case(
+    bencher, b, hq, hk, sq, sk, d, d_pe, causal, varlen, device, shared_pe=False
+):
+    if shared_pe:
+        gen = functools.partial(generate_shared_pe_inputs, b, hq, hk, sq, sk, device)
+        keys = SHARED_PE_KEYS
+        kernel_fn = functools.partial(
+            mha_varlen_fwd,
+            max_seqlen_q=sq,
+            max_seqlen_k=sk,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            causal=causal,
+            return_lse=not causal,
+        )
+    elif varlen:
         gen = functools.partial(
             generate_mha_varlen_fp8_inputs, [sq] * b, [sk] * b, hq, 0, device, d_pe
         )
@@ -72,8 +110,13 @@ def bench_case(bencher, b, hq, hk, sq, sk, d, d_pe, causal, varlen, device):
 
     num_pairs = sq * sk - sq * (sq - 1) / 2 if causal else sq * sk
     flops = 2.0 * b * hq * num_pairs * (2 * d + d_pe)
+    k_pe_heads = 1 if shared_pe else hk
     num_bytes = b * (
-        hq * sq * (d + d_pe) + hk * sk * (d + d_pe) + hk * sk * d + 2 * hq * sq * d
+        hq * sq * (d + d_pe)
+        + hk * sk * d
+        + k_pe_heads * sk * d_pe
+        + hk * sk * d
+        + 2 * hq * sq * d
     )
     return {
         "us": ms * 1e3,
@@ -107,7 +150,13 @@ def parse_args():
         "--varlen",
         action="store_true",
         default=False,
-        help="benchmark mha_varlen_fwd (gfx950 MLA prefill layout)",
+        help="benchmark mha_varlen_fwd (packed varlen, shared rope K; gfx950 and gfx1250)",
+    )
+    parser.add_argument(
+        "--shared_pe",
+        action="store_true",
+        default=False,
+        help="with --varlen (gfx1250): k_pe [T, 1, 64] shared by the heads, as vLLM passes it",
     )
     parser.add_argument(
         "--pe_dim", type=int, default=64, help="rope head dim of q/k with --varlen"
@@ -129,7 +178,10 @@ def main():
     assert (
         not args.causal or seqlen_k >= args.seqlen_q
     ), f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
-    if args.varlen:
+    if args.shared_pe:
+        assert args.varlen, "--shared_pe needs --varlen"
+        assert args.head_dim == 128 and args.pe_dim == 64, "--shared_pe is d 128, pe 64"
+    elif args.varlen:
         assert k_heads == args.q_heads, "--varlen needs --k_heads == --q_heads"
     pe_dim = args.pe_dim if args.varlen else 0
 
@@ -148,6 +200,7 @@ def main():
         args.causal,
         args.varlen,
         device,
+        shared_pe=args.shared_pe,
     )
 
     print("MHA varlen fwd fp8" if args.varlen else "MHA fwd fp8")

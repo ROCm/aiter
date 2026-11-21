@@ -191,6 +191,7 @@ def lse_merge(
     partial_lse: torch.Tensor,
     out: torch.Tensor,
     lse: torch.Tensor | None = None,
+    row_bounds: torch.Tensor | None = None,
 ) -> None:
     """
     Merge attention partials over disjoint key ranges into `out` (and `lse`) by log-sum-exp.
@@ -201,6 +202,7 @@ def lse_merge(
         with a contiguous last dimension.
     out: BSHD [batch, Sq, H, D], written as weighted by exp(partial_lse - lse).
     lse: optional FP32 [batch, H, Sq] receiving the merged log-sum-exp.
+    row_bounds: optional int32 cu_seqlens; only rows in [row_bounds[0], row_bounds[-1]) are written.
     """
     batch, sequence, heads, head_dim = out.shape
     if partial_out.shape[0] % batch or partial_out.shape[1:] != out.shape[1:]:
@@ -231,6 +233,13 @@ def lse_merge(
     ):
         if tensor is not None and tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have a contiguous last dimension")
+    if row_bounds is not None and (
+        row_bounds.dtype != torch.int32
+        or row_bounds.dim() != 1
+        or row_bounds.numel() == 0
+        or row_bounds.stride(0) != 1
+    ):
+        raise ValueError("row_bounds must be a non-empty contiguous 1-D int32 tensor")
     if head_dim & (head_dim - 1):
         raise ValueError(f"head dimension must be a power of two, got {head_dim}")
 
@@ -242,6 +251,8 @@ def lse_merge(
         partial_lse,
         out,
         lse if lse is not None else partial_lse,
+        row_bounds if row_bounds is not None else partial_lse,
+        row_bounds.numel() - 1 if row_bounds is not None else 0,
         sequence,
         partial_out.stride(0),
         partial_out.stride(1),
@@ -256,6 +267,7 @@ def lse_merge(
         BLOCK_M=block_m,
         HEAD_DIM=head_dim,
         WRITE_LSE=lse is not None,
+        HAS_ROW_BOUNDS=row_bounds is not None,
         num_warps=config.num_warps,
     )
 

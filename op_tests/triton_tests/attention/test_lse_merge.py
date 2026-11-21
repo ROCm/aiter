@@ -77,6 +77,36 @@ def test_lse_merge_matches_reference(
         torch.testing.assert_close(lse, reference_lse, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "begin, end", [(0, 300), (13, 300), (0, 211), (40, 41), (7, 7)]
+)
+def test_lse_merge_row_bounds(begin, end):
+    torch.manual_seed(0)
+    splits, sequence, heads, head_dim = 3, 300, 2, 128
+    partial_out, partial_lse = _partials(
+        1, splits, sequence, heads, head_dim, torch.float32
+    )
+    partial_out[:, :begin] = partial_out[:, end:] = float("nan")
+    partial_lse[:, :, :begin] = partial_lse[:, :, end:] = float("nan")
+    out = torch.full((1, sequence, heads, head_dim), 7.0, device="cuda")
+    lse = torch.full((1, heads, sequence), 7.0, device="cuda")
+    row_bounds = torch.tensor([begin, (begin + end) // 2, end], dtype=torch.int32)
+
+    lse_merge(partial_out, partial_lse, out, lse, row_bounds=row_bounds.cuda())
+
+    reference_out, reference_lse = _reference(partial_out, partial_lse, 1)
+    rows = slice(begin, end)
+    torch.testing.assert_close(
+        out[:, rows], reference_out[:, rows], atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        lse[:, :, rows], reference_lse[:, :, rows], atol=1e-5, rtol=1e-5
+    )
+    outside = torch.ones(sequence, dtype=torch.bool, device="cuda")
+    outside[rows] = False
+    assert (out[:, outside] == 7.0).all() and (lse[:, :, outside] == 7.0).all()
+
+
 def test_lse_merge_reads_and_writes_strided_views():
     """Only the last dimension has to be contiguous. The merge must not write past the view."""
     torch.manual_seed(0)
