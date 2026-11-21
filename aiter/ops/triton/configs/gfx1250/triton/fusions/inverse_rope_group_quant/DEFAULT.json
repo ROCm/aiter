@@ -1,0 +1,6 @@
+{
+  "_inverse_rope_group_quant_kernel_H64_D512": {
+    "BLOCK_H": 16,
+    "num_warps": 4
+  }
+}
