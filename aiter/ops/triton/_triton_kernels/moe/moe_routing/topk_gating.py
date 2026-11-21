@@ -6,6 +6,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _exact_sigmoid_biased_topk(
@@ -79,3 +81,146 @@ def _exact_sigmoid_biased_topk(
         selected_weights,
         mask=slot_mask,
     )
+
+
+@triton.jit
+def _sqrtsoftplus(x):
+    # compute_score<SCORE_SQRTSOFTPLUS> of the HIP topk_gating kernels.
+    x = tl.where(x > 3.4028234663852886e38, 3.4028234663852886e38, x)
+    softplus = tl.where(
+        x > 20.0,
+        x,
+        tl.math.log2(1.0 + tl.math.exp2(x * 1.4426950408889634)) * 0.6931471805599453,
+    )
+    return tl.sqrt_rn(softplus)
+
+
+@triton.jit
+def _sqrtsoftplus_384_slot(row_ptr, bias_ptr, cols, HAS_BIAS: tl.constexpr):
+    """Selection value, weight and expert id of one expert in each lane."""
+    score = _sqrtsoftplus(tl.load(row_ptr + cols).to(tl.float32))
+    weight = tl.where(score != score, 0.0, score)  # noqa: PLR0124
+    if HAS_BIAS:
+        score = score + tl.load(bias_ptr + cols)
+    choice = tl.where(score != score, float("-inf"), score)  # noqa: PLR0124
+    return choice, weight, cols
+
+
+@triton.jit
+def _compare_exchange(va, wa, ia, vb, wb, ib):
+    # Descending: swap when va < vb. A NaN compares false, as in the HIP sort.
+    swap = va < vb
+    return (
+        tl.where(swap, vb, va),
+        tl.where(swap, wb, wa),
+        tl.where(swap, ib, ia),
+        tl.where(swap, va, vb),
+        tl.where(swap, wa, wb),
+        tl.where(swap, ia, ib),
+    )
+
+
+@triton.jit
+def _pick3(cursor, a0, a1, a2, other):
+    return tl.where(
+        cursor == 0, a0, tl.where(cursor == 1, a1, tl.where(cursor == 2, a2, other))
+    )
+
+
+@triton.jit
+def _pick6(cursor, a0, a1, a2, a3, a4, a5, other):
+    return tl.where(
+        cursor < 3,
+        _pick3(cursor, a0, a1, a2, other),
+        _pick3(cursor - 3, a3, a4, a5, other),
+    )
+
+
+_sqrtsoftplus_384_topk_repr = make_kernel_repr(
+    "_sqrtsoftplus_384_topk",
+    ["TOPK", "HAS_BIAS", "HAS_NUM_VALID_ROWS"],
+)
+
+
+@triton.jit(repr=_sqrtsoftplus_384_topk_repr)
+def _sqrtsoftplus_384_topk(
+    logits_ptr,
+    bias_ptr,
+    weights_ptr,
+    ids_ptr,
+    num_valid_rows_ptr,  # [1] int32: rows at or past it route to -1
+    stride_logits,
+    stride_weights,
+    stride_ids,
+    routed_scaling,
+    TOPK: tl.constexpr,
+    TOPK_PAD: tl.constexpr,  # next power of two of TOPK
+    HAS_BIAS: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
+):
+    """Renormalized sqrtsoftplus top-k of one row of 384 experts.
+
+    Uses the lane layout of topk_gating_kernel_opt, the HIP kernel that
+    topk_gating runs for 384 experts on gfx950: one wave of 64 lanes, and lane
+    c holds experts c, c + 64, ..., c + 320 and sorts them with
+    sort_network_desc<6>. TOPK rounds of a lane argmax (lowest lane on a tie)
+    then select the experts. So the ids, the tie order and the renorm sum
+    order are the same as there.
+    """
+    LANES: tl.constexpr = 64
+    row = tl.program_id(0)
+    row_ptr = logits_ptr + row * stride_logits
+    lane = tl.arange(0, LANES)
+    s0, w0, i0 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane, HAS_BIAS)
+    s1, w1, i1 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + LANES, HAS_BIAS)
+    s2, w2, i2 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 2 * LANES, HAS_BIAS)
+    s3, w3, i3 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 3 * LANES, HAS_BIAS)
+    s4, w4, i4 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 4 * LANES, HAS_BIAS)
+    s5, w5, i5 = _sqrtsoftplus_384_slot(row_ptr, bias_ptr, lane + 5 * LANES, HAS_BIAS)
+    # sort_network_desc<6>: its 12 comparators in order
+    s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+    s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
+    s0, w0, i0, s2, w2, i2 = _compare_exchange(s0, w0, i0, s2, w2, i2)
+    s1, w1, i1, s4, w4, i4 = _compare_exchange(s1, w1, i1, s4, w4, i4)
+    s3, w3, i3, s5, w5, i5 = _compare_exchange(s3, w3, i3, s5, w5, i5)
+    s0, w0, i0, s1, w1, i1 = _compare_exchange(s0, w0, i0, s1, w1, i1)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+    s4, w4, i4, s5, w5, i5 = _compare_exchange(s4, w4, i4, s5, w5, i5)
+    s1, w1, i1, s2, w2, i2 = _compare_exchange(s1, w1, i1, s2, w2, i2)
+    s3, w3, i3, s4, w4, i4 = _compare_exchange(s3, w3, i3, s4, w4, i4)
+    s2, w2, i2, s3, w3, i3 = _compare_exchange(s2, w2, i2, s3, w3, i3)
+
+    cursor = tl.zeros([LANES], dtype=tl.int32)
+    slots = tl.arange(0, TOPK_PAD)
+    out_w = tl.zeros([TOPK_PAD], dtype=tl.float32)
+    out_i = tl.zeros([TOPK_PAD], dtype=tl.int32)
+    weight_sum = 0.0
+    # TOPK rounds of a lane argmax over the heads of the lane lists.
+    for k in tl.static_range(TOPK):
+        head_v = _pick6(cursor, s0, s1, s2, s3, s4, s5, float("-inf"))
+        head_w = _pick6(cursor, w0, w1, w2, w3, w4, w5, 0.0)
+        head_i = _pick6(cursor, i0, i1, i2, i3, i4, i5, 0)
+        best = tl.max(head_v, axis=0)
+        # NaN choices are -inf, so some lane always ties best.
+        win_lane = tl.min(tl.where(head_v == best, lane, LANES), axis=0)
+        idx = tl.sum(tl.where(lane == win_lane, head_i, 0), axis=0)
+        won = (cursor < 6) & (head_i == idx)
+        # The weight comes from the lane that holds expert idx.
+        owner = lane == (idx & (LANES - 1))
+        wt = tl.sum(tl.where(owner & won, head_w, 0.0), axis=0)
+        cursor = cursor + won.to(tl.int32)
+        # Summed in selection order, as in the HIP kernel.
+        weight_sum = weight_sum + wt
+        out_w = tl.where(slots == k, wt, out_w)
+        out_i = tl.where(slots == k, idx, out_i)
+
+    # The sum has the same floor as in the HIP kernels (RENORM_SUM_FLOOR).
+    out_w = out_w * tl.math.div_rn(routed_scaling, tl.maximum(weight_sum, 1e-20))
+    if HAS_NUM_VALID_ROWS:
+        pad = row >= tl.load(num_valid_rows_ptr)
+        out_i = tl.where(pad, -1, out_i)
+        out_w = tl.where(pad, 0.0, out_w)
+    slot_mask = slots < TOPK
+    tl.store(ids_ptr + row * stride_ids + slots, out_i, mask=slot_mask)
+    tl.store(weights_ptr + row * stride_weights + slots, out_w, mask=slot_mask)
