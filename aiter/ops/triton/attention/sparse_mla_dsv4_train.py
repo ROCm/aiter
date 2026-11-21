@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# DSV4 sparse-MLA training op: forward (with LSE) + backward (non-atomic).
+# DSV4 sparse-MLA training op: forward (with LSE) + backward (chunked, non-atomic).
 # Optimised for MI308X (gfx942, 64 KB LDS).
 
 import torch
@@ -9,52 +9,22 @@ import triton
 
 from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
     _FWD_FALLBACK,
-    _bwd_dkv_gather_kernel,
     _bwd_dkv_interm_kernel,
-    _bwd_dq_store_dp_kernel,
+    _bwd_dq_kernel,
     _sparse_mla_fwd_kernel,
+)
+from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
+    build_inverted_topk,
+    delta_v4,
+    dkv_gather_acc,
 )
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
-_BWD_FALLBACK = triton.Config({"BLOCK_H": 16, "BLOCK_K": 32}, num_warps=4, num_stages=1)
+_BWD_FALLBACK = triton.Config({"BLOCK_H": 16, "BLOCK_K": 16}, num_warps=4, num_stages=1)
 
-
-# =====================================================================
-# Host-side CSR inverted-topk builder
-# =====================================================================
-
-
-def _build_inverted_topk(indices, num_kv):
-    """Build CSR index mapping KV tokens back to (token, rank) pairs.
-
-    Args:
-        indices: [N, topk] int32, -1 = invalid
-        num_kv:  number of KV tokens
-
-    Returns:
-        inv_ptr:  [num_kv + 1] int32, CSR row pointers
-        inv_data: [nnz] int32, flat positions (token * topk + rank)
-    """
-    N, topk = indices.shape
-    flat = indices.reshape(-1).long()
-    valid = (flat >= 0) & (flat < num_kv)
-
-    positions = torch.arange(N * topk, device=indices.device, dtype=torch.int64)
-    valid_pos = positions[valid]
-    valid_kv = flat[valid]
-
-    sort_idx = torch.argsort(valid_kv, stable=True)
-    inv_data = valid_pos[sort_idx].to(torch.int32)
-    sorted_kv = valid_kv[sort_idx]
-
-    counts = torch.zeros(num_kv + 1, device=indices.device, dtype=torch.int32)
-    if sorted_kv.numel() > 0:
-        counts[1:].scatter_add_(
-            0, sorted_kv.int(), torch.ones_like(sorted_kv, dtype=torch.int32)
-        )
-    inv_ptr = counts.cumsum(0).to(torch.int32)
-
-    return inv_ptr, inv_data
+# The backward splits the top-k axis into chunks of at most this many slots. This
+# limits the dKV-interm workspace to [N, chunk, D].
+_MAX_R_CHUNK = 512
 
 
 # =====================================================================
@@ -122,123 +92,132 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
 
 
 def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
+    """Backward of the DSV4 sparse-MLA training attention (K == V == kv).
+
+    The op splits the top-k axis into chunks of at most ``_MAX_R_CHUNK`` slots.
+    For each chunk, one kernel computes dQ and stores dS and P. A second kernel
+    computes interm[t, k, :] = sum_h (dS * Q + P * dO), and a CSR gather adds
+    interm into dKV. dQ, interm and dKV are fp32.
+
+    Args:
+        q: [N, H, D] query.
+        kv: [N_kv, D] key and value.
+        o: [N, H, D] forward output.
+        do: [N, H, D] gradient of o.
+        indices: [N, topk] int32 rows of kv. A value out of [0, N_kv) is masked.
+        lse: [N, H] fp32 forward log-sum-exp, with the sink included.
+        attn_sink: [H] fp32 sink logits, or None.
+        scale: softmax scale. The default is 1 / sqrt(D).
+
+    Returns:
+        dq [N, H, D] fp32, dkv [N_kv, D] fp32, and d_sink [H] fp32 (None without
+        a sink).
+
+    D must be a power of two.
+    """
     N, H, D = q.shape
     N_kv = kv.shape[0]
     topk = indices.shape[1]
+    assert D & (D - 1) == 0, f"head_dim must be a power of two, got {D}"
 
     if scale is None:
         scale = 1.0 / (D**0.5)
 
-    bwd_cfg = get_tuned_kernel_config(
-        "attention", "SPARSE_MLA_DSV4_TRAIN", "_bwd_kernels", _BWD_FALLBACK
+    dq_cfg = get_tuned_kernel_config(
+        "attention", "SPARSE_MLA_DSV4_TRAIN", "_bwd_dq_kernel", _BWD_FALLBACK
     )
-    BLOCK_H = bwd_cfg.kwargs["BLOCK_H"]
-    BLOCK_K = bwd_cfg.kwargs["BLOCK_K"]
-    num_warps = bwd_cfg.num_warps
-    BLOCK_D = triton.next_power_of_2(D)
-
-    has_sink = attn_sink is not None
-    if not has_sink:
-        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
-
-    num_hg = triton.cdiv(H, BLOCK_H)
-
-    # Pre-compute delta = sum_d(O * dO) — avoids loading O in the dQ kernel
-    delta = (o.float() * do.float()).sum(dim=-1)  # [N, H] fp32
-
-    dq = torch.zeros(N, H, D, device=q.device, dtype=torch.float32)
-    d_sink = torch.zeros(H, device=q.device, dtype=torch.float32) if has_sink else None
-    d_sink_buf = (
-        d_sink if has_sink else torch.empty(1, device=q.device, dtype=torch.float32)
+    interm_cfg = get_tuned_kernel_config(
+        "attention", "SPARSE_MLA_DSV4_TRAIN", "_bwd_dkv_interm_kernel", _BWD_FALLBACK
     )
+    # tl.dot needs 16 rows. A head tile larger than the head count only adds masked rows.
+    max_block_h = max(16, triton.next_power_of_2(H))
+    dq_kwargs = dict(dq_cfg.kwargs)
+    dq_kwargs["BLOCK_H"] = min(dq_kwargs["BLOCK_H"], max_block_h)
+    interm_kwargs = dict(interm_cfg.kwargs)
+    interm_kwargs["BLOCK_H"] = min(interm_kwargs["BLOCK_H"], max_block_h)
 
-    # P/dP buffers for kernel 2  [N, H, topk] bf16
-    p_buf = torch.empty(N, H, topk, device=q.device, dtype=torch.bfloat16)
-    dp_buf = torch.empty(N, H, topk, device=q.device, dtype=torch.bfloat16)
+    num_chunks = triton.cdiv(topk, _MAX_R_CHUNK)
+    r_chunk = triton.cdiv(topk, num_chunks)
+    padded_topk = num_chunks * r_chunk
+    if padded_topk != topk:
+        # A CSR entry addresses interm by its slot in the chunk, so all chunks have one width.
+        indices = torch.nn.functional.pad(indices, (0, padded_topk - topk), value=-1)
 
-    # Kernel 1: dQ + store P/dP — grid (N, num_hg)
-    _bwd_dq_store_dp_kernel[(N, num_hg)](
-        q,
-        kv,
-        do,
-        indices,
-        lse,
-        delta,
-        attn_sink,
-        dq,
-        d_sink_buf,
-        p_buf,
-        dp_buf,
-        q.stride(0),
-        q.stride(1),
-        kv.stride(0),
-        do.stride(0),
-        do.stride(1),
-        indices.stride(0),
-        lse.stride(0),
-        delta.stride(0),
-        dq.stride(0),
-        dq.stride(1),
-        p_buf.stride(0),
-        p_buf.stride(1),
-        H,
-        D,
-        N_kv,
-        topk,
-        scale,
-        HAS_ATTN_SINK=has_sink,
-        BLOCK_H=BLOCK_H,
-        BLOCK_D=BLOCK_D,
-        BLOCK_K=BLOCK_K,
-        num_warps=num_warps,
-    )
+    delta = delta_v4(o.contiguous(), do.contiguous())
+    q_t = q.transpose(1, 2).contiguous()
+    do_t = do.transpose(1, 2).contiguous()
 
-    # Kernel 2: dKV intermediate — grid (N,)
-    interm = torch.empty(N, topk, D, device=q.device, dtype=torch.float32)
-    _bwd_dkv_interm_kernel[(N,)](
-        q,
-        do,
-        p_buf,
-        dp_buf,
-        interm,
-        q.stride(0),
-        q.stride(1),
-        do.stride(0),
-        do.stride(1),
-        p_buf.stride(0),
-        p_buf.stride(1),
-        interm.stride(0),
-        interm.stride(1),
-        H,
-        D,
-        topk,
-        BLOCK_H=BLOCK_H,
-        BLOCK_D=BLOCK_D,
-        BLOCK_K=BLOCK_K,
-        NUM_HG=num_hg,
-        num_warps=num_warps,
-    )
+    dq = torch.empty(N, H, D, device=q.device, dtype=torch.float32)
+    dkv = torch.empty(N_kv, D, device=q.device, dtype=torch.float32)
+    chunk_ds = torch.empty(N, H, r_chunk, device=q.device, dtype=torch.bfloat16)
+    chunk_p = torch.empty(N, H, r_chunk, device=q.device, dtype=torch.bfloat16)
+    interm = torch.empty(N, r_chunk, D, device=q.device, dtype=torch.float32)
 
-    # CSR gather into dkv
-    inv_ptr, inv_data = _build_inverted_topk(indices, N_kv)
-    dkv = torch.zeros(N_kv, D, device=q.device, dtype=torch.float32)
+    for r_start in range(0, padded_topk, r_chunk):
+        _bwd_dq_kernel[(N, triton.cdiv(H, dq_kwargs["BLOCK_H"]))](
+            q,
+            kv,
+            do,
+            indices,
+            lse,
+            delta,
+            dq,
+            chunk_ds,
+            chunk_p,
+            q.stride(0),
+            q.stride(1),
+            kv.stride(0),
+            do.stride(0),
+            do.stride(1),
+            indices.stride(0),
+            lse.stride(0),
+            delta.stride(0),
+            dq.stride(0),
+            dq.stride(1),
+            chunk_ds.stride(0),
+            chunk_ds.stride(1),
+            H,
+            N_kv,
+            r_start,
+            scale,
+            R_CHUNK=r_chunk,
+            IS_FIRST_CHUNK=(r_start == 0),
+            BLOCK_D=D,
+            **dq_kwargs,
+            num_warps=dq_cfg.num_warps,
+            num_stages=dq_cfg.num_stages,
+        )
+        _bwd_dkv_interm_kernel[(N,)](
+            q_t,
+            do_t,
+            chunk_ds,
+            chunk_p,
+            interm,
+            q_t.stride(0),
+            q_t.stride(1),
+            do_t.stride(0),
+            do_t.stride(1),
+            chunk_ds.stride(0),
+            chunk_ds.stride(1),
+            interm.stride(0),
+            interm.stride(1),
+            H,
+            R_CHUNK=r_chunk,
+            BLOCK_D=D,
+            NUM_HG=triton.cdiv(H, interm_kwargs["BLOCK_H"]),
+            **interm_kwargs,
+            num_warps=interm_cfg.num_warps,
+            num_stages=interm_cfg.num_stages,
+        )
+        inv_ptr, inv_data = build_inverted_topk(
+            indices[:, r_start : r_start + r_chunk], N_kv
+        )
+        # The first chunk writes every row of dkv, so dkv needs no zero fill.
+        dkv_gather_acc(interm, inv_ptr, inv_data, dkv, accumulate=(r_start > 0))
 
-    BLOCK_G = 64
-    _bwd_dkv_gather_kernel[(N_kv,)](
-        interm,
-        inv_ptr,
-        inv_data,
-        dkv,
-        interm.stride(0),
-        interm.stride(1),
-        dkv.stride(0),
-        D,
-        topk,
-        N,
-        BLOCK_D=BLOCK_D,
-        BLOCK_G=BLOCK_G,
-        num_warps=num_warps,
-    )
+    d_sink = None
+    if attn_sink is not None:
+        d_sink = -(torch.exp(attn_sink[None, :].float() - lse) * delta).sum(dim=0)
 
     return dq, dkv, d_sink
 
