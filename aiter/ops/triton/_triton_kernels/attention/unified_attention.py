@@ -1008,7 +1008,7 @@ _reduce_segments_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_reduce_segments_repr)
+@triton.jit(do_not_specialize=["num_seqs"], repr=_reduce_segments_repr)
 def reduce_segments(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
