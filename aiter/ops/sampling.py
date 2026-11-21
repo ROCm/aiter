@@ -98,16 +98,19 @@ def _topk_first_fast_path_applicable(
     )
 
 
-def _select_topk(probs: torch.Tensor, k: int):
+def _select_topk(probs: torch.Tensor, k: int, deterministic: bool = False):
     """Top-k selection for the fast path.
 
     Uses aiter's native radix-select kernel `top_k_per_row_prefill`, which is the
     fastest top-k option in this repo for small k over a large vocab at small
     batch (the regime this fast path targets): measured ~1.5-7x faster than both
-    `topk_plain` and `torch.topk`. Order of the survivors does not matter here -
-    they are renormalized and fed to top-p as a set. The full row is selected by
-    passing rowStarts=0 and rowEnds=vocab. Returns (values: float32,
-    indices: int64).
+    `topk_plain` and `torch.topk`. The top-p draw picks by position, so the
+    order of the survivors decides which token a given random number picks; the
+    distribution does not change. The default select returns the survivors in
+    no fixed order and breaks ties in no fixed way. With `deterministic`, it runs
+    with `stable=True`: ascending index order, ties to the smaller index. The
+    full row is selected by passing rowStarts=0 and rowEnds=vocab. Returns
+    (values: float32, indices: int64).
     """
     from aiter.ops.topk import top_k_per_row_prefill
 
@@ -126,6 +129,7 @@ def _select_topk(probs: torch.Tensor, k: int):
         probs.stride(0),
         probs.stride(1),
         k=k,
+        stable=deterministic,
     )
     return vals.float(), ids.long()
 
@@ -139,7 +143,9 @@ def _topk_first_fast_path(
 ) -> torch.Tensor:
     # 1. parallel top-k selection: shrinks the row the top-p kernel must scan
     #    from `vocab` down to `k`.
-    values, gathered_indices = _select_topk(probs, top_k_val)
+    #    `deterministic` also fixes the survivors and their order, so the same
+    #    RNG state picks the same token.
+    values, gathered_indices = _select_topk(probs, top_k_val, deterministic)
     # 2. renormalize over the k survivors so the top-p kernel's proportional
     #    draw stays well-defined; clamp guards degenerate (all-zero) rows.
     denom = values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
