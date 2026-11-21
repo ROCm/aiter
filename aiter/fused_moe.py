@@ -1769,6 +1769,11 @@ def fused_moe_(
     )
 
 
+# FlyDSL stage 1 kernel families (A4W4 and A16W4 with MXFP4 weights) the standard-sort
+# presort is tested on; other families fall back to the host sort.
+_STD_PRESORT_STAGE1_FAMILIES = ("flydsl_moe1_afp4_wfp4", "flydsl_moe1_abf16_wfp4")
+
+
 def _standard_presort_unsupported(metadata, asm_mode, need_local_topk_ids):
     """Why a pipeline without the aux sort cannot take a registered presort, or "".
 
@@ -1787,6 +1792,9 @@ def _standard_presort_unsupported(metadata, asm_mode, need_local_topk_ids):
         _flydsl_v2_stage2_wrapper,
     ):
         return "the selected MoE pipeline is not a FlyDSL two-stage one"
+    kernel = getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
+    if not str(kernel).startswith(_STD_PRESORT_STAGE1_FAMILIES):
+        return "the selected FlyDSL stage 1 kernel family has no presort coverage"
     return ""
 
 

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import gc
 import itertools
 import logging
@@ -2456,9 +2457,12 @@ def test_presorted_moe_block_m():
     # a sort fused_moe then ignores.
     fm = aiter.fused_moe
 
+    def stage1(kernel="flydsl_moe1_afp4_wfp4_bf16_t32x64x256"):
+        return functools.partial(fm._flydsl_stage1_wrapper, kernelName=kernel)
+
     def meta(block_m, **kw):
         fields = {
-            "stage1": fm._flydsl_stage1_wrapper,
+            "stage1": stage1(),
             "stage2": fm._flydsl_stage2_wrapper,
             "block_m": block_m,
             "ksplit": 0,
@@ -2472,7 +2476,14 @@ def test_presorted_moe_block_m():
     for block_m, want in ((16, 16), (32, None)):
         got = fm.presorted_moe_block_m(meta(block_m, output_aux=True))
         assert got == want, f"aux sort BM={block_m}: {got}"
+    got = fm.presorted_moe_block_m(
+        meta(16, stage1=stage1("flydsl_moe1_abf16_wfp4_bf16_t32x128x128_xcd4"))
+    )
+    assert got == 16, f"A16W4 family: {got}"
     rejected = {
+        "unvalidated kernel family": {
+            "stage1": stage1("flydsl_moe1_afp8_wfp4_bf16_t32")
+        },
         "full_impl": {"full_impl": object()},
         "1-stage": {"run_1stage": True},
         "post-reduce": {"flat": fm.AsmMoeMode.POST_REDUCE},
