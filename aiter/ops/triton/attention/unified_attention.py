@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import math
+import json
 import os
 from typing import NamedTuple
 
@@ -97,6 +98,9 @@ _GFX12_3D_PREFILL_SPLIT = os.environ.get("AITER_UA3D_PREFILL_SPLIT", "1") == "1"
 # gfx1250 2D kernel, a prefill whose grid leaves CUs idle: split the KV range when the
 # attn_2d entry has SPLIT_* keys (_gfx12_2d_split). Off: AITER_UA2D_PREFILL_SPLIT=0.
 _GFX12_2D_PREFILL_SPLIT = os.environ.get("AITER_UA2D_PREFILL_SPLIT", "1") == "1"
+# gfx1250 2D kernel, loop variant 2: fixed reference max (skips the row max, alpha and the accumulator rescale;
+# rounds differently, so off by default). AITER_UA_2D_CONFIG='{"FM_FIXED_MAX": true, ...}' sets it per launch.
+_UA2D_FIXED_MAX = os.environ.get("AITER_UA_2D_FIXED_MAX", "0") == "1"
 # AITER_UA_FP4PT_NO_SPECIALIZE=1: the gfx1250 2D kernel takes the KV pool's page count (num_blocks) as a runtime,
 # never-specialized i32 instead of a constexpr. num_blocks only bounds the TDM descriptors' rows (the loaders clamp
 # the page ids to the sequence's own pages), but a constexpr keys the compile, and a served pool's count comes from
@@ -1486,6 +1490,17 @@ _reduce_segments_{arch}(
 """
 
 
+def _2d_full_causal_prefill(params: _UAParams) -> bool:
+    """Causal prefill with full attention (no window, no sinks), the scope of the fixed-max loop."""
+    return (
+        not params.all_decode
+        and not params.spec_decode
+        and params.causal
+        and params.sliding_window == 0
+        and params.sinks is None
+    )
+
+
 def _gfx12_2d_split(params: _UAParams, config: dict):
     """(KV splits, config) of a gfx1250 2D prefill launch. An attn_2d entry with
     SPLIT_* keys splits a prefill over a context of at least SPLIT_MIN_KV into the
@@ -1539,8 +1554,26 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     assert params.softcap == 0, "Softcap is not supported"
 
-    config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    config = dict(get_unified_attention_config("attn_2d", params, backend="gluon"))
+    long_kv = config.pop("LONG_KV_OVERRIDE", None)
+    if (
+        long_kv
+        and os.environ.get("AITER_UA_2D_LONG_KV", "1") == "1"
+        and params.max_seqlen_k >= long_kv["min_kv"]
+        and _2d_full_causal_prefill(params)
+    ):
+        # causal full-attention prefill over a long key range: the entry's long-KV launch and FM_* options
+        config.update(long_kv["config"])
+    env_cfg = os.environ.get("AITER_UA_2D_CONFIG")
+    if env_cfg:
+        # tuning / debugging: JSON merged into the resolved attn_2d config
+        config.update(json.loads(env_cfg))
     num_splits, config = _gfx12_2d_split(params, config)
+    # fixed-max loop options (FM_*), passed to the kernel as they are; AITER_UA_2D_FIXED_MAX=1 turns the fixed
+    # reference max on for causal full-attention prefill on loop variant 2 (off by default: not bitwise)
+    fm_options = {k: config.pop(k) for k in list(config) if k.startswith("FM_")}
+    if _UA2D_FIXED_MAX and "FM_FIXED_MAX" not in fm_options and _2d_full_causal_prefill(params):
+        fm_options["FM_FIXED_MAX"] = True
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -1711,6 +1744,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         partial_l_ptr=segm_expsum,
         partial_acc_ptr=segm_output,
         enable_fp_fusion=True,
+        **fm_options,
     )
     if num_splits > 1:
         # all heads of a token in few programs (~16 x 256 x 4 splits a program)

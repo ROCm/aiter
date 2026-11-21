@@ -1734,6 +1734,29 @@ class AttentionProgram:
             return (p * s[None, :]).to(gl.bfloat16, fp_downcast_rounding="rtz"), e
 
     @gluon.jit
+    def scale_p_v_pt_rows(self, p, s, e, l_ij):
+        """Fixed-max loop, PV_FP8FP4: scale_p_v_pt with a per-row power of two on top of the tile's 2^E. P is
+        relative to the fixed reference max, not to the tile's max, so a tile's P can sit far below 1 (where e4m3
+        flushes it) or above e4m3's 448. Since max(P * s) / 2^E <= max(P) <= l_ij (the row sum L takes anyway),
+        the row's e8m0 scale 2^E * 2^(floor(log2 l_ij) - 7) keeps the row's largest value below 256 and at or
+        above 2^-7 * 256 / 128 = 1 whenever its 128 keys are equal (the normalization of the running-max loop),
+        higher when a few keys dominate. Costs one exponent extract and add per row, no reduction."""
+        le = (l_ij.to(gl.int32, bitcast=True) >> 23) & 0xFF
+        er = gl.minimum(gl.maximum(le + (e - 134), 1), 254)
+        er_dc = gl.convert_layout(er, gl.SliceLayout(1, self.cfg.p_dc_scales_layout))
+        p_dc_scales = (
+            gl.zeros([self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32], gl.int32, layout=self.cfg.p_dc_scales_layout)
+            + er_dc[:, None]
+        ).to(gl.uint8)
+        p = gl.amd.gfx1250.scaled_downcast(p * s[None, :], p_dc_scales, "e4m3", axis=1)
+        er_w = gl.convert_layout(er, gl.SliceLayout(1, self.cfg.p_scales_layout))
+        p_scales = (
+            gl.zeros([self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32], gl.int32, layout=self.cfg.p_scales_layout)
+            + er_w[:, None]
+        ).to(gl.uint8)
+        return p, p_scales
+
+    @gluon.jit
     def compute_pv_fp4pt(self, p, v, acc, p_scales):
         """A8K4V4PT PV on the packed e2m1 V (one tile, or one head-dim half of it), P from scale_p_v_pt.
         PV_FP8FP4: the scaled 16x16x128 WMMA, fp8 P (e8m0 p_scales) x e2m1 V (unit scale).
@@ -2030,6 +2053,11 @@ class AttentionProgram:
             dtype=gl.float32,
             layout=self.cfg.qk_layout,
         )
+        return self.compute_qk_subtile_from(k, k_scales, S)
+
+    @gluon.jit
+    def compute_qk_subtile_from(self, k, k_scales, S):
+        """compute_qk_subtile accumulating onto S (the fixed-max loop seeds it with -M)."""
         if self.cfg.KV_NVFP4:
             # NVFP4 K: the scaled WMMA of compute_qk on one key half
             return gl.amd.gfx1250.wmma_scaled(
@@ -2142,6 +2170,15 @@ def _p_for_pv(pgm, p, s, e, target_dtype):
     else:
         p = p.to(target_dtype)
         return p, p
+
+
+@gluon.jit
+def _p_for_pv_fm(pgm, p, s, e, target_dtype, l_ij, PSCALE: gl.constexpr):
+    """_p_for_pv of the fixed-max loop: PSCALE (fp4pt PV_FP8FP4) adds the per-row power of two from l_ij."""
+    if PSCALE:
+        return pgm.scale_p_v_pt_rows(p, s, e, l_ij)
+    else:
+        return _p_for_pv(pgm, p, s, e, target_dtype)
 
 
 @gluon.jit
@@ -2475,8 +2512,22 @@ def attention_loop_tensor_subtile_split(
     L,
     acc0,
     acc1,
+    FIXED_MAX: gl.constexpr = False,
+    PEEK_RECENT: gl.constexpr = False,
+    PSCALE: gl.constexpr = False,
+    SEED_MASK: gl.constexpr = False,
 ):
     """Reordered pipeline with tensor-register K/V subtile splitting.
+
+    FIXED_MAX (full attention only; port of the ROCm cagri_ua2d_muse_opt fixed reference max): the steady loop
+    and the 3-tile epilogue keep each row's softmax reference max at the prologue's value instead of tracking
+    the running max, so they skip the row max, alpha's exp2 and the accumulator rescale. The QK WMMA starts
+    from -M, so p = exp2(qk * scale). L sums every p, so L <= 2^100 bounds every p and acc; the caller reruns
+    the running-max loop for the program if any row's L passed 2^100 (or is inf / NaN).
+    PEEK_RECENT: the reference also covers the last fully visible tile before the causal diagonal.
+    SEED_MASK: the last epilogue tile masks the QK seed before its WMMA instead of the QK result after it.
+    PSCALE (fp4pt PV_FP8FP4): P is relative to the fixed reference, not to its tile's max, so its fp8 cast
+    takes a per-row power of two from the row sum (scale_p_v_pt_rows) instead of the tile's V exponent only.
 
     Per iter (one WMMA + one softmax slice per stage):
         stage 1: QK-0 + SM1-A
@@ -2506,6 +2557,25 @@ def attention_loop_tensor_subtile_split(
     else:
         buf_tile_next2: gl.int32 = 0  # aliases buf_tile_cur
 
+    if FIXED_MAX and PEEK_RECENT:
+        # Score the last fully visible tile (no causal mask needed) once, before any pipeline TDM is issued.
+        peek_tile = gl.maximum(pgm.safe_tile_end - 1, pgm.tile_start)
+        kv_loader.load_k_to_shared(kv_loader.load_block_ids(peek_tile), buffer_id=buf_tile_cur)
+        k_peek = kv_loader.load_k_from_shared(wait_count=0, buffer_id=buf_tile_cur, target_dtype=q.dtype)
+        kp0, kp1 = pgm.split_subtile(k_peek)
+        if cfg.KV_NVFP4:
+            ksp0, ksp1 = pgm.split_k_scales(kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_cur))
+            sp0 = pgm.compute_qk_subtile(kp0, ksp0)
+            sp1 = pgm.compute_qk_subtile(kp1, ksp1)
+        else:
+            sp0 = pgm.compute_qk_subtile(kp0)
+            sp1 = pgm.compute_qk_subtile(kp1)
+        sp0 = gl.convert_layout(sp0, cfg.pv_layout, assert_trivial=True)
+        sp1 = gl.convert_layout(sp1, cfg.pv_layout, assert_trivial=True)
+        m_peek = reduce_max_prop_nan(pgm.concat_subtile(sp0, sp1), -1)
+        # no fully visible tile (short chunks): the peeked tile may hold masked keys, so ignore it
+        m_peek = gl.where(pgm.safe_tile_end > pgm.tile_start, m_peek, float("-inf"))
+        gl.barrier()
     # ---- Prologue ----
     kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buf_tile_cur)
     kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)
@@ -2537,6 +2607,8 @@ def attention_loop_tensor_subtile_split(
     qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
     qk = pgm.concat_subtile(qk0, qk1)
     m = reduce_max_prop_nan(qk, -1)
+    if FIXED_MAX and PEEK_RECENT:
+        m = elementwise_max_prop_nan(m, m_peek)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
     m_diff_scaled = M * QK_scale - m_ij_scaled
@@ -2558,6 +2630,17 @@ def attention_loop_tensor_subtile_split(
     # At iter j entry 3 TDMs outstanding: V_j, K_{j+2}, V_{j+1}.
     # Merged: one async_wait(1) drains V_j + K_{j+2}; V_{j+1} stays pending into next iter.
     tile_end = gl.maximum(3, pgm.tile_end)
+    if FIXED_MAX:
+        # apply the prologue's alpha now; the loop keeps M (and so alpha == 1) fixed
+        acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
+        L = L * alpha
+        alpha = gl.full_like(alpha, 1.0)
+        # seed the QK accumulator with the raw -M so the loop needs only exp2(qk * scale)
+        qk_seed = (
+            gl.zeros([cfg.BLOCK_M, cfg.TILE_SIZE // 2], dtype=gl.float32, layout=cfg.qk_layout)
+            - gl.convert_layout(M, gl.SliceLayout(1, cfg.qk_layout))[:, None]
+        )
     for j in range(pgm.tile_start, tile_end - 3):
         next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
 
@@ -2568,7 +2651,9 @@ def attention_loop_tensor_subtile_split(
             ks0, ks1 = pgm.split_k_scales(k_scales)
 
         # --- S1: QK sub 0 + SM1-A ---
-        if cfg.KV_NVFP4:
+        if FIXED_MAX:
+            qk0 = pgm.compute_qk_subtile_from(k0_s, ks0 if cfg.KV_NVFP4 else None, qk_seed)
+        elif cfg.KV_NVFP4:
             qk0 = pgm.compute_qk_subtile(k0_s, ks0)
         else:
             qk0 = pgm.compute_qk_subtile(k0_s)
@@ -2589,8 +2674,9 @@ def attention_loop_tensor_subtile_split(
         )
         vs, ve = _v_pt_scales(pgm, kv_loader, v, buf_tile_cur, j, False)
         p1 = gl.exp2(qk1_shifted)
-        acc0 = acc0 * alpha[:, None]
-        acc1 = acc1 * alpha[:, None]
+        if not FIXED_MAX:
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
 
         v0_s, v1_s = pgm.split_subtile(v)
         if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
@@ -2601,14 +2687,20 @@ def attention_loop_tensor_subtile_split(
             )
 
         # --- S2: QK sub 1 + SM1-B ---
-        if cfg.KV_NVFP4:
+        if FIXED_MAX:
+            qk1 = pgm.compute_qk_subtile_from(k1_s, ks1 if cfg.KV_NVFP4 else None, qk_seed)
+        elif cfg.KV_NVFP4:
             qk1 = pgm.compute_qk_subtile(k1_s, ks1)
         else:
             qk1 = pgm.compute_qk_subtile(k1_s)
         p = pgm.concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
-        L = L * alpha + l_ij
-        p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
+        if FIXED_MAX:
+            L = L + l_ij
+            p, p_scales = _p_for_pv_fm(pgm, p, vs, ve, q.dtype, l_ij, PSCALE)
+        else:
+            L = L * alpha + l_ij
+            p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
         k = kv_loader.load_k_from_shared(
             later="VK",
             wait_count=2,
@@ -2623,13 +2715,14 @@ def attention_loop_tensor_subtile_split(
         acc0 = _pv_half(pgm, p, v0_s, acc0, p_scales)
         qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
         qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-        qk = pgm.concat_subtile(qk0, qk1)
-        m = reduce_max_prop_nan(qk, -1)
-        m_ij = elementwise_max_prop_nan(M, m)
-        m_ij_scaled = m_ij * QK_scale
-        m_diff_scaled = M * QK_scale - m_ij_scaled
-        M = m_ij
-        alpha = gl.exp2(m_diff_scaled)
+        if not FIXED_MAX:
+            qk = pgm.concat_subtile(qk0, qk1)
+            m = reduce_max_prop_nan(qk, -1)
+            m_ij = elementwise_max_prop_nan(M, m)
+            m_ij_scaled = m_ij * QK_scale
+            m_diff_scaled = M * QK_scale - m_ij_scaled
+            M = m_ij
+            alpha = gl.exp2(m_diff_scaled)
         if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
             kv_loader.load_v_to_shared(
                 next2_physical_block_idx, buffer_id=buf_tile_next2
@@ -2637,8 +2730,12 @@ def attention_loop_tensor_subtile_split(
 
         # --- S4: PV sub 1 + SM0-B ---
         acc1 = _pv_half(pgm, p, v1_s, acc1, p_scales)
-        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+        if FIXED_MAX:
+            qk0_shifted = qk0 * QK_scale
+            qk1_shifted = qk1 * QK_scale
+        else:
+            qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+            qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
         p0 = gl.exp2(qk0_shifted)
 
         next2_physical_block_idx, next3_physical_block_idx = (
@@ -2671,13 +2768,16 @@ def attention_loop_tensor_subtile_split(
         ks0, ks1 = pgm.split_k_scales(k_scales)
 
     # --- S1: QK sub 0 for L+1 + SM1-A for L ---
-    if cfg.KV_NVFP4:
+    if FIXED_MAX:
+        qk0 = pgm.compute_qk_subtile_from(k0_s, ks0 if cfg.KV_NVFP4 else None, qk_seed)
+    elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
         qk0 = pgm.compute_qk_subtile(k0_s)
     p1 = gl.exp2(qk1_shifted)
-    acc0 = acc0 * alpha[:, None]
-    acc1 = acc1 * alpha[:, None]
+    if not FIXED_MAX:
+        acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
 
     if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
         qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
@@ -2692,7 +2792,9 @@ def attention_loop_tensor_subtile_split(
     vs, ve = _v_pt_scales(pgm, kv_loader, v, buf_tile_cur, tile_end - 3, True)
 
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
-    if cfg.KV_NVFP4:
+    if FIXED_MAX:
+        qk1 = pgm.compute_qk_subtile_from(k1_s, ks1 if cfg.KV_NVFP4 else None, qk_seed)
+    elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
         qk1 = pgm.compute_qk_subtile(k1_s)
@@ -2700,9 +2802,13 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
-    L = L * alpha + l_ij
     # the epilogue's tiles may lie past kv_end (tile_end is at least 3): fp4pt masks their scales
-    p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
+    if FIXED_MAX:
+        L = L + l_ij
+        p, p_scales = _p_for_pv_fm(pgm, p, vs, ve, q.dtype, l_ij, PSCALE)
+    else:
+        L = L * alpha + l_ij
+        p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
 
     if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -2721,18 +2827,23 @@ def attention_loop_tensor_subtile_split(
     acc0 = _pv_half(pgm, p, v0_s, acc0, p_scales)
     qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
     qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-    qk = pgm.concat_subtile(qk0, qk1)
-    m = reduce_max_prop_nan(qk, -1)
-    m_ij = elementwise_max_prop_nan(M, m)
-    m_ij_scaled = m_ij * QK_scale
-    m_diff_scaled = M * QK_scale - m_ij_scaled
-    M = m_ij
-    alpha = gl.exp2(m_diff_scaled)
+    if not FIXED_MAX:
+        qk = pgm.concat_subtile(qk0, qk1)
+        m = reduce_max_prop_nan(qk, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        m_ij_scaled = m_ij * QK_scale
+        m_diff_scaled = M * QK_scale - m_ij_scaled
+        M = m_ij
+        alpha = gl.exp2(m_diff_scaled)
 
     # --- S4: PV sub 1 for L + SM0-B for L+1 ---
     acc1 = _pv_half(pgm, p, v1_s, acc1, p_scales)
-    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    if FIXED_MAX:
+        qk0_shifted = qk0 * QK_scale
+        qk1_shifted = qk1 * QK_scale
+    else:
+        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
     p0_next = gl.exp2(qk0_shifted)
 
     if MERGE_EPI_TDM_WAITS:
@@ -2752,26 +2863,46 @@ def attention_loop_tensor_subtile_split(
         ks0, ks1 = pgm.split_k_scales(k_scales)
 
     # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
-    if cfg.KV_NVFP4:
+    if FIXED_MAX and SEED_MASK:
+        # mask the seed (-inf where masked) instead of the WMMA result: -inf + finite products stays -inf
+        qk0 = pgm.compute_qk_subtile_from(
+            k0_s, ks0 if cfg.KV_NVFP4 else None, pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 0)
+        )
+    elif FIXED_MAX:
+        qk0 = pgm.compute_qk_subtile_from(k0_s, ks0 if cfg.KV_NVFP4 else None, qk_seed)
+    elif cfg.KV_NVFP4:
         qk0 = pgm.compute_qk_subtile(k0_s, ks0)
     else:
         qk0 = pgm.compute_qk_subtile(k0_s)
-    acc0 = acc0 * alpha[:, None]
-    acc1 = acc1 * alpha[:, None]
+    if not FIXED_MAX:
+        acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
     p1_next = gl.exp2(qk1_shifted)
     p = pgm.concat_subtile(p0_next, p1_next)
 
-    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+    if not (FIXED_MAX and SEED_MASK):
+        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
-    if cfg.KV_NVFP4:
+    if FIXED_MAX and SEED_MASK:
+        qk1 = pgm.compute_qk_subtile_from(
+            k1_s, ks1 if cfg.KV_NVFP4 else None, pgm.apply_mask_qk_subtile(qk_seed, epilogue_t_3, 1)
+        )
+    elif FIXED_MAX:
+        qk1 = pgm.compute_qk_subtile_from(k1_s, ks1 if cfg.KV_NVFP4 else None, qk_seed)
+    elif cfg.KV_NVFP4:
         qk1 = pgm.compute_qk_subtile(k1_s, ks1)
     else:
         qk1 = pgm.compute_qk_subtile(k1_s)
     l_ij = gl.sum(p, 1)
-    L = L * alpha + l_ij
-    p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
-    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
+    if FIXED_MAX:
+        L = L + l_ij
+        p, p_scales = _p_for_pv_fm(pgm, p, vs, ve, q.dtype, l_ij, PSCALE)
+    else:
+        L = L * alpha + l_ij
+        p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
+    if not (FIXED_MAX and SEED_MASK):
+        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
     v0_s, v1_s = pgm.split_subtile(v)
 
@@ -2779,13 +2910,14 @@ def attention_loop_tensor_subtile_split(
     acc0 = _pv_half(pgm, p, v0_s, acc0, p_scales)
     qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
     qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
-    qk = pgm.concat_subtile(qk0, qk1)
-    m = reduce_max_prop_nan(qk, -1)
-    m_ij = elementwise_max_prop_nan(M, m)
-    m_ij_scaled = m_ij * QK_scale
-    m_diff_scaled = M * QK_scale - m_ij_scaled
-    M = m_ij
-    alpha = gl.exp2(m_diff_scaled)
+    if not FIXED_MAX:
+        qk = pgm.concat_subtile(qk0, qk1)
+        m = reduce_max_prop_nan(qk, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        m_ij_scaled = m_ij * QK_scale
+        m_diff_scaled = M * QK_scale - m_ij_scaled
+        M = m_ij
+        alpha = gl.exp2(m_diff_scaled)
 
     v = kv_loader.load_v_from_shared(
         later="",
@@ -2797,21 +2929,30 @@ def attention_loop_tensor_subtile_split(
     vs, ve = _v_pt_scales(pgm, kv_loader, v, buf_tile_next2, epilogue_t_3, True)
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = _pv_half(pgm, p, v1_s, acc1, p_scales)
-    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    if FIXED_MAX:
+        qk0_shifted = qk0 * QK_scale
+        qk1_shifted = qk1 * QK_scale
+    else:
+        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
     p0_next = gl.exp2(qk0_shifted)
     p1_next = gl.exp2(qk1_shifted)
     p = pgm.concat_subtile(p0_next, p1_next)
 
     # ---- Final SM1 + PV for L+2 ----
-    acc0 = acc0 * alpha[:, None]
     l_ij = gl.sum(p, 1)
-    L = L * alpha + l_ij
-    p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
+    if FIXED_MAX:
+        L = L + l_ij
+        p, p_scales = _p_for_pv_fm(pgm, p, vs, ve, q.dtype, l_ij, PSCALE)
+    else:
+        acc0 = acc0 * alpha[:, None]
+        L = L * alpha + l_ij
+        p, p_scales = _p_for_pv(pgm, p, vs, ve, q.dtype)
 
     v0_s, v1_s = pgm.split_subtile(v)
     acc0 = _pv_half(pgm, p, v0_s, acc0, p_scales)
-    acc1 = acc1 * alpha[:, None]
+    if not FIXED_MAX:
+        acc1 = acc1 * alpha[:, None]
 
     acc1 = _pv_half(pgm, p, v1_s, acc1, p_scales)
     acc = pgm.concat_subtile(acc0, acc1)
@@ -3007,6 +3148,11 @@ def _unified_attention_gluon_kernel_2d(
     # instead of the num_blocks constexpr. The count only bounds the TDM descriptors' rows, but as a constexpr it
     # keys the compile, and a served pool's count is the memory profile's: per DP rank and per restart.
     NUM_BLOCKS_RUNTIME: gl.constexpr = False,
+    # fixed reference max in loop variant 2 (AITER_UA_2D_FIXED_MAX / AITER_UA_2D_CONFIG FM_* keys; off = today's loop)
+    FM_FIXED_MAX: gl.constexpr = False,
+    FM_PEEK_RECENT: gl.constexpr = True,
+    FM_PSCALE: gl.constexpr = True,
+    FM_SEED_MASK: gl.constexpr = False,
     num_blocks_rt=None,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
@@ -3338,15 +3484,37 @@ def _unified_attention_gluon_kernel_2d(
         acc1 = gl.zeros(
             [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
         )
-        M, L, acc = attention_loop_tensor_subtile_split(
-            pgm,
-            kv_loader,
-            q,
-            M,
-            L,
-            acc0,
-            acc1,
-        )
+        if FM_FIXED_MAX:
+            # fixed reference max (env AITER_UA_2D_FIXED_MAX, off by default); rerun the program with the
+            # running-max loop if some row's L left the safe range (> 2^100, inf or NaN)
+            gl.static_assert(
+                SLIDING_WINDOW == 0 and not USE_SINKS and cfg.CAUSAL,
+                "the fixed-max loop takes causal full attention without sinks",
+            )
+            gl.static_assert(
+                cfg.PT_FP8_PV or not (V_FP4PT or KV_FP8),
+                "the fixed-max loop takes fp4pt PV mode 2 or a bf16 / fp16 P",
+            )
+            M_init = M
+            L_init = L
+            M, L, acc = attention_loop_tensor_subtile_split(
+                pgm, kv_loader, q, M_init, L_init, acc0, acc1, True, FM_PEEK_RECENT, FM_PSCALE and cfg.PT_FP8_PV, FM_SEED_MASK
+            )
+            n_overflow = gl.sum(gl.where(L <= 1.2676506002282294e30, 0, 1), axis=0)
+            if n_overflow > 0:
+                M, L, acc = attention_loop_tensor_subtile_split(
+                    pgm, kv_loader, q, M_init, L_init, acc0, acc1
+                )
+        else:
+            M, L, acc = attention_loop_tensor_subtile_split(
+                pgm,
+                kv_loader,
+                q,
+                M,
+                L,
+                acc0,
+                acc1,
+            )
 
     if NUM_SPLITS > 1:
         # Split-KV: emit un-reduced partials; the reduction happens separately.

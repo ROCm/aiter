@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
 import random
 import sys
 from types import SimpleNamespace
@@ -2766,3 +2767,106 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+# Fixed reference max (port of ROCm cagri_ua2d_muse_opt) on the A8K4V4PT 2D prefill, loop variant 2 (BLOCK_M 64,
+# 2 warps, the c1024 prefill launch). sm_mult sharpens the scores (the reference uses the same scale): x8 puts
+# later tiles far above / below the reference tiles (the per-row P scale), x64 makes some rows' sums pass 2^100
+# (the running-max rerun).
+_K4V4PT_FM_CASES = [
+    [(1500, 1500)],
+    [(4096, 4096 + 20000)],
+    [(478, 478), (600, 3600), (37, 1500), (1500, 1500)],
+    [(5, 5), (64, 64), (130, 200), (300, 1000)],
+    [(512, 512 + 65536)],  # few query blocks over a long prefix: the KV-split (NUM_SPLITS > 1) launch
+]
+
+
+@pytest.mark.parametrize("sm_mult", [1.0, 8.0, 64.0])
+@pytest.mark.parametrize("pscale", [True, False])
+@pytest.mark.parametrize("seq_lens", _K4V4PT_FM_CASES)
+@torch.inference_mode()
+def test_unified_attn_k4v4pt_prefill_fixed_max(
+    sm_mult: float, pscale: bool, seq_lens: list[tuple[int, int]], monkeypatch
+) -> None:
+    """A8K4V4PT 2D prefill, loop variant 2, fp8 P (PV mode 2): the fixed-max loop (FM_FIXED_MAX, off by default)
+    against the fp32 reference with the A8K4V4PT bounds, and the default launch (FM off) bitwise equal to an explicit
+    FM_FIXED_MAX false. pscale False (the P cast keeps the tile's V exponent only) is checked at sm_mult 1 only:
+    with sharpened scores its fp8 P leaves e4m3's range."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    if not pscale and sm_mult != 1.0:
+        pytest.skip("FM_PSCALE false is only bounded for unsharpened scores")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", "fp8")
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": True)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt"
+    )
+    scale = inp["scale"] * sm_mult
+    launch = {"BLOCK_M": 64, "num_warps": 2, "LOOP_VARIANT": 2, "TILE_SIZE": 128}
+
+    def run(cfg):
+        if cfg is None:
+            monkeypatch.delenv("AITER_UA_2D_CONFIG", raising=False)
+        else:
+            monkeypatch.setenv("AITER_UA_2D_CONFIG", json.dumps(dict(launch, **cfg)))
+        return unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=inp["value_cache"],
+            out=torch.full_like(inp["output"], float("nan")),
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=scale,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+        ).float()
+
+    base = run({})
+    assert torch.equal(run({"FM_FIXED_MAX": False}), base)
+    out = run({"FM_FIXED_MAX": True, "FM_PSCALE": pscale})
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=scale,
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.float32,
+    )
+    assert not out.isnan().any()
+    rel_max, abs_max = _K4V4PT_TOL["fp8"]
+    rel = ((out - ref).norm() / ref.norm()).item()
+    rel_base = ((base - ref).norm() / ref.norm()).item()
+    err = (out - ref).abs().max().item()
+    err_base = (base - ref).abs().max().item()
+    # sharpened scores (sm_mult > 1) put a row's weight on a few keys, so both loops' fp8 P roundings show up
+    # unaveraged: bound the max error by today's loop's
+    abs_bound = max(abs_max, 1.25 * err_base + 0.02)
+    assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max}; today's loop {rel_base:.4f})"
+    assert err < abs_bound, f"max abs error {err:.4f} (bound {abs_bound:.4f}; today's loop {err_base:.4f})"
+    # no worse than today's loop beyond rounding noise
+    assert rel < 1.1 * rel_base + 1e-3, f"relative L2 error {rel:.4f} vs today's loop {rel_base:.4f}"
