@@ -1,1 +1,2 @@
 *.csv text eol=lf
+aiter/configs/model_configs/proxy12l_tp8_ep1_gfx1250_grouped_fmoe_v4.csv -text
