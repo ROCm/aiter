@@ -19,6 +19,7 @@ _fused_bf16_bmm_cat_quant_pad_mla_repr = make_kernel_repr(
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "DUP",
+        "D_PE",
         "EVEN_K",
         "ROPE_AND_CACHE",
         "IS_NEOX",
@@ -188,9 +189,10 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
     tl.assume(stride_bh > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
-    tl.assume(stride_rm > 0)
-    tl.assume(stride_rh > 0)
-    tl.assume(stride_rd > 0)
+    if D_PE > 0:
+        tl.assume(stride_rm > 0)
+        tl.assume(stride_rh > 0)
+        tl.assume(stride_rd > 0)
     tl.assume(stride_om > 0)
     tl.assume(stride_oh > 0)
     tl.assume(stride_od > 0)
@@ -264,7 +266,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             FP8_MAX,
             DUP,
         )
-    elif pid < bmm_programs + QH * num_pid_m:
+    elif D_PE > 0 and pid < bmm_programs + QH * num_pid_m:
         pid_pe = pid - bmm_programs
         pid_h = tl.cast(pid_pe % QH, tl.int64)
         offs_m = (pid_pe // QH) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
