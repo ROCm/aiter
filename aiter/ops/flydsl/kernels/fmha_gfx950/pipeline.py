@@ -10,12 +10,15 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import (
+    probability_mask_columns,
+)
 
 from ..kernels_common import LOG2E as _LOG2E
 
@@ -28,9 +31,12 @@ _P_HEADROOM_LOG2 = 8.807354922057604
 LDS_BYTES_GFX950 = 160 * 1024
 
 
-# The dual-wave 8-wave CTA fixes the q-block height; callers need it to count
-# q-blocks before any traits object exists.
+# Default q-block height for the eight-wave configuration.
 DUALWAVE_SWP_BLOCK_M = 256
+
+
+def _round_up_16(n):
+    return -(-n // 16) * 16
 
 
 def _waitcnt_vm_n(n):
@@ -85,6 +91,8 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
 def _reduction_pair(v_f32):
     v_i32 = _bitcast_i32(v_f32)
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    # No stable dual-output lane-swap API at FlyDSL 0.5.0; fx.gpu.shuffle_xor is not
+    # one-for-one (single result, different lowering).
     swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
     rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
@@ -101,6 +109,12 @@ def _anchor_scalar_f32(x):
         "=v,0",
         has_side_effects=True,
     )
+
+
+def _anchor_i32x8(v):
+    """Pin a packed i32 vector operand at the current source position (no-op asm; no stable scheduling anchor)."""
+    v_ir = as_mlir_value(v)
+    return llvm.inline_asm(v_ir.type, [v_ir], "", "=v,0", has_side_effects=True)
 
 
 def _anchor_v_o(traits, v_o):
@@ -173,13 +187,13 @@ def _score_pair_sum(v_s, zero_f, fm_fast):
 
 
 def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, fm_fast, bias=None):
-    """Fused softmax-scale + row-max subtraction (optimization 1-A).
+    """Fused softmax-scale + row-max subtraction.
 
     Returns ``scale * (v_s - row_max_raw) + bias`` per element via a single FMA
     (``fma(s, scale, bias - scale*row_max_raw)``), so the fp8 QK MMA can emit raw
     (un-scaled) logits and reduce_max can run in the raw domain (scale > 0 is
-    order-preserving). Replaces the separate post-QK scale multiply + subtract.
-    ``-inf`` masked lanes stay ``-inf`` (scale > 0), matching the un-fused path.
+    order-preserving). Positive scaling preserves score order and keeps masked
+    ``-inf`` lanes at ``-inf``.
 
     ``bias`` lands in the FMA's addend, so a caller needing ``exp2`` to produce
     ``2**bias * P`` pays nothing -- see ``DualwaveFp8SoftmaxHelper.sub_m``.
@@ -202,13 +216,13 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(fx.Float32(s_lo[r]).exp2(fastmath="afn"))
+            lo_partial.append(fx.math.exp2(fx.Float32(s_lo[r]), fastmath="afn"))
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
+        hi_full.append(fx.math.exp2(fx.Float32(Vec(v_s[1])[r]), fastmath="afn"))
     return lo_partial, hi_full
 
 
@@ -256,14 +270,49 @@ def _apply_dualwave_causal_mask_pair(s_values, rel_i32, neg_inf_i32, pair_thresh
         s_values[idx_y] = _bitcast_f32(new_y)
 
 
+def _load_elem(div, idx, atom, vec_ty):
+    """One buffer_load of element ``idx`` of a (1, N)-divided buffer tensor, returned as an SSA vector.
+
+    Raw fly op: fx.copy needs an rmem destination tensor and a memref_load_vec back out of it; FlyDSL 0.5.0 has no
+    stable copy that yields the loaded value directly. All scalar global loads in this pipeline go through here.
+    """
+    return fly.copy_atom_call_ssa([vec_ty], atom, fx.slice(div, (None, fx.Int32(idx))))
+
+
+def _load_scalar_f32(tensor, idx=0):
+    """Load tensor[idx] (fp32) through a one-element buffer descriptor view."""
+    div = fx.logical_divide(fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1))
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    return Vec(
+        _load_elem(div, idx, atom, Vec.make_type(1, fx.Float32)), (1,), fx.Float32
+    )[0]
+
+
 def _cu_load(div, idx, cu_atom, cu_v1i32):
     """Load cu_seqlens[idx] into an SGPR. ``idx`` must be wave-uniform."""
-    v = fly.copy_atom_call_ssa(
-        [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
-    )
+    v = _load_elem(div, idx, cu_atom, cu_v1i32)
     return fx.Index(
         rocdl.readfirstlane(T.i32, as_mlir_value(Vec(v, (1,), fx.Int32)[0]))
     )
+
+
+def _make_page_view(base_iter, page_id, page_byte_stride, page_nrec_bytes, page_layout):
+    """Byte-indexed descriptor bounded to one KV page, not its neighbour."""
+    base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+    off_i64 = fx.Int64(page_id * page_byte_stride)
+    base_ty = fx.PointerType(base_iter.type)
+    byte_ptr_ty = fx.PointerType.get(
+        elem_ty=fx.Int8.ir_type,
+        address_space=base_ty.address_space,
+        alignment=base_ty.alignment,
+    )
+    # fx.add_offset on an existing buffer descriptor truncates the offset to i32 and
+    # keeps the original resource, which would reintroduce the int32 page-offset overflow
+    # and lose the page-local bound. Shift the global pointer in i64 before building a
+    # fresh descriptor with an explicit num_records instead.
+    shifted = fx.inttoptr(byte_ptr_ty, base_i64 + off_i64)
+    buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=page_nrec_bytes)
+    return fx.logical_divide(fx.make_view(buf_ptr, page_layout), fx.make_layout(1, 1))
 
 
 def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
@@ -313,11 +362,7 @@ def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
     """128-bit global->register load (buffer_load_dwordx4) from Q."""
-    return fly.copy_atom_call_ssa(
-        [q_load_i32x4_type],
-        _load_atom_128,
-        fx.slice(q_div, (None, fx.Int32(elem_index))),
-    )
+    return _load_elem(q_div, elem_index, _load_atom_128, q_load_i32x4_type)
 
 
 def _buffer_load_lds_128(
@@ -345,7 +390,20 @@ def _stagger_extra_barrier_if_one(stagger_i32):
     """Emit `sched_barrier(0); s_barrier;` only when stagger == 1."""
     if fx.Int32(stagger_i32) != 0:
         rocdl.sched_barrier(0)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
+
+
+@dataclass(frozen=True)
+class _LdsViews:
+    """Peeked LDS arrays; ``o_lo``/``o_hi`` (bn64's O stage halves, overlaying kv/vt) and ``bt`` (paged default
+    body) may be absent."""
+
+    kv: object
+    vt: object
+    q: object
+    bt: object = None
+    o_lo: object = None
+    o_hi: object = None
 
 
 @dataclass(frozen=True)
@@ -390,7 +448,6 @@ class DualwaveSwpFp8Traits:
     ELEM_BYTES: int
     OUT_ELEM_BYTES: int
     VEC_KV: int
-    LANE_SPLIT_KV: int
     SMEM_K_TILE_ELEMS: int
     NUM_PREFETCH_K: int
     DUALWAVE_SWP_KV_PER_BUFFER: int
@@ -403,6 +460,22 @@ class DualwaveSwpFp8Traits:
     NEG_INF_F32_BITS: int
     BATCH_INTERLEAVE_GROUP: int = 1
     RETURN_LSE: bool = False
+    PAGED: bool = False
+    K_SHUFFLED: bool = False
+    V_SHUFFLED: bool = False
+    OUT_F16: bool = False
+    PAGED_BT_LDS_SIZE: int = 2048
+    BODY_VARIANT: str = "default"
+    GQA_PACK_M: bool = False
+    # conventional_bn64 compact grid: cu_seqlens_q chunks the sequence scan loads, rank-major slot order.
+    BATCH_CHUNKS: int = 1
+    INTERLEAVED: bool = False
+    # O stored through an LDS stage as 1 KB contiguous pieces (op_epilog.store_final_o).
+    O_STAGED: bool = False
+    # Non-temporal O stores.
+    O_STORE_NT: bool = False
+    # Bytes of bn64's staged O tile (bf16/f16 rows of all waves), the union arm overlaying kv+vt; 0 otherwise.
+    O_STAGE_BYTES: int = 0
 
 
 def _make_dualwave_swp_fp8_traits(
@@ -422,14 +495,68 @@ def _make_dualwave_swp_fp8_traits(
     cross_seqlen=False,
     batch_interleave_group=1,
     return_lse=False,
+    paged=False,
+    kv_cache_layout="linear",
+    out_dtype="bf16",
+    body_variant="default",
+    gqa_pack_m=False,
+    batch_chunks=1,
+    interleaved=False,
+    o_staged=None,
+    o_store_nt=None,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
     ``head_dim`` is the QK reduction width (a multiple of 64: the QK MFMA is
     32x32x64) and ``head_dim_v`` the V/output width, tiled in 32-wide D_CHUNKs.
     """
+    if body_variant not in ("default", "conventional_bn64"):
+        raise RuntimeError(f"unsupported body_variant={body_variant!r}")
+    if body_variant == "conventional_bn64":
+        if not paged or num_kv_splits != 1:
+            raise RuntimeError(
+                "conventional_bn64 requires paged=True and num_kv_splits=1"
+            )
+        block_m = 128
+        dualwave_swp_enable_stagger = False
+        if int(batch_chunks) < 1:
+            raise RuntimeError(f"batch_chunks must be >= 1, got {batch_chunks}")
+    elif int(batch_chunks) != 1 or interleaved:
+        raise RuntimeError("batch_chunks/interleaved apply to conventional_bn64 only")
+    # The staged O epilogue writes 4 packed rows (1 KB) per store, contiguous in O only when the group is a
+    # multiple of 4, and borrows the kv+vt region (4 waves x 8 KB).
+    o_staged_ok = (
+        body_variant == "conventional_bn64"
+        and gqa_pack_m
+        and (num_heads // num_kv_heads) % 4 == 0
+    )
+    if o_staged is None:
+        o_staged = o_staged_ok
+    elif o_staged and not o_staged_ok:
+        raise RuntimeError(
+            "o_staged needs conventional_bn64 with gqa_pack_m and group % 4 == 0"
+        )
+    # NT pays only on the staged epilogue's 1 KB stores; on the direct 32-byte-per-row stores it was 7-11% slower.
+    if o_store_nt is None:
+        o_store_nt = o_staged
+    if o_store_nt and body_variant != "conventional_bn64":
+        raise RuntimeError("o_store_nt applies to conventional_bn64 only")
     if head_dim_v is None:
         head_dim_v = head_dim
+    if gqa_pack_m:
+        if (
+            body_variant != "conventional_bn64"
+            or not paged
+            or num_kv_splits != 1
+            or head_dim != 128
+            or head_dim_v != 128
+        ):
+            raise RuntimeError(
+                "gqa_pack_m requires paged single-pass D128 conventional_bn64"
+            )
+        group = num_heads // num_kv_heads
+        if group not in (1, 4, 8, 16):
+            raise RuntimeError("gqa_pack_m supports GQA groups 1, 4, 8, and 16")
     if head_dim % 64:
         raise RuntimeError(
             f"fp8 flash attention needs head_dim % 64 == 0, got head_dim={head_dim}"
@@ -441,6 +568,25 @@ def _make_dualwave_swp_fp8_traits(
             "fp8 flash attention needs 64 <= head_dim_v <= 192 and head_dim_v % 32 == 0, "
             f"got head_dim_v={head_dim_v} (head_dim={head_dim})"
         )
+    if kv_cache_layout not in ("linear", "shuffled"):
+        raise RuntimeError(
+            f"kv_cache_layout must be 'linear' or 'shuffled', got {kv_cache_layout!r}"
+        )
+    if out_dtype not in ("bf16", "f16"):
+        raise RuntimeError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
+    if kv_cache_layout == "shuffled" and not paged:
+        raise RuntimeError("kv_cache_layout='shuffled' requires paged=True")
+    if paged:
+        if not varlen:
+            raise RuntimeError("paged fp8 flash attention requires varlen=True")
+        if head_dim != 128 or head_dim_v != 128:
+            raise RuntimeError(
+                "paged fp8 flash attention requires head_dim == head_dim_v == 128, "
+                f"got head_dim={head_dim}, head_dim_v={head_dim_v}"
+            )
+        if return_lse:
+            raise RuntimeError("paged fp8 flash attention does not support return_lse")
+    paged_bt_lds_size = 2048
     block_n = 64
     k_sub_n = 32
     warp_size = 64
@@ -463,14 +609,15 @@ def _make_dualwave_swp_fp8_traits(
     default_stride_v_n = num_kv_heads * head_dim_v
     default_stride_o_n = num_heads * head_dim_v
 
-    # fp8: Q/K/V are 1B; O is bf16 (2B). ELEM_BYTES=1 drives the fp8 address math.
+    # Q/K/V use one-byte fp8 elements; bf16/f16 output uses two-byte elements.
     elem_bytes = 1
     out_elem_bytes = 2
     vec_kv = 16 // elem_bytes
-    lane_split_kv = 8
     smem_k_pad = 16 // elem_bytes
 
-    rows_per_wave_dma = -(-block_n // num_waves)
+    # Eight padded stripes avoid the BN64 wide K reader's two-way bank conflicts.
+    k_stripes = 8 if body_variant == "conventional_bn64" else num_waves
+    rows_per_wave_dma = -(-block_n // k_stripes)
     k_band_chunk, k_band_base, k_band_line_stride, k_band_global_d = [], [], [], []
     _off, _cursor = 0, 0
     while _off < head_dim:
@@ -480,7 +627,7 @@ def _make_dualwave_swp_fp8_traits(
         k_band_base.append(_cursor)
         k_band_line_stride.append(line_stride)
         k_band_global_d.append(_off)
-        _cursor += num_waves * line_stride
+        _cursor += k_stripes * line_stride
         _off += chunk
     smem_k_tile_elems = _cursor
     k_ws_band, k_ws_off = [], []
@@ -488,7 +635,7 @@ def _make_dualwave_swp_fp8_traits(
         for _o in range(0, chunk, 64):
             k_ws_band.append(_bi)
             k_ws_off.append(_o)
-    num_prefetch_k = 6
+    num_prefetch_k = 2 if body_variant == "conventional_bn64" else 6
     dualwave_swp_kv_per_buffer = smem_k_tile_elems
     lds_kv_total_size = num_prefetch_k * dualwave_swp_kv_per_buffer
     dualwave_swp_k_buf_base = tuple(
@@ -502,11 +649,22 @@ def _make_dualwave_swp_fp8_traits(
 
     splitk = num_kv_splits > 1
 
-    qlds = head_dim <= 128
+    # BN64 loads Q straight into VGPRs: dropping the Q stage lets 3 WGs share a CU.
+    qlds = head_dim <= 128 and body_variant != "conventional_bn64"
 
-    lds_bytes = lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf
+    # bn64's SharedStorage overlays one half of the staged O tile on kv and the other on vt, each in its own union.
+    bn64 = body_variant == "conventional_bn64"
+    o_stage_bytes = num_waves * rows_per_wave * head_dim_v * 2 if bn64 else 0
+    # Every member is 16-byte aligned, so each struct field starts on a 16-byte boundary.
+    lds_bytes = _round_up_16(
+        max(lds_kv_total_size * elem_bytes, o_stage_bytes // 2)
+    ) + _round_up_16(max(vt_bf16_total * eb_bf, o_stage_bytes // 2))
     if qlds:
         lds_bytes += block_m * head_dim * elem_bytes
+    # bn64 reads page ids with scalar loads; only the default body stages the table in LDS.
+    paged_bt_lds = paged and body_variant != "conventional_bn64"
+    if paged_bt_lds:
+        lds_bytes += paged_bt_lds_size * 4
     if lds_bytes > LDS_BYTES_GFX950:
         raise RuntimeError(
             f"fp8 flash attention head_dim={head_dim}/head_dim_v={head_dim_v} at block_m={block_m} "
@@ -516,6 +674,7 @@ def _make_dualwave_swp_fp8_traits(
         )
 
     return DualwaveSwpFp8Traits(
+        GQA_PACK_M=bool(gqa_pack_m),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         WARP_SIZE=warp_size,
@@ -554,7 +713,6 @@ def _make_dualwave_swp_fp8_traits(
         ELEM_BYTES=elem_bytes,
         OUT_ELEM_BYTES=out_elem_bytes,
         VEC_KV=vec_kv,
-        LANE_SPLIT_KV=lane_split_kv,
         SMEM_K_TILE_ELEMS=smem_k_tile_elems,
         NUM_PREFETCH_K=num_prefetch_k,
         DUALWAVE_SWP_KV_PER_BUFFER=dualwave_swp_kv_per_buffer,
@@ -567,6 +725,18 @@ def _make_dualwave_swp_fp8_traits(
         NEG_INF_F32_BITS=0xFF800000,
         BATCH_INTERLEAVE_GROUP=int(batch_interleave_group),
         RETURN_LSE=bool(return_lse),
+        PAGED=bool(paged),
+        K_SHUFFLED=kv_cache_layout == "shuffled",
+        V_SHUFFLED=kv_cache_layout == "shuffled",
+        OUT_F16=out_dtype == "f16",
+        PAGED_BT_LDS_SIZE=paged_bt_lds_size,
+        BODY_VARIANT=body_variant,
+        BATCH_CHUNKS=int(batch_chunks),
+        # Rank-major order is a causal longest-first heuristic; non-causal blocks cost the same.
+        INTERLEAVED=bool(interleaved) and bool(causal),
+        O_STAGED=bool(o_staged),
+        O_STORE_NT=bool(o_store_nt),
+        O_STAGE_BYTES=o_stage_bytes,
     )
 
 
@@ -583,31 +753,55 @@ def dualwave_fp8_dma_per_iter(traits):
     return 2 * k_instr + 2 * v_instr_min
 
 
+# Outer extent of a mode that never wraps: idx2crd lowers every mode as mod(div(i, stride), shape).
+_UNBOUNDED = 2**31 - 1
+
+
+def _bn64_compact_grid(traits):
+    """conventional_bn64 launches a 1D grid of (slot, KV head) and finds each slot's sequence on device."""
+    return traits.BODY_VARIANT == "conventional_bn64"
+
+
 def _init_dualwave_thread_mapping(ctx):
     """Set block/wave/lane/head indices on a dualwave-style context.
 
     Sets h_idx / q_block_idx / batch_idx / split_idx and the lane decomposition."""
     traits = ctx.traits
     batch_interleave_group = traits.BATCH_INTERLEAVE_GROUP
-    if const_expr(batch_interleave_group > 1):
-        linear_head_batch = fx.Index(gpu.block_idx.x)
+    compact = _bn64_compact_grid(traits)
+    if const_expr(compact):
+        # Grid x = Hkv * slot + KV head; init_sequence_lengths maps the slot to (sequence, q-block).
+        head_slot = fx.idx2crd(
+            fx.Int32(fx.block_idx.x),
+            fx.make_layout((traits.NUM_HEADS_KV, _UNBOUNDED), (1, traits.NUM_HEADS_KV)),
+        )
+        ctx.h_idx = fx.Int64(fx.Int32(head_slot[0].unpack()))
+        ctx.slot_i32 = fx.Int32(head_slot[1].unpack())
+    elif const_expr(batch_interleave_group > 1):
+        linear_head_batch = fx.Int64(fx.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
         ctx.batch_idx = (
-            fx.Index(gpu.block_idx.z) * batch_interleave_group
+            fx.Int64(fx.block_idx.z) * batch_interleave_group
             + linear_head_batch // traits.NUM_HEADS_Q
         )
-        ctx.q_block_idx = fx.Index(gpu.block_idx.y)
+        if const_expr(traits.GQA_PACK_M):
+            ctx.h_idx = linear_head_batch % traits.NUM_HEADS_KV
+            ctx.batch_idx = (
+                fx.Int64(fx.block_idx.z) * batch_interleave_group
+                + linear_head_batch // traits.NUM_HEADS_KV
+            )
+        ctx.q_block_idx = fx.Int64(fx.block_idx.y)
     else:
-        ctx.h_idx = fx.Index(gpu.block_idx.x)
-        ctx.q_block_idx = fx.Index(gpu.block_idx.y)
+        ctx.h_idx = fx.Int64(fx.block_idx.x)
+        ctx.q_block_idx = fx.Int64(fx.block_idx.y)
     if const_expr(traits.SPLITK):
-        ctx.bz_idx = fx.Index(gpu.block_idx.z)
+        ctx.bz_idx = fx.Int64(fx.block_idx.z)
         ctx.batch_idx = ctx.bz_idx // traits.NUM_KV_SPLITS
         ctx.split_idx = ctx.bz_idx % traits.NUM_KV_SPLITS
-    elif const_expr(batch_interleave_group > 1):
+    elif const_expr(batch_interleave_group > 1 or compact):
         ctx.split_idx = None
     else:
-        ctx.batch_idx = fx.Index(gpu.block_idx.z)
+        ctx.batch_idx = fx.Int64(fx.block_idx.z)
         ctx.split_idx = None
     ctx.tid = fx.Index(gpu.thread_idx.x)
 
@@ -628,12 +822,19 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE
-    ctx.q_start = ctx.q_block_idx * traits.BLOCK_M
+    # Packed GQA tiles BLOCK_M packed rows, i.e. BLOCK_M // group query tokens.
+    block_q = traits.BLOCK_M
+    if const_expr(traits.GQA_PACK_M):
+        block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+    if const_expr(not compact):
+        ctx.q_start = ctx.q_block_idx * block_q
 
     ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
+    if const_expr(traits.GQA_PACK_M):
+        ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE
 
 
 def _init_dualwave_q_row(ctx):
@@ -642,15 +843,26 @@ def _init_dualwave_q_row(ctx):
     ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
     ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
     ctx.q_row = ctx.q_start + ctx.q_row_in_block
+    if const_expr(traits.GQA_PACK_M):
+        packed_rows = fx.make_layout(
+            (traits.BLOCK_M // traits.GQA_GROUP_SIZE, traits.GQA_GROUP_SIZE),
+            (traits.GQA_GROUP_SIZE, 1),
+        )
+        coord = fx.idx2crd(fx.Int64(ctx.q_row_in_block), packed_rows)
+        ctx.q_row = ctx.q_start + fx.Int64(coord[0].unpack())
+        ctx.q_head_row = ctx.q_head_idx + fx.Int64(coord[1].unpack())
+        ctx.q_start_pos_i32 = fx.Int32(
+            ctx.q_start
+            + ctx.wave_id_uni * traits.ROWS_PER_WAVE // traits.GQA_GROUP_SIZE
+        )
     ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 
 class DualwaveFp8KernelContext:
     """Shared per-kernel state for the gfx950 dualwave fp8 attention helpers.
 
-    Raw fp8 Q/K/V
-    (i8 buffer views), per-tensor Q/K/V descale scalars applied to the fp32 logits,
-    and a bf16 ``vt`` LDS scratch for HIPREC PV."""
+    Byte-addressed Q/K/V, Q/K descales for logits, a V descale for output, and LDS
+    staging."""
 
     def __init__(
         self,
@@ -672,6 +884,9 @@ class DualwaveFp8KernelContext:
         stride_kv_n=None,
         softmax_scale=None,
         lse_stride_h=None,
+        BlockTable=None,
+        block_table_stride=None,
+        batch_size=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -696,6 +911,9 @@ class DualwaveFp8KernelContext:
         self.stride_kv_n = stride_kv_n
         self.softmax_scale = softmax_scale
         self.lse_stride_h = lse_stride_h
+        self.BlockTable = BlockTable
+        self.block_table_stride = block_table_stride
+        self.batch_size = batch_size
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -735,12 +953,29 @@ class DualwaveFp8KernelContext:
         init_sequence_lengths / init_tile_bounds / init_q_row read q_start.
         """
         traits = self.traits
-        num_q_blocks = (self.seq_len_v + traits.BLOCK_M - 1) // traits.BLOCK_M
-        self.q_block_idx = num_q_blocks - 1 - self.q_block_idx
-        self.q_start = self.q_block_idx * traits.BLOCK_M
+        block_q = traits.BLOCK_M
+        if const_expr(traits.GQA_PACK_M):
+            block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+        num_q_blocks = (self.seq_len_v + block_q - 1) // block_q
+        self.q_block_idx = num_q_blocks - 1 - fx.Int64(fx.block_idx.y)
+        self.q_start = self.q_block_idx * block_q
 
     def init_lds(self, shared_storage):
-        lds = fx.SharedAllocator().allocate(shared_storage).peek()
+        st = fx.SharedAllocator().allocate(shared_storage)
+        # A struct holding a union cannot be peeked whole (FlyDSL 0.5.0), so resolve each leaf.
+        if const_expr(hasattr(st, "ko")):
+            lds = _LdsViews(
+                kv=st.ko.kv.peek(),
+                vt=st.vo.vt.peek(),
+                q=st.q.peek(),
+                o_lo=st.ko.o.peek(),
+                o_hi=st.vo.o.peek(),
+            )
+        else:
+            whole = st.peek()
+            lds = _LdsViews(
+                kv=whole.kv, vt=whole.vt, q=whole.q, bt=getattr(whole, "bt", None)
+            )
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))
@@ -750,16 +985,175 @@ class DualwaveFp8KernelContext:
         _init_dualwave_thread_mapping(self)
 
     def init_dma_thread_offsets(self):
-        # Emitted after descriptors/atoms (matching the original schedule) so the
-        # d_bucket ``v_and`` lands at the same ISA position.
         traits = self.traits
         self.lane_in_warp = self.tid % traits.WARP_SIZE
-        self.n_in_warp = self.lane_in_warp // traits.LANE_SPLIT_KV
-        self.d_bucket = self.lane_in_warp % traits.LANE_SPLIT_KV
+
+    def _init_compact_sequence(self, cuq_div, cuk_div, cu_atom, cu_v1i32):
+        """Map this workgroup's slot to (sequence, q-block) with a wave-wide scan of cu_seqlens_q.
+
+        Sequence b owns slots [start[b], start[b + 1]) with start[b] = sum_{i<b} ceil(len_i / BLOCK_Q): real
+        blocks pack contiguously and the grid's total_q // BLOCK_Q + B slots leave all spares at the tail, so
+        spares do not shift real workgroups across XCDs/CUs. Lane l of chunk c holds cu_q[64 c + l] and
+        seqused_k[64 c + l]; BATCH_CHUNKS >= ceil((B + 1) / 64) so cu_q[B], the last sequence's end, has a lane
+        too. Lane l scans ceil(len_{l-1} / BLOCK_Q) to start[l]; slots past start[B] map past the last end (no rows).
+        """
+        traits = self.traits
+        block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+        q_shift = fx.Int32(block_q.bit_length() - 1)
+        warp = traits.WARP_SIZE
+        nb = fx.Int32(self.batch_size)
+        slot = self.slot_i32
+        lane = fx.Int32(self.lane)
+        count = fx.Int32(0)
+        n_bad = fx.Int32(0)
+        carry = fx.Int32(0)
+        cu_lanes, kv_lanes, start_lanes = [], [], []
+        # Entry i of the scan lives in lane i % warp of chunk i // warp.
+        lane_chunk = fx.make_layout((warp, _UNBOUNDED), (1, warp))
+        for c in range_constexpr(traits.BATCH_CHUNKS):
+            l_i32 = fx.Int32(fx.get_scalar(fx.crd2idx((lane, c), lane_chunk)))
+            # Lanes past the batch re-read the last entry rather than run off the tensor.
+            lq = (l_i32 < nb).select(l_i32, nb)
+            lk = (l_i32 < nb).select(l_i32, nb - fx.Int32(1))
+            cu_l = fx.Int32(
+                Vec(_load_elem(cuq_div, lq, cu_atom, cu_v1i32), (1,), fx.Int32)[0]
+            )
+            kv_l = fx.Int32(
+                Vec(_load_elem(cuk_div, lk, cu_atom, cu_v1i32), (1,), fx.Int32)[0]
+            )
+            cu_lanes.append(cu_l)
+            kv_lanes.append(kv_l)
+            if const_expr(c == 0):
+                # Slots count from cu_q[0], which need not be 0. Raw rocdl op: no stable uniform-broadcast API.
+                self.cu_q0 = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(cu_l)))
+            rel = cu_l - self.cu_q0
+            # Lane l takes cu_q[l - 1]; lane 0 takes the previous chunk's last entry (itself in chunk 0: len 0).
+            if const_expr(c == 0):
+                prev_last = cu_l
+            else:
+                # Raw rocdl op: no stable uniform-broadcast API.
+                prev_last = fx.Int32(
+                    rocdl.readlane(
+                        T.i32,
+                        as_mlir_value(cu_lanes[c - 1]),
+                        as_mlir_value(fx.Int32(warp - 1)),
+                    )
+                )
+            cu_prev = (lane == fx.Int32(0)).select(
+                prev_last, fx.shuffle_up(cu_l, 1, warp)
+            )
+            start_l = fx.Int32(
+                fx.arith.shrui(cu_l - cu_prev + fx.Int32(block_q - 1), q_shift)
+            )
+            # Inclusive log-step scan of the previous sequences' block counts.
+            for k in range_constexpr(warp.bit_length() - 1):
+                off = 1 << k
+                up = fx.shuffle_up(start_l, off, warp)
+                start_l = start_l + (lane >= fx.Int32(off)).select(up, fx.Int32(0))
+            start_l = start_l + carry
+            if const_expr(c + 1 < traits.BATCH_CHUNKS):
+                # Raw rocdl op: no stable uniform-broadcast API. Carries the running start into the next chunk.
+                carry = fx.Int32(
+                    rocdl.readlane(
+                        T.i32, as_mlir_value(start_l), as_mlir_value(fx.Int32(warp - 1))
+                    )
+                )
+            start_lanes.append(start_l)
+            hit = (l_i32 < nb) & (start_l <= slot)
+            # Raw rocdl op: no stable wave-vote API. The popcount of starts at or below the slot is b + 1.
+            count = count + fx.Int32(
+                fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, as_mlir_value(hit))))
+            )
+            if const_expr(traits.INTERLEAVED):
+                bad = (l_i32 <= nb) & (rel != l_i32 * fx.Int32(self.seq_len))
+                # Raw rocdl op: no stable wave-vote API.
+                n_bad = n_bad + fx.Int32(
+                    fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, as_mlir_value(bad))))
+                )
+        # Raw rocdl op: count is wave-uniform, but LLVM cannot prove it after the ctpop sum.
+        b_i32 = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(count - fx.Int32(1))))
+        if const_expr(traits.INTERLEAVED):
+            # Rank-major (slot = rank * B + b) is global longest-first for a uniform batch. It is only a hint:
+            # a ragged batch (e.g. a CUDA-graph replay) keeps the compact map, which the same grid covers.
+            uniform = n_bad == fx.Int32(0)
+            b_i32 = uniform.select(slot % nb, b_i32)
+
+        def _lane_value(vals, idx):
+            # Raw rocdl op: readlane fetches the owner lane's entry with no second memory round trip.
+            crd = fx.idx2crd(idx, lane_chunk)
+            lane_idx = fx.Int32(crd[0].unpack())
+            chunk = fx.Int32(crd[1].unpack())
+            out = fx.Int32(
+                rocdl.readlane(T.i32, as_mlir_value(vals[0]), as_mlir_value(lane_idx))
+            )
+            for c in range_constexpr(1, len(vals)):
+                v = fx.Int32(
+                    rocdl.readlane(
+                        T.i32, as_mlir_value(vals[c]), as_mlir_value(lane_idx)
+                    )
+                )
+                out = (chunk == fx.Int32(c)).select(v, out)
+            return out
+
+        q_base_i32 = _lane_value(cu_lanes, b_i32)
+        self.batch_idx = fx.Int64(b_i32)
+        self.q_tok_base = fx.Index(q_base_i32)
+        self.q_tok_end = fx.Index(_lane_value(cu_lanes, b_i32 + fx.Int32(1)))
+        self.kv_tok_base = fx.Index(0)
+        self.kv_tok_end = fx.Index(_lane_value(kv_lanes, b_i32))
+        self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+        self.seqlen_kv_v = self.kv_tok_end
+        self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
+
+        rank = slot - _lane_value(start_lanes, b_i32)
+        if const_expr(traits.INTERLEAVED):
+            rank = uniform.select(slot // nb, rank)
+        # A sequence's q-blocks run longest-first (causal work grows with the block index, and workgroups
+        # dispatch in id order); ranks past its blocks stay past its end. i32: SALU has no 64-bit ordered compare.
+        seqlen_q_i32 = fx.Int32(self.seqlen_q_v)
+        num_q_blocks = fx.Int32(
+            fx.arith.shrui(seqlen_q_i32 + fx.Int32(block_q - 1), q_shift)
+        )
+        q_block = (rank < num_q_blocks).select(num_q_blocks - fx.Int32(1) - rank, rank)
+        self.q_block_idx = fx.Int64(q_block)
+        self.q_start = fx.Index(q_block * fx.Int32(block_q))
+
+        # Page ids come from scalar loads, not an LDS-staged table. The descriptor is bounded by the table's
+        # extent; reads stay inside the sequence's row anyway (page_id_smem clamps to [0, t_end - 1]).
+        self.bt_buf = fx.get_iter(
+            fx.rocdl.make_buffer_tensor(self.BlockTable, max_size=False)
+        )
+        self.bt_row_i32 = b_i32 * fx.Int32(self.block_table_stride)
+        # Tile 0's page rides this lookup's round trip; init_tile_bounds zeroes it for an empty segment.
+        self.page0_raw = fx.rocdl.s_buffer_load(self.bt_buf, self.bt_row_i32)
+
+    def page_id_smem(self, tile, lower_clamp=True):
+        """Page of KV tile ``tile`` clamped into [0, t_end - 1]: one s_buffer_load into an SGPR.
+
+        The clamp keeps the read inside the row's valid entries, so table padding is never read. Drop the lower
+        clamp only where tile >= 0 is known.
+        """
+        tile = fx.Int32(tile)
+        last = fx.Int32(self.split_t_end) - fx.Int32(1)
+        clamped = (tile < last).select(tile, last)
+        if const_expr(lower_clamp):
+            clamped = (clamped > fx.Int32(0)).select(clamped, fx.Int32(0))
+        return fx.rocdl.s_buffer_load(self.bt_buf, self.bt_row_i32 + clamped)
 
     def init_sequence_lengths(self):
         traits = self.traits
-        if const_expr(traits.VARLEN):
+        if const_expr(_bn64_compact_grid(traits)):
+            self._init_compact_sequence(
+                fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1)
+                ),
+                fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.CuSeqKv), fx.make_layout(1, 1)
+                ),
+                fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32),
+                Vec.make_type(1, fx.Int32),
+            )
+        elif const_expr(traits.VARLEN):
             _cuq_div = fx.logical_divide(
                 fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1)
             )
@@ -771,12 +1165,22 @@ class DualwaveFp8KernelContext:
 
             self.q_tok_base = _cu_load(_cuq_div, self.batch_idx, _cu_atom, _cu_v1i32)
             self.q_tok_end = _cu_load(_cuq_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
-            self.kv_tok_base = _cu_load(_cuk_div, self.batch_idx, _cu_atom, _cu_v1i32)
-            self.kv_tok_end = _cu_load(
-                _cuk_div, self.batch_idx + 1, _cu_atom, _cu_v1i32
-            )
-            self.seqlen_q_v = self.q_tok_end - self.q_tok_base
-            self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
+            if const_expr(traits.PAGED):
+                self.kv_tok_base = fx.Index(0)
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+                self.seqlen_kv_v = self.kv_tok_end
+            else:
+                self.kv_tok_base = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx + 1, _cu_atom, _cu_v1i32
+                )
+                self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+                self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
         else:
             self.q_tok_base = self.batch_idx * self.seq_len_v
@@ -790,12 +1194,22 @@ class DualwaveFp8KernelContext:
         self.q_gmem_elem_offset = (
             self.q_tok_base + self.q_start
         ) * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
-        self.kv_gmem_elem_offset = (
-            self.kv_tok_base * self.stride_kv_n_v + self.kv_head_idx * traits.HEAD_DIM
-        )
-        self.v_gmem_elem_offset = (
-            self.kv_tok_base * self.stride_v_n_v + self.kv_head_idx * traits.HEAD_DIM_V
-        )
+        if const_expr(traits.PAGED):
+            self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
+            if const_expr(traits.K_SHUFFLED):
+                self.kv_gmem_elem_offset *= traits.BLOCK_N
+            self.v_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM_V
+            if const_expr(traits.V_SHUFFLED):
+                self.v_gmem_elem_offset *= traits.BLOCK_N
+        else:
+            self.kv_gmem_elem_offset = (
+                self.kv_tok_base * self.stride_kv_n_v
+                + self.kv_head_idx * traits.HEAD_DIM
+            )
+            self.v_gmem_elem_offset = (
+                self.kv_tok_base * self.stride_v_n_v
+                + self.kv_head_idx * traits.HEAD_DIM_V
+            )
 
     def init_descriptors(self):
         traits = self.traits
@@ -823,11 +1237,78 @@ class DualwaveFp8KernelContext:
             return fx.logical_divide(bt, fx.make_layout(1, 1))
 
         self.q_div = _make_buf_div(self.Q, q_nrec_bytes)
-        self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
-        self.v_div = _make_buf_div(self.V, v_nrec_bytes)
+        if const_expr(traits.PAGED):
+            self.k_div = None
+            self.v_div = None
+            if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+                # The router (_strides_ok) only admits stride_kv_n == num_kv_heads * head_dim, so the page stride is a
+                # compile-time constant and page -> byte offset becomes a shift.
+                self.page_byte_stride = fx.Int64(
+                    traits.BLOCK_N * traits.DEFAULT_STRIDE_KV_N
+                )
+            else:
+                self.page_byte_stride = fx.Int64(traits.BLOCK_N) * fx.Int64(
+                    self.stride_kv_n_v
+                )
+            self.page_layout = fx.make_layout(
+                fx.Int32(self.page_byte_stride), fx.Int32(1)
+            )
+            self.k_iter = fx.get_iter(self.K)
+            self.v_iter = fx.get_iter(self.V)
+            if const_expr(traits.BODY_VARIANT != "conventional_bn64"):
+                # bn64 reads page ids through bt_buf (_init_compact_sequence).
+                self.block_table_stride_v = fx.Index(self.block_table_stride)
+                self.bt_div = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
+                )
+                self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        else:
+            self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
+            self.v_div = _make_buf_div(self.V, v_nrec_bytes)
         self.o_div = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(self.O, num_records_bytes=o_nrec_bytes),
             fx.make_layout(1, 1),
+        )
+
+    def kv_page_div(self, which, page_id, tile_start, real_tile=False):
+        base_iter = self.k_iter if which == "k" else self.v_iter
+        # Bounds follow the logical tile, not the clamped page id: invalid-token
+        # V must be zero even when the last page contains stale fp8 NaNs.
+        # Signed: tiles wholly past the sequence end would underflow in index math.
+        shuffled = (which == "k" and self.traits.K_SHUFFLED) or (
+            which == "v" and self.traits.V_SHUFFLED
+        )
+        if const_expr(self.traits.BODY_VARIANT == "conventional_bn64" and not shuffled):
+            # i32 tile math: SALU has no 64-bit ordered compare. No max/min clamp: it combines into VALU v_med3_i32
+            # and the descriptor then needs a readfirstlane waterfall. Shuffled keeps i64: an i32 compare there
+            # reschedules the causal body into a spill at 168 VGPR.
+            remaining = self.seqlen_kv_i32 - fx.Int32(tile_start)
+            full = fx.Int32(self.traits.BLOCK_N * self.traits.DEFAULT_STRIDE_KV_N)
+            part = remaining * fx.Int32(self.traits.DEFAULT_STRIDE_KV_N)
+            nrec = fx.Int64(
+                (remaining > fx.Int32(0)).select(
+                    (remaining < fx.Int32(self.traits.BLOCK_N)).select(part, full),
+                    fx.Int32(0),
+                )
+            )
+        else:
+            remaining = fx.Int64(self.seqlen_kv_v) - fx.Int64(tile_start)
+            valid = (remaining > fx.Int64(0)).select(remaining, fx.Int64(0))
+            valid = (valid < fx.Int64(self.traits.BLOCK_N)).select(
+                valid, fx.Int64(self.traits.BLOCK_N)
+            )
+            nrec = valid * fx.Int64(self.stride_kv_n_v)
+            if const_expr(shuffled and real_tile):
+                # The caller proved tile_start < seqlen_kv; the K tail sentinel still masks a partial tile.
+                nrec = self.page_byte_stride
+            elif const_expr(shuffled):
+                nrec = (valid > fx.Int64(0)).select(self.page_byte_stride, fx.Int64(0))
+        return _make_page_view(
+            base_iter,
+            page_id,
+            self.page_byte_stride,
+            nrec,
+            self.page_layout,
         )
 
     def init_atoms_and_lds_ptrs(self):
@@ -835,34 +1316,47 @@ class DualwaveFp8KernelContext:
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
-        self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        if const_expr(traits.O_STORE_NT):
+            self.store_atom_128 = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(2), fx.Int32
+            )
+        else:
+            self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are byte-addressed.
         self.lds_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, 2, traits.DMA_BYTES)
 
-    def init_descale(self):
-        def _load_scale_scalar(tensor):
-            _div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1)
-            )
-            _atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            _v = fly.copy_atom_call_ssa(
-                [Vec.make_type(1, fx.Float32)],
-                _atom,
-                fx.slice(_div, (None, fx.Int32(0))),
-            )
-            return Vec(_v, (1,), fx.Float32)[0]
+    def issue_descale_loads(self):
+        """Issue the three descale loads; at kernel entry they share the sequence lookup's memory round trip."""
 
+        self._descales = (
+            _load_scalar_f32(self.QDescale),
+            _load_scalar_f32(self.KDescale),
+            _load_scalar_f32(self.VDescale),
+        )
+
+    def init_descale(self):
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = self.softmax_scale * c_log2e_f
-        _qd = _load_scale_scalar(self.QDescale)
-        _kd = _load_scale_scalar(self.KDescale)
-        self.vd_fp8 = _load_scale_scalar(self.VDescale)
+        if const_expr(getattr(self, "_descales", None) is not None):
+            _qd, _kd, self.vd_fp8 = self._descales
+        else:
+            _qd = _load_scalar_f32(self.QDescale)
+            _kd = _load_scalar_f32(self.KDescale)
+            self.vd_fp8 = _load_scalar_f32(self.VDescale)
         # fp8 feeds raw Q/K into the MFMA, so q/k descale * softmax scale multiplies
         # the fp32 logits after QK.
         self.c_logit_scale = c_sm_scale_log2e * (_qd * _kd)
+        if const_expr(self.traits.BODY_VARIANT == "conventional_bn64"):
+            # Wave-uniform: in an SGPR the per-score FMAs read it as a scalar operand, not a VGPR splat.
+            # Raw rocdl op: no stable uniform-broadcast API in FlyDSL 0.5.0.
+            self.c_logit_scale = fx.Float32(
+                _bitcast_f32(
+                    rocdl.readfirstlane(T.i32, _bitcast_i32(self.c_logit_scale))
+                )
+            )
 
     def init_tile_bounds(self):
         traits = self.traits
@@ -872,6 +1366,11 @@ class DualwaveFp8KernelContext:
             causal_end_raw_i32 = (
                 fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
             )
+            if const_expr(traits.GQA_PACK_M):
+                causal_end_raw_i32 = (
+                    fx.Int32(self.q_start + traits.BLOCK_M // traits.GQA_GROUP_SIZE)
+                    + self.delta_i32
+                )
             causal_end_i32 = fx.Int32(
                 (causal_end_raw_i32 > fx.Int32(0)).select(
                     causal_end_raw_i32, fx.Int32(0)
@@ -886,9 +1385,13 @@ class DualwaveFp8KernelContext:
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
-        # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
-        max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
+        # Pipeline needs an EVEN tile count >= 4; extra tiles are masked. Past the sequence end they read zero
+        # (num_records) or clamped pages; under causal masking the loop end can precede
+        # the physical KV end, so dead tiles may read finite payload from clamped pages
+        # that masking discards.
+        if const_expr(traits.BODY_VARIANT == "default"):
+            max_num_tiles = ((max_num_tiles + 1) // 2) * 2
+            max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -925,6 +1428,11 @@ class DualwaveFp8KernelContext:
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
+        if const_expr(_bn64_compact_grid(traits)):
+            # An empty segment keeps page 0: tile 0's unconditional DMA then has an in-range base.
+            self.page0 = (fx.Int32(split_t_end) > fx.Int32(0)).select(
+                self.page0_raw, fx.Int32(0)
+            )
 
     def init_workspace_io(self):
         if const_expr(self.traits.SPLITK):
@@ -958,6 +1466,21 @@ class DualwaveFp8KernelContext:
     def init_q_row(self):
         _init_dualwave_q_row(self)
 
+    def k_rows_permuted(self):
+        """Shuffled bn64 K sits chunk-major in LDS with its rows permuted (operand_layouts.k_row_permutation)."""
+        return (
+            self.traits.BODY_VARIANT == "conventional_bn64" and self.traits.K_SHUFFLED
+        )
+
+    def score_mask_columns(self):
+        """(lane-half column offset, per-pair column thresholds) of a 32-key strip of QK's scores."""
+        if const_expr(self.k_rows_permuted()):
+            lane_off, cols = probability_mask_columns()
+            return lane_off, [
+                (cols[2 * p], cols[2 * p + 1]) for p in range(len(cols) // 2)
+            ]
+        return 4, _causal_pair_thresholds(False)
+
     def k_buf_base(self, buf_id):
         traits = self.traits
         if const_expr(isinstance(buf_id, int)):
@@ -989,6 +1512,13 @@ class DualwaveFp8KernelContext:
         )
 
     def global_idx_q(self, token_idx, col):
+        if const_expr(self.traits.GQA_PACK_M):
+            # Packed row r reads token q_start + r // G at head q_head_idx + r % G.
+            return (
+                (self.q_tok_base + token_idx) * self.stride_q_n_v
+                + self.ctx_ref.q_head_row * self.traits.HEAD_DIM
+                + col
+            )
         return (
             (self.q_tok_base + token_idx) * self.stride_q_n_v
             + self.q_head_idx * self.traits.HEAD_DIM
@@ -997,13 +1527,19 @@ class DualwaveFp8KernelContext:
 
     def global_idx_o(self, token_idx, col):
         """Element index into O, which is HEAD_DIM_V wide (not HEAD_DIM)."""
+        if const_expr(self.traits.GQA_PACK_M):
+            return (
+                (self.q_tok_base + token_idx) * self.stride_o_n_v
+                + self.ctx_ref.q_head_row * self.traits.HEAD_DIM_V
+                + col
+            )
         return (
             (self.q_tok_base + token_idx) * self.stride_o_n_v
             + self.q_head_idx * self.traits.HEAD_DIM_V
             + col
         )
 
-    def read_i32x8_lds(self, base_ptr, byte_row):
+    def read_i32x8_lds(self, base_ptr, byte_row, half_stride=16):
         vec_ty = Vec.make_type(4, fx.Int32)
         ptr_ty = fx.PointerType.get(
             fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
@@ -1011,6 +1547,6 @@ class DualwaveFp8KernelContext:
         base_ptr = fx.recast_iter(ptr_ty, base_ptr)
         halves = []
         for h in range_constexpr(2):
-            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * 16))
+            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * half_stride))
             halves.append(fx.ptr_load(p, result_type=vec_ty))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()

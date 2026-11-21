@@ -28,7 +28,7 @@ op_tests/test_flydsl_causal_conv1d_update.py	84
 op_tests/test_flydsl_compress_attn.py	58
 op_tests/test_flydsl_conv_implicit.py	10
 op_tests/test_flydsl_dcp_topk_merge.py	12
-op_tests/test_flydsl_fmha.py	4
+op_tests/test_flydsl_fmha.py	150
 op_tests/test_flydsl_fp8_mqa_logits.py	36
 op_tests/test_flydsl_fp8_paged_mqa_logits.py	10
 op_tests/test_flydsl_fp8_quant.py	4
@@ -232,4 +232,5 @@ op_tests/test_vsa_sparse_attention.py	4
 op_tests/tuning_tests/test_config_shape_collision.py	5
 op_tests/tuning_tests/test_csv_validation.py	1
 op_tests/tuning_tests/test_mixed_mxfp_tuning.py	4
+op_tests/test_unified_attention.py	33
 op_tests/tuning_tests/test_mp_tuner_fault.py	84
