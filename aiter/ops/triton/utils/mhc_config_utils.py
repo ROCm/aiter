@@ -229,27 +229,3 @@ def get_mhc_post_pre_gluon_gfx1250_config(M: int) -> dict:
     cfg_dir = resolve_config_dir("mhc", "MHC_POST_PRE", backend="gluon")
     cfg = load_config_json(f"{cfg_dir}/DEFAULT.json")
     return select_leq_config(cfg, M, prefix="M_LEQ_")
-
-
-def hip_post_dispatch_block(C: int, arch_id: str) -> int | None:
-    """Return the ``residual_block`` ``aiter.mhc_post`` selects for this C.
-
-    Mirrors ``MHC_POST_KERNEL_DISPATCH`` in
-    ``csrc/kernels/mhc_kernels.cu``:
-
-        non-gfx942 + C % 1024 == 0 -> 1024
-        C % 512 == 0               -> 512
-        C % 256 == 0               -> 256
-        else                       -> None  (unsupported, caller should skip)
-
-    The HIP kernel additionally enforces ``C >= 2 * residual_block`` via
-    ``TORCH_CHECK``, so callers should reject shapes where
-    ``C < 2 * hip_post_dispatch_block(C, arch_id)``.
-    """
-    if arch_id != "gfx942" and C % 1024 == 0:
-        return 1024
-    if C % 512 == 0:
-        return 512
-    if C % 256 == 0:
-        return 256
-    return None
