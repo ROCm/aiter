@@ -17,6 +17,7 @@ from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     buf_base_i64,
     buf_copy_load,
+    buf_copy_store,
     ptr_buf_tensor,
 )
 from .utils import rcp_f32, udiv_const, urem_const
@@ -58,6 +59,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    query_map: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -90,6 +92,11 @@ def compile_pa_decode_ps_reduce(
     batch * (rows * KV heads)**2 <= 2**30.
     Sinks are per-head zero-value logits: include them in the shared maximum
     and add their denominator mass once.
+
+    ``query_map`` builds ``launch_varlen``, which takes an int32 [batch, 4] map
+    of (first output row, table row, valid queries, unused) per sequence:
+    query q of a sequence is output row first + q, and rows q >= valid are not
+    stored. ``stride_output_bs`` is then unused.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
@@ -196,6 +203,9 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if query_map:
+        kernel_name += "_qmap"
+    out_bytes = output_dtype.width // 8
 
     @flyc.jit
     def _pa_decode_reduce_body(
@@ -219,6 +229,7 @@ def compile_pa_decode_ps_reduce(
         num_ctas: fx.Int32,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        query_map_ptr: fx.Pointer,
     ):
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
@@ -256,12 +267,34 @@ def compile_pa_decode_ps_reduce(
         lane = fx.thread_idx.x & fx.Int32(wave - 1)
         group_idx = urem_const(row_idx, query_group_size)
         query_idx = udiv_const(row_idx, query_group_size)
-        output_base = (
-            batch_idx * stride_output_bs
-            + query_idx * stride_output_len
-            + kv_head_idx * stride_output_kv_head
-            + group_idx * stride_output_group_size
-        )
+        if fx.const_expr(query_map):
+            qmap = fx.recast_iter(fx.Int32, query_map_ptr)
+            first_row = fx.Int32(qmap[batch_idx * 4])
+            valid_rows = fx.Int32(qmap[batch_idx * 4 + 2])
+            row_elem = (
+                (first_row + query_idx) * stride_output_len
+                + kv_head_idx * stride_output_kv_head
+                + group_idx * stride_output_group_size
+            )
+            # Padded query rows get an empty resource: their stores are dropped.
+            output_rows = ptr_buf_tensor(
+                buf_base_i64(output_ptr) + fx.Int64(row_elem) * out_bytes,
+                output_dtype,
+                unit_elems=elems,
+                num_records_bytes=fx.Int64(
+                    (query_idx < valid_rows).select(
+                        fx.Int32(head_size * out_bytes), zero_i
+                    )
+                ),
+            )
+            output_base = zero_i
+        else:
+            output_base = (
+                batch_idx * stride_output_bs
+                + query_idx * stride_output_len
+                + kv_head_idx * stride_output_kv_head
+                + group_idx * stride_output_group_size
+            )
         if fx.const_expr(use_sinks):
             sink_token = fx.recast_iter(sink_dtype, sink_token_ptr)
             sink_value = fx.Float32(
@@ -325,6 +358,15 @@ def compile_pa_decode_ps_reduce(
             return fx.Float32(value)
 
         def _store(acc, unit):
+            if fx.const_expr(query_map):
+                buf_copy_store(
+                    output_rows,
+                    unit,
+                    acc.to(output_dtype),
+                    output_dtype,
+                    unit_elems=elems,
+                )
+                return
             # Output rows need only element alignment, so pairs store scalars.
             offset = output_base + unit * fx.Int32(elems)
             if fx.const_expr(pairs):
@@ -655,6 +697,7 @@ def compile_pa_decode_ps_reduce(
             num_ctas: fx.Int32,
             rows_magic: fx.Int32,
             seq_magic: fx.Int32,
+            query_map_ptr: fx.Pointer,
         ):
             _pa_decode_reduce_body(
                 output_ptr,
@@ -677,6 +720,7 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                query_map_ptr,
             )
 
         def _reduce_args(
@@ -700,6 +744,7 @@ def compile_pa_decode_ps_reduce(
             num_ctas,
             rows_magic,
             seq_magic,
+            query_map_ptr,
         ):
             return (
                 reduce_info,
@@ -722,6 +767,7 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                query_map_ptr,
             )
 
     else:
@@ -748,6 +794,7 @@ def compile_pa_decode_ps_reduce(
             num_ctas: fx.Int32,
             rows_magic: fx.Int32,
             seq_magic: fx.Int32,
+            query_map_ptr: fx.Pointer,
         ):
             _pa_decode_reduce_body(
                 output_ptr,
@@ -770,34 +817,35 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                query_map_ptr,
             )
 
         def _reduce_args(*args):
             return args
 
-    @flyc.jit
-    def launch_pa_decode_ps_reduce_kernel(
-        output: fx.Pointer,
-        exp_sums: fx.Pointer,
-        max_logits: fx.Pointer,
-        logits: fx.Pointer,
-        sink_token: fx.Pointer,
-        stride_output_bs: fx.Int32,
-        stride_output_len: fx.Int32,
-        stride_output_kv_head: fx.Int32,
-        stride_output_group_size: fx.Int32,
-        stride_exp_sums_head: fx.Int32,
-        stride_exp_sums_part: fx.Int32,
-        stride_logits_head: fx.Int32,
-        stride_logits_part: fx.Int32,
-        stride_logits_group: fx.Int32,
-        query_seq_len: fx.Int32,
-        batch_size: fx.Int32,
-        num_kv_heads: fx.Int32,
-        reduce_info: fx.Pointer,
-        rows_magic: fx.Int32,
-        seq_magic: fx.Int32,
-        stream: fx.Stream,
+    def _launch(
+        output,
+        exp_sums,
+        max_logits,
+        logits,
+        sink_token,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group,
+        query_seq_len,
+        batch_size,
+        num_kv_heads,
+        reduce_info,
+        rows_magic,
+        seq_magic,
+        query_map_ptr,
+        stream,
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
@@ -823,6 +871,7 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                query_map_ptr,
             )
         ).launch(
             grid=(
@@ -834,13 +883,118 @@ def compile_pa_decode_ps_reduce(
             stream=stream,
         )
 
+    @flyc.jit
+    def launch_pa_decode_ps_reduce_kernel(
+        output: fx.Pointer,
+        exp_sums: fx.Pointer,
+        max_logits: fx.Pointer,
+        logits: fx.Pointer,
+        sink_token: fx.Pointer,
+        stride_output_bs: fx.Int32,
+        stride_output_len: fx.Int32,
+        stride_output_kv_head: fx.Int32,
+        stride_output_group_size: fx.Int32,
+        stride_exp_sums_head: fx.Int32,
+        stride_exp_sums_part: fx.Int32,
+        stride_logits_head: fx.Int32,
+        stride_logits_part: fx.Int32,
+        stride_logits_group: fx.Int32,
+        query_seq_len: fx.Int32,
+        batch_size: fx.Int32,
+        num_kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
+        rows_magic: fx.Int32,
+        seq_magic: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _launch(
+            output,
+            exp_sums,
+            max_logits,
+            logits,
+            sink_token,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            query_seq_len,
+            batch_size,
+            num_kv_heads,
+            reduce_info,
+            rows_magic,
+            seq_magic,
+            reduce_info,
+            stream,
+        )
+
+    @flyc.jit
+    def launch_pa_decode_ps_reduce_varlen(
+        output: fx.Pointer,
+        exp_sums: fx.Pointer,
+        max_logits: fx.Pointer,
+        logits: fx.Pointer,
+        sink_token: fx.Pointer,
+        stride_output_bs: fx.Int32,
+        stride_output_len: fx.Int32,
+        stride_output_kv_head: fx.Int32,
+        stride_output_group_size: fx.Int32,
+        stride_exp_sums_head: fx.Int32,
+        stride_exp_sums_part: fx.Int32,
+        stride_logits_head: fx.Int32,
+        stride_logits_part: fx.Int32,
+        stride_logits_group: fx.Int32,
+        query_seq_len: fx.Int32,
+        batch_size: fx.Int32,
+        num_kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
+        rows_magic: fx.Int32,
+        seq_magic: fx.Int32,
+        query_map_ptr: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        _launch(
+            output,
+            exp_sums,
+            max_logits,
+            logits,
+            sink_token,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            query_seq_len,
+            batch_size,
+            num_kv_heads,
+            reduce_info,
+            rows_magic,
+            seq_magic,
+            query_map_ptr,
+            stream,
+        )
+
     if architecture == "gfx950":
         # The leading arguments preload into the free user SGPRs (14 dwords on
         # gfx950), so the first loads skip a kernarg round trip.
-        launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
-            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
-        }
+        for launch in (
+            launch_pa_decode_ps_reduce_kernel,
+            launch_pa_decode_ps_reduce_varlen,
+        ):
+            launch.compile_hints["llvm_options"] = {
+                "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+                "amdgpu-kernarg-preload-count": min(
+                    16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT
+                ),
+            }
     if architecture in ("gfx1250", "gfx1250-strict"):
         # All 108 argument bytes preload into user SGPRs, so the first load
         # is reduce_info.
@@ -850,5 +1004,6 @@ def compile_pa_decode_ps_reduce(
         }
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
+        "launch_varlen": launch_pa_decode_ps_reduce_varlen,
         "kernel": pa_decode_reduce_kernel,
     }

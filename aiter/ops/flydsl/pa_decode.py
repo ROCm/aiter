@@ -222,8 +222,12 @@ def launch_pa_decode_ps_reduce(
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
+    query_map: torch.Tensor | None = None,
 ) -> None:
-    """Reduce packed partials; every sequence has at most ``max_partitions``."""
+    """Reduce packed partials; every sequence has at most ``max_partitions``.
+
+    ``query_map`` (int32 [batch, 4]) places each sequence's query rows.
+    """
     props = torch.cuda.get_device_properties(output.device)
     if max_partitions > props.multi_processor_count:
         raise ImportError(
@@ -317,6 +321,7 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        query_map=query_map is not None,
     )
     sink_ptr = (
         flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
@@ -324,7 +329,7 @@ def launch_pa_decode_ps_reduce(
         else ptr_arg(sink_token, torch_to_fx_dtype(sink_token.dtype))
     )
     _run_compiled(
-        compiled["launch"],
+        compiled["launch" if query_map is None else "launch_varlen"],
         ptr_arg(output, torch_to_fx_dtype(output.dtype)),
         ptr_arg(exp_sums, fx.Float32),
         ptr_arg(max_logits, fx.Float32),
@@ -345,6 +350,7 @@ def launch_pa_decode_ps_reduce(
         ptr_arg(reduce_info, fx.Int32),
         -(-(1 << 30) // rows),
         -(-(1 << 30) // (rows * kv_heads)),
+        *(() if query_map is None else (ptr_arg(query_map, fx.Int32),)),
         stream,
     )
 

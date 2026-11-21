@@ -3,23 +3,11 @@
 
 """Host launch of the FlyDSL TopK launchers."""
 
-import copy
-
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _launcher_on, _run_compiled
 
-# A JitFunction's per-device state, each with the value it starts from: its
-# in-process caches, its own and its disk-cache manager's, which FlyDSL keys
-# without the device -- a build loaded on one GPU cannot launch on another --
-# and the GPU target it resolves once, with the signature, on its first call.
-_PER_DEVICE_STATE = {
-    "_mem_cache": dict,
-    "_last_compiled": lambda: None,
-    "cache_manager": lambda: None,
-    "_sig": lambda: None,
-    "_backend_target": lambda: None,
-}
+__all__ = ["_launcher_on", "run_topk_launcher"]
 
 
 def _launch_key(args):
@@ -38,48 +26,10 @@ def _launch_key(args):
     return key
 
 
-def _launcher_on(exe, device):
-    """`exe` on the first GPU it runs on; on each further GPU, a copy of it whose
-    per-device state starts afresh, its builds reloading from disk.
-
-    Raises rather than share `exe` with a further GPU when this FlyDSL lacks a
-    piece of that state: the copy could not be told apart from the original.
-    """
-    by_device = exe.__dict__.get("_topk_by_device")
-    if by_device is None:
-        by_device = exe._topk_by_device = {}
-    own = by_device.get(device)
-    if own is None:
-        if not by_device:
-            own = exe
-        else:
-            missing = [n for n in _PER_DEVICE_STATE if not hasattr(exe, n)]
-            if missing:
-                raise RuntimeError(
-                    f"TopK launcher {getattr(exe, '__name__', type(exe).__name__)} "
-                    f"cannot get a launcher of its own on cuda:{device}: this "
-                    f"FlyDSL has no {', '.join(missing)}, so the one built on "
-                    "another GPU would be reused"
-                )
-            own = copy.copy(exe)
-            for n in ("_topk_by_device", "_cf", "_cf_by_specialization"):
-                own.__dict__.pop(n, None)
-            for n, fresh in _PER_DEVICE_STATE.items():
-                setattr(own, n, fresh())
-            if hasattr(exe, "_extern_linkage_keys"):
-                own._extern_linkage_keys = set(exe._extern_linkage_keys)
-        by_device[device] = own
-    return own
-
-
 def run_topk_launcher(exe, *args):
-    """`_run_compiled`, with one compiled kernel per GPU and per `_launch_key`.
+    """`_run_compiled`, with one compiled kernel per `_launch_key`.
 
     `_run_compiled` alone keeps a launcher's first build for every later call,
     which skips the parts of FlyDSL's key that change between TopK calls.
     """
-    _run_compiled(
-        _launcher_on(exe, torch._C._cuda_getDevice()),
-        *args,
-        specialization_key=_launch_key(args),
-    )
+    _run_compiled(exe, *args, specialization_key=_launch_key(args))
