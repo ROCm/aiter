@@ -43,72 +43,82 @@ def dao_ai_impl():
 
 # fmt: off
 DENSE_CASES = [
-    (1, 128, 128, 8, 8, 64, True, False, (-1, -1), 0.0),  # fwd causal
-    (2, 256, 256, 16, 4, 128, False, False, (-1, -1), 0.0),  # fwd GQA non-causal
-    (1, 128, 128, 8, 8, 64, True, True, (-1, -1), 0.0),  # bwd causal
-    (1, 128, 128, 8, 8, 64, True, True, (32, 0), 0.0),  # causal window
-    (1, 128, 128, 8, 8, 64, False, True, (16, 16), 0.0),  # symmetric window
-    (1, 128, 128, 8, 8, 64, False, True, (-1, 32), 0.0),  # infinite-left window
+    (1, 128, 128, 8, 8, 64, True, False, (-1, -1), 0.0, True),  # fwd causal
+    (2, 256, 256, 16, 4, 128, False, False, (-1, -1), 0.0, True),  # fwd GQA non-causal
+    (1, 128, 128, 8, 8, 64, True, True, (-1, -1), 0.0, True),  # bwd causal
+    (1, 128, 128, 8, 8, 64, True, True, (32, 0), 0.0, True),  # causal window
+    (1, 128, 128, 8, 8, 64, False, True, (16, 16), 0.0, True),  # symmetric window
+    (1, 128, 128, 8, 8, 64, False, True, (-1, 32), 0.0, True),  # infinite-left window
     # Infinite-RIGHT window (L, -1): the mirror of the infinite-left row above.
     # MUST be non-causal -- under causal the right edge is capped to the diagonal
     # (attention_ref forces window=(L, 0)), so (L, -1) would collapse to (L, 0)
     # and never exercise the new unbounded-right path.
-    (1, 128, 128, 8, 8, 64, False, True, (32, -1), 0.0),  # infinite-right window
+    (1, 128, 128, 8, 8, 64, False, True, (32, -1), 0.0, True),  # infinite-right window
     # seqlen_q != seqlen_k exercises the causal_offset / delta_qk arithmetic
-    (1, 128, 256, 8, 8, 64, True, True, (32, 0), 0.0),  # causal, sq != sk
-    (1, 128, 256, 8, 8, 64, False, True, (16, 16), 0.0),  # symmetric, sq != sk
+    (1, 128, 256, 8, 8, 64, True, True, (32, 0), 0.0, True),  # causal, sq != sk
+    (1, 128, 256, 8, 8, 64, False, True, (16, 16), 0.0, True),  # symmetric, sq != sk
     # infinite-right with sq != sk: exercises the sk-sq offset in the
     # unbounded-right per-element mask and the _sliding_window bounds.
-    (1, 128, 256, 8, 8, 64, False, True, (32, -1), 0.0),  # infinite-right sq != sk
+    (1, 128, 256, 8, 8, 64, False, True, (32, -1), 0.0, True),  # infinite-right sq != sk
     # GQA (num_q_heads != num_k_heads) combined with sliding-window backward
-    (2, 128, 128, 16, 4, 64, True, True, (32, 0), 0.0),  # GQA causal window
+    (2, 128, 128, 16, 4, 64, True, True, (32, 0), 0.0, True),  # GQA causal window
     # Production-size sequence lengths (beyond the upstream 2048 cap) with
     # large windows (128/256). seqlen >> window means the window spans many
     # key blocks, exercising the bwd full/partial/skipped block
     # classification that the small (seqlen 128, window 16/32) cases barely
     # reach.
-    (1, 4096, 4096, 8, 8, 64, True, True, (256, 0), 0.0),  # large causal window
-    (1, 4096, 4096, 8, 8, 64, False, True, (256, 256), 0.0),  # large symmetric
-    (2, 4096, 4096, 16, 4, 64, True, True, (128, 0), 0.0),  # GQA large causal
+    (1, 4096, 4096, 8, 8, 64, True, True, (256, 0), 0.0, True),  # large causal window
+    (1, 4096, 4096, 8, 8, 64, False, True, (256, 256), 0.0, True),  # large symmetric
+    (2, 4096, 4096, 16, 4, 64, True, True, (128, 0), 0.0, True),  # GQA large causal
     # seqlen_q != seqlen_k at production size exercises the causal_offset /
     # delta_qk arithmetic with a window spanning many blocks.
-    (1, 4096, 8192, 8, 8, 64, True, True, (256, 0), 0.0),  # large causal sq != sk
+    (1, 4096, 8192, 8, 8, 64, True, True, (256, 0), 0.0, True),  # large causal sq != sk
     # Padded last block: seqlen NOT a multiple of the block size, with an active
     # window -> exercises handle_padded_last_block (the last partial-K-block bucket
     # move). Every multiple-of-block case above skips this branch. sq == sk keeps
     # every query row with at least the diagonal key (no fully-masked rows).
-    (1, 1023, 1023, 8, 8, 64, True, True, (128, 0), 0.0),  # causal
-    (1, 1025, 1025, 8, 8, 64, False, True, (64, 64), 0.0),  # symmetric
-    (1, 4097, 4097, 8, 8, 64, True, True, (256, 0), 0.0),  # production size
-    (1, 1024, 1024, 8, 8, 64, False, True, (0, 0), 0.0),  # (0,0) band
+    (1, 1023, 1023, 8, 8, 64, True, True, (128, 0), 0.0, True),  # causal
+    (1, 1025, 1025, 8, 8, 64, False, True, (64, 64), 0.0, True),  # symmetric
+    (1, 4097, 4097, 8, 8, 64, True, True, (256, 0), 0.0, True),  # production size
+    (1, 1024, 1024, 8, 8, 64, False, True, (0, 0), 0.0, True),  # (0,0) band
     # Broaden the production block-skip regime past hd64 / MHA: block sizes are
     # head-dim dependent and MQA changes the block-classification arithmetic.
-    (1, 4096, 4096, 8, 8, 128, True, True, (256, 0), 0.0),  # hd128
-    (2, 4096, 4096, 8, 1, 64, True, True, (256, 0), 0.0),  # MQA
+    (1, 4096, 4096, 8, 8, 128, True, True, (256, 0), 0.0, True),  # hd128
+    (2, 4096, 4096, 8, 1, 64, True, True, (256, 0), 0.0, True),  # MQA
     # Dropout: the reference applies the dropout record the forward returned.
-    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17),
-    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17),
-    (2, 96, 96, 4, 4, 64, False, True, (16, 16), 0.17),
+    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17, True),
+    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17, True),
+    (2, 96, 96, 4, 4, 64, False, True, (16, 16), 0.17, True),
+    # Without return_attn_probs, as training calls it: the reference applies the record of
+    # the same call with it.
+    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17, False),
+    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17, False),
+    (1, 128, 128, 8, 8, 64, True, True, (-1, -1), 0.0, False),
 ]
 VARLEN_CASES = [
-    (1, 128, 128, 8, 8, 64, True, False, (-1, -1), 0.0),  # fwd_varlen causal
-    (1, 128, 128, 8, 8, 64, True, True, (-1, -1), 0.0),  # bwd_varlen causal
-    (1, 128, 128, 8, 8, 64, True, True, (32, 0), 0.0),  # causal window varlen
-    (1, 128, 128, 8, 8, 64, False, True, (16, 16), 0.0),  # symmetric win varlen
-    (1, 128, 128, 8, 8, 64, False, True, (32, -1), 0.0),  # infinite-right varlen
-    (1, 128, 256, 8, 8, 64, True, True, (32, 0), 0.0),  # causal varlen, sq != sk
-    (2, 128, 128, 16, 4, 64, False, True, (16, 16), 0.0),  # GQA symmetric varlen
-    (1, 4096, 4096, 8, 8, 64, True, True, (256, 0), 0.0),  # large causal varlen
+    (1, 128, 128, 8, 8, 64, True, False, (-1, -1), 0.0, True),  # fwd_varlen causal
+    (1, 128, 128, 8, 8, 64, True, True, (-1, -1), 0.0, True),  # bwd_varlen causal
+    (1, 128, 128, 8, 8, 64, True, True, (32, 0), 0.0, True),  # causal window varlen
+    (1, 128, 128, 8, 8, 64, False, True, (16, 16), 0.0, True),  # symmetric win varlen
+    (1, 128, 128, 8, 8, 64, False, True, (32, -1), 0.0, True),  # infinite-right varlen
+    (1, 128, 256, 8, 8, 64, True, True, (32, 0), 0.0, True),  # causal varlen, sq != sk
+    (2, 128, 128, 16, 4, 64, False, True, (16, 16), 0.0, True),  # GQA symmetric varlen
+    (1, 4096, 4096, 8, 8, 64, True, True, (256, 0), 0.0, True),  # large causal varlen
     # Dropout, with random padding: the reference applies the forward's record.
-    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17),
-    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17),
-    (2, 96, 96, 4, 4, 64, False, True, (16, 16), 0.17),
+    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17, True),
+    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17, True),
+    (2, 96, 96, 4, 4, 64, False, True, (16, 16), 0.17, True),
+    # Without return_attn_probs, as training calls it (varlen once drew its dropout random
+    # numbers with strides of 0 then).
+    (2, 96, 96, 4, 4, 64, False, True, (-1, -1), 0.17, False),
+    (2, 96, 96, 4, 4, 64, True, True, (-1, -1), 0.17, False),
+    (2, 128, 128, 16, 4, 64, False, True, (16, 16), 0.17, False),
 ]
 # fmt: on
 
 
 @pytest.mark.parametrize(
-    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, BWD, WINDOW_SIZE, DROPOUT",
+    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, BWD, WINDOW_SIZE, DROPOUT, RETURN_ATTN_PROBS",
     DENSE_CASES,
 )
 def test_flash_attn_func_correctness(
@@ -122,10 +132,13 @@ def test_flash_attn_func_correctness(
     BWD: bool,
     WINDOW_SIZE: tuple[int, int],
     DROPOUT: float,
+    RETURN_ATTN_PROBS: bool,
     dtype=torch.bfloat16,
 ):
-    """flash_attn_func with dao_ai, forward and backward, matches the PyTorch reference.
-    With dropout, the reference applies the dropout record that the forward returned."""
+    """flash_attn_func with dao_ai, forward and backward, matches the PyTorch reference, with
+    and without return_attn_probs. With dropout, the reference applies the forward's dropout
+    record; without return_attn_probs, the record of the same call with it (the dropout seeds
+    are fixed, so the pattern is the same)."""
     torch.cuda.empty_cache()
     torch.manual_seed(20)
     q = torch.randn(
@@ -156,8 +169,8 @@ def test_flash_attn_func_correctness(
         requires_grad=BWD,
     )
 
-    with torch.set_grad_enabled(BWD):
-        out, _, scores = flash_attn_func(
+    def call(return_attn_probs):
+        return flash_attn_func(
             q,
             k,
             v,
@@ -165,10 +178,18 @@ def test_flash_attn_func_correctness(
             window_size=WINDOW_SIZE,
             dropout_p=DROPOUT,
             return_lse=True,
-            return_attn_probs=True,
+            return_attn_probs=return_attn_probs,
             implementation="dao_ai",
         )
-    mask = scores >= 0 if DROPOUT else None
+
+    with torch.set_grad_enabled(BWD):
+        out, _, *scores = call(RETURN_ATTN_PROBS)
+    mask = None
+    if DROPOUT:
+        if not RETURN_ATTN_PROBS:
+            with torch.no_grad():
+                scores = call(True)[2:]
+        mask = scores[0] >= 0
 
     # For backward, attention_ref_with_tol derives each tensor's atol from the
     # fp32-vs-bf16 reference gap (upstream FA pattern).
@@ -232,7 +253,7 @@ def test_flash_attn_func_correctness(
 
 
 @pytest.mark.parametrize(
-    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, BWD, WINDOW_SIZE, DROPOUT",
+    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, BWD, WINDOW_SIZE, DROPOUT, RETURN_ATTN_PROBS",
     VARLEN_CASES,
 )
 def test_flash_attn_varlen_func_correctness(
@@ -246,11 +267,13 @@ def test_flash_attn_varlen_func_correctness(
     BWD: bool,
     WINDOW_SIZE: tuple[int, int],
     DROPOUT: float,
+    RETURN_ATTN_PROBS: bool,
     dtype=torch.bfloat16,
 ):
     """flash_attn_varlen_func with dao_ai, forward and backward, matches the PyTorch
-    reference. With dropout, the reference applies the dropout record that the forward
-    returned."""
+    reference, with and without return_attn_probs. With dropout, the reference applies the
+    forward's dropout record; without return_attn_probs, the record of the same call with it
+    (the dropout seeds are fixed, so the pattern is the same)."""
     torch.cuda.empty_cache()
     torch.manual_seed(20)
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -278,8 +301,8 @@ def test_flash_attn_varlen_func_correctness(
     k_unpad.requires_grad_(BWD)
     v_unpad.requires_grad_(BWD)
 
-    with torch.set_grad_enabled(BWD):
-        out_unpad, _, scores = flash_attn_varlen_func(
+    def call(return_attn_probs):
+        return flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -291,14 +314,20 @@ def test_flash_attn_varlen_func_correctness(
             window_size=WINDOW_SIZE,
             dropout_p=DROPOUT,
             return_lse=True,
-            return_attn_probs=True,
+            return_attn_probs=return_attn_probs,
             implementation="dao_ai",
         )
+
+    with torch.set_grad_enabled(BWD):
+        out_unpad, _, *scores = call(RETURN_ATTN_PROBS)
     out = output_pad_fn(out_unpad)
     mask = None
     if DROPOUT:
+        if not RETURN_ATTN_PROBS:
+            with torch.no_grad():
+                scores = call(True)[2:]
         # The record covers the longest real sequence; the rest is dropped.
-        scores = scores[:, :, :SEQLEN_Q, :SEQLEN_K]
+        scores = scores[0][:, :, :SEQLEN_Q, :SEQLEN_K]
         pad = (0, SEQLEN_K - scores.shape[3], 0, SEQLEN_Q - scores.shape[2])
         mask = torch.nn.functional.pad(scores, pad, value=-1.0) >= 0
 

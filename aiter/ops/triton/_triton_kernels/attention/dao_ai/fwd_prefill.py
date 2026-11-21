@@ -1743,7 +1743,12 @@ def attention_forward_prefill_triton_impl(
             sd_mask.stride(3),
         )
     else:
-        stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
+        # No score tensor: the dropout random numbers are still indexed as in a contiguous
+        # (batch, nheads_q, max_seqlens_q, max_seqlens_k) tensor, as the backward indexes them.
+        stride_sn = 1
+        stride_sm = max_seqlens_k
+        stride_sh = max_seqlens_q * max_seqlens_k
+        stride_sz = nheads_q * stride_sh
 
     if bias is not None:
         stride_bz, stride_bh, stride_bm, stride_bn = (
