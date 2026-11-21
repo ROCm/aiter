@@ -272,7 +272,7 @@ def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         df = pd.read_csv(tune_dict_csv)
         # Other backends share the CSV but must never enter the CK registry.
-        external = ("_ZN", "triton_", "flydsl_")
+        external = ("_ZN", "triton_", "flydsl_", "opus_")
         ck_rows = df[~df["kernelName"].astype(str).str.startswith(external)]
         registry = build_tune_dict(
             ck_rows,
