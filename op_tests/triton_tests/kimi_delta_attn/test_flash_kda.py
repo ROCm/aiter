@@ -14,6 +14,7 @@ error rather than allclose.
 """
 
 import contextlib
+import functools
 import importlib
 import inspect
 import math
@@ -33,6 +34,10 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
     flash_kda_supported,
+)
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils import index as _index
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
+    prepare_chunk_indices,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
@@ -1159,6 +1164,344 @@ def test_paged_cache_rejected_on_default_pipeline():
         )
 
 
+def _cu_seqlens_pair(lens):
+    """``cu_seqlens`` on the device and the same values on the host."""
+    host = torch.tensor([0, *lens], dtype=torch.int32, device="cpu").cumsum(0).int()
+    return host.to(device), host
+
+
+def test_cu_seqlens_cpu_issues_no_sync():
+    """With host bounds nothing synchronizes, cache miss included, and the
+    result equals the device-bounds call's.
+
+    The same call with only device bounds must trip the check, or the check
+    proves nothing.
+    """
+    lens, H = [100, 0, 257, 33], 4
+    args = make_inputs(1, sum(lens), H)
+    h0 = (
+        torch.randn(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+        * 0.1
+    )
+
+    def fresh(with_host):
+        # New tensors each time, so no identity cache can answer.
+        cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
+        cache, indices, _ = _paged_pool(len(lens), H, h0)
+        extra = {"cu_seqlens_cpu": cu_seqlens_cpu} if with_host else {}
+        return _kimi_kwargs(
+            *args,
+            cu_seqlens=cu_seqlens,
+            out=torch.full_like(args[2], float("nan")),
+            state_cache=cache,
+            state_indices=indices,
+            # Alternating, so both the load and the zero start are in the result.
+            has_initial_state=torch.arange(len(lens), device=device) % 2 == 0,
+            **extra,
+        )
+
+    chunk_kimi_delta_attn(**fresh(True))  # compile, autotune, pinned pool
+    host_kw, dev_kw = fresh(True), fresh(False)
+    torch.cuda.synchronize()
+    saved = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _flash_kda._build_metadata.cache_clear()  # take the upload path
+        chunk_kimi_delta_attn(**host_kw)
+        _flash_kda._build_metadata.cache_clear()
+        # ROCm builds of PyTorch say "HIP" (2.10) or "CUDA" (2.13) here.
+        with pytest.raises(RuntimeError, match=r"synchronizing (CUDA|HIP) operation"):
+            chunk_kimi_delta_attn(**dev_kw)
+    finally:
+        torch.cuda.set_sync_debug_mode(saved)
+    # The read-back raised before any kernel ran, so dev_kw is still fresh.
+    _flash_kda._build_metadata.cache_clear()
+    chunk_kimi_delta_attn(**dev_kw)
+    assert torch.equal(host_kw["out"], dev_kw["out"])
+    assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
+
+
+def _expected_chunk_indices(lens, chunk_size):
+    """``prepare_chunk_indices``' rows from the sequence lengths, by repeat_interleave
+    rather than by its loop."""
+    counts = torch.tensor([-(-n // chunk_size) for n in lens], device="cpu")
+    seq = torch.repeat_interleave(torch.arange(len(lens), device="cpu"), counts)
+    chunk = (
+        torch.arange(seq.numel(), device="cpu")
+        - (torch.cumsum(counts, 0) - counts)[seq]
+    )
+    return torch.stack([seq, chunk], 1).int()
+
+
+def test_prepare_chunk_indices_numbers_empty_sequences():
+    """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
+    lens, chunk_size = [0, 100, 0, 0, 257, 33], 64
+    cu_seqlens, _ = _cu_seqlens_pair(lens)
+    got = prepare_chunk_indices(cu_seqlens, chunk_size)
+    assert got.dtype == cu_seqlens.dtype and got.device == cu_seqlens.device
+    assert torch.equal(got.cpu(), _expected_chunk_indices(lens, chunk_size))
+
+
+def test_prepare_chunk_indices_keeps_a_cpu_tensor_on_the_cpu():
+    """A CPU cu_seqlens gives a CPU table: there is no stream to upload on."""
+    lens, chunk_size = [0, 100, 0, 257, 33], 64
+    _, host = _cu_seqlens_pair(lens)
+    got = prepare_chunk_indices(host, chunk_size)
+    assert got.dtype == host.dtype and got.device == host.device
+    assert torch.equal(got, _expected_chunk_indices(lens, chunk_size))
+
+
+# The metadata uploads are cached on the sequence bounds and shared across
+# streams: an upload queued on one stream is read on another. X and Y have
+# tables of the same size and different contents (the first two sequences swap
+# their chunk counts), so a table read before its upload landed, or after its
+# block was reused for another, differs from the right one. Z is a third set of
+# bounds.
+_C = FLASH_KDA_CHUNK
+_LENS_X, _LENS_Y, _LENS_Z = [2 * _C, _C, _C], [_C, 2 * _C, _C], [_C] * 4
+
+
+def _clear_upload_caches():
+    _flash_kda._build_metadata.cache_clear()
+    _index._chunk_indices_from_bounds.cache_clear()
+
+
+@functools.cache
+def _sleep_cycles_per_second():
+    n = 10_000_000
+    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    torch.cuda._sleep(n)  # the first launch is slow
+    torch.cuda.synchronize()
+    start.record()
+    torch.cuda._sleep(n)
+    end.record()
+    end.synchronize()
+    return n / (start.elapsed_time(end) / 1e3)
+
+
+def _gpu_sleep(seconds):
+    """Queue about ``seconds`` of idle device time on the current stream."""
+    torch.cuda._sleep(int(seconds * _sleep_cycles_per_second()))
+
+
+def _prepare_index(lens, n):
+    """``n`` launchers of ``prepare_chunk_indices`` on ``lens``. Inputs are built
+    and synchronized here; a launch queues the call and a copy of its table on
+    the current stream and returns the copy."""
+    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
+    torch.cuda.synchronize()
+    return [
+        lambda: prepare_chunk_indices(cu_seqlens, _C, cu_seqlens_cpu).clone()
+        for _ in range(n)
+    ]
+
+
+def _index_reference(lens):
+    """The table from its definition: a row [sequence, chunk in sequence] per chunk."""
+    rows = [[i, c] for i, n in enumerate(lens) for c in range(-(-n // _C))]
+    return torch.tensor(rows, dtype=torch.int32, device=device)
+
+
+def _prepare_flash(lens, n):
+    """``n`` launchers of ``chunk_kimi_delta_attn`` (varlen, host bounds, on the
+    FlashKDA path through a paged cache) on ``lens``, each with its own state
+    and output so that none allocates a small tensor in its call. A launch
+    queues the call on the current stream and returns the output."""
+    H = 4
+    args = make_inputs(1, sum(lens), H)
+    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
+    h0 = torch.zeros(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+    has_initial_state = torch.zeros(len(lens), device=device, dtype=torch.bool)
+
+    def launcher():
+        cache, indices, _ = _paged_pool(len(lens), H, h0)
+        out = torch.full_like(args[2], float("nan"))
+
+        def launch():
+            chunk_kimi_delta_attn(
+                **_kimi_kwargs(
+                    *args,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                    out=out,
+                    state_cache=cache,
+                    state_indices=indices,
+                    has_initial_state=has_initial_state,
+                )
+            )
+            return out
+
+        return launch
+
+    launchers = [launcher() for _ in range(n)]
+    torch.cuda.synchronize()
+    return launchers
+
+
+def _flash_reference(lens):
+    out = _prepare_flash(lens, 1)[0]()
+    torch.cuda.synchronize()
+    return out
+
+
+_UPLOAD_ROUTES = {
+    "index": (_prepare_index, _index_reference),
+    "flash": (_prepare_flash, _flash_reference),
+}
+
+
+@pytest.fixture
+def stream_pair():
+    """Two streams of different priority, so that a backlog on one is less likely
+    to hold up the other (the second-stream test checks that it does not)."""
+    _clear_upload_caches()
+    yield torch.cuda.Stream(priority=0), torch.cuda.Stream(priority=-1)
+    torch.cuda.synchronize()
+    _clear_upload_caches()
+
+
+@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
+def test_cached_metadata_on_second_stream_sees_the_upload(route, stream_pair):
+    """A cache hit on stream B waits for the copy stream A queued behind a
+    backlog, rather than reading the block before the copy lands."""
+    prepare, reference = _UPLOAD_ROUTES[route]
+    a, b = stream_pair
+    expected = reference(_LENS_X)
+    (launch_y,) = prepare(_LENS_Y, 1)
+    launch_a, launch_b = prepare(_LENS_X, 2)
+    # Leave A's allocator a freed block that holds Y's table, for X's miss.
+    with torch.cuda.stream(a):
+        launch_y()
+    a.synchronize()
+    _clear_upload_caches()
+    with torch.cuda.stream(a):
+        _gpu_sleep(0.5)
+        launch_a()  # the miss: its copy queues behind the sleep
+    with torch.cuda.stream(b):
+        got = launch_b()  # the hit
+    torch.cuda.synchronize()
+    assert torch.equal(got, expected)
+
+
+def test_cached_metadata_outlives_its_eviction_on_second_stream(stream_pair):
+    """The cache may evict a table that stream B's queued kernels still read: its
+    block must not be handed to a new upload before B is done.
+
+    Through ``prepare_chunk_indices`` only: the FlashKDA call site shares
+    ``wait_for_upload``, and a variant through it passed with ``record_stream``
+    removed, so it could not tell.
+    """
+    prepare, reference = _UPLOAD_ROUTES["index"]
+    a, b = stream_pair
+    expected = reference(_LENS_X)
+    (launch_y,) = prepare(_LENS_Y, 1)
+    launch_a, launch_b = prepare(_LENS_X, 2)
+    with torch.cuda.stream(a):
+        launch_a()  # X's miss, uploaded on A
+    a.synchronize()
+    with torch.cuda.stream(b):
+        _gpu_sleep(0.5)
+        got = launch_b()  # the hit: its kernels queue behind the sleep
+    _clear_upload_caches()  # X's table is evicted while B has yet to read it
+    with torch.cuda.stream(a):
+        launch_y()  # an upload of the same size, onto X's block if it was freed
+    torch.cuda.synchronize()
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
+def test_second_stream_hit_does_not_wait_for_later_work(route, stream_pair):
+    """A hit on stream B waits for the copy only, not for work queued on stream A
+    after it."""
+    prepare, _ = _UPLOAD_ROUTES[route]
+    a, b = stream_pair
+    launch_a, launch_warm, launch_b = prepare(_LENS_X, 3)
+    with torch.cuda.stream(a):
+        launch_a()
+    a.synchronize()
+    with torch.cuda.stream(b):
+        launch_warm()
+    b.synchronize()
+    backlog_done = torch.cuda.Event()
+    with torch.cuda.stream(a):
+        _gpu_sleep(0.5)
+        backlog_done.record(a)
+    # Work unrelated to the upload must get past the backlog, or the two streams
+    # do not run alongside each other here and this test cannot tell.
+    control = torch.cuda.Event()
+    with torch.cuda.stream(b):
+        torch.ones(1, device=device, dtype=torch.float32).add_(1)
+        control.record(b)
+    control.synchronize()
+    if backlog_done.query():
+        pytest.skip("stream B does not run alongside stream A's backlog on this device")
+    hit_done = torch.cuda.Event()
+    with torch.cuda.stream(b):
+        launch_b()
+        hit_done.record(b)
+    hit_done.synchronize()
+    assert not backlog_done.query(), "the hit waited for work queued after the upload"
+
+
+@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
+def test_graph_replay_after_metadata_cache_eviction(route):
+    """A graph replays the table it captured at a fixed address, so the table
+    outlives its eviction from the cache and its block is not reused."""
+    prepare, reference = _UPLOAD_ROUTES[route]
+    _clear_upload_caches()
+    expected = reference(_LENS_X)
+    (launch_y,) = prepare(_LENS_Y, 1)
+    launch_x, launch_captured = prepare(_LENS_X, 2)
+    launch_x()  # compile, autotune and the cache entry the capture hits
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch_captured()
+    _clear_upload_caches()
+    launch_y()  # an upload of the same size, onto the table's block if it was freed
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, expected)
+    _clear_upload_caches()
+
+
+@pytest.mark.parametrize("route", _UPLOAD_ROUTES)
+def test_metadata_cache_miss_during_capture_raises(route):
+    """Building a table in capture would bake a read of a host buffer into the
+    graph, so a miss there raises, and the capture ends cleanly."""
+    prepare, reference = _UPLOAD_ROUTES[route]
+    _clear_upload_caches()
+    (launch_warm,) = prepare(_LENS_X, 1)
+    launch_miss, launch_after = prepare(_LENS_Z, 2)
+    launch_warm()  # compile and autotune
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="cannot be built during graph capture"),
+        torch.cuda.graph(graph),
+    ):
+        # A node, so the capture can end.
+        torch.ones(1, device=device, dtype=torch.float32).add_(1)
+        launch_miss()
+    assert not torch.cuda.is_current_stream_capturing()
+    got = launch_after()
+    torch.cuda.synchronize()
+    assert torch.equal(got, reference(_LENS_Z))
+    _clear_upload_caches()
+
+
+def test_prepare_chunk_indices_under_cuda_default_device():
+    """Factory calls follow the default device, and only CPU tensors can be pinned,
+    so the staging tensor is made on the CPU explicitly."""
+    cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(_LENS_Z)
+    _clear_upload_caches()
+    with torch.device(device):
+        got = prepare_chunk_indices(cu_seqlens, _C, cu_seqlens_cpu)
+    assert torch.equal(got, _index_reference(_LENS_Z))
+    _clear_upload_caches()
+
+
 def _bands(*xs, skew=0):
     """``xs`` as the bands of one fused tensor, as a fused input projection
     gives them. ``skew`` leading pad elements break the 16-byte alignment."""
@@ -1328,6 +1671,7 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "state_cache": cache,
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+        "cu_seqlens_cpu": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
