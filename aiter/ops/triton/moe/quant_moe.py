@@ -94,10 +94,25 @@ def downcast_to_mxfp(
     kernel_quant_tensor = out_quant_tensor.view(-1, out_quant_tensor.shape[-1])
     kernel_scale = out_scale.view(-1, out_scale.shape[-1])
 
+    rows, cols = kernel_src_tensor.shape
+    num_warps = 8
     BLOCK_OUT_DIM = 128
     BLOCK_QUANT_DIM = 32
-    grid_out = triton.cdiv(kernel_src_tensor.shape[0], BLOCK_OUT_DIM)
-    grid_quant = triton.cdiv(kernel_src_tensor.shape[1], BLOCK_QUANT_DIM)
+    grid_out = triton.cdiv(rows, BLOCK_OUT_DIM)
+    if get_arch() == "gfx1250" and cols >= 256:
+        # 128x32 tiles write 1 B of each scale row and 32 B of each payload row,
+        # so many CTAs share every cache line. Use wide tiles instead (measured
+        # faster for cols >= 256 only).
+        if cols <= 1024 or (cols <= 2048 and rows >= 4096):
+            BLOCK_OUT_DIM, BLOCK_QUANT_DIM = 32, 128
+        else:
+            BLOCK_OUT_DIM, BLOCK_QUANT_DIM = 16, 256
+        num_warps = 4
+        # CTAs go round-robin over the 8 XCDs. With grid dim 0 a multiple of 8,
+        # all CTAs of a row block run on one XCD, so no cache line is written
+        # from two XCDs (2-3x faster). The row masks drop the extra CTAs.
+        grid_out = triton.cdiv(triton.cdiv(rows, BLOCK_OUT_DIM), 8) * 8
+    grid_quant = triton.cdiv(cols, BLOCK_QUANT_DIM)
 
     _downcast_to_mxfp[(grid_out, grid_quant)](
         kernel_quant_tensor,
@@ -111,7 +126,7 @@ def downcast_to_mxfp(
         BLOCK_QUANT_DIM,
         DEQUANT_SCALE_ROUNDING_MODE.value,
         pow2_scale,
-        num_warps=8,
+        num_warps=num_warps,
     )
 
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)

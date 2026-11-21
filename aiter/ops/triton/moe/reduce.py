@@ -16,9 +16,17 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
         reduce_grouped_gluon_num_warps as _reduce_grouped_gluon_num_warps,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
+        reduce_grouped_valid_gluon as _reduce_grouped_valid_gluon,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
+        reduce_grouped_valid_gluon_config as _reduce_grouped_valid_gluon_config,
+    )
 except (ImportError, ModuleNotFoundError):
     _reduce_grouped_gluon = None
     _reduce_grouped_gluon_num_warps = None
+    _reduce_grouped_valid_gluon = None
+    _reduce_grouped_valid_gluon_config = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,7 @@ def reduce_grouped(
     swiglu_add_residual: bool = True,
     residual: torch.Tensor | None = None,
     indx_valid: torch.Tensor | None = None,
+    num_rows: torch.Tensor | None = None,
 ):
     """
     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
@@ -169,6 +178,10 @@ def reduce_grouped(
     - Memory traffic per group is approximately (valid_rows_read + 1) * N * sizeof(x),
       plus index reads. With no invalid entries, this becomes (K + 1) reads/writes
       of length N per group.
+
+    - num_rows: optional (1,) int32 device tensor, with indx_valid: groups at or past it
+      MAY be left unwritten (the EP receive-buffer padding, whose gates are all dead). Only
+      for consumers that never read those rows; the kernels without it write zeros there.
 
     Returns
     - The output tensor `out`.
@@ -191,7 +204,6 @@ def reduce_grouped(
     # Gluon path on gfx1250 for the plain grouped combine; swiglu-fused (MoE1 split-k) reductions, reduction_n != 1, and non-contiguous inputs stay on the Triton _reduce_grouped.
     use_gluon = (
         is_tdm_avail()
-        # the gluon reduce has no per-gate validity support
         and indx_valid is None
         and indx is not None
         and not apply_swiglu
@@ -200,6 +212,55 @@ def reduce_grouped(
         and x.is_contiguous()
         and indx.is_contiguous()
     )
+    # Expert-parallel combine (per-gate validity): the Gluon masked-load reduce, bit-identical to _reduce_grouped.
+    use_gluon_valid = (
+        _reduce_grouped_valid_gluon is not None
+        and is_tdm_avail()
+        and indx_valid is not None
+        and indx is not None
+        and not apply_swiglu
+        and reduction_n == 1
+        and x.ndim == 3
+        and x.stride(2) == 1
+        and out.stride(1) == 1
+        and indx.is_contiguous()
+        and indx_valid.is_contiguous()
+        and (residual is None or residual.stride(1) == 1)
+    )
+    if use_gluon_valid:
+        B, M, N = x.shape
+        block_n, vec, nw = _reduce_grouped_valid_gluon_config(N, x.element_size())
+        # all loads of a lane stay in flight: at most 32 (K=8, B=1, N=2048: 16 or 32); more -> _reduce_grouped
+        use_gluon_valid = K * B * (block_n // (vec * 32 * nw)) <= 32
+    if use_gluon_valid:
+        has_ext_residual = residual is not None
+        if has_ext_residual:
+            assert residual.shape == out.shape, (
+                f"residual.shape {tuple(residual.shape)} must match "
+                f"out.shape {tuple(out.shape)}"
+            )
+        _reduce_grouped_valid_gluon[(num_groups, triton.cdiv(N, block_n))](
+            x,
+            out,
+            indx,
+            indx_valid,
+            residual if has_ext_residual else out,
+            num_rows,
+            x.stride(0),
+            x.stride(1),
+            out.stride(0),
+            residual.stride(0) if has_ext_residual else 0,
+            N=N,
+            BLOCK_N=block_n,
+            B=B,
+            K=K,
+            VEC=vec,
+            NUM_WARPS=nw,
+            HAS_EXT_RESIDUAL=has_ext_residual,
+            num_warps=nw,
+        )
+        return out
+
     if use_gluon:
         B, M, N = x.shape[0], x.shape[1], x.shape[2]
         npad = triton.next_power_of_2(N)

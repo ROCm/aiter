@@ -8,7 +8,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
     _ep_gate_prep_scan_kernel,
-    _ep_scatter_atomic_expt_data_kernel,
+    _ep_scatter_expt_data_kernel,
+    _ep_sort_fused_kernel,
 )
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
@@ -542,6 +543,16 @@ class EpScatterGeometry:
 # below is paid once per process rather than once per layer per step.
 _EP_SORT_SCRATCH = {}
 
+# Up to this many gates one CTA does the whole sort in one launch.
+_EP_SORT_ONE_CTA_MAX = 512
+# Two-kernel sort: (largest n_gates, gates per CTA, num_warps), measured on
+# gfx1250. A CTA sorts its gates, so smaller blocks are faster, but each CTA also
+# sums the histograms of the CTAs in front of it.
+_EP_SORT_TILES = ((4096, 256, 4), (32768, 512, 4), (65536, 1024, 8), (None, 2048, 16))
+# Up to this many CTAs each CTA of kernel B sums all per-CTA histograms itself:
+# kernel A then needs no grid-wide join (no atomics, no ticket).
+_EP_SORT_NO_JOIN_MAX_CTAS = 1024
+
 
 def _ep_sort_scratch(device, n_bins):
     key = (device, n_bins)
@@ -575,18 +586,23 @@ def ep_sort_routing(
     belong to this rank. Non-local entries go to a sentinel bin that the caller
     slices off the histogram, so the matmul schedules no block for them.
 
-    Atomic-cursor prep+sort, 2 kernels and no memset:
+    Up to ``_EP_SORT_ONE_CTA_MAX`` gates one CTA does all of it in one launch.
+    Above, 2 kernels and no memset:
 
-    A  : gating + histogram + (last CTA) scan + ExptData stage1  (grid: n_ctas)
-    B  : atomic-cursor scatter | ExptData stage2                 (grid: E + n_ctas)
+    A  : gating + per-CTA histogram                       (grid: n_ctas)
+    B  : sorted scatter + ExptData | ExptData stage2      (grid: E + n_ctas)
+
+    Each CTA of B sums the per-CTA histograms itself. Above
+    ``_EP_SORT_NO_JOIN_MAX_CTAS`` CTAs, A joins the histograms with atomics and
+    a ticket instead (last CTA: scan + ExptData stage1). Each expert's rows are
+    in ascending gate order, so the outputs do not depend on the CTA schedule.
 
     ``expt_data_bufs`` is what ``_compute_expt_data_internal`` returns; the caller
-    allocates it so kernel A can fill it in the same launch as the histogram
-    scan. Returns ``(hist, topk_indx, gate_indx, gate_scal, gate_valid,
-    dst_row)`` with
-    the ExptData buffers filled in place. ``hist`` has ``next_pow2(E + 1)``
+    allocates it so the sort can fill it in the same launches. Returns ``(hist,
+    topk_indx, gate_indx, gate_scal, gate_valid, dst_row)`` with
+    the ExptData buffers filled in place. ``hist`` has ``next_pow2(E)``
     entries -- the caller wants ``hist[:num_local_experts]``, since the tail
-    holds the sentinel (non-local) count.
+    holds no rows.
 
     ``gate_valid`` is the piece ``routing()`` has no need for: it marks which
     gate slots this rank actually owns, in flat gate order (``row * topk +
@@ -594,47 +610,93 @@ def ep_sort_routing(
 
     With ``ep_scatter_geometry`` (an ``EpScatterGeometry``) the returned tuple
     gains a sixth entry, ``dst_row``: where each sorted row must be delivered for
-    a scatter-fused combine. It is None otherwise.
+    a scatter-fused combine (-1 past the live rows). It is None otherwise.
 
-    SINGLE STREAM ONLY. The histogram and join counter are process-persistent and
-    re-armed by the kernel that drains them, so two concurrent calls sharing a
-    device would interleave into the same counters. Cheap escape hatch if that is
-    ever needed: key _EP_SORT_SCRATCH on the current stream as well as the
-    device.
+    SINGLE STREAM ONLY above ``_EP_SORT_NO_JOIN_MAX_CTAS`` CTAs. The histogram
+    and join counter are process-persistent and re-armed by the kernel that
+    drains them, so two concurrent calls sharing a device would interleave into
+    the same counters. Cheap escape hatch if that is ever needed: key
+    _EP_SORT_SCRATCH on the current stream as well as the device.
     """
     device = dispatch_ids.device
     sentinel = num_local_experts
-    GATE_BLOCK = 256
-    # next_pow2(E + 1), not next_pow2(E): keeps SENTINEL a valid index so the
-    # masked-off atomic on a dead gate still forms an in-bounds address.
-    n_bins = triton.next_power_of_2(sentinel + 1)
-    n_ctas = triton.cdiv(n_gates, GATE_BLOCK)
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK_A, block_m_log2 = (
+    # No bin for SENTINEL: the dead gates are never counted.
+    n_bins = triton.next_power_of_2(sentinel)
+    token_offs_raw, token_offs_pad, block_pid_map, blocks1, _, block_m_log2 = (
         expt_data_bufs
     )
     # The fused grid recovers the gate CTA as pid - N_EXPTS, so the expt_data
     # half must be exactly num_local_experts CTAs wide.
     assert blocks1 == num_local_experts, f"{blocks1} != {num_local_experts}"
 
-    hist_atomic, ticket = _ep_sort_scratch(device, n_bins)
     gate_valid = torch.empty(n_gates, dtype=torch.int32, device=device)
-    expt_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     hist = torch.empty(n_bins, dtype=torch.int32, device=device)
-    cursor = torch.empty(n_bins, dtype=torch.int32, device=device)
-    # Not zero_()/full_(): kernel A pre-fills it with the "skip" sentinel over the
-    # grid it is already running, so this stays a bare allocation.
+    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
+    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
+    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
+    # Not zero_()/full_(): the sort fills the "do not deliver" tail with -1 over
+    # the grid it is already running, so this stays a bare allocation.
     if ep_scatter_geometry is None:
         dst_row = None
         src_token_map = None
+        max_tok = 0
+        peer_rows = 0
     else:
         dst_row = torch.empty(n_gates, dtype=torch.int32, device=device)
         src_token_map = ep_scatter_geometry.src_token_map
+        max_tok = ep_scatter_geometry.max_tokens_per_rank
+        peer_rows = ep_scatter_geometry.peer_rows
+
+    if n_gates <= _EP_SORT_ONE_CTA_MAX:
+        block = triton.next_power_of_2(max(n_gates, 16))
+        _ep_sort_fused_kernel[(1,)](
+            dispatch_ids,
+            expert_map,
+            num_local_tokens,
+            dispatch_weights,
+            src_token_map,
+            gate_valid,
+            hist,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            dst_row,
+            block_pid_map.shape[0],
+            n_gates,
+            expert_map.numel(),
+            N_EXPTS=num_local_experts,
+            TOPK=topk,
+            SENTINEL=sentinel,
+            N_BINS=n_bins,
+            BLOCK=block,
+            LOG2_BLOCK=block.bit_length() - 1,
+            tile_dim_log2=block_m_log2,
+            TILE_BLOCK=4,
+            MEMSET_BLOCK=256,
+            HAS_DST_ROW=dst_row is not None,
+            MAX_TOK=max_tok,
+            PEER_ROWS=peer_rows,
+            num_warps=1 if block <= 128 else 4,
+        )
+        return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
+
+    block, num_warps = next(
+        (b, w) for top, b, w in _EP_SORT_TILES if top is None or n_gates <= top
+    )
+    n_ctas = triton.cdiv(n_gates, block)
+    join = n_ctas > _EP_SORT_NO_JOIN_MAX_CTAS
+    hist_atomic, ticket = _ep_sort_scratch(device, n_bins)
+    cursor = torch.empty(n_bins, dtype=torch.int32, device=device)
+    cta_hist = torch.empty((n_ctas, n_bins), dtype=torch.int32, device=device)
     _ep_gate_prep_scan_kernel[(n_ctas,)](
         dispatch_ids,
         expert_map,
         num_local_tokens,
         gate_valid,
-        expt_indx,
+        cta_hist,
         hist_atomic,
         ticket,
         hist,
@@ -650,42 +712,48 @@ def ep_sort_routing(
         TOPK=topk,
         SENTINEL=sentinel,
         N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
+        BLOCK=block,
         tile_dim_log2=block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(num_local_experts == BLOCK_A),
-        N_CTAS=n_ctas,
+        MEMSET_BLOCK=1024,
         HAS_DST_ROW=dst_row is not None,
+        JOIN=join,
+        num_warps=num_warps,
     )
 
-    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_scatter_atomic_expt_data_kernel[(num_local_experts + n_ctas,)](
-        expt_indx,
+    _ep_scatter_expt_data_kernel[(num_local_experts + n_ctas,)](
+        dispatch_ids,
+        expert_map,
+        num_local_tokens,
         dispatch_weights,
+        cta_hist,
         cursor,
         topk_indx,
         gate_indx,
         gate_scal,
         hist,
+        token_offs_raw,
         token_offs_pad,
         block_pid_map,
         dst_row,
         src_token_map,
+        block_pid_map.shape[0],
         n_gates,
+        expert_map.numel(),
+        n_ctas,
         N_EXPTS=num_local_experts,
-        SENTINEL=sentinel,
-        tile_dim_log2=block_m_log2,
-        GATE_BLOCK=GATE_BLOCK,
-        HAS_DST_ROW=dst_row is not None,
         TOPK=topk,
-        MAX_TOK=(
-            0
-            if ep_scatter_geometry is None
-            else ep_scatter_geometry.max_tokens_per_rank
-        ),
-        PEER_ROWS=(0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows),
+        SENTINEL=sentinel,
+        N_BINS=n_bins,
+        BLOCK=block,
+        LOG2_BLOCK=block.bit_length() - 1,
+        PREFIX_ROWS=min(256, triton.next_power_of_2(n_ctas)),
+        tile_dim_log2=block_m_log2,
+        MEMSET_BLOCK=256,
+        HAS_DST_ROW=dst_row is not None,
+        JOIN=join,
+        MAX_TOK=max_tok,
+        PEER_ROWS=peer_rows,
+        num_warps=num_warps,
     )
     return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
 
