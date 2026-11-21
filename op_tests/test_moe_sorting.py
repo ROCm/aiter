@@ -122,6 +122,12 @@ def set_moe_sorting_backend(backend: str) -> None:
 NO_PROGRESS_TIMEOUT_S = 300
 
 
+def _hang_guarded_child(worker, device_id, progress, *args):
+    # A spawned child starts on the default GPU; keep it on the parent's.
+    torch.cuda.set_device(device_id)
+    worker(progress, *args)
+
+
 def _run_in_hang_guard(worker, args, label):
     """Run worker(progress, *args) in a spawned child and return its rows.
 
@@ -132,7 +138,10 @@ def _run_in_hang_guard(worker, args, label):
     """
     ctx = multiprocessing.get_context("spawn")
     progress = ctx.Queue()
-    proc = ctx.Process(target=worker, args=(progress, *args))
+    proc = ctx.Process(
+        target=_hang_guarded_child,
+        args=(worker, torch.cuda.current_device(), progress, *args),
+    )
     proc.start()
     rows, current, done = [], "process start", False
     deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
@@ -198,6 +207,47 @@ def _warm_moe_sorting(backend, dtype, model_dim, topk):
         torch.cuda.synchronize()
     finally:
         fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING = saved_backend
+
+
+def _assert_routing_exact(ref, out, topk, num_rows, case):
+    """Compare what a sort copies or counts exactly: ids, counts and weights.
+
+    The shared comparator's 1% rtol and 0.01 atol would accept a count of 257 for
+    256, expert id 801 for 800, or a 0.060 weight swapped with a 0.065 one (top-k
+    weights here are all about 1/topk).
+    """
+    ids_a, weights_a, experts_a, count_a = ref
+    _ids_b, weights_b, experts_b, count_b = out[:4]
+    live = ids_a != (topk << 24 | num_rows)
+    used = experts_a != -1
+    assert torch.equal(count_b[:1], count_a[:1]), f"num_valid_ids at {case}"
+    assert torch.equal(experts_b[used], experts_a[used]), f"expert ids at {case}"
+    assert torch.equal(weights_b[live], weights_a[live]), f"sorted weights at {case}"
+
+
+def _check_routing_exact_controls():
+    """The exact check above must reject each corruption it exists for."""
+    ids = torch.tensor([3 << 24 | 5, 0, 3 << 24 | 5, 3 << 24 | 5], dtype=torch.int32)
+    weights = torch.tensor([0.060, 0.065, 0.0, 0.0])
+    experts = torch.tensor([7, 800, -1], dtype=torch.int32)
+    count = torch.tensor([256, 5], dtype=torch.int32)
+    ref = (ids, weights, experts, count)
+
+    def rejected(index, value):
+        out = [t.clone() for t in ref] + [None]
+        out[index] = value
+        try:
+            _assert_routing_exact(ref, out, 3, 5, "control")
+        except AssertionError:
+            return True
+        return False
+
+    _assert_routing_exact(ref, [t.clone() for t in ref] + [None], 3, 5, "control")
+    assert rejected(1, weights[[1, 0, 2, 3]]), "swapped weights passed"
+    assert rejected(
+        2, torch.tensor([7, 801, -1], dtype=torch.int32)
+    ), "expert id passed"
+    assert rejected(3, torch.tensor([257, 5], dtype=torch.int32)), "count passed"
 
 
 def run_torch_moe_sorting(
@@ -781,6 +831,7 @@ CK_LDS_FALLBACK_EXPERTS = (818, 819, 896)
 def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
     """Child process for test_moe_sorting_ck_large_expert_no_hang."""
     set_moe_sorting_backend("ck")
+    _check_routing_exact_controls()
     for E, block_size, has_expert_mask, token in itertools.product(
         CK_LDS_FALLBACK_EXPERTS, (16, 32, 64), (False, True), (1, 64)
     ):
@@ -810,11 +861,7 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
         errs = _compare_moe_sorting_outputs(ref, out, topk, token)
         bad = {name: err for name, err in errs.items() if err}
         assert not bad, f"CK moe_sorting mismatch at {case}: {bad}"
-        # The comparator's 1% rtol would accept a count of 257 for 256 or expert
-        # id 801 for 800; both steer the GEMM, so compare them exactly here.
-        assert torch.equal(out[3][:1], ref[3][:1]), f"num_valid_ids at {case}"
-        used = ref[2] != -1
-        assert torch.equal(out[2][used], ref[2][used]), f"expert ids at {case}"
+        _assert_routing_exact(ref, out, topk, token, case)
         case["err"] = max(errs.values())
         progress.put(("row", case))
 
