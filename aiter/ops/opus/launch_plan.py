@@ -18,6 +18,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
+    canonical_output_dtype,
     get_kernel_instance,
     group_kids,
 )
@@ -32,6 +33,13 @@ _GFX1250_FUSED_SPLITK_TAG = "a16w16_clusterlaunch_tdm_splitk_fuse"
 _GFX1250_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# A16W16 kernels other than the 4g_safe and gfx1250 CO ones form operand
+# offsets in 32-bit int and give each operand one buffer descriptor with a
+# 32-bit size, so A, B and C must each stay below 4 GiB (the gfx950
+# split-barrier kernels limit C to 2^31 elements instead). Their split-K reduce
+# kernels read the whole workspace through one such descriptor as well; the
+# gfx1250 fused split-K kernel addresses its workspace per tile instead.
+_A16W16_BUFFER_LIMIT_BYTES = 1 << 32
 
 
 @dataclass(frozen=True)
@@ -325,6 +333,32 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} does not support output dtype " f"{output_dtype}"
         )
 
+    buffer_limited = (
+        not instance.is_4g_safe and instance.kernel_tag not in _GFX1250_CO_TAGS
+    )
+    if buffer_limited:
+        c_elem_bytes = 2 if canonical_output_dtype(output_dtype) == "bf16_t" else 4
+        c_limit = _A16W16_BUFFER_LIMIT_BYTES // c_elem_bytes
+        if registry_arch == GFX950 and instance.kernel_tag == "a16w16":
+            # These kernels give C no descriptor size and move its base by
+            # row * stride_c in int, so C is limited in elements, not bytes.
+            c_limit = 1 << 31
+        operand_limits = {
+            "A": (batch * M * K, _A16W16_BUFFER_LIMIT_BYTES // 2),
+            "B": (batch * N * K, _A16W16_BUFFER_LIMIT_BYTES // 2),
+            "C": (batch * M * N, c_limit),
+        }
+        over = [
+            f"{name}={elems} (limit {limit})"
+            for name, (elems, limit) in operand_limits.items()
+            if elems >= limit
+        ]
+        if over:
+            raise ValueError(
+                f"OPUS kid {resolved_kid} uses 32-bit operand offsets and cannot "
+                f"address {', '.join(over)} elements (4g_safe kids have no "
+                "such limit)"
+            )
     if instance.max_m is not None and M > instance.max_m:
         raise ValueError(
             f"OPUS kid {resolved_kid} requires M <= {instance.max_m}; got M={M}"
@@ -419,6 +453,21 @@ def _build_a16w16_launch_plan(
         M=M,
         N=N,
     )
+    if (
+        buffer_limited
+        and workspace_spec is not None
+        and instance.kernel_tag != _GFX1250_FUSED_SPLITK_TAG
+    ):
+        workspace_bytes = workspace_spec.dtype.itemsize
+        for extent in workspace_spec.shape:
+            workspace_bytes *= extent
+        if workspace_bytes >= _A16W16_BUFFER_LIMIT_BYTES:
+            raise ValueError(
+                f"OPUS kid {resolved_kid} reduces split-K partials through a "
+                "32-bit buffer descriptor, so its workspace (split_k x padded "
+                f"M x padded N) must be smaller than 4 GiB; got {workspace_bytes} "
+                f"bytes with split_k={workspace_capacity_split_k}"
+            )
     return A16W16LaunchPlan(
         registry_arch=registry_arch,
         resolved_kid=resolved_kid,
