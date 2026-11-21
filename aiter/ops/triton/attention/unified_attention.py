@@ -516,7 +516,83 @@ def unified_attention(
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
 ):
-    assert causal, "Only causal attention is supported"
+    """Paged attention for a varlen batch of query tokens.
+
+    The query tokens are the last positions of their sequence. With causal=True
+    a token sees the keys up to its own position; with causal=False it sees all
+    keys of its sequence.
+
+    Args:
+        q: [num_tokens, num_query_heads, head_size] queries. An fp4 q
+            (torch.uint8) packs two values in each byte.
+        k, v: [num_blocks, block_size, num_kv_heads, head_size] paged key and
+            value caches. With shuffled_kv_cache, k is [num_blocks,
+            num_kv_heads, head_size // x, block_size, x] and v is [num_blocks,
+            num_kv_heads, block_size // x, head_size, x], with x elements in
+            16 bytes. An fp4 cache (torch.uint8) also holds its scales.
+        out: [num_tokens, num_query_heads, head_size_v] output, written in place.
+        cu_seqlens_q: [num_seqs + 1] offsets of the query tokens of each sequence.
+        max_seqlen_q: the largest query length. 1 selects the decode path.
+        seqused_k: [num_seqs] int32 or int64 key count of each sequence.
+        max_seqlen_k: an upper bound of seqused_k, for example the bound that a
+            CUDA graph captures. It selects the kernel and sizes the split.
+        softmax_scale: the scale of the query-key products.
+        causal: if True, mask the keys after each query token.
+        window_size: (left, right). left >= 0 keeps the last left + 1 keys of
+            each query token. (-1, -1) and (-1, 0) have no window. The kernels
+            do not read right; causal=False rejects right > 0.
+        block_table: [num_seqs, max_num_blocks_per_seq] page of each block of
+            keys.
+        softcap: tanh soft cap of the scores. 0 disables it.
+        q_descale, k_descale, v_descale: [1] float32 dequantization scales of
+            an fp8 q, k and v, or None.
+        q_scales: fp8 block scales of an fp4 q. An fp4 q requires them.
+        alibi_slopes: [num_query_heads] float32 ALiBi slopes, or None.
+        output_scale: [1] float32. The kernels divide the output by it, for
+            example to quantize it to fp8. None disables it.
+        qq_bias: [max_seqlen_q, max_seqlen_q] float32 bias that adds to the
+            scores of a query token and the query tokens of its sequence.
+        sinks: [num_query_heads] float32 attention sink logits, or None.
+        shuffled_kv_cache: k and v use the pre-shuffled layout.
+        skip_reduce: return the unmerged split-KV segments.
+        backend: "triton" or "gluon". None selects Gluon where it is available.
+
+    Returns:
+        out. With skip_reduce and a launch that splits the keys into segments,
+        the float32 tuple (segm_output, segm_max, segm_expsum) of shapes
+        [num_tokens, num_query_heads, num_segments, head_size_v padded to a
+        power of 2] and [num_tokens, num_query_heads, num_segments] (twice).
+
+    Limits:
+        Non-causal attention does not support a sliding window, ALiBi, a
+        query-query bias or an fp4 q or cache. The Gluon kernels are
+        causal-only, so non-causal calls run the Triton kernels, except a
+        decode batch (max_seqlen_q == 1), which keeps Gluon where available.
+        Non-causal calls with max_seqlen_q > 1 raise on gfx1250 (not validated).
+    """
+    # Checked before the decode case below turns causal on, so a decode batch
+    # rejects them too; raised rather than asserted, so python -O keeps them.
+    if not causal:
+        # The kernels read only the left size; (-1, 0) and (-1, -1) have no window, and
+        # a right size above 0 would be ignored, so it is rejected too.
+        if window_size[0] >= 0 or window_size[1] > 0:
+            raise ValueError("Non-causal attention does not support a sliding window")
+        if alibi_slopes is not None or qq_bias is not None:
+            raise ValueError(
+                "Non-causal attention does not support ALiBi or a query-query bias"
+            )
+        if q.dtype == torch.uint8 or k.dtype == torch.uint8 or v.dtype == torch.uint8:
+            raise ValueError(
+                "Non-causal attention does not support an fp4 Q or KV cache"
+            )
+    ALL_DECODE = int(max_seqlen_q) == 1
+    if not causal and not ALL_DECODE and IS_DEVICE_ARCH_GFX12:
+        raise ValueError(
+            "Non-causal attention with more than one query token is not validated on gfx1250"
+        )
+    # A decode query sees all keys either way, so it keeps the causal kernels.
+    non_causal = not causal
+    causal = causal or ALL_DECODE
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -525,6 +601,10 @@ def unified_attention(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels;
+    # a non-causal decode batch keeps Gluon where it is available.
+    if not causal or (non_causal and not _is_gluon_available()):
+        backend = "triton"
     if backend == "gluon":
         assert (
             _is_gluon_available()
@@ -631,7 +711,6 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
-    ALL_DECODE = int(max_seqlen_q) == 1
     # With equal_seqlen_q, seq i's queries are q rows [i, i + 1) * max_seqlen_q.
     # Trailing pad seqs may have no rows behind them so long as their seqused_k
     # is 0: the launches stop at the last seq with rows, and both kernels return
@@ -1095,6 +1174,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
         enable_fp_fusion=True,
     )
@@ -1172,6 +1252,7 @@ def _unified_attention_3d_triton(
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        CAUSAL=params.causal,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
