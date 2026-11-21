@@ -1,4 +1,5 @@
 #pragma once
+#include "fmha_fwd_softmax_scale.hpp"
 #include "op_gemm.hpp"
 
 // ================================================================
@@ -17,10 +18,8 @@
 //   incrementally so the kernel never materializes the full score row.
 //
 // DEFERRED SCALE
-//   GEMM0 emits RAW (unscaled) scores. The softmax scale (1/sqrt(d) folded into
-//   log2e) is NOT applied here — it is fused into the exp2 argument in
-//   softmax_exp2 as exp2(scale*S - scale*m). Carrying S unscaled keeps mask /
-//   max bookkeeping in raw units and saves a multiply pass over S_acc.
+//   GEMM0 produces unscaled scores. Apply the mask and find the row maximum
+//   before scaling their difference for exp2.
 //
 // S_acc distribution (TransposedC, groups-of-8 via SwizzleA):
 //   m_row = (lane%32) + 32*warp  — each lane owns ONE M-row
@@ -45,9 +44,8 @@
 //       = kv_offset + 32 + (i/8)*16 + k_sub*8 + (i%8)  [for n1 tile]
 //
 // softmax_mask<HasMask>: set masked S_acc entries to -INF in place.
-//   The -INF survives the deferred scale (fmaf(scale, -INF, ...) = -INF) and
-//   becomes exp2(-INF) = 0 in softmax_exp2, so masked columns contribute nothing
-//   to either the row max or the row sum.
+//   With a positive scale and a finite shift, masked scores stay at -INF and
+//   contribute exp2(-INF) = 0 to the row sum.
 //
 //   HasMask is a COMPILE-TIME switch: false = boundary masking only (non-causal),
 //   true = causal + boundary. Templating it lets the dead branch fold away.
@@ -165,32 +163,17 @@ __device__ __forceinline__ float softmax_row_max(
     return fmaxf(local_max, other);
 }
 
-// ---- Exp2: P = exp2(scale * S - scale * m_new) ----
-//
-// softmax_exp2: convert raw masked scores S into probabilities P, in place.
-// This is where the DEFERRED softmax scale is finally applied, fused with the
-// max-subtraction into one FMA: arg = fmaf(scale, S, -scale_m) = scale*(S - m).
-// Then P = exp2(arg) via the hardware exp2.
-//   - scale is log2e-based (the 1/sqrt(d) factor folded into log2e), so exp2 of
-//     a log2-domain argument yields the natural-base softmax weight.
-//   - scale_m = scale * m_new is precomputed by the caller (max already in
-//     log2 domain), so each element costs one v_fma_f32 (1-cycle, guaranteed
-//     fused) + one v_exp_f32 — no separate subtract/multiply pass over S.
-//   - Masked entries: fmaf(scale, -INF, -scale_m) = -INF, exp2(-INF) = 0, so
-//     they drop out of the subsequent row sum / P.V GEMM automatically.
-//
-//   s_acc_n0/n1 : scores in, probabilities P out (in place)
-//   scale       : log2e-based softmax scale
-//   scale_m     : scale * running_max (the shift, precomputed by caller)
-
-__device__ __forceinline__ void softmax_exp2(
-    v16f& s_acc_n0, v16f& s_acc_n1,
-    float scale, float scale_m)
+// Convert raw masked scores into unnormalized weights in place.
+template <bool Wide>
+__device__ __forceinline__ void
+softmax_exp2(v16f& s_acc_n0, v16f& s_acc_n1, float scale, float row_max)
 {
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        s_acc_n0[i] = __builtin_amdgcn_exp2f(fmaf(scale, s_acc_n0[i], -scale_m));
-        s_acc_n1[i] = __builtin_amdgcn_exp2f(fmaf(scale, s_acc_n1[i], -scale_m));
+        s_acc_n0[i] = __builtin_amdgcn_exp2f(
+            aiter::fmha::scaled_difference<Wide>(s_acc_n0[i], row_max, scale));
+        s_acc_n1[i] = __builtin_amdgcn_exp2f(
+            aiter::fmha::scaled_difference<Wide>(s_acc_n1[i], row_max, scale));
     }
 }
 

@@ -32,10 +32,7 @@ struct FmhaFwdParams {
     // (each KV head is shared by nhead_q / nhead_k query heads).
     int nhead_q, nhead_k;
 
-    // Softmax scale, PRE-MULTIPLIED by log2(e): scale == log2(e)/sqrt(head_dim),
-    // NOT a plain 1/sqrt(head_dim).  The kernel's softmax is base-2 (it uses
-    // exp2, not exp), so folding log2(e) into the scale converts the natural-e
-    // softmax into the equivalent base-2 form.  See op_softmax.hpp.
+    // Softmax scale in natural-exponential units.
     float scale;
 
     // All strides below are in ELEMENTS (BF16 units), not bytes.  For each
@@ -84,7 +81,7 @@ struct FmhaFwdCombineParams {
     int num_splits;            // G
     int seqlen_q, nhead_q;
     int stride_o, nhead_stride_o, batch_stride_o;
-    float scale;               // params.scale (base-2, log2e-folded) — for global LSE only
+    float scale; // forward softmax scale (unused by combine)
     // OPTIONAL fp32 output (split-K combine precision check). When non-null, the
     // combine ALSO writes the exact fp32 convex-combination result (before bf16
     // truncation) here, in NATURAL head-dim order, CONTIGUOUS [B][Hq][Sq][64]:

@@ -23,7 +23,7 @@
 //
 #pragma once
 
-#include <opus/opus.hpp>
+#include "fmha_fwd_bf16_opus_softmax.hpp"
 #include "fmha_fwd_hd192_v128_bf16_opus_defs.h"
 #include <bit>
 #include <cstdint>
@@ -67,37 +67,6 @@ __device__ inline void sched_mfma_tail() {
 }
 
 // ─── softmax / scaling helpers (W_M = 32 → single permlane32 cross-lane swap) ───
-template<typename T, typename V>
-__device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
-    using D_ACC = typename T::D_ACC;
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
-    opus::static_for<s_len>([&](auto i) { row_max = max(row_max, v_s[i.value]); });
-    opus::vector_t<opus::u32_t, 2> res = __builtin_amdgcn_permlane32_swap(
-        std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res.x), std::bit_cast<float>(res.y));
-}
-
-template<typename T, typename V>
-__device__ inline void attn_scale_sub_row(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    opus::static_for<s_len>([&](auto i) { 
-        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max); 
-        asm volatile("" : "+v"(v_s[i.value]));
-    });
-}
-
-// Sliced scale-sub (`v_s*scale - row_max`) over [Offset, Offset+Count) so the work can be
-// spread across compute stages (mirrors attn_exp2_slice).
-template<typename T, opus::index_t Offset, opus::index_t Count, typename V>
-__device__ inline void attn_scale_sub_row_slice(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
-    opus::static_for<Count>([&](auto i) {
-        constexpr opus::index_t idx = Offset + i.value;
-        v_s[idx] = __builtin_fmaf(v_s[idx], scale, -row_max);
-        asm volatile("" : "+v"(v_s[idx]));
-    });
-}
-
 // Apply exp2 to a contiguous slice [Offset, Offset+Count) of the S tile so the
 // softmax VALU work can be spread across multiple compute stages.
 template<typename T, opus::index_t Offset, opus::index_t Count, typename V>
@@ -456,8 +425,10 @@ __device__ inline void attn_mask_border_tile(V& v_s, int seqlen_k, int kv_tile_i
 // resolve to this namespace's members (the symmetric D=128 kernel in the shared TU
 // declares identically-named helpers at global scope; keeping the impl namespaced
 // avoids the otherwise-ambiguous unqualified lookup).
-template<class Traits, bool STAGGER>
-__device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_kargs kargs, char* smem_buf) {
+template <class Traits, bool STAGGER, bool Wide>
+__device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_kargs kargs,
+                                                                  char* smem_buf)
+{
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -659,18 +630,15 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     constexpr index_t s_len      = T::GEMM0_E_N * (T::W_M * T::W_N / T::WARP_SIZE); // 32
     constexpr index_t s_half_len = s_len / 2;                                       // 16
     constexpr index_t s_quarter  = s_half_len / 2;                                  // 8
-    // scale-sub slice moved forward into stage5 (rest stays in stage7): stagger 12, non-stagger 6.
+    // Number of scores to center in stage5. Stage7 handles the rest.
     constexpr index_t STAGE5_SUB_CNT = STAGGER ? 12 : 6;
     constexpr index_t S_SU_LEN = T::GEMM0_E_N_SU * (T::W_M * T::W_N / T::WARP_SIZE); // 16
     constexpr index_t O_SU_LEN = T::GEMM1_E_N_SU * (T::W_M * T::W_N / T::WARP_SIZE); // 32
 
-    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
     constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
 
-    // Scaling constants and online softmax state
+    // Keep the running maximum in raw QK units and the rescale threshold in log2 units.
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
 
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
@@ -774,9 +742,10 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         // s_cbranch_scc1 label_write_out`.
         auto store_result = [&]() {
             if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
-                constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
                 const D_ACC lse = (l_row > D_ACC(0.0f))
-                                      ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                      ? aiter::fmha::softmax_lse<Wide>(m_row,
+                                                                       kargs.softmax_scale,
+                                                                       __builtin_amdgcn_logf(l_row))
                                       : -opus::numeric_limits<D_ACC>::infinity();
                 auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) + lse_batch_base +
                                            (int64_t)h * kargs.stride_lse_h + q_block_start,
@@ -919,14 +888,17 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
 
             // stage5 [compute]: gemm1 su0(t-1); softmax-head(t) row-max + rescale decision.
             gemm1_su0(vs_prev.p);
-            D_ACC row_max = temperature_scale * attn_row_max<T>(vs_cur.s);
-            bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+            D_ACC row_max = fmha_bf16_opus::tile_max<T>(vs_cur.s);
+            const D_ACC delta =
+                aiter::fmha::scaled_difference<Wide>(row_max, m_row, kargs.softmax_scale);
+            // Adopt the first live reference even when it is close to the empty-tile seed.
+            bool below_thresh = delta <= RESCALE_THRESHOLD && (l_row > 0.0f || row_max == m_row);
             bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
             row_max = all_below ? m_row : max(m_row, row_max);
             asm volatile("" : "+v"(row_max) ::);
-            // scale-sub a leading slice (STAGE5_SUB_CNT) of the S tile here (moved forward
-            // from stage7); the rest stays in stage7. Pin vs_cur so it stays in this stage.
-            attn_scale_sub_row_slice<T, 0, STAGE5_SUB_CNT>(vs_cur.s, temperature_scale, row_max);
+            // Center and scale the leading scores here. The register pin keeps them in stage5.
+            fmha_bf16_opus::center_scores<Wide, 0, STAGE5_SUB_CNT>(
+                vs_cur.s, row_max, kargs.softmax_scale);
             asm volatile("" : "+v"(vs_cur.s) ::);
             sched_mfma_valu<2, 5, 3>();    // 6 MFMA × 6 VALU
             sched_mfma_valu<1, 6, 3>();
@@ -944,12 +916,12 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
             stage_end();
 
-            // stage7 [compute]: gemm1 su1(t-1) → full O update; softmax-head(t) sub+exp+rescale
+            // Stage7 finishes the output update, centers the remaining scores, and rescales O.
             gemm1_su1(vs_prev.p);
-            attn_scale_sub_row_slice<T, STAGE5_SUB_CNT, s_len - STAGE5_SUB_CNT>(vs_cur.s, temperature_scale, row_max);
+            fmha_bf16_opus::center_scores<Wide, STAGE5_SUB_CNT, s_len - STAGE5_SUB_CNT>(
+                vs_cur.s, row_max, kargs.softmax_scale);
             asm volatile("" : "+v"(vs_cur.s) ::);
-            // stage7 co-exec: 8 MFMA; ~32 VALU (sub) + rescale mul. Pin vs_cur so the compiler
-            // cannot sink the sub past the `if(!all_below)` branch below (d128 trick).
+            // Keep the centered scores above the rescale branch to overlap the work with GEMM1.
             if constexpr(STAGGER) {
                 sched_mfma_valu<1, 3, 4>();
                 // sched_mfma_tail<1, 4>();
@@ -962,7 +934,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
                 sched_mfma_valu<5, 4, 4>();
             }
             if (!all_below) {
-                D_ACC rescale = __builtin_amdgcn_exp2f(m_row - row_max);
+                D_ACC rescale = __builtin_amdgcn_exp2f(-max(0.0f, delta));
                 scale_output_tile<T>(v_o, rescale);
                 l_row *= rescale;
                 m_row = row_max;
@@ -993,9 +965,6 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
 
     v_k = load<T::VEC_KV>(s_k[0], u_rk);
     load_v_async(s_v[0].ptr, u_gv, u_sv, tile_idx(0));
-    // auto v_q_f32 = opus::cast<float>(v_q);
-    // static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
-    // v_q = opus::cast<D_ATTN>(v_q_f32);
     s_waitcnt_lgkmcnt(0_I); //wait LDS-K.blk[0].su0
     stage_end();
 
@@ -1022,8 +991,8 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             attn_mask_border_tile<T>(v_s0.s, seqlen_kv, 0, neg_inf_v, lane_id);
         }
     }
-    m_row = temperature_scale * attn_row_max<T>(v_s0.s);
-    attn_scale_sub_row<T>(v_s0.s, temperature_scale, m_row);
+    m_row = fmha_bf16_opus::tile_max<T>(v_s0.s);
+    fmha_bf16_opus::center_scores<Wide, 0, s_len>(v_s0.s, m_row, kargs.softmax_scale);
     // head-exp of tile 0 moved to the first main-loop phase's tail (stage1/stage3, on v_s0).
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{}); // wait vmem-K.blk[1]
     stage_end();
@@ -1106,12 +1075,16 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
 // Outer dispatcher: pick the stagger / non-stagger specialization per wave group.
 // warp_id is readfirstlane → scalar branch (no VGPR divergence); the two mutually-
 // exclusive inlined bodies share physical registers (VGPR = max, not sum).
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d192_v128_kernel(opus_gqa_d192_kargs kargs) {
+template <class Traits, bool Wide = false>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE,
+                             2) void gqa_d192_v128_kernel(opus_gqa_d192_kargs kargs)
+{
     __shared__ char smem_buf[Traits::smem_size_bytes()];
     const int warp_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / Traits::WARP_SIZE);
     __builtin_amdgcn_sched_barrier(0);
-    if (warp_id / 4) gqa_d192_v128::gqa_d192_v128_impl<Traits, true>(kargs, smem_buf);
+    if(warp_id / 4)
+        gqa_d192_v128::gqa_d192_v128_impl<Traits, true, Wide>(kargs, smem_buf);
     __builtin_amdgcn_sched_barrier(0);
-    if (!(warp_id / 4))  gqa_d192_v128::gqa_d192_v128_impl<Traits, false>(kargs, smem_buf);
+    if(!(warp_id / 4))
+        gqa_d192_v128::gqa_d192_v128_impl<Traits, false, Wide>(kargs, smem_buf);
 }

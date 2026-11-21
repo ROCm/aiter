@@ -2,7 +2,7 @@
 // Include this header from per-variant .cc files that instantiate specific traits.
 #pragma once
 
-#include <opus/opus.hpp>
+#include "fmha_fwd_bf16_opus_softmax.hpp"
 #include "fmha_fwd_hd128_bf16_opus_defs.h"
 #include <bit>
 #include <cstdint>
@@ -318,35 +318,10 @@ __device__ inline auto make_layout_rq(int warp_id, int lane_id) {
 }
 
 template<typename T, typename V>
-__device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
-    using D_ACC = typename T::D_ACC;
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
-    opus::static_for<s_len>([&](auto i) {
-        row_max = max(row_max, v_s[i.value]);
-    });
-    opus::vector_t<opus::u32_t, 2> res = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res.x), std::bit_cast<float>(res.y));
-}
-
-template<typename T, typename V>
 __device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
         v_s[i.value] -= row_max;
-    });
-}
-
-// d192-style fused scale+subtract: v_s = v_s*scale - row_max via a single FMA (fmaf), so
-// the temperature scale is applied HERE instead of pre-multiplied into Q. row_max must be
-// passed already scaled (temperature_scale * raw_max). The per-element opaque keeps each
-// fmaf on the VALU pipe for the mfma/valu interleave scheduler.
-template<typename T, typename V>
-__device__ inline void attn_scale_sub_row(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
-    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
-        asm volatile("" : "+v"(v_s[i.value]));
     });
 }
 
@@ -881,7 +856,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // head(t): row-max, rescale, sub, exp 1st half.
         // __builtin_amdgcn_s_setprio(1);
         v_o = mma1.step_k(0_I, vs_prev.p, v_kv.v, v_o);
-        D_ACC row_max = attn_row_max<T>(vs_cur.s);
+        D_ACC row_max = fmha_bf16_opus::tile_max<T>(vs_cur.s);
         // sched_barrier_pairs<1, 5, 2>();
         sched_barrier_pairs<3, 6, 2>();
         sched_barrier_pairs<1, 5, 2>();
@@ -972,7 +947,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             attn_mask_border_tile<T>(v_s0.s, seqlen_kv, 0, neg_inf_v, lane_id);
         }
     }
-    m_row = attn_row_max<T>(v_s0.s);
+    m_row = fmha_bf16_opus::tile_max<T>(v_s0.s);
     attn_sub_row<T>(v_s0.s, m_row);
     asm volatile("" : "+v"(v_s0.s) ::);
     attn_exp2_slice<T, 0, s_half_len - 1>(v_s0.s);

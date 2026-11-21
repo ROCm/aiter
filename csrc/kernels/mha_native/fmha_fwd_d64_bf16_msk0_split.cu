@@ -3,6 +3,7 @@
 #include "fused/pipeline.hpp"
 #include "mha_native_launch.h"
 
+template <bool Wide>
 __global__ void __launch_bounds__(kBlockSize, 4)
 fmha_fwd_d64_bf16_msk0_split(FmhaFwdSplitParams sp) {
     __shared__ char lds[kLdsBytes];
@@ -10,11 +11,14 @@ fmha_fwd_d64_bf16_msk0_split(FmhaFwdSplitParams sp) {
     const int m_tile_idx = blockIdx.y;                  // natural order (no mask)
     const int b          = blockIdx.z / sp.num_splits;  // batch lives in z / G
     const int split_idx  = blockIdx.z % sp.num_splits;  // split lives in z % G
-    fmha_fwd_d64_device<false, false, true>(
+    fmha_fwd_d64_device<false, false, true, Wide>(
         sp.base, lds, b, head_idx, m_tile_idx,
         sp.scratch_o, sp.scratch_lse, sp.num_splits, split_idx);
 }
 
 void launch_msk0_split(const FmhaFwdSplitParams& sp, dim3 grid, hipStream_t stream) {
-    fmha_fwd_d64_bf16_msk0_split<<<grid, kBlockSize, 0, stream>>>(sp);
+    if (aiter::fmha::requires_wide_scale(sp.base.scale))
+        fmha_fwd_d64_bf16_msk0_split<true><<<grid, kBlockSize, 0, stream>>>(sp);
+    else
+        fmha_fwd_d64_bf16_msk0_split<false><<<grid, kBlockSize, 0, stream>>>(sp);
 }

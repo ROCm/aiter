@@ -89,6 +89,8 @@ struct fmha_fwd_bf16_opus_args
 
 #ifdef FMHA_FWD_BF16_OPUS_LAUNCH_IMPL
 
+#include "fmha_fwd_softmax_scale.hpp"
+
 #define FMHA_FWD_HD128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd128_bf16_opus.h"
 #define FMHA_FWD_HD128_BF16_OPUS_SWA_IMPL
@@ -103,7 +105,9 @@ namespace fmha_fwd_bf16_opus_detail {
 
 inline float resolve_scale(float softmax_scale, int hdim_q)
 {
-    if(softmax_scale > 0.f)
+    // A positive subnormal remains an explicit scale when the host flushes FP32 inputs.
+    const unsigned bits = __builtin_bit_cast(unsigned, softmax_scale);
+    if(bits > 0 && bits <= 0x7f800000u)
         return softmax_scale;
     return 1.0f / std::sqrt(static_cast<float>(hdim_q));
 }
@@ -214,7 +218,12 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         // The sliding window has its own form of this kernel (fmha_fwd_hd128_bf16_opus_swa.h);
         // everything else stays on the shared one.
         if constexpr(Traits::LOCAL)
-            gqa_d128_swa_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+        {
+            if(aiter::fmha::requires_wide_scale(kargs.softmax_scale))
+                gqa_d128_swa_kernel<Traits, true><<<grid, block, 0, stream>>>(kargs);
+            else
+                gqa_d128_swa_kernel<Traits, false><<<grid, block, 0, stream>>>(kargs);
+        }
         else
             gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
@@ -316,7 +325,10 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 
     auto launch = [&](auto traits_tag) {
         using Traits = decltype(traits_tag);
-        gqa_d192_v128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+        if(aiter::fmha::requires_wide_scale(kargs.softmax_scale))
+            gqa_d192_v128_kernel<Traits, true><<<grid, block, 0, stream>>>(kargs);
+        else
+            gqa_d192_v128_kernel<Traits, false><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 

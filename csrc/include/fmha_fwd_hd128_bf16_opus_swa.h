@@ -11,12 +11,14 @@
 
 #include "fmha_fwd_hd128_bf16_opus_defs.h"
 
-template <class Traits>
+template <class Traits, bool Wide>
 __global__ void gqa_d128_swa_kernel(opus_gqa_kargs kargs);
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
-template <class Traits>
-__global__ void gqa_d128_swa_kernel(opus_gqa_kargs) {}
+template <class Traits, bool Wide = false>
+__global__ void gqa_d128_swa_kernel(opus_gqa_kargs)
+{
+}
 #else
 #include "fmha_fwd_hd128_bf16_opus_swa_kernel.hpp"
 #endif
