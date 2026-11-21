@@ -43,6 +43,7 @@ and the SPLIT_MIN_* floors; see compute_segment_params.
 import copy
 import functools
 import itertools
+import os
 
 import torch
 import triton
@@ -65,6 +66,10 @@ _ARCH_ALIAS = {
 }
 
 _SEP = "."
+
+# AITER_GFX1250_2D_KV_RING=0 removes the attn_2d entries with LOOP_VARIANT 3 (the gfx1250 K / V TDM ring)
+# from the table, so the lookup falls back to the other entries.
+_KV_RING = os.environ.get("AITER_GFX1250_2D_KV_RING", "1") == "1"
 
 _AXIS_KIND = {
     "D": "num",  # head_size
@@ -360,7 +365,10 @@ def _load(op: str, backend, arch: str | None) -> tuple:
         f"{_CONFIG_NAME}[{op}] in {cfg_dir}: schema names unknown axes {unknown} "
         f"(known: {sorted(_AXIS_KIND)})"
     )
-    return config[op], axes, cfg_dir
+    table = config[op]
+    if op == "attn_2d" and not _KV_RING:
+        table = {k: v for k, v in table.items() if v.get("LOOP_VARIANT") != 3}
+    return table, axes, cfg_dir
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
