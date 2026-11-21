@@ -517,8 +517,9 @@ def _build_kernel_mfma_r_w(
 
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
-        # Past-the-end slots reuse the last real row's addresses and take an
-        # empty window, so they are not stored.
+        # Past-the-end slots reuse the last real row's addresses and take the
+        # inverted window [seq_len_kv, 0): empty, so they are not stored, and its
+        # start is past every key, so it cannot pull the union's start to column 0.
         starts = [None] * RPB
         ends = [None] * RPB
         a_packs = [None] * RPB
@@ -531,7 +532,7 @@ def _build_kernel_mfma_r_w(
             in_rows = row < seq_len
             ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
-            starts[j] = in_rows.select(ss, fx.Int32(0))
+            starts[j] = in_rows.select(ss, seq_len_kv)
             ends[j] = in_rows.select(ee, fx.Int32(0))
 
             # lane -> Q[row, h = mi*MFMA_M + lane%MFMA_N,
@@ -951,7 +952,7 @@ def _build_kernel_mfma_lds_pipe(
             in_rows = row < seq_len
             ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
-            starts[j] = in_rows.select(ss, fx.Int32(0))
+            starts[j] = in_rows.select(ss, seq_len_kv)
             ends[j] = in_rows.select(ee, fx.Int32(0))
 
             # Load A-frags:
@@ -992,7 +993,9 @@ def _build_kernel_mfma_lds_pipe(
             in_rows = rr < seq_len
             ss = fx.max(fx.Int32(cs_t[rr_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[rr_ld]), seq_len_kv)
-            ss = in_rows.select(ss, fx.Int32(0))
+            # A past-the-end row takes [seq_len_kv, 0): its start is past every
+            # key, where [0, 0) would pull u_start to column 0.
+            ss = in_rows.select(ss, seq_len_kv)
             ee = in_rows.select(ee, fx.Int32(0))
             if jj == 0:
                 u_start = ss
