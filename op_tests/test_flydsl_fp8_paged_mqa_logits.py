@@ -49,6 +49,9 @@ KV_BLOCK_SIZE = 64
 ARCH_KV_BLOCK_SIZES = {"gfx950": [64], "gfx1250": [8, 16, 64]}
 INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
+# Pre-fill of every kernel output: a NaN left after the call is a cell the
+# kernel did not write.
+UNWRITTEN = float("nan")
 WIDE_MAX_MODEL_LEN = 1 << 20
 # probe_1079 decode (bs64): 44362 × 64-token pages, output stride 258048.
 PROBE_NUM_BLOCKS = 44362
@@ -293,7 +296,7 @@ def _build_probe_inputs(nq, next_n, kv_len, q_dtype):
     tables = scattered_block_tables(nq, pages)
     out = torch.full(
         (nq * next_n, PROBE_MAX_MODEL_LEN),
-        float("-inf"),
+        UNWRITTEN,
         device="cuda",
         dtype=torch.float32,
     )
@@ -317,7 +320,7 @@ def _kernel_inputs(inp, batch_size, next_n, head_dim):
     kv_cache_kernel = preshuffle_kv_data(inp.kv_cache_fp8, head_dim)
     out = torch.full(
         (batch_size * next_n, inp.max_model_len),
-        float("-inf"),
+        UNWRITTEN,
         device="cuda",
         dtype=torch.float32,
     )
@@ -400,7 +403,25 @@ def _split_arg(split_kv):
     return None if int(split_kv) <= 0 else int(split_kv)
 
 
-def _grade(ref, got, msg):
+def _grade(ref, got, msg, context_lens, next_n_lens=None):
+    """Grade ``got`` against ``ref``. Row ``j < n_b`` of request ``b`` must be
+    written below column ``L_b`` (``context_lens[b]``): a logit, or ``-inf``
+    past the row's causal bound. Cells outside that region are not the
+    kernel's to write; they are set to ``-inf``, as in ``ref``."""
+    batch = context_lens.shape[0]
+    max_nn = got.shape[0] // batch
+    n_rows = (
+        next_n_lens
+        if next_n_lens is not None
+        else torch.full_like(context_lens, max_nn)
+    )
+    row = torch.arange(max_nn, device=got.device)
+    col = torch.arange(got.shape[1], device=got.device)
+    live = (row[None, :] < n_rows[:, None].to(got.device)).reshape(-1, 1)
+    within = col[None, :] < context_lens[:, None].to(got.device)
+    must_write = live & within.repeat_interleave(max_nn, dim=0)
+    assert not got[must_write].isnan().any(), f"{msg}: unwritten cell"
+    got = torch.where(must_write, got, float("-inf"))
     ref_mask = ref == float("-inf")
     got_mask = got == float("-inf")
     assert torch.equal(got_mask, ref_mask), f"{msg}: -inf mask mismatch"
@@ -431,12 +452,14 @@ def _roofline(batch, next_n, kv_len, context_lens, q_fp8, weights, out):
     return flops, nbytes
 
 
-def _time_candidates(candidates, ref, flops, nbytes, msg):
+def _time_candidates(
+    candidates, ref, flops, nbytes, msg, context_lens, next_n_lens=None
+):
     ret = {"gfx": get_gfx()}
     for name, (fn, buf) in candidates.items():
         with torch.inference_mode():
             _, us = run_perftest(fn)
-        err = _grade(ref, buf, f"{name}: {msg}")
+        err = _grade(ref, buf, f"{name}: {msg}", context_lens, next_n_lens)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -446,10 +469,16 @@ def _time_candidates(candidates, ref, flops, nbytes, msg):
 
 def _context_lens_arg(context_lens, next_n, layout):
     """``[B]`` lengths as the kernel takes them: ``1d`` as is, ``2d`` as the
-    ``(B, next_n)`` table vLLM builds (row ``b`` = ``[L_b - next_n + 1, ..., L_b]``)."""
+    ``(B, next_n)`` table vLLM builds (row ``b`` = ``[L_b - next_n + 1, ..., L_b]``),
+    ``dcp`` as that table with DCP 2 on rank 0: each row is the rank's share of
+    the row's global length, so rows repeat (e.g. ``[50, 51, 51]``) and only the
+    last column is still ``L_b``."""
     if layout == "1d":
         return context_lens
     offsets = torch.arange(next_n, dtype=torch.int32, device=context_lens.device)
+    if layout == "dcp":
+        global_lens = 2 * context_lens[:, None] - next_n + 1 + offsets
+        return ((global_lens + 1) // 2).clamp_(min=0).to(torch.int32)
     # vLLM clamps at 0, so a padding request (L_b = 0) is an all-zero row.
     return (context_lens[:, None] - next_n + 1 + offsets).clamp_(min=0)
 
@@ -477,7 +506,7 @@ def test_fp8_paged_mqa_logits(
     split = _split_arg(split_kv)
 
     def flydsl():
-        out.fill_(float("-inf"))
+        out.fill_(UNWRITTEN)
         return flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -499,7 +528,7 @@ def test_fp8_paged_mqa_logits(
         out_g = out.clone()
 
         def gluon():
-            out_g.fill_(float("-inf"))
+            out_g.fill_(UNWRITTEN)
             return deepgemm_fp8_paged_mqa_logits(
                 inp.q_fp8,
                 kv_cache_kernel,
@@ -519,7 +548,9 @@ def test_fp8_paged_mqa_logits(
     flops, nbytes = _roofline(
         batch, next_n, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
     )
-    return _time_candidates(candidates, ref, flops, nbytes, "paged fp8_mqa_logits")
+    return _time_candidates(
+        candidates, ref, flops, nbytes, "paged fp8_mqa_logits", inp.context_lens
+    )
 
 
 @benchmark()
@@ -540,7 +571,7 @@ def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
     )
 
     def flydsl():
-        out.fill_(float("-inf"))
+        out.fill_(UNWRITTEN)
         flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -560,7 +591,7 @@ def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
         scored_g = out_g[:, :kv_len]
 
         def gluon():
-            out_g.fill_(float("-inf"))
+            out_g.fill_(UNWRITTEN)
             deepgemm_fp8_paged_mqa_logits(
                 inp.q_fp8,
                 kv_cache_kernel,
@@ -581,7 +612,9 @@ def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
     flops, nbytes = _roofline(
         nq, next_n, kv_len, inp.context_lens, inp.q_fp8, inp.weights, scored
     )
-    return _time_candidates(candidates, ref, flops, nbytes, "paged probe1079")
+    return _time_candidates(
+        candidates, ref, flops, nbytes, "paged probe1079", inp.context_lens
+    )
 
 
 @benchmark()
@@ -609,7 +642,7 @@ def test_fp8_paged_mqa_logits_ragged(
     live = int(next_n_lens.sum().item())
 
     def flydsl():
-        out.fill_(float("-inf"))
+        out.fill_(UNWRITTEN)
         return flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -635,12 +668,18 @@ def test_fp8_paged_mqa_logits_ragged(
         out,
     )
     ret = _time_candidates(
-        {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged ragged"
+        {"flydsl": (flydsl, out)},
+        ref,
+        flops,
+        nbytes,
+        "paged ragged",
+        inp.context_lens,
+        next_n_lens,
     )
     unused = ~live_row_mask(next_n_lens, next_n, inp.max_model_len)[:, 0]
     if unused.any():
         assert torch.all(ref[unused] == float("-inf"))
-        assert torch.all(out[unused] == float("-inf"))
+        assert torch.all(out[unused].isnan()), "kernel wrote a padded row"
     return ret
 
 
@@ -655,7 +694,7 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
     next_n_lens = torch.ones(batch, dtype=torch.int32, device="cuda")
     wide = torch.full(
         (batch * next_n, WIDE_MAX_MODEL_LEN),
-        float("-inf"),
+        UNWRITTEN,
         dtype=torch.float32,
     )
     ref = ref_padded_ragged(
@@ -675,7 +714,7 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
     scored = wide[:, : inp.max_model_len]
 
     def flydsl():
-        wide.fill_(float("-inf"))
+        wide.fill_(UNWRITTEN)
         flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -695,7 +734,13 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
         batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, wide
     )
     return _time_candidates(
-        {"flydsl": (flydsl, scored)}, ref, flops, nbytes, "paged wide_out"
+        {"flydsl": (flydsl, scored)},
+        ref,
+        flops,
+        nbytes,
+        "paged wide_out",
+        inp.context_lens,
+        next_n_lens,
     )
 
 
@@ -728,7 +773,7 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
     )
 
     def flydsl():
-        out.fill_(float("-inf"))
+        out.fill_(UNWRITTEN)
         return flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -745,7 +790,12 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
         batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
     )
     return _time_candidates(
-        {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
+        {"flydsl": (flydsl, out)},
+        ref,
+        flops,
+        nbytes,
+        "paged big_cache",
+        inp.context_lens,
     )
 
 
@@ -787,8 +837,8 @@ def test_fp8_paged_mqa_logits_mixed_context_lens(batch=5, next_n=3, kv_len=3000)
         inp.fp8_dtype,
         block_size=KV_BLOCK_SIZE,
     )
-    for layout, split_kv in itertools.product(("1d", "2d"), (0, 3)):
-        out.fill_(float("-inf"))
+    for layout, split_kv in itertools.product(("1d", "2d", "dcp"), (0, 3)):
+        out.fill_(UNWRITTEN)
         flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
@@ -805,66 +855,11 @@ def test_fp8_paged_mqa_logits_mixed_context_lens(batch=5, next_n=3, kv_len=3000)
             ref,
             out,
             f"mixed context_lens {layout} split_kv={split_kv} lengths={seq_lens.tolist()}",
+            seq_lens,
         )
     aiter.logger.info(
         "fp8_paged_mqa_logits mixed context_lens ok: lengths=%s", seq_lens.tolist()
     )
-
-
-def test_fp8_paged_mqa_logits_dcp_context_lens(batch=5, next_n=3, kv_len=3000):
-    """The (B, next_n) table vLLM builds with DCP 2 on rank 0: each row is the
-    rank's share of that row's global length, so rows repeat (e.g. [50, 51, 51])
-    and top-k reads row j up to its own length. Every column below the last
-    one must be written: a logit, or -inf past the row's bound."""
-    inp = _build_inputs(
-        batch,
-        next_n,
-        HEADS,
-        HEAD_DIM,
-        kv_len,
-        _E4M3_NATIVE,
-        block_size=KV_BLOCK_SIZE,
-        var_ratio=0.9,
-    )
-    kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
-    local_lens = inp.context_lens
-    offsets = torch.arange(next_n, dtype=torch.int32, device=local_lens.device)
-    global_lens = 2 * local_lens[:, None] - next_n + 1 + offsets
-    row_lens = ((global_lens + 1) // 2).to(torch.int32).contiguous()
-    assert torch.equal(row_lens[:, -1], local_lens)
-    assert bool((row_lens[:, 1:] == row_lens[:, :-1]).any()), row_lens.tolist()
-    ref = run_torch(
-        inp.q,
-        inp.kv_cache_fp8,
-        inp.weights,
-        local_lens,
-        inp.block_tables,
-        inp.max_model_len,
-        inp.fp8_dtype,
-        block_size=KV_BLOCK_SIZE,
-    )
-    for split_kv in (0, 3):
-        # NaN marks a column the kernel did not write.
-        out.fill_(float("nan"))
-        flydsl_fp8_paged_mqa_logits(
-            inp.q_fp8,
-            kv_cache_kernel,
-            inp.weights,
-            out,
-            row_lens,
-            inp.block_tables,
-            inp.max_model_len,
-            Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
-            SplitKV=_split_arg(split_kv),
-        )
-        msg = f"dcp context_lens split_kv={split_kv} rows={row_lens.tolist()}"
-        for b, length in enumerate(local_lens.tolist()):
-            rows = slice(b * next_n, (b + 1) * next_n)
-            assert not out[rows, :length].isnan().any(), f"{msg}: unwritten column"
-            out[rows, length:] = float("-inf")
-        _grade(ref, out, msg)
-    aiter.logger.info("fp8_paged_mqa_logits dcp context_lens ok")
 
 
 def test_fp8_paged_mqa_logits_bad_context_lens(next_n=3, kv_len=3000):
@@ -941,7 +936,7 @@ def test_fp8_paged_mqa_logits_padded_rows(row_dim=144, batch=8, next_n=2, kv_len
         )
         outs = []
         for kv in (packed, padded):
-            out.fill_(float("-inf"))
+            out.fill_(UNWRITTEN)
             flydsl_fp8_paged_mqa_logits(
                 inp.q_fp8,
                 kv,
@@ -954,8 +949,17 @@ def test_fp8_paged_mqa_logits_padded_rows(row_dim=144, batch=8, next_n=2, kv_len
                 KVBlockSize=kvb,
             )
             outs.append(out.clone())
-        assert torch.equal(outs[0], outs[1]), f"row_dim={row_dim} kvb={kvb} differs"
-        _grade(ref, outs[1], f"padded rows row_dim={row_dim} kvb={kvb}")
+        torch.testing.assert_close(
+            outs[0],
+            outs[1],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            msg=f"row_dim={row_dim} kvb={kvb} differs",
+        )
+        _grade(
+            ref, outs[1], f"padded rows row_dim={row_dim} kvb={kvb}", inp.context_lens
+        )
     aiter.logger.info("fp8_paged_mqa_logits padded rows (%d B): ok", row_dim)
 
 
@@ -1022,10 +1026,10 @@ def main():
         "--ctx_lens",
         type=str,
         nargs="*",
-        default=["1d", "2d"],
-        choices=["1d", "2d"],
-        help="context_lens layout: [B] (1d) or the (B, next_n) table vLLM "
-        "builds (2d).\n    e.g.: -c 2d",
+        default=["1d", "2d", "dcp"],
+        choices=["1d", "2d", "dcp"],
+        help="context_lens layout: [B] (1d), the (B, next_n) table vLLM "
+        "builds (2d), or that table with DCP 2 (dcp).\n    e.g.: -c 2d",
     )
     parser.add_argument(
         "--ragged-batch",
@@ -1122,7 +1126,6 @@ def main():
         )
     ]
     test_fp8_paged_mqa_logits_mixed_context_lens()
-    test_fp8_paged_mqa_logits_dcp_context_lens()
     test_fp8_paged_mqa_logits_bad_context_lens()
     if get_gfx() == "gfx1250":
         test_fp8_paged_mqa_logits_padded_rows()
