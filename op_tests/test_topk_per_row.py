@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import itertools
 import os
 from unittest import mock
 
@@ -8,12 +9,26 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops import topk as T
 from aiter.ops import topk_select as S
-from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+from aiter.ops.flydsl.kernels.topk.topk_launch import run_topk_launcher
+from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
+    _COMPACT_LIMIT,
+    _COMPACT_MIN_ROW,
+    build_topk_per_row_decode_one_workgroup_module,
+)
+from aiter.ops.flydsl.topk.topk_per_row import (
+    _FLYDSL_TOPK_ONE_BLOCK_ARCHES,
+    _ONE_WORKGROUP_MAX_ROW_WIDTH,
+)
+from aiter.ops.flydsl.topk.topk_per_row import (
+    flydsl_top_k_per_row_decode as _flydsl_decode_topk,
+)
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
-from aiter.test_common import benchmark, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 
 def create_random_logits(
@@ -1121,6 +1136,493 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
+def _f32_from_bits(pattern: int) -> float:
+    signed = pattern if pattern < 2**31 else pattern - 2**32
+    return torch.tensor([signed], dtype=torch.int32).view(torch.float32).item()
+
+
+def test_flydsl_decode_finite_only_drops_nonfinite():
+    """finite_only keeps torch.isfinite columns. NaN and +inf stay unselected.
+
+    The short row has one finite score, so the pack path writes that column
+    and pads with -1, including when k covers the whole row. The ranked row
+    has at least k finite scores, so the radix returns those and not the
+    nonfinites. finite_only=False still ranks NaN above +inf.
+    """
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[finite-only] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    pos_inf = float("inf")
+    neg_inf = float("-inf")
+    qnan = _f32_from_bits(0x7FC00000)
+    nnan = _f32_from_bits(0xFFC00000)
+    snan = _f32_from_bits(0x7F800001)
+
+    def run(row, k, finite_only):
+        logits = torch.tensor([row], dtype=torch.float32, device="cuda")
+        indices = torch.empty(1, k, dtype=torch.int32, device="cuda")
+        _flydsl_decode_topk(
+            logits,
+            1,
+            None,
+            indices,
+            1,
+            logits.stride(0),
+            1,
+            k,
+            finite_only=finite_only,
+        )
+        torch.cuda.synchronize()
+        return indices[0].tolist()
+
+    short = [pos_inf, qnan, 1.0, neg_inf, nnan, snan, neg_inf, neg_inf]
+    got = run(short, 2, True)
+    if got != [2, -1]:
+        raise AssertionError(f"short finite_only k=2: {got}")
+    got = run(short, 8, True)
+    if got != [2, -1, -1, -1, -1, -1, -1, -1]:
+        raise AssertionError(f"short finite_only k=8: {got}")
+
+    ranked = [pos_inf, 4.0, qnan, 3.0, nnan, 2.0, neg_inf, 1.0]
+    got = run(ranked, 2, True)
+    if got != [1, 3]:
+        raise AssertionError(f"ranked finite_only k=2: {got}")
+    got = run(ranked, 4, True)
+    if got != [1, 3, 5, 7]:
+        raise AssertionError(f"ranked finite_only k=4: {got}")
+
+    # k=1 so the winner is the single selected column. At k=2 both specials
+    # are above the cutoff and the scatter writes them in column order.
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, False)
+    if got != [1]:
+        raise AssertionError(f"default order, quiet NaN above +inf: {got}")
+    got = run([nnan, pos_inf, 1.0, neg_inf], 1, False)
+    if got != [0]:
+        raise AssertionError(f"default order, negative NaN above +inf: {got}")
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, True)
+    if got != [2]:
+        raise AssertionError(f"finite_only k=1 kept a nonfinite: {got}")
+    print("[finite-only] PASS")
+
+
+def test_flydsl_decode_compact_long_row():
+    """The compact build keeps a short candidate list and falls back past it.
+
+    Each row is one vector past ``_COMPACT_MIN_ROW``. The tied row and the
+    ranked row stay within ``_COMPACT_LIMIT`` candidates, so they take the
+    compact passes. The overflow row has one more, so the same build finishes
+    on the full row. k is 512, the indexer block budget. Higher scores sit at
+    lower columns, which is the column order the stable scatter writes.
+    """
+    if get_gfx_runtime() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[compact] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    k = 512
+    width = _COMPACT_MIN_ROW + 4
+    tie_n = 600
+    overflow_n = _COMPACT_LIMIT + 1
+    if width % 4 or not k < tie_n <= _COMPACT_LIMIT < overflow_n < width:
+        raise AssertionError(
+            f"compact bounds do not separate the rows: width={width} k={k} "
+            f"tie={tie_n} limit={_COMPACT_LIMIT} overflow={overflow_n}"
+        )
+    rows = 3
+    logits = torch.zeros(rows, width, dtype=torch.float32, device="cuda")
+    logits[0, :tie_n] = 1.0
+    base = width - k
+    logits[1, base:] = torch.arange(k, 0, -1, device="cuda", dtype=torch.float32)
+    logits[2, :overflow_n] = 1.0
+    row_ends = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.full((rows, k), -2, dtype=torch.int32, device="cuda")
+    arch = get_gfx_runtime()
+    launcher = build_topk_per_row_decode_one_workgroup_module(
+        k,
+        wave_size=get_warp_size(arch),
+        write_values=False,
+        compact=True,
+    )
+    run_topk_launcher(
+        launcher,
+        logits,
+        row_ends,
+        row_ends,
+        indices,
+        logits,
+        width,
+        1,
+        int(logits.stride(0)),
+        rows,
+        torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    expected = torch.tensor(
+        [list(range(k)), list(range(base, width)), list(range(k))],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    if not torch.equal(indices, expected):
+        raise AssertionError(f"compact indices:\n{indices.tolist()}")
+    print("[compact] PASS")
+
+
+# (case, width, row_len, top_k). all_finite: the isfinite remap on a full row.
+# sparse_pack: k-1 finite scores on a row longer than k (histogram, then
+# finish_finite). short_pack: the live row is shorter than k, so the early
+# finish_finite runs. The buffer stays at least k wide: the wrapper rejects
+# k past the allocated width. Widths stay inside the one-workgroup band.
+_FINITE_ONLY_SHAPES = (
+    ("all_finite", 4096, 4096, 512),
+    ("all_finite", 4096, 4096, 2048),
+    ("all_finite", 16384, 16384, 512),
+    ("all_finite", 16384, 16384, 2048),
+    ("all_finite", 20000, 20000, 512),
+    ("all_finite", 20000, 20000, 2048),
+    ("sparse_pack", 16384, 16384, 512),
+    ("short_pack", 4096, 64, 512),
+)
+_FINITE_ONLY_ROWS = (8, 32)
+
+# n_high equal scores above zeros, so the first-threshold candidate count is
+# n_high. tight and at_limit stay within _COMPACT_LIMIT; overflow is one past
+# it and both builds finish on the full row. Widths are past _COMPACT_MIN_ROW,
+# which the public wrapper never hands to this kernel.
+_COMPACT_SHAPES = tuple(
+    (distribution, width, top_k, n_high)
+    for width in (32768, 65536, 131072)
+    for top_k in (512, 2048)
+    for distribution, n_high in (("tight", top_k), ("at_limit", _COMPACT_LIMIT))
+) + tuple(("overflow", 32768, top_k, _COMPACT_LIMIT + 1) for top_k in (512, 2048))
+_COMPACT_ROWS = (8, 32)
+
+
+def _selection_traffic(logits, indices, values, row_len):
+    """Shared roofline: one key classification per live score, one read of
+    that span, and the index write. Value writes count only when the build
+    stores them. The full path rereads the row for the later passes; compact
+    rereads it once into LDS. Both candidates use this count so the columns
+    compare.
+    """
+    rows = logits.shape[0]
+    flops = rows * row_len
+    nbytes = rows * row_len * logits.element_size()
+    nbytes += indices.numel() * indices.element_size()
+    if values is not None:
+        nbytes += values.numel() * values.element_size()
+    return flops, nbytes
+
+
+def _check_exact(name, ref, got):
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg=f"{name}: ",
+    )
+    assert err == 0, f"{name}: {err:.2%} of elements outside rtol/atol"
+    return err
+
+
+def _emit_summary(title, rows):
+    frame = pd.DataFrame(rows)
+    text = frame.to_markdown(index=False)
+    aiter.logger.info("%s summary (markdown):\n%s", title, text)
+    for column in (name for name in frame.columns if name.endswith(" err")):
+        present = frame[column].dropna()
+        assert bool((present == 0).all()), f"{title} {column}:\n{text}"
+    print(f"[{title}] PASS")
+
+
+def _pack_logits(num_rows, width, row_len, n_finite):
+    """NaN, +inf and -inf in the live prefix, plus n_finite finite scores.
+
+    The finite columns are not a prefix and shift by row. Column 0 is +inf,
+    column 1 is -inf, and the middle of the live row is +inf. Past row_len
+    the buffer holds a huge finite score, so a read that ignores the length
+    selects it.
+    """
+    live = torch.full((num_rows, row_len), float("nan"), device="cuda")
+    live[:, 0] = float("inf")
+    live[:, 1] = float("-inf")
+    live[:, row_len // 2] = float("inf")
+    blocked = torch.zeros(row_len, dtype=torch.bool, device="cuda")
+    blocked[0] = True
+    blocked[1] = True
+    blocked[row_len // 2] = True
+    pool = (~blocked).nonzero(as_tuple=False).flatten()
+    if n_finite > int(pool.numel()):
+        raise AssertionError(f"{n_finite} finites do not fit in row {row_len}")
+    for row in range(num_rows):
+        shift = row % int(pool.numel())
+        cols = torch.sort(torch.cat((pool[shift:], pool[:shift]))[:n_finite]).values
+        live[row, cols] = torch.arange(
+            1, n_finite + 1, device="cuda", dtype=torch.float32
+        )
+    if row_len == width:
+        return live
+    logits = torch.full((num_rows, width), 1.0e9, device="cuda")
+    logits[:, :row_len] = live
+    return logits
+
+
+def _ranked_logits(num_rows, width):
+    """Distinct finite scores, a different permutation on every row."""
+    logits = torch.empty(num_rows, width, device="cuda", dtype=torch.float32)
+    for row in range(num_rows):
+        logits[row] = torch.randperm(width, device="cuda") + row * width
+    return logits
+
+
+def _finite_reference(logits, top_k, case, row_len):
+    live = logits[:, :row_len]
+    if case == "all_finite":
+        values, indices = torch.topk(live, top_k, dim=-1)
+        return indices.to(torch.int32), values
+    rows = live.shape[0]
+    ref_idx = torch.full((rows, top_k), -1, dtype=torch.int32, device=live.device)
+    ref_vals = torch.full((rows, top_k), float("-inf"), device=live.device)
+    for row in range(rows):
+        cols = torch.isfinite(live[row]).nonzero(as_tuple=False).flatten()
+        n = min(top_k, int(cols.numel()))
+        ref_idx[row, :n] = cols[:n].to(torch.int32)
+        ref_vals[row, :n] = live[row, cols[:n]]
+    return ref_idx, ref_vals
+
+
+@benchmark()
+def test_flydsl_decode_finite_only(num_rows, width, row_len, top_k, case, write_values):
+    """finite_only through flydsl_top_k_per_row_decode, as topk_select calls it.
+
+    next_n is 1 and seq_lens is row_len. all_finite compares the selected set:
+    the scatter writes radix-group column order, which is not torch.topk's
+    value order. The pack cases compare indices in column order, then -1.
+    """
+    torch.set_default_device("cuda:0")
+    if width > _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        raise AssertionError(
+            f"finite_only needs rows of at most {_ONE_WORKGROUP_MAX_ROW_WIDTH}"
+        )
+    if row_len > width or top_k > width:
+        raise AssertionError(f"row_len {row_len} k {top_k} width {width}")
+    if case == "short_pack":
+        if row_len > top_k:
+            raise AssertionError(f"short_pack row {row_len} exceeds k {top_k}")
+        n_finite = 3
+    elif case == "sparse_pack":
+        if row_len != width or top_k >= row_len:
+            raise AssertionError(f"sparse_pack row {row_len} k {top_k} width {width}")
+        n_finite = top_k - 1
+    elif case == "all_finite":
+        if row_len != width or top_k >= row_len:
+            raise AssertionError(f"all_finite row {row_len} k {top_k} width {width}")
+        n_finite = row_len
+    else:
+        raise AssertionError(f"unknown finite_only case {case}")
+
+    if case == "all_finite":
+        logits = _ranked_logits(num_rows, width)
+    else:
+        logits = _pack_logits(num_rows, width, row_len, n_finite)
+    finite_per_row = torch.isfinite(logits[:, :row_len]).sum(dim=1)
+    if not torch.equal(finite_per_row, finite_per_row[0].expand_as(finite_per_row)):
+        raise AssertionError("finite counts differ across rows")
+    if int(finite_per_row[0].item()) != n_finite:
+        raise AssertionError(f"expected {n_finite} finites, got {finite_per_row[0]}")
+    if case != "all_finite":
+        if n_finite >= top_k:
+            raise AssertionError("pack row has a full top-k of finite scores")
+        if not bool(torch.isposinf(logits).any() and torch.isneginf(logits).any()):
+            raise AssertionError("pack row is missing an infinity")
+        if not bool(torch.isnan(logits).any()):
+            raise AssertionError("pack row is missing a NaN")
+
+    ref_idx, ref_vals = _finite_reference(logits, top_k, case, row_len)
+    seq_lens = torch.full((num_rows,), row_len, dtype=torch.int32, device="cuda")
+    # default ranks NaN above +inf, so it is not a finite_only result.
+    modes = (("finite_only", True),)
+    if case == "all_finite":
+        modes = (("default", False),) + modes
+
+    ret = {"gfx": get_gfx_runtime()}
+    for name, finite_only in modes:
+        indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+        values = (
+            torch.full((num_rows, top_k), float("nan"), device="cuda")
+            if write_values
+            else None
+        )
+
+        def run(logits, indices, values, finite_only=finite_only):
+            _flydsl_decode_topk(
+                logits,
+                1,
+                seq_lens,
+                indices,
+                num_rows,
+                int(logits.stride(0)),
+                int(logits.stride(1)),
+                top_k,
+                values=values,
+                arch=get_gfx_runtime(),
+                finite_only=finite_only,
+            )
+            return indices, values
+
+        (got_idx, got_vals), us = run_perftest(run, logits, indices, values)
+        if case == "all_finite":
+            got_cmp = torch.sort(got_idx, dim=1).values
+            ref_cmp = torch.sort(ref_idx, dim=1).values
+        else:
+            got_cmp, ref_cmp = got_idx, ref_idx
+        err = _check_exact(f"{name} indices", ref_cmp, got_cmp)
+        if write_values:
+            if case == "all_finite":
+                got_vals = torch.sort(got_vals, dim=1).values
+                vals_ref = torch.sort(ref_vals, dim=1).values
+            else:
+                vals_ref = ref_vals
+            _check_exact(f"{name} values", vals_ref, got_vals)
+        flops, nbytes = _selection_traffic(logits, got_idx, got_vals, row_len)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def _compact_problem(num_rows, width, top_k, n_high):
+    """n_high tied scores per row, starting at a per-row column, rest zeros."""
+    logits = torch.zeros(num_rows, width, device="cuda")
+    ref_idx = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    ref_vals = torch.empty(num_rows, top_k, device="cuda")
+    for row in range(num_rows):
+        shift = row % 7
+        if shift + n_high > width:
+            raise AssertionError(f"spike of {n_high} at {shift} exceeds {width}")
+        logits[row, shift : shift + n_high] = float(row + 1)
+        ref_idx[row] = torch.arange(
+            shift, shift + top_k, dtype=torch.int32, device="cuda"
+        )
+        ref_vals[row] = float(row + 1)
+    return logits, ref_idx, ref_vals
+
+
+@benchmark()
+def test_flydsl_decode_compact(
+    num_rows, width, top_k, distribution, n_high, write_values
+):
+    """compact=True against the same one-workgroup build with compact=False.
+
+    The wrapper never sets compact and does not launch this kernel past
+    20000 columns, so both candidates call the builder. Scores are n_high
+    copies of one value and zeros elsewhere, so the candidate count is n_high.
+    The selected columns are the lowest n_high ones, in column order.
+    """
+    torch.set_default_device("cuda:0")
+    if width <= _COMPACT_MIN_ROW:
+        raise AssertionError(f"compact needs a row longer than {_COMPACT_MIN_ROW}")
+    if distribution == "tight":
+        if n_high != top_k:
+            raise AssertionError(f"tight candidate count {n_high} is not k {top_k}")
+    elif distribution == "at_limit":
+        if n_high != _COMPACT_LIMIT:
+            raise AssertionError(f"at_limit candidate count {n_high}")
+    elif distribution == "overflow":
+        if n_high != _COMPACT_LIMIT + 1:
+            raise AssertionError(f"overflow candidate count {n_high}")
+    else:
+        raise AssertionError(f"unknown compact distribution {distribution}")
+    if not top_k <= n_high < width:
+        raise AssertionError(f"k {top_k} candidates {n_high} width {width}")
+
+    logits, ref_idx, ref_vals = _compact_problem(num_rows, width, top_k, n_high)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_ends = torch.full((num_rows,), width, dtype=torch.int32, device="cuda")
+    wave_size = get_warp_size(get_gfx_runtime())
+    ret = {"gfx": get_gfx_runtime()}
+    for name, compact in (("full", False), ("compact", True)):
+        indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+        values = (
+            torch.full((num_rows, top_k), float("nan"), device="cuda")
+            if write_values
+            else None
+        )
+        launcher = build_topk_per_row_decode_one_workgroup_module(
+            top_k,
+            wave_size=wave_size,
+            write_values=write_values,
+            compact=compact,
+        )
+
+        def run(logits, indices, values, launcher=launcher):
+            run_topk_launcher(
+                launcher,
+                logits,
+                row_starts,
+                row_ends,
+                indices,
+                logits if values is None else values,
+                width,
+                1,
+                int(logits.stride(0)),
+                num_rows,
+                torch.cuda.current_stream(),
+            )
+            return indices, values
+
+        (got_idx, got_vals), us = run_perftest(run, logits, indices, values)
+        err = _check_exact(f"{name} indices", ref_idx, got_idx)
+        if write_values:
+            _check_exact(f"{name} values", ref_vals, got_vals)
+        flops, nbytes = _selection_traffic(logits, got_idx, got_vals, width)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def test_flydsl_decode_finite_only_bench():
+    if get_gfx_runtime() not in _FLYDSL_TOPK_DECODE_GATES:
+        aiter.logger.warning(
+            "finite_only bench unsupported on %s; skipping", get_gfx_runtime()
+        )
+        return
+    _emit_summary(
+        "flydsl decode finite_only",
+        [
+            test_flydsl_decode_finite_only(
+                num_rows, width, row_len, top_k, case, write_values
+            )
+            for (case, width, row_len, top_k), num_rows, write_values in (
+                itertools.product(_FINITE_ONLY_SHAPES, _FINITE_ONLY_ROWS, (False, True))
+            )
+        ],
+    )
+
+
+def test_flydsl_decode_compact_bench():
+    if get_gfx_runtime() not in _FLYDSL_TOPK_DECODE_GATES:
+        aiter.logger.warning(
+            "compact bench unsupported on %s; skipping", get_gfx_runtime()
+        )
+        return
+    _emit_summary(
+        "flydsl decode compact",
+        [
+            test_flydsl_decode_compact(
+                num_rows, width, top_k, distribution, n_high, write_values
+            )
+            for (distribution, width, top_k, n_high), num_rows, write_values in (
+                itertools.product(_COMPACT_SHAPES, _COMPACT_ROWS, (False, True))
+            )
+        ],
+    )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1218,6 +1720,10 @@ _REGRESSIONS = {
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
     "flydsl-decode-gates": test_flydsl_decode_gates,
     "flydsl-one-block-long-rows": test_flydsl_one_block_long_rows,
+    "finite-only": test_flydsl_decode_finite_only_drops_nonfinite,
+    "finite-only-bench": test_flydsl_decode_finite_only_bench,
+    "compact": test_flydsl_decode_compact_long_row,
+    "compact-bench": test_flydsl_decode_compact_bench,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,
