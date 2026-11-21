@@ -204,6 +204,35 @@ class TestRuntimeArchitecture(unittest.TestCase):
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
 
+    def test_runtime_arch_fullgraph_with_cold_and_warm_caches(self):
+        if not self.torch.cuda.is_available():
+            self.skipTest("requires a live GPU for runtime architecture detection")
+
+        torch, chip_info = self.torch, self.chip_info
+
+        def dispatch(x):
+            arch = chip_info.get_gfx_runtime()
+            return x + (1 if arch == "gfx950" else -1), arch
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                torch._dynamo.reset()
+                for probe in (
+                    chip_info.get_gfx_runtime,
+                    chip_info._detect_native,
+                    chip_info._gpu_info_output,
+                ):
+                    probe.cache_clear()
+                    self.addCleanup(probe.cache_clear)
+                if warm:
+                    chip_info.get_gfx_runtime()
+                compiled = torch.compile(dispatch, backend="eager", fullgraph=True)
+                x = torch.ones(1, device="cpu")
+                out, arch = compiled(x)
+                expected, expected_arch = dispatch(x)
+                self.assertEqual(arch, expected_arch)
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
     def test_native_detection_preserves_strict_identity(self):
         # Regression lock: _detect_native must return the exact ROCr-reported
         # identity, NOT fold gfx1250-strict (A0) to gfx1250. Folding here makes
