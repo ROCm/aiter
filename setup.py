@@ -134,6 +134,11 @@ if _torch_version_below("2.9.1"):
     print(
         "[aiter] To use aiter-compatible triton, please upgrade torch to 2.9.1 or later."
     )
+elif sys.version_info < (3, 11):
+    print(
+        "[aiter] aiter's triton (3.9) needs Python 3.11 or newer; skipping the triton install"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
+    )
 elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
