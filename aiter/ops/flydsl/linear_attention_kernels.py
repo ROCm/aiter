@@ -1258,15 +1258,41 @@ def _check_disjoint_rows(
 
 
 def _slot_blocks(tensor: torch.Tensor) -> tuple[int, int, int, int]:
-    """Return (start, step, size, count): the byte blocks of each dim-0 slot.
+    """Return (start, step, size, count): evenly spaced byte blocks of a tensor.
 
-    Spans are conservative: a block covers every byte its slot can reach,
+    The blocks are the slices along the largest-stride axis, so a cache gives
+    its slots and an output with a leading singleton dim gives its batch rows.
+    Spans are conservative: a block covers every byte its slice can reach,
     which is exact for the dense slots the callers have already checked.
+    Blocks that touch or overlap are merged into one.
     """
     es = tensor.element_size()
-    count = tensor.shape[0]
-    reach = sum((n - 1) * st for n, st in zip(tensor.shape[1:], tensor.stride()[1:]))
-    return tensor.data_ptr(), tensor.stride(0) * es, (reach + 1) * es, count
+    if tensor.numel() == 0:
+        return tensor.data_ptr(), 0, 0, 0
+    axes = [dim for dim, size in enumerate(tensor.shape) if size > 1]
+    if not axes:
+        return tensor.data_ptr(), 0, es, 1
+    axis = max(axes, key=tensor.stride)
+    count = tensor.shape[axis]
+    step = tensor.stride(axis) * es
+    reach = sum(
+        (size - 1) * stride
+        for dim, (size, stride) in enumerate(zip(tensor.shape, tensor.stride()))
+        if dim != axis
+    )
+    size = (reach + 1) * es
+    if step <= size:
+        return tensor.data_ptr(), 0, (count - 1) * step + size, 1
+    return tensor.data_ptr(), step, size, count
+
+
+def _blocks_span(blocks: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Return the [low, high) byte range a run of blocks covers."""
+    start, step, size, count = blocks
+    if count == 0:
+        return start, start
+    last = start + (count - 1) * step
+    return min(start, last), max(start, last) + size
 
 
 def _blocks_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
@@ -1302,18 +1328,24 @@ def _check_no_alias(
 ) -> None:
     """Reject a written buffer that shares a byte with a read-only input.
 
-    A verify must leave the caches unchanged until the caller commits, so a
-    scratch or output store into a cache is an early commit. A store into a
-    weight corrupts it for the workgroups that have not read it yet. Buffers
-    may still interleave slots in one pool.
+    A store into an input or cache races with the workgroups that have not read
+    it yet, and a verify must leave the caches unchanged until the caller commits,
+    so a store into one is an early commit. Pure host arithmetic on shapes,
+    strides and base pointers: no sync. Buffers may still interleave slots in
+    one pool.
     """
-    read_blocks = [(name, _slot_blocks(tensor)) for name, tensor in read]
+    read_blocks = []
+    for name, tensor in read:
+        blocks = _slot_blocks(tensor)
+        read_blocks.append((name, blocks, _blocks_span(blocks)))
     for w_name, w in written:
         if w is None:
             continue
         w_blocks = _slot_blocks(w)
-        for r_name, r_blocks in read_blocks:
-            if _blocks_overlap(w_blocks, r_blocks):
+        w_lo, w_hi = _blocks_span(w_blocks)
+        for r_name, r_blocks, (r_lo, r_hi) in read_blocks:
+            # Overall spans first: most operands live in other allocations.
+            if w_lo < r_hi and r_lo < w_hi and _blocks_overlap(w_blocks, r_blocks):
                 raise ValueError(f"`{w_name}` must not overlap `{r_name}`.")
 
 
@@ -1363,8 +1395,13 @@ def _validate_kda_inputs(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
     out: torch.Tensor | None,
+    extra_inputs: tuple[tuple[str, torch.Tensor], ...] = (),
 ) -> torch.Tensor:
-    """Validate operands shared by both explicit KDA specializations."""
+    """Validate operands shared by both explicit KDA specializations.
+
+    ``extra_inputs`` are the specialization's own, already validated, read-only
+    operands; a caller-supplied ``out`` must not overlap them either.
+    """
     if not is_flydsl_kda_decode_supported(device):
         raise RuntimeError(f"`{api_name}` requires a gfx942 or gfx950 GPU.")
     if batch <= 0:
@@ -1502,6 +1539,7 @@ def _validate_kda_inputs(
     if 1 not in conv_weight.stride():
         raise ValueError("`conv_weight` must have an axis with stride 1.")
 
+    caller_out = out is not None
     if out is None:
         out = torch.empty(
             (1, batch, _KDA_HEADS, _KDA_DIM),
@@ -1519,6 +1557,23 @@ def _validate_kda_inputs(
     )
     _check_i32_addressing("out", out, first_dim=1)
     _check_disjoint_rows("out", out, (1, 2), "batch and head")
+    if caller_out:
+        _check_no_alias(
+            (("out", out),),
+            (
+                ("x", x),
+                ("conv_weight", conv_weight),
+                ("conv_state", conv_state),
+                ("raw_beta", raw_beta),
+                ("A_log", A_log),
+                ("dt_bias", dt_bias),
+                ("state", state),
+                ("state_indices", state_indices),
+                ("output_gate", output_gate),
+                ("norm_weight", norm_weight),
+            )
+            + extra_inputs,
+        )
     if _KDA_SLOT_CHECK:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
@@ -1565,8 +1620,8 @@ def flydsl_kda_decode(
     overlap, but may be padded and in either order (batch- or heads-outer).
     Taken by increasing stride, each of the two row dimensions must step past
     everything the other spans.
-    ``out`` must not share memory with any input or cache; the kernel does
-    not check this.
+    A caller-supplied ``out`` must not share memory with any input or cache;
+    this raises ``ValueError`` (host arithmetic on strides, no sync).
     Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
     padding: they produce zero output and leave both caches unchanged. Slot
     zero is a live slot, as in the Triton ``fused_kda_decode``. Indices at or
@@ -1593,6 +1648,16 @@ def flydsl_kda_decode(
         raise ValueError("`x` must be a CUDA tensor.")
     device = x.device
     batch = x.shape[0]
+    _check_same_device((("raw_g", raw_g),), device)
+    _check_tensor(
+        "raw_g",
+        raw_g,
+        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_i32_addressing("raw_g", raw_g, first_dim=1)
     out = _validate_kda_inputs(
         api_name="flydsl_kda_decode",
         batch_source="x",
@@ -1611,17 +1676,8 @@ def flydsl_kda_decode(
         output_gate=output_gate,
         norm_weight=norm_weight,
         out=out,
+        extra_inputs=(("raw_g", raw_g),),
     )
-    _check_same_device((("raw_g", raw_g),), device)
-    _check_tensor(
-        "raw_g",
-        raw_g,
-        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
-        dtype=torch.bfloat16,
-        device=device,
-        inner_strides=(_KDA_DIM, 1),
-    )
-    _check_i32_addressing("raw_g", raw_g, first_dim=1)
 
     executable = create_kda_decode_kernel(
         float(norm_eps),
@@ -1692,6 +1748,7 @@ def flydsl_kda_decode_with_f_b(
     as :func:`flydsl_kda_decode`.
     ``state_indices`` follows the same bounded, unique-live-slot contract and
     opt-in ``AITER_KDA_DECODE_SLOT_CHECK`` as :func:`flydsl_kda_decode`.
+    A caller-supplied ``out`` must not overlap ``f_a`` or ``f_b_weight`` either.
 
     Fusing saves the projection launch, which wins at decode batch sizes, but each
     head re-reads the whole ``f_a`` row. On MI355X (CUDA-graph replay) it beats a
@@ -1742,6 +1799,7 @@ def flydsl_kda_decode_with_f_b(
         output_gate=output_gate,
         norm_weight=norm_weight,
         out=out,
+        extra_inputs=(("f_a", f_a), ("f_b_weight", f_b_weight)),
     )
 
     executable = create_kda_decode_kernel(

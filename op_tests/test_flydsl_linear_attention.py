@@ -689,13 +689,19 @@ def _copy_kda_inputs(inputs: KdaInputs) -> KdaInputs:
     )
 
 
-def _kda_reference(inputs: KdaInputs) -> torch.Tensor:
+def _kda_reference(inputs: KdaInputs, round_qkv: bool = True) -> torch.Tensor:
+    """FP32 reference of one KDA decode step.
+
+    ``round_qkv`` rounds the convolved Q/K/V to BF16 before the recurrence, as
+    the unfused model does and the FlyDSL kernel does. The Triton baseline keeps
+    them in FP32, so it is compared against ``round_qkv=False``.
+    """
     if inputs.state.dtype != torch.float32:
         # The kernel's rounding boundary for a narrow state: widen on load,
         # update in FP32, round to nearest-even on store.
         stored = inputs.state
         inputs.state = stored.float()
-        output = _kda_reference(inputs)
+        output = _kda_reference(inputs, round_qkv)
         stored.copy_(inputs.state)
         inputs.state = stored
         return output
@@ -724,9 +730,9 @@ def _kda_reference(inputs: KdaInputs) -> torch.Tensor:
             ),
             dim=-1,
         )
-        packed_qkv = F.silu((conv_values * inputs.conv_weight).sum(dim=-1)).to(
-            torch.bfloat16
-        )
+        packed_qkv = F.silu((conv_values * inputs.conv_weight).sum(dim=-1))
+        if round_qkv:
+            packed_qkv = packed_qkv.to(torch.bfloat16)
         history[:, 0].copy_(history[:, 1])
         history[:, 1].copy_(history[:, 2])
         history[:, 2].copy_(inputs.x[batch_idx])
@@ -813,12 +819,14 @@ def _kda_err_ratio(batch: int) -> float:
 
 
 # The Triton baseline keeps the convolved Q/K/V in FP32 and computes SiLU as
-# x * sigmoid(x), so it only matches the BF16-rounded reference to the GDR
-# decode tolerance, with a few outputs one BF16 ULP away.
+# x * sigmoid(x), so it is compared against the reference without the BF16
+# rounding of Q/K/V (round_qkv=False) and keeps the GDR decode tolerance.
+# Against the BF16-rounding reference it is not wrong but a different function:
+# up to 6-15% of one token/head's outputs sit one BF16 ULP away at every batch from 16 up
+# (9.4% at batch 128), where its worst region against round_qkv=False is 7.8e-3
+# (one element) and its output state matches exactly (MI355X, batch 1-256, 4 seeds).
+# It therefore shares the FlyDSL region bound.
 _KDA_TRITON_TOLS = ({"atol": 1e-3, "rtol": 1e-3}, {"atol": 1e-3, "rtol": 1e-3}, 1e-2)
-# Its worst region is looser than the FlyDSL kernel's: 9.4% of one token/head at
-# batch 128 on MI355X, so the bound is the 0.25 cap; a lost region is still 1.0.
-_KDA_TRITON_MAX_REGION_BAD = 0.25
 
 
 def _assert_kda_close(
@@ -828,7 +836,6 @@ def _assert_kda_close(
     msg: str,
     tol_err_ratio: float = 0.0,
     region_dims: int = 1,
-    max_region_bad: float = _KDA_MAX_REGION_BAD,
 ) -> float:
     err = checkAllclose(
         reference.float(),
@@ -842,7 +849,7 @@ def _assert_kda_close(
     region = math.prod(reference.shape[-region_dims:])
     worst = bad.reshape(-1, region).float().mean(dim=-1).max().item()
     assert (
-        worst <= max_region_bad
+        worst <= _KDA_MAX_REGION_BAD
     ), f"{msg}: a region of {region} elements has {worst:.2%} mismatches"
     return err
 
@@ -1015,20 +1022,20 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
         conv_width_major=conv_layout == "width_major",
         state_dtype=state_dtype,
     )
-    reference_inputs = _copy_kda_inputs(base_inputs)
-    reference = _kda_reference(reference_inputs)
     cu_seqlens = torch.arange(batch + 1, dtype=torch.int64, device=_KDA_DEVICE)
 
     flydsl_tols = _KDA_FLYDSL_TOLS
     if state_dtype == dtypes.bf16:
         flydsl_tols = (_KDA_OUTPUT_TOL, _KDA_BF16_STATE_TOL, _TOL_ERR_RATIO)
-    # raw_g holds the f_b projection, so every candidate shares one reference.
+    # raw_g holds the f_b projection, so the candidates share one reference; the
+    # last field picks whether it rounds the convolved Q/K/V to BF16.
     candidates = {
-        "flydsl": (_run_kda, False, flydsl_tols),
+        "flydsl": (_run_kda, False, flydsl_tols, True),
         "flydsl_f_b": (
             lambda inputs, out: _run_kda_with_f_b(f_a, f_b_weight, inputs, out),
             True,
             flydsl_tols,
+            True,
         ),
     }
     # The Triton kernel takes the conv cache as SGLang's transposed view only.
@@ -1037,14 +1044,20 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             lambda inputs, out: _run_kda_triton(inputs, cu_seqlens, out),
             False,
             _KDA_TRITON_TOLS,
+            False,
         )
 
     ret = {"gfx": get_gfx_runtime()}
-    for name, (candidate, fuse_f_b, tols) in candidates.items():
+    references = {}
+    for name, (candidate, fuse_f_b, tols, round_qkv) in candidates.items():
         output_tol, state_tol, tol_err_ratio = tols
-        region_bad = (
-            _KDA_TRITON_MAX_REGION_BAD if name == "triton" else _KDA_MAX_REGION_BAD
-        )
+        if round_qkv not in references:
+            reference_inputs = _copy_kda_inputs(base_inputs)
+            references[round_qkv] = (
+                reference_inputs,
+                _kda_reference(reference_inputs, round_qkv),
+            )
+        reference_inputs, reference = references[round_qkv]
         # Both caches update in place; run_perftest rotates deep copies, which
         # keep the padded and transposed cache strides.
         # SGLang's KDA backend preallocates the output and passes it as out=.
@@ -1067,7 +1080,6 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             output_tol,
             f"{name}: KDA decode output ",
             tol_err_ratio,
-            max_region_bad=region_bad,
         )
         err_state = _assert_kda_close(
             reference_inputs.state,
@@ -1076,7 +1088,6 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             f"{name}: KDA decode state ",
             tol_err_ratio,
             region_dims=2,
-            max_region_bad=region_bad,
         )
         assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
         flops, nbytes = _kda_decode_work(batch, fuse_f_b, base_inputs.state)
@@ -1772,6 +1783,83 @@ def test_flydsl_kda_decode_rejects_unsafe_write_layouts(
                 _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
             else:
                 _run_kda(inputs, out=out)
+
+
+@_requires_kda
+@pytest.mark.parametrize(
+    "fused_f_b, name",
+    [
+        (fused_f_b, name)
+        for fused_f_b in (False, True)
+        for name in ("x", "conv_state", "state", "output_gate")
+    ]
+    + [(False, "raw_g"), (True, "f_a"), (True, "f_b_weight")],
+)
+def test_flydsl_kda_decode_rejects_out_overlapping_an_input(
+    monkeypatch: pytest.MonkeyPatch, fused_f_b: bool, name: str
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("An aliased out must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_decode_kernel", unexpected_compile
+    )
+    batch = 2
+    # A BF16 state, so that it can back the BF16 out as well.
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch, state_dtype=dtypes.bf16)
+    if name == "f_a":
+        # Strided rows of a pool large enough to back out.
+        f_a = torch.randn((batch, 1536), dtype=torch.bfloat16, device=_KDA_DEVICE)[
+            :, :_KDA_DIM
+        ]
+    pool = {"f_a": f_a, "f_b_weight": f_b_weight}.get(name)
+    if pool is None:
+        pool = getattr(inputs, name)
+    # A dense out laid over the first bytes of that input.
+    out = torch.as_strided(pool, (1, batch, _KDA_HEADS, _KDA_DIM), (0, 1536, 128, 1))
+    with pytest.raises(ValueError, match=f"`out` must not overlap `{name}`"):
+        if fused_f_b:
+            _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
+        else:
+            _run_kda(inputs, out=out)
+
+
+@_requires_kda
+@pytest.mark.parametrize(
+    "fused_f_b, neighbor",
+    [(False, "output_gate"), (False, "raw_g"), (True, "output_gate")],
+)
+def test_flydsl_kda_decode_accepts_out_interleaved_with_an_input(
+    fused_f_b: bool, neighbor: str
+) -> None:
+    batch = 2
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
+    # Per token, one pool row holds the input and the next one holds out: the
+    # byte ranges interleave but share nothing.
+    pool = torch.empty(
+        (batch, 2, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
+    )
+    # NaN fill: an out row the kernel never writes fails the comparison.
+    pool[:, 1].fill_(float("nan"))
+    if neighbor == "output_gate":
+        pool[:, 0].copy_(inputs.output_gate)
+        inputs.output_gate = pool[:, 0]
+    else:
+        pool[:, 0].copy_(inputs.raw_g[0])
+        inputs.raw_g = pool[:, 0].unsqueeze(0)
+    out = pool[:, 1].unsqueeze(0)
+    reference_inputs = _copy_kda_inputs(inputs)
+    reference = _kda_reference(reference_inputs)
+    if fused_f_b:
+        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
+    else:
+        actual = _run_kda(inputs, out=out)
+    torch.cuda.synchronize()
+
+    assert actual is out
+    _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
 
 
 @_requires_kda
