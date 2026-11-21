@@ -105,7 +105,11 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
+from aiter.utility.mp_tuner import (
+    _is_accelerator_error,
+    clear_inherited_rocprofiler_env,
+    mp_tuner,
+)
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     DEFAULT_SCREEN_TOPK,
     AccumulationMode,
@@ -8960,6 +8964,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         print(
             f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
         )
+        clear_inherited_rocprofiler_env()
         ctx = _mp.get_context("spawn")
         payloads = [(self.keys, row, args, None) for row in rows]
         results = (
