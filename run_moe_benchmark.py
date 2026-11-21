@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark grouped MoE token sizes in a named container from the Linux host.
 
 Select exactly one workload group: --dsr1, --dsv41_flash, or --dsv4_pro.
@@ -803,7 +802,15 @@ def main():
             repo,
         )
         checked(
-            [*docker_command, "exec", args.container, "chmod", "-R", "a+rwX", str(root)],
+            [
+                *docker_command,
+                "exec",
+                args.container,
+                "chmod",
+                "-R",
+                "a+rwX",
+                str(root),
+            ],
             repo,
         )
         container_environment = json.loads(
