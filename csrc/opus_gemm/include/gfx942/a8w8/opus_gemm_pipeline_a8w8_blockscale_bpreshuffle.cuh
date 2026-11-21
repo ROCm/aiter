@@ -609,6 +609,10 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
                 v_b[1] = opus::load<T::VEC_B>(s_b[1], u_rb);
                 auto b_pref_1 = opus::load<T::VEC_B>(g_b, u_gb_1, next_b_offset);
                 opus::s_waitcnt_vmcnt(opus::number<2 * T::b_buffer_load_insts>{});
+                // Single buffer: all waves must have read this tile's s_a[0], s_b[0] and s_b[1]
+                // before any wave overwrites them with the next tile.
+                opus::s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
                 opus::store<T::VEC_A>(s_a[0], a_pref_0, u_sa);
                 scale_c_tile_packed_row_scale_gfx942_a8w8<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(
                     v_mma, v_scale[0], v_c[0][0]);
@@ -626,7 +630,8 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
                 opus::store<T::VEC_B>(s_b[1], b_pref_1, u_sb);
                 auto v_sfa_next0 = v_sfa_next_leader[0];
                 v_sfa_next_leader[0] = v_sfa_next2_leader0;
-                opus::s_waitcnt_lgkmcnt(1_I);
+                // Include the s_b[1] refill: the next K step reads s_b[1] before its first barrier.
+                opus::s_waitcnt_lgkmcnt(0_I);
                 __builtin_amdgcn_s_barrier();
                 v_sfa[0] = v_sfa_next0;
                 v_sfb = v_sfb_next;
@@ -650,6 +655,7 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
                 v_mma, v_scale[0], v_c[0][1]);
 
             // Epilogue reuses A/B LDS as C scratch; all waves must finish final LDS reads first.
+            opus::s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_s_barrier();
             epilogue_store_c_gfx942_a8w8<T>(
                 mma, g_c, kargs, v_c, wave_id_m, wave_id_n, lane_id, row, col, smem_a, smem_b);
@@ -705,6 +711,10 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
             const int next_b_offset = (tile + 1) * b_tile_stride;
             auto b_pref_0 = opus::load<T::VEC_B>(g_b, u_gb_0, next_b_offset);
             opus::s_waitcnt_vmcnt(opus::number<T::a_buffer_load_insts>{});
+            // Single buffer: all waves must have read this tile's s_a[0], s_b[0] and s_a[1]
+            // before any wave overwrites them with the next tile.
+            opus::s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
             opus::store<T::VEC_A>(s_a[0], a_pref_0, u_sa);
             scale_c_tile_packed_row_scale_gfx942_a8w8<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(
                 v_mma, v_scale[0], v_c[0][0]);
@@ -736,20 +746,25 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
             __builtin_amdgcn_s_setprio(0);
 
             opus::s_waitcnt_vmcnt(opus::number<0>{});
+            // s_b[1] is read after the barrier above: all waves must read it before the refill.
+            opus::s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
             opus::store<T::VEC_B>(s_b[1], b_pref_1, u_sb);
 
             auto v_sfa_next0 = v_sfa_next_leader[0];
             auto v_sfa_next1 = v_sfa_next_leader[1];
             v_sfa_next_leader[0] = v_sfa_next2_leader[0];
             v_sfa_next_leader[1] = v_sfa_next2_leader[1];
-            opus::s_waitcnt_lgkmcnt(1_I);
-            __builtin_amdgcn_s_barrier();
             scale_c_tile_packed_row_scale_gfx942_a8w8<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(
                 v_mma, v_scale[1], v_c[1][1]);
             v_sfa[0] = v_sfa_next0;
             v_sfa[1] = v_sfa_next1;
             v_sfb = v_sfb_next;
         }
+        // The next K step reads the s_b[1] refill only after its first barrier; the tail reads it
+        // right away.
+        opus::s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
 
         {
             v_scale[0] = make_row_scale_gfx942_a8w8<T::E_M, D_SF>(v_sfa[0], v_sfb);
@@ -784,6 +799,7 @@ void gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942(opus_gemm_a8w8_blo
         }
 
         // Epilogue reuses A/B LDS as C scratch; all waves must finish final LDS reads first.
+        opus::s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         epilogue_store_c_gfx942_a8w8<T>(
             mma, g_c, kargs, v_c, wave_id_m, wave_id_n, lane_id, row, col, smem_a, smem_b);
