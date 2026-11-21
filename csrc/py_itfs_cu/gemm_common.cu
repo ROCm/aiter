@@ -41,7 +41,11 @@ int getPaddedM(int M, int N, int K, int gl) {
             padded_m = (M + 127) / 128 * 128;
         }
     } else if (gl == 1) {
-        if (M > 8192 && N > 4096) {
+        // M < 16: gl = 0 already tried nextPow2(M), so fall back to the
+        // 16-row bucket. Tables tuned only at M = 1 / 16 keep serving 2..15.
+        if (M > 0 && M < 16) {
+            padded_m = 16;
+        } else if (M > 8192 && N > 4096) {
             padded_m = 8192;
         } else {
             padded_m = nextPow2(M);
