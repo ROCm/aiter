@@ -1817,10 +1817,11 @@ def _presorted_moe_buf(presorted, output, accumulate, shape, dtype, device):
     """
     if not accumulate:
         return torch.empty((0, 0), dtype=dtype, device=device)
-    # Atomic GEMM2 accumulates with 4-byte atomics and faults on an output at an
-    # odd bf16 element, so such an output gets a fresh moe_buf and
-    # _return_output copies back.
-    in_place = output is not None and output.data_ptr() % 4 == 0
+    # The zeroing kernels write 16-byte vectors from moe_buf and atomic GEMM2 uses
+    # 4-byte atomics (an output at an odd bf16 element faults), so an output that is
+    # not 16-byte aligned gets a fresh moe_buf and _return_output copies back. The
+    # same rule as the 16-byte rule of fused_moe's other kernel destinations (#6485).
+    in_place = output is not None and output.data_ptr() % 16 == 0
     moe_buf = output if in_place else torch.empty(shape, dtype=dtype, device=device)
     # Skip the zeroing only if the caller zeroed this exact output. A buffer
     # allocated here can reuse a freed block at the same address, so always

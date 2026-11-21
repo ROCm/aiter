@@ -1554,8 +1554,8 @@ def test_presorted_moe_hook():
     presorted, and "own err" (diff vs the own sort on the timed routing) for both
     presorted calls. Its eager summed kernel time does not rank the two presorted
     calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
-    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
-    copied back while a 4-byte-aligned one is used in place, and a registration
+    contract: a reused-address moe_buf is zeroed, an output that is not 16-byte
+    aligned is copied back while a 16-byte-aligned one is used in place, and a registration
     that does not match the call is ignored and still consumed, so it never
     leaks into a later call, even when fused_moe exits before sorting.
     """
@@ -1799,9 +1799,10 @@ def test_presorted_moe_hook():
         assert handed and out is stale, "presort did not allocate its own moe_buf"
         check_close(ref, out, "reused-address moe_buf was not zeroed")
 
-        # An output at an odd bf16 element (2-byte aligned) cannot be the atomic
-        # moe_buf (GEMM2's 4-byte atomics fault on it): fused_moe uses a fresh
-        # one and copies back. A 4-byte-aligned one is used in place.
+        # An output that is not 16-byte aligned cannot be the atomic moe_buf (the
+        # zeroing kernels store 16 bytes at a time, GEMM2's 4-byte atomics fault at
+        # an odd bf16 element): fused_moe uses a fresh one and copies back. A
+        # 16-byte-aligned one is used in place. Offsets are bf16 elements.
         real_return = fm._return_output
         copies = []
 
@@ -1809,7 +1810,7 @@ def test_presorted_moe_hook():
             copies.append(output is not None and ret is not output)
             return real_return(ret, output)
 
-        for offset, copied in ((1, True), (2, False)):
+        for offset, copied in ((1, True), (2, True), (8, False)):
             pool = torch.empty(token * model_dim + offset, dtype=dtype)
             buf = pool[offset:].view(token, model_dim)
             sort_calls.clear()
@@ -1982,7 +1983,7 @@ def test_presorted_moe_std_pipelines():
     # selects on this arch, read back from the call under test.
     cases = (
         ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, (64, 65, 256)),
-        ("a16w4", None, {}, (1, 32, 64, 256)),
+        ("a16w4", None, {}, (1, 32, 64, 256, 1024)),
     )
     # a4w4 needs the running GPU to be gfx950 and a build with HIP fp4x2 quant; the
     # build-target read (get_gfx) is the build question, get_gfx_runtime the GPU one.
@@ -2107,6 +2108,7 @@ def test_presorted_moe_std_pipelines():
                     row = {
                         "pipeline": name,
                         "token": token,
+                        "gfx": get_gfx_runtime(),
                         "block_m": block_m,
                         "stage2 reduce": deterministic,
                         "bit-identical": torch.equal(own, pre),
@@ -2148,9 +2150,10 @@ def test_presorted_moe_std_pipelines():
         fm.get_2stage_cfgs = real_cfgs
         fm.register_presorted_moe(None)
     # block_m is read from the dispatch, so nothing above says which sizes ran.
-    # gfx950's shipped Kimi-K3 tables reach both; without this check a retune
-    # could silently leave the BM=32 standard path with no pipeline test.
-    if get_gfx_runtime() == "gfx950":
+    # The shipped Kimi-K3 A16W4 tables reach both on gfx950 and gfx942 (BM=32 at
+    # 1024 tokens on both); without this check a retune could silently leave the
+    # BM=32 standard path with no pipeline test.
+    if get_gfx_runtime() in ("gfx950", "gfx942"):
         covered = {row["block_m"] for row in rows}
         assert covered == set(
             presorted_moe.PRESORTED_MOE_BLOCK_MS
@@ -2447,6 +2450,38 @@ def test_presorted_moe_block_m():
             got = match(16, aux_sort, stage_block_m=stage_block_m) is not None
             assert got == ok, f"{aux_sort=} block_size_M={stage_block_m}: {ok=}"
     assert match(32, False, stage_block_m=16) is None, "BM=32 sort, BM=16 stages"
+
+    # presorted_moe_block_m(metadata): what a caller's router asks before it
+    # builds a sort. Every rejection must give None, or the router would build
+    # a sort fused_moe then ignores.
+    fm = aiter.fused_moe
+
+    def meta(block_m, **kw):
+        fields = {
+            "stage1": fm._flydsl_stage1_wrapper,
+            "stage2": fm._flydsl_stage2_wrapper,
+            "block_m": block_m,
+            "ksplit": 0,
+        }
+        return fm.MOEMetadata(**{**fields, **kw})
+
+    for stage2 in (fm._flydsl_stage2_wrapper, fm._flydsl_v2_stage2_wrapper):
+        for block_m, want in ((16, 16), (32, 32), (64, None)):
+            got = fm.presorted_moe_block_m(meta(block_m, stage2=stage2))
+            assert got == want, f"FlyDSL standard sort BM={block_m}: {got}"
+    for block_m, want in ((16, 16), (32, None)):
+        got = fm.presorted_moe_block_m(meta(block_m, output_aux=True))
+        assert got == want, f"aux sort BM={block_m}: {got}"
+    rejected = {
+        "full_impl": {"full_impl": object()},
+        "1-stage": {"run_1stage": True},
+        "post-reduce": {"flat": fm.AsmMoeMode.POST_REDUCE},
+        "CK-tile stage 1": {"stage1": fm.cktile_moe_stage1},
+        "CK-tile stage 2": {"stage2": fm.cktile_moe_stage2},
+    }
+    for what, kw in rejected.items():
+        got = fm.presorted_moe_block_m(meta(16, **kw))
+        assert got is None, f"{what}: presorted_moe_block_m={got}"
     aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
 
 
