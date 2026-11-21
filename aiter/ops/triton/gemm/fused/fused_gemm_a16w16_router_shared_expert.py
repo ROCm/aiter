@@ -14,7 +14,10 @@ _CONFIG_NAME = "FUSED-GEMM-A16W16-ROUTER-SHARED-EXPERT"
 # Above this many rows the persistent decode kernel is slower than separate
 # GEMMs; those sizes take the prefill path (`fused_gemm_a16w16_router_gate_up`
 # for the router and gate_up as one GEMM, then the down GEMM).
-_DECODE_MAX_M = 512
+# 640 (was 512): the decode kernel beats the separate GEMMs up to 640 rows on gfx1250
+# (c1024 decode graphs at 544-640 rows); ATOM still gates it with
+# ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS (default 512).
+_DECODE_MAX_M = 640
 # Prefill: rows of the router weight the router tiles cover; the rest (the
 # shared-gate logit and the zero padding) go to the narrow tail tiles.
 _NR_MAIN = 256
