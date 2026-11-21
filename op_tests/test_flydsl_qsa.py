@@ -474,6 +474,26 @@ def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
     return torch.arange(seq_len - m, seq_len, device=device, dtype=dtypes.i32)
 
 
+def _paged_gqa_live_n_sel(
+    m: int, seq_len: int, token_budget: int, compress_ratio: int
+) -> int:
+    """Widest packed prefix expand fills, the max over the batch."""
+    if compress_ratio < 1 or token_budget % compress_ratio:
+        raise ValueError(
+            f"token_budget {token_budget} must be a multiple of "
+            f"compress_ratio {compress_ratio}"
+        )
+    if m < 1 or m > seq_len:
+        raise ValueError(f"m must fit in seq_len, got m={m} seq_len={seq_len}")
+    block_topk = token_budget // compress_ratio
+    widest = 0
+    for qpos in range(seq_len - m, seq_len):
+        visible = min((qpos + 1) // compress_ratio, seq_len // compress_ratio)
+        complete = min(visible, block_topk)
+        widest = max(widest, complete * compress_ratio + (qpos + 1) % compress_ratio)
+    return widest
+
+
 def _selected_width(indices: torch.Tensor) -> float:
     """Mean live selection slots per row, ignoring -1 padding."""
     return float((indices >= 0).sum().item()) / indices.shape[0]
@@ -876,9 +896,9 @@ def _assert_indexer_caller_workspace(
 
 
 def _assert_gqa_caller_workspace(
-    q, k_cache, v_cache, indices, kv_table, token_to_req, ref_out
+    q, k_cache, v_cache, indices, kv_table, token_to_req, ref_out, n_sel=None
 ):
-    """A caller split workspace matches the default launch."""
+    """A caller split workspace matches the default launch at the same n_sel."""
     m = q.shape[0]
     n_heads = q.shape[1]
     head_dim = q.shape[2]
@@ -902,6 +922,7 @@ def _assert_gqa_caller_workspace(
                 kv_table,
                 token_to_req,
                 out=out,
+                n_sel=n_sel,
                 workspace=(partial_out, partial_lse),
             )
         except ValueError:
@@ -924,6 +945,7 @@ def _assert_gqa_caller_workspace(
                 kv_table,
                 token_to_req,
                 out=out,
+                n_sel=n_sel,
                 workspace=(dummy_out, dummy_lse),
             )
         except ValueError as exc:
@@ -948,6 +970,7 @@ def _assert_gqa_caller_workspace(
             kv_table,
             token_to_req,
             out=out,
+            n_sel=n_sel,
             workspace=(bad, partial_lse),
         ),
         "partial_out",
@@ -1256,12 +1279,96 @@ def check_score_chunk_matches_oracle():
     _assert_indexer_block_ids(torch.cat(refs), got, "chunked indexer score workspace")
 
 
+def check_paged_gqa_live_prefix_matches_full_width():
+    """A packed live prefix matches the allocated row and the oracle."""
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
+    for m, seq_len in ((1, 512), (1, 2048), (1, 8192), (8, 512), (8, 8192)):
+        case = _flash_next_gqa_case(
+            m,
+            seq_len,
+            16,
+            dtypes.bf16,
+            gqa.n_heads,
+            gqa.kv_heads,
+            "packed",
+            "packed",
+        )
+        q = case["q"]
+        k_cache = case["k_cache"]
+        v_cache = case["v_cache"]
+        indices = case["indices"]
+        kv_table = case["kv_table"]
+        token_to_req = case["token_to_req"]
+        live = _paged_gqa_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
+        if m == 1 and seq_len == 512:
+            try:
+                flydsl_qsa_paged_gqa(
+                    q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True
+                )
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("bool n_sel was accepted")
+            past = int(indices.shape[1]) + 1
+            _expect_value_error(
+                lambda q=q, k_cache=k_cache, v_cache=v_cache, indices=indices, kv_table=kv_table, token_to_req=token_to_req, past=past: flydsl_qsa_paged_gqa(
+                    q,
+                    k_cache,
+                    v_cache,
+                    indices,
+                    kv_table,
+                    token_to_req,
+                    n_sel=past,
+                ),
+                "n_sel",
+                "n_sel past the row",
+            )
+        if live <= 0 or live > indices.shape[1]:
+            raise AssertionError(f"live n_sel {live} outside 1..{indices.shape[1]}")
+        if int((indices[:, live:] >= 0).any().item()):
+            raise AssertionError(f"live token past n_sel={live} at M={m} L={seq_len}")
+        if int((indices >= 0).sum(dim=1).max().item()) > live:
+            raise AssertionError(
+                f"a row is wider than n_sel={live} at M={m} L={seq_len}"
+            )
+        full = flydsl_qsa_paged_gqa(
+            q, k_cache, v_cache, indices, kv_table, token_to_req
+        )
+        short = flydsl_qsa_paged_gqa(
+            q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live
+        )
+        err = checkAllclose(
+            full.to(dtypes.fp32),
+            short.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"live prefix vs full width M={m} L={seq_len}",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"live prefix diverged from the full row at M={m} L={seq_len} (err={err})"
+            )
+        err = checkAllclose(
+            case["ref"].output,
+            short.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"live prefix vs oracle M={m} L={seq_len}",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"live prefix diverged from the oracle at M={m} L={seq_len} (err={err})"
+            )
+
+
 def check_qsa_edges():
     """Run the untimed edge checks."""
     check_cache_past_4gib()
     check_invalid_pages_match_oracle()
     check_empty_first_tile_keeps_later_token()
     check_large_negative_score_keeps_weight()
+    check_paged_gqa_live_prefix_matches_full_width()
     check_tie_keeps_smaller_block_id()
     check_partial_block_not_selected()
     check_expand_rejects_strided_metadata()
@@ -1737,12 +1844,17 @@ def bench_qsa_flash_next_paged_gqa(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(k_cache),
     }
+    live_n_sel = _paged_gqa_live_n_sel(
+        m, seq_len, FLASH_NEXT_INDEXER.token_budget, FLASH_NEXT_INDEXER.compress_ratio
+    )
     for name, (fn, msg) in candidates.items():
+        extra = {"n_sel": live_n_sel} if fn is flydsl_qsa_paged_gqa else {}
         out, us = run_perftest(
             fn,
             *_WideRotation.wrap(rotate, *gqa_args),
             num_rotate_args=rotate,
             num_iters=_WideRotation.iters,
+            **extra,
         )
         err = checkAllclose(
             ref.output,
@@ -1756,7 +1868,14 @@ def bench_qsa_flash_next_paged_gqa(
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     _assert_gqa_caller_workspace(
-        q_gqa, k_cache, v_cache, indices, kv_table, token_to_req, out
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        out,
+        n_sel=live_n_sel,
     )
     return ret
 
