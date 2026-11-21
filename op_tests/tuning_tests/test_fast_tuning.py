@@ -751,6 +751,134 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertTrue(result["kernelName1"].startswith("FAILED:"))
 
 
+class TestMxfp4FatalGpuError(unittest.TestCase):
+    KEYS = (
+        "gfx",
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+    )
+
+    @staticmethod
+    def _row(token):
+        return {
+            "token": token,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+        }
+
+    @staticmethod
+    def _fatal_error():
+        # The tuner matches torch.AcceleratorError by name.
+        error_type = type("AcceleratorError", (RuntimeError,), {})
+        return error_type("HIP error: an illegal memory access was encountered")
+
+    def _tune(self, rows, args, run_candidate):
+        import pandas as pd
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = list(self.KEYS)
+
+        def candidate_rows(_row, full_search=False):
+            return [
+                {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
+                for name in ("fast", "slow")
+            ]
+
+        with (
+            mock.patch.object(gemm_moe_tune.torch.cuda, "device_count", return_value=1),
+            mock.patch.object(
+                gemm_moe_tune.torch.cuda, "current_device", return_value=0
+            ),
+            mock.patch.object(
+                tuner, "_runtime_device_identity", return_value=("gfx950", 256)
+            ),
+            mock.patch.object(tuner, "_candidate_rows", side_effect=candidate_rows),
+            mock.patch.object(tuner, "_precompile_candidates", return_value=(2, 0)),
+            mock.patch.object(tuner, "_prepare_case", return_value="fixture"),
+            mock.patch.object(tuner, "_torch_ref", return_value="reference"),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            return tuner, tuner.tune(pd.DataFrame(rows), None, args)
+
+    def test_fatal_error_fails_its_shape_and_later_shapes_still_tune(self):
+        fatal = self._fatal_error()
+
+        def run_candidate(row, candidate, _args, **_kwargs):
+            # Shape 1 times its fast pair, then faults on the slow one.
+            if row["token"] == 1 and candidate["kernelName1"] == "g1_slow":
+                raise fatal
+            candidate["us"] = 2.0 if candidate["kernelName1"] == "g1_fast" else 3.0
+            return candidate["us"]
+
+        args = SimpleNamespace(
+            mp=1,
+            mxfp4_search_mode="prune",
+            fast_scan=False,
+            timeout=0,
+            errRatio=0.1,
+            warmup=1,
+            iters=10,
+        )
+        tuner, (first, second) = self._tune(
+            [self._row(1), self._row(2)], args, run_candidate
+        )
+
+        self.assertEqual(first["us"], tuner.INVALID_TIME)
+        self.assertTrue(first["kernelName1"].startswith("FAILED"))
+        self.assertEqual(second["kernelName1"], "g1_fast")
+        self.assertEqual(second["us"], 2.0)
+
+    def test_fatal_error_during_finalist_retime_fails_the_shape(self):
+        fatal = self._fatal_error()
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            fast = candidate["kernelName1"] == "g1_fast"
+            if kwargs["num_iters"] == 100 and fast:
+                raise fatal
+            candidate.update(us=1.0 if fast else 2.0, _err=0.01)
+            return candidate["us"]
+
+        args = SimpleNamespace(
+            mp=1,
+            fast_scan=True,
+            fast_scan_warmup_accuracy_checks=1,
+            fast_scan_iters=10,
+            fast_scan_final_iters=100,
+            fast_scan_finalists=2,
+            timeout=0,
+            errRatio=0.1,
+            warmup=2,
+            iters=101,
+        )
+        tuner, (result,) = self._tune([self._row(1)], args, run_candidate)
+
+        self.assertEqual(result["us"], tuner.INVALID_TIME)
+        self.assertTrue(result["kernelName1"].startswith("FAILED"))
+
+
 class TestGlm53TunedArtifact(unittest.TestCase):
     def test_token_one_row_matches_validated_coupled_winner(self):
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
