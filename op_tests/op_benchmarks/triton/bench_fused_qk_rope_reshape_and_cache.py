@@ -15,6 +15,8 @@ using prefill at TP1 with a bf16 KV cache and concurrency 16, for simplicity:
     cos/sin=[131072, 1, 1, 32]                  neox, front-half freqs reused
     flash_layout=False, apply_scale=False, output_zeros=False
 
+--qk_norm adds the per-head q/k RMSNorm prologue (and FP8 saturation).
+
 Metrics: time (default), throughput, bandwidth.
 
 Usage Example:
@@ -251,6 +253,14 @@ def bench_qk_rope_fn(
     sample = rot_bufs[0]
 
     flops = M * QH * D * 3 + M * KH * D * 3  # rope
+    norm_kwargs = {}
+    if args.qk_norm:
+        flops += (M * QH * D + M * KH * D) * 4  # square, sum, scale, weight
+        norm_kwargs = {
+            "q_norm_weight": torch.ones(D, dtype=torch.bfloat16, device="cuda"),
+            "k_norm_weight": torch.ones(D, dtype=torch.bfloat16, device="cuda"),
+            "saturate_fp8": True,
+        }
 
     elem = sample["q"].element_size()
 
@@ -299,6 +309,7 @@ def bench_qk_rope_fn(
             output_zeros=args.output_zeros,
             zeros_out=zeros_out,
             upcast_operand=args.upcast_operand,
+            **norm_kwargs,
         )
 
     ms = bencher.bench(_run)
@@ -434,6 +445,12 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         default=False,
         help="Upcast the RoPE operands to fp32 inside the kernel",
+    )
+    parser.add_argument(
+        "--qk_norm",
+        action="store_true",
+        default=False,
+        help="Apply the per-head q/k RMSNorm before RoPE, and saturate an FP8 cache",
     )
     return parser.parse_args(args=args)
 
