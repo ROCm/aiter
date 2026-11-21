@@ -8,6 +8,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import wmma_compat
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 
 try:
@@ -487,7 +488,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         mfma_k = gl.convert_layout(k.T, mfma_layout_b)
 
         if IS_GFX1250:
-            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+            o = wmma_compat(mfma_q, mfma_k, zero)
         else:
             o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
         o = o * k_scale_f[None, :]
@@ -542,7 +543,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
     mfma_k = gl.convert_layout(k.T, mfma_layout_b)
     if IS_GFX1250:
-        o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+        o = wmma_compat(mfma_q, mfma_k, zero)
     else:
         o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
@@ -801,7 +802,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 .permute([1, 0])
                 .load(layout=mfma_layout_b)
             )
-            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
+            o = wmma_compat(mfma_q, mfma_k, zero_acc)
 
             if j + 1 < n_blocks:
                 gl.amd.gfx1250.tdm.async_wait(2)

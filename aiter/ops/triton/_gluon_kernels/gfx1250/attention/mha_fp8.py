@@ -3,6 +3,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
+from aiter.ops.triton._gluon_kernels.common.utils import wmma_compat
+
 
 @gluon.jit
 def fast_maximum(a, b):
@@ -332,8 +334,8 @@ def _mha_fwd_subtiled(
         num_n_iter = gl.cdiv(SEQLEN_K, BLOCK_N)
 
     gl.amd.gfx1250.tdm.async_wait(2)
-    qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
-    qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
+    qk0 = wmma_compat(q, k0, qk_zeros)
+    qk1 = wmma_compat(q, k1, qk_zeros)
     if (CAUSAL or not EVEN_N) and num_n_iter <= 2:
         qk0 = apply_mask(
             qk0,
@@ -376,7 +378,7 @@ def _mha_fwd_subtiled(
 
         gl.barrier()
         with gl.amd.warp_pipeline_stage("stage0"):
-            qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
+            qk0 = wmma_compat(q, k0, qk_zeros)
             k1 = local_load_k(
                 k_buffer, read_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
             )
@@ -398,7 +400,7 @@ def _mha_fwd_subtiled(
 
         gl.amd.gfx1250.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage1"):
-            qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
+            qk1 = wmma_compat(q, k1, qk_zeros)
             v0 = local_load_v(
                 v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
             )
@@ -412,7 +414,7 @@ def _mha_fwd_subtiled(
 
         gl.barrier()
         with gl.amd.warp_pipeline_stage("stage2"):
-            acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
+            acc0 = wmma_compat(p_quant, v0, acc0)
             v1 = local_load_v(
                 v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
             )
@@ -431,7 +433,7 @@ def _mha_fwd_subtiled(
 
         gl.amd.gfx1250.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage3"):
-            acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
+            acc1 = wmma_compat(p_quant, v1, acc1)
             k0 = local_load_k(
                 k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
             )
@@ -444,7 +446,7 @@ def _mha_fwd_subtiled(
 
     gl.barrier()
     with gl.amd.warp_pipeline_stage("ep0_0"):
-        qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
+        qk0 = wmma_compat(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
             num_n_iter = gl.maximum(num_n_iter, 3)
             qk0 = apply_mask(
@@ -482,7 +484,7 @@ def _mha_fwd_subtiled(
 
     gl.amd.gfx1250.tdm.async_wait(2)
     with gl.amd.warp_pipeline_stage("ep0_1"):
-        qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
+        qk1 = wmma_compat(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
             qk1 = apply_mask(
                 qk1,
@@ -509,7 +511,7 @@ def _mha_fwd_subtiled(
 
     gl.barrier()
     with gl.amd.warp_pipeline_stage("ep0_2"):
-        acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
+        acc0 = wmma_compat(p_quant, v0, acc0)
         v1 = local_load_v(
             v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
@@ -519,7 +521,7 @@ def _mha_fwd_subtiled(
 
     gl.amd.gfx1250.tdm.async_wait(1)
     with gl.amd.warp_pipeline_stage("ep0_3"):
-        acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
+        acc1 = wmma_compat(p_quant, v1, acc1)
         k0 = local_load_k(
             k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
         )
@@ -540,7 +542,7 @@ def _mha_fwd_subtiled(
 
     gl.barrier()
     with gl.amd.warp_pipeline_stage("ep1_0"):
-        qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
+        qk0 = wmma_compat(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
             qk0 = apply_mask(
                 qk0,
@@ -568,7 +570,7 @@ def _mha_fwd_subtiled(
 
     gl.amd.gfx1250.tdm.async_wait(1)
     with gl.amd.warp_pipeline_stage("ep1_1"):
-        qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
+        qk1 = wmma_compat(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
             qk1 = apply_mask(
                 qk1,
@@ -595,7 +597,7 @@ def _mha_fwd_subtiled(
 
     gl.barrier()
     with gl.amd.warp_pipeline_stage("ep1_2"):
-        acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
+        acc0 = wmma_compat(p_quant, v0, acc0)
         v1 = local_load_v(
             v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
@@ -604,7 +606,7 @@ def _mha_fwd_subtiled(
         m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
 
     gl.amd.gfx1250.tdm.async_wait(0)
-    acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
+    acc1 = wmma_compat(p_quant, v1, acc1)
     qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
     qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
     p0 = gl.exp2(qk0_shifted)
@@ -628,13 +630,13 @@ def _mha_fwd_subtiled(
     p_quant = p.to(gl.float8e4nv)
     p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
-    acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
+    acc0 = wmma_compat(p_quant, v0, acc0)
     acc0 = acc0 * ep_norm
     acc0 = acc0.to(gl.bfloat16)
     v1 = local_load_v(
         v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
     )
-    acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
+    acc1 = wmma_compat(p_quant, v1, acc1)
     acc1 = acc1 * ep_norm
     acc1 = acc1.to(gl.bfloat16)
 

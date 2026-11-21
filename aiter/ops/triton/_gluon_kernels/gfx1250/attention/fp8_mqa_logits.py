@@ -4,6 +4,8 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import wmma_compat
+
 # same reduction technique, arch agnostic
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
@@ -182,7 +184,7 @@ def _mqa_dot(
         dtype=gl.float32,
         layout=layout,
     )
-    return gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
+    return wmma_compat(mfma_q, mfma_k, acc)
 
 
 @gluon.jit

@@ -186,7 +186,7 @@ def test_fused_rms_quant(
 
     torch.manual_seed(0)
 
-    if inargs == "gluon" and arch_info.get_arch() != "gfx1250":
+    if inargs == "gluon" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -712,7 +712,7 @@ def test_fuse_reduce_rms_quant(
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    if args == "gluon" and arch_info.get_arch() != "gfx1250":
+    if args == "gluon" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Gluon kernel is not supported on this arch")
 
     torch.manual_seed(0)
@@ -869,7 +869,7 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
-    if args == "gluon" and arch_info.get_arch() != "gfx1250":
+    if args == "gluon" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.manual_seed(0)

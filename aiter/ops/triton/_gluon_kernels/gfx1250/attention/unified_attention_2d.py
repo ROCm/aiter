@@ -8,6 +8,7 @@ from triton.experimental import gluon
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import wmma_compat
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -16,10 +17,9 @@ float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
-# tdm.async_gather takes a source column in upstream Triton (desc, rows, col, dst) but not in every gfx1250 build
-# (desc, rows, dst); _tdm_gather calls whichever this Triton has.
+# True if tdm.async_gather takes a column argument (its third parameter is not "dst").
 _GATHER_TAKES_COL = gl.constexpr(
-    len(inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters) >= 6
+    list(inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters)[2] != "dst"
 )
 
 
@@ -1398,7 +1398,7 @@ class AttentionProgram:
                 S,
             )
         else:
-            return gl.amd.gfx1250.wmma(self.q, k, S)
+            return wmma_compat(self.q, k, S)
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -1483,7 +1483,7 @@ class AttentionProgram:
     @gluon.jit
     def compute_pv(self, p, v, acc):
         p = gl.convert_layout(p, self.cfg.p_layout)
-        return gl.amd.gfx1250.wmma(p, v, acc)
+        return wmma_compat(p, v, acc)
 
     @gluon.jit
     def store_output(
@@ -1782,7 +1782,7 @@ class AttentionProgram:
                 S,
             )
         else:
-            return gl.amd.gfx1250.wmma(self.q, k, S)
+            return wmma_compat(self.q, k, S)
 
     @gluon.jit
     def split_k_scales(self, k_scales):
