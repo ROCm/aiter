@@ -41,8 +41,10 @@ from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     MX32_COMPUTE_WMMA_NAME_PREFIX,
     compute_kernel_k_pair,
     is_compute_wmma_kernel_name,
+    MX32_STREAM_NAME_PREFIX,
     parse_mxfp8_32_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+    run_gemm_a8w8_mxfp8_32_stream_gfx1250,
 )
 
 BLOCK_K = 128
@@ -544,6 +546,25 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         or pick_bmm_mx32_compute_kernel_name(b, m, n, k)
         or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
     )
+    if name.startswith(MX32_STREAM_NAME_PREFIX + "_"):
+        # Decode weight-streaming kernel: B = 1, row-major A and A scale, 1x32 B scale.
+        if b != 1 or fused or w_scale_32x32:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] stream kernel {name!r} needs B=1, a 1x32 "
+                "w_scale and no fused output quant"
+            )
+        if m:
+            from aiter.utility import dtypes
+
+            run_gemm_a8w8_mxfp8_32_stream_gfx1250(
+                XQ[:, 0],
+                WQ[0],
+                x_scale[:, 0].view(dtypes.fp8_e8m0),
+                w_scale[0].view(dtypes.fp8_e8m0),
+                Out[:, 0],
+                name,
+            )
+        return Out
     direct_cfg = parse_mxfp8_32_wmma_kernel_name(name)
     if direct_cfg is not None:
         compute = is_compute_wmma_kernel_name(name)

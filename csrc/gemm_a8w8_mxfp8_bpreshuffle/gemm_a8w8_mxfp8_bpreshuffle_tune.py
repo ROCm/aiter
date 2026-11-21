@@ -488,6 +488,9 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
 # (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
+# Decode weight-streaming mxfp8_32 kernels (flydsl_mxfp8_32_bpreshuffle_stream_*),
+# run through the same B = 1 bmm dispatch.
+KERNEL_ID_BASE_STREAM = 3_900_000  # inside the bmm id range: rows get kernelId "bmm"
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
@@ -611,6 +614,12 @@ def gfx1250_1x32_runs(m, n, k):
                 run_bmm_flydsl,
             )
         )
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        mxfp8_32_stream_candidates,
+    )
+
+    for index, name in enumerate(mxfp8_32_stream_candidates(m, n, k)):
+        runs.append((KERNEL_ID_BASE_STREAM + index, 1, name, run_bmm_flydsl))
     return list({entry[2]: entry for entry in runs}.values())
 
 
