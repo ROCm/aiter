@@ -7,7 +7,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)

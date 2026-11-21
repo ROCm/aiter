@@ -266,3 +266,7 @@ def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, rope_nan, h, 
     nan_bytes = nan_bytes.view(torch.uint8).cuda()
     for out in (q_out[..., : KV_LORA + PE_DIM], kv_cache):
         assert torch.isin(out.view(torch.uint8), nan_bytes).any() == rope_nan
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main(["-q", __file__]))
