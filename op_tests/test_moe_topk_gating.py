@@ -12,9 +12,12 @@ Usage:
   python test_moe_topk_gating.py --section ties,eplb
   python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
       --num-tokens 1,8,32,128 --topk 16 --dtype bf16
+  python test_moe_topk_gating.py --section softplus-384 --num-tokens 1,64,1024 \
+      --topk 6,8
 """
 
 import argparse
+import functools
 import itertools
 import math
 import os
@@ -24,7 +27,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
@@ -514,6 +517,82 @@ def bench_topk_softplus(
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = n_mism / num_tokens
         ret[f"{name} max_weight_err"] = _max_weight_error(w, ids, w_torch, i_torch)
+    return ret
+
+
+def _sqrtsoftplus_384_special_rows():
+    """Rows where a tie or NaN rule decides the result: all NaN, NaN in every
+    third column, constant, and few distinct values."""
+    rows = torch.randn((4, 384), dtype=torch.float32, device="cuda") * 4
+    rows[0] = float("nan")
+    rows[1, ::3] = float("nan")
+    rows[2] = 0.25
+    rows[3] = (rows[3] * 2).round() / 2
+    return rows.to(torch.bfloat16)
+
+
+@benchmark()
+def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
+    """Compare the Triton 384-expert sqrtsoftplus top-k with the HIP kernel.
+    topk_gating takes the Triton kernel for these calls. The bit check runs
+    eagerly, with a random bias and with none, on the benchmark rows and on
+    special rows (NaN, ties): the Triton result must be bit-identical. The
+    CUDA graph is used only to time the two kernels, with the bias."""
+    from aiter.ops.topk import (
+        _can_use_sqrtsoftplus_384_topk,
+        topk_gating,
+        topk_gating_fwd,
+    )
+    from aiter.ops.triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    torch.random.manual_seed(0)
+    num_experts = 384
+    arch = SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+    gating_output = _make_gating(num_experts, num_tokens, torch.bfloat16)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    no_bias = torch.empty(0, dtype=torch.float32, device="cuda")
+
+    def outputs(rows):
+        return (
+            torch.empty((rows, topk), dtype=torch.float32),
+            torch.empty((rows, topk), dtype=torch.int32),
+        )
+
+    def run_triton(logits, b, w, i):
+        topk_gating(w, i, logits, b, True, route_scale)
+        return w, i
+
+    def run_hip(logits, b, w, i):
+        hb = no_bias if b is None else b
+        topk_gating_fwd(w, i, logits, hb, True, route_scale, "sqrtsoftplus")
+        return w, i
+
+    id_mismatch = weight_mismatch = 0
+    for logits in (gating_output, _sqrtsoftplus_384_special_rows()):
+        for b in (bias, None):
+            tw, ti = outputs(logits.shape[0])
+            hw, hi = outputs(logits.shape[0])
+            # Without this the Triton side could run HIP: topk_gating falls back.
+            assert _can_use_sqrtsoftplus_384_topk(
+                arch, tw, ti, logits, no_bias if b is None else b
+            ), "topk_gating does not take the Triton kernel for this config"
+            run_triton(logits, b, tw, ti)
+            run_hip(logits, b, hw, hi)
+            id_mismatch += int((ti != hi).sum())
+            weight_mismatch += int((tw.view(torch.int32) != hw.view(torch.int32)).sum())
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "id mismatch": id_mismatch,
+        "weight bit mismatch": weight_mismatch,
+    }
+    tw, ti = outputs(num_tokens)
+    hw, hi = outputs(num_tokens)
+    for name, fn, w, i in (("triton", run_triton, tw, ti), ("hip", run_hip, hw, hi)):
+        # No tensor arguments: run_perftest would rotate copies of them.
+        _, us = run_perftest(
+            functools.partial(fn, gating_output, bias, w, i), testGraph=True
+        )
+        ret[f"{name} graph us"] = us
     return ret
 
 
@@ -1065,25 +1144,27 @@ def main():
         "--score-func",
         dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=[
-            "sigmoid",
-            "softplus",
-            "softmax",
-            "nan",
-            "ties",
-            "eplb",
-            "shared",
-            "pad-rows",
-            "unaligned",
-        ],
+        default=None,
         help="Comma-separated list of sections to run: "
-        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows,"
-        "unaligned (default: all except biased-sigmoid). "
+        "sigmoid,biased-sigmoid,softplus,softplus-384,softmax,nan,ties,eplb,shared,"
+        "pad-rows,unaligned (default: all except biased-sigmoid; softplus-384 only "
+        "on an arch in SQRTSOFTPLUS_384_ARCHS). "
         "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
         "eplb, pad-rows and unaligned "
         "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
+    default_sections = [
+        "sigmoid",
+        "softplus",
+        "softmax",
+        "nan",
+        "ties",
+        "eplb",
+        "shared",
+        "pad-rows",
+        "unaligned",
+    ]
 
     def to_list(x):
         return x if isinstance(x, (list, tuple)) else [x]
@@ -1093,6 +1174,17 @@ def main():
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
     sections = args.section
+    softplus_384_named = sections is not None and "softplus-384" in sections
+    if sections is None:
+        from aiter.ops.triton.moe.moe_routing.topk_gating import (
+            SQRTSOFTPLUS_384_ARCHS,
+        )
+
+        sections = default_sections
+        # By default on these arches, so that a HIP-only change to topk_gating
+        # also runs the bit-identity check against the Triton kernel.
+        if get_gfx_runtime() in SQRTSOFTPLUS_384_ARCHS:
+            sections = sections + ["softplus-384"]
 
     failed_sections: list[str] = []
 
@@ -1160,6 +1252,46 @@ def main():
             print(f"\nERROR: {len(errors)} softplus config(s) had errors!")
             print(errors.to_string(index=False))
             failed_sections.append("softplus")
+
+    # -- 384-expert sqrtsoftplus: Triton versus HIP ------------------------
+    if "softplus-384" in sections:
+        from aiter.ops.triton.moe.moe_routing.topk_gating import (
+            SQRTSOFTPLUS_384_ARCHS,
+        )
+
+        gfx = get_gfx_runtime()
+        if gfx not in SQRTSOFTPLUS_384_ARCHS:
+            raise ValueError(
+                f"softplus-384 requires one of {sorted(SQRTSOFTPLUS_384_ARCHS)}"
+            )
+        # The rows that topk_gating sends to the Triton kernel on this arch.
+        max_rows = SQRTSOFTPLUS_384_ARCHS[gfx].max_rows
+        configs = list(
+            itertools.product(
+                [t for t in num_tokens_list if t <= max_rows],
+                [k for k in topk_list if k <= 8],
+            )
+        )
+        message = (
+            f"softplus-384 has nothing to run on {gfx}: it needs a --num-tokens "
+            f"value of at most {max_rows} and a --topk value from 1 to 8"
+        )
+        if not configs and softplus_384_named:
+            raise ValueError(message)
+        if not configs:
+            # Added by default: skip it, so that the other sections still run.
+            print(f"SKIP: {message}")
+        else:
+            df = pd.DataFrame([bench_sqrtsoftplus_384(*cfg) for cfg in configs])
+            aiter.logger.info(
+                "384-expert sqrtsoftplus summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+            errors = df[(df["id mismatch"] != 0) | (df["weight bit mismatch"] != 0)]
+            if len(errors) > 0:
+                print(f"\nERROR: {len(errors)} softplus-384 config(s) mismatched HIP!")
+                print(errors.to_string(index=False))
+                failed_sections.append("softplus-384")
 
     # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
     if "softmax" in sections:
