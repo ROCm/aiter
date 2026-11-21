@@ -257,6 +257,11 @@ class AttentionOutputA2AIntraNodeOp:
                 math.prod(shape) * torch.empty((), dtype=self.dtype).element_size(),
             )
 
+        from aiter.dist.device_communicators.all2all import ensure_mori_shmem
+
+        # mori's heap is initialised lazily (over the registered EP group, if
+        # any); it must be up before its PE is read or a tensor allocated.
+        ensure_mori_shmem()
         if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
             raise ValueError(
                 f"rank/world_size ({rank}/{world_size}) != MoRI "
