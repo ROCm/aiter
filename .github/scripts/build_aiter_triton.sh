@@ -34,13 +34,19 @@ echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
+
+# Remove any pre-installed triton variants that share the triton/ namespace.
+# If amd-triton is installed on top of an old triton package, a later
+# ``pip uninstall triton`` (from setup.py) deletes shared files and leaves
+# amd-triton's metadata intact but its module files missing.
+pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm triton-kernels 2>/dev/null || true
+
 retry_cmd 3 pip install -r .github/requirements/triton-test.txt
-.github/scripts/install_triton.sh
 pip uninstall -y aiter || true
 retry_cmd 3 pip install --no-build-isolation -e .
 
 echo
-echo "==== Verify triton installed by install_triton.sh ===="
+echo "==== Verify amd-triton installed ===="
 python .github/scripts/verify_triton_pin.py
 
 # Read BUILD_TRITON env var, default to 0. If 1, override the pinned triton wheel with a source build; if 0, use the pinned wheel from triton-test.txt.

@@ -25,6 +25,8 @@ OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.
 PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.5.0"
+TRITON_VERSION = "amd-triton==3.9.0.dev20261110"
+TRITON_KERNELS_VERSION = "amd-triton-kernels==1.0.0.dev20261031"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -36,6 +38,12 @@ ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 # flydsl publishes Linux-only wheels.
 FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
+TRITON_REQUIRES = (
+    []
+    if IS_WINDOWS or AITER_USE_SYSTEM_TRITON
+    else [TRITON_VERSION, TRITON_KERNELS_VERSION]
+)
 # Single skip-C++/HIP-build gate.
 AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 
@@ -87,30 +95,27 @@ if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
         )
 
 
-def _is_triton_installed():
-    from importlib.metadata import version as pkg_version
-
-    for pkg in [
-        "triton",
-        "amd-triton",
-        "pytorch-triton",
-        "pytorch-triton-rocm",
-        "triton-rocm",
-    ]:
-        try:
-            return pkg, pkg_version(pkg)
-        except Exception:  # noqa: BLE001,S110
-            pass
-    return None
+_TRITON_CONFLICTS = [
+    "triton",
+    "pytorch-triton",
+    "pytorch-triton-rocm",
+    "triton-rocm",
+]
 
 
-def _run_install_triton():
-    print("[aiter] Installing triton via .github/scripts/install_triton.sh")
-    install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
-    subprocess.check_call(["bash", install_triton])
-
-
-AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
+def _uninstall_triton_conflicts():
+    for pkg in _TRITON_CONFLICTS:
+        subprocess.call(
+            [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    for pkg in ["triton-kernels"]:
+        subprocess.call(
+            [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def _torch_version_below(min_version):
@@ -123,6 +128,46 @@ def _torch_version_below(min_version):
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+def _is_triton_installed():
+    from importlib.metadata import version as pkg_version
+
+    for pkg in [
+        "amd-triton",
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]:
+        try:
+            return pkg, pkg_version(pkg)
+        except Exception:  # noqa: BLE001,S110
+            pass
+    return None
+
+
+def _triton_satisfied():
+    from importlib.metadata import version as pkg_version
+
+    from packaging.version import Version
+
+    for spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
+        name, ver = spec.split("==")
+        try:
+            if Version(pkg_version(name)) != Version(ver):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+    # Metadata can survive even when the module files were removed by
+    # ``pip uninstall triton`` (the old distribution shares triton/).
+    try:
+        import importlib
+
+        importlib.import_module("triton.language")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 _triton_info = _is_triton_installed()
@@ -138,20 +183,33 @@ elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
     )
-    print(
-        "[aiter] To ensure compatibility, consider running .github/scripts/install_triton.sh."
-    )
-else:
-    if _triton_info:
-        print(
-            f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
-            " with aiter-compatible triton"
-            " (if needed, set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
-        )
-    try:
-        _run_install_triton()
-    except Exception:  # noqa: BLE001
-        print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
+elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
+    _uninstall_triton_conflicts()
+
+    if not _triton_satisfied():
+        if _triton_info:
+            print(
+                f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
+                " with aiter-compatible triton"
+                " (set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
+            )
+        for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
+            try:
+                subprocess.check_call(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--force-reinstall",
+                        "--no-deps",
+                        pkg_spec,
+                    ]
+                )
+            except Exception:  # noqa: BLE001
+                print(
+                    f"[aiter] Skipping {pkg_spec} install (will be handled by install_requires)"
+                )
 
 
 def write_install_mode():
@@ -517,6 +575,7 @@ else:
         "psutil",
         "packaging",
         *FLYDSL_REQUIRES,
+        *TRITON_REQUIRES,
     ]
 
 setup(

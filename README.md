@@ -107,8 +107,7 @@ Release automation validates that the release tag points at the matching release
 ```bash
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
-./.github/scripts/install_triton.sh
-AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
+python3 -m pip install -e .
 ```
 
 If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
@@ -128,12 +127,15 @@ pip install -r requirements.txt
 
 ### Triton
 
-AITER includes Triton-based operators that require Triton from AMD PyPI, with the correct version selected based on your ROCm installation. For an editable installation, run the install script before `pip install -e .` as shown above.
+AITER requires [`amd-triton`](https://pypi.org/project/amd-triton/), which is installed automatically via `pip install -e .`.
 
-To keep an existing compatible Triton installation, skip the script and set:
+At runtime, AITER detects conflicting Triton packages (`triton`, `pytorch-triton`, `pytorch-triton-rocm`, `triton-rocm`) and replaces them with `amd-triton`.
+
+To skip the automatic install and conflict detection (e.g. when using a custom Triton build), set `AITER_USE_SYSTEM_TRITON=1` at both install time and runtime:
 
 ```bash
 AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
+AITER_USE_SYSTEM_TRITON=1 python3 your_script.py
 ```
 
 ### Build parallelism
