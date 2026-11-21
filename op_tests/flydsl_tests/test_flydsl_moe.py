@@ -69,6 +69,7 @@ def _generate_a8w4_gui_data(
     block_m: int,
     seed: int = 0,
     dtype=torch.bfloat16,
+    distinct_experts: bool = False,
 ):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -84,6 +85,10 @@ def _generate_a8w4_gui_data(
         w2[:, :, -inter_pad:] = 0
 
     score = torch.randn(token, E, dtype=dtype, device="cuda")
+    if distinct_experts:
+        # Token i -> experts topk*i .. topk*i+topk-1, one routed row per expert.
+        slots = torch.arange(token * topk, device="cuda")
+        score[slots // topk, slots] += 100
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, block_m
