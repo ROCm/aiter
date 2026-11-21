@@ -36,7 +36,15 @@ def compile_moe_gemm1(
     swiglu_limit=None,
     fused_down_clear=False,
     has_num_local_tokens=False,
+    N_VALID=None,
 ):
+    # Split-K and batch1 launch only the N blocks covering the first N_VALID
+    # Gate/Up columns. The output row stays N // 2 wide; columns of the last
+    # block past N_VALID come from the zero tail and Down does not read them.
+    if N_VALID is None:
+        N_VALID = N
+    if N_VALID != N and alg not in ("splitk", "batch1"):
+        raise ValueError("N_VALID < N needs the split-K or batch1 kernels")
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
         weight_dtype,
@@ -828,7 +836,7 @@ def compile_moe_gemm1(
             fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
 
         if const_expr(fused_down_clear):
-            clear_blocks = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
+            clear_blocks = (N_VALID + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
             clear_threads = clear_blocks * 256
             clear_rounds = (K // 8 + clear_threads - 1) // clear_threads
             for clear_round in range_constexpr(clear_rounds):
@@ -1031,7 +1039,7 @@ def compile_moe_gemm1(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        num_n_blocks = fxh.div_up(N_VALID, BLOCK_TILE_SIZE_N)
         if const_expr(E is not None) and M * TOPK <= E:
             task_num = M * TOPK
         moe_2stage_gateup_splitk(
@@ -1063,7 +1071,7 @@ def compile_moe_gemm1(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        num_n_blocks = fxh.div_up(N_VALID, BLOCK_TILE_SIZE_N)
         batch_size = task_num // TOPK
         # Other launchers take the routing weights in the p_clear_output position.
         moe_2stage_gateup_batch1(
