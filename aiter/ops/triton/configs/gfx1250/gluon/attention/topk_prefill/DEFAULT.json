@@ -1,0 +1,10 @@
+{
+    "VPT": 8,
+    "MIN_WARPS": 4,
+    "MAX_WARPS": 8,
+    "CAP": 4096,
+    "SAMPLE_MIN_TILES": 4,
+    "SAMPLE_BLOCKS": 8,
+    "HI_NUM": 12,
+    "LO_NUM": 22
+}
