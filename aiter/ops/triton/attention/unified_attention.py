@@ -1272,6 +1272,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         0=plain double buffered version,
         1=2-stage version,
         2=4-stage version
+        3=4-stage version with the fp8 P scale folded into the exponent
     """
     assert params.softcap == 0, "Softcap is not supported"
 
@@ -1338,6 +1339,15 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
 
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
+    # Each warp owns 16-row WMMA tiles of the BLOCK_M rows (warp_bases split the rows), so a
+    # BLOCK_M below 16 * num_warps would leave a warp without rows.
+    assert BLOCK_M >= 16 * num_warps, (
+        f"BLOCK_M={BLOCK_M} needs at least 16 rows per warp (num_warps={num_warps})"
+    )
+    # Loop variant 0 is double-buffered only (static_assert in the kernel); a config that asks
+    # for 3 buffers and is demoted to variant 0 above falls back to 2.
+    if loop_variant == 0:
+        num_buffers = 2
     # spec decode launches the exact block count, so the kernel needs no search
     SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
     if params.all_decode:
