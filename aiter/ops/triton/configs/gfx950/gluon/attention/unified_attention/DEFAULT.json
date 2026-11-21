@@ -243,6 +243,14 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "WIDE_BLOCK_M_MULT": 2,
+      "PREFILL_WIDE": {
+        "min_kv": 12288,
+        "config": {
+          "BLOCK_M": 128,
+          "MFMA_DIM": 32,
+          "waves_per_eu": 0
+        }
+      },
       "PRELOAD_PAGES": 0,
       "USE_EXPLICIT_FMA": false
     },
