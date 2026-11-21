@@ -872,3 +872,229 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         batch=batch,
         y_scale_out=y_scale_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Decode-sized weight-streaming mxfp8_32 GEMM (kernels/gemm_a8w8_mx32_stream_gfx1250)
+# ---------------------------------------------------------------------------
+
+MX32_STREAM_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_stream"
+_MX32_STREAM_KERNEL_NAME_RE = re.compile(
+    rf"^{re.escape(MX32_STREAM_NAME_PREFIX)}_t(?P<tile_m>\d+)x(?P<tile_n>\d+)"
+    r"_wn(?P<wn>\d+)_wk(?P<wk>\d+)_sk(?P<split_k>\d+)(?P<cluster>c)?"
+    r"_d(?P<depth>\d+)(?P<a_lds>_al)?(?P<a_wave>_aw)?$"
+)
+_launch_stream = None
+
+
+def mxfp8_32_stream_kernel_name(
+    tile_m, tile_n, wn, wk, split_k, depth, a_lds=0, cluster=False
+) -> str:
+    """a_lds: 0 direct A, 1 workgroup-staged A (``_al``), 2 per-wave A transpose (``_aw``)."""
+    return (
+        f"{MX32_STREAM_NAME_PREFIX}_t{tile_m}x{tile_n}_wn{wn}_wk{wk}"
+        f"_sk{split_k}{'c' if cluster else ''}_d{depth}"
+        f"{ {0: '', 1: '_al', 2: '_aw'}[int(a_lds)] }"
+    )
+
+
+def is_mxfp8_32_stream_kernel_name(name: str) -> bool:
+    return _MX32_STREAM_KERNEL_NAME_RE.fullmatch(name) is not None
+
+
+@functools.lru_cache(maxsize=1024)
+def parse_mxfp8_32_stream_kernel_name(name: str) -> dict | None:
+    match = _MX32_STREAM_KERNEL_NAME_RE.fullmatch(name)
+    if match is None:
+        return None
+    g = match.groupdict()
+    cfg = {
+        key: int(g[key]) for key in ("tile_m", "tile_n", "wn", "wk", "split_k", "depth")
+    }
+    cfg["cluster"] = g["cluster"] is not None
+    if g["a_lds"] is not None and g["a_wave"] is not None:
+        return None
+    cfg["a_lds"] = (
+        1 if g["a_lds"] is not None else (2 if g["a_wave"] is not None else 0)
+    )
+    return cfg
+
+
+def _stream_shape_error(cfg: dict, M: int, N: int, K: int) -> str | None:
+    from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
+
+    from .kernels.gemm_a8w8_mx32_stream_gfx1250 import (
+        stream_k_steps_per_wave,
+        stream_lds_bytes,
+    )
+
+    tile_m, tile_n = cfg["tile_m"], cfg["tile_n"]
+    wn, wk, split_k = cfg["wn"], cfg["wk"], cfg["split_k"]
+    waves = wn * wk
+    if tile_m % 16 or not 16 <= tile_m <= 256 or tile_n % (16 * wn):
+        return f"unsupported tile {tile_m}x{tile_n} for wn={wn}"
+    n_blocks = tile_n // (16 * wn)
+    if not 1 <= n_blocks <= 8 or not 1 <= waves <= 16 or not 1 <= split_k <= 16:
+        return "unsupported waves / n_blocks / split_k"
+    if N % tile_n:
+        return f"N={N} is not a multiple of tile_n={tile_n}"
+    if stream_k_steps_per_wave(K, wk, split_k) < 1:
+        return f"K={K} does not split into 128-wide steps over {wk}x{split_k}"
+    tile_vec, block = tile_m * tile_n // 4, waves * 32
+    if tile_vec % block and block % tile_vec:
+        return f"tile {tile_m}x{tile_n} does not divide over {waves} waves"
+    if split_k > 1 and waves == 1:
+        return "split_k > 1 needs two or more waves"
+    if cfg["cluster"] and (tile_m * tile_n // 4) % split_k:
+        return "cluster split_k must divide the tile"
+    if cfg["a_lds"] == 1 and (tile_m * (K // split_k) // 16) % (waves * 32):
+        return "staged A tile does not divide over the block"
+    lds = stream_lds_bytes(K, tile_m, n_blocks, wn, wk, split_k, cfg["a_lds"])
+    if lds > get_lds_capacity_bytes("gfx1250"):
+        return f"needs {lds} bytes of LDS"
+    return None
+
+
+@functools.lru_cache(maxsize=4096)
+def mxfp8_32_stream_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
+    cfg = parse_mxfp8_32_stream_kernel_name(kernel_name)
+    return cfg is not None and M > 0 and _stream_shape_error(cfg, M, N, K) is None
+
+
+@capture_scoped_cache
+def _stream_semaphore(device: torch.device, stream_id: int, tiles: int) -> Tensor:
+    """Per-tile arrival counters; every reducer hands its counter back zeroed."""
+    del stream_id
+    with persistent_alloc(device):
+        return torch.zeros((tiles,), dtype=torch.int32, device=device)
+
+
+def run_gemm_a8w8_mxfp8_32_stream_gfx1250(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    kernel_name: str,
+) -> Tensor:
+    """Run the decode weight-streaming mxfp8_32 GEMM named by ``kernel_name``.
+
+    XQ ``(M, K)`` e4m3 with unit column stride and a 16-byte-multiple row
+    stride; WQ ``(N, K)`` e4m3 16x16 preshuffled; x_scale ``(M, K//32)`` e8m0
+    row-major; w_scale ``(N, K//32)`` e8m0 32x4 shuffled; Out ``(M, N)``
+    bf16/f16 with unit column stride.
+    """
+    cfg = parse_mxfp8_32_stream_kernel_name(kernel_name)
+    if cfg is None:
+        raise ValueError(
+            f"[FlyDSL gfx1250 mxfp8_32 stream] bad kernelName {kernel_name!r}"
+        )
+    if XQ.dim() != 2 or WQ.dim() != 2 or XQ.element_size() != 1:
+        raise RuntimeError("[FlyDSL gfx1250 mxfp8_32 stream] A/B must be 2-D fp8")
+    M, K = XQ.shape
+    N = WQ.shape[0]
+    if WQ.shape[1] != K or tuple(Out.shape) != (M, N):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_32 stream] shape mismatch A{tuple(XQ.shape)} "
+            f"B{tuple(WQ.shape)} C{tuple(Out.shape)}"
+        )
+    if M == 0:
+        return Out
+    err = _stream_shape_error(cfg, M, N, K)
+    if err is not None:
+        raise RuntimeError(f"[FlyDSL gfx1250 mxfp8_32 stream] {kernel_name}: {err}")
+    out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
+    if out_dtype is None:
+        raise RuntimeError(f"[FlyDSL gfx1250 mxfp8_32 stream] out dtype {Out.dtype}")
+    if (
+        XQ.stride(1) != 1
+        or XQ.stride(0) % 16
+        or not WQ.is_contiguous()
+        or Out.stride(1) != 1
+        or Out.stride(0) % 4
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_32 stream] needs unit column strides, a "
+            "16-byte-multiple A row stride, an 8-byte-aligned C row and a "
+            "contiguous B"
+        )
+    k_blocks = K // MX32_BLOCK_K
+    a_scale = _require_e8m0_scale(x_scale, (M, k_blocks), "x_scale")
+    b_scale = _require_e8m0_scale(w_scale, (N, k_blocks), "w_scale")
+    if not (a_scale.is_contiguous() and b_scale.is_contiguous()):
+        raise RuntimeError("[FlyDSL gfx1250 mxfp8_32 stream] scales must be contiguous")
+
+    global _launch_stream
+    _lazy_import()
+    if _launch_stream is None:
+        from .kernels.gemm_a8w8_mx32_stream_gfx1250 import (
+            launch_gemm_a8w8_mx32_stream,
+        )
+
+        _launch_stream = launch_gemm_a8w8_mx32_stream
+    tile_m, tile_n = cfg["tile_m"], cfg["tile_n"]
+    split_k = cfg["split_k"]
+    torch_stream = torch.cuda.current_stream(device=XQ.device)
+    tiles = ((M + tile_m - 1) // tile_m) * (N // tile_n)
+    if split_k > 1:
+        stream_id = int(torch_stream.cuda_stream)
+        ws = _fused_splitk_workspace(
+            Out.device, stream_id, (tiles, split_k, tile_m * tile_n)
+        )
+        sem = _stream_semaphore(Out.device, stream_id, tiles)
+    else:
+        ws = sem = Out
+    spec = (
+        K,
+        tile_m,
+        tile_n // (16 * cfg["wn"]),
+        cfg["wn"],
+        cfg["wk"],
+        split_k,
+        cfg["depth"],
+        cfg["a_lds"],
+        cfg["cluster"],
+        1 if out_dtype == "f16" else 0,
+    )
+    _run_compiled(
+        _launch_stream,
+        _ptr_arg(Out),
+        _ptr_arg(XQ),
+        _ptr_arg(WQ),
+        _ptr_arg(a_scale),
+        _ptr_arg(b_scale),
+        _ptr_arg(ws),
+        _ptr_arg(sem),
+        M,
+        _fx.Stream(torch_stream),
+        N,
+        XQ.stride(0),
+        Out.stride(0),
+        *spec,
+        specialization_key=("mx32_stream", Out.device.index) + spec,
+    )
+    return Out
+
+
+def mxfp8_32_stream_candidates(M: int, N: int, K: int) -> list[str]:
+    """Stream kernelNames the tuner times for a decode-sized shape.
+
+    Only M <= 16 is offered: one 16-row tile, the whole K inside the workgroup
+    (``wk`` K-waves, no cross-workgroup split), which is where the kernel beats
+    the TDM kernels on gfx1250 (M 1-8: 1.1-1.4x on the MiniMax-M3.1 shapes).
+    """
+    from .kernels.gemm_a8w8_mx32_stream_gfx1250 import stream_k_steps_per_wave
+
+    if not 0 < M <= 16:
+        return []
+    names = []
+    for tile_n in (16, 32):
+        for wk in (2, 4, 6, 8, 12, 16):
+            kpw = stream_k_steps_per_wave(K, wk, 1)
+            if kpw < 1:
+                continue
+            for depth in sorted({min(kpw, 3), min(kpw, 6)}):
+                name = mxfp8_32_stream_kernel_name(16, tile_n, 1, wk, 1, depth)
+                if mxfp8_32_stream_kernel_launchable(name, M, N, K):
+                    names.append(name)
+    return names
