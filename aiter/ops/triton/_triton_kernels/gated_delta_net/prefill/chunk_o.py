@@ -822,7 +822,11 @@ def chunk_fwd_o_opt(
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T", "T_flat"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T", "T_flat"],
+    do_not_specialize_on_alignment=["cu_seqlens", "sequence_ids", "chunk_ids"],
+)
 def chunk_fwd_kernel_o_opt_vk(
     q,
     k,

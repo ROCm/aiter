@@ -325,7 +325,11 @@ def merge_16x16_to_32x32_inverse_kernel(
     key=["H", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["cu_seqlens", "sequence_ids", "chunk_ids"],
+)
 def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,

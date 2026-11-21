@@ -171,7 +171,11 @@ _CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["cu_seqlens", "sequence_ids", "chunk_ids"],
+)
 def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     g,
     k,
