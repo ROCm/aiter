@@ -2158,10 +2158,11 @@ _sparse_mla_repr = make_kernel_repr(
 
 
 # Split counts follow the batch, so they (and the stride they scale) stay out of the
-# compile key.
+# compile key, as does the alignment of positions, which callers slice at any offset.
 @gluon.jit(
     repr=_sparse_mla_repr,
     do_not_specialize=["pm_stride0", "num_splits", "main_num_splits"],
+    do_not_specialize_on_alignment=["pos_ptr"],
 )
 def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
@@ -2797,7 +2798,8 @@ _sparse_mla_reduce_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_sparse_mla_reduce_repr)
+# Callers pass position slices at any offset.
+@gluon.jit(repr=_sparse_mla_reduce_repr, do_not_specialize_on_alignment=["pos_ptr"])
 def _sparse_mla_reduce(
     part_m_ptr,
     part_l_ptr,
