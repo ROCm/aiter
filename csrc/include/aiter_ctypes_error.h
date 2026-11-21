@@ -48,26 +48,37 @@
 #include <utility>
 
 // ---------------------------------------------------------------------------
-// AITER_CTYPES_ERROR_DEF -- place once at file scope in ONE translation unit
-// per shared object (.so) that is called via ctypes.
+// g_aiter_last_error -- TLS error storage. Inline, like
+// aiter_detail::g_aiter_can_throw, so it has one definition even when several
+// ctypes modules are linked into one library.
+// ---------------------------------------------------------------------------
+inline thread_local std::string g_aiter_last_error;
+
+// ---------------------------------------------------------------------------
+// AITER_CTYPES_ERROR_DEF -- place once at file scope in each ctypes module.
 // Requires: aiter_hip_common.h included first (provides AITER_C_ITFS).
 // Defines:
-//   - thread_local g_aiter_last_error  (TLS error storage)
 //   - extern "C" aiter_ctypes_abi_version (returns ABI version number)
 //   - extern "C" aiter_get_last_error   (returns c_str or nullptr)
 //   - extern "C" aiter_clear_last_error
+// They are inline, so modules linked into one library share one copy, and
+// `used`, so every module emits and exports them: only ctypes calls them.
 // ---------------------------------------------------------------------------
 #define AITER_CTYPES_ERROR_DEF                                                    \
-    thread_local std::string g_aiter_last_error;                                  \
+    AITER_C_ITFS inline __attribute__((used)) int aiter_ctypes_abi_version()      \
+    {                                                                             \
+        return 2;                                                                 \
+    }                                                                             \
                                                                                   \
-    AITER_C_ITFS int aiter_ctypes_abi_version() { return 2; }                     \
-                                                                                  \
-    AITER_C_ITFS const char* aiter_get_last_error()                               \
+    AITER_C_ITFS inline __attribute__((used)) const char* aiter_get_last_error()  \
     {                                                                             \
         return g_aiter_last_error.empty() ? nullptr : g_aiter_last_error.c_str(); \
     }                                                                             \
                                                                                   \
-    AITER_C_ITFS void aiter_clear_last_error() { g_aiter_last_error.clear(); }
+    AITER_C_ITFS inline __attribute__((used)) void aiter_clear_last_error()       \
+    {                                                                             \
+        g_aiter_last_error.clear();                                               \
+    }
 
 // ---------------------------------------------------------------------------
 // AITER_CTYPES_ERROR_DECL -- use in additional translation units within the
