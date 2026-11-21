@@ -34,6 +34,8 @@ Notes on the fla-compatible surface:
       tensor.
 """
 
+import itertools
+
 import torch
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
@@ -66,6 +68,13 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -162,6 +171,30 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        out_gate (torch.Tensor, optional):
+            `[B, T, HV, V]` gate of the fused output norm
+            `o = rmsnorm(o) * norm_weight * sigmoid(out_gate)` (RMS over V,
+            fp32 math). May be a strided token slice of a wider projection
+            (head stride V, element stride 1). Fused into the output pass on
+            the FlashKDA path.
+        norm_weight (torch.Tensor, optional):
+            `[V]` weight of the fused norm. Required with `out_gate`.
+        norm_eps (float):
+            Epsilon of the fused norm. Default: 1e-5.
+        checkpoint_state (torch.Tensor, optional):
+            fp32 `[rows, HV, V, K]` destination of mid-prefill state snapshots,
+            in the paged `state_cache` layout. It can be `state_cache` itself.
+        checkpoint_offsets (torch.Tensor, optional):
+            Integer `[N]`. Snapshot each sequence's state after this many of its
+            tokens. `0` skips the sequence. An offset that is not a multiple of
+            32 or not less than the sequence length writes nothing. Needs
+            `cu_seqlens` or `B` sequences, and the gfx950 Gluon FlashKDA path.
+        checkpoint_state_indices (torch.Tensor, optional):
+            Integer `[N]` destination row per sequence; a negative row skips the
+            sequence. Default: row `n` for sequence `n`.
+        cu_seqlens_cpu (torch.Tensor, optional):
+            A CPU copy of `cu_seqlens`. The FlashKDA path then plans from it and
+            does not read `cu_seqlens` back from the device (no host sync).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -256,9 +289,8 @@ def chunk_kimi_delta_attn(
     )
 
     # Match fla's `@input_guard`: several kernels below index their operands
-    # with contiguous strides, so a view would be read as garbage. q, k, v and
-    # g are left to `chunk_delta_attn_fwd`, which packs them where needed.
-    beta = beta.contiguous()
+    # with contiguous strides, so a view would be read as garbage. q, k, v, g
+    # and beta are left to `chunk_delta_attn_fwd`, which packs them where needed.
     if A_log is not None:
         A_log = A_log.contiguous()
     if dt_bias is not None:
@@ -300,5 +332,98 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        out_gate=out_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
+        checkpoint_state_indices=checkpoint_state_indices,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
-    return o.to(q.dtype), final_state
+    return (o if o.dtype == q.dtype else o.to(q.dtype)), final_state
+
+
+def warmup_chunk_kimi_delta_attn(
+    num_heads: int = 12,
+    norm: bool = True,
+    checkpoints: bool = True,
+    beta_token_stride: int | None = None,
+    state_row_stride: int | None = None,
+    device: str | torch.device = "cuda",
+) -> None:
+    """Compile the FlashKDA kernel variants that a serving run reaches.
+
+    Runs ``chunk_kimi_delta_attn`` once per representative prefill step (short,
+    copier-wave and segmented steps; few and many sequences), with and without
+    the fused norm and checkpoints. ``beta_token_stride`` and
+    ``state_row_stride`` must match the caller's ``beta`` and ``state_cache``
+    layouts, because both select a kernel variant. Writes only scratch tensors.
+    """
+    H, D = num_heads, 128
+    steps = (
+        [64],
+        [1112] * 7,
+        [7680],
+        [2136, 4608],
+        [6272] + [128] * 15,
+        [1024] * 16,
+        [128] * 64,
+    )
+    rows = max(map(len, steps)) + 1
+    stride = state_row_stride or H * D * D
+    pool = torch.zeros(rows * stride, dtype=torch.float32, device=device)
+    cache = torch.as_strided(pool, (rows, H, D, D), (stride, D * D, D, 1))
+
+    def rand(*shape):
+        return torch.randn(*shape, dtype=torch.bfloat16, device=device)
+
+    for lens in steps:
+        T, n = sum(lens), len(lens)
+        bounds = torch.tensor([0, *itertools.accumulate(lens)], dtype=torch.int32)
+        width = beta_token_stride or H
+        kw = {
+            "q": rand(1, T, H, D),
+            "k": rand(1, T, H, D),
+            "v": rand(1, T, H, D),
+            "g": rand(1, T, H, D),
+            "beta": rand(T, width)[:, :H].unsqueeze(0),
+            "A_log": torch.zeros(H, dtype=torch.float32, device=device),
+            "dt_bias": torch.zeros(H * D, dtype=torch.float32, device=device),
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "safe_gate": True,
+            "lower_bound": -5.0,
+            "state_v_first": True,
+            "cu_seqlens": bounds.to(device),
+            "cu_seqlens_cpu": bounds,
+            "out": rand(1, T, H, D),
+            "state_cache": cache,
+            "state_indices": torch.arange(1, n + 1, dtype=torch.int32, device=device),
+            "has_initial_state": torch.zeros(n, dtype=torch.bool, device=device),
+        }
+        for use_norm in {False, norm}:
+            for use_ckpt in {False, checkpoints}:
+                extra = {}
+                if use_norm:
+                    extra.update(
+                        out_gate=rand(1, T, H, D),
+                        norm_weight=torch.ones(D, dtype=torch.float32, device=device),
+                    )
+                if use_ckpt:
+                    offsets = [(L - 1) // 64 * 64 for L in lens]
+                    extra.update(
+                        checkpoint_state=cache,
+                        checkpoint_offsets=torch.tensor(
+                            offsets, dtype=torch.int32, device=device
+                        ),
+                        checkpoint_state_indices=torch.zeros(
+                            n, dtype=torch.int64, device=device
+                        ),
+                    )
+                try:
+                    chunk_kimi_delta_attn(**kw, **extra)
+                except NotImplementedError:
+                    if not use_ckpt:
+                        raise
+    torch.cuda.synchronize(device)

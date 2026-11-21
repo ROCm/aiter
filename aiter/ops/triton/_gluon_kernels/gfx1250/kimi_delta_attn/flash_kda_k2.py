@@ -13,6 +13,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 _SH_1D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+_SH_2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 
 # get_num_xcds imports aiter.jit on every call. Under AITER_TRITON_ONLY=1 that
 # import fails and is retried each time, about 2 ms per launch.
@@ -45,6 +46,7 @@ def _program(
     seg_tok_end,
     H: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    seg_ids=None,
 ):
     # Keeps a (segment, head)'s V blocks on one XCD, so their re-reads of the
     # chunk workspace share an L2.
@@ -56,6 +58,8 @@ def _program(
     i_sh = pid // n_w
     i_seg = i_sh // H
     i_h = i_sh % H
+    if seg_ids is not None:
+        i_seg = gl.load(seg_ids + i_seg)
     chunk_base = gl.load(seg_chunk_base + i_seg).to(gl.int64)
     n_chunks = gl.load(seg_nchunks + i_seg)
     tok_base = gl.load(seg_tok_base + i_seg)
@@ -186,6 +190,8 @@ def _issue_c(
     K: gl.constexpr,
     C: gl.constexpr,
     CPL: gl.constexpr,
+    d_g=None,
+    s_g=None,
 ):
     # Warp masks: a quarter of the warps each.
     Q: gl.constexpr = gl.num_warps() // 4
@@ -198,6 +204,8 @@ def _issue_c(
             (_at(d_v, j0 * C), s_v, M << (3 * Q)),
         ]
     )
+    if d_g is not None:
+        gl.amd.gfx1250.tdm.async_load(_at(d_g, j0 * C), dest=s_g)
     gl.amd.gfx1250.async_copy.global_to_shared(
         s_im,
         p_im + j0 * (2 * C * C) + im_off,
@@ -290,6 +298,7 @@ def k2_ab_fused_gluon(
     beta_raw,
     h_out_b,
     h_out_a,
+    seg_ids,
     seg_chunk_base,
     seg_nchunks,
     seg_tok_base,
@@ -330,7 +339,7 @@ def k2_ab_fused_gluon(
         [[C, 8]], [G, C], [1, 0]
     )
     i_w, i_seg, i_h, chunk_base, n_chunks, tok_base, n_tok = _program(
-        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS
+        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS, seg_ids
     )
 
     s_kd = gl.allocate_shared_memory(ws_kd.dtype.element_ty, [2, G, K], SH_KD)
@@ -424,6 +433,21 @@ def _store_o(
     gl.amd.gfx1250.async_copy.commit_group()
 
 
+@gluon.jit
+def _gnorm(o, g, w, eps, s_ss, V: gl.constexpr):
+    NW: gl.constexpr = gl.num_warps()
+    C: gl.constexpr = o.shape[0]
+    x = gl.reshape(o * o, [C, V // (16 * NW), NW, 16])
+    s_ss.store(gl.permute(gl.sum(gl.sum(x, axis=3), axis=1), [1, 0]))
+    ROW: gl.constexpr = gl.SliceLayout(1, o.type.layout)
+    s_1 = s_ss.reinterpret(layout=_SH_1D)
+    ss = s_1.index(0).load(ROW)
+    for w_i in gl.static_range(1, NW):
+        ss = ss + s_1.index(w_i).load(ROW)
+    r = gl.rsqrt(ss * (1.0 / V) + eps)
+    return o * r[:, None] * (w[None, :] * fast_sigmoid(g))
+
+
 _k2_c_repr = make_kernel_repr(
     "k2_c_gluon",
     [
@@ -437,6 +461,7 @@ _k2_c_repr = make_kernel_repr(
         "STATE_V_FIRST",
         "PAGED_CACHE",
         "PAGED_H_IN",
+        "NORM",
     ],
 )
 
@@ -480,6 +505,16 @@ def k2_c_gluon(
     MMA_O: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     CM_OUT: gl.constexpr = "",
+    gate=None,
+    norm_w=None,
+    stride_g=0,
+    norm_eps=1e-5,
+    ckpt_state=None,
+    ckpt_offsets=None,
+    ckpt_rows=None,
+    ckpt_bos=None,
+    NORM: gl.constexpr = False,
+    CKPT_STRIDE: gl.constexpr = 0,
 ):
     """Pass C: the output of one segment, head and BW-column block. CPL is the
     number of chunks in one TDM load."""
@@ -489,6 +524,7 @@ def k2_c_gluon(
     gl.static_assert(BW % (16 * NW) == 0 and V % BW == 0)
     gl.static_assert(CPL * C <= 32 * NW)
     gl.static_assert(not (HAS_H_IN and PAGED_H_IN))
+    gl.static_assert(not NORM or BW == V)
     G: gl.constexpr = CPL * C
     B_OP: gl.constexpr = gl.DotOperandLayout(1, MMA, 8)
     COL: gl.constexpr = gl.SliceLayout(0, MMA)
@@ -518,7 +554,7 @@ def k2_c_gluon(
     # Read up front: past the output stores the compiler must assume these
     # words may have changed. When neither is set the pointers are null and
     # must not be read.
-    if STORE_FINAL or PAGED_CACHE:
+    if STORE_FINAL or PAGED_CACHE or ckpt_state is not None:
         i_n = gl.load(seg_seq + i_seg).to(gl.int64)
     if STORE_FINAL:
         is_last = gl.load(seg_is_last + i_seg)
@@ -528,6 +564,18 @@ def k2_c_gluon(
             + gl.load(state_indices + i_n).to(gl.int64) * cache_stride
             + i_h * (V * K)
         )
+
+    if ckpt_state is not None:
+        c_pos = gl.load(ckpt_offsets + i_n).to(gl.int64)
+        rel = c_pos + gl.load(ckpt_bos + i_n).to(gl.int64) - tok_base
+        ckpt_row = i_n
+        if ckpt_rows is not None:
+            ckpt_row = gl.load(ckpt_rows + i_n).to(gl.int64)
+        ok = (c_pos > 0) & (c_pos % C == 0) & (rel > 0) & (ckpt_row >= 0)
+        mid = gl.load(seg_is_last + i_seg) == 0
+        ok = ok & ((rel < n_tok) | ((rel == n_tok) & mid))
+        ckpt_j = gl.where(ok, rel // C, -1)
+        p_ckpt = ckpt_state + ckpt_row * CKPT_STRIDE + i_h * (V * K)
 
     s_kd = gl.allocate_shared_memory(ws_kd.dtype.element_ty, [2, G, K], SH_KD)
     s_qd = gl.allocate_shared_memory(ws_qd.dtype.element_ty, [2, G, K], SH_KD)
@@ -576,13 +624,24 @@ def k2_c_gluon(
     else:
         h = gl.zeros([BW, K], gl.float32, MMA)
 
+    d_g = None
+    s_g = None
+    if NORM:
+        s_g = gl.allocate_shared_memory(gate.dtype.element_ty, [2, G, BW], SH_V)
+        d_g = _descriptor(
+            gate + tok_base * stride_g + i_h * V, n_tok, BW, stride_g, G, SH_V
+        )
+        w_n = gl.load(norm_w + gl.arange(0, BW, layout=gl.SliceLayout(0, MMA_O)))
+        s_ss = gl.allocate_shared_memory(gl.float32, [NW, C], _SH_2D)
+
     p_out = out + tok_base * (H * V) + i_h * V + i_w * BW
     zero_o = gl.zeros([C, BW], gl.float32, MMA_O)
     n_groups = (n_chunks + CPL - 1) // CPL
     if n_groups > 0:
         _issue_c(d_kd, d_qd, d_kr, d_v, s_kd.index(0), s_qd.index(0),
                  s_kr.index(0), s_v.index(0), s_im.index(0), s_gt.index(0), p_im,
-                 im_off, o_imr, p_gt, 0, n_chunks, K, C, CPL)  # fmt: skip
+                 im_off, o_imr, p_gt, 0, n_chunks, K, C, CPL, d_g,
+                 s_g.index(0) if NORM else None)  # fmt: skip
     beta = _load_beta(p_beta, 0, n_tok, H, C, CPL)
     for g in range(n_groups):
         cur = g % 2
@@ -596,7 +655,8 @@ def k2_c_gluon(
             _issue_c(d_kd, d_qd, d_kr, d_v, s_kd.index(nxt), s_qd.index(nxt),
                      s_kr.index(nxt), s_v.index(nxt), s_im.index(nxt),
                      s_gt.index(nxt), p_im, im_off, o_imr, p_gt, (g + 1) * CPL,
-                     n_chunks, K, C, CPL)  # fmt: skip
+                     n_chunks, K, C, CPL, d_g,
+                     s_g.index(nxt) if NORM else None)  # fmt: skip
         beta = _load_beta(p_beta, (g + 1) * CPL, n_tok, H, C, CPL)
         if g > 0:
             _store_o(s_o.index(1 - cur), p_out, (g - 1) * G, n_tok, o_or, o_oc,
@@ -612,10 +672,16 @@ def k2_c_gluon(
             mqk = s_im.index(cur).slice((2 * i + 1) * C, C).load(A_OP_O)
             o = gl.amd.gfx1250.wmma(qd, _b_op_o(h, gl.bfloat16, MMA_O), zero_o)
             o = gl.amd.gfx1250.wmma(mqk, _b_op_o(U, mqk.dtype, MMA_O), o)
+            if NORM:
+                gt_o = s_g.index(cur).slice(i * C, C).load(MMA_O)
+                o = _gnorm(o, gt_o, w_n, norm_eps, s_ss, V)
             s_o.index(cur).slice(i * C, C).store(o.to(out.dtype.element_ty))
             kr = s_kr.index(cur).slice(i * C, C).load(B_OP)
             gt = s_gt.index(cur).slice(i * K, K).load(COL)
             h = _update(h, U, kr, gt, MMA)
+            if ckpt_state is not None:  # noqa: SIM102
+                if g * CPL + i + 1 == ckpt_j:
+                    gl.amd.gfx1250.buffer_store(h, p_ckpt, vk_off)
     if n_groups > 0:
         _store_o(s_o.index((n_groups - 1) % 2), p_out, (n_groups - 1) * G, n_tok,
                  o_or, o_oc, H, V, CM_OUT)  # fmt: skip
@@ -649,6 +715,7 @@ def gluon_k2_ab_fused(
     beta_raw,
     h_out_b,
     h_out_a,
+    seg_ids,
     seg_chunk_base,
     seg_nchunks,
     seg_tok_base,
@@ -659,12 +726,12 @@ def gluon_k2_ab_fused(
     K,
     V,
     C,
-    num_segs,
     BW,
     CPL,
     num_warps,
+    waves_per_eu=0,
 ):
-    return k2_ab_fused_fast[(V // BW, num_segs * H)](
+    return k2_ab_fused_fast[(V // BW, seg_ids.numel() * H)](
         ws_kd=ws_kd,
         ws_kr=ws_kr,
         ws_gt=ws_gt,
@@ -673,6 +740,7 @@ def gluon_k2_ab_fused(
         beta_raw=beta_raw,
         h_out_b=h_out_b,
         h_out_a=h_out_a,
+        seg_ids=seg_ids,
         seg_chunk_base=seg_chunk_base,
         seg_nchunks=seg_nchunks,
         seg_tok_base=seg_tok_base,
@@ -688,6 +756,7 @@ def gluon_k2_ab_fused(
         MMA=build_layouts(num_warps)["MMA"],
         NUM_XCDS=_num_xcds(),
         num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
 
 
@@ -725,6 +794,14 @@ def gluon_k2_c(
     STORE_FINAL,
     STATE_V_FIRST,
     CM_OUT="",
+    out_gate=None,
+    norm_weight=None,
+    norm_eps=1e-5,
+    ckpt_state=None,
+    ckpt_offsets=None,
+    ckpt_rows=None,
+    ckpt_bos=None,
+    waves_per_eu=0,
 ):
     paged = state_cache is not None
     return k2_c_fast[(V // BW, num_segs * H)](
@@ -764,5 +841,16 @@ def gluon_k2_c(
         **build_layouts(num_warps),
         NUM_XCDS=_num_xcds(),
         CM_OUT=CM_OUT,
+        gate=out_gate,
+        norm_w=norm_weight,
+        stride_g=out_gate.stride(1) if out_gate is not None else 0,
+        norm_eps=norm_eps,
+        ckpt_state=ckpt_state,
+        ckpt_offsets=ckpt_offsets,
+        ckpt_rows=ckpt_rows,
+        ckpt_bos=ckpt_bos,
+        NORM=out_gate is not None,
+        CKPT_STRIDE=0 if ckpt_state is None else ckpt_state.stride(0),
         num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
