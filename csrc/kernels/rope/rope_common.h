@@ -1820,6 +1820,37 @@ struct OpUncachedBwd
     }
 };
 
+__device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b);
+
+__device__ __forceinline__ void
+round_f32x2_to_bf16(float value0, float value1, float& rounded0, float& rounded1)
+{
+    const uint32_t packed = f32x2_to_bf16x2_rne(value0, value1);
+    rounded0 = __builtin_bit_cast(float, packed << 16);
+    rounded1 = __builtin_bit_cast(float, packed & 0xffff0000u);
+}
+
+template <typename scalar_t, typename scalar_f_t>
+__device__ __forceinline__ void cached_rope_fwd_pair(
+    float x0, float x1, float cos0, float sin0, float cos1, float sin1, float& out0, float& out1)
+{
+    if constexpr(std::is_same_v<scalar_t, hip_bfloat16> && std::is_same_v<scalar_f_t, hip_bfloat16>)
+    {
+        // Match the BF16 lowering used by Triton 3.8: cosine products stay
+        // FP32, while sine products round to BF16 before the final add/sub.
+        float x1_sin0;
+        float x0_sin1;
+        round_f32x2_to_bf16(x1 * sin0, x0 * sin1, x1_sin0, x0_sin1);
+        out0 = x0 * cos0 - x1_sin0;
+        out1 = x1 * cos1 + x0_sin1;
+    }
+    else
+    {
+        out0 = x0 * cos0 - x1 * sin0;
+        out1 = x1 * cos1 + x0 * sin1;
+    }
+}
+
 struct OpCachedFwd
 {
     template <int32_t RotateStyle,
@@ -1884,8 +1915,14 @@ struct OpCachedFwd
             float output_0[VecPairs], output_1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
+                cached_rope_fwd_pair<scalar_t, scalar_f_t>(input_0[v],
+                                                           input_1[v],
+                                                           cos_0[v],
+                                                           sin_0[v],
+                                                           cos_1[v],
+                                                           sin_1[v],
+                                                           output_0[v],
+                                                           output_1[v]);
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
@@ -2007,10 +2044,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
-                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
-                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
-                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0_a[v], ix1_a[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0_a[v], iy1_a[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2021,10 +2058,10 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
-                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
-                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
-                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0_b[v], ix1_b[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0_b[v], iy1_b[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
@@ -2045,10 +2082,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2072,10 +2109,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2104,8 +2141,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        a0[v], a1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2113,8 +2150,8 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        b0[v], b1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
@@ -2129,8 +2166,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2148,8 +2185,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2175,8 +2212,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        a0[v], a1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
@@ -2184,8 +2221,8 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        b0[v], b1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
@@ -2200,8 +2237,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
@@ -2219,8 +2256,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
@@ -3543,7 +3580,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs = 1,
+          int32_t VecPairs  = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -3569,10 +3606,14 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
     const int32_t stride_y_d,
     const int32_t size_s,
     const int32_t threads_per_sb,
-    const int32_t total_sb)
+    const int32_t total_sb,
+    const int32_t heads_per_tile,
+    const int32_t head_tiles)
 {
     const int32_t global_tid  = blockIdx.x * 256 + threadIdx.x;
-    const int32_t sb_idx      = global_tid / threads_per_sb;
+    const int32_t work_idx    = global_tid / threads_per_sb;
+    const int32_t head_tile   = work_idx % head_tiles;
+    const int32_t sb_idx      = work_idx / head_tiles;
     const int32_t d_chunk_idx = global_tid % threads_per_sb;
     if(sb_idx >= total_sb)
         return;
@@ -3584,8 +3625,12 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
 
     if((pos >= 0) && (pos < max_position))
     {
-        const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
-        const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
+        const int32_t head_start = head_tile * heads_per_tile;
+        const int32_t tile_h_x   = min(heads_per_tile, max(0, size_h_x - head_start));
+        const int32_t tile_h_y   = min(heads_per_tile, max(0, size_h_y - head_start));
+        const int32_t offset_x   = sid * stride_x_s + bid * stride_x_b + head_start * stride_x_h;
+        const int32_t offset_y   = sid * stride_y_s + bid * stride_y_b +
+                                   (head_start < size_h_y ? head_start * stride_y_h : 0);
         const int64_t offset_f = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -3597,31 +3642,31 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                               StrideDXEq1,
                               StrideDYEq1,
                               VecPairs,
-                          DoubleBuffer>(p_inout_x,
-                                        p_inout_y,
-                                        p_inout_x,
-                                        p_inout_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        p_cos,
-                                        p_sin,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                              DoubleBuffer>(p_inout_x,
+                                            p_inout_y,
+                                            p_inout_x,
+                                            p_inout_y,
+                                            (int32_t)offset_x,
+                                            (int32_t)offset_y,
+                                            (int32_t)offset_x,
+                                            (int32_t)offset_y,
+                                            p_cos,
+                                            p_sin,
+                                            (int32_t)offset_f,
+                                            tile_h_x,
+                                            tile_h_y,
+                                            size_d,
+                                            size_f,
+                                            stride_x_h,
+                                            stride_x_d,
+                                            stride_y_h,
+                                            stride_y_d,
+                                            stride_x_h,
+                                            stride_x_d,
+                                            stride_y_h,
+                                            stride_y_d,
+                                            d_chunk_idx,
+                                            threads_per_sb);
     }
 }
 
@@ -4473,6 +4518,8 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     const int32_t size_half_r = size_r >> 1;
     const int32_t total_sb    = size_s_h * size_s_w * size_b;
 
+    const int32_t warp_size = static_cast<int32_t>(get_warp_size_func());
+
     // VP selection depends on rotate style (benchmarked on gfx942):
     //   NEOX: VP=2 always wins (8-15% over VP=1, VP=4 always worst)
     //   GPTJ: VP=4 wins at saturated workloads, VP=1 is catastrophically slow (2-3x)
@@ -4485,7 +4532,6 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
     const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
@@ -5481,6 +5527,12 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
+    const int32_t max_heads  = max(size_h_x, size_h_y);
+    const int32_t heads_per_tile =
+        (get_warp_size_func() == 32 && max_heads >= 128) ? 64 : max_heads;
+    const int32_t head_tiles    = (max_heads + heads_per_tile - 1) / heads_per_tile;
+    const int32_t tiled_threads = total_sb * head_tiles * threads_per_sb;
+    const dim3 tiled_grid((tiled_threads + block.x - 1) / block.x);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
@@ -5508,27 +5560,29 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                          Stride1Eq1,
                                                          VP,
                                                          DB>
-                <<<grid, block, 0, stream>>>(p_output_x,
-                                             p_output_y,
-                                             p_cos,
-                                             p_sin,
-                                             p_indirect_buffer,
-                                             max_position,
-                                             size_h_x,
-                                             size_h_y,
-                                             size_d,
-                                             size_f,
-                                             stride_ix_s,
-                                             stride_ix_b,
-                                             stride_ix_h,
-                                             stride_ix_d,
-                                             stride_iy_s,
-                                             stride_iy_b,
-                                             stride_iy_h,
-                                             stride_iy_d,
-                                             size_s,
-                                             threads_per_sb,
-                                             total_sb);
+                    <<<tiled_grid, block, 0, stream>>>(p_output_x,
+                                                       p_output_y,
+                                                       p_cos,
+                                                       p_sin,
+                                                       p_indirect_buffer,
+                                                       max_position,
+                                                       size_h_x,
+                                                       size_h_y,
+                                                       size_d,
+                                                       size_f,
+                                                       stride_ix_s,
+                                                       stride_ix_b,
+                                                       stride_ix_h,
+                                                       stride_ix_d,
+                                                       stride_iy_s,
+                                                       stride_iy_b,
+                                                       stride_iy_h,
+                                                       stride_iy_d,
+                                                       size_s,
+                                                       threads_per_sb,
+                                                       total_sb,
+                                                       heads_per_tile,
+                                                       head_tiles);
             }
             else
             {
@@ -5544,27 +5598,29 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                              Stride1Eq1,
                                                              VP,
                                                              DB>
-                    <<<grid, block, 0, stream>>>(p_output_x,
-                                                 p_output_y,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer,
-                                                 max_position,
-                                                 size_h_x,
-                                                 size_h_y,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_ix_s,
-                                                 stride_ix_b,
-                                                 stride_ix_h,
-                                                 stride_ix_d,
-                                                 stride_iy_s,
-                                                 stride_iy_b,
-                                                 stride_iy_h,
-                                                 stride_iy_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb););
+                    <<<tiled_grid, block, 0, stream>>>(p_output_x,
+                                                       p_output_y,
+                                                       p_cos,
+                                                       p_sin,
+                                                       p_indirect_buffer,
+                                                       max_position,
+                                                       size_h_x,
+                                                       size_h_y,
+                                                       size_d,
+                                                       size_f,
+                                                       stride_ix_s,
+                                                       stride_ix_b,
+                                                       stride_ix_h,
+                                                       stride_ix_d,
+                                                       stride_iy_s,
+                                                       stride_iy_b,
+                                                       stride_iy_h,
+                                                       stride_iy_d,
+                                                       size_s,
+                                                       threads_per_sb,
+                                                       total_sb,
+                                                       heads_per_tile,
+                                                       head_tiles););
             }
         } else {
             if constexpr(AllStrideDEq1)
@@ -7512,22 +7568,23 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 // path produces NaN under finite inputs (eps>0 prevents div-by-zero in rsqrt,
 // and rotate is a linear combination of finites), so the difference is unreachable.
 //
-// On gfx94 (CDNA3) this lowers to a 10-instruction VALU sequence with NO EXEC
-// mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
-// expansions, each of which serializes the warp via s_and_saveexec / s_xor /
-// s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
-// v_cvt_pk_bf16_f32 -- not implemented here yet.
+// gfx1250 and gfx950 use one packed conversion instruction. gfx94 (CDNA3)
+// uses a 10-instruction VALU sequence with NO EXEC mask manipulation (vs 26
+// instructions for two scalar __hip_bfloat16(float) expansions, each of which
+// serializes the warp via s_and_saveexec / s_xor / s_or around the NaN-check).
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 {
+    uint32_t result;
+#if defined(__gfx1250__) || defined(__gfx950__)
+    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+#else
     constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
     constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN -> BF16 0x7fff
     constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
-    uint32_t result;
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
-    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
-    defined(__gfx950__)
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
     // CDNA path: v_cmp_u_f32 with explicit SGPR dest + v_add3 + v_and_or_b32
     // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
     // We declare them as early-clobber outputs so the compiler doesn't alias them
@@ -7569,6 +7626,7 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     uint32_t lo = rne_f32_to_bf16(a_bits);
     uint32_t hi = rne_f32_to_bf16(b_bits);
     result = lo | (hi << 16);
+#endif
 #endif
     return result;
 }
