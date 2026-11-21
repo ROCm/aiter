@@ -142,8 +142,14 @@ def _run_in_hang_guard(worker, args, label):
                 kind, payload = progress.get(timeout=1.0)
             except queue.Empty:
                 if not proc.is_alive():
-                    break
-                continue
+                    # The child may have queued its last messages and exited
+                    # between the get and this check: drain them before giving up.
+                    try:
+                        kind, payload = progress.get(timeout=1.0)
+                    except queue.Empty:
+                        break
+                else:
+                    continue
             deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
             if kind == "start":
                 current = payload
