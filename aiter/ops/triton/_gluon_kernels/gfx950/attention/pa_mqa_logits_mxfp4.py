@@ -1027,7 +1027,7 @@ def _dot(cfg, q, q_scale, k, k_scale, ROWS: gl.constexpr):
 
 
 @gluon.jit
-def _row_logits(cfg, q, q_scale, w, k, k_scale):
+def _row_logits(cfg, q, q_scale, w, k, k_scale, FOLD_ASM: gl.constexpr):
     if cfg.M_CHUNK > 0:
         # Fold each head group as its MFMA retires, so one group's accumulator
         # is live at a time and the lane crossing is paid once for the row.
@@ -1041,7 +1041,7 @@ def _row_logits(cfg, q, q_scale, w, k, k_scale):
                 cfg.BLOCK_KV,
                 cfg.mfma_layout,
                 cfg.NUM_CHAINS,
-                cfg.FOLD_ASM,
+                FOLD_ASM,
                 acc,
                 c > 0,
             )
@@ -1055,7 +1055,7 @@ def _row_logits(cfg, q, q_scale, w, k, k_scale):
             cfg.BLOCK_KV,
             cfg.mfma_layout,
             cfg.NUM_CHAINS,
-            cfg.FOLD_ASM,
+            FOLD_ASM,
         )
         return _fold_tail(acc, cfg.mfma_layout)
 
@@ -1200,8 +1200,11 @@ class Program:
         pos = tile_pos + col
         if cfg.STORE_LOGITS:
             offsets = pos * self.stride_k
+        # Pack the fold only in the body of a KV loop that is not unrolled. Elsewhere
+        # it compiles to v_pk_fma_f32 with op_sel, which can drop a head's term.
+        fold_asm: gl.constexpr = cfg.FOLD_ASM or MASKED or cfg.UNROLL > 1
         for r in gl.static_range(0, cfg.BLOCK_M):
-            scores = _row_logits(cfg, qs[r], qss[r], ws[r], k, k_scale)
+            scores = _row_logits(cfg, qs[r], qss[r], ws[r], k, k_scale, fold_asm)
             if cfg.BLOCK_M == 1:
                 if cfg.BSCORE and MASKED:
                     scores = gl.where(pos < row_hi[r], scores, float("-inf"))
