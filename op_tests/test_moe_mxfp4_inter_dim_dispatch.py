@@ -275,5 +275,57 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert torch.all(padded == pad_value)
 
 
+def test_swiglu_mxfp4_a4w4_unsafe_shapes_stay_bf16_past_the_bound():
+    """MiniMax-M3-MXFP4 TP8 (expert=129 fused shared expert, inter_dim=512):
+    the fp4-activation path past GPTOSS_SWIGLU_MXFP4_BF16_BOUND tokens is
+    measured numerically broken for this shape (test_fmoe logits_diff ~2e-5
+    at token<256 vs ~0.073 at token>=256, well past the project's 0.01 bound).
+    Regression guard for that silent corruption: this exact (expert, inter_dim)
+    must stay on bf16 activations regardless of token count.
+    """
+    for token in (1, 255, 256, 1024, 4096):
+        assert (
+            fused_moe_module.resolve_activation_dtype(
+                QuantType.per_1x32,
+                dtypes.fp4x2,
+                activation=ActivationType.Swiglu,
+                gate_mode=GateMode.SEPARATED,
+                M=token,
+                expert=129,
+                inter_dim=512,
+            )
+            == dtypes.bf16
+        )
+
+
+def test_swiglu_mxfp4_bf16_bound_still_applies_outside_unsafe_shapes():
+    """Negative control: the general token-count bound is untouched for a
+    shape not in the unsafe set."""
+    assert (
+        fused_moe_module.resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED,
+            M=255,
+            expert=257,
+            inter_dim=512,
+        )
+        == dtypes.bf16
+    )
+    assert (
+        fused_moe_module.resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED,
+            M=256,
+            expert=257,
+            inter_dim=512,
+        )
+        == dtypes.fp4x2
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
