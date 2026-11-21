@@ -22,6 +22,7 @@ def load_chip_parsers(output):
         "_rocminfo_gpu_agents",
         "_hipinfo_gpu_agents",
         "get_asic_revision",
+        "_asic_revision",
     }
     tree = ast.parse(source.read_text(encoding="utf-8"), str(source))
     tree.body = [

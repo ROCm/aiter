@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Unit tests for the JIT arch-coverage guard offload-target parser."""
 
+import contextlib
 import os
 import tempfile
 
@@ -18,6 +19,23 @@ def _patch_jit_dir(tmpdir):
 
 def _restore_jit_dir(orig):
     core.get_user_jit_dir = orig
+
+
+@contextlib.contextmanager
+def _gpu_archs(value):
+    """Set GPU_ARCHS for a block (None unsets it); CI runners export their own."""
+    old = os.environ.get("GPU_ARCHS")
+    if value is None:
+        os.environ.pop("GPU_ARCHS", None)
+    else:
+        os.environ["GPU_ARCHS"] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("GPU_ARCHS", None)
+        else:
+            os.environ["GPU_ARCHS"] = old
 
 
 def test_parse_offload_archs():
@@ -93,11 +111,17 @@ def test_validate_strict_build_target():
 
 
 def test_needs_arch_rebuild():
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # A rebuild (GPU_ARCHS=native) covers the running arch, so each uncovered
+    # case below rebuilds; the guard that raises instead is tested after it.
+    with _gpu_archs("native"), tempfile.TemporaryDirectory() as tmpdir:
         orig = _patch_jit_dir(tmpdir)
         orig_runtime = core.get_gfx_runtime
+        orig_windows = core.IS_WINDOWS
+        # GPU_ARCHS=native is resolved through hipinfo on Windows; the Windows
+        # case lives in test_build_targets_architecture.py.
+        core.IS_WINDOWS = False
         try:
-            so_path = os.path.join(tmpdir, "module_dummy.so")
+            so_path = os.path.join(tmpdir, f"module_dummy{core.JIT_LIB_EXT}")
             with open(so_path, "wb") as f:
                 f.write(
                     b"\x00ELF junk hipv4-amdgcn-amd-amdhsa--gfx942 more "
@@ -126,8 +150,107 @@ def test_needs_arch_rebuild():
             # Unknown build archs (no manifest, no .so) -> no rebuild.
             assert core._needs_arch_rebuild("module_unknown") is False
         finally:
+            core.IS_WINDOWS = orig_windows
             core.get_gfx_runtime = orig_runtime
             _restore_jit_dir(orig)
+
+
+def test_needs_arch_rebuild_raises_when_a_rebuild_cannot_cover_the_arch():
+    """A .so for other archs under a GPU_ARCHS that omits the running arch.
+
+    Loading it only faults at its first kernel launch, and a rebuild would miss
+    the arch too, so the guard raises at load and names GPU_ARCHS.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig = _patch_jit_dir(tmpdir)
+        orig_runtime = core.get_gfx_runtime
+        orig_windows = core.IS_WINDOWS
+        # GPU_ARCHS=native is resolved through hipinfo on Windows; the Windows
+        # case lives in test_build_targets_architecture.py.
+        core.IS_WINDOWS = False
+        try:
+            so_path = os.path.join(tmpdir, f"module_dummy{core.JIT_LIB_EXT}")
+            with open(so_path, "wb") as f:
+                f.write(
+                    b"\x00ELF junk hipv4-amdgcn-amd-amdhsa--gfx942 more "
+                    b"hipv4-amdgcn-amd-amdhsa--gfx950 tail"
+                )
+            core.get_gfx_runtime = lambda: "gfx1201"
+            with _gpu_archs("gfx950"):
+                try:
+                    core._needs_arch_rebuild("module_dummy")
+                except RuntimeError as e:
+                    message = str(e)
+                else:
+                    raise AssertionError("expected a RuntimeError")
+            for part in ("module_dummy", so_path, "gfx1201", "GPU_ARCHS='gfx950'"):
+                assert part in message, (part, message)
+            # A rebuild that does cover the running arch is attempted instead.
+            for value in ("gfx950;gfx1201", "native"):
+                with _gpu_archs(value):
+                    assert core._needs_arch_rebuild("module_dummy") is True, value
+            # An unusable GPU_ARCHS is left for the build to report.
+            with _gpu_archs("not-an-arch"):
+                assert core._needs_arch_rebuild("module_dummy") is True
+            # A covered arch needs neither, whatever GPU_ARCHS says.
+            core.get_gfx_runtime = lambda: "gfx942"
+            with _gpu_archs("gfx950"):
+                assert core._needs_arch_rebuild("module_dummy") is False
+        finally:
+            core.IS_WINDOWS = orig_windows
+            core.get_gfx_runtime = orig_runtime
+            _restore_jit_dir(orig)
+
+
+def test_cold_ctypes_build_raises_when_the_build_misses_the_arch():
+    """A fresh ctypes build under a GPU_ARCHS that omits the running arch fails at
+    build_ctypes_module, not at the first kernel launch (no .so existed before)."""
+    names = ("get_user_jit_dir", "get_gfx_runtime", "build_module", "get_args_of_build")
+    orig = {name: getattr(core, name) for name in names}
+    orig_windows = core.IS_WINDOWS
+    keys = [
+        "srcs",
+        "flags_extra_cc",
+        "flags_extra_hip",
+        "blob_gen_cmd",
+        "extra_include",
+        "extra_ldflags",
+        "verbose",
+        "is_python_module",
+        "is_standalone",
+        "torch_exclude",
+        "third_party",
+    ]
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            so_path = os.path.join(tmpdir, f"module_dummy{core.JIT_LIB_EXT}")
+
+            def fake_build(*args, **kwargs):
+                with open(so_path, "wb") as f:
+                    f.write(b"\x00ELF junk hipv4-amdgcn-amd-amdhsa--gfx950 tail")
+
+            core.IS_WINDOWS = False
+            core.get_user_jit_dir = lambda: tmpdir
+            core.build_module = fake_build
+            core.get_args_of_build = lambda md_name: dict.fromkeys(keys, None)
+            with _gpu_archs("gfx950"):
+                core.get_gfx_runtime = lambda: "gfx942"
+                try:
+                    core.build_ctypes_module("module_dummy")
+                except RuntimeError as e:
+                    message = str(e)
+                else:
+                    raise AssertionError("expected a RuntimeError")
+                for part in ("gfx942", "GPU_ARCHS='gfx950'"):
+                    assert part in message, (part, message)
+                # A build that covers the running arch returns the path.
+                os.remove(so_path)
+                core.get_gfx_runtime = lambda: "gfx950"
+                assert core.build_ctypes_module("module_dummy") == so_path
+    finally:
+        core.IS_WINDOWS = orig_windows
+        for name, value in orig.items():
+            setattr(core, name, value)
 
 
 if __name__ == "__main__":
@@ -135,4 +258,6 @@ if __name__ == "__main__":
     test_parse_host_only_is_empty()
     test_missing_file_is_empty()
     test_needs_arch_rebuild()
+    test_needs_arch_rebuild_raises_when_a_rebuild_cannot_cover_the_arch()
+    test_cold_ctypes_build_raises_when_the_build_misses_the_arch()
     print("ALL_PASS")
