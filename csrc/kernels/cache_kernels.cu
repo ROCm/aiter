@@ -26,6 +26,38 @@
 
 namespace aiter {
 
+// fp32x2 -> fp8x2 like fp32_to_fp8_scaled_x2, but a NaN stays NaN (v_med3_f32 would
+// turn it into the lower clamp bound). Infinity and finite overflow still saturate.
+// ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_and_b32 / v_cmp_lt_u32 / v_cndmask_b32 x2 + v_cvt_pk_fp8_f32
+template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+__device__ __forceinline__ decltype(auto) fp32_to_fp8_scaled_keep_nan_x2(const S& s, float inverted_scale)
+{
+    fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
+#if defined(__gfx942__)
+    constexpr float hi = 240.0f, lo = -240.0f;
+#else
+    constexpr float hi = 448.0f, lo = -448.0f;
+#endif
+    float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
+    float ca = a, cb = b;
+    asm volatile("v_med3_f32 %0, %0, %2, %3\n"
+                 "v_med3_f32 %1, %1, %2, %3"
+                 : "+v"(ca), "+v"(cb)
+                 : "v"(lo), "v"(hi));
+    // Bit test, not isnan: the JIT build uses -ffast-math, which folds isnan to false.
+    ca = (__builtin_bit_cast(uint32_t, a) & 0x7fffffffu) > 0x7f800000u ? a : ca;
+    cb = (__builtin_bit_cast(uint32_t, b) & 0x7fffffffu) > 0x7f800000u ? b : cb;
+    int w;
+    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(ca), "v"(cb));
+    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
+    (void)a; (void)b; (void)lo; (void)hi; return fp8x2_t{};
+#endif
+}
+
 // slot_mapping arrives as int64 from the torch stacks -- vLLM allocates it as
 // torch.int64 and SGLang's out_cache_loc is likewise int64 -- and as int32 from
 // JAX front ends, which emit 32-bit integers unless jax_enable_x64 is set at
@@ -2194,8 +2226,8 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
     float f32_cos = static_cast<float>(cos);
     float f32_sin = static_cast<float>(sin);
     if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-        // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-        const auto rot = aiter::scaled_cast<opus::fp8_t>(
+        // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
             fp32x2_t{f32_x * f32_cos - f32_y * f32_sin,
                      f32_y * f32_cos + f32_x * f32_sin},
             inv_scale);
@@ -2421,8 +2453,8 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
         const int64_t token_head = kv_cache_offset;
         cache_t* kv_cache_rot = kv_cache + token_head;
         if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-          // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-          const auto rot = aiter::scaled_cast<opus::fp8_t>(
+          // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+          const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
               fp32x2_t{fp32_k_x * fp32_cos - fp32_k_y * fp32_sin,
                        fp32_k_y * fp32_cos + fp32_k_x * fp32_sin},
               inv_kscale);
@@ -2441,8 +2473,8 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
     float f32_x = static_cast<float>(x);
     float f32_y = static_cast<float>(y);
     if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-        // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-        const auto rot = aiter::scaled_cast<opus::fp8_t>(
+        // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+        const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
             fp32x2_t{f32_x * fp32_cos - f32_y * fp32_sin,
                      f32_y * fp32_cos + f32_x * fp32_sin},
             inv_qscale);
@@ -2743,10 +2775,10 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         using o_t = std::remove_pointer_t<decltype(out_tag)>;
         using o_vec_t = opus::vector_t<o_t, VEC>;
         auto cvt = [](float r, float s) -> o_t {
-            // Saturate like the nope part's scaled_cast; a bare cast turns a
-            // value past the fp8 range into NaN.
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN);
+            // a NaN stays NaN.
             if constexpr(std::is_same_v<o_t, opus::fp8_t>)
-                return aiter::scaled_cast<o_t>(fp32x2_t{r, r}, s)[0];
+                return aiter::fp32_to_fp8_scaled_keep_nan_x2(fp32x2_t{r, r}, s)[0];
             else
                 return static_cast<o_t>(r);
         };
@@ -3396,8 +3428,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float f32_cos = static_cast<float>(cos);
           float f32_sin = static_cast<float>(sin);
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-              // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-              const auto rot = aiter::scaled_cast<opus::fp8_t>(
+              // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+              const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                   fp32x2_t{f32_x * f32_cos - f32_y * f32_sin,
                            f32_y * f32_cos + f32_x * f32_sin},
                   inverted_qscale);
@@ -3743,8 +3775,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float k_rot_y = ky * f32_cos + kx * f32_sin;
           
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{k_rot_x,
                          k_rot_y},
                 inverted_kscale);
@@ -3765,8 +3797,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float q_rot_y = qy * f32_cos + qx * f32_sin;
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{q_rot_x,
                          q_rot_y},
                 inverted_qscale);
@@ -3807,8 +3839,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float qy = static_cast<float>(q_in[y_idx]);
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{qx * f32_cos - qy * f32_sin,
                          qy * f32_cos + qx * f32_sin},
                 inverted_qscale);
@@ -4065,8 +4097,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float k_rot_y = ky * f32_cos + kx * f32_sin;
           
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{k_rot_x,
                          k_rot_y},
                 inverted_kscale);
@@ -4087,8 +4119,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float q_rot_y = qy * f32_cos + qx * f32_sin;
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{q_rot_x,
                          q_rot_y},
                 inverted_qscale);
@@ -4129,8 +4161,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           float qy = static_cast<float>(q_in[y_idx]);
           
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
-            const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            // Saturate a value past the fp8 range (a bare cast turns it into NaN); a NaN stays NaN.
+            const auto rot = aiter::fp32_to_fp8_scaled_keep_nan_x2(
                 fp32x2_t{qx * f32_cos - qy * f32_sin,
                          qy * f32_cos + qx * f32_sin},
                 inverted_qscale);

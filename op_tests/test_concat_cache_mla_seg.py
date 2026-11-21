@@ -76,7 +76,11 @@ def _expected_cache(kv_cache, slots, nope, pe):
 
 
 def _bytes_differ(a, b):
-    return int((a.view(torch.uint8) != b.view(torch.uint8)).sum().item())
+    diff = a.view(torch.uint8) != b.view(torch.uint8)
+    if a.dtype == dtypes.fp8:
+        # Two NaNs match whatever their sign bit: torch writes +NaN, the convert -NaN.
+        diff &= ~(a.float().isnan() & b.float().isnan())
+    return int(diff.sum().item())
 
 
 @pytest.mark.parametrize("kv_dtype", ["fp8", "auto"])
@@ -187,10 +191,13 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     get_gfx_runtime() not in FP8_CVT_GFX, reason="needs the packed fp8 convert"
 )
 @pytest.mark.parametrize("is_neox", [True, False])
+# NaN in the rope inputs must stay NaN, not the saturated byte
+@pytest.mark.parametrize("rope_nan", [False, True])
 # one head per block, and eight heads per block
 @pytest.mark.parametrize("h,t", [(1, 7), (32, 192), (128, 1536)])
-def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, h, t):
-    """Values past the fp8 range store the saturated byte, never the NaN pattern."""
+def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, rope_nan, h, t):
+    """Values past the fp8 range store the saturated byte, never the NaN pattern;
+    a NaN rope input stores NaN."""
     fmax = torch.finfo(dtypes.fp8).max
 
     def wide(*shape):
@@ -205,6 +212,12 @@ def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, h, t):
     gen = torch.Generator().manual_seed(h * 100003 + t)
     q_nope, q_pe = wide(t, h, KV_LORA), wide(t, h, PE_DIM)
     kv_c, k_pe = wide(t, KV_LORA), wide(t, PE_DIM)
+    if rope_nan:
+        # Columns 0, 1, 32 and 33 hold both members of every rope pair (neox
+        # (0, 32), (1, 33); GPT-J (0, 1), (32, 33)); the identity rope turns a
+        # NaN into a NaN partner, so every pair is NaN in both layouts.
+        q_pe[..., [0, 1, 32, 33]] = float("nan")
+        k_pe[..., [0, 1, 32, 33]] = float("nan")
     num_blocks = 4096
     kv_cache = torch.zeros(
         (num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=dtypes.fp8, device="cuda"
@@ -252,4 +265,4 @@ def test_fused_qk_rope_concat_and_cache_mla_seg_saturates(is_neox, h, t):
     nan_bytes = torch.tensor([float("nan"), -float("nan")]).to(dtypes.fp8)
     nan_bytes = nan_bytes.view(torch.uint8).cuda()
     for out in (q_out[..., : KV_LORA + PE_DIM], kv_cache):
-        assert not torch.isin(out.view(torch.uint8), nan_bytes).any()
+        assert torch.isin(out.view(torch.uint8), nan_bytes).any() == rope_nan

@@ -327,11 +327,14 @@ def check_fused_rope_fp8_saturates(
     heads: int = 16,
     kv_heads: int | None = None,
     dtype: torch.dtype = dtypes.bf16,
+    rope_nan: bool = False,
 ):
     """FP8 q_out and KV cache clamp to the fp8 range in the rope part as in the
     nope part; a bare cast turned rope values past it into NaN. The shape picks
     the kernel (see FUSED_ROPE_FP8_SATURATE_CASES); kv_heads=None passes 2-D
-    kv_c/k_pe (decode), an int passes [tokens, kv_heads, ...] (prefill/GQA)."""
+    kv_c/k_pe (decode), an int passes [tokens, kv_heads, ...] (prefill/GQA).
+    rope_nan also puts NaN in the rope inputs; the rope part must store NaN
+    for it, not the saturated byte."""
     fp8_max = torch.finfo(dtypes.fp8).max
     kv_shape = (tokens,) if kv_heads is None else (tokens, kv_heads)
     q_nope = torch.randn(tokens, heads, kv_lora_rank, dtype=dtype, device=device)
@@ -344,6 +347,12 @@ def check_fused_rope_fp8_saturates(
         for cols, sign in ((slice(0, 2), 1), (slice(2, 4), -1), (slice(-4, -2), 1)):
             t.view(-1, t.shape[-1])[:, cols] = sign * 4 * fp8_max
         t.view(-1, t.shape[-1])[:, -2:] = -4 * fp8_max
+    if rope_nan:
+        # Columns 0, 1, 32 and 33 hold both members of every rope pair, neox
+        # (0, 32), (1, 33) and GPT-J (0, 1), (32, 33): the identity rope turns a
+        # NaN into a NaN partner, so every pair is NaN in both layouts.
+        for t in (q_pe, k_pe):
+            t.view(-1, t.shape[-1])[:, [0, 1, 32, 33]] = float("nan")
     kv_cache = torch.zeros(
         tokens, 1, kv_heads or 1, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
     )
@@ -375,9 +384,13 @@ def check_fused_rope_fp8_saturates(
     torch.cuda.synchronize()
     expect_q = torch.cat((q_nope, q_pe), -1).float().clamp(-fp8_max, fp8_max)
     expect_k = torch.cat((kv_c, k_pe), -1).float().clamp(-fp8_max, fp8_max)
-    torch.testing.assert_close(q_out.float(), expect_q.to(dtypes.fp8).float())
     torch.testing.assert_close(
-        kv_cache.view(expect_k.shape).float(), expect_k.to(dtypes.fp8).float()
+        q_out.float(), expect_q.to(dtypes.fp8).float(), equal_nan=rope_nan
+    )
+    torch.testing.assert_close(
+        kv_cache.view(expect_k.shape).float(),
+        expect_k.to(dtypes.fp8).float(),
+        equal_nan=rope_nan,
     )
 
 
@@ -914,13 +927,24 @@ def main():
                 kv_heads,
                 dtype,
             ) in FUSED_ROPE_FP8_SATURATE_CASES.items():
-                for is_neox in (True, False):
+                for is_neox, rope_nan in itertools.product(
+                    (True, False), (False, True)
+                ):
                     try:
                         check_fused_rope_fp8_saturates(
-                            args.device, rank, is_neox, tokens, heads, kv_heads, dtype
+                            args.device,
+                            rank,
+                            is_neox,
+                            tokens,
+                            heads,
+                            kv_heads,
+                            dtype,
+                            rope_nan,
                         )
                     except AssertionError as e:
-                        raise AssertionError(f"{case}, {is_neox=}: {e}") from e
+                        raise AssertionError(
+                            f"{case}, {is_neox=}, {rope_nan=}: {e}"
+                        ) from e
         df = []
         for num_token in args.token:
             num_blocks = num_token // args.block_size
