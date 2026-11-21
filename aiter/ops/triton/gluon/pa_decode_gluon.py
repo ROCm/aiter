@@ -1541,8 +1541,23 @@ def paged_attention_decode_sliding_window_head_1(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
-        page_size = gl.cdiv(
-            context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        # Split on whole partitions, as the window branch does: a split loads
+        # every partition it touches in full, so a split edge inside a
+        # partition makes both neighbours load it. Splits past the end of the
+        # context take the early return below.
+        SPLIT_ALIGNMENT: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
+        sequence_split_count = gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        # The clamp to the context changes no split: when it applies, split 0
+        # already holds the whole context. It keeps LLVM from proving that a
+        # split starts on a multiple of 256; with that proof LLVM drops the
+        # start masks and reschedules the partition loop, which measured up
+        # to 9% slower on gfx950 at the same partitioning.
+        page_size = gl.minimum(
+            gl.cdiv(context_length, sequence_split_count * SPLIT_ALIGNMENT)
+            * SPLIT_ALIGNMENT,
+            context_length,
         )
         sequence_start_idx = page_size * sequence_split_idx
 
@@ -2664,8 +2679,23 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
-        page_size = gl.cdiv(
-            context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        # Split on whole partitions, as the window branch does: a split loads
+        # every partition it touches in full, so a split edge inside a
+        # partition makes both neighbours load it. Splits past the end of the
+        # context take the early return below.
+        SPLIT_ALIGNMENT: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
+        sequence_split_count = gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        # The clamp to the context changes no split: when it applies, split 0
+        # already holds the whole context. It keeps LLVM from proving that a
+        # split starts on a multiple of 256; with that proof LLVM drops the
+        # start masks and reschedules the partition loop, which measured up
+        # to 9% slower on gfx950 at the same partitioning.
+        page_size = gl.minimum(
+            gl.cdiv(context_length, sequence_split_count * SPLIT_ALIGNMENT)
+            * SPLIT_ALIGNMENT,
+            context_length,
         )
         sequence_start_idx = page_size * sequence_split_idx
 
