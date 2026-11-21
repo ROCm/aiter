@@ -520,6 +520,8 @@ def _pa_decode_sparse_reduce(
     BLOCK_K: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
     num_warps: gl.constexpr,
+    lse_ptr=None,
+    HAS_LSE: gl.constexpr = False,
 ):
     """Gluon reduce for pa_decode_sparse: combine KV_SPLITS partials, fold in
     attn_sink, write final output.
@@ -665,6 +667,17 @@ def _pa_decode_sparse_reduce(
     l_combined_hd = gl.convert_layout(l_combined, gl.SliceLayout(1, L_HD))
     l_final = l_combined_hd * alpha_kv + alpha_sink
     acc_final = acc_combined * alpha_kv[:, None]
+
+    if HAS_LSE:
+        LN2: gl.constexpr = 0.6931471805599453
+        log_l = gl.log2(l_combined_hd) * LN2
+        m_nat = m_max_hd * LN2
+        gl.amd.cdna4.buffer_store(
+            gl.where(l_combined_hd > 0.0, m_nat + log_l, float("-inf")),
+            ptr=lse_ptr + t * H,
+            offsets=h_offs_out_eff.to(gl.int32),
+            mask=h_offs_out_eff < H,
+        )
 
     safe_denom = gl.maximum(l_final, 1.0e-30)
     out_val = gl.where(l_final[:, None] > 0.0, acc_final / safe_denom[:, None], 0.0)
