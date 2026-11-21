@@ -46,7 +46,9 @@ def mxfp8_decode_gemm_config(m: int, n: int, k: int):
 def mxfp8_decode_gemm_supported(m: int, n: int, k: int) -> bool:
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx_runtime() == "gfx1250" and mxfp8_decode_gemm_config(m, n, k) is not None
+    return (
+        get_gfx_runtime() == "gfx1250" and mxfp8_decode_gemm_config(m, n, k) is not None
+    )
 
 
 @functools.cache
@@ -102,7 +104,11 @@ def mxfp8_decode_gemm(
         raise ValueError("mxfp8_decode_gemm: operand shapes / strides")
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    elif out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n) or not out.is_contiguous():
+    elif (
+        out.dtype != torch.bfloat16
+        or tuple(out.shape) != (m, n)
+        or not out.is_contiguous()
+    ):
         raise ValueError("mxfp8_decode_gemm: out must be a contiguous bf16 [M, N]")
     if m == 0:
         return out

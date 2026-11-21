@@ -34,7 +34,10 @@ from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
-from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops, pipeline_fence
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    make_lds_copy_ops,
+    pipeline_fence,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -178,12 +181,22 @@ def launch_mxfp8_decode_gemm(
             # zero-filled, not fetched.
             gA_base = fx.recast_iter(fx.Int8, arg_a)
             if wave < n_chunks:
-                c_off = fx.Int64(m0) * fx.Int64(i32_lda) + fx.Int64(kpart * (K // ks) + wave * A_KC)
+                c_off = fx.Int64(m0) * fx.Int64(i32_lda) + fx.Int64(
+                    kpart * (K // ks) + wave * A_KC
+                )
                 desc = tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=fx.Tensor(fx.make_view(fx.add_offset(gA_base, c_off),
-                                                      fx.make_layout((tile_m, A_KC), (A_KC, 1)))),
-                    lds_memref=fx.Tensor(fx.make_view(fx.add_offset(base_ptr, PLANES + wave * A_STAGE),
-                                                      fx.make_layout((tile_m, A_KC), (A_ROW, 1)))),
+                    global_ptr=fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(gA_base, c_off),
+                            fx.make_layout((tile_m, A_KC), (A_KC, 1)),
+                        )
+                    ),
+                    lds_memref=fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(base_ptr, PLANES + wave * A_STAGE),
+                            fx.make_layout((tile_m, A_KC), (A_ROW, 1)),
+                        )
+                    ),
                     global_offset=(0, 0),
                     tensor_shape=(tile_m, A_KC),
                     strides=(i32_lda, 1),
@@ -198,7 +211,9 @@ def launch_mxfp8_decode_gemm(
                 tdm_ops.tensor_load_2d(desc)
 
         # Activation rows past M read zeros (buffer range); their outputs are dropped.
-        a_buf = ptr_buf_tensor(arg_a, fx.Int32, unit_elems=4, num_records_bytes=i32_m * i32_lda)
+        a_buf = ptr_buf_tensor(
+            arg_a, fx.Int32, unit_elems=4, num_records_bytes=i32_m * i32_lda
+        )
         sa_buf = ptr_buf_tensor(arg_as, fx.Int32, num_records_bytes=i32_m * (K // 32))
         b_buf = ptr_buf_tensor(arg_w, fx.Int32, unit_elems=4)
         sb_buf = ptr_buf_tensor(arg_ws, fx.Int32)
@@ -209,7 +224,11 @@ def launch_mxfp8_decode_gemm(
         sb_col = [(nblk0 + j) * 16 + lane16 for j in range_constexpr(nbw)]
         sb_base = [(c // 32) * (K // 4) + c % 32 for c in sb_col]
         sa_row = [
-            (m0 + (2 * p) * 16 + lane) if const_expr(sa_opsel) else (m0 + p * 16 + lane16)
+            (
+                (m0 + (2 * p) * 16 + lane)
+                if const_expr(sa_opsel)
+                else (m0 + p * 16 + lane16)
+            )
             for p in range_constexpr(sa_loads)
         ]
         sa_base = [r * KB4 for r in sa_row]
@@ -223,36 +242,68 @@ def launch_mxfp8_decode_gemm(
             ksg = ks0 + i
             bfr = [
                 [
-                    buf_copy_load(b_buf, b_base[j] + ksg * 128 + jj * 32, fx.Int32, 4, cache_modifier=wcpol)
+                    buf_copy_load(
+                        b_buf,
+                        b_base[j] + ksg * 128 + jj * 32,
+                        fx.Int32,
+                        4,
+                        cache_modifier=wcpol,
+                    )
                     for jj in range_constexpr(4)
                 ]
                 for j in range_constexpr(nbw)
             ]
-            sb = [buf_copy_load(sb_buf, sb_base[j] + ksg * 32, fx.Int32) for j in range_constexpr(nbw)]
-            sa = [buf_copy_load(sa_buf, sa_base[p] + ksg, fx.Int32) for p in range_constexpr(sa_loads)]
+            sb = [
+                buf_copy_load(sb_buf, sb_base[j] + ksg * 32, fx.Int32)
+                for j in range_constexpr(nbw)
+            ]
+            sa = [
+                buf_copy_load(sa_buf, sa_base[p] + ksg, fx.Int32)
+                for p in range_constexpr(sa_loads)
+            ]
             afr = None
             if const_expr(not atdm):
                 afr = [
-                    [buf_copy_load(a_buf, a_row[mi] + ksg * 8 + jj * 2, fx.Int32, 4) for jj in range_constexpr(4)]
+                    [
+                        buf_copy_load(a_buf, a_row[mi] + ksg * 8 + jj * 2, fx.Int32, 4)
+                        for jj in range_constexpr(4)
+                    ]
                     for mi in range_constexpr(mbt)
                 ]
             return bfr, sb, sa, afr
 
         def lds_a_frag(mi, i):
             s_ = w_k * steps_w + i  # K step inside the workgroup range
-            base = PLANES + (s_ // 4) * A_STAGE + (mi * 16 + lane16) * A_ROW + (s_ % 4) * 128 + kgrp * 16
-            return [Vec(lds_load_b128(lds_idx, base + 32 * jj)) for jj in range_constexpr(4)]
+            base = (
+                PLANES
+                + (s_ // 4) * A_STAGE
+                + (mi * 16 + lane16) * A_ROW
+                + (s_ % 4) * 128
+                + kgrp * 16
+            )
+            return [
+                Vec(lds_load_b128(lds_idx, base + 32 * jj)) for jj in range_constexpr(4)
+            ]
 
         atoms = [
             fx.make_mma_atom(
                 fx.rocdl.WMMAScale(
-                    16, 16, WMMA_K, fx.Float8E4M3FN, fx.Float8E4M3FN, fx.Float32,
-                    opsel_a=0, opsel_b=sel,
+                    16,
+                    16,
+                    WMMA_K,
+                    fx.Float8E4M3FN,
+                    fx.Float8E4M3FN,
+                    fx.Float32,
+                    opsel_a=0,
+                    opsel_b=sel,
                 )
             )
             for sel in range_constexpr(2 if sa_opsel else 1)
         ]
-        acc = [[fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(nbw)] for _ in range_constexpr(mbt)]
+        acc = [
+            [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(nbw)]
+            for _ in range_constexpr(mbt)
+        ]
         for row in acc:
             for c in row:
                 c.store(fx.full(8, 0.0, fx.Float32))
@@ -283,7 +334,9 @@ def launch_mxfp8_decode_gemm(
         inflight = [load_step(i) for i in range_constexpr(wdepth)]
         rocdl.sched_barrier(0)
         if const_expr(atdm):
-            pipeline_fence(outstanding=0, use_cluster=False)  # the activation tile is in LDS
+            pipeline_fence(
+                outstanding=0, use_cluster=False
+            )  # the activation tile is in LDS
         for i in range_constexpr(steps_w):
             st = inflight.pop(0)
             if const_expr(i + wdepth < steps_w):
@@ -298,19 +351,27 @@ def launch_mxfp8_decode_gemm(
                 col = (w_n * nbw + j) * 16 + kgrp * 8
                 v = Vec(acc[mi][j].load())
                 off = w_k * P_PLANE + row * P_ROW + col * 4
-                lds_store_b128(lds_idx, off, v.shuffle(v, [0, 1, 2, 3]).bitcast(fx.Int32))
-                lds_store_b128(lds_idx, off + 16, v.shuffle(v, [4, 5, 6, 7]).bitcast(fx.Int32))
+                lds_store_b128(
+                    lds_idx, off, v.shuffle(v, [0, 1, 2, 3]).bitcast(fx.Int32)
+                )
+                lds_store_b128(
+                    lds_idx, off + 16, v.shuffle(v, [4, 5, 6, 7]).bitcast(fx.Int32)
+                )
         _lds_barrier()
 
         def plane_sum(r, c4):
             tot = None
             for k in range_constexpr(kw):
-                part = Vec(lds_load_b128(lds_idx, k * P_PLANE + r * P_ROW + c4 * 16)).bitcast(fx.Float32)
+                part = Vec(
+                    lds_load_b128(lds_idx, k * P_PLANE + r * P_ROW + c4 * 16)
+                ).bitcast(fx.Float32)
                 tot = part if tot is None else tot + part
             return tot
 
         n0 = ntile * cols
-        out_buf = ptr_buf_tensor(arg_out, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (N * 2))
+        out_buf = ptr_buf_tensor(
+            arg_out, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (N * 2)
+        )
         p_units = tile_m * U_ROW
         if const_expr(ks == 1):
             for t in range_constexpr((p_units + block - 1) // block):
@@ -322,10 +383,14 @@ def launch_mxfp8_decode_gemm(
                 if const_expr(p_units % block):
                     ok = ok & (u < p_units)
                 if ok:
-                    buf_copy_store(out_buf, ((m0 + r) * N + n0) // 4 + c4, yw, fx.Int32, 2)
+                    buf_copy_store(
+                        out_buf, ((m0 + r) * N + n0) // 4 + c4, yw, fx.Int32, 2
+                    )
         else:
             slab_buf = ptr_buf_tensor(
-                arg_slab, fx.Float32, unit_elems=4,
+                arg_slab,
+                fx.Float32,
+                unit_elems=4,
                 num_records_bytes=fx.Int64(i32_mpad) * (ks * N * 4),
             )
             # the other ranks' rows out to the slab (real rows only)
@@ -338,8 +403,14 @@ def launch_mxfp8_decode_gemm(
                 if const_expr(p_units % block):
                     ok = ok & (u < p_units)
                 if ok:
-                    buf_copy_store(slab_buf, ((kpart * i32_mpad + m0 + r) * N + n0) // 4 + c4, tot, fx.Float32, 4,
-                                   cache_modifier=CPOL_SE)
+                    buf_copy_store(
+                        slab_buf,
+                        ((kpart * i32_mpad + m0 + r) * N + n0) // 4 + c4,
+                        tot,
+                        fx.Float32,
+                        4,
+                        cache_modifier=CPOL_SE,
+                    )
             rocdl.s_wait_storecnt(0)
             cluster.cluster_barrier()
             r_units = rpr * U_ROW
@@ -351,8 +422,16 @@ def launch_mxfp8_decode_gemm(
                 parts = []
                 for k in range_constexpr(ks):
                     gi = ((k * i32_mpad + m0 + r) * N + n0) // 4 + c4
-                    gi = (kpart == k).select(fx.Int32(0x0FFFFFF0), gi)  # own part: out of range, no fetch
-                    parts.append(Vec(buf_copy_load(slab_buf, gi, fx.Float32, 4, cache_modifier=CPOL_SE)))
+                    gi = (kpart == k).select(
+                        fx.Int32(0x0FFFFFF0), gi
+                    )  # own part: out of range, no fetch
+                    parts.append(
+                        Vec(
+                            buf_copy_load(
+                                slab_buf, gi, fx.Float32, 4, cache_modifier=CPOL_SE
+                            )
+                        )
+                    )
                 tot = None
                 for k in range_constexpr(ks):
                     pk = (kpart == k).select(own, parts[k])
@@ -362,11 +441,21 @@ def launch_mxfp8_decode_gemm(
                 if const_expr(r_units % block):
                     ok = ok & (u < r_units)
                 if ok:
-                    buf_copy_store(out_buf, ((m0 + r) * N + n0) // 4 + c4, yw, fx.Int32, 2)
+                    buf_copy_store(
+                        out_buf, ((m0 + r) * N + n0) // 4 + c4, yw, fx.Int32, 2
+                    )
 
     mgroups = (i32_m + (tile_m - 1)) // tile_m
     kernel_decode_gemm(
-        arg_a, arg_as, arg_w, arg_ws, arg_out, arg_slab, i32_m, i32_lda, i32_mpad,
+        arg_a,
+        arg_as,
+        arg_w,
+        arg_ws,
+        arg_out,
+        arg_slab,
+        i32_m,
+        i32_lda,
+        i32_mpad,
         value_attrs={"rocdl.cluster_dims": (f"{ks},1,1" if ks > 1 else None)},
     ).launch(
         grid=(ks, N // cols, mgroups),

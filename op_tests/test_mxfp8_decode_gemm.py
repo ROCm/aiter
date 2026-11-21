@@ -37,14 +37,27 @@ def _case(m, seed):
 
     x = torch.randn(m, K, generator=g, device=dev).clamp(-8, 8).to(torch.float8_e4m3fn)
     xs = e8m0((m, K // 32), 120, 127)
-    w = (torch.randn(N, K, generator=g, device=dev) * 0.5).clamp(-8, 8).to(torch.float8_e4m3fn)
+    w = (
+        (torch.randn(N, K, generator=g, device=dev) * 0.5)
+        .clamp(-8, 8)
+        .to(torch.float8_e4m3fn)
+    )
     ws = e8m0((N, K // 32), 118, 126)
-    return x, xs, w, ws, shuffle_weight(w, layout=(16, 16)), shuffle_mxfp8_bpreshuffle_scale(ws)
+    return (
+        x,
+        xs,
+        w,
+        ws,
+        shuffle_weight(w, layout=(16, 16)),
+        shuffle_mxfp8_bpreshuffle_scale(ws),
+    )
 
 
 def _deq(codes, scales):
     s = torch.exp2(scales.view(torch.uint8).double() - 127.0)
-    return (codes.double().view(codes.shape[0], -1, 32) * s[..., None]).view(codes.shape[0], -1)
+    return (codes.double().view(codes.shape[0], -1, 32) * s[..., None]).view(
+        codes.shape[0], -1
+    )
 
 
 @pytest.mark.parametrize("m", [1, 16, 33, 64, 100, 128, 150, 192, 256])
@@ -58,7 +71,9 @@ def test_mxfp8_decode_gemm(m):
         pytest.skip(f"M={m} keeps the tuned GEMM")
     x, xs, w, ws, w_sh, ws_sh = _case(m, seed=m)
     ref = _deq(x, xs) @ _deq(w, ws).T
-    prod = aiter.gemm_a8w8_blockscale(x, w_sh, xs, ws_sh, dtype=torch.bfloat16, isBpreshuffled=True)
+    prod = aiter.gemm_a8w8_blockscale(
+        x, w_sh, xs, ws_sh, dtype=torch.bfloat16, isBpreshuffled=True
+    )
     out = torch.full((m + 7, N), -3.0, dtype=torch.bfloat16, device="cuda")
     y = mxfp8_decode_gemm(x, xs, w_sh, ws_sh, out=out[:m])
     torch.cuda.synchronize()
