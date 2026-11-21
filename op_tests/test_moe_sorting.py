@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import itertools
 import multiprocessing
 import queue
@@ -523,9 +524,11 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
             token, model_dim, E, topk, dtype, has_expert_mask, padding_extra=0
         )
         ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size, expert_mask)
+
         # output_aux sorts pick their own dispatch_policy; the plain sort forces
         # the single kernel, as a C++ caller of dispatch_policy=1 does.
-        out = moe_sorting(
+        sort = functools.partial(
+            moe_sorting,
             topk_ids,
             topk_weights,
             E,
@@ -536,6 +539,8 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
             dispatch_policy=1,
             output_aux=output_aux,
         )
+
+        out = sort()
         torch.cuda.synchronize()
         errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
         bad = {name: err for name, err in errs.items() if err}
@@ -546,6 +551,13 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
         case["oneshot ws bytes"] = aiter.moe_sorting_opus_get_workspace_size(
             token, E, topk, 1, device_id
         )
+        # Timed after the checked launch, so a hang is caught first. The roofline is
+        # the crude one of the main benchmark.
+        _, us = run_perftest(sort, num_warmup=1, num_iters=2)
+        flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
+        case["us"] = round(us, 2)
+        case["TFLOPS"] = round(flops / us / 1e6, 5)
+        case["TB/s"] = round(nbytes / us / 1e6, 5)
         case["err"] = max(errs.values())
         progress.put(("row", case))
 
