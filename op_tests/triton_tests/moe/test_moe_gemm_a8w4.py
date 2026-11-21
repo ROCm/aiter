@@ -10,6 +10,7 @@ from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+    get_kernel_config_gluon,
     moe_gemm_a8w4,
     moe_gemm_torch,
 )
@@ -357,14 +358,25 @@ def test_op(
     ],
 )
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
 def test_op_unpadded_scale_swizzle_gfx1250(
-    m, n_buf, k_buf, n, k, apply_swiglu, device="cuda"
+    m, n_buf, k_buf, n, k, apply_swiglu, persistent, monkeypatch, device="cuda"
 ):
     """GFX1250_SCALE weight scales with unpadded_N / unpadded_K, as vLLM's W4A8
     MoE passes them: buffers padded to the scale-shuffle tile, zero outside n x k.
+    ``persistent`` runs the same call on ``_moe_gemm_a8w4_decode_persistent``.
     """
     if get_arch() != "gfx1250":
         pytest.skip("GFX1250_SCALE with unpadded sizes is gfx1250-only.")
+    if persistent:
+        # the tuned configs give these shapes persistent_iters 1
+        monkeypatch.setattr(
+            "aiter.ops.triton.moe.moe_op_gemm_a8w4.get_kernel_config_gluon",
+            lambda *args, **kwargs: {
+                **get_kernel_config_gluon(*args, **kwargs),
+                "persistent_iters": 2,
+            },
+        )
     torch.manual_seed(0)
     n_expts_tot, n_expts_act = 8, 2
     m, rdata, gindx, sindx = init_routing_data(
