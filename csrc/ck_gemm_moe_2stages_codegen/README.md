@@ -13,6 +13,7 @@
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build moe 2-stages kernels via jit:
 `python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv`
+From the repo root, `python3 -m aiter.tuning.moe` runs the same tuner and takes the same arguments as every `gemm_moe_tune.py` command below.
 You can find the results of this tuning in `aiter/configs/tuned_fmoe.csv`, like this:
     |**cu_num**|**token**|**model_dim**|**inter_dim**|**expert**|**topk**|**act_type**|**dtype**|**q_dtype_a**|**q_dtype_w**|**q_type**|**use_g1u1**|**doweight_stage1**|**block_m**|**ksplit**|**us1**|**kernelName1**|**err1**|**us2**|**kernelName2**|**err2**|**us**|**run_1stage**|**tflops**|**bw**|
     |----------|---------|-------------|-------------|----------|--------|------------|---------|-------------|-------------|----------|------------|-------------------|-----------|----------|-------|---------------|--------|-------|---------------|--------|------|--------------|----------|------|

@@ -11,13 +11,17 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
+import ast
 import importlib
+import importlib.util
+import inspect
 import math
 import multiprocessing as mp
 import os
 import pickle
 import subprocess
 import sys
+import textwrap
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
@@ -27,6 +31,13 @@ from unittest.mock import patch
 def _wait_for_release(release, value):
     release.wait(timeout=5)
     return value
+
+
+def _new_tensor_device(gpu):
+    import torch
+
+    torch.cuda.set_device(gpu)
+    return str(torch.zeros(1).device)
 
 
 class FakeAsyncResult:
@@ -787,7 +798,7 @@ class TestMpTunerResubmission(unittest.TestCase):
         submissions = []
         manager = mock.Mock(Queue=queue_module.Queue)
 
-        def new_pool(parallel_num, start_times, pids):
+        def new_pool(parallel_num, start_times, pids, default_device=None):
             tuner._TASK_START_TIMES, tuner._TASK_PIDS = start_times, pids
             return _FakePool(submissions)
 
@@ -883,6 +894,82 @@ class TestMpTunerResubmission(unittest.TestCase):
                 )
                 self.assertEqual([info for info, *_ in results], names)
                 self.assertEqual(seen, [("s1", "s1 data"), ("s3", "s3 data")])
+
+
+class TestDefaultDevice(unittest.TestCase):
+    def test_none_does_not_call_set_default_device(self):
+        from unittest import mock
+
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        with (
+            mock.patch.object(tuner, "configure_worker_subprocesses"),
+            mock.patch.object(tuner.torch, "set_default_device") as set_dev,
+        ):
+            tuner._init_task_start_times([], None)
+            tuner._init_task_start_times([], None, None)
+            set_dev.assert_not_called()
+
+    def test_cuda_is_forwarded_to_the_initializer(self):
+        from unittest import mock
+
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        times, pids = object(), object()
+        with (
+            mock.patch.object(tuner, "configure_worker_subprocesses"),
+            mock.patch.object(tuner.torch, "set_default_device") as set_dev,
+            mock.patch.object(tuner.mp, "Pool") as pool,
+        ):
+            tuner._init_task_start_times(times, pids, "cuda")
+            set_dev.assert_called_once_with("cuda")
+            tuner._new_pool(2, times, pids, default_device="cuda")
+            self.assertEqual(pool.call_args.kwargs["initargs"], (times, pids, "cuda"))
+            pool.reset_mock()
+            tuner._new_pool(2, times, pids)
+            self.assertEqual(pool.call_args.kwargs["initargs"], (times, pids, None))
+
+    def test_both_pool_calls_pass_default_device(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        tree = ast.parse(textwrap.dedent(inspect.getsource(tuner.mp_tuner)))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_new_pool"
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            passed = [a.id for a in call.args if isinstance(a, ast.Name)]
+            passed += [
+                k.value.id
+                for k in call.keywords
+                if k.arg == "default_device" and isinstance(k.value, ast.Name)
+            ]
+            self.assertIn("default_device", passed, ast.unparse(call))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "needs torch")
+    def test_pool_worker_creates_tensors_on_its_gpu(self):
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            self.skipTest("needs a CUDA GPU")
+        from unittest import mock
+
+        # GPU 1 when there is one: "cuda" must follow set_device, not pin GPU 0.
+        gpu = 1 if torch.cuda.device_count() > 1 else 0
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        got = {}
+        with mock.patch.object(tuner, "mp", mp.get_context("spawn")):
+            for default_device in (None, "cuda"):
+                pool = tuner._new_pool(1, None, None, default_device)
+                try:
+                    got[default_device] = pool.apply_async(
+                        _new_tensor_device, (gpu,)
+                    ).get(timeout=300)
+                finally:
+                    pool.terminate()
+                    pool.join()
+        self.assertEqual(got, {None: "cpu", "cuda": f"cuda:{gpu}"})
 
 
 if __name__ == "__main__":

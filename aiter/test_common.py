@@ -11,6 +11,7 @@ import torch
 import torch.profiler as tpf
 
 from aiter import logger
+from aiter.utility import dtypes
 
 pd.set_option("display.max_rows", 200)
 ## debug ##
@@ -642,6 +643,173 @@ def assertAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", **kwa
         ratio <= tol_err_ratio
     ), f"{prefix}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
     return ratio
+
+
+COS_DIFF_THRESHOLD = 1e-1
+
+
+def _all_finite(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor).all().item())
+
+
+_E2M1_MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_LUT = _E2M1_MAG + tuple(-v for v in _E2M1_MAG)
+
+
+def _to_f64_flat(t):
+    """Flatten to float64, unpacking fp4x2 by hand.
+
+    ``fp4x2.double()`` faults the queue (HIP unspecified launch failure), and
+    viewing it as uint8 would compare two packed e2m1 codes as one byte value,
+    so decode the nibbles into their represented values instead.
+    """
+    if t.dtype == dtypes.fp4x2:
+        b = t.reshape(-1).view(torch.uint8)
+        lut = torch.tensor(_E2M1_LUT, device=b.device, dtype=torch.float64)
+        return torch.stack(
+            [lut[(b & 0xF).long()], lut[((b >> 4) & 0xF).long()]], dim=-1
+        ).flatten()
+    return t.double().flatten()
+
+
+def cosine_diff_compare(ref, res, msg="", printLog=True):
+
+    x = _to_f64_flat(ref)
+    y = _to_f64_flat(res)
+    # Keep the reduction and ratio on the accelerator. Only the final scalar is
+    # copied to the host, where Python needs it for immediate fail-fast control.
+    cos_diff = (
+        1 - 2 * (x * y).sum() / torch.clamp((x * x + y * y).sum(), min=1e-12)
+    ).item()
+    if printLog:
+        if cos_diff < COS_DIFF_THRESHOLD:
+            logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
+        else:
+            logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
+    # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
+    return cos_diff
+
+
+def limit_cosine_diff_compare(ref, res, msg="", printLog=True):
+    # A tiny swiglu_limit makes correct outputs tiny or all zero, which the
+    # 1e-12 floor in cosine_diff_compare rejects, so normalize first.
+    x = _to_f64_flat(ref)
+    y = _to_f64_flat(res)
+    scale = torch.maximum(x.abs().max(), y.abs().max())
+    if scale.item() == 0:
+        return 0.0
+    return cosine_diff_compare(x / scale, y / scale, msg, printLog)
+
+
+def tensor_compare_diagnostics(
+    ref, res, rtol=1e-2, atol=1e-2, max_items=3, sample_elements=4096
+):
+    """Return a compact, log-safe summary for run_config mismatches."""
+    try:
+        with torch.no_grad():
+            ref_flat = ref.detach().flatten()
+            res_flat = res.detach().flatten()
+            ref_numel = ref_flat.numel()
+            res_numel = res_flat.numel()
+            total = min(ref_numel, res_numel)
+            max_items = max(0, int(max_items))
+            sample_limit = max(0, int(sample_elements))
+            sample_count = min(total, sample_limit)
+            examples = []
+
+            parts = [
+                f"shape=out{tuple(res.shape)},ref{tuple(ref.shape)}",
+                f"dtype=out={res.dtype},ref={ref.dtype}",
+                f"numel=out={res_numel},ref={ref_numel}",
+            ]
+            if tuple(res.shape) != tuple(ref.shape):
+                parts.append("shape_mismatch=True")
+            if res_numel != ref_numel:
+                parts.append("numel_mismatch=True")
+
+            if sample_count:
+                if sample_count == 1:
+                    sample_idx_cpu = torch.zeros(1, device="cpu", dtype=torch.long)
+                else:
+                    sample_idx_cpu = torch.arange(
+                        sample_count, device="cpu", dtype=torch.long
+                    )
+                    sample_idx_cpu = sample_idx_cpu * (total - 1) // (sample_count - 1)
+
+                ref_idx = (
+                    sample_idx_cpu
+                    if ref_flat.device.type == "cpu"
+                    else sample_idx_cpu.to(ref_flat.device)
+                )
+                res_idx = (
+                    sample_idx_cpu
+                    if res_flat.device.type == "cpu"
+                    else sample_idx_cpu.to(res_flat.device)
+                )
+                ref_f = ref_flat[ref_idx].to(device="cpu", dtype=torch.float32)
+                res_f = res_flat[res_idx].to(device="cpu", dtype=torch.float32)
+                delta = (res_f - ref_f).abs()
+                close = torch.isclose(res_f, ref_f, rtol=rtol, atol=atol)
+                mismatch = ~close
+
+                sample_mismatch = int(mismatch.sum().item())
+                finite_delta = delta[torch.isfinite(delta)]
+                max_abs = float(delta.max().item())
+                mean_abs = (
+                    float(finite_delta.mean().item())
+                    if finite_delta.numel()
+                    else float("nan")
+                )
+                out_norm = float(torch.linalg.vector_norm(res_f).item())
+                ref_norm = float(torch.linalg.vector_norm(ref_f).item())
+                nonfinite = int(
+                    (
+                        torch.logical_not(torch.isfinite(ref_f))
+                        | torch.logical_not(torch.isfinite(res_f))
+                    )
+                    .sum()
+                    .item()
+                )
+                parts.extend(
+                    [
+                        f"sampled={sample_count}/{total}",
+                        f"mismatch={sample_mismatch}/{sample_count}",
+                        f"max_abs={max_abs:.6g}",
+                        f"mean_abs={mean_abs:.6g}",
+                        f"out_norm={out_norm:.6g}",
+                        f"ref_norm={ref_norm:.6g}",
+                    ]
+                )
+                if nonfinite:
+                    parts.append(f"nonfinite={nonfinite}/{sample_count}")
+
+                if sample_mismatch > 0 and max_items > 0:
+                    positions = torch.nonzero(mismatch, as_tuple=False).flatten()
+                    for pos in positions[:max_items].tolist():
+                        src_idx = int(sample_idx_cpu[pos].item())
+                        examples.append(
+                            (
+                                src_idx,
+                                float(res_f[pos].item()),
+                                float(ref_f[pos].item()),
+                                float(delta[pos].item()),
+                            )
+                        )
+            else:
+                parts.append(f"sampled=0/{total}")
+
+        if examples:
+            example_text = []
+            for idx, out_value, ref_value, abs_value in examples:
+                example_text.append(
+                    f"{idx}:out={out_value:.6g},"
+                    f"ref={ref_value:.6g},"
+                    f"abs={abs_value:.6g}"
+                )
+            parts.append("top=[" + "; ".join(example_text) + "]")
+        return ", ".join(parts)
+    except Exception as exc:  # noqa: BLE001
+        return f"diagnostic_error={type(exc).__name__}:{exc}"
 
 
 def tensor_dump(x: torch.Tensor, name: str, dir="./"):

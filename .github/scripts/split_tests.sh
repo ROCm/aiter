@@ -61,6 +61,14 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
                 "$TEST_DIR/tuning_tests/test_fast_tuning.py" \
                 "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_aiter_import.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_calculate.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_ck_swiglu_limit.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_e2e_tune.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_tag_rows.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_task_record.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_tune_dispatch.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_winner_replay.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py" \
                 "$TEST_DIR/flydsl_tests/test_flydsl_allreduce_policy.py" \
                 "$TEST_DIR/flydsl_tests/test_flydsl_allreduce_rank_agreement.py" \
