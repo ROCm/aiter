@@ -4125,14 +4125,29 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
-    """Select the A16W16 compile floor from the current CU table."""
+    """Select the A16W16 compile floor from the current CU table.
+
+    On gfx950 the MXFP8 NN / TT / TN CO kids are added as well: the shape
+    heuristic and the tuners never pick them, so no tuned row requests them,
+    and gemm_a8w8_blockscale_bpreshuffle_opus must find them compiled.
+    """
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    return {
+    keys = {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
+    if lookup_gfx == "gfx950":
+        keys.update(
+            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
+            for kid, instance in get_registry(
+                "a8w8_blockscale_bpreshuffle", gfx, cu_num
+            ).items()
+            if instance.bpreshuffle_co is not None
+            and MXFP8_DIRECTION_PATTERN.search(instance.name)
+        )
+    return keys
 
 
 def _in_group(name, family, instance):

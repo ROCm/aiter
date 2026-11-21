@@ -240,19 +240,26 @@ def test_gfx950_mxscale_co_accepts_supported_shape(kid, shape, _gfx950_device):
     assert (backing[M * N :] == -7.0).all().item(), "CO modified output canary"
 
 
-# MXFP8 NN / TT / TN COs: (direction, kid, shape). 256x256 crosses the 64-column scale
-# panel (K / 128 = 65), 256x128 PadM takes M % 16 == 0, and GroupM 16 runs a partial
-# last group (17 M tiles).
-_MXFP8_DIRECTION_CASES = (
-    ("NN", 56, (512, 512, 8320)),
-    ("TT", 57, (512, 512, 8320)),
-    ("TN", 58, (512, 512, 8320)),
-    ("NN", 65, (272, 384, 256)),
-    ("TT", 66, (272, 384, 256)),
-    ("TN", 67, (272, 384, 256)),
-    ("NN", 74, (4352, 768, 256)),
-    ("TT", 75, (4352, 768, 256)),
-    ("TN", 76, (4352, 768, 256)),
+# MXFP8 NN / TT / TN COs: (direction, kid, shape), every shipped kid 56-85.
+# 256x256 crosses the 64-column scale panel (K / 128 = 65), PadM takes
+# M % 16 == 0, 256x128 takes N an odd multiple of 128, and GroupM 4 / 8 / 16
+# runs a partial last group (17 M tiles).
+_MXFP8_DIRECTION_SHAPES = (
+    ((56, 57, 58), (512, 512, 8320)),  # 256x256
+    ((59, 60, 61), (272, 512, 256)),  # 256x256 PadM
+    ((62, 63, 64), (512, 384, 256)),  # 256x128
+    ((65, 66, 67), (272, 384, 256)),  # 256x128 PadM
+    ((68, 69, 70), (4352, 768, 256)),  # 256x256 GroupM 4
+    ((71, 72, 73), (4352, 768, 256)),  # 256x256 GroupM 8
+    ((74, 75, 76), (4352, 768, 256)),  # 256x256 GroupM 16
+    ((77, 78, 79), (4352, 768, 256)),  # 256x128 GroupM 4
+    ((80, 81, 82), (4352, 768, 256)),  # 256x128 GroupM 8
+    ((83, 84, 85), (4352, 768, 256)),  # 256x128 GroupM 16
+)
+_MXFP8_DIRECTION_CASES = tuple(
+    (direction, kid, shape)
+    for kids, shape in _MXFP8_DIRECTION_SHAPES
+    for direction, kid in zip(("NN", "TT", "TN"), kids)
 )
 _MXFP8_DIRECTION_TEST_KIDS = tuple(kid for _, kid, _ in _MXFP8_DIRECTION_CASES)
 
@@ -329,6 +336,64 @@ def test_gfx950_mxfp8_direction_co_rejects_other_layout(
     )
     with pytest.raises(RuntimeError, match="CO expects XQ strides"):
         _gfx950_mxfp8_direction_run(xq, wq, x_scale, w_scale, other_kid)
+
+
+# gemm_a8w8_blockscale_bpreshuffle_opus picks the kid by shape: 256x128 for small
+# outputs (512 x 512, also crossing the scale panel at K = 8320), PadM (M = 272),
+# 256x256 (4352 x 1024) and GroupM 16 (M = 16384).
+@pytest.mark.parametrize("direction", ("NN", "TT", "TN"))
+@pytest.mark.parametrize(
+    "shape",
+    ((512, 512, 8320), (272, 384, 256), (4352, 1024, 256), (16384, 256, 256)),
+)
+def test_gfx950_mxfp8_direction_api_matches_reference(direction, shape, _gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_bpreshuffle_opus
+
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        direction, *shape, _gfx950_device
+    )
+    Y = gemm_a8w8_blockscale_bpreshuffle_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    assert Y.shape == ref.shape and Y.dtype == torch.bfloat16
+    err = (Y.float() - ref).abs().max().item()
+    assert err <= 2e-2 * ref.abs().max().item(), f"{direction} {shape}: max err {err}"
+
+
+def test_gfx950_mxfp8_direction_api_explicit_kid_and_out(_gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_bpreshuffle_opus
+
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        "TT", 512, 384, 256, _gfx950_device
+    )
+    out = torch.full(
+        (512, 384), float("nan"), device=_gfx950_device, dtype=torch.bfloat16
+    )
+    Y = gemm_a8w8_blockscale_bpreshuffle_opus(
+        xq, wq, x_scale, w_scale, kernelId=63, out=out
+    )
+    torch.cuda.synchronize(_gfx950_device)
+    assert Y.data_ptr() == out.data_ptr()
+    assert (Y.float() - ref).abs().max().item() <= 2e-2 * ref.abs().max().item()
+    # Another direction's kid rejects these strides in its launcher.
+    with pytest.raises(RuntimeError, match="CO expects XQ strides"):
+        gemm_a8w8_blockscale_bpreshuffle_opus(xq, wq, x_scale, w_scale, kernelId=62)
+
+
+def test_gfx950_mxfp8_direction_api_rejects_nt_and_bad_shapes(_gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_bpreshuffle_opus
+
+    xq, wq, x_scale, w_scale, _ = _gfx950_mxfp8_direction_inputs(
+        "TT", 256, 256, 128, _gfx950_device
+    )
+    # NT storage: A [M, K] and B [N, K] both row-major.
+    with pytest.raises(ValueError, match="NT: use gemm_a8w8_blockscale_bpreshuffle"):
+        gemm_a8w8_blockscale_bpreshuffle_opus(xq.contiguous(), wq, x_scale, w_scale)
+    # M % 16 != 0: no kid supports the shape.
+    xq, wq, x_scale, w_scale, _ = _gfx950_mxfp8_direction_inputs(
+        "NN", 1000, 256, 128, _gfx950_device
+    )
+    with pytest.raises(ValueError, match="no NN MXFP8 kernel supports"):
+        gemm_a8w8_blockscale_bpreshuffle_opus(xq, wq, x_scale, w_scale)
 
 
 @pytest.fixture
