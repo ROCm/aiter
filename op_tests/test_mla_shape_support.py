@@ -144,6 +144,9 @@ def test_default_96_heads_fold_at_qlen_7_and_8(monkeypatch):
             **_cp(cprr),
         )
         assert s.native is native, (q, cprr, s)
+        if native and s.asm_status is not MlaAsmStatus.ARCH_NOT_BUILT:
+            # the asm table must hold the kernel whatever the env var says
+            assert s.supported is True, (q, cprr, s)
     monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
     assert get_mla_decode_shape_support(
         96, 8, torch.float8_e4m3fn, torch.float8_e4m3fn, arch="gfx950", **_cp(True)
