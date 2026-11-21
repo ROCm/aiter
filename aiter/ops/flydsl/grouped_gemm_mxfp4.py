@@ -139,6 +139,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
+    post_gemm2_rmsnorm=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     row_major_ascale=0,
@@ -262,6 +263,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
+    if post_gemm2_rmsnorm and not enable_ep_scatter:
+        raise ValueError("post_gemm2_rmsnorm requires the MegaMoE stage2 scatter")
     if enable_ep_scatter and stage2_scatter.combine_quant_bits:
         # N is the payload plane's length and so the scale plane's base, which
         # has to land on a cache line; fp4 packs two elements to the byte and
@@ -315,6 +318,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
         k_waves,
+        int(bool(post_gemm2_rmsnorm)),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,

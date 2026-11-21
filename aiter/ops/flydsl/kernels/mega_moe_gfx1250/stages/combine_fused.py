@@ -20,7 +20,7 @@ from ..combine import (
 )
 from ..config import _WAVE_SIZE
 from ..recipe import _COMBINE_WIRE_QUANT, MegaMoEConfig
-from ..types import Stage2ScatterContext
+from ..types import Stage2ScatterContext, _from_gpu_ptr
 from .base import (
     BatchLayout,
     Routing,
@@ -97,10 +97,13 @@ class _FusedScatterCombine:
     needs_aggregated_reservation = False
     # finish() can fold a bf16 [tokens, hidden] tensor into the reduce.
     adds_shared = True
+    supports_post_norm = True
 
     def __init__(self, config: MegaMoEConfig, caps=None):
         self.config = config
         self.res = None
+        self._post_norm = config.recipe.post_expert_norm
+        self._zero_centered = config.recipe.post_expert_norm_zero_centered
         self._tiles = {
             bits: _combine_tile(
                 topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
@@ -170,6 +173,29 @@ class _FusedScatterCombine:
                     chunks_per_iter=chunks,
                     add_shared=add_shared,
                 )
+        if self._post_norm:
+            self._norm_slots = torch.empty(
+                (config.max_tokens_per_rank * config.topk, config.hidden_dim),
+                dtype=torch.bfloat16,
+                device=res.total_recv.device,
+            )
+            toks, chunks = self._tiles[0]
+            lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            self._norm_reduces = {
+                add_shared: _make_combine_fused_reduce(
+                    experts_per_token=config.topk,
+                    hidden_dim=config.hidden_dim,
+                    block_num=512,
+                    warp_num_per_block=lanes // _WAVE_SIZE,
+                    slot_stride_nbytes=config.hidden_dim * 2,
+                    quant_bits=0,
+                    tokens_per_block=toks,
+                    chunks_per_iter=chunks,
+                    apply_route_weight=True,
+                    add_shared=add_shared,
+                )
+                for add_shared in (False, True)
+            }
         self._sync = _make_combine_fused_sync(
             rank=config.rank,
             npes=config.world_size,
@@ -188,21 +214,35 @@ class _FusedScatterCombine:
             source_token_map=batch.routing.source_token_map,
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
+            post_norm_combine=self._post_norm,
         )
         return _ComputeTarget(
             scatter=scatter, dispatch_context=scatter if grouped else None
         )
 
     def finish(
-        self, routing: Routing, quant_bits: int, expert_out=None, shared_add=None
+        self,
+        routing: Routing,
+        quant_bits: int,
+        expert_out=None,
+        shared_add=None,
+        post_norm=None,
     ) -> torch.Tensor:
         """The gemm2 epilogue has already scattered the results into the peers'
         slots, packed as the ``quant_bits`` wire; reduce them.
 
         ``shared_add``: a bf16 ``[>= token_count, hidden]`` tensor added to each
         token's sum in the reduce itself, bit-identical to adding it afterwards.
+
+        ``post_norm``: ``(weight, eps, topk_weights)``. Required when the recipe
+        enables ``post_expert_norm``.
         """
         res = self.res
+        if (post_norm is not None) != self._post_norm:
+            raise ValueError(
+                "post_norm must be given exactly when the recipe enables "
+                "post_expert_norm"
+            )
         if shared_add is not None:
             count = routing.token_count
             if (
@@ -227,21 +267,80 @@ class _FusedScatterCombine:
             self.config.rank,
             stream,
         )
-        grid = (
-            (combine_direct_reduce_blocks(self.config.hidden_dim, routing.token_count),)
-            if quant_bits == 0
-            else ()
-        )
-        _run_compiled(
-            self._reduces[quant_bits, shared_add is not None],
-            res.arena.local_ptr("comb_inp"),
-            res.combine_output.data_ptr(),
-            routing.token_count,
-            0 if shared_add is None else shared_add.data_ptr(),
-            *grid,
-            stream,
-        )
+        shared_ptr = 0 if shared_add is None else shared_add.data_ptr()
+        if post_norm is not None:
+            self._normalize_slots(routing.token_count, quant_bits, post_norm)
+            _run_compiled(
+                self._norm_reduces[shared_add is not None],
+                self._norm_slots.data_ptr(),
+                res.combine_output.data_ptr(),
+                post_norm[2].data_ptr(),
+                routing.token_count,
+                shared_ptr,
+                stream,
+            )
+            return res.output(routing.token_count)
+        if quant_bits == 0:
+            _run_compiled(
+                self._reduces[0, shared_add is not None],
+                res.arena.local_ptr("comb_inp"),
+                res.combine_output.data_ptr(),
+                routing.token_count,
+                shared_ptr,
+                combine_direct_reduce_blocks(
+                    self.config.hidden_dim, routing.token_count
+                ),
+                stream,
+            )
+        else:
+            _run_compiled(
+                self._reduces[quant_bits, shared_add is not None],
+                res.arena.local_ptr("comb_inp"),
+                res.combine_output.data_ptr(),
+                0,  # GEMM2 already applied the route weights
+                routing.token_count,
+                shared_ptr,
+                stream,
+            )
         return res.output(routing.token_count)
+
+    def _normalize_slots(self, token_count, quant_bits, post_norm) -> None:
+        """RMSNorm this rank's bf16 slots into the dense ``_norm_slots`` buffer."""
+        from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
+
+        if quant_bits:
+            raise ValueError("the post-GEMM2 RMSNorm supports only the bf16 wire")
+        config = self.config
+        weight, eps, topk_weights = post_norm
+        if (
+            topk_weights.dtype != torch.float32
+            or not topk_weights.is_contiguous()
+            or tuple(topk_weights.shape) != (token_count, config.topk)
+        ):
+            raise ValueError(
+                f"topk_weights must be contiguous fp32 [{token_count}, "
+                f"{config.topk}], got {tuple(topk_weights.shape)} "
+                f"{topk_weights.dtype}"
+            )
+        rows = token_count * config.topk
+        capacity = config.max_tokens_per_rank * config.topk
+        pitch = config.combine_slot_stride_for(0) // 2
+        slots = torch.as_strided(
+            _from_gpu_ptr(
+                self.res.arena.local_ptr("comb_inp"),
+                (capacity * pitch,),
+                torch.bfloat16,
+            ),
+            (capacity, config.hidden_dim),
+            (pitch, 1),
+        )
+        rmsnorm_flydsl_out(
+            self._norm_slots[:rows],
+            slots[:rows],
+            weight,
+            float(eps),
+            zero_centered=self._zero_centered,
+        )
 
     def close(self) -> None:
         """Nothing to release: its kernels and buffers are not held by mori."""

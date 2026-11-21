@@ -165,6 +165,9 @@ class MegaMoERecipe:
     dispatch_wire: str = "bf16"
     combine_wires: tuple = ("bf16",)
     compute: ExpertComputeConfig = field(default_factory=ExpertComputeConfig)
+    # Allow for post-GEMM2 RMSNorm on each route before the route weights.
+    post_expert_norm: bool = False
+    post_expert_norm_zero_centered: bool = False
 
     def __post_init__(self):
         def coerce(name, value):
@@ -215,6 +218,19 @@ class MegaMoERecipe:
                 f"combine={self.combine.value} offers the {combine.wires} wires, "
                 f"got combine_wires={self.combine_wires!r}"
             )
+        if self.post_expert_norm_zero_centered and not self.post_expert_norm:
+            raise ValueError("post_expert_norm_zero_centered needs post_expert_norm")
+        if self.post_expert_norm:
+            if not getattr(combine, "supports_post_norm", False):
+                raise ValueError(
+                    f"combine={self.combine.value} cannot apply the post-GEMM2 "
+                    "RMSNorm; it needs the fused scatter combine"
+                )
+            if self.combine_wires != ("bf16",):
+                raise ValueError(
+                    "the post-GEMM2 RMSNorm supports only the bf16 combine wire, "
+                    f"got combine_wires={self.combine_wires!r}"
+                )
 
     @classmethod
     def from_legacy(
@@ -231,6 +247,8 @@ class MegaMoERecipe:
         hidden_pad: int = 0,
         intermediate_pad: int = 0,
         swiglu_limit: float = 0.0,
+        post_gemm2_rmsnorm: bool = False,
+        post_gemm2_rms_zero_centered: bool = False,
     ) -> "MegaMoERecipe":
         """The recipe the old constructor flags describe.
 
@@ -274,6 +292,8 @@ class MegaMoERecipe:
                 intermediate_pad=intermediate_pad,
                 swiglu_limit=swiglu_limit,
             ),
+            post_expert_norm=bool(post_gemm2_rmsnorm),
+            post_expert_norm_zero_centered=bool(post_gemm2_rms_zero_centered),
         )
 
     @property
