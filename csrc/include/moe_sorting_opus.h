@@ -1508,8 +1508,8 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
 }
 
 // return size in byte
-// dispatch_policy: 0-automatically pick up kerel. 1-always use single kernel, 2-always use mp
-// kernel
+// dispatch_policy: 0-automatically pick up kerel. 1-single kernel when its LDS fits (else mp),
+// 2-always use mp kernel
 OPUS_H opus::index_t
 moe_sorting_get_workspace_size(
     int tokens_, int num_experts_, int topk_, int dispatch_policy_, int device_id_ = -1)
@@ -1529,7 +1529,12 @@ moe_sorting_get_workspace_size(
     }
     else if(dispatch_policy_ == 1)
     {
-        return 0; // always use single kernel
+        // The single kernel advances its token loop by sub_tokens. When LDS has no
+        // sub-token row (num_experts >= 819 with the 64 KB host-pass LDS size),
+        // sub_tokens is 0 and the loop never ends, so use the mp kernel.
+        if(tokens_ > 0 && moe_sorting_get_sub_token(tokens_, num_experts_) <= 0)
+            return moe_sorting_mp_get_workspace_size(tokens_, num_experts_, topk_);
+        return 0;
     }
     else
     {
@@ -3691,6 +3696,9 @@ moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::strea
         if(moe_sorting_opus_get_workspace_size(
                a.tokens, a.num_experts, a.topk, t.dispatch_policy) != 0)
         {
+            if(a.p_ws == nullptr)
+                throw std::runtime_error("opus moe_sorting: the mp kernel needs a workspace of "
+                                         "moe_sorting_opus_get_workspace_size() bytes");
             return moe_sorting_opus_mp(t, a, s);
         }
         using ms_weight_type         = float;
@@ -3699,6 +3707,9 @@ moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::strea
         bool is_sub_token_onshot     = a.tokens <= sub_token_;
         bool is_local_expert_masking = t.local_expert_masking;
         bool is_local_token          = a.p_local_tokens != nullptr;
+        // sub_token_ <= 0 would make the single kernel loop forever; fail instead.
+        if(a.tokens > 0 && sub_token_ <= 0)
+            throw std::runtime_error("opus moe_sorting: single kernel has no LDS sub-token row");
 
         OPUS_MOE_SORTING_DISPATCH_EMASK_(row_);
     }

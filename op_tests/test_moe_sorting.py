@@ -2,7 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import itertools
+import multiprocessing
+import queue
+import time
 
 import pandas as pd
 import torch
@@ -11,7 +15,7 @@ import aiter
 import aiter.fused_moe as fm
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -115,6 +119,139 @@ def set_moe_sorting_backend(backend: str) -> None:
         raise ValueError(f"unknown backend: {backend}")
 
 
+# A sort takes microseconds. No progress for this long means a kernel hangs.
+NO_PROGRESS_TIMEOUT_S = 300
+
+
+def _hang_guarded_child(worker, device_id, progress, *args):
+    # A spawned child starts on the default GPU; keep it on the parent's.
+    torch.cuda.set_device(device_id)
+    worker(progress, *args)
+
+
+def _run_in_hang_guard(worker, args, label):
+    """Run worker(progress, *args) in a spawned child and return its rows.
+
+    A hung kernel cannot be stopped from its own process. The worker puts
+    ("start", case), ("row", case) and finally ("done", None) on `progress`; the
+    child is killed after NO_PROGRESS_TIMEOUT_S without a message, so a hang
+    fails the test instead of the CI job.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    progress = ctx.Queue()
+    proc = ctx.Process(
+        target=_hang_guarded_child,
+        args=(worker, torch.cuda.current_device(), progress, *args),
+    )
+    proc.start()
+    rows, current, done = [], "process start", False
+    deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
+    try:
+        while not done and time.monotonic() < deadline:
+            try:
+                kind, payload = progress.get(timeout=1.0)
+            except queue.Empty:
+                if not proc.is_alive():
+                    # The child may have queued its last messages and exited
+                    # between the get and this check: drain them before giving up.
+                    try:
+                        kind, payload = progress.get(timeout=1.0)
+                    except queue.Empty:
+                        break
+                else:
+                    continue
+            deadline = time.monotonic() + NO_PROGRESS_TIMEOUT_S
+            if kind == "start":
+                current = payload
+            elif kind == "row":
+                rows.append(payload)
+            else:
+                done = True
+        proc.join(timeout=60 if done else 1)
+    finally:
+        hung = proc.is_alive()
+        if hung:
+            proc.kill()
+            proc.join()
+    assert not hung, (
+        f"{label} made no progress for {NO_PROGRESS_TIMEOUT_S}s "
+        f"(GPU hang) at {current}"
+    )
+    assert done and proc.exitcode == 0, (
+        f"{label} worker failed (exit code {proc.exitcode}) at {current}; "
+        "see its traceback above"
+    )
+    return rows
+
+
+def _warm_moe_sorting(backend, dtype, model_dim, topk):
+    """Build or load, in this process, the JIT modules a hang-guarded sort uses.
+
+    The spawned child then only loads them; a cold build there (161 s for
+    module_moe_asm on MI355X) would count against NO_PROGRESS_TIMEOUT_S.
+    """
+    saved_backend = (fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING)
+    set_moe_sorting_backend(backend)
+    try:
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            1, model_dim, 32, topk, dtype, False, padding_extra=0
+        )
+        moe_sorting(
+            topk_ids,
+            topk_weights,
+            32,
+            model_dim,
+            dtype,
+            BLOCK_SIZE_M,
+            dispatch_policy=1,
+        )
+        torch.cuda.synchronize()
+    finally:
+        fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING = saved_backend
+
+
+def _assert_routing_exact(ref, out, topk, num_rows, case):
+    """Compare what a sort copies or counts exactly: ids, counts and weights.
+
+    The shared comparator's 1% rtol and 0.01 atol would accept a count of 257 for
+    256, expert id 801 for 800, or a 0.060 weight swapped with a 0.065 one (top-k
+    weights here are all about 1/topk).
+    """
+    ids_a, weights_a, experts_a, count_a = ref
+    _ids_b, weights_b, experts_b, count_b = out[:4]
+    live = ids_a != (topk << 24 | num_rows)
+    used = experts_a != -1
+    assert torch.equal(count_b, count_a), f"token counts at {case}"
+    assert torch.equal(experts_b[used], experts_a[used]), f"expert ids at {case}"
+    assert torch.equal(weights_b[live], weights_a[live]), f"sorted weights at {case}"
+
+
+def _check_routing_exact_controls():
+    """The exact check above must reject each corruption it exists for."""
+    ids = torch.tensor([3 << 24 | 5, 0, 3 << 24 | 5, 3 << 24 | 5], dtype=torch.int32)
+    weights = torch.tensor([0.060, 0.065, 0.0, 0.0])
+    experts = torch.tensor([7, 800, -1], dtype=torch.int32)
+    count = torch.tensor([256, 5], dtype=torch.int32)
+    ref = (ids, weights, experts, count)
+
+    def rejected(index, value):
+        out = [t.clone() for t in ref] + [None]
+        out[index] = value
+        try:
+            _assert_routing_exact(ref, out, 3, 5, "control")
+        except AssertionError:
+            return True
+        return False
+
+    _assert_routing_exact(ref, [t.clone() for t in ref] + [None], 3, 5, "control")
+    assert rejected(1, weights[[1, 0, 2, 3]]), "swapped weights passed"
+    assert rejected(
+        2, torch.tensor([7, 801, -1], dtype=torch.int32)
+    ), "expert id passed"
+    assert rejected(3, torch.tensor([257, 5], dtype=torch.int32)), "count passed"
+    assert rejected(3, torch.tensor([256, 6], dtype=torch.int32)), "second count passed"
+
+
 def run_torch_moe_sorting(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -176,11 +313,11 @@ def run_torch_moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
-def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
+def _moe_sorting_roofline(token, topk, E, model_dim, dtype, block_size=BLOCK_SIZE_M):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
-    max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
-    max_num_m_blocks = (max_num_tokens_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    max_num_tokens_padded = max_num_m_blocks * BLOCK_SIZE_M
+    max_num_tokens_padded = token * topk + E * block_size - topk
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    max_num_tokens_padded = max_num_m_blocks * block_size
     elem_bytes = torch.empty((), dtype=dtype).element_size()
     nbytes = (
         token * topk * 4
@@ -226,6 +363,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     errs["num_tokens_post_padded"] = checkAllclose(
         num_tokens_post_padded_a,
         num_tokens_post_padded_b,
+        rtol=0,  # integers: the default 1% tolerance would accept a wrong count
         atol=0,
         msg="num_tokens_post_padded",
     )
@@ -249,6 +387,8 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     errs["sorted_expert_ids"] = checkAllclose(
         sorted_expert_ids_a[expert_mask],
         sorted_expert_ids_b[expert_mask],
+        rtol=0,
+        atol=0,
         msg="sorted_expert_ids",
     )
     return errs
@@ -288,37 +428,233 @@ def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
                 f"block_size={block_size}: {bad}"
             )
             assert not bad, mismatch
-            (
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                _,
-                _,
-                aux_m_indices,
-                aux_reverse_sorted,
-            ) = out
-            expected_capacity = sorted_expert_ids.numel() * block_size
-            assert sorted_ids.numel() == expected_capacity
-            assert sorted_weights.numel() == expected_capacity
-            assert aux_m_indices.numel() == expected_capacity
-            assert aux_reverse_sorted.numel() == topk_ids.numel()
-            num_tokens_post_pad = out[3][0].item()
-            assert torch.equal(
-                aux_m_indices[:num_tokens_post_pad],
-                sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+            _check_aux_outputs(out, topk_ids, block_size)
+
+
+def _check_aux_outputs(out, topk_ids, block_size, expert_mask=None):
+    """Check m_indices and reverse_sorted against the sorted_ids they index."""
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        _,
+        aux_m_indices,
+        aux_reverse_sorted,
+    ) = out
+    token, topk = topk_ids.shape
+    expected_capacity = sorted_expert_ids.numel() * block_size
+    assert sorted_ids.numel() == expected_capacity
+    assert sorted_weights.numel() == expected_capacity
+    assert aux_m_indices.numel() == expected_capacity
+    assert aux_reverse_sorted.numel() == topk_ids.numel()
+    num_tokens_post_pad = num_valid_ids[0].item()
+    assert torch.equal(
+        aux_m_indices[:num_tokens_post_pad],
+        sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+    )
+    topk_slots = torch.arange(topk, dtype=topk_ids.dtype, device=topk_ids.device)
+    expected_sorted_ids = (
+        topk_slots.unsqueeze(0) << 24
+        | torch.arange(token, dtype=topk_ids.dtype, device=topk_ids.device).unsqueeze(1)
+    ).flatten()
+    # Routes to experts masked out by EP are not sorted; their slots hold -1.
+    routed = (
+        torch.ones_like(expected_sorted_ids, dtype=torch.bool)
+        if expert_mask is None
+        else (expert_mask[topk_ids.long()] != 0).flatten()
+    )
+    live = aux_reverse_sorted[routed]
+    assert (
+        (live >= 0) & (live < num_tokens_post_pad)
+    ).all(), "reverse index out of range"
+    assert torch.equal(sorted_ids[live.long()], expected_sorted_ids[routed])
+    if expert_mask is not None:
+        assert (aux_reverse_sorted[~routed] == -1).all(), "masked route not -1"
+
+
+# The Opus single kernel keeps one LDS row per sub-token. With the 64 KB host-pass
+# LDS size it has no such row from 819 experts up, and dispatch_policy=1 must then
+# take the multi-phase kernels. 818 is the last expert count that fits.
+LDS_FALLBACK_EXPERTS = (818, 819, 896)
+LDS_FALLBACK_FIRST_EXPERT = 819
+
+
+def test_moe_sorting_opus_oneshot_lds_fallback_dispatch(topk=16):
+    """Forced single kernel (dispatch_policy=1) gets an mp workspace when LDS is short."""
+    device_id = torch.cuda.current_device()
+    for E, token in itertools.product((818, 819, 896), (1, 16, 64)):
+        oneshot = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, topk, 1, device_id
+        )
+        multi = aiter.moe_sorting_opus_get_workspace_size(token, E, topk, 2, device_id)
+        if E < LDS_FALLBACK_FIRST_EXPERT:
+            assert oneshot == 0, f"E={E}, M={token}: single kernel fits, got {oneshot}"
+        else:
+            assert oneshot == multi > 0, (
+                f"E={E}, M={token}: single kernel has no LDS sub-token row and "
+                f"must use the mp workspace ({multi}), got {oneshot}"
             )
-            topk_slots = torch.arange(
-                topk, dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            expected_sorted_ids = (
-                topk_slots.unsqueeze(0) << 24
-                | torch.arange(
-                    token, dtype=topk_ids.dtype, device=topk_ids.device
-                ).unsqueeze(1)
-            ).flatten()
-            assert torch.equal(
-                sorted_ids[aux_reverse_sorted.long()], expected_sorted_ids
-            )
+
+
+def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
+    """Child process for test_moe_sorting_opus_large_expert_no_hang."""
+    set_moe_sorting_backend("opus")
+    _check_routing_exact_controls()
+    # Reject the fused aux sort, as EP expert_mask, AITER_MOE_SORT_BACKEND=opus or
+    # an uninstantiated shape do, so output_aux=True takes the Opus sort under test.
+    fm._mxfp4_aux_instance_supported = lambda *_args: False
+    device_id = torch.cuda.current_device()
+    # M=2048 is where the multi-phase sort changes launch scheme, so test both sides of
+    # it at one block size.
+    aux_modes = (False, True, fm.AUX_SORT_OPUS)
+    cases = itertools.chain(
+        itertools.product(
+            LDS_FALLBACK_EXPERTS, (16, 32, 64), aux_modes, (False, True), (1, 64)
+        ),
+        itertools.product(
+            LDS_FALLBACK_EXPERTS, (32,), aux_modes, (False, True), (2047, 2048, 4096)
+        ),
+    )
+    for E, block_size, output_aux, has_expert_mask, token in cases:
+        case = {
+            "gfx": get_gfx_runtime(),
+            "E": E,
+            "topk": topk,
+            "block_size": block_size,
+            "output_aux": output_aux,
+            "expert_mask": has_expert_mask,
+            "token": token,
+        }
+        progress.put(("start", case))
+        topk_ids, topk_weights, expert_mask, _ = _build_moe_sorting_inputs(
+            token, model_dim, E, topk, dtype, has_expert_mask, padding_extra=0
+        )
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size, expert_mask)
+
+        # output_aux sorts pick their own dispatch_policy; the plain sort forces
+        # the single kernel, as a C++ caller of dispatch_policy=1 does.
+        sort = functools.partial(
+            moe_sorting,
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            block_size,
+            expert_mask,
+            dispatch_policy=1,
+            output_aux=output_aux,
+        )
+
+        out = sort()
+        torch.cuda.synchronize()
+        errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
+        bad = {name: err for name, err in errs.items() if err}
+        assert not bad, f"moe_sorting mismatch at {case}: {bad}"
+        _assert_routing_exact(ref, out, topk, token, case)
+        if output_aux:
+            _check_aux_outputs(out, topk_ids, block_size, expert_mask)
+        case["oneshot ws bytes"] = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, topk, 1, device_id
+        )
+        # Timed after the checked launch, so a hang is caught first. The roofline is
+        # the crude one of the main benchmark.
+        _, us = run_perftest(sort, num_warmup=1, num_iters=2)
+        flops, nbytes = _moe_sorting_roofline(
+            token, topk, E, model_dim, dtype, block_size
+        )
+        case["us"] = round(us, 2)
+        case["TFLOPS"] = round(flops / us / 1e6, 5)
+        case["TB/s"] = round(nbytes / us / 1e6, 5)
+        case["err"] = max(errs.values())
+        progress.put(("row", case))
+
+    def expect_rejected(described, call):
+        try:
+            call()
+        except RuntimeError:
+            return
+        raise AssertionError(f"moe_sorting_opus accepted {described}")
+
+    # A shape the mp path rejects (P23 LDS 65588 B > 64 KB at 8192 experts with
+    # local ids) used to return silently with unwritten outputs.
+    progress.put(("start", {"reject": "unsupported shape", "E": 8192}))
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        1, model_dim, 8192, topk, dtype, False, padding_extra=0
+    )
+    expect_rejected(
+        "a shape the mp sort cannot run",
+        lambda: moe_sorting(
+            topk_ids,
+            topk_weights,
+            8192,
+            model_dim,
+            dtype,
+            16,
+            dispatch_policy=1,
+            return_local_topk_ids=True,
+        ),
+    )
+    # The mp path needs a workspace of moe_sorting_opus_get_workspace_size() bytes.
+    progress.put(("start", {"reject": "short workspace", "E": 819}))
+    E, block_size = 819, 16
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        1, model_dim, E, topk, dtype, False, padding_extra=0
+    )
+    padded = topk_ids.numel() + E * block_size - topk
+    padded = (padded + block_size - 1) // block_size * block_size
+    opus_outputs = (
+        torch.empty(padded, dtype=torch.int32, device="cuda"),
+        torch.empty(padded, dtype=torch.float32, device="cuda"),
+        torch.empty(padded // block_size, dtype=torch.int32, device="cuda"),
+        torch.empty(2, dtype=torch.int32, device="cuda"),
+        torch.empty((1, model_dim), dtype=dtype, device="cuda"),
+    )
+
+    def sort_with_workspace(workspace):
+        aiter.moe_sorting_opus_fwd(
+            topk_ids,
+            topk_weights,
+            *opus_outputs,
+            E,
+            block_size,
+            None,
+            None,
+            workspace,
+            1,
+        )
+
+    ws_size = aiter.moe_sorting_opus_get_workspace_size(1, E, topk, 1, device_id)
+    assert ws_size > 1, f"E={E} must take the mp path, got workspace {ws_size} B"
+    expect_rejected(
+        "a 1-byte workspace",
+        lambda: sort_with_workspace(torch.empty(1, dtype=torch.uint8, device="cuda")),
+    )
+    expect_rejected("a missing workspace", lambda: sort_with_workspace(None))
+    sort_with_workspace(torch.empty(ws_size, dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    progress.put(("done", None))
+
+
+def test_moe_sorting_opus_large_expert_no_hang(dtype, model_dim, topk=16):
+    """Opus sort at the single-kernel LDS limit (818/819/896 experts, topk 16).
+
+    Before the fix, a forced or aux single-kernel sort with >= 819 experts looped
+    forever on the GPU. A hung kernel cannot be stopped from its own process, so
+    the cases run in a child process that is killed when it makes no progress.
+    """
+    _warm_moe_sorting("opus", dtype, model_dim, topk)
+
+    rows = _run_in_hang_guard(
+        _moe_sorting_opus_lds_fallback_worker,
+        (dtype, model_dim, topk),
+        "Opus moe_sorting",
+    )
+    aiter.logger.info(
+        "moe_sorting Opus single-kernel LDS fallback (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
@@ -929,7 +1265,9 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
+    test_moe_sorting_opus_oneshot_lds_fallback_dispatch()
     for dtype in args.dtype:
+        test_moe_sorting_opus_large_expert_no_hang(dtype, args.model_dim)
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
         df = []
