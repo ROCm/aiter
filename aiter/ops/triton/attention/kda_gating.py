@@ -15,13 +15,12 @@ caller can select its route one time.
 
 import torch
 
-from aiter.jit.utils.build_targets import is_gfx1250_family
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_gating import (
     get_kda_gating_config,
     kda_gating_kernel,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -41,7 +40,9 @@ def supports(
     """Whether ``kda_gating_decode`` takes a model with this setup on this GPU.
 
     The kernel needs the lower-bounded gate, an FP32 state, ``head_k_dim =
-    head_v_dim = 128``, BF16 or FP16 activations and a gfx1250-family GPU.
+    head_v_dim = 128``, BF16 or FP16 activations and a gfx1250 GPU. Its config
+    tables are keyed by the exact arch, as all tuned configs are, and only
+    gfx1250 has them, so a gfx1250-strict GPU is not supported.
     ``kda_gating_decode`` checks the other limits on each call.
     """
     return (
@@ -50,7 +51,7 @@ def supports(
         and head_k_dim == _HEAD_DIM
         and head_v_dim == _HEAD_DIM
         and act_dtype in _ACT_DTYPES
-        and is_gfx1250_family(get_gfx_runtime())
+        and arch_info.get_arch() == "gfx1250"
     )
 
 
@@ -147,7 +148,7 @@ def kda_gating_decode(
             K,
             V,
             q.dtype,
-            get_gfx_runtime(),
+            arch_info.get_arch(),
         )
     if HV % H:
         return _decline("HV %d is not a multiple of H %d", HV, H)
