@@ -525,8 +525,6 @@ def _fused_quant_tuned_kernel(
     runner picks the tile, the compute kernel for prefill-sized M). Any other
     name is passed through as is: a name the flydsl runner does not accept
     raises there, as it does for the bf16 entry."""
-    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
-
     cfg = lookup_mxscale_bmm_config(
         g,
         m,
@@ -540,6 +538,10 @@ def _fused_quant_tuned_kernel(
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
     name = cfg["kernelName"]
+    if gfx == "gfx950":
+        return name
+    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
+
     return None if is_compute_wmma_kernel_name(name) else name
 
 
