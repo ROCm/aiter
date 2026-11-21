@@ -25,6 +25,7 @@ from codegen.common import (
     write_if_changed,
 )
 from opus_gemm_common import (
+    A4W4_TAGS,
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
@@ -289,6 +290,8 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a4w4_mxfp4_nt_co": ("fp4_t", "fp4_t"),
+    "a4w4_mxfp4_nt_small": ("fp4_t", "fp4_t"),
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
@@ -897,6 +900,34 @@ class opus_gemm_codegen:
                 "bf16_t",
             )
 
+    def gen_a4w4_kid_dispatch(self, kernels_dict):
+        """Emit the sorted (CU, local kid) launcher table of the gfx950 A4W4 family (layout="plain")."""
+        rows = sorted(
+            (kid, k.name)
+            for kid, k in kernels_dict.items()
+            if isinstance(kid, KernelKey)
+            and kid.family == "a4w4"
+            and kid.gfx == "gfx950"
+            and k.kernel_tag in A4W4_TAGS
+        )
+        lines = [
+            "#pragma once",
+            "// SPDX-License-Identifier: MIT",
+            "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.",
+            "// Auto-generated. Do not edit. See gen_instances.py:gen_a4w4_kid_dispatch.",
+            f"#define GENERATE_A4W4_KID_DISPATCH_GFX950_SIZE {len(rows)}",
+            "#define GENERATE_A4W4_KID_DISPATCH_GFX950" + (" \\" if rows else ""),
+        ]
+        lines += [
+            f"    {{ {{ {kid.cu_num}, {kid.kid} }}, &{name}<bf16_t> }},"
+            + (" \\" if index + 1 < len(rows) else "")
+            for index, (kid, name) in enumerate(rows)
+        ]
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a4w4_kid_dispatch.h"),
+            "\n".join(lines) + "\n",
+        )
+
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
         header = """#pragma once
@@ -1033,7 +1064,11 @@ void
 """
         parts = [MANIFEST_HEAD]
         for k in kernels_dict.values():
-            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
+            # A4W4 launchers take the same arguments as the MXFP8 BMM ones.
+            if (
+                k.kernel_tag.startswith("a8w8_mxscale_bmm_")
+                or k.kernel_tag in A4W4_TAGS
+            ):
                 parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in SPLITK_TAGS:
                 parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
@@ -1325,6 +1360,7 @@ void
         self.gen_manifest_head(by_symbol)
         self.gen_a16w16_kid_dispatch(kernels_dict)
         self.gen_a8w8_kid_dispatch(kernels_dict)
+        self.gen_a4w4_kid_dispatch(kernels_dict)
         self.gen_bmm_mxscale_kid_dispatch(kernels_dict)
 
         # Kids that left the compile set must not leave a source behind.

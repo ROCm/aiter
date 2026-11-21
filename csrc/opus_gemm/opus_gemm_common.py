@@ -26,6 +26,11 @@ def base_gfx_arch(gfx: str) -> str:
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 MXFP4 x MXFP4 NT with row-major inputs (a4w4 family): the 2x2
+# pipeline is pre-compiled (.co, gen_co/gfx950/a4w4/), the small-tile pipeline is
+# built by the JIT.
+_A4W4_CO_TAGS = frozenset({"a4w4_mxfp4_nt_co"})
+A4W4_TAGS = frozenset({*_A4W4_CO_TAGS, "a4w4_mxfp4_nt_small"})
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -440,6 +445,19 @@ class OpusGemmInstance:
                 "wsf32" if self.splitk_workspace_dtype == "fp32_t" else "wsbf16"
             )
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag in _A4W4_CO_TAGS:
+            # Same name identity as the gfx1250 CO families (launcher symbol ==
+            # ELF entry point == .co filename):
+            # opus_gemm_gfx950_a4w4_mxfp4_nt_co_{B_M}x{B_N}x{B_K}[_{variant}].
+            return "_".join(
+                [
+                    self.name_root,
+                    self.arch_prefix,
+                    self.kernel_tag,
+                    "x".join(map(str, [self.B_M, self.B_N, self.B_K])),
+                    *([self.co_variant] if self.co_variant else []),
+                ]
+            )
         elif self.kernel_tag in _A16W16_CO_TAGS:
             # The host launcher symbol, ELF entry point and .co filename must
             # remain identical. Encode every device configuration axis that
@@ -2677,6 +2695,11 @@ _FUSE_MAX_NCLUSTER = 5
 CO_KERNELS_JSON = os.path.join(
     os.path.dirname(__file__), "gen_co", "co_kernels_gfx1250.json"
 )
+# gfx950 a4w4 (layout="plain") .co kernels: own JSON, images in gen_co/<A4W4_CO_DIR>/.
+A4W4_CO_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a4w4.json"
+)
+A4W4_CO_DIR = "gfx950/a4w4"
 
 _CO_DTYPE_BYTES = {
     "bf16_t": 2,
@@ -2750,15 +2773,69 @@ def _validate_co_instance(kid, instance):
         raise ValueError(f"CO kid {kid} must not declare workspace storage")
 
 
-def co_image_path(path, instance):
-    """Return the pre-built image corresponding to an instance JSON file."""
-    return os.path.join(
-        os.path.dirname(path), instance.arch_prefix, f"{instance.name}.co"
+def _a4w4_co_instance_from_json(arch, entry):
+    """Convert one gfx950 a4w4 JSON record to its host-launcher instance."""
+    bm, bn, bk = entry["tile"]
+    t_m, t_n = entry["wave_layout"]
+    lb_threads, lb_waves = entry["launch_bounds"]
+    assert lb_threads == entry["block_size"], (
+        f"co kid {entry['kid']}: launch_bounds[0]={lb_threads} must equal "
+        f"block_size={entry['block_size']}"
+    )
+    assert entry.get("variant", "") in A4W4_CO_MODE, entry
+    return OpusGemmInstance(
+        entry["block_size"],
+        bm,
+        bn,
+        bk,
+        t_m,
+        t_n,
+        16,
+        16,
+        128,
+        16,
+        16,
+        4,
+        1,
+        1,
+        32,
+        entry["tag"],
+        ["bf16_t"],
+        arch_prefix=arch,
+        co_min_waves_per_eu=lb_waves,
+        co_device_flags=tuple(entry.get("device_flags", ())),
+        co_variant=entry.get("variant", ""),
+        co_wave_layout=(t_m, t_n),
     )
 
 
-def _load_co_kernels(path, require_image=True):
-    """Load pre-built CO instances, safely dropping records with no image."""
+# a4w4_mxfp4_nt_co variant -> traits MODE (0 persistent, 1 one tile
+# per block); "nob" is the persistent kernel without M/N boundary handling.
+A4W4_CO_MODE = {"": 0, "np": 1, "nob": 0}
+
+
+def a4w4_co_traits_args(instance):
+    """``opus_mxfp4_nt_traits`` arguments of one a4w4 CO kid (B_M, B_N, MODE, BOUNDARY)."""
+    boundary = "false" if instance.co_variant == "nob" else "true"
+    mode = A4W4_CO_MODE[instance.co_variant]
+    return f"{instance.B_M}, {instance.B_N}, {mode}, {boundary}"
+
+
+_CO_FAMILY_TAGS = {"gfx1250": _A16W16_CO_TAGS, "gfx950": _A4W4_CO_TAGS}
+
+
+def co_image_path(path, instance):
+    """Return the pre-built image corresponding to an instance JSON file."""
+    sub = (
+        A4W4_CO_DIR
+        if instance.kernel_tag in _A4W4_CO_TAGS
+        else instance.arch_prefix
+    )
+    return os.path.join(os.path.dirname(path), sub, f"{instance.name}.co")
+
+
+def _load_co_kernels(path, require_image=True, arch="gfx1250"):
+    """Load one arch's pre-built CO instances, safely dropping records with no image."""
     if not os.path.exists(path):
         return {}
 
@@ -2770,19 +2847,22 @@ def _load_co_kernels(path, require_image=True):
     instances = {}
     seen_names = {}
     missing = []
-    for arch, entries in document.items():
-        if arch.startswith("_"):
+    for entry_arch, entries in document.items():
+        if entry_arch != arch:
             continue
         for entry in entries:
             kid = entry["kid"]
             tag = entry["tag"]
-            if tag not in _A16W16_CO_TAGS:
+            if tag not in _CO_FAMILY_TAGS[arch]:
                 raise ValueError(f"unsupported CO kernel tag {tag!r} for kid {kid}")
             if type(kid) is not int or kid < 0:
                 raise ValueError(f"invalid local CO kid {kid}")
             assert kid not in instances, f"duplicate co kid {kid} in {path}"
-            instance = _co_instance_from_json(arch, entry)
-            _validate_co_instance(kid, instance)
+            if arch == "gfx950":
+                instance = _a4w4_co_instance_from_json(arch, entry)
+            else:
+                instance = _co_instance_from_json(arch, entry)
+                _validate_co_instance(kid, instance)
             assert instance.name not in seen_names, (
                 f"co kids {seen_names[instance.name]} and {kid} generate the same "
                 f"symbol {instance.name!r}"
@@ -2818,6 +2898,49 @@ gfx1250_4wave_co_kernels_declared = {
     ).items()
     if instance.kernel_tag in _A16W16_CO_TAGS
 }
+
+# -- gfx950 a4w4 (MXFP4 x MXFP4 NT, 1x32 e8m0 scales) --------------
+# Plain row-major inputs, the layout of Triton gemm_afp4wfp4: A [M, K/2] and
+# B [N, K/2] fp4x2, scales [M, K/32] / [N, K/32] e8m0 (no shuffle_weight, no
+# e8m0_shuffle, no padding). Kids are local to the a4w4/gfx950/CU
+# namespace:
+#   100-105 persistent, 110-115 one tile per block, 130 persistent without M/N
+#   boundary handling: pre-compiled 2x2 pipeline (gen_co/gfx950/a4w4,
+#   co_kernels_gfx950_a4w4.json), tiles indexed 256x256, 256x128, 128x256, 128x128,
+#   192x256, 256x192;
+#   500-504: 1x4 small-tile pipeline (JIT), see A4W4_SMALL_CFGS.
+a4w4_co_kernels_list = _load_co_kernels(A4W4_CO_JSON, arch="gfx950")
+a4w4_co_kernels_declared = _load_co_kernels(
+    A4W4_CO_JSON, require_image=False, arch="gfx950"
+)
+
+# (B_M, B_N, D, KS): D = LDS ring depth, KS = waves splitting K in the block.
+A4W4_SMALL_CFGS = {
+    500: (16, 32, 4, 2),
+    501: (32, 32, 4, 2),
+    502: (32, 64, 4, 1),
+    503: (64, 64, 4, 1),
+    504: (64, 128, 4, 1),
+}
+
+
+def _a4w4_small(bm, bn, d, ks):
+    return OpusGemmInstance(
+        256, bm, bn, 256, 1, 4, 16, 16, 128, 16, 16, 4, 1, 1, 32,
+        "a4w4_mxfp4_nt_small", ["bf16_t"],
+        arch_prefix="gfx950", name_tag=f"a4w4_mxfp4_nt_rm_d{d}ks{ks}",
+    )
+
+
+a4w4_small_kernels_list = {
+    kid: _a4w4_small(*cfg) for kid, cfg in A4W4_SMALL_CFGS.items()
+}
+A4W4_SMALL_CFG_OF = {
+    a4w4_small_kernels_list[kid].name: cfg
+    for kid, cfg in A4W4_SMALL_CFGS.items()
+}
+assert not set(a4w4_co_kernels_declared) & set(a4w4_small_kernels_list)
+a4w4_kernels_list = {**a4w4_co_kernels_list, **a4w4_small_kernels_list}
 
 GFX1250_SPLITK_FUSE_KID_BASE = max(
     (*gfx1250_kernels_list, *gfx1250_clusterlaunch_kernels_list,
@@ -3996,6 +4119,7 @@ KERNEL_REGISTRY = {
         "gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)},
         "gfx950": {cu: dict(sorted(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list.items())) for cu in (128, 256)},
     },
+    "a4w4": {"gfx950": {cu: dict(sorted(a4w4_kernels_list.items())) for cu in (128, 256)}},
 }
 
 
@@ -4011,6 +4135,7 @@ for _cat in (
     gfx950_a16w16_kernels_list,
     gfx942_kernels_list,
     gfx1250_a16w16_kernels_list,
+    a4w4_kernels_list,
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
 ):
     for _kid, _inst in _cat.items():
@@ -4320,6 +4445,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
         ),
+        "a4w4": A4W4_TAGS,
     },
     "gfx942": {
         "a16w16": frozenset(
@@ -4343,6 +4469,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_bpreshuffle_singlebuf"}
         ),
+        "a4w4": frozenset(),
     },
     "gfx1250": {
         "a16w16": frozenset(
@@ -4359,6 +4486,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale": frozenset(),
         "a8w8_mxscale_bmm": frozenset(),
         "a8w8_blockscale_bpreshuffle": frozenset(),
+        "a4w4": frozenset(),
     },
 }
 
