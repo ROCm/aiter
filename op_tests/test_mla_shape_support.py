@@ -572,7 +572,7 @@ def test_default_metadata_info_sizes_96_heads_for_the_fold(monkeypatch):
         monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
         on = aiter.get_mla_metadata_info_v1(bs, msq, 96, dtypes.fp8, dtypes.fp8, **kw)
         monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP")
-        # the fold: 6 pseudo-batches of msq one-tile qo tiles each
+        # main's legacy sizing: ceil(96 * msq / 16) = 6 * msq tiles per batch
         assert off[4][0] == (bs * 6 * msq, 2), off
         assert on[4][0] == (bs * msq, 2), on
 
