@@ -45,6 +45,7 @@ Based on this, we provide two CI paths: one for generating tuned CSVs on demand,
           - `test_csv_validation.py`
           - `test_tuner_infra.py`
           - `test_mp_tuner_logic.py`
+          - `test_arch_resolution.py`
         - Level 2 pipeline:
           - `test_tune_pipeline.py`
         - Level 2 run_config:

@@ -162,6 +162,17 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -235,6 +246,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -286,6 +302,18 @@ def _runtime_power_selection() -> bool:
     if raw not in {"power", "efficiency", "power_efficiency"}:
         return False
     return "aiter" in sys.modules
+
+
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
 
 
 class AITER_CONFIG:
@@ -366,6 +394,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -437,6 +473,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_CONV3D_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
         )
 
     @property
@@ -792,15 +836,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -811,9 +848,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
@@ -1036,6 +1071,50 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
+
+
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1406,21 +1485,6 @@ def build_module(
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
-
-    if md_name.startswith("module_mega_mhc_stream_"):
-        # Keep source selection and host dispatch in sync for JIT and prebuild.
-        mhc_gfx1250 = any(
-            arch in ("gfx1250", "gfx1250-strict")
-            for arch in _build_archs_from_env(get_gfx)
-        )
-        if not mhc_gfx1250:
-            srcs = [
-                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
-            ]
-        flags_extra_hip = [
-            *flags_extra_hip,
-            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
-        ]
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1877,6 +1941,9 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "flags_extra_hip_per_source": single_ops[
+                            "flags_extra_hip_per_source"
+                        ],
                         "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
