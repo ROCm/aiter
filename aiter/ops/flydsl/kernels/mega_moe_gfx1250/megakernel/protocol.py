@@ -1180,9 +1180,9 @@ def reduce(kc):
                 for j in range_constexpr(2):
                     raw = buffer_load(
                         rsrc_comb,
-                        (slot_b + ch * fx.Int32(RED_ELEMS * 2) + lane * fx.Int32(32))
+                        (slot_b + ch * fx.Int32(RED_ELEMS * 2) + lane * fx.Int32(16))
                         // fx.Int32(4)
-                        + fx.Int32(4 * j),
+                        + fx.Int32(WAVE * 4 * j),
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=SCOPE_SYS,
@@ -1199,13 +1199,13 @@ def reduce(kc):
                     v = valid.select(v, fx.full(8, 0.0, fx.Float32))
                     accs[j] = accs[j] + v
             o_dw = (
-                t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)
+                t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(8)
             ) // fx.Int32(2)
             if in_u:
                 for j in range_constexpr(2):
                     buffer_store(
                         accs[j].to(fx.BFloat16).bitcast(fx.Int32),
                         rsrc_out,
-                        o_dw + fx.Int32(4 * j),
+                        o_dw + fx.Int32(WAVE * 4 * j),
                     )
     stamp(7)
