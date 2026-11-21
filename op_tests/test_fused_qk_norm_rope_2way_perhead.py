@@ -24,6 +24,11 @@ FP8_DTYPE = dtypes.fp8
 # The kernel's amax floor: aiter::kAmaxFloor in csrc/include/quant_amax_floor.h.
 AMAX_FLOOR = 1e-10
 
+pytestmark = pytest.mark.skipif(
+    aiter.get_gfx() != "gfx942",
+    reason="2way per-head FP8 tests are validated only on MI308/gfx942 (fp8_max=240)",
+)
+
 
 def _torch_per_head_fp8_quant(x: Tensor) -> tuple[Tensor, Tensor]:
     """Reference per-(batch, head) fp8 quant (amax/240 descale)."""
@@ -642,6 +647,13 @@ if __name__ == "__main__":
         help="Collect perf via @benchmark (slower).",
     )
     args = parser.parse_args()
+
+    if aiter.get_gfx() != "gfx942":
+        print(
+            "Skipping: 2way per-head FP8 tests require MI308/gfx942 (fp8_max=240)",
+            flush=True,
+        )
+        raise SystemExit(0)
 
     qk_cases = [
         # Qwen-Image-Edit style

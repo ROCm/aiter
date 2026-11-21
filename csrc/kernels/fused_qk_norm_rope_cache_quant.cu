@@ -3974,6 +3974,9 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
     AITER_CHECK(q_partial_amax.dtype() == AITER_DTYPE_fp32 &&
                     k_partial_amax.dtype() == AITER_DTYPE_fp32,
                 "q/k_partial_amax scratch must be float32");
+    AITER_CHECK(get_gpu_arch() == "gfx942",
+                "fused_qk_norm_rope_2way_fp8_perhead_quant is validated only on gfx942/MI308 "
+                "because this path uses fp8_e4m3fnuz with fp8_max=240");
 
     HipDeviceGuard device_guard(q0.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -4216,6 +4219,9 @@ void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
     AITER_CHECK(v0.dtype() == v1.dtype(), "v0/v1 dtype must match");
     AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
     AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+    AITER_CHECK(get_gpu_arch() == "gfx942",
+                "v_2way_per_head_fp8_quant is validated only on gfx942/MI308 because this path "
+                "uses fp8_e4m3fnuz with fp8_max=240");
     // v_amax is accumulated with atomic_fmax_pos, so the caller must pass a
     // zero-initialized fp32 [batch_size, num_heads] scratch buffer.
     AITER_CHECK(v_amax.dtype() == AITER_DTYPE_fp32, "v_amax scratch must be float32");
