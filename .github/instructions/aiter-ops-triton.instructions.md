@@ -169,6 +169,11 @@ In unified attention configs, flag:
 - A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
   `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
   `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
+- A `kv_split` entry with `SPLIT_PROGRAMS_PER_CU` but without the other
+  length-aware `SPLIT_*` keys (see `configs/AGENTS.md#unified-attention`). The
+  split then silently falls back to the uniform one. An entry without a
+  `G_LEQ_4` key opts in every GQA group; that regressed GPT-OSS TP8 (8 Q / 1 KV
+  heads) to 0.84x.
 
 ## Configs: Python code
 
