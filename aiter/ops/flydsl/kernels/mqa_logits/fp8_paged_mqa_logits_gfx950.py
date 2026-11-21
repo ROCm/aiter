@@ -333,16 +333,16 @@ def _build_kernel(ctx_stride: int):
             out = _make_out_row_view(
                 out_logits, stride_out, pid_batch * rows_per_batch + row
             )
+            # Past row's causal bound but below context_len: -inf, as Gluon
+            # writes. Callers that read each row's own length (vLLM top-k with
+            # DCP-localized (B, next_n) lengths) can read up to context_len.
+            masked = col > context_len - nn + row
+            final = masked.select(fx.Float32(float("-inf")), value)
 
-            def _write(_out=out, _col=col, _value=value):
+            def _write(_out=out, _col=col, _value=final):
                 _out[_col] = _value
 
-            _guarded(
-                (lane_div_16 == 0)
-                & (col < context_len)
-                & (col <= context_len - nn + row),
-                _write,
-            )
+            _guarded((lane_div_16 == 0) & (col < context_len), _write)
 
         def _compute_tile(bank_base, page, tile):
             k_base = lds_base + bank_base
@@ -517,7 +517,10 @@ def flydsl_fp8_paged_mqa_logits(
       vLLM builds. Only the last column is read: query row ``j`` attends to KV
       positions ``[0, L_b - n_b + 1 + j)``, where ``n_b`` is the number of live
       rows (``min(next_n_lens[b], next_n)`` when ``next_n_lens`` is given, else
-      ``next_n``), so other row values are not supported.
+      ``next_n``); the other columns are ignored.
+
+    Columns of row ``j`` from ``L_b - n_b + 1 + j`` up to ``L_b`` are ``-inf``,
+    as in the Gluon kernel; columns at or past ``L_b`` are not written.
 
     ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
     strided tensor is rejected rather than copied.
