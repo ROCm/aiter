@@ -13,17 +13,28 @@ Each rank builds the EP group with ``aiter.init_dist_env`` and asks the
   it with FlyDSL; dispatch returns no scales, the received rows, weights and
   ids equal the source tokens' (and a mori handle's for the same call), and
   combine equals an f32 sum over the distinct destination ranks (and mori's).
-  The same no-scales dispatch + combine captured in a CUDA graph and replayed
-  gives the same result.
+  The same no-scales dispatch + combine captured in a CUDA graph and replayed,
+  with every output overwritten before each replay, gives the same received
+  rows / weights / ids and combine result.
 * ``lifetime``: a handle the caller dropped is returned again (same op, no new
   IPC allocation); another ``index`` gets its own op; ``destroy()`` unmaps
   every peer mapping and frees every allocation; a handle requested after
   ``destroy()`` works; ``aiter.destroy_dist_env()`` with live FlyDSL handles
   returns cleanly and releases their IPC memory (every mapping closed, every
   allocation freed).
-* ``agreement``: when opening a peer's IPC handle fails on one rank, building
-  the op raises on every rank (no rank hangs in the next collective), and every
+* ``agreement``: when opening a peer's IPC handle fails on one rank, or one
+  rank runs out of memory while allocating the op's buffers, building the op
+  raises on every rank (no rank hangs in the next collective), and every
   allocation and peer mapping made so far is released.
+* ``geometry``: launch geometry on the default path. A handle with tuned rows
+  (MXFP8 wire at EP8 with hidden 7168, top-8, 32 local experts) has every
+  tuned geometry's dispatch and combine kernel loaded when it is built, so
+  dispatch + combine at 1 to 4096 tokens (every row's bucket, 1025..2048
+  included) loads nothing new, and the results match the reference. With the
+  CU count capped at 80 (MI308X) and 38 (a CPX partition), new handles use
+  only geometries within it and give the same results. The gate declines a
+  handle whose EP rank is not the current device, and one whose scale rows
+  are not whole 4-byte words (gpt-oss MXFP4 rows: 90 B of e8m0 scales).
 
     python op_tests/multigpu_tests/test_mori_all2all_flydsl_handles.py [--world 8]
 """
@@ -42,20 +53,20 @@ import torch.multiprocessing as mp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_flydsl_ep_intranode import _bitdiff, _reference
 
-CASES = ("scales", "lifetime", "agreement")
+CASES = ("scales", "lifetime", "agreement", "geometry")
 
 
 class _IpcCounter:
     """Counts HIP IPC allocations / peer mappings and can fail one mapping."""
 
     def __init__(self):
-        from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+        from aiter.ops.flydsl.ipc_heap import IpcHeap
 
-        self.cls = UncachedIpcHeap
+        self.cls = IpcHeap
         self.orig = {
-            n: getattr(UncachedIpcHeap, n)
+            n: getattr(IpcHeap, n)
             for n in (
-                "alloc_uncached",
+                "alloc",
                 "free_device_mem",
                 "open_mem_handle",
                 "close_mem_handle",
@@ -64,10 +75,16 @@ class _IpcCounter:
         self.live_alloc, self.live_open = set(), set()
         self.n_alloc = 0
         self.fail_open_at = None  # 1-based count of open_mem_handle calls
+        self.fail_alloc_at = None  # 1-based count of alloc calls
         self.n_open = 0
 
-        def alloc(size):
-            ptr = self.orig["alloc_uncached"](size)
+        def alloc(size, flags=None, fill=0):
+            if (
+                self.fail_alloc_at is not None
+                and self.n_alloc + 1 == self.fail_alloc_at
+            ):
+                raise RuntimeError("injected hipErrorOutOfMemory")
+            ptr = self.orig["alloc"](size, flags, fill)
             self.live_alloc.add(ptr)
             self.n_alloc += 1
             return ptr
@@ -89,12 +106,20 @@ class _IpcCounter:
             return self.orig["close_mem_handle"](ptr)
 
         for name, fn in (
-            ("alloc_uncached", alloc),
+            ("alloc", alloc),
             ("free_device_mem", free),
             ("open_mem_handle", open_),
             ("close_mem_handle", close),
         ):
-            setattr(UncachedIpcHeap, name, staticmethod(fn))
+            setattr(IpcHeap, name, staticmethod(fn))
+
+    def leaked(self, alloc_base, open_base):
+        """(allocations, mappings) made since the bases and still live. An
+        allocation is freed once its heap is closed and no tensor on it is
+        left, so collect first."""
+        gc.collect()
+        torch.cuda.synchronize()
+        return self.live_alloc - alloc_base, self.live_open - open_base
 
 
 def _ids(T, K, E, g):
@@ -119,30 +144,41 @@ def _round_trip(handle, x, w, ids, epr, rank, launch):
     return recv, n, out[2], res
 
 
+def _poison(*tensors):
+    for t in tensors:
+        t.view(torch.uint8).fill_(0xFF)
+
+
 def _graph_round_trip(handle, x, w, ids, rank, launch, group, replays=3):
     """``_round_trip``'s dispatch(x, w, None, ids) + combine captured in one
-    CUDA graph and replayed; returns the combine result after the replays."""
-
-    def step():
-        out = handle.dispatch(x, w, None, ids, *launch)
-        cin = (out[0].float() * (1.0 + rank / 8.0)).to(torch.bfloat16)
-        return handle.combine(cin, None, ids, *launch)[0]
-
+    CUDA graph and replayed. Every output is overwritten on every rank before
+    each replay; returns, per replay, ``_round_trip``'s received tuple and
+    count and the combine result."""
     dist.barrier(group=group)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=s):
-            res = step()
+            out = handle.dispatch(x, w, None, ids, *launch)
+            n_g = out[4].clone()  # combine resets the count
+            cin = (out[0].float() * (1.0 + rank / 8.0)).to(torch.bfloat16)
+            res = handle.combine(cin, None, ids, *launch)[0]
     torch.cuda.synchronize()
-    dist.barrier(group=group)
+    results = []
     for _ in range(replays):
+        _poison(out[0], out[1], out[3], n_g, res)
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
         graph.replay()
-    torch.cuda.synchronize()
-    out = res[: x.shape[0]].clone()
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+        n = int(n_g.reshape(-1)[0].item())
+        order = torch.argsort(out[1][:n, 0])
+        recv = tuple(t[:n][order].cpu() for t in (out[0], out[1], out[3]))
+        results.append((recv, n, res[: x.shape[0]].clone()))
     del graph
     dist.barrier(group=group)
-    return out
+    return results
 
 
 def _case_scales(manager, rank, world, dev, failures, has_mori):
@@ -213,10 +249,16 @@ def _case_scales(manager, rank, world, dev, failures, has_mori):
         bad = _bitdiff(res, ref)
         if bad:
             failures.append(f"{tag}: combine {bad} elements differ from reference")
-        res_g = _graph_round_trip(fly, x, w, ids, rank, launch, manager.cpu_group)
-        bad = _bitdiff(res_g, ref)
-        if bad:
-            failures.append(f"{tag}: graph replay {bad} elements differ")
+        replays = _graph_round_trip(fly, x, w, ids, rank, launch, manager.cpu_group)
+        for i, (got_g, n_g, res_g) in enumerate(replays):
+            if n_g != n or any(
+                not torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+                for a, b in zip(got_g, got)
+            ):
+                failures.append(f"{tag}: graph replay {i} dispatch differs")
+            bad = _bitdiff(res_g, ref)
+            if bad:
+                failures.append(f"{tag}: graph replay {i} {bad} elements differ")
         if mori_h is not None:
             m_got, m_n, m_scales, m_res = _round_trip(
                 mori_h, x, w, ids, epr, rank, launch
@@ -285,8 +327,7 @@ def _case_lifetime(manager, rank, world, dev, failures, counter):
     del h, h1, op
     dist.barrier(group=manager.cpu_group)
     manager.destroy()  # also frees the earlier cases' FlyDSL ops
-    left_o = counter.live_open - counter.base_open
-    left_a = counter.live_alloc - counter.base_alloc
+    left_a, left_o = counter.leaked(counter.base_alloc, counter.base_open)
     if left_o:
         failures.append(f"{tag}: {len(left_o)} peer mappings left open")
     if left_a:
@@ -297,29 +338,173 @@ def _case_lifetime(manager, rank, world, dev, failures, counter):
 
 
 def _case_agreement(manager, rank, world, dev, failures, counter):
-    tag = f"rank{rank} agreement"
     kw = _small_kwargs(rank, world, hidden=1024, max_tok=32)
-    before_alloc, before_open = set(counter.live_alloc), set(counter.live_open)
-    # the last rank fails to open a peer's handle in the middle of the op's
-    # allocations; every rank must raise
-    if rank == world - 1:
-        counter.fail_open_at = counter.n_open + 3 * (world - 1) + 1
-    raised = None
+    # the last rank fails in the middle of the op's buffers: opening a peer's
+    # IPC handle, or allocating (out of memory); every rank must raise
+    for how, index in (("open", 7), ("alloc", 8)):
+        tag = f"rank{rank} agreement ({how})"
+        before_alloc, before_open = set(counter.live_alloc), set(counter.live_open)
+        if rank == world - 1:
+            if how == "open":
+                counter.fail_open_at = counter.n_open + 3 * (world - 1) + 1
+            else:
+                counter.fail_alloc_at = counter.n_alloc + 4
+        raised = None
+        try:
+            manager.get_handle(kw, index=index)
+        except RuntimeError as e:
+            raised = e
+        finally:
+            counter.fail_open_at = counter.fail_alloc_at = None
+        if raised is None:
+            failures.append(f"{tag}: building the op did not raise")
+        raised = None  # its traceback holds the half-built op
+        leaked_a, leaked_o = counter.leaked(before_alloc, before_open)
+        if leaked_a or leaked_o:
+            failures.append(
+                f"{tag}: {len(leaked_a)} allocations / {len(leaked_o)} mappings "
+                "leaked"
+            )
+        dist.barrier(group=manager.cpu_group)  # nobody hangs in a collective
+
+
+def _loaded_geometries(op):
+    """{"dispatch" / "combine": {(block_num, warp_num_per_block)}} of the
+    kernels the op has compiled and loaded."""
+    out = {"dispatch": set(), "combine": set()}
+    for k in op._loaded:
+        phase = "combine" if hasattr(k, "variant") else "dispatch"
+        out[phase].add((k.block_num, k.warp_num_per_block))
+    return out
+
+
+def _jit_state(op):
+    """Every JIT launcher of the op and how many artifacts it has compiled."""
+    return {
+        key: len(getattr(fn, "_mem_cache", None) or {})
+        for cache in (op._disp_jit_cache, op._comb_jit_cache)
+        for key, fn in cache.items()
+    }
+
+
+def _case_geometry(manager, rank, world, dev, failures):
+    from aiter.dist.device_communicators import all2all
+    from aiter.ops.flydsl.kernels import (
+        flydsl_dispatch_combine_intranode_op as op_mod,
+    )
+
+    hidden, epr, K, max_tok = 7168, 32, 8, 4096
+    E = epr * world
+    kwargs = {
+        "rank": rank,
+        "num_ep_ranks": world,
+        "input_dtype": torch.bfloat16,
+        "quant_dtype": torch.float8_e4m3fn,
+        "token_hidden_size": hidden,
+        "scale_dim": hidden // 32,
+        "scale_type_size": 1,
+        "max_num_tokens_per_dp_rank": max_tok,
+        "num_local_experts": epr,
+        "num_experts_per_token": K,
+        "gpu_per_node": world,
+        "low_latency": False,
+    }
+    # the tuned rows' buckets for this shape at EP8, and their neighbours
+    token_counts = (1, 5, 8, 9, 33, 100, 1024, 1025, 2048, 2049, 4096)
+    g = torch.Generator().manual_seed(91 + rank)
+    orig_cu = op_mod._device_cu_count
     try:
-        manager.get_handle(kw, index=7)
-    except RuntimeError as e:
-        raised = e
+        for cu_cap, index in ((None, 0), (80, 1), (38, 2)):
+            tag = f"rank{rank} geometry cu<={cu_cap or 'device'}"
+            if cu_cap is not None:
+                op_mod._device_cu_count = lambda i, c=cu_cap: min(orig_cu(i), c)
+            num_cu = op_mod._device_cu_count(torch.cuda.current_device())
+            h = manager.get_handle(kwargs, index=index)
+            if not isinstance(h, all2all._FlyDSLMoriCallSurface):
+                failures.append(f"{tag}: handle is {type(h).__name__}")
+                return
+            op = h._op
+            table = op.cfg.tuning_table
+            if world == 8 and (
+                table is None or not table.dispatch or not table.combine
+            ):
+                failures.append(f"{tag}: no tuned rows for the EP8 shape")
+            loaded = _loaded_geometries(op)
+            jit = _jit_state(op)
+            for phase, default in (
+                (
+                    "dispatch",
+                    (
+                        op_mod._DEFAULT_DISPATCH_BLOCK_NUM,
+                        op_mod._DEFAULT_DISPATCH_WARP_NUM,
+                    ),
+                ),
+                (
+                    "combine",
+                    (
+                        op_mod._DEFAULT_COMBINE_BLOCK_NUM,
+                        op_mod._DEFAULT_COMBINE_WARP_NUM,
+                    ),
+                ),
+            ):
+                rows = getattr(table, phase) if table is not None else {}
+                want = {
+                    (min(bn, num_cu), wpb)
+                    for bn, wpb in (rows.values() if rows else [default])
+                }
+                if loaded[phase] != want:
+                    failures.append(
+                        f"{tag}: {phase} geometries loaded at build "
+                        f"{sorted(loaded[phase])}, want {sorted(want)}"
+                    )
+            for T in token_counts:
+                ids = _ids(T, K, E, g).to(dev)
+                w = torch.rand(T, K, generator=g).to(dev)
+                xf = (torch.randn(T, hidden, generator=g) * 4).clamp(-448, 448)
+                x = xf.to(torch.float8_e4m3fn).to(dev)
+                sc = torch.full((T, hidden // 32), 127, dtype=torch.uint8, device=dev)
+                out = h.dispatch(x, w, sc, ids, 64, -1, 16)
+                rows = max(1, int(out[4].reshape(-1)[0].item()))
+                cin = (out[0][:rows].float() * (1.0 + rank / 8.0)).to(torch.bfloat16)
+                res = h.combine(cin, None, ids, 64, -1, 16)[0][:T]
+                torch.cuda.synchronize()
+                bad = _bitdiff(res, _reference(x.float(), ids, epr))
+                if bad:
+                    failures.append(f"{tag} T={T}: combine {bad} elements differ")
+                dist.barrier(group=manager.cpu_group)
+            now = _jit_state(op)
+            if now != jit or _loaded_geometries(op) != loaded:
+                grown = {
+                    k: (jit.get(k, 0), n) for k, n in now.items() if n != jit.get(k)
+                }
+                failures.append(f"{tag}: live calls compiled kernels: {grown}")
     finally:
-        counter.fail_open_at = None
-    if raised is None:
-        failures.append(f"{tag}: building the op did not raise")
-    leaked_a = counter.live_alloc - before_alloc
-    leaked_o = counter.live_open - before_open
-    if leaked_a or leaked_o:
-        failures.append(
-            f"{tag}: {len(leaked_a)} allocations / {len(leaked_o)} mappings leaked"
-        )
-    dist.barrier(group=manager.cpu_group)  # nobody hangs in a collective
+        op_mod._device_cu_count = orig_cu
+
+    # the gate
+    fly_kwargs = all2all._flydsl_op_kwargs(
+        **{k: v for k, v in kwargs.items() if k not in ("gpu_per_node", "low_latency")}
+    )
+    if not all2all._flydsl_intranode_supported(fly_kwargs):
+        failures.append(f"rank{rank} geometry: gate declines the supported handle")
+    torch.cuda.set_device((rank + 1) % world)
+    try:
+        if all2all._flydsl_intranode_supported(fly_kwargs):
+            failures.append(f"rank{rank} geometry: gate accepts rank != device")
+    finally:
+        torch.cuda.set_device(rank)
+    gpt_oss = {
+        **fly_kwargs,
+        "dispatch_dtype": torch.float4_e2m1fn_x2,
+        "hidden_dim": 2880,
+        "scale_dim": 2880 // 32,
+        "scale_type_size": 1,
+        "num_experts_per_rank": 128 // world,
+        "num_experts_per_token": 4,
+    }
+    if all2all._flydsl_intranode_supported(gpt_oss):
+        failures.append(f"rank{rank} geometry: gate accepts 90-byte scale rows")
+    dist.barrier(group=manager.cpu_group)
 
 
 def _worker(rank, world, port, cases, result_q):
@@ -355,6 +540,8 @@ def _worker(rank, world, port, cases, result_q):
                     _case_lifetime(manager, rank, world, dev, failures, counter)
                 elif case == "agreement":
                     _case_agreement(manager, rank, world, dev, failures, counter)
+                elif case == "geometry":
+                    _case_geometry(manager, rank, world, dev, failures)
             except Exception as e:  # noqa: BLE001
                 failures.append(f"rank{rank} {case}: {type(e).__name__}: {e}")
         torch.cuda.synchronize()
@@ -365,8 +552,7 @@ def _worker(rank, world, port, cases, result_q):
         else:
             # Everything mapped since init, the FlyDSL heap the lifetime case
             # leaves live included, is released by the teardown.
-            left_o = counter.live_open - counter.base_open
-            left_a = counter.live_alloc - counter.base_alloc
+            left_a, left_o = counter.leaked(counter.base_alloc, counter.base_open)
             if left_o or left_a:
                 failures.append(
                     f"rank{rank} destroy_dist_env: {len(left_o)} peer mappings "

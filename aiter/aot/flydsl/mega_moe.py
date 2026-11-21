@@ -176,7 +176,7 @@ def _mori_unavailable(*_args, **_kwargs):
 
 
 @contextmanager
-def _fake_shmem(device):
+def _fake_shmem(device, rank, world_size):
     """mori shmem that hands out FakeTensors and fake peer addresses."""
     if sys.modules.get("mori") is None and importlib.util.find_spec("mori") is None:
         # The replay never reaches mori itself, so a build host need not have
@@ -186,10 +186,12 @@ def _fake_shmem(device):
         shmem.shmem_barrier_all = _mori_unavailable
         shmem.shmem_ptr_p2p = _mori_unavailable
         shmem.mori_shmem_create_tensor = _mori_unavailable
+        shmem.shmem_mype = _mori_unavailable
+        shmem.shmem_npes = _mori_unavailable
         sys.modules.update({"mori": package, "mori.shmem": shmem})
     import mori.shmem as ms
 
-    # The dispatch/combine op allocates through MoriShmemAllocator, which looks
+    # The dispatch/combine op allocates through MoriSymmetricHeap, which looks
     # these up on mori.shmem at call time, so patching the module covers it.
     def create_tensor(shape, dtype):
         return torch.empty(shape, dtype=dtype, device=device)
@@ -198,6 +200,8 @@ def _fake_shmem(device):
         mock.patch.object(ms, "shmem_barrier_all", lambda: None),
         mock.patch.object(ms, "shmem_ptr_p2p", lambda ptr, _rank, _pe: ptr),
         mock.patch.object(ms, "mori_shmem_create_tensor", create_tensor),
+        mock.patch.object(ms, "shmem_mype", lambda: rank),
+        mock.patch.object(ms, "shmem_npes", lambda: world_size),
     ):
         yield
 
@@ -238,7 +242,7 @@ def compile_one_config(**job):
         with (
             mock.patch.dict(os.environ, fused_paths),
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
-            _fake_shmem(device),
+            _fake_shmem(device, job["rank"], job["world_size"]),
         ):
             # Imported only now: without mori, its stand-in must be in place.
             from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2

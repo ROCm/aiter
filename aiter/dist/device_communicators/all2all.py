@@ -58,11 +58,11 @@ def _register_mori_shmem_group(cpu_group) -> None:
 def ensure_mori_shmem() -> None:
     """Initialise mori's shmem heap over the EP group, once. Collective.
 
-    Every EP all-to-all manager registers its group when mori is installed.
-    With no registered group this is a no-op: the process has no aiter EP
-    manager, so whoever uses mori's heap initialises it (as mori's own tests
-    and MegaMoE's do); mori offers no query that tells an initialised heap
-    from an uninitialised one. Also a no-op on gfx125x, which has no shmem
+    ``MoriAll2AllManager`` registers its EP group, and
+    ``FlyDSLAll2AllManager`` does when mori is installed. With no registered
+    group this is a no-op: the process has no such manager, so whoever uses
+    mori's heap initialises it (as mori's own tests and MegaMoE's do); mori
+    offers no query that tells an initialised heap from an uninitialised one. Also a no-op on gfx125x, which has no shmem
     (mori's EP backend there is CCO; running the init can hang).
     """
     global _MORI_SHMEM_READY
@@ -79,13 +79,26 @@ def _flydsl_intranode_supported(fly_kwargs: dict) -> bool:
     """Whether the FlyDSL intra-node op serves a handle built from
     *fly_kwargs* (see :func:`_flydsl_op_kwargs`).
 
-    The kernels are wave64 (gfx942 / gfx950); everything else is the op's own
-    static config check, so the two cannot disagree.
+    The kernels are wave64 (gfx942 / gfx950), and the op keeps its buffers on
+    ``cuda:{rank}``, so the rank must be the current device; everything else
+    is the op's own static config check, so the two cannot disagree.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     arch = get_gfx_runtime()
     if arch not in ("gfx942", "gfx950") or not _has_module("flydsl"):
+        return False
+    try:
+        device = torch.cuda.current_device()
+    except (RuntimeError, AssertionError):  # no usable GPU
+        return False
+    if device != fly_kwargs["rank"]:
+        logger.debug(
+            "FlyDSL intra-node EP does not serve this handle: EP rank %d is not "
+            "the current device %d",
+            fly_kwargs["rank"],
+            device,
+        )
         return False
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
         FlyDSLDispatchCombineConfig,
@@ -107,7 +120,8 @@ class _FlyDSLMoriCallSurface:
 
     ``dispatch`` / ``combine`` take mori's arguments; the launch-geometry
     keywords are accepted and ignored (the FlyDSL op picks its geometry from
-    the token count). Other attributes are the FlyDSL op's.
+    its tuned rows by token count, capped at the device's CU count). Other
+    attributes are the FlyDSL op's.
     """
 
     def __init__(self, op):
@@ -178,9 +192,10 @@ class MoriAll2AllManager(All2AllManagerBase):
 
     On one node, a high-throughput handle (``low_latency=False``) whose shape
     the FlyDSL intra-node op accepts (gfx942 / gfx950, and the op's static
-    config check) is served by that op over HIP IPC buffers; mori is not used
-    for it. The manager keeps these ops alive until :meth:`destroy`. Every other handle -- inter-node, low latency, other
-    shapes or arches, or ``backend="mori"`` -- is a mori
+    config check, with the EP rank as the current device) is served by that op
+    over HIP IPC buffers; mori is not used for it. The manager keeps these ops
+    alive until :meth:`destroy`. Every other handle -- inter-node, low
+    latency, other shapes or arches, or ``backend="mori"`` -- is a mori
     ``EpDispatchCombineOp``. mori's shmem heap is initialised the first time
     something needs it (see :func:`ensure_mori_shmem`).
     """
@@ -318,7 +333,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         handles, self._flydsl_handles = self._flydsl_handles, []
         self.handle_cache = Cache()
         for handle in reversed(handles):
-            handle._op._heap.close()
+            handle._op.close()
 
     def get_handle(self, kwargs, index: int = 0, *, backend: str = "auto"):
         """Cached op for one config and ``index``. Always a single handle.
@@ -566,15 +581,22 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
     """
     EP all2all backend backed by FlyDSL intranode dispatch/combine kernels.
 
-    Self-contained: the symmetric P2P buffers are HIP IPC allocations exchanged
-    over this group's CPU group (``aiter.ops.flydsl.ipc_symm_heap``); mori is
-    not imported. Intra-node only.
+    Self-contained: the symmetric P2P buffers are uncached HIP IPC allocations
+    exchanged over this group's CPU group (``IpcSymmetricHeap``); mori is not
+    imported. Intra-node only.
+
+    Unlike before, the combine-side codec comes from the caller's
+    ``quant_type`` (default ``"none"``, as for the mori manager) instead of
+    being derived from the dtypes (bf16 input with an fp8 ``quant_dtype``
+    used to imply ``"fp8_direct_cast"``), and dispatch moves rows in
+    ``quant_dtype``.
 
     ``get_handle`` takes the handle arguments of :class:`MoriAll2AllManager`
     (the mori-only ones -- ``gpu_per_node``, ``low_latency`` -- are accepted
     and ignored); it has no ``backend`` keyword.
     TBO multi-instance ops use ``get_handle(..., index=)`` so ubatches get
-    distinct cached ops. ``create_handle`` remains for a one-off uncached op.
+    distinct cached ops. ``create_handle`` builds an op outside the handle
+    cache.
     """
 
     def __init__(self, cpu_group):
@@ -634,10 +656,11 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         )
 
     def create_handle(self, kwargs):
-        """Create a fresh, uncached FlyDSL op instance.
+        """Create a new FlyDSL op that ``get_handle`` never returns.
 
         Prefer ``get_handle(kwargs, index=)`` when the op should be reused.
-        Use this only if you need a throwaway instance that is not cached.
+        The manager still owns the op: its IPC buffers stay allocated until
+        :meth:`destroy` (collective), however long the caller keeps it.
         """
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("FlyDSL all2all (uncached) args %s", flydsl_kwargs)
@@ -648,4 +671,4 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         handles, self._live_handles = self._live_handles, []
         self.handle_cache = Cache()
         for handle in reversed(handles):
-            handle._heap.close()
+            handle.close()

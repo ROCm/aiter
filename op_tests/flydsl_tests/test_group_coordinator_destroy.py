@@ -2,14 +2,15 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """`GroupCoordinator.destroy` releases its device communicator while its
-process groups are still alive, so communicators that free IPC buffers shared
-with the peers can still agree with them; the FlyDSL symmetric heap warns when
-it is closed after its group is gone. CPU only: the process groups and the
-communicator are stand-ins."""
+process groups are still alive: the FlyDSL all-to-all ops close their IPC
+heaps there, and that close is collective over the group. CPU only: the
+process groups and the communicator are stand-ins.
+
+    python -m pytest -q op_tests/flydsl_tests/test_group_coordinator_destroy.py
+"""
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from aiter.dist import parallel_state
@@ -62,22 +63,3 @@ def test_borrowed_communicator_and_groups_are_dropped_not_destroyed(monkeypatch)
     group.destroy()
     assert events == []
     assert group.device_communicator is None
-
-
-def test_heap_closed_after_its_group_warns(monkeypatch):
-    pytest.importorskip("flydsl")
-    from aiter.ops.flydsl import ipc_symm_heap
-
-    heap = object.__new__(ipc_symm_heap.IpcSymmetricAllocator)
-    heap.group = "gone"
-    heap._bufs = [SimpleNamespace(bytes=torch.empty(4096, dtype=torch.uint8))] * 2
-    warnings = []
-    monkeypatch.setattr(ipc_symm_heap, "_group_alive", lambda g: False)
-    monkeypatch.setattr(
-        ipc_symm_heap,
-        "logger",
-        SimpleNamespace(warning=lambda msg, *args: warnings.append(msg % args)),
-    )
-    heap.close()
-    assert heap._bufs == []
-    assert len(warnings) == 1 and "2 IPC buffer(s) (8192 bytes)" in warnings[0]

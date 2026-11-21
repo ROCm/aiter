@@ -9,6 +9,7 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import T, const_expr, range_constexpr
 from flydsl.expr.rocdl import (
     ballot,
@@ -46,6 +47,34 @@ from .communication_ops_utils import (
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
 # AMDGPU cache modifier used by Stage-3 buffer loads/stores.
 _SLC_CACHE = 2
+
+
+def _load_row_v4(rsrc, lane, n_chunks):
+    """One wave's registers for a whole row of ``n_chunks`` 16-byte chunks:
+    lane l holds chunks l, l + 64, ...; the tail chunk is loaded on every lane
+    (lanes past the tail reload chunk 0 of it) and stored only by the lanes
+    that own one (see ``_store_row_v4``)."""
+    n_full, n_tail = divmod(n_chunks, 64)
+    vals = []
+    for j in range_constexpr(n_full):
+        vals.append(buffer_load(rsrc, (lane + j * 64) * 4, vec_width=4, dtype=T.i32))
+    if const_expr(n_tail > 0):
+        tail_lane = (lane < n_tail).select(lane, 0)
+        vals.append(
+            buffer_load(rsrc, (tail_lane + n_full * 64) * 4, vec_width=4, dtype=T.i32)
+        )
+    return vals
+
+
+@ASTRewriter.transform
+def _store_row_v4(vals, rsrc, lane, n_chunks):
+    """Store a row loaded by ``_load_row_v4``."""
+    n_full, n_tail = divmod(n_chunks, 64)
+    for j in range_constexpr(n_full):
+        buffer_store(vals[j], rsrc, (lane + j * 64) * 4)
+    if const_expr(n_tail > 0):
+        if lane < n_tail:
+            buffer_store(vals[n_full], rsrc, (lane + n_full * 64) * 4)
 
 
 def _pack_f32x4_to_fp8(v4f32):
@@ -453,8 +482,6 @@ def make_dispatch_kernel_tokmajor(
     nbytes = hidden_dim // 2 if _is_fp4 else hidden_dim * hidden_elem_size
     assert nbytes % 16 == 0, "token row must be a multiple of 16 B"
     n_chunks = nbytes // 16
-    n_full = n_chunks // 64
-    n_tail = n_chunks % 64
     scale_bytes = scale_dim * scale_type_size
     scale_n_i32 = (scale_bytes + 3) // 4 if scale_bytes > 0 else 0
     enable_scales = scale_bytes > 0
@@ -533,7 +560,6 @@ def make_dispatch_kernel_tokmajor(
         _r_tok_map = create_buffer_resource_from_addr(addr_out_tok_map)
         _r_sc_in = create_buffer_resource_from_addr(addr_inp_scales)
         k_lane = (lane < K).select(lane, 0)
-        tail_lane = (lane < n_tail).select(lane, 0)
         sc_lane = (lane < scale_n_i32).select(lane, 0)
 
         for tok in range(global_warp_id, inp_cur_tok, global_warp_num):
@@ -541,20 +567,7 @@ def make_dispatch_kernel_tokmajor(
             rsrc_src = create_buffer_resource_from_addr(
                 addr_inp_tok + fx.Int64(tok) * nbytes
             )
-            vals = []
-            for j in range_constexpr(n_full):
-                vals.append(
-                    buffer_load(rsrc_src, (lane + j * 64) * 4, vec_width=4, dtype=T.i32)
-                )
-            if const_expr(n_tail > 0):
-                vals.append(
-                    buffer_load(
-                        rsrc_src,
-                        (tail_lane + n_full * 64) * 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
+            vals = _load_row_v4(rsrc_src, lane, n_chunks)
             sc_val = fx.Int32(0)
             if const_expr(enable_scales):
                 sc_val = buffer_load(
@@ -591,11 +604,7 @@ def make_dispatch_kernel_tokmajor(
                     r_dst = create_buffer_resource_from_addr(
                         fx.memref_load(_tbl, dj) + fx.Int64(sj) * nbytes
                     )
-                    for jj in range_constexpr(n_full):
-                        buffer_store(vals[jj], r_dst, (lane + jj * 64) * 4)
-                    if const_expr(n_tail > 0):
-                        if lane < n_tail:
-                            buffer_store(vals[n_full], r_dst, (lane + n_full * 64) * 4)
+                    _store_row_v4(vals, r_dst, lane, n_chunks)
                     if const_expr(enable_scales):
                         if lane < scale_n_i32:
                             r_sc = create_buffer_resource_from_addr(
@@ -631,6 +640,9 @@ def make_dispatch_kernel_tokmajor(
             epoch = buffer_load(_r_ep, 0, vec_width=1, dtype=T.i32) + 1
             if lane == 0:
                 wait_i32_until_equals(addr_disp_bar, block_num)
+                # Acquire fence pairs with the per-wave release fence before
+                # the ``addr_disp_bar`` arrival, as in the expert-major dispatch.
+                fence_system_acquire()
                 buffer_store(
                     fx.Int32(0), create_buffer_resource_from_addr(addr_disp_bar), 0
                 )
@@ -1103,27 +1115,9 @@ def make_combine_kernel(
                 rsrc_src = create_buffer_resource_from_addr(src_tok_addr)
                 rsrc_dst = create_buffer_resource_from_addr(dest_tok_addr)
                 if const_expr(fast_path):
-                    _nf = n_chunks // 64
-                    _nt = n_chunks % 64
-                    _row = []
-                    for jj in range_constexpr(_nf):
-                        _row.append(
-                            buffer_load(
-                                rsrc_src, (lane + jj * 64) * 4, vec_width=4, dtype=T.i32
-                            )
-                        )
-                    if const_expr(_nt > 0):
-                        _tl = (lane < _nt).select(lane, 0)
-                        _row.append(
-                            buffer_load(
-                                rsrc_src, (_tl + _nf * 64) * 4, vec_width=4, dtype=T.i32
-                            )
-                        )
-                    for jj in range_constexpr(_nf):
-                        buffer_store(_row[jj], rsrc_dst, (lane + jj * 64) * 4)
-                    if const_expr(_nt > 0):
-                        if lane < _nt:
-                            buffer_store(_row[_nf], rsrc_dst, (lane + _nf * 64) * 4)
+                    _store_row_v4(
+                        _load_row_v4(rsrc_src, lane, n_chunks), rsrc_dst, lane, n_chunks
+                    )
                 elif const_expr(_xfer_bf16_to_fp8):
                     for elem_off in range(lane, n_i32, 64):
                         bf_pair = buffer_load(
@@ -1566,10 +1560,11 @@ def make_dispatch_jit(
     scale_type_size=0,
     enable_std_moe=False,
     max_recv=None,
-    tokmajor=False,
 ):
-    """Build the dispatch JIT launcher. ``max_recv`` (per-rank receive-slot cap
-    for sentinel encoding) must match make_combine_jit."""
+    """Build the dispatch JIT launcher: the expert-major kernel when the
+    StdMoE output is requested, else the token-major one. ``max_recv``
+    (per-rank receive-slot cap for sentinel encoding) must match
+    make_combine_jit."""
     hidden_elem_size = torch.tensor([], dtype=data_type).element_size()
     common = {
         "rank": rank,
@@ -1586,11 +1581,10 @@ def make_dispatch_jit(
         "data_type": data_type,
         "max_recv": max_recv,
     }
-    if tokmajor:
-        assert not enable_std_moe
-        kernel = make_dispatch_kernel_tokmajor(**common)
+    if enable_std_moe:
+        kernel = make_dispatch_kernel(**common, enable_std_moe=True)
     else:
-        kernel = make_dispatch_kernel(**common, enable_std_moe=enable_std_moe)
+        kernel = make_dispatch_kernel_tokmajor(**common)
 
     @flyc.jit
     def dispatch_launch(

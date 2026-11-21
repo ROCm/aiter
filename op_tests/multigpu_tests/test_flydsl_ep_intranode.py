@@ -20,8 +20,10 @@ combines bf16 rows that are a function of what it received. Variants:
   distinct destination ranks in top-k slot order, rounded to bf16 (each
   contribution rounded to fp8 first under ``fp8_direct_cast``). Negative ids
   are skipped, duplicates of a rank count once.
-* the same pair captured in a CUDA graph and replayed several times gives the
-  same result (launch epochs advance on the device).
+* the same pair captured in a CUDA graph and replayed several times: before
+  each replay every dispatch and combine output is overwritten with garbage
+  (on all ranks), and after it the dispatch and combine checks above pass
+  again (launch epochs advance on the device).
 
 Routings: random, all tokens to one rank, one rank receiving nothing, all
 top-k slots on one rank, masked (-1) slots, ranks with no tokens.
@@ -30,6 +32,7 @@ top-k slots on one rank, masked (-1) slots, ranks with no tokens.
 """
 
 import argparse
+import gc
 import os
 import sys
 
@@ -105,6 +108,14 @@ def _stacked(all_rows, t_max, j, cols, dtype):
     for r_i, r in enumerate(all_rows):
         out[r_i, : r[j].shape[0]] = r[j].reshape(r[j].shape[0], cols)
     return out
+
+
+def poison(*tensors):
+    """Overwrite output buffers with NaN / all-ones bytes, so that a check
+    after a graph replay cannot pass on what an earlier launch left there."""
+    for t in tensors:
+        if t is not None:
+            t.view(torch.uint8).fill_(0xFF)
 
 
 def _reference(xf, ids, epr, wire_fp8=False):
@@ -206,30 +217,41 @@ def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
                         )
                         return op.combine(cin, None, ids)[0]
 
-                    out = op.dispatch(x, w, sc, ids)
-                    torch.cuda.synchronize()
                     tag = (
                         f"rank{rank} {variant} hidden={hidden} E={E} K={K} "
                         f"{routing} T={T0}"
                     )
-                    # dispatch (read before combine, which resets the count)
-                    n = int(out[4].reshape(-1)[0].item())
-                    src = op.get_dispatch_src_token_pos()[:n].long().cpu()
-                    expect = sum(
-                        int(
-                            ((r[0].long() >= 0) & (r[0].long() // epr == rank))
-                            .any(1)
-                            .sum()
+
+                    def check_dispatch(
+                        out,
+                        src,
+                        when,
+                        tag=tag,
+                        all_rows=all_rows,
+                        geom=(epr, max_tok, sd, xb, K),
+                    ):
+                        epr, max_tok, sd, xb, K = geom
+                        # out[4] / src: the count and source positions as
+                        # dispatch left them (combine resets the count)
+                        n = int(out[4].reshape(-1)[0].item())
+                        src = src[:n].long().cpu()
+                        expect = sum(
+                            int(
+                                ((r[0].long() >= 0) & (r[0].long() // epr == rank))
+                                .any(1)
+                                .sum()
+                            )
+                            for r in all_rows
+                            if r[0].numel()
                         )
-                        for r in all_rows
-                        if r[0].numel()
-                    )
-                    if n != expect:
-                        failures.append(f"{tag}: received {n}, expected {expect}")
-                    if n and n == expect:
+                        if n != expect:
+                            failures.append(
+                                f"{tag}: {when} received {n}, expected {expect}"
+                            )
+                        if not n or n != expect:
+                            return
                         # every received row against its source token
                         t_max = max(int(r[0].shape[0]) for r in all_rows)
-
                         s_r, s_t = src // max_tok, src % max_tok
                         got = (
                             out[0][:n].view(torch.uint8).cpu(),
@@ -247,7 +269,11 @@ def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
                             ("rows", "scales", "weights", "ids"), got, want
                         ):
                             if not torch.equal(g_t.view(w_t.dtype), w_t):
-                                failures.append(f"{tag}: received {name} differ")
+                                failures.append(f"{tag}: {when} received {name} differ")
+
+                    out = op.dispatch(x, w, sc, ids)
+                    torch.cuda.synchronize()
+                    check_dispatch(out, op.shmem_tok_id_to_src, "dispatch")
                     # combine
                     res = combine(out)
                     torch.cuda.synchronize()
@@ -255,24 +281,41 @@ def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
                     bad = _bitdiff(res[:T], ref) if T else 0
                     if bad:
                         failures.append(f"{tag}: combine {bad} elements differ")
-                    # CUDA graph capture + replays
+                    # CUDA graph capture + replays. The graph's outputs are the
+                    # op's buffers, which still hold the eager results: poison
+                    # them on every rank before each replay.
                     dist.barrier(group=group)
                     s = torch.cuda.Stream()
                     with torch.cuda.stream(s):
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph, stream=s):
-                            res_g = combine(op.dispatch(x, w, sc, ids))
+                            out_g = op.dispatch(x, w, sc, ids)
+                            # combine resets the count
+                            n_g = out_g[4].clone()
+                            src_g = op.shmem_tok_id_to_src.clone()
+                            res_g = combine(out_g)
                     torch.cuda.synchronize()
-                    dist.barrier(group=group)
-                    for _ in range(replays):
+                    for i in range(replays):
+                        poison(*out_g[:4], n_g, src_g, res_g, op.shmem_tok_id_to_src)
+                        torch.cuda.synchronize()
+                        dist.barrier(group=group)
                         graph.replay()
-                    torch.cuda.synchronize()
-                    bad = _bitdiff(res_g[:T], ref) if T else 0
-                    if bad:
-                        failures.append(f"{tag}: graph replay {bad} elements differ")
+                        torch.cuda.synchronize()
+                        dist.barrier(group=group)
+                        check_dispatch((*out_g[:4], n_g), src_g, f"replay {i}")
+                        bad = _bitdiff(res_g[:T], ref) if T else 0
+                        if bad:
+                            failures.append(
+                                f"{tag}: graph replay {i} combine {bad} elements differ"
+                            )
                     del graph
                     dist.barrier(group=group)
-            op._heap.close()
+            op.close()
+            # Drop every view of the op's buffers here: IPC memory is freed when
+            # its last tensor dies, and that must not happen inside the next
+            # variant's graph capture.
+            op = out = out_g = res = res_g = n_g = src_g = combine = None
+            gc.collect()
     except Exception as e:  # noqa: BLE001
         failures.append(f"rank{rank}: {type(e).__name__}: {e}")
     result_q.put((rank, failures))
