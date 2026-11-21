@@ -8,6 +8,8 @@ import functools
 import torch
 from torch import Tensor
 
+from aiter.jit.utils.chip_info import get_num_xcds
+
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
     TILE_M,
@@ -84,6 +86,7 @@ def _compile_gemm(
     kernel_name: str,
     device_index: int,
     out_dtype: torch.dtype = torch.bfloat16,
+    num_xcds: int = 8,
 ):
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 
@@ -99,6 +102,7 @@ def _compile_gemm(
         N,
         K,
         preshuffle_b=ki.preshuffle_b,
+        num_xcds=num_xcds,
     )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
@@ -138,7 +142,9 @@ def run_gemm_a8w8_blockscale(
     N = WQ.shape[0]
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
-        launch = _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype)
+        launch = _compile_gemm(
+            N, K, kernel_name, XQ.device.index, Out.dtype, get_num_xcds()
+        )
         out_contiguous = Out.contiguous()
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.

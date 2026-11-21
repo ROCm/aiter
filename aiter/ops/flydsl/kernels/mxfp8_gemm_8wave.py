@@ -440,6 +440,7 @@ def compile_mxfp8_gemm_8w(
     scale_preshuffled: bool = False,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     b_scale_block: str = "1x32",
     a_scale_block: str = "1x32",
     k_split: int = 1,
@@ -526,6 +527,8 @@ def compile_mxfp8_gemm_8w(
         f"{waves_per_eu}x{xcd_swizzle}{_scale_tag}_k{K}"
         f"{f'_ks{k_split}' if k_split > 1 else ''}"
     )
+    if xcd_swizzle > 0 and num_xcds != 8:
+        _kname += f"_nxcd{num_xcds}"
 
     @fx.struct
     class SharedStorage:
@@ -580,7 +583,7 @@ def compile_mxfp8_gemm_8w(
             b_k_off = k0 * B_K_STEP
         elif const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle
+                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle, num_xcds=num_xcds
             )
         else:
             block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)

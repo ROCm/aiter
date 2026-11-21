@@ -52,6 +52,7 @@ from .mfma_preshuffle_pipeline import (
     make_preshuffle_scale_layout,
     swizzle_xor16,
     tile_chunk_coord_i32,
+    xcd_remap_grid,
 )
 from .tensor_shim import ptr_rsrc
 
@@ -135,6 +136,7 @@ def compile_mixed_moe_gemm1_common(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
@@ -265,6 +267,8 @@ def compile_mixed_moe_gemm1_common(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    if xcd_swizzle > 0 and num_xcds != 8:
+        xcd_tag += f"_nxcd{num_xcds}"
     v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
@@ -514,7 +518,6 @@ def compile_mixed_moe_gemm1_common(
             bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
-                num_xcds = 8
                 one = 1
                 tile_n_idx = tile_n
                 inter_pad_idx = 2 * inter_dim_pad
@@ -529,24 +532,14 @@ def compile_mixed_moe_gemm1_common(
                     )
                 persist_m_idx = persist_m
                 grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                bx_persist, by = xcd_remap_grid(
+                    bx_persist,
+                    by,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by = workgroup_in_group // group_size_m
 
             by_n = by * tile_n
 
@@ -3005,6 +2998,7 @@ def compile_mixed_moe_gemm2_common(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     shared_expert_id: int | None = None,
     use_global_a: bool = True,
 ):
@@ -3180,6 +3174,8 @@ def compile_mixed_moe_gemm2_common(
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    if xcd_swizzle > 0 and num_xcds != 8:
+        xcd_tag += f"_nxcd{num_xcds}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b and is_f8_b:
@@ -3277,7 +3273,6 @@ def compile_mixed_moe_gemm2_common(
             bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
-                num_xcds = 8
                 one = 1
                 tile_n_idx = tile_n
                 model_pad_idx = model_dim_pad
@@ -3287,24 +3282,14 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     persist_m_idx = persist_m
                     grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by_outer
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                bx_persist, by_outer = xcd_remap_grid(
+                    bx_persist,
+                    by_outer,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by_outer = workgroup_in_group // group_size_m
 
             by = by_outer
 
