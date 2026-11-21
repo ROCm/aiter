@@ -190,9 +190,10 @@ Scope: D2 is about a **temporary rollback kill-switch** for a risky default swap
 Real example (PR#3266): flydsl sort replaced opus sort; reviewer: "gate flydsl behind env var until validated on broader workloads."
 → `⚠️ D2: new default path needs rollback env-var for safe rollout`
 
-**D3 — hipblaslt in CSV/YAML tuning config** 🔴
-Any `+` line with `hipblaslt` in a tuning file. Not persistent across Docker; causes hangs.
-→ `🔴 D3: hipblaslt config must not be committed`
+**D3 — hipBLASLt in shared tuning configs** 🔴
+Flag entries added or retuned to select hipBLASLt in shared tuning files. Saved solution indices vary
+across builds; a recorded kernel name does not make them portable (PR#8166).
+→ `🔴 D3: hipBLASLt config must not be committed`
 
 **D4 — Invariant reversal without citation** 🔴
 A documented safety invariant is reversed: old comment says "must X because Y" → new code removes X claiming "X not needed" but no spec/asm/test is cited to prove Y no longer holds.
