@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import itertools
 import multiprocessing
 import queue
@@ -847,7 +848,9 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
             token, model_dim, E, topk, dtype, has_expert_mask, padding_extra=0
         )
         ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size, expert_mask)
-        out = moe_sorting(
+
+        sort = functools.partial(
+            moe_sorting,
             topk_ids,
             topk_weights,
             E,
@@ -857,11 +860,20 @@ def _moe_sorting_ck_lds_fallback_worker(progress, dtype, model_dim, topk):
             expert_mask,
             dispatch_policy=1,
         )
+
+        out = sort()
         torch.cuda.synchronize()
         errs = _compare_moe_sorting_outputs(ref, out, topk, token)
         bad = {name: err for name, err in errs.items() if err}
         assert not bad, f"CK moe_sorting mismatch at {case}: {bad}"
         _assert_routing_exact(ref, out, topk, token, case)
+        # Timed after the checked launch, so a hang is caught first. The roofline is
+        # the crude one of the main benchmark.
+        _, us = run_perftest(sort, num_warmup=1, num_iters=2)
+        flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
+        case["us"] = round(us, 2)
+        case["TFLOPS"] = round(flops / us / 1e6, 5)
+        case["TB/s"] = round(nbytes / us / 1e6, 5)
         case["err"] = max(errs.values())
         progress.put(("row", case))
 
