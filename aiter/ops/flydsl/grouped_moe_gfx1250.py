@@ -2042,6 +2042,25 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A weight placed by moe_shuffle_weight_iod is readable only by its
+        # layout tiling and the one with tile_n halved, four waves, two waves
+        # per TDM tensor; each GEMM keeps the tuned tile_n when it is one of
+        # them, and the tuned four-wave grid and cluster for the tuned tile,
+        # else 1 x 4 waves and no cluster.
+        from .iod_locality import pin_tile
+
+        for _w, _sfx in ((w1, ""), (w2, "2")):
+            _tile = pin_tile(_w, _tdm_kw.get(f"tile_n{_sfx}"))
+            if _tile is None:
+                continue
+            _grid = (_tdm_kw.get(f"m_warp{_sfx}"), _tdm_kw.get(f"n_warp{_sfx}"))
+            _tuned = (_tdm_kw.get(f"tile_n{_sfx}"), _tdm_kw.get(f"tile_k{_sfx}"))
+            if _tile != _tuned or None in _grid or _grid[0] * _grid[1] != 4:
+                _grid = (1, 4)
+                _tdm_kw[f"cluster_m{_sfx}"] = _tdm_kw[f"cluster_n{_sfx}"] = 1
+            _tdm_kw[f"tile_n{_sfx}"], _tdm_kw[f"tile_k{_sfx}"] = _tile
+            _tdm_kw[f"m_warp{_sfx}"], _tdm_kw[f"n_warp{_sfx}"] = _grid
+            _tdm_kw[f"waves_per_tensor_tdm{_sfx}"] = 2
         # A tile from the CSV row or an AITER_TDM_* override must fit as given;
         # only the built-in default may be narrowed (see _grouped_a8w4_tdm_moe).
         _tdm_kw["tiles_configured"] = any(
