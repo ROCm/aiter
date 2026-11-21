@@ -17,15 +17,40 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 
 
 @gluon.jit
-def _conv_load(hb, wb, ho, wo, m, s_pos, LP: gl.constexpr):
+def _conv_load(hb, wb, ho, wo, m, s_pos, CW_WIDTH: gl.constexpr):
     """The three history taps and four conv weights of this head's q/k/v rows."""
     h0 = gl.amd.cdna4.buffer_load(hb, ho, mask=m, cache=".cg")
     h1 = gl.amd.cdna4.buffer_load(hb, ho + s_pos, mask=m, cache=".cg")
     h2 = gl.amd.cdna4.buffer_load(hb, ho + 2 * s_pos, mask=m, cache=".cg")
-    w0 = gl.amd.cdna4.buffer_load(wb, wo, mask=m).to(gl.float32)
-    w1 = gl.amd.cdna4.buffer_load(wb, wo + LP, mask=m).to(gl.float32)
-    w2 = gl.amd.cdna4.buffer_load(wb, wo + 2 * LP, mask=m).to(gl.float32)
-    w3 = gl.amd.cdna4.buffer_load(wb, wo + 3 * LP, mask=m).to(gl.float32)
+    if CW_WIDTH == 1:
+        # A channel's taps are adjacent: load them as one vector per channel
+        # (a tap dim in-thread) instead of one strided load per tap.
+        rows: gl.constexpr = wo.shape[0]
+        chans: gl.constexpr = wo.shape[1]
+        TAPS: gl.constexpr = gl.BlockedLayout(
+            [1, (rows * chans) // (64 * gl.num_warps()), 4],
+            [1, 64, 1],
+            [rows, gl.num_warps() // rows, 1],
+            [2, 1, 0],
+        )
+        ROWS: gl.constexpr = gl.SliceLayout(2, TAPS)
+        tap = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, TAPS)))[None, None, :]
+        off = gl.convert_layout(wo, ROWS, assert_trivial=True)[:, :, None] + tap
+        mt = gl.convert_layout(m, ROWS, assert_trivial=True)[:, :, None] & (tap >= 0)
+        w = gl.amd.cdna4.buffer_load(wb, off, mask=mt).to(gl.float32)
+        w02, w13 = gl.split(gl.reshape(w, [rows, chans, 2, 2]))
+        w0, w2 = gl.split(w02)
+        w1, w3 = gl.split(w13)
+        FLAT: gl.constexpr = wo.type.layout
+        w0 = gl.convert_layout(w0, FLAT, assert_trivial=True)
+        w1 = gl.convert_layout(w1, FLAT, assert_trivial=True)
+        w2 = gl.convert_layout(w2, FLAT, assert_trivial=True)
+        w3 = gl.convert_layout(w3, FLAT, assert_trivial=True)
+    else:
+        w0 = gl.amd.cdna4.buffer_load(wb, wo, mask=m).to(gl.float32)
+        w1 = gl.amd.cdna4.buffer_load(wb, wo + CW_WIDTH, mask=m).to(gl.float32)
+        w2 = gl.amd.cdna4.buffer_load(wb, wo + 2 * CW_WIDTH, mask=m).to(gl.float32)
+        w3 = gl.amd.cdna4.buffer_load(wb, wo + 3 * CW_WIDTH, mask=m).to(gl.float32)
     return h0, h1, h2, w0, w1, w2, w3
 
 
@@ -42,7 +67,7 @@ def _token(
     a_exp,
     dt,
     gate_c,
-    LP: gl.constexpr,
+    CW_WIDTH: gl.constexpr,
     USE_CONV: gl.constexpr,
     USE_GATE_IN_KERNEL: gl.constexpr,
     USE_LOWER_BOUND: gl.constexpr,
@@ -52,7 +77,7 @@ def _token(
         # g has its own dtype: load it apart and splice it into row 2
         x = gl.where(m, x.to(gl.float32), gl.load(gp, mask=~m).to(gl.float32))
     if USE_CONV:
-        h0, h1, h2, w0, w1, w2, w3 = _conv_load(hb, wb, ho, wo, m, s_pos, LP)
+        h0, h1, h2, w0, w1, w2, w3 = _conv_load(hb, wb, ho, wo, m, s_pos, CW_WIDTH)
         acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
         acc += h2.to(gl.float32) * w2 + x.to(gl.float32) * w3
         gl.amd.cdna4.buffer_store(h1, hb, ho, mask=m, cache=".cs")
@@ -146,6 +171,9 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_cs_slot,
     stride_cs_dim,
     stride_cs_pos,
+    stride_cw_group: gl.constexpr,
+    stride_cw_width: gl.constexpr,
+    stride_cw_ch: gl.constexpr,
     scale: gl.constexpr,
     H: gl.constexpr,
     HV: gl.constexpr,
@@ -293,7 +321,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     grp = gl.where(r == 3, 2, r)
     cc = gl.where(r == 3, i_hv * V, i_h * K) + c
     ho = (grp * LP + cc) * stride_cs_dim
-    wo = grp * (W * LP) + cc
+    wo = grp * stride_cw_group + cc * stride_cw_ch
     if IS_BETA_HEADWISE:
         b_p = beta_ptr + tok0 * stride_beta_token + i_hv * V
     else:
@@ -347,7 +375,13 @@ def fused_recurrent_kda_packed_decode_kernel(
                 st = st + (gl.zeros([RC, K], gl.float32, CHUNK),)
         if USE_CONV:
             h0, h1, h2, w0, w1, w2, w3 = _conv_load(
-                hb, conv_weight_ptr, ho + seed * stride_cs_pos, wo, m, stride_cs_pos, LP
+                hb,
+                conv_weight_ptr,
+                ho + seed * stride_cs_pos,
+                wo,
+                m,
+                stride_cs_pos,
+                stride_cw_width,
             )
             if IS_SPEC_DECODING:
                 keep1 = h1
@@ -451,7 +485,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                 a_exp,
                 dt,
                 gate_c,
-                LP,
+                stride_cw_width,
                 USE_CONV,
                 USE_GATE_IN_KERNEL,
                 USE_LOWER_BOUND,

@@ -43,6 +43,7 @@ def make_inputs(
     fused=False,
     W=4,
     state_dtype=torch.float32,
+    conv1d_layout=False,
 ):
     """K3 serves `full_k3`: raw q/k/g/beta, gate chain and l2norm fused in."""
     total_T = B * T
@@ -87,12 +88,14 @@ def make_inputs(
     if fused:
         # spec decoding keeps vLLM's W-2+T tap window, read from num_accepted-1
         taps = W - 1 if accepted is None else W - 2 + T
+        cw = torch.randn(3, W, H * D, dtype=torch.float32, device=device) * 0.1
+        if conv1d_layout:  # a fused [3*H*D, 1, W] conv1d parameter, viewed as 2-D
+            cw = cw.permute(0, 2, 1).reshape(3 * H * D, W)
         extra = {
             "conv_state": torch.randn(
                 state.shape[0], 3 * H * D, taps, dtype=dtype, device=device
             ),
-            "conv_weight": torch.randn(3, W, H * D, dtype=torch.float32, device=device)
-            * 0.1,
+            "conv_weight": cw,
             "out_gate": torch.randn_like(v),
             "norm_weight": torch.rand(D, dtype=torch.float32, device=device) + 0.5,
         }
@@ -266,6 +269,7 @@ def benchmark(args):
             args.num_accepted,
             fused=args.fused,
             state_dtype=state_dtype,
+            conv1d_layout=args.conv1d_layout,
         )
         shared = dict(
             inputs,
@@ -377,8 +381,9 @@ def parse_args():
         type=int,
         nargs="+",
         default=[2],
-        choices=[1, 2],
-        help="1: sync loads; 2: register prefetch of the next token",
+        choices=[1, 2, 4, 8],
+        help="state row chunks in flight (1: sync loads); gfx950's tuned configs use "
+        "2 to 8, gfx1250 takes 1 or 2",
     )
     parser.add_argument(
         "--tdm_store",
@@ -426,6 +431,13 @@ def parse_args():
     parser.add_argument("--state_k_first", action="store_true", default=False)
     parser.add_argument("--paged", action="store_true", default=False)
     parser.add_argument("--fused", action="store_true", default=False)
+    parser.add_argument(
+        "--conv1d_layout",
+        action="store_true",
+        default=False,
+        help="--fused only: pass the conv weight as a [3*H*D, W] view of a fused "
+        "conv1d parameter instead of [3, W, H*D]",
+    )
     parser.add_argument(
         "--backends",
         type=str,
