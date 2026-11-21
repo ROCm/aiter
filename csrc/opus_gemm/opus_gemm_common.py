@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -26,6 +27,16 @@ def base_gfx_arch(gfx: str) -> str:
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 MXFP8 x MXFP8 with 1x32 e8m0 scales (a8w8_mxfp8 family): the 2x2
+# pipeline is pre-compiled (.co, gen_co/gfx950/a8w8_mxfp8_bpreshuffle/). A kid
+# carries one image per layout, <name>_<nt|nn|tt|tn>.co; its launcher picks one
+# from the tensor strides (image index = A_T * 2 + B_T: A stored [K, M] / B
+# stored [K, N]).
+A8W8_MXFP8_TAGS = frozenset({"a8w8_mxfp8_co"})
+A8W8_MXFP8_LAYOUTS = ("nt", "nn", "tt", "tn")
+# a8w8_mxfp8_co variant -> traits MODE (0 persistent, 1 one tile per block,
+# 2 split-K); "nob" is one tile per block without M/N boundary handling.
+A8W8_MXFP8_CO_MODE = {"": 0, "np": 1, "sk": 2, "nob": 1}
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -440,6 +451,18 @@ class OpusGemmInstance:
                 "wsf32" if self.splitk_workspace_dtype == "fp32_t" else "wsbf16"
             )
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag in A8W8_MXFP8_TAGS:
+            # Launcher symbol == ELF entry point == .co filename (+ _<layout>):
+            # opus_gemm_gfx950_<tag>_{B_M}x{B_N}x{B_K}[_{variant}].
+            return "_".join(
+                [
+                    self.name_root,
+                    self.arch_prefix,
+                    self.kernel_tag,
+                    "x".join(map(str, [self.B_M, self.B_N, self.B_K])),
+                    *([self.co_variant] if self.co_variant else []),
+                ]
+            )
         elif self.kernel_tag in _A16W16_CO_TAGS:
             # The host launcher symbol, ELF entry point and .co filename must
             # remain identical. Encode every device configuration axis that
@@ -2819,6 +2842,96 @@ gfx1250_4wave_co_kernels_declared = {
     if instance.kernel_tag in _A16W16_CO_TAGS
 }
 
+# -- gfx950 a8w8_mxfp8 (MXFP8 x MXFP8, 1x32 e8m0 scales) ----------------------
+# x_scale [M, K/32] / w_scale [N, K/32] row-major e8m0 and bf16 C in every
+# layout; B is the shuffle_weight(w, layout=(16, 16)) of its storage.
+#   NT: A [M, K], B [N, K] (aiter gemm_a8w8_mxfp8_bpreshuffle); NN: B [K, N];
+#   TT: A [K, M]; TN: A [K, M], B [K, N].  K % 256; A [K, M] needs M % 16, B [K, N] N % 32.
+# Kids are local to the a8w8_mxfp8/gfx950/CU namespace (pre-compiled 2x2
+# pipeline, co_kernels_gfx950_a8w8_mxfp8_bpreshuffle.json; B_K 128):
+#   0: 256x256 one tile per block without M/N boundary handling ("nob");
+#   1-6: one tile per block ("np"): 256x256, 256x128, 128x256, 128x128, 192x256, 256x192;
+#   7-11: persistent, 12-16: split-K ("sk", fp32 partials summed by splitk_reduce_kernel):
+#   256x128, 128x256, 128x128, 192x256, 256x192 (no persistent / split-K 256x256: register
+#   spills / out of registers) -- any M, N % 16; every kid has the nt / nn / tt / tn images.
+# The images are built by gen_co/build_co.py --arch gfx950 --family a8w8_mxfp8_bpreshuffle.
+A8W8_MXFP8_CO_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a8w8_mxfp8_bpreshuffle.json"
+)
+# Image directory under gen_co/ (opus_gfx950_co::co_kernel co_dir).
+A8W8_MXFP8_CO_DIR = "gfx950/a8w8_mxfp8_bpreshuffle"
+# sizeof(opus_gemm_mxfp8_kargs_gfx950): the .co kernel ABI build_co.py checks.
+A8W8_MXFP8_KARGS_BYTES = 112
+
+
+def a8w8_mxfp8_co_images(instance):
+    """[(layout, symbol)] of the .co images of one a8w8_mxfp8 kid."""
+    return [(layout, f"{instance.name}_{layout}") for layout in A8W8_MXFP8_LAYOUTS]
+
+
+def a8w8_mxfp8_co_traits_args(instance, layout):
+    """opus_mxfp8_traits<B_M, B_N, A_T, B_T, MODE, BOUNDARY> arguments of one image."""
+    # layout "nt" / "nn" / "tt" / "tn": A_T = A stored [K, M], B_T = B stored [K, N] ("n").
+    a_t, b_t = str(layout[0] == "t").lower(), str(layout[1] == "n").lower()
+    mode = A8W8_MXFP8_CO_MODE[instance.co_variant]
+    boundary = "false" if instance.co_variant == "nob" else "true"
+    return f"{instance.B_M}, {instance.B_N}, {a_t}, {b_t}, {mode}, {boundary}"
+
+
+def _a8w8_mxfp8_co_image_dir():
+    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(A8W8_MXFP8_CO_JSON)
+    return os.path.join(root, A8W8_MXFP8_CO_DIR)
+
+
+def _load_a8w8_mxfp8_co_kernels(require_image=True):
+    """{local kid: OpusGemmInstance} of the a8w8_mxfp8 JSON; with require_image,
+    a kid missing any of its four images is dropped (it could not launch)."""
+    import json
+
+    if not os.path.exists(A8W8_MXFP8_CO_JSON):
+        return {}
+    with open(A8W8_MXFP8_CO_JSON) as stream:
+        entries = json.load(stream)["gfx950"]
+    instances, missing = {}, []
+    for entry in entries:
+        kid = entry["kid"]
+        assert type(kid) is int and kid >= 0 and kid not in instances, entry
+        assert entry["tag"] in A8W8_MXFP8_TAGS, entry
+        assert entry.get("variant", "") in A8W8_MXFP8_CO_MODE, entry
+        bm, bn, bk = entry["tile"]
+        t_m, t_n = entry["wave_layout"]
+        lb_threads, lb_waves = entry["launch_bounds"]
+        assert lb_threads == entry["block_size"], entry
+        instance = OpusGemmInstance(
+            entry["block_size"], bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4, 1, 1, 32,
+            entry["tag"], ["bf16_t"], arch_prefix="gfx950",
+            co_min_waves_per_eu=lb_waves,
+            co_device_flags=tuple(entry.get("device_flags", ())),
+            co_variant=entry.get("variant", ""),
+            co_wave_layout=(t_m, t_n),
+        )
+        image_dir = _a8w8_mxfp8_co_image_dir()
+        if require_image and not all(
+            os.path.isfile(os.path.join(image_dir, f"{symbol}.co"))
+            for _layout, symbol in a8w8_mxfp8_co_images(instance)
+        ):
+            missing.append(kid)
+            continue
+        instances[kid] = instance
+    if missing:
+        print(
+            f"[opus] a8w8_mxfp8 kid(s) {missing} dropped -- images not found under "
+            f"{_a8w8_mxfp8_co_image_dir()}. Build them with "
+            "csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
+            file=sys.stderr,
+        )
+    return instances
+
+
+a8w8_mxfp8_kernels_list = _load_a8w8_mxfp8_co_kernels()
+a8w8_mxfp8_co_kernels_declared = _load_a8w8_mxfp8_co_kernels(require_image=False)
+
+
 GFX1250_SPLITK_FUSE_KID_BASE = max(
     (*gfx1250_kernels_list, *gfx1250_clusterlaunch_kernels_list,
      *gfx1250_4wave_co_kernels_declared), default=-1,
@@ -3029,6 +3142,9 @@ def _gfx950_co_image_path(path, entry):
     return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
+MXFP8_DIRECTION_PATTERN = re.compile(r"_mxfp8_(nn|tt|tn)_")
+
+
 def _load_gfx950_co_kernels(path, require_image=True):
     with open(path) as stream:
         document = json.load(stream)
@@ -3055,6 +3171,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
         "prefetch_b_vgpr": "b_vgpr_co",
         "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
         "pingpong_lds": "m_repeat_co",
+        "mxfp8_nn": "mxfp8_nn_4wave_co",
+        "mxfp8_tt": "mxfp8_tt_4wave_co",
+        "mxfp8_tn": "mxfp8_tn_4wave_co",
     }
     for entry in entries.values():
         fields = (
@@ -3949,7 +4068,8 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
         for kid, instance in sorted(
             get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
         )
-        if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        if not MXFP8_DIRECTION_PATTERN.search(instance.name)
+        and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
     ]
 
 
@@ -3996,6 +4116,7 @@ KERNEL_REGISTRY = {
         "gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)},
         "gfx950": {cu: dict(sorted(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list.items())) for cu in (128, 256)},
     },
+    "a8w8_mxfp8": {"gfx950": {cu: dict(sorted(a8w8_mxfp8_kernels_list.items())) for cu in (128, 256)}},
 }
 
 
@@ -4012,6 +4133,7 @@ for _cat in (
     gfx942_kernels_list,
     gfx1250_a16w16_kernels_list,
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
+    a8w8_mxfp8_kernels_list,
 ):
     for _kid, _inst in _cat.items():
         _sig = repr(asdict(_inst))
@@ -4117,14 +4239,29 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
-    """Select the A16W16 compile floor from the current CU table."""
+    """Select the A16W16 compile floor from the current CU table.
+
+    On gfx950 the MXFP8 NN / TT / TN CO kids are added as well: the shape
+    heuristic and the tuners never pick them, so no tuned row requests them,
+    and gemm_a8w8_blockscale_bpreshuffle_opus must find them compiled.
+    """
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    return {
+    keys = {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
+    if lookup_gfx == "gfx950":
+        keys.update(
+            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
+            for kid, instance in get_registry(
+                "a8w8_blockscale_bpreshuffle", gfx, cu_num
+            ).items()
+            if instance.bpreshuffle_co is not None
+            and MXFP8_DIRECTION_PATTERN.search(instance.name)
+        )
+    return keys
 
 
 def _in_group(name, family, instance):
@@ -4320,6 +4457,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
         ),
+        "a8w8_mxfp8": A8W8_MXFP8_TAGS,
     },
     "gfx942": {
         "a16w16": frozenset(
@@ -4343,6 +4481,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_bpreshuffle_singlebuf"}
         ),
+        "a8w8_mxfp8": frozenset(),
     },
     "gfx1250": {
         "a16w16": frozenset(
@@ -4359,6 +4498,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale": frozenset(),
         "a8w8_mxscale_bmm": frozenset(),
         "a8w8_blockscale_bpreshuffle": frozenset(),
+        "a8w8_mxfp8": frozenset(),
     },
 }
 
