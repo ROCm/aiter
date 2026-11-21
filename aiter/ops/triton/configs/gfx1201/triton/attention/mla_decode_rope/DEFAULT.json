@@ -1,0 +1,21 @@
+{
+    "fwd_grouped_kernel_stage1_rope": {
+        "BLOCK_H": 16,
+        "BLOCK_N": 32,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    },
+    "fwd_grouped_kernel_stage1_rope_fp32": {
+        "BLOCK_H": 16,
+        "BLOCK_N": 32,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    },
+    "fwd_kernel_stage2": {
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 2
+    }
+}
