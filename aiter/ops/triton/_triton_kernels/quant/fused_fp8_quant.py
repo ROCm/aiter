@@ -995,3 +995,40 @@ def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
         quant_fp8_out.to(out_fp8_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+@triton.jit
+def _fused_silu_mul_fp8_per_token_quant_kernel(
+    q_ptr,
+    s_ptr,
+    inp_ptr,
+    stride_inp_row,
+    N: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    MIN_SCALE: tl.constexpr,
+):
+    """q[m], s[m] = per-token fp8 of silu(inp[m, :N]) * inp[m, N:]
+
+    silu and the product are each rounded to the input dtype, as an unfused
+    silu-and-mul stores them; one program per row.
+    """
+    # int64: row * N overflows int32 past 2**31 elements.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
+    gate = tl.load(inp_ptr + row * stride_inp_row + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(inp_ptr + row * stride_inp_row + N + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    act = (gate / (1.0 + tl.exp(-gate))).to(inp_ptr.dtype.element_ty).to(tl.float32)
+    y = (act * up).to(inp_ptr.dtype.element_ty).to(tl.float32)
+
+    # scale = amax * fp32(1 / DTYPE_MAX) and an IEEE reciprocal, as eager does.
+    amax = tl.max(tl.where(mask, tl.abs(y), 0.0), axis=0)
+    s = tl.maximum(amax * tl.math.div_rn(1.0, DTYPE_MAX), MIN_SCALE)
+    q = tl.clamp(y * tl.math.div_rn(1.0, s), -DTYPE_MAX, DTYPE_MAX)
+    tl.store(q_ptr + row * N + cols, q.to(q_ptr.dtype.element_ty), mask=mask)
+    tl.store(s_ptr + row, s)
