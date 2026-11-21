@@ -946,7 +946,7 @@ def build_one_a4w4_bpreshuffle(k, args, llvm_bin, workdir):
     }
 
 
-def _default_co_output_dir(arch, offload_arch, family):
+def _default_co_output_dir(arch, offload_arch, family=None):
     if arch == "gfx950":
         return os.path.join(
             _HERE,
