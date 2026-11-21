@@ -654,8 +654,11 @@ def _expand_selected_groups(
     tail_start = full_groups * RATIO
     history_end = tl.minimum(full_groups, n_groups) * RATIO
     is_history = cols < history_end
+    # A call now covers every row at once, so `row * out_s0` can pass 2^31
+    # elements (1M rows x 2051 columns). Widen before multiplying.
+    row64 = row.to(tl.int64)
     group = tl.load(
-        Groups + row * group_s0 + (cols // RATIO) * group_s1,
+        Groups + row64 * group_s0 + (cols // RATIO) * group_s1,
         (cols < out_cols) & is_history,
         -1,
     )
@@ -669,7 +672,7 @@ def _expand_selected_groups(
         -1,
     )
     tl.store(
-        Out + row * out_s0 + cols * out_s1,
+        Out + row64 * out_s0 + cols * out_s1,
         tl.where(is_history, history, tail).to(tl.int32),
         cols < out_cols,
     )
