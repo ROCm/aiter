@@ -15,7 +15,7 @@ import aiter
 import aiter.fused_moe as fm
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -312,11 +312,11 @@ def run_torch_moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
-def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
+def _moe_sorting_roofline(token, topk, E, model_dim, dtype, block_size=BLOCK_SIZE_M):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
-    max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
-    max_num_m_blocks = (max_num_tokens_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    max_num_tokens_padded = max_num_m_blocks * BLOCK_SIZE_M
+    max_num_tokens_padded = token * topk + E * block_size - topk
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    max_num_tokens_padded = max_num_m_blocks * block_size
     elem_bytes = torch.empty((), dtype=dtype).element_size()
     nbytes = (
         token * topk * 4
@@ -512,6 +512,7 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
         (1, 64),
     ):
         case = {
+            "gfx": get_gfx_runtime(),
             "E": E,
             "topk": topk,
             "block_size": block_size,
@@ -554,7 +555,9 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
         # Timed after the checked launch, so a hang is caught first. The roofline is
         # the crude one of the main benchmark.
         _, us = run_perftest(sort, num_warmup=1, num_iters=2)
-        flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
+        flops, nbytes = _moe_sorting_roofline(
+            token, topk, E, model_dim, dtype, block_size
+        )
         case["us"] = round(us, 2)
         case["TFLOPS"] = round(flops / us / 1e6, 5)
         case["TB/s"] = round(nbytes / us / 1e6, 5)
