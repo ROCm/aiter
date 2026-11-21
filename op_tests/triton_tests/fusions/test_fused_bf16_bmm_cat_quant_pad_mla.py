@@ -173,10 +173,14 @@ def ref_rope_cache(
 
 # M = 257 is above the largest M bucket, so it runs the "any" config with grouped tiles.
 @pytest.mark.parametrize("M", [1, 15, 64, 257])
-@pytest.mark.parametrize("QH, num_padded_heads", [(8, 16), (4, 16), (6, 12), (16, 16)])
+# (8, 8): the unpadded query of a sparse MLA decode at 8 heads per rank.
+@pytest.mark.parametrize(
+    "QH, num_padded_heads", [(8, 16), (4, 16), (6, 12), (16, 16), (8, 8)]
+)
 @pytest.mark.parametrize("scale", [1.0, 0.37, 1e-3])
-# K = 192 is not a multiple of BLOCK_SIZE_K, so it runs a masked K tail.
-@pytest.mark.parametrize("d_nope", [D_NOPE, 192])
+# K = 192 is not a multiple of BLOCK_SIZE_K, so it runs a masked K tail; K = 64
+# (Mistral Large 4's RoPE layers) has tuned configs for 8 and 16 heads.
+@pytest.mark.parametrize("d_nope", [D_NOPE, 192, 64])
 def test_fused_bf16_bmm_cat_quant_pad_mla(M, QH, num_padded_heads, scale, d_nope):
     if get_arch() not in SUPPORTED_ARCHS:
         pytest.skip(f"fused_bf16_bmm_cat_quant_pad_mla has no config for {get_arch()}")
