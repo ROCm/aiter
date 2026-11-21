@@ -1051,6 +1051,11 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
 
 
+def _skip_non_causal_verify_on_gfx1250(max_query_len: int) -> None:
+    if max_query_len > 1 and DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("multi-token non-causal calls raise on gfx1250 (not validated)")
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -1091,6 +1096,7 @@ def test_unified_attn_non_causal(
     backend: str,  # "triton" | "gluon"
 ) -> None:
     """With causal=False every query token attends to all keys of its sequence."""
+    _skip_non_causal_verify_on_gfx1250(max(q for q, _ in seq_lens))
     if backend == "gluon" and not _is_gluon_available():
         pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
     # Non-causal gluon calls run the Triton kernels; one shape checks that gate.
@@ -1213,6 +1219,7 @@ def test_unified_attn_non_causal_features(
 ) -> None:
     """Non-causal attention also takes sinks, a softcap and a shuffled KV cache;
     those run on the Triton kernels, as the Gluon kernels are causal-only."""
+    _skip_non_causal_verify_on_gfx1250(max(q for q, _ in seq_lens))
     block_size = 128
     (
         query,
@@ -1323,6 +1330,7 @@ def test_unified_attn_non_causal_no_window(
     window_size: tuple[int, int], query_len: int
 ) -> None:
     """Non-causal attention takes both forms of "no window"."""
+    _skip_non_causal_verify_on_gfx1250(query_len)
     block_size = 128
     seq_lens = [(query_len, 8704)] * 3 + [(query_len, 40)]
     (
@@ -1398,13 +1406,14 @@ def test_unified_attn_non_causal_no_window(
     "window_size, unsupported, match",
     [
         ((255, 0), None, "sliding window"),
+        ((-1, 128), None, "sliding window"),
         ((-1, -1), "alibi", "ALiBi"),
         ((-1, -1), "qq_bias", "query-query bias"),
         ((-1, -1), "fp4_q", "fp4 Q"),
         ((-1, -1), "fp4_kv", "fp4 Q or KV"),
         ((-1, -1), "fp4_v", "fp4 Q or KV"),
     ],
-    ids=["left_window", "alibi", "qq_bias", "fp4_q", "fp4_kv", "fp4_v"],
+    ids=["left_window", "right_window", "alibi", "qq_bias", "fp4_q", "fp4_kv", "fp4_v"],
 )
 # a decode batch runs on the causal kernels, but it must reject them too
 @pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
@@ -1453,6 +1462,7 @@ def test_unified_attn_non_causal_rejects_unsupported(
 @pytest.mark.parametrize("query_len", [4, 1])  # 1: the decode case
 def test_unified_attn_non_causal_ignores_gluon_request(monkeypatch, query_len) -> None:
     """A non-causal call runs Triton even when backend="gluon" and Gluon is missing."""
+    _skip_non_causal_verify_on_gfx1250(query_len)
     block_size = 128
     seq_lens = [(query_len, 1024)] * 2
     (
@@ -2913,3 +2923,31 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+def test_unified_attn_non_causal_rejected_on_gfx1250(monkeypatch) -> None:
+    """Multi-token non-causal calls raise on gfx1250, where they are not validated."""
+    monkeypatch.setattr(
+        sys.modules[unified_attention.__module__], "IS_DEVICE_ARCH_GFX12", True
+    )
+    q = torch.empty(2, 1, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.empty(1, 16, 1, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="not validated on gfx1250"):
+        unified_attention(
+            q=q,
+            k=kv,
+            v=kv,
+            out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=2,
+            max_seqlen_k=2,
+            softmax_scale=1.0,
+            causal=False,
+            window_size=(-1, -1),
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )

@@ -493,7 +493,7 @@ def unified_attention(
         causal: if True, mask the keys after each query token.
         window_size: (left, right). left >= 0 keeps the last left + 1 keys of
             each query token. (-1, -1) and (-1, 0) have no window. The kernels
-            do not read right.
+            do not read right; causal=False rejects right > 0.
         block_table: [num_seqs, max_num_blocks_per_seq] page of each block of
             keys.
         softcap: tanh soft cap of the scores. 0 disables it.
@@ -521,12 +521,14 @@ def unified_attention(
         query-query bias or an fp4 q or cache. The Gluon kernels are
         causal-only, so non-causal calls run the Triton kernels, except a
         decode batch (max_seqlen_q == 1), which keeps Gluon where available.
+        Non-causal calls with max_seqlen_q > 1 raise on gfx1250 (not validated).
     """
     # Checked before the decode case below turns causal on, so a decode batch
     # rejects them too; raised rather than asserted, so python -O keeps them.
     if not causal:
-        # The kernels read only the left size; (-1, 0) and (-1, -1) have no window.
-        if window_size[0] >= 0:
+        # The kernels read only the left size; (-1, 0) and (-1, -1) have no window, and
+        # a right size above 0 would be ignored, so it is rejected too.
+        if window_size[0] >= 0 or window_size[1] > 0:
             raise ValueError("Non-causal attention does not support a sliding window")
         if alibi_slopes is not None or qq_bias is not None:
             raise ValueError(
@@ -537,6 +539,10 @@ def unified_attention(
                 "Non-causal attention does not support an fp4 Q or KV cache"
             )
     ALL_DECODE = int(max_seqlen_q) == 1
+    if not causal and not ALL_DECODE and IS_DEVICE_ARCH_GFX12:
+        raise ValueError(
+            "Non-causal attention with more than one query token is not validated on gfx1250"
+        )
     # A decode query sees all keys either way, so it keeps the causal kernels.
     non_causal = not causal
     causal = causal or ALL_DECODE
