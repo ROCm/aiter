@@ -6,6 +6,7 @@
 Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
+import dataclasses
 import importlib.util
 import subprocess
 import sys
@@ -2583,10 +2584,9 @@ def _run_pa_decode_case(case, device, monkeypatch):
         pa.pa_decode(
             output,
             *arguments,
-            work_plan=None if case["plan_free"] else plan,
             **options,
             **workspace,
-            **quant,
+            **{"work_plan": None if case["plan_free"] else plan, **quant},
         )
 
     def check(out=None):
@@ -2670,7 +2670,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
     if case["nhd_contracts"]:
         _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["quant"] and arch == "gfx1250":
-        _check_quant_output(launch, query, output, compile_kwargs, case)
+        _check_quant_output(launch, query, output, compile_kwargs, case, plan)
     elif case["quant"]:
         with pytest.raises(NotImplementedError, match="requires gfx1250"):
             launch(
@@ -2782,7 +2782,7 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
             )
 
 
-def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
+def _check_quant_output(launch, query, output, compile_kwargs, case, plan, pad=3):
     """The FP8 output equals PA's output and the standalone per-token quant bit
     for bit, eagerly and in graph replays; poisoned outputs show every row is
     written, padded rows included. ``case["quant"]`` pins the path: "fused"
@@ -2796,7 +2796,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
     )
     scale = torch.empty(rows + pad, 1, device=output.device)
 
-    def run(store_output):
+    def run(store_output, **extra):
         output.fill_(float("nan"))
         fp8.view(torch.uint8).fill_(0x7F)
         scale.fill_(float("nan"))
@@ -2805,6 +2805,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
             output_scale=scale,
             store_output=store_output,
             quantized_pad_rows=pad,
+            **extra,
         )
 
     def check(store_output):
@@ -2821,10 +2822,22 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
         assert torch.equal(scale[:rows], ref_scale)
         assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
 
+    # Launches recorded by other cases must not skip the dispatch checked here.
+    importlib.import_module("aiter.ops.flydsl.pa_decode")._VALIDATED_LAUNCHES.clear()
     for store_output in (True, False):
         run(store_output)
         assert compile_kwargs[-1].get("quant_output", False) == fused
         check(store_output)
+    if fused and case["capture"]:
+        # With caller workspace (as ATOM passes it), a repeated call and a new
+        # plan of the same fields take the recorded launch: no dispatch, same
+        # bytes.
+        calls = len(compile_kwargs)
+        run(False)
+        fields = {f: getattr(plan, f).clone() for f in ("work_info", "reduce_info")}
+        run(False, work_plan=dataclasses.replace(plan, **fields))
+        assert len(compile_kwargs) == calls
+        check(False)
     if case["capture"]:
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
