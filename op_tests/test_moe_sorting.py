@@ -504,13 +504,18 @@ def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
     # an uninstantiated shape do, so output_aux=True takes the Opus sort under test.
     fm._mxfp4_aux_instance_supported = lambda *_args: False
     device_id = torch.cuda.current_device()
-    for E, block_size, output_aux, has_expert_mask, token in itertools.product(
-        LDS_FALLBACK_EXPERTS,
-        (16, 32, 64),
-        (False, True, fm.AUX_SORT_OPUS),
-        (False, True),
-        (1, 64),
-    ):
+    # M=2048 is where the multi-phase sort changes launch scheme, so test both sides of
+    # it at one block size.
+    aux_modes = (False, True, fm.AUX_SORT_OPUS)
+    cases = itertools.chain(
+        itertools.product(
+            LDS_FALLBACK_EXPERTS, (16, 32, 64), aux_modes, (False, True), (1, 64)
+        ),
+        itertools.product(
+            LDS_FALLBACK_EXPERTS, (32,), aux_modes, (False, True), (2047, 2048, 4096)
+        ),
+    )
+    for E, block_size, output_aux, has_expert_mask, token in cases:
         case = {
             "gfx": get_gfx_runtime(),
             "E": E,
