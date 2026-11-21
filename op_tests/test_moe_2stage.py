@@ -121,9 +121,10 @@ def parse_num_expert_activated():
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
-# Two runs of one kernel path differ by atomic-accumulation noise (~1e-7 per row in
-# 1 - cosine); a wrong, zeroed or half-written row differs by order 1.
-_OUTPUT_ROW_TOL = 1e-2
+# Two runs of one kernel path differ by atomic-accumulation noise: bf16 rounding of
+# a different summation order, about 4e-3 relative per element, so about 4e-3 in
+# per-row relative L2 error. A wrong, zeroed or half-written row is above 0.05.
+_OUTPUT_ROW_TOL = 0.05
 
 
 def _output_corruption(plain, out, row_tol=_OUTPUT_ROW_TOL):
@@ -131,22 +132,27 @@ def _output_corruption(plain, out, row_tol=_OUTPUT_ROW_TOL):
     without output=, or "" when it does not.
 
     Batch-wide metrics hide a single bad row (zeroing one of 4096 equal-energy rows
-    moves logits_diff by 1e-4), so rows are compared one by one. A row may be
-    non-finite only where `plain` is, which is how the known K-pad NaN shows up.
+    moves logits_diff by 1e-4, and a cosine ignores a row's gain), so every row is
+    compared by its relative L2 error. An element may be non-finite only where
+    `plain` is, which is how the known K-pad NaN shows up; any other non-finite
+    element is reported, even inside a row that already has one.
     """
-    out_bad = ~out.isfinite().all(-1)
-    plain_bad = ~plain.isfinite().all(-1)
-    if (out_bad & ~plain_bad).any():
-        return f"non-finite rows {torch.where(out_bad & ~plain_bad)[0].tolist()[:8]}"
-    ok = ~(out_bad | plain_bad)
-    x, y = plain.double()[ok], out.double()[ok]
-    denom = (x * x + y * y).sum(-1)
-    diff = torch.where(
-        denom > 0, 1 - 2 * (x * y).sum(-1) / denom, torch.zeros_like(denom)
+    out_ok, plain_ok = out.isfinite(), plain.isfinite()
+    new_bad = ~out_ok & plain_ok
+    if new_bad.any():
+        rows = torch.where(new_bad.any(-1))[0].tolist()[:8]
+        return f"non-finite elements in rows {rows}"
+    both = out_ok & plain_ok
+    x = torch.where(both, plain, torch.zeros_like(plain)).double()
+    y = torch.where(both, out, torch.zeros_like(out)).double()
+    num = ((x - y) ** 2).sum(-1)
+    den = (x**2).sum(-1)
+    rel = torch.where(
+        den > 0, (num / den.clamp_min(1e-300)).sqrt(), torch.where(num > 0, 1.0, 0.0)
     )
-    if diff.numel() and diff.max() > row_tol:
-        row = torch.where(ok)[0][diff.argmax()].item()
-        return f"row {row} differs from the call without output= by {diff.max():.3g}"
+    if rel.numel() and rel.max() > row_tol:
+        row = rel.argmax().item()
+        return f"row {row} differs from the call without output= by {rel.max():.3g}"
     return ""
 
 
@@ -2508,15 +2514,30 @@ def test_output_buffer_contract():
     # Negative controls for the row-wise check test_fmoe applies to output=.
     good = torch.randn((4096, 64), dtype=dtypes.bf16)
     assert not _output_corruption(good, good.clone())
+    noisy = (good.float() * (1 + 4e-3 * torch.randn_like(good.float()))).to(good.dtype)
+    assert not _output_corruption(good, noisy), "rounding-level noise failed"
     zeroed = good.clone()
     zeroed[1234] = 0
     assert "row 1234" in _output_corruption(good, zeroed), "a zeroed row passed"
+    gain = good.clone()
+    gain[77] = (gain[77].float() * 1.14).to(good.dtype)
+    assert "row 77" in _output_corruption(good, gain), "a 14% gain error passed"
     nan_out = good.clone()
     nan_out[7, 3] = float("nan")
     assert "non-finite" in _output_corruption(good, nan_out), "an extra NaN passed"
     nan_plain = good.clone()
     nan_plain[7, 5] = float("nan")
     assert not _output_corruption(nan_plain, nan_plain.clone()), "a shared NaN failed"
+    same_row = nan_plain.clone()
+    same_row[7, 9] = float("nan")
+    assert "non-finite" in _output_corruption(
+        nan_plain, same_row
+    ), "a new NaN in a NaN row passed"
+    unwritten = nan_plain.clone()
+    unwritten[7] = float("nan")
+    assert "non-finite" in _output_corruption(
+        nan_plain, unwritten
+    ), "an unwritten NaN row passed"
     new_nan = nan_plain.clone()
     new_nan[9, 5] = float("nan")
     assert "non-finite" in _output_corruption(
