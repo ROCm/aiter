@@ -24,33 +24,60 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 D = 128
 NQ, NKV, ROT = 16, 1, 64
 K_DIM = 6144
-# Past this the unfused GEMM + fused_qknorm_idxrqknorm is faster: the partial
-# planes outgrow what L2 absorbs and the activation re-reads the per-CU budget.
-MAX_TOKENS = 192
+# (max rows, config) per number of index-q heads; config = (tile_m, ns, ks, kw,
+# wm, wn, depth, astage, wcpol, owner_keeps). Graph-replay sweeps on MI455X,
+# MiniMax-M3.1 TP4 shapes, cold weights (bench_qkv_chain.py / validate_k3.py). A
+# cluster is one head's ns x ks workgroups; head-aligned clusters with ns = 1 take a
+# whole head (128 columns) a workgroup and keep the cluster count <= the concurrent
+# cluster slots (16 shader engines x 16 // (ns * ks)), so every cluster is resident.
+_CHAIN_ROWS = {
+    # niq: [(max rows, cfg)]. Cold-weight graph replay on MI455X (24 weight
+    # copies): non-temporal weight loads (wcpol 1) everywhere; one m-tile up to 96
+    # rows (65-96: 6 K-waves, owner-kept rows), 64-row tiles past that; from 49
+    # rows the activation slab goes to LDS by TDM (astage 2).
+    1: [
+        (16, (16, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (32, (32, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (48, (48, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (64, (64, 2, 4, 6, 1, 2, 2, 2, 1, 0)),
+        (80, (80, 2, 4, 6, 1, 2, 2, 2, 1, 1)),
+        (96, (96, 2, 4, 6, 1, 2, 2, 2, 1, 1)),
+        (192, (64, 2, 4, 4, 1, 2, 2, 2, 1, 1)),
+    ],
+    # indexer CP (4 index-q heads, 23 heads): past 128 rows the 69 clusters of the
+    # 64-row tiles outrun the shader engines and the unfused chain is as fast.
+    4: [
+        (16, (16, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (32, (32, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (48, (48, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (64, (64, 2, 4, 6, 1, 2, 2, 2, 1, 0)),
+        (80, (80, 2, 4, 6, 1, 2, 2, 2, 1, 1)),
+        (96, (96, 2, 4, 6, 1, 2, 2, 2, 1, 1)),
+        (128, (64, 2, 4, 4, 1, 2, 2, 2, 1, 1)),
+    ],
+}
+MAX_TOKENS = max(r for rows in _CHAIN_ROWS.values() for r, _ in rows)
 
 
-def mxfp8_qkv_chain_config(m: int):
-    """(tile_m, ns, ks, kw, wm, wn, depth) for ``m`` tokens, or None past MAX_TOKENS.
-
-    A cluster is one head's ns x ks workgroups; graph-replay sweeps on MI455X,
-    MiniMax-M3.1 TP4, warm and cold weights."""
-    if not 0 < m <= MAX_TOKENS:
-        return None
-    if m <= 64:
-        return ((m + 15) // 16 * 16, 2, 4, 6, 1, 2, 2)
-    return (64, 2, 4, 4, 1, 2, 2)
+def mxfp8_qkv_chain_config(m: int, num_index_heads: int = 1):
+    """The chain config for ``m`` tokens (10 fields), or None where the unfused GEMM +
+    fused_qknorm_idxrqknorm keeps the call."""
+    for max_rows, cfg in _CHAIN_ROWS.get(num_index_heads, ()):
+        if 0 < m <= max_rows:
+            return cfg
+    return None
 
 
 def mxfp8_qkv_chain_supported(
     m: int, num_heads: int, num_kv_heads: int, head_dim: int, rotary_dim: int,
-    hidden_size: int,
+    hidden_size: int, num_index_heads: int = 1,
 ) -> bool:  # fmt: skip
     """Whether the fused chain takes this call (gfx1250, the M3 TP4 head shape)."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return (
         get_gfx_runtime() == "gfx1250"
-        and mxfp8_qkv_chain_config(m) is not None
+        and mxfp8_qkv_chain_config(m, num_index_heads) is not None
         and (num_heads, num_kv_heads, head_dim, rotary_dim, hidden_size)
         == (NQ, NKV, D, ROT, K_DIM)
     )
@@ -129,7 +156,7 @@ def mxfp8_qkv_norm_rope_nvfp4_insert(
         return
     niq = num_index_heads
     n = (NQ + 2 * NKV + niq + 1) * D
-    cfg = config or mxfp8_qkv_chain_config(m)
+    cfg = config or mxfp8_qkv_chain_config(m, num_index_heads)
     if cfg is None:
         raise ValueError(f"mxfp8_qkv_norm_rope_nvfp4_insert: no config for M={m}")
     if (
@@ -169,13 +196,27 @@ def mxfp8_qkv_norm_rope_nvfp4_insert(
         or eps < 2.0**-126  # v_rsq_f32 without ocml's denormal scaling
     ):
         raise ValueError("mxfp8_qkv_norm_rope_nvfp4_insert: outputs / rope / eps")
-    tile_m, ns, ks, kw, wm, wn, depth = cfg
+    cfg = tuple(cfg) + (1, 0, 0)[len(cfg) - 7 :] if len(cfg) < 10 else tuple(cfg)
+    tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol, owner_keeps = cfg
     mpad = (m + tile_m - 1) // tile_m * tile_m
     slab = _slab(x.device, ks * mpad * n)
     write_qkv = qkv_out is not None
     eps_bits = struct.unpack("<i", struct.pack("<f", float(eps)))[0]
     stream = torch.cuda.current_stream(x.device)
-    spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, write_qkv)
+    spec = (
+        tile_m,
+        ns,
+        ks,
+        kw,
+        wm,
+        wn,
+        depth,
+        niq,
+        write_qkv,
+        astage,
+        wcpol,
+        owner_keeps,
+    )
     _run_compiled(
         _launcher(),
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),

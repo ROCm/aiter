@@ -51,7 +51,11 @@ from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
+from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    make_lds_copy_ops,
+    pipeline_fence,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -76,7 +80,7 @@ def chain_heads(niq: int) -> int:
     return NQ + 2 * NKV + niq + 1
 
 
-def chain_config_error(tile_m, ns, ks, kw, wm, wn, depth):
+def chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage=1):
     steps_total = K_DIM // WMMA_K
     if ns not in (1, 2, 4, 8) or ns * ks > 16 or ns * ks < 2:
         return f"ns={ns} x ks={ks} must be a 2..16 cluster"
@@ -92,17 +96,26 @@ def chain_config_error(tile_m, ns, ks, kw, wm, wn, depth):
     block = kw * wm * wn * WAVE
     if block > 1024:
         return "more than 32 waves"
-    if (tile_m * steps * 8) % block:
+    if astage == 1 and (tile_m * steps * 8) % block:
         return "staged activation does not divide over the block"
+    if astage == 2 and ((K_DIM // ks) % A_KC or block // WAVE < (K_DIM // ks) // A_KC):
+        return f"TDM activation: whole {A_KC}-byte K chunks, one wave a chunk"
     if depth < 1:
         return "depth >= 1"
-    if chain_lds_bytes(tile_m, ns, ks, kw) > 320 * 1024:
+    if chain_lds_bytes(tile_m, ns, ks, kw, astage) > 320 * 1024:
         return "LDS over 320 KB"
     return None
 
 
-def chain_lds_bytes(tile_m, ns, ks, kw):
-    a = tile_m * (K_DIM // ks)
+A_KC = 512  # K bytes of one TDM activation chunk (the pad interval must be <= 1024 B)
+A_PAD = 16  # its LDS row pad (the production GEMMs' LDS_PAD_A)
+
+
+def chain_lds_bytes(tile_m, ns, ks, kw, astage=1):
+    if astage == 2:
+        a = (K_DIM // ks) // A_KC * tile_m * (A_KC + A_PAD)
+    else:
+        a = tile_m * (K_DIM // ks) if astage else 0
     p = kw * tile_m * (D // ns * 4 + P_PAD)
     return max(a, p)
 
@@ -239,8 +252,19 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     depth: Constexpr[int],
     niq: Constexpr[int],
     write_qkv: Constexpr[bool],
+    astage: Constexpr[int] = 1,
+    wcpol: Constexpr[int] = 0,
+    owner_keeps: Constexpr[int] = 0,
 ):
-    err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth)
+    # astage 1: the activation slab is staged in LDS through VGPRs; 2: by TDM in
+    # 512-byte K chunks into padded LDS rows (the production gfx1250 GEMMs'
+    # non-multicast descriptor + pipeline_fence); 0: each wave loads its
+    # activation fragments straight from global (L2) into VGPRs (no LDS traffic,
+    # wm = 1 waves never duplicate a weight load). wcpol: the weight loads' cache
+    # policy (1: non-temporal; every weight byte is read once). owner_keeps: a rank's
+    # own K-part of the rows it reduces stays in its LDS K-wave planes (and padding
+    # rows are never written), so only the other ranks' rows cross the slab.
+    err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
     if err is not None:
         raise ValueError(f"qkv chain: {err}")
     K = K_DIM
@@ -263,7 +287,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     sa_loads = mbw // 2 if sa_opsel else mbw
     KB4 = K // 128  # activation-scale dwords of a row
     per_thr = tile_m * CPR // block
-    lds_bytes = chain_lds_bytes(tile_m, ns, ks, kw)
+    lds_bytes = chain_lds_bytes(tile_m, ns, ks, kw, astage)
     P_ROW = cols * 4 + P_PAD  # LDS pitch of a partial row
     P_PLANE = tile_m * P_ROW
     p_units = tile_m * cols // 4  # float4s of a partial tile
@@ -275,7 +299,8 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     cpol = CPOL_DEV
     kernel_name = (
         f"mxfp8_qkv_norm_rope_nvfp4_insert_gfx1250_n{N}_t{tile_m}_ns{ns}_ks{ks}"
-        f"_w{kw}x{wm}x{wn}_d{depth}{'_wq' if write_qkv else ''}"
+        f"_w{kw}x{wm}x{wn}_d{depth}{'_wq' if write_qkv else ''}{'' if astage == 1 else ('_tdmA' if astage == 2 else '_dA')}"
+        f"{f'_c{wcpol}' if wcpol else ''}{'_ok' if owner_keeps else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -359,6 +384,12 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
         lda16 = i32_lda // 16
         sa_buf = ptr_buf_tensor(arg_as, fx.Int32, num_records_bytes=i32_m * (K // 32))
         b_buf = ptr_buf_tensor(arg_w, fx.Int32, unit_elems=4)
+        # direct activation fragments: lane row lane16 of m-block mi, 16-byte chunk
+        # 2 jj + kgrp of the K step (the WMMA operand order)
+        a_rowu = [
+            (m0 + (w_m * mbw + mi) * 16 + lane16) * lda16 + kgrp
+            for mi in range_constexpr(mbw)
+        ]
         sb_buf = ptr_buf_tensor(arg_ws, fx.Int32)
 
         nblk0 = head * 8 + npart * nbt + w_n * nbw
@@ -386,7 +417,13 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             ksg = ks0 + st0 + i
             bfr = [
                 [
-                    buf_copy_load(b_buf, b_base[j] + ksg * 128 + jj * 32, fx.Int32, 4)
+                    buf_copy_load(
+                        b_buf,
+                        b_base[j] + ksg * 128 + jj * 32,
+                        fx.Int32,
+                        4,
+                        cache_modifier=wcpol,
+                    )
                     for jj in range_constexpr(4)
                 ]
                 for j in range_constexpr(nbw)
@@ -399,7 +436,20 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
                 buf_copy_load(sa_buf, sa_base[p] + ksg, fx.Int32)
                 for p in range_constexpr(sa_loads)
             ]
-            return [bfr, sb, sa]
+            afr = None
+            if const_expr(not astage):
+                afr = [
+                    [
+                        Vec(
+                            buf_copy_load(
+                                a_buf, a_rowu[mi] + ksg * 8 + jj * 2, fx.Int32, 4
+                            )
+                        )
+                        for jj in range_constexpr(4)
+                    ]
+                    for mi in range_constexpr(mbw)
+                ]
+            return [bfr, sb, sa, afr]
 
         # Activation staging: unit u = (row u // CPR, 16-byte chunk u % CPR of the
         # workgroup's K range) lands at its fragment-order, row-swizzled LDS slot.
@@ -427,8 +477,24 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             for par in range_constexpr(2)
         ]
 
+        A_ROW = A_KC + A_PAD
+        A_STAGE = tile_m * A_ROW
+        n_chunks = (K // ks) // A_KC
+
         def load_a_frag(mi, i):
             s = st0 + i  # step inside the workgroup range
+            if const_expr(astage == 2):
+                # TDM chunks: [chunk][tile row][512 + 16 B], 4 K steps a chunk
+                b2 = (
+                    (s // 4) * A_STAGE
+                    + ((mblk0 + mi) * 16 + lane16) * A_ROW
+                    + (s % 4) * 128
+                    + kgrp * 16
+                )
+                return [
+                    Vec(lds_load_b128(lds_idx, b2 + 32 * jj))
+                    for jj in range_constexpr(4)
+                ]
             base = ((mblk0 + mi) * steps + s) * 2048
             par = (w_k * steps_w + i) % 2 if const_expr(steps_w % 2) else i % 2
             if const_expr(steps_w % 2):
@@ -477,7 +543,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             return t
 
         def compute_step(st, afr):
-            bfr, sb, sa = st
+            bfr, sb, sa, _ = st
             bt = [_rmem(_cat16(bfr[j])) for j in range_constexpr(nbw)]
             at = [_rmem(_cat16(afr[mi])) for mi in range_constexpr(mbw)]
             for mi in range_constexpr(mbw):
@@ -502,24 +568,66 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             ]
             for b0 in range_constexpr(0, per_thr, A_BATCH)
         ]
-        a_vals0 = [a_load(u) for u in batches[0]]
+        if const_expr(astage == 2):
+            # wave c < n_chunks moves activation chunk c ([tile_m, 512 B] of the
+            # workgroup's K range); rows past M are zero-filled, not fetched
+            gA_base = fx.recast_iter(fx.Int8, arg_a)
+            if wave < n_chunks:
+                c_off = fx.Int64(m0) * fx.Int64(i32_lda) + fx.Int64(
+                    ks0 * WMMA_K + wave * A_KC
+                )
+                desc = tdm_ops.make_tensor_descriptor_2d(
+                    global_ptr=fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(gA_base, c_off),
+                            fx.make_layout((tile_m, A_KC), (A_KC, 1)),
+                        )
+                    ),
+                    lds_memref=fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(arena.base_ptr, wave * A_STAGE),
+                            fx.make_layout((tile_m, A_KC), (A_ROW, 1)),
+                        )
+                    ),
+                    global_offset=(0, 0),
+                    tensor_shape=(tile_m, A_KC),
+                    strides=(i32_lda, 1),
+                    tile_shape=(tile_m, A_KC),
+                    elem_bytes=1,
+                    pad_interval=A_KC,
+                    pad_amount=A_PAD,
+                    num_warps=1,
+                    workgroup_mask=0,
+                    oob_outer_bound=i32_m - m0,
+                )
+                tdm_ops.tensor_load_2d(desc)
+        a_vals0 = [a_load(u) for u in batches[0]] if const_expr(astage == 1) else []
         rocdl.sched_barrier(0)
         inflight = [load_b_step(i) for i in range_constexpr(depth)]
         rocdl.sched_barrier(0)
         for u, val in zip(batches[0], a_vals0):
             lds_store_b128(lds_idx, a_lds_off(u), val)
-        for units in batches[1:]:
+        for units in (batches[1:] if const_expr(astage == 1) else []):
             vals = [a_load(u) for u in units]
             for u, val in zip(units, vals):
                 lds_store_b128(lds_idx, a_lds_off(u), val)
-        _lds_barrier()
+        if const_expr(astage == 2):
+            pipeline_fence(
+                outstanding=0, use_cluster=False
+            )  # the activation tile is in LDS
+        else:
+            _lds_barrier()
         rocdl.sched_barrier(0)
         for i in range_constexpr(steps_w):
             st = inflight.pop(0)
             if const_expr(i + depth < steps_w):
                 inflight.append(load_b_step(i + depth))
                 rocdl.sched_barrier(0)
-            afr = [load_a_frag(mi, i) for mi in range_constexpr(mbw)]
+            afr = (
+                [load_a_frag(mi, i) for mi in range_constexpr(mbw)]
+                if const_expr(astage)
+                else st[3]
+            )
             compute_step(st, afr)
 
         # ---- epilogue inputs that are not partials: in flight across the barrier ----
@@ -578,7 +686,13 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
                 ).bitcast(fx.Float32)
                 tot = part if tot is None else tot + part
             g = ((kpart * i32_mpad + m0 + r) * N + head * D + npart * cols) // 4 + c4
-            if const_expr(p_units % block == 0):
+            if const_expr(owner_keeps):
+                ok = ((r < r_base) | (r >= r_base + rpr)) & ((m0 + r) < i32_m)
+                if const_expr(p_units % block):
+                    ok = ok & (u < p_units)
+                if ok:
+                    buf_copy_store(slab_buf, g, tot, fx.Float32, 4, cache_modifier=cpol)
+            elif const_expr(p_units % block == 0):
                 buf_copy_store(slab_buf, g, tot, fx.Float32, 4, cache_modifier=cpol)
             else:
                 if u < p_units:
@@ -599,20 +713,32 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
         # ---- reduce this rank's rows in split order, then the head's epilogue ----
         eps = i32_eps.bitcast(fx.Float32)
         parts = []
+        owns = []
+        own_lane = (
+            hl // (cols // 4)
+        ) == npart  # this lane's dims are this WG's columns
         for t in range_constexpr(row_iters):
             row = m0 + e_rows[t]
-            parts.append(
-                [
-                    buf_copy_load(
-                        slab_buf,
-                        ((k * i32_mpad + row) * N + head * D) // 4 + hl,
-                        fx.Float32,
-                        4,
-                        cache_modifier=cpol,
-                    )
-                    for k in range_constexpr(ks)
-                ]
-            )
+            pk = []
+            for k in range_constexpr(ks):
+                gi = ((k * i32_mpad + row) * N + head * D) // 4 + hl
+                if const_expr(owner_keeps):
+                    # the own part: an out-of-range index, no fetch (read from LDS below)
+                    gi = ((kpart == k) & own_lane).select(fx.Int32(0x0FFFFFF0), gi)
+                pk.append(
+                    buf_copy_load(slab_buf, gi, fx.Float32, 4, cache_modifier=cpol)
+                )
+            parts.append(pk)
+            if const_expr(owner_keeps):
+                rl = (e_rows[t] < tile_m).select(e_rows[t], fx.Int32(tile_m - 1))
+                cl = own_lane.select(hl - npart * (cols // 4), fx.Int32(0))
+                own = None
+                for k in range_constexpr(kw):
+                    part = Vec(
+                        lds_load_b128(lds_idx, k * P_PLANE + rl * P_ROW + cl * 16)
+                    ).bitcast(fx.Float32)
+                    own = part if own is None else own + part
+                owns.append(own)
         q_buf = ptr_buf_tensor(
             arg_q, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (NQ * D * 2)
         )
@@ -632,9 +758,12 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
         for t in range_constexpr(row_iters):
             row = m0 + e_rows[t]
             valid = e_valid[t]
-            acc4 = parts[t][0]
-            for k in range_constexpr(1, ks):
-                acc4 = acc4 + parts[t][k]
+            acc4 = None
+            for k in range_constexpr(ks):
+                pk = Vec(parts[t][k])
+                if const_expr(owner_keeps):
+                    pk = ((kpart == k) & own_lane).select(owns[t], pk)
+                acc4 = pk if acc4 is None else acc4 + pk
             raw = acc4.to(fx.BFloat16)
             raw_w = raw.bitcast(fx.Int32)  # 2 dwords
             e = _bf16x4(raw_w)

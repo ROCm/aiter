@@ -117,8 +117,9 @@ def deq(codes, scales):
     )
 
 
-@pytest.mark.parametrize("m, niq", [(1, 1), (16, 1), (33, 1), (64, 1), (100, 1),
-                                    (128, 1), (192, 1), (64, 4), (128, 4)])  # fmt: skip
+@pytest.mark.parametrize("m, niq", [(1, 1), (16, 1), (33, 1), (64, 1), (80, 1), (96, 1),
+                                    (100, 1), (128, 1), (150, 1), (192, 1), (64, 4),
+                                    (96, 4), (128, 4)])  # fmt: skip
 def test_fused_chain(m, niq):
     c = make_case(m, niq, seed=m * 7 + niq)
     of = pools(c)
