@@ -2636,18 +2636,30 @@ def test_gfx942_asm_1stage_4gib_guard():
 
             # int8 g1u1: the 2-stage path also launches an asm stage 1, which wraps
             # the same way, so an oversized one is rejected instead of rerouted.
+            # 16 tokens stay off the 1-stage heuristic (token > 32) on both arches,
+            # whose int8 per_Token key is in the gfx942 1-stage table.
             i8 = dtypes.i8
             i8_qtype = aiter.QuantType.per_Token
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
-            assert dispatch(256, 2048, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
+            assert dispatch(16, 2048, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
             try:
-                dispatch(256, 2048, i8_qtype, i8, i8)
+                dispatch(16, 2048, i8_qtype, i8, i8)
             except NotImplementedError:
                 pass
             else:
                 raise AssertionError("oversized int8 g1u1 weights must be rejected")
-            assert dispatch(256, 1024, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
+            assert dispatch(16, 1024, i8_qtype, i8, i8).stage1.func is fm.asm_stage1
+            if host == "gfx942":
+                # gfx942 also takes asm 1-stage for int8 above 32 tokens: the guard
+                # rejects oversized weights there and keeps the ones that fit.
+                try:
+                    dispatch(256, 2048, i8_qtype, i8, i8)
+                except NotImplementedError:
+                    pass
+                else:
+                    raise AssertionError("oversized int8 1-stage must be rejected")
+                assert run_1stage(256, 1024, i8_qtype, i8, i8)
 
             # A tuned 1-stage row bypasses the heuristic branch; it must not get
             # past the guard either. Inject one row into the tuned-config cache.
@@ -2692,6 +2704,47 @@ def test_gfx942_asm_1stage_4gib_guard():
                     return run_1stage(tuned_token, 2048, qtype, fp8, tuned=True)
                 finally:
                     fm.cfg_2stages = saved_cfgs
+
+            # A tuned non-gated 1-stage row at 256+ tokens: dropping it would
+            # hand the call to CK stage 1 (the heuristic only keeps 1-stage below
+            # 256 tokens), which assumes fused gate and up, so it is rejected.
+            ng_key = (
+                host,
+                get_cu_num(),
+                256,
+                7168,
+                2048,
+                256,
+                8,
+                str(aiter.ActivationType.Silu),
+                str(bf16),
+                str(bf16),
+                str(bf16),
+                str(ng_qtype),
+                False,
+                False,
+            )
+            ng_row = {
+                "block_m": 32,
+                "ksplit": 0,
+                "kernelName1": row_kernel,
+                "kernelName2": "",
+                "run_1stage": True,
+            }
+            saved_cfgs = fm.cfg_2stages
+            fm.cfg_2stages = ({ng_key: ng_row}, {})
+            try:
+                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
+                assert run_1stage(256, 2048, ng_qtype, bf16, bf16, False, tuned=True)
+                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+                try:
+                    run_1stage(256, 2048, ng_qtype, bf16, bf16, False, tuned=True)
+                except NotImplementedError:
+                    pass
+                else:
+                    raise AssertionError("tuned oversized non-gated row not rejected")
+            finally:
+                fm.cfg_2stages = saved_cfgs
 
             per_token = aiter.QuantType.per_Token
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()

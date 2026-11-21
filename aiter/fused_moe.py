@@ -2531,6 +2531,14 @@ _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
 _ASM_FMOE_U32_WEIGHT_OFFSET_OK = (("gfx950", QuantType.per_1x128),)
 
 
+def _non_gated_past_4gib_error():
+    return NotImplementedError(
+        "Non-gated MoE weights past 4 GiB are not supported on "
+        f"{get_gfx_runtime()}: the asm 1-stage kernel wraps 32-bit "
+        "offsets and CK stage 1 assumes gate and up are fused."
+    )
+
+
 def _asm_fmoe_weights_fit_u32_offsets(
     expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
 ):
@@ -4843,6 +4851,10 @@ def get_2stage_cfgs(
             (get_gfx_runtime(), q_type) in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
             and not guard_xbf16
         ):
+            # Non-gated weights cannot fall back to CK stage 1 (it assumes gate
+            # and up are fused), and the heuristic would pick it at 256+ tokens.
+            if not use_g1u1:
+                raise _non_gated_past_4gib_error()
             logger.warning(
                 "[fused_moe] discarding tuned asm 1-stage config %r for %s: the "
                 "weights are past 4 GiB and the kernel uses 32-bit expert offsets; "
@@ -4905,11 +4917,7 @@ def get_2stage_cfgs(
                 )
             ):
                 if not use_g1u1:
-                    raise NotImplementedError(
-                        "Non-gated MoE weights past 4 GiB are not supported on "
-                        f"{get_gfx_runtime()}: the asm 1-stage kernel wraps 32-bit "
-                        "offsets and CK stage 1 assumes gate and up are fused."
-                    )
+                    raise _non_gated_past_4gib_error()
                 run_1stage = False
                 run_1stage_xbf16 = False
 
