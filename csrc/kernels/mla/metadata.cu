@@ -193,6 +193,7 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                             const std::string& arch,
                             const int64_t enable_experimental,
                             const int64_t flydsl_ps1,
+                            const int64_t native_96h_cp,
                             const int64_t v_head_dim,
                             const int64_t page_size,
                             const int64_t cp_world_size,
@@ -216,7 +217,8 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
     const std::string arch_id = arch.empty() ? get_gpu_arch() : arch;
     const MlaPlannerFlags flags{
         enable_experimental < 0 ? env_flag("AITER_ENABLE_EXPERIMENTAL") : enable_experimental != 0,
-        flydsl_ps1 < 0 ? env_flag("AITER_MLA_DECODE_PS1_FLYDSL") : flydsl_ps1 != 0};
+        flydsl_ps1 < 0 ? env_flag("AITER_MLA_DECODE_PS1_FLYDSL") : flydsl_ps1 != 0,
+        native_96h_cp < 0 ? env_flag("AITER_MLA_NATIVE_96H_CP") : native_96h_cp != 0};
     const AiterDtype q_dtype  = static_cast<AiterDtype>(dtype_q_nope);
     const AiterDtype kv_dtype = static_cast<AiterDtype>(dtype_kv_nope);
 
@@ -230,6 +232,7 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                                                      static_cast<int32_t>(page_size),
                                                      fast_mode,
                                                      intra_batch_mode,
+                                                     cp_round_robin,
                                                      flags);
     const bool reduce_supported =
         mla_reduce_v1_supports(p.kernel_num_heads, static_cast<int32_t>(v_head_dim));

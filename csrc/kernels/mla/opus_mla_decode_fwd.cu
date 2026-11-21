@@ -95,8 +95,10 @@ enum class OpusA8W8Route
 inline OpusA8W8Route opus_a8w8_route(int nhead, int max_seqlen_q)
 {
     const int q = max_seqlen_q;
+    // 96 heads up to qlen 8 is kernel capability; the planner (AITER_MLA_NATIVE_96H_CP)
+    // decides whether they arrive unfolded.
     if((nhead == 32 && q >= 4) || (nhead == 64 && q >= 2) || nhead == 128 ||
-       (nhead == 96 && q <= 6) || (nhead == 16 && q > 4) || (nhead == 12 && nhead * q <= 128))
+       (nhead == 96 && q <= 8) || (nhead == 16 && q > 4) || (nhead == 12 && nhead * q <= 128))
         return OpusA8W8Route::k32mx4;
     if((nhead == 16 && (q == 3 || q == 4)) || (nhead == 32 && (q == 2 || q == 3)) ||
        (nhead == 64 && q == 1))

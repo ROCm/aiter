@@ -1987,6 +1987,7 @@ def get_mla_decode_head_plan_v1(
     arch: str,
     enable_experimental: int,
     flydsl_ps1: int,
+    native_96h_cp: int,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -2048,6 +2049,10 @@ _MlaHeadPlan = _namedtuple(
 )
 
 
+def _mla_native_96h_cp_enabled() -> bool:
+    return env_flag_atoi("AITER_MLA_NATIVE_96H_CP")
+
+
 def _mla_opus_enabled() -> bool:
     return env_flag_atoi("AITER_MLA_USE_OPUS")
 
@@ -2088,7 +2093,7 @@ def _mla_shape_dtype(dtype: torch.dtype) -> tuple[int, str]:
 def _mla_cpp_gpu_arch(device_index: int) -> str:
     bf16 = _aiter_dtype_ids["bf16"]
     plan = get_mla_decode_head_plan_v1(
-        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 512, 1, 1, *(False,) * 4
+        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 0, 512, 1, 1, *(False,) * 4
     )
     return plan[0]
 
@@ -2110,6 +2115,7 @@ def _mla_decode_head_plan_cached(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -2132,6 +2138,7 @@ def _mla_decode_head_plan_cached(
             arch,
             int(enable_experimental),
             int(flydsl_ps1),
+            int(native_96h_cp),
             v_head_dim,
             page_size,
             cp_world_size,
@@ -2162,6 +2169,7 @@ def _mla_decode_head_plan(
     arch: str | None = None,
     enable_experimental: bool | None = None,
     flydsl_ps1: bool | None = None,
+    native_96h_cp: bool | None = None,
 ) -> _MlaHeadPlan:
     # mla_decode_fwd calls this on every eager step: resolve the env flags and
     # the arch here and leave everything else to one cache lookup.
@@ -2183,6 +2191,7 @@ def _mla_decode_head_plan(
             if flydsl_ps1 is None
             else bool(flydsl_ps1)
         ),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         int(v_head_dim),
         int(page_size),
         int(cp_world_size),
@@ -2204,6 +2213,7 @@ def _mla_decode_head_plan_by_dtype(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -2227,6 +2237,7 @@ def _mla_decode_head_plan_by_dtype(
         arch,
         enable_experimental,
         flydsl_ps1,
+        native_96h_cp,
         v_head_dim,
         page_size,
         cp_world_size,
@@ -2249,11 +2260,14 @@ def _mla_decode_launch_plan(
     cp_world_size: int,
     cp_round_robin: bool,
     has_scales: bool,
+    native_96h_cp: bool | None = None,
 ) -> tuple[_MlaHeadPlan, int]:
     """mla_decode_fwd's persistent gate: the head plan and the split bound.
 
     It runs on every eager step, so it reads the env flags as raw strings and
     leaves parsing, the arch and both C++ rules to one cache lookup.
+    native_96h_cp=None reads AITER_MLA_NATIVE_96H_CP; mla_decode_fwd passes the
+    opt-in get_mla_metadata_v1 recorded with the metadata instead.
     """
     env = _os.environ
     return _mla_decode_launch_plan_cached(
@@ -2270,6 +2284,11 @@ def _mla_decode_launch_plan(
         torch.cuda.current_device(),
         env.get("AITER_ENABLE_EXPERIMENTAL", ""),
         env.get("AITER_MLA_DECODE_PS1_FLYDSL", ""),
+        (
+            env.get("AITER_MLA_NATIVE_96H_CP", "")
+            if native_96h_cp is None
+            else str(int(bool(native_96h_cp)))
+        ),
         env.get("AITER_MLA_USE_OPUS", ""),
         env.get("AITER_MLA_DECODE_PS1_ASM", "1"),
     )
@@ -2290,6 +2309,7 @@ def _mla_decode_launch_plan_cached(
     device_index: int,
     experimental: str,
     flydsl_ps1: str,
+    native_96h_cp: str,
     use_opus: str,
     use_ps1_asm: str,
 ) -> tuple[_MlaHeadPlan, int]:
@@ -2310,6 +2330,7 @@ def _mla_decode_launch_plan_cached(
         arch=arch,
         enable_experimental=_atoi_flag(experimental),
         flydsl_ps1=_atoi_flag(flydsl_ps1),
+        native_96h_cp=_atoi_flag(native_96h_cp),
     )
     # A byte KV buffer (3-buffer layout) is sized as fp8, like its callers do.
     if kv_dtype in (torch.int8, torch.uint8):
@@ -2431,6 +2452,7 @@ def _get_mla_decode_shape_support_cached(
     arch: str,
     enable_experimental: bool,
     flydsl_ps1: bool,
+    native_96h_cp: bool,
     use_opus: bool,
     use_ps1_asm: bool,
 ) -> MlaDecodeShapeSupport:
@@ -2446,6 +2468,7 @@ def _get_mla_decode_shape_support_cached(
         arch,
         enable_experimental,
         flydsl_ps1,
+        native_96h_cp,
         v_head_dim,
         page_size,
         cp_world_size,
@@ -2616,6 +2639,7 @@ def get_mla_decode_shape_support(
     arch: str | None = None,
     enable_experimental: bool | None = None,
     flydsl_ps1: bool | None = None,
+    native_96h_cp: bool | None = None,
 ) -> MlaDecodeShapeSupport:
     """Report how mla_decode_fwd will run an MLA decode shape, without launching.
 
@@ -2637,7 +2661,9 @@ def get_mla_decode_shape_support(
     arch=None uses the current device's arch; an explicit arch needs no device,
     but asm availability is only known for arches compiled into the build.
     enable_experimental and flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL
-    and AITER_MLA_DECODE_PS1_FLYDSL env vars. Results are cached; call
+    and AITER_MLA_DECODE_PS1_FLYDSL env vars. native_96h_cp defaults to
+    AITER_MLA_NATIVE_96H_CP (off): 96 fp8 heads at qlen 7 and 8 are native only
+    when it is set and cp_round_robin is True, and fold otherwise. Results are cached; call
     get_mla_decode_shape_support.cache_clear() after changing env vars.
 
     Raises TypeError for a non-int count or a non-torch.dtype, and ValueError
@@ -2696,6 +2722,7 @@ def get_mla_decode_shape_support(
             if flydsl_ps1 is None
             else bool(flydsl_ps1)
         ),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         _mla_opus_enabled(),
         _mla_ps1_asm_enabled(),
     )
@@ -2817,7 +2844,10 @@ def _mla_metadata_head_plan(
     kv_dtype: torch.dtype,
     fast_mode: bool,
     intra_batch_mode: bool,
+    cp_round_robin: bool = False,
+    native_96h_cp: bool | None = None,
 ) -> _MlaHeadPlan:
+    # native_96h_cp=None reads AITER_MLA_NATIVE_96H_CP.
     return _mla_decode_head_plan_cached(
         int(num_head_qo),
         max(1, int(max_seqlen_qo)),
@@ -2828,10 +2858,11 @@ def _mla_metadata_head_plan(
         _mla_resolve_arch(None),
         env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
         env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
+        _mla_native_96h_cp_enabled() if native_96h_cp is None else bool(native_96h_cp),
         512,
         1,
         1,
-        False,
+        bool(cp_round_robin),
         True,
         False,
         False,
@@ -2932,7 +2963,13 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo == 96
-            and effective_seqlen_qo <= 6
+            # qlen 7 and 8 are native only when AITER_MLA_NATIVE_96H_CP opts in
+            # (and under round-robin CP); the fold that runs otherwise is sized
+            # from its own plan.
+            and (
+                effective_seqlen_qo <= 6
+                or (effective_seqlen_qo <= 8 and _mla_native_96h_cp_enabled())
+            )
         )
         or (
             get_gfx() == "gfx950"
@@ -2979,7 +3016,7 @@ def get_mla_metadata_info_v1(
         5. Shape of reduce_final_map followed by its scalar type.
         6. Shape of reduce_partial_map followed by its scalar type.
     """
-    # Sizing is a pure function of the arguments, the arch and two env flags;
+    # Sizing is a pure function of the arguments, the arch and three env flags;
     # cache it, since callers can ask on every step.
     return _mla_metadata_info_v1_cached(
         int(batch_size),
@@ -2995,6 +3032,7 @@ def get_mla_metadata_info_v1(
         _mla_resolve_arch(None),
         env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
         env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
+        _mla_native_96h_cp_enabled(),
     )
 
 
@@ -3013,6 +3051,7 @@ def _mla_metadata_info_v1_cached(
     _arch: str,
     _enable_experimental: bool,
     _flydsl_ps1: bool,
+    _native_96h_cp: bool,
 ):
     if is_sparse or num_head_qo < 1:
         assert num_head_qo % 4 == 0
@@ -3043,30 +3082,40 @@ def _mla_metadata_info_v1_cached(
     if num_head_qo < 1:
         return sizes(batch_size, legacy_tiles)
 
-    plan = _mla_metadata_head_plan(
-        num_head_qo=num_head_qo,
-        max_seqlen_qo=max_seqlen_qo,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
-        fast_mode=fast_mode,
-        intra_batch_mode=intra_batch_mode,
-    )
-    if plan.plan == _MlaHeadPlanKind.UNSUPPORTED:
-        assert num_head_qo % 4 == 0
-    if plan.kernel_num_heads * 2 > plan.packed_qo_len_per_wg:
-        max_qo_tiles_per_batch = max_seqlen_qo
-    else:
-        max_qo_tiles_per_batch = math.ceil(
-            max_seqlen_qo * plan.kernel_num_heads / plan.packed_qo_len_per_wg
+    # The head plan can depend on round-robin CP (96 fp8 heads at qlen 7 and 8),
+    # which get_mla_metadata_v1 learns only when it plans: size for both.
+    plans = {
+        _mla_metadata_head_plan(
+            num_head_qo=num_head_qo,
+            max_seqlen_qo=max_seqlen_qo,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            cp_round_robin=cp_round_robin,
         )
-    planned = sizes(
-        batch_size * plan.qk_batch_ratio, max_qo_tiles_per_batch, v12_intra=True
-    )
-    if legacy_tiles is None:
-        return planned
-    return tuple(
-        (_mla_max_shape(a[0], b[0]), a[1])
-        for a, b in zip(planned, sizes(batch_size, legacy_tiles))
+        for cp_round_robin in (False, True)
+    }
+    candidates = [] if legacy_tiles is None else [sizes(batch_size, legacy_tiles)]
+    for plan in plans:
+        if plan.plan == _MlaHeadPlanKind.UNSUPPORTED:
+            assert num_head_qo % 4 == 0
+        if plan.kernel_num_heads * 2 > plan.packed_qo_len_per_wg:
+            max_qo_tiles_per_batch = max_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = math.ceil(
+                max_seqlen_qo * plan.kernel_num_heads / plan.packed_qo_len_per_wg
+            )
+        candidates.append(
+            sizes(
+                batch_size * plan.qk_batch_ratio,
+                max_qo_tiles_per_batch,
+                v12_intra=True,
+            )
+        )
+    return _functools.reduce(
+        lambda a, b: tuple((_mla_max_shape(x[0], y[0]), x[1]) for x, y in zip(a, b)),
+        candidates,
     )
 
 
@@ -3192,6 +3241,18 @@ def _get_mla_metadata_v1_impl(
         max_split_per_batch: Cap on KV splits per batch. -1 means unbounded (default -1).
         intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
         is_cp_round_robin: Context-parallel round-robin work assignment (default False).
+            Set it for a round-robin CP decode (mla_decode_fwd with g_kv_indptr). 96
+            fp8 heads at qlen 7 and 8 are planned natively only with it AND the
+            AITER_MLA_NATIVE_96H_CP=1 opt-in (off by default: the native route is
+            slower than the fold at long context); otherwise they fold. The mode is recorded with work_metadata_ptrs (views and deep copies
+            keep it; a clone, or a deep copy of a view, has no record, and copy_ into
+            a planned buffer keeps that buffer's own record, so plan the destination
+            again instead) and mla_decode_fwd runs the head plan it records. The
+            opt-in is recorded the same way, so changing AITER_MLA_NATIVE_96H_CP
+            after planning does not change how decode or the update read it. Where
+            the mode changes the plan, mla_decode_fwd raises ValueError on a buffer
+            without a record (a clone), and on CP-planned metadata without
+            g_kv_indptr.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
@@ -3217,6 +3278,98 @@ def _get_mla_metadata_v1_impl(
         [5] reduce_partial_map  (#partial_tiles)                Partial-buffer locations of the
                                                 tiles awaiting reduction.
     """
+
+
+class _MlaPlannedCp:
+    """The is_cp_round_robin and AITER_MLA_NATIVE_96H_CP opt-in get_mla_metadata_v1
+    planned a work_metadata_ptrs with: together they fix its head layout.
+
+    One cell per buffer, kept on its storage (keyed by data pointer, so views
+    share it) and on the planned tensor (so copy.deepcopy snapshots it, and a
+    view of the snapshot finds it on its base). A clone or copy_ into another
+    buffer has none: its mode reads as unknown (None). A copy_ into a buffer that
+    was planned keeps that buffer's own record, which no longer describes the
+    copied contents; plan the destination with get_mla_metadata_v1 instead.
+    """
+
+    def __init__(self) -> None:
+        self.is_cp_round_robin: bool | None = None
+        self.native_96h_cp: bool | None = None
+
+
+_MLA_PLANNED_CP_ATTR = "_aiter_mla_planned_cp"
+
+
+def _mla_planned_cp_cell(
+    work_metadata_ptrs: torch.Tensor, create: bool
+) -> _MlaPlannedCp | None:
+    storage = work_metadata_ptrs.untyped_storage()
+    cells = getattr(storage, _MLA_PLANNED_CP_ATTR, None)
+    cell = None if cells is None else cells.get(work_metadata_ptrs.data_ptr())
+    if not create:
+        cell = cell or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+        if cell is not None:
+            return cell
+        # A view of a planned base is the same buffer only at the same address:
+        # an offset slice such as workspace[2:4] is another buffer.
+        base = work_metadata_ptrs._base
+        if base is not None and base.data_ptr() == work_metadata_ptrs.data_ptr():
+            return getattr(base, _MLA_PLANNED_CP_ATTR, None)
+        return None
+    if cells is None:
+        cells = {}
+        setattr(storage, _MLA_PLANNED_CP_ATTR, cells)
+    if cell is None:
+        # A deep copy carries its cell on the tensor but not on its new storage.
+        # Adopt that cell for the same buffer address, so a replan through a view
+        # updates the one the copy (and its next deep copy) reads.
+        base = work_metadata_ptrs._base
+        cell = getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+        if (
+            cell is None
+            and base is not None
+            and base.data_ptr() == work_metadata_ptrs.data_ptr()
+        ):
+            cell = getattr(base, _MLA_PLANNED_CP_ATTR, None)
+        cell = cells[work_metadata_ptrs.data_ptr()] = cell or _MlaPlannedCp()
+    setattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, cell)
+    return cell
+
+
+def _mla_record_planned_cp_round_robin(
+    work_metadata_ptrs: torch.Tensor,
+    is_cp_round_robin: bool | None,
+    native_96h_cp: bool | None = None,
+) -> None:
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=True)
+    cell.is_cp_round_robin = (
+        None if is_cp_round_robin is None else bool(is_cp_round_robin)
+    )
+    cell.native_96h_cp = None if native_96h_cp is None else bool(native_96h_cp)
+
+
+def _mla_planned_cp_round_robin(
+    work_metadata_ptrs: torch.Tensor | None,
+) -> bool | None:
+    """The is_cp_round_robin get_mla_metadata_v1 planned these buffers with, or None."""
+    if work_metadata_ptrs is None:
+        return None
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=False)
+    return None if cell is None else cell.is_cp_round_robin
+
+
+def _mla_planned_native_96h_cp(
+    work_metadata_ptrs: torch.Tensor | None,
+) -> bool | None:
+    """The AITER_MLA_NATIVE_96H_CP opt-in these buffers were planned with, or None."""
+    if work_metadata_ptrs is None:
+        return None
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=False)
+    return None if cell is None else cell.native_96h_cp
+
+
+def _mla_head_fold(plan: _MlaHeadPlan) -> tuple[int, int]:
+    return plan.qk_batch_ratio, plan.kernel_num_heads
 
 
 def get_mla_metadata_v1(
@@ -3276,7 +3429,12 @@ def get_mla_metadata_v1(
     def _dtype_id(d):
         return _aiter_dtype_id(d) if d is not None else None
 
-    return _get_mla_metadata_v1_impl(
+    # Forget the previous plan's mode first, so a failed replan leaves it unknown.
+    _mla_record_planned_cp_round_robin(work_metadata_ptrs, None)
+    # The C++ planner reads AITER_MLA_NATIVE_96H_CP itself; record the value it sees,
+    # so a later toggle cannot make decode or the update disagree with the plan.
+    native_96h_cp = _mla_native_96h_cp_enabled()
+    _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
         kv_last_page_lens,
@@ -3303,6 +3461,11 @@ def get_mla_metadata_v1(
         dtype_q_rope=_dtype_id(dtype_q_rope),
         dtype_kv_nope=_dtype_id(dtype_kv_nope),
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
+    )
+    # mla_decode_fwd and decode_update_mla_metadata_v1 read this back: for some
+    # shapes the head plan, folded or native, depends on round-robin CP and the opt-in.
+    _mla_record_planned_cp_round_robin(
+        work_metadata_ptrs, is_cp_round_robin, native_96h_cp
     )
 
 
@@ -3501,6 +3664,12 @@ def decode_update_mla_metadata_v1(
     """
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
+    Every request's KV grows by 1 - num_reject_tokens (default 1) tokens.
+    The head plan is the one without round-robin CP, so where CP changes that
+    plan (96 fp8 heads at qlen 7 and 8 on gfx950, with the AITER_MLA_NATIVE_96H_CP
+    opt-in recorded at planning) it raises ValueError on metadata
+    get_mla_metadata_v1 planned with is_cp_round_robin=True, and on metadata
+    with no recorded mode (a clone, which reads the opt-in from the env).
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -3509,14 +3678,39 @@ def decode_update_mla_metadata_v1(
     assert (
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
+    plan_args = (num_heads_per_head_k, max_seqlen_qo, dtype_q, dtype_kv)
+    # The opt-in the metadata was planned with, not the current env (None for a
+    # clone, which falls back to the env).
+    native_96h_cp = _mla_planned_native_96h_cp(work_metadata_ptrs)
     head_plan = _mla_metadata_head_plan(
-        num_heads_per_head_k,
-        max_seqlen_qo,
-        dtype_q,
-        dtype_kv,
+        *plan_args,
         fast_mode=True,
         intra_batch_mode=False,
+        native_96h_cp=native_96h_cp,
     )
+    planned_cprr = _mla_planned_cp_round_robin(work_metadata_ptrs)
+    if planned_cprr is not False:
+        cp_plan = _mla_metadata_head_plan(
+            *plan_args,
+            fast_mode=True,
+            intra_batch_mode=False,
+            cp_round_robin=True,
+            native_96h_cp=native_96h_cp,
+        )
+        if _mla_head_fold(cp_plan) != _mla_head_fold(head_plan):
+            planned = (
+                "with no recorded is_cp_round_robin (a clone)"
+                if planned_cprr is None
+                else "with is_cp_round_robin=True"
+            )
+            raise ValueError(
+                "decode_update_mla_metadata_v1 cannot update metadata planned "
+                f"{planned} for {num_heads_per_head_k} heads at "
+                f"max_seqlen_qo={max_seqlen_qo}: CP changes its head plan "
+                f"({'x'.join(map(str, _mla_head_fold(cp_plan)))} planned vs "
+                f"{'x'.join(map(str, _mla_head_fold(head_plan)))} here). "
+                "Call get_mla_metadata_v1 again instead."
+            )
     qk_batch_ratio = head_plan.qk_batch_ratio
     num_heads_per_head_k = head_plan.kernel_num_heads
     cu_num = work_indptr.shape[0] - 1

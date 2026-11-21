@@ -438,7 +438,9 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
                    || (gqa_ratio == 128)
-                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
+                   // kernel capability only: the planner (AITER_MLA_NATIVE_96H_CP) decides
+                   // whether 96 heads at qlen 7-8 reach here instead of being folded
+                   || (gqa_ratio == 96 && max_seqlen_q <= 8))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         s_MQA = gqa_ratio;
