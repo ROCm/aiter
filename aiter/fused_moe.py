@@ -3600,6 +3600,9 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        # select the gfx942 a8w4 kernel and its x input by name, not by dtype / arch
+        in_dtype=parsed.get("in_dtype"),
+        x_layout=parsed.get("x_layout"),
         fused_shared_w1=fused_shared_w1,
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
@@ -6870,6 +6873,27 @@ def fused_moe_2stages(
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
+    # gfx942 a8w4 (fp8 A x mxfp4 W, `_g942` stage-1 names): stage 1 is
+    # compile_gemm1_a8w4_gfx942 (moe_2stage_a16wmix), which also returns its own
+    # sorted bf16 intermediate, consumed by the a16w4 stage 2 as is -- no out buffer,
+    # no inter-stage requant. Its `_qi` names quantise x in-kernel, so they take the
+    # bf16 x and skip the separate quant launch.
+    _s1_params = None
+    if getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper:
+        _s1_params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(
+            metadata.stage1.keywords.get("kernelName", "")
+        )
+    _is_a8w4_g942 = _get_flydsl_moe_kernels().is_a8w4_gfx942_kernel(_s1_params)
+    _get_flydsl_moe_kernels().check_a8w4_gfx942_inputs(
+        w1,
+        w1_scale,
+        hidden_states,
+        prequantized_a1,
+        _s1_params,
+        getattr(metadata.stage1, "keywords", {}).get(
+            "kernelName", getattr(metadata.stage1, "func", metadata.stage1)
+        ),
+    )
     if prequantized_a1 is not None:
         if quant_type != QuantType.per_1x32:
             raise ValueError(
@@ -6884,6 +6908,10 @@ def fused_moe_2stages(
         a1_scale = prequantized_a1_scale
     elif not metadata.prequant:
         a1 = hidden_states
+        a1_scale = None
+    elif _is_a8w4_g942 and _s1_params.get("x_layout") == "bf16":
+        # `_qi` stage 1: quantises the bf16 x itself (inputs checked above)
+        a1 = hidden_states.to(dtypes.bf16)
         a1_scale = None
     elif (
         quant_type == QuantType.per_1x32
@@ -6999,7 +7027,7 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    if _is_a16w4_port or _is_a8w4_g942:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -7168,6 +7196,9 @@ def fused_moe_2stages(
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
+        a2_scale = None
+    elif _is_a8w4_g942:
+        # gfx942 a8w4: bf16 sorted intermediate straight into the a16w4 stage 2.
         a2_scale = None
     elif (
         quant_type == aiter.QuantType.per_1x32

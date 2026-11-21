@@ -655,6 +655,8 @@ def _get_pci_chip_id(device_id=None):
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI325X and MI325X VF (SR-IOV guests); same gfx942 / 304 CU as MI300X (0x74A1).
+MI325X_CHIP_IDS = {0x74A5, 0x74B9}
 # MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
 MI300A_CHIP_IDS = {0x74A0}
 

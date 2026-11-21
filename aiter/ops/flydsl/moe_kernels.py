@@ -189,6 +189,70 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
     return tile_n
 
 
+# in_dtype of the gfx942 a8w4 stage-1 family (the `_g942` names, gemm1_a8w4_gfx942).
+A8W4_GFX942_IN_DTYPE = "a8w4_gfx942"
+
+
+def is_a8w4_gfx942_kernel(name_or_params) -> bool:
+    """Whether a stage-1 kernel name, or its params dict, is the gfx942 a8w4 kernel.
+
+    The one test for that family: its weights are relaid, its x layout comes from the
+    name, and it runs on gfx942 only.
+    """
+    if isinstance(name_or_params, str):
+        name_or_params = get_flydsl_kernel_params(name_or_params.strip())
+    return bool(name_or_params) and (
+        name_or_params.get("in_dtype") == A8W4_GFX942_IN_DTYPE
+    )
+
+
+def check_a8w4_gfx942_inputs(
+    w1, w1_scale, hidden_states, prequantized_a1, params, kernel_name=""
+) -> None:
+    """Raise if fused_moe's inputs do not fit the stage 1 it picked, for the gfx942
+    a8w4 family; a mismatch would otherwise give wrong output without an error.
+
+    - W1 / W1 scale: shuffle_{weight,scale}_a8w4_gfx942 keep shape and dtype, so only
+      their ``a8w4_gfx942_layout`` tag tells the relaid layout from the a16w4
+      preshuffle. A `_g942` stage 1 needs both tagged; any other stage 1 none.
+    - A caller-prequantized A has no agreed layout for the `_g942` kernels.
+    - The `_qi` kernels quantise x themselves and have no input for x scales, so they
+      take bf16 / fp16 x only (a pre-quantised fp8 x would lose its scales).
+    """
+    is_g942 = is_a8w4_gfx942_kernel(params)
+    relaid = [
+        getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale) if t is not None
+    ]
+    if is_g942 and not (len(relaid) == 2 and all(relaid)):
+        raise ValueError(
+            f"the gfx942 a8w4 stage 1 kernel {kernel_name} reads W1 and W1 scale "
+            "relaid by shuffle_weight_a8w4_gfx942 / shuffle_scale_a8w4_gfx942 "
+            f"(tagged a8w4_gfx942_layout); got tags (w1, w1_scale) = {tuple(relaid)}"
+        )
+    if not is_g942 and any(relaid):
+        raise ValueError(
+            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
+            "(a8w4_gfx942_layout), which only the `_g942` kernels read, but stage 1 "
+            f"is {kernel_name}; is AITER_SITUV2_A8W4=1 set?"
+        )
+    if not is_g942:
+        return
+    if prequantized_a1 is not None:
+        raise ValueError(
+            "prequantized_a1 is not supported with the gfx942 a8w4 stage 1: its "
+            "kernels read x as bf16 (`_qi`) or in the layout "
+            "fused_dynamic_mxfp8_quant_moe_sort writes"
+        )
+    if params.get("x_layout") == "bf16" and hidden_states.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        raise ValueError(
+            f"the gfx942 a8w4 stage 1 kernel {kernel_name} quantises x itself and "
+            f"takes bf16 / fp16 x, got {hidden_states.dtype}"
+        )
+
+
 def a16w4_shared_tile_from_params(params: dict) -> dict:
     """Return the ``_sh`` suffix fields of parsed kernel params as ``shared_tile``."""
     keys = ("shared_tile_m", "shared_tile_n", "shared_tile_k", "shared_k_wave")
@@ -619,6 +683,92 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+@functools.cache
+def _a8w4_gfx942_chip_id(device: int) -> int:
+    # 0 when the id cannot be read, so the gate fails closed.
+    from aiter.jit.utils.chip_info import _get_pci_chip_id
+
+    try:
+        return _get_pci_chip_id(device)
+    except RuntimeError:
+        return 0
+
+
+def a8w4_gfx942_supported(device=None) -> bool:
+    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X).
+
+    MI300X (0x74A1) is the same gfx942 / 304 CU part, so it shares the tuned CSV rows,
+    but there a8w4 is slower than a16w4 at large M (latency-bound stage 1; 0.81-0.89x
+    at M >= 1024).
+    """
+    if os.getenv("AITER_AOT_REPLAY") == "1":
+        # An AOT replay has no device and compiles for the arch GPU_ARCHS names; the
+        # device check applies when serving.
+        return True
+    idx = device.index if isinstance(device, torch.device) else device
+    if idx is None:
+        idx = torch.cuda.current_device()
+    from aiter.jit.utils.chip_info import MI325X_CHIP_IDS
+
+    return _a8w4_gfx942_chip_id(int(idx)) in MI325X_CHIP_IDS
+
+
+def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
+    """Return {kernelName: params} for the gfx942 a8w4 stage1 (MXFP8 A x MXFP4 W).
+
+    Served by ``moe_2stage_a16wmix.gemm1_a8w4_gfx942`` (FP4 -> FP8 decode + fp8 MFMA,
+    MX scales after the MFMA), not by the gfx950 mixed_moe kernels, so it gets its own
+    ``_g942`` name family:
+    ``flydsl_moe1_afp8_wfp4_bf16_t{M}x{N}x{K}_g942[_bnt0][_kw{n}][_qi]``.
+    Standard (GGUU) gate/up layout; stage 2 is the a16w4 bf16-intermediate kernel.
+    ``_qi``: the kernel quantises the bf16 x to MXFP8 itself (``x_layout="bf16"``), so
+    fused_moe skips the separate quant launch -- a win at small M (the CSV uses it for
+    M <= 8).
+    Enabled on MI325X only (see ``a8w4_gfx942_supported``).
+    """
+    kernels = {}
+
+    def _emit(tm, tn, tk, *, kw=1, bnt=2, qi=False):
+        name = flydsl_kernel_name(1, "fp8", "fp4", "bf16", tm, tn, tk) + "_g942"
+        if bnt != 2:
+            name += f"_bnt{bnt}"
+        if kw != 1:
+            name += f"_kw{kw}"
+        if qi:
+            name += "_qi"
+        kernels[name] = {
+            "stage": 1,
+            "a_dtype": "fp8",
+            "b_dtype": "fp4",
+            "out_dtype": "bf16",
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "MPerBlock": tm,
+            "in_dtype": A8W4_GFX942_IN_DTYPE,
+            "gate_mode": "separated",
+            "b_nt": bnt,
+            "k_wave": kw,
+            # compiler default, as fused_moe passes it (an absent key would make
+            # callers that default to 3 time a different kernel)
+            "waves_per_eu": None,
+            "x_layout": "bf16" if qi else "moe_sort",
+        }
+
+    for tm in (16, 32):
+        for tn in (32, 64, 128):
+            for tk in (128, 256):
+                for kw in (1, 2, 4):
+                    # 4/kw N-waves of whole 16-wide groups; one A-tile load pass needs
+                    # BM*TILE_K to be a multiple of 1 KB (see compile_gemm1_a8w4_gfx942).
+                    if tn % (16 * (4 // kw)) or (tm * tk) % 1024:
+                        continue
+                    for bnt in (0, 2):
+                        for qi in (False, True):
+                            _emit(tm, tn, tk, kw=kw, bnt=bnt, qi=qi)
+    return kernels
+
+
 def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage2 configs.
 
@@ -773,6 +923,8 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # gfx942 a8w4 stage1 (own name family; stage 2 reuses the a16w4 names)
+    _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a8w4_gfx942())
     # a16w16: bf16 output only. Do not copy the a16w4/a16wi4 f16 loop —
     # compile_flydsl_moe_stage{1,2} never pass out_dtype into the a16w-mix port.
     _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a16w16("bf16"))
@@ -1650,6 +1802,8 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    in_dtype: str | None = None,
+    x_layout: str | None = None,
     activation_bf16: bool = False,
     fused_shared_w1: torch.Tensor | None = None,
     fused_shared_w1_scale: torch.Tensor | None = None,
@@ -1783,6 +1937,86 @@ def _flydsl_moe_stage1_impl(
             **_a16w4_shared_tile(shared_tile, 1),
         )
         return inter_sorted
+    # gfx942 a8w4 (MXFP8 A x MXFP4 W), the `_g942` names (in_dtype="a8w4_gfx942"). The
+    # gfx950 mixed_moe a8w4 kernels need the gfx950-only scaled f8f6f4 MFMA; on gfx942
+    # this kernel decodes FP4 -> FP8 and runs the fp8 MFMA. `a` / `a1_scale` are
+    # fused_dynamic_mxfp8_quant_moe_sort's outputs (x_layout="moe_sort"), or, for the
+    # `_qi` names, the bf16 x with no scale, which the kernel quantises itself
+    # (x_layout="bf16"); w1 / w1_scale must be the a16w4 preshuffle relaid by
+    # shuffle_{weight,scale}_a8w4_gfx942. Output is the a16w4 bf16 intermediate
+    # [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4 kernel.
+    # The path is chosen by the kernel name, not by dtype and arch: any other fp8 x fp4
+    # name on gfx942 expects other weights and inputs, so it raises below.
+    _g942 = is_a8w4_gfx942_kernel({"in_dtype": in_dtype})
+    if _g942 or (a_dtype == "fp8" and b_dtype == "fp4"):
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if not _g942:
+            if get_gfx_runtime() == "gfx942":
+                raise NotImplementedError(
+                    "fp8 x fp4 stage1 on gfx942 runs only the `_g942` kernels "
+                    "(in_dtype='a8w4_gfx942'), got a kernel for another arch"
+                )
+        else:
+            from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+                flydsl_a8w4_gemm1_gfx942,
+            )
+
+            # Off gfx942, compile_gemm1_a8w4_gfx942 raises for the compile target.
+            if not a8w4_gfx942_supported(dev):
+                raise NotImplementedError(
+                    "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
+                    "slower than a16w4 at large M (0.81-0.89x at M>=1024); "
+                    "use a16w4"
+                )
+            if _fuse_any_quant or _is_splitk or gate_up_interleave or bias is not None:
+                raise NotImplementedError(
+                    "gfx942 a8w4 stage1: bf16 output, k_batch=1, separated gate/up, "
+                    f"no bias only (out_dtype={out_dtype}, k_batch={k_batch}, "
+                    f"gate_mode={gate_mode}, bias={bias is not None})"
+                )
+            _x_dtype = {"bf16": torch.bfloat16, "moe_sort": dtypes.fp8}.get(x_layout)
+            if _x_dtype is None or a.dtype != _x_dtype:
+                raise ValueError(
+                    f"gfx942 a8w4 stage1 x_layout={x_layout!r} takes "
+                    f"{_x_dtype} x, got {a.dtype}"
+                )
+            _act = "situv2" if act in ("situv2", "situ") else act
+            sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
+            _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
+            inter_sorted = _alloc(
+                sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
+            )
+            _x_bf16 = x_layout == "bf16"
+            flydsl_a8w4_gemm1_gfx942(
+                a_fp8=a.contiguous(),
+                a_scale_u8=(
+                    None if _x_bf16 else a1_scale.view(torch.uint8).contiguous()
+                ),
+                w1_u8=w1.view(torch.uint8).contiguous(),
+                w1_scale_u8=w1_scale.view(torch.uint8).contiguous().view(-1),
+                sorted_expert_ids=sorted_expert_ids,
+                cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
+                m_indices=sorted_token_ids.to(torch.int32).contiguous(),
+                inter_sorted_bf16=inter_sorted,
+                n_tokens=token_num,
+                NE=E,
+                D_HIDDEN=model_dim,
+                D_INTER=inter_dim,
+                tile_m=int(tile_m),
+                tile_n=tile_n,
+                tile_k=tile_k,
+                k_wave=k_wave,
+                b_nt=b_nt,
+                xcd_swizzle=xcd_swizzle,
+                waves_per_eu=_g1_waves_per_eu,
+                act=_act,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
+                x_layout=x_layout,
+            )
+            return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
     # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
     # or memfault). Downgrade to a divisor (128). Applies to both a16w4
@@ -2139,6 +2373,8 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    in_dtype: str | None = None,
+    x_layout: str | None = None,
     activation_bf16: bool = False,
     fused_shared_w1: torch.Tensor | None = None,
     fused_shared_w1_scale: torch.Tensor | None = None,
@@ -2201,6 +2437,8 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        in_dtype=in_dtype,
+        x_layout=x_layout,
         activation_bf16=activation_bf16,
         fused_shared_w1=fused_shared_w1,
         fused_shared_w1_scale=fused_shared_w1_scale,
