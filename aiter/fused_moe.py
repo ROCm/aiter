@@ -2524,12 +2524,10 @@ def fused_moe_1stage(
 # path) address expert weights with 32-bit byte offsets (see
 # _asm_fmoe_weights_fit_u32_offsets).
 _ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942", "gfx950")
-# (arch, quant type) pairs on those arches whose asm kernel was run past 4 GiB
-# and came out right (gfx950 fp8 per_1x128: experts 147-255 of E=256, 7168/2048,
-# match CK 2-stage), so they keep asm 1-stage. The AITER_XBFLOAT16=1 blockscale
-# kernel is not in that run: it wraps and stays guarded. Only the kernel the
-# default heuristic selects was run, so a tuned row is never exempt.
-_ASM_FMOE_U32_WEIGHT_OFFSET_OK = (("gfx950", QuantType.per_1x128),)
+# No kernel is exempt: the gfx950 per_1x128 blockscale kernel that was run past
+# 4 GiB (experts 147-255 of E=256, 7168/2048, matching CK 2-stage) is one of
+# several the asm launcher picks by shape, and the 32x256 variant multiplies the
+# expert id by the weight stride in 32 bits.
 
 
 def _non_gated_past_4gib_error():
@@ -4835,10 +4833,7 @@ def get_2stage_cfgs(
     # A tuned 1-stage row takes run_1stage from the CSV, so it would bypass the
     # 4 GiB guard of the heuristic branch below. Drop an unsafe row so that the
     # heuristic (and its guard / raise) decides. per_1x32 FLAT rows are kept:
-    # their 32-bit wrap was never measured. The per_1x128 exemption of the
-    # heuristic is not applied to a tuned row: it was measured for the kernel the
-    # heuristic selects, and a row can name another one (e.g. the 32x256 blockscale
-    # variants multiply the expert id by the w1 stride in 32 bits).
+    # their 32-bit wrap was never measured.
     if (
         cfg is not None
         and not bypass_tuned_config
@@ -4908,10 +4903,6 @@ def get_2stage_cfgs(
                 and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
                 and not _asm_fmoe_weights_fit_u32_offsets(
                     expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
-                )
-                and not (
-                    (get_gfx_runtime(), q_type) in _ASM_FMOE_U32_WEIGHT_OFFSET_OK
-                    and not run_1stage_xbf16
                 )
             ):
                 if not use_g1u1:

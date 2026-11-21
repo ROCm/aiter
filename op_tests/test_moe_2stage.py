@@ -2576,15 +2576,15 @@ def test_gfx942_asm_1stage_4gib_guard():
     host = fm.get_gfx_runtime()
     real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
     assert real_gfx == ("gfx942", "gfx950"), "the guard must cover gfx942 and gfx950"
-    # gfx950 fp8 per_1x128 was run past 4 GiB and is right, so it keeps asm 1-stage.
-    ok_pairs = fm._ASM_FMOE_U32_WEIGHT_OFFSET_OK
-    assert ok_pairs == (("gfx950", aiter.QuantType.per_1x128),), ok_pairs
+    # No (arch, quant type) pair is exempt: the gfx950 per_1x128 kernel that was run
+    # past 4 GiB is one of several the launcher picks by shape, and one wraps.
+    assert not hasattr(fm, "_ASM_FMOE_U32_WEIGHT_OFFSET_OK")
     cases = (  # (token, quant type): the default heuristic takes asm 1-stage here
         (256, aiter.QuantType.per_Token),
         (256, aiter.QuantType.per_1x128),
     )
     # The control runs the default kernels; AITER_XBFLOAT16=1 exported by the
-    # caller would turn the exempt per_1x128 case into the guarded xbf16 kernel.
+    # caller would turn the per_1x128 case into the xbf16 kernel.
     env_stack = ExitStack()
     env_stack.enter_context(override_env("AITER_XBFLOAT16", "0"))
     try:
@@ -2598,24 +2598,11 @@ def test_gfx942_asm_1stage_4gib_guard():
                     f"{qtype}: the default heuristic no longer takes asm 1-stage, "
                     "so this test cannot see the guard"
                 )
-            # The guard on for this arch: oversized weights leave asm 1-stage
-            # (unless the pair is known right past 4 GiB), weights that fit keep
-            # the previous dispatch.
+            # The guard on for this arch: oversized weights leave asm 1-stage,
+            # weights that fit keep the previous dispatch.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
-            exempt = (host, qtype) in ok_pairs
-            assert run_1stage(token, 2048, qtype, fp8) == (
-                before_big if exempt else False
-            ), f"{qtype}: 7 GiB w1"
+            assert not run_1stage(token, 2048, qtype, fp8), f"{qtype}: 7 GiB w1"
             assert run_1stage(token, 1024, qtype, fp8) == before_small, qtype
-            if exempt:
-                # The AITER_XBFLOAT16=1 blockscale kernel wraps (not in the run
-                # that cleared per_1x128), so it leaves asm 1-stage.
-                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
-                with override_env("AITER_XBFLOAT16", "1"):
-                    assert run_1stage(token, 2048, qtype, fp8), "xbf16 not asm"
-                    fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
-                    assert not run_1stage(token, 2048, qtype, fp8), "xbf16 7 GiB w1"
-                fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
             # An arch outside the guard keeps the previous dispatch at any size.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx90a",)
             assert run_1stage(token, 2048, qtype, fp8) == before_big, qtype
@@ -2745,6 +2732,11 @@ def test_gfx942_asm_1stage_4gib_guard():
                     pass
                 else:
                     raise AssertionError("tuned oversized non-gated row not rejected")
+                # AITER_BYPASS_TUNE_CONFIG=1 ignores the injected row: no raise, and
+                # the 256-token heuristic picks two stages.
+                assert not run_1stage(
+                    256, 2048, ng_qtype, bf16, bf16, False, tuned=False
+                )
             finally:
                 fm.cfg_2stages = saved_cfgs
 
@@ -2754,9 +2746,8 @@ def test_gfx942_asm_1stage_4gib_guard():
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
             assert not tuned_row_run_1stage(per_token, row_kernel), "tuned 7 GiB row"
             if host == "gfx950":
-                # The heuristic exempts per_1x128 (checked above for the kernel it
-                # selects), but a tuned row can name any blockscale kernel, so it is
-                # discarded whatever its xbf16 flag says, or when it has none.
+                # A tuned per_1x128 row is discarded whatever its xbf16 flag says,
+                # or when it has none.
                 per_1x128 = aiter.QuantType.per_1x128
                 for extra in ({"xbf16": 0}, {"xbf16": 1}, {}):
                     assert not tuned_row_run_1stage(
