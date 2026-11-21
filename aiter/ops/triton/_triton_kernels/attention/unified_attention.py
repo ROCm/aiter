@@ -1076,11 +1076,13 @@ def reduce_segments(
         _, window_tiles = split_window_tiles(
             seq_len, query_len, TILE_SIZE, SLIDING_WINDOW
         )
-        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        # at least 1: a kv_len 0 row would divide by 0 below and get no segments
+        tiles_per_segment = tl.maximum(cdiv_fn(window_tiles, num_segments), 1)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
     else:
-        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # at least 1: a kv_len 0 row would divide by 0 below and get no segments
+        tiles_per_segment = tl.maximum(cdiv_fn(seq_len, num_segments * TILE_SIZE), 1)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
@@ -1126,6 +1128,8 @@ def reduce_segments(
             segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
         )
         overall_max = tl.max(segm_max)
+        # No segment (kv_len 0): max is -inf and exp2(-inf - -inf) is NaN; 0 weights it to 0.
+        overall_max = tl.where(overall_max == float("-inf"), 0.0, overall_max)
 
         # load and rescale segment exp sums
         segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
@@ -1164,6 +1168,8 @@ def reduce_segments(
             segm_max_ptr + segm_base + offs_all, mask=all_mask, other=float("-inf")
         )
         overall_max = tl.max(segm_max_all)
+        # No segment (kv_len 0): max is -inf and exp2(-inf - -inf) is NaN; 0 weights it to 0.
+        overall_max = tl.where(overall_max == float("-inf"), 0.0, overall_max)
         segm_expsum_all = tl.load(
             segm_expsum_ptr + segm_base + offs_all, mask=all_mask, other=0.0
         )
