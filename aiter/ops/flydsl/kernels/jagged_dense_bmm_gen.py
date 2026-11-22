@@ -30,6 +30,7 @@ from .tensor_shim import _run_compiled
 BLOCK_M = 128
 BLOCK_N = 128
 STAGES_A = 2
+_COPY_VEC = 8  # 16B / bf16
 
 
 @dataclass(frozen=True)
@@ -549,7 +550,7 @@ def _build_launcher(
                 fx.make_layout(TRAITS.k_perm_shape, TRAITS.k_perm_stride),
             ),
         )
-        val_per_thr = 8  # 16B / bf16
+        val_per_thr = _COPY_VEC
         thrs_col = BLOCK_K // val_per_thr
         thrs_row = THREADS // thrs_col
         tiled_copy_g2s_A = fx.make_tiled_copy_tv(
@@ -558,7 +559,7 @@ def _build_launcher(
             fx.make_layout((1, val_per_thr), (1, 1)),
         )
 
-        c_val = 8
+        c_val = _COPY_VEC
         c_thrs_n = BLOCK_N // c_val  # threads along N
         c_thrs_m = THREADS // c_thrs_n  # threads along M
         tiled_copy_s2g_C = fx.make_tiled_copy_tv(
@@ -589,6 +590,74 @@ def _build_launcher(
     return _launch
 
 
+def check_config(
+    *,
+    K: int,
+    N: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    threads: int,
+    xcd_c: int,
+    xcd_w: int,
+    traits: ArchTraits,
+) -> None:
+    """Raise ValueError for a config the kernel cannot run exactly."""
+    if block_m <= 0 or block_m & (block_m - 1):
+        raise ValueError(f"block_m must be a power of two, got {block_m}")
+    # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
+    # would silently drop the trailing N % block_n output columns.
+    if block_n <= 0 or N % block_n != 0:
+        raise ValueError(f"block_n={block_n} must be a positive divisor of N={N}")
+    if block_n % 32:
+        raise ValueError(f"block_n must be a multiple of 32, got {block_n}")
+    if block_k <= 0 or block_k % traits.k_tile_gran != 0:
+        raise ValueError(
+            f"block_k must be a positive multiple of {traits.k_tile_gran}, "
+            f"got {block_k}"
+        )
+    if traits.a_lds_dma and block_k & (block_k - 1):
+        raise ValueError(f"A LDS DMA needs a power-of-two block_k, got {block_k}")
+    if block_k < traits.min_block_k:
+        mma = "x".join(map(str, traits.mma_mnk))
+        raise ValueError(
+            f"block_k must be >= {traits.min_block_k} for MFMA {mma}, got {block_k}"
+        )
+    # n_tiles = K // block_k floors, silently dropping the K tail.
+    if K % block_k != 0:
+        raise ValueError(f"block_k={block_k} must divide K={K}")
+    a_smem = block_m * block_k * STAGES_A * 2
+    epi_smem = max(a_smem, block_m * block_n * 2)
+    if epi_smem > traits.lds_bytes:
+        raise ValueError(
+            f"block_k={block_k} needs {epi_smem} bytes LDS "
+            f"(max {traits.lds_bytes}); "
+            f"A-stage staging is {a_smem} bytes"
+        )
+    if threads <= 0 or threads % traits.wave_size:
+        raise ValueError(
+            f"threads must be a positive multiple of {traits.wave_size}, got {threads}"
+        )
+    mma_m, mma_n = traits.mma_mnk[:2]
+    waves = threads // traits.wave_size
+    n_warps = min(waves, block_n // (mma_n * 2))
+    m_warps = waves // n_warps
+    if waves % n_warps or block_n % (mma_n * n_warps) or block_m % (mma_m * m_warps):
+        raise ValueError(
+            f"threads={threads} splits into {m_warps}x{n_warps} MFMA waves, "
+            f"which do not tile block_m={block_m} x block_n={block_n}"
+        )
+    for operand, cols in (("A copy block_k", block_k), ("C copy block_n", block_n)):
+        thr_cols = cols // _COPY_VEC
+        if threads % thr_cols or block_m % (threads // thr_cols):
+            raise ValueError(
+                f"{operand}={cols} does not tile: {threads} threads in rows of "
+                f"{thr_cols} must cover block_m={block_m} rows exactly"
+            )
+    if xcd_c < 1 or xcd_w < 1:
+        raise ValueError(f"xcd_c and xcd_w must be >= 1, got {xcd_c} and {xcd_w}")
+
+
 def jagged_dense_bmm(
     C,
     A,
@@ -614,39 +683,19 @@ def jagged_dense_bmm(
     B = B.view(n_groups * K, N)
     bmn = BLOCK_M if block_m is None else int(block_m)
     bnn = BLOCK_N if block_n is None else int(block_n)
-    if bmn <= 0 or bmn & (bmn - 1):
-        raise ValueError(f"block_m must be a power of two, got {bmn}")
-    # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
-    # would silently drop the trailing N % block_n output columns.
-    if bnn <= 0 or N % bnn != 0:
-        raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
-    if bnn % 32:
-        raise ValueError(f"block_n must be a multiple of 32, got {bnn}")
     block_k = int(block_k)
-    if block_k <= 0 or block_k % traits.k_tile_gran != 0:
-        raise ValueError(
-            f"block_k must be a positive multiple of {traits.k_tile_gran}, "
-            f"got {block_k}"
-        )
-    if traits.a_lds_dma and block_k & (block_k - 1):
-        raise ValueError(f"A LDS DMA needs a power-of-two block_k, got {block_k}")
-    if block_k < traits.min_block_k:
-        mma = "x".join(map(str, traits.mma_mnk))
-        raise ValueError(
-            f"block_k must be >= {traits.min_block_k} for MFMA {mma}, got {block_k}"
-        )
-    # n_tiles = K // block_k floors, silently dropping the K tail.
-    if K % block_k != 0:
-        raise ValueError(f"block_k={block_k} must divide K={K}")
-    a_smem = bmn * block_k * STAGES_A * 2
-    epi_smem = max(a_smem, bmn * bnn * 2)
-    if epi_smem > traits.lds_bytes:
-        raise ValueError(
-            f"block_k={block_k} needs {epi_smem} bytes LDS "
-            f"(max {traits.lds_bytes}); "
-            f"A-stage staging is {a_smem} bytes"
-        )
     nthreads = int(threads)
+    check_config(
+        K=K,
+        N=N,
+        block_m=bmn,
+        block_n=bnn,
+        block_k=block_k,
+        threads=nthreads,
+        xcd_c=xcd_c,
+        xcd_w=xcd_w,
+        traits=traits,
+    )
     compact = not uniform_seqlen
     if compact:
         # Slot-count bound from A.shape[0] >= SEQ_OFFSETS[-1]; reading

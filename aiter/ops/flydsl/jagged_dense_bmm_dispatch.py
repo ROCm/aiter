@@ -9,6 +9,7 @@ then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
 from ``get_gfx_runtime()``, so a ``GPU_ARCHS`` build override does not pick the
 row. Under ``AITER_AOT_REPLAY=1``, ``GPU_ARCHS`` names the target and does pick it. The skew path takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w``
 from the row; an empty skew cell falls back to the analytic skew XCD remap.
+A row that fails ``check_config`` is dropped with a warning when the table loads.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import functools
 import pandas as pd
 import torch
 
+from aiter import logger
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
@@ -25,6 +27,7 @@ from .kernels.jagged_dense_bmm_gen import (
     ARCH_TRAITS,
     BLOCK_M,
     BLOCK_N,
+    check_config,
     jagged_dense_bmm,
 )
 
@@ -49,6 +52,28 @@ _CFG_KEYS = ("xcd_c", "xcd_w", "block_k")
 _ROW_KEYS = _CFG_KEYS + ("skew_xcd_c", "skew_xcd_w")
 
 
+def _check_row(key: tuple, row: dict) -> None:
+    gfx, _, reduction_k, output_n, _ = key
+    if (row["skew_xcd_c"] is None) != (row["skew_xcd_w"] is None):
+        raise ValueError("set both skew_xcd_c and skew_xcd_w, or neither")
+    traits = ARCH_TRAITS.get(gfx)
+    if traits is None:
+        return
+    for uniform_seqlen in (True, False):
+        cfg = _row_config(
+            row, n_groups=1, reduction_k=reduction_k, uniform_seqlen=uniform_seqlen
+        )
+        check_config(
+            K=reduction_k,
+            N=output_n,
+            block_m=BLOCK_M,
+            block_n=BLOCK_N,
+            threads=DEFAULT_THREADS,
+            traits=traits,
+            **cfg,
+        )
+
+
 @functools.cache
 def _tuned_table() -> dict:
     df = pd.read_csv(
@@ -56,15 +81,22 @@ def _tuned_table() -> dict:
         dtype=str,
         keep_default_na=False,
     )
-    table = {
-        (r["gfx"], int(r["cu_num"]), int(r["K"]), int(r["N"]), int(r["tiles_log2"])): {
-            k: int(r[k]) if r[k] else None for k in _ROW_KEYS
-        }
-        for r in df.to_dict("records")
-    }
-    for key, row in table.items():
-        if (row["skew_xcd_c"] is None) != (row["skew_xcd_w"] is None):
-            raise ValueError(f"{key}: set both skew_xcd_c and skew_xcd_w, or neither")
+    table = {}
+    for r in df.to_dict("records"):
+        key = (
+            r["gfx"],
+            int(r["cu_num"]),
+            int(r["K"]),
+            int(r["N"]),
+            int(r["tiles_log2"]),
+        )
+        row = {k: int(r[k]) if r[k] else None for k in _ROW_KEYS}
+        try:
+            _check_row(key, row)
+        except ValueError as exc:
+            logger.warning("jagged_dense_bmm: dropping tuned row %s: %s", key, exc)
+            continue
+        table[key] = row
     return table
 
 
@@ -77,11 +109,6 @@ def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int, int]:
     if n_groups <= _SKEW_XCD_REMAP_SMALL_B_THRESHOLD and reduction_k < 512:
         return SKEW_COMPACT_KN_XCD_C_SMALL, SKEW_COMPACT_KN_XCD_W_SMALL
     return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
-
-
-def _config_valid(cfg: dict, *, reduction_k: int) -> bool:
-    bk = cfg["block_k"] or DEFAULT_BLOCK_K
-    return reduction_k % bk == 0 and reduction_k // bk >= 2
 
 
 def resolve_config(
@@ -102,9 +129,27 @@ def resolve_config(
         output_n,
         tiles_log2(n_groups=n_groups, output_n=output_n, max_seq_len=max_seq_len),
     )
-    row = _tuned_table().get(key) or dict.fromkeys(_ROW_KEYS)
-    if not _config_valid(row, reduction_k=reduction_k):
-        row = dict.fromkeys(_ROW_KEYS)
+    return _row_config(
+        _tuned_table().get(key) or dict.fromkeys(_ROW_KEYS),
+        n_groups=n_groups,
+        reduction_k=reduction_k,
+        uniform_seqlen=uniform_seqlen,
+        xcd_c=xcd_c,
+        xcd_w=xcd_w,
+        block_k=block_k,
+    )
+
+
+def _row_config(
+    row: dict,
+    *,
+    n_groups: int,
+    reduction_k: int,
+    uniform_seqlen: bool,
+    xcd_c: int | None = None,
+    xcd_w: int | None = None,
+    block_k: int | None = None,
+) -> dict:
     cfg = {k: row[k] for k in _CFG_KEYS}
     if block_k is not None:
         cfg["block_k"] = int(block_k)

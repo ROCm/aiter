@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import itertools
 import os
 import tempfile
@@ -15,7 +17,12 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_custom_op_core
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx,
+    get_gfx_custom_op_core,
+    get_gfx_runtime,
+)
 from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
@@ -181,18 +188,19 @@ def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
 
 
 @benchmark()
-def test_jdbba_block_k_invalid(B, D, Kout, Mi, block_k, dtype):
+def test_jdbba_config_invalid(B, D, Kout, Mi, arg, value, dtype):
     d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
     out = _nan_out(d["L"], d["N"], dtype)
     try:
-        _launch(d, out, B, Mi, True, block_k=block_k)
+        _launch(d, out, B, Mi, True, **{arg: value})
     except ValueError:
         raised = True
     else:
         raised = False
+    torch.cuda.synchronize()
     untouched = bool(out.isnan().all())
-    assert raised, f"block_k={block_k} with K={D} must raise ValueError"
-    assert untouched, f"block_k={block_k}: rejected call must not write C"
+    assert raised, f"{arg}={value} with K={D} must raise ValueError"
+    assert untouched, f"{arg}={value}: rejected call must not write C"
     return {"gfx": get_gfx(), "raised ValueError": raised, "C untouched": untouched}
 
 
@@ -275,17 +283,33 @@ def _clear_tuned_cache():
     get_gfx_custom_op_core.cache_clear()
 
 
-def _selection_csv(path, tiles):
-    rows = (
-        f"gfx950,256,{_SELECT_K},{_SELECT_N},{tiles},48,24,64,120,16,1\n"
-        f"gfx942,304,{_SELECT_K},{_SELECT_N},{tiles},32,16,64,64,8,1\n"
-        f"gfx942,38,{_SELECT_K},{_SELECT_N},{tiles},9,9,64,9,9,1\n"
-    )
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(
-            "gfx,cu_num,K,N,tiles_log2,xcd_c,xcd_w,block_k,skew_xcd_c,skew_xcd_w,us\n"
-        )
-        fh.write(rows)
+@contextlib.contextmanager
+def _tuned_csv(rows, gpu_archs=None):
+    prev = {
+        name: os.environ.get(name)
+        for name in ("AITER_CONFIG_JAGGED_DENSE_BMM", "GPU_ARCHS")
+    }
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "gfx,cu_num,K,N,tiles_log2,"
+                    "xcd_c,xcd_w,block_k,skew_xcd_c,skew_xcd_w,us\n"
+                )
+                fh.write(rows)
+            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
+            if gpu_archs is not None:
+                os.environ["GPU_ARCHS"] = gpu_archs
+            _clear_tuned_cache()
+            yield
+    finally:
+        for name, value in prev.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        _clear_tuned_cache()
 
 
 @benchmark()
@@ -295,44 +319,65 @@ def test_jdbba_config_selection(
     tiles = jdbba_dispatch.tiles_log2(
         n_groups=_SELECT_B, output_n=_SELECT_N, max_seq_len=_SELECT_MI
     )
-    prev = {
-        "AITER_CONFIG_JAGGED_DENSE_BMM": os.environ.get(
-            "AITER_CONFIG_JAGGED_DENSE_BMM"
-        ),
-        "GPU_ARCHS": os.environ.get("GPU_ARCHS"),
-    }
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
-            _selection_csv(path, tiles)
-            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
-            os.environ["GPU_ARCHS"] = decoy_gpu_archs
-            _clear_tuned_cache()
-            with (
-                mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch),
-                mock.patch.object(jdbba_dispatch, "get_cu_num", return_value=cu_num),
-            ):
-                cfg = jdbba_dispatch.resolve_config(
-                    n_groups=_SELECT_B,
-                    reduction_k=_SELECT_K,
-                    output_n=_SELECT_N,
-                    max_seq_len=_SELECT_MI,
-                    uniform_seqlen=regime == "uniform",
-                    xcd_c=xcd_c,
-                    xcd_w=xcd_w,
-                )
-    finally:
-        for name, value in prev.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        _clear_tuned_cache()
+    rows = (
+        f"gfx950,256,{_SELECT_K},{_SELECT_N},{tiles},48,24,64,120,16,1\n"
+        f"gfx942,304,{_SELECT_K},{_SELECT_N},{tiles},32,16,64,64,8,1\n"
+        f"gfx942,38,{_SELECT_K},{_SELECT_N},{tiles},9,9,64,9,9,1\n"
+    )
+    with (
+        _tuned_csv(rows, gpu_archs=decoy_gpu_archs),
+        mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch),
+        mock.patch.object(jdbba_dispatch, "get_cu_num", return_value=cu_num),
+    ):
+        cfg = jdbba_dispatch.resolve_config(
+            n_groups=_SELECT_B,
+            reduction_k=_SELECT_K,
+            output_n=_SELECT_N,
+            max_seq_len=_SELECT_MI,
+            uniform_seqlen=regime == "uniform",
+            xcd_c=xcd_c,
+            xcd_w=xcd_w,
+        )
     assert (cfg["xcd_c"], cfg["xcd_w"]) == (expect_c, expect_w), (
         f"{arch} cu={cu_num} {regime} selected "
         f"{cfg['xcd_c']},{cfg['xcd_w']} instead of {expect_c},{expect_w}"
     )
     return {"xcd_c": cfg["xcd_c"], "xcd_w": cfg["xcd_w"], "block_k": cfg["block_k"]}
+
+
+@benchmark()
+def test_jdbba_tuned_row(B, D, Kout, Mi, xcd_c, xcd_w, block_k, dropped, dtype):
+    tiles = jdbba_dispatch.tiles_log2(n_groups=B, output_n=Kout, max_seq_len=Mi)
+    key = (get_gfx_runtime(), get_cu_num(), D, Kout, tiles)
+    resolve = functools.partial(
+        jdbba_dispatch.resolve_config,
+        n_groups=B,
+        reduction_k=D,
+        output_n=Kout,
+        max_seq_len=Mi,
+        uniform_seqlen=True,
+    )
+    with _tuned_csv(""):
+        default = resolve()
+    row = ",".join(map(str, (*key, xcd_c, xcd_w, block_k, "", "", 1)))
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    with (
+        _tuned_csv(row + "\n"),
+        mock.patch.object(
+            aiter.logger, "warning", wraps=aiter.logger.warning
+        ) as warning,
+    ):
+        cfg = resolve()
+        _launch(d, out, B, Mi, True)
+    err = _check(d, out, dtype, f"tuned row {row}")
+    warned = any(call.args[1:2] == (key,) for call in warning.call_args_list)
+    kept = {"xcd_c": xcd_c, "xcd_w": xcd_w, "block_k": block_k}
+    expect = default if dropped else kept
+    assert cfg == expect, f"tuned row {row}: selected {cfg}, expected {expect}"
+    assert warned == dropped, f"tuned row {row}: warned={warned}, dropped={dropped}"
+    assert err <= 0.05, f"tuned row {row}: {err:.3%} of elements mismatch"
+    return {"gfx": get_gfx(), **{f"used {k}": v for k, v in cfg.items()}, "err": err}
 
 
 @benchmark()
@@ -561,9 +606,32 @@ def main():
     for dtype, (B, D, Kout, Mi) in itertools.product(
         args.dtype, args.regression_shapes
     ):
-        for block_k in (0, 24, 3 * D // 8):
-            rows.append(test_jdbba_block_k_invalid(B, D, Kout, Mi, block_k, dtype))
-    _summarize("jagged_dense_bmm invalid block_k", rows)
+        cases = [
+            (D, "block_k", 0),
+            (D, "block_k", 24),
+            (D, "block_k", 3 * D // 8),
+            (192, "block_k", 96),
+        ]
+        cases += [(D, arg, v) for arg in ("xcd_c", "xcd_w") for v in (0, -1)]
+        for K, arg, value in cases:
+            rows.append(test_jdbba_config_invalid(B, K, Kout, Mi, arg, value, dtype))
+    _summarize("jagged_dense_bmm invalid config", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        for K, xcd_c, xcd_w, block_k, dropped in (
+            (128, 16, 4, 128, False),
+            (D, 0, 8, 64, True),
+            (384, 32, 8, 96, True),
+        ):
+            rows.append(
+                test_jdbba_tuned_row(
+                    B, K, Kout, Mi, xcd_c, xcd_w, block_k, dropped, dtype
+                )
+            )
+    _summarize("jagged_dense_bmm tuned row", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi), seed in itertools.product(
