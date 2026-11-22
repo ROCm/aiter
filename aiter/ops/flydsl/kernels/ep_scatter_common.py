@@ -23,8 +23,9 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
 # Per wave: (m: overlaps next prologue, n: overlaps next mainloop).
 # Both the GEMM's wave ownership and the callbacks use this table.
 # The m indices are consumed in the current epilogue. The n indices cross the
-# task boundary as scatter_dst_index0/1: each wave-wide index vector
-# supplies GATHERS_PER_INDEX_VECTOR gathers (four for wave32 / eight-row gather).
+# task boundary as previous_task_scatter_dst_index_low/high. Each wave-wide
+# index vector supplies GATHERS_PER_INDEX_VECTOR gathers (four for wave32
+# / eight-row gather).
 SCATTER_SCHEDULE = (
     (0, 0),  # wave 0: load
     (0, 0),  # wave 1: load
@@ -166,8 +167,10 @@ def make_overlap_callbacks(
     Returns prologue, epilogue and skipped-task callbacks. ``scatter_dst_state``
     holds the previous task's two destination index vectors, column offset and
     valid flag.
-    Both index vectors belong to the table's n column: vector 0 supplies its
-    first GATHERS_PER_INDEX_VECTOR gathers, vector 1 the next group. Each lane
+    Both index vectors belong to the table's n column: low supplies its first
+    GATHERS_PER_INDEX_VECTOR gathers, high the next group. The suffixes refer
+    to C row ranges, not address bits. With the default schedule, low covers
+    C rows 128:192 and high covers 192:256 across the store waves. Each lane
     holds one flattened peer/slot index (or OOB), not a pointer. These indices
     must survive the task boundary because the next task may target different
     rows. The C data stays in LDS.
@@ -175,9 +178,12 @@ def make_overlap_callbacks(
     mutates captured state. ``load_first`` loads the first register tile and
     preserves GEMM's scheduling fence.
     """
-    scatter_dst_index0, scatter_dst_index1, scatter_column_offset, scatter_valid = (
-        scatter_dst_state
-    )
+    (
+        previous_task_scatter_dst_index_low,
+        previous_task_scatter_dst_index_high,
+        scatter_column_offset,
+        scatter_valid,
+    ) = scatter_dst_state
 
     def issue_scatter_burst(first, count, index_lanes, column_offset):
         for i in range_constexpr(count):
@@ -204,23 +210,26 @@ def make_overlap_callbacks(
             issue_scatter_burst(
                 PROLOGUE_GATHERS,
                 MAINLOOP_GATHERS,
-                (scatter_dst_index0, scatter_dst_index1),
+                (
+                    previous_task_scatter_dst_index_low,
+                    previous_task_scatter_dst_index_high,
+                ),
                 scatter_column_offset,
             )
         issue(2, 2)
 
     @flyc.jit
     def overlap_epilogue(index_lanes, column_offset):
-        next_scatter_dst_index0 = fx.Int32(0)
-        next_scatter_dst_index1 = fx.Int32(0)
+        next_scatter_dst_index_low = fx.Int32(0)
+        next_scatter_dst_index_high = fx.Int32(0)
         next_scatter_column_offset = fx.Int32(0)
         next_scatter_valid = fx.Int32(0)
         if wave >= FIRST_STORE_WAVE:
             issue_scatter_burst(0, PROLOGUE_GATHERS, index_lanes, column_offset)
             if const_expr(MAINLOOP_GATHERS > 0):
-                next_scatter_dst_index0 = index_lanes[TAIL_FIRST_VECTOR]
+                next_scatter_dst_index_low = index_lanes[TAIL_FIRST_VECTOR]
             if const_expr(MAINLOOP_GATHERS > GATHERS_PER_INDEX_VECTOR):
-                next_scatter_dst_index1 = index_lanes[TAIL_FIRST_VECTOR + 1]
+                next_scatter_dst_index_high = index_lanes[TAIL_FIRST_VECTOR + 1]
             next_scatter_column_offset = fx.Int32(column_offset)
             next_scatter_valid = fx.Int32(1)
             if last_task != 0:
@@ -229,14 +238,14 @@ def make_overlap_callbacks(
                 issue_scatter_burst(
                     PROLOGUE_GATHERS,
                     MAINLOOP_GATHERS,
-                    (next_scatter_dst_index0, next_scatter_dst_index1),
+                    (next_scatter_dst_index_low, next_scatter_dst_index_high),
                     column_offset,
                 )
                 next_scatter_valid = fx.Int32(0)
             rocdl.s_nop(0)
         return (
-            next_scatter_dst_index0,
-            next_scatter_dst_index1,
+            next_scatter_dst_index_low,
+            next_scatter_dst_index_high,
             next_scatter_column_offset,
             next_scatter_valid,
         )
@@ -249,7 +258,10 @@ def make_overlap_callbacks(
             issue_scatter_burst(
                 PROLOGUE_GATHERS,
                 MAINLOOP_GATHERS,
-                (scatter_dst_index0, scatter_dst_index1),
+                (
+                    previous_task_scatter_dst_index_low,
+                    previous_task_scatter_dst_index_high,
+                ),
                 scatter_column_offset,
             )
 

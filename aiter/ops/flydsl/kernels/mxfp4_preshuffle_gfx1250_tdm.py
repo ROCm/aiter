@@ -690,10 +690,11 @@ def build_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
-        # Previous task's n-column indices from SCATTER_SCHEDULE: each i32
-        # is one lane of an index vector, supplying four gathers per wave.
-        scatter_dst_index0: scatter_state_type = 0,
-        scatter_dst_index1: scatter_state_type = 0,
+        # Previous task's n-column indices from SCATTER_SCHEDULE. Low/high
+        # refer to C row ranges (128:192 / 192:256 with the default schedule),
+        # not address bits. Each i32 is one lane of a destination index vector.
+        previous_task_scatter_dst_index_low: scatter_state_type = 0,
+        previous_task_scatter_dst_index_high: scatter_state_type = 0,
         # Destination byte offset and whether the deferred tail needs issuing.
         scatter_column_offset: scatter_state_type = 0,
         scatter_valid: scatter_state_type = 0,
@@ -1997,8 +1998,8 @@ def build_gemm_a8w4_tdm_task(
                     wave,
                     scatter_wave,
                     (
-                        scatter_dst_index0,
-                        scatter_dst_index1,
+                        previous_task_scatter_dst_index_low,
+                        previous_task_scatter_dst_index_high,
                         scatter_column_offset,
                         scatter_valid,
                     ),
@@ -2010,8 +2011,8 @@ def build_gemm_a8w4_tdm_task(
                     load_first,
                 )
             )
-        next_scatter_dst_index0 = fx.Int32(0)
-        next_scatter_dst_index1 = fx.Int32(0)
+        next_scatter_dst_index_low = fx.Int32(0)
+        next_scatter_dst_index_high = fx.Int32(0)
         next_scatter_column_offset = fx.Int32(0)
         next_scatter_valid = fx.Int32(0)
         if const_expr(overlap_scatter):  # noqa: SIM102
@@ -2839,8 +2840,8 @@ def build_gemm_a8w4_tdm_task(
 
                 if const_expr(epilogue_callback is not None):
                     (
-                        next_scatter_dst_index0,
-                        next_scatter_dst_index1,
+                        next_scatter_dst_index_low,
+                        next_scatter_dst_index_high,
                         next_scatter_column_offset,
                         next_scatter_valid,
                     ) = epilogue_callback(_scatter_idx_lanes, _gboff)
@@ -2946,8 +2947,8 @@ def build_gemm_a8w4_tdm_task(
 
         if const_expr(overlap_scatter):
             return (
-                next_scatter_dst_index0,
-                next_scatter_dst_index1,
+                next_scatter_dst_index_low,
+                next_scatter_dst_index_high,
                 next_scatter_column_offset,
                 next_scatter_valid,
             )
