@@ -33,10 +33,19 @@ def remap_xcd_aid(
 ):
     """AID-aware remap for parts whose L2 is shared by the XCDs inside an AID, such as gfx1250.
 
-    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs, so pid % W is the
-    XCD. The L2 is per AID, not per XCD, so this blocks the tile space by AID and interleaves an
-    AID's XCDs inside its block. The XCDs that share an L2 then work on adjacent tiles at the
-    same time and share their operands in it.
+    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs. The L2 is per
+    AID, not per XCD, so this blocks the tile space by AID and interleaves an AID's XCDs inside
+    its block. The XCDs that share an L2 then work on adjacent tiles at the same time and share
+    their operands in it.
+
+    The round robin does not start at XCD 0. It starts at an XCD set by the hardware queue the
+    launch goes through: with n = 4 * pipe + queue, dispatch id i runs on XCD (i - n) mod W.
+    Measured on gfx1250 for n = 0 to 4 with single workgroups and with clusters of 4 and 16
+    CTAs. A stream's queue is chosen by the runtime, a graph replay uses a stream of its own,
+    and a process with more than four streams moves them between queues, so n cannot be
+    assumed. The wave reads its own pipe and queue from HW_REG_WAVE_HW_ID2 instead. Taking
+    pid % W as the XCD is right only for n = 0 and n = 4; for the other queues one to three
+    of every four XCDs of an AID's block run on the other AID.
 
     Giving each XCD its own contiguous run instead, which is the obvious form, makes an AID's
     total range contiguous but leaves its XCDs one run apart at any instant, so the shared L2
@@ -52,7 +61,19 @@ def remap_xcd_aid(
     blk = GRID_MN // W  # pids for one XCD
     if pid >= blk * W:
         return pid
-    xcd_g = pid % W
+    # Bits 3:0 of HW_REG_WAVE_HW_ID2 (register 24) are the pipe and bits 7:4 the queue.
+    hw = tl.inline_asm_elementwise(
+        "s_getreg_b32 $0, hwreg(24, 0, 8)",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    n = 4 * (hw & 0xF) + ((hw >> 4) & 0xF)
+    # The true XCD of this dispatch id. Inside one round of W ids this is a rotation of the
+    # residues, so the map stays a bijection for every n.
+    xcd_g = (pid % W + W - n % W) % W
     pos = pid // W
     if AID_CONTIGUOUS:
         aid = xcd_g // XCDS_PER_AID
