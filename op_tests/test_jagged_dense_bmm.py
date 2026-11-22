@@ -29,7 +29,6 @@ from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
 from aiter.test_common import (
     assertAllclose,
     benchmark,
-    checkAllclose,
     run_perftest,
 )
 
@@ -37,6 +36,7 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 SEED = 1234
+_SIDE_GATE_CYCLES = 10**9  # GPU cycles. The gate must outlast the snapshot below.
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -117,20 +117,17 @@ def _launch(d, out, B, Mi, uniform, **kwargs):
     return out
 
 
+# tol_err_ratio=0: one missed group (1.56% of rows at B=64) would pass the 5% default.
 def _check(d, got, dtype, msg):
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
-    return checkAllclose(
+    return assertAllclose(
         ref.to(dtypes.fp32),
         got.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
+        tol_err_ratio=0,
         msg=msg,
     )
-
-
-def _require(d, got, dtype, msg):
-    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
-    return assertAllclose(ref.to(dtypes.fp32), got.to(dtypes.fp32), msg=msg)
 
 
 def _roofline(d, B, us):
@@ -156,7 +153,7 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
             Mi, so64, d["jagged"], d["dense"], d["bias"]
         )[0][:L]
 
-    ret = {"gfx": get_gfx(), "L": L}
+    ret = {"gfx": get_gfx_runtime(), "L": L}
     for name, fn in candidates.items():
         out.fill_(float("nan"))
         got, us = run_perftest(fn)
@@ -178,7 +175,7 @@ def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
     got, us = run_perftest(lambda: _launch(d, out, B, Mi, True, block_k=block_k))
     tflops, tbps = _roofline(d, B, us)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "L": d["L"],
         "flydsl us": us,
         "flydsl TFLOPS": tflops,
@@ -201,7 +198,11 @@ def test_jdbba_config_invalid(B, D, Kout, Mi, arg, value, dtype):
     untouched = bool(out.isnan().all())
     assert raised, f"{arg}={value} with K={D} must raise ValueError"
     assert untouched, f"{arg}={value}: rejected call must not write C"
-    return {"gfx": get_gfx(), "raised ValueError": raised, "C untouched": untouched}
+    return {
+        "gfx": get_gfx_runtime(),
+        "raised ValueError": raised,
+        "C untouched": untouched,
+    }
 
 
 def _permute_group_lengths_(seq_offsets):
@@ -248,19 +249,25 @@ def test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype):
     assert not torch.equal(before, d["seq_offsets"]), "permutation must change offsets"
     err_inplace = _skew_run(d, "skew in-place offsets update")
 
-    side = torch.cuda.Stream()
     out = _nan_out(d["L"], d["N"], dtype)
+    side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        _launch(d, out, B, Mi, False, stream=side)
-    torch.cuda.current_stream().wait_stream(side)
-    err_side = _check(d, out, dtype, "skew explicit side stream")
+    # Holds back a launch that ignores `stream`, so the snapshot sees NaN in C.
+    torch.cuda._sleep(_SIDE_GATE_CYCLES)
+    _launch(d, out, B, Mi, False, stream=side)
+    reader = torch.cuda.Stream()
+    reader.wait_stream(side)
+    with torch.cuda.stream(reader):
+        snap = out.clone()
+    reader.synchronize()
+    err_side = _check(d, snap, dtype, "skew explicit side stream")
+    torch.cuda.synchronize()
 
     out = _nan_out(d["L"], d["N"], dtype)
     _, us = run_perftest(lambda: _launch(d, out, B, Mi, False))
     tflops, tbps = _roofline(d, B, us)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "L": d["L"],
         "err new": err_first,
         "err new L": err_new_l,
@@ -376,8 +383,95 @@ def test_jdbba_tuned_row(B, D, Kout, Mi, xcd_c, xcd_w, block_k, dropped, dtype):
     expect = default if dropped else kept
     assert cfg == expect, f"tuned row {row}: selected {cfg}, expected {expect}"
     assert warned == dropped, f"tuned row {row}: warned={warned}, dropped={dropped}"
-    assert err <= 0.05, f"tuned row {row}: {err:.3%} of elements mismatch"
-    return {"gfx": get_gfx(), **{f"used {k}": v for k, v in cfg.items()}, "err": err}
+    return {
+        "gfx": get_gfx_runtime(),
+        **{f"used {k}": v for k, v in cfg.items()},
+        "err": err,
+    }
+
+
+def _live_tuned_row(B, D, Kout, Mi, xcd_c, xcd_w, block_k):
+    tiles = jdbba_dispatch.tiles_log2(n_groups=B, output_n=Kout, max_seq_len=Mi)
+    key = (get_gfx_runtime(), get_cu_num(), D, Kout, tiles)
+    return ",".join(map(str, (*key, xcd_c, xcd_w, block_k, "", "", 1)))
+
+
+@benchmark()
+def test_jdbba_tuned_row_skew_fallback(B, D, Kout, Mi, dtype):
+    row = _live_tuned_row(B, D, Kout, Mi, 16, 4, 64)
+    d = _build_inputs(B, D, Kout, Mi, "skew", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    with _tuned_csv(row + "\n"):
+        cfg = jdbba_dispatch.resolve_config(
+            n_groups=B,
+            reduction_k=D,
+            output_n=Kout,
+            max_seq_len=Mi,
+            uniform_seqlen=False,
+        )
+        _launch(d, out, B, Mi, False)
+    err = _check(d, out, dtype, f"skew fallback, tuned row {row}")
+    expect = (
+        jdbba_dispatch.SKEW_COMPACT_KN_XCD_C_SMALL,
+        jdbba_dispatch.SKEW_COMPACT_KN_XCD_W_SMALL,
+    )
+    assert (cfg["xcd_c"], cfg["xcd_w"]) == expect, (
+        f"tuned row {row} without skew cells: selected "
+        f"{cfg['xcd_c']},{cfg['xcd_w']} instead of {expect[0]},{expect[1]}"
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "used xcd_c": cfg["xcd_c"],
+        "used xcd_w": cfg["xcd_w"],
+        "err": err,
+    }
+
+
+@benchmark()
+def test_jdbba_block_k_override(B, D, Kout, Mi, block_k, dtype):
+    row = _live_tuned_row(B, D, Kout, Mi, 16, 4, 64)
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    # A cleared launcher cache makes the launch build the key it actually uses.
+    with _tuned_csv(row + "\n"), mock.patch.dict(_LAUNCHERS, clear=True):
+        cfg = jdbba_dispatch.resolve_config(
+            n_groups=B,
+            reduction_k=D,
+            output_n=Kout,
+            max_seq_len=Mi,
+            uniform_seqlen=True,
+            block_k=block_k,
+        )
+        _launch(d, out, B, Mi, True, block_k=block_k)
+        launched = {launcher_key[4] for _, launcher_key in _LAUNCHERS}
+    err = _check(d, out, dtype, f"block_k={block_k} override, tuned row {row}")
+    expect = {"xcd_c": 16, "xcd_w": 4, "block_k": block_k}
+    what = f"block_k={block_k} override"
+    assert cfg == expect, f"{what}: selected {cfg}, expected {expect}"
+    assert launched == {block_k}, f"{what}: launcher built for {sorted(launched)}"
+    return {"gfx": get_gfx_runtime(), "used block_k": cfg["block_k"], "err": err}
+
+
+@benchmark()
+def test_jdbba_dense_2d_invalid(B, D, Kout, Mi, dtype):
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    dense_2d = d["dense"].reshape(B * D, Kout)
+    try:
+        _launch({**d, "dense": dense_2d}, out, B, Mi, True)
+    except ValueError:
+        raised = True
+    else:
+        raised = False
+    torch.cuda.synchronize()
+    untouched = bool(out.isnan().all())
+    assert raised, "2-D dense B must raise ValueError"
+    assert untouched, "2-D dense B: rejected call must not write C"
+    return {
+        "gfx": get_gfx_runtime(),
+        "raised ValueError": raised,
+        "C untouched": untouched,
+    }
 
 
 @benchmark()
@@ -396,7 +490,7 @@ def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
 
     out = _nan_out(first["L"], first["N"], dtype)
     _launch(first, out, B, Mi, uniform, **_PINNED_LAUNCHER_KEY)
-    err_prime = _require(first, out, dtype, f"launcher reuse prime ({regime})")
+    err_prime = _check(first, out, dtype, f"launcher reuse prime ({regime})")
     n_launchers = len(_LAUNCHERS)
 
     out = _nan_out(second["L"], second["N"], dtype)
@@ -407,10 +501,10 @@ def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
     assert (
         new_launchers == 0
     ), f"launcher cache grew by {new_launchers} for a new {regime} length"
-    err = _require(second, got, dtype, f"launcher reuse ({regime})")
+    err = _check(second, got, dtype, f"launcher reuse ({regime})")
     tflops, tbps = _roofline(second, B2, us)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "B2": B2,
         "Mi2": Mi2,
         "L": second["L"],
@@ -429,14 +523,14 @@ def test_jdbba_two_devices(B, D, Kout, Mi, dtype):
         reason = f"needs 2 visible GPUs, found {n_dev}"
         aiter.logger.warning("jagged_dense_bmm two-device test skipped: %s", reason)
         return {"skipped": reason}
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for dev in range(2):
         with torch.cuda.device(dev):
             d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
             out = _nan_out(d["L"], d["N"], dtype)
         _launch(d, out, B, Mi, True, **_PINNED_LAUNCHER_KEY)
         with torch.cuda.device(dev):
-            ret[f"err cuda:{dev}"] = _require(d, out, dtype, f"two devices cuda:{dev}")
+            ret[f"err cuda:{dev}"] = _check(d, out, dtype, f"two devices cuda:{dev}")
     return ret
 
 
@@ -450,13 +544,13 @@ def test_jdbba_size1_dim_strides(B, D, Kout, Mi, odd, dtype):
         out = out.as_strided((1, Kout), (1, 1))
     assert first["jagged"].is_contiguous() and out.is_contiguous()
     _launch(first, out, 1, 1, True, **_PINNED_LAUNCHER_KEY)
-    err_first = _require(first, out, dtype, f"size-1 dim, odd {odd} strides")
+    err_first = _check(first, out, dtype, f"size-1 dim, odd {odd} strides")
 
     second = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
     out = _nan_out(second["L"], second["N"], dtype)
     _launch(second, out, B, Mi, True, **_PINNED_LAUNCHER_KEY)
-    err = _require(second, out, dtype, f"canonical strides after odd {odd}")
-    return {"gfx": get_gfx(), "err odd": err_first, "err next": err}
+    err = _check(second, out, dtype, f"canonical strides after odd {odd}")
+    return {"gfx": get_gfx_runtime(), "err odd": err_first, "err next": err}
 
 
 def _summarize(name, rows):
@@ -486,8 +580,10 @@ def _expand_shapes(shapes, batch, parser):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("jagged_dense_bmm unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "jagged_dense_bmm unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
     if not _HAS_TRITON:
         aiter.logger.warning(
@@ -581,7 +677,7 @@ def main():
         ("gfx942", 304, "uniform", "gfx950", None, None, 32, 16),
         ("gfx950", 256, "skew", "gfx942", None, None, 120, 16),
         ("gfx942", 38, "uniform", "gfx950", None, None, 9, 9),
-        ("gfx950", 38, "uniform", "gfx942", 32, 8, 32, 8),
+        ("gfx942", 38, "uniform", "gfx950", 16, 4, 16, 4),
     ):
         rows.append(test_jdbba_config_selection(**dict(zip(fields, case))))
     _summarize("jagged_dense_bmm config selection", rows)
@@ -621,6 +717,13 @@ def main():
     for dtype, (B, D, Kout, Mi) in itertools.product(
         args.dtype, args.regression_shapes
     ):
+        rows.append(test_jdbba_dense_2d_invalid(B, D, Kout, Mi, dtype))
+    _summarize("jagged_dense_bmm 2-D dense", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
         for K, xcd_c, xcd_w, block_k, dropped in (
             (128, 16, 4, 128, False),
             (D, 0, 8, 64, True),
@@ -632,6 +735,20 @@ def main():
                 )
             )
     _summarize("jagged_dense_bmm tuned row", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        rows.append(test_jdbba_tuned_row_skew_fallback(B, D, Kout, Mi, dtype))
+    _summarize("jagged_dense_bmm tuned row skew fallback", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        rows.append(test_jdbba_block_k_override(B, D, Kout, Mi, 128, dtype))
+    _summarize("jagged_dense_bmm block_k override", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi), seed in itertools.product(
