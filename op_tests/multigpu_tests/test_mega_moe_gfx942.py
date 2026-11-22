@@ -4,10 +4,10 @@
 
 The layer is DeepSeek-V4-Flash's MoE: H 4096, I 2048, 256 experts (32 per rank),
 top-6, silu with swiglu_limit 10. Every output is checked against an fp32 reference
-with the clamp. ``--quant a8w8`` runs the layer on FP8 128x128 block-scale experts
-instead of MXFP4 ones (main and prequant on the a8w8 mega kernel, small on the main
-path compiled for fp8 W); some of their blocks have scale 0 over non-zero bytes (they
-must contribute nothing).
+with the clamp. Main and prequant run on the mega kernel, small on the main path.
+``--quant a8w8`` runs the layer on FP8 128x128 block-scale experts instead of MXFP4
+ones; some of their blocks have scale 0 over non-zero bytes (they must contribute
+nothing).
 
 - test_mega_moe_gfx942: every path the layer reports available (main, main on x
   quantized beforehand by aiter's per_1x128 quant ("prequant", timed with that quant),

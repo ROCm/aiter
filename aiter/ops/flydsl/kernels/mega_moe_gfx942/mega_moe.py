@@ -4,21 +4,23 @@
 """MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X), shaped like
 MegaMoEV2.
 
-a8w4 has MegaMoEV2's main path (``forward``, ``forward_prequant``): five kernels per
-call. ``comm.py`` quantizes x, exchanges the route counts and plans every route's
-destination row; ``main.py`` is one persistent kernel that writes each route's row into
-its destination, runs gemm1 / gemm2 on the rows as they arrive and adds every route into
-its source rank's output (BF16 atomics); ``comm.py`` then waits until all ranks' adds
-are done. Its tasks only wait for work that is already running, so it needs no
-co-residency. The small-input and large-input single-kernel paths are not in this
-version: the layer reports them unavailable (``small_m_mtpr`` 0, ``large_m_available``
-False), so a caller written for all three paths runs the main path.
+Two kernel sets run it:
 
-a8w8 runs ``forward`` / ``forward_prequant`` on its own mega kernel (``a8w8/``: GEMM
-tiles of 256 rows with A and W staged through LDS; faster from about 1000 tokens per
-rank) and ``forward_small_m`` on the main path above compiled for fp8 W (W streamed
-into VGPRs; faster for decode batches) at the small-input capacity. Both read the same
-experts.
+- the main path: five kernels per call. ``comm.py`` quantizes x, exchanges the route
+  counts and plans every route's destination row; ``main.py`` is one persistent kernel
+  that writes each route's row into its destination, runs gemm1 / gemm2 on the rows as
+  they arrive and adds every route into its source rank's output (BF16 atomics);
+  ``comm.py`` then waits until all ranks' adds are done. Its tasks only wait for work
+  that is already running, so it needs no co-residency. W streams into VGPRs: faster
+  for decode batches.
+- the mega kernel of ``a8w8/``: GEMM tiles of 256 rows with A and W staged through
+  LDS, faster from about 1000 tokens per rank. It decodes a8w4's MXFP4 experts to FP8
+  in its W loaders.
+
+``forward`` / ``forward_prequant`` run the mega kernel and ``forward_small_m`` the main
+path at the small-input capacity, both on the same experts. a8w4 with
+``x_quant="per_token"`` runs every call on the main path and has no small-input path.
+There is no large-input path in this version (``large_m_available`` False).
 
 Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
@@ -26,8 +28,8 @@ receives at most every route of every rank (8 x max_tok_per_rank x topk rows plu
 partial block per expert), so no route is dropped. The main path's buffers at
 max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
 (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory; 8192 is the
-largest (the receive buffer stays below 2 GiB). a8w8's mega kernel takes about the
-same; its small-input path at 128 tokens per rank 0.04 GiB.
+largest (the receive buffer stays below 2 GiB). The mega kernel takes about the same;
+the small-input path at 128 tokens per rank 0.04 GiB.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -83,9 +85,9 @@ class MegaMoEGfx942:
     builds the same instances in the same order after MORI shmem is initialized.
 
     ``small_m_mtprs``, ``small_m_enabled`` and ``large_m_enabled`` are MegaMoEV2's
-    arguments. a8w4 has no small- or large-input path in this version and ignores them;
-    a8w8 builds its small-input path when ``small_m_enabled`` (None: the
-    ``AITER_MEGA_SMALL_M`` flag), for up to max(``small_m_mtprs``) tokens per rank."""
+    arguments. The small-input path (the main path for up to max(``small_m_mtprs``)
+    tokens per rank) is built when ``small_m_enabled`` (None: the ``AITER_MEGA_SMALL_M``
+    flag); there is no large-input path in this version."""
 
     def __init__(
         self,
@@ -149,11 +151,12 @@ class MegaMoEGfx942:
         self._weights = {}
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
         self._x1, self._small_mtpr = None, 0
-        if quant == "a8w4":
+        if x_quant != "per_1x128":
+            if quant != "a8w4":
+                raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
+            # the mega kernel quantizes x per 1x128 only
             self._build_main(self.mtpr)
             return
-        if x_quant != "per_1x128":
-            raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
         from .a8w8.host import MegaMoEGfx942A8W8
 
         self._x1 = MegaMoEGfx942A8W8(
@@ -165,6 +168,7 @@ class MegaMoEGfx942:
             topk=topk,
             max_tok_per_rank=self.mtpr,
             swiglu_limit=limit,
+            wq=_WQ[quant],
             w1=w1,
             w1_scale=w1_scale,
             w2=w2,
@@ -458,7 +462,7 @@ class MegaMoEGfx942:
     @property
     def small_m_mtpr(self):
         """Largest per-rank token count ``forward_small_m`` accepts: 0 when the path is
-        off (always for a8w4 in this version)."""
+        off."""
         return self._small_mtpr
 
     @property
@@ -554,13 +558,13 @@ class MegaMoEGfx942:
     def forward_small_m(
         self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True
     ):
-        """MegaMoEV2's small-input call (a8w8 only in this version). ``max_tokens``: the
-        most rows of this call on any EP rank, the same on every rank."""
+        """MegaMoEV2's small-input call, on the main path. ``max_tokens``: the most rows
+        of this call on any EP rank, the same on every rank."""
         if not self._small_mtpr:
             raise RuntimeError(
                 "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
                 if self._x1 is not None
-                else "MegaMoEGfx942 has no small-input path for a8w4 in this version"
+                else "MegaMoEGfx942 has no small-input path for x_quant='per_token'"
             )
         need = int(max_tokens)
         if need < int(x_bf16.shape[0]) or need > self._small_mtpr:
