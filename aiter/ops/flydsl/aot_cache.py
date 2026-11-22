@@ -91,7 +91,7 @@ from aiter import logger
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
-_SCHEMA = 5
+_SCHEMA = 6
 _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
@@ -312,8 +312,8 @@ def _process_start_ns() -> int:
 
 def _changed_since_start(files) -> list:
     """Sources modified after this process started. The process may run the code
-    it imported before the change, so an entry built now could hold the old code
-    under the new file's hash."""
+    it imported before the change, so the contents on disk cannot establish
+    that the process and the entry use the same code."""
     start = _process_start_ns()
     changed = []
     for f in files:
@@ -719,7 +719,8 @@ def _record_sources(out: set, env: set, calls: set):
         yield
     finally:
         sys.setprofile(old)
-        out.update(os.path.realpath(f) for f in seen if _is_tracked(f))
+        resolved = {os.path.realpath(f) for f in seen}
+        out.update(f for f in resolved if _is_tracked(f))
         env.update(
             k
             for f, k in reads
@@ -769,10 +770,12 @@ def _called_lines(calls) -> dict:
 
 def _entry_current(meta: dict) -> bool:
     root = _tracked_root()
-    sources = meta["sources"].items()
     # os.path.join keeps an absolute path as it is.
-    return all(_file_digest(os.path.join(root, p)) == d for p, d in sources) and all(
-        _input(k) == v for k, v in meta["env"].items()
+    sources = {os.path.join(root, p): d for p, d in meta["sources"].items()}
+    return (
+        all(_file_digest(p) == d for p, d in sources.items())
+        and not _changed_since_start(sources)
+        and all(_input(k) == v for k, v in meta["env"].items())
     )
 
 
@@ -976,8 +979,19 @@ class FlyDSLAotCache:
             return _JitKernel(make_exe(), key)
         try:
             return self._resolve(key, make_exe, args)
-        except (TypeError, ValueError, NotImplementedError, RuntimeError, OSError) as e:
-            if _MODE == "verify" or isinstance(e, (_StaleEntryError, _UsageError)):
+        except (
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            OSError,
+            subprocess.CalledProcessError,
+        ) as e:
+            if (
+                _MODE == "verify"
+                or isinstance(e, (_StaleEntryError, _UsageError))
+                or (fly_env.runtime.run_only and fly_env.compile.compile_only)
+            ):
                 raise
             logger.warning(
                 f"[FlyDSL AOT] {self.name}: no exported entry for {key!r} ({e}); "
@@ -995,18 +1009,26 @@ class FlyDSLAotCache:
         sym = f"fly_{self.name}_{digest[:16]}"
         out_dir = self.directory()
         found = self._find(out_dir, digest)
+        run_only = fly_env.runtime.run_only
         if found is None:
+            if run_only:
+                raise RuntimeError(
+                    f"FLYDSL_RUNTIME_RUN_ONLY=1 but no current exported entry "
+                    f"for {self.name} ({digest}) in {out_dir}"
+                )
             with _file_lock(out_dir / f"{digest}.lock"):
                 found = self._find(out_dir, digest)
                 if found is None:
                     found = self._build(make_exe, args, out_dir, sym, digest)
-        elif _MODE == "verify":
+        elif _MODE == "verify" and not run_only:
             self._verify(make_exe(), args, sym, found.with_suffix(".o"))
         if fly_env.compile.compile_only:
             return None
         try:
             return _load_module(found.with_suffix(".o"))
         except (OSError, ValueError) as e:
+            if run_only:
+                raise
             # A truncated or foreign object: rebuild once.
             logger.warning(f"[FlyDSL AOT] loading {found}.o failed ({e}); rebuilding")
             with _file_lock(out_dir / f"{digest}.lock"):
@@ -1051,16 +1073,15 @@ class FlyDSLAotCache:
             _bindings.cache_clear()
             called = _called_lines(calls)
             files |= _import_sources(files, called)
+            # Hash the current files, then check their timestamps before publishing.
+            _file_digest.cache_clear()
+            sources = {_portable(f): _file_digest(f) for f in sorted(files)}
             changed = _changed_since_start(files)
             if changed:
                 raise RuntimeError(
                     f"{changed[0]} changed after this process started; not caching "
                     f"a build that may hold its earlier code"
                 )
-            # Hashed now, not from the per-process cache: the build read the
-            # files as they are on disk at this point.
-            _file_digest.cache_clear()
-            sources = {_portable(f): _file_digest(f) for f in sorted(files)}
             meta = {"sources": sources, "env": _entry_env(files, read, calls, called)}
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"

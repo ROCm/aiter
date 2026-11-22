@@ -611,6 +611,8 @@ def flydsl_preshuffle_gemm_a8(
         WQ.element_size(),
         Out.element_size(),
     )
+    if m == 0 or n == 0:
+        return Out
 
     compile_kwargs = {
         "N": n,

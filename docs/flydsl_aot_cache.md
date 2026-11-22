@@ -277,11 +277,10 @@ instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
-A process runs the code it imported, so a source edited after it started
-(`git checkout` during a test run) no longer matches what it would trace. A
-build that records such a file is not written: that key takes the JIT path
-in this process, with a warning, and the next process builds the entry from
-the new code.
+A process can still hold the code it imported before a source edit. Disk
+lookups and exports check for dependencies modified after process start.
+In mode `1`, a key affected by such an edit takes the JIT path in that
+process. A fresh process can load or build the entry for the new source.
 
 Recording costs about 80 ms on a miss (≈110 ms → ≈190 ms), once per entry
 per machine. A hit pays nothing for it.
@@ -368,6 +367,12 @@ export just built the entry, its own compile already showed the replay the
 request and filled FlyDSL's cache (the same artifact), so the JIT launch is
 skipped. Otherwise it runs and also fills FlyDSL's own cache for mode `0`
 and the fallback, like before this cache.
+
+The replay's `--check` sets `FLYDSL_RUNTIME_RUN_ONLY=1`. With the AOT
+cache enabled, each converted launcher requires a current `.o` and `.json`
+pair before checking the underlying FlyDSL artifact. Use mode `0` to check
+only the underlying FlyDSL cache. Run-only mode also skips `verify`'s
+re-export since the check is read-only.
 
 Cost, gfx950 mxfp8 and a4w4 CSVs above, run one after the other on fresh
 directories: 155 s at HEAD, 164 s with the cache (62 GPU binaries, the same

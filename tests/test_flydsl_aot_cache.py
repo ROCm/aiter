@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from runpy import run_path
 
 import flydsl.compiler as flyc
 import pandas as pd
@@ -50,6 +51,8 @@ from aiter.test_common import checkAllclose
 CASES = {
     (200, 2048, 1024): (32, 64, 128, 1),
     (64, 1024, 2048): (16, 64, 128, 2),
+    # Reuse the first case's specialization to exercise the empty warm path.
+    (0, 2048, 1024): (32, 64, 128, 1),
 }
 DTYPES = {"fp8": dtypes.fp8}
 # mode name -> {((m, n, k), qdtype): record}, filled by check_paths()
@@ -204,6 +207,96 @@ def check_paths(cache_dir, cases):
     rebuilt = {**expected, "builds": entries, "traces": entries}
     _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
     assert state == rebuilt, f"a variable the build read did not rebuild: {state}"
+
+
+def test_record_sources_through_symlink(tmp_path, monkeypatch):
+    from aiter.ops.flydsl import aot_cache
+
+    root = tmp_path / "source" / "aiter"
+    root.mkdir(parents=True)
+    kernel = root / "kernel.py"
+    kernel.write_text("def trace():\n    pass\n")
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    alias = site_packages / "aiter"
+    alias.symlink_to(root, target_is_directory=True)
+    monkeypatch.setattr(aot_cache, "_tracked_root", lambda: str(root) + os.sep)
+
+    trace = run_path(str(alias / kernel.name))["trace"]
+    sources = set()
+    with aot_cache._record_sources(sources, set(), set()):
+        trace()
+    assert str(kernel) in sources
+
+
+def test_entry_requires_source_from_before_process_start(tmp_path, monkeypatch):
+    from aiter.ops.flydsl import aot_cache
+
+    kernel = tmp_path / "kernel.py"
+    kernel.write_text("value = 2\n")
+    mtime = kernel.stat().st_mtime_ns
+    monkeypatch.setattr(aot_cache, "_tracked_root", lambda: str(tmp_path) + os.sep)
+    monkeypatch.setattr(aot_cache, "_process_start_ns", lambda: mtime)
+
+    meta = {
+        "sources": {kernel.name: hashlib.sha256(kernel.read_bytes()).hexdigest()},
+        "env": {},
+    }
+    assert aot_cache._entry_current(meta)
+    os.utime(kernel, ns=(mtime, mtime + 1_000_000_000))
+    assert not aot_cache._entry_current(meta)
+
+
+@pytest.mark.parametrize("mode", ["1", "verify"])
+def test_aot_compile_only_run_only_checks_disk_without_export(
+    tmp_path, monkeypatch, mode
+):
+    from aiter.ops.flydsl import aot_cache
+
+    cache = aot_cache.FlyDSLAotCache("run_only_test")
+    key = (1,)
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
+    monkeypatch.setattr(aot_cache, "_MODE", mode)
+    monkeypatch.setattr(cache, "directory", lambda: tmp_path)
+    monkeypatch.setattr(
+        aot_cache, "_load_module", lambda _: pytest.fail("loaded GPU code")
+    )
+    monkeypatch.setattr(cache, "_build", lambda *_: pytest.fail("built missing entry"))
+    monkeypatch.setattr(
+        cache, "_verify", lambda *_: pytest.fail("re-exported cached entry")
+    )
+
+    with pytest.raises(RuntimeError, match="no current exported entry"):
+        cache.launch(key, lambda: pytest.fail("called the launcher factory"))
+    assert not list(tmp_path.iterdir())
+
+    entry = tmp_path / (cache._disk_key(key, ()) + "-variant")
+    entry.with_suffix(".json").write_text('{"sources": {}, "env": {}}')
+    entry.with_suffix(".o").touch()
+
+    # Replay still checks the underlying FlyDSL artifact on an AOT hit.
+    jit_calls = []
+    monkeypatch.setattr(
+        aot_cache, "_JitKernel", lambda _, key: lambda: jit_calls.append(key)
+    )
+    cache.launch(key, lambda: None)
+    assert jit_calls == [key]
+
+
+def test_objcopy_failure_falls_back_to_jit(monkeypatch):
+    from aiter.ops.flydsl import aot_cache
+
+    def fail_export(*_args):
+        raise subprocess.CalledProcessError(1, ["objcopy", "--strip-debug"])
+
+    cache = aot_cache.FlyDSLAotCache("objcopy_test")
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(
+        aot_cache, "_load_module", lambda _: pytest.fail("loaded GPU code")
+    )
+    monkeypatch.setattr(cache, "_resolve", fail_export)
+    assert isinstance(cache._kernel((1,), object, ()), aot_cache._JitKernel)
 
 
 def test_aot_cache():
