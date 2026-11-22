@@ -1971,7 +1971,6 @@ def build_gemm_a8w4_tdm_task(
                 ),
                 elem_bytes,
                 SCATTER_GROUP_ROWS,
-                overlap_scatter,
             )
 
         prologue_callback, epilogue_callback, skip_callback = None, None, None

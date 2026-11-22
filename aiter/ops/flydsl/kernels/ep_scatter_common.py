@@ -10,8 +10,7 @@ inline code, with no runtime plugin dispatch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
@@ -35,14 +34,12 @@ def make_scatter_store(
     output_type,
     elem_bytes,
     group_rows,
-    overlap_scatter,
 ):
     """Bind the symmetric combine arena and return (emitter, rank rows, OOB).
 
     A peer/slot pair folds into one row index, peer * rank_rows + slot.
     Quantized rows include their scales and are addressed in bytes. Ordinary
-    and overlapped scatter share descriptors; the latter's callbacks replace
-    the shim's implicit wait with explicit burst drains.
+    and overlapped scatter use the same descriptor and store intrinsic.
     """
     rank_rows = fx.Int32((lsa1 - lsa0) // fx.Int64(slot_stride_bytes))
     # Hardware drops padding rows at this exclusive upper bound.
@@ -96,19 +93,9 @@ def make_scatter_store(
             ),
             global_byte_offset=column_offset,
         )
-        if const_expr(overlap_scatter):
-            # tensor_store_gather emits redundant tensorcnt(0xa).
-            # Store-only waves issue at most eight stores between
-            # explicit drains; inline asm keeps that burst wait-free.
-            llvm_dialect.inline_asm(
-                None,
-                [desc.dgroup0, desc.dgroup1, desc.dgroup2, desc.dgroup3],
-                "tensor_store_from_lds $0, $1, $2, $3\n" "s_nop 0",
-                "s,s,s,s,~{memory}",
-                has_side_effects=True,
-            )
-        else:
-            tensor_store_gather(desc)
+        # Preserve the compiler's tensorcnt(0xa) hardware guard. The overlap
+        # callbacks issue only eight stores per wave between explicit drains.
+        tensor_store_gather(desc)
 
     return issue_scatter_group, rank_rows, oob
 
