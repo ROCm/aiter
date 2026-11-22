@@ -83,12 +83,21 @@ class WmmaKernelInstance:
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
     fused_splitk: bool = False
+    # LDS row pad (elements) of the fused epilogue staging; -1 = default.
+    c_pad: int = -1
+    # Opt-in quadrant early-prefetch schedule (_qe), see the mxscale quadrant kernel.
+    quad_early: bool = False
+    # Opt-in: no cluster barrier in the main loop (only with cluster_m == cluster_n == 1; see the kernel).
+    no_loop_cbar: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + (f"_cp{self.c_pad}" if self.c_pad >= 0 else "")
+            + ("_qe" if self.quad_early else "")
+            + ("_nlb" if self.no_loop_cbar else "")
             + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
@@ -239,6 +248,69 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     extra += [
         ki for ki in wide if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
     ]
+    # Appended last: the tile_m=64 split-4 candidate with a 4-element LDS pad (K3 rows up to M=240).
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=64,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=2,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            fused_splitk=True,
+            c_pad=4,
+        )
+    )
+    # Appended last (ids 9716, 9717): the _qe twins that the K3 decode sweep confirmed on two GPUs
+    # (T01 M=512; T11/T05 M=320 and M=512, whose table name cm8 launches as cm1).
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=512,
+            num_buffers=3,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            quad_early=True,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=128,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            quad_early=True,
+        )
+    )
+    # Appended last (id 9718): the _qe + _nlb twin that the K3 decode screen confirmed on two GPUs (T14 M=320).
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            fused_splitk=True,
+            quad_early=True,
+            no_loop_cbar=True,
+        )
+    )
     return dict(enumerate([*base, *extra]))
 
 

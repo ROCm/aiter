@@ -232,6 +232,39 @@ def test_fused_splitk(block, kernel_name, m, n, k):
     }
 
 
+def test_mx128_kernel_direct(kernel_name, m, n, k):
+    """A non-split-K (sk1) generic mx128 kernel, named explicitly: the output matches the
+    torch reference, no reduce kernel is launched, and CUDA graph replay equals the eager
+    output. test_fused_splitk needs a split-K twin, so it does not apply to sk1 names."""
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as flydsl_gemm
+
+    flydsl_gemm._lazy_import()
+    entry = flydsl_gemm.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250
+    xq, x_scale, weight, w_scale = _fused_splitk_operands(128, m, n, k)
+    ref = run_torch(xq, x_scale, weight, w_scale, (128, 128), x_block=128)
+    x_scale = x_scale.t().contiguous().view(*x_scale.shape)  # K-major A scale, as in test_fused_splitk
+    w_shuf = shuffle_weight(weight, layout=(16, 16))
+
+    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+    with mock.patch.object(
+        flydsl_gemm,
+        "_compile_splitk_reduce",
+        wraps=flydsl_gemm._compile_splitk_reduce,
+    ) as reduce:
+        entry(xq, w_shuf, x_scale, w_scale, out, kernel_name)
+    assert reduce.call_count == 0, f"{kernel_name}: sk1 launched a reduce kernel"
+    err = assertAllclose(ref, out.float(), msg=f"M={m} N={n} K={k} {kernel_name}: ")
+
+    eager = out.clone()
+    out.fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        entry(xq, w_shuf, x_scale, w_scale, out, kernel_name)
+    graph.replay()
+    assert torch.equal(out, eager), f"{kernel_name}: graph replay differs at M={m}"
+    return {"err": err}
+
+
 def test_fused_splitk_whole_row_passes():
     """The epilogue stores whole passes of rows_per_iter * unroll rows: a 192x256 tile with
     two splits would leave 32 of 96 rows of every stripe unwritten, so it must take the
@@ -269,6 +302,29 @@ def tuned_shapes():
     return shapes
 
 
+def test_untuned_fallback_pick():
+    """The pick for a shape without a tuned row: unfused, unsplit, fits the shape, lowest cost."""
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        kernel_fits_shape,
+    )
+    from aiter.ops.gemm_op_a8w8 import _flydsl_mxfp8_fallback_kernel
+
+    for m, n, k in (
+        (1, 1536, 7168),
+        (48, 6400, 7168),
+        (333, 4096, 1536),
+        (4097, 7168, 4224),
+        (20000, 2304, 1536),
+    ):
+        ki = _flydsl_mxfp8_fallback_kernel(m, n, k)
+        assert ki is not None and kernel_fits_shape(ki, m, n, k), (m, n, k)
+        assert ki.split_k == 1 and not ki.fused_splitk, (m, n, k, ki.name)
+        # mx32 needs 32-aligned tiles and plain A; an odd M has no A-preshuffle pairing.
+        k32 = _flydsl_mxfp8_fallback_kernel(m, n, k, mx32=True)
+        assert k32 is None or (not k32.a_preshuffle and k32.tile_n % 32 == 0), (m, n, k)
+        assert _flydsl_mxfp8_fallback_kernel(m | 1, n, k, a_preshuffle=True) is None
+
+
 if __name__ == "__main__":
     torch.set_default_device("cuda")
     parser = argparse.ArgumentParser(
@@ -291,6 +347,7 @@ if __name__ == "__main__":
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
     if get_gfx() == "gfx1250":
+        test_untuned_fallback_pick()
         test_fused_splitk_whole_row_passes()
         df = pd.DataFrame(
             [
