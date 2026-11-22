@@ -93,8 +93,15 @@ def make_scatter_store(
             ),
             global_byte_offset=column_offset,
         )
-        # Preserve the compiler's tensorcnt(0xa) hardware guard. The overlap
-        # callbacks issue only eight stores per wave between explicit drains.
+        # This intrinsic emits the gather scatter itself; gather mode and the
+        # destination rows are encoded in desc, not in the instruction name.
+        # Keep the compiler-inserted tensorcnt(0xa) hardware workaround: it
+        # limits outstanding tensor operations to 10, rather than draining all
+        # stores. In the overlap path, waves 2/3 issue no tensor loads and at
+        # most eight stores between explicit drains, so this guard does not
+        # require the burst to finish. The callbacks still use tensor_wait(0)
+        # at LDS reuse boundaries; the compiler guard cannot replace those
+        # completion waits. Ordinary and overlapped scatter share this emitter.
         tensor_store_gather(desc)
 
     return issue_scatter_group, rank_rows, oob
