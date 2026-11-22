@@ -114,7 +114,7 @@ resolve_triton_index() {
     fi
     candidates+=("${TRITON_DEFAULT_ROCM_VERSION}")
     for rocm in "${candidates[@]}"; do
-        url="https://pypi.amd.com/triton/release_1031/rocm-${rocm}/simple/"
+        url="https://pypi.amd.com/triton/release-1031/rocm-${rocm}/simple/"
         rc=0
         has_triton_wheel "${url}triton/" || rc=$?
         if [[ ${rc} -eq 0 ]]; then
