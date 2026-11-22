@@ -162,13 +162,22 @@ def _hash_tree(h, root: Path, patterns, *, contents: bool) -> None:
 
 def _target_arch() -> str:
     # Overrides (FLYDSL_GPU_ARCH, HSA_OVERRIDE_GFX_VERSION) are also hashed with
-    # the environment. Without a device (AOT builds) ask FlyDSL, as its compiler does.
-    if os.environ.get("FLYDSL_GPU_ARCH") or not torch.cuda.is_available():
+    # the environment. FLYDSL_GPU_ARCH names the target FlyDSL compiles for, so it
+    # wins; get_rocm_arch() lower-cases it as FlyDSL's compiler does.
+    if os.environ.get("FLYDSL_GPU_ARCH"):
         from flydsl.runtime.device import get_rocm_arch
 
         return get_rocm_arch()
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return props.gcnArchName.split(":")[0]
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return props.gcnArchName.split(":")[0]
+    # No device: an AOT build sets FLYDSL_GPU_ARCH (aiter/aot/flydsl/dry_run.py).
+    # Without it there is no target to key the cache on; guessing one (FlyDSL
+    # < 0.5.1 fell back to gfx942) would file entries under the wrong arch.
+    raise RuntimeError(
+        "FlyDSL AOT cache: no GPU is visible and FLYDSL_GPU_ARCH is unset; "
+        "set FLYDSL_GPU_ARCH to the target gfx arch"
+    )
 
 
 def _wheel_record(fly_root: Path) -> bytes | None:
