@@ -106,8 +106,15 @@ Re-run `python3 -m pytest -q tests/test_flydsl_aot_cache.py` on every FlyDSL pin
 The design is the exported-object cache of §2.3, built on the FlyDSL APIs
 in §3.
 
+Kernels opt in at their launcher factory (`aiter/ops/flydsl/aot_launch.py`,
+§6); the op wrapper keeps calling `_run_compiled`, which hands a bound
+launcher to the cache:
+
 ```
-op wrapper ──► FlyDSLAotCache.launch(key, make_exe, *launcher_args)
+op wrapper ──► _run_compiled(launcher, *launcher_args)
+                 │  launcher bound by aot_factory / bind_aot
+                 ▼
+               FlyDSLAotCache.launch(key, make_exe, *launcher_args)
                  │
                  ├─ memory hit (key) ───────────────────────► CompiledFunction(*args)
                  │
@@ -328,8 +335,9 @@ compiled with a null pointer of the same element type, address space and
 alignment: a non-null pointer counts as a live device argument and
 `flyc.compile` would launch on it.
 
-**Every mode goes through `launch`.** Mode `0` and keys that cannot be
-exported or loaded (an argument type `export_to_c` does not support) use
+**Every bound launch goes through `launch`.** Mode `0` binds nothing, so
+`_run_compiled` takes its JIT path unchanged. Keys that cannot be exported
+or loaded (an argument type `export_to_c` does not support) use
 `_JitKernel`, which calls `_run_compiled(exe, *args,
 specialization_key=key)`. A fallback logs one warning per key. Caller bugs
 (`_UsageError`, e.g. an unsupported key element) and `verify` failures
@@ -402,9 +410,15 @@ not prebuilt. This predates the cache and is left to a separate change.
 ### 5.1 gfx942: `flydsl_preshuffle_gemm_a8`
 
 ```python
-key = (tuple(sorted(compile_kwargs.items())), x_scale.dtype, w_scale.dtype, XQ.device)
-_PRESHUFFLE_AOT_CACHE.launch(
-    key, lambda: _get_compile_fn()(**compile_kwargs), *args
+@aot_factory("preshuffle_gemm_a8")
+@functools.cache
+def _preshuffle_launcher(**compile_kwargs):
+    return _get_compile_fn()(**compile_kwargs)
+
+_run_compiled(
+    _preshuffle_launcher.lazy(**compile_kwargs),
+    *args,
+    specialization_key=(x_scale.dtype, w_scale.dtype, XQ.device),
 )
 ```
 
@@ -462,15 +476,14 @@ Also verified (`AITER_FLYDSL_AOT_CACHE_DIR` fresh each time):
 ### 5.2 gfx950: `run_gemm_a8w8_blockscale`
 
 ```python
-key = (N, K, kernel_name, Out.dtype, XQ.device)
-_AOT_CACHE.launch(
-    key,
-    lambda: _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype),
+_run_compiled(
+    _compile_gemm.lazy(N, K, kernel_name, XQ.device, Out.dtype),
     ...
 )
 ```
 
-`_compile_gemm` keeps one launcher per device, so the device is in `key`
+`_compile_gemm` (an `aot_factory`) keeps one launcher per device, so the
+device is one of its arguments and so in `key`
 (memory only; the `.o` is shared). Validated compile-only on gfx942 under
 `dry_run("gfx950", 256)` for the tuned kernel
 `flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps0`, M=8192 N=768 K=7168, bf16
@@ -492,12 +505,13 @@ Three launcher families, five caches:
 
 | Cache | Wrapper | Key |
 |---|---|---|
-| `mxscale_preshuffle_gemm`, `_fused`, `mxscale_preshuffle_splitk_reduce` | `mxscale_preshuffle_kernels.flydsl_mxscale_preshuffle_gemm` (also a4w4) | the launcher's constexprs; `(split_k, out_dtype)` for the reduce |
-| `gemm_a8w8_mxfp8_8wave` | `gemm_a8w8_mxfp8_8wave` | `sorted(compile_kwargs.items())` |
+| `mxscale_preshuffle_gemm`, `_fused`, `mxscale_preshuffle_splitk_reduce` | `mxscale_preshuffle_kernels.flydsl_mxscale_preshuffle_gemm` (also a4w4) | the launcher's constexprs; `(split_k, out_dtype, strided)` for the reduce |
+| `gemm_a8w8_mxfp8_8wave` | `gemm_a8w8_mxfp8_8wave` | `compile_mxfp8_8wave_gemm`'s arguments |
 | `bmm_a8w8_mxscale_gfx950` | `batched_gemm_a8w8_gfx950` | the launcher's constexprs |
 
-Every key also holds the device of the output or first tensor, for the JIT
-path (FlyDSL issue 4 in §7); the disk digest keeps only the device type.
+The key is each `aot_factory`'s arguments. Every launch also passes the device
+of the output or first tensor as `specialization_key`, for the JIT path
+(FlyDSL issue 4 in §7); the disk digest keeps only the device type.
 
 The constexprs are bound by a cached `@flyc.jit` wrapper per key, which copies
 the kernel launcher's `compile_hints` (the bmm one sets an LLVM option).
@@ -521,23 +535,41 @@ not converted.
 
 ## 6. Adopting it for another op
 
-0. **Import the kernel compiler inside `make_exe`.** A hit then never pays
-   the import (about 30 ms of AST rewriting per kernel module).
+Opt in at the launcher factory, not at the call site:
+
+```python
+@aot_factory("my_kernel")            # the cache name
+@functools.cache
+def my_launcher(N, K, tile_m, ...):  # its arguments are the key
+    return compile_my_kernel(N, K, tile_m, ...)
+
+_run_compiled(my_launcher.lazy(N, K, tile_m, ...), *args, stream)
+```
+
+A launcher built inside a wrapper (no factory returning it) binds where it is
+built: `bind_aot(launch, FlyDSLAotCache("my_kernel"), (TOPK, N))`.
+
+0. **Launch `factory.lazy(...)` on hot paths.** It does not call the factory,
+   so a hit pays neither the compiler import nor the `@flyc.kernel`
+   definitions (a few hundred ms of AST rewriting per kernel module in a fresh
+   process). `_run_compiled(factory(...), ...)` works too, and is what an
+   unchanged call site does; it calls the factory once per process and key.
 1. **Launch arguments are runtime only.** Every launcher parameter that
    varies per call is a tensor, an `fx` numeric (`Int32`, …) or an
-   `fx.Stream`. Constexprs go to the factory (`make_exe`) and into `key`.
-2. **`key` covers the specialization.** Include every constexpr, every
-   tensor dtype that can vary, and any trace-time state that is not in the
-   environment or the sources, e.g. a mode global. Arch, CU count and the
-   variables the kernel's files read are tracked already. Tensor
-   rank and unit-stride axis are covered by the disk digest. Include them in
-   `key` too if they can vary for the same `key`, as the FlyDSL
-   compiled-handle rules in `aiter/ops/flydsl/AGENTS.md` require.
+   `fx.Stream` (a torch stream as the last argument is converted). Constexprs
+   go to the factory and so into the key.
+2. **The key covers the specialization.** The factory's arguments must
+   determine its launcher, as `functools.cache` on it already requires. Pass
+   anything else the compiled function depends on, e.g. a tensor dtype that
+   can vary for one launcher, as `_run_compiled`'s `specialization_key`, as
+   on the JIT path. Arch, CU count and the variables the kernel's files read
+   are tracked already. Tensor rank and unit-stride axis are covered by the
+   disk digest.
 3. **Pass extra sources.** If the kernel uses code outside the aiter
-   package, pass those paths as `extra_sources=`. Constants imported from an
-   aiter module are recorded already.
-4. **Call `launch` unconditionally.** It handles mode `0`, the fallback
-   and compile-only; the wrapper needs no branch.
+   package, pass those paths as `aot_factory(..., extra_sources=)`. Constants
+   imported from an aiter module are recorded already.
+4. **Keep the wrapper branch-free.** `_run_compiled` handles mode `0`, the
+   fallback and compile-only.
 5. **Test it.** Run the op's test under `AITER_FLYDSL_AOT_CACHE=verify` once,
    and add a bitwise check against the JIT path.
 
