@@ -633,16 +633,31 @@ def test_moe(token, model_dim, inter_dim, experts, topk, quant, activation, conf
 
 
 @benchmark()
-def test_aot_prefill(token, model_dim, inter_dim, experts, topk):
+def test_aot(token, model_dim, inter_dim, experts, topk, quant, config):
     from aiter.ops.flydsl import aot_cache, fused_moe_gfx942
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import moe_reduce
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import quant as fp8_quant
 
-    config = "64_128_64_True"
+    parsed = Config.from_string(config)
     request, reference, _ = make_case(
-        token, model_dim, inter_dim, experts, topk, "no", "silu", "random", True, None
+        token,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        quant,
+        "silu",
+        "random",
+        parsed.use_prefill,
+        None,
     )
     impl = resolve_fused_moe_impl(make_fused_moe_impl_kernel_name(IMPL, config))
-    caches = (fused_moe_gfx942._GEMM_AOT_CACHE, moe_reduce._SORTED_SUM_AOT_CACHE)
+    caches = (
+        fused_moe_gfx942._GEMM_AOT_CACHE,
+        moe_reduce._SORTED_SUM_AOT_CACHE,
+        fp8_quant._ABSMAX_AOT_CACHE,
+        fp8_quant._QUANT_AOT_CACHE,
+    )
     results = {}
     outputs = []
     flops = 6 * token * topk * model_dim * inter_dim
@@ -660,25 +675,30 @@ def test_aot_prefill(token, model_dim, inter_dim, experts, topk):
                 impl(request)
                 torch.cuda.synchronize()
                 if name == "aot":
-                    builds = [cache._builds for cache in caches]
-                    assert builds == [2, 1], f"unexpected AOT export counts: {builds}"
-                    for cache in caches:
+                    used = [cache for cache in caches if cache._mem]
+                    builds = [cache._builds for cache in used]
+                    # verify mode exports every kernel the path launches.
+                    assert used and all(builds), f"{config}: AOT exports {builds}"
+                    for cache in used:
                         cache._mem.clear()
                     with patch.object(aot_cache, "_MODE", "1"):
                         impl(request)
-                    assert builds == [cache._builds for cache in caches]
-                    for cache in caches:
+                    # Mode 1 loads them back from disk without exporting again.
+                    assert builds == [cache._builds for cache in used], config
+                    for cache in used:
                         assert cache._mem and all(
                             not isinstance(kernel, aot_cache._JitKernel)
                             for kernel in cache._mem.values()
-                        )
+                        ), f"{config}: {cache.name} fell back to JIT"
                 output, us = run_perftest(impl, request, num_iters=20, num_warmup=3)
                 results[f"{name} us"] = us
                 results[f"{name} TFLOPS"] = flops / us / 1e6
                 results[f"{name} TB/s"] = nbytes / us / 1e6
                 results[f"{name} err"] = check_output(reference, output, name)
                 outputs.append(output.clone())
-    assert torch.equal(*outputs), "AOT and JIT prefill outputs differ"
+    # Decode kernels accumulate routes with atomics, so only prefill is bitwise.
+    if parsed.use_prefill:
+        assert torch.equal(*outputs), f"{config}: AOT and JIT outputs differ"
     return results
 
 
@@ -830,6 +850,16 @@ EDGE_CASES = [
     ),
 ]
 
+# Every gfx942 path through the AOT cache, with the FP8 per-tensor quant kernels:
+# (token, model_dim, inter_dim, experts, topk, quant, config).
+AOT_CASES = [
+    (128, 512, 128, 8, 2, "no", "64_128_64_True"),
+    (2048, 2560, 320, 513, 11, "per_tensor", "64_128_256_True:1x4_64x256:128"),
+    (2, 2560, 320, 513, 11, "ptpc", "16_16_16_False_True"),
+    (16, 2560, 320, 513, 11, "ptpc", "16_16_16_False"),
+    (200, 2560, 320, 513, 11, "ptpc", "16_128_64_False"),
+]
+
 
 def summarize(name, rows):
     aiter.logger.info(
@@ -886,7 +916,7 @@ def main():
         check_moe(*case)
     timed = [row for row in rows if not args.batch or row[0] in args.batch]
     summarize("Whole MoE", [test_moe(*row) for row in timed])
-    summarize("AOT and JIT prefill", [test_aot_prefill(128, 512, 128, 8, 2)])
+    summarize("AOT and JIT", [test_aot(*case) for case in AOT_CASES])
 
 
 if __name__ == "__main__":

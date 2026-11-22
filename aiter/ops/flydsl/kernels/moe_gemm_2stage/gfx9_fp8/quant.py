@@ -85,12 +85,7 @@ def flydsl_absmax():
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
         device = A.device
-        wg_count = (
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            * 8
-        )
+        wg_count = torch.cuda.get_device_properties(device).multi_processor_count * 8
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
         _ABSMAX_AOT_CACHE.launch(
@@ -206,12 +201,7 @@ def flydsl_quant_per_tensor(torch_dtype):
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
         device = A.device
-        wg_count = (
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            * 8
-        )
+        wg_count = torch.cuda.get_device_properties(device).multi_processor_count * 8
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
         _QUANT_AOT_CACHE.launch(

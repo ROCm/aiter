@@ -221,7 +221,9 @@ def _variants(row: dict) -> list[dict]:
         # Unset betas launch with the model defaults; plain SiTU (1.0) must be
         # passed explicitly.
         betas += [(1.0, 1.0), (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)]
-    # Callers behind an EP dispatch pass the received token count.
+    # Callers behind an EP dispatch pass the received token count. fused_moe
+    # drops whole-graph gfx942 rows given one unless SiLU is clamped, and the
+    # replay never clamps, so those rows have no local-token variant.
     local_token_options = (
         (False,)
         if row["kernelName1"].startswith(_WHOLE_GFX942_PREFIX)
