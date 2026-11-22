@@ -29,6 +29,12 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel,
 )
+from aiter.ops.triton.attention.pa_decode_sparse import (
+    _V4_PACKED_FP8_DTYPES,
+    _V4_REC_ALIGNED,
+    _pa_decode_sparse_gfx1250_fp8,
+    pa_decode_sparse,
+)
 from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
@@ -37,6 +43,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 DEVICE_ARCH = arch_info.get_arch()
+# Targets with the DSv4 packed-fp8 (640 B record) reader.
+_V4_ARCHS = ("gfx1250", "gfx1250-strict")
 
 _LOGGER = AiterTritonLogger()
 
@@ -75,6 +83,12 @@ def pa_prefill_sparse(
     softmax_scale: float,
     has_invalid: bool | None = None,
     out: torch.Tensor | None = None,
+    *,
+    q_rope: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
+    kv_rope: torch.Tensor | None = None,
+    block_h: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
@@ -106,11 +120,39 @@ def pa_prefill_sparse(
             skips ``-1`` and out-of-pool slots. gfx950 (``mla_gluon``) does not
             check slot values: pass only valid slots there.
         out:               optional contiguous [T, H, D] buffer on q's device,
-            same dtype as q; written in place and returned.
+            same dtype as q; written in place and returned. On the DSv4
+            packed-fp8 path below it is bf16 while q is fp8.
+
+    DSv4 packed-fp8 (gfx1250 only), keyword-only: pass q_rope /
+    unified_kv_rope (and kv_rope with an extend source), or a one-tensor
+    cache of 640-byte aligned records. Served by the fp8 decode kernel at
+    kv_splits=1; block_h / num_warps override its launch defaults. This path
+    requires attn_sink.
 
     Returns:
-        [T, H, D] attention output, same dtype as q.
+        [T, H, D] attention output, same dtype as q. The DSv4 packed-fp8 path
+        returns bf16.
     """
+    if _is_v4_2buff(q, unified_kv, q_rope, unified_kv_rope):
+        return _prefill_v4_2buff(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            has_invalid=has_invalid,
+            q_rope=q_rope,
+            unified_kv_rope=unified_kv_rope,
+            kv_rope=kv_rope,
+            block_h=block_h,
+            num_warps=num_warps,
+            out=out,
+        )
+
     if out is None:
         out = torch.empty_like(q)
     else:
@@ -320,6 +362,113 @@ def pa_prefill_sparse(
             BLOCK_D=block_d,
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# DSv4 "2buff" packed-fp8 prefill
+# ---------------------------------------------------------------------------
+
+
+def _is_v4_2buff(q, unified_kv, q_rope, unified_kv_rope) -> bool:
+    """True for DSv4 packed-fp8 operands: q_rope / unified_kv_rope given, or a
+    one-tensor cache of 640 B records.
+
+    Only the implicit form is arch-gated, because gfx950's packed cache has
+    the same shape and dtype and must still reach its own path.
+    """
+    if q_rope is not None or unified_kv_rope is not None:
+        return True
+    return (
+        DEVICE_ARCH in _V4_ARCHS
+        and unified_kv.dim() == 3
+        and unified_kv.shape[-1] == _V4_REC_ALIGNED
+        and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
+    )
+
+
+def _prefill_v4_2buff(
+    q,
+    unified_kv,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    *,
+    has_invalid,
+    q_rope,
+    unified_kv_rope,
+    kv_rope,
+    block_h,
+    num_warps,
+    out,
+):
+    """Packed-fp8 sparse prefill on the single-pass (kv_splits=1) fp8 decode
+    kernel. The prefix maps to its main pool and the extend source (optional)
+    to its extra pool.
+    """
+    if DEVICE_ARCH not in _V4_ARCHS:
+        raise NotImplementedError(
+            f"the DSv4 packed-fp8 prefill path is gfx1250-only, got {DEVICE_ARCH}; "
+            "pass bf16 operands for the portable path"
+        )
+    if attn_sink is None:
+        # The fp8 kernel always reads the sink.
+        raise ValueError("the DSv4 packed-fp8 prefill path needs attn_sink")
+    # The fp8 driver reads None as False (no -1 masking), so default to True.
+    has_invalid = True if has_invalid is None else bool(has_invalid)
+    # Pre-split pools go to the internal driver: only it takes the extend
+    # pool's RoPE plane.
+    if kv is not None and unified_kv_rope is not None:
+        if kv_rope is None:
+            raise ValueError(
+                "packed-fp8 prefill with a pre-split extend source needs "
+                "kv_rope (its bf16 RoPE plane). Without it the extend pool's "
+                "RoPE reads as zero and the numbers are quietly wrong. Pass "
+                "kv_rope, or hand both pools as one-tensor aligned records "
+                f"(..., {_V4_REC_ALIGNED}), or kv=None for prefix-only."
+            )
+        return _pa_decode_sparse_gfx1250_fp8(
+            q,
+            unified_kv,
+            unified_kv_rope,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            attn_sink,
+            softmax_scale,
+            q_rope=q_rope,
+            extra_cache=kv,
+            extra_cache_rope=kv_rope,
+            extra_indices=kv_indices_extend,
+            extra_indptr=kv_indptr_extend,
+            block_h=block_h,
+            num_warps=num_warps,
+            kv_splits=1,
+            has_invalid=has_invalid,
+            out=out,
+        )
+    if kv_rope is not None and kv is None:
+        raise ValueError("kv_rope given without kv; nothing to attend over")
+    return pa_decode_sparse(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        attn_sink,
+        softmax_scale,
+        kv_splits=1,
+        has_invalid=has_invalid,
+        block_h=block_h,
+        num_warps=num_warps,
+        out=out,
+        extra_cache=kv,
+        extra_indices=kv_indices_extend,
+        extra_indptr=kv_indptr_extend,
+        unified_kv_rope=unified_kv_rope,
+        q_rope=q_rope,
+    )
 
 
 # ---------------------------------------------------------------------------
