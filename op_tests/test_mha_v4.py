@@ -2476,6 +2476,34 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     assert torch.equal(gqa, mha)
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd128 FP6 P validation")
+@parametrize(
+    ("qk_format", "v_format"),
+    [
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="mxfp4"),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, id="mxfp6"),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, id="f6f4"),
+        param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
+    ],
+)
+def test_mha_v4_fp6_p_keeps_each_rows_largest_weight(qk_format, v_format):
+    torch.manual_seed(47)
+    q = torch.randn((1, 300, 8, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 384, 8, 128), device="cuda", dtype=torch.bfloat16)
+    # An identity V on the first 128 keys returns their attention weights as O.
+    v = torch.zeros_like(k)
+    v[:, :128] = torch.eye(128, device="cuda", dtype=torch.bfloat16)[None, :, None]
+
+    weights = mha_v4(q, k, v, qk_format, qk_format, v_format)
+    torch.cuda.synchronize()
+
+    scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+    reference = torch.softmax(scores * 128**-0.5, dim=-1)[..., :128]
+    largest = weights.float().amax(dim=-1) / reference.permute(0, 2, 1, 3).amax(dim=-1)
+    # A block max that saturates its FP6 code loses 6% of the weight.
+    assert largest.mean() > 0.96, largest.mean()
+
+
 # hd256 runs a 64-token KV tile where hd128 runs 128, so the aligned/partial split moves.
 _HD256_SHAPES = [
     param(1, 256, 256, 1, id="aligned"),
