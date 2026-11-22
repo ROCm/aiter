@@ -4,13 +4,13 @@
 """TDM EP-scatter emission and persistent GEMM overlap callbacks.
 
 The GEMM owns LDS allocation and input/compute operations. These factories
-bind scatter geometry and pending writes at trace time; their callbacks emit
-inline code, with no runtime plugin dispatch.
+bind scatter geometry and destination indices at trace time. Their callbacks
+emit inline code, with no runtime plugin dispatch.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
@@ -19,6 +19,39 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
+
+# Per wave: (m: overlaps next prologue, n: overlaps next mainloop).
+# Both the GEMM's wave ownership and the callbacks use this table.
+# The m indices are consumed in the current epilogue. The n indices cross the
+# task boundary as scatter_dst_index0/1: each wave-wide index vector
+# supplies GATHERS_PER_INDEX_VECTOR gathers (four for wave32 / eight-row gather).
+SCATTER_SCHEDULE = (
+    (0, 0),  # wave 0: load
+    (0, 0),  # wave 1: load
+    (8, 8),  # wave 2: store
+    (8, 8),  # wave 3: store
+)
+WAVE_SIZE = 32
+ROWS_PER_GATHER = 8
+GATHERS_PER_INDEX_VECTOR = WAVE_SIZE // ROWS_PER_GATHER
+STORE_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if any(counts))
+LOAD_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if not any(counts))
+STORE_WAVE_COUNT = len(STORE_WAVES)
+FIRST_STORE_WAVE = STORE_WAVES[0]
+PROLOGUE_GATHERS, MAINLOOP_GATHERS = SCATTER_SCHEDULE[FIRST_STORE_WAVE]
+TAIL_FIRST_VECTOR = PROLOGUE_GATHERS // GATHERS_PER_INDEX_VECTOR
+
+# The current row mapping interleaves equally sized bursts across a contiguous
+# suffix of store waves. The persistent task ABI carries two tail index vectors.
+assert len(LOAD_WAVES) == 2
+assert STORE_WAVES == tuple(range(FIRST_STORE_WAVE, len(SCATTER_SCHEDULE)))
+assert all(
+    counts == (PROLOGUE_GATHERS, MAINLOOP_GATHERS)
+    for wave, counts in enumerate(SCATTER_SCHEDULE)
+    if wave in STORE_WAVES
+)
+assert PROLOGUE_GATHERS > 0 and PROLOGUE_GATHERS % GATHERS_PER_INDEX_VECTOR == 0
+assert 0 <= MAINLOOP_GATHERS <= 2 * GATHERS_PER_INDEX_VECTOR
 
 
 def make_scatter_store(
@@ -111,7 +144,7 @@ def make_overlap_callbacks(
     issue_scatter_group,
     wave,
     scatter_wave,
-    pending,
+    scatter_dst_state,
     last_task,
     issue,
     init_accumulators,
@@ -119,39 +152,39 @@ def make_overlap_callbacks(
     tdm_per,
     load_first,
 ):
-    """Bind the two-store-wave, 8+8 gather schedule to GEMM operations.
+    """Bind SCATTER_SCHEDULE to GEMM operations.
 
-    Fixed gather counts per wave (each gather writes eight C rows):
-
-        Wave    m: overlaps next prologue    n: overlaps next mainloop
-        0       0                            0
-        1       0                            0
-        2       8                            8
-        3       8                            8
-        Total   16                           16
+    SCATTER_SCHEDULE is the source of the per-wave burst counts. Each gather
+    consumes ROWS_PER_GATHER lane indices; a full index vector spans WAVE_SIZE
+    lanes, so it supplies GATHERS_PER_INDEX_VECTOR gathers.
 
     Task t's epilogue issues m. Task t+1's prologue waits for m after issuing
     input stages 0/1, then uses one barrier before reusing C's head. It issues
     n before input stage 2; n must retire before task t+1 overwrites C in its
     epilogue. The final task issues both bursts without a following prologue.
 
-    Returns prologue, epilogue and skipped-task callbacks. ``pending`` holds
-    the previous task's two tail index vectors, column offset and valid flag.
-    The lo/hi vectors cover C rows 128:192 and 192:256 respectively. Each lane
-    holds one flattened peer/slot index (or OOB); each store wave contributes
-    32 indices per vector. The output data stays in LDS until the tail retires.
+    Returns prologue, epilogue and skipped-task callbacks. ``scatter_dst_state``
+    holds the previous task's two destination index vectors, column offset and
+    valid flag.
+    Both index vectors belong to the table's n column: vector 0 supplies its
+    first GATHERS_PER_INDEX_VECTOR gathers, vector 1 the next group. Each lane
+    holds one flattened peer/slot index (or OOB), not a pointer. These indices
+    must survive the task boundary because the next task may target different
+    rows. The C data stays in LDS.
     The epilogue returns the same four values for the next task; it never
     mutates captured state. ``load_first`` loads the first register tile and
     preserves GEMM's scheduling fence.
     """
-    pending_tail_index_lo, pending_tail_index_hi, pending_col, pending_valid = pending
+    scatter_dst_index0, scatter_dst_index1, scatter_column_offset, scatter_valid = (
+        scatter_dst_state
+    )
 
-    def issue_scatter_burst(first, idx0, idx1, column_offset):
-        for i in range_constexpr(8):
+    def issue_scatter_burst(first, count, index_lanes, column_offset):
+        for i in range_constexpr(count):
             issue_scatter_group(
-                scatter_wave + fx.Int32((first + i) * 2),
-                idx0 if i < 4 else idx1,
-                i % 4,
+                scatter_wave + fx.Int32((first + i) * STORE_WAVE_COUNT),
+                index_lanes[i // GATHERS_PER_INDEX_VECTOR],
+                i % GATHERS_PER_INDEX_VECTOR,
                 column_offset,
             )
 
@@ -163,43 +196,61 @@ def make_overlap_callbacks(
             issue(i, i)
         init_accumulators()
         load_wait(tdm_per)
-        if (wave >= 2) & (pending_valid != 0):
+        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
             tdm_ops.tensor_wait(0)
         workgroup_barrier()
         load_first(interleaved_lds_load)
-        if (wave >= 2) & (pending_valid != 0):
+        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
             issue_scatter_burst(
-                8, pending_tail_index_lo, pending_tail_index_hi, pending_col
+                PROLOGUE_GATHERS,
+                MAINLOOP_GATHERS,
+                (scatter_dst_index0, scatter_dst_index1),
+                scatter_column_offset,
             )
         issue(2, 2)
 
     @flyc.jit
     def overlap_epilogue(index_lanes, column_offset):
-        next_tail_index_lo = fx.Int32(0)
-        next_tail_index_hi = fx.Int32(0)
-        next_col = fx.Int32(0)
-        next_valid = fx.Int32(0)
-        if wave >= 2:
-            issue_scatter_burst(0, index_lanes[0], index_lanes[1], column_offset)
-            next_tail_index_lo = index_lanes[2]
-            next_tail_index_hi = index_lanes[3]
-            next_col = fx.Int32(column_offset)
-            next_valid = fx.Int32(1)
+        next_scatter_dst_index0 = fx.Int32(0)
+        next_scatter_dst_index1 = fx.Int32(0)
+        next_scatter_column_offset = fx.Int32(0)
+        next_scatter_valid = fx.Int32(0)
+        if wave >= FIRST_STORE_WAVE:
+            issue_scatter_burst(0, PROLOGUE_GATHERS, index_lanes, column_offset)
+            if const_expr(MAINLOOP_GATHERS > 0):
+                next_scatter_dst_index0 = index_lanes[TAIL_FIRST_VECTOR]
+            if const_expr(MAINLOOP_GATHERS > GATHERS_PER_INDEX_VECTOR):
+                next_scatter_dst_index1 = index_lanes[TAIL_FIRST_VECTOR + 1]
+            next_scatter_column_offset = fx.Int32(column_offset)
+            next_scatter_valid = fx.Int32(1)
             if last_task != 0:
                 # No following prologue will issue the last task's tail.
                 tdm_ops.tensor_wait(0)
-                issue_scatter_burst(8, index_lanes[2], index_lanes[3], column_offset)
-                next_valid = fx.Int32(0)
+                issue_scatter_burst(
+                    PROLOGUE_GATHERS,
+                    MAINLOOP_GATHERS,
+                    (next_scatter_dst_index0, next_scatter_dst_index1),
+                    column_offset,
+                )
+                next_scatter_valid = fx.Int32(0)
             rocdl.s_nop(0)
-        return next_tail_index_lo, next_tail_index_hi, next_col, next_valid
+        return (
+            next_scatter_dst_index0,
+            next_scatter_dst_index1,
+            next_scatter_column_offset,
+            next_scatter_valid,
+        )
 
     @flyc.jit
     def skip_task():
         # A partial M-cluster tail has no prologue to issue the deferred burst.
-        if (wave >= 2) & (pending_valid != 0):
+        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
             tdm_ops.tensor_wait(0)
             issue_scatter_burst(
-                8, pending_tail_index_lo, pending_tail_index_hi, pending_col
+                PROLOGUE_GATHERS,
+                MAINLOOP_GATHERS,
+                (scatter_dst_index0, scatter_dst_index1),
+                scatter_column_offset,
             )
 
     return overlap_prologue, overlap_epilogue, skip_task

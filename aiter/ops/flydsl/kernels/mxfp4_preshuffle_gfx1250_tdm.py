@@ -320,7 +320,7 @@ def build_gemm_a8w4_tdm_task(
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
-    WAVE = 32
+    WAVE = ep_scatter_common.WAVE_SIZE
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
     # K may end on half a k128 (K % 128 == 64, e.g. 576 = 4 x 128 + 64): the
@@ -447,8 +447,8 @@ def build_gemm_a8w4_tdm_task(
         and not tdm_as_in_prologue
         and k_waves == 1
     )
-    scatter_waves = 2 if overlap_scatter else num_waves
-    SCATTER_GROUP_ROWS = 8
+    scatter_waves = ep_scatter_common.STORE_WAVE_COUNT if overlap_scatter else num_waves
+    SCATTER_GROUP_ROWS = ep_scatter_common.ROWS_PER_GATHER
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
     scatter_groups = (tile_m + SCATTER_GROUP_ROWS - 1) // SCATTER_GROUP_ROWS
     scatter_passes = (scatter_groups + scatter_waves - 1) // scatter_waves
@@ -552,8 +552,14 @@ def build_gemm_a8w4_tdm_task(
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     C_EP_OFF = A_LDS_OFF + 2 * A_LDS_STAGE if overlap_scatter else 0
     if overlap_scatter:
-        assert scatter_passes == 16
-        assert INPUT_LDS_B <= C_EP_OFF + C_STORE_B // 2
+        assert num_waves == len(ep_scatter_common.SCATTER_SCHEDULE)
+        assert scatter_groups == sum(
+            m + n for m, n in ep_scatter_common.SCATTER_SCHEDULE
+        )
+        retired_rows = (
+            ep_scatter_common.PROLOGUE_GATHERS * scatter_waves * SCATTER_GROUP_ROWS
+        )
+        assert INPUT_LDS_B <= C_EP_OFF + retired_rows * _lds_row_bytes
     request_lds_size = max(
         AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
         C_EP_OFF + C_STORE_B,
@@ -684,13 +690,13 @@ def build_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
-        # Previous task's deferred tail: lo covers C rows 128:192, hi 192:256.
-        # Each store wave owns 32 rows per range, one destination index per lane.
-        pending_tail_index_lo: scatter_state_type = 0,
-        pending_tail_index_hi: scatter_state_type = 0,
+        # Previous task's n-column indices from SCATTER_SCHEDULE: each i32
+        # is one lane of an index vector, supplying four gathers per wave.
+        scatter_dst_index0: scatter_state_type = 0,
+        scatter_dst_index1: scatter_state_type = 0,
         # Destination byte offset and whether the deferred tail needs issuing.
-        pending_col: scatter_state_type = 0,
-        pending_valid: scatter_state_type = 0,
+        scatter_column_offset: scatter_state_type = 0,
+        scatter_valid: scatter_state_type = 0,
         # The final task must issue its own tail without a following prologue.
         last_task: scatter_state_type = 0,
     ):
@@ -713,11 +719,15 @@ def build_gemm_a8w4_tdm_task(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
-        scatter_wave = wave - 2 if const_expr(overlap_scatter) else wave
+        scatter_wave = (
+            wave - ep_scatter_common.FIRST_STORE_WAVE
+            if const_expr(overlap_scatter)
+            else wave
+        )
 
         def load_wait(outstanding):
             if const_expr(overlap_scatter):
-                if wave < 2:
+                if wave < ep_scatter_common.FIRST_STORE_WAVE:
                     tdm_ops.tensor_wait(outstanding)
             else:
                 tdm_ops.tensor_wait(outstanding)
@@ -994,8 +1004,8 @@ def build_gemm_a8w4_tdm_task(
             elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
         )
         if const_expr(overlap_scatter):
-            waves = [(0,), (1,), (0,), (1,)]
-            TDM_PER = 2
+            waves = [(w,) for w in ep_scatter_common.LOAD_WAVES] * 2
+            TDM_PER = len(waves) // len(ep_scatter_common.LOAD_WAVES)
         elif const_expr(tdm_as_in_prologue):
             assert num_waves == 4, "As-prologue requires a four-wave workgroup"
             # Match the WST rotating-stage assignment. The one-shot A-scale load
@@ -1987,10 +1997,10 @@ def build_gemm_a8w4_tdm_task(
                     wave,
                     scatter_wave,
                     (
-                        pending_tail_index_lo,
-                        pending_tail_index_hi,
-                        pending_col,
-                        pending_valid,
+                        scatter_dst_index0,
+                        scatter_dst_index1,
+                        scatter_column_offset,
+                        scatter_valid,
                     ),
                     last_task,
                     issue,
@@ -2000,10 +2010,10 @@ def build_gemm_a8w4_tdm_task(
                     load_first,
                 )
             )
-        next_tail_index_lo = fx.Int32(0)
-        next_tail_index_hi = fx.Int32(0)
-        next_col = fx.Int32(0)
-        next_valid = fx.Int32(0)
+        next_scatter_dst_index0 = fx.Int32(0)
+        next_scatter_dst_index1 = fx.Int32(0)
+        next_scatter_column_offset = fx.Int32(0)
+        next_scatter_valid = fx.Int32(0)
         if const_expr(overlap_scatter):  # noqa: SIM102
             if not has_work:
                 skip_callback()
@@ -2035,7 +2045,9 @@ def build_gemm_a8w4_tdm_task(
                         _scatter_row_lane < mn_oob
                     )
                     if const_expr(overlap_scatter):
-                        _scatter_lane_valid = _scatter_lane_valid & (wave >= 2)
+                        _scatter_lane_valid = _scatter_lane_valid & (
+                            wave >= ep_scatter_common.FIRST_STORE_WAVE
+                        )
                     _scatter_safe_row = _scatter_lane_valid.select(
                         _scatter_row_lane, fx.Int32(0)
                     )
@@ -2826,9 +2838,12 @@ def build_gemm_a8w4_tdm_task(
                     )
 
                 if const_expr(epilogue_callback is not None):
-                    next_tail_index_lo, next_tail_index_hi, next_col, next_valid = (
-                        epilogue_callback(_scatter_idx_lanes, _gboff)
-                    )
+                    (
+                        next_scatter_dst_index0,
+                        next_scatter_dst_index1,
+                        next_scatter_column_offset,
+                        next_scatter_valid,
+                    ) = epilogue_callback(_scatter_idx_lanes, _gboff)
                 else:
                     for scatter_pass in range_constexpr(scatter_passes):
                         group = wave + fx.Int32(scatter_pass * num_waves)
@@ -2930,7 +2945,12 @@ def build_gemm_a8w4_tdm_task(
                 workgroup_barrier()
 
         if const_expr(overlap_scatter):
-            return next_tail_index_lo, next_tail_index_hi, next_col, next_valid
+            return (
+                next_scatter_dst_index0,
+                next_scatter_dst_index1,
+                next_scatter_column_offset,
+                next_scatter_valid,
+            )
 
     layout = {
         "kernel_attrs": kernel_attrs,
@@ -3082,7 +3102,7 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
-        def run_task(task_id, rows, pending=None, last_task=0):
+        def run_task(task_id, rows, scatter_dst_state=None, last_task=0):
             # i32_m remains the allocation capacity: the scale buffer's
             # descriptor must include the padding in its shuffled layout.
             args = (
@@ -3105,7 +3125,7 @@ def launch_gemm_a8w4_tdm(
             )
 
             if const_expr(layout["overlap_scatter"]):
-                return gemm_task(*args, *pending, last_task)
+                return gemm_task(*args, *scatter_dst_state, last_task)
             else:
                 gemm_task(*args)
 
@@ -3123,7 +3143,7 @@ def launch_gemm_a8w4_tdm(
             tasks = ceildiv(rows, tile_m * cluster_m) * ceildiv(i32_n, tile_n)
             stride = persistent_workers // cluster_m
             if const_expr(layout["overlap_scatter"]):
-                for task_id, pending in range(
+                for task_id, scatter_dst_state in range(
                     fx.block_idx.x,
                     tasks,
                     stride,
@@ -3133,7 +3153,7 @@ def launch_gemm_a8w4_tdm(
                     updated = run_task(
                         task_i32,
                         rows,
-                        pending,
+                        scatter_dst_state,
                         (task_i32 + stride >= tasks).select(1, 0),
                     )
                     yield [updated[0], updated[1], updated[2], updated[3]]
@@ -3142,7 +3162,9 @@ def launch_gemm_a8w4_tdm(
                     run_task(task_id, rows)
             if const_expr(layout["overlap_scatter"]):  # noqa: SIM102
                 # No next epilogue will retire the last task's remote writes.
-                if fx.thread_idx.x >= 64:
+                if fx.thread_idx.x >= (
+                    ep_scatter_common.FIRST_STORE_WAVE * ep_scatter_common.WAVE_SIZE
+                ):
                     tdm_ops.tensor_wait(0)
         else:
             run_task(fx.block_idx.x, i32_m)
