@@ -37,10 +37,12 @@ change. Stage 2 adds the shared output into ``flat_out`` at weight 1.0 (atomic
 epilog). Only gfx950 is validated.
 """
 
+import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.kernels.tensor_shim import current_stream_arg
 
 from .gemm1 import (
     a16w4_default_shared_tile_n,
@@ -49,6 +51,9 @@ from .gemm1 import (
     gemm1_a16w4_grid,
 )
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
+
+_GEMM1_AOT_CACHE = FlyDSLAotCache("moe_a16wmix_gemm1")
+_GEMM2_AOT_CACHE = FlyDSLAotCache("moe_a16wmix_gemm2")
 
 __all__ = [
     "a16w4_default_shared_tile_n",
@@ -129,6 +134,12 @@ def _check_shared(device, **tensors):
 # scalar dequant fallback; gfx950 (CDNA4) uses the K=32 path. compile_gemm{1,2}_a16w4_port
 # are @functools.cache'd, so building through them directly (all-keyword) shares one
 # compile with moe_kernels.py's AOT/runtime direct calls.
+
+
+def _stream_arg(stream, device):
+    if stream is None:
+        return current_stream_arg(device)
+    return stream if isinstance(stream, fx.Stream) else fx.Stream(stream)
 
 
 def flydsl_a16w4_gemm1(
@@ -265,7 +276,7 @@ def flydsl_a16w4_gemm1(
         shared_tiles = a16w4_shared_tiles(
             shared_tile_m or BM, n_tokens=n_tokens, N=D_INTER, shared_tile_n=sh_tn
         )
-    launch = compile_gemm1_a16w4_port(
+    compile_kwargs = dict(
         BM=BM,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
@@ -319,8 +330,10 @@ def flydsl_a16w4_gemm1(
             sh_scale.data_ptr(),
             shared_inter_bf16.data_ptr(),
         )
-    _run_compiled(
-        launch,
+    device = a_bf16.device
+    _GEMM1_AOT_CACHE.launch(
+        (tuple(compile_kwargs.items()), device),
+        lambda: compile_gemm1_a16w4_port(**compile_kwargs),
         a_bf16.data_ptr(),
         w1_u8.data_ptr(),
         w1_scale_u8.data_ptr(),
@@ -336,7 +349,7 @@ def flydsl_a16w4_gemm1(
         float(swiglu_limit),
         inter_sorted_bf16.data_ptr(),
         *shared_ptrs,
-        torch.cuda.current_stream() if stream is None else stream,
+        _stream_arg(stream, device),
     )
     return inter_sorted_bf16
 
@@ -447,7 +460,7 @@ def flydsl_a16w4_gemm2(
         shared_tiles = a16w4_shared_tiles(
             shared_tile_m or BM, n_tokens=M_logical, N=D_HIDDEN, shared_tile_n=sh_tn
         )
-    launch = compile_gemm2_a16w4_port(
+    compile_kwargs = dict(
         BM=BM,
         NE=NE,
         N_OUT=D_HIDDEN,
@@ -489,8 +502,10 @@ def flydsl_a16w4_gemm2(
             fused_shared_w2.data_ptr(),
             sh_scale.data_ptr(),
         )
-    _run_compiled(
-        launch,
+    device = inter_sorted_bf16.device
+    _GEMM2_AOT_CACHE.launch(
+        (tuple(compile_kwargs.items()), device),
+        lambda: compile_gemm2_a16w4_port(**compile_kwargs),
         inter_sorted_bf16.data_ptr(),
         w2_u8.data_ptr(),
         w2_scale_u8.data_ptr(),
@@ -503,7 +518,7 @@ def flydsl_a16w4_gemm2(
         int(grid),
         flat_out.data_ptr(),
         *shared_ptrs,
-        torch.cuda.current_stream() if stream is None else stream,
+        _stream_arg(stream, device),
     )
     return flat_out
 

@@ -32,6 +32,11 @@ auxiliary kernels as at inference; every FlyDSL launch on that path is
 compiled into the cache instead of run. Kernel or wrapper changes therefore
 need no AOT change.
 
+The two-stage A16W kernels and the gfx942 whole-MoE Gate/Up, Down, sorted
+reduction and per-tensor FP8 quantization launchers also export objects into
+the FlyDSL AOT cache. Their runtime wrappers load the corresponding objects.
+`--check` requires both caches for these launchers when AOT is enabled.
+
 - Each row is replayed at its tuned token count and at the smallest M that
   `get_padded_M` maps to it, because some compile-time parameters follow the
   actual M. Where the two request different FlyDSL kernels, the replay bisects

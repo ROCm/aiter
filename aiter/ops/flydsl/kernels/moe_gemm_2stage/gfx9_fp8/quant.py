@@ -12,10 +12,14 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.kernels.tensor_shim import current_stream_arg
 
 from . import common as fxh
 from .common import _ptr
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax")
+_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor")
 
 
 @functools.cache
@@ -80,7 +84,7 @@ def flydsl_absmax():
         )
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
-        stream = torch.cuda.current_stream()
+        device = A.device
         wg_count = (
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
@@ -89,7 +93,15 @@ def flydsl_absmax():
         )
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
-        _run_compiled(launch, _ptr(A), _ptr(Amax), A.numel(), wg_count, stream)
+        _ABSMAX_AOT_CACHE.launch(
+            (A.dtype, Amax.dtype, device),
+            lambda: launch,
+            _ptr(A),
+            _ptr(Amax),
+            A.numel(),
+            wg_count,
+            current_stream_arg(device),
+        )
 
     return callable
 
@@ -193,7 +205,7 @@ def flydsl_quant_per_tensor(torch_dtype):
         )
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
-        stream = torch.cuda.current_stream()
+        device = A.device
         wg_count = (
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
@@ -202,6 +214,15 @@ def flydsl_quant_per_tensor(torch_dtype):
         )
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
-        _run_compiled(launch, _ptr(A), _ptr(Amax), _ptr(B), A.numel(), wg_count, stream)
+        _QUANT_AOT_CACHE.launch(
+            (torch_dtype, A.dtype, Amax.dtype, B.dtype, device),
+            lambda: launch,
+            _ptr(A),
+            _ptr(Amax),
+            _ptr(B),
+            A.numel(),
+            wg_count,
+            current_stream_arg(device),
+        )
 
     return callable

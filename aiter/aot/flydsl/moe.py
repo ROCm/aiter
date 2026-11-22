@@ -123,6 +123,7 @@ _ROW_KEY = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
 _JOBS_PER_WORKER = 12
 _FP8 = ("float8_e4m3fn", "float8_e4m3fnuz")
 _FP4 = "float4_e2m1fn_x2"
+_WHOLE_GFX942_PREFIX = "impl__flydsl_gfx942__"
 
 
 def _int(value, default=0) -> int:
@@ -153,7 +154,7 @@ def _reaches_flydsl(row: dict) -> bool:
     kernel2 = (row.get("kernelName2") or "").strip()
     # A cktile stage1 finishes with a FlyDSL activation epilogue.
     return (
-        kernel1.startswith(("flydsl_", "cktile_"))
+        kernel1.startswith(("flydsl_", "cktile_", _WHOLE_GFX942_PREFIX))
         or kernel2.startswith("flydsl_")
         or _is_grouped(row)
     )
@@ -221,6 +222,11 @@ def _variants(row: dict) -> list[dict]:
         # passed explicitly.
         betas += [(1.0, 1.0), (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)]
     # Callers behind an EP dispatch pass the received token count.
+    local_token_options = (
+        (False,)
+        if row["kernelName1"].startswith(_WHOLE_GFX942_PREFIX)
+        else (False, True)
+    )
     return [
         {
             "gate_mode": gate_mode.value,
@@ -230,7 +236,7 @@ def _variants(row: dict) -> list[dict]:
             "local_tokens": local_tokens,
             "clamp_shared": clamp_shared,
         }
-        for local_tokens in (False, True)
+        for local_tokens in local_token_options
         for gate_mode in gate_modes
         for bias in biases
         for beta, linear_beta in betas

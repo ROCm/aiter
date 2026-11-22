@@ -11,13 +11,16 @@ from aiter import ActivationType, QuantType
 from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import current_stream_arg
+
+_GEMM_AOT_CACHE = FlyDSLAotCache("moe_gfx942_gemm")
 
 
 @dataclass
@@ -209,7 +212,7 @@ def get_tune_space():
 
 
 @cache
-def _get_compiled_kernel(
+def _get_launcher(
     N,
     K,
     weight_dtype_str,
@@ -229,37 +232,54 @@ def _get_compiled_kernel(
     fused_down_clear=False,
     has_num_local_tokens=False,
 ):
-    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
+    compile_kwargs = {
+        "N": N,
+        "K": K,
+        "weight_dtype": weight_dtype_str,
+        "weight_quant_type": quant_type_str,
+        "TOPK": TOPK,
+        "BLOCK_TILE_SIZE_M": BLOCK_TILE_SIZE_M,
+        "BLOCK_TILE_SIZE_N": BLOCK_TILE_SIZE_N,
+        "tile_k": BLOCK_TILE_SIZE_K,
+        "stage": stage,
+        "alg": alg,
+        "E": E,
+        "USE_ATOMIC_WRITE": True,
+        "act_quant_type": act_quant_type_str,
+        "activation": activation_str,
+        "swiglu_limit": swiglu_limit,
+        "down_path": down_path,
+        "down_output_padding_bytes": down_output_padding_bytes,
+        "fused_down_clear": fused_down_clear,
+        "has_num_local_tokens": has_num_local_tokens,
+    }
+    key = tuple(compile_kwargs.values())
 
-    return compile_gemm(
-        N=N,
-        K=K,
-        weight_dtype=weight_dtype_str,
-        weight_quant_type=quant_type_str,
-        TOPK=TOPK,
-        BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
-        BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
-        tile_k=BLOCK_TILE_SIZE_K,
-        stage=stage,
-        alg=alg,
-        E=E,
-        USE_ATOMIC_WRITE=True,
-        act_quant_type=act_quant_type_str,
-        activation=activation_str,
-        swiglu_limit=swiglu_limit,
-        down_path=down_path,
-        down_output_padding_bytes=down_output_padding_bytes,
-        fused_down_clear=fused_down_clear,
-        has_num_local_tokens=has_num_local_tokens,
+    def make_exe():
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
+
+        return compile_gemm(**compile_kwargs)
+
+    return key, make_exe
+
+
+def _launch(launcher, *args):
+    key, make_exe = launcher
+    device = args[0].device
+    prepared_args = []
+    dtypes = []
+    # The typed pointers in _ptr specialize on the tensor dtype.
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            dtypes.append(arg.dtype)
+            arg = _ptr(arg)
+        prepared_args.append(arg)
+    _GEMM_AOT_CACHE.launch(
+        (key, tuple(dtypes), device),
+        make_exe,
+        *prepared_args,
+        current_stream_arg(device),
     )
-
-
-def _launch(kernel_fn, *args):
-    stream = torch.cuda.current_stream()
-    prepared_args = [
-        _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
-    ]
-    _run_compiled(kernel_fn, *prepared_args, stream)
 
 
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
@@ -363,7 +383,7 @@ def _run_prefill(
     if quant_type == QuantType.per_Tensor:
         # Gate/Up skips routes sorting drops, but the Down absmax reads every row.
         gemm1_out.zero_()
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_launcher(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -420,7 +440,7 @@ def _run_prefill(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_launcher(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -511,7 +531,7 @@ def _run_batch1(
     )
     route_count = problem.batch * problem.topk
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_launcher(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -539,7 +559,7 @@ def _run_batch1(
         route_count,
     )
 
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_launcher(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -600,7 +620,7 @@ def _run_decode(
     block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gemm1_out = _gateup_output(hidden_states, problem)
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_launcher(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -628,7 +648,7 @@ def _run_decode(
         grid,
     )
 
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_launcher(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -725,6 +745,8 @@ def run_flydsl_moe_gfx942(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
         )
+    if problem.batch == 0:
+        return hidden_states.new_empty((0, problem.model_dim))
     if config.use_prefill:
         return _run_prefill(
             hidden_states,

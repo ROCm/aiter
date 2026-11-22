@@ -9,10 +9,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.kernels.tensor_shim import current_stream_arg
 
 from . import common as fxh
 from .common import _ptr
+
+_SORTED_SUM_AOT_CACHE = FlyDSLAotCache("moe_gfx942_sorted_sum")
 
 
 @functools.cache
@@ -85,14 +88,15 @@ def sorted_sum(TOPK, N, output_padding_bytes=0):
     def callable(
         loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
-            launch,
+        device = A.device
+        _SORTED_SUM_AOT_CACHE.launch(
+            (TOPK, N, output_padding_bytes, loc_ids.dtype, A.dtype, B.dtype, device),
+            lambda: launch,
             _ptr(loc_ids),
             _ptr(A),
             _ptr(B),
             batch_size,
-            stream,
+            current_stream_arg(device),
         )
 
     return callable

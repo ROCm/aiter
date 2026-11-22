@@ -14,6 +14,8 @@ import dataclasses
 import functools
 import itertools
 import os
+import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,7 +38,7 @@ from aiter.fused_moe_registry import (
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.fused_moe_gfx942 import (
     Config,
     _gateup_output,
@@ -630,6 +632,56 @@ def test_moe(token, model_dim, inter_dim, experts, topk, quant, activation, conf
     }
 
 
+@benchmark()
+def test_aot_prefill(token, model_dim, inter_dim, experts, topk):
+    from aiter.ops.flydsl import aot_cache, fused_moe_gfx942
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import moe_reduce
+
+    config = "64_128_64_True"
+    request, reference, _ = make_case(
+        token, model_dim, inter_dim, experts, topk, "no", "silu", "random", True, None
+    )
+    impl = resolve_fused_moe_impl(make_fused_moe_impl_kernel_name(IMPL, config))
+    caches = (fused_moe_gfx942._GEMM_AOT_CACHE, moe_reduce._SORTED_SUM_AOT_CACHE)
+    results = {}
+    outputs = []
+    flops = 6 * token * topk * model_dim * inter_dim
+    nbytes = 2 * request.hidden_states.nbytes + request.w1.nbytes + request.w2.nbytes
+    with tempfile.TemporaryDirectory() as directory:
+        for name, mode in {"jit": "0", "aot": "verify"}.items():
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(aot_cache, "_MODE", mode))
+                stack.enter_context(
+                    patch.dict(os.environ, {"AITER_FLYDSL_AOT_CACHE_DIR": directory})
+                )
+                for cache in caches:
+                    stack.enter_context(patch.object(cache, "_mem", {}))
+                    stack.enter_context(patch.object(cache, "_builds", 0))
+                impl(request)
+                torch.cuda.synchronize()
+                if name == "aot":
+                    builds = [cache._builds for cache in caches]
+                    assert builds == [2, 1], f"unexpected AOT export counts: {builds}"
+                    for cache in caches:
+                        cache._mem.clear()
+                    with patch.object(aot_cache, "_MODE", "1"):
+                        impl(request)
+                    assert builds == [cache._builds for cache in caches]
+                    for cache in caches:
+                        assert cache._mem and all(
+                            not isinstance(kernel, aot_cache._JitKernel)
+                            for kernel in cache._mem.values()
+                        )
+                output, us = run_perftest(impl, request, num_iters=20, num_warmup=3)
+                results[f"{name} us"] = us
+                results[f"{name} TFLOPS"] = flops / us / 1e6
+                results[f"{name} TB/s"] = nbytes / us / 1e6
+                results[f"{name} err"] = check_output(reference, output, name)
+                outputs.append(output.clone())
+    assert torch.equal(*outputs), "AOT and JIT prefill outputs differ"
+    return results
+
+
 def shipped_rows():
     """Every shipped FlyDSL row as test_moe arguments, grouped by shape."""
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
@@ -786,9 +838,10 @@ def summarize(name, rows):
 
 
 def main():
-    if get_gfx() != "gfx942":
+    gfx = get_gfx_runtime()
+    if gfx != "gfx942":
         aiter.logger.warning(
-            "gfx942 FlyDSL whole-MoE backend unsupported on %s; skipping", get_gfx()
+            "gfx942 FlyDSL whole-MoE backend unsupported on %s; skipping", gfx
         )
         return
     parser = argparse.ArgumentParser(
@@ -833,6 +886,7 @@ def main():
         check_moe(*case)
     timed = [row for row in rows if not args.batch or row[0] in args.batch]
     summarize("Whole MoE", [test_moe(*row) for row in timed])
+    summarize("AOT and JIT prefill", [test_aot_prefill(128, 512, 128, 8, 2)])
 
 
 if __name__ == "__main__":
