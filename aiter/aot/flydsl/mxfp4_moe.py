@@ -32,9 +32,9 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     override_env,
     resolve_target_arch,
-    target_num_xcds,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.jit.utils.build_targets import target_num_xcds
 from aiter.ops.flydsl.kernels.mxfp4_gemm2 import DEFAULT_NUM_CU
 
 AOT_ARCH = "gfx950"

@@ -276,11 +276,14 @@ def flydsl_mxfp8_8wave_gemm(
                 Out.copy_(out_c)
             return Out
 
+    # get_num_xcds reads the current device; the launch and its key use XQ's.
+    with torch.cuda.device(XQ.device):
+        num_xcds = get_num_xcds()
     compile_kwargs = {
         "K": K,
         "waves_per_eu": int(waves_per_eu),
         "xcd_swizzle": int(xcd_swizzle),
-        "num_xcds": get_num_xcds(),
+        "num_xcds": num_xcds,
         "scale_preshuffled": scale_preshuffled,
         "w_scale_block": w_scale_block,
     }
@@ -370,11 +373,13 @@ def _run_tail_split(
         w_scale_block=w_scale_block,
     )
     ws = torch.empty((n_split, M, n2), dtype=torch.float32, device=XQ.device)
+    with torch.cuda.device(XQ.device):
+        num_xcds = get_num_xcds()
     compile_kwargs = {
         "K": K,
         "waves_per_eu": int(waves_per_eu),
         "xcd_swizzle": 0,
-        "num_xcds": get_num_xcds(),
+        "num_xcds": num_xcds,
         "w_scale_block": w_scale_block,
         "k_split": n_split,
     }

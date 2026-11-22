@@ -201,9 +201,9 @@ def dry_run(
     from flydsl.compiler.jit_executor import CompiledArtifact
     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
-    from aiter.aot.flydsl.common import target_num_xcds
     from aiter.jit import core as jit_core
     from aiter.jit.utils import chip_info
+    from aiter.jit.utils.build_targets import target_num_xcds
     from aiter.utility import graph_alloc
 
     _register_stream_stub()

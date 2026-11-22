@@ -612,6 +612,9 @@ def flydsl_preshuffle_gemm_a8(
         Out.element_size(),
     )
 
+    # get_num_xcds reads the current device; the launch and its key use XQ's.
+    with torch.cuda.device(XQ.device):
+        num_xcds = get_num_xcds()
     compile_kwargs = {
         "N": n,
         "K": k,
@@ -624,7 +627,7 @@ def flydsl_preshuffle_gemm_a8(
         "waves_per_eu": wpe,
         "enable_scheduler": bool(enable_scheduler),
         "xcd_swizzle": int(xcd_swizzle),
-        "num_xcds": get_num_xcds(),
+        "num_xcds": num_xcds,
         "lds_stage": int(lds_stage),
         "split_k": int(split_k),
     }

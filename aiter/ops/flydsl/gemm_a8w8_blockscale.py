@@ -88,8 +88,8 @@ def _compile_gemm(
     K: int,
     kernel_name: str,
     device_index: int,
-    out_dtype: torch.dtype = torch.bfloat16,
-    num_xcds: int = 8,
+    out_dtype: torch.dtype,
+    num_xcds: int,
 ):
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 

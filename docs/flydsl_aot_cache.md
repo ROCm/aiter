@@ -292,7 +292,7 @@ Known holes, and how they are handled:
 |---|---|---|
 | A module-level value reached without an import in build code | `getattr(consts, name)`, `globals()[name] = ...`, or an import inside a function the build did not call | Imports in build code are followed statically (above). Pass the file in `extra_sources`, or run `verify` mode |
 | Code outside the aiter package affects the kernel | a helper in another installed package | Pass it in `extra_sources`, or run `verify` mode |
-| The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count | Put it in `key`. `verify` mode detects it |
+| The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count, such as the XCD count from `get_num_xcds()` | Put it in `key`. `verify` mode detects it |
 | A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
 | A variable read outside the build in a shared module | a module-level `os.getenv("X")` in `aiter/jit/` | Name it in kernel code under `aiter/ops/flydsl/`, or pass it in `key`. Today's shared reads are arch, CU count and config paths, all covered |
 | A variable read only by copying the environment | `env = dict(os.environ)` then `env["X"]` | Read it by name |
@@ -462,16 +462,25 @@ Also verified (`AITER_FLYDSL_AOT_CACHE_DIR` fresh each time):
 ### 5.2 gfx950: `run_gemm_a8w8_blockscale`
 
 ```python
-key = (N, K, kernel_name, Out.dtype, XQ.device)
-_AOT_CACHE.launch(
-    key,
-    lambda: _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype),
-    ...
-)
+with torch.cuda.device(XQ.device):
+    num_xcds = get_num_xcds()
+    key = (N, K, kernel_name, Out.dtype, num_xcds, XQ.device)
+    _AOT_CACHE.launch(
+        key,
+        lambda: _compile_gemm(
+            N, K, kernel_name, XQ.device.index, Out.dtype, num_xcds
+        ),
+        ...
+    )
 ```
 
 `_compile_gemm` keeps one launcher per device, so the device is in `key`
-(memory only; the `.o` is shared). Validated compile-only on gfx942 under
+(memory only; the `.o` is shared). The kernel's workgroup remap is built for
+the device's XCD count, which the cache directory's fingerprint does not
+cover, so `num_xcds` is in `key` as well. `get_num_xcds()` reads the current
+HIP device, not a tensor's, so it is called with `XQ.device` current;
+otherwise a process using GPUs with different XCD counts could build or look
+up the entry for the wrong count. Validated compile-only on gfx942 under
 `dry_run("gfx950", 256)` for the tuned kernel
 `flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps0`, M=8192 N=768 K=7168, bf16
 and fp16 output:
@@ -529,7 +538,9 @@ not converted.
 2. **`key` covers the specialization.** Include every constexpr, every
    tensor dtype that can vary, and any trace-time state that is not in the
    environment or the sources, e.g. a mode global. Arch, CU count and the
-   variables the kernel's files read are tracked already. Tensor
+   variables the kernel's files read are tracked already; the XCD count is
+   not, so a kernel built with `num_xcds` puts it in `key`, read under the
+   launch's device (`get_num_xcds()` reads the current one). Tensor
    rank and unit-stride axis are covered by the disk digest. Include them in
    `key` too if they can vary for the same `key`, as the FlyDSL
    compiled-handle rules in `aiter/ops/flydsl/AGENTS.md` require.

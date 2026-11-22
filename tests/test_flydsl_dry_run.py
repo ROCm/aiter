@@ -13,9 +13,9 @@ if str(_REPO_ROOT) not in sys.path:
 @unittest.skipUnless(importlib.util.find_spec("flydsl"), "FlyDSL is not installed")
 class DryRunXcdCountTest(unittest.TestCase):
     def test_xcd_count_follows_the_replayed_target(self):
-        from aiter.aot.flydsl.common import target_num_xcds
         from aiter.aot.flydsl.dry_run import dry_run
         from aiter.jit.utils import chip_info
+        from aiter.jit.utils.build_targets import target_num_xcds
         from aiter.ops.flydsl import moe_kernels
 
         for arch, cu_num in (("gfx950", 128), ("gfx950", 256), ("gfx942", 228)):
