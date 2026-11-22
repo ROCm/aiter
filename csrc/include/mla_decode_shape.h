@@ -177,7 +177,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
         // 96 heads at qlen 7 and 8 run natively only when opted in (native_96h_cp) and
         // under round-robin CP. Off by default: at 350K tokens of context the native
-        // route measured 0.35x (qlen 7) and 0.59x (qlen 8) of the fold at batch 1.
+        // route measured 0.37x (qlen 7) and 0.62x (qlen 8) of the fold at batch 1.
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
          ((max_seqlen_qo <= 6) ||
           (flags.native_96h_cp && cp_round_robin && (max_seqlen_qo <= 8)))) ||
