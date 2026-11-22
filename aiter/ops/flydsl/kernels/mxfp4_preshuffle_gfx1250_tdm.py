@@ -16,6 +16,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
+from . import ep_scatter_common
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
@@ -28,10 +29,6 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .kernels_common import ceildiv
-from .mega_moe_gfx1250.tdm_gather_shim import (
-    make_tensor_gather_descriptor,
-    tensor_store_gather,
-)
 from .mega_moe_gfx1250.types import (
     COMBINE_CHUNK,
     COMBINE_SCALE_BLOCK,
@@ -437,11 +434,18 @@ def build_gemm_a8w4_tdm_task(
     num_waves = m_warp * n_warp
     block = num_waves * k_waves * WAVE
     overlap_scatter = bool(
-        persistent_workers == 256 and enable_ep_scatter and ep_world_size > 1
-        and not ep_quant_bits and a_is_fp4 and a_preshuffled
-        and tile_m == tile_n == tile_k == 256 and num_buffers == 3
-        and m_warp == n_warp == 2 and next_stage_on
-        and not tdm_as_in_prologue and k_waves == 1
+        persistent_workers == 256
+        and enable_ep_scatter
+        and ep_world_size > 1
+        and not ep_quant_bits
+        and a_is_fp4
+        and a_preshuffled
+        and tile_m == tile_n == tile_k == 256
+        and num_buffers == 3
+        and m_warp == n_warp == 2
+        and next_stage_on
+        and not tdm_as_in_prologue
+        and k_waves == 1
     )
     scatter_waves = 2 if overlap_scatter else num_waves
     SCATTER_GROUP_ROWS = 8
@@ -578,7 +582,9 @@ def build_gemm_a8w4_tdm_task(
     if defer_c_wait:
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
         assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
-        assert C_Q_OFF + tile_m * (tile_n // 4) <= request_lds_size, "C staging past arena"
+        assert (
+            C_Q_OFF + tile_m * (tile_n // 4) <= request_lds_size
+        ), "C staging past arena"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -1940,171 +1946,57 @@ def build_gemm_a8w4_tdm_task(
                 )
                 rocdl.sched_barrier(0)
 
-        is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
-        STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
-        # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
-        # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
-        # them to 4-way, the b128 floor. Pad cols never reach global.
-        STORE_PAD = (
-            c_lds_pad_elems
-            if const_expr(enable_ep_scatter)
-            else (16 if not stage1_act else 0)
-        )
-        STORE_PITCH = STORE_N + STORE_PAD
-        oc = fx.Float16 if out_is_f16 else fx.BFloat16
-
         if const_expr(enable_ep_scatter):
-            # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
-            # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
-            # are padded to a pow2 so perRankSize divides by the slot stride
-            # exactly -- which lets (pe, slot) fold into ONE row index
-            # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
-            # measured in-kernel from the lsa_ptr stride. Each wave issues the
-            # gather-stores for its row groups, 8 rows per instruction.
-            # Quantized rows are addressed in bytes, scale lines included.
             elem_bytes = 1 if ep_quant_bits else 2
-            _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
-            _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
-            _stride_elems = ep_slot_stride_bytes // elem_bytes
-            _GRP = SCATTER_GROUP_ROWS
-            _ngrp = scatter_groups
-            _pr = _ep_lsa1 - _ep_lsa0
-            _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
-            # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
-            # slot<K); dropped/padding rows use this index so the HW drops them.
-            _oob = _K * fx.Int32(ep_world_size)
-            _comb_ptr_ty = fx.PointerType.get(
-                T.i8 if ep_quant_bits else T.i16,
-                address_space=fx.AddressSpace.Global,
-                alignment=16,
-            )
-            _comb_iter = fx.inttoptr(
-                _comb_ptr_ty,
-                _ep_lsa0 + fx.Int64(ep_combine_input_offset),
-            )
-            _comb_view = tensor_view(
-                _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
-            )
-            _lds_c = tensor_view(
-                fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_ep_base_ptr),
-                (tile_m, _lds_row_elems),
-                (_lds_row_elems, 1),
+            issue_scatter_group, _K, _oob = ep_scatter_common.make_scatter_store(
+                _ep_lsa0,
+                _ep_lsa1,
+                ep_combine_input_offset,
+                ep_slot_stride_bytes,
+                ep_world_size,
+                c_ep_base_ptr,
+                tile_m,
+                C_ROW_BYTES if ep_quant_bits else tile_n,
+                _lds_row_bytes if ep_quant_bits else tile_n + c_lds_pad_elems,
+                (
+                    fx.Int8
+                    if ep_quant_bits
+                    else (fx.Float16 if out_is_f16 else fx.BFloat16)
+                ),
+                elem_bytes,
+                SCATTER_GROUP_ROWS,
+                overlap_scatter,
             )
 
-            def issue_scatter_group(group, index_lane, vector_pass, column_offset):
-                base_row = group * fx.Int32(_GRP)
-                row_indices = []
-                for i in range_constexpr(_GRP):
-                    src_lane = fx.Int32(vector_pass * _GRP + i)
-                    row_indices.append(
-                        fx.Int32(
-                            rocdl.readlane(
-                                T.i32,
-                                _raw(index_lane),
-                                _raw(src_lane),
-                            )
-                        )
-                    )
-                # Geometry is explicit because traced layout leaves are not
-                # Python integers suitable for the descriptor bitfields.
-                desc = make_tensor_gather_descriptor(
-                    _comb_view,
-                    _lds_c,
-                    row_indices,
-                    row_width=_lds_row_elems,
-                    tensor_dim0=_row_elems,
-                    tensor_dim1=_oob.ir_value(),
-                    stride=_stride_elems,
-                    elem_bytes=elem_bytes,
-                    index_size=32,
-                    lds_byte_offset=fx.index_cast(
-                        T.index,
-                        base_row * fx.Int32(_lds_row_elems * elem_bytes),
-                    ),
-                    global_byte_offset=column_offset,
+        prologue_callback, epilogue_callback, skip_callback = None, None, None
+        if const_expr(overlap_scatter):
+
+            def load_first(interleaved_lds_load):
+                first_lds_addr = calc_lds_addr(0)
+                rocdl.sched_barrier(0)
+                load_lds_data(rmem_slots[0], first_lds_addr, 0, 0, interleaved_lds_load)
+
+            prologue_callback, epilogue_callback, skip_callback = (
+                ep_scatter_common.make_overlap_callbacks(
+                    issue_scatter_group,
+                    wave,
+                    scatter_wave,
+                    (pending_idx0, pending_idx1, pending_col, pending_valid),
+                    last_task,
+                    issue,
+                    init_accumulators,
+                    load_wait,
+                    TDM_PER,
+                    load_first,
                 )
-                if const_expr(overlap_scatter):
-                    # tensor_store_gather emits redundant tensorcnt(0xa).
-                    # Store-only waves issue at most eight stores between
-                    # explicit drains; inline asm keeps that burst wait-free.
-                    llvm_dialect.inline_asm(
-                        None,
-                        [desc.dgroup0, desc.dgroup1, desc.dgroup2, desc.dgroup3],
-                        "tensor_store_from_lds $0, $1, $2, $3\n"
-                        "s_nop 0",
-                        "s,s,s,s,~{memory}",
-                        has_side_effects=True,
-                    )
-                else:
-                    tensor_store_gather(desc)
-
-            def issue_scatter_burst(first, idx0, idx1, column_offset):
-                for i in range_constexpr(8):
-                    issue_scatter_group(
-                        scatter_wave + fx.Int32((first + i) * 2),
-                        idx0 if i < 4 else idx1,
-                        i % SCATTER_PASSES_PER_VECTOR,
-                        column_offset,
-                    )
-
-        def overlap_prologue(interleaved_lds_load):
-            # Stages 0/1 are disjoint from old C. One rendezvous covers both
-            # the first input's readiness and retirement of C's first half.
-            for i in range_constexpr(2):
-                issue(i, i)
-            init_accumulators()
-            load_wait(TDM_PER)
-            if (wave >= 2) & (pending_valid != 0):
-                tdm_ops.tensor_wait(0)
-            workgroup_barrier()
-            first_lds_addr = calc_lds_addr(0)
-            rocdl.sched_barrier(0)
-            load_lds_data(
-                rmem_slots[0], first_lds_addr, 0, 0, interleaved_lds_load
             )
-            if (wave >= 2) & (pending_valid != 0):
-                issue_scatter_burst(
-                    8, pending_idx0, pending_idx1, pending_col
-                )
-            issue(2, 2)
-
-        def overlap_epilogue(index_lanes, column_offset):
-            next_idx0 = fx.Int32(0)
-            next_idx1 = fx.Int32(0)
-            next_col = fx.Int32(0)
-            next_valid = fx.Int32(0)
-            if wave >= 2:
-                issue_scatter_burst(
-                    0, index_lanes[0], index_lanes[1], column_offset
-                )
-                next_idx0 = index_lanes[2]
-                next_idx1 = index_lanes[3]
-                next_col = fx.Int32(column_offset)
-                next_valid = fx.Int32(1)
-                if last_task != 0:
-                    # No following prologue will issue the last task's tail.
-                    tdm_ops.tensor_wait(0)
-                    issue_scatter_burst(
-                        8, index_lanes[2], index_lanes[3], column_offset
-                    )
-                    next_valid = fx.Int32(0)
-                rocdl.s_nop(0)
-            return next_idx0, next_idx1, next_col, next_valid
-
-        epilogue_callback = overlap_epilogue if overlap_scatter else None
         next_idx0 = fx.Int32(0)
         next_idx1 = fx.Int32(0)
         next_col = fx.Int32(0)
         next_valid = fx.Int32(0)
-        if const_expr(overlap_scatter):
-            # A partial M-cluster tail skips its prologue, but must still
-            # issue the previous populated task's deferred second burst.
+        if const_expr(overlap_scatter):  # noqa: SIM102
             if not has_work:
-                if (wave >= 2) & (pending_valid != 0):
-                    tdm_ops.tensor_wait(0)
-                    issue_scatter_burst(
-                        8, pending_idx0, pending_idx1, pending_col
-                    )
+                skip_callback()
 
         # Skip padding tiles; uniform across every workgroup and cluster.
         if has_work:
@@ -2120,8 +2012,8 @@ def build_gemm_a8w4_tdm_task(
                     _scatter_pass_lane = lane // fx.Int32(
                         SCATTER_GROUP_ROWS
                     ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
-                    _scatter_group_lane = (
-                        scatter_wave + _scatter_pass_lane * fx.Int32(scatter_waves)
+                    _scatter_group_lane = scatter_wave + _scatter_pass_lane * fx.Int32(
+                        scatter_waves
                     )
                     _scatter_row_lane = _scatter_group_lane * fx.Int32(
                         SCATTER_GROUP_ROWS
@@ -2276,7 +2168,10 @@ def build_gemm_a8w4_tdm_task(
                             first_lds_addr = calc_lds_addr(0)
                             rocdl.sched_barrier(0)
                             load_lds_data(
-                                rmem_slots[0], first_lds_addr, 0, 0,
+                                rmem_slots[0],
+                                first_lds_addr,
+                                0,
+                                0,
                                 interleaved_lds_load,
                             )
 
@@ -2394,10 +2289,7 @@ def build_gemm_a8w4_tdm_task(
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
-            run_mainloop(
-                bool(interleaved_lds_load_on),
-                overlap_prologue if overlap_scatter else None,
-            )
+            run_mainloop(bool(interleaved_lds_load_on), prologue_callback)
 
             if const_expr(k_waves > 1):
                 # Every group is past its last LDS input read once this fence
@@ -2462,15 +2354,23 @@ def build_gemm_a8w4_tdm_task(
                         ).ir_value()
                     )
             if const_expr(overlap_scatter):
-                # Waves 2/3 retire the PREVIOUS task's store before any wave
-                # overwrites C. Their mainloop never waits on tensorcnt.
-                tdm_ops.tensor_wait(0)
-                workgroup_barrier()
+                ep_scatter_common.retire_scatter()
             else:
                 # Peer multicast loads are pairwise matched with ours.
                 stage_fence(0)
             if const_expr(item_hooks is not None):
                 item_hooks[0]["epi_start"]()
+            is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
+            STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
+            # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
+            # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
+            # them to 4-way, the b128 floor. Pad cols never reach global.
+            STORE_PAD = (
+                c_lds_pad_elems
+                if const_expr(enable_ep_scatter)
+                else (16 if not stage1_act else 0)
+            )
+            STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             is_situv2 = stage1_act == 3
@@ -2481,6 +2381,8 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(is_situv2)
                 else None
             )
+
+            oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             if const_expr(has_bias):
                 bias_elem = {1: T.bf16, 2: T.f32, 3: T.f16}[has_bias]
@@ -2922,16 +2824,20 @@ def build_gemm_a8w4_tdm_task(
                         group = wave + fx.Int32(scatter_pass * num_waves)
                         scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
                         vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
-                        if const_expr(_ngrp % num_waves):
-                            if group < fx.Int32(_ngrp):
+                        if const_expr(scatter_groups % num_waves):
+                            if group < fx.Int32(scatter_groups):
                                 issue_scatter_group(
-                                    group, _scatter_idx_lanes[scatter_vector],
-                                    vector_pass, _gboff,
+                                    group,
+                                    _scatter_idx_lanes[scatter_vector],
+                                    vector_pass,
+                                    _gboff,
                                 )
                         else:
                             issue_scatter_group(
-                                group, _scatter_idx_lanes[scatter_vector],
-                                vector_pass, _gboff,
+                                group,
+                                _scatter_idx_lanes[scatter_vector],
+                                vector_pass,
+                                _gboff,
                             )
                     tdm_ops.tensor_wait(0)
             else:
@@ -3208,19 +3114,23 @@ def launch_gemm_a8w4_tdm(
             stride = persistent_workers // cluster_m
             if const_expr(layout["overlap_scatter"]):
                 for task_id, pending in range(
-                    fx.block_idx.x, tasks, stride,
+                    fx.block_idx.x,
+                    tasks,
+                    stride,
                     init=[fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0)],
                 ):
                     task_i32 = fx.Int32(task_id)
                     updated = run_task(
-                        task_i32, rows, pending,
+                        task_i32,
+                        rows,
+                        pending,
                         (task_i32 + stride >= tasks).select(1, 0),
                     )
                     yield [updated[0], updated[1], updated[2], updated[3]]
             else:
                 for task_id in range(fx.block_idx.x, tasks, stride):
                     run_task(task_id, rows)
-            if const_expr(layout["overlap_scatter"]):
+            if const_expr(layout["overlap_scatter"]):  # noqa: SIM102
                 # No next epilogue will retire the last task's remote writes.
                 if fx.thread_idx.x >= 64:
                     tdm_ops.tensor_wait(0)
