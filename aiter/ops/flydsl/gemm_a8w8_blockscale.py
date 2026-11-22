@@ -8,6 +8,7 @@ import functools
 import torch
 from torch import Tensor
 
+from .aot_cache import FlyDSLAotCache
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
     TILE_M,
@@ -16,6 +17,8 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernelInstance,
     kernels_by_name,
 )
+
+_AOT_CACHE = FlyDSLAotCache("gemm_a8w8_blockscale")
 
 
 def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
@@ -90,7 +93,7 @@ def _compile_gemm(
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
-    # _run_compiled caches the first typed CompiledFunction on each launcher.
+    # each caches the first typed CompiledFunction it compiles.
     ki = kernels_by_name[kernel_name]
     launch = compile_gemm_fp8_8wave(
         TILE_M,
@@ -130,27 +133,30 @@ def run_gemm_a8w8_blockscale(
     if x_scale.device != XQ.device or w_scale.device != XQ.device:
         raise ValueError("FlyDSL blockscale scales must be on the input device")
 
-    import flydsl.expr as fx
-
-    from .kernels.tensor_shim import _run_compiled
+    from .kernels.tensor_shim import current_stream_arg
 
     M, K = XQ.shape
     N = WQ.shape[0]
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
-        launch = _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype)
         out_contiguous = Out.contiguous()
+        # Every tensor is contiguous and only Out's dtype varies, so the
+        # compile arguments determine the launcher's argument signature. The
+        # device keeps one launcher per device on the JIT path, as
+        # _compile_gemm does; on disk the entry is shared by every device.
+        key = (N, K, kernel_name, Out.dtype, XQ.device)
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
-        _run_compiled(
-            launch,
+        _AOT_CACHE.launch(
+            key,
+            lambda: _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype),
             XQ.contiguous().view(torch.int8),
             WQ.contiguous().view(torch.int8),
             out_contiguous,
             sa,
             sb,
             M,
-            fx.Stream(torch.cuda.current_stream(XQ.device)),
+            current_stream_arg(XQ.device),
         )
         if out_contiguous is not Out:
             Out.copy_(out_contiguous)
