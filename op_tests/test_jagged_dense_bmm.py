@@ -327,6 +327,19 @@ def test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype):
 
 _SELECT_B, _SELECT_K, _SELECT_N, _SELECT_MI = 64, 256, 256, 2048
 _PINNED_LAUNCHER_KEY = {"xcd_c": 32, "xcd_w": 8, "block_k": 64}
+_CSV_COLS = (
+    "gfx",
+    "cu_num",
+    "K",
+    "N",
+    "tiles_log2",
+    "xcd_c",
+    "xcd_w",
+    "block_k",
+    "skew_xcd_c",
+    "skew_xcd_w",
+    "us",
+)
 
 
 def _clear_tuned_cache():
@@ -346,10 +359,7 @@ def _tuned_csv(rows, gpu_archs=None):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "gfx,cu_num,K,N,tiles_log2,"
-                    "xcd_c,xcd_w,block_k,skew_xcd_c,skew_xcd_w,us\n"
-                )
+                fh.write(",".join(_CSV_COLS) + "\n")
                 fh.write(rows)
             os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
             if gpu_archs is not None:
@@ -440,6 +450,36 @@ def _live_tuned_row(B, D, Kout, Mi, xcd_c, xcd_w, block_k):
     tiles = jdbba_dispatch.tiles_log2(n_groups=B, output_n=Kout, max_seq_len=Mi)
     key = (get_gfx_runtime(), get_cu_num(), D, Kout, tiles)
     return ",".join(map(str, (*key, xcd_c, xcd_w, block_k, "", "", 1)))
+
+
+@benchmark()
+def test_jdbba_tuned_csv_bad_cell(B, D, Kout, Mi, cell, dtype):
+    good = _live_tuned_row(B, D, Kout, Mi, 16, 4, 64)
+    bad = _live_tuned_row(B, 2 * D, Kout, Mi, 32, 8, 64).split(",")
+    col, value = cell.split("=")
+    bad[_CSV_COLS.index(col)] = value
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    with (
+        _tuned_csv(",".join(bad) + "\n" + good + "\n"),
+        mock.patch.object(
+            aiter.logger, "warning", wraps=aiter.logger.warning
+        ) as warning,
+    ):
+        cfg = jdbba_dispatch.resolve_config(
+            n_groups=B,
+            reduction_k=D,
+            output_n=Kout,
+            max_seq_len=Mi,
+            uniform_seqlen=True,
+        )
+        _launch(d, out, B, Mi, True)
+    err = _check(d, out, dtype, f"tuned CSV with a bad row ({cell})")
+    drops = sum("dropping tuned row" in c.args[0] for c in warning.call_args_list)
+    expect = {"xcd_c": 16, "xcd_w": 4, "block_k": 64}
+    assert cfg == expect, f"bad row ({cell}): selected {cfg}, expected {expect}"
+    assert drops == 1, f"bad row ({cell}): {drops} drop warnings, expected 1"
+    return {"gfx": get_gfx_runtime(), "drop warnings": drops, "err": err}
 
 
 @benchmark()
@@ -855,6 +895,13 @@ def main():
                 )
             )
     _summarize("jagged_dense_bmm tuned row", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), cell in itertools.product(
+        args.dtype, args.regression_shapes, ("xcd_c=abc", "xcd_w=32.0", "K=")
+    ):
+        rows.append(test_jdbba_tuned_csv_bad_cell(B, D, Kout, Mi, cell, dtype))
+    _summarize("jagged_dense_bmm tuned CSV bad cell", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi) in itertools.product(

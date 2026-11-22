@@ -9,7 +9,8 @@ then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
 from ``get_gfx_runtime()``, so a ``GPU_ARCHS`` build override does not pick the
 row. Under ``AITER_AOT_REPLAY=1``, ``GPU_ARCHS`` names the target and does pick it. The skew path takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w``
 from the row; an empty skew cell falls back to the analytic skew XCD remap.
-A row that fails ``check_config`` is dropped with a warning when the table loads.
+A row with a cell that is not an integer, or that fails ``check_config``, is
+dropped with a warning when the table loads; the other rows still dispatch.
 """
 
 from __future__ import annotations
@@ -85,15 +86,10 @@ def _tuned_table() -> dict:
     )
     table = {}
     for r in df.to_dict("records"):
-        key = (
-            r["gfx"],
-            int(r["cu_num"]),
-            int(r["K"]),
-            int(r["N"]),
-            int(r["tiles_log2"]),
-        )
-        row = {k: int(r[k]) if r[k] else None for k in _ROW_KEYS}
+        key = tuple(r[k] for k in _KEY_COLS)
         try:
+            key = (key[0], *map(int, key[1:]))
+            row = {k: int(r[k]) if r[k] else None for k in _ROW_KEYS}
             _check_row(key, row)
         except ValueError as exc:
             logger.warning("jagged_dense_bmm: dropping tuned row %s: %s", key, exc)
