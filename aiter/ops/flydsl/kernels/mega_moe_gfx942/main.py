@@ -132,6 +132,8 @@ def ep_mega_kernel(
     # the up block of each 128 inter cols, gemm2 one block per 128 out cols.
     NB1, NB2 = 2 * (NI // 128), NO // 128
     BT1, BT2 = RATIO + (G1N + 1) * BM * 4, RATIO + (G2N + 1) * BM * 4
+    W1S_BYTES = E_LOCAL * (N2 // 128) * G1N * 4  # f32 [E_LOCAL, 2I / 128, H / 128]
+    W2S_BYTES = E_LOCAL * (H // 128) * G2N * 4  # f32 [E_LOCAL, H / 128, I / 128]
     LDS_BYTES = max(
         BT1 + (NB1 * (G1N + 1) * 4 if FP8W else 0),
         BT2 + (NB2 * (G2N + 1) * 4 if FP8W else 0),
@@ -150,10 +152,10 @@ def ep_mega_kernel(
     assert (
         producers % QUEUES == 0 and ROWV[-1] == BM and LDS_BYTES <= LDS_BYTES_MAX
     ), LDS_BYTES
-    # build_b_ratios: waves 1.. fill a task's B tables while wave 0 waits for its rows;
-    # a gemm2 wave's columns lie in one 128-col W block
+    # build_b_ratios: a thread per (W block, 128-K group) of a task; a gemm2 wave's
+    # columns lie in one 128-col W block
     assert not FP8W or (
-        max(NB1 * G1N, NB2 * G2N) <= NT - 64 and 128 % NOW == 0 and 128 % NIW == 0
+        max(NB1 * G1N, NB2 * G2N) <= NT and 128 % NOW == 0 and 128 % NIW == 0
     )
     GPW = NI // 128  # gemm1 epilogue: quant groups per WG row, waves per group
     WPG = NW // GPW
@@ -378,23 +380,24 @@ def ep_mega_kernel(
                 seen = _atomic_load_at(addr, scope)
             _inv_l1()
 
-        def build_b_ratios(scales, rows, G, table, tx):
+        def build_b_ratios(scales, nbytes, rows, G, table, tx):
             """fp8 W: LDS ``table`` (bytes) [len(rows)][G + 1] f32 of a task's 128-col W
             blocks: s[g - 1] / s[g] for each 128-K group g (1 for g = 0), then s[G - 1],
-            from the f32 block scales at ``scales`` (``rows``: each block's scale row of G).
-            The K loop scales acc by them at every group start (with x's ratios), so acc
-            ends in units of s[G - 1]. A zero scale acts as 1 (its W block is all zero,
-            see weights.prepare_weights_a8w8). Waves 1.. fill it while wave 0 waits for
-            the task's rows; it is visible after the K loop's first barrier."""
-            raw = tx - fx.Int32(64)
-            ok = (raw >= fx.Int32(0)) & (raw < fx.Int32(len(rows) * G))
-            idx = ok.select(raw, fx.Int32(0))
+            from the f32 block scales at ``scales`` (``nbytes`` of them; ``rows``: each
+            block's scale row of G). The K loop scales acc by them at every group start
+            (with x's ratios), so acc ends in units of s[G - 1]. A zero scale acts as 1
+            (its W block is all zero, see weights.prepare_weights_a8w8). Called after
+            pre_a's barrier (before it, the previous task's scatter may still read this
+            LDS); visible after the K loop's first barrier."""
+            ok = tx < fx.Int32(len(rows) * G)
+            idx = ok.select(tx, fx.Int32(0))
             t = idx // fx.Int32(G)
             g = idx % fx.Int32(G)
             row = rows[0]
             for j in range_constexpr(1, len(rows)):
                 row = (t == fx.Int32(j)).select(rows[j], row)
-            rs = _rsrc(scales)
+            # bounded: a masked lane's offset is 0x7FFFFFFF
+            rs = _rsrc(scales, nbytes)
             one = fx.Float32(1.0)
             cur = fx.Int32(_ld(rs, row * fx.Int32(G) + g, mask=ok)).bitcast(fx.Float32)
             prv = fx.Int32(
@@ -796,8 +799,6 @@ def ep_mega_kernel(
 
             def run_rows(R):
                 def pre_a():  # the W prefetch is in flight
-                    if const_expr(FP8W):
-                        build_b_ratios(a["w1s"], b_rows, G1N, BT1, tx)
                     if wave == fx.Int32(0):
                         spin_ge(
                             a["ws"]
@@ -806,6 +807,8 @@ def ep_mega_kernel(
                             "one-as",
                         )
                     gpu.barrier()
+                    if const_expr(FP8W):
+                        build_b_ratios(a["w1s"], W1S_BYTES, b_rows, G1N, BT1, tx)
                     if const_expr(QX):
                         build_ratios(R)  # visible after the K loop's first barrier
                     else:  # LDS fin[r]: row r's x scale (the first of its G1N); padding: 1
@@ -1040,8 +1043,6 @@ def ep_mega_kernel(
 
             def run_rows(R):
                 def pre_a():  # the W prefetch is in flight
-                    if const_expr(FP8W):
-                        build_b_ratios(a["w2s"], b_rows, G2N, BT2, tx)
                     if wave == fx.Int32(0):
                         spin_ge(
                             a["sched"]
@@ -1053,6 +1054,8 @@ def ep_mega_kernel(
                             "agent-one-as",
                         )
                     gpu.barrier()
+                    if const_expr(FP8W):
+                        build_b_ratios(a["w2s"], W2S_BYTES, b_rows, G2N, BT2, tx)
                     build_ratios(R)
 
                 acc = core(R, row_base16, hook, pre_a=pre_a)
