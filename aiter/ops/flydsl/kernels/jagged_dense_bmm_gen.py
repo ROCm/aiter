@@ -14,6 +14,8 @@ sequence lengths that maps each workgroup to its group on device.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import math
 from dataclasses import dataclass
 
@@ -21,8 +23,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr.typing import T
+from flydsl.utils import env
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
+from aiter.jit.utils.chip_info import (
+    get_lds_capacity_bytes,
+    get_num_xcds,
+    load_hip_runtime,
+)
 
 from .tensor_shim import _run_compiled, buf_scalar_load
 
@@ -30,6 +37,15 @@ BLOCK_M = 128
 BLOCK_N = 128
 STAGES_A = 2
 _COPY_VEC = 8  # 16B / bf16
+
+_INT32_MAX = 2**31 - 1
+# An HSA dispatch packet holds each axis's work-item count in a uint32.
+_MAX_DISPATCH_ITEMS = 2**32 - 1
+# A buffer descriptor holds num_records in 32 bits.
+_MAX_BUFFER_BYTES = 2**32 - 1
+# Measured on gfx942: one group of B reads wrong above 2 GiB (K=64).
+_MAX_B_GROUP_BYTES = 2**31
+_HIP_ATTR_MAX_GRID_DIM_X = 29  # hipDeviceAttributeMaxGridDimX; Y and Z follow.
 
 
 @dataclass(frozen=True)
@@ -567,10 +583,7 @@ def _build_launcher(
 
         epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
 
-        if fx.const_expr(COMPACT):
-            grid = (grid_m, 1, N_BLOCKS)
-        else:
-            grid = (grid_m * N_BLOCKS, 1, n_groups)
+        grid = _launch_grid(COMPACT, grid_m, n_groups, N_BLOCKS)
         jdbba_kernel(
             C,
             A,
@@ -587,6 +600,84 @@ def _build_launcher(
     return _launch
 
 
+def _launch_grid(compact, grid_m, n_groups, n_blocks):
+    if compact:
+        return (grid_m, 1, n_blocks)
+    return (grid_m * n_blocks, 1, n_groups)
+
+
+@functools.cache
+def _max_grid_dims(device_index: int) -> tuple[int, int, int]:
+    libhip = load_hip_runtime()
+    dims = []
+    for axis in range(3):
+        val = ctypes.c_int(0)
+        attr = _HIP_ATTR_MAX_GRID_DIM_X + axis
+        err = libhip.hipDeviceGetAttribute(ctypes.byref(val), attr, device_index)
+        if err != 0:
+            raise RuntimeError(
+                f"hipDeviceGetAttribute(MaxGridDim{'XYZ'[axis]}) failed with "
+                f"error {err} for device {device_index}"
+            )
+        dims.append(val.value)
+    return tuple(dims)
+
+
+def _check_launch(
+    *,
+    grid: tuple[int, int, int],
+    threads: int,
+    block_m: int,
+    block_n: int,
+    n_groups: int,
+    max_seq_len: int,
+    K: int,
+    N: int,
+    compact: bool,
+    device_index: int,
+) -> None:
+    """Raise ValueError for a launch past a HIP grid limit or a 32-bit offset."""
+    if compact:
+        names = (f"A.shape[0] // {block_m} + n_groups", "1", f"N / {block_n}")
+    else:
+        names = (f"ceil(max_seq_len / {block_m}) * N / {block_n}", "1", "n_groups")
+    # A compile-only run has no device to ask and never launches.
+    if not env.compile.compile_only:
+        limits = zip(grid, names, _max_grid_dims(device_index), (threads, 1, 1))
+        for axis, (dim, name, max_dim, block) in zip("xyz", limits):
+            limit = min(max_dim, _MAX_DISPATCH_ITEMS // block)
+            if dim > limit:
+                hint = ""
+                if name == "n_groups":
+                    hint = "; the skew path (uniform_seqlen=False) has no such limit"
+                raise ValueError(
+                    f"grid {axis} = {name} = {dim} is over the device limit "
+                    f"{limit}{hint}"
+                )
+    workgroups = math.prod(grid)
+    if workgroups > _INT32_MAX:
+        raise ValueError(
+            f"{workgroups} workgroups overflow the kernel's Int32 workgroup index "
+            f"(max {_INT32_MAX})"
+        )
+    if n_groups * N > _INT32_MAX:
+        raise ValueError(
+            f"n_groups * N = {n_groups * N} overflows the kernel's Int32 BIAS "
+            f"offset (max {_INT32_MAX})"
+        )
+    if K * N * 2 > _MAX_B_GROUP_BYTES:
+        raise ValueError(
+            f"one group of B is K * N * 2 = {K * N * 2} bytes, over the 2 GiB "
+            "the kernel addresses"
+        )
+    if not compact and max_seq_len * max(K, N) * 2 > _MAX_BUFFER_BYTES:
+        raise ValueError(
+            f"max_seq_len * max(K, N) * 2 = {max_seq_len * max(K, N) * 2} bytes "
+            "bounds one group of A or C, which must stay under the 4 GiB of a "
+            "32-bit buffer descriptor"
+        )
+
+
 def check_config(
     *,
     K: int,
@@ -597,9 +688,12 @@ def check_config(
     threads: int,
     xcd_c: int,
     xcd_w: int,
+    n_xcd: int,
     traits: ArchTraits,
 ) -> None:
     """Raise ValueError for a config the kernel cannot run exactly."""
+    if N < 1:
+        raise ValueError(f"N must be >= 1, got {N}")
     if block_m <= 0 or block_m & (block_m - 1):
         raise ValueError(f"block_m must be a power of two, got {block_m}")
     # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
@@ -653,6 +747,17 @@ def check_config(
             )
     if xcd_c < 1 or xcd_w < 1:
         raise ValueError(f"xcd_c and xcd_w must be >= 1, got {xcd_c} and {xcd_w}")
+    if n_xcd * xcd_c > _INT32_MAX:
+        raise ValueError(
+            f"xcd_c={xcd_c} times {n_xcd} XCDs overflows the XCD remap's Int32 "
+            f"period (max {_INT32_MAX})"
+        )
+    n_blocks = N // block_n
+    if xcd_w * n_blocks > _INT32_MAX:
+        raise ValueError(
+            f"xcd_w={xcd_w} times {n_blocks} N-tiles overflows the XCD remap's "
+            f"Int32 window (max {_INT32_MAX})"
+        )
 
 
 def jagged_dense_bmm(
@@ -682,17 +787,6 @@ def jagged_dense_bmm(
     bnn = BLOCK_N if block_n is None else int(block_n)
     block_k = int(block_k)
     nthreads = int(threads)
-    check_config(
-        K=K,
-        N=N,
-        block_m=bmn,
-        block_n=bnn,
-        block_k=block_k,
-        threads=nthreads,
-        xcd_c=xcd_c,
-        xcd_w=xcd_w,
-        traits=traits,
-    )
     compact = not uniform_seqlen
     if compact:
         # Slot-count bound from A.shape[0] >= SEQ_OFFSETS[-1]; reading
@@ -701,16 +795,40 @@ def jagged_dense_bmm(
     else:
         grid_m = (max_seq_len + bmn - 1) // bmn
 
-    search_steps = (n_groups - 1).bit_length()
-    launch_args = (
-        *map(_row_major, (C, A, B, BIAS, SEQ_OFFSETS)),
-        grid_m,
-        n_groups,
-        search_steps,
-        stream,
-    )
-
     with torch.cuda.device(A.device):
+        n_xcd = get_num_xcds()
+        check_config(
+            K=K,
+            N=N,
+            block_m=bmn,
+            block_n=bnn,
+            block_k=block_k,
+            threads=nthreads,
+            xcd_c=xcd_c,
+            xcd_w=xcd_w,
+            n_xcd=n_xcd,
+            traits=traits,
+        )
+        _check_launch(
+            grid=_launch_grid(compact, grid_m, n_groups, N // bnn),
+            threads=nthreads,
+            block_m=bmn,
+            block_n=bnn,
+            n_groups=n_groups,
+            max_seq_len=max_seq_len,
+            K=K,
+            N=N,
+            compact=compact,
+            device_index=A.device.index,
+        )
+        search_steps = (n_groups - 1).bit_length()
+        launch_args = (
+            *map(_row_major, (C, A, B, BIAS, SEQ_OFFSETS)),
+            grid_m,
+            n_groups,
+            search_steps,
+            stream,
+        )
         key = (
             N,
             K,
@@ -721,7 +839,7 @@ def jagged_dense_bmm(
             xcd_c,
             xcd_w,
             compact,
-            get_num_xcds(),
+            n_xcd,
             traits,
         )
         launch = _LAUNCHERS.get((A.device.index, key))

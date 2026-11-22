@@ -22,10 +22,11 @@ from aiter.jit.utils.chip_info import (
     get_gfx,
     get_gfx_custom_op_core,
     get_gfx_runtime,
+    get_num_xcds,
 )
 from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
-from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS, BLOCK_N
 from aiter.test_common import (
     assertAllclose,
     benchmark,
@@ -36,6 +37,7 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 SEED = 1234
+INT32_MAX = 2**31 - 1
 _SIDE_GATE_CYCLES = 10**9  # GPU cycles. The gate must outlast the snapshot below.
 
 try:
@@ -203,6 +205,40 @@ def test_jdbba_config_invalid(B, D, Kout, Mi, arg, value, dtype):
         "raised ValueError": raised,
         "C untouched": untouched,
     }
+
+
+@benchmark()
+def test_jdbba_limit_invalid(limit, B, D, Kout, rows, max_seq_len, regime, dtype):
+    # The call must raise before launch, so the inputs need no values.
+    d = {
+        "jagged": torch.empty(B * rows, D, dtype=dtype),
+        "dense": torch.empty(B, D, Kout, dtype=dtype),
+        "bias": torch.empty(B, Kout, dtype=dtype),
+        "seq_offsets": torch.arange(0, (B + 1) * rows, rows, dtype=torch.int32),
+    }
+    out = _nan_out(B * rows, Kout, dtype)
+    try:
+        _launch(d, out, B, max_seq_len, regime == "uniform")
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        message = None
+    torch.cuda.synchronize()
+    untouched = bool(out.isnan().all())
+    assert message and limit in message, (
+        f"B={B} K={D} N={Kout} max_seq_len={max_seq_len} {regime}: "
+        f"must raise ValueError naming {limit!r}, got {message!r}"
+    )
+    assert untouched, f"{limit}: rejected call must not write C"
+    return {"gfx": get_gfx_runtime(), "C untouched": untouched, "error": message}
+
+
+@benchmark()
+def test_jdbba_k0(B, Kout, Mi, regime, dtype):
+    d = _build_inputs(B, 0, Kout, Mi, regime, dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    _launch(d, out, B, Mi, regime == "uniform")
+    return {"gfx": get_gfx_runtime(), "err": _check(d, out, dtype, f"K=0 {regime}")}
 
 
 def _permute_group_lengths_(seq_offsets):
@@ -709,9 +745,38 @@ def main():
             (192, "block_k", 96),
         ]
         cases += [(D, arg, v) for arg in ("xcd_c", "xcd_w") for v in (0, -1)]
+        cases += [
+            (D, "xcd_c", INT32_MAX // get_num_xcds() + 1),
+            (D, "xcd_w", INT32_MAX // (Kout // BLOCK_N) + 1),
+        ]
         for K, arg, value in cases:
             rows.append(test_jdbba_config_invalid(B, K, Kout, Mi, arg, value, dtype))
     _summarize("jagged_dense_bmm invalid config", rows)
+
+    rows = []
+    for dtype, case in itertools.product(
+        args.dtype,
+        (
+            ("skew path (uniform_seqlen=False)", 65537, 64, 128, 1, 1, "uniform"),
+            ("grid x", 1, 64, 128, 5, INT32_MAX, "uniform"),
+            ("workgroups", 65536, 64, 128, 1, 2**22, "uniform"),
+            ("grid z = N / 128", 1, 64, 65537 * BLOCK_N, 1, 1, "skew"),
+            ("BIAS", 2**23, 0, 256, 1, 1, "skew"),
+            ("one group of B", 1, 64, 2**24 + BLOCK_N, 1, 1, "uniform"),
+            ("one group of A or C", 1, 64, 128, 5, 2**24, "uniform"),
+            ("one group of A or C", 1, 4096, 128, 5, 2**19, "uniform"),
+            ("N must be >= 1", 4, 64, 0, 5, 5, "uniform"),
+        ),
+    ):
+        rows.append(test_jdbba_limit_invalid(*case, dtype))
+    _summarize("jagged_dense_bmm launch limits", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), regime in itertools.product(
+        args.dtype, args.regression_shapes, args.regime
+    ):
+        rows.append(test_jdbba_k0(B, Kout, Mi, regime, dtype))
+    _summarize("jagged_dense_bmm K=0", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi) in itertools.product(
@@ -728,6 +793,7 @@ def main():
             (128, 16, 4, 128, False),
             (D, 0, 8, 64, True),
             (384, 32, 8, 96, True),
+            (D, 32, INT32_MAX // (Kout // BLOCK_N) + 1, 64, True),
         ):
             rows.append(
                 test_jdbba_tuned_row(

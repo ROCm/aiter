@@ -21,7 +21,7 @@ import torch
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, get_num_xcds
 
 from .kernels.jagged_dense_bmm_gen import (
     ARCH_TRAITS,
@@ -69,6 +69,7 @@ def _check_row(key: tuple, row: dict) -> None:
             block_m=BLOCK_M,
             block_n=BLOCK_N,
             threads=DEFAULT_THREADS,
+            n_xcd=get_num_xcds(),
             traits=traits,
             **cfg,
         )
@@ -238,19 +239,27 @@ def jagged_dense_bmm_dispatched(
         A: ``(L, K)`` bf16 packed jagged rows. Requires
             ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
             read. One group's rows of ``A`` and of ``C`` must each stay under
-            4 GiB, the 32-bit buffer bound.
-        B: bf16 dense weights ``(n_groups, K, N)``.
+            4 GiB, the 32-bit buffer bound. The uniform path checks this
+            through ``max_seq_len``; the skew path does not check it.
+        B: bf16 dense weights ``(n_groups, K, N)``. One group,
+            ``K * N * 2`` bytes, must be at most 2 GiB.
         BIAS: ``(n_groups, N)`` or ``(n_groups * N,)`` bf16.
         SEQ_OFFSETS: ``(n_groups + 1,)`` int32 prefix sum of group lengths,
             read on the device only.
+        n_groups: Uniform path: at most the device's grid z limit (65536 on
+            gfx942). The skew path has no such limit.
         max_seq_len: Uniform path: must be >= the longest group, which is
-            not checked; rows past it are not computed. Skew path: only a
-            tuning-table key.
+            not checked; rows past it are not computed.
+            ``max_seq_len * max(K, N) * 2`` must be under 4 GiB. Skew path:
+            only a tuning-table key.
         stream: Defaults to the current torch stream. One launch and no host
             sync, so the call can be captured in a graph.
         uniform_seqlen: True selects the dense ``(group, M-tile, N-tile)``
             grid; False the compact grid that skips empty tiles.
         xcd_c, xcd_w, block_k: Override the tuned config.
+
+    Raises ``ValueError`` before launch, with C untouched, for a grid past
+    the device's limits or a size past the kernel's 32-bit offsets.
 
     Eager-only: no FakeTensor or ``torch.compile`` registration.
     """
