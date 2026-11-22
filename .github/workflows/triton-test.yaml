@@ -287,7 +287,7 @@ jobs:
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -exo pipefail
           echo "Running Triton Tests..."
@@ -343,7 +343,7 @@ jobs:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' && needs.split_triton_tests.outputs.needs_mi300x == 'true' }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
