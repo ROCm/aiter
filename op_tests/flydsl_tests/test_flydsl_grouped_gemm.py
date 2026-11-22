@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import pytest
 import torch
@@ -363,6 +365,29 @@ def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Core runner: build inputs, invoke fused_moe, optionally compare to ref
 # ---------------------------------------------------------------------------
+@contextmanager
+def _capture_kernel_launches(audit: dict | None):
+    """Observe the eager dispatch only; restore the launcher before timing."""
+    if audit is None:
+        yield
+        return
+    from aiter.ops.flydsl import grouped_gemm_mxfp4 as grouped
+
+    original_run = grouped._run_compiled
+
+    def observe(launcher, *args, **kwargs):
+        key = kwargs["specialization_key"]
+        stage = "gemm1" if key[1][1] else "gemm2"
+        audit[stage] = {"N": args[7], "specialization_key": key}
+        return original_run(launcher, *args, **kwargs)
+
+    grouped._run_compiled = observe
+    try:
+        yield
+    finally:
+        grouped._run_compiled = original_run
+
+
 def _run_grouped_via_fused_moe(
     *,
     experts: int,
@@ -386,13 +411,16 @@ def _run_grouped_via_fused_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
     num_valid_tokens: int | None = None,
+    routing_stats: dict[str, int] | None = None,
     shared_experts: int = 0,
+    launch_audit: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``num_valid_tokens``: rows at or past it are padding, routed as the router
     leaves them under ``num_valid_rows`` (expert -1, weight 0) and passed as
     ``num_local_tokens``. The reference covers the real rows and is 0 past them.
+    ``routing_stats`` records the actual active expert count after all timing.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
     with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
@@ -551,7 +579,8 @@ def _run_grouped_via_fused_moe(
         kernel_bench_callable: list = []
         _grouped.kernel_bench_callable = kernel_bench_callable
         try:
-            out = _call()
+            with _capture_kernel_launches(launch_audit):
+                out = _call()
         finally:
             _grouped.kernel_bench_callable = None
         us = None
@@ -596,6 +625,8 @@ def _run_grouped_via_fused_moe(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     ).to(out.dtype)
+    if routing_stats is not None:
+        routing_stats["active_experts"] = _active_expert_count(topk_id)
     return out, ref, us, kernel_us
 
 
@@ -619,9 +650,15 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(((x - y) ** 2).sum() / denom)
 
 
+def _active_expert_count(topk_ids: torch.Tensor) -> int:
+    """Count distinct routed experts, excluding dropped/padded routes (-1)."""
+    return topk_ids[topk_ids >= 0].unique().numel()
+
+
 def _gemm_work_metrics(
     *,
-    experts: int,
+    active_experts: int | None = None,
+    experts: int | None = None,
     tokens: int,
     topk: int,
     model_dim: int,
@@ -649,9 +686,11 @@ def _gemm_work_metrics(
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
     routed_rows = tokens * topk
-    active_experts = (
-        min(tokens * (topk - shared_experts), experts - shared_experts) + shared_experts
-    )
+    if active_experts is None:
+        active_experts = (
+            min(tokens * (topk - shared_experts), experts - shared_experts)
+            + shared_experts
+        )
     if fuse_gemm1_act and fuse_gemm1_requant:
         # Match the MX output allocation, including padded E8M0 scale dwords.
         gemm1_output_bytes = routed_rows * (
@@ -729,24 +768,36 @@ def test_shared_expert_byte_accounting(
     assert work["gemm2"] == (2359296, gemm2_bytes)
 
 
-@pytest.mark.parametrize("tokens", [1, 16])
-def test_shared_expert_routing(tokens, monkeypatch):
-    """The shared expert sees every token without diluting routed weights."""
-    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_EXPERT_BALANCE", True)
-    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 0)
-    hidden = torch.zeros((tokens, 256), dtype=torch.bfloat16)
-    ids, weights = _make_topk(hidden, experts=65, topk=9, shared_experts=1)
-    assert ids.shape == weights.shape == (tokens, 9)
-    assert torch.all(ids[:, -1] == 64)
-    assert torch.all(weights[:, -1] == 1)
-    routed = ids[:, :8]
-    assert torch.all((routed >= 0) & (routed < 64))
-    ordered = routed.sort(dim=1).values
-    assert torch.all(ordered[:, 1:] != ordered[:, :-1])
-    torch.testing.assert_close(weights[:, :8].sum(dim=1), torch.ones(tokens))
-    counts = torch.bincount(routed.flatten().long(), minlength=64)
-    assert int(counts.max() - counts.min()) <= 1
-    assert int(torch.count_nonzero(counts)) == min(tokens * 8, 64)
+@pytest.mark.parametrize(
+    "ids, expected",
+    [([[0, 1], [1, 0]], 2), ([[7, 7], [-1, 2]], 2), ([[-1, -1]], 0)],
+)
+def test_active_expert_count(ids, expected):
+    assert _active_expert_count(torch.tensor(ids, device="cpu")) == expected
+
+
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_gemm_work_metrics_active_weights(data_format):
+    shape = {
+        "tokens": 1,
+        "topk": 8,
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "data_format": data_format,
+    }
+    active = _gemm_work_metrics(active_experts=8, **shape)
+    allocated = _gemm_work_metrics(active_experts=64, **shape)
+    for name, weight_elements in (
+        ("gemm1", 7168 * 4096),
+        ("gemm2", 2048 * 7168),
+    ):
+        assert active[name][0] == allocated[name][0]
+        assert allocated[name][1] - active[name][1] == 56 * (
+            weight_elements // 2 + weight_elements // SCALE_BLOCK
+        )
+        tflops, bw = _rates(active[name], 10.0)
+        assert tflops == active[name][0] / 10.0 / 1e6
+        assert bw == active[name][1] / 10.0 / 1e3
 
 
 def run_moe(
@@ -775,6 +826,7 @@ def run_moe(
     scale_init: str = "auto",
     check_aot_cache: bool = True,
     shared_experts: int = 0,
+    launch_audit: dict | None = None,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -794,6 +846,7 @@ def run_moe(
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
     run_only = run_only_env() if check_aot_cache else nullcontext()
+    routing_stats = {}
     with run_only:
         out, ref, us, kernel_us = _run_grouped_via_fused_moe(
             experts=experts,
@@ -817,6 +870,8 @@ def run_moe(
             iters=iters,
             data_init=data_init,
             scale_init=scale_init,
+            routing_stats=routing_stats,
+            launch_audit=launch_audit,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -831,34 +886,32 @@ def run_moe(
         assert (
             passed
         ), f"grouped {tag} {mode} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL}"
+    truthy = ("1", "true", "True", "yes", "YES")
+    work = _gemm_work_metrics(
+        shared_experts=shared_experts,
+        fuse_gemm1_act=os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT", "").strip()
+        not in truthy,
+        fuse_gemm1_requant=os.environ.get(
+            "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", ""
+        ).strip()
+        not in truthy,
+        active_experts=routing_stats["active_experts"],
+        tokens=tokens,
+        topk=topk,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        data_format=data_format,
+    )
     metrics = {
+        "active_experts": routing_stats["active_experts"],
+        "gemm1_bytes": work["gemm1"][1],
+        "gemm2_bytes": work["gemm2"][1],
         "logits_diff": ld,
         "rel_l2": rel,
         "passed": passed,
         "grouped_norm": float(out.float().norm()),
         "ref_norm": float(ref.float().norm()),
     }
-
-    if bench or kernel_bench:
-        # Use the same accepted flag spellings as the grouped dispatcher.
-        truthy = ("1", "true", "True", "yes", "YES")
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            shared_experts=shared_experts,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-            fuse_gemm1_act=(
-                os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT", "").strip()
-                not in truthy
-            ),
-            fuse_gemm1_requant=(
-                os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "").strip()
-                not in truthy
-            ),
-        )
 
     # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
@@ -914,6 +967,29 @@ def run_moe(
         metrics["gemm1_us"] = g1
         metrics["gemm2_us"] = g2
     return metrics
+
+
+@pytest.mark.parametrize("tokens", [1, 16])
+@pytest.mark.parametrize("balanced", [False, True])
+def test_shared_expert_routing(tokens, balanced, monkeypatch):
+    """The shared expert sees every token without diluting routed weights."""
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_EXPERT_BALANCE", balanced)
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 0)
+    hidden = torch.zeros((tokens, 256), dtype=torch.bfloat16)
+    ids, weights = _make_topk(hidden, experts=65, topk=9, shared_experts=1)
+    assert ids.shape == weights.shape == (tokens, 9)
+    assert torch.all(ids[:, -1] == 64)
+    assert torch.all(weights[:, -1] == 1)
+    routed = ids[:, :8]
+    assert torch.all((routed >= 0) & (routed < 64))
+    ordered = routed.sort(dim=1).values
+    assert torch.all(ordered[:, 1:] != ordered[:, :-1])
+    torch.testing.assert_close(weights[:, :8].sum(dim=1), torch.ones(tokens))
+    if balanced:
+        counts = torch.bincount(routed.flatten().long(), minlength=64)
+        assert int(counts.max() - counts.min()) <= 1
+        assert int(torch.count_nonzero(counts)) == min(tokens * 8, 64)
+    assert _active_expert_count(ids) == int(torch.unique(ids).numel())
 
 
 # model_dim=512 (not the 256 default): the grouped kernel needs
@@ -1550,6 +1626,7 @@ def _run_csv_file(args, csv_path: str) -> None:
                     "seed": args.seed,
                     "logits_diff": metrics["logits_diff"],
                     "rel_l2": metrics["rel_l2"],
+                    "active_experts": metrics["active_experts"],
                     "pass": metrics["passed"],
                     "error": None,
                     "us": metrics.get("us"),
@@ -1627,6 +1704,11 @@ def main() -> None:
         help="route tokens evenly across experts (same as "
         "AITER_MOE_EXPERT_BALANCE=true)",
     )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="save per-case results and eager launch audits",
+    )
     parser.add_argument("--model-dim", type=int, default=7168)
     parser.add_argument("--inter-dim", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=5)
@@ -1702,6 +1784,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.balanced_routing:
         AITER_MOE_EXPERT_BALANCE = True
+    if not 0 <= args.shared_experts < args.topk <= args.experts:
+        parser.error("Expected 0 <= --shared-experts < --topk <= --experts")
     data_init_list = args.data_init or ["constant", "uniform"]
     scale_init_list = args.scale_init or ["constant", "auto"]
     if len(data_init_list) == 1:
@@ -1744,6 +1828,7 @@ def main() -> None:
     # None (unset) defaults to swiglu for the single-shape scenarios.
     activation = _ACT_BY_NAME.get(args.act, ActivationType.Swiglu)
     rows = []
+    json_rows = []
     for _tok in token_list:
         args.tokens = _tok
         if len(token_list) > 1:
@@ -1751,6 +1836,7 @@ def main() -> None:
 
         for data_init, scale_init in args.init_pairs:
             tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+            launch_audit = {} if args.output_json is not None else None
             # raise_on_fail=False so one out-of-gate token does not abort the
             # sweep; the failure is recorded and reported after the table.
             metrics = run_moe(
@@ -1759,6 +1845,7 @@ def main() -> None:
                 tokens=args.tokens,
                 topk=args.topk,
                 shared_experts=args.shared_experts,
+                launch_audit=launch_audit,
                 model_dim=args.model_dim,
                 inter_dim=args.inter_dim,
                 tol=tol,
@@ -1790,6 +1877,9 @@ def main() -> None:
                     "topk": args.topk,
                     "model_dim": args.model_dim,
                     "inter_dim": args.inter_dim,
+                    "active_experts": metrics["active_experts"],
+                    "gemm1_bytes": metrics["gemm1_bytes"],
+                    "gemm2_bytes": metrics["gemm2_bytes"],
                     "logits_diff": metrics["logits_diff"],
                     "rel_l2": metrics["rel_l2"],
                     "pass": metrics["passed"],
@@ -1804,6 +1894,14 @@ def main() -> None:
                     "gemm2_Bandwidth (GB/s)": metrics.get("gemm2_bandwidth_gbs"),
                 }
             )
+            if args.output_json is not None:
+                json_rows.append({**rows[-1], "launch_audit": launch_audit})
+                args.output_json.parent.mkdir(parents=True, exist_ok=True)
+                args.output_json.write_text(
+                    json.dumps(json_rows, indent=2) + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
 
     # Always print the summary table (verify and bench).
     summarize(rows)

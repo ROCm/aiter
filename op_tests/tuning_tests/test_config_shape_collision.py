@@ -356,6 +356,17 @@ class TestConfigShapeCollision(unittest.TestCase):
         rows = list(csv.DictReader(merged.splitlines()))
         self.assertEqual([row["splitK"] for row in rows], ["4", "", "8"])
 
+    def test_merge_keeps_missing_gemm2_cache_hint_inherited(self):
+        """An older table inherits GEMM1's hint; explicit GEMM2 zero is kept."""
+        err, merged, _, _ = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,tdm_b_th,us\ngfx1250,256,1,64,128,3,10.0\n",
+            "gfx,cu_num,M,N,K,tdm_b_th,tdm_b_th2,us\n"
+            "gfx1250,256,2,64,128,1,0,11.0\n",
+        )
+        self.assertIsNone(err, err)
+        rows = list(csv.DictReader(merged.splitlines()))
+        self.assertEqual([row["tdm_b_th2"] for row in rows], ["-1", "0"])
+
     def test_merge_compares_keys_as_numbers(self):
         """Cells kept as text still compare as numbers: a shape written 256 in
         one table and 256.0 in another is one shape."""

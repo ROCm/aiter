@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import math
 import os
 
 import torch
@@ -887,11 +888,9 @@ def test_fmoe_ep_mxfp4(
         gate_mode = GateMode.SEPARATED.value
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
-    # Optional per-kernel (gemm1/gemm2) timing, gated by AITER_EP_KERNEL_BENCH=1.
-    # Mirrors the TP test's --scenario kernel: one eager fused_moe call with the
-    # grouped kernel_bench hook set captures the gemm1/gemm2 launch callables,
-    # then each is looped in isolation. Default behavior (env unset) is unchanged.
-    _ep_kernel_bench = os.environ.get("AITER_EP_KERNEL_BENCH", "0") in (
+    # On gfx1250, capture the real GEMM launches once and time them independently.
+    # AITER_EP_KERNEL_BENCH=0 retains full fused_moe timing instead.
+    _ep_kernel_bench = os.environ.get("AITER_EP_KERNEL_BENCH", "1") in (
         "1",
         "true",
         "True",
@@ -929,18 +928,22 @@ def test_fmoe_ep_mxfp4(
             _grouped.kernel_bench_callable = None
         _ku = {}
         for _name, _callable in _cap:
+            if _name not in ("gemm1", "gemm2"):
+                continue
             _, _u = run_perftest(
-                _callable, num_warmup=50, num_iters=101, testGraph=False
+                _callable, num_warmup=5, num_iters=128, testGraph=False
             )
             _ku[_name] = _u
-        gemm1_us = _ku.get("gemm1")
-        gemm2_us = _ku.get("gemm2")
-        us = (gemm1_us or 0.0) + (gemm2_us or 0.0)
-        _g1s = "n/a" if gemm1_us is None else f"{gemm1_us:.2f}"
-        _g2s = "n/a" if gemm2_us is None else f"{gemm2_us:.2f}"
+        if not all(name in _ku for name in ("gemm1", "gemm2")):
+            raise RuntimeError(f"Missing GEMM launch capture: {tuple(_ku)}")
+        gemm1_us, gemm2_us = _ku["gemm1"], _ku["gemm2"]
+        if any(not math.isfinite(u) or u <= 0 for u in (gemm1_us, gemm2_us)):
+            raise RuntimeError(f"Invalid GEMM timings: {gemm1_us}, {gemm2_us}")
+        us = gemm1_us + gemm2_us
         print(
             f"[ep-kernel-bench] {quant_label} token={token}(local={total_recv}) "
-            f"gemm1 us = {_g1s} gemm2 us = {_g2s}"
+            f"gemm1 us = {gemm1_us:.2f} gemm2 us = {gemm2_us:.2f}",
+            flush=True,
         )
     else:
         out, us = run_perftest(
@@ -983,8 +986,10 @@ def test_fmoe_ep_mxfp4(
         _logits_diff_tol = 0.01
         err = logits_diff
         _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
+        _timing_label = "GEMM1 + GEMM2" if gemm1_us is not None else "GPU kernel total"
         print(
-            f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
+            f"[aiter] {_msg} {_timing_label} us = {us:.2f} "
+            f"logits_diff={logits_diff:.6f} "
             f"(tol {_logits_diff_tol}) {_verdict}"
         )
         assert (
@@ -1008,6 +1013,7 @@ def test_fmoe_ep_mxfp4(
             "topk": topk,
             "ep": ep,
             "us": round(us, 2),
+            "timing_scope": "gemm1+gemm2" if gemm1_us is not None else "fused_moe",
             "gemm1_us": None if gemm1_us is None else round(gemm1_us, 2),
             "gemm2_us": None if gemm2_us is None else round(gemm2_us, 2),
             "logits_diff": round(logits_diff, 6),

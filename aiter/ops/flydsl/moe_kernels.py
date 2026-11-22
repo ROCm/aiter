@@ -3691,13 +3691,11 @@ def flydsl_moe_fused_quant_preshuffle(
     if prequantized and quant_mode == "fp4":
         feat_dim *= 2
     if payload_preshuffled:
-        from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
-            validate_apre_k,
-        )
-
         if quant_mode != "fp4":
             raise ValueError("A-preshuffled payload requires MXFP4")
         if topids_to_rows is not None:
+            from .kernels.moe_apreshuffled_quant_scatter import validate_apre_k
+
             # The route scatter uses K1024 slices; grouped quant uses K128 tiles.
             validate_apre_k(feat_dim)
         elif feat_dim <= 0 or feat_dim % 128:
