@@ -157,9 +157,10 @@ def _run(
     num_tokens: int,
     out: torch.Tensor | None = None,
     num_warps: int | None = None,
+    **kwargs,
 ) -> torch.Tensor:
     return flydsl_kda_verify_with_f_b(
-        **_kwargs(inp, num_tokens), out=out, num_warps=num_warps
+        **_kwargs(inp, num_tokens), out=out, num_warps=num_warps, **kwargs
     )
 
 
@@ -285,11 +286,11 @@ def _assert_matches(inp, out, refs, max_bad=1e-3):
         _assert_close(ref_ring[3], inp.ring[3], "ring beta", 1e-5, 1e-4, 0.0)
 
 
-def _check(inp, num_tokens, max_bad=1e-3, num_warps=None):
+def _check(inp, num_tokens, max_bad=1e-3, num_warps=None, out=None, **kwargs):
     conv_before = inp.conv_state.clone()
     state_before = inp.state.clone()
     refs = _reference(inp, num_tokens)
-    out = _run(inp, num_tokens, num_warps=num_warps)
+    out = _run(inp, num_tokens, out=out, num_warps=num_warps, **kwargs)
     torch.cuda.synchronize()
     # Verify never advances the caches.
     assert torch.equal(inp.conv_state, conv_before)
@@ -423,6 +424,19 @@ def test_kda_verify_accepts_padded_pool_slices(ring):
         assert torch.count_nonzero(pool.view(slots, 2, -1)[:, 1]) == 0
 
 
+def test_kda_verify_exports_and_tags():
+    import aiter.ops.flydsl as flydsl_ops
+
+    assert "flydsl_kda_verify_with_f_b" in flydsl_ops.__all__
+    assert flydsl_ops.flydsl_kda_verify_with_f_b is flydsl_kda_verify_with_f_b
+    assert flydsl_kda_verify_with_f_b.state_dtypes == (torch.float32, torch.bfloat16)
+    assert (
+        flydsl_kda_verify_with_f_b.max_tokens
+        == linear_attention_kernels.KDA_VERIFY_MAX_TOKENS
+    )
+    assert flydsl_kda_verify_with_f_b.zeroes_invalid_output is True
+
+
 @pytest.mark.parametrize("ring", [False, True])
 def test_kda_verify_padding_rows(ring):
     inp = _make_inputs(6, 5, torch.bfloat16, ring)
@@ -435,7 +449,11 @@ def test_kda_verify_padding_rows(ring):
     scratch = (inp.window, inp.inter_states) if not ring else (inp.window, *inp.ring)
     for tensor in scratch:
         tensor.fill_(sentinel)
-    out = _check(inp, 5)
+    # NaN fill: a padding row the kernel never zeroes stays non-zero.
+    nan_out = torch.full(
+        (1, 6 * 5, _H, _D), float("nan"), dtype=torch.bfloat16, device=_DEVICE
+    )
+    out = _check(inp, 5, out=nan_out)
     for b in (1, 3, 4):
         assert torch.count_nonzero(out[0, b * 5 : (b + 1) * 5]) == 0
     # A padding row writes neither its line (rows 1 and 4 hold a valid one) nor
@@ -599,9 +617,7 @@ def test_kda_verify_large_cache_slot_offsets(state_dtype, ring):
 
 
 @pytest.mark.parametrize("ring", [False, True])
-def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring):
-    # AITER_KDA_DECODE_SLOT_CHECK is read at import; patch the flag it sets.
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+def test_kda_verify_slot_check_rejects_duplicate_live_indices(ring):
     inp = _make_inputs(4, 5, torch.bfloat16, ring)
 
     def set_indices(cache, inter):
@@ -611,7 +627,7 @@ def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring)
     # Padding may repeat either index, also a live slot or line paired with a
     # padding index in the other array.
     set_indices([-1, -1, 2, 2], [0, 0, -1, 3])
-    _check(inp, 5)
+    _check(inp, 5, validate_slots=True)
 
     cases = [([1, 2, 3, 4], [5, 2, 2, -1], "intermediate_indices", 2)]
     if ring:
@@ -623,39 +639,35 @@ def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring)
         with pytest.raises(
             ValueError, match=rf"`{name}`.*duplicated slots: \[{duplicate}\]"
         ):
-            _run(inp, 5)
+            _run(inp, 5, validate_slots=True)
         torch.cuda.synchronize()
         # The check runs before launch, so no scratch is written.
         for written, original in zip(_verify_writes(inp), before):
             assert torch.equal(written, original)
 
 
-def test_kda_verify_snapshot_lets_live_sequences_share_a_cache_slot(monkeypatch):
+def test_kda_verify_snapshot_lets_live_sequences_share_a_cache_slot():
     """Without a ring the caches are only read, so a repeated live cache slot
     is fine as long as every sequence has its own intermediate line."""
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
     inp = _make_inputs(4, 5, torch.bfloat16, False)
     inp.cache_indices.copy_(torch.tensor([3, 3, 1, 3], dtype=torch.int32))
     inp.inter_indices.copy_(torch.tensor([0, 1, 2, 4], dtype=torch.int32))
-    _check(inp, 5)
+    _check(inp, 5, validate_slots=True)
 
 
 @pytest.mark.parametrize("ring", [False, True])
-def test_kda_verify_slot_check_treats_the_padding_slot_as_padding(monkeypatch, ring):
-    """Rows on AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT are padding for both
-    uniqueness checks, so they may share their slot and their scratch line."""
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", None)
+def test_kda_verify_slot_check_treats_the_padding_slot_as_padding(ring):
+    """Rows on ``padding_slot`` are padding for both uniqueness checks, so they
+    may share their slot and their scratch line."""
     inp = _make_inputs(4, 5, torch.bfloat16, ring)
     # Rows 0 and 1 are DP-attention padding on the reserved slot 0.
     inp.cache_indices.copy_(torch.tensor([0, 0, 1, 2], dtype=torch.int32))
     inp.inter_indices.copy_(torch.tensor([3, 3, 4, 5], dtype=torch.int32))
     with pytest.raises(ValueError, match="duplicated slots"):
-        _run(inp, 5)
+        _run(inp, 5, validate_slots=True)
 
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
     ref_out = _reference(inp, 5)[0]
-    out = _run(inp, 5)
+    out = _run(inp, 5, validate_slots=True, padding_slot=0)
     torch.cuda.synchronize()
     # The padding rows race on their shared scratch, so only check the live rows.
     live = slice(2 * 5, 4 * 5)
@@ -667,15 +679,13 @@ def test_kda_verify_slot_check_rejects_padding_on_a_live_line(monkeypatch, ring)
     """A row on the padding slot still writes its line, so it may not share a
     live sequence's line."""
     _reject_compile(monkeypatch)
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
     inp = _make_inputs(3, 5, torch.bfloat16, ring)
     inp.cache_indices.copy_(torch.tensor([0, 1, 2], dtype=torch.int32))
     inp.inter_indices.copy_(torch.tensor([4, 4, 5], dtype=torch.int32))
     with pytest.raises(
         ValueError, match=r"line of a live sequence; shared lines: \[4\]"
     ):
-        _run(inp, 5)
+        _run(inp, 5, validate_slots=True, padding_slot=0)
 
 
 @pytest.mark.parametrize(
@@ -1001,6 +1011,9 @@ def test_flydsl_kda_verify(batch, num_tokens, state_dtype, mode):
                         rtol=1e-2,
                     ),
                 )
+        # The pool-wide ratios above hide one fully corrupted token/head, so the
+        # per-region bounds of the pytest cases gate the sweep as well.
+        _assert_matches(inp, out, (ref_out, ref_window, ref_states, ref_ring))
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6

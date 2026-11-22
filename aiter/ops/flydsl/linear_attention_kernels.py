@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import collections
 import functools
-import os
 from collections.abc import Iterable
 
 import flydsl.expr as fx
@@ -1098,40 +1097,6 @@ _KDA_CONV_WIDTH = 4
 # kernels/gdr_decode.py's _KDA_STATE_DTYPES; the recurrence computes in FP32.
 _KDA_STATE_DTYPE_TAGS = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _INT32_MAX = 2**31 - 1
-# Debug check that live KDA ``state_indices`` are unique. It copies the
-# duplicates to the host, a sync, so it is off by default and skipped while a
-# CUDA graph is being captured. Slot 0 is live, so by default it also flags
-# SGLang's eager DP-attention padding rows, which share the reserved scratch
-# slot 0; AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0 lets that slot repeat.
-_KDA_SLOT_CHECK = os.environ.get("AITER_KDA_DECODE_SLOT_CHECK", "0") == "1"
-
-
-def _env_padding_slot(name: str) -> int | None:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        raise ValueError(f"{name} must be a slot index, got {value!r}.") from None
-
-
-# A slot the debug check treats as padding, like a negative index: the kernel
-# still decodes it, but the caller reserves it for rows whose results it drops.
-# Parsed only when the check is on, so a malformed value cannot break importing
-# this module, which also hosts the GDR decode ops.
-_KDA_SLOT_CHECK_PADDING_SLOT = (
-    _env_padding_slot("AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT")
-    if _KDA_SLOT_CHECK
-    else None
-)
-
-
-def _mask_padding_slot(state_indices: torch.Tensor) -> torch.Tensor:
-    """Map the opted-in padding slot to -1, so the slot check lets it repeat."""
-    if _KDA_SLOT_CHECK_PADDING_SLOT is None:
-        return state_indices
-    return torch.where(state_indices == _KDA_SLOT_CHECK_PADDING_SLOT, -1, state_indices)
 
 
 def is_flydsl_kda_decode_supported(
@@ -1206,10 +1171,19 @@ def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
 
 
 def _check_unique_live_slots(
-    state_indices: torch.Tensor, num_slots: int, name: str = "state_indices"
+    state_indices: torch.Tensor,
+    num_slots: int,
+    padding_slot: int | None = None,
+    name: str = "state_indices",
 ) -> None:
-    """Reject a live slot that appears more than once in ``state_indices``."""
+    """Reject a live slot that appears more than once in ``state_indices``.
+
+    ``padding_slot`` is a slot the caller reserves for rows whose results it
+    drops (like a negative index): it may repeat.
+    """
     live = state_indices[(state_indices >= 0) & (state_indices < num_slots)]
+    if padding_slot is not None:
+        live = live[live != padding_slot]
     slots, counts = torch.unique(live, return_counts=True)
     duplicates = slots[counts > 1].tolist()
     if duplicates:
@@ -1396,6 +1370,8 @@ def _validate_kda_inputs(
     norm_weight: torch.Tensor,
     out: torch.Tensor | None,
     extra_inputs: tuple[tuple[str, torch.Tensor], ...] = (),
+    validate_slots: bool = False,
+    padding_slot: int | None = None,
 ) -> torch.Tensor:
     """Validate operands shared by both explicit KDA specializations.
 
@@ -1557,30 +1533,38 @@ def _validate_kda_inputs(
     )
     _check_i32_addressing("out", out, first_dim=1)
     _check_disjoint_rows("out", out, (1, 2), "batch and head")
+    # Both caches are stored to as well as read, so they must not share a byte
+    # with each other or with a read-only input (a store races the loads of
+    # workgroups that have not run yet). `out` is checked the same way when the
+    # caller supplies it.
+    read_only = (
+        ("x", x),
+        ("conv_weight", conv_weight),
+        ("raw_beta", raw_beta),
+        ("A_log", A_log),
+        ("dt_bias", dt_bias),
+        ("state_indices", state_indices),
+        ("output_gate", output_gate),
+        ("norm_weight", norm_weight),
+    ) + extra_inputs
+    _check_no_alias(
+        (("conv_state", conv_state), ("state", state)),
+        read_only,
+    )
+    _check_no_alias((("conv_state", conv_state),), (("state", state),))
     if caller_out:
         _check_no_alias(
             (("out", out),),
-            (
-                ("x", x),
-                ("conv_weight", conv_weight),
-                ("conv_state", conv_state),
-                ("raw_beta", raw_beta),
-                ("A_log", A_log),
-                ("dt_bias", dt_bias),
-                ("state", state),
-                ("state_indices", state_indices),
-                ("output_gate", output_gate),
-                ("norm_weight", norm_weight),
-            )
-            + extra_inputs,
+            read_only + (("conv_state", conv_state), ("state", state)),
         )
-    if _KDA_SLOT_CHECK:
+    if validate_slots:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
             if not torch.cuda.is_current_stream_capturing():
                 _check_unique_live_slots(
-                    _mask_padding_slot(state_indices),
+                    state_indices,
                     _num_cache_slots(state, conv_state),
+                    padding_slot,
                 )
     return out
 
@@ -1601,6 +1585,9 @@ def flydsl_kda_decode(
     norm_weight: torch.Tensor,
     norm_eps: float,
     out: torch.Tensor | None = None,
+    *,
+    validate_slots: bool = False,
+    padding_slot: int | None = None,
 ) -> torch.Tensor:
     """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
 
@@ -1620,7 +1607,8 @@ def flydsl_kda_decode(
     overlap, but may be padded and in either order (batch- or heads-outer).
     Taken by increasing stride, each of the two row dimensions must step past
     everything the other spans.
-    A caller-supplied ``out`` must not share memory with any input or cache;
+    A caller-supplied ``out`` must not share memory with any input or cache, and
+    the two caches must not share memory with each other or with an input;
     this raises ``ValueError`` (host arithmetic on strides, no sync).
     Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
     padding: they produce zero output and leave both caches unchanged. Slot
@@ -1636,11 +1624,11 @@ def flydsl_kda_decode(
     each live request owns a distinct slot from its mamba slot allocator and
     CUDA-graph padding rows are PAD_SLOT_ID (-1). Its eager DP-attention padding
     rows instead share the reserved scratch slot 0, which is only safe because no
-    request owns that slot. Set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    request owns that slot. Pass ``validate_slots=True`` to raise
     ``ValueError`` on any duplicate live slot; the check syncs with the host and
     is skipped during graph capture. By default it also flags those shared
-    slot-0 padding rows; set ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0`` to
-    let slot 0 repeat like a negative index (the kernel still decodes it).
+    slot-0 padding rows; pass ``padding_slot=0`` to let slot 0 repeat like a
+    negative index (the kernel still decodes it).
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
@@ -1677,6 +1665,8 @@ def flydsl_kda_decode(
         norm_weight=norm_weight,
         out=out,
         extra_inputs=(("raw_g", raw_g),),
+        validate_slots=validate_slots,
+        padding_slot=padding_slot,
     )
 
     executable = create_kda_decode_kernel(
@@ -1739,6 +1729,9 @@ def flydsl_kda_decode_with_f_b(
     norm_weight: torch.Tensor,
     norm_eps: float,
     out: torch.Tensor | None = None,
+    *,
+    validate_slots: bool = False,
+    padding_slot: int | None = None,
 ) -> torch.Tensor:
     """Run :func:`flydsl_kda_decode` with a fused head-local ``f_b`` projection.
 
@@ -1747,7 +1740,7 @@ def flydsl_kda_decode_with_f_b(
     Uses the same int32 stride/span limits and FP32-or-BF16 ``state`` storage
     as :func:`flydsl_kda_decode`.
     ``state_indices`` follows the same bounded, unique-live-slot contract and
-    opt-in ``AITER_KDA_DECODE_SLOT_CHECK`` as :func:`flydsl_kda_decode`.
+    opt-in ``validate_slots`` / ``padding_slot`` as :func:`flydsl_kda_decode`.
     A caller-supplied ``out`` must not overlap ``f_a`` or ``f_b_weight`` either.
 
     Fusing saves the projection launch, which wins at decode batch sizes, but each
@@ -1800,6 +1793,8 @@ def flydsl_kda_decode_with_f_b(
         norm_weight=norm_weight,
         out=out,
         extra_inputs=(("f_a", f_a), ("f_b_weight", f_b_weight)),
+        validate_slots=validate_slots,
+        padding_slot=padding_slot,
     )
 
     executable = create_kda_decode_kernel(
@@ -1944,6 +1939,9 @@ def flydsl_kda_verify_with_f_b(
     ) = None,
     out: torch.Tensor | None = None,
     num_warps: int | None = None,
+    *,
+    validate_slots: bool = False,
+    padding_slot: int | None = None,
 ) -> torch.Tensor:
     """Kimi-K3 KDA speculative verify of ``num_tokens`` draft tokens per sequence.
 
@@ -1977,10 +1975,10 @@ def flydsl_kda_verify_with_f_b(
     ring slot is written by several workgroups at once, with undefined results.
     Without a ring, ``conv_state`` and ``state`` are only read, so live
     sequences may share a cache slot. Padding entries may repeat. The kernel
-    does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    does not check this; pass ``validate_slots=True`` to raise
     ``ValueError`` on a repeat (it syncs with the host and is skipped during
-    CUDA graph capture). As in the decode check, a sequence on
-    ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT`` counts as padding there. Its
+    CUDA graph capture). As in the decode check, a sequence whose cache index is
+    ``padding_slot`` counts as padding there. Its
     indices are in range, so the kernel still writes its intermediate line,
     and the check rejects that line when a live sequence uses it too.
 
@@ -2313,7 +2311,7 @@ def flydsl_kda_verify_with_f_b(
         if tensor is not None:
             _check_no_alias(written[i + 1 :], ((name, tensor),))
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
-    if _KDA_SLOT_CHECK:
+    if validate_slots:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
             if not torch.cuda.is_current_stream_capturing():
@@ -2326,19 +2324,21 @@ def flydsl_kda_verify_with_f_b(
                     & (intermediate_indices >= 0)
                     & (intermediate_indices < num_inter_lines)
                 )
-                live = writes & (_mask_padding_slot(cache_indices) >= 0)
+                live = writes
+                if padding_slot is not None:
+                    live = live & (cache_indices != padding_slot)
                 # Only the ring is written per cache slot; a snapshot verify
                 # just reads conv_state and state there.
                 if replay_ring is not None:
                     _check_unique_live_slots(
                         torch.where(live, cache_indices, -1),
                         num_slots,
-                        "cache_indices",
+                        name="cache_indices",
                     )
                 _check_unique_live_slots(
                     torch.where(live, intermediate_indices, -1),
                     num_inter_lines,
-                    "intermediate_indices",
+                    name="intermediate_indices",
                 )
                 shared = torch.isin(
                     intermediate_indices[live], intermediate_indices[writes & ~live]
