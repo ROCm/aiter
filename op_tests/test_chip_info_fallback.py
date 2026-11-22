@@ -277,3 +277,15 @@ def test_asic_revision_follows_the_current_devices_arch(
     for device, revision in ((0, 1), (1, 0), (0, 1)):
         current["device"] = device
         assert chip_info.get_asic_revision() == revision
+
+
+def test_get_cu_num_cache_clear_clears_every_module_copy(device1_selected_empty_tool):
+    # The torch custom op may run the top-level `chip_info` copy, whose per-device
+    # cache must be dropped too, or a clear leaves a stale CU count behind.
+    for m in _MODULES:
+        assert m.get_cu_num_custom_op() == 304
+    # The op is bound to one copy, so only that copy's cache fills.
+    assert sum(m._device_cu_num.cache_info().currsize for m in _MODULES) >= 1
+    chip_info.get_cu_num.cache_clear()
+    for m in _MODULES:
+        assert m._device_cu_num.cache_info().currsize == 0
