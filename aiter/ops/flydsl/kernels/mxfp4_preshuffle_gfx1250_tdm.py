@@ -650,7 +650,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_malign}{_kwaves}"
     )
     if overlap_scatter:
-        _kname += "_load01_store23_headwait_merged_prologue"
+        _kname += "_overlap_scatter"
 
     # Compile the static path directly, preserving its launch ABI and the
     # compiler's knowledge of block IDs. Only persistent workers need a helper
@@ -662,6 +662,8 @@ def build_gemm_a8w4_tdm_task(
     )
     task_index_type = fx.Int32 if persistent_workers else Constexpr[int]
 
+    # Only overlap carries runtime scatter state between persistent tasks.
+    # Ordinary callers keep compile-time zero defaults and no extra kernel args.
     scatter_state_type = fx.Int32 if overlap_scatter else Constexpr[int]
 
     @task_decorator
@@ -682,10 +684,14 @@ def build_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
+        # Previous task's deferred tail: each index is one i32 per lane;
+        # a wave's 32 lanes supply four 8-row gathers, eight across both indices.
         pending_idx0: scatter_state_type = 0,
         pending_idx1: scatter_state_type = 0,
+        # Destination byte offset and whether the deferred tail needs issuing.
         pending_col: scatter_state_type = 0,
         pending_valid: scatter_state_type = 0,
+        # The final task must issue its own tail without a following prologue.
         last_task: scatter_state_type = 0,
     ):
         A_KROW = K // A_PACK
