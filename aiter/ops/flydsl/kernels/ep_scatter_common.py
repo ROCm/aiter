@@ -129,11 +129,14 @@ def make_overlap_callbacks(
 
     Returns prologue, epilogue and skipped-task callbacks. ``pending`` holds
     the previous task's two tail index vectors, column offset and valid flag.
+    The lo/hi vectors cover C rows 128:192 and 192:256 respectively. Each lane
+    holds one flattened peer/slot index (or OOB); each store wave contributes
+    32 indices per vector. The output data stays in LDS until the tail retires.
     The epilogue returns the same four values for the next task; it never
     mutates captured state. ``load_first`` loads the first register tile and
     preserves GEMM's scheduling fence.
     """
-    pending_idx0, pending_idx1, pending_col, pending_valid = pending
+    pending_tail_index_lo, pending_tail_index_hi, pending_col, pending_valid = pending
 
     def issue_scatter_burst(first, idx0, idx1, column_offset):
         for i in range_constexpr(8):
@@ -157,19 +160,21 @@ def make_overlap_callbacks(
         workgroup_barrier()
         load_first(interleaved_lds_load)
         if (wave >= 2) & (pending_valid != 0):
-            issue_scatter_burst(8, pending_idx0, pending_idx1, pending_col)
+            issue_scatter_burst(
+                8, pending_tail_index_lo, pending_tail_index_hi, pending_col
+            )
         issue(2, 2)
 
     @flyc.jit
     def overlap_epilogue(index_lanes, column_offset):
-        next_idx0 = fx.Int32(0)
-        next_idx1 = fx.Int32(0)
+        next_tail_index_lo = fx.Int32(0)
+        next_tail_index_hi = fx.Int32(0)
         next_col = fx.Int32(0)
         next_valid = fx.Int32(0)
         if wave >= 2:
             issue_scatter_burst(0, index_lanes[0], index_lanes[1], column_offset)
-            next_idx0 = index_lanes[2]
-            next_idx1 = index_lanes[3]
+            next_tail_index_lo = index_lanes[2]
+            next_tail_index_hi = index_lanes[3]
             next_col = fx.Int32(column_offset)
             next_valid = fx.Int32(1)
             if last_task != 0:
@@ -178,14 +183,16 @@ def make_overlap_callbacks(
                 issue_scatter_burst(8, index_lanes[2], index_lanes[3], column_offset)
                 next_valid = fx.Int32(0)
             rocdl.s_nop(0)
-        return next_idx0, next_idx1, next_col, next_valid
+        return next_tail_index_lo, next_tail_index_hi, next_col, next_valid
 
     @flyc.jit
     def skip_task():
         # A partial M-cluster tail has no prologue to issue the deferred burst.
         if (wave >= 2) & (pending_valid != 0):
             tdm_ops.tensor_wait(0)
-            issue_scatter_burst(8, pending_idx0, pending_idx1, pending_col)
+            issue_scatter_burst(
+                8, pending_tail_index_lo, pending_tail_index_hi, pending_col
+            )
 
     return overlap_prologue, overlap_epilogue, skip_task
 

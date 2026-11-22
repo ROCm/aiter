@@ -684,10 +684,10 @@ def build_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
-        # Previous task's deferred tail: each index is one i32 per lane;
-        # a wave's 32 lanes supply four 8-row gathers, eight across both indices.
-        pending_idx0: scatter_state_type = 0,
-        pending_idx1: scatter_state_type = 0,
+        # Previous task's deferred tail: lo covers C rows 128:192, hi 192:256.
+        # Each store wave owns 32 rows per range, one destination index per lane.
+        pending_tail_index_lo: scatter_state_type = 0,
+        pending_tail_index_hi: scatter_state_type = 0,
         # Destination byte offset and whether the deferred tail needs issuing.
         pending_col: scatter_state_type = 0,
         pending_valid: scatter_state_type = 0,
@@ -1987,7 +1987,12 @@ def build_gemm_a8w4_tdm_task(
                     issue_scatter_group,
                     wave,
                     scatter_wave,
-                    (pending_idx0, pending_idx1, pending_col, pending_valid),
+                    (
+                        pending_tail_index_lo,
+                        pending_tail_index_hi,
+                        pending_col,
+                        pending_valid,
+                    ),
                     last_task,
                     issue,
                     init_accumulators,
@@ -1996,8 +2001,8 @@ def build_gemm_a8w4_tdm_task(
                     load_first,
                 )
             )
-        next_idx0 = fx.Int32(0)
-        next_idx1 = fx.Int32(0)
+        next_tail_index_lo = fx.Int32(0)
+        next_tail_index_hi = fx.Int32(0)
         next_col = fx.Int32(0)
         next_valid = fx.Int32(0)
         if const_expr(overlap_scatter):  # noqa: SIM102
@@ -2822,8 +2827,8 @@ def build_gemm_a8w4_tdm_task(
                     )
 
                 if const_expr(epilogue_callback is not None):
-                    next_idx0, next_idx1, next_col, next_valid = epilogue_callback(
-                        _scatter_idx_lanes, _gboff
+                    next_tail_index_lo, next_tail_index_hi, next_col, next_valid = (
+                        epilogue_callback(_scatter_idx_lanes, _gboff)
                     )
                 else:
                     for scatter_pass in range_constexpr(scatter_passes):
@@ -2926,7 +2931,7 @@ def build_gemm_a8w4_tdm_task(
                 workgroup_barrier()
 
         if const_expr(overlap_scatter):
-            return next_idx0, next_idx1, next_col, next_valid
+            return next_tail_index_lo, next_tail_index_hi, next_col, next_valid
 
     layout = {
         "kernel_attrs": kernel_attrs,
