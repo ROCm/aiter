@@ -3154,6 +3154,11 @@ def _unified_attention_gluon_kernel_2d(
     FM_PSCALE: gl.constexpr = True,
     FM_SEED_MASK: gl.constexpr = False,
     num_blocks_rt=None,
+    # AITER_UA_2D_LPT: prefill programs in longest-first order (seq_order_ptr, int32, from ua2d_seq_order: [0] the
+    # q block count, then one (seq, q block, query start, query len) row per program in dispatch order). Each
+    # program computes what it computes in the default order: the output is bitwise the same.
+    SEQ_ORDER: gl.constexpr = False,
+    seq_order_ptr=None,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -3232,6 +3237,16 @@ def _unified_attention_gluon_kernel_2d(
         # or out written; the search path does the same through its zero length.
         if gl.load(seq_lens_ptr + seq_idx) == 0:
             return
+    elif SEQ_ORDER:
+        # longest-first order: one row per program (a single dependent load, no search)
+        v = gl.program_id(1)
+        if v >= gl.load(seq_order_ptr):
+            return
+        row = seq_order_ptr + 4 + v * 4
+        seq_idx = gl.load(row)
+        q_block_local_idx = gl.load(row + 1)
+        cur_batch_in_all_start_index = gl.load(row + 2)
+        cur_batch_query_len = gl.load(row + 3)
     elif not ALL_DECODE:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
