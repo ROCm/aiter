@@ -252,7 +252,7 @@ def build_gemm_a8w4_tdm_task(
       cluster only).
     - ``lds_base``: a one-element list the enclosing kernel fills with its LDS
       base pointer before calling the body (a kernel may own only one
-      SharedAllocator); the body then uses ``arena_bytes`` from it.
+      SharedAllocator); the body then uses ``request_lds_size`` bytes from it.
     - ``a_ready`` (S1F stage-1 kernel): a one-element list the enclosing kernel
       fills with a callable before calling the body. The waves that own the A
       or A-scale loads call it before their first A issue (the wait for the
@@ -550,7 +550,7 @@ def build_gemm_a8w4_tdm_task(
     if overlap_scatter:
         assert scatter_passes == 16
         assert INPUT_LDS_B <= C_EP_OFF + C_STORE_B // 2
-    ARENA_B = max(
+    request_lds_size = max(
         AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
         C_EP_OFF + C_STORE_B,
     )
@@ -564,7 +564,7 @@ def build_gemm_a8w4_tdm_task(
         * num_waves
         * WAVE
     )
-    GROUP_ARENA_B = ceildiv(max(ARENA_B, K_PARTIAL_B), 512) * 512
+    GROUP_ARENA_B = ceildiv(max(request_lds_size, K_PARTIAL_B), 512) * 512
     # Stages the mainloop issues before its first fence (mirrors run_mainloop).
     _mid_compute = not (tile_m <= 32 or num_buffers <= 2)
     _pro_stages = (
@@ -578,7 +578,7 @@ def build_gemm_a8w4_tdm_task(
     if defer_c_wait:
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
         assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
-        assert C_Q_OFF + tile_m * (tile_n // 4) <= ARENA_B, "C staging past arena"
+        assert C_Q_OFF + tile_m * (tile_n // 4) <= request_lds_size, "C staging past arena"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -867,7 +867,7 @@ def build_gemm_a8w4_tdm_task(
                 else fx.SharedAllocator(static=True)
             )
             base_ptr = _smem.allocate(
-                GROUP_ARENA_B * k_waves if k_waves > 1 else ARENA_B
+                GROUP_ARENA_B * k_waves if k_waves > 1 else request_lds_size
             )._ptr
             if const_expr(k_waves > 1):
                 # Rebuild the pointer so the group offset keeps its 16-B alignment;
@@ -3018,7 +3018,7 @@ def build_gemm_a8w4_tdm_task(
 
     layout = {
         "kernel_attrs": kernel_attrs,
-        "arena": ARENA_B,
+        "arena": request_lds_size,
         "pitch": PITCH,
         "prologue_stages": _pro_stages,
         "c_ep_off": C_EP_OFF,
