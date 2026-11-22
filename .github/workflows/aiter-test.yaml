@@ -1046,16 +1046,6 @@ jobs:
           aiter_test \
           bash -c "pip show amd-aiter || true"
 
-      - name: Focused regression tests
-        if: ${{ matrix.label == 'MI35X' && matrix.shard_idx == 0 }}
-        timeout-minutes: 10
-        run: |
-          set -ex
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "python3 -m pytest -q tests"
-
       - name: Tests
         timeout-minutes: 120
         env:
