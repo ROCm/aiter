@@ -27,9 +27,10 @@ Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, Fals
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
 form; the per-channel exponents ride at the tail of each scale tensor, so a layer is
 still ``(w1, w1_scale, w2, w2_scale)``. ``quant="a8w8"`` takes fp8 experts with f32
-128x128 block scales instead (aiter's fp8 MoE preshuffle ``shuffle_weight(w, (16, 16))``,
-converted by ``prepare_weights(..., quant="a8w8")``): the same kernels, compiled with
-the fp8 W loads and the block scales applied per 128-K group.
+128x128 block scales instead, in aiter's fp8 MoE preshuffle
+``shuffle_weight(w, (16, 16))``, as they are (``prepare_weights(..., quant="a8w8")``
+checks them and zeroes the W of zero-scale blocks in place): the same kernels, compiled
+with the fp8 W loads and the block scales applied per 128-K group.
 """
 
 from contextlib import nullcontext
@@ -40,7 +41,8 @@ from . import host
 from . import weights as _weights
 
 _EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK, _NUM_CU = 8, 4096, 2048, 256, 6, 304
-# a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (fd8 W)
+# a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (W in the
+# (16, 16) preshuffle)
 _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
 # The main kernel splits a route id with shifts, so it needs a power-of-two top-k: other
 # top-k values are padded with no-route slots.
@@ -147,8 +149,8 @@ class MegaMoEGfx942:
     ):
         """One layer's local experts -> ``(w1, w1_scale, w2, w2_scale)`` as the kernels
         read them. a8w4: the standard aiter a16w4 preshuffle -> fd2; a8w8: fp8 in aiter's
-        (16, 16) preshuffle with f32 128x128 block scales -> fd8. Load time, once per
-        layer."""
+        (16, 16) preshuffle with f32 128x128 block scales, read as they are (the W of
+        zero-scale blocks zeroed in place). Load time, once per layer."""
         if w1_gate_up_interleaved:
             raise NotImplementedError(
                 "MegaMoEGfx942 takes w1 shuffled with gate_up=False for now"

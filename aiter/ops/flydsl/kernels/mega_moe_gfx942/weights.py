@@ -20,9 +20,9 @@ a8w8 (``prepare_weights_a8w8``): fp8 W with f32 128x128 block scales.
                           preshuffle ``shuffle_weight(w, layout=(16, 16))``
   w2        [E, H, I]     float8_e4m3fnuz, ``shuffle_weight(w, layout=(16, 16))``
   w*_scale  f32 [E, N/128, K/128], the dequant scale of each 128x128 block
-Output: W in the fd8 order the K loop streams (per 16 rows and 128-K chunk, the 32-K
-group of each row in lane order: [N/16, K/128, klane 4, nlane 16, 32 B]); a block whose
-scale is 0 has its W zeroed (the kernels treat a zero scale as 1); the scales as is.
+Output: the same W, which the K loop reads as they are (so other readers of the
+preshuffle can share them); a block whose scale is 0 has its W zeroed in place (the
+kernels treat a zero scale as 1); the scales as f32.
 """
 
 import functools
@@ -171,15 +171,17 @@ def tail_exp(w, scale):
     return scale.view(torch.uint8)[-tail:].view(torch.int32).view(experts, channels)
 
 
-def _fd8(w, scale):
-    """fp8 W [E, N, K] in the (16, 16) preshuffle ([N/16, K/32, 2, 16 rows, 16 B]) ->
-    fd8 ([N/16, K/128, klane 4, nlane 16, 32 B]); blocks with a zero scale zeroed."""
+def _zero_unscaled(w, scale):
+    """Check fp8 W [E, N, K] in the (16, 16) preshuffle ([N/16, K/32, 2, 16 rows, 16 B])
+    and its block scales; zero (in place) the W of blocks with a zero scale."""
     E, N, K = w.shape
     if N % 128 or K % 128 or tuple(scale.shape) != (E, N // 128, K // 128):
         raise ValueError(
             f"w {tuple(w.shape)} / scale {tuple(scale.shape)}: expected N, K multiples "
             "of 128 and one scale per 128x128 block"
         )
+    if not w.is_contiguous():
+        raise ValueError("w must be contiguous")
     if not bool(torch.isfinite(scale).all()) or bool((scale < 0).any()):
         raise ValueError("block scales must be finite and non-negative")
     # The K loop keeps acc in units of the current 128-K group's scale (x's per-128
@@ -192,17 +194,16 @@ def _fd8(w, scale):
         raise ValueError(
             "the block scales along K of a 128-row block span more than 2^60"
         )
-    w8 = w.contiguous().view(torch.uint8).view(E, N // 16, K // 128, 4, 2, 16, 16)
-    w8 = w8.permute(0, 1, 2, 3, 5, 4, 6).contiguous()
     zero = (scale == 0).repeat_interleave(8, dim=1)  # [E, N/16, K/128]
     if bool(zero.any()):
-        w8[zero] = 0
-    return w8.view(E, N, K).view(w.dtype)
+        # a 128-K chunk of 16 rows: 4 x 32-K groups of 2 x 16 rows x 16 B
+        w.view(torch.uint8).view(E, N // 16, K // 128, 2048)[zero] = 0
 
 
 def prepare_weights_a8w8(w1, w1_scale, w2, w2_scale):
     """One layer's experts in aiter's fp8 (16, 16) preshuffle -> ``(w1, w1_scale, w2,
-    w2_scale)`` in fd8 form (see the module docstring). w1 [E, 2I, H], w2 [E, H, I]."""
+    w2_scale)`` as the kernels read them: the same W (zero-scale blocks zeroed in
+    place), f32 scales (see the module docstring). w1 [E, 2I, H], w2 [E, H, I]."""
     E, n2, h = w1.shape
     if tuple(w2.shape) != (E, h, n2 // 2):
         raise ValueError(f"w1 {tuple(w1.shape)} and w2 {tuple(w2.shape)} do not match")
@@ -211,5 +212,6 @@ def prepare_weights_a8w8(w1, w1_scale, w2, w2_scale):
         if w.dtype != torch.float8_e4m3fnuz:
             raise TypeError(f"{w.dtype} weights: expected float8_e4m3fnuz")
         s = s.to(torch.float32).contiguous()
-        out += [_fd8(w, s), s]
+        _zero_unscaled(w, s)
+        out += [w, s]
     return tuple(out)

@@ -3,7 +3,8 @@
 """The K loop of the a8w4 / a8w8 GEMM tiles, and the dispatch to its row variants.
 
 W is streamed from HBM straight into VGPRs: fd2 mxfp4 (a8w4) is decoded to fp8 there,
-fd8 fp8 (a8w8) is the MFMA operand as loaded; fp8 A goes through LDS.
+fp8 (a8w8, aiter's (16, 16) preshuffle) is the MFMA operand as loaded; fp8 A goes
+through LDS.
 """
 
 import flydsl.compiler as flyc
@@ -91,9 +92,9 @@ def _make_core(
     table from loads ``pre_a`` issued without waiting for A in between).
     ``ARB``: A bytes per row per K tile (128 / 256).
     ``WQ``: the W format. "fp4": fd2 mxfp4, each 32-K group decoded with its scale
-    folded in (the caller applies the per-channel exponent). "fp8": fd8 fp8
-    (``weights.prepare_weights_a8w8``), 32 B per lane per 128-K chunk, used as loaded;
-    the caller applies the 128x128 block scales (``hook`` and its epilogue).
+    folded in (the caller applies the per-channel exponent). "fp8": fp8 in aiter's
+    (16, 16) preshuffle, two 16 B halves per lane per 128-K chunk, used as loaded; the
+    caller applies the 128x128 block scales (``hook`` and its epilogue).
 
     Each K tile's W prefetch, the next A tile's LDS store and the one after's global
     load are issued between MFMA steps (step ``W_STEP`` / ``ST_STEP``), A fragments
@@ -131,9 +132,13 @@ def _make_core(
     ws_tiles = _global_i32_buffer_tiles(arg_ws, WS_BYTES, 1)
     ws_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
     keys = [k for k, _, _ in cols]
+    # 16 B unit of lane L in a 128-K chunk of a 16-row block: fd2, L; fp8 (16, 16)
+    # preshuffle [32-K group 4, half 2, row 16, 16 B]: row L % 16 of group L // 16, its
+    # second half 16 units further
+    lane_w = lane_div_16 * fx.Int32(32) + lane_mod_16 if FP8W else lane * WL
     w_base, npack, s_base, skey_of = {}, {}, {}, {}
     for key, n0, skey in cols:
-        w_base[key] = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64 * WL) + lane * WL
+        w_base[key] = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64 * WL) + lane_w
         npack[key] = (n0 // fx.Int32(16)) % fx.Int32(2)
         skey_of[key] = skey
         if skey not in s_base and not FP8W:
@@ -165,7 +170,11 @@ def _make_core(
         k128 = kt * fx.Int32(KG)
         if const_expr(FP8W):
             for (k, g, h), r in buf["w"].items():
-                off = w_base[k] + (k128 + fx.Int32(g)) * fx.Int32(64 * WL) + fx.Int32(h)
+                off = (
+                    w_base[k]
+                    + (k128 + fx.Int32(g)) * fx.Int32(64 * WL)
+                    + fx.Int32(h * 16)
+                )
                 fx.copy(w_atom, fx.slice(w_tiles, (None, off)), r)
             return
         for (k, g), r in buf["w"].items():

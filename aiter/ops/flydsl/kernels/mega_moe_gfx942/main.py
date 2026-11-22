@@ -112,7 +112,8 @@ def ep_mega_kernel(
     token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``WQ``: "fp4" fd2 mxfp4 W
-    (a8w4), "fp8" fd8 fp8 W with f32 128x128 block scales (a8w8)."""
+    (a8w4), "fp8" fp8 W in aiter's (16, 16) preshuffle with f32 128x128 block scales
+    (a8w8)."""
     assert ACT in ("silu", "silu_clamped", "situv2") and QX in (0, 1), (ACT, QX)
     assert WQ in ("fp4", "fp8"), WQ
     FP8W = WQ == "fp8"
