@@ -88,8 +88,9 @@ def register_presorted_moe(aux: dict | None) -> None:
     call. A caller that registers and then does not call fused_moe must clear it
     with ``register_presorted_moe(None)``. It is only used when the call runs
     without expert_mask or num_local_tokens, on an aux-sort pipeline at
-    block_m == PRESORTED_MOE_BLOCK_M or a FlyDSL two-stage pipeline at a block_m
-    in PRESORTED_MOE_BLOCK_MS; other calls run fused_moe's own sort.
+    block_m == PRESORTED_MOE_BLOCK_M or a FlyDSL two-stage pipeline (only the
+    tested stage 1 families; see presorted_moe_block_m) at a block_m in
+    PRESORTED_MOE_BLOCK_MS; other calls run fused_moe's own sort.
 
     Under torch.compile this call runs eagerly, so it stays ordered before the
     fused_moe that consumes it; a ``fullgraph=True`` compile rejects it instead.

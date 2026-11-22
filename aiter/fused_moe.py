@@ -1777,7 +1777,7 @@ _STD_PRESORT_STAGE1_FAMILIES = ("flydsl_moe1_afp4_wfp4", "flydsl_moe1_abf16_wfp4
 def _standard_presort_unsupported(metadata, asm_mode, need_local_topk_ids):
     """Why a pipeline without the aux sort cannot take a registered presort, or "".
 
-    Only the FlyDSL two-stage pipelines are enabled: they read the four standard
+    Only the FlyDSL two-stage pipelines of _STD_PRESORT_STAGE1_FAMILIES are enabled: they read the four standard
     sort outputs and size their grids from the tensors' shapes, so a presort in
     moe_sorting's layout stands in for its sort.
     """
