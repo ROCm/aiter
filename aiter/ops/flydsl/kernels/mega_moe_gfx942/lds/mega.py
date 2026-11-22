@@ -37,12 +37,12 @@ from .down import down_task_emitter
 from .gateup import (
     OOB_OFFSET,
     SORT_BLOCK_M,
-    _load_i32,
-    _rsrc_of,
-    _uniform,
     gateup_task_emitter,
 )
 from .util import (
+    _load_i32,
+    _rsrc_of,
+    _uniform,
     atomic_add_i32,
     buffer_rsrc_at,
     fence,

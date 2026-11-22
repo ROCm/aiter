@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 EP8 MoE communication kernels of the a8w8 mega MoE: routing plan + count exchange (ep_prep, ep_plan) and
+"""gfx942 EP8 MoE communication kernels of the mega MoE: routing plan + count exchange (ep_prep, ep_plan) and
 the combine completion barrier (ep_finish). Peers are MORI symmetric-heap buffers, passed as int64 tables of their
 addresses. From pyhip contrib/flydsl/ep_moe_comm_gfx942.py (branch luwei/942-fp8-megamoe) with two changes:
 - the call epoch lives in device memory (`epoch` [1], local int32): ep_prep and ep_finish use epoch[0] + 1 and

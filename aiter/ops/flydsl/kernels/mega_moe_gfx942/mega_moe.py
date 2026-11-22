@@ -13,7 +13,7 @@ Two kernel sets run it:
   ``comm.py`` then waits until all ranks' adds are done. Its tasks only wait for work
   that is already running, so it needs no co-residency. W streams into VGPRs: faster
   for decode batches.
-- the mega kernel of ``a8w8/``: GEMM tiles of 256 rows with A and W staged through
+- the mega kernel of ``lds/``: GEMM tiles of 256 rows with A and W staged through
   LDS, faster from about 1000 tokens per rank. It decodes a8w4's MXFP4 experts to FP8
   in its W loaders.
 
@@ -150,16 +150,16 @@ class MegaMoEGfx942:
         self._no_route = torch.full((), -1, dtype=torch.int32, device=self.dev)
         self._weights = {}
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
-        self._x1, self._small_mtpr = None, 0
+        self._lds, self._small_mtpr = None, 0
         if x_quant != "per_1x128":
             if quant != "a8w4":
                 raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
             # the mega kernel quantizes x per 1x128 only
             self._build_main(self.mtpr)
             return
-        from .a8w8.host import MegaMoEGfx942A8W8
+        from .lds.host import LdsMegaMoE
 
-        self._x1 = MegaMoEGfx942A8W8(
+        self._lds = LdsMegaMoE(
             rank=rank,
             world_size=world_size,
             model_dim=model_dim,
@@ -260,8 +260,8 @@ class MegaMoEGfx942:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale):
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
-        if self._x1 is not None:
-            self._x1.bind_weights(w1, w1_scale, w2, w2_scale)
+        if self._lds is not None:
+            self._lds.bind_weights(w1, w1_scale, w2, w2_scale)
 
     def bind_layer(self, layer_slot, w1, w1_scale, w2, w2_scale):
         self.bind_weights(w1, w1_scale, w2, w2_scale)
@@ -522,9 +522,9 @@ class MegaMoEGfx942:
         are always skipped, so ``mask_invalid_slots`` has no effect; the output is always
         sliced to T rows."""
         with _on(stream):
-            if self._x1 is not None:
+            if self._lds is not None:
                 ids, w = self._routes(x_bf16, topk_ids, wts, self.topk)
-                return self._x1.forward(x_bf16, w, ids)
+                return self._lds.forward(x_bf16, w, ids)
             ids, w = self._routes(x_bf16, topk_ids, wts, _KERNEL_TOPK)
             return self._forward_main(x_bf16, w, ids)
 
@@ -549,9 +549,9 @@ class MegaMoEGfx942:
                 f"{shape} on {self.dev}"
             )
         with _on(stream):
-            if self._x1 is not None:
+            if self._lds is not None:
                 ids, w = self._routes(x_q, topk_ids, wts, self.topk)
-                return self._x1.forward_prequant(x_q, x_scale, w, ids)
+                return self._lds.forward_prequant(x_q, x_scale, w, ids)
             ids, w = self._routes(x_q, topk_ids, wts, _KERNEL_TOPK)
             return self._forward_main(x_q, w, ids, x_scale)
 
@@ -563,7 +563,7 @@ class MegaMoEGfx942:
         if not self._small_mtpr:
             raise RuntimeError(
                 "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
-                if self._x1 is not None
+                if self._lds is not None
                 else "MegaMoEGfx942 has no small-input path for x_quant='per_token'"
             )
         need = int(max_tokens)

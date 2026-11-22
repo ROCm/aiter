@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MegaMoEGfx942A8W8: the gfx942 EP8 MegaMoE on FP8 128x128 block-scale experts (a8w8).
+"""LdsMegaMoE: the gfx942 EP8 MegaMoE on FP8 128x128 block-scale experts (wq "fp8") or a8w4's fd2 MXFP4
+experts (wq "fp4", decoded to FP8 on the way into LDS).
 
 Per call, on the current stream (x is first quantized to FP8 per 1x128 by aiter's per_1x128 quant):
   ep_prep    count routes per global expert, exchange the count rows, derive every route's sorted row
@@ -44,7 +45,7 @@ _PRODUCERS, _LAG = 16, 2
 
 
 def eligible(*, world_size, model_dim, inter_dim, experts, topk, act="silu"):
-    """Whether the a8w8 build runs the layer: gfx942, EP8 x 32 local experts, H 4096, I 2048, top-k <= 8, silu."""
+    """Whether the mega kernel runs the layer: gfx942, EP8 x 32 local experts, H 4096, I 2048, top-k <= 8, silu."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return (
@@ -60,8 +61,8 @@ def _on(stream):
     return torch.cuda.stream(stream) if stream is not None else nullcontext()
 
 
-class MegaMoEGfx942A8W8:
-    """One rank's EP8 a8w8 MoE layer (32 local experts)."""
+class LdsMegaMoE:
+    """One rank's EP8 MoE layer (32 local experts) on the mega kernel."""
 
     def __init__(
         self,
@@ -88,7 +89,7 @@ class MegaMoEGfx942A8W8:
             topk=topk,
         ):
             raise ValueError(
-                f"MegaMoEGfx942A8W8 does not run world_size={world_size}, model_dim={model_dim}, "
+                f"LdsMegaMoE does not run world_size={world_size}, model_dim={model_dim}, "
                 f"inter_dim={inter_dim}, experts={experts}, topk={topk} on this device"
             )
         if not swiglu_limit >= 0:
