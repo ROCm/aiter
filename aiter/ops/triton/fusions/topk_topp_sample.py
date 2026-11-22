@@ -103,6 +103,7 @@ def topk_topp_sample(
     rng_state: tuple[torch.Tensor, int] | None = None,
     out2: torch.Tensor | None = None,
     record: tuple[torch.Tensor, torch.Tensor, int] | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample one token a row from ``softmax(logits / t)`` under top-k and top-p.
 
@@ -151,6 +152,13 @@ def topk_topp_sample(
             device counter), the draw of atom's ``_draft_uniform_kernel``,
             made in the kernels in place of ``uniform``.
         out2: int32 [n], gluon_select only: a second copy of the tokens.
+        stats: int32 [n, V / 256, 8], gluon_select without row maps only: a
+            32-byte record for each row and 256-column tile of the
+            presence-penalized logits, already made (the draft LM head's
+            epilogue, ``gemm_a8w8_lmhead_stats``): its 8 32-column group
+            keys (int16), the softmax partial max / t (f32 word 4) and sum
+            of exp(x / t - max / t) (word 5). No stats kernel.
+            With ``rng_state``, ``state[0]`` was advanced by n with them.
         record: ``(ctx, pos, width)``, gluon_select only: after the draw,
             ``ctx[r * width + 1 + pos[r]] = token`` (when ``pos[r] < width -
             1``) and ``pos[r] += 1`` (atom ``DraftPresencePenalty.record``).
@@ -185,6 +193,7 @@ def topk_topp_sample(
     assert rng_state is None or (
         uniform is None and philox is None
     ), "rng_state replaces uniform"
+    assert stats is None or gluon_select, "stats needs gluon_select"
     if uniform is None and philox is None and rng_state is None:
         uniform = torch.rand(n, dtype=torch.float32, device=device)
     _LOGGER.info(
@@ -198,9 +207,10 @@ def topk_topp_sample(
     NG_P2 = triton.next_power_of_2(NG)
     KB = max(16, triton.next_power_of_2(top_k))
     block_bs = max(16, triton.next_power_of_2(max(n_cu, 1)))
-    m = torch.empty((n, NCH), dtype=torch.float32, device=device)
-    z = torch.empty((n, NCH), dtype=torch.float32, device=device)
-    g = torch.empty((n, NG), dtype=torch.int16, device=device)
+    if stats is None:
+        m = torch.empty((n, NCH), dtype=torch.float32, device=device)
+        z = torch.empty((n, NCH), dtype=torch.float32, device=device)
+        g = torch.empty((n, NG), dtype=torch.int16, device=device)
     penalty = presence is not None
     if penalty:
         pen = (
@@ -230,34 +240,43 @@ def topk_topp_sample(
         gcfg = _get_gluon_select_config(n)
         # 4 waves a chunk: the Triton stats kernel's reduction order
         gcpp = gcfg["stats_chunks"]
-        _topk_topp_sample_stats_gluon_kernel[(n, triton.cdiv(NCH, gcpp))](
-            logits,
-            logits.stride(0),
-            verify_rows,
-            bonus_rows,
-            cu_num_draft_tokens,
-            temperatures,
-            m,
-            z,
-            g,
-            *pen,
-            n_verify,
-            n_cu,
-            V,
-            NG,
-            NCH,
-            rng_state[0] if rng_state is not None else out,
-            ROW_MAP=row_map,
-            BLOCK_BS=block_bs,
-            PENALTY=penalty,
-            MAX_EXTRA=max_extra,
-            ANCHOR=anchor,
-            GROUPS=groups,
-            CPP=gcpp,
-            NW=4 * gcpp,
-            RNG_ADV=rng_state is not None,
-            num_warps=4 * gcpp,
-        )
+        np_ = NCH
+        if stats is not None:
+            assert not row_map and not anchor, "stats: one row a request, no anchor"
+            np_ = stats.shape[1]
+            assert stats.dtype == torch.int32 and stats.is_contiguous()
+            assert stats.shape[0] >= n and stats.shape[2] == 8 and np_ * 8 == NG
+            m = z = stats.view(torch.float32)
+            g = stats.view(torch.int16)
+        else:
+            _topk_topp_sample_stats_gluon_kernel[(n, triton.cdiv(NCH, gcpp))](
+                logits,
+                logits.stride(0),
+                verify_rows,
+                bonus_rows,
+                cu_num_draft_tokens,
+                temperatures,
+                m,
+                z,
+                g,
+                *pen,
+                n_verify,
+                n_cu,
+                V,
+                NG,
+                NCH,
+                rng_state[0] if rng_state is not None else out,
+                ROW_MAP=row_map,
+                BLOCK_BS=block_bs,
+                PENALTY=penalty,
+                MAX_EXTRA=max_extra,
+                ANCHOR=anchor,
+                GROUPS=groups,
+                CPP=gcpp,
+                NW=4 * gcpp,
+                RNG_ADV=rng_state is not None,
+                num_warps=4 * gcpp,
+            )
         nw = gcfg["num_warps"]
         if rng_state is not None:
             seed, offset = int(rng_state[1]), 0
@@ -295,6 +314,7 @@ def topk_topp_sample(
             out2 if out2 is not None else out,
             record[0] if record is not None else out,
             record[1] if record is not None else out,
+            np_,
             ROW_MAP=row_map,
             BLOCK_BS=block_bs,
             PENALTY=penalty,
@@ -314,6 +334,7 @@ def topk_topp_sample(
             REC_CTX=int(record[2]) if record is not None else 0,
             num_warps=nw,
             **({"CAP1_": _CAP1, "CAP2_": _CAP2} if _SELECT_FAST else {}),
+            NP_P2=triton.next_power_of_2(np_) if stats is not None else 0,
         )
         return out
     cpp = stats_cfg["CHUNKS_PER_PROGRAM"]
