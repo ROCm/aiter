@@ -21,6 +21,8 @@ candidates, the bisections carry their counts and skip the index bisection
 when the ties at the k-th key are all taken, and up to 1024 group candidates
 are compacted before their bisection: the same k columns, far fewer dependent
 steps when the chunk bound is loose (realistic rows: 30-200 groups >= L).
+NP_P2 (atom ATOM_MTP_DRAFT_LMHEAD_STATS): the softmax partials and group
+keys come from the draft LM head GEMM's epilogue, one per 256-column tile.
 RNG_STATE / OUT2 / REC_CTX (atom ATOM_MTP_DRAFT_FUSED_SELECT): the draft
 draw's uniform (tl.rand at a device counter the stats kernel advances), a
 second copy of the tokens and the draft presence record, in the kernels.
@@ -377,6 +379,7 @@ def _topk_topp_sample_select_gluon_kernel(
     out2_ptr,
     rec_ctx_ptr,
     rec_pos_ptr,
+    NP,
     ROW_MAP: gl.constexpr,
     BLOCK_BS: gl.constexpr,
     PENALTY: gl.constexpr,
@@ -396,6 +399,7 @@ def _topk_topp_sample_select_gluon_kernel(
     REC_CTX: gl.constexpr = 0,
     CAP1_: gl.constexpr = 0,
     CAP2_: gl.constexpr = 0,
+    NP_P2: gl.constexpr = 0,
 ):
     # FAST: the pairwise ranks take up to CAP1_ groups / CAP2_ columns before
     # the exact first-k searches (realistic rows often bound 64-200 groups)
@@ -417,9 +421,18 @@ def _topk_topp_sample_select_gluon_kernel(
 
     lane = gl.arange(0, 32 * NW, layout=L1)
     # softmax statistics of the row
-    ch = gl.arange(0, NCH_P2, layout=L1)
-    ms = gl.load(m_ptr + r * NCH + ch, mask=ch < NCH, other=float("-inf"))
-    zs = gl.load(z_ptr + r * NCH + ch, mask=ch < NCH, other=0.0)
+    # NP partials a row: the stats kernel's NCH chunks, or (NP_P2 > 0) the
+    # LM head GEMM's per-tile records (aiter gemm_a8w8_lmhead_stats)
+    if NP_P2 > 0:
+        ch = gl.arange(0, NP_P2, layout=L1)
+        # a 32-byte record a (row, tile): 8 keys, max / t (word 4), sum (5)
+        rec = (r * NP + ch) * 8
+        ms = gl.load(m_ptr + rec + 4, mask=ch < NP, other=float("-inf"))
+        zs = gl.load(z_ptr + rec + 5, mask=ch < NP, other=0.0)
+    else:
+        ch = gl.arange(0, NCH_P2, layout=L1)
+        ms = gl.load(m_ptr + r * NCH + ch, mask=ch < NCH, other=float("-inf"))
+        zs = gl.load(z_ptr + r * NCH + ch, mask=ch < NCH, other=0.0)
     M = gl.max(ms, axis=0)
     zc = gl.where(ms == float("-inf"), 0.0, zs * gl.exp(ms - M))
     Z = gl.sum(zc, axis=0)
@@ -429,7 +442,13 @@ def _topk_topp_sample_select_gluon_kernel(
     gj = gl.arange(0, GROUPS, layout=gl.SliceLayout(0, GT))
     gid = cr[:, None] * GROUPS + gj[None, :]
     gv = (cr[:, None] < NCH) & (gid < NG)
-    G = gl.load(g_ptr + r * NG + gid, mask=gv, other=0)
+    if NP_P2 > 0:
+        # the records' keys: 8 contiguous int16 of each 16
+        goff = (r * NP + cr[:, None] * (GROUPS // 8)) * 16 + (gj[None, :] >> 3) * 16 + (gj[None, :] & 7)
+        goff = gl.max_contiguous(gl.multiple_of(goff, [1, 8]), [1, 8])
+        G = gl.load(g_ptr + goff, mask=gv, other=0)
+    else:
+        G = gl.load(g_ptr + r * NG + gid, mask=gv, other=0)
     G = G.to(gl.int32)
     G = gl.where(gv, G, KEY_NONE)
 
