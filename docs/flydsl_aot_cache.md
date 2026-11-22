@@ -549,6 +549,10 @@ _run_compiled(my_launcher.lazy(N, K, tile_m, ...), *args, stream)
 A launcher built inside a wrapper (no factory returning it) binds where it is
 built: `bind_aot(launch, FlyDSLAotCache("my_kernel"), (TOPK, N))`.
 
+A factory argument the cache cannot key (e.g. a numpy scalar) leaves that
+launcher on the JIT path. A module that imports `aot_launch` records it as a
+source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
+
 0. **Launch `factory.lazy(...)` on hot paths.** It does not call the factory,
    so a hit pays neither the compiler import nor the `@flyc.kernel`
    definitions (a few hundred ms of AST rewriting per kernel module in a fresh

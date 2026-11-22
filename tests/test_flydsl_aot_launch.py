@@ -62,6 +62,32 @@ def test_one_launcher_under_two_keys_runs_the_jit():
     assert getattr(exe, _ATTR) is False
 
 
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 binds nothing",
+)
+def test_argument_the_cache_cannot_key_runs_the_jit():
+    import functools
+
+    import numpy as np
+
+    from aiter.ops.flydsl.aot_launch import _LazyLauncher, aot_factory
+
+    @aot_factory("test_unkeyable")
+    @functools.cache
+    def factory(limit):
+        return _Launcher()
+
+    # A numpy scalar hashes like a float but has no disk key: no binding, so
+    # _run_compiled takes the JIT path instead of raising on every launch.
+    exe = factory(np.float32(7.0))
+    assert getattr(exe, _ATTR) is False
+    handle = factory.lazy(np.float32(7.0))
+    assert not isinstance(handle, _LazyLauncher)
+    assert getattr(handle, _ATTR) is False
+    assert isinstance(factory.lazy(8.0), _LazyLauncher)
+
+
 def child():
     import importlib
 
@@ -155,6 +181,7 @@ def test_moe_gfx942_through_aot_cache():
 
         miss, state = run_mode("1", cache_dir)
         state.pop("gemm factories")
+        entries = {name: s["entries"] for name, s in state.items()}
         for name, s in state.items():
             assert s["entries"] > 0, f"{name} launched nothing through the cache"
             assert s["jit"] == 0, f"{name} fell back to the JIT: {s}"
@@ -164,6 +191,8 @@ def test_moe_gfx942_through_aot_cache():
         hit, state = run_mode("1", cache_dir)
         assert state.pop("gemm factories") == 0, "a hit built a GEMM launcher"
         for name, s in state.items():
+            # Every launcher still goes through the cache, and loads.
+            assert s["entries"] == entries[name], f"{name} skipped the cache: {s}"
             assert s["jit"] == 0 and s["builds"] == 0, f"{name} rebuilt: {s}"
         after = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
         assert after == built, "aot hit rewrote the AOT cache"

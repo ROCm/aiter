@@ -71,7 +71,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_compare_logic.py" \
                 "$TEST_DIR/tuning_tests/test_mp_tuner_logic.py" \
                 "$TEST_DIR/tuning_tests/test_tuner_infra.py" \
-                "tests/test_flydsl_aot_cache.py"
+                "tests/test_flydsl_aot_cache.py" \
+                "tests/test_flydsl_aot_launch.py"
         } | LC_ALL=C sort -u
     )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
