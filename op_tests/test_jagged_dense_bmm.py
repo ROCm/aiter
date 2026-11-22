@@ -207,6 +207,23 @@ def test_jdbba_config_invalid(B, D, Kout, Mi, arg, value, dtype):
     }
 
 
+def _expect_rejected(launch, out, what, match):
+    before = out.clone()
+    try:
+        launch()
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        message = None
+    torch.cuda.synchronize(out.device)
+    untouched = torch.equal(out.view(torch.int16), before.view(torch.int16))
+    assert (
+        message and match in message
+    ), f"{what} must raise ValueError naming {match!r}, got {message!r}"
+    assert untouched, f"{what}: rejected call must not write C"
+    return {"C untouched": untouched, "error": message}
+
+
 @benchmark()
 def test_jdbba_limit_invalid(limit, B, D, Kout, rows, max_seq_len, regime, dtype):
     # The call must raise before launch, so the inputs need no values.
@@ -217,20 +234,13 @@ def test_jdbba_limit_invalid(limit, B, D, Kout, rows, max_seq_len, regime, dtype
         "seq_offsets": torch.arange(0, (B + 1) * rows, rows, dtype=torch.int32),
     }
     out = _nan_out(B * rows, Kout, dtype)
-    try:
-        _launch(d, out, B, max_seq_len, regime == "uniform")
-    except ValueError as exc:
-        message = str(exc)
-    else:
-        message = None
-    torch.cuda.synchronize()
-    untouched = bool(out.isnan().all())
-    assert message and limit in message, (
-        f"B={B} K={D} N={Kout} max_seq_len={max_seq_len} {regime}: "
-        f"must raise ValueError naming {limit!r}, got {message!r}"
+    ret = _expect_rejected(
+        lambda: _launch(d, out, B, max_seq_len, regime == "uniform"),
+        out,
+        f"B={B} K={D} N={Kout} max_seq_len={max_seq_len} {regime}",
+        limit,
     )
-    assert untouched, f"{limit}: rejected call must not write C"
-    return {"gfx": get_gfx_runtime(), "C untouched": untouched, "error": message}
+    return {"gfx": get_gfx_runtime(), **ret}
 
 
 @benchmark()
@@ -508,6 +518,50 @@ def test_jdbba_dense_2d_invalid(B, D, Kout, Mi, dtype):
         "raised ValueError": raised,
         "C untouched": untouched,
     }
+
+
+@benchmark()
+def test_jdbba_stream_device_invalid(B, D, Kout, Mi, dtype):
+    n_dev = torch.cuda.device_count()
+    if n_dev < 2:
+        reason = f"needs 2 visible GPUs, found {n_dev}"
+        aiter.logger.warning("jagged_dense_bmm stream device test skipped: %s", reason)
+        return {"skipped": reason}
+    with torch.cuda.device(1):
+        d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+        out = _nan_out(d["L"], d["N"], dtype)
+    stream = torch.cuda.Stream(torch.device("cuda", 0))
+    ret = _expect_rejected(
+        lambda: _launch(d, out, B, Mi, True, stream=stream),
+        out,
+        "tensors on cuda:1 with a cuda:0 stream",
+        "stream is on cuda:0",
+    )
+    return {"gfx": get_gfx_runtime(), **ret}
+
+
+@benchmark()
+def test_jdbba_output_overlap_invalid(B, D, Kout, Mi, overlaps, dtype):
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    c_bytes = d["L"] * d["N"] * dtype.itemsize
+    if overlaps == "A":
+        out = d["jagged"]
+    else:
+        key = {"B": "dense", "BIAS": "bias", "SEQ_OFFSETS": "seq_offsets"}[overlaps]
+        src = d[key]
+        # The input starts 4 bytes before the end of C.
+        buf = torch.empty(c_bytes - 4 + src.nbytes, dtype=torch.uint8)
+        out = buf[:c_bytes].view(dtype).view(d["L"], d["N"])
+        shared = buf[c_bytes - 4 :].view(src.dtype).view(src.shape)
+        shared.copy_(src)
+        d = {**d, key: shared}
+    ret = _expect_rejected(
+        lambda: _launch(d, out, B, Mi, True),
+        out,
+        f"C overlapping {overlaps}",
+        f"C overlaps {overlaps}",
+    )
+    return {"gfx": get_gfx_runtime(), **ret}
 
 
 @benchmark()
@@ -843,6 +897,22 @@ def main():
     ):
         rows.append(test_jdbba_two_devices(B, D, Kout, Mi, dtype))
     _summarize("jagged_dense_bmm two devices", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        rows.append(test_jdbba_stream_device_invalid(B, D, Kout, Mi, dtype))
+    _summarize("jagged_dense_bmm stream device", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), overlaps in itertools.product(
+        args.dtype, args.regression_shapes, ("A", "B", "BIAS", "SEQ_OFFSETS")
+    ):
+        if overlaps == "A" and D != Kout:
+            continue
+        rows.append(test_jdbba_output_overlap_invalid(B, D, Kout, Mi, overlaps, dtype))
+    _summarize("jagged_dense_bmm output overlap", rows)
 
 
 if __name__ == "__main__":

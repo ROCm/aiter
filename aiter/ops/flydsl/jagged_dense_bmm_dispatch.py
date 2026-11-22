@@ -18,6 +18,7 @@ import functools
 
 import pandas as pd
 import torch
+from flydsl.utils import env
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS
@@ -177,7 +178,7 @@ def _row_config(
     return cfg
 
 
-def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int) -> tuple[int, int]:
+def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int, stream) -> tuple[int, int]:
     tensors = {"C": C, "A": A, "B": B, "BIAS": BIAS, "SEQ_OFFSETS": SEQ_OFFSETS}
     for name, t in tensors.items():
         if not isinstance(t, torch.Tensor):
@@ -186,6 +187,16 @@ def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int) -> tuple[int, int]:
             raise ValueError(f"{name} must be on A's GPU device {A.device}")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    if isinstance(stream, torch.cuda.Stream) and stream.device != A.device:
+        raise ValueError(f"stream is on {stream.device}, not on A's device {A.device}")
+    # A compile-only run's data pointers are not addresses, and it never launches.
+    if not env.compile.compile_only:
+        c_start = C.data_ptr()
+        for name in ("A", "B", "BIAS", "SEQ_OFFSETS"):
+            t_start, t_bytes = tensors[name].data_ptr(), tensors[name].nbytes
+            overlaps = t_start < c_start + C.nbytes and c_start < t_start + t_bytes
+            if C.nbytes and t_bytes and overlaps:
+                raise ValueError(f"C overlaps {name}; C must not share memory with it")
     for name in ("C", "A", "B", "BIAS"):
         if tensors[name].dtype != torch.bfloat16:
             raise TypeError(f"{name} must be bfloat16, got {tensors[name].dtype}")
@@ -236,6 +247,7 @@ def jagged_dense_bmm_dispatched(
     Args:
         C: ``(L, N)`` bf16 output. Rows of a group are all written; rows past
             ``SEQ_OFFSETS[-1]`` in an over-allocated ``C`` are left untouched.
+            Must not overlap any input.
         A: ``(L, K)`` bf16 packed jagged rows. Requires
             ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
             read. One group's rows of ``A`` and of ``C`` must each stay under
@@ -252,8 +264,9 @@ def jagged_dense_bmm_dispatched(
             not checked; rows past it are not computed.
             ``max_seq_len * max(K, N) * 2`` must be under 4 GiB. Skew path:
             only a tuning-table key.
-        stream: Defaults to the current torch stream. One launch and no host
-            sync, so the call can be captured in a graph.
+        stream: Defaults to the current torch stream on A's device. A
+            ``torch.cuda.Stream`` must be on A's device. One launch and no
+            host sync, so the call can be captured in a graph.
         uniform_seqlen: True selects the dense ``(group, M-tile, N-tile)``
             grid; False the compact grid that skips empty tiles.
         xcd_c, xcd_w, block_k: Override the tuned config.
@@ -266,7 +279,7 @@ def jagged_dense_bmm_dispatched(
     arch = get_gfx_runtime()
     if arch not in SUPPORTED_ARCHS:
         raise RuntimeError(f"jagged_dense_bmm supports {SUPPORTED_ARCHS}, not {arch}")
-    output_n, reduction_k = _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups)
+    output_n, reduction_k = _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups, stream)
     BIAS = BIAS.view(-1)
     if A.shape[0] == 0:
         return
