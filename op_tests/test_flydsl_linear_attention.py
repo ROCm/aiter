@@ -13,9 +13,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
-import os
-import subprocess
-import sys
 from dataclasses import dataclass
 
 import pandas as pd
@@ -885,7 +882,9 @@ def _assert_kda_state_close(
     ), f"{msg}: {mismatched:.4%} of BF16 state bits differ from the reference"
 
 
-def _run_kda(inputs: KdaInputs, out: torch.Tensor | None = None) -> torch.Tensor:
+def _run_kda(
+    inputs: KdaInputs, out: torch.Tensor | None = None, **kwargs
+) -> torch.Tensor:
     return flydsl_kda_decode(
         x=inputs.x,
         conv_weight=inputs.conv_weight,
@@ -902,6 +901,7 @@ def _run_kda(inputs: KdaInputs, out: torch.Tensor | None = None) -> torch.Tensor
         norm_weight=inputs.norm_weight,
         norm_eps=_KDA_NORM_EPS,
         out=out,
+        **kwargs,
     )
 
 
@@ -942,6 +942,7 @@ def _run_kda_with_f_b(
     f_b_weight: torch.Tensor,
     inputs: KdaInputs,
     out: torch.Tensor | None = None,
+    **kwargs,
 ) -> torch.Tensor:
     return flydsl_kda_decode_with_f_b(
         f_a=f_a,
@@ -960,6 +961,7 @@ def _run_kda_with_f_b(
         norm_weight=inputs.norm_weight,
         norm_eps=_KDA_NORM_EPS,
         out=out,
+        **kwargs,
     )
 
 
@@ -1163,10 +1165,11 @@ def _run_kda_api(
     f_a: torch.Tensor,
     f_b_weight: torch.Tensor,
     inputs: KdaInputs,
+    **kwargs,
 ) -> torch.Tensor:
     if fused_f_b:
-        return _run_kda_with_f_b(f_a, f_b_weight, inputs)
-    return _run_kda(inputs)
+        return _run_kda_with_f_b(f_a, f_b_weight, inputs, **kwargs)
+    return _run_kda(inputs, **kwargs)
 
 
 @_requires_kda
@@ -1428,11 +1431,18 @@ def test_flydsl_kda_decode_negative_slots_do_not_modify_caches(
     )
     conv_before = inputs.conv_state.clone()
     state_before = inputs.state.clone()
+    # NaN fill: a padding row the kernel never zeroes stays non-zero.
+    out = torch.full(
+        (1, 2, _KDA_HEADS, _KDA_DIM),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=_KDA_DEVICE,
+    )
 
     if fused_f_b:
-        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs)
+        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
     else:
-        actual = _run_kda(inputs)
+        actual = _run_kda(inputs, out=out)
     torch.cuda.synchronize()
 
     assert torch.count_nonzero(actual) == 0
@@ -1465,19 +1475,15 @@ def test_flydsl_kda_decode_slot_zero_is_live(fused_f_b: bool) -> None:
 
 @_requires_kda
 @pytest.mark.parametrize("fused_f_b", [False, True])
-def test_flydsl_kda_decode_slot_check_rejects_duplicate_live_slots(
-    monkeypatch: pytest.MonkeyPatch, fused_f_b: bool
+def test_flydsl_kda_decode_validate_slots_rejects_duplicate_live_slots(
+    fused_f_b: bool,
 ) -> None:
-    from aiter.ops.flydsl import linear_attention_kernels
-
-    # AITER_KDA_DECODE_SLOT_CHECK is read at import; patch the flag it sets.
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
     f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=4)
     # Repeated padding (negative or past the cache) is allowed.
     inputs.state_indices.copy_(
         torch.tensor([-1, -1, 1000, 1000], dtype=torch.int32, device=_KDA_DEVICE)
     )
-    _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
+    _run_kda_api(fused_f_b, f_a, f_b_weight, inputs, validate_slots=True)
     torch.cuda.synchronize()
 
     inputs.state_indices.copy_(
@@ -1486,63 +1492,34 @@ def test_flydsl_kda_decode_slot_check_rejects_duplicate_live_slots(
     conv_before = inputs.conv_state.clone()
     state_before = inputs.state.clone()
     with pytest.raises(ValueError, match=r"duplicated slots: \[3\]"):
-        _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
+        _run_kda_api(fused_f_b, f_a, f_b_weight, inputs, validate_slots=True)
     torch.cuda.synchronize()
     # The check runs before launch, so neither cache is touched.
     assert torch.equal(inputs.conv_state, conv_before)
     assert torch.equal(inputs.state, state_before)
+    # Off by default: the same indices launch without a check.
+    _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
+    torch.cuda.synchronize()
 
 
 @_requires_kda
-def test_flydsl_kda_decode_slot_check_padding_slot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from aiter.ops.flydsl import linear_attention_kernels
-
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+def test_flydsl_kda_decode_validate_slots_padding_slot() -> None:
     inputs = _make_kda_inputs(batch=4)
     # SGLang's eager DP-attention padding rows share its reserved slot 0.
     inputs.state_indices.copy_(
         torch.tensor([2, 0, 0, 1], dtype=torch.int32, device=_KDA_DEVICE)
     )
     with pytest.raises(ValueError, match=r"duplicated slots: \[0\]"):
-        _run_kda(inputs)
+        _run_kda(inputs, validate_slots=True)
 
-    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
-    _run_kda(inputs)
+    _run_kda(inputs, validate_slots=True, padding_slot=0)
     torch.cuda.synchronize()
     # Other live slots still may not repeat.
     inputs.state_indices.copy_(
         torch.tensor([2, 0, 0, 2], dtype=torch.int32, device=_KDA_DEVICE)
     )
     with pytest.raises(ValueError, match=r"duplicated slots: \[2\]"):
-        _run_kda(inputs)
-
-    env = "AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"
-    monkeypatch.setenv(env, " 0 ")
-    assert linear_attention_kernels._env_padding_slot(env) == 0
-    monkeypatch.setenv(env, "")
-    assert linear_attention_kernels._env_padding_slot(env) is None
-    monkeypatch.setenv(env, "zero")
-    with pytest.raises(ValueError, match=f"{env} must be a slot index"):
-        linear_attention_kernels._env_padding_slot(env)
-
-
-def test_flydsl_kda_decode_padding_slot_env_ignored_when_check_off() -> None:
-    # A malformed debug value must not break importing the module that also
-    # hosts flydsl_gdr_decode while the slot check is off.
-    env = dict(os.environ)
-    env["AITER_KDA_DECODE_SLOT_CHECK"] = "0"
-    env["AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"] = "none"
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode",
-        ],
-        env=env,
-        check=True,
-    )
+        _run_kda(inputs, validate_slots=True, padding_slot=0)
 
 
 @_requires_kda
@@ -1575,11 +1552,18 @@ def test_flydsl_kda_decode_out_of_range_slots_do_not_modify_caches(
     state_before = inputs.state.clone()
     reference_inputs = _copy_kda_inputs(inputs)
     reference = _kda_reference(reference_inputs)
+    # NaN fill: a padding row the kernel never zeroes stays non-zero.
+    out = torch.full(
+        (1, batch, _KDA_HEADS, _KDA_DIM),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=_KDA_DEVICE,
+    )
 
     if fused_f_b:
-        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs)
+        actual = _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
     else:
-        actual = _run_kda(inputs)
+        actual = _run_kda(inputs, out=out)
     torch.cuda.synchronize()
 
     assert torch.count_nonzero(actual[:, [0, 2, 3]]) == 0
@@ -1824,6 +1808,53 @@ def test_flydsl_kda_decode_rejects_out_overlapping_an_input(
             _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
         else:
             _run_kda(inputs, out=out)
+
+
+@_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize(
+    "cache, name",
+    [
+        ("state", "conv_state"),
+        ("state", "output_gate"),
+        ("conv_state", "x"),
+        ("conv_state", "output_gate"),
+    ],
+)
+def test_flydsl_kda_decode_rejects_cache_overlapping_another_operand(
+    monkeypatch: pytest.MonkeyPatch, fused_f_b: bool, cache: str, name: str
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("An aliased cache must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_decode_kernel", unexpected_compile
+    )
+    batch = 2
+    # A BF16 state, so that its bytes can back BF16 operands.
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch, state_dtype=dtypes.bf16)
+    # The other operand is laid over the first bytes of each slot of the cache,
+    # which the kernel stores to while it reads that operand.
+    conv_channels = 3 * _KDA_HEADS * _KDA_DIM
+    pool = getattr(inputs, cache).flatten(1)
+    if name == "conv_state":
+        view = pool[:, : conv_channels * 3].view(-1, conv_channels, 3)
+    elif name == "x":
+        view = pool[:batch, :conv_channels]
+    else:
+        view = pool[:batch, : _KDA_HEADS * _KDA_DIM].view(batch, _KDA_HEADS, _KDA_DIM)
+    setattr(inputs, name, view)
+    # A cache pair is reported as (conv_state, state) whichever one is the view.
+    first, second = (
+        ("conv_state", "state") if name in ("conv_state",) else (cache, name)
+    )
+    with pytest.raises(ValueError, match=f"`{first}` must not overlap `{second}`"):
+        if fused_f_b:
+            _run_kda_with_f_b(f_a, f_b_weight, inputs)
+        else:
+            _run_kda(inputs)
 
 
 @_requires_kda
