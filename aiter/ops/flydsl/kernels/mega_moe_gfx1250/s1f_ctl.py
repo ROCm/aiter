@@ -172,6 +172,32 @@ def _wire_row(config) -> int:
     return _align_up(config.dispatch_token_nbytes + config.dispatch_scale_nbytes, 128)
 
 
+def iod_placement_reason() -> str | None:
+    """Why the stage-1 kernel and the megakernels cannot read this run's MoE
+    weights, or None.
+
+    IOD placement (``AITER_MOE_LOC``, aiter.ops.flydsl.iod_locality) re-lays
+    the weights at load time in a layout only the grouped GEMM reads. The env
+    decides, not whether a rank's weights were placed: a placement can fail on
+    one rank only, and every rank has to take the same path.
+    """
+    try:
+        from aiter.ops.flydsl import iod_locality
+    except ImportError:
+        return None
+    if not iod_locality.mode():
+        return None
+    why = "AITER_MOE_LOC lays the MoE weights out for the grouped GEMM only"
+    global _iod_warned
+    if not _iod_warned:
+        _iod_warned = True
+        _log.warning("MegaMoE: the megakernels and S1F stay off: %s", why)
+    return why
+
+
+_iod_warned = False
+
+
 def blocking_reasons(config) -> list:
     """Why this compact config cannot build the stage-1 kernel.
 
@@ -180,6 +206,9 @@ def blocking_reasons(config) -> list:
     what the instance allocates) and by ``_Stage1Fusion.arm``.
     """
     reasons = []
+    iod = iod_placement_reason()
+    if iod:
+        reasons.append(iod)
     if config.dispatch_wire != "fp4":
         reasons.append(f"needs the fp4 dispatch wire, got {config.dispatch_wire}")
     if config.world_size > 16:

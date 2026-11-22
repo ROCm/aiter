@@ -76,6 +76,11 @@ def slots_reason(config) -> str | None:
     """Why this MegaMoE cannot run the slots megakernel, or None if it can."""
     if not read_megakernel() or SLOTS_TOKENS <= 0:
         return "AITER_MEGAKERNEL is off"
+    from ..s1f_ctl import iod_placement_reason
+
+    why = iod_placement_reason()
+    if why is not None:
+        return why
     return _mega_reason(config, slots_tile(slots_tokens(config)))
 
 
@@ -83,6 +88,11 @@ def compact_reason(config) -> str | None:
     """Why this MegaMoE cannot run the compact megakernel, or None if it can."""
     if not read_megakernel():
         return "AITER_MEGAKERNEL is off"
+    from ..s1f_ctl import iod_placement_reason
+
+    why = iod_placement_reason()
+    if why is not None:
+        return why
     geo = config.geometry
     if geo.max_tokens_per_rank > 0xFFFF:
         return "X1 holds a source's rows of an expert in 16 bits"
