@@ -3,8 +3,8 @@ size inside a row's range it may report as the runtime refusing that size, and
 the command line its per-arch processes get.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
-The last test needs a gfx950 GPU: it serves a real run-only process from an
-AOT-built cache.
+``test_a16w16_aot_cache_serves_a_run_only_process`` needs a gfx950 GPU: it serves
+a real run-only process from an AOT-built cache.
 """
 
 import csv
@@ -245,10 +245,14 @@ _HGEMM_CSV = (
 _DEVICE_PROBE = """
 import torch
 if torch.version.hip is not None and torch.cuda.is_available():
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.ops.opus._arch import _device_arch_and_cu
     try:
-        print("device", get_gfx_runtime(), get_cu_num())
-    except (KeyError, RuntimeError):
+        arch, cu_num = _device_arch_and_cu(torch.device("cuda", 0))
+        # flydsl_hgemm checks get_gfx_runtime() against its build target.
+        if get_gfx_runtime() == arch:
+            print("device", arch, cu_num)
+    except (AssertionError, KeyError, RuntimeError):
         pass
 """
 _HGEMM_RUN_ONLY = """
@@ -304,20 +308,30 @@ def test_a16w16_aot_cache_serves_a_run_only_process(tmp_path):
     """A fresh FLYDSL_RUNTIME_RUN_ONLY process must load the kernel the AOT
     replay built for a tuned A16W16 row; a cache miss raises there."""
     deadline = time.monotonic() + _BUDGET_S
-    # The children must not inherit FlyDSL settings from the caller: an inherited
-    # COMPILE_ONLY would make the run-only child skip the launch, and a disabled
-    # cache would stop the AOT child from writing the entry the run-only child loads.
+    # The children must not inherit FlyDSL or arch settings from the caller: an inherited
+    # COMPILE_ONLY would make the run-only child skip the launch, a disabled cache would
+    # stop the AOT child from writing the entry the run-only child loads, and CU_NUM,
+    # FLYDSL_GPU_ARCH, ARCH or AITER_AOT_REPLAY would move the arch or CU count one child
+    # builds or looks up away from the other's.
     env = dict(
         os.environ,
         FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
         FLYDSL_RUNTIME_ENABLE_CACHE="1",
         AITER_CONFIG_GEMM_BF16=str(tmp_path / "bf16_tuned_gemm.csv"),
     )
-    for name in ("FLYDSL_RUNTIME_RUN_ONLY", "GPU_ARCHS", "COMPILE_ONLY"):
+    for name in (
+        "FLYDSL_RUNTIME_RUN_ONLY",
+        "GPU_ARCHS",
+        "COMPILE_ONLY",
+        "CU_NUM",
+        "AITER_AOT_REPLAY",
+        "FLYDSL_GPU_ARCH",
+        "ARCH",
+    ):
         env.pop(name, None)
-    # Device 0 is read in a child through the chip_info helpers gemm_a16w16 looks
-    # its row up with, so that this pytest process starts no HIP runtime for the
-    # tests that follow.
+    # Device 0 is read in a child through the helper gemm_a16w16 looks its row up
+    # with on gfx950 (device properties, not rocminfo), so that this pytest process
+    # starts no HIP runtime for the tests that follow.
     probe = _run("device probe", ["-c", _DEVICE_PROBE], env, deadline)
     lines = [line.split() for line in probe.splitlines() if line.startswith("device ")]
     _, arch, cu_num = lines[-1] if lines else (None, None, None)
