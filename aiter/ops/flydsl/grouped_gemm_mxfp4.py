@@ -358,6 +358,34 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
+    # Keep smaller receive buckets on their existing specialization.
+    fixed_n_ep = (
+        contiguous_m >= 417792
+        and SUPPORT_EXPLICIT_VGPR_PARTITION
+        and enable_ep_scatter
+        and not stage2_scatter.combine_quant_bits
+        and stage2_scatter.world_size == 4
+        and stage2_scatter.slot_stride_bytes == 10240
+        and (N, K, n_experts) == (5120, 2304, 96)
+        and a_is_fp4
+        and a_preshuffled
+        and not persistent_workers
+        and not stage1_act
+        and not stage1_quant_out
+        and not has_bias
+        and not row_major_ascale
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (256, 256, 256, 2, 2, 4)
+        and cluster_m == cluster_n == k_waves == 1
+        and tdm_spec[2] == 1
+    )
+    # The accepted Flash receive bucket favors a bounded live-route grid.
+    # Explicit worker overrides keep their requested dispatch.
+    if fixed_n_ep and stage == 2 and not any(
+        name in os.environ
+        for name in ("AITER_FLYDSL_PERSISTENT_WORKERS", "AITER_FLYDSL_PERSISTENT_WORKERS2")
+    ):
+        persistent_workers = 4096
     layout_spec = (
         int(row_major_ascale),
         int(a_row_stride_bytes),
@@ -369,7 +397,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
-    launch_spec = (int(quant_payload_preshuffled), int(N) if persistent_prefill else 0)
+    launch_spec = (
+        int(quant_payload_preshuffled),
+        int(N) if persistent_prefill or fixed_n_ep else 0,
+    )
     # Paired gfx1250 profiling favors Tensor packing for clustered workers.
     # Only the base address reaches the kernel; extents use the explicit sizes.
     # Small views retain main's large-buffer ABI and pitched/offset support.

@@ -930,6 +930,8 @@ def make_s1f_stage1(
             + f"_{g1_name}"
         )
 
+        kname += "_llvmsched_maxilp"
+
         @flyc.kernel(name=kname, known_block_size=[block, 1, 1])
         def kernel(
             arg_a2: fx.Pointer,
@@ -2280,4 +2282,7 @@ def make_s1f_stage1(
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
+    # LLVM exposes this scheduler as a string cl::opt; preserve memory waits.
+    launch.compile_hints["llvm_options"] = dict(launch.compile_hints.get("llvm_options", {}))
+    launch.compile_hints["llvm_options"]["amdgpu-sched-strategy"] = "max-ilp"
     return launch

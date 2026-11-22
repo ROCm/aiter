@@ -86,6 +86,23 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
     )
 
 
+def _bf16_prefill_threads(config, token_count, quant_bits, shared_add):
+    """Use the measured four-wave reduce for the dense Flash prefill step."""
+    if (
+        quant_bits == 0
+        and shared_add is None
+        and token_count == 16384
+        and config.max_tokens_per_rank == 16384
+        and config.stage1_fused
+        and (config.hidden_dim, config.geometry.inter_dim,
+             config.experts_per_rank, config.topk, config.world_size)
+        == (5120, 2304, 96, 6, 4)
+        and config.combine_slot_stride_for(0) == 10240
+    ):
+        return 128
+    return 0
+
+
 class _FusedScatterCombine:
     """The gemm2 epilogue P2P-scatters each row into the slot of the peer its
     token came from, packed as the step's wire; after a cross-device barrier a
@@ -170,6 +187,14 @@ class _FusedScatterCombine:
                     chunks_per_iter=chunks,
                     add_shared=add_shared,
                 )
+        self._prefill_bf16_reduce = None
+        if _bf16_prefill_threads(config, config.max_tokens_per_rank, 0, None):
+            self._prefill_bf16_reduce = _make_combine_direct_reduce(
+                experts_per_token=config.topk,
+                hidden_dim=config.hidden_dim,
+                slot_stride_nbytes=config.combine_slot_stride_for(0),
+                block_threads=128,
+            )
         self._sync = _make_combine_fused_sync(
             rank=config.rank,
             npes=config.world_size,
@@ -227,13 +252,22 @@ class _FusedScatterCombine:
             self.config.rank,
             stream,
         )
+        direct_threads = _bf16_prefill_threads(
+            self.config, routing.token_count, quant_bits, shared_add
+        )
+        reduce = (
+            self._prefill_bf16_reduce if direct_threads
+            else self._reduces[quant_bits, shared_add is not None]
+        )
         grid = (
-            (combine_direct_reduce_blocks(self.config.hidden_dim, routing.token_count),)
+            (combine_direct_reduce_blocks(
+                self.config.hidden_dim, routing.token_count, direct_threads
+            ),)
             if quant_bits == 0
             else ()
         )
         _run_compiled(
-            self._reduces[quant_bits, shared_add is not None],
+            reduce,
             res.arena.local_ptr("comb_inp"),
             res.combine_output.data_ptr(),
             routing.token_count,
