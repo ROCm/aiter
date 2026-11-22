@@ -58,7 +58,7 @@ _inside = threading.local()
 
 
 class _AotBinding:
-    __slots__ = ("cache", "key", "make_exe", "launcher")
+    __slots__ = ("cache", "key", "launcher", "make_exe")
 
     def __init__(self, cache: FlyDSLAotCache, key, make_exe, launcher):
         self.cache = cache
