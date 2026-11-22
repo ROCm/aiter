@@ -183,7 +183,7 @@ DINLINE void start_sync(const RankSignals& sg,
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                      __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
@@ -234,9 +234,12 @@ DINLINE void end_sync(const RankSignals& sg,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __ATOMIC_RELAXED,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
+        // Pair with the peer's release once, after the flag is observed.
+        if constexpr(!final_sync)
+            __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
     }
     __syncthreads();
     // use one thread to update flag
