@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import math
 from collections.abc import Iterable
 
 import flydsl.expr as fx
@@ -1287,6 +1288,63 @@ def _blocks_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) 
     return k_low <= k_high
 
 
+_EXACT_OVERLAP_MAX_RUNS = 1 << 22
+
+
+def _byte_runs(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Return (start byte of every run, run length in bytes) of a tensor.
+
+    Dimensions that follow each other in memory merge into one run, so the
+    runs are the dense pieces the tensor is made of, holes between them kept.
+    All runs have the same length. Starts are int64 on the CPU.
+    """
+    es = tensor.element_size()
+    run = 1
+    rows = []
+    for size, stride in sorted(
+        (
+            (size, stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+            if size > 1
+        ),
+        key=lambda dim: dim[1],
+    ):
+        if stride == run:
+            run *= size
+        else:
+            rows.append((size, stride))
+    starts = torch.tensor([tensor.data_ptr()], dtype=torch.int64)
+    for size, stride in rows:
+        starts = (
+            starts[:, None] + torch.arange(size, dtype=torch.int64) * (stride * es)
+        ).reshape(-1)
+    return starts, run * es
+
+
+def _exactly_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors share a byte, comparing their dense runs one by one.
+
+    Slower than :func:`_blocks_overlap`, so only the cases it cannot rule out
+    come here (an error path, or interleaved layouts such as per-head rows).
+    Past ``_EXACT_OVERLAP_MAX_RUNS`` runs it answers True, like the span check.
+    """
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    runs = 1
+    for tensor in (a, b):
+        sizes = [size for size in tensor.shape if size > 1]
+        runs *= max(1, math.prod(sizes) // max(1, tensor.shape[-1]))
+    if runs > _EXACT_OVERLAP_MAX_RUNS:
+        return True
+    a_starts, a_len = _byte_runs(a)
+    b_starts, b_len = _byte_runs(b)
+    b_sorted = torch.sort(b_starts).values
+    # The last b run starting before a run's end is the one reaching furthest.
+    below = torch.searchsorted(b_sorted, a_starts + a_len)
+    last = b_sorted[(below - 1).clamp(min=0)]
+    return bool(((below > 0) & (last + b_len > a_starts)).any())
+
+
 def _check_no_alias(
     written: tuple[tuple[str, torch.Tensor | None], ...],
     read: tuple[tuple[str, torch.Tensor], ...],
@@ -1300,15 +1358,20 @@ def _check_no_alias(
     read_blocks = []
     for name, tensor in read:
         blocks = _slot_blocks(tensor)
-        read_blocks.append((name, blocks, _blocks_span(blocks)))
+        read_blocks.append((name, tensor, blocks, _blocks_span(blocks)))
     for w_name, w in written:
         if w is None:
             continue
         w_blocks = _slot_blocks(w)
         w_lo, w_hi = _blocks_span(w_blocks)
-        for r_name, r_blocks, (r_lo, r_hi) in read_blocks:
+        for r_name, r_tensor, r_blocks, (r_lo, r_hi) in read_blocks:
             # Overall spans first: most operands live in other allocations.
-            if w_lo < r_hi and r_lo < w_hi and _blocks_overlap(w_blocks, r_blocks):
+            if (
+                w_lo < r_hi
+                and r_lo < w_hi
+                and _blocks_overlap(w_blocks, r_blocks)
+                and _exactly_overlap(w, r_tensor)
+            ):
                 raise ValueError(f"`{w_name}` must not overlap `{r_name}`.")
 
 
@@ -1732,11 +1795,14 @@ def flydsl_kda_decode_with_f_b(
     opt-in ``validate_slots`` / ``padding_slot`` as :func:`flydsl_kda_decode`.
     A caller-supplied ``out`` must not overlap ``f_a`` or ``f_b_weight`` either.
 
-    Fusing saves the projection launch, which wins at decode batch sizes, but each
-    head re-reads the whole ``f_a`` row. On MI355X (CUDA-graph replay) it beats a
-    BF16 ``F.linear`` followed by :func:`flydsl_kda_decode` by 3-4 us up to batch 32,
-    is within 6% at 64-96, and is 2-8% slower at 128 (more with a BF16 state).
-    Callers serving larger batches should project separately.
+    Fusing saves the projection launch, which wins at small decode batches, but each
+    head re-reads the whole ``f_a`` row. GPU time on MI355X from the in-tree sweep
+    (``python op_tests/test_flydsl_linear_attention.py``, ``flydsl_f_b`` against
+    ``flydsl_proj``, the BF16 ``F.linear`` followed by :func:`flydsl_kda_decode`):
+    the fused call is faster by 2-5 us up to batch 32, and slower by 6-8% at batch
+    64-256 with an FP32 state (6-25% with a BF16 state). Callers serving batches of
+    64 or more should project separately. These are GPU times: the host-side validation
+    (about 50 us per eager call on MI355X, none under CUDA graph replay) is not in them.
     """
     if f_a.ndim != 2:
         raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")

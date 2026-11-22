@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 import pytest
@@ -1039,6 +1039,22 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             flydsl_tols,
             True,
         ),
+        # The split path the fused projection replaces: a BF16 GEMM into raw_g,
+        # then the decode kernel. Both launches are timed.
+        "flydsl_proj": (
+            lambda inputs, out: _run_kda(
+                replace(
+                    inputs,
+                    raw_g=F.linear(f_a, f_b_weight.view(-1, _KDA_DIM)).view(
+                        1, batch, _KDA_HEADS, _KDA_DIM
+                    ),
+                ),
+                out,
+            ),
+            False,
+            flydsl_tols,
+            True,
+        ),
     }
     # The Triton kernel takes the conv cache as SGLang's transposed view only.
     if include_triton and conv_layout == "width_major":
@@ -1158,6 +1174,7 @@ def test_flydsl_kda_decode_matches_reference(
     )
     assert result["flydsl err"] <= _kda_err_ratio(batch)
     assert result["flydsl_f_b err"] <= _kda_err_ratio(batch)
+    assert result["flydsl_proj err"] <= _kda_err_ratio(batch)
 
 
 def _run_kda_api(
@@ -1270,10 +1287,13 @@ def test_flydsl_kda_decode_graph_replay(
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        # validate_slots=True is skipped during capture: its host sync would fail here.
         if fused_f_b:
-            _run_kda_with_f_b(graph_f_a, f_b_weight, graph_inputs, out=out)
+            _run_kda_with_f_b(
+                graph_f_a, f_b_weight, graph_inputs, out=out, validate_slots=True
+            )
         else:
-            _run_kda(graph_inputs, out=out)
+            _run_kda(graph_inputs, out=out, validate_slots=True)
 
     generator = torch.Generator(device=_KDA_DEVICE).manual_seed(7)
     for step in range(3):
@@ -1860,27 +1880,42 @@ def test_flydsl_kda_decode_rejects_cache_overlapping_another_operand(
 @_requires_kda
 @pytest.mark.parametrize(
     "fused_f_b, neighbor",
-    [(False, "output_gate"), (False, "raw_g"), (True, "output_gate")],
+    [
+        (False, "output_gate"),
+        (False, "raw_g"),
+        (True, "output_gate"),
+        (False, "output_gate_heads"),
+        (True, "output_gate_heads"),
+    ],
 )
 def test_flydsl_kda_decode_accepts_out_interleaved_with_an_input(
     fused_f_b: bool, neighbor: str
 ) -> None:
     batch = 2
     f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
-    # Per token, one pool row holds the input and the next one holds out: the
-    # byte ranges interleave but share nothing.
-    pool = torch.empty(
-        (batch, 2, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
-    )
-    # NaN fill: an out row the kernel never writes fails the comparison.
-    pool[:, 1].fill_(float("nan"))
-    if neighbor == "output_gate":
-        pool[:, 0].copy_(inputs.output_gate)
-        inputs.output_gate = pool[:, 0]
+    # Per token (or, for "_heads", per head), one pool row holds the input and
+    # the next one holds out: the byte ranges interleave but share nothing.
+    if neighbor == "output_gate_heads":
+        pool = torch.empty(
+            (batch, _KDA_HEADS, 2, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
+        )
+        pool[:, :, 1].fill_(float("nan"))
+        pool[:, :, 0].copy_(inputs.output_gate)
+        inputs.output_gate = pool[:, :, 0]
+        out = pool[:, :, 1].unsqueeze(0)
     else:
-        pool[:, 0].copy_(inputs.raw_g[0])
-        inputs.raw_g = pool[:, 0].unsqueeze(0)
-    out = pool[:, 1].unsqueeze(0)
+        pool = torch.empty(
+            (batch, 2, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
+        )
+        # NaN fill: an out row the kernel never writes fails the comparison.
+        pool[:, 1].fill_(float("nan"))
+        if neighbor == "output_gate":
+            pool[:, 0].copy_(inputs.output_gate)
+            inputs.output_gate = pool[:, 0]
+        else:
+            pool[:, 0].copy_(inputs.raw_g[0])
+            inputs.raw_g = pool[:, 0].unsqueeze(0)
+        out = pool[:, 1].unsqueeze(0)
     reference_inputs = _copy_kda_inputs(inputs)
     reference = _kda_reference(reference_inputs)
     if fused_f_b:
