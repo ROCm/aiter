@@ -76,6 +76,7 @@ def compile_ep_mega(
     combine="bf16",
     transpose_scales=True,
     swiglu_limit=0.0,
+    wq="fp8",
 ):
     """xcd_queues: one task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a
     workgroup whose queue is empty takes tasks from the next queues. lag counts units (block groups) of one queue.
@@ -96,6 +97,7 @@ def compile_ep_mega(
     chunks; for GateUp and Down, the shader clocks (s_memtime) from wait done to the end, to the K loop's start and to
     its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split).
     swiglu_limit > 0: the GateUp activation clamps gate and up (see gateup_task_emitter).
+    wq: "fp8" weights, or "fp4": a8w4's prepare_weights (fd2) output, decoded to FP8 in the loaders.
     topk need not be a power of two: the producers then divide a route index by it instead of shifting.
     """
     H, I = hidden_dim, inter_dim
@@ -113,6 +115,7 @@ def compile_ep_mega(
         a_scale_token_major=not transpose_scales,
         store_aux=16 if relaxed else 0,
         swiglu_limit=float(swiglu_limit),
+        wq=wq,
     )
     down = down_task_emitter(
         H,
@@ -124,6 +127,7 @@ def compile_ep_mega(
         sorted_a2=True,
         remote_token_shift=token_shift,
         fp8_routes=combine == "fp8",
+        wq=wq,
     )
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
@@ -1049,6 +1053,7 @@ def ep_mega(
         combine=op.combine,
         transpose_scales=transpose_scales,
         swiglu_limit=op.swiglu_limit,
+        wq=op.wq,
     )
     grid = int(os.environ.get("MEGA_GRID", "0")) or -(
         -mega_grid(op, producers) // tasks_per_wg

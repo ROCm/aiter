@@ -35,6 +35,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ..cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
 from .util import BufferTensor, pack_bf16x2_rne
 
 SORT_BLOCK_M = 256
@@ -112,6 +113,7 @@ def gateup_task_emitter(
     a_scale_token_major=False,
     store_aux=0,
     swiglu_limit=0.0,
+    wq="fp8",
 ):
     """One GateUp task (256 sorted rows x 128 gate + 128 up columns) for use inside a kernel.
 
@@ -132,6 +134,14 @@ def gateup_task_emitter(
     b_k_bytes = TILE_K * 16
     scale_rows_b = 2 * I // 128
     stream_a = layout == "2x4_pf1"
+    # wq "fp4": W in a8w4's fd2 form (weights.prepare_weights). A 16-row group's 128-K
+    # chunk is 1 KiB: lane q * 16 + r holds row r's 32-K group q, 8 nibbles per dword in
+    # K order. Each loader thread reads the 8 B of the unit it would load in fp8 and
+    # decodes them (group scale folded in) right before the LDS write; the per-channel
+    # exponent is applied in the epilogue.
+    FP4 = wq == "fp4"
+    assert wq in ("fp8", "fp4") and (stream_a or not FP4), (wq, layout)
+    w_k_bytes = TILE_K * 8 if FP4 else b_k_bytes
     # 16-row M / N slices per wave; N slices are gate first, then the matching up slices.
     m_slices = 8 if stream_a else 4
     n_slices = 32 // m_slices
@@ -301,6 +311,22 @@ def gateup_task_emitter(
                 + lane * 16
                 for q in range_constexpr(4)
             ]
+            if const_expr(FP4):
+                # The fp8 unit of this thread is row lane % 16 of 32-K group q, half h; the
+                # packet's wave-uniform part of both offsets goes in soffset (VGPR budget).
+                unit_lane = (wave % 2 * 2 + lane // 32) * 16 + lane % 16
+                w_voffset = unit_lane * 16 + lane // 16 % 2 * 8
+                s_voffset = unit_lane * 4
+                loader_s = _uniform(loader)
+                w_soffsets = [
+                    (side_rows[q // 2] + (loader_s * 2 + q % 2) * 16) * (K // 2)
+                    for q in range_constexpr(4)
+                ]
+                # scale dword (32-row pair, 256-K block, lane) of the task's rows; its
+                # byte (k % 2) * 2 + 16-row group % 2, and group % 2 is q % 2
+                s_soffsets = [
+                    (side_rows[q // 2] // 32 + loader_s) * K for q in range_constexpr(4)
+                ]
             b_write = _lds_dwords(loader * 16 + lane % 16, wave % 2 * 4 + lane // 16)
             a_write = _lds_dwords(copy_row, copy_col)
             # Per (distinct packet-relative row, half_k) read addresses; the packet goes in the immediate offset.
@@ -358,21 +384,33 @@ def gateup_task_emitter(
 
             def task_ops(n_tile, expert, a_offsets, sa_offsets, sb_lanes):
                 """Global loads and B scales of one task."""
+                w_dwords = 2 * I * K // (8 if FP4 else 4)
                 b_tensor = fx.rocdl.make_buffer_tensor(
                     fx.make_view(
                         pB
                         + (
-                            fx.Int64(expert) * (2 * I * K // 4)
-                            + fx.Int64(n_tile) * (TILE_N * K // 4)
+                            fx.Int64(expert) * w_dwords
+                            + fx.Int64(n_tile) * (TILE_N * w_dwords // (2 * I))
                         ),
                         fx.make_layout(1, 1),
                     ),
                     max_size=False,
-                    num_records_bytes=(I + TILE_N) * K,
+                    num_records_bytes=(I + TILE_N) * K // (2 if FP4 else 1),
                 )
                 b_packet = BufferTensor(
-                    fx.make_view(fx.get_iter(b_tensor), fx.make_layout(4, 1))
+                    fx.make_view(
+                        fx.get_iter(b_tensor), fx.make_layout(2 if FP4 else 4, 1)
+                    )
                 )
+                if const_expr(FP4):
+                    # scale dwords from the task's first 32-row pair on
+                    sb_rsrc = rsrc_of(
+                        pScaleB
+                        + (fx.Int64(expert) * (2 * I) + fx.Int64(n_tile) * TILE_N)
+                        // 32
+                        * (K // 4),
+                        (I + TILE_N) * K // 32,
+                    )
 
                 def load_a(k_block, packet):
                     return a_packet.load(
@@ -380,9 +418,31 @@ def gateup_task_emitter(
                     )
 
                 def load_b(k_block, packet):
-                    return b_packet.load(
-                        voffset_bytes=b_voffsets[packet],
-                        soffset_bytes=k_block * b_k_bytes,
+                    if const_expr(not FP4):
+                        return b_packet.load(
+                            voffset_bytes=b_voffsets[packet],
+                            soffset_bytes=k_block * b_k_bytes,
+                        )
+                    w = Vec(
+                        b_packet.load(
+                            voffset_bytes=w_voffset,
+                            soffset_bytes=k_block * w_k_bytes + w_soffsets[packet],
+                        )
+                    )
+                    s = fx.Int32(
+                        rocdl.raw_ptr_buffer_load(
+                            T.i32,
+                            sb_rsrc,
+                            fx.Int32(s_voffset).ir_value(),
+                            fx.Int32(
+                                (k_block >> 1) * 256 + s_soffsets[packet]
+                            ).ir_value(),
+                            zero,
+                        )
+                    )
+                    # the stage keeps its 4 dwords; the last one is dead after decode_b
+                    return Vec.from_elements(
+                        [fx.Int32(w[0]), fx.Int32(w[1]), s, s], fx.Int32
                     )
 
                 def load_scale_a(k_block, j):
@@ -401,6 +461,8 @@ def gateup_task_emitter(
                     return Vec.from_elements([fx.Float32(value)], fx.Float32)
 
                 def scale_b(side, k_block):
+                    if const_expr(FP4):  # folded into the decode and the epilogue
+                        return fx.Float32(1.0)
                     index = fx.Int32(side * KB) + k_block
                     return fx.Float32(
                         rocdl.readlane(T.f32, sb_lanes.ir_value(), index.ir_value())
@@ -455,11 +517,30 @@ def gateup_task_emitter(
                         s_stage[None, packet].load()
                     )
 
-            def write_h(packet, value):
+            def write_h(packet, value, k_parity=0):
+                """k_parity: parity of the K block of `value` (fp4 picks its scale byte)."""
                 if const_expr(stream_a):
-                    lds_view(b_write + (B_BASE + packet * PACKET_DWORDS)).store(value)
+                    lds_view(b_write + (B_BASE + packet * PACKET_DWORDS)).store(
+                        decode_b(value, (k_parity * 2 + packet % 2) * 0x01010101)
+                    )
                 else:
                     lds_view(a_write + packet * PACKET_DWORDS).store(value)
+
+            def decode_b(value, selector):
+                """fp4: the loaded [w0, w1, scale dword, -] -> 16 B of fp8; `selector`
+                replicates the index of the scale byte."""
+                if const_expr(not FP4):
+                    return value
+                v = Vec(value)
+                p = fx.Uint32(fx.Int32(v[2]))
+                lut = _fp8_lut_predelta(_perm_u32(p, p, fx.Uint32(selector)))
+                words = []
+                for i in range_constexpr(2):
+                    pair = Vec(_fp4x8_to_fp8x8_fast(fx.Int32(v[i]), lut)).bitcast(
+                        fx.Int32
+                    )
+                    words += [fx.Int32(pair[0]), fx.Int32(pair[1])]
+                return Vec.from_elements(words, fx.Int32)
 
             def read_held():
                 # 2x4: the four N slices of B; 4x2: the four M slices of A.
@@ -488,9 +569,14 @@ def gateup_task_emitter(
                         write_s(3)
                     else:
                         write_s(stage - 1)
-                        write_h(stage - 1, h_stage[None, (stage - 1) % 2].load())
+                        # the held packets are K block k_next (unused when clamped)
+                        write_h(
+                            stage - 1,
+                            h_stage[None, (stage - 1) % 2].load(),
+                            1 - parity,
+                        )
                         if const_expr(stage == 3):
-                            write_h(3, h_stage[None, 1].load())
+                            write_h(3, h_stage[None, 1].load(), 1 - parity)
                     rocdl.sched_barrier(0)
                     if const_expr(stage == 0):
                         read_held()
@@ -692,12 +778,8 @@ def gateup_task_emitter(
                 halves = [
                     pack_bf16x2_rne(
                         silu_mul(
-                            Vec(accum[None, acc_index(m_slice, gate + side)].load()),
-                            Vec(
-                                accum[
-                                    None, acc_index(m_slice, gate_slices + gate + side)
-                                ].load()
-                            ),
+                            acc_values(m_slice, gate + side),
+                            acc_values(m_slice, gate_slices + gate + side),
                         )
                     )
                     for side in range_constexpr(2)
@@ -786,12 +868,8 @@ def gateup_task_emitter(
                 values = [
                     [
                         silu_mul(
-                            Vec(accum[None, acc_index(m_slice, gate)].load()),
-                            Vec(
-                                accum[
-                                    None, acc_index(m_slice, gate_slices + gate)
-                                ].load()
-                            ),
+                            acc_values(m_slice, gate),
+                            acc_values(m_slice, gate_slices + gate),
                         )
                         for gate in range_constexpr(gate_slices)
                     ]
@@ -872,11 +950,50 @@ def gateup_task_emitter(
                 )
 
             block, n_tile, expert = coords()
+
+            def channel_factors():
+                """fp4: f32 2**(exp - 132) of the 4 columns this lane holds in each N slice
+                (2x4: slice s is side s // 2, 16-row group wave_n * 2 + s % 2)."""
+                exp_rsrc = rsrc_of(
+                    pScaleB + fx.Int64(num_experts * 2 * I * K // 128),
+                    num_experts * 2 * I * 4,
+                )
+                return [
+                    [
+                        _channel_factor(
+                            load_i32(
+                                exp_rsrc,
+                                (
+                                    expert * (2 * I)
+                                    + side_rows[n_slice // gate_slices]
+                                    + n_tile * TILE_N
+                                    + (wave_n * 2 + n_slice % 2) * 16
+                                    + lane // 16 * 4
+                                    + element
+                                )
+                                * 4,
+                            )
+                        )
+                        for element in range_constexpr(4)
+                    ]
+                    for n_slice in range_constexpr(n_slices)
+                ]
+
+            def acc_values(m_slice, n_slice):
+                values = Vec(accum[None, acc_index(m_slice, n_slice)].load())
+                if const_expr(not FP4):
+                    return values
+                return [values[e] * factors[n_slice][e] for e in range_constexpr(4)]
+
             a_offsets, sa_offsets = task_offsets(
                 route_ids(block, copy_rows()), route_ids(block, slice_lane_rows())
             )
             ops = task_ops(
-                n_tile, expert, a_offsets, sa_offsets, task_scale_b(expert, n_tile)
+                n_tile,
+                expert,
+                a_offsets,
+                sa_offsets,
+                None if FP4 else task_scale_b(expert, n_tile),
             )
             for pro_packet in range_constexpr(4):
                 load_s(ops, 0, pro_packet)
@@ -894,6 +1011,9 @@ def gateup_task_emitter(
             if const_expr(kloop_hook is not None):
                 kloop_hook()
             k_loop(ops)
+            if const_expr(FP4):
+                # after the K loop, which has no register left
+                factors = channel_factors()
             if const_expr(epilog_hook is not None):
                 epilog_hook()
             if const_expr(fp8_out):

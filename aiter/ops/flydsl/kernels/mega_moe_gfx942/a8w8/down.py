@@ -37,6 +37,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ..cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
 from .gateup import (
     FP8_MAX,
     LAYOUTS,
@@ -48,6 +49,7 @@ from .gateup import (
     TOKEN_MASK,
     _lds_dwords,
     _load_i32,
+    _uniform,
 )
 from .util import BufferTensor, pack_bf16x2_rne
 
@@ -113,6 +115,7 @@ def down_task_emitter(
     single_store=False,
     remote_token_shift=0,
     fp8_routes=False,
+    wq="fp8",
 ):
     """One Down task (256 sorted rows x 256 hidden columns) for use inside a kernel.
 
@@ -137,6 +140,11 @@ def down_task_emitter(
     b_k_bytes = TILE_K * 16
     scale_rows_b = H // 128
     stream_a = layout == "2x4_pf1"
+    # wq "fp4": W2 in a8w4's fd2 form, decoded right before the LDS write (see
+    # gateup_task_emitter); the per-channel exponent joins the routing weight.
+    FP4 = wq == "fp4"
+    assert wq in ("fp8", "fp4") and not (FP4 and fp8_routes), (wq, fp8_routes)
+    w_k_bytes = TILE_K * 8 if FP4 else b_k_bytes
     # 16-row M / N slices per wave.
     m_slices = 8 if stream_a else 4
     n_slices = 32 // m_slices
@@ -264,39 +272,62 @@ def down_task_emitter(
                 fx.make_view(fx.get_iter(a_tensor), fx.make_layout(4, 1))
             )
             scale_a_rsrc = _rsrc_of(pScaleA, a2_rows * (KB * 4))
+            w_dwords = H * K // (8 if FP4 else 4)
             b_tensor = fx.rocdl.make_buffer_tensor(
                 fx.make_view(
                     pB
                     + (
-                        fx.Int64(expert) * (H * K // 4)
-                        + fx.Int64(n_tile) * (TILE_N * K // 4)
+                        fx.Int64(expert) * w_dwords
+                        + fx.Int64(n_tile) * (TILE_N * w_dwords // H)
                     ),
                     fx.make_layout(1, 1),
                 ),
                 max_size=False,
-                num_records_bytes=TILE_N * K,
+                num_records_bytes=TILE_N * K // (2 if FP4 else 1),
             )
             b_packet = BufferTensor(
-                fx.make_view(fx.get_iter(b_tensor), fx.make_layout(4, 1))
+                fx.make_view(fx.get_iter(b_tensor), fx.make_layout(2 if FP4 else 4, 1))
             )
             # A wave's columns lie in one 128-column scale group: B scale of K block k in lane k.
             scale_group = n_tile * 2 + (wave_n // 2 if stream_a else wave_n)
             scale_b_offset = ((expert * scale_rows_b + scale_group) * KB + lane) * 4
-            sb_lanes = fx.Float32(
-                rocdl.raw_ptr_buffer_load(
-                    T.f32,
-                    _rsrc_of(pScaleB, num_experts * scale_rows_b * (KB * 4)),
-                    (lane < KB).select(scale_b_offset, fx.Int32(OOB_OFFSET)).ir_value(),
-                    zero,
-                    zero,
+            if const_expr(not FP4):
+                sb_lanes = fx.Float32(
+                    rocdl.raw_ptr_buffer_load(
+                        T.f32,
+                        _rsrc_of(pScaleB, num_experts * scale_rows_b * (KB * 4)),
+                        (lane < KB)
+                        .select(scale_b_offset, fx.Int32(OOB_OFFSET))
+                        .ir_value(),
+                        zero,
+                        zero,
+                    )
                 )
-            )
 
             loader = wave // 2
             b_voffsets = [
                 weight_group(q, loader) * 16 * K + wave % 2 * 1024 + lane * 16
                 for q in range_constexpr(4)
             ]
+            if const_expr(FP4):
+                # The fp8 unit of this thread is row lane % 16 of 32-K group q, half h; the
+                # packet's wave-uniform part of both offsets goes in soffset (VGPR budget).
+                unit_lane = (wave % 2 * 2 + lane // 32) * 16 + lane % 16
+                w_voffset = unit_lane * 16 + lane // 16 % 2 * 8
+                s_voffset = unit_lane * 4
+                loader_s = _uniform(loader)
+                groups = [weight_group(q, loader_s) for q in range_constexpr(4)]
+                w_soffsets = [group * 16 * (K // 2) for group in groups]
+                # scale dword (32-row pair, 256-K block, lane); byte (k % 2) * 2 + group % 2
+                sb_rsrc = _rsrc_of(
+                    pScaleB
+                    + (fx.Int64(expert) * H + fx.Int64(n_tile) * TILE_N)
+                    // 32
+                    * (K // 4),
+                    TILE_N * K // 32,
+                )
+                s_soffsets = [group // 2 * K for group in groups]
+                group_parities = [group % 2 for group in groups]
             b_write = _lds_dwords(loader * 16 + lane % 16, wave % 2 * 4 + lane // 16)
             a_write = _lds_dwords(copy_row, copy_col)
             # Per (distinct packet-relative row, half_k) read addresses; the packet goes in the immediate offset.
@@ -358,9 +389,47 @@ def down_task_emitter(
                 )
 
             def load_b(k_block, packet):
-                return b_packet.load(
-                    voffset_bytes=b_voffsets[packet], soffset_bytes=k_block * b_k_bytes
+                if const_expr(not FP4):
+                    return b_packet.load(
+                        voffset_bytes=b_voffsets[packet],
+                        soffset_bytes=k_block * b_k_bytes,
+                    )
+                w = Vec(
+                    b_packet.load(
+                        voffset_bytes=w_voffset,
+                        soffset_bytes=k_block * w_k_bytes + w_soffsets[packet],
+                    )
                 )
+                s = fx.Int32(
+                    rocdl.raw_ptr_buffer_load(
+                        T.i32,
+                        sb_rsrc,
+                        fx.Int32(s_voffset).ir_value(),
+                        fx.Int32((k_block >> 1) * 256 + s_soffsets[packet]).ir_value(),
+                        zero,
+                    )
+                )
+                # the stage keeps its 4 dwords; the last one is dead after decode_b
+                return Vec.from_elements(
+                    [fx.Int32(w[0]), fx.Int32(w[1]), s, s], fx.Int32
+                )
+
+            def decode_b(value, packet, k_parity):
+                """fp4: the loaded [w0, w1, scale dword, -] of `packet`, K block parity
+                `k_parity` -> 16 B of fp8."""
+                if const_expr(not FP4):
+                    return value
+                v = Vec(value)
+                p = fx.Uint32(fx.Int32(v[2]))
+                selector = (group_parities[packet] + k_parity * 2) * 0x01010101
+                lut = _fp8_lut_predelta(_perm_u32(p, p, fx.Uint32(selector)))
+                words = []
+                for i in range_constexpr(2):
+                    pair = Vec(_fp4x8_to_fp8x8_fast(fx.Int32(v[i]), lut)).bitcast(
+                        fx.Int32
+                    )
+                    words += [fx.Int32(pair[0]), fx.Int32(pair[1])]
+                return Vec.from_elements(words, fx.Int32)
 
             def load_scale_a(k_block, j):
                 value = rocdl.raw_ptr_buffer_load(
@@ -373,6 +442,8 @@ def down_task_emitter(
                 return Vec.from_elements([fx.Float32(value)], fx.Float32)
 
             def scale_b(k_block):
+                if const_expr(FP4):  # folded into the decode and the epilogue
+                    return fx.Float32(1.0)
                 return fx.Float32(
                     rocdl.readlane(
                         T.f32, sb_lanes.ir_value(), fx.Int32(k_block).ir_value()
@@ -407,19 +478,22 @@ def down_task_emitter(
                     load_b(k_block, packet) if stream_a else load_a(k_block, packet)
                 )
 
-            def write_s(packet):
+            def write_s(packet, k_parity=0):
+                """k_parity: parity of the packet's K block (fp4 picks its scale byte)."""
                 if const_expr(stream_a):
                     lds_view(a_write + packet * PACKET_DWORDS).store(
                         s_stage[None, packet].load()
                     )
                 else:
                     lds_view(b_write + (B_BASE + packet * PACKET_DWORDS)).store(
-                        s_stage[None, packet].load()
+                        decode_b(s_stage[None, packet].load(), packet, k_parity)
                     )
 
-            def write_h(packet, value):
+            def write_h(packet, value, k_parity=0):
                 if const_expr(stream_a):
-                    lds_view(b_write + (B_BASE + packet * PACKET_DWORDS)).store(value)
+                    lds_view(b_write + (B_BASE + packet * PACKET_DWORDS)).store(
+                        decode_b(value, packet, k_parity)
+                    )
                 else:
                     lds_view(a_write + packet * PACKET_DWORDS).store(value)
 
@@ -446,13 +520,19 @@ def down_task_emitter(
                 k_next = (k_block + 1 < KB).select(k_block + 1, KB - 1)
                 previous = last_pair
                 for stage in range_constexpr(4):
+                    # packet 3 is this K block's, the others K block k_next's (unused
+                    # when clamped)
                     if const_expr(stage == 0):
-                        write_s(3)
+                        write_s(3, parity)
                     else:
-                        write_s(stage - 1)
-                        write_h(stage - 1, h_stage[None, (stage - 1) % 2].load())
+                        write_s(stage - 1, 1 - parity)
+                        write_h(
+                            stage - 1,
+                            h_stage[None, (stage - 1) % 2].load(),
+                            1 - parity,
+                        )
                         if const_expr(stage == 3):
-                            write_h(3, h_stage[None, 1].load())
+                            write_h(3, h_stage[None, 1].load(), 1 - parity)
                     rocdl.sched_barrier(0)
                     if const_expr(stage == 0):
                         read_held()
@@ -572,11 +652,43 @@ def down_task_emitter(
                 if group == 0:
                     barrier()
 
+            # fp4: f32 2**(exp - 132) of the 4 columns this lane holds in each N slice
+            def channel_factors():
+                exp_rsrc = _rsrc_of(
+                    pScaleB + fx.Int64(num_experts * H * K // 128), num_experts * H * 4
+                )
+                return [
+                    [
+                        _channel_factor(
+                            load_i32(
+                                exp_rsrc,
+                                (
+                                    expert * H
+                                    + n_tile * TILE_N
+                                    + (wave_n * (4 if stream_a else 8) + n_slice) * 16
+                                    + lane // 16 * 4
+                                    + element
+                                )
+                                * 4,
+                            )
+                        )
+                        for element in range_constexpr(4)
+                    ]
+                    for n_slice in range_constexpr(n_slices)
+                ]
+
             def weighted_words(m_slice, n_slice, weight):
                 """BF16 of routing weight * the 4 consecutive columns this lane holds (row lane % 16)."""
                 values = Vec(accum[None, acc_index(m_slice, n_slice)].load())
+                if const_expr(not FP4):
+                    return pack_bf16x2_rne(
+                        [values[element] * weight for element in range_constexpr(4)]
+                    )
                 return pack_bf16x2_rne(
-                    [values[element] * weight for element in range_constexpr(4)]
+                    [
+                        values[element] * (weight * factors[n_slice][element])
+                        for element in range_constexpr(4)
+                    ]
                 )
 
             # Prologue: K block 0 into LDS.
@@ -613,6 +725,10 @@ def down_task_emitter(
                 run_k(KB % 2, k_block)
                 run_k(1 - KB % 2, k_block + 1)
 
+            if const_expr(FP4):
+                # after the K loop, which has no register left, and before the
+                # epilogue's asm atomics, which LLVM's vmcnt waits do not count
+                factors = channel_factors()
             if const_expr(epilog_hook is not None):
                 epilog_hook()
             # Output rows are reloaded here (not kept through the K loop) so the loads overlap the drain.

@@ -74,6 +74,7 @@ class MegaMoEGfx942A8W8:
         topk,
         max_tok_per_rank,
         swiglu_limit=0.0,
+        wq="fp8",
         w1=None,
         w1_scale=None,
         w2=None,
@@ -94,6 +95,8 @@ class MegaMoEGfx942A8W8:
             raise ValueError(
                 f"swiglu_limit={swiglu_limit}: expected >= 0 (0: no clamp)"
             )
+        if wq not in ("fp8", "fp4"):
+            raise ValueError(f"wq={wq!r}: expected 'fp8' or 'fp4'")
         import mori.shmem as ms
 
         import aiter
@@ -101,6 +104,7 @@ class MegaMoEGfx942A8W8:
         self.rank, self.world, self.topk, self.experts = rank, world_size, topk, experts
         self.hidden, self.inter = model_dim, inter_dim
         self.swiglu_limit = float(swiglu_limit)
+        self.wq = wq
         self.combine = "bf16"
         self.token_shift = max(int(max_tok_per_rank - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
@@ -161,7 +165,9 @@ class MegaMoEGfx942A8W8:
     def bind_weights(self, w1, w1_scale, w2, w2_scale):
         """This rank's experts: w1 [32, 2I, H] / w2 [32, H, I] FP8 (float8_e4m3fnuz) in aiter's
         shuffle_weight(layout=(16, 16)) form, gate rows before up rows; w1_scale [32, 2I/128, H/128] and
-        w2_scale [32, H/128, I/128] FP32 dequant scales of the 128x128 blocks."""
+        w2_scale [32, H/128, I/128] FP32 dequant scales of the 128x128 blocks.
+        wq "fp4": a8w4's prepare_weights output instead, w1 [32, 2I, H/2] / w2 [32, H, I/2] bytes and
+        w1_scale [32 * 2I * (H/32 + 4)] / w2_scale [32 * H * (I/32 + 4)] bytes."""
         H, I = self.hidden, self.inter
         expect = {
             "w1": (w1, (E_LOCAL, 2 * I, H), torch.float8_e4m3fnuz),
@@ -169,16 +175,23 @@ class MegaMoEGfx942A8W8:
             "w2": (w2, (E_LOCAL, H, I), torch.float8_e4m3fnuz),
             "w2_scale": (w2_scale, (E_LOCAL, H // 128, I // 128), torch.float32),
         }
+        if self.wq == "fp4":
+            expect = {
+                "w1": (w1, (E_LOCAL, 2 * I, H // 2), None),
+                "w1_scale": (w1_scale, (E_LOCAL * 2 * I * (H // 32 + 4),), None),
+                "w2": (w2, (E_LOCAL, H, I // 2), None),
+                "w2_scale": (w2_scale, (E_LOCAL * H * (I // 32 + 4),), None),
+            }
         for name, (t, shape, dtype) in expect.items():
             if (
                 tuple(t.shape) != shape
-                or t.dtype != dtype
+                or (t.dtype != dtype if dtype is not None else t.element_size() != 1)
                 or not t.is_contiguous()
                 or t.device != self.dev
             ):
                 raise ValueError(
-                    f"{name} {tuple(t.shape)} {t.dtype} on {t.device}: expected contiguous {shape} {dtype} on "
-                    f"{self.dev}"
+                    f"{name} {tuple(t.shape)} {t.dtype} on {t.device}: expected contiguous {shape} "
+                    f"{dtype or 'bytes'} on {self.dev}"
                 )
         self.w1, self.w1_scale, self.w2, self.w2_scale = w1, w1_scale, w2, w2_scale
 
