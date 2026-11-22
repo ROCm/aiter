@@ -17,6 +17,7 @@ import multiprocessing as mp
 import statistics
 import struct
 import time
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -32,7 +33,7 @@ def unavailable_reason(tp_size: int, devices: list[int]) -> str:
     if torch.cuda.device_count() <= max(devices[:tp_size]):
         return f"needs GPUs {devices[:tp_size]}, found {torch.cuda.device_count()}"
     links = glob.glob("/sys/class/kfd/kfd/topology/nodes/*/io_links/*/properties")
-    if not any("type 11\n" in open(p).read() for p in links):
+    if not any("type 11\n" in Path(p).read_text() for p in links):
         return "no xGMI link in the KFD topology"
     try:
         with open("/dev/kfd", "rb", buffering=0) as kfd:
