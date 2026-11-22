@@ -1,19 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MegaMoEGfx942: the EP8 a8w4 MegaMoE layer for gfx942 (MI300X), shaped like MegaMoEV2.
+"""MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X), shaped like
+MegaMoEV2.
 
-This version has MegaMoEV2's main path (``forward``, ``forward_prequant``): five
-kernels per call. ``comm.py`` quantizes x, exchanges the route counts and plans every
-route's destination row; ``main.py`` is one persistent kernel that writes each route's
-row into its destination, runs gemm1 / gemm2 on the rows as they arrive and adds every
-route into its source rank's output (BF16 atomics); ``comm.py`` then waits until all
-ranks' adds are done. Its tasks only wait for work that is already running, so it needs
-no co-residency.
+a8w4 has MegaMoEV2's main path (``forward``, ``forward_prequant``): five kernels per
+call. ``comm.py`` quantizes x, exchanges the route counts and plans every route's
+destination row; ``main.py`` is one persistent kernel that writes each route's row into
+its destination, runs gemm1 / gemm2 on the rows as they arrive and adds every route into
+its source rank's output (BF16 atomics); ``comm.py`` then waits until all ranks' adds
+are done. Its tasks only wait for work that is already running, so it needs no
+co-residency. The small-input and large-input single-kernel paths are not in this
+version: the layer reports them unavailable (``small_m_mtpr`` 0, ``large_m_available``
+False), so a caller written for all three paths runs the main path.
 
-The small-input and large-input single-kernel paths are not in this version: the layer
-reports them unavailable (``small_m_mtpr`` 0, ``large_m_available`` False), so a caller
-written for all three paths runs the main path.
+a8w8 runs ``forward`` / ``forward_prequant`` on its own mega kernel (``a8w8/``: GEMM
+tiles of 256 rows with A and W staged through LDS; faster from about 1000 tokens per
+rank) and ``forward_small_m`` on the main path above compiled for fp8 W (W streamed
+into VGPRs; faster for decode batches) at the small-input capacity. Both read the same
+experts.
 
 Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
@@ -21,7 +26,8 @@ receives at most every route of every rank (8 x max_tok_per_rank x topk rows plu
 partial block per expert), so no route is dropped. The main path's buffers at
 max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
 (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory; 8192 is the
-largest (the receive buffer stays below 2 GiB).
+largest (the receive buffer stays below 2 GiB). a8w8's mega kernel takes about the
+same; its small-input path at 128 tokens per rank 0.04 GiB.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -29,14 +35,14 @@ form; the per-channel exponents ride at the tail of each scale tensor, so a laye
 still ``(w1, w1_scale, w2, w2_scale)``. ``quant="a8w8"`` takes fp8 experts with f32
 128x128 block scales instead, in aiter's fp8 MoE preshuffle
 ``shuffle_weight(w, (16, 16))``, as they are (``prepare_weights(..., quant="a8w8")``
-checks them and zeroes the W of zero-scale blocks in place): the same kernels, compiled
-with the fp8 W loads and the block scales applied per 128-K group.
+checks them and zeroes the W of zero-scale blocks in place).
 """
 
 from contextlib import nullcontext
 
 import torch
 
+from ..mega_moe import envs
 from . import host
 from . import weights as _weights
 
@@ -77,7 +83,9 @@ class MegaMoEGfx942:
     builds the same instances in the same order after MORI shmem is initialized.
 
     ``small_m_mtprs``, ``small_m_enabled`` and ``large_m_enabled`` are MegaMoEV2's
-    arguments; this version has no small- or large-input path and ignores them."""
+    arguments. a8w4 has no small- or large-input path in this version and ignores them;
+    a8w8 builds its small-input path when ``small_m_enabled`` (None: the
+    ``AITER_MEGA_SMALL_M`` flag), for up to max(``small_m_mtprs``) tokens per rank."""
 
     def __init__(
         self,
@@ -137,9 +145,36 @@ class MegaMoEGfx942:
         # linear_beta, 1 / linear_beta, swiglu_limit): silu_clamped reads the limit.
         self._situ = (1.0, 1.0, 1.0, 1.0, limit if limit > 0 else float("inf"))
         self._x_quant, self._qx = x_quant, qx_of(x_quant)
+        self._no_route = torch.full((), -1, dtype=torch.int32, device=self.dev)
         self._weights = {}
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
-        self._build_main()
+        self._x1, self._small_mtpr = None, 0
+        if quant == "a8w4":
+            self._build_main(self.mtpr)
+            return
+        if x_quant != "per_1x128":
+            raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
+        from .a8w8.host import MegaMoEGfx942A8W8
+
+        self._x1 = MegaMoEGfx942A8W8(
+            rank=rank,
+            world_size=world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            max_tok_per_rank=self.mtpr,
+            swiglu_limit=limit,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+        )
+        if small_m_enabled is None:
+            small_m_enabled = envs.AITER_MEGA_SMALL_M
+        if small_m_enabled:
+            self._small_mtpr = max(int(m) for m in small_m_mtprs)
+            self._build_main(self._small_mtpr)
 
     # ---- weights ---------------------------------------------------------------
 
@@ -221,6 +256,8 @@ class MegaMoEGfx942:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale):
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
+        if self._x1 is not None:
+            self._x1.bind_weights(w1, w1_scale, w2, w2_scale)
 
     def bind_layer(self, layer_slot, w1, w1_scale, w2, w2_scale):
         self.bind_weights(w1, w1_scale, w2, w2_scale)
@@ -233,7 +270,8 @@ class MegaMoEGfx942:
 
     # ---- main path ---------------------------------------------------------------
 
-    def _build_main(self):
+    def _build_main(self, mtpr):
+        """The main path for up to ``mtpr`` tokens per rank."""
         import mori.shmem as ms
 
         from . import comm, main
@@ -248,14 +286,14 @@ class MegaMoEGfx942:
         )
 
         H, I, topk, dev = self.model_dim, self.inter_dim, _KERNEL_TOPK, self.dev
-        self._token_shift = max((self.mtpr - 1).bit_length(), 1)
+        self._token_shift = max((mtpr - 1).bit_length(), 1)
         self._tcap = tcap = 1 << self._token_shift
         # Every route of every rank (the real top-k; the padding slots take no row),
         # plus one partial block per local expert.
         s_cap = -(-(NPES * tcap * self.topk + E_LOCAL * BLOCK_M) // BLOCK_M) * BLOCK_M
         if s_cap >= 1 << ROW_BITS or s_cap * H >= BUFFER_BYTES_MAX:
             raise ValueError(
-                f"max_tok_per_rank={self.mtpr}: {s_cap} receive rows of {H} bytes pass "
+                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
                 "the 2 GiB the kernels address with i32 offsets"
             )
         self._s_cap, self._nblk = s_cap, s_cap // BLOCK_M
@@ -280,7 +318,6 @@ class MegaMoEGfx942:
         self._route_idx = torch.empty(tcap * topk, **i32)
         # forward's ids / weights padded to the kernels' top-k (see _routes)
         self._ids_pad = torch.full((tcap, topk), -1, **i32)
-        self._no_route = torch.full((), -1, **i32)
         self._wts_pad = torch.zeros((tcap, topk), dtype=torch.float32, device=dev)
         self._send_route = torch.empty(tcap * topk, **i32)
         self._send_info = torch.empty(tcap * topk, **i32)
@@ -292,7 +329,7 @@ class MegaMoEGfx942:
         # the plan kernel: one workgroup per producer wave, up to 1024 routes each
         self._slices = _PRODUCERS * 8
         if tcap * topk > self._slices * 1024:
-            raise ValueError(f"max_tok_per_rank={self.mtpr}: too many routes per call")
+            raise ValueError(f"max_tok_per_rank={mtpr}: too many routes per call")
         self._a2 = torch.empty((s_cap, I), dtype=torch.uint8, device=dev)
         self._a2_scale = torch.empty((s_cap, I // 128), dtype=torch.float32, device=dev)
         self._x8 = torch.empty((tcap, H), dtype=torch.uint8, device=dev)
@@ -416,13 +453,13 @@ class MegaMoEGfx942:
         host.launch(self._finish_k, bufs["ws"], tab["ws"], self._status, self.rank)
         return bufs["out"][:T]
 
-    # ---- small / large paths: not in this version ---------------------------------
+    # ---- small / large paths -----------------------------------------------------
 
     @property
     def small_m_mtpr(self):
-        """Largest per-rank token count ``forward_small_m`` accepts: 0, no small-input
-        path in this version."""
-        return 0
+        """Largest per-rank token count ``forward_small_m`` accepts: 0 when the path is
+        off (always for a8w4 in this version)."""
+        return self._small_mtpr
 
     @property
     def large_m_available(self):
@@ -481,6 +518,9 @@ class MegaMoEGfx942:
         are always skipped, so ``mask_invalid_slots`` has no effect; the output is always
         sliced to T rows."""
         with _on(stream):
+            if self._x1 is not None:
+                ids, w = self._routes(x_bf16, topk_ids, wts, self.topk)
+                return self._x1.forward(x_bf16, w, ids)
             ids, w = self._routes(x_bf16, topk_ids, wts, _KERNEL_TOPK)
             return self._forward_main(x_bf16, w, ids)
 
@@ -489,7 +529,7 @@ class MegaMoEGfx942:
     def forward_prequant(
         self, x_q, x_scale, wts, topk_ids, *, stream=None, slice_output=True
     ):
-        """The main path on x already quantized as this instance's ``x_quant``: x_q
+        """``forward`` on x already quantized as this instance's ``x_quant``: x_q
         float8_e4m3fnuz [T, H] and x_scale f32 [T, H / 128] ("per_1x128") or [T]
         ("per_token")."""
         T, H = x_q.shape
@@ -505,11 +545,29 @@ class MegaMoEGfx942:
                 f"{shape} on {self.dev}"
             )
         with _on(stream):
+            if self._x1 is not None:
+                ids, w = self._routes(x_q, topk_ids, wts, self.topk)
+                return self._x1.forward_prequant(x_q, x_scale, w, ids)
             ids, w = self._routes(x_q, topk_ids, wts, _KERNEL_TOPK)
             return self._forward_main(x_q, w, ids, x_scale)
 
     def forward_small_m(
         self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True
     ):
-        """MegaMoEV2's small-input call; not in this version (``small_m_mtpr`` is 0)."""
-        raise RuntimeError("MegaMoEGfx942 has no small-input path in this version")
+        """MegaMoEV2's small-input call (a8w8 only in this version). ``max_tokens``: the
+        most rows of this call on any EP rank, the same on every rank."""
+        if not self._small_mtpr:
+            raise RuntimeError(
+                "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
+                if self._x1 is not None
+                else "MegaMoEGfx942 has no small-input path for a8w4 in this version"
+            )
+        need = int(max_tokens)
+        if need < int(x_bf16.shape[0]) or need > self._small_mtpr:
+            raise ValueError(
+                f"max_tokens={need}: this rank has {int(x_bf16.shape[0])} rows, the "
+                f"small-input path takes at most {self._small_mtpr}"
+            )
+        with _on(stream):
+            ids, w = self._routes(x_bf16, topk_ids, wts, _KERNEL_TOPK)
+            return self._forward_main(x_bf16, w, ids)
