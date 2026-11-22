@@ -59,7 +59,7 @@
     },
     "M_LEQ_192": {
         "BLOCK_M": 16,
-        "BLOCK_N1": 64,
+        "BLOCK_N1": 128,
         "BLOCK_K1": 256,
         "NUM_BUFFERS1": 4,
         "BLOCK_N2": 128,
