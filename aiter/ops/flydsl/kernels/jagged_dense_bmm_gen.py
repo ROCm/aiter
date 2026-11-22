@@ -23,9 +23,8 @@ import torch
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
-from aiter.ops.flydsl.kernels import buffer_ops
 
-from .tensor_shim import _run_compiled
+from .tensor_shim import _run_compiled, buf_scalar_load
 
 BLOCK_M = 128
 BLOCK_N = 128
@@ -174,12 +173,10 @@ def _build_launcher(
     ):
         tid = fx.thread_idx.x
         pid_mn, _, raw_b = fx.block_idx
-        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+        seq_buf = fx.rocdl.make_buffer_tensor(SEQ_OFFSETS, max_size=True)
 
         def load_seq(i):
-            return fx.Int32(
-                buffer_ops.buffer_load(seq_rsrc, i, vec_width=1, is_scalar=True)
-            )
+            return fx.Int32(buf_scalar_load(seq_buf, i))
 
         if fx.const_expr(COMPACT):
             if fx.const_expr(XCD_C > 1):
