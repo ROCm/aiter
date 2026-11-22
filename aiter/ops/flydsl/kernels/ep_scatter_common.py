@@ -38,14 +38,15 @@ GATHERS_PER_INDEX_VECTOR = WAVE_SIZE // ROWS_PER_GATHER
 STORE_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if any(counts))
 LOAD_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if not any(counts))
 STORE_WAVE_COUNT = len(STORE_WAVES)
-FIRST_STORE_WAVE = STORE_WAVES[0]
-PROLOGUE_GATHERS, MAINLOOP_GATHERS = SCATTER_SCHEDULE[FIRST_STORE_WAVE]
+# Wave-ID boundary, not a count: load waves 0/1 precede store waves 2/3.
+TDM_STORE_WAVE_START = STORE_WAVES[0]
+PROLOGUE_GATHERS, MAINLOOP_GATHERS = SCATTER_SCHEDULE[TDM_STORE_WAVE_START]
 TAIL_FIRST_VECTOR = PROLOGUE_GATHERS // GATHERS_PER_INDEX_VECTOR
 
 # The current row mapping interleaves equally sized bursts across a contiguous
 # suffix of store waves. The persistent task ABI carries two tail index vectors.
 assert len(LOAD_WAVES) == 2
-assert STORE_WAVES == tuple(range(FIRST_STORE_WAVE, len(SCATTER_SCHEDULE)))
+assert STORE_WAVES == tuple(range(TDM_STORE_WAVE_START, len(SCATTER_SCHEDULE)))
 assert all(
     counts == (PROLOGUE_GATHERS, MAINLOOP_GATHERS)
     for wave, counts in enumerate(SCATTER_SCHEDULE)
@@ -149,7 +150,7 @@ def make_overlap_callbacks(
     last_task,
     issue,
     init_accumulators,
-    load_wait,
+    tdm_wait_per_wave,
     tdm_per,
     load_first,
 ):
@@ -201,12 +202,12 @@ def make_overlap_callbacks(
         for i in range_constexpr(2):
             issue(i, i)
         init_accumulators()
-        load_wait(tdm_per)
-        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
+        tdm_wait_per_wave(tdm_per)
+        if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
             tdm_ops.tensor_wait(0)
         workgroup_barrier()
         load_first(interleaved_lds_load)
-        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
+        if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
             issue_scatter_burst(
                 PROLOGUE_GATHERS,
                 MAINLOOP_GATHERS,
@@ -224,7 +225,7 @@ def make_overlap_callbacks(
         next_scatter_dst_index_high = fx.Int32(0)
         next_scatter_column_offset = fx.Int32(0)
         next_scatter_valid = fx.Int32(0)
-        if wave >= FIRST_STORE_WAVE:
+        if wave >= TDM_STORE_WAVE_START:
             issue_scatter_burst(0, PROLOGUE_GATHERS, index_lanes, column_offset)
             if const_expr(MAINLOOP_GATHERS > 0):
                 next_scatter_dst_index_low = index_lanes[TAIL_FIRST_VECTOR]
@@ -253,7 +254,7 @@ def make_overlap_callbacks(
     @flyc.jit
     def skip_task():
         # A partial M-cluster tail has no prologue to issue the deferred burst.
-        if (wave >= FIRST_STORE_WAVE) & (scatter_valid != 0):
+        if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
             tdm_ops.tensor_wait(0)
             issue_scatter_burst(
                 PROLOGUE_GATHERS,

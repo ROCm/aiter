@@ -721,14 +721,19 @@ def build_gemm_a8w4_tdm_task(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
         scatter_wave = (
-            wave - ep_scatter_common.FIRST_STORE_WAVE
+            wave - ep_scatter_common.TDM_STORE_WAVE_START
             if const_expr(overlap_scatter)
             else wave
         )
 
-        def load_wait(outstanding):
+        def tdm_wait_per_wave(outstanding):
+            """Wait on load waves in overlap mode, otherwise on every wave.
+
+            outstanding is the allowed remaining TDM count for each wave.
+            Store waves drain separately at the scatter LDS reuse boundaries.
+            """
             if const_expr(overlap_scatter):
-                if wave < ep_scatter_common.FIRST_STORE_WAVE:
+                if wave < ep_scatter_common.TDM_STORE_WAVE_START:
                     tdm_ops.tensor_wait(outstanding)
             else:
                 tdm_ops.tensor_wait(outstanding)
@@ -1779,7 +1784,7 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(wait_fn is not None):
                     wait_fn()
                 else:
-                    load_wait(num_outstanding_tdm)
+                    tdm_wait_per_wave(num_outstanding_tdm)
                 # TDM readiness is handled above; LDS reuse waits before signal.
                 # No global-memory publication is required by this rendezvous.
                 rocdl.s_barrier_signal(-1)
@@ -2006,7 +2011,7 @@ def build_gemm_a8w4_tdm_task(
                     last_task,
                     issue,
                     init_accumulators,
-                    load_wait,
+                    tdm_wait_per_wave,
                     TDM_PER,
                     load_first,
                 )
@@ -2047,7 +2052,7 @@ def build_gemm_a8w4_tdm_task(
                     )
                     if const_expr(overlap_scatter):
                         _scatter_lane_valid = _scatter_lane_valid & (
-                            wave >= ep_scatter_common.FIRST_STORE_WAVE
+                            wave >= ep_scatter_common.TDM_STORE_WAVE_START
                         )
                     _scatter_safe_row = _scatter_lane_valid.select(
                         _scatter_row_lane, fx.Int32(0)
@@ -2090,7 +2095,7 @@ def build_gemm_a8w4_tdm_task(
                 # LDS (dscnt) and TDM (tensorcnt); VMEM loads and stores in
                 # flight (S1F claim, flag pre-check, e8m0 stores) stay out.
                 if const_expr(raw_drain):
-                    load_wait(outstanding)
+                    tdm_wait_per_wave(outstanding)
                     rocdl.s_wait_dscnt(0)
                     rocdl.s_barrier_signal(-1)
                     rocdl.s_barrier_wait(-1)
@@ -2116,7 +2121,7 @@ def build_gemm_a8w4_tdm_task(
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
-                        load_wait(TDM_PER * (num_buffers - 1))
+                        tdm_wait_per_wave(TDM_PER * (num_buffers - 1))
                         workgroup_barrier()
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
@@ -2251,7 +2256,7 @@ def build_gemm_a8w4_tdm_task(
                         item_hooks[0]["drain_start"]()
 
                     def wait_drain_stage(outstanding):
-                        load_wait(outstanding)
+                        tdm_wait_per_wave(outstanding)
                         if const_expr(raw_drain):
                             rocdl.s_wait_dscnt(0)
 
@@ -3164,7 +3169,7 @@ def launch_gemm_a8w4_tdm(
             if const_expr(layout["overlap_scatter"]):  # noqa: SIM102
                 # No next epilogue will retire the last task's remote writes.
                 if fx.thread_idx.x >= (
-                    ep_scatter_common.FIRST_STORE_WAVE * ep_scatter_common.WAVE_SIZE
+                    ep_scatter_common.TDM_STORE_WAVE_START * ep_scatter_common.WAVE_SIZE
                 ):
                     tdm_ops.tensor_wait(0)
         else:
