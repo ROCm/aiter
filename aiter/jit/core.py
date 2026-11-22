@@ -167,6 +167,12 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -296,6 +302,18 @@ def _runtime_power_selection() -> bool:
     if raw not in {"power", "efficiency", "power_efficiency"}:
         return False
     return "aiter" in sys.modules
+
+
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
 
 
 class AITER_CONFIG:
@@ -818,15 +836,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -837,9 +848,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
@@ -1062,6 +1071,50 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
+
+
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):

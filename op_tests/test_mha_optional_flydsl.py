@@ -14,7 +14,7 @@ MHA_PATH = Path(__file__).resolve().parents[1] / "aiter" / "ops" / "mha.py"
 
 def _top_level_node(name, node_type):
     tree = ast.parse(MHA_PATH.read_text(encoding="utf-8"), filename=str(MHA_PATH))
-    return next(
+    node = next(
         node
         for node in tree.body
         if isinstance(node, node_type)
@@ -27,6 +27,12 @@ def _top_level_node(name, node_type):
             )
         )
     )
+    # The tests compile the bare function into their own namespace; its
+    # decorators (a plugin route, say) would be evaluated there and need names
+    # that namespace does not have, and they are not what these tests check.
+    if isinstance(node, ast.FunctionDef):
+        node.decorator_list = []
+    return node
 
 
 def _flydsl_available(find_spec):
@@ -72,6 +78,7 @@ def _dispatcher(name, *, available, flydsl=None, triton=None):
         "get_gfx": lambda: "gfx1151",
         "is_gfx1250_asm_supported": lambda: False,
         "_IS_GFX1250_ASM_DEVICE": False,
+        "_reject_sink_autograd": lambda *_args: None,
     }
     node = _top_level_node(name, ast.FunctionDef)
     exec(  # noqa: S102 - compiles one function parsed from this local module
