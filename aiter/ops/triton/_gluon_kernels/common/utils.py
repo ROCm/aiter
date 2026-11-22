@@ -33,16 +33,21 @@ def _fp8_wmma_format(dtype):
     return "e5m2" if dtype == gl.float8e5 else "e4m3"
 
 
+_wmma_native = gl.amd.gfx1250.wmma
+
+
 @gluon.jit
-def wmma_compat(a, b, acc):
+def _wmma_compat(a, b, acc):
     """gl.amd.gfx1250.wmma, but uses wmma_scaled with unit scales for fp8/bf8 16x16x128 on gfx1250-strict."""
     if _use_scaled_fp8_wmma(a.dtype, b.dtype, acc.type.layout):
-        res = gl.amd.gfx1250.wmma_scaled(
+        return gl.amd.gfx1250.wmma_scaled(
             a, None, _fp8_wmma_format(a.dtype), b, None, _fp8_wmma_format(b.dtype), acc
         )
-    else:
-        res = gl.amd.gfx1250.wmma(a, b, acc)
-    return res
+    return _wmma_native(a, b, acc)
+
+
+gl.amd.gfx1250.wmma = _wmma_compat
+gl.amd.cdna5.wmma = _wmma_compat
 
 
 @gluon.jit
