@@ -245,14 +245,15 @@ _HGEMM_CSV = (
 _DEVICE_PROBE = """
 import torch
 if torch.version.hip is not None and torch.cuda.is_available():
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-    from aiter.ops.opus._arch import _device_arch_and_cu
+    # Importing aiter reads the arch too, so every failure to read it must skip.
     try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from aiter.ops.opus._arch import _device_arch_and_cu
         arch, cu_num = _device_arch_and_cu(torch.device("cuda", 0))
         # flydsl_hgemm checks get_gfx_runtime() against its build target.
         if get_gfx_runtime() == arch:
             print("device", arch, cu_num)
-    except (AssertionError, KeyError, RuntimeError):
+    except (AssertionError, ImportError, KeyError, RuntimeError):
         pass
 """
 _HGEMM_RUN_ONLY = """
@@ -308,11 +309,12 @@ def test_a16w16_aot_cache_serves_a_run_only_process(tmp_path):
     """A fresh FLYDSL_RUNTIME_RUN_ONLY process must load the kernel the AOT
     replay built for a tuned A16W16 row; a cache miss raises there."""
     deadline = time.monotonic() + _BUDGET_S
-    # The children must not inherit FlyDSL or arch settings from the caller: an inherited
+    # The children must not inherit FlyDSL, arch or AITER import settings: an inherited
     # COMPILE_ONLY would make the run-only child skip the launch, a disabled cache would
     # stop the AOT child from writing the entry the run-only child loads, and CU_NUM,
     # FLYDSL_GPU_ARCH, ARCH or AITER_AOT_REPLAY would move the arch or CU count one child
-    # builds or looks up away from the other's.
+    # builds or looks up away from the other's. AITER_AOT_IMPORT and AITER_TRITON_ONLY
+    # make `import aiter.tuned_gemm` fail in the run-only child.
     env = dict(
         os.environ,
         FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
@@ -327,6 +329,8 @@ def test_a16w16_aot_cache_serves_a_run_only_process(tmp_path):
         "AITER_AOT_REPLAY",
         "FLYDSL_GPU_ARCH",
         "ARCH",
+        "AITER_AOT_IMPORT",
+        "AITER_TRITON_ONLY",
     ):
         env.pop(name, None)
     # Device 0 is read in a child through the helper gemm_a16w16 looks its row up
