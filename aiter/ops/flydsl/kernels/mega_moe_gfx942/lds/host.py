@@ -76,6 +76,7 @@ class LdsMegaMoE:
         max_tok_per_rank,
         swiglu_limit=0.0,
         wq="fp8",
+        skip_padding=True,
         w1=None,
         w1_scale=None,
         w2=None,
@@ -106,6 +107,7 @@ class LdsMegaMoE:
         self.hidden, self.inter = model_dim, inter_dim
         self.swiglu_limit = float(swiglu_limit)
         self.wq = wq
+        self.skip_padding = bool(skip_padding)
         self.combine = "bf16"
         self.token_shift = max(int(max_tok_per_rank - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift

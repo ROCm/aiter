@@ -77,6 +77,7 @@ def compile_ep_mega(
     transpose_scales=True,
     swiglu_limit=0.0,
     wq="fp8",
+    skip_padding=False,
 ):
     """xcd_queues: one task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a
     workgroup whose queue is empty takes tasks from the next queues. lag counts units (block groups) of one queue.
@@ -98,6 +99,8 @@ def compile_ep_mega(
     its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split).
     swiglu_limit > 0: the GateUp activation clamps gate and up (see gateup_task_emitter).
     wq: "fp8" weights, or "fp4": a8w4's prepare_weights (fd2) output, decoded to FP8 in the loaders.
+    skip_padding: GateUp and Down skip the MFMAs of a block's 64-row packets past its valid rows (see the emitters);
+    Down then runs 2x4 (the skip is per streamed A packet; 2x4 and 4x2 Down time the same on full blocks).
     topk need not be a power of two: the producers then divide a route index by it instead of shifting.
     """
     H, I = hidden_dim, inter_dim
@@ -105,6 +108,8 @@ def compile_ep_mega(
     # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
     row_bits = ROW_BITS
     KB = H // 128
+    if skip_padding:
+        down_layout = "2x4_pf1"
     gateup = gateup_task_emitter(
         I,
         H,
@@ -116,6 +121,7 @@ def compile_ep_mega(
         store_aux=16 if relaxed else 0,
         swiglu_limit=float(swiglu_limit),
         wq=wq,
+        skip_padding=skip_padding,
     )
     down = down_task_emitter(
         H,
@@ -128,6 +134,7 @@ def compile_ep_mega(
         remote_token_shift=token_shift,
         fp8_routes=combine == "fp8",
         wq=wq,
+        skip_padding=skip_padding,
     )
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
@@ -673,6 +680,7 @@ def compile_ep_mega(
                 tid=tid,
                 epilog_hook=hook,
                 kloop_hook=loop_start,
+                rows=expected,
             )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
@@ -686,6 +694,15 @@ def compile_ep_mega(
             return holder[0] if holder else fx.Int32(-1)
 
         def down_task(block, tile, expert, at):
+            rows = None
+            if const_expr(skip_padding):
+                # issued before the wait, which hides its latency
+                rows = _uniform(
+                    _load_i32(
+                        _rsrc_of(pSched, (SCHED_EXPECTED + 2 * num_blocks) * 4),
+                        (SCHED_EXPECTED + block) * 4,
+                    )
+                )
             if wave == 0:
                 spin_wait_ge(
                     sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4),
@@ -717,6 +734,7 @@ def compile_ep_mega(
                 epilog_hook=hook,
                 pOutScale=pOutScaleTable,
                 kloop_hook=loop_start,
+                rows=rows,
             )
             record(*at, waited, 3, cycles() - began, [mark - began for mark in marks])
             return holder[0] if holder else fx.Int32(-1)
@@ -1054,6 +1072,7 @@ def ep_mega(
         transpose_scales=transpose_scales,
         swiglu_limit=op.swiglu_limit,
         wq=op.wq,
+        skip_padding=op.skip_padding,
     )
     grid = int(os.environ.get("MEGA_GRID", "0")) or -(
         -mega_grid(op, producers) // tasks_per_wg

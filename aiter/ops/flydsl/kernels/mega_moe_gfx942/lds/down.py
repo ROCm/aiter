@@ -115,6 +115,7 @@ def down_task_emitter(
     remote_token_shift=0,
     fp8_routes=False,
     wq="fp8",
+    skip_padding=False,
 ):
     """One Down task (256 sorted rows x 256 hidden columns) for use inside a kernel.
 
@@ -123,11 +124,14 @@ def down_task_emitter(
     (an i1 or Python bool), with coords() giving its (block, N tile, expert) and lds a SharedTiles allocation.
     With fp8_routes, pOut and pOutScale are int64 tables of the ranks' comb [Tcap, topk, H] FP8 and
     [Tcap, topk, H / 128] FP32 bases.
+    skip_padding (2x4): emit takes `rows`, the block's valid rows (its first rows; wave uniform), and skips the MFMAs
+    of the 64-row A packets past them (a uniform branch per stage).
     """
     validate_parameters(
         1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2
     )
     assert layout in LAYOUTS, layout
+    assert not skip_padding or layout == "2x4_pf1", layout
     assert atomic or not single_store
     remote = remote_token_shift > 0
     assert not remote or atomic and not single_store
@@ -196,6 +200,7 @@ def down_task_emitter(
         epilog_hook=None,
         pOutScale=None,
         kloop_hook=None,
+        rows=None,
     ):
         if const_expr(tid is None):
             tid = fx.thread_idx.x
@@ -489,9 +494,105 @@ def down_task_emitter(
 
             last_pair = stage_pairs(3)[3]
 
+            def retire_element(pair, slot, index):
+                """Element `index` (of 8) of `pair`'s partials (slots 2 slot + {0, 1}, scale `slot`) into accum."""
+                target = accum[None, acc_index(pair[0], pair[1][index // 4])]
+                element = index % 4
+                target[element] = fx.fma(
+                    Vec(partial[None, slot * 2 + index // 4].load())[element],
+                    Vec(partial_scale[None, slot].load())[0],
+                    target[element],
+                )
+
+            def issue_pairs(parity, k_block, stage, streamed, previous, pair_ids):
+                """The MFMAs of a stage's pairs `pair_ids`, each retiring the pair before it."""
+                for pair_id in pair_ids:
+                    m_slice, n_pair = stage_pairs(stage)[pair_id]
+                    # Every pair of a stage alternates partial slots: entries pair_id % 2 * 2 + {0, 1}.
+                    base = pair_id % 2 * 2
+                    for k_step in range_constexpr(4):
+                        half_k, word = divmod(k_step, 2)
+                        for inner in range_constexpr(2):
+                            mfma_index = k_step * 2 + inner
+                            n_slice = n_pair[inner]
+                            if const_expr(stream_a):
+                                a_value = streamed[m_slice % 2][half_k][word]
+                                b_value = held_word(n_slice, half_k, word)
+                            else:
+                                a_value = held_word(m_slice, half_k, word)
+                                b_value = streamed[inner][half_k][word]
+                            accumulator = (
+                                Vec.filled(4, 0.0, fx.Float32)
+                                if k_step == 0
+                                else Vec(partial[None, base + inner].load())
+                            )
+                            partial[None, base + inner].store(
+                                Vec(
+                                    rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                        T.f32x4,
+                                        [b_value, a_value, accumulator, 0, 0, 0],
+                                    )
+                                )
+                            )
+                            # Keep MFMA -> FMA order: the FMA's partial then has two MFMAs of XDL latency cover.
+                            rocdl.sched_barrier(0)
+                            if const_expr(mfma_index == 0):
+                                if const_expr(stream_a):
+                                    a_scale = Vec(
+                                        scale_a[
+                                            None, stage % 2 * 2 + m_slice % 2
+                                        ].load()
+                                    )[0]
+                                else:
+                                    a_scale = Vec(
+                                        scale_a[None, parity * 4 + m_slice].load()
+                                    )[0]
+                                partial_scale[None, pair_id % 2].store(
+                                    Vec.from_elements(
+                                        [a_scale * scale_b(k_block)], fx.Float32
+                                    )
+                                )
+                            # Retire one element of the previous pair under each MFMA.
+                            retire_element(previous, (pair_id + 1) % 2, mfma_index)
+                            rocdl.sched_barrier(0)
+                    previous = (m_slice, n_pair)
+
+            def retire(pair, slot=1, scale=None):
+                """`pair` (partial slots 2 slot + {0, 1}, scale `slot` unless `scale`) into accum, in no MFMA
+                shadow."""
+                last_m, last_n = pair
+                final_scale = (
+                    Vec(partial_scale[None, slot].load())[0] if scale is None else scale
+                )
+                for inner in range_constexpr(2):
+                    target = accum[None, acc_index(last_m, last_n[inner])]
+                    values = Vec(partial[None, slot * 2 + inner].load())
+                    for element in range_constexpr(4):
+                        target[element] = fx.fma(
+                            values[element], final_scale, target[element]
+                        )
+
+            def retire_tail():
+                """skip_padding: past the valid rows no MFMA retires the last pair of the last stage with valid
+                rows; retire it, then zero its slots, which the next pair retires as the skipped last pair.
+                """
+                if rows <= 3 * PACKET_ROWS:
+                    # Every candidate gets the FMAs, with scale 0 unless it is the tail: branches that
+                    # differ only in the target become a dynamic accum index (scratch) in LLVM.
+                    scale = Vec(partial_scale[None, 1].load())[0]
+                    for stage in range_constexpr(3):
+                        tail = (rows > stage * PACKET_ROWS) & (
+                            rows <= (stage + 1) * PACKET_ROWS
+                        )
+                        retire(stage_pairs(stage)[3], 1, tail.select(scale, 0.0))
+                    for inner in range_constexpr(2):
+                        partial[None, 2 + inner].store(Vec.filled(4, 0.0, fx.Float32))
+
             def run_k(parity, k_block):
                 # The last block re-fetches clamped blocks so it stays inside the loop body.
                 k_next = (k_block + 1 < KB).select(k_block + 1, KB - 1)
+                if const_expr(skip_padding):
+                    retire_tail()
                 previous = last_pair
                 for stage in range_constexpr(4):
                     # packet 3 is this K block's, the others K block k_next's (unused
@@ -547,81 +648,25 @@ def down_task_emitter(
                     rocdl.s_waitcnt(lgkmcnt=0)
                     barrier()
                     rocdl.s_setprio(3)
-                    for pair_id, (m_slice, n_pair) in enumerate(stage_pairs(stage)):
-                        # Every pair of a stage alternates partial slots: entries pair_id % 2 * 2 + {0, 1}.
-                        base, old_base = pair_id % 2 * 2, (pair_id + 1) % 2 * 2
-                        for k_step in range_constexpr(4):
-                            half_k, word = divmod(k_step, 2)
-                            for inner in range_constexpr(2):
-                                mfma_index = k_step * 2 + inner
-                                n_slice = n_pair[inner]
-                                if const_expr(stream_a):
-                                    a_value = streamed[m_slice % 2][half_k][word]
-                                    b_value = held_word(n_slice, half_k, word)
-                                else:
-                                    a_value = held_word(m_slice, half_k, word)
-                                    b_value = streamed[inner][half_k][word]
-                                accumulator = (
-                                    Vec.filled(4, 0.0, fx.Float32)
-                                    if k_step == 0
-                                    else Vec(partial[None, base + inner].load())
-                                )
-                                partial[None, base + inner].store(
-                                    Vec(
-                                        rocdl.mfma_f32_16x16x32_fp8_fp8(
-                                            T.f32x4,
-                                            [b_value, a_value, accumulator, 0, 0, 0],
-                                        )
-                                    )
-                                )
-                                # Keep MFMA -> FMA order: the FMA's partial then has two MFMAs of XDL latency cover.
-                                rocdl.sched_barrier(0)
-                                if const_expr(mfma_index == 0):
-                                    if const_expr(stream_a):
-                                        a_scale = Vec(
-                                            scale_a[
-                                                None, stage % 2 * 2 + m_slice % 2
-                                            ].load()
-                                        )[0]
-                                    else:
-                                        a_scale = Vec(
-                                            scale_a[None, parity * 4 + m_slice].load()
-                                        )[0]
-                                    partial_scale[None, pair_id % 2].store(
-                                        Vec.from_elements(
-                                            [a_scale * scale_b(k_block)], fx.Float32
-                                        )
-                                    )
-                                # Retire one element of the previous pair under each MFMA.
-                                old_m, old_n = previous
-                                source = old_base + mfma_index // 4
-                                target = accum[
-                                    None, acc_index(old_m, old_n[mfma_index // 4])
-                                ]
-                                element = mfma_index % 4
-                                target[element] = fx.fma(
-                                    Vec(partial[None, source].load())[element],
-                                    Vec(partial_scale[None, (pair_id + 1) % 2].load())[
-                                        0
-                                    ],
-                                    target[element],
-                                )
-                                rocdl.sched_barrier(0)
-                        previous = (m_slice, n_pair)
+                    if const_expr(skip_padding and stage > 0):
+                        # A packet `stage` holds block rows [64 stage, 64 stage + 64).
+                        if rows > stage * PACKET_ROWS:
+                            issue_pairs(
+                                parity, k_block, stage, streamed, previous, range(4)
+                            )
+                    else:
+                        issue_pairs(
+                            parity, k_block, stage, streamed, previous, range(4)
+                        )
+                    previous = stage_pairs(stage)[3]
                     rocdl.s_setprio(0)
                     barrier()
 
             def finish_k_loop():
                 # The last pair has no later MFMA shadow.
-                last_m, last_n = last_pair
-                final_scale = Vec(partial_scale[None, 1].load())[0]
-                for inner in range_constexpr(2):
-                    target = accum[None, acc_index(last_m, last_n[inner])]
-                    values = Vec(partial[None, 2 + inner].load())
-                    for element in range_constexpr(4):
-                        target[element] = fx.fma(
-                            values[element], final_scale, target[element]
-                        )
+                if const_expr(skip_padding):
+                    retire_tail()
+                retire(last_pair)
                 # Pairs with group 1's last K-loop barrier: after it no wave reads the A/B tiles any more.
                 if group == 0:
                     barrier()
