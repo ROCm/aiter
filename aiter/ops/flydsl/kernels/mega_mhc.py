@@ -349,33 +349,35 @@ def check_config(H: int, cfg: dict) -> None:
             )
 
 
-def dist_residency_error(T: int, cfg: dict, cu_num: int) -> str | None:
+def dist_residency_error(T: int, cfg: dict, cu_num: int, num_xcds: int) -> str | None:
     """Why ``DIST_FINISH`` is unsafe for T tokens on a GPU with ``cu_num`` CUs, or None.
 
     Waiting splits spin until the last arrival of their token block, so a split that is
     not yet scheduled must never be held back by waiting ones: every split of the grid
     has to be resident at once. Conservatively assume one workgroup per CU (the kernel
     is 8 warps, 2 per SIMD; LDS or VGPRs may allow more, which is not relied on) and
-    8 XCDs of ``cu_num / 8`` CUs, workgroups dealt round-robin to XCDs. The splits
-    of a token block share one XCD, so the busiest XCD holds ``ceil(blocks / 8)``
-    whole blocks. Does not see CU masks or other kernels.
+    ``num_xcds`` XCDs of ``cu_num / num_xcds`` CUs, workgroups dealt round-robin to
+    XCDs. The splits of a token block share one XCD, so the busiest XCD holds
+    ``ceil(blocks / num_xcds)`` whole blocks. Does not see CU masks or other kernels.
     """
     if not cfg.get("DIST_FINISH"):
         return None
-    if cu_num < 8 or cu_num % 8:
-        return f"cu_num={cu_num} is not a multiple of the 8 XCDs"
+    if cu_num < num_xcds or cu_num % num_xcds:
+        return f"cu_num={cu_num} is not a multiple of the {num_xcds} XCDs"
     nblk = -(-T // cfg["BLOCK_M"])
     ks = cfg["NUM_KSPLIT"]
-    per_xcd = -(-nblk // 8) * ks
-    if per_xcd > cu_num // 8:
+    per_xcd = -(-nblk // num_xcds) * ks
+    if per_xcd > cu_num // num_xcds:
         return (
-            f"{per_xcd} workgroups on the busiest XCD exceed its {cu_num // 8} CUs "
+            f"{per_xcd} workgroups on the busiest XCD exceed its {cu_num // num_xcds} CUs "
             f"(T={T}, NUM_KSPLIT={ks})"
         )
     return None
 
 
-def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, quant: str) -> str:
+def kernel_name(
+    cfg: dict, has_post: bool, identity_pre: bool, quant: str, num_xcds: int = 8
+) -> str:
     mode = "post" if has_post else "nopost"
     if identity_pre:
         mode += "_idpre"
@@ -399,15 +401,18 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, quant: str) -> st
         + ("_s128" if cfg.get("SEG128") else "")
         + ("_ntl" if cfg.get("NT_LD") else "")
         + ("_nts" if cfg.get("NT_ST") else "")
+        + (f"_nxcd{num_xcds}" if num_xcds != 8 and cfg["NUM_KSPLIT"] > 1 else "")
     )
 
 
-def grid_size(T: int, cfg: dict) -> tuple[int, int]:
+def grid_size(T: int, cfg: dict, num_xcds: int) -> tuple[int, int]:
     """(number of token blocks, number of workgroups) for T tokens."""
     nblk = -(-T // cfg["BLOCK_M"])
     ks = cfg["NUM_KSPLIT"]
-    if ks > 1:  # whole groups of 8 token blocks, see the XCD mapping in the kernel
-        return nblk, -(-nblk // 8) * 8 * ks
+    if (
+        ks > 1
+    ):  # whole groups of num_xcds token blocks, see the XCD mapping in the kernel
+        return nblk, -(-nblk // num_xcds) * num_xcds * ks
     return nblk, nblk
 
 
@@ -432,6 +437,7 @@ def compile_mega_mhc(
     SEG128: bool = False,
     NT_LD: bool = False,
     NT_ST: bool = False,
+    NUM_XCDS: int = 8,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -498,7 +504,7 @@ def compile_mega_mhc(
     FN_LDS = WARP_SPLIT == "tokens" and WARPS_PER_WG > 1
     FN_PER_WARP = -(-NOPS // WARPS_PER_WG)
     fn_units = (H // 32) * N_STREAMS * N_FN_OPS * WAVE
-    name = kernel_name(cfg, HAS_POST, IDENTITY_PRE, QUANT)
+    name = kernel_name(cfg, HAS_POST, IDENTITY_PRE, QUANT, NUM_XCDS)
 
     @fx.struct
     class Smem:
@@ -605,9 +611,9 @@ def compile_mega_mhc(
             ekg = lane % 4  # elementwise layout: 8-column group (4 lanes = 64 B)
         w_id = I32(fx.block_idx.x)
         if fx.const_expr(KS > 1):
-            # all splits of a token block share w_id % 8, i.e. one XCD and its L2
-            j = w_id // 8
-            blk = (j // KS) * 8 + w_id % 8
+            # all splits of a token block share w_id % NUM_XCDS, i.e. one XCD and its L2
+            j = w_id // NUM_XCDS
+            blk = (j // KS) * NUM_XCDS + w_id % NUM_XCDS
             ks = j % KS
         else:
             blk = w_id
@@ -1629,7 +1635,7 @@ def compile_mega_mhc(
                         _put(LT.cnt_t, blk * 32, I32(0))
 
         if fx.const_expr(KS > 1):
-            # the XCD mapping pads the grid to whole groups of 8 token blocks
+            # the XCD mapping pads the grid to whole groups of NUM_XCDS token blocks
             if tok0 < n_tok:
                 body(tok0)
         else:

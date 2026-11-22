@@ -11,7 +11,7 @@ import re
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
 
 from .aot_cache import FlyDSLAotCache
 
@@ -106,6 +106,7 @@ def compile_mxfp8_8wave_gemm(
     K: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int,
     scale_preshuffled: bool = False,
     w_scale_block: str = "1x32",
     k_split: int = 1,
@@ -122,6 +123,7 @@ def compile_mxfp8_8wave_gemm(
         scale_preshuffled=bool(scale_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         b_scale_block=w_scale_block,
         a_scale_block="1x128" if w_scale_block == "128x128" else "1x32",
         k_split=int(k_split),
@@ -274,10 +276,14 @@ def flydsl_mxfp8_8wave_gemm(
                 Out.copy_(out_c)
             return Out
 
+    # get_num_xcds reads the current device; the launch and its key use XQ's.
+    with torch.cuda.device(XQ.device):
+        num_xcds = get_num_xcds()
     compile_kwargs = {
         "K": K,
         "waves_per_eu": int(waves_per_eu),
         "xcd_swizzle": int(xcd_swizzle),
+        "num_xcds": num_xcds,
         "scale_preshuffled": scale_preshuffled,
         "w_scale_block": w_scale_block,
     }
@@ -367,10 +373,13 @@ def _run_tail_split(
         w_scale_block=w_scale_block,
     )
     ws = torch.empty((n_split, M, n2), dtype=torch.float32, device=XQ.device)
+    with torch.cuda.device(XQ.device):
+        num_xcds = get_num_xcds()
     compile_kwargs = {
         "K": K,
         "waves_per_eu": int(waves_per_eu),
         "xcd_swizzle": 0,
+        "num_xcds": num_xcds,
         "w_scale_block": w_scale_block,
         "k_split": n_split,
     }

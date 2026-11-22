@@ -28,6 +28,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .aot_cache import FlyDSLAotCache
@@ -40,8 +41,18 @@ from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-# 256 CUs over 8 XCDs: the fused split-K l2_reduce grid's per-XCD budget.
+# CUs per XCD on every gfx950 part: the fused split-K l2_reduce grid's per-XCD budget.
 _GFX950_CUS_PER_XCD = 32
+
+
+def _device_num_xcds(device: torch.device) -> int:
+    """get_num_xcds for ``device``; on its own it reads the current device."""
+    if device.type != "cuda":
+        # A compile-only build passes CPU tensors and has no device to switch
+        # to; the current one is the target there (the AOT dry run sets it).
+        return get_num_xcds()
+    with torch.cuda.device(device):
+        return get_num_xcds()
 
 
 @functools.cache
@@ -69,8 +80,8 @@ _REDUCE_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_splitk_reduce")
 
 
 @functools.cache
-def _bound_gemm_exe(fused: bool, constexprs: tuple):
-    """``_gemm_exe(fused)`` with its Constexpr tail bound.
+def _bound_gemm_exe(fused: bool, constexprs: tuple, num_xcds: int):
+    """``_gemm_exe(fused)`` with its Constexpr tail and ``num_xcds`` bound.
 
     The bound launcher takes only the runtime arguments, which is all an
     exported launcher can take. The call inlines while tracing, and the
@@ -104,6 +115,7 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
                 i32_n,
                 stream,
                 *constexprs,
+                num_xcds=num_xcds,
             )
 
     else:
@@ -129,6 +141,7 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
                 i32_n,
                 stream,
                 *constexprs,
+                num_xcds=num_xcds,
             )
 
     launch.compile_hints.update(exe.compile_hints)
@@ -388,6 +401,9 @@ def flydsl_mxscale_preshuffle_gemm(
     layouts = (a_scale_layout, b_scale_layout)  # launch_gemm's last Constexprs
     # launch_gemm's Constexpr tail but fused_split_k, which each launch appends.
     spec = (*cfg, multi_row, *layouts)
+    # The XCD swizzle remaps workgroups over the device's dies; unswizzled
+    # configs build one kernel for every die count.
+    num_xcds = _device_num_xcds(A.device) if int(xcd_swizzle) > 0 else 8
     if prefetch is True:
         from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import prefetch_depth
 
@@ -417,8 +433,8 @@ def flydsl_mxscale_preshuffle_gemm(
     if split_k == 1:
         constexprs = (*spec, False, *pf_tail)
         _GEMM_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(False, constexprs),
+            (constexprs, num_xcds, A.device),
+            lambda: _bound_gemm_exe(False, constexprs, num_xcds),
             out_ptr,
             a_ptr,
             b_ptr,
@@ -454,12 +470,15 @@ def flydsl_mxscale_preshuffle_gemm(
             semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=A.device)
 
         if l2_reduce is None:
-            l2_reduce = -(-num_tiles // 8) * split_k <= _GFX950_CUS_PER_XCD
+            # The l2_reduce grid pads the tiles to groups of 8 so a tile's splits
+            # share an XCD; it fits when each XCD's share is one workgroup per CU.
+            wgs = -(-num_tiles // 8) * 8 * split_k
+            l2_reduce = wgs <= _device_num_xcds(A.device) * _GFX950_CUS_PER_XCD
         fused_tail = (depth, bool(b_nt), True) if fused_f32 and l2_reduce else pf_tail
         constexprs = (*spec, fused_f32, *fused_tail)
         _GEMM_FUSED_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(True, constexprs),
+            (constexprs, num_xcds, A.device),
+            lambda: _bound_gemm_exe(True, constexprs, num_xcds),
             ptr_arg(workspace),
             a_ptr,
             b_ptr,
@@ -480,8 +499,8 @@ def flydsl_mxscale_preshuffle_gemm(
     tmp_ptr = ptr_arg(tmp)
     constexprs = (*spec, False, *pf_tail)
     _GEMM_AOT_CACHE.launch(
-        (constexprs, A.device),
-        lambda: _bound_gemm_exe(False, constexprs),
+        (constexprs, num_xcds, A.device),
+        lambda: _bound_gemm_exe(False, constexprs, num_xcds),
         tmp_ptr,
         a_ptr,
         b_ptr,

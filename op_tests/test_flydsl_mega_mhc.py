@@ -34,7 +34,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -403,6 +403,7 @@ def test_mega_mhc_config(
             mode != "no_post",
             mode == "identity_pre",
             {"bf16": "none", "fp8_grid": "grid", "mxfp8": "mx"}[out_dtype],
+            get_num_xcds(),
         )
     )
     ret.update(res)
@@ -452,7 +453,7 @@ def test_mega_mhc_dist(T, H, ksplit, mode, out_dtype):
         "TILE_K": 64 if H % (ksplit * 8 * 64) == 0 else 32,
     }
     cu = torch.cuda.get_device_properties(0).multi_processor_count
-    if dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
+    if dist_residency_error(T, dict(base, DIST_FINISH=True), cu, get_num_xcds()):
         return {"gfx": get_gfx(), "skipped": "not resident"}
     args, kw, ref = _call_kwargs(mode, T, H)
     d = out_dtype
@@ -516,7 +517,7 @@ def test_mega_mhc_late(T, H, ksplit, mode, out_dtype):
     args, kw, ref = _call_kwargs(mode, T, H)
     ret = {"gfx": get_gfx()}
     variants = [("classic", {})]
-    if not dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
+    if not dist_residency_error(T, dict(base, DIST_FINISH=True), cu, get_num_xcds()):
         variants.append(("dist", {"DIST_FINISH": True}))
     for name, extra in variants:
         plain = _clone(
@@ -546,14 +547,16 @@ def _scratch_sizes(T, H, out_dtype):
     from aiter.ops.flydsl.mega_mhc_kernels import get_mega_mhc_config
 
     dev = torch.cuda.current_device()
+    num_xcds = get_num_xcds()
     cfg = get_mega_mhc_config(
         T,
         H,
         get_gfx(),
         torch.cuda.get_device_properties(dev).multi_processor_count,
         out_dtype,
+        num_xcds=num_xcds,
     )
-    _nblk, n_wg = grid_size(T, cfg)
+    _nblk, n_wg = grid_size(T, cfg, num_xcds)
     ks = cfg["NUM_KSPLIT"]
     return max(T * ks * 32, 32), max(n_wg // ks * 32, 32)
 

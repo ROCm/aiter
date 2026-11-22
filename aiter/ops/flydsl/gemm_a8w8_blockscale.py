@@ -8,6 +8,8 @@ import functools
 import torch
 from torch import Tensor
 
+from aiter.jit.utils.chip_info import get_num_xcds
+
 from .aot_cache import FlyDSLAotCache
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
@@ -86,7 +88,8 @@ def _compile_gemm(
     K: int,
     kernel_name: str,
     device_index: int,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype,
+    num_xcds: int,
 ):
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 
@@ -102,6 +105,7 @@ def _compile_gemm(
         N,
         K,
         preshuffle_b=ki.preshuffle_b,
+        num_xcds=num_xcds,
     )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
@@ -140,16 +144,19 @@ def run_gemm_a8w8_blockscale(
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
         out_contiguous = Out.contiguous()
+        num_xcds = get_num_xcds()
         # Every tensor is contiguous and only Out's dtype varies, so the
         # compile arguments determine the launcher's argument signature. The
         # device keeps one launcher per device on the JIT path, as
         # _compile_gemm does; on disk the entry is shared by every device.
-        key = (N, K, kernel_name, Out.dtype, XQ.device)
+        key = (N, K, kernel_name, Out.dtype, num_xcds, XQ.device)
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
         _AOT_CACHE.launch(
             key,
-            lambda: _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype),
+            lambda: _compile_gemm(
+                N, K, kernel_name, XQ.device.index, Out.dtype, num_xcds
+            ),
             XQ.contiguous().view(torch.int8),
             WQ.contiguous().view(torch.int8),
             out_contiguous,

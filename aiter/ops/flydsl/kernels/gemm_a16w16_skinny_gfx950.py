@@ -24,8 +24,8 @@ every m up to ``block_m``.
 
 Fixed choices, each measured faster than its alternative on MI355X when the
 kernel was tuned for the GLM-5.2 o_proj decode shape (N=6144, K=2048):
-  * the weight is loaded non-temporal and the N slabs are dealt to the 8 XCDs
-    in contiguous runs, so each XCD reads one dense region of the weight;
+  * the weight is loaded non-temporal and the N slabs are dealt to the device's
+    XCDs in contiguous runs, so each XCD reads one dense region of the weight;
   * a stage is refilled right after its MFMA fragments are read, before the
     MFMAs run, so the refill DMA does not queue behind MFMA issue;
   * chunk-0 DMAs are issued as soon as their own offsets are computed;
@@ -65,7 +65,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
 
 from . import buffer_ops
 from .kernels_common import create_llvm_ptr
@@ -81,7 +81,6 @@ WAVE_SIZE = 64
 DMA_VEC = 8
 # MFMA 16x16x32: K elements consumed per step
 MFMA_K = 32
-GFX950_NUM_XCDS = 8
 # fp32 row pad of the row-major partial reduce: puts the four MFMA lane groups
 # in distinct LDS banks
 REDUCE_ROW_PAD = 4
@@ -140,6 +139,7 @@ def compile_gemm_a16w16_skinny_gfx950(
     stages: int,
     k_waves: int,
     bpreshuffle: bool = False,
+    num_xcds: int = 8,
 ):
     if bpreshuffle and (block_n % 16 or k % 32):
         raise ValueError("AITER BF16 shuffle requires block_n % 16 == K % 32 == 0")
@@ -174,7 +174,7 @@ def compile_gemm_a16w16_skinny_gfx950(
     VEC_PER_ROW = TN // DMA_VEC
     OUT_VECS = TM * VEC_PER_ROW
     ROW_GROUP = max(1, 16 // CPR)  # rows sharing one 256-byte bank line
-    XCD = GFX950_NUM_XCDS if N_BLOCKS % GFX950_NUM_XCDS == 0 else 0
+    XCD = num_xcds if N_BLOCKS % num_xcds == 0 else 0
 
     def swz(r, c):
         return c ^ ((r // ROW_GROUP) % CPR)
@@ -186,6 +186,8 @@ def compile_gemm_a16w16_skinny_gfx950(
     KERNEL_NAME = f"hgemm_bf16_skinny_t{TA}x{TN}x{KC}x{ST}_w1x1x{K_WAVES}"
     if bpreshuffle:
         KERNEL_NAME += "_bshuffle"
+    if XCD and XCD != 8:
+        KERNEL_NAME += f"_nxcd{XCD}"
 
     def mfma(a_fr, b_fr, acc):
         # raw intrinsic: the fragments come straight out of the swizzled LDS
@@ -501,6 +503,8 @@ def gemm_a16w16_skinny(
         raise ValueError(
             f"out must be a contiguous bf16 [{m}, {n}] tensor on {a.device}"
         )
+    with torch.cuda.device(a.device):
+        num_xcds = get_num_xcds()
     exe = compile_gemm_a16w16_skinny_gfx950(
         int(n),
         int(k),
@@ -510,6 +514,7 @@ def gemm_a16w16_skinny(
         int(stages),
         int(k_waves),
         bpreshuffle=bpreshuffle,
+        num_xcds=num_xcds,
     )
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream

@@ -203,6 +203,7 @@ def dry_run(
 
     from aiter.jit import core as jit_core
     from aiter.jit.utils import chip_info
+    from aiter.jit.utils.build_targets import target_num_xcds
     from aiter.utility import graph_alloc
 
     _register_stream_stub()
@@ -324,6 +325,13 @@ def dry_run(
             (torch.Tensor, "contiguous", contiguous),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
+            # FlyDSL kernels bake the XCD count in, so answer the target's.
+            (chip_info, "get_current_hip_device", lambda: 0),
+            (
+                chip_info,
+                "_num_xcds_for_device",
+                lambda _device_id: target_num_xcds(arch, cu_num),
+            ),
             (
                 jit_core,
                 "_pybind_develop_hooks_cache",

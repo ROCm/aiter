@@ -26,6 +26,7 @@ _DEFAULT_MAX_RETRIES = 2
 
 _CU_NUM_TO_ARCH = {
     80: "gfx942",
+    228: "gfx942",
     304: "gfx942",
     256: "gfx950",
 }

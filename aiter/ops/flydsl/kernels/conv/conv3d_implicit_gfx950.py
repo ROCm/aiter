@@ -14,6 +14,8 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
+from aiter.jit.utils.chip_info import get_num_xcds
+
 from .conv3d_gfx950_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_TILE,
@@ -176,7 +178,9 @@ def _shape_agnostic_key(grid, im2col_plan, scatter_plan, unit):
     )
 
 
-def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, unit):
+def _assert_shape_agnostic(
+    param, cfg, kernel_grid, im2col_plan, scatter_plan, unit, num_xcds
+):
     """Check dyn_hw plans match a probe one output step larger. Unexpressible probes skip."""
     st, sh, sw = param.st, param.sh, param.sw
     probe = make_conv3d_implicit_param(
@@ -212,7 +216,9 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
     try:
         probe_geom = make_conv_geometry(probe)
         probe_im2col = make_im2col_plan(probe, probe_geom, cfg)
-        probe_grid = make_launch_grid(probe, probe_geom, cfg, probe_im2col.out_block)
+        probe_grid = make_launch_grid(
+            probe, probe_geom, cfg, probe_im2col.out_block, num_xcds=num_xcds
+        )
         if probe_grid.m_chunks != 1:
             # The probe needs M chunking, which this path rules out anyway.
             return
@@ -240,9 +246,14 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
     )
 
 
-# Tuning walks ~100 configs per shape in one process; 256 would evict.
-@functools.lru_cache(maxsize=1024)
 def compile_conv3d_implicit(param: Conv3dImplicitParam):
+    return _compile_conv3d_implicit(param, get_num_xcds())
+
+
+# Tuning walks ~100 configs per shape in one process; 256 would evict. The die
+# count is part of the key: an AOT replay builds several targets in one process.
+@functools.lru_cache(maxsize=1024)
+def _compile_conv3d_implicit(param: Conv3dImplicitParam, num_xcds: int):
     c, k, groups = param.c, param.k, param.groups
 
     cfg = make_tile_config(param.tile)
@@ -267,7 +278,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
     # How the work is spread: the grid, its limits, and what a block decodes
     # to find its own (M, N, K) tile.
-    grid = make_launch_grid(param, geom, cfg, im2col_plan.out_block)
+    grid = make_launch_grid(param, geom, cfg, im2col_plan.out_block, num_xcds=num_xcds)
 
     # How C is written back: the 5D scatter, the tail masking and the split-K
     # staging, against the same grid the gather reads A on.
@@ -287,7 +298,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         dyn_unit = unit_divisors(param, geom)
         kernel_grid = grid._replace(grid_x=0, grid_z=0, grid_m=0)
         _assert_shape_agnostic(
-            param, cfg, kernel_grid, im2col_plan, scatter_plan, dyn_unit
+            param, cfg, kernel_grid, im2col_plan, scatter_plan, dyn_unit, num_xcds
         )
     else:
         extra_args = ()

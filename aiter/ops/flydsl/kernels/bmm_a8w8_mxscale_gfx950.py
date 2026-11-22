@@ -351,6 +351,7 @@ def launch_bmm_a8w8_mxscale(
     x_scale_transposed: Constexpr[bool] = False,
     xcd_swizzle: Constexpr[int] = 0,
     fuse_quant_out: Constexpr[bool] = False,
+    num_xcds: Constexpr[int] = 8,
 ):
     """splits > 1 splits K over that many workgroups per output tile. A tile's
     splits run on one XCD; each writes an FP32 partial, and the last to arrive
@@ -385,9 +386,13 @@ def launch_bmm_a8w8_mxscale(
     k_steps = tile_k // MFMA_K
     k_span = _padded_k(K) // splits  # the K range of one split
     half_step = K % MFMA_K != 0  # the last MFMA step holds 64 K
-    # The 1-D grids (split-K, xcd_order) put tiles in groups of 8, one per XCD;
-    # a tile count that is not a multiple of 8 is rounded up with idle pids.
-    padded = (splits > 1 or xcd_order) and (N // tile_n * batch) % 8 != 0
+    # The 1-D grids (split-K, xcd_order) put tiles in groups of `group`, one per
+    # XCD; a tile count that is not a multiple of it is rounded up with idle pids.
+    # Split-K keeps 8, a multiple of every gfx950 XCD count, so a tile's splits
+    # stay on one XCD (their partials meet in its L2) even with a misread count;
+    # the xcd_order run follows the device's num_xcds.
+    group = 8 if splits > 1 else num_xcds
+    padded = (splits > 1 or xcd_order) and (N // tile_n * batch) % group != 0
     k_tiles = k_span // tile_k  # K tiles per split
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
@@ -456,6 +461,7 @@ def launch_bmm_a8w8_mxscale(
     kernel_name = format_kernel_name(
         f"bmm_a8w8_mxscale{config}_b{batch}_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
         f"{'_xt' if x_scale_transposed else ''}{'_fq' if fuse_quant_out else ''}"
+        f"{f'_nxcd{group}' if group != 8 else ''}"
     )
 
     @fx.struct
@@ -489,11 +495,11 @@ def launch_bmm_a8w8_mxscale(
             )
             kt0 = split * k_tiles
         elif const_expr(xcd_order):
-            # pid % 8 is the XCD. Give each XCD a contiguous run of tiles, so the
-            # N tiles sharing an A row block, and the M tiles sharing a B column
-            # block, meet in that XCD's L2.
-            per_xcd = ceildiv(tiles, 8) if padded else tiles // 8
-            tile = bid_x % 8 * per_xcd + bid_x // 8
+            # pid % group is the XCD. Give each XCD a contiguous run of tiles, so
+            # the N tiles sharing an A row block, and the M tiles sharing a B
+            # column block, meet in that XCD's L2.
+            per_xcd = ceildiv(tiles, group) if padded else tiles // group
+            tile = bid_x % group * per_xcd + bid_x // group
             if const_expr(xcd_swizzle > 1):
                 # M-major groups of xcd_swizzle M tiles: fewer B column blocks
                 # live at once.
@@ -1297,9 +1303,9 @@ def launch_bmm_a8w8_mxscale(
             body()
 
     m_tiles = ceildiv(i32_m, tile_m)
-    # Split-K and xcd_order take a 1-D grid of whole groups of 8 tiles.
+    # Split-K and xcd_order take a 1-D grid of whole groups of tiles.
     grid = (
-        (ceildiv(m_tiles * (N // tile_n * batch), 8) * 8 * splits, 1, 1)
+        (ceildiv(m_tiles * (N // tile_n * batch), group) * group * splits, 1, 1)
         if splits > 1 or xcd_order
         else (m_tiles, N // tile_n, batch)
     )
