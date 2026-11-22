@@ -163,10 +163,10 @@ def get_bwd_configs(mode: AutotuneMode):
             noncausal_configs = [
                 triton.Config(
                     {
-                        "BLOCK_M1": 32,
+                        "BLOCK_M1": 16,
                         "BLOCK_N1": 32,
                         "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
+                        "BLOCK_N2": 16,
                         "BLK_SLICE_FACTOR": 2,
                     },
                     num_stages=1,
@@ -176,10 +176,10 @@ def get_bwd_configs(mode: AutotuneMode):
             causal_configs = [
                 triton.Config(
                     {
-                        "BLOCK_M1": 32,
+                        "BLOCK_M1": 16,
                         "BLOCK_N1": 32,
                         "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
+                        "BLOCK_N2": 16,
                         "BLK_SLICE_FACTOR": 2,
                     },
                     num_stages=1,
@@ -592,10 +592,10 @@ def get_bwd_configs(mode: AutotuneMode):
             noncausal_configs = [
                 triton.Config(
                     {
-                        "BLOCK_M1": 32,
+                        "BLOCK_M1": 16,
                         "BLOCK_N1": 32,
                         "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
+                        "BLOCK_N2": 16,
                         "BLK_SLICE_FACTOR": 2,
                     },
                     num_stages=1,
@@ -605,10 +605,10 @@ def get_bwd_configs(mode: AutotuneMode):
             causal_configs = [
                 triton.Config(
                     {
-                        "BLOCK_M1": 32,
+                        "BLOCK_M1": 16,
                         "BLOCK_N1": 32,
                         "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
+                        "BLOCK_N2": 16,
                         "BLK_SLICE_FACTOR": 2,
                     },
                     num_stages=1,
