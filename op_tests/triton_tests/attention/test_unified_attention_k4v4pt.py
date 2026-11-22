@@ -2870,3 +2870,79 @@ def test_unified_attn_k4v4pt_prefill_fixed_max(
     assert err < abs_bound, f"max abs error {err:.4f} (bound {abs_bound:.4f}; today's loop {err_base:.4f})"
     # no worse than today's loop beyond rounding noise
     assert rel < 1.1 * rel_base + 1e-3, f"relative L2 error {rel:.4f} vs today's loop {rel_base:.4f}"
+
+
+
+# Longest-first dispatch order (AITER_UA_2D_LPT) of the A8K4V4PT 2D prefill, the c1024 launch (BLOCK_M 64, 2 warps,
+# loop variant 2): batches with partial last q blocks, empty and equal-length sequences, the split-KV launch.
+_K4V4PT_ORDER_CASES = [
+    [(478, 478 + 9000), (600, 3600), (37, 1500), (1500, 1500 + 30000), (130, 200)],
+    [(5, 5), (300, 1000), (64, 64 + 20000), (900, 900 + 2000), (0, 700), (64, 64 + 20000)],
+    [(16, 16 + 65536), (8, 8 + 30000)],  # few query blocks over a long prefix: the KV-split launch
+    [(1024, 1024 + 40000)],  # one sequence: the default order
+]
+
+
+@pytest.mark.parametrize("fixed_max", [True, False])
+@pytest.mark.parametrize("gate", [True, False])
+@pytest.mark.parametrize("seq_lens", _K4V4PT_ORDER_CASES)
+@torch.inference_mode()
+def test_unified_attn_k4v4pt_prefill_order(
+    fixed_max: bool, gate: bool, seq_lens: list[tuple[int, int]], monkeypatch
+) -> None:
+    """The longest-first order (AITER_UA_2D_LPT) is bitwise the default launch's output."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", "fp8")
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": True)
+    monkeypatch.setattr(module, "_UA2D_FIXED_MAX", fixed_max)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt", ref=False
+    )
+    num_tokens = inp["q_fp8"].shape[0]
+    g = (
+        torch.randn(num_tokens, num_heads[0] * head_size, dtype=torch.bfloat16, device="cuda")
+        if gate
+        else None
+    )
+    monkeypatch.setenv(
+        "AITER_UA_2D_CONFIG",
+        json.dumps({"BLOCK_M": 64, "num_warps": 2, "LOOP_VARIANT": 2, "TILE_SIZE": 128}),
+    )
+
+    def run(lpt):
+        monkeypatch.setattr(module, "_UA2D_LPT", lpt)
+        out = torch.full_like(inp["output"], float("nan"))
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=inp["value_cache"],
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+            output_gate=g,
+        )
+        return out
+
+    base = run(False)
+    assert not base.isnan().any()
+    assert torch.equal(run(True).view(torch.int16), base.view(torch.int16)), "the longest-first order changed the output"

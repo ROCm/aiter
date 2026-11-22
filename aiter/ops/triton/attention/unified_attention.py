@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import torch
 import triton
+import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
@@ -101,6 +102,12 @@ _GFX12_2D_PREFILL_SPLIT = os.environ.get("AITER_UA2D_PREFILL_SPLIT", "1") == "1"
 # gfx1250 2D kernel, loop variant 2: fixed reference max (skips the row max, alpha and the accumulator rescale;
 # rounds differently, so off by default). AITER_UA_2D_CONFIG='{"FM_FIXED_MAX": true, ...}' sets it per launch.
 _UA2D_FIXED_MAX = os.environ.get("AITER_UA_2D_FIXED_MAX", "0") == "1"
+# gfx1250 2D kernel, prefill of several sequences: dispatch the programs longest sequence first (AITER_UA_2D_LPT=1).
+# The default order walks the q blocks of the batch backwards (last sequence first), so a long-context sequence
+# early in the batch runs in the last wave while CUs idle. ua2d_seq_order (one small kernel a launch) ranks the
+# sequences by seq_len and writes one (seq, q block, start, len) row per program; the kernel's per-program work is
+# unchanged, so the output is bitwise the same. Off by default.
+_UA2D_LPT = os.environ.get("AITER_UA_2D_LPT", "0") == "1"
 # AITER_UA_FP4PT_NO_SPECIALIZE=1: the gfx1250 2D kernel takes the KV pool's page count (num_blocks) as a runtime,
 # never-specialized i32 instead of a constexpr. num_blocks only bounds the TDM descriptors' rows (the loaders clamp
 # the page ids to the sequence's own pages), but a constexpr keys the compile, and a served pool's count comes from
@@ -1501,6 +1508,63 @@ def _2d_full_causal_prefill(params: _UAParams) -> bool:
     )
 
 
+@triton.jit
+def ua2d_seq_order(
+    query_start_len_ptr,  # [num_seqs + 1]
+    seq_lens_ptr,  # [num_seqs]
+    order_ptr,  # out, int32 [4 + 4 * q blocks]
+    num_seqs,
+    BLOCK_Q: tl.constexpr,
+    N: tl.constexpr,  # >= num_seqs, power of 2
+    CHUNK: tl.constexpr,
+):
+    """Longest-first program order of a prefill for the gfx1250 2D kernel (SEQ_ORDER). Program i (one per
+    sequence) ranks sequence i by seq_len (descending; ties: batch order) and writes the rows of its q blocks,
+    heaviest (last) first, from its first virtual block on: row v = (seq, q block, query start, query len).
+    order[0] = the number of q blocks."""
+    i = tl.program_id(0)
+    j = tl.arange(0, N)
+    valid = j < num_seqs
+    start = tl.load(query_start_len_ptr + j, mask=valid, other=0)
+    stop = tl.load(query_start_len_ptr + j + 1, mask=valid, other=0)
+    nblk = tl.where(valid, (stop - start + BLOCK_Q - 1) // BLOCK_Q, 0)
+    w = tl.load(seq_lens_ptr + j, mask=valid, other=0)
+    w_i = tl.load(seq_lens_ptr + i)
+    before = ((w > w_i) | ((w == w_i) & (j < i))) & valid
+    vstart = tl.sum(tl.where(before, nblk, 0), axis=0)
+    s_i = tl.load(query_start_len_ptr + i)
+    len_i = tl.load(query_start_len_ptr + i + 1) - s_i
+    nb_i = (len_i + BLOCK_Q - 1) // BLOCK_Q
+    if i == 0:
+        tl.store(order_ptr, tl.sum(nblk, axis=0))
+    for c in range(0, nb_i, CHUNK):
+        b = c + tl.arange(0, CHUNK)
+        m = b < nb_i
+        row = order_ptr + 4 + (vstart + b) * 4
+        tl.store(row, tl.zeros([CHUNK], tl.int32) + i, mask=m)
+        tl.store(row + 1, nb_i - 1 - b, mask=m)
+        tl.store(row + 2, tl.zeros([CHUNK], tl.int32) + s_i, mask=m)
+        tl.store(row + 3, tl.zeros([CHUNK], tl.int32) + len_i, mask=m)
+
+
+def _gfx12_2d_seq_order(params: _UAParams, block_q: int, q_blocks: int):
+    """Device-side longest-first program order of a multi-sequence prefill (AITER_UA_2D_LPT), or None."""
+    if not _UA2D_LPT or params.all_decode or params.spec_decode or params.num_seqs < 2:
+        return None
+    order = torch.empty(4 + 4 * q_blocks, dtype=torch.int32, device=params.q.device)
+    ua2d_seq_order[(params.num_seqs,)](
+        params.cu_seqlens_q,
+        params.seqused_k,
+        order,
+        params.num_seqs,
+        BLOCK_Q=block_q,
+        N=max(32, triton.next_power_of_2(params.num_seqs)),
+        CHUNK=256,
+        num_warps=4,
+    )
+    return order
+
+
 def _gfx12_2d_split(params: _UAParams, config: dict):
     """(KV splits, config) of a gfx1250 2D prefill launch. An attn_2d entry with
     SPLIT_* keys splits a prefill over a context of at least SPLIT_MIN_KV into the
@@ -1671,6 +1735,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     v_cache = params.v.view(torch.uint8) if v_fp4pt else params.v
     if v_fp4pt:
         _fp4pt_log("2d", _fp4pt_pv_mode(), v=tuple(params.v.shape), tile=TILE_SIZE, block_m=BLOCK_M)
+    seq_order = _gfx12_2d_seq_order(params, BLOCK_Q, total_query_blocks)
+    seq_order_args = {} if seq_order is None else dict(SEQ_ORDER=True, seq_order_ptr=seq_order)
     _unified_attention_kernel_2d_gfx1250[
         (params.num_kv_heads, total_query_blocks, num_splits)
     ](
@@ -1745,6 +1811,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         partial_acc_ptr=segm_output,
         enable_fp_fusion=True,
         **fm_options,
+        **seq_order_args,
     )
     if num_splits > 1:
         # all heads of a token in few programs (~16 x 256 x 4 splits a program)
