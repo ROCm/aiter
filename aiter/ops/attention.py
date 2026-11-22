@@ -1321,7 +1321,6 @@ def get_mla_decode_head_plan_v1(
     arch: str,
     enable_experimental: int,
     flydsl_ps1: int,
-    native_96h_cp: int,
     v_head_dim: int,
     page_size: int,
     cp_world_size: int,
@@ -1329,6 +1328,7 @@ def get_mla_decode_head_plan_v1(
     has_scales: bool,
     use_opus: bool,
     use_ps1_asm: bool,
+    native_96h_cp: int = 0,
 ) -> tuple[str, bool, bool, int, int, bool, int, int, int, int, bool, int]: ...
 
 
@@ -1427,7 +1427,7 @@ def _mla_shape_dtype(dtype: torch.dtype) -> tuple[int, str]:
 def _mla_cpp_gpu_arch(device_index: int) -> str:
     bf16 = _aiter_dtype_ids["bf16"]
     plan = get_mla_decode_head_plan_v1(
-        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 0, 512, 1, 1, *(False,) * 4
+        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 512, 1, 1, *(False,) * 4
     )
     return plan[0]
 
@@ -1472,7 +1472,6 @@ def _mla_decode_head_plan_cached(
             arch,
             int(enable_experimental),
             int(flydsl_ps1),
-            int(native_96h_cp),
             v_head_dim,
             page_size,
             cp_world_size,
@@ -1480,6 +1479,7 @@ def _mla_decode_head_plan_cached(
             has_scales,
             use_opus,
             use_ps1_asm,
+            int(native_96h_cp),
         )
     )
     return plan._replace(backend=_MlaBackendId.ASM) if asm_only else plan

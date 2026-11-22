@@ -193,14 +193,14 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                             const std::string& arch,
                             const int64_t enable_experimental,
                             const int64_t flydsl_ps1,
-                            const int64_t native_96h_cp,
                             const int64_t v_head_dim,
                             const int64_t page_size,
                             const int64_t cp_world_size,
                             const bool cp_round_robin,
                             const bool has_scales,
                             const bool use_opus,
-                            const bool use_ps1_asm)
+                            const bool use_ps1_asm,
+                            const int64_t native_96h_cp)
 {
     if(num_heads_k < 1 || num_heads_per_head_k < 1)
     {

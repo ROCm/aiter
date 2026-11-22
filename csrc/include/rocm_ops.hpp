@@ -2443,14 +2443,14 @@ namespace py = pybind11;
           py::arg("arch"),                               \
           py::arg("enable_experimental"),                \
           py::arg("flydsl_ps1"),                         \
-          py::arg("native_96h_cp"),                      \
           py::arg("v_head_dim"),                         \
           py::arg("page_size"),                          \
           py::arg("cp_world_size"),                      \
           py::arg("cp_round_robin"),                     \
           py::arg("has_scales"),                         \
           py::arg("use_opus"),                           \
-          py::arg("use_ps1_asm"));                       \
+          py::arg("use_ps1_asm"),                        \
+          py::arg("native_96h_cp") = 0);                 \
     m.def("mla_reduce_v1_supports",                      \
           &mla_reduce_v1_supports,                       \
           "mla_reduce_v1_supports",                      \

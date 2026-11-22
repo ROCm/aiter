@@ -176,6 +176,20 @@ def test_default_launch_plan_folds_96_heads_under_cprr(monkeypatch):
     assert _mla_decode_launch_plan(*args)[0].plan == attention._MlaHeadPlanKind.NATIVE
 
 
+def test_head_plan_binding_keeps_its_pre_opt_in_signature(monkeypatch):
+    # get_mla_decode_head_plan_v1 is exported: callers written against the 18
+    # argument form keep working, and omitting native_96h_cp means "off" (main's
+    # plan) even with the env var set. native_96h_cp is a trailing optional arg.
+    monkeypatch.setenv("AITER_MLA_NATIVE_96H_CP", "1")
+    fp8 = attention._aiter_dtype_ids["fp8"]
+    old = (1, 96, 8, 8, fp8, fp8, True, False, "gfx950", 0, 0, 512, 1, 8)
+    tail = (True, False, False, False)  # cp_round_robin, has_scales, use_opus, ps1
+    plan = attention.get_mla_decode_head_plan_v1(*old, *tail)
+    opted = attention.get_mla_decode_head_plan_v1(*old, *tail, 1)
+    assert plan != opted
+    assert opted == attention.get_mla_decode_head_plan_v1(*old, *tail, native_96h_cp=1)
+
+
 def test_gfx942_96_heads_stay_folded():
     # gfx942 has no native qh96 kernel, so the gfx950-only native route must
     # leave its plan alone: 96 heads fold x6 at every qlen, with or without
