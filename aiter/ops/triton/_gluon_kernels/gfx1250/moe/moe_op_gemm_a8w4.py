@@ -2157,12 +2157,10 @@ def _moe_gemm_a8w4_prefill(
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
         SCALE_KWIDTH: gl.constexpr = 4
-        SCALE_KGROUP: gl.constexpr = SCALE_KWIDTH
     else:
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-        SCALE_KGROUP: gl.constexpr = 1
 
     # B pointers
     off_w_n_scale = pid_n * SCALE_BLOCK_N
@@ -2206,12 +2204,7 @@ def _moe_gemm_a8w4_prefill(
         )
     w_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=WMxScale,
-        shape=(
-            tl.cdiv(N, PRESHUFFLE_FACTOR),
-            tl.cdiv(tl.cdiv(K, MX_PACK_DIVISOR), SCALE_KGROUP)
-            * SCALE_KGROUP
-            * PRESHUFFLE_FACTOR,
-        ),
+        shape=(N // PRESHUFFLE_FACTOR, tl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
         strides=(stride_w_mx_n, stride_w_mx_k),
         block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
         layout=SHARED_LAYOUT_W_SCALES,
