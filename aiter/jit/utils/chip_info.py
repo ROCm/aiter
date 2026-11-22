@@ -508,9 +508,8 @@ def _clear_cu_num_cache() -> None:
     _get_cu_num.cache_clear()
     # The torch custom op may be bound to the top-level `chip_info` copy of this
     # module (aiter/jit/core.py imports it so), which has its own cache.
-    for module in {
-        id(m): m for m in (sys.modules.get("chip_info"), sys.modules.get(__name__)) if m
-    }.values():
+    names = ("chip_info", "aiter.jit.utils.chip_info", __name__)
+    for module in {id(m): m for m in map(sys.modules.get, names) if m}.values():
         module._device_cu_num.cache_clear()
 
 
