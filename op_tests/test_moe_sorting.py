@@ -396,6 +396,9 @@ def test_moe_sorting_opus_contract():
             expert_mask[local : 2 * local] = 1
         valid = {"all": m, "some": m - m // 3 - 7, "none": 0}[valid_kind]
         num_local_tokens = torch.tensor([valid], dtype=dtypes.i32, device=device)
+        # Callers may hand over weights for the valid tokens only, while the ids are
+        # padded to the token capacity: the sort must not read past them.
+        topk_weights = topk_weights[: max(valid, 1)].clone()
 
         padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
         sorted_ids = torch.full((padded,), fill, dtype=dtypes.i32, device=device)
@@ -473,7 +476,9 @@ def test_moe_sorting_opus_contract():
         assert torch.equal(
             local_topk_ids[:valid], ref_local[:valid].to(dtypes.i32)
         ), f"local_topk_ids at {where}"
-        assert bool((local_topk_ids[valid:] == fill).all()), f"local ids tail at {where}"
+        assert bool(
+            (local_topk_ids[valid:] == fill).all()
+        ), f"local ids tail at {where}"
 
         ref_m = torch.where(is_pad, valid, sorted_ids[:n] & 0x00FFFFFF)
         assert torch.equal(m_indices[:n], ref_m.to(dtypes.i32)), f"m_indices at {where}"
@@ -659,7 +664,7 @@ def test_moe_sorting(
     return ret
 
 
-def test_moe_sorting_flydsl_cuda_graph_capture(
+def test_moe_sorting_cuda_graph_capture(
     dtype,
     token,
     model_dim,
@@ -667,16 +672,17 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     topk,
     has_expert_mask=False,
     routing_case="valid",
+    backend="flydsl",
 ):
-    """Capture moe_sorting (FlyDSL backend) under a real torch.cuda.graph(),
-    then replay with a DIFFERENT num_local_tokens tensor value than was
+    """Capture moe_sorting (`backend` "flydsl" or "opus") under a real
+    torch.cuda.graph(), then replay with a DIFFERENT num_local_tokens tensor value than was
     captured. Regression test for the .item() capture-safety fix: reading
     num_local_tokens on the host during capture used to raise
     'operation not permitted when stream is capturing'; and even a naive
     host-side guard would still bake a stale capture-time count into the
     graph. This asserts real dynamic behavior survives across replay.
     """
-    set_moe_sorting_backend("flydsl")
+    set_moe_sorting_backend(backend)
 
     capture_tokens = token
     replay_tokens = max(1, token // 2)  # a different dynamic count at replay time
@@ -744,7 +750,7 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     errs = _compare_moe_sorting_outputs(ref, out, topk, topk_ids.shape[0])
     bad = {k: v for k, v in errs.items() if v}
     assert not bad, (
-        f"moe_sorting cuda-graph replay mismatch (captured token={capture_tokens}, "
+        f"moe_sorting[{backend}] cuda-graph replay mismatch (captured token={capture_tokens}, "
         f"replayed token={replay_tokens}, E={E}, topk={topk}, "
         f"has_expert_mask={has_expert_mask}, routing_case={routing_case}): {bad}"
     )
@@ -817,7 +823,7 @@ def test_moe_sorting_invalid_topk_ids():
                 f"routing_case={routing_case}: {bad}"
             )
 
-    test_moe_sorting_flydsl_cuda_graph_capture(
+    test_moe_sorting_cuda_graph_capture(
         dtype,
         token=2048,
         model_dim=model_dim,
@@ -1123,15 +1129,19 @@ def main():
             if m < 2:
                 continue  # need capture/replay token counts to differ
             for E, topk in model_configs:
-                test_moe_sorting_flydsl_cuda_graph_capture(
-                    dtype,
-                    m,
-                    args.model_dim,
-                    E,
-                    topk,
-                    has_expert_mask=expert_mask,
-                )
-        aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
+                for backend in ("flydsl", "opus"):
+                    test_moe_sorting_cuda_graph_capture(
+                        dtype,
+                        m,
+                        args.model_dim,
+                        E,
+                        topk,
+                        has_expert_mask=expert_mask,
+                        backend=backend,
+                    )
+        aiter.logger.info(
+            "moe_sorting FlyDSL and Opus cuda-graph capture/replay: all passed"
+        )
 
         if args.decode_graph:
             decode_rows = []

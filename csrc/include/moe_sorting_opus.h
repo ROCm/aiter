@@ -3409,10 +3409,16 @@ struct MoeSortingChunkPlaceKernel
         IndexType* p_reverse_sorted   = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
         IndexType* p_local_topk_ids   = static_cast<IndexType*>(kargs.p_local_topk_ids);
 
-        // the weights are first needed after the starts are known: fetch them meanwhile
-        impl::moe_sorting_chunk_touch(p_weights,
-                                      group * kargs.rounds * kChunkTokens * topk,
-                                      routes_end((group + 1) * kargs.rounds * kChunkTokens));
+        // The weights are first needed after the starts are known: fetch them meanwhile.
+        // Only the rows of the valid tokens: callers may pass a weights tensor that is
+        // shorter than the ids, and the ids' padding rows are not routed.
+        {
+            const opus::index_t w_end = tokens * topk < numel ? tokens * topk : numel;
+            const opus::index_t r_end = routes_end((group + 1) * kargs.rounds * kChunkTokens);
+            impl::moe_sorting_chunk_touch(p_weights,
+                                          group * kargs.rounds * kChunkTokens * topk,
+                                          r_end < w_end ? r_end : w_end);
+        }
 
         // ---- every expert's start slot for this group ----
         {
