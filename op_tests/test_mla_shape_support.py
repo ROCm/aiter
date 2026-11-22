@@ -51,6 +51,14 @@ def _native_96h_cp_env(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_native_96h_cp_plan_yet(monkeypatch):
+    # get_mla_metadata_v1 marks the process once it plans round-robin CP with the
+    # opt-in, and unrecorded metadata (a clone) then assumes it; each test starts
+    # as a process that has not, and monkeypatch restores the mark afterwards.
+    monkeypatch.setattr(attention, "_mla_native_96h_cp_ever_planned", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_opus_env(monkeypatch):
     # The tests pin the default backends; AITER_MLA_USE_OPUS is read on every
     # query and launch, so an inherited value would select OPUS instead, and an
@@ -1078,6 +1086,130 @@ def test_decode_update_keeps_the_planned_opt_in_after_a_toggle(
         update(ref, msq)
         for got, want in zip(meta[1:], ref[1:]):
             assert torch.equal(got, want), msq
+
+
+def test_a_native_cp_plan_marks_unrecorded_metadata(monkeypatch):
+    # Only a round-robin CP plan with the opt-in marks the process; after it,
+    # metadata with no record assumes the opt-in even once the env is cleared.
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
+    wmd = torch.zeros(2, dtype=torch.uint64)
+    idx = torch.zeros(3, dtype=torch.int32)
+
+    def plan(cprr):
+        aiter.get_mla_metadata_v1(
+            *(idx, idx, idx, 96, 1, False, wmd, *(idx,) * 5),
+            is_cp_round_robin=cprr,
+        )
+
+    for native, cprr in ((False, True), (True, False)):
+        _set_native_96h_cp(monkeypatch, native)
+        plan(cprr)
+    _set_native_96h_cp(monkeypatch, False)
+    assert not attention._mla_unrecorded_native_96h_cp()
+    _set_native_96h_cp(monkeypatch, True)
+    assert attention._mla_unrecorded_native_96h_cp()
+    plan(True)
+    _set_native_96h_cp(monkeypatch, False)
+    assert attention._mla_unrecorded_native_96h_cp()
+    # the record still decides for the planned buffer
+    assert _mla_planned_native_96h_cp(wmd) is True
+
+
+def _update(meta, msq, n=96, bs=2, qd=dtypes.fp8):
+    qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
+    decode_update_mla_metadata_v1(
+        *(qo, kv_indptr, last, n, 1, True, *meta),
+        max_seqlen_qo=msq,
+        dtype_q=qd,
+        dtype_kv=qd,
+    )
+    torch.cuda.synchronize()
+
+
+@requires_gpu
+def test_unrecorded_clone_fails_closed_after_the_opt_in_is_cleared(monkeypatch):
+    # A clone has no record of the opt-in. Planned natively under round-robin CP
+    # and then decoded or updated with the opt-in cleared, it must not run or
+    # write the fold on native metadata: both refuse it.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    cp_rank = 3
+    for msq in (7, 8):
+        _set_native_96h_cp(monkeypatch, True)
+        with pytest.raises(ValueError, match="no recorded is_cp_round_robin"):
+            _run_decode(
+                *(96, msq, "fp8", True),
+                cp_rank=cp_rank,
+                meta_view=torch.clone,
+                after_plan=lambda: _set_native_96h_cp(monkeypatch, False),
+            )
+        _set_native_96h_cp(monkeypatch, True)
+        _, _, meta = _run_planner(2, msq, 96, dtypes.fp8, dtypes.fp8, cp_rank=0)
+        _set_native_96h_cp(monkeypatch, False)
+        with pytest.raises(ValueError, match="no recorded is_cp_round_robin"):
+            _update((meta[0].clone(), *meta[1:]), msq)
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "meta_view",
+    [None, lambda t: t[:], copy.deepcopy],
+    ids=["original", "view", "deepcopy"],
+)
+def test_recorded_metadata_keeps_its_plan_after_the_opt_in_is_cleared(
+    monkeypatch, meta_view
+):
+    # The same toggle on the planned tensor, a view or a deep copy: they carry the
+    # record, so decode runs the native plan and the update refuses it as CP
+    # metadata (not as a clone).
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    folds = []
+    fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
+
+    def counting_fold(*args):
+        folds.append(args)
+        return fold_seqlen_indptr(*args)
+
+    monkeypatch.setattr(aiter.mla, "_fold_seqlen_indptr", counting_fold)
+    cp_rank = 3
+    for msq in (7, 8):
+        folds.clear()
+        _set_native_96h_cp(monkeypatch, True)
+        out, lse, inputs = _run_decode(
+            *(96, msq, "fp8", True),
+            cp_rank=cp_rank,
+            meta_view=meta_view,
+            after_plan=lambda: _set_native_96h_cp(monkeypatch, False),
+        )
+        assert not folds, msq
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+        _set_native_96h_cp(monkeypatch, True)
+        _, _, meta = _run_planner(2, msq, 96, dtypes.fp8, dtypes.fp8, cp_rank=0)
+        _set_native_96h_cp(monkeypatch, False)
+        wmd = meta[0] if meta_view is None else meta_view(meta[0])
+        with pytest.raises(ValueError, match="is_cp_round_robin=True"):
+            _update((wmd, *meta[1:]), msq)
+
+
+@requires_gpu
+def test_default_unrecorded_clone_decodes_and_updates():
+    # A process that never planned with the opt-in (each test starts as one, after
+    # the tests above set it) keeps main's behaviour for a clone: under
+    # round-robin CP, 96 fp8 heads at qlen 7 and 8 fold either way, so decode runs
+    # the fold and the update rewrites it.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    assert not attention._mla_native_96h_cp_ever_planned
+    cp_rank = 3
+    for msq in (7, 8):
+        out, lse, inputs = _run_decode(
+            *(96, msq, "fp8", True), cp_rank=cp_rank, meta_view=torch.clone
+        )
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+        _, _, meta = _run_planner(2, msq, 96, dtypes.fp8, dtypes.fp8, cp_rank=0)
+        _update((meta[0].clone(), *meta[1:]), msq)
+    assert not attention._mla_native_96h_cp_ever_planned
 
 
 @requires_gpu

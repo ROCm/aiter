@@ -1387,6 +1387,18 @@ def _mla_native_96h_cp_enabled() -> bool:
     return env_flag_atoi("AITER_MLA_NATIVE_96H_CP")
 
 
+# Set once get_mla_metadata_v1 has planned round-robin CP with the opt-in. A
+# clone of metadata has no record of the opt-in it was planned with, so after
+# that it may hold the native plan even once the env is cleared.
+_mla_native_96h_cp_ever_planned = False
+
+
+def _mla_unrecorded_native_96h_cp() -> bool:
+    """The opt-in to assume for metadata with no record (a clone): set if it is
+    set now or was ever planned with CP, so the CP head-plan check fails closed."""
+    return _mla_native_96h_cp_enabled() or _mla_native_96h_cp_ever_planned
+
+
 def _mla_opus_enabled() -> bool:
     return env_flag_atoi("AITER_MLA_USE_OPUS")
 
@@ -2768,6 +2780,9 @@ def get_mla_metadata_v1(
     # The C++ planner reads AITER_MLA_NATIVE_96H_CP itself; record the value it sees,
     # so a later toggle cannot make decode or the update disagree with the plan.
     native_96h_cp = _mla_native_96h_cp_enabled()
+    if native_96h_cp and is_cp_round_robin:
+        global _mla_native_96h_cp_ever_planned
+        _mla_native_96h_cp_ever_planned = True
     _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
@@ -2972,7 +2987,8 @@ def decode_update_mla_metadata_v1(
     plan (96 fp8 heads at qlen 7 and 8 on gfx950, with the AITER_MLA_NATIVE_96H_CP
     opt-in recorded at planning) it raises ValueError on metadata
     get_mla_metadata_v1 planned with is_cp_round_robin=True, and on metadata
-    with no recorded mode (a clone, which reads the opt-in from the env).
+    with no recorded mode (a clone) once the opt-in is set or was ever planned
+    with round-robin CP in this process.
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2982,9 +2998,11 @@ def decode_update_mla_metadata_v1(
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
     plan_args = (num_heads_per_head_k, max_seqlen_qo, dtype_q, dtype_kv)
-    # The opt-in the metadata was planned with, not the current env (None for a
-    # clone, which falls back to the env).
+    # The opt-in the metadata was planned with, not the current env. A clone has
+    # none: assume it if it is set or was ever planned with CP, so it fails closed.
     native_96h_cp = _mla_planned_native_96h_cp(work_metadata_ptrs)
+    if native_96h_cp is None:
+        native_96h_cp = _mla_unrecorded_native_96h_cp()
     head_plan = _mla_metadata_head_plan(
         *plan_args,
         fast_mode=True,

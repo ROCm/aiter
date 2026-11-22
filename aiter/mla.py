@@ -30,6 +30,7 @@ from aiter.ops.attention import (
     _mla_head_fold,
     _mla_planned_cp_round_robin,
     _mla_planned_native_96h_cp,
+    _mla_unrecorded_native_96h_cp,
     _MlaBackendId,
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1466,9 +1467,13 @@ def mla_decode_fwd(
         has_scales = q_scale is not None and kv_scale is not None
         cp_launch = g_kv_indptr is not None
         # The AITER_MLA_NATIVE_96H_CP opt-in the metadata was planned with, so
-        # toggling it after planning cannot change the head plan (a clone has no
-        # record and reads the env).
+        # toggling it after planning cannot change the head plan. A clone has no
+        # record: assume the opt-in if it is set or was ever planned with CP, so
+        # the check below fails closed instead of running the fold on native
+        # metadata after the env is cleared.
         planned_native = _mla_planned_native_96h_cp(work_meta_data)
+        if planned_native is None:
+            planned_native = _mla_unrecorded_native_96h_cp()
         head_plan, max_splits = _mla_decode_launch_plan(
             *plan_shape, cp_launch, has_scales, planned_native
         )
