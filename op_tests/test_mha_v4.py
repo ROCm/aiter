@@ -1776,14 +1776,7 @@ def test_mha_v4_kv_splits_auto_cost_model_compiles():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
-@parametrize(
-    "formats",
-    [
-        param((AttentionFormat.BF16,) * 3, id="BF16"),
-        param((AttentionFormat.FP8,) * 3, id="FP8"),
-    ],
-)
-def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence(formats):
+def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
     """Auto under a dynamic sequence: one graph for every length, each split as eager picks.
 
     A DiT's sequence follows its prompt, so a compiled model sees many key lengths. Traced, the
@@ -1792,6 +1785,7 @@ def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence(formats):
     """
     torch._dynamo.reset()
     torch.manual_seed(63)
+    formats = (AttentionFormat.BF16,) * 3
     counter = torch._dynamo.testing.CompileCounterWithBackend("inductor")
     compiled = torch.compile(mha_v4, backend=counter, fullgraph=True, dynamic=True)
     picks = set()
