@@ -199,7 +199,16 @@ def make_megakernel(
                 "AITER_MEGAKERNEL_BLOCK_RUNS", str(s1f_block_runs(max_tok_per_rank))
             )
         )
+        # GEMM1 claimed per XCC (protocol.gemm_queue): faster with two
+        # n-tiles an XCC (DSR1 4096 tpr -12 us); three (Pro) read a little
+        # slower, so they keep the one queue unless asked.
+        NXCC = 8
+        _xq = os.environ.get("AITER_MEGAKERNEL_XQ", "1" if NT1 == 2 * NXCC else "0")
+        XQ = int(_xq == "1" and NT1 % NXCC == 0)
         st_kw = dict(  # noqa: C408 - KCtx fields
+            XQ=XQ,
+            NXCC=NXCC,
+            GMX=int(os.environ.get("AITER_MEGAKERNEL_GMX", "32")),
             GM1=int(os.environ.get("AITER_MEGAKERNEL_GM1", "32")),
             GM2=int(os.environ.get("AITER_MEGAKERNEL_GM2", "32")),
             FM=FM,
@@ -267,6 +276,7 @@ def make_megakernel(
         for name, val, default in (
             ("st", (st_kw["P"] * 100 + st_kw["RBK"]) if STREAM else 0, 0),
             ("gm", (st_kw["GM1"] * 100 + st_kw["GM2"]) if STREAM else 3232, 3232),
+            ("xq", st_kw["XQ"] * st_kw["GMX"] if STREAM else 32, 32),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),

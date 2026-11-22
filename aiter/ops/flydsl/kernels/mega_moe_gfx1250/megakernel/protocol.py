@@ -56,6 +56,10 @@ CTL_TALLY = 5248  # + 32 * parity: compact layout, tally CTAs done
 #: quantized their tokens into the local wire rows (+ 32 * parity each).
 CTL_PHEAD = 5376
 CTL_QDONE = 5504
+#: compact STREAM, GEMM1 by XCC: a claim head per XCC (128 B apart), a
+#: block of them per parity.
+CTL_XQ = 5632
+XQ_PAR = 256
 #: Per m-tile: g1_cnt at word 0 and g1_ready at word 32, each on its own
 #: 128 B line, so the ready polls do not queue the completion atomics.
 CTL_G1 = 6144
@@ -390,6 +394,14 @@ def start(kc):
                 + other * fx.Int32(32),
                 cache_modifier=SCOPE_DEV,
             )
+        if const_expr(STREAM and kc.XQ):  # noqa: SIM102 - preserve DSL staging
+            if lane < fx.Int32(kc.NXCC):
+                buffer_store(
+                    fx.Int32(0),
+                    rsrc_ctl,
+                    fx.Int32(CTL_XQ) + other * fx.Int32(XQ_PAR) + lane * fx.Int32(32),
+                    cache_modifier=SCOPE_DEV,
+                )
         if const_expr(STREAM):  # noqa: SIM102 - preserve DSL staging
             if lane < fx.Int32(2):
                 buffer_store(
@@ -915,7 +927,52 @@ def gemm_queue(kc, n_mt):
             return fx.Int32((j >= n_mt).select(j - n_mt, j))
         return i
 
-    if const_expr(STREAM):
+    XQ = bool(STREAM and kc.XQ)
+    q_head = fx.Int32(CTL_QHEAD * 4) + par * fx.Int32(128)
+    if const_expr(XQ):
+        # GEMM1 by XCC: XCC x runs n-tiles x, x + NXCC, ... of every m-tile,
+        # so the m-tiles of one expert read each W1 slice through one L2.
+        # Workgroups go to the XCCs round-robin (workgroup b runs on XCC
+        # (b + c) % 8, c fixed per launch), so b % 8 names a CTA's XCC
+        # group. Each group claims its GEMM1 items from its own head, GMX
+        # m-tiles a group, m fastest; past them, GEMM2 from the shared head.
+        # A GEMM2 item may then wait on another group's unclaimed GEMM1
+        # items, which that group's CTAs (resident, G % 64 == 0) claim
+        # before any GEMM2 item of theirs.
+        NXCC, GMX = kc.NXCC, kc.GMX
+        NTX = NT1 // NXCC
+        xcc = bid & fx.Int32(NXCC - 1)
+        U1 = n_mt * fx.Int32(NTX)
+        U = U1 + n_mt * fx.Int32(NT2)
+        x_head = fx.Int32(CTL_XQ * 4) + par * fx.Int32(XQ_PAR * 4) + xcc * fx.Int32(128)
+
+        def order_x(w):
+            g = w // fx.Int32(GMX * NTX)
+            base = g * fx.Int32(GMX)
+            gsz = n_mt - base
+            gsz = fx.Int32((gsz > fx.Int32(GMX)).select(fx.Int32(GMX), gsz))
+            r = w - g * fx.Int32(GMX * NTX)
+            kx = r // gsz
+            return base + r - kx * gsz, xcc + kx * fx.Int32(NXCC)
+
+        def xq_next(c):
+            """t0: a GEMM1 claim past the group's items takes a GEMM2 one."""
+            nq = c
+            if c >= U1:
+                nq = U1 + _buffer_atomic_add_ret(rsrc_ctl, q_head, 1, SCOPE_DEV)
+            return nq
+
+    if const_expr(XQ):
+        c0 = _buffer_atomic_add_ret(
+            rsrc_ctl, fx.Int32(is_t0.select(x_head, fx.Int32(_OOB))), 1, SCOPE_DEV
+        )
+        if is_t0:
+            comm_ops.store_i32_lds(bc_next, xq_next(c0))
+        rocdl.s_wait_dscnt(0)
+        rocdl.s_barrier_signal(-1)
+        rocdl.s_barrier_wait(-1)
+        u = _uniform(comm_ops.load_i32_lds(bc_next))
+    if const_expr(STREAM and not XQ):
         u = fx.Int32((bid == fx.Int32(0)).select(fx.Int32(0), bid - fx.Int32(P)))
         if is_prod:
             if is_t0:
@@ -939,7 +996,7 @@ def gemm_queue(kc, n_mt):
             rsrc_ctl,
             fx.Int32(
                 is_t0.select(
-                    fx.Int32(CTL_QHEAD * 4) + par * fx.Int32(128),
+                    fx.Int32((u < U1).select(x_head, q_head)) if XQ else q_head,
                     fx.Int32(_OOB),
                 )
             ),
@@ -947,7 +1004,7 @@ def gemm_queue(kc, n_mt):
             SCOPE_DEV,
         )
         if u < U1:
-            i, n = order(u, NT1, kc.GM1 if STREAM else 1)
+            i, n = order_x(u) if XQ else order(u, NT1, kc.GM1 if STREAM else 1)
             i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
             if const_expr(STREAM):
@@ -1064,7 +1121,13 @@ def gemm_queue(kc, n_mt):
                 n,
             )
         if is_t0:
-            comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + claim)
+            if const_expr(XQ):
+                nxq = U1 + claim
+                if u < U1:
+                    nxq = xq_next(claim)
+                comm_ops.store_i32_lds(bc_next, nxq)
+            else:
+                comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + claim)
         rocdl.s_wait_dscnt(0)
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
