@@ -140,7 +140,7 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   as identifying every M). Then one M per set of kernels the
   row's own replay did not build is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
   would miss kernels there, since the gfx1250 GEMMs' kernels follow M's tile
-  counts (the heuristics' picks; a gfx1250 GEMM kernel is one binary for every
+  counts (the heuristics' picks; a compute kernel is one binary for every
   cluster_m, except that a launch fitting to one workgroup runs the plain
   kernel), so two sizes that request one kernel can bound a size that requests
   another. Rows of other archs are replayed at

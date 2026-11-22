@@ -492,7 +492,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
     constexpr_args = (*constexpr_args[:7], use_cluster, *constexpr_args[8:])
     if compute_bound:
-        specialization = constexpr_args + (
+        # A launch of one workgroup is no cluster: it runs the plain kernel.
+        use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
+        specialization = (*constexpr_args[:7], use_cluster, *constexpr_args[8:]) + (
             scale_block,
             split_k,
             a_preshuffle,
