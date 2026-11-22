@@ -6,12 +6,12 @@ This checks separation of the statistics and temporary-output buffers only.
 GPU attention correctness, including MTP writer/reducer indexing, is separate.
 """
 
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
-from jinja2 import Template
 import pytest
+from jinja2 import Template
 
 
 @pytest.mark.parametrize("mtp", [1, 2, 4])
