@@ -1810,10 +1810,11 @@ def flydsl_kda_decode_with_f_b(
     head re-reads the whole ``f_a`` row. GPU time on MI355X from the in-tree sweep
     (``python op_tests/test_flydsl_linear_attention.py``, ``flydsl_f_b`` against
     ``flydsl_proj``, the BF16 ``F.linear`` followed by :func:`flydsl_kda_decode`):
-    the fused call is faster by 2-5 us up to batch 32, and slower by 6-8% at batch
-    64-256 with an FP32 state (6-25% with a BF16 state). Callers serving batches of
-    64 or more should project separately. These are GPU times: the host-side validation
-    (about 50 us per eager call on MI355X, none under CUDA graph replay) is not in them.
+    the fused call is faster by about 1-4 us up to batch 32 (the gap narrows as the
+    batch grows), and slower by 6-9% at batch 64-256 with an FP32 state (6-23% with
+    a BF16 state). Callers serving batches of 64 or more should project separately.
+    These are GPU times: the host-side validation (about 50 us per eager call on
+    MI355X, none under CUDA graph replay) is not in them.
     """
     if f_a.ndim != 2:
         raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
