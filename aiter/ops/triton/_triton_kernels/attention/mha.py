@@ -300,7 +300,7 @@ _attn_fwd_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_attn_fwd_repr)
+@triton.jit(repr=_attn_fwd_repr, do_not_specialize=["BATCH"])
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
