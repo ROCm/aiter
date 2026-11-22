@@ -127,6 +127,20 @@ def make_overlap_callbacks(
 ):
     """Bind the two-store-wave, 8+8 gather schedule to GEMM operations.
 
+    Fixed gather counts per wave (each gather writes eight C rows):
+
+        Wave    m: overlaps next prologue    n: overlaps next mainloop
+        0       0                            0
+        1       0                            0
+        2       8                            8
+        3       8                            8
+        Total   16                           16
+
+    Task t's epilogue issues m. Task t+1's prologue waits for m after issuing
+    input stages 0/1, then uses one barrier before reusing C's head. It issues
+    n before input stage 2; n must retire before task t+1 overwrites C in its
+    epilogue. The final task issues both bursts without a following prologue.
+
     Returns prologue, epilogue and skipped-task callbacks. ``pending`` holds
     the previous task's two tail index vectors, column offset and valid flag.
     The lo/hi vectors cover C rows 128:192 and 192:256 respectively. Each lane
