@@ -1291,14 +1291,13 @@ def _blocks_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) 
 _EXACT_OVERLAP_MAX_RUNS = 1 << 22
 
 
-def _byte_runs(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Return (start byte of every run, run length in bytes) of a tensor.
+def _dense_runs(tensor: torch.Tensor) -> tuple[list[tuple[int, int]], int]:
+    """Split a tensor into (row axes as (size, stride), run length in elements).
 
     Dimensions that follow each other in memory merge into one run, so the
     runs are the dense pieces the tensor is made of, holes between them kept.
-    All runs have the same length. Starts are int64 on the CPU.
+    All runs have the same length.
     """
-    es = tensor.element_size()
     run = 1
     rows = []
     for size, stride in sorted(
@@ -1313,12 +1312,17 @@ def _byte_runs(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
             run *= size
         else:
             rows.append((size, stride))
-    starts = torch.tensor([tensor.data_ptr()], dtype=torch.int64)
+    return rows, run
+
+
+def _byte_starts(tensor: torch.Tensor, rows: list[tuple[int, int]]) -> torch.Tensor:
+    """Start byte of every run, as int64 on the CPU whatever the default device."""
+    es = tensor.element_size()
+    starts = torch.tensor([tensor.data_ptr()], dtype=torch.int64, device="cpu")
     for size, stride in rows:
-        starts = (
-            starts[:, None] + torch.arange(size, dtype=torch.int64) * (stride * es)
-        ).reshape(-1)
-    return starts, run * es
+        steps = torch.arange(size, dtype=torch.int64, device="cpu") * (stride * es)
+        starts = (starts[:, None] + steps).reshape(-1)
+    return starts
 
 
 def _exactly_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -1326,19 +1330,21 @@ def _exactly_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
 
     Slower than :func:`_blocks_overlap`, so only the cases it cannot rule out
     come here (an error path, or interleaved layouts such as per-head rows).
-    Past ``_EXACT_OVERLAP_MAX_RUNS`` runs it answers True, like the span check.
+    Past ``_EXACT_OVERLAP_MAX_RUNS`` runs in total it answers True, like the
+    span check. Host work on CPU tensors only: no sync, safe during capture.
     """
     if a.numel() == 0 or b.numel() == 0:
         return False
-    runs = 1
-    for tensor in (a, b):
-        sizes = [size for size in tensor.shape if size > 1]
-        runs *= max(1, math.prod(sizes) // max(1, tensor.shape[-1]))
-    if runs > _EXACT_OVERLAP_MAX_RUNS:
+    a_rows, a_run = _dense_runs(a)
+    b_rows, b_run = _dense_runs(b)
+    if (
+        math.prod(size for size, _ in a_rows) + math.prod(size for size, _ in b_rows)
+        > _EXACT_OVERLAP_MAX_RUNS
+    ):
         return True
-    a_starts, a_len = _byte_runs(a)
-    b_starts, b_len = _byte_runs(b)
-    b_sorted = torch.sort(b_starts).values
+    a_starts = _byte_starts(a, a_rows)
+    b_sorted = torch.sort(_byte_starts(b, b_rows)).values
+    a_len, b_len = a_run * a.element_size(), b_run * b.element_size()
     # The last b run starting before a run's end is the one reaching furthest.
     below = torch.searchsorted(b_sorted, a_starts + a_len)
     last = b_sorted[(below - 1).clamp(min=0)]

@@ -1888,10 +1888,10 @@ def test_flydsl_kda_decode_rejects_cache_overlapping_another_operand(
         (True, "output_gate_heads"),
     ],
 )
+@pytest.mark.parametrize("batch", [2, 256])
 def test_flydsl_kda_decode_accepts_out_interleaved_with_an_input(
-    fused_f_b: bool, neighbor: str
+    fused_f_b: bool, neighbor: str, batch: int
 ) -> None:
-    batch = 2
     f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
     # Per token (or, for "_heads", per head), one pool row holds the input and
     # the next one holds out: the byte ranges interleave but share nothing.
@@ -1926,6 +1926,41 @@ def test_flydsl_kda_decode_accepts_out_interleaved_with_an_input(
 
     assert actual is out
     _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
+
+
+@_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
+def test_flydsl_kda_decode_head_interleaved_out_under_graph_capture(
+    fused_f_b: bool,
+) -> None:
+    """The exact overlap comparison is host-only CPU work: it must neither fail
+    nor sync while a graph is captured, with a CUDA default device as here."""
+    batch = 8
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
+    pool = torch.full(
+        (batch, _KDA_HEADS, 2, _KDA_DIM),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=_KDA_DEVICE,
+    )
+    pool[:, :, 0].copy_(inputs.output_gate)
+    inputs.output_gate = pool[:, :, 0]
+    out = pool[:, :, 1].unsqueeze(0)
+    reference_inputs = _copy_kda_inputs(inputs)
+    reference = _kda_reference(reference_inputs)
+    # Compile outside the capture on a throwaway copy, so capture records launches only.
+    _run_kda_api(fused_f_b, f_a, f_b_weight, _copy_kda_inputs(inputs))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        if fused_f_b:
+            _run_kda_with_f_b(f_a, f_b_weight, inputs, out=out)
+        else:
+            _run_kda(inputs, out=out)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_kda_close(reference, out, _KDA_OUTPUT_TOL, "output")
 
 
 @_requires_kda
