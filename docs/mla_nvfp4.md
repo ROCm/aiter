@@ -44,7 +44,7 @@ with a positive floor of `2**-9`; all-zero blocks use an ideal scale of 1.
 Valid input values must be finite. This is a quantized attention operator:
 agreement with its quantized oracle does not establish full-model accuracy.
 
-The O34a shader uses N128 tiles and local N16 probability quantization. Each
+The decoder uses N128 tiles and local N16 probability quantization. Each
 N16 group computes a local log2 maximum `b` and
 `e = exp2(fma(raw_score, beta, -b))`. With the common N128 online anchor `a`,
 `w = exp2(b - a)` and `P = FP4(6*e) * FP8(5*w)`. Both the PV numerator `R`
@@ -61,7 +61,7 @@ the integer physical page capacity. Recreate old parameter buffers: the previous
 The fixed probability factors 6 and 5 cancel between numerator and denominator;
 the output multiplier removes only the KV gain.
 
-O34a does not produce a natural-log LSE. The public wrappers reject
+The decoder does not produce a natural-log LSE. The public wrappers reject
 `return_lse=True`; the ABI retains its LSE pointer slot without accessing it.
 The pipeline overlaps KV prefetch with QK/PV, with separate startup/drain paths
 and LDS-staged tensor output stores.
@@ -227,64 +227,55 @@ per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
 and unified dispatch, repeatability, guards, producer byte layouts, active-tail
 requantization, BF16-to-decode, dense-to-CSR, stream/graph and fullgraph compile.
 The optional test allocates approximately 12GiB to put both KV streams above
-4GiB offsets. The previous O24a performance tables and matched-threshold
-#7987 comparison do not describe O34a T1; no O34a speedup is claimed here.
+4GiB offsets. The previous large-batch performance and accuracy sweeps measured
+an earlier code object. The validation below applies to the updated decoder.
 
-### Public integration validation (2026-11-20)
+### Public integration validation (2026-11-22)
 
 On gfx1250 B0 hardware, **44 selected GPU tests passed, with no skips** using a
 fresh v6 JIT build. This includes the standard BF16 reference, supplemental
 algorithm checks, constant V, guards, producer layouts, graph/fullgraph paths,
->4 GiB KV offsets and FP8 QH128 regression coverage. The loaded decoder bytes
-match the model-tested instructions; decode and both HIP producer entries are
-16 KiB aligned. Black, Ruff and `git diff --check` also pass.
+KV offsets beyond 4 GiB and FP8 QH128 regression coverage. Existing test tolerances
+are unchanged. The loaded decoder instructions match those used in the
+full-model evaluation; decoder and both HIP producer entries are 16 KiB aligned.
 
-A separate full-output accuracy sweep used the standard FP32 attention
-reference on original BF16 Q/KV for all nine large shapes below. Every output
-was checked, with zero elements outside each format's existing tolerance.
-These are accuracy measurements, without decode timing. Each cell is the
-maximum per-request output NRMS, not an average across the batch.
+### Full-model accuracy
 
-| Batch | KV tokens | O34a T1 max NRMS | FP8 max NRMS |
-|---:|---:|---:|---:|
-| 5120 | 5120 | 0.133414 | 0.036040 |
-| 5120 | 8192 | 0.124834 | 0.033366 |
-| 5120 | 10240 | 0.118575 | 0.032297 |
-| 6144 | 5120 | 0.133958 | 0.035989 |
-| 6144 | 8192 | 0.122718 | 0.033346 |
-| 6144 | 10240 | 0.118686 | 0.032225 |
-| 7168 | 5120 | 0.134002 | 0.035947 |
-| 7168 | 8192 | 0.123126 | 0.033543 |
-| 7168 | 10240 | 0.118694 | 0.032310 |
+One complete DeepSeek-R1 MLPerf accuracy evaluation used the updated decoder,
+N16 producers, threshold 1, output multiplier `1/89.6` and one KV split.
+It covered all **4388** unique samples and passed the supplied accuracy gate:
 
-The formats have different quantization error; passing their respective
-operator limits does not establish equal precision or model-level equivalence.
-
-### Full-model accuracy: O34a T1
-
-Two complete DeepSeek-R1 MLPerf accuracy runs used the same O34a instruction
-stream, N16 producers, threshold 1, output multiplier `1/89.6` and one KV split.
-Both covered all **4388** samples once and passed the supplied accuracy gate:
-
-| Run | Correct | Exact match | Tokens/sample | Result |
-|---|---:|---:|---:|---|
-| Original | 3541 / 4388 | 80.697356% | 3931.095260 | PASS |
-| Repeat | 3541 / 4388 | 80.697356% | 3931.071103 | PASS |
+| Correct | Exact match | Tokens/sample | Result |
+|---:|---:|---:|---|
+| 3541 / 4388 | 80.697356% | 3931.095260 | PASS |
 
 The gate requires exact match >=80.545% and 3497.6–4274.9 tokens/sample.
-All 4388 per-sample scores agreed between the two O34a runs; 4382 generated
-outputs were identical. The earlier #7987 T1 evaluation scored 3557/4388
-(81.061987%), so O34a T1 is **16 correct answers lower**, or **0.364631 percentage
-points**. Passing the acceptance gate is not a claim of zero regression versus
-that historical baseline.
-These results apply to the tested DeepSeek-R1 checkpoint and supplied MLPerf
-harness, not to every model or input distribution. The runs used four gfx1250
-GPUs and image `rocm/fw-bringup-mlperf:gfx1250-atom-20261116-dsr1`.
+The earlier #7987 T1 evaluation scored 3557/4388 (81.061987%), so this run is
+**16 correct answers lower**, or **0.364631 percentage points**. Passing the
+acceptance gate is not a claim of zero regression versus that historical baseline.
+The result applies to the tested DeepSeek-R1 checkpoint and supplied MLPerf
+harness, using four gfx1250 GPUs. One run does not establish repeated-run
+accuracy stability or accuracy for other models and input distributions.
 
-The public CO preserves the tested instruction stream and descriptor exactly;
-only its exported name and ELF metadata were repackaged for the existing
-AITER filename. SHA256 identities:
+The model run's token-weighted time per output token after the first token was
+41.250 ms. Mean per-request decode duration (`latency - TTFT`) was 162.116 s.
+These timings include framework scheduling. The 732 s query window includes
+prefill and decode and excludes model loading and scoring. Concurrent request
+durations are not summed as wall time. No model-throughput improvement is
+established by this single accuracy run.
 
-- Public CO: `c18ad764cca5be882cb38afc01058c3a7f535a609aa968d1a7f7248be0a0d040`.
-- Instructions (90236 bytes): `d8098a5a02a57147e990770d69ac7fa806f35fa9031146986e03eddd7100ea09`.
-- Complete `.text` including padding (90620 bytes): `93916cb5274f96897aac3f401b21229ffc29a05594ced43b7b79339169f63be9`.
+### Decode timing
+
+Two single-GPU paired measurement blocks used batch 512, fixed KV length 2500,
+the same original BF16 inputs and physical page mapping. Each block retained
+all 30 rounds; each sample averaged 32 graph dispatches. NVFP4 produced output
+only, while the existing FP8 API also produced LSE.
+
+| Block | NVFP4 mean (us) | FP8 mean (us) | NVFP4 time increase |
+|---|---:|---:|---:|
+| First | 79.481 | 78.169 | 1.678% |
+| Second | 83.008 | 80.627 | 2.953% |
+
+FP8 was faster in 25/30 paired rounds in each block. These measurements exclude
+input preparation, cache writes and model execution. Performance depends on
+the workload; the updated decoder is not faster than FP8 in this measured shape.
