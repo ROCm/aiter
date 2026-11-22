@@ -51,19 +51,19 @@ from .tensor_shim import (
 sched_vgpr = getattr(getattr(rocdl, "experimental", rocdl), "sched_vgpr", None)
 
 
-def place_vgpr(storage, start):
-    """Pin SSA consumers without competing constraints on writes."""
+def place_vgpr(storage, start, *, soft=False):
+    """Place SSA consumers without competing constraints on writes."""
 
     # Keep the adapter in this helper's source for recursive JIT hashing.
     class ScheduledVgprStorage:
-        """Register memory whose loads use strict VGPR placement."""
+        """Register memory whose loads carry VGPR placement hints."""
 
         def __init__(self, storage, start):
             self.storage = storage
             self.start = start
 
         def load(self):
-            return Vec(sched_vgpr(self.storage.load(), self.start, soft=False))
+            return Vec(sched_vgpr(self.storage.load(), self.start, soft=soft))
 
         def store(self, value):
             return self.storage.store(value)
@@ -373,6 +373,16 @@ def build_gemm_a8w4_tdm_task(
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
     USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # FlyDSL 0.5.1 retains strict-pin pseudos through register allocation.
+    # In the M256 persistent EP kernel they cause 560 VGPR spills. Advisory
+    # hints allow repeated reads to coalesce, avoiding scratch and storecnt.
+    soft_vgpr_hints = bool(
+        a_is_fp4
+        and enable_ep_scatter
+        and ep_world_size > 1
+        and persistent_workers
+        and not ep_quant_bits
+    )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
@@ -1502,7 +1512,9 @@ def build_gemm_a8w4_tdm_task(
         if const_expr(USE_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
-                c_frags[idx] = place_vgpr(c_frags[idx], 512 + idx * WMMA_VECTOR_DWORDS)
+                c_frags[idx] = place_vgpr(
+                    c_frags[idx], 512 + idx * WMMA_VECTOR_DWORDS, soft=soft_vgpr_hints
+                )
 
         def init_accumulators():
             # Cover prologue TDM latency before the first pipeline wait.
@@ -1645,10 +1657,10 @@ def build_gemm_a8w4_tdm_task(
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
-                    a[wm] = place_vgpr(a[wm], reg)
+                    a[wm] = place_vgpr(a[wm], reg, soft=soft_vgpr_hints)
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
-                    b[wn] = place_vgpr(b[wn], reg)
+                    b[wn] = place_vgpr(b[wn], reg, soft=soft_vgpr_hints)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
                 # Scales remain free in v0-v255.
