@@ -417,7 +417,7 @@ _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 # 16-byte packs a chunk (ragged chunks). fp32 takes the LL one-shot only at TP2
 # up to 1 MiB (0.36 MB) and the two-shot everywhere else: split at TP2 from 2 to
 # 4 MiB (2.62 and 3.91 MB), at TP4 from 4 to 8 MiB (4.59, 6.39 and 7.81 MB) and
-# at TP8 from 256 KiB to 4 MiB (0.36, 1.15, 2.62 and 3.91 MB), fused elsewhere.
+# at TP8 up to 4 MiB (0.36, 1.15, 2.62 and 3.91 MB), fused elsewhere.
 # The LL kernel keeps its own scratch and state; the split and fused two-shot
 # share the Lamport inbox and its rounds, split in blocks of 3 x 32 to 2 x 480
 # lanes and fused in blocks of 256 and 512, so a pack's owning block changes

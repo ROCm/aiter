@@ -219,7 +219,7 @@ def test_gfx1250_plain_ar_gate_lamport():
     def fp32(n):
         return torch.empty(n // 4, dtype=torch.float32)
 
-    for ws, cap in ((2, 16 * MiB), (4, 8 * MiB), (8, MiB)):
+    for ws, cap in ((2, 16 * MiB), (4, 8 * MiB), (8, 4 * MiB)):
         ca = _stub(ws=ws, lamport_max_bytes=cap)
         cut = ca._plain_ar_max_size
         assert ca.should_custom_plain_ar(bf16(cut + 16)), ws
@@ -246,16 +246,16 @@ def test_gfx1250_lamport_ar_route():
         )
 
     bf16, fp32 = torch.bfloat16, torch.float32
-    ca = _stub(ws=8, lamport_max_bytes=MiB)
+    ca = _stub(ws=8, lamport_max_bytes=4 * MiB)
     route = ca.select_lamport_ar
-    assert route(t(MiB, bf16)) == (False, False)  # the one-shot
-    assert route(t(MiB + 512, bf16)) == (True, True)  # split to 4 MiB
+    assert route(t(768 * 1024, bf16)) == (False, False)  # the one-shot
+    assert route(t(768 * 1024 + 512, bf16)) == (True, True)  # split to 4 MiB
     assert route(t(4 * MiB, bf16)) == (True, True)
-    assert route(t(4 * MiB + 512, bf16)) == (True, False)  # fused to 8 x the cap
-    assert route(t(8 * MiB, bf16)) == (True, False)
-    assert route(t(8 * MiB + 512, bf16)) is None
-    assert route(t(256 * 1024, fp32)) == (True, False)  # fp32: fused, then split
-    assert route(t(256 * 1024 + 512, fp32)) == (True, True)
+    assert route(t(4 * MiB + 512, bf16)) == (True, False)  # fused above
+    assert route(t(32 * MiB, bf16)) == (True, False)
+    assert route(t(32 * MiB + 512, bf16)) is None
+    assert route(t(512, fp32)) == (True, True)  # fp32: split from any size
+    assert route(t(4 * MiB, fp32)) == (True, True)
     assert route(t(4 * MiB + 512, fp32)) == (True, False)
     ca = _stub(ws=4, lamport_max_bytes=8 * MiB)
     assert ca.select_lamport_ar(t(1280 * 1024, bf16)) == (False, False)

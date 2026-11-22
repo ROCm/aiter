@@ -278,30 +278,30 @@ _LAMPORT_AR_RMS_MAX_BYTES = {2: 16 * 1024 * 1024, 4: 8 * 1024 * 1024}
 _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 # gfx1250 plain all-reduce on the same Lamport inbox, per world size: a sender's
 # slot of the inbox, which caps the one-shot; the two-shot takes up to
-# world_size x it, 32 MiB at TP2 and TP4 and 8 MiB at TP8. Past 8 MiB at TP8 the
-# fused two-shot runs more blocks than CUs and RCCL is level with it (MI455X,
-# two trays, symm_mem, bf16: 45.9 vs 43.0 us at 10 MiB, 47.0 vs 46.7 at 12 MiB;
-# 21.2 vs 41.3 at 8 MiB). The inbox is sized by the larger of this and the
+# world_size x it, 32 MiB at TP2, TP4 and TP8. Past 8 MiB at TP8 the fused
+# two-shot runs more blocks than CUs and slows, but stays ahead of RCCL (MI455X,
+# two trays, symm_mem, bf16: 20.8 vs 41.4 us at 8 MiB, 33.5 vs 43.2 at 10 MiB,
+# 66.0 vs 96.6 at 32 MiB). The inbox is sized by the larger of this and the
 # RMSNorm cap: 3 x world_size x it, plus a quarter of that for the all-gather's
 # escape flags, plus world_size x it for the two-shot's all-gather, 152 MiB a
-# rank at TP2 and TP4 and 38 MiB at TP8. Every transport builds it.
+# rank at each of these. Every transport builds it.
 # AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE overrides this cap as it does the
 # RMSNorm one; 0 turns every Lamport op off.
-_LAMPORT_AR_MAX_BYTES = {2: 16 * 1024 * 1024, 4: 8 * 1024 * 1024, 8: 1024 * 1024}
+_LAMPORT_AR_MAX_BYTES = {2: 16 * 1024 * 1024, 4: 8 * 1024 * 1024, 8: 4 * 1024 * 1024}
 # The one-shot up to this many bytes per world size (and the cap), the two-shot
 # above it. fp16/bf16 alike, CUDA graphs: the two cross at 9-9.5 MiB at TP2 and
-# 1.25-1.375 MiB at TP4 (4x gfx1250), and at 1 MiB at TP8 across two MI455X
-# trays over symm_mem, against the split two-shot (11.1 vs 11.5 us at 1 MiB,
-# 17.5 vs 12.0 at 1.25 MiB). Unmeasured world sizes take the one-shot up to the
-# cap, as the other Lamport ops do.
-_LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024, 8: 1024 * 1024}
+# 1.25-1.375 MiB at TP4 (4x gfx1250), and past 768 KiB at TP8 across two MI455X
+# trays over symm_mem, against the split two-shot (8.6 vs 10.0 us at 512 KiB,
+# 9.9 vs 10.3 at 768 KiB, 11.1 vs 10.5 at 1 MiB). Unmeasured world sizes take the
+# one-shot up to the cap, as the other Lamport ops do.
+_LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024, 8: 768 * 1024}
 # The Lamport one-shot takes 2-byte dtypes only: fp32 takes the LL one-shot up
 # to this many bytes per world size instead, and the two-shot above it. MI455X,
 # CUDA graphs, us an all-reduce, LL one-shot vs two-shot: TP2 7.1 vs 7.7 at
 # 512 KiB, level at 1 MiB (8.0 vs 7.9), 11.5 vs 8.0 at 1.25 MiB; TP4 level to
 # 256 KiB (7.5 vs 7.3 at 16 KiB), 9.5 vs 8.5 at 384 KiB, 12.2 vs 8.9 at 1 MiB;
-# TP8 across two trays 10.5 vs 9.3 at 8 KiB, 14.6 vs 10.3 at 256 KiB (the fused
-# two-shot timed in bf16 at the same bytes). So TP4 and TP8 take none.
+# TP8 across two trays 11.1 vs 9.0 at 16 KiB, 14.6 vs 10.1 at 256 KiB (the split
+# two-shot, which TP8 takes there). So TP4 and TP8 take none.
 # Unmeasured world sizes take the LL one-shot up to the one-shot's bound (and at
 # most _GFX1250_LL_MAX_BYTES).
 _LAMPORT_AR_FP32_LL_MAX_BYTES = {2: 1024 * 1024, 4: 0, 8: 0}
@@ -313,14 +313,12 @@ _LAMPORT_AR_FP32_LL_MAX_BYTES = {2: 1024 * 1024, 4: 0, 8: 0}
 # - TP4: 13.7 vs 11.4 at 4 MiB, 15.2 vs 16.3 at 5 MiB, 17.6 vs 19.5 at 8 MiB,
 #   32.3 vs 23.7 at 12 MiB.
 # - TP8, two trays over symm_mem, where a poll after its own wave's stores waits
-#   a fabric round trip: 10.9 vs 14.2 at 512 KiB, 11.5 vs 13.9 at 1 MiB, 14.9 vs
-#   15.3 at 4 MiB, 21.2 (3 x 160 lanes, a block a CU) vs 17.3 at 5 MiB; fused
-#   10.3 at 256 KiB. Timed on the two kernels this one merges, the split one with
-#   its own inbox and, below 4 MiB, its own launch shapes.
+#   a fabric round trip: fp32 9.0 vs 9.6 at 16 KiB, 10.1 vs 10.7 at 256 KiB;
+#   bf16 10.5 vs 14.0 at 1 MiB, 14.4 vs 16.4 at 4 MiB, 19.5 vs 17.0 at 5 MiB.
 _LAMPORT_AR_SPLIT_BYTES = {
     2: (2 * 1024 * 1024, 4 * 1024 * 1024),
     4: (4 * 1024 * 1024, 8 * 1024 * 1024),
-    8: (256 * 1024, 4 * 1024 * 1024),
+    8: (0, 4 * 1024 * 1024),
 }
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512

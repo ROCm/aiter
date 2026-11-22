@@ -85,14 +85,14 @@ MIXED_RMS = [(4, 7168), (300, 4096)]
 MIXED_AG = [((4, 64, 32), torch.int32, 0), ((48, 7168), torch.bfloat16, -1)]
 GRAPH_AR = [(48, 7168, True), (7, 1000, False), (288, 5120, True), (1, 8, True)]
 # restated from custom_all_reduce.py / custom_all_reduce_gfx1250.cuh
-LAMPORT_1SHOT_MAX_BYTES = {2: 9 << 20, 4: 1280 << 10, 8: 1 << 20}
+LAMPORT_1SHOT_MAX_BYTES = {2: 9 << 20, 4: 1280 << 10, 8: 768 << 10}
 # fp32 takes the LL one-shot up to here instead, the two-shot above
 LAMPORT_FP32_LL_MAX_BYTES = {2: 1 << 20, 4: 0, 8: 0}
 # the two-shot is split in (lo, hi], fused elsewhere
 LAMPORT_SPLIT_BYTES = {
     2: (2 << 20, 4 << 20),
     4: (4 << 20, 8 << 20),
-    8: (256 << 10, 4 << 20),
+    8: (0, 4 << 20),
 }
 LL_AR_MAX_BYTES = 4 << 20
 
