@@ -36,6 +36,11 @@ from ..s1f_stage1 import (
     _uniform,
 )
 
+try:  # with IOD placement (aiter.ops.flydsl.iod_locality) only
+    from aiter.ops.flydsl.kernels.iod_loc_probe import launch_rotation
+except ImportError:
+    launch_rotation = None
+
 #: HIP ``kAmaxFloor`` (csrc/include/quant_amax_floor.h): the staged wire quant
 #: seeds every group's amax with it, so an all-zero group gets the same e8m0.
 AMAX_FLOOR = 1e-10
@@ -60,6 +65,9 @@ CTL_QDONE = 5504
 #: block of them per parity.
 CTL_XQ = 5632
 XQ_PAR = 256
+#: IOD-placed weights (LOC): domain 1's GEMM2 head, past domain 0's
+#: (CTL_QHEAD), + 32 * parity.
+CTL_QHEAD1 = CTL_QHEAD + 512
 #: Per m-tile: g1_cnt at word 0 and g1_ready at word 32, each on its own
 #: 128 B line, so the ready polls do not queue the completion atomics.
 CTL_G1 = 6144
@@ -400,6 +408,14 @@ def start(kc):
                     fx.Int32(0),
                     rsrc_ctl,
                     fx.Int32(CTL_XQ) + other * fx.Int32(XQ_PAR) + lane * fx.Int32(32),
+                    cache_modifier=SCOPE_DEV,
+                )
+        if const_expr(STREAM and kc.XQ and kc.LOC):  # noqa: SIM102
+            if lane == fx.Int32(0):
+                buffer_store(
+                    fx.Int32(0),
+                    rsrc_ctl,
+                    fx.Int32(CTL_QHEAD1) + other * fx.Int32(32),
                     cache_modifier=SCOPE_DEV,
                 )
         if const_expr(STREAM):  # noqa: SIM102 - preserve DSL staging
@@ -753,6 +769,7 @@ def gemm_queue(kc, n_mt):
     arg_disp, arg_disp_scale, arg_rowmap = kc.arg_disp, kc.arg_disp_scale, kc.arg_rowmap
     arg_w1, arg_w1_scale, arg_w2 = kc.arg_w1, kc.arg_w1_scale, kc.arg_w2
     arg_w2_scale, bc, bid = kc.arg_w2_scale, kc.bc, kc.bid
+    loc1, loc2 = kc.loc1, kc.loc2
     f32_swiglu_limit, g1_task, g2_task = kc.f32_swiglu_limit, kc.g1_task, kc.g2_task
     gen, i32_rows, is_t0, lane = kc.gen, kc.i32_rows, kc.is_t0, kc.lane
     lds_end, lds_rows, meta1_holder = kc.lds_end, kc.lds_rows, kc.meta1_holder
@@ -945,6 +962,35 @@ def gemm_queue(kc, n_mt):
         U1 = n_mt * fx.Int32(NTX)
         U = U1 + n_mt * fx.Int32(NT2)
         x_head = fx.Int32(CTL_XQ * 4) + par * fx.Int32(XQ_PAR * 4) + xcc * fx.Int32(128)
+        if const_expr(kc.LOC):
+            # IOD-placed W1 / W2: workgroup b runs on IOD domain
+            # ((b + c) & 7) >> 2, c the launch's rotation, and each GEMM's
+            # n-tiles come in runs of R alternating domains (an odd last run
+            # split in halves, iod_locality). XCC x of domain d takes run
+            # 2 (x & 3) + d of W1; GEMM2 has a head per domain over its own
+            # n-tiles, NT2 / 2 of them.
+            x_real = (xcc + _uniform(launch_rotation())) & fx.Int32(NXCC - 1)
+            dom = x_real >> fx.Int32(2)
+            NT2D = NT2 // 2
+            U = U1 + n_mt * fx.Int32(NT2D)
+            q_head = q_head + dom * fx.Int32((CTL_QHEAD1 - CTL_QHEAD) * 4)
+
+        def loc_n(d, k, R, NRUN):
+            """The k-th n-tile of domain d."""
+            run = d + fx.Int32(2) * (k // fx.Int32(R))
+            n = run * fx.Int32(R) + k % fx.Int32(R)
+            if const_expr(NRUN % 2):
+                full = (NRUN // 2) * R
+                n = fx.Int32(
+                    (k < fx.Int32(full)).select(
+                        n,
+                        fx.Int32((NRUN - 1) * R)
+                        + d * fx.Int32(R // 2)
+                        + k
+                        - fx.Int32(full),
+                    )
+                )
+            return n
 
         def order_x(w):
             g = w // fx.Int32(GMX * NTX)
@@ -953,6 +999,14 @@ def gemm_queue(kc, n_mt):
             gsz = fx.Int32((gsz > fx.Int32(GMX)).select(fx.Int32(GMX), gsz))
             r = w - g * fx.Int32(GMX * NTX)
             kx = r // gsz
+            if const_expr(kc.LOC):
+                nx_ = loc_n(
+                    dom,
+                    (x_real & fx.Int32(3)) * fx.Int32(NTX) + kx,
+                    kc.R1,
+                    NT1 // kc.R1,
+                )
+                return base + r - kx * gsz, nx_
             return base + r - kx * gsz, xcc + kx * fx.Int32(NXCC)
 
         def xq_next(c):
@@ -1041,6 +1095,7 @@ def gemm_queue(kc, n_mt):
                 arg_disp,
                 arg_a2_scale,
                 arg_disp,
+                *loc1,
                 rows_cap,
                 n1,
                 f32_swiglu_limit,
@@ -1072,7 +1127,11 @@ def gemm_queue(kc, n_mt):
                     stamp(TR_FIRST_G2)
             n2_done = n2_done + fx.Int32(1)
             v = u - U1
-            i, n = order(v, NT2, kc.GM2 if STREAM else 1)
+            if const_expr(XQ and kc.LOC):
+                i, kk = order(v, NT2D, kc.GM2)
+                n = loc_n(dom, kk, kc.R2, NT2 // kc.R2)
+            else:
+                i, n = order(v, NT2, kc.GM2 if STREAM else 1)
             i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
             if const_expr(STREAM):
@@ -1112,6 +1171,7 @@ def gemm_queue(kc, n_mt):
                 arg_disp,
                 arg_disp,
                 arg_rowmap,
+                *loc2,
                 rows_cap,
                 n2,
                 f32_swiglu_limit,

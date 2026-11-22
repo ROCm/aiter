@@ -88,11 +88,6 @@ def compact_reason(config) -> str | None:
     """Why this MegaMoE cannot run the compact megakernel, or None if it can."""
     if not read_megakernel():
         return "AITER_MEGAKERNEL is off"
-    from ..s1f_ctl import iod_placement_reason
-
-    why = iod_placement_reason()
-    if why is not None:
-        return why
     geo = config.geometry
     if geo.max_tokens_per_rank > 0xFFFF:
         return "X1 holds a source's rows of an expert in 16 bits"
@@ -113,6 +108,44 @@ def compact_reason(config) -> str | None:
         why = _mega_reason(config, tile)
         if why is not None:
             return why
+    return _placed_reason(variants)
+
+
+def _reads_placed(tile) -> bool:
+    """Whether a compact tile's GEMMs read the IOD-placed W1 and W2."""
+    from aiter.ops.flydsl import iod_locality
+
+    return bool(
+        iod_locality.placed_ratio(iod_locality.W13_TILE, tile["tile_n"], tile["tile_k"])
+        and iod_locality.placed_ratio(
+            iod_locality.W2_TILE, tile["tile_n2"], tile["tile_k2"]
+        )
+    )
+
+
+def _compact_tiles():
+    """COMPACT_TILES, less the rows whose tiles cannot read IOD-placed
+    weights when they are placed: the next row serves their steps."""
+    from ..s1f_ctl import iod_placement_reason
+
+    if iod_placement_reason() is None:
+        return COMPACT_TILES
+    return tuple(r for r in COMPACT_TILES if r[0] is None or _reads_placed(r[1]))
+
+
+def _placed_reason(variants) -> str | None:
+    """Why the compact megakernel cannot read IOD-placed weights, or None
+    (also when nothing is placed). Its GEMMs read them through the builder's
+    ``b_placed`` when every variant's tiles serve the placed layouts."""
+    from ..s1f_ctl import iod_placement_reason
+
+    why = iod_placement_reason()
+    if why is None:
+        return None
+    from .kernel import BUILDER_LOC
+
+    if not BUILDER_LOC or not all(_reads_placed(t) for _, _, t, _ in variants):
+        return why
     return None
 
 
@@ -212,7 +245,7 @@ def compact_variants(config) -> list:
     lo = slots_recv_cap(config) if slots_reason(config) is None else 0
     top = min(config.max_recv, config.world_size * COMPACT_MAX_TOKENS - 1)
     out = []
-    for upto, tile, ctas in COMPACT_TILES:
+    for upto, tile, ctas in _compact_tiles():
         if lo >= top:
             break
         hi = top if upto is None else min(top, config.world_size * int(upto))

@@ -142,8 +142,23 @@ class MegaKernel:
             self.config.max_recv if recv_token_bound is None else int(recv_token_bound)
         )
 
-    def _launcher(self, stage1_act):
-        if self._launch is None or self._act_key != stage1_act:
+    def _placement(self, w1, w1_scale, w2, w2_scale):
+        """The IOD phase tables of W1 / W2 and the builder's placed-B
+        constants (``b_placed1``, ``loc_group1``, ``b_placed2``,
+        ``loc_group2``): zeros for a weight left unplaced."""
+        try:
+            from aiter.ops.flydsl.iod_locality import lookup
+        except ImportError:
+            return (None, None), (0, 1, 0, 1)
+        geo, t = self.config.geometry, self.tile
+        h, i = self.config.hidden_dim, geo.inter_dim
+        tab1, bp1, g1 = lookup(w1, w1_scale, 2 * i, h, t["tile_n"], t["tile_k"])
+        tab2, bp2, g2 = lookup(w2, w2_scale, h, i, t["tile_n2"], t["tile_k2"])
+        return (tab1, tab2), (bp1, g1 or 1, bp2, g2 or 1)
+
+    def _launcher(self, stage1_act, placed=(0, 1, 0, 1)):
+        key = (stage1_act, placed)
+        if self._launch is None or self._act_key != key:
             config, arena = self.config, self.res.arena
             geo = config.geometry
             self._launch = make_megakernel(
@@ -170,9 +185,13 @@ class MegaKernel:
                 mt_cap=self.mt_cap,
                 stream=self.stream,
                 producers=STREAM_PRODUCERS,
+                b_placed1=placed[0],
+                loc_group1=placed[1],
+                b_placed2=placed[2],
+                loc_group2=placed[3],
                 **self.tile,
             )
-            self._act_key = stage1_act
+            self._act_key = key
         return self._launch
 
     def forward(
@@ -235,7 +254,8 @@ class MegaKernel:
             rows, route = self.rows, 0
         w1_u8 = _grouped_weight_uint8(w1)
         w2_u8 = _grouped_weight_uint8(w2)
-        launch = self._launcher(stage1_act)
+        (tab1, tab2), placed = self._placement(w1_u8, w1_scale, w2_u8, w2_scale)
+        launch = self._launcher(stage1_act, placed)
         args = (
             ptr(self.a2.data_ptr()),
             ptr(disp),
@@ -246,6 +266,8 @@ class MegaKernel:
             ptr(w2_u8.data_ptr()),
             ptr(w2_scale.data_ptr()),
             ptr(arena.local_ptr(self.regions[1])),
+            ptr((self.ctl if tab1 is None else tab1).data_ptr()),
+            ptr((self.ctl if tab2 is None else tab2).data_ptr()),
             arena.handle,
             hidden_states.data_ptr(),
             topk_ids.data_ptr(),

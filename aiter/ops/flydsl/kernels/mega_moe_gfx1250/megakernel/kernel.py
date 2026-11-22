@@ -7,6 +7,7 @@ dispatch_compact) and then the shared protocol."""
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import flydsl.compiler as flyc
@@ -22,6 +23,20 @@ from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
     build_gemm_a8w4_tdm_task,
     launch_gemm_a8w4_tdm,
 )
+
+#: Whether the GEMM builder reads IOD-placed weights (``b_placed``,
+#: aiter.ops.flydsl.iod_locality); its task then takes their phase table.
+BUILDER_LOC = "b_placed" in inspect.signature(build_gemm_a8w4_tdm_task).parameters
+
+
+def _placed_kw(b_placed, loc_group):
+    """The builder's placed-B keywords for one GEMM (none when unplaced)."""
+    if not b_placed:
+        return {}
+    if not BUILDER_LOC:
+        raise ValueError("this GEMM builder reads no IOD-placed weights")
+    return {"b_placed": b_placed, "loc_group": loc_group}
+
 
 from ..config import _WAVE_SIZE as WAVE
 from ..s1f_stage1 import (
@@ -85,6 +100,10 @@ def make_megakernel(
     mt_cap=None,
     stream=False,
     producers=64,
+    b_placed1=0,
+    loc_group1=1,
+    b_placed2=0,
+    loc_group2=1,
 ):
     """Build a megakernel; returns a ``@flyc.jit`` launcher.
 
@@ -96,7 +115,9 @@ def make_megakernel(
 
     Launcher arguments (positional): ``arg_a2``, ``arg_disp``,
     ``arg_disp_scale``, ``arg_w1``, ``arg_w1_scale``, ``arg_a2_scale``,
-    ``arg_w2``, ``arg_w2_scale``, ``arg_rowmap`` (pointers), then i64
+    ``arg_w2``, ``arg_w2_scale``, ``arg_rowmap``, ``arg_loc1``, ``arg_loc2``
+    (pointers; the last two the IOD phase tables of W1 / W2 when
+    ``b_placed1`` / ``b_placed2`` read them placed), then i64
     ``arena`` (window handle), ``x``, ``ids``, ``wts``, ``out``, ``ctl``, then
     ``i32_tok`` (this rank's tokens), ``i32_rows`` (rows the GEMMs may see),
     ``addr_route`` (compact: the route slots, i32 per route; STREAM: its
@@ -205,9 +226,26 @@ def make_megakernel(
         NXCC = 8
         _xq = os.environ.get("AITER_MEGAKERNEL_XQ", "1" if NT1 == 2 * NXCC else "0")
         XQ = int(_xq == "1" and NT1 % NXCC == 0)
+        # IOD-placed W1 and W2: n-tiles come in runs of R alternating IOD
+        # domains (an odd last run split in halves). Under XQ, each CTA then
+        # takes the n-tiles of its own domain (protocol.gemm_queue).
+        R1, R2 = loc_group1 * b_placed1, loc_group2 * b_placed2
+        LOC = int(
+            os.environ.get("AITER_MEGAKERNEL_LOC", "1") == "1"
+            and XQ
+            and b_placed1
+            and b_placed2
+            and R1 % 2 == 0
+            and R2 % 2 == 0
+            and NT1 % R1 == 0
+            and NT2 % R2 == 0
+        )
         st_kw = dict(  # noqa: C408 - KCtx fields
             XQ=XQ,
             NXCC=NXCC,
+            LOC=LOC,
+            R1=R1 or 1,
+            R2=R2 or 1,
             GMX=int(os.environ.get("AITER_MEGAKERNEL_GMX", "32")),
             GM1=int(os.environ.get("AITER_MEGAKERNEL_GM1", "32")),
             GM2=int(os.environ.get("AITER_MEGAKERNEL_GM2", "32")),
@@ -277,6 +315,8 @@ def make_megakernel(
             ("st", (st_kw["P"] * 100 + st_kw["RBK"]) if STREAM else 0, 0),
             ("gm", (st_kw["GM1"] * 100 + st_kw["GM2"]) if STREAM else 3232, 3232),
             ("xq", st_kw["XQ"] * st_kw["GMX"] if STREAM else 32, 32),
+            ("bp", b_placed1 * 10 + b_placed2, 0),
+            ("lc", st_kw["LOC"] if STREAM else 0, 0),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -356,6 +396,8 @@ def make_megakernel(
         arg_w2: fx.Pointer,
         arg_w2_scale: fx.Pointer,
         arg_rowmap: fx.Pointer,
+        arg_loc1: fx.Pointer,
+        arg_loc2: fx.Pointer,
         arena: fx.Int64,
         addr_x: fx.Int64,
         addr_ids: fx.Int64,
@@ -420,6 +462,7 @@ def make_megakernel(
             a_ready=ready1_holder if (COMPACT or EARLY) else None,
             a_cache_modifier=0,
             c_cache_modifier=SCOPE_DEV,
+            **_placed_kw(b_placed1, loc_group1),
             **common,
         )
         g2_task, block2, g2_name, _, lay2 = build_gemm_a8w4_tdm_task(
@@ -449,6 +492,7 @@ def make_megakernel(
             a_cache_modifier=0,
             scatter_cache_policy=SCOPE_SYS,
             defer_ep_wait=DEFER_SC,
+            **_placed_kw(b_placed2, loc_group2),
             **common,
         )
         if block != 4 * WAVE or block2 != block:
@@ -501,6 +545,8 @@ def make_megakernel(
             arg_w2: fx.Pointer,
             arg_w2_scale: fx.Pointer,
             arg_rowmap: fx.Pointer,
+            arg_loc1: fx.Pointer,
+            arg_loc2: fx.Pointer,
             arena: fx.Int64,
             addr_x: fx.Int64,
             addr_ids: fx.Int64,
@@ -572,6 +618,8 @@ def make_megakernel(
                 arg_w2=arg_w2,
                 arg_w2_scale=arg_w2_scale,
                 arg_rowmap=arg_rowmap,
+                loc1=(arg_loc1,) if BUILDER_LOC else (),
+                loc2=(arg_loc2,) if BUILDER_LOC else (),
                 arena=arena,
                 addr_x=addr_x,
                 addr_ids=addr_ids,
@@ -641,6 +689,8 @@ def make_megakernel(
             arg_w2,
             arg_w2_scale,
             arg_rowmap,
+            arg_loc1,
+            arg_loc2,
             arena,
             addr_x,
             addr_ids,

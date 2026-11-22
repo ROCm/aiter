@@ -191,7 +191,7 @@ def iod_placement_reason() -> str | None:
     global _iod_warned
     if not _iod_warned:
         _iod_warned = True
-        _log.warning("MegaMoE: the megakernels and S1F stay off: %s", why)
+        _log.warning("MegaMoE: what cannot read placed weights stays off: %s", why)
     return why
 
 
