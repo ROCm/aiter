@@ -20,6 +20,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
+    ragged_n_ok,
 )
 
 WMMA = 16  # WMMA M/N tile granularity
@@ -182,7 +183,7 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
 
 def mxfp8_32_kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """Whether a shared WMMA instance fits the shape and mx32 LDS footprint."""
-    if not kernel_fits_shape(ki, M, N, K):
+    if not kernel_fits_shape(ki, M, N, K, allow_ragged_n=True):
         return False
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import mx32_lds_bytes
 
@@ -375,8 +376,12 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 
 
-def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
-    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
+def kernel_fits_shape(
+    ki: WmmaKernelInstance, M: int, N: int, K: int, allow_ragged_n: bool = False
+) -> bool:
+    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``.
+    ``allow_ragged_n`` (mxfp8_32): a compute kernel may end N on a partial tile
+    where its launcher supports it (``ragged_n_ok``)."""
 
     # Row pairs need both rows, so an odd M has no valid pairing.
     if ki.a_preshuffle and M % 2 != 0:
@@ -438,7 +443,18 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         # must not launch when M < tile_m (cluster barrier hang on decode M).
         if M < ki.tile_m:
             return False
-        if N % (ki.tile_n * ki.cluster_n) != 0:
+        if N % (ki.tile_n * ki.cluster_n) != 0 and not (
+            allow_ragged_n
+            and ragged_n_ok(
+                N,
+                ki.tile_n,
+                ki.cluster_m,
+                ki.cluster_n,
+                ki.split_k,
+                ki.persistent_n_tiles,
+                True,
+            )
+        ):
             return False
         if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False

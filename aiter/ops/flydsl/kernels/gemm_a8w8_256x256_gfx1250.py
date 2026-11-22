@@ -70,6 +70,7 @@ def launch_gemm_a8w8_256x256(
     batched: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
     fuse_quant_out: Constexpr[bool] = False,
+    ragged_n: Constexpr[bool] = False,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -100,6 +101,20 @@ def launch_gemm_a8w8_256x256(
     assert (
         1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
+    # ragged_n: N need not be a multiple of tile_n. The last N tile's B and B-scale
+    # rows past N load as zeros (TDM OOB bound, as the A M-tail does) and its C
+    # store is clipped to N. B is never multicast then (cluster_m == 1), and the
+    # tile body, sync and per-element sums are unchanged.
+    assert not ragged_n or (
+        cluster_m == 1
+        and split_k == 1
+        and persistent_n_tiles == 1
+        and not fuse_quant_out
+        and not batched
+        and not fused_splitk
+        and block_size == 32
+        and not b_scale_32x32
+    ), "ragged_n needs cluster_m 1, split_k 1, no persistent tiles, batch or fused quant, mxfp8_32"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -295,6 +310,7 @@ def launch_gemm_a8w8_256x256(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
         + ("_fq" if fuse_quant_out else "")
+        + ("_rn" if ragged_n else "")
     )
 
     def _run_tile(
@@ -356,6 +372,7 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
+        n_oob = i32_n - blk_n  # valid N columns of this tile (ragged_n)
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (
             (
@@ -496,7 +513,8 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    # B rows are 16-column groups: zero-fill the groups past N.
+                    (n_oob // 16) if const_expr(ragged_n) else None,
                     0,
                     True,
                 )
@@ -524,7 +542,8 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    # n32k4 scale super-rows are 32-column groups.
+                    (n_oob // 32) if const_expr(ragged_n) else None,
                     0,
                     True,
                 )
@@ -1819,7 +1838,12 @@ def launch_gemm_a8w8_256x256(
                 )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
-                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                c_cols = (
+                    (n_oob < tile_n).select(n_oob, fx.Int32(tile_n))
+                    if const_expr(ragged_n)
+                    else tile_n
+                )
+                gtC = _gv(gC_base, c_off_rt, (mn_oob, c_cols), (ldc64, 1))
                 atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
                     fx.rocdl.TensorStore(),
                     gtC,

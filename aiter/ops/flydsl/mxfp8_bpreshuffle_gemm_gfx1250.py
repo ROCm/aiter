@@ -289,7 +289,18 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] a gfx1250 cluster holds at most 16 "
             f"workgroups, got {cluster_m}x{cluster_n}"
         )
-    if N % (tile_n * cluster_n) != 0:
+    # A ragged last N tile (B / B-scale rows past N zero-filled, C clipped) is
+    # served by the compute kernel when B is not multicast; see ragged_n there.
+    ragged_n = ragged_n_ok(
+        N,
+        tile_n,
+        cluster_m,
+        cluster_n,
+        split_k,
+        persistent_n_tiles,
+        compute_bound and mx32 and not w_scale_32x32 and batch == 1 and not fuse_quant,
+    )
+    if N % (tile_n * cluster_n) != 0 and not ragged_n:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] N={N} must be a multiple of "
             f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
@@ -536,7 +547,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             *specialization,
             batch,
             fuse_quant,
-            specialization_key=specialization + (fuse_quant,),
+            ragged_n,
+            specialization_key=specialization + (fuse_quant, ragged_n),
         )
     else:
         rank0_splitk = fused and not small_native
@@ -671,6 +683,30 @@ def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool
                 instance, M, N, K
             )
     return False
+
+
+def ragged_n_ok(
+    N: int,
+    tile_n: int,
+    cluster_m: int,
+    cluster_n: int,
+    split_k: int,
+    persistent_n_tiles: int,
+    compute_mx32: bool,
+) -> bool:
+    """Whether the compute kernel runs N with a ragged last tile: N a multiple of
+    32 but not of tile_n, whole clusters of N tiles, and B never multicast
+    (cluster_m 1), no split-K or persistent tiles."""
+    n_tiles = -(-N // tile_n)
+    return bool(
+        compute_mx32
+        and N % tile_n != 0
+        and N % 32 == 0
+        and cluster_m == 1
+        and n_tiles % cluster_n == 0
+        and split_k == 1
+        and persistent_n_tiles == 1
+    )
 
 
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
