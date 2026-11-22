@@ -2619,7 +2619,7 @@ def test_triton_unified_attn_3d_empty_row_is_zero(
     # A kv_len 0 row (a padded decode slot) has no KV segment, so the reduce sees an
     # all -inf maximum and exp2(-inf - -inf) is NaN. It must store 0, as for an
     # all-zero exp sum, and leave the other rows as they are without that row.
-    if DEVICE_ARCH not in ("gfx950", "gfx1250"):
+    if DEVICE_ARCH not in ("gfx942", "gfx950", "gfx1250"):
         pytest.skip(f"skip {DEVICE_ARCH}")
     torch.manual_seed(0)
     seq_lens = [(1, 120000)] + [(1, 2000)] * 6 + [(1, 0)]
