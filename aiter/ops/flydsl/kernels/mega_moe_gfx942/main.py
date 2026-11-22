@@ -106,12 +106,16 @@ def ep_mega_kernel(
     ACT="silu",
     BCM1=2,
     BCM2=2,
+    WQ="fp4",
 ):
     """The mega kernel for (H, I, top-k); ``token_shift``: bits of the source
     token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
-    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
+    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``WQ``: "fp4" fd2 mxfp4 W
+    (a8w4), "fp8" fd8 fp8 W with f32 128x128 block scales (a8w8)."""
     assert ACT in ("silu", "silu_clamped", "situv2") and QX in (0, 1), (ACT, QX)
+    assert WQ in ("fp4", "fp8"), WQ
+    FP8W = WQ == "fp8"
     BM = BLOCK_M
     NT = 64 * NW
     N2 = 2 * I
@@ -123,7 +127,16 @@ def ep_mega_kernel(
     RATIO = (
         2 * BM * ARB
     )  # bytes: f32 ratio tables [G][BM] + fin [BM] after the A buffers
-    LDS_BYTES = max(RATIO + (G1N + 1) * BM * 4, RATIO + (G2N + 1) * BM * 4, BM * NO * 2)
+    # fp8 W: per 128-col W block of a task, the ratios of its 128-K group scales and its
+    # last scale (``build_b_ratios``), after the A ratio tables: gemm1 has the gate and
+    # the up block of each 128 inter cols, gemm2 one block per 128 out cols.
+    NB1, NB2 = 2 * (NI // 128), NO // 128
+    BT1, BT2 = RATIO + (G1N + 1) * BM * 4, RATIO + (G2N + 1) * BM * 4
+    LDS_BYTES = max(
+        BT1 + (NB1 * (G1N + 1) * 4 if FP8W else 0),
+        BT2 + (NB2 * (G2N + 1) * 4 if FP8W else 0),
+        BM * NO * 2,
+    )
     NIW, NOW = NI // NW, NO // NW
     NC1, NC2 = NIW // 16, NOW // 16
     RPS = NT // 32  # gemm2 scatter rows per pass (32 lanes x 2 cols per row)
@@ -137,11 +150,16 @@ def ep_mega_kernel(
     assert (
         producers % QUEUES == 0 and ROWV[-1] == BM and LDS_BYTES <= LDS_BYTES_MAX
     ), LDS_BYTES
+    # build_b_ratios: waves 1.. fill a task's B tables while wave 0 waits for its rows;
+    # a gemm2 wave's columns lie in one 128-col W block
+    assert not FP8W or (
+        max(NB1 * G1N, NB2 * G2N) <= NT - 64 and 128 % NOW == 0 and 128 % NIW == 0
+    )
     GPW = NI // 128  # gemm1 epilogue: quant groups per WG row, waves per group
     WPG = NW // GPW
     kname = (
-        f"a8w4_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}_p{producers}_l{lag}"
-        f"_r{'x'.join(map(str, ROWV))}_ni{NI}_no{NO}_pf{PF}"
+        f"a8w{8 if FP8W else 4}_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}"
+        f"_p{producers}_l{lag}_r{'x'.join(map(str, ROWV))}_ni{NI}_no{NO}_pf{PF}"
         + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
@@ -360,6 +378,42 @@ def ep_mega_kernel(
                 seen = _atomic_load_at(addr, scope)
             _inv_l1()
 
+        def build_b_ratios(scales, rows, G, table, tx):
+            """fp8 W: LDS ``table`` (bytes) [len(rows)][G + 1] f32 of a task's 128-col W
+            blocks: s[g - 1] / s[g] for each 128-K group g (1 for g = 0), then s[G - 1],
+            from the f32 block scales at ``scales`` (``rows``: each block's scale row of G).
+            The K loop scales acc by them at every group start (with x's ratios), so acc
+            ends in units of s[G - 1]. A zero scale acts as 1 (its W block is all zero,
+            see weights.prepare_weights_a8w8). Waves 1.. fill it while wave 0 waits for
+            the task's rows; it is visible after the K loop's first barrier."""
+            raw = tx - fx.Int32(64)
+            ok = (raw >= fx.Int32(0)) & (raw < fx.Int32(len(rows) * G))
+            idx = ok.select(raw, fx.Int32(0))
+            t = idx // fx.Int32(G)
+            g = idx % fx.Int32(G)
+            row = rows[0]
+            for j in range_constexpr(1, len(rows)):
+                row = (t == fx.Int32(j)).select(rows[j], row)
+            rs = _rsrc(scales)
+            one = fx.Float32(1.0)
+            cur = fx.Int32(_ld(rs, row * fx.Int32(G) + g, mask=ok)).bitcast(fx.Float32)
+            prv = fx.Int32(
+                _ld(
+                    rs,
+                    row * fx.Int32(G) + fx.max(g - fx.Int32(1), fx.Int32(0)),
+                    mask=ok,
+                )
+            ).bitcast(fx.Float32)
+            cur = (cur == fx.Float32(0.0)).select(one, cur)
+            prv = (prv == fx.Float32(0.0)).select(one, prv)
+            base = fx.Int32(table // 4) + t * fx.Int32(G + 1)
+            _lds_f32_store_masked(
+                lds_f32, base + g, (g == fx.Int32(0)).select(one, prv / cur), ok
+            )
+            _lds_f32_store_masked(
+                lds_f32, base + fx.Int32(G), cur, ok & (g == fx.Int32(G - 1))
+            )
+
         # ------------------------------------------------------------------ producer
         def produce(a, index, lane, wave):
             """Wave j of producer ``index`` sends the routes the plan kernel sorted into slice
@@ -506,22 +560,53 @@ def ep_mega_kernel(
                 for c in range_constexpr(NC1):
                     n0 = e * fx.Int32(N2) + fx.Int32(gu * I) + col0 + fx.Int32(c * 16)
                     cols.append(((gu, c), n0, (gu, c // 2)))
-            exps = {
-                (gu, c, v): fx.Int32(
-                    _global_i32_at(
-                        a["w1e"],
-                        e * fx.Int32(N2)
-                        + fx.Int32(gu * I)
-                        + col0
-                        + fx.Int32(c * 16)
-                        + lane_div_16 * fx.Int32(4)
-                        + fx.Int32(v),
+            # fp8 W: the task's B table rows (gate blocks, then up blocks) and each
+            # key's entry: its 128-col block of gate (gu 0) or up (gu 1)
+            b_rows = (
+                [
+                    e * fx.Int32(N2 // 128)
+                    + fx.Int32(gu * (I // 128) + j)
+                    + nb * fx.Int32(NI // 128)
+                    for gu in range(2)
+                    for j in range(NI // 128)
+                ]
+                if FP8W
+                else []
+            )
+            b_tab = (
+                {
+                    (gu, c): fx.Int32(BT1 // 4)
+                    + (
+                        fx.Int32(gu * (NI // 128))
+                        + (wave * fx.Int32(NIW) + fx.Int32(c * 16)) // fx.Int32(128)
                     )
-                )
-                for gu in range(2)
-                for c in range(NC1)
-                for v in range(4)
-            }
+                    * fx.Int32(G1N + 1)
+                    for gu in range(2)
+                    for c in range(NC1)
+                }
+                if FP8W
+                else {}
+            )
+            exps = (
+                {}
+                if FP8W
+                else {
+                    (gu, c, v): fx.Int32(
+                        _global_i32_at(
+                            a["w1e"],
+                            e * fx.Int32(N2)
+                            + fx.Int32(gu * I)
+                            + col0
+                            + fx.Int32(c * 16)
+                            + lane_div_16 * fx.Int32(4)
+                            + fx.Int32(v),
+                        )
+                    )
+                    for gu in range(2)
+                    for c in range(NC1)
+                    for v in range(4)
+                }
+            )
             core = _make_core(
                 K=H,
                 W_ROWS=E_LOCAL * N2,
@@ -541,6 +626,7 @@ def ep_mega_kernel(
                 ARB=ARB,
                 acm=2,
                 TR=True,
+                WQ=WQ,
             )
 
             def row_base16(
@@ -591,14 +677,22 @@ def ep_mega_kernel(
                 if const_expr(kk % 128 != 0):
                     return
                 for key in acc:
+                    rb = None
+                    if const_expr(FP8W):  # W's ratio: one per key
+                        rb = fx.Float32(lds_f32[b_tab[key] + kt])
                     for mi in range_constexpr(
                         len(acc[key])
                     ):  # TR: lane = row mi*16 + L%16
-                        rt = lds_f32[
-                            fx.Int32(RATIO // 4 + mi * 16)
-                            + kt * fx.Int32(BM)
-                            + lane_mod_16
-                        ]
+                        if const_expr(QX):
+                            rt = lds_f32[
+                                fx.Int32(RATIO // 4 + mi * 16)
+                                + kt * fx.Int32(BM)
+                                + lane_mod_16
+                            ]
+                            if const_expr(FP8W):
+                                rt = fx.Float32(rt) * rb
+                        else:
+                            rt = rb
                         a4 = Vec(acc[key][mi].load())
                         acc[key][mi].store(
                             Vec.from_elements(
@@ -613,7 +707,15 @@ def ep_mega_kernel(
                 MR = R // 16
                 rows = [fx.Int32(mi * 16) + lane_mod_16 for mi in range(MR)]
                 valid = [r < n_valid for r in rows]
-                fac = {k: _channel_factor(v) for k, v in exps.items()}
+                if const_expr(FP8W):  # acc is in units of the last group's scale
+                    fac = {
+                        (gu, c, v): fx.Float32(lds_f32[b_tab[gu, c] + fx.Int32(G1N)])
+                        for gu in range(2)
+                        for c in range(NC1)
+                        for v in range(4)
+                    }
+                else:
+                    fac = {k: _channel_factor(v) for k, v in exps.items()}
                 rsc = [
                     fx.Float32(lds_f32[fx.Int32(RATIO // 4 + G1N * BM) + r])
                     for r in rows
@@ -694,6 +796,8 @@ def ep_mega_kernel(
 
             def run_rows(R):
                 def pre_a():  # the W prefetch is in flight
+                    if const_expr(FP8W):
+                        build_b_ratios(a["w1s"], b_rows, G1N, BT1, tx)
                     if wave == fx.Int32(0):
                         spin_ge(
                             a["ws"]
@@ -715,7 +819,7 @@ def ep_mega_kernel(
                             tx < fx.Int32(R),
                         )
 
-                acc = core(R, row_base16, hook if QX else None, pre_a=pre_a)
+                acc = core(R, row_base16, hook if (QX or FP8W) else None, pre_a=pre_a)
                 epilogue(R, acc)
                 rocdl.s_waitcnt(vmcnt=0)  # a2 written through
                 gpu.barrier()
@@ -743,15 +847,34 @@ def ep_mega_kernel(
                 ((0, c), e * fx.Int32(H) + col0 + fx.Int32(c * 16), (0, c // 2))
                 for c in range(NC2)
             ]
-            exps = [
-                fx.Int32(
-                    _global_i32_at(
-                        a["w2e"],
-                        e * fx.Int32(H) + col0 + fx.Int32(c * 16) + lane_mod_16,
+            # fp8 W: the task's B table rows and this wave's entry (its 128-col block)
+            b_rows = (
+                [
+                    e * fx.Int32(H // 128) + nb * fx.Int32(NO // 128) + fx.Int32(j)
+                    for j in range(NB2)
+                ]
+                if FP8W
+                else []
+            )
+            b_tab = (
+                fx.Int32(BT2 // 4)
+                + (wave * fx.Int32(NOW)) // fx.Int32(128) * fx.Int32(G2N + 1)
+                if FP8W
+                else None
+            )
+            exps = (
+                []
+                if FP8W
+                else [
+                    fx.Int32(
+                        _global_i32_at(
+                            a["w2e"],
+                            e * fx.Int32(H) + col0 + fx.Int32(c * 16) + lane_mod_16,
+                        )
                     )
-                )
-                for c in range(NC2)
-            ]
+                    for c in range(NC2)
+                ]
+            )
             core = _make_core(
                 K=I,
                 W_ROWS=E_LOCAL * H,
@@ -771,6 +894,7 @@ def ep_mega_kernel(
                 ARB=ARB,
                 acm=2,
                 TR=False,
+                WQ=WQ,
             )
 
             def row_base16(row):
@@ -821,8 +945,13 @@ def ep_mega_kernel(
                 kk = s * 32
                 if const_expr(kk % 128 != 0):
                     return
+                rb = None
+                if const_expr(FP8W):  # W's ratio: one per wave
+                    rb = fx.Float32(lds_f32[b_tab + kt])
                 for mi in range_constexpr(len(acc[0, 0])):
                     rt = ratio4(fx.Int32(RATIO // 4) + kt * fx.Int32(BM), mi)
+                    if const_expr(FP8W):
+                        rt = [fx.Float32(rt[v]) * rb for v in range(4)]
                     for c in range_constexpr(NC2):
                         a4 = Vec(acc[0, c][mi].load())
                         acc[0, c][mi].store(
@@ -873,7 +1002,10 @@ def ep_mega_kernel(
             def epilogue(R, acc):
                 """acc * fin * channel factor * route weight -> bf16 LDS tile [R, NO] -> scatter."""
                 MR = R // 16
-                fac = [_channel_factor(x) for x in exps]
+                if const_expr(FP8W):  # acc is in units of the last group's scale
+                    fac = [fx.Float32(lds_f32[b_tab + fx.Int32(G2N)])] * NC2
+                else:
+                    fac = [_channel_factor(x) for x in exps]
                 sw_tiles = _global_i32_buffer_tiles(
                     a["rw"], fx.Int64(rows_cap) * fx.Int64(4), 1
                 )
@@ -908,6 +1040,8 @@ def ep_mega_kernel(
 
             def run_rows(R):
                 def pre_a():  # the W prefetch is in flight
+                    if const_expr(FP8W):
+                        build_b_ratios(a["w2s"], b_rows, G2N, BT2, tx)
                     if wave == fx.Int32(0):
                         spin_ge(
                             a["sched"]

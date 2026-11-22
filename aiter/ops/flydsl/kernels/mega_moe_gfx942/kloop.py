@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The K loop of the a8w4 GEMM tiles, and the dispatch to its row variants.
+"""The K loop of the a8w4 / a8w8 GEMM tiles, and the dispatch to its row variants.
 
-fd2 mxfp4 W is streamed from HBM straight into VGPRs and decoded to fp8 there; fp8 A goes
-through LDS.
+W is streamed from HBM straight into VGPRs: fd2 mxfp4 (a8w4) is decoded to fp8 there,
+fd8 fp8 (a8w8) is the MFMA operand as loaded; fp8 A goes through LDS.
 """
 
 import flydsl.compiler as flyc
@@ -74,6 +74,7 @@ def _make_core(
     acm=2,
     ST_STEP=None,
     TR=False,
+    WQ="fp4",
 ):
     """Trace-time builder of the streamed-W K loop.
 
@@ -89,6 +90,10 @@ def _make_core(
     after the first A tile's loads are issued, before they go to LDS (e.g. finish a
     table from loads ``pre_a`` issued without waiting for A in between).
     ``ARB``: A bytes per row per K tile (128 / 256).
+    ``WQ``: the W format. "fp4": fd2 mxfp4, each 32-K group decoded with its scale
+    folded in (the caller applies the per-channel exponent). "fp8": fd8 fp8
+    (``weights.prepare_weights_a8w8``), 32 B per lane per 128-K chunk, used as loaded;
+    the caller applies the 128x128 block scales (``hook`` and its epilogue).
 
     Each K tile's W prefetch, the next A tile's LDS store and the one after's global
     load are issued between MFMA steps (step ``W_STEP`` / ``ST_STEP``), A fragments
@@ -110,7 +115,11 @@ def _make_core(
     assert 0 <= ST_STEP < STEPS
     SLOT = BM * ARB
     W_K0 = K // 128
-    W_BYTES = W_ROWS * K // 2
+    FP8W = WQ == "fp8"
+    assert WQ in ("fp4", "fp8"), WQ
+    # 16 B W loads per lane per 128-K chunk: 32 fp4 or 2 x 16 fp8 of one 32-K group
+    WL = 2 if FP8W else 1
+    W_BYTES = W_ROWS * K // (1 if FP8W else 2)
     WS_BYTES = W_ROWS * K // 32
     SC_STRIDE_N0 = (K // 256) * 64  # scale dwords per 32-col block
     CH = ARB // 16  # 16 B A chunks per row per tile
@@ -124,13 +133,23 @@ def _make_core(
     keys = [k for k, _, _ in cols]
     w_base, npack, s_base, skey_of = {}, {}, {}, {}
     for key, n0, skey in cols:
-        w_base[key] = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64) + lane
+        w_base[key] = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64 * WL) + lane * WL
         npack[key] = (n0 // fx.Int32(16)) % fx.Int32(2)
         skey_of[key] = skey
-        if skey not in s_base:
+        if skey not in s_base and not FP8W:
             s_base[skey] = (n0 // fx.Int32(32)) * fx.Int32(SC_STRIDE_N0) + lane
 
     def new_wbuf():
+        if const_expr(FP8W):
+            return {
+                "w": {
+                    (k, g, h): fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                    for k in keys
+                    for g in range(KG)
+                    for h in range(WL)
+                },
+                "s": {},
+            }
         return {
             "w": {
                 (k, g): fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -144,6 +163,11 @@ def _make_core(
 
     def load_w(buf, kt):
         k128 = kt * fx.Int32(KG)
+        if const_expr(FP8W):
+            for (k, g, h), r in buf["w"].items():
+                off = w_base[k] + (k128 + fx.Int32(g)) * fx.Int32(64 * WL) + fx.Int32(h)
+                fx.copy(w_atom, fx.slice(w_tiles, (None, off)), r)
+            return
         for (k, g), r in buf["w"].items():
             fx.copy(
                 w_atom,
@@ -157,7 +181,18 @@ def _make_core(
             fx.copy(ws_atom, fx.slice(ws_tiles, (None, s_base[sk] + s_off)), r)
 
     def read_w(buf, kt):
-        """-> raw[key, g] = 4 x i32 (8 fp4 each), lut[key, g]."""
+        """-> raw[key, g] = 4 x i32 (8 fp4 each), lut[key, g]; fp8: 8 x i32 (4 fp8
+        each), no lut."""
+        if const_expr(FP8W):
+            raw = {}
+            for k in keys:
+                for g in range(KG):
+                    words = []
+                    for h in range(WL):
+                        v4 = Vec(fx.memref_load_vec(buf["w"][k, g, h]))
+                        words += [fx.Int32(v4[j]) for j in range(4)]
+                    raw[k, g] = words
+            return raw, None
         raw, lut = {}, {}
         packed = {
             sk: fx.Int32(Vec(fx.memref_load_vec(r))[0]) for sk, r in buf["s"].items()
@@ -254,6 +289,14 @@ def _make_core(
 
         def decode_b(raw, lut, s):
             """B operand words (2 x i32) of MFMA step s, per key."""
+            if const_expr(FP8W):
+                j = s % 4
+                return {
+                    k: Vec.from_elements(
+                        [raw[k, s // 4][2 * j], raw[k, s // 4][2 * j + 1]], fx.Int32
+                    )
+                    for k in keys
+                }
             bws = {}
             for k in keys:  # step s = 128-K chunk s//4, dword s%4
                 b8 = _fp4x8_to_fp8x8_fast(raw[k, s // 4][s % 4], lut[k, s // 4])

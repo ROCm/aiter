@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MegaMoEGfx942 (the gfx942 EP8 a8w4 MegaMoE) accuracy and performance on 8 GPUs.
+"""MegaMoEGfx942 (the gfx942 EP8 a8w4 / a8w8 MegaMoE) accuracy and performance on 8 GPUs.
 
 The layer is DeepSeek-V4-Flash's MoE: H 4096, I 2048, 256 experts (32 per rank),
 top-6, silu with swiglu_limit 10. Every output is checked against an fp32 reference
-with the clamp.
+with the clamp. ``--quant a8w8`` runs the layer on FP8 128x128 block-scale experts
+instead of MXFP4 ones; some of their blocks have scale 0 over non-zero bytes (they must
+contribute nothing).
 
 - test_mega_moe_gfx942: every path the layer reports available (main, main on x
   quantized beforehand by aiter's per_1x128 quant ("prequant", timed with that quant),
@@ -39,7 +41,11 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
@@ -69,7 +75,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _skip_reason():
+def _skip_reason(quant):
     gfx = get_gfx_runtime()
     if gfx != "gfx942":
         return f"MegaMoEGfx942 runs on gfx942, this is {gfx}"
@@ -81,14 +87,59 @@ def _skip_reason():
         return "needs mori"
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import eligible
 
-    if not eligible(
-        world_size=WORLD, model_dim=H, inter_dim=I, experts=E, topk=TOPK, act="silu"
-    ):
-        return "MegaMoEGfx942 does not run this layer on this device (CU count)"
+    shape = {
+        "world_size": WORLD,
+        "model_dim": H,
+        "inter_dim": I,
+        "experts": E,
+        "topk": TOPK,
+    }
+    if not eligible(**shape, quant=quant, act="silu"):
+        return f"MegaMoEGfx942 ({quant}) does not run this layer on this device"
     return None
 
 
-def _make_weights(rank):
+def _make_weights(rank, quant):
+    """This rank's experts in the form the layer takes and the fp32 dequantized
+    weights for the reference."""
+    if quant == "a8w8":
+        return _make_weights_a8w8(rank)
+    return _make_weights_a8w4(rank)
+
+
+def _make_weights_a8w8(rank):
+    """FP8 128x128 block-scale experts in aiter's fp8 MoE preshuffle
+    (``shuffle_weight(w, (16, 16))``, as sglang loads them for aiter). About 3% of the
+    blocks have scale 0 over non-zero bytes, which must contribute nothing."""
+    gen = torch.Generator(device="cuda").manual_seed(1000 + rank)
+    fp8_max = torch.finfo(dtypes.fp8).max
+
+    def block_quant(rows, cols, std):
+        shape = (E_LOCAL, rows // 128, 128, cols // 128, 128)
+        w = torch.randn(shape, device="cuda", generator=gen).mul_(std)
+        zero = torch.rand(
+            (E_LOCAL, rows // 128, cols // 128), device="cuda", generator=gen
+        ).lt(0.03)
+        scale = (w.abs().amax(dim=(2, 4)) / fp8_max).masked_fill(zero, 0.0)
+        q = (w / scale.clamp_min(1e-30)[:, :, None, :, None]).to(dtypes.fp8)
+        del w
+        junk = (torch.rand(shape, device="cuda", generator=gen) * 2 - 1).to(dtypes.fp8)
+        q = torch.where(zero[:, :, None, :, None], junk, q)
+        ref = q.float() * scale[:, :, None, :, None]
+        return q.view(E_LOCAL, rows, cols), scale, ref.view(E_LOCAL, rows, cols)
+
+    w1, w1_scale, w1_ref = block_quant(2 * I, H, H**-0.25)
+    w2, w2_scale, w2_ref = block_quant(H, I, I**-0.25)
+    kernel = (
+        shuffle_weight(w1, layout=(16, 16)).contiguous(),
+        w1_scale,
+        shuffle_weight(w2, layout=(16, 16)).contiguous(),
+        w2_scale,
+    )
+    return kernel, (w1_ref, w2_ref)
+
+
+def _make_weights_a8w4(rank):
     """This rank's experts: the standard a16w4 preshuffle (gate_up=False, as sglang
     loads them) and the fp32 dequantized weights for the reference."""
     gen = torch.Generator(device="cuda").manual_seed(1000 + rank)
@@ -199,11 +250,13 @@ def _check(name, out, ref, routed):
 
 
 def _perf(tokens, rank, routes):
-    """(FLOPs, bytes) per GPU: every route's two GEMMs; the local experts' fp4 weights
-    (+ e8m0 scales), this rank's bf16 rows in and out, and the fp8 rows it receives."""
+    """(FLOPs, bytes) per GPU: every route's two GEMMs; the local experts' weights
+    (fp4 + e8m0 scales, or fp8 + fp32 128x128 scales), this rank's bf16 rows in and out,
+    and the fp8 rows it receives."""
     flops = 2 * routes * 3 * H * I / WORLD
+    weight_bytes = 1 + 4 / 128**2 if _STATE["quant"] == "a8w8" else 1 / 2 + 1 / 32
     nbytes = (
-        E_LOCAL * 3 * H * I * (1 / 2 + 1 / 32)
+        E_LOCAL * 3 * H * I * weight_bytes
         + 2 * tokens[rank] * H * 2
         + routes / WORLD * H
     )
@@ -268,7 +321,7 @@ def _run_paths(tokens, paths, inputs, stale, graph, ret):
         assert ret[f"{path} err"] == 0, (
             f"{path} {tokens}: {ret[f'{path} err']:.2%} of elements outside the "
             f"tolerance, max |out - ref| / rms {ret[f'{path} max_err']:.3f} "
-            f"(atol {ATOL})"
+            f"(atol {_STATE['atol']})"
         )
     return ret
 
@@ -314,7 +367,7 @@ def _layer(rank, weights, mtpr, small):
         inter_dim=I,
         experts=E,
         topk=TOPK,
-        quant="a8w4",
+        quant=_STATE["quant"],
         w1=w1,
         w1_scale=w1_scale,
         w2=w2,
@@ -367,22 +420,25 @@ def _worker(rank, port, args):
     try:
         from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
-        weights, ref_weights = _make_weights(rank)
-        weights = MegaMoEGfx942.prepare_weights(*weights, w1_gate_up_interleaved=False)
+        quant = _STATE["quant"] = args.quant
+        weights, ref_weights = _make_weights(rank, quant)
+        weights = MegaMoEGfx942.prepare_weights(
+            *weights, w1_gate_up_interleaved=False, quant=quant
+        )
         _STATE.update(rank=rank, ref_weights=ref_weights)
         _STATE["mega"] = _layer(rank, weights, MTPR, small=True)
         rows = [
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)
         ]
-        _summary(f"MegaMoEGfx942, max_tok_per_rank {MTPR}", rows, rank)
+        _summary(f"MegaMoEGfx942 {quant}, max_tok_per_rank {MTPR}", rows, rank)
         rows = []
         for mtpr in args.mtpr:
             _STATE["mega"] = _layer(rank, weights, mtpr, small=False)
             rows += [
                 test_mega_moe_gfx942_capacity(mtpr, routing) for routing in args.routing
             ]
-        _summary("MegaMoEGfx942 at full capacity", rows, rank)
+        _summary(f"MegaMoEGfx942 {quant} at full capacity", rows, rank)
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -391,13 +447,17 @@ def _worker(rank, port, args):
 
 
 def main():
-    reason = _skip_reason()
-    if reason:
-        aiter.logger.warning("test_mega_moe_gfx942 skipped: %s", reason)
-        return
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="MegaMoEGfx942 on 8 GPUs",
+    )
+    parser.add_argument(
+        "-q",
+        "--quant",
+        choices=["a8w4", "a8w8"],
+        default="a8w4",
+        help="the layer's quant: a8w4 (MXFP4 experts) or a8w8 (FP8 128x128 "
+        "block-scale experts)",
     )
     parser.add_argument(
         "-t",
@@ -433,6 +493,10 @@ def main():
         help="routing of the full-capacity calls",
     )
     args = parser.parse_args()
+    reason = _skip_reason(args.quant)
+    if reason:
+        aiter.logger.warning("test_mega_moe_gfx942 skipped: %s", reason)
+        return
     for tokens in args.tokens:
         if not isinstance(tokens, tuple) or len(tokens) != WORLD or max(tokens) > MTPR:
             parser.error(f"--tokens takes {WORLD} counts <= {MTPR}, got {tokens}")

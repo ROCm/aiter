@@ -26,7 +26,10 @@ largest (the receive buffer stays below 2 GiB).
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
 form; the per-channel exponents ride at the tail of each scale tensor, so a layer is
-still ``(w1, w1_scale, w2, w2_scale)``.
+still ``(w1, w1_scale, w2, w2_scale)``. ``quant="a8w8"`` takes fp8 experts with f32
+128x128 block scales instead (aiter's fp8 MoE preshuffle ``shuffle_weight(w, (16, 16))``,
+converted by ``prepare_weights(..., quant="a8w8")``): the same kernels, compiled with
+the fp8 W loads and the block scales applied per 128-K group.
 """
 
 from contextlib import nullcontext
@@ -37,6 +40,8 @@ from . import host
 from . import weights as _weights
 
 _EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK, _NUM_CU = 8, 4096, 2048, 256, 6, 304
+# a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (fd8 W)
+_WQ = {"a8w4": "fp4", "a8w8": "fp8"}
 # The main kernel splits a route id with shifts, so it needs a power-of-two top-k: other
 # top-k values are padded with no-route slots.
 _KERNEL_TOPK = 8
@@ -48,7 +53,7 @@ def eligible(
     *, world_size, model_dim, inter_dim, experts, topk, quant="a8w4", act="silu"
 ):
     """Whether this build runs the layer: gfx942 with 304 CUs, EP8 and the MoE shape of
-    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6)."""
+    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6), a8w4 or a8w8."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     return (
@@ -56,7 +61,7 @@ def eligible(
         and get_cu_num() == _NUM_CU
         and (world_size, model_dim, inter_dim, experts, topk)
         == (_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK)
-        and quant == "a8w4"
+        and quant in _WQ
         and act == "silu"
     )
 
@@ -66,8 +71,8 @@ def _on(stream):
 
 
 class MegaMoEGfx942:
-    """One rank's EP8 a8w4 MoE layer. Construction is collective: every rank builds the
-    same instances in the same order after MORI shmem is initialized.
+    """One rank's EP8 a8w4 / a8w8 MoE layer. Construction is collective: every rank
+    builds the same instances in the same order after MORI shmem is initialized.
 
     ``small_m_mtprs``, ``small_m_enabled`` and ``large_m_enabled`` are MegaMoEV2's
     arguments; this version has no small- or large-input path and ignores them."""
@@ -105,7 +110,7 @@ class MegaMoEGfx942:
         ):
             raise ValueError(
                 "MegaMoEGfx942 runs gfx942 (304 CUs), EP8, H 4096, I 2048, 256 experts, "
-                f"top-6, a8w4 silu; got world_size={world_size} "
+                f"top-6, a8w4 or a8w8 silu; got world_size={world_size} "
                 f"model_dim={model_dim} inter_dim={inter_dim} experts={experts} "
                 f"topk={topk} quant={quant} act={act}"
             )
@@ -121,6 +126,7 @@ class MegaMoEGfx942:
         self.model_dim, self.inter_dim = int(model_dim), int(inter_dim)
         self.experts, self.topk = int(experts), int(topk)
         self.mtpr = int(max_tok_per_rank)
+        self.quant = quant
         self.dev = torch.device("cuda", torch.cuda.current_device())
         limit = float(swiglu_limit)
         # As MegaMoEV2: a limit of 0 means no clamp.
@@ -136,13 +142,21 @@ class MegaMoEGfx942:
     # ---- weights ---------------------------------------------------------------
 
     @staticmethod
-    def prepare_weights(w1, w1_scale, w2, w2_scale, *, w1_gate_up_interleaved=False):
-        """One layer's local experts in the standard aiter a16w4 preshuffle ->
-        ``(w1, w1_scale, w2, w2_scale)`` in fd2 form. Load time, once per layer."""
+    def prepare_weights(
+        w1, w1_scale, w2, w2_scale, *, w1_gate_up_interleaved=False, quant="a8w4"
+    ):
+        """One layer's local experts -> ``(w1, w1_scale, w2, w2_scale)`` as the kernels
+        read them. a8w4: the standard aiter a16w4 preshuffle -> fd2; a8w8: fp8 in aiter's
+        (16, 16) preshuffle with f32 128x128 block scales -> fd8. Load time, once per
+        layer."""
         if w1_gate_up_interleaved:
             raise NotImplementedError(
                 "MegaMoEGfx942 takes w1 shuffled with gate_up=False for now"
             )
+        if quant == "a8w8":
+            return _weights.prepare_weights_a8w8(w1, w1_scale, w2, w2_scale)
+        if quant != "a8w4":
+            raise ValueError(f"quant={quant!r}: 'a8w4' or 'a8w8'")
         return _weights.prepare_weights(w1, w1_scale, w2, w2_scale)
 
     def _weight_dict(self, w1, w1_scale, w2, w2_scale):
@@ -150,21 +164,41 @@ class MegaMoEGfx942:
         W = self._weights.get(key)
         if W is None:
             self._check_weights(w1, w1_scale, w2, w2_scale)
+            fp8 = self.quant == "a8w8"
             W = {
                 "w1": w1,
                 "w1_scale": w1_scale,
-                "w1_exp": _weights.tail_exp(w1, w1_scale),
+                # a8w8 has no per-channel exponents: the kernel does not read them
+                "w1_exp": w1_scale if fp8 else _weights.tail_exp(w1, w1_scale),
                 "w2": w2,
                 "w2_scale": w2_scale,
-                "w2_exp": _weights.tail_exp(w2, w2_scale),
+                "w2_exp": w2_scale if fp8 else _weights.tail_exp(w2, w2_scale),
             }
             self._weights[key] = W
         return W
 
     def _check_weights(self, w1, w1_scale, w2, w2_scale):
         """The kernels read the weights through raw pointers: ``prepare_weights``'
-        output for this rank's experts, contiguous bytes on the layer's device."""
+        output for this rank's experts, contiguous on the layer's device."""
         E, H, I = self.experts // self.world_size, self.model_dim, self.inter_dim
+        if self.quant == "a8w8":
+            want = (
+                ("w1", w1, (E, 2 * I, H), torch.float8_e4m3fnuz),
+                ("w1_scale", w1_scale, (E, 2 * I // 128, H // 128), torch.float32),
+                ("w2", w2, (E, H, I), torch.float8_e4m3fnuz),
+                ("w2_scale", w2_scale, (E, H // 128, I // 128), torch.float32),
+            )
+            for name, t, shape, dtype in want:
+                if tuple(t.shape) != shape or t.dtype != dtype or not t.is_contiguous():
+                    raise ValueError(
+                        f"{name} {t.dtype} {tuple(t.shape)}: expected contiguous "
+                        f"{dtype} {shape} (prepare_weights(..., quant='a8w8') output)"
+                    )
+                if t.device != self.dev:
+                    raise ValueError(
+                        f"{name} is on {t.device}, the layer on {self.dev}"
+                    )
+            return
         want = (
             ("w1", w1, (E, 2 * I, H // 2)),
             ("w1_scale", w1_scale, (E * 2 * I * (H // 32 + 4),)),
@@ -276,6 +310,8 @@ class MegaMoEGfx942:
         }
         if not self._qx:
             key["QX"] = 0
+        if self.quant != "a8w4":
+            key["WQ"] = _WQ[self.quant]
         d = dev.index
         self._mega_k = host.launcher(main.ep_mega_kernel, d, **key)
         # From BLOCK_M * E_LOCAL / topk tokens on this rank (uniform routing: an
