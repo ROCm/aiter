@@ -76,6 +76,8 @@ SHAPES = [
     (289, 4096, 1024, 9),  # GLM-5.3-Flash TP=2 shared-expert variant
     (289, 4096, 512, 9),  # GLM-5.3-Flash TP=4 shared-expert variant
     (289, 4096, 256, 9),  # GLM-5.3-Flash TP=8 shared-expert variant
+    (576, 2048, 2048, 16),  # latent MoE (H=2048, E=576, TOPK=16) TP=1
+    (576, 2048, 256, 16),  # latent MoE TP=8
 ]
 
 
