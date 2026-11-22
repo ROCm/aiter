@@ -32,7 +32,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .aot_cache import FlyDSLAotCache
@@ -280,7 +280,13 @@ _SCALE_PARAMS = ("x_scale_k", "w_scale_n", "w_scale_k", "x_scale_transposed")
 
 @functools.lru_cache(maxsize=1024)
 def _constexprs(
-    name: str, n: int, k: int, b: int, *scale_args, fuse_quant_out: bool = False
+    name: str,
+    n: int,
+    k: int,
+    b: int,
+    *scale_args,
+    fuse_quant_out: bool = False,
+    num_xcds: int = 8,
 ) -> tuple:
     """A kernel's Constexpr arguments in parameter order, the key of its
     compiled launcher. ``scale_args`` are the _SCALE_PARAMS values."""
@@ -292,12 +298,26 @@ def _constexprs(
         **_require_config(name),
         **dict(zip(_SCALE_PARAMS, scale_args)),
         fuse_quant_out=fuse_quant_out,
+        num_xcds=num_xcds,
     )
     bound.apply_defaults()
     return bound.args[_RUNTIME_PARAMS:]
 
 
 _AOT_CACHE = FlyDSLAotCache("bmm_a8w8_mxscale_gfx950")
+
+
+def _order_xcds(cfg, device: torch.device | None = None) -> int:
+    """The XCD count a config's xcd_order tile run is built for; every other
+    config (split-K included) keeps 8. ``device`` is the launch's; None (a
+    compile-only build, which has none) reads the current device, which the AOT
+    dry run sets to the target."""
+    if not cfg["xcd_order"] or cfg["splits"] > 1:
+        return 8
+    if device is None:
+        return get_num_xcds()
+    with torch.cuda.device(device):
+        return get_num_xcds()
 
 
 def _bound_launcher(constexprs: tuple):
@@ -364,7 +384,15 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     runtime argument, so this serves every M. Call it under
     ``aiter.aot.flydsl.common.compile_only_env``."""
     constexprs = _constexprs(
-        kernel_name, n, k, b, x_scale_k, w_scale_n, w_scale_k, x_scale_transposed
+        kernel_name,
+        n,
+        k,
+        b,
+        x_scale_k,
+        w_scale_n,
+        w_scale_k,
+        x_scale_transposed,
+        num_xcds=_order_xcds(_require_config(kernel_name)),
     )
     placeholder = torch.empty(0, dtype=torch.uint8)
     _launch((placeholder,) * 7, 1, fx.Stream(0), constexprs)
@@ -492,7 +520,15 @@ def run_bmm_a8w8_mxfp8_gfx950(
         tensors,
         m,
         fx.Stream(stream),
-        _constexprs(name, n, k, b, *scale_args, fuse_quant_out=fuse),
+        _constexprs(
+            name,
+            n,
+            k,
+            b,
+            *scale_args,
+            fuse_quant_out=fuse,
+            num_xcds=_order_xcds(cfg, XQ.device),
+        ),
     )
     return Out
 

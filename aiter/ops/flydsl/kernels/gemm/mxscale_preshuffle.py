@@ -157,6 +157,7 @@ def _launch_gemm_impl(
     prefetch: Constexpr[int] = 1,
     b_nt: Constexpr[bool] = False,
     l2_reduce: Constexpr[bool] = False,
+    num_xcds: Constexpr[int] = 8,
 ):
     BM, BN, BK = tile_m, tile_n, tile_k
     assert a_scale_block in ("1x32", "1x128"), f"a_scale_block {a_scale_block}"
@@ -453,6 +454,8 @@ def _launch_gemm_impl(
         _kname += "_nt"
     if fused_l2:
         _kname += "_l2"
+    if xcd_swizzle > 0 and num_xcds != 8:
+        _kname += f"_nxcd{num_xcds}"
 
     def _kernel_body(
         arg_c: fx.Int64,
@@ -497,6 +500,7 @@ def _launch_gemm_impl(
                 tile_n=BN,
                 N=N,
                 xcd_swizzle=xcd_swizzle,
+                num_xcds=num_xcds,
             )
             bx_m = fx.Int32(_bx) * BM
             by_n = fx.Int32(_by) * BN
@@ -1784,6 +1788,7 @@ def launch_gemm(
     prefetch: Constexpr[int] = 1,
     b_nt: Constexpr[bool] = False,
     l2_reduce: Constexpr[bool] = False,
+    num_xcds: Constexpr[int] = 8,
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
     _launch_gemm_impl(
@@ -1824,6 +1829,7 @@ def launch_gemm(
         prefetch,
         b_nt,
         l2_reduce,
+        num_xcds,
     )
 
 
@@ -1866,6 +1872,7 @@ def launch_gemm_fused(
     prefetch: Constexpr[int] = 1,
     b_nt: Constexpr[bool] = False,
     l2_reduce: Constexpr[bool] = False,
+    num_xcds: Constexpr[int] = 8,
 ):
     """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
     _launch_gemm_impl(
@@ -1906,6 +1913,7 @@ def launch_gemm_fused(
         prefetch,
         b_nt,
         l2_reduce,
+        num_xcds,
     )
 
 
