@@ -377,6 +377,43 @@ def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
     }
 
 
+@benchmark()
+def test_jdbba_two_devices(B, D, Kout, Mi, dtype):
+    n_dev = torch.cuda.device_count()
+    if n_dev < 2:
+        reason = f"needs 2 visible GPUs, found {n_dev}"
+        aiter.logger.warning("jagged_dense_bmm two-device test skipped: %s", reason)
+        return {"skipped": reason}
+    ret = {"gfx": get_gfx()}
+    for dev in range(2):
+        with torch.cuda.device(dev):
+            d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+            out = _nan_out(d["L"], d["N"], dtype)
+        _launch(d, out, B, Mi, True, **_PINNED_LAUNCHER_KEY)
+        with torch.cuda.device(dev):
+            ret[f"err cuda:{dev}"] = _require(d, out, dtype, f"two devices cuda:{dev}")
+    return ret
+
+
+@benchmark()
+def test_jdbba_size1_dim_strides(B, D, Kout, Mi, odd, dtype):
+    first = _build_inputs(1, D, Kout, 1, "uniform", dtype)
+    out = _nan_out(1, Kout, dtype)
+    if "A" in odd:
+        first["jagged"] = first["jagged"].as_strided((1, D), (1, 1))
+    if "C" in odd:
+        out = out.as_strided((1, Kout), (1, 1))
+    assert first["jagged"].is_contiguous() and out.is_contiguous()
+    _launch(first, out, 1, 1, True, **_PINNED_LAUNCHER_KEY)
+    err_first = _require(first, out, dtype, f"size-1 dim, odd {odd} strides")
+
+    second = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(second["L"], second["N"], dtype)
+    _launch(second, out, B, Mi, True, **_PINNED_LAUNCHER_KEY)
+    err = _require(second, out, dtype, f"canonical strides after odd {odd}")
+    return {"gfx": get_gfx(), "err odd": err_first, "err next": err}
+
+
 def _summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -541,6 +578,20 @@ def main():
     ):
         rows.append(test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype))
     _summarize("jagged_dense_bmm launcher reuse", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), odd in itertools.product(
+        args.dtype, args.regression_shapes, ("A", "C", "AC")
+    ):
+        rows.append(test_jdbba_size1_dim_strides(B, D, Kout, Mi, odd, dtype))
+    _summarize("jagged_dense_bmm size-1 dim strides", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        rows.append(test_jdbba_two_devices(B, D, Kout, Mi, dtype))
+    _summarize("jagged_dense_bmm two devices", rows)
 
 
 if __name__ == "__main__":

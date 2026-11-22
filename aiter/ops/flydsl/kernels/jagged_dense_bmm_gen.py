@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
@@ -121,6 +122,15 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
 
 
 _LAUNCHERS: dict = {}
+
+
+def _row_major(t):
+    # FlyDSL compiles the first stride-1 axis as static, and a contiguous tensor
+    # may carry any stride on a size-1 dim.
+    strides = [1] * t.dim()
+    for i in range(t.dim() - 1, 0, -1):
+        strides[i - 1] = strides[i] * t.shape[i]
+    return t if t.stride() == tuple(strides) else t.as_strided(t.shape, strides)
 
 
 def _build_launcher(
@@ -646,32 +656,29 @@ def jagged_dense_bmm(
         grid_m = (max_seq_len + bmn - 1) // bmn
 
     search_steps = (n_groups - 1).bit_length()
-    key = (
-        N,
-        K,
-        bmn,
-        bnn,
-        block_k,
-        nthreads,
-        xcd_c,
-        xcd_w,
-        compact,
-        get_num_xcds(),
-        traits,
-    )
     launch_args = (
-        C,
-        A,
-        B,
-        BIAS,
-        SEQ_OFFSETS,
+        *map(_row_major, (C, A, B, BIAS, SEQ_OFFSETS)),
         grid_m,
         n_groups,
         search_steps,
         stream,
     )
 
-    launch = _LAUNCHERS.get(key)
-    if launch is None:
-        launch = _LAUNCHERS[key] = _build_launcher(*key)
-    _run_compiled(launch, *launch_args)
+    with torch.cuda.device(A.device):
+        key = (
+            N,
+            K,
+            bmn,
+            bnn,
+            block_k,
+            nthreads,
+            xcd_c,
+            xcd_w,
+            compact,
+            get_num_xcds(),
+            traits,
+        )
+        launch = _LAUNCHERS.get((A.device.index, key))
+        if launch is None:
+            launch = _LAUNCHERS[A.device.index, key] = _build_launcher(*key)
+        _run_compiled(launch, *launch_args)
