@@ -18,7 +18,8 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .config import _WAVE_SIZE
-from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
+from .types import COMBINE_CHUNK as _COMBINE_CHUNK
+from .types import combine_chunk_bytes
 
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
@@ -493,11 +494,7 @@ class MegaMoEConfig:
     def combine_wire_nbytes(self, quant_bits: int) -> int:
         """What combine moves per token at ``quant_bits``: MX, or bf16 at 0."""
         if quant_bits:
-            # A payload plane of MX bytes, then its e8m0 scale plane.
-            return (
-                self.hidden_dim * quant_bits // 8
-                + self.hidden_dim // _COMBINE_SCALE_BLOCK
-            )
+            return self.hidden_dim // _COMBINE_CHUNK * combine_chunk_bytes(quant_bits)
         return self.hidden_dim * 2
 
     @property

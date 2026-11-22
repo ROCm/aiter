@@ -6,10 +6,12 @@
   per-M heuristic picks;
 * the mxscale bpreshuffle lookup's N/K pre-check answers like the padded-M walk
   and reports an untuned weight shape once;
-* the nested custom op called through its undecorated body (gemm_a8w8_blockscale
-  -> gemm_a8w8_blockscale_bpreshuffle) returns what the registered torch.ops
-  dispatch returns (torch_compile_guard's _eager_body), and a rebound module
-  attribute still wins.
+* the nested call (gemm_a8w8_blockscale -> gemm_a8w8_blockscale_bpreshuffle)
+  reaches the native body rather than the public spelling, which now routes
+  when no output buffer is named, and a rebound module attribute still wins.
+  The public spelling stays registered under its own name, so
+  `torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle` and `_eager_body` are
+  still there for callers that use them.
 
 The first two and the routing contract run on CPU; the numerical checks run
 on any GPU whose arch has the kernel and skip elsewhere.
@@ -156,9 +158,16 @@ def test_blockscale_bpreshuffle_nested_body_and_rebind(monkeypatch):
         calls.append((x_scale.dtype, w_scale.dtype))
         return torch.zeros(XQ.shape[0], WQ.shape[0], dtype=dtype)
 
+    # The public spelling stays registered under its own name -- the guard sits
+    # on it, not on the native body, so `torch.ops.aiter.<this name>` and
+    # `_eager_body` both survive the routing split.
     op = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle
     assert op._eager_body.__name__ == "gemm_a8w8_blockscale_bpreshuffle"
-    monkeypatch.setattr(op, "_eager_body", body)
+
+    # The nested group32 call targets the native body rather than the public
+    # spelling: with no buffer named the public one routes, and a provider
+    # serving it here would be a second dispatch of the op we are inside.
+    monkeypatch.setattr(gemm_op_a8w8, "_gemm_a8w8_blockscale_bpreshuffle_native", body)
     x = torch.zeros(4, 64, dtype=dtypes.fp8)
     w = torch.zeros(32, 64, dtype=dtypes.fp8)
     xs = torch.zeros(4, 2, dtype=torch.uint8)
@@ -173,7 +182,9 @@ def test_blockscale_bpreshuffle_nested_body_and_rebind(monkeypatch):
         rebound.append(True)
         return torch.ones(XQ.shape[0], WQ.shape[0], dtype=dtype)
 
-    monkeypatch.setattr(gemm_op_a8w8, "gemm_a8w8_blockscale_bpreshuffle", patched)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "_gemm_a8w8_blockscale_bpreshuffle_native", patched
+    )
     y = gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws, isBpreshuffled=True)
     assert rebound == [True] and len(calls) == 1
     assert bool((y == 1).all())
