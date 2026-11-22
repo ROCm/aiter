@@ -3491,6 +3491,163 @@ def _get_compiled_token_multidest_quant(
 
 
 @functools.cache
+def _get_compiled_route_quant_front(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    experts: int,
+    token_cap: int,
+    ksplit: int,
+    shared: bool,
+):
+    from aiter.ops.flydsl.kernels.moe_route_quant_front import (
+        build_moe_route_quant_front_module,
+    )
+
+    return build_moe_route_quant_front_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        topk=topk,
+        experts=experts,
+        token_cap=token_cap,
+        ksplit=ksplit,
+        shared=shared,
+    )
+
+
+def route_quant_front_supported(
+    token_num: int, topk: int, experts: int, feat_dim: int
+) -> bool:
+    """Whether this batch's route and stage-1 MXFP4 quant fit one launch."""
+    from aiter.ops.flydsl.kernels.moe_route_quant_front import (
+        ROUTE_QUANT_FRONT_MAX_EXPERTS,
+        ROUTE_QUANT_FRONT_MAX_TOKENS,
+    )
+
+    return (
+        0 < int(token_num) <= ROUTE_QUANT_FRONT_MAX_TOKENS
+        and 1 <= int(topk) <= _TOKEN_MULTIDEST_MAX_TOPK
+        and int(experts) <= ROUTE_QUANT_FRONT_MAX_EXPERTS
+        and int(feat_dim) % 256 == 0
+        and os.environ.get("AITER_FLYDSL_ROUTE_QUANT_FRONT", "1")
+        in ("1", "true", "True")
+    )
+
+
+def _route_quant_front_ksplit(feat_dim: int, token_num: int) -> int:
+    """Ways to split a row's K groups over ``grid.y``: a workgroup per CU.
+
+    A warp converts a K group in ~0.3 us, so a decode batch wants its rows
+    split as far as they go. Every workgroup rebuilds the route table first,
+    though, and past one per CU they queue behind each other: at 512 tokens
+    (64 blocks) 4 ways take 8.3 us, 12 ways 10.9 us and 24 ways 13.2 us.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    k_groups = feat_dim // 256
+    grid = -(-token_num // 8)
+    best = 1
+    for n in range(1, k_groups + 1):
+        if k_groups % n == 0 and grid * n <= (get_cu_num() or 256):
+            best = n
+    return best
+
+
+def flydsl_moe_route_quant_front(
+    hidden: torch.Tensor,  # (token_num, feat_dim) bf16
+    topk_ids: torch.Tensor,  # (token_num, topk)
+    experts: int,
+    contiguous_m: int,
+    tile_m: int,
+    *,
+    wmma_rep: int,
+    shared_rows: int = 0,
+):
+    """Route + stage-1 MXFP4 quant + scale preshuffle of a small TP batch, one launch.
+
+    Replaces ``fused_route_psum_remap`` followed by
+    ``flydsl_moe_fused_quant_preshuffle``. With ``shared_rows`` (the row
+    capacity of the per-token buffers) the last top-k column is the shared
+    expert ``experts - 1``: its rows stay in token order and its activations
+    are also quantized to MXFP8, row = token.
+
+    Returns (masked_m, topids_to_rows[token_num, topk], psum, payload, scale,
+    shared_payload, shared_scale); the last two are None without ``shared_rows``.
+    """
+    from aiter.ops.flydsl.kernels.moe_route_quant_front import (
+        route_quant_front_token_cap,
+    )
+
+    assert (
+        hidden.dtype == torch.bfloat16
+    ), f"route + quant front kernel requires bf16 input (got {hidden.dtype})"
+    device = hidden.device
+    token_num, topk = topk_ids.shape
+    feat_dim = hidden.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert contiguous_m % rows_per_tile == 0 and shared_rows % rows_per_tile == 0
+    Ws = feat_dim // 32
+    payload = torch.empty(
+        (1, contiguous_m, feat_dim // 2), dtype=torch.uint8, device=device
+    )
+    scale = torch.empty(
+        (1, contiguous_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+    )
+    shared_payload = shared_scale = None
+    if shared_rows:
+        shared_payload = torch.empty(
+            (1, shared_rows, feat_dim), dtype=torch.uint8, device=device
+        )
+        shared_scale = torch.empty(
+            (1, shared_rows // wmma_rep, Ws * wmma_rep),
+            dtype=torch.uint8,
+            device=device,
+        )
+    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
+    masked_m = torch.empty(int(experts), dtype=torch.int32, device=device)
+    psum = torch.empty(int(experts), dtype=torch.int32, device=device)
+
+    ksplit = int(os.environ.get("AITER_FLYDSL_ROUTE_QUANT_FRONT_KSPLIT", "0"))
+    if ksplit <= 0:
+        ksplit = _route_quant_front_ksplit(feat_dim, token_num)
+    launch = _get_compiled_route_quant_front(
+        feat_dim=int(feat_dim),
+        wmma_rep=int(wmma_rep),
+        topk=int(topk),
+        experts=int(experts),
+        token_cap=route_quant_front_token_cap(token_num),
+        ksplit=ksplit,
+        shared=bool(shared_rows),
+    )
+    warps_per_block = 256 // 32
+    _dispatch_compiled(
+        launch,
+        ptr_arg(hidden.contiguous().view(-1)),
+        ptr_arg(payload.view(-1)),
+        ptr_arg(scale.view(-1)),
+        ptr_arg((shared_payload if shared_rows else payload).view(-1)),
+        ptr_arg((shared_scale if shared_rows else scale).view(-1)),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(psum),
+        int(token_num),
+        int(tile_m),
+        (token_num + warps_per_block - 1) // warps_per_block,
+        current_stream_arg(),
+    )
+    return (
+        masked_m,
+        topids_to_rows.view(token_num, topk),
+        psum,
+        payload,
+        scale,
+        shared_payload,
+        shared_scale,
+    )
+
+
+@functools.cache
 def _get_compiled_apre_quant(
     feat_dim: int,
     wmma_rep: int,

@@ -429,8 +429,14 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     chunk_prefetch = getattr(c, "chunk_prefetch", None)
     hidden_lds_load = getattr(c, "hidden_lds_load", None)
 
+    # A caller that issued the row's loads itself (ahead of other work, or to
+    # share them between two quant passes) hands them over per iteration.
+    hidden_preloaded = getattr(c, "hidden_preloaded", None)
+
     def _emit_hidden_load(it):
         """This iteration's 8 bf16 (one aligned dwordx4)."""
+        if const_expr(hidden_preloaded is not None):
+            return hidden_preloaded[it]
         col_base = (
             _mx_block_of(it) * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
         )

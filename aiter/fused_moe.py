@@ -1297,6 +1297,85 @@ def fused_moe(
                 "fused_moe(deterministic=True) does not support shared experts"
             )
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+        if (
+            get_gfx_runtime() == "gfx1250"
+            and not routed_mxfp8
+            and GateMode(gate_mode) == GateMode.INTERLEAVE
+        ):
+            # gfx1250: A4W4 routed experts with the A8W8 (MXFP8) shared
+            # expert's tiles fused into the grouped GEMM launches (no FHMoE
+            # there).
+            unsupported = [
+                name
+                for name, given in (
+                    ("stage2_scatter", stage2_scatter is not None),
+                    ("expert_mask", expert_mask is not None),
+                    ("bias1 / bias2", bias1 is not None or bias2 is not None),
+                    (
+                        "a1_scale / a2_scale",
+                        a1_scale is not None or a2_scale is not None,
+                    ),
+                    ("quant_type_a", quant_type_a is not None),
+                    (
+                        "quant_dtype_a",
+                        quant_dtype_a is not None and quant_dtype_a != dtypes.fp4x2,
+                    ),
+                    ("quant_dtype_a2", quant_dtype_a2 is not None),
+                    ("doweight_stage1", doweight_stage1),
+                    ("clamp_shared=False", not clamp_shared),
+                    (
+                        "w1_global_scale / w2_global_scale",
+                        w1_global_scale is not None or w2_global_scale is not None,
+                    ),
+                )
+                if given
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    "gfx1250 fused shared-expert dispatch does not support "
+                    + ", ".join(unsupported)
+                )
+            if any(
+                t is None
+                for t in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
+            ):
+                raise ValueError(
+                    "shared_w1, shared_w2, shared_w1_scale, and shared_w2_scale "
+                    "must be provided together"
+                )
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                grouped_fused_shared_gfx1250,
+            )
+
+            default_beta, default_linear_beta = (
+                (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
+                if activation == ActivationType.Situv2
+                else (1.0, 1.0)
+            )
+            return grouped_fused_shared_gfx1250(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                shared_w1=shared_w1,
+                shared_w2=shared_w2,
+                shared_w1_scale=shared_w1_scale,
+                shared_w2_scale=shared_w2_scale,
+                shared_expert_id=shared_expert_id,
+                activation=activation,
+                quant_type=quant_type,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                dtype=dtype,
+                swiglu_limit=swiglu_limit,
+                situ_beta=default_beta if beta is None else float(beta),
+                situ_linear_beta=(
+                    default_linear_beta if linear_beta is None else float(linear_beta)
+                ),
+                num_local_tokens=num_local_tokens,
+                output=output,
+            )
         unsupported = []
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
