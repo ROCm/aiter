@@ -480,11 +480,24 @@ def _ring_drive(
             vals.extend(dies(i))
         held.append(tuple(vals) if vals else None)
 
+    # Fragment runs between refills -- one STRETCH per burst. The ring takes a single
+    # s_wait_dscnt at the head of each instead of one per fragment: a fence at every
+    # fragment head leaves anything scheduling the stream only ``wmma_per_frag`` wmma to
+    # work in. The refill cadence is a pure function of the counters, so the stretch
+    # boundaries are known here by replaying it.
+    stretches = []
+    _sim, _first = num_prefetch, 0
     for i in range(num_frag):
-        # The wait is placed before the refill, so it is measured against what is already
-        # outstanding: everything issued past the end of this fragment may still be in
-        # flight, and the refill below only adds younger loads.
-        _waitn(issued - starts[i + 1])
+        _t = starts[i + 1] + num_prefetch
+        if not refill_burst or _t - _sim >= refill_burst or _t >= num_ld:
+            if i > _first:
+                stretches.append((_first, i - 1))
+                _first = i
+            _sim = min(_t, num_ld)
+    stretches.append((_first, num_frag - 1))
+
+    def _ring_fragment(i):
+        nonlocal issued
         _release(i)
         refilling = issued < num_ld
         _target = starts[i + 1] + num_prefetch
@@ -510,6 +523,16 @@ def _ring_drive(
         rocdl.sched_barrier(0)
         # Past the last refill nothing can clobber the slots, so holding them buys nothing.
         _record(i, parts if (ring_lag and refilling) else None)
+
+    for _first, _last in stretches:
+        # ONE wait for the whole stretch, at the depth its LAST fragment needs, so every
+        # fragment in it is covered where it stands. Measured against what is already
+        # outstanding: everything issued past the end of the stretch may still be in
+        # flight, and the refills inside it only add younger loads.
+        _waitn(issued - starts[_last + 1])
+        for i in range(_first, _last + 1):
+            _ring_fragment(i)
+
     for p in held:
         if p is not None:
             _keepalive(p)
