@@ -400,7 +400,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     return Y
 
 
-# ---- MXFP8 NN / TT / TN (gfx950 CO kids) ------------------------------------
+# ---- MXFP8 NT / NN / TT / TN, plain B (gfx950 CO kids) ------------------------
 
 
 def _mxfp8_direction(XQ: Tensor, WQ: Tensor) -> str | None:
@@ -429,7 +429,7 @@ def _mxfp8_direction(XQ: Tensor, WQ: Tensor) -> str | None:
 def _select_mxfp8_direction_kid(
     direction: str, M: int, N: int, K: int, arch: str, cu_num: int
 ) -> int | None:
-    """Pick a supported NN / TT / TN kid for the shape.
+    """Pick a supported NT / NN / TT / TN kid for the shape.
 
     256x128 tiles for N not a multiple of 256 or up to 2048 x 2048 outputs
     (more tiles to fill the CUs), else 256x256; GroupM 16 from M = 16384;
@@ -455,7 +455,7 @@ def _select_mxfp8_direction_kid(
     return None if best is None else best[1]
 
 
-def gemm_a8w8_blockscale_bpreshuffle_opus(
+def gemm_a8w8_blockscale_opus(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -465,29 +465,27 @@ def gemm_a8w8_blockscale_bpreshuffle_opus(
     kernelId: int | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
-    """gfx950 MXFP8 1x128 blockscale GEMM for NN / TT / TN operand storage.
+    """gfx950 MXFP8 1x128 blockscale GEMM for NT / NN / TT / TN operand storage.
 
     Computes Y[M, N] = XQ[M, K] @ WQ[N, K]^T on logical shapes; the storage is
     read from the strides (see ``_mxfp8_direction``), so pass the transposed
-    view of a [K, M] A or of a [K, N] B, never a copy. WQ is the
-    ``shuffle_weight(layout=(16, 16))`` of its own storage. x_scale is the
-    E8M0 [M, K/128] scale with column-major bytes; w_scale the E8M0
+    view of a [K, M] A or of a [K, N] B, never a copy. A and B are plain FP8
+    (no ``shuffle_weight``), as DeepGEMM's fp8_gemm_{nt,nn,tn,tt}. x_scale is
+    the E8M0 [M, K/128] scale with column-major bytes; w_scale the E8M0
     [N/128, K/128] scale stored like WQ ([N/128, K/128] for B "T",
     [K/128, N/128] for B "N"). Output is BF16.
 
-    ``kernelId`` runs that kid (56-85); otherwise one is picked by shape.
-    NT operands belong to ``gemm_a8w8_blockscale_bpreshuffle``.
+    ``kernelId`` runs that kid (56-95); otherwise one is picked by shape.
     """
     if XQ.dim() != 2 or WQ.dim() != 2:
-        raise ValueError("gemm_a8w8_blockscale_bpreshuffle_opus expects 2D XQ / WQ")
+        raise ValueError("gemm_a8w8_blockscale_opus expects 2D XQ / WQ")
     if dtype != torch.bfloat16:
-        raise ValueError("gemm_a8w8_blockscale_bpreshuffle_opus writes BF16 only")
+        raise ValueError("gemm_a8w8_blockscale_opus writes BF16 only")
     direction = _mxfp8_direction(XQ, WQ)
-    if direction is None or direction == "NT":
+    if direction is None:
         raise ValueError(
-            f"gemm_a8w8_blockscale_bpreshuffle_opus serves NN / TT / TN storage; got "
+            "gemm_a8w8_blockscale_opus serves NT / NN / TT / TN storage; got "
             f"XQ strides {tuple(XQ.stride())}, WQ strides {tuple(WQ.stride())}"
-            + (" (NT: use gemm_a8w8_blockscale_bpreshuffle)" if direction else "")
         )
     M, K = map(int, XQ.shape)
     N = int(WQ.shape[0])
@@ -892,6 +890,6 @@ def _mxscale_bmm_workspace(
 __all__ = [
     "bmm_a8w8_mxscale_opus",
     "bmm_a8w8_mxscale_opus_bpreshuffle",
-    "gemm_a8w8_blockscale_bpreshuffle_opus",
+    "gemm_a8w8_blockscale_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
 ]

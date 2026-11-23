@@ -33,8 +33,9 @@ __device__ __forceinline__ void schedule_step() {
 }
 
 // ============================================================================
-// A [M, K] (K-contiguous): the NT copy and LDS shuffle, plain ds_read_b128.
-// The reader follows the copy's even / odd row interleaving.
+// A [M, K] / B [N, K] (K-contiguous): the NT copy and LDS shuffle, plain ds_read_b128.
+// The reader follows the copy's even / odd row interleaving. B calls these with N as M
+// (HALF_B_N == HALF_B_M, E_N == E_M, ...), so its fragments map like A's.
 // ============================================================================
 // Create layout for loading A matrix from global memory.
 template<class T>
@@ -106,7 +107,7 @@ __device__ inline auto make_layout_ra_k(int lane_id, int wave_id_m) {
 }
 
 // ============================================================================
-// A [K, M] (A_T, M-contiguous): K8 x M128 LDS slots, ds_read_b64_tr_b8
+// A [K, M] / B [K, N] (A_T / B_T, M/N-contiguous): K8 x M128 LDS slots, ds_read_b64_tr_b8
 // ============================================================================
 // Create layout for loading A matrix from global memory.
 template<class T>
@@ -157,11 +158,12 @@ __device__ inline auto make_layout_sa_mn(int wave_id_m, int wave_id_n) {
 template<class T>
 __device__ inline auto make_layout_ra_mn(int lane_id, int wave_id_m) {
     constexpr int P = T::smem_linear_wave + T::smem_padding;
+    constexpr int VEC_TR = 8;  // ds_read_b64_tr_b8 bytes per lane
     constexpr int k_groups = T::WARP_SIZE / T::W_M;
     constexpr int k64_repeats = T::W_K / T::WARP_SIZE;
-    constexpr int tr_reads_per_k16 = 16 / T::VEC_LDS_A;
+    constexpr int tr_reads_per_k16 = 16 / VEC_TR;
     static_assert(T::E_K == 1 && k_groups == 4);
-    static_assert(k64_repeats == 2 && tr_reads_per_k16 == 2 && T::W_M == 2 * T::VEC_LDS_A);
+    static_assert(k64_repeats == 2 && tr_reads_per_k16 == 2 && T::W_M == 2 * VEC_TR);
     // K8 x M128 slots: LDS(k, m) = (k / 8) * P + (k % 8) * 128 + m. Reads go in
     // repeat -> K64 -> TR8 order, the MMA register order.
     constexpr auto ra_block_shape = opus::make_tuple(
@@ -171,8 +173,8 @@ __device__ inline auto make_layout_ra_mn(int lane_id, int wave_id_m) {
         opus::number<tr_reads_per_k16>{},
         opus::number<k_groups>{},
         opus::number<T::smem_sub>{},
-        opus::number<16 / T::VEC_LDS_A>{},
-        opus::number<T::VEC_LDS_A>{});
+        opus::number<16 / VEC_TR>{},
+        opus::number<VEC_TR>{});
 
     constexpr auto ra_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
@@ -182,89 +184,15 @@ __device__ inline auto make_layout_ra_mn(int lane_id, int wave_id_m) {
         opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
-    return opus::make_layout<T::VEC_LDS_A>(
+    return opus::make_layout<VEC_TR>(
         ra_block_shape,
         opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::W_M>{}, opus::number<8 * P>{}, opus::number<P>{}, opus::number<2 * P>{}, opus::number<T::HALF_B_M>{}, 1_I}),
         opus::unfold_p_coord(ra_block_dim, opus::tuple{wave_id_m, lane_id / T::W_M, (lane_id % T::W_M) / 2, lane_id % 2}));
 }
 
 // ============================================================================
-// B [N, K] (K-contiguous): shuffle_weight(B, (16, 16)), the NT copy / LDS / reader
-// path, plain ds_read_b128
+// Scale factors for B 128x128, by B's storage
 // ============================================================================
-// Create layout for loading B matrix from global memory.
-template<class T>
-__device__ inline auto make_layout_gb_k(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
-    constexpr int lanes_n = T::W_N;
-    constexpr int lanes_k = T::WARP_SIZE / lanes_n;
-    constexpr int k_per_wave_load = lanes_k * T::VEC_B;
-    constexpr int n_repeats = T::HALF_B_N / (T::NUM_WAVES * lanes_n);
-    constexpr int k_repeats = T::B_K / k_per_wave_load;
-
-    constexpr auto gb_block_shape = opus::make_tuple(
-        opus::number<n_repeats>{},
-        opus::number<T::T_N>{},
-        opus::number<T::T_M>{},
-        opus::number<k_repeats>{},
-        opus::number<T::WARP_SIZE>{},
-        opus::number<T::VEC_B>{});
-
-    constexpr auto gb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout<T::VEC_B>(
-        gb_block_shape,
-        opus::unfold_x_stride(gb_block_dim, gb_block_shape, opus::tuple{T::W_N * stride_b, 1_I}),
-        opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
-}
-
-// Create layout for storing B matrix to shared memory.
-template<class T>
-__device__ inline auto make_layout_sb_k(int wave_id_m, int wave_id_n) {
-    constexpr auto sb_block_shape = opus::make_tuple(
-        opus::number<T::smem_n_rep / T::NUM_WAVES>{},
-        opus::number<T::T_N>{},
-        opus::number<T::T_M>{},
-        opus::number<T::VEC_B>{});
-
-    constexpr auto sb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-
-    return opus::make_layout(
-        sb_block_shape,
-        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
-        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n}));
-}
-
-// Create layout for reading B matrix from shared memory to registers.
-template<class T>
-__device__ inline auto make_layout_rb_k(int lane_id, int wave_id_n) {
-    constexpr int P = T::smem_linear_wave + T::smem_padding;
-    constexpr int n_repeats = T::NUM_WAVES / T::T_N;
-
-    constexpr auto rb_block_shape = opus::make_tuple(
-        opus::number<T::E_N / n_repeats>{},
-        opus::number<n_repeats>{},
-        opus::number<T::T_N>{},
-        opus::number<T::W_N * T::W_K / T::WARP_SIZE / T::VEC_B>{},
-        opus::number<T::E_K>{},
-        opus::number<T::WARP_SIZE>{},
-        opus::number<T::VEC_B>{});
-
-    constexpr auto rb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout<T::VEC_B>(
-        rb_block_shape,
-        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<8 * P>{}, opus::number<P>{}, opus::number<4 * P>{}, 1_I}),
-        opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id}));
-}
-
 // Create layout for loading scale factors for B from global memory.
 // scaleB [N/128, K/128]: waves 0 / 1 publish one N128 half each.
 template<class T>
@@ -282,91 +210,6 @@ __device__ inline auto make_layout_gsfb_k(int lane_id, int wave_id, int stride_s
         gsfb_block_shape,
         opus::unfold_x_stride(gsfb_block_dim, gsfb_block_shape, opus::tuple{stride_sfb, 1_I}),
         opus::unfold_p_coord(gsfb_block_dim, opus::tuple{wave_id, lane_id}));
-}
-
-// ============================================================================
-// B [K, N] (B_T, N-contiguous): shuffle_weight(B, (16, 16)), paired slots, ds_read_b64_tr_b8
-// ============================================================================
-// Create layout for loading B matrix from global memory: packed 16-byte N vectors.
-template<class T>
-__device__ inline auto make_layout_gb_mn(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
-    constexpr int lanes_k = T::W_N;
-    constexpr int lanes_n = T::WARP_SIZE / lanes_k;
-    constexpr int n_per_wave_load = lanes_n * T::VEC_B;
-    constexpr int k_repeats = T::B_K / (T::NUM_WAVES * lanes_k);
-    constexpr int n_repeats = T::HALF_B_N / n_per_wave_load;
-
-    constexpr auto gb_block_shape = opus::make_tuple(
-        opus::number<n_repeats>{},
-        opus::number<T::T_N>{},
-        opus::number<T::T_M>{},
-        opus::number<k_repeats>{},
-        opus::number<T::WARP_SIZE>{},
-        opus::number<T::VEC_B>{});
-
-    constexpr auto gb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout<T::VEC_B>(
-        gb_block_shape,
-        opus::unfold_x_stride(gb_block_dim, gb_block_shape, opus::tuple{T::W_N * stride_b, 1_I}),
-        opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
-}
-
-// Create layout for storing B matrix to shared memory.
-template<class T>
-__device__ inline auto make_layout_sb_mn(int wave_id_m, int wave_id_n) {
-    // Slot s = 4 * repeat + 2 * p0 + p1 lives at (s / 2) * B_SLOT_PAIR + (s % 2) * B_SLOT_ODD.
-    constexpr auto sb_block_shape = opus::make_tuple(
-        opus::number<T::smem_n_rep / T::NUM_WAVES>{},
-        opus::number<T::T_N>{},
-        opus::number<T::T_M>{},
-        opus::number<T::VEC_B>{});
-
-    constexpr auto sb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-
-    return opus::make_layout<T::VEC_B>(
-        sb_block_shape,
-        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{opus::number<2 * T::B_SLOT_PAIR>{}, opus::number<T::B_SLOT_PAIR>{}, opus::number<T::B_SLOT_ODD>{}, 1_I}),
-        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n}));
-}
-
-// Create layout for reading B matrix from shared memory to registers.
-template<class T>
-__device__ inline auto make_layout_rb_mn(int lane_id, int wave_id_n) {
-    constexpr int n_repeats = T::WARP_SIZE / 16 / T::T_N;
-
-    // Lanes 0-31 and 32-63 form separate TR8 LDS passes. Within a pass the
-    // two 16-lane groups read slots 2j and 2j+1, which are B_SLOT_ODD apart
-    // (128 mod 256 bytes), so the pass covers all 64 banks once.
-    constexpr auto rb_block_shape = opus::make_tuple(
-        opus::number<T::E_N / n_repeats>{},
-        opus::number<n_repeats>{},
-        opus::number<T::T_N>{},
-        opus::number<T::W_K / T::WARP_SIZE>{},
-        opus::number<T::WARP_SIZE / T::W_N / 2>{},  // lane_id / 32
-        opus::number<2>{},                          // (lane_id / 16) % 2
-        opus::number<16 / T::VEC_LDS_B>{},
-        opus::number<T::W_N>{},
-        opus::number<T::VEC_LDS_B>{});
-
-    constexpr auto rb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout<T::VEC_LDS_B>(
-        rb_block_shape,
-        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<2 * T::B_SLOT_PAIR>{}, opus::number<T::W_N * 16>{}, opus::number<4 * T::B_SLOT_PAIR>{}, opus::number<T::B_SLOT_PAIR>{}, opus::number<T::B_SLOT_ODD>{}, 1_I}),
-        opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id / 32, (lane_id / T::W_N) % 2, lane_id % T::W_N}));
 }
 
 // Create layout for loading scale factors for B from global memory.
@@ -500,7 +343,9 @@ __device__ inline auto make_layout_rsfb() {
 }
 
 // ============================================================================
-// A / B layouts: each operand takes the _k or _mn builder by its own storage
+// A / B layouts: each operand takes the _k or _mn builder by its own storage; B passes
+// the same wave ids to the copy and store (the slot filled does not depend on which
+// wave copies it) and wave_id_n to the reader.
 // ============================================================================
 // Create layout for loading A matrix from global memory.
 template<class T>
@@ -526,22 +371,22 @@ __device__ inline auto make_layout_ra(int lane_id, int wave_id_m) {
 // Create layout for loading B matrix from global memory.
 template<class T>
 __device__ inline auto make_layout_gb(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
-    if constexpr (T::B_T) return make_layout_gb_mn<T>(lane_id, wave_id_m, wave_id_n, stride_b);
-    else return make_layout_gb_k<T>(lane_id, wave_id_m, wave_id_n, stride_b);
+    if constexpr (T::B_T) return make_layout_ga_mn<T>(lane_id, wave_id_m, wave_id_n, stride_b);
+    else return make_layout_ga_k<T>(lane_id, wave_id_m, wave_id_n, stride_b);
 }
 
 // Create layout for storing B matrix to shared memory.
 template<class T>
 __device__ inline auto make_layout_sb(int wave_id_m, int wave_id_n) {
-    if constexpr (T::B_T) return make_layout_sb_mn<T>(wave_id_m, wave_id_n);
-    else return make_layout_sb_k<T>(wave_id_m, wave_id_n);
+    if constexpr (T::B_T) return make_layout_sa_mn<T>(wave_id_m, wave_id_n);
+    else return make_layout_sa_k<T>(wave_id_m, wave_id_n);
 }
 
 // Create layout for reading B matrix from shared memory to registers.
 template<class T>
 __device__ inline auto make_layout_rb(int lane_id, int wave_id_n) {
-    if constexpr (T::B_T) return make_layout_rb_mn<T>(lane_id, wave_id_n);
-    else return make_layout_rb_k<T>(lane_id, wave_id_n);
+    if constexpr (T::B_T) return make_layout_ra_mn<T>(lane_id, wave_id_n);
+    else return make_layout_ra_k<T>(lane_id, wave_id_n);
 }
 
 // Create layout for loading scale factors for B from global memory.
@@ -553,7 +398,7 @@ __device__ inline auto make_layout_gsfb(int lane_id, int wave_id, int stride_sfb
 
 } // namespace opus_gemm_mxfp8_detail
 
-// NN / TT / TN. Each operand takes its own layouts by its storage (A_T / B_T); the
+// NT / NN / TT / TN. Each operand takes its own layouts by its storage (A_T / B_T); the
 // schedule details that were tuned per direction are kept as such (see NN_SCHEDULE,
 // A_FIRST below).
 template<class Traits>
@@ -570,8 +415,8 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     using D_SF = opus::u8_t;        // E8M0
     using D_SF_PACK = opus::u32_t;  // 4 E8M0 scales
 
-    // NN (A plain, B TR8) keeps its own copy issue (per-pass layouts), C11 staging and
-    // scale-read point; TT (B plain) consumes A0 first in the 2x2 schedule.
+    // NN / NT (A plain) keep their own copy issue (per-pass layouts), C11 staging and
+    // scale-read point; TT / NT (B plain) consume A0 first in the 2x2 schedule.
     constexpr bool NN_SCHEDULE = !T::A_T;
     constexpr bool A_FIRST = !T::B_T;
     static_assert(T::BLOCK_SIZE == 256 && T::B_K == 128);
@@ -615,12 +460,12 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
 
     // Global views, each a 64-bit base at this tile and a buffer range ending with its matrix.
     // A_T: A [K, M], the tile starts at column row; else A [M, K], at row row.
-    // B is the (16, 16) shuffle_weight of [K, N] (B_T: column col starts at col * 16) or of
-    // [N, K] (row col). scaleB is [K128, N128] (B_T) or [N128, K128].
+    // B_T: B [K, N], the tile starts at column col; else B [N, K], at row col.
+    // scaleB is [K128, N128] (B_T) or [N128, K128].
     // C: the range ends at the tile's last valid row. Padded-M rows fall outside it and their
     // stores are dropped by the hardware, so the epilogue needs no per-store branch.
     const int64_t a_offset = T::A_T ? int64_t(row) : int64_t(row) * kargs.stride_a;
-    const int64_t b_offset = T::B_T ? int64_t(col) * 16 : int64_t(col) * kargs.stride_b;
+    const int64_t b_offset = T::B_T ? int64_t(col) : int64_t(col) * kargs.stride_b;
     const int64_t sfb_offset = T::B_T ? int64_t(col / T::GROUP_N) : int64_t(col / T::GROUP_N) * kargs.stride_sfb;
     const int c_rows = kargs.m - row < T::B_M ? kargs.m - row : T::B_M;
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + int64_t(batch_id) * kargs.stride_a_batch + a_offset,
@@ -663,14 +508,14 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     opus::array<typename MMA::vtype_c, T::E_M * T::E_N> v_c[T::H_M][T::H_N];
 
     // Global -> LDS: A / B copies (LDS DMA) into the two K slots.
-    // A_T: XOR swizzle for the TR8 reads. An A slot holds 8 K rows of 128 M bytes,
+    // A_T / B_T: XOR swizzle for the TR8 reads. A slot holds 8 K rows of 128 M (N) bytes,
     // so rows k and k+2 are 256 bytes apart and land on the same banks: the
     // 16 lanes that read one M chunk from 8 rows conflict 4-way. Store chunk c
     // of row k at chunk position c ^ (k / 2). The LDS DMA writes lane l to row
     // l / 8, position l % 8, so that lane fetches source chunk (l % 8) ^ (l / 16).
-    const int a_copy_lane_id = T::A_T ? (lane_id & ~7) | ((lane_id & 7) ^ (lane_id >> 4)) : lane_id;
-    auto u_ga = make_layout_ga<T>(a_copy_lane_id, wave_id_m, wave_id_n, kargs.stride_a);
-    auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+    const int tr_copy_lane_id = (lane_id & ~7) | ((lane_id & 7) ^ (lane_id >> 4));
+    auto u_ga = make_layout_ga<T>(T::A_T ? tr_copy_lane_id : lane_id, wave_id_m, wave_id_n, kargs.stride_a);
+    auto u_gb = make_layout_gb<T>(T::B_T ? tr_copy_lane_id : lane_id, wave_id_m, wave_id_n, kargs.stride_b);
     auto u_sa = make_layout_sa<T>(wave_id_m, wave_id_n);
     auto u_sb = make_layout_sb<T>(wave_id_m, wave_id_n);
     auto ga_offset = [&](int half_tile_m, int tile_k) {
@@ -685,15 +530,25 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     };
     auto ga_soffset = [&](int half_tile_m, int tile_k) { return T::PAD_M ? 0 : ga_offset(half_tile_m, tile_k); };
     auto gb_offset = [&](int half_tile_n, int tile_k) {
-        if constexpr (T::B_T) return tile_k * T::B_K * kargs.stride_b + half_tile_n * T::HALF_B_N * 16;
-        else return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K * 16;
+        if constexpr (T::B_T) return tile_k * T::B_K * kargs.stride_b + half_tile_n * T::HALF_B_N;
+        else return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
     };
     auto sa_offset = [&](int stage, int half_tile_m) { return (stage * T::H_M + half_tile_m) * smem_a_elem; };
     auto sb_offset = [&](int stage, int half_tile_n) { return (stage * T::H_N + half_tile_n) * smem_b_elem; };
     const auto ga_copy_offsets = layout_to_offsets<T::VEC_A>(u_ga);
-    const auto gb_copy_offsets = layout_to_offsets<T::VEC_B>(u_gb);
     const auto sa_copy_offsets = layout_to_offsets<T::VEC_A>(u_sa);
-    const auto sb_copy_offsets = layout_to_offsets<T::VEC_B>(u_sb);
+    // One B copy pass with its repeat coordinate fixed, leaving one contiguous vector for
+    // async_load; the uniform tile offset goes to SOFFSET, so each copy keeps a
+    // loop-invariant VGPR address and B's buffer resource stays in SGPRs.
+    auto copy_b_pass = [&](OPUS_LDS_ADDR char* base, auto pass_i, int half, int tile) {
+        constexpr int pass = decltype(pass_i)::value;
+        const auto u_gb_copy = make_layout<T::VEC_B>(u_gb.shape(), u_gb.stride(),
+            merge_peepholed_tuple(u_gb.coord(), make_tuple(number<pass>{}, underscore{})));
+        const auto u_sb_copy = make_layout<T::VEC_B>(u_sb.shape(), u_sb.stride(),
+            merge_peepholed_tuple(u_sb.coord(), make_tuple(number<pass>{}, underscore{})));
+        static_assert(layout_load_traits<decltype(u_gb_copy), T::VEC_B>::r_elem.value == 1);
+        async_load<T::VEC_B>(g_b, base, u_gb_copy, u_sb_copy + sb_offset(0, half), gb_offset(half, tile));
+    };
     // NN prologue: every 128-row/column quadrant with the complete layouts.
     auto prefetch_tile = [&](int tile, int stage) {
         static_for<T::H_M>([&](auto half_i) {
@@ -721,21 +576,22 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                     + sa_copy_offsets[pass] + sa_offset(stage, half)),
                 ga_voffset(ga_copy_offsets[pass], half, tile), ga_soffset(half, tile));
         else
-            async_load<T::VEC_B>(g_b,
-                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(s_b.ptr)
-                    + sb_copy_offsets[pass] + sb_offset(stage, half)),
-                gb_copy_offsets[pass], gb_offset(half, tile));
+            copy_b_pass(s_b.ptr + sb_offset(stage, 0), pass_i, half, tile);
     };
 
     // LDS -> registers: A / B operand fragment reads.
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
-    // A_T: TR8 lane l reads row (l % 16) / 2 of its slot; chunk c = mi * T_M + wave_id_m
-    // moved to c ^ (row / 2). The shift is constant per lane and fragment.
-    const int a_read_xor = (lane_id % 16) / 4;
+    // A_T / B_T: TR8 lane l reads row (l % 16) / 2 of its slot; chunk c = mi * T_M + wave_id_m
+    // (ni * T_N + wave_id_n) moved to c ^ (row / 2). The shift is constant per lane and fragment.
+    const int tr_read_xor = (lane_id % 16) / 4;
     auto ra_shift = [&](int mi) {
         const int chunk = mi * T::T_M + wave_id_m;
-        return T::A_T ? ((chunk ^ a_read_xor) - chunk) * 16 : 0;
+        return T::A_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : 0;
+    };
+    auto rb_shift = [&](int ni) {
+        const int chunk = ni * T::T_N + wave_id_n;
+        return T::B_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : 0;
     };
     // LDS reads of operand fragment chunks [first, first + count). A_T / B_T read with
     // ds_read_tr8 through the builtin (opus' tr_load is inline asm), so the result can
@@ -769,7 +625,7 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
         constexpr int ni = decltype(ni_i)::value, first = decltype(first_i)::value, count = decltype(count_i)::value;
         vector_t<D_B, count * T::VEC_LDS_B> raw;
         static_for<count>([&](auto c) {
-            const int base = rb_base + ofs;
+            const int base = rb_base + rb_shift(ni) + ofs;
             constexpr int delta = rb_deltas[ni * b_chunks + first + c.value] - rb_deltas[0];
             if constexpr (T::B_T)
                 set_slice(raw, __builtin_bit_cast(vector_t<D_B, T::VEC_LDS_B>, tr8(sm_, base, delta)),
@@ -937,10 +793,8 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                         async_load<T::VEC_A>(g_a, s_a.ptr,
                             u_ga_copy, u_sa_copy + sa_offset(stage, half), ga_offset(half, future_tile));
                 } else {
-                    constexpr int k_repeats = T::B_K / (T::NUM_WAVES * T::W_N);
                     const auto u_gb_copy = make_layout<T::VEC_B>(u_gb.shape(), u_gb.stride(),
-                        merge_peepholed_tuple(u_gb.coord(), make_tuple(
-                            number<pass / k_repeats>{}, number<pass % k_repeats>{}, underscore{})));
+                        merge_peepholed_tuple(u_gb.coord(), make_tuple(number<pass>{}, underscore{})));
                     const auto u_sb_copy = make_layout<T::VEC_B>(u_sb.shape(), u_sb.stride(),
                         merge_peepholed_tuple(u_sb.coord(), make_tuple(number<pass>{}, underscore{})));
                     static_assert(layout_load_traits<decltype(u_gb_copy), T::VEC_B>::r_elem.value == 1);
@@ -953,10 +807,7 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                         + sa_copy_offsets[pass] + sa_offset(0, half)),
                     ga_voffset(ga_copy_offsets[pass], half, future_tile), ga_soffset(half, future_tile));
             else
-                async_load<T::VEC_B>(g_b,
-                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(write_b)
-                        + sb_copy_offsets[pass] + sb_offset(0, half)),
-                    gb_copy_offsets[pass], gb_offset(half, future_tile));
+                copy_b_pass(write_b, pass_i, half, future_tile);
         };
         constexpr bool has_next = decltype(next_tile)::value;
         constexpr bool has_later = decltype(later_tile)::value;
@@ -1032,16 +883,18 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
         };
         if constexpr (T::H_N == 2) {
             if constexpr (A_FIRST) {
-                // TT: C[0][0] and C[0][1] consume A0 across both opposite halves.
-                // Each retired fragment is reloaded one DS chunk per MFMA pair.
+                // TT / NT: C[0][0] and C[0][1] consume A0 across both opposite halves.
+                // Each retired fragment is reloaded over the four MFMA pairs of the next row.
                 static_for<4>([&](auto mi) {
                     static_for<4>([&](auto ni) {
                         constexpr int m = decltype(mi)::value, n = decltype(ni)::value;
+                        constexpr int begin = n * a_chunks / 4;
+                        constexpr int end = (n + 1) * a_chunks / 4;
                         mfma(number<0>{}, number<0>{}, mi, ni);
-                        if constexpr (has_next && m > 0)
+                        if constexpr (has_next && m > 0 && end > begin)
                             load_a(number<0>{}, number<m - 1>{},
-                                ni, number<1>{});
-                        schedule_step<1, 0, (has_next && m > 0 ? 1 : 0),
+                                number<begin>{}, number<end - begin>{});
+                        schedule_step<1, 0, (has_next && m > 0 ? end - begin : 0),
                             has_next && m == 1 && n == 0 ? 1 : 0>();
                         mfma(number<0>{}, number<1>{}, mi, ni);
                         if constexpr (has_later) prefetch(mi, ni);
@@ -1055,15 +908,17 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                         constexpr int m = decltype(mi)::value, n = decltype(ni)::value;
                         constexpr int begin = m * b_chunks / 4;
                         constexpr int end = (m + 1) * b_chunks / 4;
+                        constexpr int a_begin = m * a_chunks / 4;
+                        constexpr int a_end = (m + 1) * a_chunks / 4;
                         mfma(number<1>{}, number<0>{}, mi, ni);
-                        if constexpr (has_next && n == 0)
+                        if constexpr (has_next && n == 0 && a_end > a_begin)
                             load_a(number<0>{}, number<3>{},
-                                mi, number<1>{});
+                                number<a_begin>{}, number<a_end - a_begin>{});
                         if constexpr (has_next && n > 0 && end > begin)
                             load_b(number<0>{}, number<n - 1>{},
                                 number<begin>{}, number<end - begin>{});
-                        schedule_step<1, 0,
-                            has_next ? (n == 0 ? (m == 0 ? 3 : 1) : end - begin) : 0>();
+                        schedule_step<1, 0, has_next ? (n == 0 ?
+                            (m == 0 ? a_end - a_begin + 2 : a_end - a_begin) : end - begin) : 0>();
                     });
                 });
             } else {

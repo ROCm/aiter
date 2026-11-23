@@ -355,7 +355,7 @@ def _check_gfx950_pin(
         ]
     ).stdout
     if mxfp8_direction(entry):
-        # NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
+        # NT / NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
         # every MFMA A / B operand must be an AGPR range that an LDS read filled.
         reads = {
             reg

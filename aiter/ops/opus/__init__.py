@@ -102,7 +102,7 @@ def gemm_a16w16_opus(
     )
 
 
-def gemm_a8w8_blockscale_bpreshuffle_opus(
+def gemm_a8w8_blockscale_opus(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -112,14 +112,14 @@ def gemm_a8w8_blockscale_bpreshuffle_opus(
     kernelId: int | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
-    """Run the gfx950 MXFP8 NN / TT / TN blockscale GEMM (kid picked by shape)."""
-    from .gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle_opus as _impl
+    """Run the gfx950 MXFP8 NT / NN / TT / TN plain-B blockscale GEMM (kid picked by shape)."""
+    from .gemm_op_a8w8 import gemm_a8w8_blockscale_opus as _impl
 
     return _impl(XQ, WQ, x_scale, w_scale, dtype, kernelId=kernelId, out=out)
 
 
 __all__ = [
-    "gemm_a8w8_blockscale_bpreshuffle_opus",
+    "gemm_a8w8_blockscale_opus",
     "gemm_a16w16_opus",
     "opus_bmm",
     "opus_gemm",

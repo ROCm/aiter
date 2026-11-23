@@ -3029,11 +3029,16 @@ def _gfx950_co_image_path(path, entry):
     return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
-_MXFP8_DIRECTION_PIPELINES = {"mxfp8_nn": "NN", "mxfp8_tt": "TT", "mxfp8_tn": "TN"}
+_MXFP8_DIRECTION_PIPELINES = {
+    "mxfp8_nt": "NT",
+    "mxfp8_nn": "NN",
+    "mxfp8_tt": "TT",
+    "mxfp8_tn": "TN",
+}
 
 
 def mxfp8_direction(entry):
-    """Direction ("NN" / "TT" / "TN") of a gfx950 MXFP8 CO manifest entry, else None."""
+    """Direction ("NT" / "NN" / "TT" / "TN") of a gfx950 MXFP8 plain-B CO manifest entry, else None."""
     return _MXFP8_DIRECTION_PIPELINES.get((entry or {}).get("pipeline"))
 
 
@@ -3063,6 +3068,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
         "prefetch_b_vgpr": "b_vgpr_co",
         "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
         "pingpong_lds": "m_repeat_co",
+        "mxfp8_nt": "mxfp8_nt_4wave_co",
         "mxfp8_nn": "mxfp8_nn_4wave_co",
         "mxfp8_tt": "mxfp8_tt_4wave_co",
         "mxfp8_tn": "mxfp8_tn_4wave_co",
@@ -4131,9 +4137,9 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the A16W16 compile floor from the current CU table.
 
-    On gfx950 the MXFP8 NN / TT / TN CO kids are added as well: the shape
-    heuristic and the tuners never pick them, so no tuned row requests them,
-    and gemm_a8w8_blockscale_bpreshuffle_opus must find them compiled.
+    On gfx950 the MXFP8 plain-B NT / NN / TT / TN CO kids are added as well: the
+    shape heuristic and the tuners never pick them, so no tuned row requests them,
+    and gemm_a8w8_blockscale_opus must find them compiled.
     """
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())

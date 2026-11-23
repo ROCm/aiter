@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// gfx950 MXFP8 1x128 blockscale GEMM in the NN / TT / TN directions (NT is the
-// pin_agpr kernel). FP8 A / B, E8M0 scales 1x128 for A and 128x128 for B, BF16 C.
+// gfx950 MXFP8 1x128 blockscale GEMM in the NT / NN / TT / TN directions with plain
+// (not shuffled) A and B, as DeepGEMM. FP8 A / B, E8M0 scales 1x128 for A and 128x128
+// for B, BF16 C. Both operands share the copy / LDS / read layouts: N plays M for B.
 //   A_T: A stored [K, M] (M-contiguous, TR8 reads), else [M, K] (K-contiguous, plain reads)
 //   B_T: B stored [K, N] (N-contiguous, TR8 reads), else [N, K] (K-contiguous, plain reads)
-//        NN = (A_T, B_T) = (0, 1), TT = (1, 0), TN = (1, 1)
+//        NT = (A_T, B_T) = (0, 0), NN = (0, 1), TT = (1, 0), TN = (1, 1)
 //
 // A tile is built from 128x128 C quadrants: H_M = B_M / 128 = 2 and H_N = B_N / 128
 // quadrants (1 or 2). Inside a quadrant the 2x2 waves each own E_M x E_N = 4x4
@@ -14,7 +15,6 @@
 //   GroupM: 0 keeps the 2x2 raster; 4 / 8 / 16 walk GroupM M tiles per N column, as NT's gm.
 template<bool A_T_, bool B_T_, int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
 struct opus_gemm_mxfp8_4wave_tile_traits {
-    static_assert(A_T_ || B_T_, "NT is the pin_agpr kernel");
     static_assert(BM == 256 && (BN == 128 || BN == 256),
                   "MXFP8 direction tiles are 256x256 or 256x128");
     static_assert(GroupM == 0 || GroupM == 4 || GroupM == 8 || GroupM == 16);
@@ -78,12 +78,9 @@ struct opus_gemm_mxfp8_4wave_tile_traits {
     static constexpr int VEC_LDS_B = B_T ? 8 : 16;
     // Each quadrant occupies sixteen 1024-byte wave slots, with 32-byte padding.
     static constexpr int SMEM_HALF_A_ELEMS = smem_m_rep * (smem_linear_wave + smem_padding);
-    // B read with TR8: slots are placed in pairs, odd slots start 1152 bytes (128 mod 256)
-    // after their even partner, so both 16-lane TR8 groups of a pass are bank-disjoint.
-    static constexpr int B_SLOT_ODD = smem_linear_wave + 128;
-    static constexpr int B_SLOT_PAIR = B_SLOT_ODD + smem_linear_wave;
-    static constexpr int SMEM_HALF_B_ELEMS = B_T ? smem_n_rep / 2 * B_SLOT_PAIR
-                                                 : smem_n_rep * (smem_linear_wave + smem_padding);
+    static constexpr int SMEM_HALF_B_ELEMS = smem_n_rep * (smem_linear_wave + smem_padding);
+    static_assert(HALF_B_N == HALF_B_M && VEC_B == VEC_A && E_N == E_M && W_N == W_M && T_N == T_M,
+                  "B reuses the A copy / LDS / read layouts");
     // Two LDS stages of H_M A quadrants and H_N B quadrants.
     static constexpr int SMEM_A_ELEMS = SMEM_HALF_A_ELEMS * 2 * H_M;
     static constexpr int SMEM_B_ELEMS = SMEM_HALF_B_ELEMS * 2 * H_N;
@@ -92,12 +89,12 @@ struct opus_gemm_mxfp8_4wave_tile_traits {
 };
 
 template<int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
+using opus_gemm_mxfp8_nt_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<false, false, BM, BN, PadM, GroupM>;
+template<int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
 using opus_gemm_mxfp8_nn_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<false, true, BM, BN, PadM, GroupM>;
 template<int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
 using opus_gemm_mxfp8_tt_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<true, false, BM, BN, PadM, GroupM>;
 template<int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
 using opus_gemm_mxfp8_tn_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<true, true, BM, BN, PadM, GroupM>;
 
-static_assert(opus_gemm_mxfp8_nn_4wave_tile_traits<256, 256>::LDS_BYTES == 154112);
-static_assert(opus_gemm_mxfp8_tt_4wave_tile_traits<256, 256>::LDS_BYTES == 152064);
-static_assert(opus_gemm_mxfp8_tn_4wave_tile_traits<256, 256>::LDS_BYTES == 154112);
+static_assert(opus_gemm_mxfp8_nt_4wave_tile_traits<256, 256>::LDS_BYTES == 152064);
