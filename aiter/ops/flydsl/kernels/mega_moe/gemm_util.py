@@ -402,7 +402,10 @@ class AS2RLoader:
         addr_hi = lds_base + (row_i32 + _c(col_lo + fx.Int32(16))) * fx.Int32(4)
         # Row mi * 16 + lane % 16: the swizzle only sees lane % 16, so mi is an immediate offset.
         imm = mi * 16 * self._k_step_bytes
-        # Inline asm: FlyDSL 0.5.3 LDS reads cannot be marked noalias vs the in-flight A LDS DMA.
+        # Inline asm: FlyDSL 0.5.3 has no LDS load or LDS-DMA copy atom carrying alias scopes, so every
+        # compiler-visible LDS read (view .load(), fx.copy UniversalCopy, generic_load, llvm.load with scopes on
+        # the read only) gets an s_waitcnt vmcnt that drains this step's 4 buffer_load ... lds before the first
+        # ds_read_b128 (gfx950 v41_ep4 large_stage1 K-loops: vmcnt(0) vs vmcnt(7) here; -1.5% E2E measured).
         v4 = fx.Vector.make_type(4, fx.Int32)
         pair = llvm.inline_asm(
             llvm.StructType.get_literal([v4, v4]),

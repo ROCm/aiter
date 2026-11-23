@@ -79,7 +79,9 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
     e8m0 = fx.Int32(fx.shuffle_idx(leader_e8m0, leader_lane, 64))
     block_scale = (e8m0 << 23).bitcast(fx.Float32)
-    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32.
+    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32. .to(Float8E4M3FN) does
+    # not lower (arith.truncf, no arith-to-amdgpu); fx.rocdl.cvt_pk_fp8_f32 after a 1/scale multiply costs
+    # +1 v_pk_mul_f32 and ~1.5 v_mov_b32 per pair (gfx950 stage2_compact t64x256: 2561 -> 2737 instrs).
     pk_ty = T.vec(2, T.i16)
     packed_words = []
     for word in range_constexpr(scatter_vec // 4):
@@ -132,7 +134,8 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
         for w in range_constexpr(2):
             word = fx.Int32(0)
             for b in range_constexpr(4):
-                # Raw intrinsic: FlyDSL 0.5.3 has no rocdl op or fx wrapper for v_cvt_pk_u8_f32.
+                # Raw intrinsic: FlyDSL 0.5.3 has no rocdl op or fx wrapper for v_cvt_pk_u8_f32; the fx
+                # clampf/roundeven/.to(Uint8) form is med3 + rndne + cvt_i32 + or per byte (large_stage1 +207 instrs).
                 word = fx.Int32(
                     llvm.call_intrinsic(
                         T.i32,
@@ -151,7 +154,9 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
             words.append(word)
         return e8m0, fx.Vector.from_elements(words, fx.Int32)
     block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32.
+    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32. .to(Float8E4M3FN) does
+    # not lower (arith.truncf, no arith-to-amdgpu); fx.rocdl.cvt_pk_fp8_f32 after a 1/scale multiply costs
+    # +1 v_pk_mul_f32 and ~1.5 v_mov_b32 per pair (gfx950 stage2_compact t64x256: 2561 -> 2737 instrs).
     pk_ty = T.vec(2, T.i16)
     packed_lo = fx.Vector.filled(2, 0, fx.Int16).ir_value()
     packed_hi = fx.Vector.filled(2, 0, fx.Int16).ir_value()
