@@ -1883,11 +1883,11 @@ def _fused_config(
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
     if layout in V41_DRAFT_LAYOUTS:
-        return _tune_v41_draft_small(config, bucket)
+        return _tune_v41_draft_small(config, bucket, world_size)
     return config
 
 
-def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int, world_size: int = 8) -> MegaMoEConfig:
     """DSpark draft MoE (16 experts a rank, top-3) small-input kernel: a starting point, NOT measured.
 
     The EP8 V4.1-Flash tune and its launch protocol. A draft pass of 160 rows a rank gives each of the 16 local
@@ -1898,6 +1898,11 @@ def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     """
     config = _tune_v41_flash_ep8_small(config, bucket)
     if bucket < 128:
+        return config
+    if bucket == 128 and world_size == 8:
+        # Measured at EP8 (skewed routes): the verify layout's 32-row tiles and 256-wide GEMM1 /
+        # GEMM2 n-blocks instead: -5.5..-6.1% at 100 draft rows a rank (graph bs 20), -4.2..-4.5% at 120, -2.4..-2.8%
+        # at 145; bit-identical.
         return config
     return replace(
         config,
