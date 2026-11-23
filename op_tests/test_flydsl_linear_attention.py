@@ -1155,9 +1155,9 @@ def test_flydsl_kda_decode_supported_checks_arch_and_build_target(
         assert not is_flydsl_kda_decode_supported(device)
     with monkeypatch.context() as patch:
         # A supported GPU, but FlyDSL builds for the other supported arch.
-        build = linear_attention_kernels.GDR_GPU_ARCH
+        build = linear_attention_kernels._gdr_gpu_arch()
         other = "gfx950" if build == "gfx942" else "gfx942"
-        patch.setattr(linear_attention_kernels, "GDR_GPU_ARCH", other)
+        patch.setattr(linear_attention_kernels, "_gdr_gpu_arch", lambda: other)
         assert not is_flydsl_kda_decode_supported(device)
 
 
