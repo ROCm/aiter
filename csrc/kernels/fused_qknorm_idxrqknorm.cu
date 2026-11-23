@@ -173,33 +173,73 @@ __device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restric
     }
 }
 
+// What a lane reads from global memory for the norm and the rope: its kElemsPerLane norm weights
+// and the cos / sin pair of each of its dims. They stay in the storage type (converting would
+// make the loader wait for the loads), so a caller issues them together with the row's and
+// converts when it computes. The loads are unconditional, so the compiler cannot fold them into
+// the branches that use them: a lane without rotated dims reads (and ignores) a valid pair.
 template <typename scalar_t>
-__device__ __forceinline__ void normAndRope(
-    float (&elems)[kElemsPerLane],
-    int lane_id,
-    float eps,
-    const scalar_t* __restrict__ weight,
-    bool do_rope,
-    int rotary_dim,
-    const scalar_t* __restrict__ cos_ptr,
-    bool apply_norm)
+struct NormRopeOperands
 {
-    if(apply_norm)
+    scalar_t w[kElemsPerLane];
+    scalar_t c[kElemsPerLane];
+    scalar_t s[kElemsPerLane];
+};
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadNormWeights(const scalar_t* __restrict__ weight,
+                                                int lane_id,
+                                                NormRopeOperands<scalar_t>& ops)
+{
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
     {
-        float sumsq = 0.0f;
+        ops.w[i] = weight[lane_id * kElemsPerLane + i];
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadRopeOperands(const scalar_t* __restrict__ cos_sin_cache,
+                                                 int64_t pos,
+                                                 int lane_id,
+                                                 int rotary_dim,
+                                                 NormRopeOperands<scalar_t>& ops)
+{
+    const int half   = rotary_dim / 2;
+    const int dim0   = lane_id * kElemsPerLane;
+    const int i_base = min(dim0 < half ? dim0 : dim0 - half, half - kElemsPerLane);
+    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            sumsq += elems[i] * elems[i];
-        }
-        sumsq = warpReduceSum(sumsq);
-        const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        ops.c[i] = cos_ptr[i_base + i];
+        ops.s[i] = sin_ptr[i_base + i];
+    }
+}
+
+// RMSNorm (with the (1 + weight) form) and partial NeoX RoPE of one row, on the operands
+// loadNormWeights / loadRopeOperands read.
+template <typename scalar_t>
+__device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
+                                            int lane_id,
+                                            float eps,
+                                            const NormRopeOperands<scalar_t>& ops,
+                                            bool do_rope,
+                                            int rotary_dim)
+{
+    float sumsq = 0.0f;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            const int dim = lane_id * kElemsPerLane + i;
-            elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(weight[dim]));
-        }
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        sumsq += elems[i] * elems[i];
+    }
+    sumsq = warpReduceSum(sumsq);
+    const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(ops.w[i]));
     }
 
     if(do_rope)
@@ -211,18 +251,15 @@ __device__ __forceinline__ void normAndRope(
         if(in_rope)
         {
             const bool first_half = dim0 < half;
-            const int i_base = first_half ? dim0 : dim0 - half;
             const int partner_lane = first_half ? (dim0 + half) / kElemsPerLane
                                                 : (dim0 - half) / kElemsPerLane;
-            const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
             for(int i = 0; i < kElemsPerLane; ++i)
             {
-                const float c = static_cast<float>(cos_ptr[i_base + i]);
-                const float s = static_cast<float>(sin_ptr[i_base + i]);
+                const float c       = static_cast<float>(ops.c[i]);
+                const float s       = static_cast<float>(ops.s[i]);
                 const float partner = __shfl(elems[i], partner_lane, 32);
-                elems[i] = first_half ? elems[i] * c - partner * s
-                                      : elems[i] * c + partner * s;
+                elems[i] = first_half ? elems[i] * c - partner * s : elems[i] * c + partner * s;
             }
         }
     }
@@ -451,11 +488,11 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
                                                  int head,
                                                  int pos,
                                                  float gs,
-                                                 const scalar_t* __restrict__ row,
+                                                 const scalar_t (&row)[kElemsPerLane],
                                                  int lane_id)
 {
     float v[kElemsPerLane];
-    loadElems(row + lane_id * kElemsPerLane, v);
+    loadElems(row, v);
     uint32_t code[kElemsPerLane];
     const uint32_t sb = nvQuantLane(v, gs, code);
     uint32_t* words   = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
@@ -620,17 +657,30 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
     }
 
-    int64_t mapped_slot = -1;
+    // The row and slot_mapping are loaded here, before the V branch, which uses both: the loads
+    // are in flight while the rest of the loads (position, norm weight, cos / sin) issue below,
+    // not chained behind them. V reuses `raw` so that the compiler keeps the row load here
+    // instead of sinking it past the branch into the non-V path.
+    scalar_t raw[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = row_ptr[dim_base + i];
+    }
+
+    int64_t slot_val = -1;
+    bool has_slot    = false;
     if constexpr(kInsertKV)
     {
         if constexpr(kProcessIndex)
         {
-            mapped_slot = is_ik ? index_slot_mapping[token_idx]
-                                : ((is_k || is_v) ? slot_mapping[token_idx] : -1);
+            slot_val = (is_ik ? index_slot_mapping : slot_mapping)[token_idx];
+            has_slot = is_ik || is_k || is_v;
         }
         else
         {
-            mapped_slot = (is_k || is_v) ? slot_mapping[token_idx] : -1;
+            slot_val = slot_mapping[token_idx];
+            has_slot = is_k || is_v;
         }
     }
 
@@ -638,6 +688,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         if(is_v)
         {
+            const int64_t mapped_slot = has_slot ? slot_val : -1;
             if constexpr(kKvFp4)
             {
                 if constexpr(kNvfp4)
@@ -654,7 +705,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                                                    head,
                                                    static_cast<int>(mapped_slot % kNvTokens),
                                                    *v_scale,
-                                                   row_ptr,
+                                                   raw,
                                                    lane_id);
                     }
                 }
@@ -662,7 +713,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 {
                     // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
                     float velems[kElemsPerLane];
-                    loadElems(row_ptr + dim_base, velems);
+                    loadElems(raw, velems);
                     storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
                                             mapped_slot,
                                             v_s_block,
@@ -734,11 +785,18 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         }
     }
 
-    float elems[kElemsPerLane];
-    loadElems(row_ptr + dim_base, elems);
+    // Past the V branch every warp has a norm weight and rotates. All the loads of the norm and
+    // the rope are issued together, none behind a condition (which the compiler would fold into
+    // the code that uses them, waiting for each right after issuing it): position, weight, then
+    // cos / sin once the position is back. They stay in the storage type until they are used.
+    NormRopeOperands<scalar_t> ops;
     const int64_t pos = positions[token_idx];
-    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    normAndRope(elems, lane_id, eps, norm_w, do_rope, rotary_dim, cos_ptr, norm_w != nullptr);
+    loadNormWeights(norm_w, lane_id, ops);
+    loadRopeOperands(cos_sin_cache, pos, lane_id, rotary_dim, ops);
+    float elems[kElemsPerLane];
+    loadElems(raw, elems);
+    normAndRope(elems, lane_id, eps, ops, do_rope, rotary_dim);
+    const int64_t mapped_slot = has_slot ? slot_val : -1;
 
     if constexpr(kInsertKV)
     {
