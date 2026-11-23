@@ -808,9 +808,11 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, g2_b2stage=False):
+    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, g2_b2stage=False,
+    rg0_only=False):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
+    ``rg0_only``: gemm2_compute_v2's, for tiles of at most 16 valid rows.
 
     Uses the absolute LDS layout of ``g2_lds_layout`` (the caller's LDS pool must start at address 0); the peer
     table at ``layout['peer']`` must be loaded by the caller. Same numerics as the stage2 kernel.
@@ -867,7 +869,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows, **({"g2_b2stage": True} if g2_b2stage else {}))
+            expert_offset=expert_offset, valid_rows=vrows, **({"g2_b2stage": True} if g2_b2stage else {}),
+            **({"rg0_only": True} if rg0_only else {}))
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
@@ -913,7 +916,11 @@ def compile_mega_moe_stage1(
     # 1: GEMM1 (W1) only, 2: GEMM1 and GEMM2 (W1 and W2). Only the cache policy of the weight loads changes.
     assert expert_cached_w in (0, 1, 2), expert_cached_w
     probe_skip = frozenset(p for p in probe.split("+") if p)
-    assert probe_skip <= {"g1", "g2"}, probe
+    # "null" (benchmarks only): the launch runs an empty kernel of the same grid, block and arguments -- the
+    # launch floor of the bench graph. It touches no protocol state, so launches of other variants stay in step.
+    # "hm" / "hm2" (upper-bound probes, wrong output for tiles of more than 16 rows): every GEMM1 / GEMM2
+    # tile runs only the MFMAs of its first 16-row group.
+    assert probe_skip <= {"g1", "g2", "null", "hm", "hm2"}, probe
     # M2 fixed-base prototype switches (AITER_MEGA_SMALL_M2, '+'-joined, default off; every rank must set the same):
     #   st  static roles: owner / producers / consumers by block index, the launch epoch read from this rank's own
     #       combine flag of the previous launch instead of one entry-ticket atomic per CTA (the owner still advances
@@ -1027,6 +1034,7 @@ def compile_mega_moe_stage1(
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
         epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, g2_b2stage=g2_b2stage,
+        **({"rg0_only": True} if "hm2" in probe_skip else {}),
     )
     g2_tile_cached, _ = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
@@ -1035,6 +1043,7 @@ def compile_mega_moe_stage1(
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
         epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, g2_b2stage=g2_b2stage,
+        **({"rg0_only": True} if "hm2" in probe_skip else {}),
     )
     # The combine's last WG zeroes the expert counters one per thread.
     assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
@@ -1114,6 +1123,36 @@ def compile_mega_moe_stage1(
         f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
         f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
     )
+
+    if "null" in probe_skip:
+        @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
+        def kernel_null(
+            out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor,
+            sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, out_scale: fx.Tensor,
+            tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
+            addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
+            addr_expected: fx.Int64,
+        ):
+            fx.barrier()
+
+        @flyc.jit
+        def launch_null(
+            out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor,
+            sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, out_scale: fx.Tensor,
+            tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
+            addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
+            addr_expected: fx.Int64, stream: fx.Stream,
+        ):
+            kernel_null(
+                out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, out_scale, tokens,
+                addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
+                value_attrs={
+                    "rocdl.waves_per_eu": waves_per_eu_hint,
+                    "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
+                },
+            ).launch(grid=(launch_grid_x, 1, 1), block=(TOTAL_THREADS, 1, 1), stream=stream)
+
+        return launch_null
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
     def kernel(
@@ -1361,6 +1400,7 @@ def compile_mega_moe_stage1(
             rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
             fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+            **({"mfma_m_active": 1} if "hm" in probe_skip else {}),
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
@@ -1381,6 +1421,7 @@ def compile_mega_moe_stage1(
                 rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
                 fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+                **({"mfma_m_active": 1} if "hm" in probe_skip else {}),
             )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
