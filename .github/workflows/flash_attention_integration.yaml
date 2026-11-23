@@ -190,7 +190,7 @@ jobs:
 
           # Install test dependencies
           RUN pip install --upgrade pip
-          RUN pip install pytest pytest-rerunfailures pytest-timeout einops
+          RUN pip install pytest pytest-rerunfailures pytest-timeout pytest-xdist einops
 
           # The aiter under test, and flash-attention built against it. One script, shared with
           # the windows job, because the ORDER is the whole recipe.
@@ -306,7 +306,7 @@ jobs:
           FROM ${{ env.BASE_IMAGE }}
 
           RUN pip install --upgrade pip
-          RUN pip install pytest pytest-rerunfailures pytest-timeout einops
+          RUN pip install pytest pytest-rerunfailures pytest-timeout pytest-xdist einops
 
           COPY . /aiter
 
