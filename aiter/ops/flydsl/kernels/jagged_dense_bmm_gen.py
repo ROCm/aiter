@@ -43,8 +43,8 @@ _INT32_MAX = 2**31 - 1
 _MAX_DISPATCH_ITEMS = 2**32 - 1
 # A buffer descriptor holds num_records in 32 bits.
 _MAX_BUFFER_BYTES = 2**32 - 1
-# Measured on gfx942: one group of B reads wrong above 2 GiB (K=64).
-_MAX_B_GROUP_BYTES = 2**31
+# A buffer offset is 32 bits, so a tile row past num_records can wrap back into range.
+_BUFFER_OFFSET_SPAN = 2**32
 _HIP_ATTR_MAX_GRID_DIM_X = 29  # hipDeviceAttributeMaxGridDimX; Y and Z follow.
 
 
@@ -665,10 +665,20 @@ def _check_launch(
             f"n_groups * N = {n_groups * N} overflows the kernel's Int32 BIAS "
             f"offset (max {_INT32_MAX})"
         )
-    if K * N * 2 > _MAX_B_GROUP_BYTES:
+    if compact:
+        c_rows, rows = block_m, f"{block_m}"
+    else:
+        c_rows = -(-max_seq_len // block_m) * block_m
+        rows = f"ceil(max_seq_len / {block_m}) * {block_m}"
+    if c_rows * N * 2 > _BUFFER_OFFSET_SPAN:
         raise ValueError(
-            f"one group of B is K * N * 2 = {K * N * 2} bytes, over the 2 GiB "
-            "the kernel addresses"
+            f"the tile rows of C span {rows} * N * 2 = {c_rows * N * 2} bytes, "
+            "past the 4 GiB a 32-bit buffer offset reaches"
+        )
+    if K * N * 2 > _BUFFER_OFFSET_SPAN:
+        raise ValueError(
+            f"one group of B is K * N * 2 = {K * N * 2} bytes, past the 4 GiB "
+            "a 32-bit buffer offset reaches"
         )
     if not compact and max_seq_len * max(K, N) * 2 > _MAX_BUFFER_BYTES:
         raise ValueError(

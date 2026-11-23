@@ -247,10 +247,12 @@ def jagged_dense_bmm_dispatched(
         A: ``(L, K)`` bf16 packed jagged rows. Requires
             ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
             read. One group's rows of ``A`` and of ``C`` must each stay under
-            4 GiB, the 32-bit buffer bound. The uniform path checks this
-            through ``max_seq_len``; the skew path does not check it.
+            4 GiB, the 32-bit buffer bound. A group's rows of ``C``, rounded
+            up to whole 128-row tiles, must span at most 4 GiB. The uniform
+            path checks both through ``max_seq_len``; the skew path checks
+            only one tile.
         B: bf16 dense weights ``(n_groups, K, N)``. One group,
-            ``K * N * 2`` bytes, must be at most 2 GiB.
+            ``K * N * 2`` bytes, must be at most 4 GiB.
         BIAS: ``(n_groups, N)`` or ``(n_groups * N,)`` bf16.
         SEQ_OFFSETS: ``(n_groups + 1,)`` int32 prefix sum of group lengths,
             read on the device only.
