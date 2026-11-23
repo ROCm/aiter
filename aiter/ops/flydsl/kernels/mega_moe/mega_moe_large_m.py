@@ -1300,13 +1300,12 @@ def emit_dispatch_payload(
                     slot = fx.Int32(comm_ops.atomic_add_lds(send_cnt_addr, fx.Int32(1)))
                     fx.ptr_store(source_token, _send_slot(slot))
             fx.barrier()
-            num_sent = fx.Int32(
-                fx.rocdl.readfirstlane(T.i32, fx.Int32(comm_ops.load_i32_lds(send_cnt_addr)).ir_value()))
+            num_sent = fx.Int32(fx.rocdl.readfirstlane(T.i32, comm_ops.load_i32_lds(send_cnt_addr)))
             for first in range(row0, num_sent, fx.Int32(2 * num_waves)):
                 second = first + fx.Int32(num_waves)
                 has_second = second < num_sent
                 pair = [first, has_second.select(second, first)]
-                tokens = [fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(_send_slot(i)).ir_value())) for i in pair]
+                tokens = [fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(_send_slot(i)))) for i in pair]
                 values = []
                 for token in tokens:
                     source_rsrc = AddrBuffer(addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes))
@@ -1521,9 +1520,9 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
             row = wave + fx.Int32(row_iter * NW)
             p = fx.ptr_load(lds_typed_ptr(fx.Int32(lds_packed_off + meta_row0 * 4) + row * fx.Int32(4), T.i32,
                 align=4))
-            p = rocdl.readfirstlane(T.i32, p.ir_value())
+            p = fx.Int32(fx.rocdl.readfirstlane(T.i32, p))
             t = p & fx.Int32(0x00FFFFFF)
-            s = p >> fx.Int32(24)
+            s = p.shrui(fx.Int32(24))
             dest_pe = t >> fx.Int32(log2_max_tok)
             dest_lid = t & fx.Int32(mask_max_tok)
             valid = (t < fx.Int32(_recv_cap)) & (s < fx.Int32(topk)) & (dest_pe < fx.Int32(npes))
@@ -1531,7 +1530,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
             peer_base = fx.ptr_load(
                 lds_typed_ptr(fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8), T.i64, align=8)
             )
-            peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
+            peer_base = fx.Int64(fx.rocdl.readfirstlane(T.i64, peer_base))
             rsrc_dst = AddrBuffer(peer_base, _comb_inp_nbytes)
             # Lanes past the n-blocks send zeros so the row's scale lines are written whole.
             scale_off = (valid & (lane < fx.Int32(scale_groups))).select(
@@ -2418,8 +2417,8 @@ def compile_mega_moe_stage1(
 
             def _wait_rows(srcs):
                 # The launch epoch sits in a thread-0-private LDS word written before the GEMM1 loop.
-                epoch = fx.Int32(fx.ptr_load(lds_typed_ptr(
-                    fx.Int32(fx.ptrtoint(lds.A_scale.ptr)) + fx.Int32(n_scale_bytes + 8), T.i32), result_type=T.i32))
+                epoch = fx.ptr_load(
+                    lds_typed_ptr(fx.Int32(fx.ptrtoint(lds.A_scale.ptr)) + fx.Int32(n_scale_bytes + 8), T.i32))
                 for src in srcs:
                     slot = src & fx.Int32(0xFFFFFF)
                     if slot < fx.Int32(fz_npes * fz_mtpr):
@@ -2577,7 +2576,7 @@ def compile_mega_moe_stage1(
                     if const_expr(G2_EARLY_K > 0):
                         # Past its limit the CTA claims from the spare head the owner set past any work, so its
                         # next claim finds no GEMM1 work and it moves on to GEMM2.
-                        early_shard = fx.Int32(fx.ptr_load(early_word, result_type=T.i32)) & fx.Int32(7)
+                        early_shard = fx.ptr_load(early_word) & fx.Int32(7)
                         local_work = fx.Int32(
                             comm_ops.atomic_add_agent(
                                 a_work_head + fx.Int64(early_shard) * fx.Int64(64),
@@ -2585,7 +2584,7 @@ def compile_mega_moe_stage1(
                             )
                         )
                         work = early_shard + local_work * fx.Int32(WORK_SHARDS)
-                        if work >= fx.Int32(fx.ptr_load(early_word, result_type=T.i32)) >> fx.Int32(3):
+                        if work >= fx.ptr_load(early_word) >> fx.Int32(3):
                             fx.ptr_store(fx.Int32(G2_EARLY_SHARD), early_word)
                     else:
                         local_work = fx.Int32(
@@ -2659,7 +2658,7 @@ def compile_mega_moe_stage1(
                             g1_mode = (f_has_prev & (f_prev_e == f_e)).select(fx.Int32(4), fx.Int32(2))
                     fx.ptr_store(g1_mode, has_work_word)
                 fx.barrier()
-                g1_mode = fx.Int32(fx.ptr_load(has_work_word, result_type=T.i32))
+                g1_mode = fx.ptr_load(has_work_word)
                 if g1_mode != fx.Int32(0):
                     # With G1_DEDUP the tile acquires once its rows landed (g1_row_map wait); thread 0 acquired
                     # the tile's srcmap above.
@@ -2685,7 +2684,7 @@ def compile_mega_moe_stage1(
                         _wait_tile_payload(work)
                     fx.ptr_store(has_work, has_work_word)
                 fx.barrier()
-                has_work = fx.Int32(fx.ptr_load(has_work_word, result_type=T.i32))
+                has_work = fx.ptr_load(has_work_word)
             # Both words are rewritten only after the next loop-head barrier, once every wave read them.
             if const_expr(not G1_FOLD):
                 if has_work != fx.Int32(0):
@@ -2770,8 +2769,8 @@ def compile_mega_moe_stage1(
                 else:
                     if g2_chunked != fx.Int32(0):
                         # Continue the claimed chunk; claim the next contiguous chunk only when it is spent.
-                        g2_cur0 = fx.Int32(fx.ptr_load(g2_cur_slot, result_type=T.i32))
-                        g2_end0 = fx.Int32(fx.ptr_load(g2_end_slot, result_type=T.i32))
+                        g2_cur0 = fx.ptr_load(g2_cur_slot)
+                        g2_end0 = fx.ptr_load(g2_end_slot)
                         if g2_cur0 >= g2_end0:
                             g2_local = fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1)))
                             g2_cbase = (g2_shard + g2_local * fx.Int32(G2_SHARDS)) * g2_chunk_len
@@ -2780,8 +2779,8 @@ def compile_mega_moe_stage1(
                             g2_cend = (g2_cend < g2_total).select(g2_cend, g2_total)
                             fx.ptr_store(g2_cbase, g2_cur_slot)
                             fx.ptr_store(g2_cend, g2_end_slot)
-                        g2_unit = fx.Int32(fx.ptr_load(g2_cur_slot, result_type=T.i32))
-                        g2_uend = fx.Int32(fx.ptr_load(g2_end_slot, result_type=T.i32))
+                        g2_unit = fx.ptr_load(g2_cur_slot)
+                        g2_uend = fx.ptr_load(g2_end_slot)
                         g2_has = (g2_unit < g2_uend).select(fx.Int32(1), fx.Int32(0))
                         fx.ptr_store(g2_unit + fx.Int32(1), g2_cur_slot)
                         g2_wait_m, _g2_wait_n = _g2_decode(g2_unit, g2_total_m)
