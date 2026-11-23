@@ -339,7 +339,8 @@ namespace py = pybind11;
           py::arg("x_scale"),                               \
           py::arg("w_scale"),                               \
           py::arg("Y"),                                     \
-          py::arg("kid"));
+          py::arg("kid"),                                     \
+          py::arg("workspace") = std::nullopt);
 
 #define OPUS_GEMM_A8W8_MXSCALE_BMM_LAUNCH_PYBIND          \
     m.def("opus_gemm_a8w8_mxscale_bmm_launch",           \
@@ -494,7 +495,9 @@ namespace py = pybind11;
           py::arg("is_neox") = true,                                                \
           py::arg("compute_all_q_rope") = false,                                    \
           py::arg("q_scale_out") = std::nullopt,                                    \
-          py::arg("kv_cache_scale") = std::nullopt);                                \
+          py::arg("kv_cache_scale") = std::nullopt,                                 \
+          py::arg("scale_layout") = "flydsl",                                     \
+          py::arg("rope_dim") = 64);                                               \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -520,6 +523,19 @@ namespace py = pybind11;
           py::arg("is_neox"),                                                       \
           py::arg("is_nope_first"),                                                 \
           py::arg("compute_all_q_rope") = false);                                   \
+    m.def("fused_qk_concat_and_cache_mla",                                          \
+          &aiter::fused_qk_concat_and_cache_mla,                                    \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q") = false);                                        \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -582,6 +598,15 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("dim"));                                                           \
+    m.def("all_gather_lastdim_add",                                                  \
+          &aiter::all_gather_lastdim_add,                                            \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("add_b"),                                                          \
+          py::arg("add_c")     = std::nullopt,                                       \
+          py::arg("reg_ptr")   = 0,                                                  \
+          py::arg("reg_bytes") = 0);                                                 \
     m.def("all_gather_unreg",                                                        \
           &aiter::all_gather_unreg,                                                  \
           py::arg("_fa"),                                                            \
@@ -1270,7 +1295,8 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);              \
+          py::arg("is_shuffled")       = true,         \
+          py::arg("swiglu_limit")      = 0.0);              \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1597,22 +1623,24 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
-#define FMHA_FWD_BF16_OPUS_PYBIND                   \
-    m.def("fmha_fwd_bf16_opus_fwd",                 \
-          &fmha_fwd_bf16_opus_fwd,                  \
-          py::arg("q"),                             \
-          py::arg("k"),                             \
-          py::arg("v"),                             \
-          py::arg("out"),                           \
-          py::arg("causal"),                        \
-          py::arg("softmax_scale"),                 \
-          py::arg("lse")            = std::nullopt, \
-          py::arg("seqstart_q")     = std::nullopt, \
-          py::arg("seqstart_k")     = std::nullopt, \
-          py::arg("seqstart_q_pad") = std::nullopt, \
-          py::arg("seqstart_k_pad") = std::nullopt, \
-          py::arg("max_seqlen_q")   = 0,            \
-          py::arg("max_seqlen_k")   = 0);
+#define FMHA_FWD_BF16_OPUS_PYBIND                     \
+    m.def("fmha_fwd_bf16_opus_fwd",                   \
+          &fmha_fwd_bf16_opus_fwd,                    \
+          py::arg("q"),                               \
+          py::arg("k"),                               \
+          py::arg("v"),                               \
+          py::arg("out"),                             \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"),                   \
+          py::arg("lse")              = std::nullopt, \
+          py::arg("seqstart_q")       = std::nullopt, \
+          py::arg("seqstart_k")       = std::nullopt, \
+          py::arg("seqstart_q_pad")   = std::nullopt, \
+          py::arg("seqstart_k_pad")   = std::nullopt, \
+          py::arg("max_seqlen_q")     = 0,            \
+          py::arg("max_seqlen_k")     = 0,            \
+          py::arg("window_size_left") = -1,           \
+          py::arg("sink")             = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

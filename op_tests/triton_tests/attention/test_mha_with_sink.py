@@ -10,6 +10,7 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_qkv,
@@ -25,6 +26,91 @@ arch = get_arch()
 
 # Run sink and sliding window tests with:
 # pytest op_tests/triton_tests/attention/test_mha_with_sink.py -q
+
+
+@pytest.mark.parametrize("DTYPE", ["bf16", "fp16", "fp32", "fp8"])
+@pytest.mark.parametrize("SEQLEN_K", [128, 1024])
+def test_mha_gluon_large_sink(DTYPE: str, SEQLEN_K: int):
+    """A dominant sink gives finite zero output in the short and pipelined loops."""
+    skip_if_gluon_unsupported("gluon")
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+        "fp8": get_fp8_e4m3_dtype(),
+    }[DTYPE]
+    q = torch.full((1, 128, 1, 128), 4.0, device="cuda", dtype=torch.float32)
+    k = torch.full((1, SEQLEN_K, 1, 128), 4.0, device="cuda", dtype=torch.float32)
+    v = torch.ones((1, SEQLEN_K, 1, 128), device="cuda", dtype=torch.float32)
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    sink = torch.full((1,), 1e10, device="cuda", dtype=torch.float32)
+    kwargs = {}
+    if DTYPE == "fp8":
+        descale = torch.ones((1, 1), device="cuda", dtype=torch.float32)
+        kwargs = {"q_descale": descale, "k_descale": descale, "v_descale": descale}
+
+    out, lse = flash_attn_func(
+        q, k, v, sink=sink, causal=False, return_lse=True, backend="gluon", **kwargs
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+    torch.testing.assert_close(lse, sink.expand_as(lse), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(17, 49), (300, 1100), (49, 17)])
+@pytest.mark.parametrize("WINDOW_SIZE", [(0, 0), (0, -1), (-1, 0), (32, 0)])
+def test_mha_gluon_zero_window(
+    VARLEN: bool, SEQLEN_Q: int, SEQLEN_K: int, WINDOW_SIZE: tuple[int, int]
+):
+    """Zero window bounds use bottom-right alignment, including fully masked rows."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(27)
+    q = torch.randn((2, SEQLEN_Q, 4, 64), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, SEQLEN_K, 2, 64), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    if VARLEN:
+        cu_seqlens_q = torch.arange(3, device="cuda", dtype=torch.int32) * SEQLEN_Q
+        cu_seqlens_k = torch.arange(3, device="cuda", dtype=torch.int32) * SEQLEN_K
+        out, lse = flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            SEQLEN_Q,
+            SEQLEN_K,
+            causal=False,
+            window_size=WINDOW_SIZE,
+            return_lse=True,
+            backend="gluon",
+        )
+        out = out.reshape_as(q)
+        lse = lse.reshape(2, SEQLEN_Q, 4).transpose(1, 2)
+    else:
+        out, lse = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=False,
+            window_size=WINDOW_SIZE,
+            return_lse=True,
+            backend="gluon",
+        )
+
+    out_ref, _, lse_ref = attention_ref(
+        q.float(), k.float(), v.float(), causal=False, window_size=WINDOW_SIZE
+    )
+    torch.testing.assert_close(out.float(), out_ref, atol=1e-2, rtol=1e-2)
+    finite = torch.isfinite(lse_ref)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], atol=1e-2, rtol=1e-3)
+    # Gluon uses zero LSE for a fully masked causal row; attention_ref uses -inf.
+    torch.testing.assert_close(
+        lse[~finite], torch.zeros_like(lse[~finite]), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])
