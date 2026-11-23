@@ -35,6 +35,16 @@ using fp32x16_t = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
 static constexpr int kNegOne = 0xBC00BC00; // {-1, -1}, fp16x2_t
 
+// Range guard for the bf16 -> fp16 fast path (cast_bf2half): fp16 saturates at 65504. Divide by a
+// power of two on load and multiply it back on store; the shift is exact, so
+// sum(x_i / S) * S == sum(x_i). Only CodecFP needs it: it carries no block scale, so S is its only
+// range guard. The block-scaled codecs already normalize each 32 values by their own scale, and
+// MODE.FP16_OVFL keeps an over-ceiling element from becoming an inf that poisons its block through
+// the block max. For them S only costs the low end, because encoding_scale = rcp(decoding_scale)
+// saturates at 65504 and moves the attenuation cliff to blockmax = S * L / 65504.
+static constexpr int kQRFp16CastScaleLog2Fp    = 4; // S = 16, CodecFP
+static constexpr int kQRFp16CastScaleLog2Quant = 0; // S = 1, block-scaled codecs
+
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
 
@@ -99,16 +109,19 @@ buffer_store_dwordx4(int32x4_t data,
                      int32_t soffset,
                      int32_t aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
 
+// MODE.FP16_OVFL (MODE[23]) clamps overflowing fp16 results to +/-MAX_FP16 instead of inf, the
+// f32 -> f16 conversion included. The memory clobber is load-bearing: without it the compiler may
+// hoist a conversion above the s_setreg, and that conversion still produces inf.
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value)
 {
-#if defined(__gfx942__)
+#if defined(__gfx942__) || defined(__gfx950__)
     if(value)
     {
-        asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::);
+        asm volatile("s_setreg_imm32_b32 0x5c1, 1;" ::: "memory");
     }
     else
     {
-        asm volatile("s_setreg_imm32_b32 0xdc1, 0;" ::);
+        asm volatile("s_setreg_imm32_b32 0x5c1, 0;" ::: "memory");
     }
 #endif
 }

@@ -28,6 +28,10 @@ template <typename T, int world_size>
 struct CodecFP : public CodecBase
 {
     static constexpr int kWorldSize = world_size;
+
+    // No block scale to protect, so the cast scale is the only range guard.
+    static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Fp;
+
     static constexpr int kRankAtoms = kAtoms / kWorldSize;
 
     // Codec tile size process by this workgroup.
@@ -69,6 +73,9 @@ template <typename T, int world_size>
 struct CodecQ4 : public CodecBase
 {
     static constexpr int kWorldSize = world_size;
+
+    // Block-scaled: the cast scale would only cost the low end.
+    static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
     // Codec tile size process by this workgroup.
     // Each threads processes a fragment of fp16x8_t (16B),
@@ -251,6 +258,9 @@ struct CodecQ3 : public CodecBase
 {
     static constexpr int kWorldSize = world_size;
 
+    // Block-scaled: the cast scale would only cost the low end.
+    static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
+
     // Layout per quantization block (32 values = 8 threads * 4 fp16x2 lanes):
     //  - each thread owns 8 values and writes:
     //      * q2 payload : 8 * 2 bits -> uint16 (2 bytes)
@@ -413,6 +423,9 @@ template <typename T, int world_size>
 struct CodecQ6 : public CodecBase
 {
     static constexpr int kWorldSize = world_size;
+
+    // Block-scaled: the cast scale would only cost the low end.
+    static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
     // Codec tile size process by this workgroup.
     // Each threads processes a fragment of fp16x8_t (16B),
@@ -592,6 +605,9 @@ struct CodecFP8 : public CodecBase
 {
     static int constexpr kWorldSize = world_size;
 
+    // Block-scaled: the cast scale would only cost the low end.
+    static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
+
     // Codec tile size process by this workgroup.
     // Each threads processes a fragment of fp16x8_t (16B),
     // into a fp8x8_t (8B) and a fp16 scale shared among 32 values.
@@ -769,6 +785,20 @@ struct CodecFP8 : public CodecBase
     }
 };
 
+// Keep the scale on the f32 side of the narrowing conversion. With nothing in between, LLVM
+// reassociates (bf16_as_f32 * scale) -> fp16 into fp16(bf16_as_f32) * scale, which clips values
+// above 65504 before the range guard is applied. The empty asm forces the scaled values into
+// registers the optimizer cannot see through. Naming v_cvt_pk_f16_f32 would do the same, but that
+// instruction is not part of the CDNA ISA.
+__quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value, float scale)
+{
+    float2 scaled = __bfloat1622float2(value);
+    scaled.x *= scale;
+    scaled.y *= scale;
+    asm volatile("" : "+v"(scaled.x), "+v"(scaled.y));
+    return __float22half2_rn(scaled);
+}
+
 // Twoshot All Reduce
 template <typename T, class Codec, bool cast_bf2half>
 struct AllReduceTwoshot
@@ -776,6 +806,10 @@ struct AllReduceTwoshot
     static_assert(sizeof(T) == 2);
 
     static constexpr int kWorldSize = Codec::kWorldSize;
+
+    // Power of two, so both multiplies are exact.
+    static constexpr float kCastScale    = static_cast<float>(1 << Codec::kCastScaleLog2);
+    static constexpr float kCastInvScale = 1.0f / kCastScale;
 
     __device__ static void run(T const* __restrict__ input,
                                T* __restrict__ output,
@@ -815,8 +849,15 @@ struct AllReduceTwoshot
 #pragma unroll
                 for(int j = 0; j < 4; ++j)
                 {
-                    float2 f    = __bfloat1622float2(bf_buf[j]);
-                    half_buf[j] = __float22half2_rn(f);
+                    if constexpr(Codec::kCastScaleLog2 == 0)
+                    {
+                        float2 f    = __bfloat1622float2(bf_buf[j]);
+                        half_buf[j] = __float22half2_rn(f);
+                    }
+                    else
+                    {
+                        half_buf[j] = scaled_bfloat162_to_half2(bf_buf[j], kCastInvScale);
+                    }
                 }
                 tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
             }
@@ -924,7 +965,10 @@ struct AllReduceTwoshot
 #pragma unroll
                 for(int j = 0; j < 4; ++j)
                 {
-                    float2 f    = __half22float2(half_buf[j]);
+                    float2 f = __half22float2(half_buf[j]);
+                    // Undo the load-side scale; the fp32 intermediate cannot overflow.
+                    f.x *= kCastScale;
+                    f.y *= kCastScale;
                     bf16_buf[j] = __float22bfloat162_rn(f);
                 }
                 buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf),
@@ -985,6 +1029,11 @@ struct AllReduceTwoshotRMSNorm
     static constexpr int kWorldSize    = Codec::kWorldSize;
     static constexpr int kElemsPerAtom = sizeof(int32x4_t) / sizeof(T);
 
+    // Power of two, so both multiplies are exact. Only the cast path is scaled on load.
+    static constexpr float kCastScale =
+        cast_bf2half ? static_cast<float>(1 << Codec::kCastScaleLog2) : 1.0f;
+    static constexpr float kCastInvScale = 1.0f / kCastScale;
+
     __device__ static void run(T const* __restrict__ input,
                                T const* __restrict__ residual_inp,
                                T* __restrict__ residual_out,
@@ -1025,8 +1074,15 @@ struct AllReduceTwoshotRMSNorm
 #pragma unroll
                 for(int j = 0; j < 4; ++j)
                 {
-                    float2 f    = __bfloat1622float2(bf_buf[j]);
-                    half_buf[j] = __float22half2_rn(f);
+                    if constexpr(Codec::kCastScaleLog2 == 0)
+                    {
+                        float2 f    = __bfloat1622float2(bf_buf[j]);
+                        half_buf[j] = __float22half2_rn(f);
+                    }
+                    else
+                    {
+                        half_buf[j] = scaled_bfloat162_to_half2(bf_buf[j], kCastInvScale);
+                    }
                 }
                 tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
             }
@@ -1142,9 +1198,9 @@ struct AllReduceTwoshotRMSNorm
 #pragma unroll
                 for(int j = 0; j < kElemsPerAtom; j++)
                 {
-                    float x = row_active
-                                  ? qr_to_float<CommT>(ar_vals[j]) + qr_to_float<T>(res_vals[j])
-                                  : 0.0f;
+                    float x = row_active ? qr_to_float<CommT>(ar_vals[j]) * kCastScale +
+                                               qr_to_float<T>(res_vals[j])
+                                         : 0.0f;
                     thread_square_sum += x * x;
                 }
             }
@@ -1187,7 +1243,8 @@ struct AllReduceTwoshotRMSNorm
 #pragma unroll
                     for(int j = 0; j < kElemsPerAtom; j++)
                     {
-                        float x = qr_to_float<CommT>(ar_vals[j]) + qr_to_float<T>(res_vals[j]);
+                        float x = qr_to_float<CommT>(ar_vals[j]) * kCastScale +
+                                  qr_to_float<T>(res_vals[j]);
                         residual_pack[j] = qr_from_float<T>(x);
                         output_pack[j] =
                             qr_from_float<T>(x * qr_to_float<T>(weight_vals[j]) * denom);
