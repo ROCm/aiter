@@ -679,7 +679,7 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
             tokens,
             rows_total * (model_dim // 2),
             ptr_arg(nvt),
-            ptr_arg(None),
+            ptr_arg(torch.empty(0)),  # no addend: null pointer
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
