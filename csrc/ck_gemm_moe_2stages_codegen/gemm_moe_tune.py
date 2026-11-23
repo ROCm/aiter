@@ -7917,11 +7917,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         topk = int(row["topk"])
         act = self._row_act(row)
         a_dtype = self._row_a_dtype(row)
+        # BM16 FP8 (native scale layout) is not validated with this tuner's A8W4
+        # pairing. Under EP the runtime rejects BM16 for both precisions, and its
+        # masked Opus sort hangs at >= 819 experts (#8014).
+        skip_bm16 = a_dtype == "fp8" or self._ep_size() > 0
         out = []
         for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS[a_dtype]):
-            # BM16 FP8 (native scale layout) is not validated with this tuner's
-            # A8W4 pairing, densely or under EP.
-            if a_dtype == "fp8" and bm == 16:
+            if skip_bm16 and bm == 16:
                 continue
             for bn in self._G1_BN:
                 for num_waves in self._G1_NUM_WAVES:
@@ -7967,8 +7969,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         "out_dtype": a_dtype,
                                     }
                                 )
-        # The M_est rules hand M_est < 4 to BM16 only, which A8W4 skips above.
-        if full_search or a_dtype == "fp8":
+        # The M_est rules hand M_est < 4 to BM16 only, which is skipped above.
+        if full_search or skip_bm16:
             return out
         m_est = self._m_est(row)
         kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
@@ -8067,9 +8069,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ).items():
                 if kp["tile_m"] != bm:
                     continue
-                # Under EP the runtime keeps a scatter GEMM2 only if a
-                # scatter_reduce instance covers (model_dim, topk), and the EP
-                # topk key carries the masked column on top of the tuned one.
+                # The runtime rejects the scatter epilog under EP.
                 if ep and kp["epilog"] == "scatter":
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))

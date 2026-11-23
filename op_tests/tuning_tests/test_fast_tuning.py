@@ -185,6 +185,21 @@ class TestMxfp4ActivationPrecision(unittest.TestCase):
             {"expert_mask": "mask", "topk_ids": "ids", "use_valid_token_count": True},
         )
 
+    def test_ep_drops_bm16_for_both_precisions(self):
+        a4w4 = dict(self.row, q_dtype_a=str(self.moe.dtypes.fp4x2))
+
+        def block_ms(row):
+            return {c["block_m"] for c in self.tuner._candidate_rows(row)}
+
+        self.assertIn(16, block_ms(dict(a4w4, token=4)))
+        self.tuner._configuration = {"swiglu_limit": None, "ep_size": 32}
+        # Rank 0 gets about 4 local routes over 8 experts, so M_est is 1, which
+        # the M_est rules hand to BM16 only.
+        self.assertLess(self.tuner._m_est(a4w4), 4)
+        for row in (a4w4, self.row):
+            with self.subTest(q_dtype_a=row["q_dtype_a"]):
+                self.assertEqual(block_ms(row), {32, 64, 128})
+
     def test_fast_scan_prepares_mxfp8_shared_fixture(self):
         args = SimpleNamespace(
             fast_scan=True, timeout=0, warmup=1, iters=2, errRatio=0.1
