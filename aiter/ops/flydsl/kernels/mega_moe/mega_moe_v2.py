@@ -1158,6 +1158,10 @@ class MegaMoEV2:
             # caller's stream, and takes the ``shared_add`` path below.
             if shared_add is not None:
                 raise ValueError("pass either shared_add or shared_in")
+            # An eager call of any route and row count builds what the layer's captured small-input calls need
+            # (a capture cannot build it and would run the dense shared expert for good).
+            for runtime in getattr(self, "_small_m_runtimes", ()):
+                runtime.shared_in_prepare(shared_in)
             if route[0] == ROUTE_SMALL_M and slice_output:
                 runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(route[1])]
                 if runtime.shared_in_ready(int(x_bf16.shape[0]), shared_in):

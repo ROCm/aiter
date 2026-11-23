@@ -43,6 +43,7 @@ from .mega_moe_config import (
     FUSED_TOKEN_BUCKETS,
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
+    fused_layout_small_only,
     fused_layout_supported,
     fused_bucket_override,
     nearest_token_bucket,
@@ -2052,6 +2053,16 @@ def shared_in_fits(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int
     )
 
 
+def shared_in_layout_enabled(world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int) -> bool:
+    """AITER_MEGA_SHARED_IN for a layout: ``1`` = the target (verify) layers only, ``2`` = also the DSpark
+    draft layers' MoE (the small-input-only layouts; not validated on a GPU). Read per call: tests set it."""
+    value = os.environ.get("AITER_MEGA_SHARED_IN", "0")
+    if value not in ("1", "2"):
+        return False
+    return value == "2" or not fused_layout_small_only(
+        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim, experts=world_size * experts_per_rank)
+
+
 def _arg_view(tensor):
     """A fixed-shape byte view of a tensor's start, for a kernel tensor argument that only carries an address."""
     return tensor.view(torch.uint8).reshape(-1)[:16]
@@ -2444,10 +2455,36 @@ class SmallMRuntime:
     def _bucket_of(self, tokens: int) -> int:
         return fused_bucket_override(max(tokens, 1), self.mtpr) or nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)
 
+    def _shared_ksplit(self, tokens: int) -> int:
+        """The GEMM1 K split of the shared_in kernel for a ``tokens``-row call (1 or 2), 0 when the dense launches of
+        that row count are not ones the tile bodies reproduce (shared_expert.dense_gate_up_ksplit)."""
+        from .shared_expert import dense_gate_up_ksplit
+
+        return dense_gate_up_ksplit(tokens, self.model_dim, self.inter_dim)
+
     def shared_in_supported(self, tokens: int) -> bool:
-        """Whether the kernel a ``tokens``-row call launches can also compute the shared expert."""
+        """Whether the kernel a ``tokens``-row call launches can also compute the shared expert, with the bits of
+        the dense launches of that row count."""
         return 0 < tokens <= self.mtpr and self.mtpr <= 512 and self.swiglu_limit > 0 and shared_in_fits(
-            self._configs[self._bucket_of(tokens)], tokens, self._s1_num_cu, self.model_dim, self.inter_dim)
+            self._configs[self._bucket_of(tokens)], tokens, self._s1_num_cu, self.model_dim, self.inter_dim
+        ) and self._shared_ksplit(tokens) != 0
+
+    def shared_in_prepare(self, shared) -> bool:
+        """Build what a later capture of this layer needs (the buffers, and the dispatch table of the bound W2 with
+        ``shared``'s weights) if it is not there yet. Called on eager calls of any route and row count, so that the
+        layer's first captured small-input call can fuse; a no-op under a capture, for weights the kernel cannot
+        read, and for a runtime none of whose buckets takes the shared expert."""
+        if torch.cuda.is_current_stream_capturing() or self.mtpr > 512 or self.swiglu_limit <= 0:
+            return False
+        if not shared.weights_fit(self.model_dim, self.inter_dim):
+            return False
+        if getattr(self, "_sh_any_bucket", None) is None:
+            self._sh_any_bucket = any(
+                self.shared_in_supported(t) for t in range(1, self.mtpr + 1))
+        if not self._sh_any_bucket:
+            return False
+        self.shared_dispatch_table(shared)
+        return True
 
     def shared_in_ready(self, tokens: int, shared) -> bool:
         """``shared_in_supported`` and ``shared`` (a weights.SharedExpertInput) is what the kernel reads; under a
@@ -2501,10 +2538,8 @@ class SmallMRuntime:
     def _shared_in_ksplits(self, bucket: int):
         """The GEMM1 K splits (shared_expert.dense_gate_up_ksplit) of the row counts that select ``bucket`` and
         whose shared expert its kernel can run."""
-        from .shared_expert import dense_gate_up_ksplit
-
         return sorted({
-            dense_gate_up_ksplit(t) for t in range(1, self.mtpr + 1)
+            self._shared_ksplit(t) for t in range(1, self.mtpr + 1)
             if self._bucket_of(t) == bucket and self.shared_in_supported(t)
         })
 
@@ -2523,7 +2558,7 @@ class SmallMRuntime:
             if os.environ.get("AITER_MEGA_SHARED_ADD", "0") == "1":
                 # The shared_add variant of the same bucket (the address is not dereferenced by a preload).
                 self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16)
-        if os.environ.get("AITER_MEGA_SHARED_IN", "0") == "1" and self.swiglu_limit > 0:
+        if shared_in_layout_enabled(self.world_size, self.epr, self.model_dim, self.inter_dim) and self.swiglu_limit > 0:
             # The shared_in variants: per bucket whose kernel fits it, the K splits its row counts take. (Buckets
             # that share a launch config share the kernel; the compile is cached.)
             stand_in = torch.zeros(16, dtype=torch.uint8, device=self.dev)
@@ -2551,11 +2586,9 @@ class SmallMRuntime:
             # The kernel writes the shared expert's rows here, then its combine adds the routed sum to them.
             shared_add = torch.empty((run_tokens, self.model_dim), dtype=torch.bfloat16, device=x_bf16.device)
             if run_tokens:
-                from .shared_expert import dense_gate_up_ksplit
-
                 if not self.shared_in_ready(run_tokens, shared_in):
                     raise ValueError("shared_in: this call cannot fuse the shared expert (see shared_in_ready)")
-                fused_shared = (dense_gate_up_ksplit(run_tokens), _arg_view(shared_in.x_fp8),
+                fused_shared = (self._shared_ksplit(run_tokens), _arg_view(shared_in.x_fp8),
                     _arg_view(shared_in.x_scale), self.shared_dispatch_table(shared_in))
         if shared_add is not None:
             if (shared_add.dtype != torch.bfloat16 or tuple(shared_add.shape) != (run_tokens, self.model_dim)

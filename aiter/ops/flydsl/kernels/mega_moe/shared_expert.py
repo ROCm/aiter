@@ -75,10 +75,43 @@ def scale32_dword(row32, kstep, ksub, k_dim):
     return row32 * (k_dim // 32 // 4) + kstep * 2 + ksub
 
 
-def dense_gate_up_ksplit(rows):
-    """The K split of the dense gate_up GEMM AITER's tuned dsv41 table serves ``rows`` with (N 4608, K 5120): its
-    48- and 64-row tiers are split-K 2 kernels, every other tier up to 576 rows is unsplit."""
+def _static_gate_up_ksplit(rows):
+    """The gate_up split of AITER's tuned dsv41 table as of d29c94315 (N 4608, K 5120, 32x32 scales): its 48- and
+    64-row tiers are split-K 2 kernels, every other tier up to 576 rows is unsplit."""
     return 2 if 33 <= int(rows) <= 64 else 1
+
+
+def dense_kernel_ksplit(rows, n, k):
+    """The K split of the kernel AITER's dense group-32 MXFP8 GEMM on (16, 16)-preshuffled weights runs for
+    ``rows x k -> n`` (32x32 weight scales): the ``_sk<N>`` of the tuned row's kernel name, the lookup the dense
+    launch itself makes (aiter.ops.gemm_op_a8w8._gemm_mxscale_bpreshuffle). 0: no tuned row (the launch runs a
+    heuristic kernel) or a name without a split. None: no AITER lookup in this process (stub tests)."""
+    try:
+        from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config
+
+        row = get_mxscale_bpreshuffle_config(int(rows), int(n), int(k), "32x32")
+    except Exception:  # noqa: BLE001 -- no AITER, or no device description to key the table with
+        return None
+    if row is None:
+        return 0
+    split = str(row.get("kernelName", "")).rpartition("_sk")[2].split("_")[0]
+    return int(split) if split.isdigit() else 0
+
+
+def dense_gate_up_ksplit(rows, k_dim=5120, inter_dim=2304):
+    """The K split (1 or 2) the shared tile bodies must run GEMM1 with so that ``rows`` rows get the bits of the
+    dense launches, or 0 when they cannot: the dense gate_up kernel of that row count is unsplit or split-K 2
+    (``0 + p0 + p1``), the dense down kernel unsplit. Read from AITER's live tuned table, so a re-tuned row moves
+    the split (or turns the fused path off for those rows) instead of changing the output; without an AITER lookup
+    the table of d29c94315."""
+    rows = int(rows)
+    if rows <= 0:
+        return 0
+    gate_up = dense_kernel_ksplit(rows, 2 * inter_dim, k_dim)
+    if gate_up is None:
+        return _static_gate_up_ksplit(rows)
+    down = dense_kernel_ksplit(rows, k_dim, inter_dim)
+    return gate_up if gate_up in (1, 2) and down == 1 else 0
 
 
 def tile_scale_byte(m_tile, n_tile, row, group, inter_dim):

@@ -91,13 +91,21 @@ class SharedExpertInput:
         self.used_dense = True
         return self._dense()
 
-    def fits(self, rows: int, model_dim: int, inter_dim: int) -> bool:
-        """Shapes, layout and alignment the kernel reads (metadata only)."""
-        sizes = (
-            (self.x_fp8, rows * model_dim), (self.x_scale, rows * (model_dim // 32)),
-            (self.gate_up, 2 * inter_dim * model_dim), (self.gate_up_scale, (2 * inter_dim // 32) * (model_dim // 32)),
-            (self.down, model_dim * inter_dim), (self.down_scale, (model_dim // 32) * (inter_dim // 32)),
-        )
-        return rows > 0 and all(
+    @staticmethod
+    def _readable(sizes) -> bool:
+        return all(
             t.numel() == n and t.element_size() == 1 and t.is_contiguous() and t.data_ptr() % 16 == 0 for t, n in sizes
         )
+
+    def weights_fit(self, model_dim: int, inter_dim: int) -> bool:
+        """Shapes, layout and alignment of the weights the kernel reads (metadata only)."""
+        return self._readable((
+            (self.gate_up, 2 * inter_dim * model_dim), (self.gate_up_scale, (2 * inter_dim // 32) * (model_dim // 32)),
+            (self.down, model_dim * inter_dim), (self.down_scale, (model_dim // 32) * (inter_dim // 32)),
+        ))
+
+    def fits(self, rows: int, model_dim: int, inter_dim: int) -> bool:
+        """``weights_fit`` and the same for the pair of a ``rows``-row call (metadata only)."""
+        return rows > 0 and self.weights_fit(model_dim, inter_dim) and self._readable((
+            (self.x_fp8, rows * model_dim), (self.x_scale, rows * (model_dim // 32)),
+        ))
