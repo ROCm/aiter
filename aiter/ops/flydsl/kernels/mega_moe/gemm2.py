@@ -423,9 +423,10 @@ def gemm2_compute_v2(
     sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
 
     if const_expr(a_scale_lds):
-        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). Inline asm: FlyDSL 0.5.3 LDS
-        # reads (fx.ptr_load / fx.copy) cannot be marked noalias vs the in-flight A LDS DMA, so the backend would
-        # insert a vmcnt wait for that copy before them.
+        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). Inline asm: plain FlyDSL 0.5.3
+        # LDS loads let LLVM fully unroll the K loop (VGPR spills 51 -> 57) or, with sched_barrier and unroll=1,
+        # issue the next A DMA after the first MFMA's wait; that version measured 0.5-1.6% slower on the
+        # V4.1-Flash EP8 large-input kernel (MI355X, 513..16384 rows a rank).
         assert BM == 64 and is_f8_a and kScaleSubBlocks == 2
         as_lds_off = aStages * slot_bytes
         # fold_rows: a third scale word (rows BM..BM+31, the folded tail) is read on every step (zeros unless folded).
