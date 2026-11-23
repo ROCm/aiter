@@ -2182,7 +2182,7 @@ def _mla_decode_fwd_kernel(
     if split_meta_ptr is not None:
         gl.static_assert(ALL_DECODE)
         num_seqs = gl.num_programs(0) // NUM_HEAD_BLOCKS
-        work_idx = segm_idx * num_seqs + seq_idx
+        work_idx = seq_idx * NUM_SEGMENTS_PER_SEQ + segm_idx
         seq_idx, segm_idx, tiles_per_segment, seq_len, num_work = _split_rebalance_work(
             seq_lens_ptr,
             split_meta_ptr,

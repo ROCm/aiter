@@ -621,8 +621,16 @@ def mla_decode_fwd(
                     split_meta_ptr=split_meta,
                     SEQ_BLOCK=max(WARP_SIZE, triton.next_power_of_2(num_seqs)),
                 )
-                # The reduce merges at least 16 work items in one step.
-                reduce_config["SPLIT_CHUNK"] = max(NUM_SEGMENTS, 16)
+                # The reduce loads SPLIT_CHUNK work items in one round trip. Fewer
+                # sequences (more segments each) leave room for more of them.
+                split_chunk = min(max(NUM_SEGMENTS, 16), 128)
+                reduce_config["SPLIT_CHUNK"] = split_chunk
+                # At most 128 fp32 values of a chunk in each lane. With more, the
+                # compiler waits for each row before it loads the next one.
+                reduce_config["num_warps"] = max(
+                    reduce_config["num_warps"],
+                    triton.cdiv(split_chunk * kv_lora_rank, 128 * WARP_SIZE),
+                )
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 
