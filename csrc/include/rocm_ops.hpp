@@ -329,7 +329,7 @@ namespace py = pybind11;
           py::arg("XQ"),                         \
           py::arg("WQ"),                         \
           py::arg("Y"),                          \
-          py::arg("ks"),                         \
+          py::arg("grouped_layout"),             \
           py::arg("C"),                          \
           py::arg("workspace"),                  \
           py::arg("kid"),                        \

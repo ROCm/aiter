@@ -16,11 +16,12 @@ void opus_gemm_a16w16_grouped_launch(aiter_tensor_t& XQ,
                                      int kid,
                                      bool masked);
 
-// K-grouped GEMM (DeepGEMM k_grouped interface): Y[g] (+)= XQ[rows of g]^T WQ[rows of g].
+// K-grouped GEMM (DeepGEMM k_grouped interface): Y[g] (+)= XQ[rows of g]^T WQ[rows of g]; grouped_layout:
+// int32 [G], the rows (K) of each group.
 void opus_gemm_a16w16_k_grouped_launch(aiter_tensor_t& XQ,
                                        aiter_tensor_t& WQ,
                                        aiter_tensor_t& Y,
-                                       aiter_tensor_t& ks,
+                                       aiter_tensor_t& grouped_layout,
                                        std::optional<aiter_tensor_t> C,
                                        aiter_tensor_t& workspace,
                                        int kid,

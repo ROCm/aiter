@@ -178,8 +178,9 @@ void opus_gemm_a16w16_grouped_launch(
 // images <name>_tn (bf16 Y) / <name>_tn_f32 (fp32 Y) with the plan kernel <image>_plan. For every
 // group g:
 //   Y[g] (+)= XQ[rows of g]^T WQ[rows of g]       XQ [R, M], WQ [R, N], Y [G, M, N]
-// rows of g: [off_g, off_g + ks[g]), off_g = the rows of the groups before g, each rounded up to
-// OPUS_A16W16_GROUP_ALIGN (rows past ks[g] are not read). ks int32 [G] on the device.
+// grouped_layout: int32 [G] on the device, the K (rows) of each group, as DeepGEMM's k_grouped grouped_layout
+// (the padded size or the true one): rows of g: [off_g, off_g + grouped_layout[g]), off_g = the rows of the
+// groups before g, each rounded up to OPUS_A16W16_GROUP_ALIGN; rows past grouped_layout[g] are not read.
 //   C: optional, the layout of Y (or Y itself: in-place accumulation): Y[g] = C[g] + ...; an empty group
 //      writes Y[g] = C[g] (or 0; nothing when C is Y). fp32 Y only.
 //   seg_len: rows per segment (a multiple of OPUS_A16W16_GROUP_ALIGN; <= 0: no split, the only choice
@@ -190,7 +191,7 @@ void opus_gemm_a16w16_k_grouped_launch(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
-    aiter_tensor_t &ks,
+    aiter_tensor_t &grouped_layout,
     std::optional<aiter_tensor_t> C,
     aiter_tensor_t &workspace,
     int kid,
@@ -199,9 +200,9 @@ void opus_gemm_a16w16_k_grouped_launch(
   aiter_detail::g_aiter_can_throw = true;
   const char* entry = "opus_gemm_a16w16_k_grouped_launch";
   if (C)
-    check_devices(entry, {&XQ, &WQ, &Y, &ks, &workspace, &*C});
+    check_devices(entry, {&XQ, &WQ, &Y, &grouped_layout, &workspace, &*C});
   else
-    check_devices(entry, {&XQ, &WQ, &Y, &ks, &workspace});
+    check_devices(entry, {&XQ, &WQ, &Y, &grouped_layout, &workspace});
 #ifdef OPUS_BUILD_HAS_GFX950
   const GroupedKid& k = find_kid(entry, k_grouped_kids, kid);
 
@@ -211,16 +212,17 @@ void opus_gemm_a16w16_k_grouped_launch(
               entry, ": XQ and WQ must be bf16, Y fp32 or bf16");
   AITER_CHECK(f32 || (!C && seg_len <= 0), entry,
               ": bf16 Y supports neither C nor a split (seg_len <= 0)");
-  AITER_CHECK(ks.dtype() == AITER_DTYPE_i32 && ks.dim() == 1 && ks.stride(0) == 1, entry,
-              ": ks must be a contiguous 1-D int32 tensor");
+  AITER_CHECK(grouped_layout.dtype() == AITER_DTYPE_i32 && grouped_layout.dim() == 1 &&
+                  grouped_layout.stride(0) == 1,
+              entry, ": grouped_layout must be a contiguous 1-D int32 tensor [G]");
   AITER_CHECK(workspace.dtype() == AITER_DTYPE_i32 && workspace.dim() == 1 &&
                   workspace.stride(0) == 1,
               entry, ": workspace must be a contiguous 1-D int32 tensor");
   AITER_CHECK(XQ.dim() == 2 && WQ.dim() == 2 && Y.dim() == 3, entry,
               ": needs XQ [R, M], WQ [R, N], Y [G, M, N]");
   const int64_t R = XQ.size(0), M = XQ.size(1), N = WQ.size(1), G = Y.size(0);
-  AITER_CHECK(WQ.size(0) == R && Y.size(1) == M && Y.size(2) == N && ks.size(0) == G, entry,
-              ": shapes of XQ / WQ / Y / ks do not match");
+  AITER_CHECK(WQ.size(0) == R && Y.size(1) == M && Y.size(2) == N && grouped_layout.size(0) == G, entry,
+              ": shapes of XQ / WQ / Y / grouped_layout do not match");
   if (C)
     AITER_CHECK(C->dtype() == Y.dtype() && C->dim() == 3 && C->size(0) == G &&
                     C->size(1) == M && C->size(2) == N && C->stride(0) == Y.stride(0) &&
@@ -265,7 +267,7 @@ void opus_gemm_a16w16_k_grouped_launch(
 
   int* const ws = static_cast<int*>(workspace.data_ptr());
   opus_gemm_a16w16_k_grouped_plan_kargs_gfx950 plan{};
-  plan.ks = static_cast<const int*>(ks.data_ptr());
+  plan.grouped_layout = static_cast<const int*>(grouped_layout.data_ptr());
   plan.table = ws;
   plan.turn = ws + 4 * items;
   plan.groups = static_cast<int>(G);

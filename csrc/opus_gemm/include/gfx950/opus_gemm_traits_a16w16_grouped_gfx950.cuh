@@ -146,8 +146,9 @@ constexpr int OPUS_M_GROUPED_PLAN_MAX_GROUPS = 4096;
 
 // K-grouped kernel arguments (the DeepGEMM k_grouped interface, the weight gradient of a grouped linear
 // layer): G GEMMs C_g = A_g^T B_g whose K (rows) differ per group. A [R][M] and B [R][N] hold the rows
-// of every group back to back, group g at rows [off_g, off_g + ks[g]), off_g = sum over j < g of ks[j]
-// rounded up to OPUS_A16W16_GROUP_ALIGN; rows past ks[g] are never read (any content). C [G][M][N].
+// of every group back to back, group g at rows [off_g, off_g + grouped_layout[g]) (grouped_layout: int32 [G],
+// the rows of each group, as DeepGEMM's k_grouped), off_g = the earlier groups' rows, each rounded up to
+// OPUS_A16W16_GROUP_ALIGN, summed; rows past grouped_layout[g] are never read (any content). C [G][M][N].
 //   C_g = (src_g +) A_g^T B_g, src (ptr_src; nullptr: none) of the layout of C, or C itself (in-place
 //   accumulation).
 // A group of more than seg_len rows is split into segments of seg_len rows (the last one shorter); the
@@ -175,7 +176,7 @@ static_assert(sizeof(opus_gemm_a16w16_k_grouped_kargs_gfx950) == 80);
 
 // Plan kernel arguments (one workgroup of OPUS_K_GROUPED_PLAN_THREADS threads, see k_grouped_plan_body).
 struct opus_gemm_a16w16_k_grouped_plan_kargs_gfx950 {
-    const int* __restrict__ ks;         // [G] rows per group
+    const int* __restrict__ grouped_layout;   // [G] rows per group
     int* __restrict__ table;            // [full_items + G][4]
     int* __restrict__ turn;             // [turn_count], zeroed
     int groups;                         // G

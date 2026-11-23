@@ -326,7 +326,7 @@ __device__ inline tile_t k_grouped_tile(const K& kargs, int slot) {
     return {(slot % tiles_m) * T::B_M, kargs.m, group, 0, e[1], rows, e[3] & 0xffff, e[3] >> 16};
 }
 
-// K-grouped plan kernel (one workgroup): from ks, the first row of each group (prefix sum of the rows
+// K-grouped plan kernel (one workgroup): from grouped_layout (the rows of each group), the first row of each group (prefix sum of the rows
 // rounded up to OPUS_A16W16_GROUP_ALIGN) and its split into seg_len-row segments. Table entries:
 //   [0, full_items)   full segments, group by group (unused slots: group -1)
 //   full_items + g    the remainder of group g
@@ -348,8 +348,8 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
     int off = 0, full = 0;   // rows / full segments of the previous chunks of NT groups
     for (int base = 0; base < k.groups; base += NT) {
         const int g = base + tid;
-        const int ks = g < k.groups ? k.ks[g] : 0;
-        const int rows = ks < 0 ? 0 : ks < k.rows ? ks : k.rows;
+        const int size = g < k.groups ? k.grouped_layout[g] : 0;
+        const int rows = size < 0 ? 0 : size < k.rows ? size : k.rows;
         const int f = rows / k.seg_len, padded = (rows + ALIGN - 1) / ALIGN * ALIGN;
         int sum_rows = padded, sum_full = f;   // inclusive prefix sums over the chunk
         for (int d = 1; d < NT; d <<= 1) {
