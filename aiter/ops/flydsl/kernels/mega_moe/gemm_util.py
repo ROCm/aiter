@@ -26,13 +26,7 @@ def _load_row_map_subgroup(row_map_rsrc, row_index, lane, subgroup_width):
     if subgroup_lane == fx.Int32(0):
         packed = row_map_rsrc[row_index]
     source_lane = lane - subgroup_lane
-    return fx.Int32(
-        fx.rocdl.ds_bpermute(
-            T.i32,
-            source_lane * fx.Int32(4),
-            packed,
-        )
-    )
+    return fx.Int32(fx.shuffle_idx(packed, source_lane, 64))
 
 
 def wait_lds_barrier(vmcnt=63):
