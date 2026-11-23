@@ -28,7 +28,12 @@ from flydsl.expr import (
 )
 
 from aiter.ops.flydsl.kernels.kernels_common import div_nonneg, kernel_signature
-from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+    buf_copy_atom,
+)
 from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 
 # The indexer contract this module implements, rather than any one model's
@@ -429,16 +434,18 @@ def build_qsa_indexer_decode_scores_module(
         known_block_size=[block_threads, 1, 1],
     )
     def qsa_indexer_scores_kernel(
+        # Preloading fills SGPRs from the front of the kernarg segment, so the
+        # row-lookup arguments come first.
+        token_to_req: fx.Tensor,
+        n_req: Int32,
+        n_columns: Int32,
+        page_table: fx.Tensor,
+        context_lens: fx.Tensor,
+        query_positions: fx.Tensor,
         q: fx.Tensor,
         k_cache: fx.Tensor,
-        page_table: fx.Tensor,
-        token_to_req: fx.Tensor,
-        query_positions: fx.Tensor,
-        context_lens: fx.Tensor,
         scores: fx.Tensor,
         row_lens: fx.Tensor,
-        n_columns: Int32,
-        n_req: Int32,
         score_scale: Float32,
         n_cache_blocks: Int32,
     ):
@@ -493,6 +500,16 @@ def build_qsa_indexer_decode_scores_module(
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
+        # The block-table read needs only req, so it stays ahead of the
+        # context_lens load and the visible test. n_columns is the table
+        # width in tokens, so score_col < n_columns keeps it in the row.
+        col = tid % Int32(block_n)
+        score_col = tile * Int32(block_n) + col
+        in_table = (score_col < n_columns) & valid_req
+        safe_col = in_table.select(score_col, zero)
+        logical_page = div_nonneg(safe_col, page)
+        off = safe_col - logical_page * page
+        phys = page_table[safe_req, logical_page]
         qpos = query_positions[row]
         slen = valid_req.select(context_lens[safe_req], zero)
         visible = fx.min(_compressed_span(qpos, slen), n_columns)
@@ -520,14 +537,8 @@ def build_qsa_indexer_decode_scores_module(
                     qv = q_live.select(q_vec[i].to(Float32), Float32(0.0))
                     q_lds[qh, d0 + Int32(i)] = qv.to(BFloat16)
 
-            col = tid % Int32(block_n)
             chunk = div_nonneg(tid, Int32(block_n))
-            score_col = tile * Int32(block_n) + col
-            col_live = (score_col < n_columns) & (score_col < visible) & valid_req
-            safe_col = col_live.select(score_col, zero)
-            logical_page = div_nonneg(safe_col, page)
-            off = safe_col - logical_page * page
-            phys = page_table[safe_req, logical_page]
+            col_live = in_table & (score_col < visible)
             phys_live = (phys >= zero) & (phys < n_cache_blocks)
             safe_phys = phys_live.select(phys, zero)
             col_live = col_live & phys_live
@@ -624,16 +635,16 @@ def build_qsa_indexer_decode_scores_module(
         stream: fx.Stream,
     ):
         qsa_indexer_scores_kernel(
+            token_to_req,
+            n_req,
+            n_columns,
+            page_table,
+            context_lens,
+            query_positions,
             q,
             k_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            context_lens,
             scores,
             row_lens,
-            n_columns,
-            n_req,
             score_scale,
             n_cache_blocks,
         ).launch(
@@ -642,6 +653,12 @@ def build_qsa_indexer_decode_scores_module(
             stream=stream,
         )
 
+    launch_qsa_indexer_scores.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
     return launch_qsa_indexer_scores
 
 
