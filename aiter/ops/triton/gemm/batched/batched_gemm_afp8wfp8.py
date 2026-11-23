@@ -27,11 +27,13 @@ def batched_gemm_afp8wfp8_preshuffle(
     x_format: str | None = None,
     w_format: str | None = None,
     is_x_scale_transposed: bool = True,
-) -> torch.Tensor:
+    y_scales: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     gfx1250 (gluon) batched MXFP8 GEMM: Y[b] = X[b] @ W[b]^T with fp8 X and W, 1x128
     e8m0 scales on X and 128x128 e8m0 scales on W. Each operand can be a strided view
     with a unit last stride, for example a token-major (M, B, K) x as x.transpose(0, 1).
+    Y can also be fp8 with 1x128 e8m0 scales, the format of X.
 
     Args:
         x (torch.Tensor): e4m3 (or uint8 view) activations, (B, M, K).
@@ -42,8 +44,12 @@ def batched_gemm_afp8wfp8_preshuffle(
             (B, M, K // 128) with unit K stride.
         w_scales (torch.Tensor): e8m0 (uint8) scales of w, (B, ceil(N / 128), K // 128)
             with unit K stride.
-        dtype (torch.dtype): output dtype (bf16 or fp16).
+        dtype (torch.dtype): output dtype (bf16, fp16 or float8_e4m3fn). An fp8 Y gets
+            one e8m0 scale per 1x128 block. The kernel rounds Y to bf16 first, so the
+            result is the same as per_group_quant_hip (group_size=128, e8m0 scales) on
+            the bf16 Y.
         y (Optional[torch.Tensor]): preallocated (B, M, N) output with unit N stride.
+            Its dtype replaces dtype.
         config (Optional[dict]): tuning keys (BLOCK_SIZE_M/N/K, num_warps, NUM_BUFFERS,
             num_ctas, GROUP_M, B2B_WMMA, NUM_KSUB, EPI_SPLIT); default from the
             BATCHED_GEMM-AFP8WFP8_PRESHUFFLED config files.
@@ -51,9 +57,13 @@ def batched_gemm_afp8wfp8_preshuffle(
             dtype (float8_e4m3fn / float8_e5m2; uint8 views default to "e4m3").
         is_x_scale_transposed (bool): x_scales is (B, K // 128, M). False: x_scales is
             (B, M, K // 128).
+        y_scales (Optional[torch.Tensor]): preallocated e8m0 (uint8) scales of an fp8 Y,
+            (B, M, N // 128) with any strides. If None, the scales are a new
+            (B, N // 128, M) tensor with unit M stride, returned as its (B, M, N // 128)
+            transpose.
 
     Returns:
-        y (torch.Tensor): (B, M, N) output.
+        y (torch.Tensor): (B, M, N) output. For an fp8 Y: the tuple (y, y_scales).
     """
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
@@ -104,6 +114,22 @@ def batched_gemm_afp8wfp8_preshuffle(
     assert (
         tuple(y.shape) == (B, M, N) and y.stride(2) == 1
     ), f"y must be (B, M, N) with a unit N stride, got {tuple(y.shape)} {y.stride()}"
+    quant_y = y.dtype == torch.float8_e4m3fn
+    if y.element_size() == 1 and not quant_y:
+        raise ValueError(f"an 8-bit y must be float8_e4m3fn, got {y.dtype}")
+    if quant_y:
+        assert N % 128 == 0, f"an fp8 y needs N % 128 == 0, got N={N}"
+        if y_scales is None:
+            y_scales = torch.empty(
+                (B, N // 128, M), dtype=torch.uint8, device=x.device
+            ).transpose(1, 2)
+        ys_shape = (B, M, N // 128)
+        assert tuple(y_scales.shape) == ys_shape and y_scales.element_size() == 1, (
+            f"y_scales must be e8m0 {ys_shape}, got {y_scales.dtype} "
+            f"{tuple(y_scales.shape)}"
+        )
+    elif y_scales is not None:
+        raise ValueError(f"y_scales needs a float8_e4m3fn y, got {y.dtype}")
     config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], K // 128)
 
     num_ctas = config["num_ctas"]
@@ -124,6 +150,11 @@ def batched_gemm_afp8wfp8_preshuffle(
         N % (config["BLOCK_SIZE_N"] // ctas_n) != 0 or config["NUM_BUFFERS"] < 2
     ):
         config["EPI_SPLIT"] = 1
+    if quant_y:
+        # each epilogue slice must hold whole 1x128 scale blocks
+        bnc = config["BLOCK_SIZE_N"] // ctas_n
+        while (bnc // config.get("EPI_SPLIT", 1)) % 128:
+            config["EPI_SPLIT"] //= 2
 
     layouts = get_gemm_afp8wfp8_preshuffle_layouts(
         config["num_warps"],
@@ -138,6 +169,7 @@ def batched_gemm_afp8wfp8_preshuffle(
         128,
         (128, 128),
         a_scale_rowmajor=not is_x_scale_transposed,
+        c_elem_bytes=y.element_size(),
     )
     _LOGGER.info(
         "BATCHED_GEMM_AFP8WFP8_PRESHUFFLE: x=%s w=%s config=%s",
@@ -148,6 +180,16 @@ def batched_gemm_afp8wfp8_preshuffle(
     x_k = x.view(torch.uint8)
     w_k = w.view(torch.uint8)
     xs, ws = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
+    c_scale_args = {}
+    if quant_y:
+        ys = y_scales.view(torch.uint8)
+        c_scale_args = {
+            "C_SCALE_GROUP": 128,
+            "c_scale_ptr": ys,
+            "stride_cs_m": ys.stride(1),
+            "stride_cs_n": ys.stride(2),
+            "stride_csb": ys.stride(0),
+        }
 
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
@@ -188,7 +230,8 @@ def batched_gemm_afp8wfp8_preshuffle(
         BATCHED=1,
         A_SCALE_ROWMAJOR=int(not is_x_scale_transposed),
         A_SCALE_K_COLS=1 if is_x_scale_transposed else triton.next_power_of_2(K // 128),
+        **c_scale_args,
         **config,
         **layouts,
     )
-    return y
+    return (y, y_scales) if quant_y else y

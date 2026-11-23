@@ -16,6 +16,8 @@ This test pins the a8w4 path the model will run:
 and the a8w8 path ``batched_gemm_a8w8_mxscale_bpreshuffle`` with each e8m0
 block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950, 1x128 /
 128x128 on gfx1250.
+The fp8-output entry ``batched_gemm_a8w8_mxscale_bpreshuffle_quant`` must
+match that entry + ``per_group_quant_hip`` byte for byte.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -42,12 +44,16 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+from aiter.ops.batched_gemm_op_a8w8 import (
+    batched_gemm_a8w8_mxscale_bpreshuffle,
+    batched_gemm_a8w8_mxscale_bpreshuffle_quant,
+)
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     flydsl_batched_gemm_a8w4_v2,
     preshuffle_a8w4_weight_mbn,
     quant_act_mxfp8_mbn,
 )
+from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -58,6 +64,14 @@ A8W4_GFX = ["gfx1250"]  # flydsl_batched_gemm_a8w4_v2
 SEED = 0
 # a8w8 e8m0 blocks per arch: 1xBLOCK on the activation, BLOCKxBLOCK on the weight.
 A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (128,)}
+# (b, m, n, k) for the fp8-output entry. On gfx1250 the tuned rows send M 256 and 1024
+# to flydsl (GEMM, then quant) and M 512 and 4096 to the gluon kernel (fused quant).
+QUANT_OUT_SHAPES = [
+    (16, 256, 1024, 4096),
+    (16, 512, 1024, 4096),
+    (16, 1024, 1024, 4096),
+    (16, 4096, 1024, 4096),
+]
 
 
 def _to_e8m0_scale(scale):
@@ -269,6 +283,48 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     return ret
 
 
+@benchmark()
+def test_batched_gemm_quant(b, m, n, k, transpose_scale):
+    """The fp8-output entry must equal the bf16 entry + per_group_quant_hip exactly."""
+    torch.manual_seed(SEED)
+    x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtypes.bf16), 128)
+    w8, ws8 = quant_weight_e8m0(blockwise_randn(b, n, k, dtype=dtypes.bf16), 128)
+    w8 = shuffle_weight(w8)
+    y = batched_gemm_a8w8_mxscale_bpreshuffle(x8, w8, xs8, ws8, dtype=dtypes.bf16)
+    ref, ref_scale = per_group_quant_hip(
+        y.view(m, b * n),
+        quant_dtype=dtypes.fp8,
+        group_size=128,
+        transpose_scale=transpose_scale,
+        scale_type=dtypes.fp8_e8m0,
+    )
+    (out, out_scale), us = run_perftest(
+        batched_gemm_a8w8_mxscale_bpreshuffle_quant,
+        x8,
+        w8,
+        xs8,
+        ws8,
+        transpose_scale,
+    )
+    err = checkAllclose(
+        ref.view(torch.uint8).to(dtypes.fp32),
+        out.view(torch.uint8).to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0.0,
+        msg="fp8 y",
+    )
+    err_scale = checkAllclose(
+        ref_scale.view(torch.uint8).to(dtypes.fp32),
+        out_scale.view(torch.uint8).to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0.0,
+        msg="e8m0 scale",
+    )
+    return {"gfx": get_gfx(), "us": us, "fp8 err": err, "scale err": err_scale}
+
+
 def summarize(title: str, rows: list) -> None:
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
@@ -343,6 +399,16 @@ def main():
         ):
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
         summarize("batched_gemm (a8w4 vs a8w8, same BF16 reference)", gemm_rows)
+
+    quant_out_rows = []
+    for (b, m, n, k), transpose_scale in itertools.product(
+        QUANT_OUT_SHAPES, (True, False)
+    ):
+        quant_out_rows.append(test_batched_gemm_quant(b, m, n, k, transpose_scale))
+    summarize(
+        "batched_gemm_a8w8_mxscale_bpreshuffle_quant (vs bf16 + per_group_quant_hip)",
+        quant_out_rows,
+    )
 
 
 if __name__ == "__main__":

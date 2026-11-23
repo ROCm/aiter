@@ -24,10 +24,23 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp8wfp8 import (
     generate_batched_gemm_afp8wfp8_preshuffle_inputs,
 )
 
+# fp8: Y in fp8 e4m3 with one e8m0 scale per 1x128 block
+DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp8": torch.float8_e4m3fn,
+}
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, model_name=None):
-    c_dtype = torch.bfloat16
 
+def bench_gemm_fn(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    model_name=None,
+    c_dtype: torch.dtype = torch.bfloat16,
+):
     # input preparation is not timed
     x, _, w, x_scales, w_scales, y = generate_batched_gemm_afp8wfp8_preshuffle_inputs(
         batch, M, N, K, c_dtype, output=True
@@ -37,7 +50,9 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, model_name=No
     flops = 2.0 * M * N * K * batch
     # memory transfer (1-byte inputs)
     mem_read = x.numel() + w.numel() + x_scales.numel() + w_scales.numel()
-    mem_write = (batch * M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = y.numel() * y.element_size()
+    if c_dtype == torch.float8_e4m3fn:
+        mem_write += y.numel() // 128  # e8m0 scales
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
@@ -91,7 +106,7 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, c_dtype=DTYPE_MAP[args.dtype])
 
     bench_batched_gemm_afp8wfp8_preshuffle.run(
         save_path="." if args.o else None, print_data=True
@@ -107,7 +122,7 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp8wfp8_preshuffle(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, c_dtype=DTYPE_MAP[args.dtype])
 
     bench_batched_gemm_afp8wfp8_preshuffle.run(
         save_path="." if args.o else None, print_data=True
@@ -144,6 +159,13 @@ def parse_args(args: list[str] | None = None):
         type=int,
         required=False,
         help="Batch size to be used when using --model flag.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=list(DTYPE_MAP.keys()),
+        default="bf16",
+        help="Output dtype. fp8 also writes one e8m0 scale per 1x128 block.",
     )
     return get_ff_args(parser, args=args)
 

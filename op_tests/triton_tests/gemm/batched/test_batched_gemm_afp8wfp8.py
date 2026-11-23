@@ -100,6 +100,19 @@ def preshuffle_check(y, ref):
     assert (y.float() - ref).abs().max().item() <= tol
 
 
+def run_torch_quant(y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """per_group_quant_hip(y, group_size=128, scale_type=fp8_e8m0) in torch: fp8 e4m3
+    values and e8m0 scales, scale = 2^ceil(log2(amax / 448)), amax >= 1e-10."""
+    yg = y.float().unflatten(-1, (-1, SCALE_GROUP_SIZE))
+    amax = yg.abs().amax(-1).clamp(1e-10, 448.0 * 2.0**119)
+    inv_max = torch.tensor(1 / 448, dtype=torch.float32, device=y.device)
+    bits = (amax * inv_max).view(torch.int32)
+    e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    inv = ((254 - e) << 23).view(torch.float32)
+    q = (yg * inv.unsqueeze(-1)).to(torch.float8_e4m3fn).flatten(-2)
+    return q, e.to(torch.uint8)
+
+
 def get_x_vals():
     return [
         (2, 1, 1024, 256),
@@ -110,6 +123,18 @@ def get_x_vals():
         (16, 512, 1024, 4096),
         (16, 2048, 1024, 4096),
         (16, 16384, 1024, 4096),
+    ]
+
+
+def get_fp8_y_vals():
+    # One shape for each config of get_x_vals(): three use the full-tile store and two
+    # use the sliced store.
+    return [
+        (3, 31, 1024, 512),
+        (3, 150, 2048, 1024),
+        (4, 1000, 1024, 4096),
+        (16, 257, 1024, 4096),
+        (16, 2048, 1024, 4096),
     ]
 
 
@@ -149,6 +174,50 @@ def test_batched_gemm_afp8wfp8_preshuffle(
 
 
 @_requires_gluon_preshuffle
+@pytest.mark.parametrize("B, M, N, K", get_fp8_y_vals())
+@pytest.mark.parametrize("output", [True, False])
+def test_batched_gemm_afp8wfp8_preshuffle_fp8_y(B, M, N, K, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    x, _, w_shuffled, x_scales, w_scales, y = (
+        generate_batched_gemm_afp8wfp8_preshuffle_inputs(
+            B, M, N, K, torch.float8_e4m3fn, token_major=True, output=output
+        )
+    )
+    # Row 0 of Y is 0, so its scales come from the 1e-10 amax floor.
+    x.view(torch.uint8)[:, 0] = 0
+    y_scales = None
+    if output:
+        # row-major scales; the default layout is (B, N // 128, M) with unit M stride
+        y_scales = torch.empty(
+            (B, M, N // SCALE_GROUP_SIZE), dtype=torch.uint8, device="cuda"
+        )
+    out, out_scales = batched_gemm_afp8wfp8_preshuffle(
+        x,
+        w_shuffled,
+        x_scales,
+        w_scales,
+        dtype=torch.float8_e4m3fn,
+        y=y,
+        is_x_scale_transposed=False,
+        y_scales=y_scales,
+    )
+    if output:
+        assert out.data_ptr() == y.data_ptr()
+        assert out_scales.data_ptr() == y_scales.data_ptr()
+    # The fp8 Y must be the quant of the bf16 Y, byte for byte.
+    ref, ref_scales = run_torch_quant(
+        batched_gemm_afp8wfp8_preshuffle(
+            x, w_shuffled, x_scales, w_scales, is_x_scale_transposed=False
+        )
+    )
+    torch.testing.assert_close(out_scales.view(torch.uint8), ref_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+    )
+
+
+@_requires_gluon_preshuffle
 def test_batched_gemm_afp8wfp8_preshuffle_rejects_bad_args():
     x, _, w_shuffled, x_scales, w_scales, _ = (
         generate_batched_gemm_afp8wfp8_preshuffle_inputs(
@@ -172,4 +241,32 @@ def test_batched_gemm_afp8wfp8_preshuffle_rejects_bad_args():
             x_scales,
             w_scales,
             is_x_scale_transposed=False,
+        )
+    with pytest.raises(ValueError):  # y scales for a bf16 y
+        batched_gemm_afp8wfp8_preshuffle(
+            x,
+            w_shuffled,
+            x_scales,
+            w_scales,
+            is_x_scale_transposed=False,
+            y_scales=torch.empty((2, 64, 8), dtype=torch.uint8, device="cuda"),
+        )
+    with pytest.raises(ValueError):  # an 8-bit y that is not e4m3fn
+        batched_gemm_afp8wfp8_preshuffle(
+            x,
+            w_shuffled,
+            x_scales,
+            w_scales,
+            dtype=torch.float8_e5m2,
+            is_x_scale_transposed=False,
+        )
+    with pytest.raises(AssertionError):  # y scales of the wrong shape
+        batched_gemm_afp8wfp8_preshuffle(
+            x,
+            w_shuffled,
+            x_scales,
+            w_scales,
+            dtype=torch.float8_e4m3fn,
+            is_x_scale_transposed=False,
+            y_scales=torch.empty((2, 64, 4), dtype=torch.uint8, device="cuda"),
         )

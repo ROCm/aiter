@@ -445,6 +445,85 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
     )
 
 
+def _batched_gemm_a8w8_mxscale_bpreshuffle_quant_fake(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    transpose_scale: bool = True,
+) -> tuple[Tensor, Tensor]:
+    m, g, n = x.shape[0], x.shape[1], wo_a.shape[1]
+    return (
+        torch.empty((m, g * n), dtype=dtypes.fp8, device=x.device),
+        torch.empty((m, g * n // 128), dtype=dtypes.fp8_e8m0, device=x.device),
+    )
+
+
+@torch_compile_guard(
+    mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_bpreshuffle_quant_fake
+)
+def batched_gemm_a8w8_mxscale_bpreshuffle_quant(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    transpose_scale: bool = True,
+) -> tuple[Tensor, Tensor]:
+    """``batched_gemm_a8w8_mxscale_bpreshuffle`` with an fp8 output for the next GEMM.
+
+    Returns ``(y, y_scale)``: y is [M, G * N] fp8 and y_scale has one e8m0 byte per
+    1x128 block of y. The bytes are the same as ``per_group_quant_hip`` (group_size=128,
+    scale_type=fp8_e8m0, transpose_scale) on the bf16 output viewed as [M, G * N].
+    When the tuned row selects the gfx1250 gluon kernel, the GEMM epilogue does the
+    quant. Other rows run the bf16 GEMM and then ``per_group_quant_hip``. The other
+    arguments are those of ``batched_gemm_a8w8_mxscale_bpreshuffle``.
+    """
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+    w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
+    cfg = lookup_mxscale_bmm_config(
+        g, m, n, k, w_scale_block=w_scale_block, bpreshuffle=True
+    )
+    if cfg is None or cfg["libtype"] != "triton" or str(cfg["kernelName"]) != "gluon":
+        from .quant import per_group_quant_hip
+
+        y = _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+            x, wo_a, x_scale, w_scale, dtype=dtypes.bf16
+        )
+        return per_group_quant_hip(
+            y.view(m, g * n),
+            quant_dtype=dtypes.fp8,
+            group_size=128,
+            transpose_scale=transpose_scale,
+            scale_type=dtypes.fp8_e8m0,
+        )
+
+    from .triton.gemm.batched.batched_gemm_afp8wfp8 import (
+        batched_gemm_afp8wfp8_preshuffle,
+    )
+
+    y = torch.empty((m, g * n), dtype=dtypes.fp8, device=x.device)
+    # Scale bytes in the order of per_group_quant_hip: (G * N / 128, M) for
+    # transpose_scale, else (M, G * N / 128). The kernel takes them as (G, M, N / 128).
+    if transpose_scale:
+        s = torch.empty((g, n // 128, m), dtype=torch.uint8, device=x.device)
+        y_scales = s.transpose(1, 2)
+    else:
+        s = torch.empty((m, g, n // 128), dtype=torch.uint8, device=x.device)
+        y_scales = s.transpose(0, 1)
+    batched_gemm_afp8wfp8_preshuffle(
+        x.transpose(0, 1),
+        wo_a.view(g, n // 16, k * 16),
+        x_scale.transpose(0, 1),
+        w_scale,
+        dtype=dtypes.fp8,
+        y=y.view(m, g, n).transpose(0, 1),
+        is_x_scale_transposed=False,
+        y_scales=y_scales,
+    )
+    return y, s.view(m, g * n // 128).view(dtypes.fp8_e8m0)
+
+
 def gen_batched_gemm_a8w8_tune_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
