@@ -3236,6 +3236,8 @@ def _fused_threshold_cases(
     window = fly_policy.resolve_fused_policy(world_size=tp, link=link).window(
         fly_policy.AllReduceAlgorithm(algorithm), quantized=True
     )
+    if window is None:
+        return []
     lo, hi = window.inclusive_range()
     out = []
     for hidden in sorted({c.hidden for c in walk}):
