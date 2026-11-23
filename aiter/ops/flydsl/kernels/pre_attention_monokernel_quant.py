@@ -52,7 +52,7 @@ def make_row_quantize(
     Token-major roles: per-tensor E4M3 or INT8 (``scales``: the per-destination scales),
     per-channel E4M3 (``scales``: address of the [world][heads_local * 128] FP32 scales) or
     an MX row codec (``scales`` unused); tiled codecs have their own functions below.
-    ``factors`` (the argument): address of the RMS factors of the role's rows, read for Q/K
+    ``factors`` (the argument): address of the row factors of the role's rows, read for Q/K
     when ``factors`` (the option) is set. ``staging`` points at this role's staging, one
     ``layout.stage_bytes`` block per destination. With ``first``/``count``, only a
     workgroup's rows bid + i * workgroups for i in [first, first + count).

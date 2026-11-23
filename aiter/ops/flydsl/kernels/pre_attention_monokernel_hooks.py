@@ -6,7 +6,7 @@
 """Hooks of the pre-attention monokernel (``gemm_hooks`` contract) and its memory plan.
 
 The fused Q/K/V roles GEMM runs these hooks:
-  - after each role's tiles: the role's RMS factors (Q/K, norm across heads) and, for
+  - after each role's tiles: the role's row factors (Q/K, the prep's row-factor op) and, for
     per-tensor scales, its amax per destination; the coordinator (last workgroup)
     exchanges amax with every peer;
   - after each workgroup's first block of the next role, when every workgroup has a tile
@@ -26,11 +26,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr import math as fmath
 
 from .communication_ops_utils import spin_until_ge_i32_agent, spin_until_ge_i64
 from .pre_attention_monokernel_quant import THREADS, make_row_quantize
-from .qk_prep_epilogue import HEAD_DIM
+from .qk_prep import HEAD_DIM
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 # Window control words, bytes from the control region, for up to 8 ranks: amax
@@ -53,7 +52,7 @@ MAX_WORLD = 8
 # Counters per role: workgroups' amax in, workgroups' rows quantized, XCDs written back,
 # scales ready.
 AMAXED, DONE, FLUSHED, READY = 0, 4, 8, 12
-# aux (ordinary memory): the GEMM's tile counters per role at 0, RMS factors [2][M] FP32
+# aux (ordinary memory): the GEMM's tile counters per role at 0, row factors [2][M] FP32
 # from FACTORS, a scratch word, then per-channel V maxima per 128 rows
 # [M / 128][heads * 128] and the per-channel V scales [heads * 128] (Plan.vpc,
 # Plan.scale_pc).
@@ -140,16 +139,16 @@ def make_hooks(
     tiles_per_role,
     workgroups,
     xcds,
-    across_heads=True,
+    row_factor=None,
     head_dim=HEAD_DIM,
-    eps=1e-6,
 ):
     """The role, first-block and tile hooks for ``layouts`` (``role_layouts``).
 
     ``tiles_per_role`` is the host GEMM's tile count per role, over ``workgroups``
-    persistent workgroups on ``xcds`` XCDs. ``across_heads`` computes Q's and K's RMS
-    factors (norm across heads) and folds them into the quantization. Returns the three
-    hooks; the first-block hook is None when quantize and puts run in the role hook.
+    persistent workgroups on ``xcds`` XCDs. ``row_factor``, the prep's row-factor op
+    (``PrepSpec.row_factor``), computes Q's and K's row factors from the epilogue's
+    per-head partials and folds them into the quantization. Returns the three hooks; the
+    first-block hook is None when quantize and puts run in the role hook.
     """
     heads_role = role_cols // head_dim
     heads_all = 3 * heads_role
@@ -170,7 +169,7 @@ def make_hooks(
     v_tile_amax = kinds[2] == "tensor"
     quantizers = [
         make_row_quantize(
-            layout, rank, world, rows, heads_local, workgroups, across_heads
+            layout, rank, world, rows, heads_local, workgroups, row_factor is not None
         )
         for layout in layouts
     ]
@@ -287,9 +286,11 @@ def make_hooks(
             valid = row < rows
             row = valid.select(row, fx.Int32(0))
             factor = fx.Float32(1.0)
-            if const_expr(role < 2 and across_heads):
-                sq = _head_sum(tables, row * heads_all + role * heads_role, heads_role)
-                factor = fmath.rsqrt(sq * (1.0 / role_cols) + eps)
+            if const_expr(role < 2 and row_factor is not None):
+                total = _head_sum(
+                    tables, row * heads_all + role * heads_role, heads_role
+                )
+                factor = row_factor.finish(total, role_cols)
                 index = valid.select(
                     fx.Int32(FACTORS // 4 + role * rows) + row, fx.Int32(factor_scratch)
                 )

@@ -7,7 +7,7 @@ One row per (world_size, profile, rows, heads, K, prep, gemm). Every row checks,
 rank and for two consecutive calls (both receive-buffer parities):
   - the fused projections against the host GEMM's standalone prep and maxima GEMMs, bit for
     bit;
-  - Q's and K's RMS factors (norm across heads) against PyTorch;
+  - Q's and K's row factors (the prep's row-factor op) against PyTorch;
   - every role's received payload and scale bytes against AttentionA2AIntraNodeOp's packed
     push of the same projections, bit for bit;
 then times one call.
@@ -50,11 +50,11 @@ def _prep(name, profile):
     from aiter.ops.flydsl.pre_attention_monokernel import PrepSpec
 
     if name == "wan":
-        return PrepSpec("rms_across_heads", "interleaved", True, profile.hadamard)
+        return PrepSpec("rms_across_heads", "interleaved", True, profile.hadamard, EPS)
     if name == "per_head":
-        return PrepSpec("rms_per_head", "rotate_half", True, profile.hadamard)
+        return PrepSpec("rms_per_head", "rotate_half", True, profile.hadamard, EPS)
     if name == "flux3":
-        return PrepSpec("rms_per_head", "interleaved", False, profile.hadamard)
+        return PrepSpec("rms_per_head", "interleaved", False, profile.hadamard, EPS)
     raise ValueError(f"unknown prep {name!r}")
 
 
@@ -104,12 +104,11 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
     R = heads * HEAD_DIM
     seq_full = rows * world
     valid_kv_len = seq_full - KV_TRIM if profile.direct_kv_output else None
-    across = prep.norm == "rms_across_heads"
+    row_factor = prep.row_factor
 
     # Weights are the same on every rank, tokens and positions are not.
     gen = torch.Generator(device=device).manual_seed(0)
-    raw, weights, scales, biases, gammas = [], [], [], [], []
-    gamma_scale = HEAD_DIM**-0.5 if prep.hadamard else 1.0
+    raw, weights, scales, biases, params = [], [], [], [], []
     for role in range(3):
         w = torch.randn(R, K, device=device, generator=gen, dtype=torch.bfloat16) * 0.02
         raw.append(w)
@@ -117,16 +116,14 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         weights.append(w_q)
         scales.append(w_s)
         biases.append(torch.randn(R, device=device, generator=gen).bfloat16().float())
-        gamma = 1 + 0.1 * torch.randn(R, device=device, generator=gen)
-        gammas.append(
-            gamma.bfloat16().float() * gamma_scale
-            if role < 2
-            else torch.ones(R, device=device)
-        )
+        # Q's and K's norm weights; V's draw keeps the later draws in place.
+        weight = 1 + 0.1 * torch.randn(R, device=device, generator=gen)
+        params.append({"weight": weight.bfloat16().float()})
+    params = params[:2]
     gen = torch.Generator(device=device).manual_seed(100 + rank)
     x = torch.randn(rows, K, device=device, generator=gen, dtype=torch.bfloat16)
     angles = torch.rand(rows, HEAD_DIM // 2, device=device, generator=gen) * 6.28
-    cos, sin = angles.cos().contiguous(), angles.sin().contiguous()
+    tables = prep.pack_tables({"cos": angles.cos(), "sin": angles.sin()})
     cu = get_cu_num()
     if gemm == "a6w6":
         # MXFP6 operands; the weights' rows in the host layout. The A6W6 host applies
@@ -138,9 +135,7 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         order = host_weight_order(R).to(device)
         role_ops = [aiter.quant_mxfp6_gemm(w[order].contiguous()) for w in raw]
         K_PAD = -(-K // 128) * 128
-        prep_gemm = compile_a6w6_host_4w(
-            K=K_PAD, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS
-        )
+        prep_gemm = compile_a6w6_host_4w(K=K_PAD, xcd_swizzle=8, num_cu=cu, prep=prep)
         amax_gemm = compile_a6w6_host_4w(
             K=K_PAD, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
         )
@@ -151,15 +146,12 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         role_ops = [
             (shuffle_weight(w, layout=(16, 16)).contiguous(), None) for w in weights
         ]
-        prep_gemm = compile_int8_gemm_4w(
-            K=K, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS
-        )
+        prep_gemm = compile_int8_gemm_4w(K=K, xcd_swizzle=8, num_cu=cu, prep=prep)
         amax_gemm = compile_int8_gemm_4w(
             K=K, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
         )
-    # B_scale per column: the scales, the biases with a bias, then the norm weights.
-    bias_sets = [torch.cat(biases)] if prep.bias else []
-    columns = torch.cat([torch.cat(scales), *bias_sets, torch.cat(gammas)])
+    # B_scale per column: the scales, the biases with a bias, then the prep's columns.
+    columns = prep.pack_columns(torch.cat(scales), torch.cat(biases), params, heads)
 
     mono = PreAttentionMonokernel(
         rank=rank,
@@ -171,7 +163,6 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         group=_CTX.cpu_group,
         prep=prep,
         valid_kv_len=valid_kv_len,
-        eps=EPS,
         gemm=gemm,
     )
 
@@ -183,13 +174,19 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
     parts = [
         torch.full((2, rows, heads), float("nan"), device=device) for _ in range(3)
     ]
-    role_bias = [[biases[r]] if prep.bias else [] for r in range(3)]
-    role_columns = [torch.cat([scales[r], *role_bias[r], gammas[r]]) for r in range(2)]
-    role_columns.append(torch.cat([scales[2], *role_bias[2]]))
+    role_columns = [
+        prep.pack_columns(scales[r], biases[r], [params[r]], heads) for r in range(2)
+    ]
+    role_columns.append(torch.cat([scales[2], biases[2]] if prep.bias else [scales[2]]))
     stream = fx.Stream(torch.cuda.current_stream())
     for role in range(3):
         w_op, w_scale = role_ops[role]
-        tables = (cos.view(-1), sin.view(-1)) if role < 2 or gemm == "a6w6" else ()
+        # The INT8 maxima GEMM takes no tables; the others read them only with a prep.
+        table_args = (
+            ((tables if tables is not None else role_columns[role]).view(-1),)
+            if role < 2 or gemm == "a6w6"
+            else ()
+        )
         _run_compiled(
             prep_gemm if role < 2 else amax_gemm,
             x_op.view(-1),
@@ -197,7 +194,7 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
             outs[role],
             *((x_scale, w_scale) if gemm == "a6w6" else (x_scale,)),
             role_columns[role],
-            *tables,
+            *table_args,
             parts[role].view(-1),
             rows,
             R,
@@ -205,7 +202,7 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         )
 
     def call():
-        return mono(x_op, x_scale, fused, columns, cos, sin, weight_scale=fused_scale)
+        return mono(x_op, x_scale, fused, columns, tables, weight_scale=fused_scale)
 
     # The A2A op's packed push of the standalone projections, as a framework builds it.
     per_tensor_qk = profile.codecs[0] in ("int8", "e4m3")
@@ -220,7 +217,7 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         softmax_scale=HEAD_DIM**-0.5,
         hadamard=False,
         valid_kv_len=valid_kv_len,
-        row_scaled_qk=per_tensor_qk and across,
+        row_scaled_qk=per_tensor_qk and row_factor is not None,
         group=_CTX.cpu_group,
     )
     side = torch.cuda.Stream(device=device)
@@ -231,14 +228,14 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         for r in range(3):
             _exact(mono.projection(r), outs[r], f"{label} {'QKV'[r]} projection")
         factors = [None, None]
-        if across:
+        if row_factor is not None:
             for r in range(2):
                 factors[r] = mono.factors(r).clone()
-                # The kernel adds the heads' sums of squares in order.
-                sq = torch.zeros(rows, device=device)
+                # The kernel adds the heads' partials in order.
+                total = torch.zeros(rows, device=device)
                 for h in range(heads):
-                    sq = sq + parts[r][0, :, h]
-                expected = torch.rsqrt(sq / R + EPS)
+                    total = total + parts[r][0, :, h]
+                expected = row_factor.reference_finish(total, R)
                 err = checkAllclose(
                     expected,
                     factors[r],
@@ -246,12 +243,12 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
                     atol=0,
                     msg=f"{label} {'QK'[r]} factors: ",
                 )
-                assert err == 0, f"{label} {'QK'[r]} RMS factors differ from PyTorch"
+                assert err == 0, f"{label} {'QK'[r]} row factors differ from PyTorch"
         inputs = []
         for r in range(3):
             value = outs[r].view(rows, R)
-            if r < 2 and across and not per_tensor_qk:
-                # MX Q/K take BF16 values that include the RMS factor.
+            if r < 2 and row_factor is not None and not per_tensor_qk:
+                # MX Q/K take BF16 values that include the row factor.
                 value = (value.float() * factors[r][:, None]).to(torch.bfloat16)
             inputs.append(value.view(1, rows, heads, HEAD_DIM))
         # The push reads inputs made on this stream.
@@ -263,7 +260,9 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
                     inputs[r],
                     stream=side,
                     row_scale=(
-                        factors[r] if r < 2 and per_tensor_qk and across else None
+                        factors[r]
+                        if r < 2 and per_tensor_qk and row_factor is not None
+                        else None
                     ),
                 )
                 for r in range(3)

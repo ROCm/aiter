@@ -35,7 +35,7 @@ from .kernels import (
 # Callers pack the fused weight for gemm="a6w6" in this row order.
 from .kernels.gemm_a6w6_4wave_host import host_weight_order  # noqa: F401
 from .kernels.gemm_hooks import GemmHooks
-from .kernels.qk_prep_epilogue import HEAD_DIM, PrepSpec
+from .kernels.qk_prep import HEAD_DIM, PrepSpec
 from .kernels.tensor_shim import _run_compiled
 from .pre_attention_monokernel_layout import role_layouts
 
@@ -166,7 +166,6 @@ class PreAttentionMonokernel:
         prep,
         valid_kv_len=None,
         softmax_scale=None,
-        eps=1e-6,
     ):
         from mori.cco import (
             GDA_CONNECTION_NONE,
@@ -216,7 +215,6 @@ class PreAttentionMonokernel:
             self.prep,
             valid_kv_len,
             softmax_scale,
-            eps,
             workgroups,
             xcds,
             gemm,
@@ -311,15 +309,14 @@ class PreAttentionMonokernel:
             tiles_per_role,
             workgroups,
             xcds,
-            across_heads=self.prep.norm == "rms_across_heads",
+            row_factor=self.prep.row_factor,
             head_dim=HEAD_DIM,
-            eps=eps,
         )
-        # Everything the hooks were built from that the GEMM's name does not cover.
+        # Everything the hooks were built from that the GEMM's name does not cover; the
+        # prep's tags, the row-factor op's among them, are in the GEMM's name.
         key = (
             f"pam{_source_key()}{self.profile.name.replace('-', '')}m{rows}"
             f"k{self.layouts[1].sequence}r{rank}w{world_size}c{workgroups}x{xcds}"
-            + (f"e{eps:g}" if eps != 1e-6 else "")
             + (f"s{softmax_scale:g}" if softmax_scale is not None else "")
         )
         host = {
@@ -329,7 +326,6 @@ class PreAttentionMonokernel:
             "prep": self.prep,
             "roles": 3,
             "role_cols": self.role_cols,
-            "eps": eps,
             "hooks": GemmHooks(role_hook, first_block_hook, tile_hook, key),
             "col_amax_offset": (
                 plan.vpc if self.layouts[2].scale == "channel" else None
@@ -344,9 +340,7 @@ class PreAttentionMonokernel:
         torch.cuda.synchronize()
         self.comm.barrier()
 
-    def __call__(
-        self, x_q, x_scale, weight, columns, cos=None, sin=None, weight_scale=None
-    ):
+    def __call__(self, x_q, x_scale, weight, columns, tables=None, weight_scale=None):
         """One call; returns the packed (payload, scale) of Q, K and V.
 
         INT8 host: ``x_q``: INT8 ``[rows, K]`` activations, ``x_scale``: their FP32 row
@@ -357,18 +351,17 @@ class PreAttentionMonokernel:
         them. ``weight`` and ``weight_scale``: the fused Q/K/V weight's rows in the host
         layout (``w[host_weight_order(3 * heads * 128)]``), packed the same way.
 
-        ``columns``: FP32 per column of the fused weight: the scales (unused by the A6W6
-        host), then the biases (``prep.bias``), then the norm weights (with a norm; V's are
-        unused), Q's and K's multiplied by 128 ** -0.5 with ``prep.hadamard``.
-        ``cos``/``sin``: FP32 ``[rows, 64]`` per token and rotation pair (with RoPE).
+        ``columns``: FP32 per column of the fused weight, as ``prep.pack_columns`` packs
+        them: the scales (unused by the A6W6 host), then the biases (``prep.bias``), then
+        the prep's column vectors (V's are unused). ``tables``: the prep's FP32 tables,
+        ``[rows, prep.table_width]``, as ``prep.pack_tables`` packs them (with tables).
 
         The results alias this call's half of the receive buffers, which a peer refills two
         calls later; consumers run on this stream before then.
         """
         rows, n = self.rows, 3 * self.role_cols
         prep = self.prep
-        column_sets = 1 + prep.bias + (prep.norm != "none")
-        rope = prep.rope != "none"
+        column_sets = 1 + prep.bias + len(prep.columns)
         if self.gemm == "a6w6":
             from aiter.ops.gemm_op_a6w6 import mxfp6_gemm_pack_size
 
@@ -389,11 +382,8 @@ class PreAttentionMonokernel:
         for name, tensor, dtype, numel in (
             operands + (("columns", columns, torch.float32, column_sets * n),)
         ) + (
-            (
-                ("cos", cos, torch.float32, rows * 64),
-                ("sin", sin, torch.float32, rows * 64),
-            )
-            if rope
+            (("tables", tables, torch.float32, rows * prep.table_width),)
+            if prep.tables
             else ()
         ):
             if (
@@ -407,8 +397,8 @@ class PreAttentionMonokernel:
                     f"{name} must be a contiguous {dtype} tensor of {numel} elements on "
                     f"{self.device}"
                 )
-        if not rope:
-            cos = sin = columns
+        if not prep.tables:
+            tables = columns
         self.generation += 1
         scales = (x_scale.view(-1),) + (
             (weight_scale.view(-1),) if self.gemm == "a6w6" else ()
@@ -420,8 +410,7 @@ class PreAttentionMonokernel:
             self.planar,
             *scales,
             columns.view(-1),
-            cos.view(-1),
-            sin.view(-1),
+            tables.view(-1),
             self.partials,
             self.aux.data_ptr(),
             self.planar.data_ptr(),
@@ -460,8 +449,8 @@ class PreAttentionMonokernel:
         return self.planar.view(3, self.rows, self.role_cols)[role]
 
     def factors(self, role):
-        """The RMS factors of Q (0) or K (1) of the last call, FP32 [rows], for a norm
-        across heads."""
+        """The row factors of Q (0) or K (1) of the last call, FP32 [rows], for a prep with
+        a row-factor op."""
         start = self._factors_at // 4 + role * self.rows
         return self.aux[start : start + self.rows]
 
