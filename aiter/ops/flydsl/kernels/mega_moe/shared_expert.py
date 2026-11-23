@@ -38,7 +38,7 @@ from .gemm1 import _LdsF32View, do_tile_la
 from .gemm_util import _PACK, AS2RLoader, AScaleLoader, ATileLoader, MfmaScaleGU, wait_lds_barrier
 
 __all__ = ["shared_gemm1", "shared_gemm2", "compile_shared_gemm1", "compile_shared_gemm2", "build_shared_tile",
-    "RefActQuantEpilogue", "Bf16RowsEpilogue", "dense_gate_up_ksplit"]
+    "build_shared_half_tiles", "RefActQuantEpilogue", "Bf16RowsEpilogue", "dense_gate_up_ksplit", "PARTIAL_UNIT_BYTES"]
 
 SORT_BLOCK_M = 32
 TILE_N = 256
@@ -47,6 +47,8 @@ K_STEP = 256
 THREADS = NUM_WAVES * 64
 M_REPEAT = SORT_BLOCK_M // 16
 NUM_ACC_N = TILE_N // NUM_WAVES // 16
+# build_shared_half_tiles: bytes of one tile's first-half partials in memory (16 bytes per accumulator and thread).
+PARTIAL_UNIT_BYTES = THREADS * M_REPEAT * NUM_ACC_N * 16
 # A store index past every buffer bound (megamoe's spelling of a dropped store).
 _OOB = 0x40000000
 # MODE's FP32 denormal field of a FlyDSL kernel (denormals kept); silu_mul_quant_epilogue flushes them.
@@ -276,6 +278,13 @@ class _KOffsetAScale:
         return self._inner.load_step(lds_ascale, fx.Int32(kstep_i32) + fx.Int32(self._k_steps))
 
 
+class _KOffsetAScaleOwn(_KOffsetAScale):
+    """_KOffsetAScale for a workgroup that runs only the second K half: it stages the tile's scales itself."""
+
+    def stage(self, *args, **kwargs):
+        return self._inner.stage(*args, **kwargs)
+
+
 class _KOffsetB:
     """A B weight or B scale loader shifted by whole K-steps."""
 
@@ -349,6 +358,43 @@ class _SumPartials:
         total = [
             (Vec.filled(4, 0.0, fx.Float32) + self._first.load(index)) + Vec(p1) for index, p1 in enumerate(acc)
         ]
+        self._epilogue.store(total, *args, **kwargs)
+
+
+def partial_slot(unit, thread, index):
+    """16-byte slot, in the partials buffer, of accumulator ``index`` of thread ``thread`` of tile ``unit``: a
+    thread's accumulators fill two cache lines of its own."""
+    return (unit * THREADS + thread) * (M_REPEAT * NUM_ACC_N) + index
+
+
+class _StorePartials:
+    """Epilogue stand-in of a split-K tile's first half when another workgroup runs the second: the accumulators
+    go to memory as raw FP32 (``partial_slot``), written through so that the other workgroup's XCD reads them."""
+
+    def __init__(self, rsrc, unit, store_cm):
+        self._rsrc, self._unit, self._store_cm = rsrc, unit, int(store_cm)
+
+    def store(self, acc, *args, **kwargs):
+        assert len(acc) == M_REPEAT * NUM_ACC_N
+        for index, a in enumerate(acc):
+            buf_copy_store(self._rsrc, partial_slot(self._unit, fx.thread_idx.x, index), Vec(a).bitcast(fx.Int32),
+                fx.Int32, unit_elems=4, cache_modifier=self._store_cm)
+
+
+class _SumStoredPartials:
+    """Epilogue of a split-K tile's second half on its own workgroup: ``wait()`` (the first half's partials are in
+    memory), then ``0 + p0 + p1`` (the dense split-K merge, as _SumPartials) and the real epilogue."""
+
+    def __init__(self, rsrc, unit, wait, epilogue):
+        self._rsrc, self._unit, self._wait, self._epilogue = rsrc, unit, wait, epilogue
+
+    def store(self, acc, *args, **kwargs):
+        assert len(acc) == M_REPEAT * NUM_ACC_N
+        self._wait()
+        total = []
+        for index, p1 in enumerate(acc):
+            p0 = Vec(buf_copy_load(self._rsrc, partial_slot(self._unit, fx.thread_idx.x, index), fx.Int32, unit_elems=4))
+            total.append((Vec.filled(4, 0.0, fx.Float32) + p0.bitcast(fx.Float32)) + Vec(p1))
         self._epilogue.store(total, *args, **kwargs)
 
 
@@ -571,6 +617,60 @@ def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim
             _KOffsetB(b_loader, half), _KOffsetB(b_scale, half), _SumPartials(first, epilogue), half)
 
     return run
+
+
+# fmt: off
+def build_shared_half_tiles(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim, epilogue, a_buf, a_scale_lds,
+    part_addr, n_tiles, units, wait, gate_up_half=0, b_cache_modifier=0, store_cm=0):
+# fmt: on
+    """``(first(m_tile, n_tile), second(m_tile, n_tile))``: the two K halves of build_shared_tile(ksplit=2)'s tile
+    as two runners for two workgroups, with the same numbers. ``first`` runs K steps [0, K / 2) from zero and
+    leaves its accumulators in memory at ``part_addr`` (PARTIAL_UNIT_BYTES per tile, tile = m_tile * ``n_tiles`` +
+    n_tile, ``units`` tiles in all; stores with ``store_cm``); its caller then tells the other workgroup. ``second`` runs
+    K steps [K / 2, K) from zero, calls ``wait()`` (returns once the first half's partials are readable), sums
+    ``0 + p0 + p1`` and runs ``epilogue``. Other arguments as build_shared_tile."""
+    k_iters = k_dim // K_STEP
+    half = k_iters // 2
+    assert k_dim % K_STEP == 0 and k_iters % 2 == 0 and half >= 2
+    n_scale = k_dim // 32
+    scale_bytes = (rows * fx.Int32(n_scale) + fx.Int32(15)) & fx.Int32(-16)
+    a_gather = ATileLoader(row_bytes=k_dim, sort_block_m=SORT_BLOCK_M, k_step_bytes=K_STEP, total_threads=THREADS,
+        swizzle=True, x_tensor=_byte_tensor(x_addr), async_copy=False, a_dtype="fp8")
+    a_s2r = AS2RLoader(k_step_bytes=K_STEP, swizzle=True, a_dtype="fp8")
+    a_scale = AScaleLoader(
+        scale_rsrc=ptr_buf_tensor(fx.Int64(scale_x_addr), fx.Int32, unit_elems=4, num_records_bytes=scale_bytes),
+        m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
+    b_loader = BWeightLoaderF8(w_rsrc=ptr_buf_tensor(fx.Int64(w_addr), fx.Int32, unit_elems=4), num_acc_n=NUM_ACC_N,
+        k_dim=k_dim, cache_modifier=b_cache_modifier, gate_up_half=gate_up_half)
+    b_scale = BScaleLoaderRow32(scale_rsrc=ptr_buf_tensor(fx.Int64(scale_w_addr), fx.Int32), num_acc_n=NUM_ACC_N,
+        k_dim=k_dim, gate_up_half=gate_up_half)
+    part = ptr_buf_tensor(fx.Int64(part_addr), fx.Int32, unit_elems=4,
+        num_records_bytes=units * fx.Int32(PARTIAL_UNIT_BYTES))
+    mfma = MfmaScaleF8B(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N)
+    sched = _NoExpert()
+    a_lds_i32 = SORT_BLOCK_M * K_STEP // 4
+    wave_base = (fx.thread_idx.x // 64) * fx.Int32(TILE_N // NUM_WAVES)
+
+    def tile(m_tile, n_tile, a_g, a_sc, b_l, b_sc, epi):
+        n_tile_base = wave_base + n_tile * fx.Int32(TILE_N)
+        tile_row_base = m_tile * fx.Int32(SORT_BLOCK_M)
+        left = rows - tile_row_base
+        meta = (tile_row_base, (left < fx.Int32(SORT_BLOCK_M)).select(left, fx.Int32(SORT_BLOCK_M)))
+        # fmt: off
+        do_tile_la(m_tile, n_tile_base, fx.Int32(0), sched, a_g, a_s2r, b_l, b_sc, a_sc, mfma, epi, a_buf,
+            a_scale_lds, a_lds_i32, half, M_REPEAT, NUM_ACC_N, K_STEP, None, None, 1, None, meta, 1)
+        # fmt: on
+
+    def first(m_tile, n_tile):
+        unit = m_tile * fx.Int32(n_tiles) + n_tile
+        tile(m_tile, n_tile, a_gather, a_scale, b_loader, b_scale, _StorePartials(part, unit, store_cm))
+
+    def second(m_tile, n_tile):
+        unit = m_tile * fx.Int32(n_tiles) + n_tile
+        tile(m_tile, n_tile, _KOffsetA(a_gather, half * K_STEP), _KOffsetAScaleOwn(a_scale, half),
+            _KOffsetB(b_loader, half), _KOffsetB(b_scale, half), _SumStoredPartials(part, unit, wait, epilogue))
+
+    return first, second
 
 
 def _lds_struct(k_dim, c_tile_bytes, ksplit=1):
