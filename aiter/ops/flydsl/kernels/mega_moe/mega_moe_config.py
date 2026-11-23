@@ -349,6 +349,10 @@ class FusedStage1Knobs:
     # 16: the same for the combine's publisher (its flags to the peers without the L2 invalidate / writeback).
     # The same stores and flags, so the output is bit-identical and ranks need not agree.
     disp_order: int = 0
+    # Small-input fused kernel, rank-local flags without an L2 writeback (bits; 0: off). 1: the GEMM2-ready epoch of an
+    # m-tile (its GEMM2 runs on the XCD whose L2 holds it, or its cut parts were each released before they were
+    # counted); 2 (with plan_wt): the plan flag. Bit-identical; ranks need not agree.
+    sync_lean: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -524,7 +524,7 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, str
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, lean_flag=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -593,8 +593,13 @@ def emit_direct_fixed_slot_finalize(
             comm_ops.fence_system_release()
         if lane == fx.Int32(0):
             nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
-            comm_ops.store_i64_global_system(
-                plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
+            plan_flag_value = (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag)
+            if const_expr(lean_flag and plan_wt):
+                # The plan went through to memory (plan_wt) and drained: the flag needs no L2 writeback.
+                fx.generic_store(comm_ops._to_ptr_global(plan_nv[0], fx.Int64, 8), plan_flag_value,
+                    memory_order=fx.AtomicOrdering.Monotonic, syncscope="one-as")
+            else:
+                comm_ops.store_i64_global_system(plan_nv[0], plan_flag_value)
     fx.barrier()
 
 
@@ -972,7 +977,7 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, g2_b2stage: bool = False, probe: str = "",
-    expert_cached_w: int = 0, m2: str = "", shared_add: bool = False, disp_order: int = 0,
+    expert_cached_w: int = 0, m2: str = "", shared_add: bool = False, disp_order: int = 0, sync_lean: int = 0,
 ):
     # ``shared_add`` (default False = unchanged kernel): the launch's ``addr_in_sc`` argument (otherwise
     # unused) is the address of the caller's BF16 shared-expert output; the combine adds each token's row to it in
@@ -991,6 +996,9 @@ def compile_mega_moe_stage1(
     # emit_direct_fixed_slot_payload. The same stores and flags, so the output is bit-identical and ranks need not
     # agree.
     assert 0 <= disp_order <= 31, disp_order
+    # ``sync_lean`` (FusedStage1Knobs.sync_lean, default 0 = unchanged kernel): bit 1 GEMM2-ready epochs, bit 2 the plan
+    # flag (with plan_wt) as relaxed stores without an L2 writeback. Bit-identical; ranks need not agree.
+    assert 0 <= sync_lean <= 3, sync_lean
     probe_skip = frozenset(p for p in probe.split("+") if p)
     # "null" (benchmarks only): the launch runs an empty kernel of the same grid, block and arguments -- the
     # launch floor of the bench graph. It touches no protocol state, so launches of other variants stay in step.
@@ -1199,6 +1207,7 @@ def compile_mega_moe_stage1(
         f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
         f"{'_sha' if shared_add else ''}"
         f"{f'_do{disp_order}' if disp_order else ''}"
+        f"{f'_snc{sync_lean}' if sync_lean else ''}"
         f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
     )
 
@@ -1395,6 +1404,7 @@ def compile_mega_moe_stage1(
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
+                lean_flag=bool(sync_lean & 2),
                 stream_w=stream_w,
             )
         wave_id = fx.thread_idx.x // 64
@@ -1639,7 +1649,15 @@ def compile_mega_moe_stage1(
                 if old_cnt + inc == fx.Int32(N_TILES):
                     # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
                     # (a max would stick at 0xffffffff).
-                    comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), gate_epoch)
+                    if const_expr(sync_lean & 1):
+                        # sync_lean bit 1: no L2 writeback before the ready epoch. A GEMM2 unit of an m-tile GEMM1 did
+                        # not cut runs on the XCD whose L2 holds the tile (store completion), and each part of a cut
+                        # m-tile was written back by its own release before it was counted.
+                        fx.generic_store(comm_ops._to_ptr_global(a_g2_ready + fx.Int64(m) * fx.Int64(4)),
+                            fx.Int32(gate_epoch), memory_order=fx.AtomicOrdering.Monotonic,
+                            syncscope=fx.rocdl.SyncScope.AgentOneAs)
+                    else:
+                        comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), gate_epoch)
                     # All counts of this launch are in: rewind to 0, since the next launch's config may use another
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
@@ -1880,6 +1898,8 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     # FusedStage1Knobs.disp_order (default 0: no knob, kernel name and cache key unchanged).
     if getattr(k1, "disp_order", 0):
         extra["disp_order"] = int(k1.disp_order)
+    if getattr(k1, "sync_lean", 0):
+        extra["sync_lean"] = int(k1.sync_lean)
     # fmt: off
     return dict(  # noqa: C408
         **extra,
