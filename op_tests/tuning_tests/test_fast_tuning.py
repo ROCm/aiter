@@ -164,20 +164,23 @@ class TestMxfp4ActivationPrecision(unittest.TestCase):
     def test_ep_drops_scatter_and_partial_dispatch_buffers(self):
         from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
+        situv2 = dict(self.row, act_type="ActivationType.Situv2")
+
         def epilogs(tuner):
             return {
                 parse_flydsl_v2_gemm2_kernel(c["kernelName2"])["epilog"]
-                for c in tuner._candidate_rows(self.row)
+                for c in tuner._candidate_rows(situv2)
             }
 
         self.assertIn("scatter", epilogs(self.tuner))
         self.tuner._configuration = {"swiglu_limit": None, "ep_size": 32}
         self.assertEqual(epilogs(self.tuner), {"atomic", "reduce"})
-        self.assertIsNone(self.tuner._unsupported_row_reason(self.row))
+        self.assertIsNone(self.tuner._unsupported_row_reason(situv2))
         self.assertIn(
             "multiple of 32",
-            self.tuner._unsupported_row_reason(dict(self.row, token=48)),
+            self.tuner._unsupported_row_reason(dict(situv2, token=48)),
         )
+        self.assertIn("SiTUv2", self.tuner._unsupported_row_reason(self.row))
         self.assertEqual(self.moe.Mxfp4FlydslTuner._stage2_ep_args({}), {})
         ep_data = {"expert_mask": "mask", "topk_ids": "ids"}
         self.assertEqual(
@@ -186,7 +189,8 @@ class TestMxfp4ActivationPrecision(unittest.TestCase):
         )
 
     def test_ep_drops_bm16_for_both_precisions(self):
-        a4w4 = dict(self.row, q_dtype_a=str(self.moe.dtypes.fp4x2))
+        a8w4 = dict(self.row, act_type="ActivationType.Situv2")
+        a4w4 = dict(a8w4, q_dtype_a=str(self.moe.dtypes.fp4x2))
 
         def block_ms(row):
             return {c["block_m"] for c in self.tuner._candidate_rows(row)}
@@ -196,8 +200,9 @@ class TestMxfp4ActivationPrecision(unittest.TestCase):
         # Rank 0 gets about 4 local routes over 8 experts, so M_est is 1, which
         # the M_est rules hand to BM16 only.
         self.assertLess(self.tuner._m_est(a4w4), 4)
-        for row in (a4w4, self.row):
+        for row in (a4w4, a8w4):
             with self.subTest(q_dtype_a=row["q_dtype_a"]):
+                self.assertIsNone(self.tuner._unsupported_row_reason(row))
                 self.assertEqual(block_ms(row), {32, 64, 128})
 
     def test_fast_scan_prepares_mxfp8_shared_fixture(self):

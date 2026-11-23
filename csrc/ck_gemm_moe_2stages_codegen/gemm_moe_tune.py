@@ -7668,6 +7668,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         ep = self._ep_size()
         if ep and int(row["token"]) % ep:
             return f"EP{ep} dispatch buffer rows must be a multiple of {ep}"
+        # The runtime rejects other activations for MXMOE under EP.
+        if ep and activation != "situv2":
+            return f"MXMOE under EP is only validated for SiTUv2, got {row.get('act_type')!r}"
         if not ep and int(row["topk"]) > int(row["expert"]):
             return "topk must not exceed expert count"
         return None
