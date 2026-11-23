@@ -310,6 +310,35 @@ namespace py = pybind11;
           py::arg("kid"),                     \
           py::arg("split_k"));
 
+#define OPUS_GEMM_A8W8_BLOCKSCALE_GROUPED_LAUNCH_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_grouped_launch",   \
+          &opus_gemm_a8w8_blockscale_grouped_launch,    \
+          "opus_gemm_a8w8_blockscale_grouped_launch",   \
+          py::arg("XQ"),                                \
+          py::arg("WQ"),                                \
+          py::arg("Y"),                                 \
+          py::arg("x_scale"),                           \
+          py::arg("w_scale"),                           \
+          py::arg("group"),                             \
+          py::arg("workspace"),                         \
+          py::arg("kid"),                               \
+          py::arg("masked"));
+
+#define OPUS_GEMM_A8W8_BLOCKSCALE_K_GROUPED_LAUNCH_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_k_grouped_launch",   \
+          &opus_gemm_a8w8_blockscale_k_grouped_launch,    \
+          "opus_gemm_a8w8_blockscale_k_grouped_launch",   \
+          py::arg("XQ"),                                  \
+          py::arg("WQ"),                                  \
+          py::arg("Y"),                                   \
+          py::arg("x_scale"),                             \
+          py::arg("w_scale"),                             \
+          py::arg("grouped_layout"),                      \
+          py::arg("C"),                                   \
+          py::arg("workspace"),                           \
+          py::arg("kid"),                                 \
+          py::arg("seg_len"));
+
 #define OPUS_GEMM_A8W8_LAUNCH_PYBIND     \
     m.def("opus_gemm_a8w8_launch",       \
           &opus_gemm_a8w8_launch,        \
