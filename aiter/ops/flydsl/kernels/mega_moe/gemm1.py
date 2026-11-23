@@ -7,12 +7,10 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value as _raw
 
 from ..tensor_shim import _run_compiled, ptr_buf_tensor
 from .gemm_util import (
@@ -390,9 +388,10 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
         a_regs = None
         if const_expr(a_next):
             if const_expr(a_ahead > 1):
-                # Opaque to LLVM, which would otherwise fold the load + LDS write into an LDS DMA issued here.
-                v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
-                a_regs = [Vec(llvm.inline_asm(v4, [_raw(v)], "", "=v,0", has_side_effects=True)) for v in aq.pop(0)]
+                # Inline asm: FlyDSL 0.5.3 has no optimization-barrier op; without this opaque copy LLVM folds the
+                # load + LDS write into an LDS DMA issued here (ISA: buffer_load ... lds).
+                v4 = fx.Vector.make_type(4, fx.Int32)
+                a_regs = [Vec(llvm.inline_asm(v4, [v.ir_value()], "", "=v,0", has_side_effects=True)) for v in aq.pop(0)]
             else:
                 a_regs = [v for _lb, v in a_gather.load_regs((sp + fx.Int32(1)) * fx.Int32(A_K_STEP_BYTES))]
 
