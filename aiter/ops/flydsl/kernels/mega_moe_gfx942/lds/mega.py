@@ -23,12 +23,15 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ...tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+from ..atomic import _atomic_add_at, _atomic_load_at, _latomic_add, _xcc_id
 from ..host import launcher
+from ..hw import _readlane
+from ..hw import _u as _uniform
 from .comm import ARRIVED, E_LOCAL, NPES, ROW_BITS, SCHED_EXPECTED
 from .down import down_task_emitter
 from .gateup import (
@@ -39,10 +42,9 @@ from .gateup import (
 from .util import (
     _load_i32,
     _rsrc_of,
-    _uniform,
-    atomic_add_i32,
+    buffer_load,
     buffer_rsrc_at,
-    load_i32_atomic,
+    buffer_store,
     spin_wait_ge,
 )
 
@@ -132,22 +134,9 @@ def compile_ep_mega(
         tid = fx.thread_idx.x
         lane = tid % 64
         wave = _uniform(tid // 64)
-        zero = fx.Int32(0).ir_value()
-        aux = ir.IntegerAttr.get(T.i32, P2P_AUX)
         lds = fx.SharedAllocator().allocate(SharedTiles).peek()
         sched = fx.Int64(fx.ptrtoint(pSched))
         rows_cap = num_blocks * SORT_BLOCK_M
-
-        def hwreg(name):
-            return fx.Int32(
-                llvm.inline_asm(
-                    T.i32,
-                    [],
-                    f"s_getreg_b32 $0, hwreg({name})",
-                    "=s",
-                    has_side_effects=True,
-                )
-            )
 
         def ticket_slot(index):
             return fx.make_view(lds.ab.ptr + index, fx.make_layout(1, 1))
@@ -173,12 +162,16 @@ def compile_ep_mega(
             """
             taken = fx.Int32(0)
             if lane == 0:
+                # Raw asm: FlyDSL 0.5.2 has no stable opaque value. With a plain zero the kernel has 37 more
+                # instructions (gfx942 compile-only probe, wq fp4).
                 lane_zero = fx.Int32(
                     llvm.inline_asm(
                         T.i32, [], "v_mov_b32 $0, 0", "=v", has_side_effects=True
                     )
                 )
-                taken = atomic_add_i32(fx.Int64(addr) + fx.Int64(lane_zero), value)
+                taken = _atomic_add_at(
+                    fx.Int64(addr) + fx.Int64(lane_zero), value, "agent-one-as"
+                )
             return taken
 
         def take_ticket(after_task=False, prefetched=None):
@@ -188,14 +181,14 @@ def compile_ep_mega(
             """
             if const_expr(after_task):
                 # The previous task's last LDS reads are done before the slots are overwritten.
-                rocdl.s_barrier()
+                gpu.barrier()
             # Wave-uniform branches only around barriers (a lane-divergent one lets LLVM move the barrier).
             if wave == 0:
                 # This XCD's queue first (its blocks then share the XCD's L2), the others once it is empty. Plain
                 # loads find the queues that may still hold tasks: once all are handed out, the leftover workgroups
                 # of the (over-sized) grid exit after one round of loads instead of contending atomics (an atomic
                 # per leftover workgroup, even on the home queue only, slows the tasks still running).
-                home = hwreg("HW_REG_XCC_ID") & (queues - 1)
+                home = _xcc_id()
                 cand = home
                 got = fx.Int32(-1)
                 if const_expr(prefetched is not None):
@@ -205,7 +198,7 @@ def compile_ep_mega(
                     open_mask = fx.Int32(0)
                     for q in range_constexpr(queues):
                         seen = _uniform(
-                            load_i32_atomic(sched + fx.Int64(q * 4), "agent-one-as")
+                            _atomic_load_at(sched + fx.Int64(q * 4), "agent-one-as")
                         )
                         open_mask = open_mask | (
                             seen < queue_tasks(fx.Int32(q))
@@ -222,11 +215,11 @@ def compile_ep_mega(
                 ticket_slot(0).store(Vec.from_elements([cand], fx.Int32))
                 ticket_slot(1).store(Vec.from_elements([got], fx.Int32))
             rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_barrier()
+            gpu.barrier()
             queue = _uniform(Vec(ticket_slot(0).load())[0])
             ticket = _uniform(Vec(ticket_slot(1).load())[0])
             rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_barrier()
+            gpu.barrier()
             return queue, ticket
 
         def produce(index):
@@ -250,16 +243,11 @@ def compile_ep_mega(
                 )
 
             def peer_rsrc(which, rank, num_bytes):
-                lo, hi = [
-                    fx.Uint32(rocdl.readlane(T.i32, half.ir_value(), rank.ir_value()))
-                    for half in bases[which]
-                ]
+                lo, hi = [fx.Uint32(_readlane(half, rank)) for half in bases[which]]
                 return buffer_rsrc_at((fx.Uint64(hi) << 32) | fx.Uint64(lo), num_bytes)
 
             def lane_value(values, j):
-                return fx.Int32(
-                    rocdl.readlane(T.i32, values.ir_value(), fx.Int32(j).ir_value())
-                )
+                return _readlane(values, fx.Int32(j))
 
             def token_slot(route):
                 """(token, slot) of a route index token * topk + slot (route >= 0)."""
@@ -276,28 +264,15 @@ def compile_ep_mega(
             # under this chunk's loads, was measured slower overall: the GateUp tasks of the first blocks then run
             # against more memory and power contention.)
             chunks = (num_routes + (CHUNK - 1)) // CHUNK
-            counter = llvm.inttoptr(
-                ir.Type.parse("!llvm.ptr<3>"),
-                fx.Int32(fx.ptrtoint(lds.ab.ptr + 2)).ir_value(),
-            )
             if wave == 0:
                 ticket_slot(2).store(Vec.from_elements([fx.Int32(0)], fx.Int32))
             rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_barrier()
+            gpu.barrier()
 
             def claim():
                 taken = fx.Int32(0)
                 if lane == 0:
-                    taken = fx.Int32(
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.add,
-                            counter,
-                            fx.Int32(1).ir_value(),
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="workgroup",
-                            alignment=4,
-                        ).result
-                    )
+                    taken = _latomic_add(fx.Int32(fx.ptrtoint(lds.ab.ptr)), 2, 1)
                 return taken
 
             chunk = index + producers * _uniform(claim())
@@ -317,25 +292,19 @@ def compile_ep_mega(
                     ok = lane_value(sends, j) != 0
                     token, slot = token_slot(route)
                     data = [
-                        rocdl.raw_ptr_buffer_load(
+                        buffer_load(
                             T.i32x4,
                             x_rsrc,
-                            ok.select(
-                                lane * 16 + part * 1024 + token * H, oob
-                            ).ir_value(),
-                            zero,
-                            zero,
+                            ok.select(lane * 16 + part * 1024 + token * H, oob),
                         )
                         for part in range_constexpr(H // 1024)
                     ]
-                    scales = rocdl.raw_ptr_buffer_load(
+                    scales = buffer_load(
                         T.i32x4,
                         xs_rsrc,
-                        (ok & scale_lane)
-                        .select(lane * 16 + token * (scale_lanes * 16), oob)
-                        .ir_value(),
-                        zero,
-                        zero,
+                        (ok & scale_lane).select(
+                            lane * 16 + token * (scale_lanes * 16), oob
+                        ),
                     )
                     weight = _load_i32(w_rsrc, ok.select(route * 4, oob))
                     pending.append(
@@ -355,55 +324,46 @@ def compile_ep_mega(
                     dest = ok.select(info >> (row_bits + 5), fx.Int32(0))
                     a_dst = peer_rsrc(0, dest, rows_cap * H)
                     for part in range_constexpr(H // 1024):
-                        rocdl.raw_ptr_buffer_store(
+                        buffer_store(
                             data[part],
                             a_dst,
-                            ok.select(
-                                lane * 16 + part * 1024 + row * H, oob
-                            ).ir_value(),
-                            zero,
-                            aux=aux,
+                            ok.select(lane * 16 + part * 1024 + row * H, oob),
+                            aux=P2P_AUX,
                         )
-                    rocdl.raw_ptr_buffer_store(
+                    buffer_store(
                         scales,
                         peer_rsrc(1, dest, rows_cap * (scale_lanes * 16)),
-                        (ok & scale_lane)
-                        .select(lane * 16 + row * (scale_lanes * 16), oob)
-                        .ir_value(),
-                        zero,
-                        aux=aux,
+                        (ok & scale_lane).select(
+                            lane * 16 + row * (scale_lanes * 16), oob
+                        ),
+                        aux=P2P_AUX,
                     )
-                    row_off = (ok & (lane == 0)).select(row * 4, oob).ir_value()
+                    row_off = (ok & (lane == 0)).select(row * 4, oob)
                     down_id = (me << token_shift | token) | (slot << 24)
-                    rocdl.raw_ptr_buffer_store(
+                    buffer_store(
                         down_id.ir_value(),
                         peer_rsrc(2, dest, rows_cap * 4),
                         row_off,
-                        zero,
-                        aux=aux,
+                        aux=P2P_AUX,
                     )
-                    rocdl.raw_ptr_buffer_store(
+                    buffer_store(
                         weight.ir_value(),
                         peer_rsrc(3, dest, rows_cap * 4),
                         row_off,
-                        zero,
-                        aux=aux,
+                        aux=P2P_AUX,
                     )
                 rocdl.s_waitcnt(vmcnt=0)
                 expert = infos >> row_bits
-                source = ((expert >> 5) & (NPES - 1)) * 4
+                source = (expert >> 5) & (NPES - 1)
                 ws_lo, ws_hi = [
-                    fx.Uint32(
-                        rocdl.ds_bpermute(T.i32, source.ir_value(), half.ir_value())
-                    )
-                    for half in bases[4]
+                    fx.Uint32(fx.gpu.shuffle_idx(half, source, 64)) for half in bases[4]
                 ]
                 block_of_row = (infos & ((1 << row_bits) - 1)) // SORT_BLOCK_M
                 arrived = fx.Int64(
                     (fx.Uint64(ws_hi) << 32) | fx.Uint64(ws_lo)
                 ) + fx.Int64((ARRIVED + block_of_row) * 4)
                 if send:
-                    atomic_add_i32(arrived, 1, "one-as")
+                    _atomic_add_at(arrived, 1, "one-as")
                 chunk = index + producers * _uniform(claimed)
 
         def prefetch_hook():
@@ -413,9 +373,7 @@ def compile_ep_mega(
             holder = []
 
             def hook():
-                queue_addr = sched + fx.Int64(
-                    (hwreg("HW_REG_XCC_ID") & (queues - 1)) * 4
-                )
+                queue_addr = sched + fx.Int64(_xcc_id() * 4)
                 taken = fx.Int32(-1)
                 if wave == 0:
                     # Read back only at the next take_ticket: the epilogue's own loads retire it on the way.
@@ -430,7 +388,8 @@ def compile_ep_mega(
             """
             # An opaque copy of rows_cap: with rows_cap itself, LLVM merges the products here and the GateUp's equal
             # ones into a VGPR phi after this branch, and wraps the GateUp's row-id and K-loop scale loads (their
-            # descriptor and soffset) in waterfall loops.
+            # descriptor and soffset) in waterfall loops. Raw asm: FlyDSL 0.5.2 has no stable opaque value. With
+            # rows_cap itself the kernel has 248 more instructions (gfx942 compile-only probe, wq fp4).
             rows = fx.Int32(
                 llvm.inline_asm(
                     T.i32,
@@ -449,23 +408,19 @@ def compile_ep_mega(
                 sorted_row * (KB * 4) + half * (KB * 2), fx.Int32(OOB_OFFSET)
             )
             parts = [
-                Vec(
-                    rocdl.raw_ptr_buffer_load(
-                        T.i32x4, src, (src_offset + i * 16).ir_value(), zero, zero
-                    )
-                )
+                Vec(buffer_load(T.i32x4, src, src_offset + i * 16))
                 for i in range_constexpr(KB // 8)
             ]
             for i in range_constexpr(KB // 2):
-                rocdl.raw_ptr_buffer_store(
+                buffer_store(
                     parts[i // 4][i % 4].ir_value(),
                     dst,
-                    (sorted_row * 4).ir_value(),
-                    ((half * (KB // 2) + i) * rows * 4).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 16),
+                    sorted_row * 4,
+                    (half * (KB // 2) + i) * rows * 4,
+                    aux=16,
                 )
             rocdl.s_waitcnt(vmcnt=0)
-            rocdl.s_barrier()
+            gpu.barrier()
             if wave == 0:
                 lane0_add(flag, 1)
 
@@ -482,10 +437,10 @@ def compile_ep_mega(
             if wave == 0:
                 # scaled[b] is set after arrived[b] was complete.
                 if tile == 0:
-                    spin_wait_ge(arrived, expected, "one-as", True)
+                    spin_wait_ge(arrived, expected, "one-as")
                 else:
-                    spin_wait_ge(scaled, 1, "agent-one-as", True)
-            rocdl.s_barrier()
+                    spin_wait_ge(scaled, 1, "agent-one-as")
+            gpu.barrier()
             if tile == 0:
                 transpose_block_scales(block, expected, scaled)
             hook, holder = prefetch_hook()
@@ -507,7 +462,7 @@ def compile_ep_mega(
                 rows=expected,
             )
             rocdl.s_waitcnt(vmcnt=0)
-            rocdl.s_barrier()
+            gpu.barrier()
             if wave == 0:
                 lane0_add(
                     sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4), 1
@@ -527,9 +482,8 @@ def compile_ep_mega(
                     sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4),
                     NG,
                     "agent-one-as",
-                    True,
                 )
-            rocdl.s_barrier()
+            gpu.barrier()
             hook, holder = prefetch_hook()
             emit_down(
                 lds,
@@ -633,6 +587,9 @@ def compile_ep_mega(
 
         def reload_args():
             """Kernel arguments and thread id read again through values LLVM cannot see through."""
+            # Raw intrinsic, asm and loads: FlyDSL 0.5.2 has no stable way to re-read a kernel argument or an opaque
+            # value. With the plain arguments LLVM hoists every task kind's address math out of the task loop: VGPR
+            # spills 2 -> 26 (wq fp8: 5 -> 41) and SGPR spills 56 -> 252 (44 -> 205; gfx942 compile-only probe).
             ptr4 = ir.Type.parse("!llvm.ptr<4>")
             segment = llvm.call_intrinsic(
                 ptr4, "llvm.amdgcn.kernarg.segment.ptr", [], [], []

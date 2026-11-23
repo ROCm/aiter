@@ -17,15 +17,14 @@ sorted block b receives, [SCHED_EXPECTED + s_cap / BLOCK_M + b] GateUp tiles fin
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr import const_expr, gpu, range_constexpr
 
 from ...tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+from ..atomic import _atomic_add_at
 from ..host import launcher
-from .gateup import _load_i32, _rsrc_of
-from .util import atomic_add_i32, fence, global_ptr
+from ..hw import _sleep
+from ..mem import _pointer
+from .util import _load_i32, _rsrc_of
 
 NPES = 8
 E_LOCAL = 32
@@ -79,51 +78,51 @@ def _addr(ptr, index, elem_bytes=4):
     return fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(index) * elem_bytes
 
 
-def _load(addr, ordering=None):
-    """i32 at an i64 global address; ordering (an llvm.AtomicOrdering name) makes it atomic at system scope."""
-    kw = (
-        {} if ordering is None else {"ordering": getattr(llvm.AtomicOrdering, ordering)}
+def _ordering(name):
+    """fx.AtomicOrdering of None (not atomic), "monotonic", "acquire" or "release"."""
+    return (
+        fx.AtomicOrdering.NotAtomic
+        if name is None
+        else getattr(fx.AtomicOrdering, name.capitalize())
     )
-    return fx.Int32(llvm.LoadOp(T.i32, global_ptr(addr), alignment=4, **kw).result)
+
+
+def _load(addr, ordering=None):
+    """i32 at an i64 global address; an ordering makes it atomic at system scope."""
+    return fx.generic_load(
+        _pointer(addr, fx.Int32, 4), memory_order=_ordering(ordering)
+    )
 
 
 def _store(addr, value, ordering=None):
-    kw = (
-        {} if ordering is None else {"ordering": getattr(llvm.AtomicOrdering, ordering)}
+    fx.generic_store(
+        _pointer(addr, fx.Int32, 4), fx.Int32(value), memory_order=_ordering(ordering)
     )
-    llvm.StoreOp(fx.Int32(value).ir_value(), global_ptr(addr), alignment=4, **kw)
 
 
 def _load_i64(addr):
-    return fx.Int64(llvm.LoadOp(T.i64, global_ptr(addr), alignment=8).result)
+    return fx.generic_load(_pointer(addr, fx.Int64, 8))
 
 
 def _lds_ptr(lds, index):
-    return llvm.inttoptr(
-        ir.Type.parse("!llvm.ptr<3>"), (lds + fx.Int32(index) * 4).ir_value()
+    return fx.inttoptr(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 4),
+        lds + fx.Int32(index) * 4,
     )
 
 
 def _lds_load(lds, index):
     """i32 at element `index` of an LDS array at byte address `lds`."""
-    return fx.Int32(llvm.LoadOp(T.i32, _lds_ptr(lds, index), alignment=4).result)
+    return fx.generic_load(_lds_ptr(lds, index))
 
 
 def _lds_store(lds, index, value):
-    llvm.StoreOp(fx.Int32(value).ir_value(), _lds_ptr(lds, index), alignment=4)
+    fx.generic_store(_lds_ptr(lds, index), fx.Int32(value))
 
 
 def _lds_add(lds, index, value):
     """LDS fetch-add; returns the old value."""
-    op = llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add,
-        _lds_ptr(lds, index),
-        fx.Int32(value).ir_value(),
-        llvm.AtomicOrdering.monotonic,
-        syncscope="workgroup",
-        alignment=4,
-    )
-    return fx.Int32(op.result)
+    return fx.atomic_add(_lds_ptr(lds, index), fx.Int32(value), syncscope="workgroup")
 
 
 def _lds_base(storage):
@@ -131,13 +130,11 @@ def _lds_base(storage):
 
 
 def _sync_threads():
-    fence("release", "workgroup")
-    rocdl.s_barrier()
-    fence("acquire", "workgroup")
+    gpu.barrier()
 
 
 def _fence_system():
-    llvm.FenceOp(llvm.AtomicOrdering.seq_cst)
+    fx.memory_fence()
 
 
 def _min(a, b):
@@ -160,7 +157,7 @@ def _round_block(rows):
 def _wait_eq_sys(addr, value):
     seen = _load(addr, "acquire")
     while seen != value:
-        rocdl.s_sleep(1)
+        _sleep(1)
         seen = _load(addr, "acquire")
 
 
@@ -487,7 +484,7 @@ def _compile_ep_plan():
             key_routes = _lds_load(lds, L_KEY_COUNT + tid)
             reserved = fx.Int32(0)
             if key_routes > 0:
-                reserved = atomic_add_i32(
+                reserved = _atomic_add_at(
                     _addr(pPlan, PLAN_KEY_CURSOR + tid), key_routes, "agent"
                 )
             _lds_store(

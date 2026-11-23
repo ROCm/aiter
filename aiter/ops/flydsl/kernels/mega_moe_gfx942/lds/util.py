@@ -6,71 +6,31 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import rocdl
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import range_constexpr
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T, is_target_address_space
 from flydsl.expr.typing import Vector as Vec
 
+from ..atomic import _atomic_load_at, _inv_l1
 from ..cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
-
-
-def global_ptr(addr):
-    """!llvm.ptr<1> at the i64 byte address `addr`."""
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.Int64(addr).ir_value())
-
-
-def atomic_add_i32(addr, value, scope="agent-one-as"):
-    """Monotonic i32 fetch-add at an i64 address ("agent-one-as": device, "one-as": system); returns the old value."""
-    op = llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add,
-        global_ptr(addr),
-        fx.Int32(value).ir_value(),
-        llvm.AtomicOrdering.monotonic,
-        syncscope=scope,
-        alignment=4,
-    )
-    return fx.Int32(op.result)
-
-
-def load_i32_atomic(addr, scope="agent-one-as"):
-    """Monotonic i32 load at an i64 address, coherent at `scope` (for polling a flag)."""
-    i32 = ir.IntegerType.get_signless(32)
-    return fx.Int32(
-        llvm.LoadOp(
-            i32,
-            global_ptr(addr),
-            alignment=4,
-            ordering=llvm.AtomicOrdering.monotonic,
-            syncscope=scope,
-        ).result
-    )
-
-
-def fence(ordering, scope="agent-one-as"):
-    """LLVM fence: "release" writes back dirty L2 lines and waits for prior memory ops, "acquire" invalidates caches."""
-    llvm.FenceOp(getattr(llvm.AtomicOrdering, ordering), syncscope=scope)
+from ..hw import _sleep
 
 
 @flyc.jit
-def spin_wait_ge(addr, target, scope, l1_only=False):
-    """Poll the i32 at `addr` until it is >= target, then acquire at `scope`.
+def spin_wait_ge(addr, target, scope):
+    """Poll the i32 at `addr` until it is >= target, then invalidate the L1 (`buffer_inv sc0`).
 
-    l1_only: invalidate only the L1 instead (`buffer_inv sc0`). On gfx942 the scoped acquire also walks the L2 for
-    non-local (MTYPE NC) lines; local memory lines are kept coherent by probes, so data in local memory that was
-    written through (or written back) before the flag needs only the L1 invalidated.
+    On gfx942 a scoped acquire also walks the L2 for non-local (MTYPE NC) lines; local memory lines are kept coherent
+    by probes, so data in local memory that was written through (or written back) before the flag needs only the L1
+    invalidated.
     """
-    seen = load_i32_atomic(addr, scope)
+    seen = _atomic_load_at(addr, scope)
     while seen < target:
-        fx.rocdl.s_sleep(2)
-        seen = load_i32_atomic(addr, scope)
-    if l1_only:
-        llvm.inline_asm(
-            ir.Type.parse("!llvm.void"), [], "buffer_inv sc0", "", has_side_effects=True
-        )
-    else:
-        fence("acquire", scope)
+        _sleep(2)
+        seen = _atomic_load_at(addr, scope)
+    _inv_l1()
 
 
 def buffer_rsrc_at(addr, num_bytes):
@@ -140,6 +100,7 @@ class BufferTensor(fx.Tensor):
         if not isinstance(aux, int):
             raise TypeError("aux: expected a compile-time int")
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        # Raw buffer load, for the soffset (see buffer_load).
         result = rocdl.RawPtrBufferLoadOp(
             ir.VectorType.get([bits // 32], fx.Uint32.ir_type),
             resource,
@@ -169,17 +130,63 @@ def _rsrc_of(ptr, num_records_bytes):
     return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
 
 
-def _load_i32(rsrc, voffset):
-    zero = fx.Int32(0).ir_value()
-    return fx.Int32(
-        fx.rocdl.raw_ptr_buffer_load(
-            T.i32, rsrc, fx.Int32(voffset).ir_value(), zero, zero
-        )
+def buffer_load(ty, rsrc, voffset, soffset=0):
+    """`ty` at byte offset voffset (per lane) + soffset (wave uniform) of the buffer resource `rsrc`; a lane whose
+    offset is past the resource's range reads 0."""
+    # Raw buffer load: the offsets are found at run time (sorted ids, routes, masked lanes at OOB_OFFSET), which has
+    # no layout form for fx.copy, and FlyDSL 0.5.2's buffer copy atoms take no soffset (wave-uniform offsets in
+    # soffset keep them out of the VGPRs).
+    return fx.rocdl.raw_ptr_buffer_load(
+        ty, rsrc, fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), None
     )
 
 
-def _uniform(value):
-    return fx.Int32(fx.rocdl.readfirstlane(T.i32, value.ir_value()))
+def buffer_store(value, rsrc, voffset, soffset=0, aux=0):
+    """Store the SSA `value` at byte offset voffset (per lane) + soffset (wave uniform) of `rsrc`; a lane whose
+    offset is past the range stores nothing. aux: cache bits (sc0 1, nt 2, sc1 16)."""
+    # Raw buffer store: as buffer_load, and FlyDSL 0.5.2's buffer copy atoms set no cache bits but nt, while these
+    # stores write through (sc1: another XCD sees the data after a vmcnt wait) or to a peer (sc0 sc1 nt).
+    rocdl.raw_ptr_buffer_store(
+        value,
+        rsrc,
+        fx.Int32(voffset).ir_value(),
+        fx.Int32(soffset).ir_value(),
+        aux=ir.IntegerAttr.get(T.i32, aux),
+    )
+
+
+def _load_i32(rsrc, voffset):
+    return fx.Int32(buffer_load(T.i32, rsrc, voffset))
+
+
+def readlane_f32(value, lane):
+    """The f32 `value` of the wave-uniform, run-time `lane`, in an SGPR."""
+    # Raw readlane, for an f32: as hw._readlane (fx.gpu.shuffle_idx gives v_readlane only for a compile-time lane).
+    return fx.Float32(
+        fx.rocdl.readlane(T.f32, value.ir_value(), fx.Int32(lane).ir_value())
+    )
+
+
+def set_priority(level):
+    """s_setprio `level` for the waves of this workgroup."""
+    # Raw: FlyDSL 0.5.2 has no stable s_setprio (not in fx.rocdl.__all__).
+    fx.rocdl.s_setprio(level)
+
+
+def _fp8_fragment(word):
+    """MFMA operand fragment: the 8 FP8 values of an i64."""
+    fragment = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float8E4M3FNUZ)
+    fragment.store(Vec.from_elements([word], fx.Int64).bitcast(fx.Float8E4M3FNUZ))
+    return fragment
+
+
+def mfma_fp8(target, a, b, accumulate):
+    """target (4 x f32 registers) = a x b + (target if accumulate else 0) with one 16x16x32 FP8 MFMA; a and b are
+    i64 words of 8 FP8 values."""
+    if not accumulate:
+        target.store(Vec.filled(4, 0.0, fx.Float32))
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+    fx.gemm(atom, target, _fp8_fragment(a), _fp8_fragment(b), target)
 
 
 # a8w4's fd2 W (weights.prepare_weights): a 16-row group's 128-K chunk is 1 KiB, lane q * 16 + r
@@ -207,13 +214,7 @@ def load_fd2(w_packet, scale_rsrc, voffsets, soffsets, k_block):
         )
     )
     s = fx.Int32(
-        fx.rocdl.raw_ptr_buffer_load(
-            T.i32,
-            scale_rsrc,
-            fx.Int32(voffsets[1]).ir_value(),
-            fx.Int32((k_block >> 1) * 256 + soffsets[1]).ir_value(),
-            fx.Int32(0).ir_value(),
-        )
+        buffer_load(T.i32, scale_rsrc, voffsets[1], (k_block >> 1) * 256 + soffsets[1])
     )
     return Vec.from_elements([fx.Int32(w[0]), fx.Int32(w[1]), s, s], fx.Int32)
 

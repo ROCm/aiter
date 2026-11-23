@@ -25,20 +25,25 @@ from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ..hw import _sched_fence
+from ..hw import _u as _uniform
 from .util import (
     BufferTensor,
     _load_i32,
     _rsrc_of,
-    _uniform,
+    buffer_load,
+    buffer_store,
     decode_fd2,
     fd2_channel_factors,
     fd2_lane_offsets,
     load_fd2,
+    mfma_fp8,
+    readlane_f32,
+    set_priority,
 )
 
 SORT_BLOCK_M = 256
@@ -149,9 +154,9 @@ def gateup_task_emitter(
             tid = fx.thread_idx.x
         lane = tid % 64
         wave = tid // 64
-        group = fx.Int32(rocdl.readfirstlane(T.i32, (tid // 256).ir_value()))
+        group = _uniform(tid // 256)
         wave_m = group
-        wave_n = fx.Int32(rocdl.readfirstlane(T.i32, (wave % 4).ir_value()))
+        wave_n = _uniform(wave % 4)
         rsrc_of, load_i32 = _rsrc_of, _load_i32
 
         if active:
@@ -216,7 +221,6 @@ def gateup_task_emitter(
             fp8_scale_rsrc = rsrc_of(
                 pScaleC, num_blocks * (SORT_BLOCK_M * (I // 128) * 4)
             )
-            zero = fx.Int32(0).ir_value()
 
             def task_scale_b(expert, n_tile):
                 """B scale of (side, K block) in lane side * KB + block."""
@@ -227,14 +231,12 @@ def gateup_task_emitter(
                     KB * 4
                 ) + (scale_lane - scale_side * KB) * 4
                 return fx.Float32(
-                    rocdl.raw_ptr_buffer_load(
+                    buffer_load(
                         T.f32,
                         scale_b_rsrc,
-                        (scale_lane < 2 * KB)
-                        .select(scale_b_offset, fx.Int32(OOB_OFFSET))
-                        .ir_value(),
-                        zero,
-                        zero,
+                        (scale_lane < 2 * KB).select(
+                            scale_b_offset, fx.Int32(OOB_OFFSET)
+                        ),
                     )
                 )
 
@@ -339,22 +341,15 @@ def gateup_task_emitter(
                     )
 
                 def load_scale_a(k_block, j):
-                    value = rocdl.raw_ptr_buffer_load(
-                        T.f32,
-                        scale_a_rsrc,
-                        fx.Int32(sa_offsets[j]).ir_value(),
-                        fx.Int32(k_block * num_tokens * 4).ir_value(),
-                        zero,
+                    value = buffer_load(
+                        T.f32, scale_a_rsrc, sa_offsets[j], k_block * num_tokens * 4
                     )
                     return Vec.from_elements([fx.Float32(value)], fx.Float32)
 
                 def scale_b(side, k_block):
                     if const_expr(FP4):  # folded into the decode and the epilogue
                         return fx.Float32(1.0)
-                    index = fx.Int32(side * KB) + k_block
-                    return fx.Float32(
-                        rocdl.readlane(T.f32, sb_lanes.ir_value(), index.ir_value())
-                    )
+                    return readlane_f32(sb_lanes, fx.Int32(side * KB) + k_block)
 
                 return SimpleNamespace(
                     load_a=load_a,
@@ -364,9 +359,9 @@ def gateup_task_emitter(
                 )
 
             def barrier():
-                rocdl.sched_barrier(0)
-                rocdl.s_barrier()
-                rocdl.sched_barrier(0)
+                _sched_fence()
+                gpu.barrier()
+                _sched_fence()
 
             # The streamed operand (A) stages all four packets of the next block, the held one (B) two slots.
             s_stage = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Int32)
@@ -439,21 +434,14 @@ def gateup_task_emitter(
                             n_slice = n_pair[inner]
                             a_value = streamed[m_slice % 2][half_k][word]
                             b_value = held_word(n_slice, half_k, word)
-                            accumulator = (
-                                Vec.filled(4, 0.0, fx.Float32)
-                                if k_step == 0
-                                else Vec(partial[None, base + inner].load())
-                            )
-                            partial[None, base + inner].store(
-                                Vec(
-                                    rocdl.mfma_f32_16x16x32_fp8_fp8(
-                                        T.f32x4,
-                                        [b_value, a_value, accumulator, 0, 0, 0],
-                                    )
-                                )
+                            mfma_fp8(
+                                partial[None, base + inner],
+                                b_value,
+                                a_value,
+                                k_step > 0,
                             )
                             # Keep MFMA -> FMA order: the FMA's partial then has two MFMAs of XDL latency cover.
-                            rocdl.sched_barrier(0)
+                            _sched_fence()
                             if const_expr(mfma_index == 0):
                                 a_scale = Vec(
                                     scale_a[None, stage % 2 * 2 + m_slice % 2].load()
@@ -466,7 +454,7 @@ def gateup_task_emitter(
                                 )
                             # Retire one element of the previous pair under each MFMA.
                             retire_element(previous, (pair_id + 1) % 2, mfma_index)
-                            rocdl.sched_barrier(0)
+                            _sched_fence()
                     previous = (m_slice, n_pair, side)
 
             def retire(pair, scale=None):
@@ -517,7 +505,7 @@ def gateup_task_emitter(
                         )
                         if const_expr(stage == 3):
                             write_h(3, h_stage[None, 1].load(), 1 - parity)
-                    rocdl.sched_barrier(0)
+                    _sched_fence()
                     if const_expr(stage == 0):
                         read_held()
                     # Streamed A slices 2s, 2s+1 of this stage.
@@ -528,7 +516,7 @@ def gateup_task_emitter(
                         ]
                         for i in range_constexpr(2)
                     ]
-                    rocdl.sched_barrier(0)
+                    _sched_fence()
                     for next_i in range_constexpr(2):
                         if const_expr(stage < 3):
                             scale_a[None, (stage + 1) % 2 * 2 + next_i].store(
@@ -543,10 +531,10 @@ def gateup_task_emitter(
                         load_h(ops, k_next, stage, stage % 2)
                     if const_expr(stage == 2):
                         load_h(ops, k_next, 3, 1)
-                    rocdl.sched_barrier(0)
+                    _sched_fence()
                     rocdl.s_waitcnt(lgkmcnt=0)
                     barrier()
-                    rocdl.s_setprio(3)
+                    set_priority(3)
                     if const_expr(stage > 0):
                         # A packet `stage` holds block rows [64 stage, 64 stage + 64).
                         if rows > stage * PACKET_ROWS:
@@ -554,7 +542,7 @@ def gateup_task_emitter(
                     else:
                         issue_pairs(ops, k_block, stage, streamed, previous)
                     previous = stage_pairs(stage)[3]
-                    rocdl.s_setprio(0)
+                    set_priority(0)
                     barrier()
 
             def k_loop(ops):
@@ -591,13 +579,14 @@ def gateup_task_emitter(
                     gate = gate_values[element]
                     up = up_values[element]
                     if const_expr(swiglu_limit > 0):
-                        gate = fx.arith.minnumf(gate, fx.Float32(swiglu_limit))
-                        up = fx.arith.maxnumf(
-                            fx.arith.minnumf(up, fx.Float32(swiglu_limit)),
+                        gate = fx.minnumf(gate, fx.Float32(swiglu_limit))
+                        up = fx.maxnumf(
+                            fx.minnumf(up, fx.Float32(swiglu_limit)),
                             fx.Float32(-swiglu_limit),
                         )
-                    exponent = fx.Float32(rocdl.exp2(T.f32, (gate * -LOG2E).ir_value()))
-                    inverse = fx.Float32(rocdl.rcp(T.f32, (exponent + 1.0).ir_value()))
+                    exponent = fx.exp2(gate * -LOG2E, fastmath="afn")
+                    with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
+                        inverse = fx.Float32(1.0) / (exponent + 1.0)
                     result.append(gate * inverse * up)
                 return result
 
@@ -607,7 +596,7 @@ def gateup_task_emitter(
                 ).bitcast(fx.Float32)
                 peak = partial[0]
                 for wave_col in range_constexpr(1, col_waves):
-                    peak = fx.arith.maxnumf(peak, partial[wave_col])
+                    peak = fx.maxnumf(peak, partial[wave_col])
                 return peak
 
             def fp8_epilogue(block, n_tile):
@@ -627,16 +616,13 @@ def gateup_task_emitter(
                     peak = fx.Float32(0.0)
                     for gate_values in values[m_slice]:
                         for value in gate_values:
-                            peak = fx.arith.maxnumf(peak, fx.math.absf(value))
-                    # Lanes l, l ^ 16, l ^ 32, l ^ 48 hold this wave's other columns of row l % 16.
+                            peak = fx.maxnumf(peak, fx.absf(value))
+                    # Lanes l, l ^ 16, l ^ 32, l ^ 48 hold this wave's other columns of row l % 16. shuffle_xor's
+                    # ds_swizzle raises the task loop's scratch ops from 2 to 9, and an unmasked index (lane is
+                    # opaque) keeps shuffle_idx's bounds check: each costs ~1% at 64 tokens per rank (wq fp4).
                     for shift in (16, 32):
-                        other = rocdl.ds_bpermute(
-                            T.i32,
-                            fx.Int32((lane ^ shift) * 4).ir_value(),
-                            peak.bitcast(fx.Int32).ir_value(),
-                        )
-                        peak = fx.arith.maxnumf(
-                            peak, fx.Int32(other).bitcast(fx.Float32)
+                        peak = fx.maxnumf(
+                            peak, fx.gpu.shuffle_idx(peak, (lane ^ shift) & 63, 64)
                         )
                     if lane < 16:
                         lds_view(
@@ -648,8 +634,10 @@ def gateup_task_emitter(
                     row = slice_rows[m_slice] + lane % 16
                     amax = row_max(row)
                     # |x| <= amax keeps x * 240 / amax within the FP8 range after rounding.
+                    with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
+                        reciprocal = fx.Float32(1.0) / amax
                     inverse = (amax > 0.0).select(
-                        fx.Float32(rocdl.rcp(T.f32, amax.ir_value())) * FP8_MAX,
+                        reciprocal * FP8_MAX,
                         fx.Float32(0.0),
                     )
                     for gate in range_constexpr(gate_slices):
@@ -657,6 +645,9 @@ def gateup_task_emitter(
                             values[m_slice][gate][element] * inverse
                             for element in range_constexpr(4)
                         ]
+                        # cvt_pk_fp8_f32 is unstable (not in fx.rocdl.__all__); the stable conversion,
+                        # Vector.to(fx.Float8E4M3FNUZ), does not lower on FlyDSL 0.5.2 (arith.truncf has no LLVM
+                        # translation; gfx942 compile-only probe).
                         low = rocdl.cvt_pk_fp8_f32(
                             T.i32, q[0], q[1], fx.Int32(0), False
                         )
@@ -672,29 +663,23 @@ def gateup_task_emitter(
                 barrier()
                 for part in range_constexpr(4):
                     out_row = part * 64 + tid // 8
-                    rocdl.raw_ptr_buffer_store(
+                    buffer_store(
                         Vec(lds_view(_lds_dwords(out_row, tid % 8)).load()).ir_value(),
                         fp8_rsrc,
-                        (
-                            (block * SORT_BLOCK_M + out_row) * I
-                            + n_tile * TILE_N
-                            + tid % 8 * 16
-                        ).ir_value(),
-                        zero,
-                        aux=ir.IntegerAttr.get(T.i32, STORE_AUX),
+                        (block * SORT_BLOCK_M + out_row) * I
+                        + n_tile * TILE_N
+                        + tid % 8 * 16,
+                        aux=STORE_AUX,
                     )
                 scale_row = tid % SORT_BLOCK_M
                 scale_offset = (
                     (n_tile * num_blocks + block) * SORT_BLOCK_M + scale_row
                 ) * 4
-                rocdl.raw_ptr_buffer_store(
+                buffer_store(
                     (row_max(scale_row) * (1.0 / FP8_MAX)).ir_value(),
                     fp8_scale_rsrc,
-                    (tid < SORT_BLOCK_M)
-                    .select(scale_offset, fx.Int32(OOB_OFFSET))
-                    .ir_value(),
-                    zero,
-                    aux=ir.IntegerAttr.get(T.i32, STORE_AUX),
+                    (tid < SORT_BLOCK_M).select(scale_offset, fx.Int32(OOB_OFFSET)),
+                    aux=STORE_AUX,
                 )
 
             block, n_tile, expert = coords()
@@ -722,7 +707,7 @@ def gateup_task_emitter(
                     load_h(ops, 0, pro_packet, pro_packet % 2)
                 for pro_packet in range_constexpr(pair_begin, pair_begin + 2):
                     write_h(pro_packet, h_stage[None, pro_packet % 2].load())
-                rocdl.sched_barrier(0)
+                _sched_fence()
             for pro_slice in range_constexpr(2):
                 scale_a[None, pro_slice].store(ops.load_scale_a(0, pro_slice))
             for pro_packet in range_constexpr(4):
