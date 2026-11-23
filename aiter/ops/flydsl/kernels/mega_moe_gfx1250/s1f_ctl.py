@@ -198,6 +198,19 @@ def iod_placement_reason() -> str | None:
 _iod_warned = False
 
 
+def _s1f_reads_placed() -> bool:
+    """Whether the stage-1 GEMM1 reads an IOD-placed W1: its 256 x 256 n/k
+    tiles serve the placed layout when the builder reads placed weights."""
+    from aiter.ops.flydsl import iod_locality
+
+    from .s1f_stage1 import BUILDER_LOC
+
+    return bool(
+        BUILDER_LOC
+        and iod_locality.placed_ratio(iod_locality.W13_TILE, _S1F_TILE_N, _S1F_TILE_K)
+    )
+
+
 def blocking_reasons(config) -> list:
     """Why this compact config cannot build the stage-1 kernel.
 
@@ -207,7 +220,7 @@ def blocking_reasons(config) -> list:
     """
     reasons = []
     iod = iod_placement_reason()
-    if iod:
+    if iod and not _s1f_reads_placed():
         reasons.append(iod)
     if config.dispatch_wire != "fp4":
         reasons.append(f"needs the fp4 dispatch wire, got {config.dispatch_wire}")
@@ -538,11 +551,27 @@ class _Stage1Fusion:
         return opts
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        placed=(0, 1),
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            placed,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
@@ -576,6 +605,8 @@ class _Stage1Fusion:
                 ctas_per_cu=ctas_per_cu,
                 m_warp=m_warp,
                 n_warp=n_warp,
+                b_placed=placed[0],
+                loc_group=placed[1],
                 **self._gemm_opts(tile_m),
             )
             self.launches[key] = launch
@@ -604,7 +635,20 @@ class _Stage1Fusion:
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    @staticmethod
+    def _w1_placement(w, w_scales, N, K):
+        """W1's IOD phase table and (b_placed, loc_group); (None, (0, 1))
+        when it stayed unplaced."""
+        try:
+            from aiter.ops.flydsl.iod_locality import lookup
+        except ImportError:
+            return None, (0, 1)
+        table, bp, group = lookup(w, w_scales, int(N), int(K), _S1F_TILE_N, _S1F_TILE_K)
+        return (None, (0, 1)) if table is None else (table, (bp, group or 1))
+
+    def _precompile(
+        self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep, placed
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -634,6 +678,7 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                placed=placed,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -735,6 +780,7 @@ class _Stage1Fusion:
         bufs = {**self.d._slot_bufs(step["slot"])}
         if stream is None:
             stream = torch.cuda.current_stream()
+        loc_table, placed = self._w1_placement(w, w_scales, N, K)
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok, tile=align_m):
             packed = self._gemm_opts(tile).get("a_preshuffled", 0)
@@ -746,6 +792,7 @@ class _Stage1Fusion:
                 w_scales.view(torch.int32),
                 quant_scale.view(torch.uint8),
                 ptr_arg(psum_t),
+                ptr_arg(self.ctl if loc_table is None else loc_table),
                 self.d.res.arena.handle,
                 step["payload_ptr"],
                 step["scale_ptr"],
@@ -763,19 +810,20 @@ class _Stage1Fusion:
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
         # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
+        keys = {(t, int(stage1_act), q, placed) for t, q in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), placed))
         if not keys <= self.precompiled and (
             not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for t, act, q, pl in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, pl))
                 self._precompile(
                     launch_args,
                     tile_m=t,
                     group_m=group_m,
                     stage1_act=act,
                     quant_wmma_rep=q,
+                    placed=pl,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -784,6 +832,7 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            placed=placed,
         )
         self._run(
             launch,

@@ -67,6 +67,8 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
+import inspect
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -92,6 +94,10 @@ from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
     build_gemm_a8w4_tdm_task,
     launch_gemm_a8w4_tdm,
 )
+
+#: Whether the GEMM builder reads IOD-placed weights (``b_placed``,
+#: aiter.ops.flydsl.iod_locality); its task then takes their phase table.
+BUILDER_LOC = "b_placed" in inspect.signature(build_gemm_a8w4_tdm_task).parameters
 
 from . import tdm_prims as TDM
 from .compact_plan import (
@@ -1258,6 +1264,15 @@ def s1f_produce(pc):
     _ring_barrier()
 
 
+def _placed_kw(b_placed, loc_group):
+    """The builder's placed-B keywords for GEMM1 (none when W1 is unplaced)."""
+    if not b_placed:
+        return {}
+    if not BUILDER_LOC:
+        raise ValueError("this GEMM builder reads no IOD-placed weights")
+    return {"b_placed": b_placed, "loc_group": loc_group}
+
+
 def make_s1f_stage1(
     *,
     rank,
@@ -1295,13 +1310,16 @@ def make_s1f_stage1(
     lds_soa=0,
     out_preshuffled=0,
     a_preshuffled=0,
+    b_placed=0,
+    loc_group=1,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
     Launcher arguments (positional): ``arg_a2`` (GEMM1 fp4 output, tensor),
     ``arg_a1`` (disp_out rows, pointer), ``arg_w1`` (pointer),
     ``arg_a1_scale`` / ``arg_w1_scale`` / ``arg_a2_scale`` (tensors),
-    ``arg_psum`` (pointer), then i64 addresses ``arena, inp_tok, inp_scale,
+    ``arg_psum``, ``arg_loc`` (pointers; the last W1's IOD phase table when
+    ``b_placed`` reads it placed), then i64 addresses ``arena, inp_tok, inp_scale,
     inp_wts, send_list, runs, tile_src, ctl``, then ``i32_m`` (GEMM1 rows
     capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``stream``.
 
@@ -1491,6 +1509,7 @@ def make_s1f_stage1(
         arg_w1_scale: fx.Tensor,
         arg_a2_scale: fx.Tensor,
         arg_psum: fx.Pointer,
+        arg_loc: fx.Pointer,
         arena: fx.Int64,
         inp_tok: fx.Int64,
         inp_scale: fx.Int64,
@@ -1555,6 +1574,7 @@ def make_s1f_stage1(
             defer_c_wait=tile_m > 32 and g1_buffers > 2 and not lds_soa,
             tdm_snop=True,
             out_preshuffled=out_preshuffled,
+            **_placed_kw(b_placed, loc_group),
         )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
@@ -1589,6 +1609,7 @@ def make_s1f_stage1(
             arg_w1_scale: fx.Pointer,
             arg_a2_scale: fx.Pointer,
             arg_psum: fx.Pointer,
+            arg_loc: fx.Pointer,
             arena: fx.Int64,
             inp_tok: fx.Int64,
             inp_scale: fx.Int64,
@@ -2222,6 +2243,7 @@ def make_s1f_stage1(
                     arg_a1,
                     arg_a2_scale,
                     arg_a1,
+                    *((arg_loc,) if BUILDER_LOC else ()),
                     i32_m,
                     n1,
                     f32_swiglu_limit,
@@ -2244,6 +2266,7 @@ def make_s1f_stage1(
             fx.get_iter(arg_w1_scale),
             fx.get_iter(arg_a2_scale),
             arg_psum,
+            arg_loc,
             arena,
             inp_tok,
             inp_scale,
