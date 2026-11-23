@@ -628,14 +628,57 @@ def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
 #
 # "no schema can express it" -- a parameter whose type is AITER's own.
 _NOT_REGISTERED = {
-    "gemm_a8w8_blockscale_bpreshuffle": "out-buffer in the contract (`out`)",
-    "inverse_rope_group_quant": "out-buffer in the contract (`x_fp8`, `x_scale`)",
-    "mla_sparse_prefill": "out-buffer in the contract (`out`)",
-    "mla_sparse_prefill_v41": "out-buffer in the contract (`out`)",
-    "pa_decode_bf16": "out-buffer in the contract (`out`)",
-    "pa_fwd": "out-buffer in the contract (`out_`)",
+    "gemm_a16w16": (
+        "out-buffer in the contract (`out`); every caller reaches it through "
+        "the torch_compile_guard of `gemm_a16w16` or `gemm_a16w16_out`, which "
+        "is already one opaque op"
+    ),
+    "gemm_a16w16_activation": (
+        "out-buffer in the contract (`y`); every caller reaches it through the "
+        "torch_compile_guard of the Triton `gemm_a16w16_`, which is already one "
+        "opaque op"
+    ),
+    "gemm_a8w8_blockscale_out": (
+        "out-buffer in the contract (`y`), and no schema can express it "
+        "(`config` is a dict)"
+    ),
     "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
+    "mla_decode_fwd": (
+        "unannotated contract, and an out-buffer in it (`o`, which the first "
+        "result may be a view of)"
+    ),
+    "mla_sparse_prefill_v4": "out-buffer in the contract (`out`)",
+    "fp8_paged_mqa_logits": (
+        "it returns the Triton cache key, a str, which a custom op cannot "
+        "return (bench_deepgemm_attention.py reads it)"
+    ),
+    "flash_attn_varlen": (
+        "unannotated contract, an out-buffer in it (`out`), and a result whose "
+        "arity follows `return_lse` and `return_attn_probs`; its native path "
+        "is an autograd.Function that a registered op would cut off"
+    ),
+    "mla_prefill_ps": (
+        "out-buffers in the contract (`splitData`, `splitLse`, `output`); the "
+        "ctypes binding beneath it is already registered under its own name"
+    ),
+    "mla_reduce": (
+        "out-buffers in the contract (`final_output`, `final_lse`); the HIP "
+        "binding beneath it is already registered under its own name"
+    ),
+    "causal_conv1d_split_qkv": (
+        "unannotated contract (`metadata`), and it writes `conv_states` in place"
+    ),
+    "fused_recurrent_kda": (
+        "an out-buffer in the contract (`out`), state written in place "
+        "(`initial_state`, `conv_state`), and `config` is a dict no schema can "
+        "express"
+    ),
+    "fused_recurrent_kda_packed_decode": (
+        "an out-buffer in the contract (`out`), state written in place "
+        "(`initial_state`, `conv_state`), and `config` is a dict no schema can "
+        "express"
+    ),
     "sp_qkv_fused": "unannotated contract",
     "pertoken_quant": (
         "unannotated contract; and its body is pure torch, which inductor "

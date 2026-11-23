@@ -20,9 +20,10 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
-from .gfx1250_cluster import compute_mcast_masks
+from .gfx1250_cluster import compute_mcast_masks_runtime
 from .kernels_common import format_kernel_name
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
@@ -46,6 +47,7 @@ def launch_gemm_a8w8_256x256(
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
     arg_out: fx.Pointer,
+    i32_cm: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -53,7 +55,7 @@ def launch_gemm_a8w8_256x256(
     n_warp: Constexpr[int],
     out_is_f16: Constexpr[int],
     num_buffers: Constexpr[int],
-    cluster_m: Constexpr[int],
+    use_cluster: Constexpr[bool],
     cluster_n: Constexpr[int],
     is_mxscale: Constexpr[bool],
     block_size: Constexpr[int],
@@ -61,21 +63,28 @@ def launch_gemm_a8w8_256x256(
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
     fused_splitk: Constexpr[bool] = False,
-    bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
     k_tiles_class: Constexpr[int] = 2,
     b_scale_32x32: Constexpr[bool] = False,
     batched: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
+    fuse_quant_out: Constexpr[bool] = False,
 ):
-    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
+    """A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
+    compiled in; ``use_cluster`` is False only for a launch of one workgroup.
+
+    N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
     least 512 per split. ``k_tiles_class`` buckets the K-tiles per split:
     0 for <= 16, 1 for <= 64, 2 above; long K loops keep the early merge
     timeout on A/B and the plain K-loop schedule, which run faster there.
     ``b_scale_32x32``: the mxfp8_32 B scale is row-major ``[N/32, K/32]``.
     ``batched``: A ``[M, batch, K]``, A scale ``[M, batch, K/32]``, B and its
-    scale ``[batch, ...]``, C ``[M, batch, N]``."""
+    scale ``[batch, ...]``, C ``[M, batch, N]``.
+    ``fuse_quant_out``: the C tile is group-32 MXFP8-quantized in the
+    epilogue. ``arg_c`` is then the e4m3 C (same layout and ``ldc``) and
+    ``arg_out`` the row-major ``[M, ldc // 32]`` e8m0 scale, bit-matching ATOM
+    ``quantize_fp8`` of the bf16 output."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -84,9 +93,7 @@ def launch_gemm_a8w8_256x256(
         (128, 256, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 3),
     ), "only the tuned 2x2-wave profiles are supported"
-    assert (
-        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
-    ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
+    assert 1 <= cluster_n < 16, f"cluster_n must be 1..15, got {cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -100,9 +107,8 @@ def launch_gemm_a8w8_256x256(
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
     cluster_k = split_k if cluster_splitk else 1
     assert (
-        cluster_m * cluster_n * cluster_k <= 16
-    ), "all K splits must fit in one cluster with at most 16 workgroups"
-    use_cluster = cluster_m * cluster_n * cluster_k > 1
+        use_cluster or cluster_n * cluster_k == 1
+    ), "a plain launch has no cluster_n or K splits"
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
     WMMA_M = WMMA_N = 16
@@ -117,6 +123,17 @@ def launch_gemm_a8w8_256x256(
     assert not batched or (
         mx32 and split_k == 1 and not a_preshuffle and not a_scale_preshuffled
     ), "batched needs mxfp8_32, split_k=1 and row-major A and A scale"
+    assert not fuse_quant_out or (
+        mx32
+        and split_k == 1
+        and not a_preshuffle
+        and not a_scale_preshuffled
+        and persistent_n_tiles == 1
+        and not fused_splitk
+    ), (
+        "fuse_quant_out needs mxfp8_32, split_k=1, row-major A and A scale and "
+        "no persistent tiles"
+    )
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
     K_WS = tile_k // WMMA_K
@@ -172,6 +189,15 @@ def launch_gemm_a8w8_256x256(
     )
     partial_bytes = 4 if split_k > 1 else 2
     ARENA_B = max(PLANAR_END, tile_m * C_LDS_ROW * partial_bytes)
+    # Fused quant: e4m3 C tile (rows padded by 16 B) plus one e8m0 byte per
+    # 32 columns, both staged in LDS. A 32-column group is two adjacent 16x16
+    # tiles of one wave, so wmma_n_rep must be even.
+    C8_ROW = tile_n + 16
+    assert not fuse_quant_out or (
+        wmma_n_rep % 2 == 0 and tile_n % 32 == 0
+    ), "fuse_quant_out needs an even wmma_n_rep"
+    if fuse_quant_out:
+        ARENA_B = max(ARENA_B, tile_m * C8_ROW + tile_m * (tile_n // 32))
     # The compile target, not the host: AOT cross-compiles these gfx1250
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
     arch = get_rocm_arch().split(":", 1)[0]
@@ -240,13 +266,15 @@ def launch_gemm_a8w8_256x256(
     kernel_name = format_kernel_name(
         f"gemm_a8w8_mx{block_size}_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
-        f"_cm{cluster_m}_cn{cluster_n}"
+        f"_cn{cluster_n}"
+        + ("" if use_cluster else "_plain")
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
+        + ("_fq" if fuse_quant_out else "")
     )
 
     def _run_tile(
@@ -262,6 +290,7 @@ def launch_gemm_a8w8_256x256(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_out: fx.Pointer,
+        i32_cm: fx.Int32,
         tile_idx=0,
     ):
         K_TILES = i32_k // (tile_k * split_k)
@@ -291,7 +320,9 @@ def launch_gemm_a8w8_256x256(
         wave_n = wave % n_warp
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+            a_mask, b_mask = compute_mcast_masks_runtime(
+                local_x, local_y, i32_cm, cluster_n
+            )
         else:
             a_mask, b_mask = 0, 0
         cluster_plane = fx.Int32(0)
@@ -299,7 +330,7 @@ def launch_gemm_a8w8_256x256(
             # Multicast inputs only within the matching K split. The hardware
             # numbers workgroups X first, then Y, then Z inside the cluster.
             cluster_plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (
-                cluster_m * cluster_n
+                i32_cm * cluster_n
             )
             a_mask = fx.Int32(a_mask) << cluster_plane
             b_mask = fx.Int32(b_mask) << cluster_plane
@@ -482,9 +513,7 @@ def launch_gemm_a8w8_256x256(
                 )
                 if const_expr(not mx32 and use_cluster):
                     flat_wg = (
-                        fx.Int32(local_x)
-                        + fx.Int32(local_y) * cluster_m
-                        + cluster_plane
+                        fx.Int32(local_x) + fx.Int32(local_y) * i32_cm + cluster_plane
                     )
                     mask = 1 << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
             inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
@@ -1613,6 +1642,108 @@ def launch_gemm_a8w8_256x256(
                     atomQ, 0, fx.make_layout(1, 1), sQ, blkQ
                 )
                 fx.copy(atomQ, tQs[None, 0], tQg[None, 0])
+        elif const_expr(fuse_quant_out):
+            # Group-32 MXFP8 quant straight from the accumulators. A lane holds
+            # 8 consecutive columns of one row per 16x16 tile (kgrp*8), so a
+            # 32-column group is two adjacent tiles across lanes l and l^16:
+            # one cross-lane max, no bf16 staging. Values are first rounded to
+            # the output dtype, as the bf16 store does, so the codes match
+            # quantize_fp8 of that output (amax floored at 1e-10, e8m0 ceil).
+            from aiter.ops.flydsl.kernels.quant_utils import (
+                emit_cvt_scalef32_pk8_fp8_f32,
+                emit_mx_e8m0_scale,
+            )
+            from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+
+            s8 = fx.recast_iter(fx.Int8, arg_out)
+            lds8 = fx.recast_iter(fx.Int8, base_ptr)
+            gC8_base = fx.recast_iter(
+                fx.PointerType.get(fx.Int8.ir_type, arg_c.address_space), arg_c
+            )
+            GN = tile_n // 32
+            S8_OFF = tile_m * C8_ROW
+            v2i32_ty = T.vec(2, T.i32)
+            srow = ldc64 // 32  # scale row stride: one byte per 32 C columns
+            c8_off = blk_m64 * ldc64 + blk_n64
+            sbase_blk = blk_n64 // 32
+            if const_expr(batched):
+                c8_off = c8_off + bat * n64
+                sbase_blk = sbase_blk + bat * (n64 // 32)
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                for wp in range_constexpr(wmma_n_rep // 2):
+                    h0 = accs[wm * wmma_n_rep + 2 * wp].to(oc).to(fx.Float32)
+                    h1 = accs[wm * wmma_n_rep + 2 * wp + 1].to(oc).to(fx.Float32)
+                    amax = abs(h0[0])
+                    for t in range_constexpr(1, 8):
+                        amax = fx.maxnumf(amax, abs(h0[t]))
+                    for t in range_constexpr(8):
+                        amax = fx.maxnumf(amax, abs(h1[t]))
+                    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
+                    amax = fx.maxnumf(amax, fx.Float32(1e-10))
+                    e8 = emit_mx_e8m0_scale(
+                        amax,
+                        mode=MxScaleRoundModeInt.RoundUp,
+                        dtype=MxDtypeInt.FP8_E4M3,
+                    )
+                    scale_f32 = (fx.Int32(e8) << 23).bitcast(fx.Float32)
+                    p0 = emit_cvt_scalef32_pk8_fp8_f32(
+                        h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                    )
+                    p1 = emit_cvt_scalef32_pk8_fp8_f32(
+                        h1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                    )
+                    gcol = fx.Int64(wnb + wp * 32)
+                    # e4m3 bytes go through LDS so the global write is the
+                    # tile's coalesced TDM store.
+                    l_off = fx.Int64(row_rel) * C8_ROW + gcol + fx.Int64(kgrp * 8)
+                    fx.ptr_store(
+                        fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off)
+                    )
+                    fx.ptr_store(
+                        fx.Vector(p1).bitcast(fx.Int8),
+                        fx.add_offset(lds8, l_off + 16),
+                    )
+                    if kgrp == 0:
+                        fx.ptr_store(
+                            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
+                            fx.add_offset(
+                                lds8,
+                                fx.Int64(S8_OFF + row_rel * GN) + gcol // 32,
+                            ),
+                        )
+            workgroup_barrier(use_cluster=False)
+            # One row's GN scale bytes per thread: contiguous in the row-major
+            # scale, so each row is a single small store.
+            for rr in range_constexpr((tile_m + block - 1) // block):
+                srow_rel = fx.Int32(tid) + rr * block
+                if (srow_rel < tile_m) and (srow_rel < mn_oob):
+                    sv = fx.ptr_load(
+                        fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
+                        result_type=T.vec(GN, T.i8),
+                    )
+                    fx.ptr_store(
+                        fx.Vector(sv),
+                        fx.add_offset(
+                            s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
+                        ),
+                    )
+            C8_TILE = (tile_m, C8_ROW)
+            gtC8 = _gv(gC8_base, c8_off, (mn_oob, tile_n), (ldc64, 1))
+            atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
+                gtC8,
+                fx.make_layout(C8_TILE, (C8_ROW, 1)),
+                C8_TILE,
+                num_warps=num_waves,
+            )
+            blkC8 = fx.zipped_divide(coordC8, C8_TILE)[None, (0, None)]
+            sC8 = _view(lds8, (C8_TILE, 1), ((C8_ROW, 1), tile_m * C8_ROW))
+            tC8s, tC8g = fx.rocdl.cdna5.tdm_partition(
+                atomC8, wave, fx.make_layout(num_waves, 1), sC8, blkC8
+            )
+            fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
+            tdm_ops.tensor_wait(0)
         else:
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
@@ -1656,7 +1787,6 @@ def launch_gemm_a8w8_256x256(
                     split_idx=split_idx,
                     mn_oob=mn_oob,
                     flat_tile=_flat_tile,
-                    bounded_m=bounded_m,
                 )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
@@ -1695,7 +1825,9 @@ def launch_gemm_a8w8_256x256(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_out: fx.Pointer,
+        i32_cm: fx.Int32,
     ):
+        prefetch_kernel_code(num_waves)
         tile_args = (
             arg_c,
             arg_a,
@@ -1709,6 +1841,7 @@ def launch_gemm_a8w8_256x256(
             i32_lda,
             i32_ldc,
             arg_out,
+            i32_cm,
         )
         if const_expr(persistent_n_tiles == 1):
             _run_tile(*tile_args)
@@ -1719,14 +1852,15 @@ def launch_gemm_a8w8_256x256(
                 _run_tile(*tile_args, tile_idx)
             tdm_ops.tensor_wait(0)
 
+    cm = i32_cm if const_expr(use_cluster) else 1
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
+    gx = (((gx > 0).select(gx, fx.Int32(1)) + (cm - 1)) // cm) * cm
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx
     capped = (pow2 < m_run_max).select(pow2, fx.Int32(m_run_max))
     # A cluster spans consecutive bid_x, so the x extent must stay a whole number of cluster rows.
-    fits_cluster = (capped % fx.Int32(cluster_m)) == 0
+    fits_cluster = (capped % fx.Int32(cm)) == 0
     if const_expr(cluster_splitk or batched):
         # Keep grid.z for K splits or batches only, so every tile's splits belong
         # to the same hardware cluster, including grids with more than 32 M tiles.
@@ -1739,7 +1873,7 @@ def launch_gemm_a8w8_256x256(
     gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
     grid_arg = (m_run, gy_launch, batch if const_expr(batched) else m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
-    cluster_arg = (cluster_m, cluster_n, cluster_k) if use_cluster else None
+    cluster_arg = (cm, cluster_n, cluster_k) if use_cluster else None
     kernel_gemm_a8w8_256x256(
         arg_c,
         arg_a,
@@ -1753,11 +1887,7 @@ def launch_gemm_a8w8_256x256(
         i32_lda,
         i32_ldc,
         arg_out,
-        value_attrs={
-            "rocdl.cluster_dims": (
-                f"{cluster_m},{cluster_n},{cluster_k}" if use_cluster else None
-            )
-        },
+        i32_cm,
     ).launch(
         grid=grid_arg,
         block=(block, 1, 1),
