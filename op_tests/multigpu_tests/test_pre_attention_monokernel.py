@@ -3,9 +3,10 @@
 
 """Multi-rank correctness and timing for the pre-attention monokernel.
 
-One row per (world_size, profile, rows, heads, K, prep). Every row checks, on every rank
-and for two consecutive calls (both receive-buffer parities):
-  - the fused projections against the standalone INT8 prep and maxima GEMMs, bit for bit;
+One row per (world_size, profile, rows, heads, K, prep, gemm). Every row checks, on every
+rank and for two consecutive calls (both receive-buffer parities):
+  - the fused projections against the host GEMM's standalone prep and maxima GEMMs, bit for
+    bit;
   - Q's and K's RMS factors (norm across heads) against PyTorch;
   - every role's received payload and scale bytes against AttentionA2AIntraNodeOp's packed
     push of the same projections, bit for bit;
@@ -82,15 +83,19 @@ def _exact(actual, expected, label):
         raise AssertionError(f"{label}: mismatch")
 
 
-def _build(profile_name, rows, heads, K, prep_name):
+def _build(profile_name, rows, heads, K, prep_name, gemm):
     """The monokernel, its reference and a timed call for one case on this rank."""
     import flydsl.expr as fx
 
     from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
     from aiter.ops.flydsl.attention_a2a_profiles import attention_a2a_profile
+    from aiter.ops.flydsl.kernels.gemm_a6w6_4wave_host import compile_a6w6_host_4w
     from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import compile_int8_gemm_4w
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-    from aiter.ops.flydsl.pre_attention_monokernel import PreAttentionMonokernel
+    from aiter.ops.flydsl.pre_attention_monokernel import (
+        PreAttentionMonokernel,
+        host_weight_order,
+    )
     from aiter.ops.shuffle import shuffle_weight
 
     rank, world, device = _CTX.rank, _CTX.world_size, _CTX.device
@@ -103,10 +108,11 @@ def _build(profile_name, rows, heads, K, prep_name):
 
     # Weights are the same on every rank, tokens and positions are not.
     gen = torch.Generator(device=device).manual_seed(0)
-    weights, scales, biases, gammas = [], [], [], []
+    raw, weights, scales, biases, gammas = [], [], [], [], []
     gamma_scale = HEAD_DIM**-0.5 if prep.hadamard else 1.0
     for role in range(3):
         w = torch.randn(R, K, device=device, generator=gen, dtype=torch.bfloat16) * 0.02
+        raw.append(w)
         w_q, w_s = _quantize_rows(w)
         weights.append(w_q)
         scales.append(w_s)
@@ -117,16 +123,43 @@ def _build(profile_name, rows, heads, K, prep_name):
             if role < 2
             else torch.ones(R, device=device)
         )
-    fused = shuffle_weight(torch.cat(weights), layout=(16, 16)).contiguous()
+    gen = torch.Generator(device=device).manual_seed(100 + rank)
+    x = torch.randn(rows, K, device=device, generator=gen, dtype=torch.bfloat16)
+    angles = torch.rand(rows, HEAD_DIM // 2, device=device, generator=gen) * 6.28
+    cos, sin = angles.cos().contiguous(), angles.sin().contiguous()
+    cu = get_cu_num()
+    if gemm == "a6w6":
+        # MXFP6 operands; the weights' rows in the host layout. The A6W6 host applies
+        # no column scales: they stay as ones in their place.
+        scales = [torch.ones(R, device=device) for _ in range(3)]
+        x_op, x_scale = aiter.quant_mxfp6_gemm(x)
+        order = host_weight_order(3 * R).to(device)
+        fused, fused_scale = aiter.quant_mxfp6_gemm(torch.cat(raw)[order].contiguous())
+        order = host_weight_order(R).to(device)
+        role_ops = [aiter.quant_mxfp6_gemm(w[order].contiguous()) for w in raw]
+        K_PAD = -(-K // 128) * 128
+        prep_gemm = compile_a6w6_host_4w(
+            K=K_PAD, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS
+        )
+        amax_gemm = compile_a6w6_host_4w(
+            K=K_PAD, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
+        )
+    else:
+        x_op, x_scale = _quantize_rows(x)
+        fused = shuffle_weight(torch.cat(weights), layout=(16, 16)).contiguous()
+        fused_scale = None
+        role_ops = [
+            (shuffle_weight(w, layout=(16, 16)).contiguous(), None) for w in weights
+        ]
+        prep_gemm = compile_int8_gemm_4w(
+            K=K, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS
+        )
+        amax_gemm = compile_int8_gemm_4w(
+            K=K, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
+        )
     # B_scale per column: the scales, the biases with a bias, then the norm weights.
     bias_sets = [torch.cat(biases)] if prep.bias else []
     columns = torch.cat([torch.cat(scales), *bias_sets, torch.cat(gammas)])
-    gen = torch.Generator(device=device).manual_seed(100 + rank)
-    x_q, x_s = _quantize_rows(
-        torch.randn(rows, K, device=device, generator=gen, dtype=torch.bfloat16)
-    )
-    angles = torch.rand(rows, HEAD_DIM // 2, device=device, generator=gen) * 6.28
-    cos, sin = angles.cos().contiguous(), angles.sin().contiguous()
 
     mono = PreAttentionMonokernel(
         rank=rank,
@@ -139,15 +172,10 @@ def _build(profile_name, rows, heads, K, prep_name):
         prep=prep,
         valid_kv_len=valid_kv_len,
         eps=EPS,
+        gemm=gemm,
     )
 
-    # The standalone GEMMs.
-    cu = get_cu_num()
-    prep_gemm = compile_int8_gemm_4w(K=K, xcd_swizzle=8, num_cu=cu, prep=prep, eps=EPS)
-    amax_gemm = compile_int8_gemm_4w(
-        K=K, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
-    )
-    shuffled = [shuffle_weight(w, layout=(16, 16)).contiguous() for w in weights]
+    # The standalone GEMMs of the same host.
     outs = [
         torch.full((rows * R,), float("nan"), device=device, dtype=torch.bfloat16)
         for _ in range(3)
@@ -159,36 +187,25 @@ def _build(profile_name, rows, heads, K, prep_name):
     role_columns = [torch.cat([scales[r], *role_bias[r], gammas[r]]) for r in range(2)]
     role_columns.append(torch.cat([scales[2], *role_bias[2]]))
     stream = fx.Stream(torch.cuda.current_stream())
-    for role in range(2):
+    for role in range(3):
+        w_op, w_scale = role_ops[role]
+        tables = (cos.view(-1), sin.view(-1)) if role < 2 or gemm == "a6w6" else ()
         _run_compiled(
-            prep_gemm,
-            x_q.view(-1),
-            shuffled[role].view(-1),
+            prep_gemm if role < 2 else amax_gemm,
+            x_op.view(-1),
+            w_op.view(-1),
             outs[role],
-            x_s,
+            *((x_scale, w_scale) if gemm == "a6w6" else (x_scale,)),
             role_columns[role],
-            cos.view(-1),
-            sin.view(-1),
+            *tables,
             parts[role].view(-1),
             rows,
             R,
             stream,
         )
-    _run_compiled(
-        amax_gemm,
-        x_q.view(-1),
-        shuffled[2].view(-1),
-        outs[2],
-        x_s,
-        role_columns[2],
-        parts[2].view(-1),
-        rows,
-        R,
-        stream,
-    )
 
     def call():
-        return mono(x_q, x_s, fused, columns, cos, sin)
+        return mono(x_op, x_scale, fused, columns, cos, sin, weight_scale=fused_scale)
 
     # The A2A op's packed push of the standalone projections, as a framework builds it.
     per_tensor_qk = profile.codecs[0] in ("int8", "e4m3")
@@ -271,14 +288,14 @@ def _agree(world_size, failure, label):
 
 
 @benchmark()
-def test_monokernel(world_size, profile, rows, heads, K, prep):
-    label = f"{profile} rows={rows} heads={heads} K={K} {prep}"
+def test_monokernel(world_size, profile, rows, heads, K, prep, gemm):
+    label = f"{profile} rows={rows} heads={heads} K={K} {prep} {gemm}"
     mono = None
     for step in ("call 1", "call 2"):
         failure = None
         try:
             if mono is None:
-                mono, call, check = _build(profile, rows, heads, K, prep)
+                mono, call, check = _build(profile, rows, heads, K, prep, gemm)
             check(step)
         except Exception as exc:  # noqa: BLE001
             failure = exc
@@ -437,6 +454,14 @@ def main():
         "(RMSNorm per head, rotate-half RoPE, bias) or flux3 (RMSNorm per head, "
         "interleaved RoPE, no bias)",
     )
+    parser.add_argument(
+        "--gemms",
+        type=str,
+        nargs="*",
+        choices=("int8", "a6w6"),
+        default=["int8"],
+        help="host GEMM: int8 (INT8 4-wave) or a6w6 (MXFP6 A6W6 4-wave)",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
         aiter.logger.warning("the pre-attention monokernel needs gfx950; skipping")
@@ -445,9 +470,9 @@ def main():
     rows = []
     for world_size in args.world_sizes:
         cases = [
-            (profile, m, heads, k, prep)
-            for (m, heads, k), profile, prep in itertools.product(
-                shapes, args.profiles, args.preps
+            (profile, m, heads, k, prep, gemm)
+            for (m, heads, k), profile, prep, gemm in itertools.product(
+                shapes, args.profiles, args.preps, args.gemms
             )
         ]
         rows += _run_world(world_size, cases)
