@@ -2,6 +2,8 @@
   "rows8": {
     "min_seq_len_kv": 4096,
     "min_programs": 512,
+    "min_split_kv": 3072,
+    "split_rounds": 12,
     "BLOCK_M": 8,
     "BLOCK_KV": 64,
     "NUM_WARPS": 4,

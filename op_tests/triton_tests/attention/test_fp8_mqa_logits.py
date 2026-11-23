@@ -328,18 +328,22 @@ def test_fp8_mqa_logits_rows8_kernel_is_available():
         (8, 4096, False),
         (8, 4097, False),
         (24, 4223, False),
-        (64, 573440, False),
         (4096, 4095, False),
-        (2048, 16384, False),
-        (1024, 49152, False),
-        (256, 245760, False),
+        (2040, 4096, False),
+        (1024, 9216, False),
+        (256, 46080, False),
+        (64, 193536, False),
+        (2040, 6145, True),
+        (2048, 4096, True),
         (4096, 4096, True),
         (4096, 8192, True),
         (4104, 8192, True),
         (2048, 32768, True),
+        (1024, 9217, True),
         (1024, 65536, True),
         (1856, 116480, True),
-        (256, 245761, True),
+        (256, 46081, True),
+        (64, 193537, True),
         (64, 1048576, True),
     ],
 )
@@ -518,6 +522,55 @@ def test_fp8_mqa_logits_rows8_matches_existing_route(
     assert mqa_launches == ["rows8", "existing", "existing"]
     assert torch.equal(dense[inside], clean[inside])
     assert torch.equal(dense[inside], packed)
+
+
+def _request_batch_inputs(layout):
+    """FP8 inputs for a batch of requests. ``layout`` lists (rows, keys) of each
+    request: its rows follow the previous request's, its keys follow the
+    previous request's keys, and row i sees its request's first
+    ``keys - rows + i + 1`` keys. ``keys > rows`` is a resumed request, whose
+    first row already sees ``keys - rows + 1`` keys."""
+    s_q, s_k = sum(rows for rows, _ in layout), sum(keys for _, keys in layout)
+    q = torch.randn(s_q, 32, 128, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, 128, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, 32, device="cuda", dtype=torch.float32)
+    starts, ends, base = [], [], 0
+    for rows, keys in layout:
+        row = torch.arange(rows, dtype=torch.int32, device="cuda")
+        starts.append(torch.full_like(row, base))
+        ends.append(base + keys - rows + row + 1)
+        base += keys
+    return q.to(e4m3_type), kv_fp8, scales, weights, torch.cat(starts), torch.cat(ends)
+
+
+@requires_rows8
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param([(1022, 8192)] * 4, id="resumed-requests"),
+        pytest.param([(3000, 3000), (500, 9000), (596, 600)], id="resumed-among-fresh"),
+        pytest.param(
+            [(1138, 1138), (2315, 2315), (118, 118), (4417, 4417), (204, 9227)],
+            id="short-resumed-last",
+        ),
+        pytest.param([(2429, 2429), (1667, 1667)], id="two-fresh"),
+        pytest.param([(9, 64)] * 448, id="two-requests-in-each-block"),
+    ],
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_rows8_request_batches(layout, mqa_launches):
+    """Requests of arbitrary lengths in one call, resumed and fresh, with
+    request boundaries inside eight-row blocks: the eight-row scores equal the
+    clean scores bit for bit and every key of a window is written."""
+    torch.manual_seed(0)
+    inputs = _request_batch_inputs(layout)
+    inside = _window_mask(inputs)
+    dense = torch.full(inside.shape, float("nan"), device="cuda", dtype=torch.float32)
+    fp8_mqa_logits(*inputs, clean_logits=False, out=dense)
+    clean = fp8_mqa_logits(*inputs, clean_logits=True)
+    assert mqa_launches == ["rows8", "existing"]
+    assert torch.equal(dense[inside], clean[inside])
 
 
 @requires_rows8
