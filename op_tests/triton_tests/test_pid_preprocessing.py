@@ -15,42 +15,45 @@ def _remap_all_kernel(
     GRID_MN,
     NUM_AIDS: tl.constexpr,
     XCDS_PER_AID: tl.constexpr,
-    AID_CONTIGUOUS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tl.store(
         out_ptr + pid,
-        remap_xcd_aid(pid, GRID_MN, NUM_AIDS, XCDS_PER_AID, AID_CONTIGUOUS),
+        remap_xcd_aid(pid, GRID_MN, NUM_AIDS, XCDS_PER_AID),
     )
 
 
-def _remap(grid_mn, num_aids, xcds_per_aid, aid_contiguous):
+def _remap(grid_mn, num_aids, xcds_per_aid):
     out = torch.zeros(grid_mn, dtype=torch.int32, device="cuda")
-    _remap_all_kernel[(grid_mn,)](out, grid_mn, num_aids, xcds_per_aid, aid_contiguous)
+    _remap_all_kernel[(grid_mn,)](out, grid_mn, num_aids, xcds_per_aid)
     return out
 
 
 # A ragged GRID_MN is the interesting case: the permuted range must stop exactly where the
 # tail begins, or a permuted pid collides with a tail pid that maps to itself.
-@pytest.mark.parametrize("grid_mn", [5, 8, 12, 16, 20, 32, 64, 256])
+@pytest.mark.parametrize("grid_mn", [5, 8, 12, 16, 20, 32, 64, 236, 256])
 @pytest.mark.parametrize("num_aids, xcds_per_aid", [(1, 4), (2, 4), (2, 2), (4, 2)])
-@pytest.mark.parametrize("aid_contiguous", [True, False])
-def test_remap_xcd_aid_is_a_bijection(grid_mn, num_aids, xcds_per_aid, aid_contiguous):
-    out = _remap(grid_mn, num_aids, xcds_per_aid, aid_contiguous).cpu()
+def test_remap_xcd_aid_is_a_bijection(grid_mn, num_aids, xcds_per_aid):
+    out = _remap(grid_mn, num_aids, xcds_per_aid).cpu()
     expected = torch.arange(grid_mn, dtype=torch.int32)
     assert torch.equal(
         torch.sort(out).values, expected
     ), f"not a permutation of 0..{grid_mn - 1}"
 
 
-def test_remap_xcd_aid_keeps_an_aid_on_adjacent_tiles():
-    """An AID's XCDs must get adjacent tiles, not one run apart.
+@pytest.mark.parametrize("grid_mn", [64, 236, 256])
+def test_remap_xcd_aid_gives_each_xcd_one_run_in_dispatch_order(grid_mn):
+    """The pids of one XCD get consecutive tiles, and the runs follow the XCD order.
 
-    The L2 is shared by the XCDs of one AID, so the four pids that land on one AID at the
-    same dispatch step must map to four consecutive tiles.
+    The start of the round robin depends on the hardware queue, so the test checks that
+    one rotation n places every pid: pid p is on XCD (p - n) mod W and holds a tile of
+    that XCD's run.
     """
-    num_aids, xcds_per_aid = 2, 4
-    out = _remap(256, num_aids, xcds_per_aid, True).cpu().tolist()
-    # pids 0..3 are the first dispatch step of AID 0, pids 4..7 of AID 1.
-    assert out[0:4] == [0, 1, 2, 3], out[0:4]
-    assert out[4:8] == [128, 129, 130, 131], out[4:8]
+    W = 8
+    blk = grid_mn // W
+    out = _remap(grid_mn, 2, 4).cpu().tolist()
+    for p in range(blk * W - W):
+        assert out[p + W] == out[p] + 1, (p, out[p], out[p + W])
+    rotations = {(p - out[p] // blk) % W for p in range(blk * W)}
+    assert len(rotations) == 1, rotations
+    assert out[blk * W :] == list(range(blk * W, grid_mn))

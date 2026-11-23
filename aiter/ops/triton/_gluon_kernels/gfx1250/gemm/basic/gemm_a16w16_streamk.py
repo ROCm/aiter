@@ -99,9 +99,9 @@ def gemm_a16w16_streamk_kernel_(
     # A single CTA fuses its two TDM loads, so one K step leaves one token, not two.
     TOKENS: gl.constexpr = tokens_per_step(num_ctas)
 
-    # NUM_SMS is the grid size in clusters, and program_id is the cluster rank. The remap blocks
-    # the tile space by AID, because the L2 is per AID and not per XCD, and interleaves an AID's
-    # XCDs inside its block so they stay on adjacent tiles.
+    # NUM_SMS is the grid size in clusters, and program_id is the cluster rank. The remap gives
+    # each XCD one contiguous run of tiles, in the order the hardware queue dispatches the XCDs,
+    # so the XCDs that share an AID's L2 hold one contiguous range.
     pid = remap_xcd_aid(gl.program_id(0), NUM_SMS)
 
     # A transposed means an M-contiguous x, so the descriptor is (K, M) with the strides

@@ -29,32 +29,29 @@ def remap_xcd_aid(
     GRID_MN,
     NUM_AIDS: tl.constexpr = 2,
     XCDS_PER_AID: tl.constexpr = 4,
-    AID_CONTIGUOUS: tl.constexpr = True,
 ):
-    """AID-aware remap for parts whose L2 is shared by the XCDs inside an AID, such as gfx1250.
+    """Queue-aligned XCD remap for parts whose L2 is shared by the XCDs of an AID, such as gfx1250.
 
-    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs. The L2 is per
-    AID, not per XCD, so this blocks the tile space by AID and interleaves an AID's XCDs inside
-    its block. The XCDs that share an L2 then work on adjacent tiles at the same time and share
-    their operands in it.
+    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs. This gives each
+    XCD one contiguous run of GRID_MN // W tiles, in XCD order. The XCDs of an AID are
+    consecutive, so an AID holds one contiguous range of tiles and its XCDs share their
+    operands in its L2. Neighbouring tiles stay on one XCD.
 
-    The round robin does not start at XCD 0. It starts at an XCD set by the hardware queue the
-    launch goes through: with n = 4 * pipe + queue, dispatch id i runs on XCD (i - n) mod W.
-    Measured on gfx1250 for n = 0 to 4 with single workgroups and with clusters of 4 and 16
-    CTAs. A stream's queue is chosen by the runtime, a graph replay uses a stream of its own,
-    and a process with more than four streams moves them between queues, so n cannot be
-    assumed. The wave reads its own pipe and queue from HW_REG_WAVE_HW_ID2 instead. Taking
-    pid % W as the XCD is right only for n = 0 and n = 4; for the other queues one to three
-    of every four XCDs of an AID's block run on the other AID.
+    The round robin does not start at XCD 0. With n = 4 * pipe + queue of the hardware queue
+    that the launch goes through, dispatch id i runs on XCD (i - n) mod W. A stream's queue is
+    chosen by the runtime, a graph replay uses a stream of its own, and a process with more
+    than four streams moves launches between queues, so n cannot be assumed. The wave reads
+    its own pipe and queue from HW_REG_WAVE_HW_ID2.
 
-    Giving each XCD its own contiguous run instead, which is the obvious form, makes an AID's
-    total range contiguous but leaves its XCDs one run apart at any instant, so the shared L2
-    holds XCDS_PER_AID disjoint working sets.
+    Taking pid % W as the XCD, as remap_xcd does, rotates the runs by n. With many dispatch ids
+    per XCD an AID still holds one contiguous range and nothing is lost. With few, such as the
+    two ids per XCD of a 16-CTA cluster, the rotation splits operand rows and columns across
+    the AIDs: measured 1.3 to 1.5% on 4096x7168x7168 with 4x4 clusters.
 
-    AID_CONTIGUOUS says the hardware numbers an AID's XCDs consecutively; set it False when the
-    AIDs are interleaved. The two measure the same on gfx1250.
+    Interleaving the XCDs of an AID inside its range, instead of one run per XCD, puts
+    neighbouring tiles on different XCDs and measured 0.9 to 1.8% slower on a two-row grid.
 
-    The map is a bijection for every GRID_MN: the permuted range is exactly
+    The map is a bijection for every GRID_MN and every n: the permuted range is exactly
     [0, (GRID_MN // W) * W), and the ragged tail above it maps to itself.
     """
     W: tl.constexpr = NUM_AIDS * XCDS_PER_AID
@@ -73,15 +70,8 @@ def remap_xcd_aid(
     n = 4 * (hw & 0xF) + ((hw >> 4) & 0xF)
     # The true XCD of this dispatch id. Inside one round of W ids this is a rotation of the
     # residues, so the map stays a bijection for every n.
-    xcd_g = (pid % W + W - n % W) % W
-    pos = pid // W
-    if AID_CONTIGUOUS:
-        aid = xcd_g // XCDS_PER_AID
-        xcd_l = xcd_g % XCDS_PER_AID
-    else:
-        aid = xcd_g % NUM_AIDS
-        xcd_l = xcd_g // NUM_AIDS
-    return aid * (blk * XCDS_PER_AID) + pos * XCDS_PER_AID + xcd_l
+    xcd = (pid % W + W - n % W) % W
+    return xcd * blk + pid // W
 
 
 @triton.jit
