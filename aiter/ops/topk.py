@@ -353,6 +353,22 @@ def moe_fused_gate(
     return topk_weights, topk_ids
 
 
+def _biased_grouped_topk_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``topk_weights``
+    and ``topk_ids`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+# Every path below writes topk_weights and topk_ids and nothing else, so the
+# list is exact rather than "unknown" (#7926).
+@_route(
+    op="biased_grouped_topk",
+    version=1,
+    fake=_biased_grouped_topk_fake,
+    mutates_args=["topk_weights", "topk_ids"],
+)
 def biased_grouped_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -363,7 +379,30 @@ def biased_grouped_topk(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_valid_rows: torch.Tensor | None = None,  # see topk_gating
-):
+) -> None:
+    """Pick each token's top-k experts by sigmoid score plus a bias, in groups.
+
+    Writes ``topk_weights`` and ``topk_ids`` in place and returns None; no
+    other argument is written. ``topk`` is ``topk_ids.shape[1]``.
+
+    The score of an expert is ``sigmoid(gating_output)``. Experts are chosen
+    by score plus ``correction_bias``, which counts for the choice only, from
+    the ``topk_group`` best of ``num_expert_group`` equal groups of experts;
+    ``biased_grouped_topk_torch`` is the reference. The weights are the
+    unbiased scores of the chosen experts, divided by their sum when
+    ``need_renorm``, times ``routed_scaling_factor``.
+
+    ``num_valid_rows``: optional int32 device tensor whose first element is the
+    count of real rows. Rows at or past it are padding: their ids are written
+    -1 (which expert-parallel dispatch skips) and their weights 0. Read on
+    device, so a replayed CUDA graph follows each step's count.
+
+    With ``AITER_FLYDSL_USE_HERD=1``, a call with one group on gfx950 whose
+    row count and model profile HERD takes is answered by HERD routing
+    instead: top-(k+1) candidates and a drop by batch popularity, whose routes
+    are not the exact top-k above. A provider computing the exact top-k must
+    decline those calls.
+    """
     if (
         num_expert_group == 1
         and topk_group == 1
