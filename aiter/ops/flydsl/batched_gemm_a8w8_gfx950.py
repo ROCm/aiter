@@ -35,6 +35,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
+from .aot_launch import aot_factory
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
     W_SCALE_ROWS,
@@ -44,7 +45,12 @@ from .kernels.bmm_a8w8_mxscale_gfx950 import (
     xcd_swizzle_runs,
 )
 from .kernels.kernels_common import ceildiv
-from .kernels.tensor_shim import _compile_and_run, check_e8m0, ptr_arg
+from .kernels.tensor_shim import (
+    _run_compiled,
+    check_e8m0,
+    current_raw_stream,
+    ptr_arg,
+)
 
 BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 
@@ -111,6 +117,8 @@ _FALLBACK = [
     (float("inf"), (256, 256, 128, 1, 4, 2), True),
 ]
 _SPLITS = (1, 2, 4, 8, 16)
+# M-major group sizes of the xcd_order run that a tuner times (xcd_swizzle).
+_XCD_SWIZZLES = (2, 3, 4, 6, 8)
 
 
 def bmm_config_runs(b: int, n: int, k: int, scale_args: dict, cfg: dict) -> bool:
@@ -219,6 +227,10 @@ def bmm_candidate_names(
                 variant.update(xcd_order=False, xcd_swizzle=0)
             if runs(variant):
                 out.add(bmm_kernel_name(**variant))
+        for swizzle in (0, *_XCD_SWIZZLES):
+            variant = {**cfg, "splits": 1, "xcd_order": True, "xcd_swizzle": swizzle}
+            if runs(variant):
+                out.add(bmm_kernel_name(**variant))
     return sorted(out)
 
 
@@ -290,25 +302,54 @@ def _constexprs(
     return bound.args[_RUNTIME_PARAMS:]
 
 
-# Compiled launchers by their Constexprs. FlyDSL's __call__ binds and hashes
-# every argument on each launch (~50 us); a CompiledFunction takes them as is.
-_COMPILED: dict[tuple, flyc.CompiledFunction] = {}
+@aot_factory("bmm_a8w8_mxscale_gfx950")
+@functools.cache
+def _bound_launcher(constexprs: tuple):
+    """launch_bmm_a8w8_mxscale with its Constexprs bound, so that every
+    parameter left is a runtime argument the AOT cache can export."""
+
+    @flyc.jit
+    def launch_bmm(
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_partials: fx.Pointer,
+        arg_counters: fx.Pointer,
+        i32_m: fx.Int32,
+        stream: fx.Stream,
+    ):
+        launch_bmm_a8w8_mxscale(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_scale_a,
+            arg_scale_b,
+            arg_partials,
+            arg_counters,
+            i32_m,
+            stream,
+            *constexprs,
+        )
+
+    # The call inlines while tracing; keep the kernel's compile hints.
+    launch_bmm.compile_hints.update(launch_bmm_a8w8_mxscale.compile_hints)
+    return launch_bmm
 
 
 def _launch(tensors, m, stream, constexprs: tuple) -> None:
     """The one call into the kernel, shared by the runtime and AOT paths so
-    both build the same FlyDSL cache key. ``tensors`` are Out, XQ, WQ,
-    x_scale, w_scale, split-K partials and counters; only their addresses
-    reach the kernel. A kernel's first launch compiles (or loads) and runs it
-    through flyc.compile, which returns None under compile-only (AOT)."""
-    args = (*map(ptr_arg, tensors), m, stream, *constexprs)
-    compiled = _COMPILED.get(constexprs)
-    if compiled is not None:
-        compiled(*args)
-        return
-    compiled = _compile_and_run(launch_bmm_a8w8_mxscale, *args)
-    if compiled is not None:
-        _COMPILED[constexprs] = compiled
+    both build the same cache entry. ``tensors`` are Out, XQ, WQ, x_scale,
+    w_scale, split-K partials and counters; only their addresses reach the
+    kernel. Under compile-only (AOT) it builds the entry without launching."""
+    _run_compiled(
+        _bound_launcher.lazy(constexprs),
+        *map(ptr_arg, tensors),
+        m,
+        stream,
+        specialization_key=tensors[0].device,
+    )
 
 
 def compile_bmm_a8w8_mxfp8_gfx950(
@@ -433,7 +474,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     if fuse:
         name = _fused_quant_name(name, b, m, n, k, scale_args)
     cfg = _require_config(name)
-    stream = torch.cuda.current_stream(XQ.device)
+    stream = current_raw_stream(XQ.device)
     partials = counters = Out
     if fuse:
         partials = y_scale_out  # the kernel writes the scale bytes there
@@ -449,10 +490,13 @@ def run_bmm_a8w8_mxfp8_gfx950(
             dtype=torch.float32,
             device=XQ.device,
         )
-        counters = _split_counters(XQ.device.index, stream.cuda_stream)
+        counters = _split_counters(XQ.device.index, stream)
     tensors = (Out, XQ, WQ, x_scale, w_scale, partials, counters)
     _launch(
-        tensors, m, stream, _constexprs(name, n, k, b, *scale_args, fuse_quant_out=fuse)
+        tensors,
+        m,
+        fx.Stream(stream),
+        _constexprs(name, n, k, b, *scale_args, fuse_quant_out=fuse),
     )
     return Out
 
