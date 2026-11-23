@@ -61,12 +61,13 @@ class _Lds(Gfx1250Memory):
 _CACHE = {}
 
 
-# Blocks a CTA scores when its scores go out through LDS (``chunk_max``): a
-# wave stores one row's chunk of at most WAVE scores with one coalesced store.
+# Blocks a CTA scores: its scores are staged in LDS, and a wave stores one row's
+# chunk of at most WAVE scores with one coalesced store (94 us against 128 us
+# for a 4-byte store per block and row: 14336 new rows on 99968 cached, MI455X).
 CHUNK_MAX = 32
 
 
-def compile_index_score_prefill_nvfp4(*, block_q, waves, ring, chunk_max):
+def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight."""
     tiles_per_wave = block_q // (16 * waves)
@@ -74,22 +75,20 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring, chunk_max):
         raise ValueError("block_q must be a multiple of 16 * waves")
     if not 2 <= ring <= 8:
         raise ValueError("ring must be in [2, 8]")
-    if chunk_max not in (0, CHUNK_MAX):
-        raise ValueError(f"chunk_max must be 0 or {CHUNK_MAX}")
-    key = (block_q, waves, ring, chunk_max)
+    key = (block_q, waves, ring)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
     ring_bytes = ring * PAGE_BYTES
-    total = ring_bytes + block_q * chunk_max * 4
+    total = ring_bytes + block_q * CHUNK_MAX * 4
 
     @fx.struct
     class SharedStorage:
         buf: fx.Array[fx.Int32, total // 4, 16]
 
-    name = f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}"
-    if chunk_max:
-        name += f"_lds{chunk_max}"
+    name = (
+        f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}_lds{CHUNK_MAX}"
+    )
 
     @flyc.kernel(name=name, known_block_size=(threads, 1, 1))
     def index_score_kernel(
@@ -287,43 +286,33 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring, chunk_max):
                 for rt in range_constexpr(tiles_per_wave):
                     m = fx.maxnumf(maxes[rt], maxes[rt].shuffle_xor(16, WAVE))
                     r = row0 + rt * 16 + lane16
-                    if const_expr(chunk_max):
-                        # Staged in LDS; a wave stores whole row chunks below.
-                        if half == 0:
-                            lds_store(
-                                ring_bytes
-                                + ((r - pid_q * block_q) * chunk_max + (blk - blk_lo))
-                                * 4,
-                                fx.Vector.from_elements([m * scale], dtype=fx.Float32),
-                                fx.Float32,
-                            )
-                    else:
-                        if (half == 0) & (r < q_len):
-                            score[
-                                fx.Int64(pid_h) * stride_s_h
-                                + fx.Int64(seq_start + r) * stride_s_n
-                                + blk
-                            ] = (m * scale)
+                    # Staged in LDS; a wave stores whole row chunks below.
+                    if half == 0:
+                        lds_store(
+                            ring_bytes
+                            + ((r - pid_q * block_q) * CHUNK_MAX + (blk - blk_lo)) * 4,
+                            fx.Vector.from_elements([m * scale], dtype=fx.Float32),
+                            fx.Float32,
+                        )
                 final = yield [state[0]]  # noqa: F841 -- the loop result is unused
             tdm_ops.tensor_wait(0)
-            if const_expr(chunk_max):
-                gpu.barrier()
-                n_blk = blk_hi - blk_lo
-                rows_per_wave = block_q // waves
-                for i in range_constexpr(rows_per_wave):
-                    rl = warp * rows_per_wave + i
-                    r = pid_q * block_q + rl
-                    if (r < q_len) & (lane < n_blk):
-                        score[
-                            fx.Int64(pid_h) * stride_s_h
-                            + fx.Int64(seq_start + r) * stride_s_n
-                            + blk_lo
-                            + lane
-                        ] = lds_load(
-                            ring_bytes + (rl * chunk_max + lane) * 4, fx.Float32, 1
-                        )[
-                            0
-                        ]
+            gpu.barrier()
+            n_blk = blk_hi - blk_lo
+            rows_per_wave = block_q // waves
+            for i in range_constexpr(rows_per_wave):
+                rl = warp * rows_per_wave + i
+                r = pid_q * block_q + rl
+                if (r < q_len) & (lane < n_blk):
+                    score[
+                        fx.Int64(pid_h) * stride_s_h
+                        + fx.Int64(seq_start + r) * stride_s_n
+                        + blk_lo
+                        + lane
+                    ] = lds_load(
+                        ring_bytes + (rl * CHUNK_MAX + lane) * 4, fx.Float32, 1
+                    )[
+                        0
+                    ]
 
     @flyc.jit
     def launch(

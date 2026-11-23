@@ -56,13 +56,11 @@ def index_score_prefill_nvfp4(
     block_q: int = 256,
     waves: int = 4,
     ring: int = 4,
-    lds_scores: bool = True,
 ) -> None:
     """``score[h, r, blk]`` for every block up to the last row of r's 256-row
-    tile, exactly as ATOM's Triton prefill scorer (same bits). ``lds_scores``:
-    a CTA scores at most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the
-    scores do not depend on the chunking) and stores each row's chunk with one
-    coalesced store instead of a 4-byte store a block."""
+    tile, exactly as ATOM's Triton prefill scorer (same bits). A CTA scores at
+    most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the scores do not
+    depend on the chunking) and stores each row's chunk with one coalesced store."""
     total_q, heads, _ = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
     max_block = score.shape[2]
@@ -83,15 +81,13 @@ def index_score_prefill_nvfp4(
         raise ValueError(
             "index_score_prefill_nvfp4: unsupported device, dtype or layout"
         )
-    if lds_scores:
-        chunk_blocks = min(chunk_blocks, CHUNK_MAX)
+    chunk_blocks = min(chunk_blocks, CHUNK_MAX)
     q_tiles = (max_query_len + block_q - 1) // block_q
     chunks = (max_block + chunk_blocks - 1) // chunk_blocks
     compiled = compile_index_score_prefill_nvfp4(
         block_q=block_q,
         waves=waves,
         ring=ring,
-        chunk_max=CHUNK_MAX if lds_scores else 0,
     )
     _run_compiled(
         compiled["launch"],

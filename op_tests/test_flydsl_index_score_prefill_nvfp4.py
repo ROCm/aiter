@@ -73,15 +73,15 @@ def make(reqs, device, seed=0):
 @pytest.mark.parametrize(
     "reqs", [[(64, 4096)], [(300, 0)], [(77, 1000), (259, 5000)], [(1024, 30000)]]
 )
-# block_q:waves:ring:lds_scores; the first is the wrapper's default.
-@pytest.mark.parametrize("variant", ["256:4:4:1", "256:8:4:1", "256:4:8:0"])
+# block_q:waves:ring; the first is the wrapper's default.
+@pytest.mark.parametrize("variant", ["256:4:4", "256:8:4", "256:4:8"])
 def test_index_score_prefill_nvfp4(reqs, variant, device):
     from aiter.ops.flydsl.index_score_prefill import index_score_prefill_nvfp4
     from aiter.ops.flydsl.kernels.index_score_prefill_nvfp4_gfx1250 import (
         sm_scale_log2e,
     )
 
-    bq, waves, ring, lds = (int(x) for x in variant.split(":"))
+    bq, waves, ring = (int(x) for x in variant.split(":"))
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device)
     max_block = (int(seq.max()) + 127) // 128
     score = torch.full((1, q.shape[0], max_block), float("nan"), device=device)
@@ -100,7 +100,6 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
         block_q=bq,
         waves=waves,
         ring=ring,
-        lds_scores=bool(lds),
     )
     torch.cuda.synchronize()
     qe = q[:, 0].float().clamp(-448, 448).to(torch.float8_e4m3fn).float()
