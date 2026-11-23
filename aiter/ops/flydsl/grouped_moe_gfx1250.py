@@ -244,6 +244,107 @@ def _take_shared_fold(token_num, model_dim, inter_dim, dtype) -> MoeSharedFold |
     return fold
 
 
+class MoeRouterQuantRows:
+    """Token-major MX rows of a MoE layer's input, written by the router
+    launch (``flydsl_moe_router_topk(quant_rows=..., quant_rows8=...)``):
+    MXFP4 payload ``[>= T, K/2]`` + E8M0 ``[>= T, K/32]`` and, optionally, the
+    MXFP8 copy ``[cap, K]`` + ``[cap, K/32]`` a folded shared expert reads."""
+
+    __slots__ = ("xq", "xs", "x8", "x8s")
+
+    def __init__(self, xq, xs, x8=None, x8s=None):
+        self.xq, self.xs, self.x8, self.x8s = xq, xs, x8, x8s
+
+    @property
+    def quant_rows(self):
+        return (self.xq, self.xs)
+
+    @property
+    def quant_rows8(self):
+        return None if self.x8 is None else (self.x8, self.x8s)
+
+
+_ROUTER_ROWS_TLS = threading.local()
+
+
+def _tp_route_quant_enabled() -> bool:
+    """The switch of the TP route-in-quant (#7543's ``_fuse_tp_route_quant``):
+    the router's rows replace exactly that A1 launch, so they follow it."""
+    return os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1") in ("1", "true", "True")
+
+
+@functools.cache
+def _router_rows_enabled() -> bool:
+    """AITER_MOE_ROUTER_QUANT_ROWS (default 1): whether a grouped MoE call may
+    take the router's rows when a caller hands them in."""
+    return os.environ.get("AITER_MOE_ROUTER_QUANT_ROWS", "1") in _TRUTHY_ENV
+
+
+def router_quant_rows_buffers(
+    tokens: int, model_dim: int, device, topk: int = 4, mxfp8=None
+) -> MoeRouterQuantRows | None:
+    """Buffers for ``moe_router_quant_rows``, or None where a grouped MoE call
+    would not take them (its A1 launch is not the TP route token-multidest
+    quant at this batch, or AITER_MOE_ROUTER_QUANT_ROWS=0). ``mxfp8`` None:
+    also the MXFP8 copy when a shared expert fold is pending
+    (``moe_shared_expert_fold``), sized for the fold's row capacity."""
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    if (
+        not _router_rows_enabled()
+        or int(topk) != 4
+        or not token_multidest_eligible(int(tokens), int(topk))
+        or int(tokens) * int(topk) > _FUSED_ROUTE_PSUM_MAX_NUMEL
+        or not _tp_route_quant_enabled()
+    ):
+        return None
+    if mxfp8 is None:
+        fold = getattr(_SHARED_FOLD_TLS, "value", None)
+        mxfp8 = fold is not None and not fold.consumed
+    xq = torch.empty((tokens, model_dim // 2), dtype=torch.uint8, device=device)
+    xs = torch.empty((tokens, model_dim // 32), dtype=torch.uint8, device=device)
+    if not mxfp8:
+        return MoeRouterQuantRows(xq, xs)
+    cap = _tdm_align_up(max(int(tokens), 1), 64)
+    x8 = torch.empty((cap, model_dim), dtype=torch.uint8, device=device)
+    x8s = torch.empty((cap, model_dim // 32), dtype=torch.uint8, device=device)
+    return MoeRouterQuantRows(xq, xs, x8, x8s)
+
+
+@contextlib.contextmanager
+def moe_router_quant_rows(topk_ids: torch.Tensor, rows: MoeRouterQuantRows):
+    """Hand the grouped MoE run inside the block the router's token-major MX
+    rows of its input (``MoeRouterQuantRows``), so the decode A1 route/quant
+    launch is skipped: GEMM1 re-derives the route from ``topk_ids`` and
+    gathers these rows (bit-exact GEMM1 output). Taken only by a call routed
+    by that very ``topk_ids`` tensor and only where the A1 launch would be
+    the TP route token-multidest quant; otherwise the rows go unused.
+    Python-side state: eager code only (an opaque custom op)."""
+    prev = getattr(_ROUTER_ROWS_TLS, "value", None)
+    _ROUTER_ROWS_TLS.value = (topk_ids, rows)
+    try:
+        yield
+    finally:
+        _ROUTER_ROWS_TLS.value = prev
+
+
+def _take_router_rows(topk_ids, token_num, model_dim) -> MoeRouterQuantRows | None:
+    held = getattr(_ROUTER_ROWS_TLS, "value", None)
+    if held is None or not _router_rows_enabled():
+        return None
+    ids, rows = held
+    if (
+        ids.data_ptr() != topk_ids.data_ptr()
+        or tuple(ids.shape) != tuple(topk_ids.shape)
+        or ids.dtype != topk_ids.dtype
+        or rows.xq.shape[0] < token_num
+        or tuple(rows.xq.shape[1:]) != (model_dim // 2,)
+        or tuple(rows.xs.shape[1:]) != (model_dim // 32,)
+    ):
+        return None
+    return rows
+
+
 def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
     _MEGA_DISPATCH_TLS.ctx = ctx
 
@@ -1524,6 +1625,37 @@ def _grouped_a8w4_tdm_moe(
             _log_shared_fold_once(int(token_num), tuple(_t1), tuple(_t2))
         else:
             _fold = None
+    # Decode GEMM1 straight off the router's token-major MXFP4 rows: no A1
+    # route/quant launch (moe_router_quant_rows). Where the A1 would be the TP
+    # route token-multidest quant, on a plain post-compute GEMM1 pipeline; a
+    # shared fold also needs the router's MXFP8 copy at the fold's capacity.
+    _tp_rows = None
+    if (
+        _fuse_tp_route_quant
+        and _is_fp4
+        and int(topk) == 4
+        and mxfp8_copy_out is None
+        and int(k_waves1) == 1
+        and not tdm_as_in_prologue
+        and not _row_major_ascale
+        and (int(tile_m) <= 32 or int(num_buffers) <= 2)
+        and model_dim % int(tile_k) == 0
+        and _align_m % int(tile_m) == 0
+        and not _as_bool(
+            os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH"), bool(next_stage_prefetch)
+        )
+        and not _as_bool(os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False)
+    ):
+        from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+        if token_multidest_eligible(token_num, topk):
+            _tp_rows = _take_router_rows(topk_ids, token_num, model_dim)
+    if _tp_rows is not None and _fold is not None:
+        _t1, _t2 = _fold_tiles
+        _sh_rep2 = get_wmma_m_rep(_t2[0], _t2[1], _t2[3], _t2[4], "shared gemm2")
+        _need = _tdm_align_up(token_num, max(_t1[0], _t2[0], 16 * _sh_rep2))
+        if _tp_rows.x8 is None or _tp_rows.x8.shape[0] < _need:
+            _tp_rows = None
     if _fold is not None:
         _t1, _t2 = _fold_tiles
         _sh_rep2 = get_wmma_m_rep(_t2[0], _t2[1], _t2[3], _t2[4], "shared gemm2")
@@ -1532,11 +1664,16 @@ def _grouped_a8w4_tdm_moe(
         _sh_cap = _tdm_align_up(token_num, _sh_align)
         # Rows past token_num: the A rows are clamped to the live rows, the
         # row-major A scales are read whole, so both are allocated to the cap.
-        _sh_xq = torch.empty((_sh_cap, model_dim), dtype=torch.uint8, device=device)
-        _sh_xs = torch.empty(
-            (_sh_cap, model_dim // 32), dtype=torch.uint8, device=device
-        )
-        mxfp8_copy_out = (_sh_xq[:token_num], _sh_xs[:token_num])
+        if _tp_rows is not None:
+            # The router wrote the MXFP8 copy already.
+            _sh_xq = _tp_rows.x8[:_sh_cap]
+            _sh_xs = _tp_rows.x8s[:_sh_cap]
+        else:
+            _sh_xq = torch.empty((_sh_cap, model_dim), dtype=torch.uint8, device=device)
+            _sh_xs = torch.empty(
+                (_sh_cap, model_dim // 32), dtype=torch.uint8, device=device
+            )
+            mxfp8_copy_out = (_sh_xq[:token_num], _sh_xs[:token_num])
         _sh_hq = torch.empty((_sh_cap, inter_dim), dtype=torch.uint8, device=device)
         _sh_hs = torch.empty(
             (_sh_cap // _sh_rep2, (inter_dim + 127) // 128 * 4 * _sh_rep2),
@@ -1590,7 +1727,26 @@ def _grouped_a8w4_tdm_moe(
     ):
         # These A1 paths take no MXFP8 copy; it goes out on its own.
         mxfp8_row_copy(hidden_states, mxfp8_copy_out)
-    if _compact and _prequantized:
+    _tp_gather = None
+    if _tp_rows is not None:
+        # The A1 launch's outputs, written by GEMM1 instead (psum by its
+        # workgroup 0 into the tile-map argument).
+        _masked_m = torch.empty(int(E), dtype=torch.int32, device=device)
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        topids_to_rows = torch.empty(
+            (token_num, topk), dtype=torch.int32, device=device
+        )
+        _tp_gather = {
+            "topk_ids": (
+                topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+            ),
+            "topids_to_rows": topids_to_rows,
+            "masked_m": _masked_m,
+            "align": int(_align_m),
+        }
+        a1_payload = _tp_rows.xq
+        a1_scale = _tp_rows.xs
+    elif _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
         if _row_gather:
@@ -1738,6 +1894,7 @@ def _grouped_a8w4_tdm_moe(
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
             **_fold_kw1,
+            **({"tp_gather": _tp_gather} if _tp_gather is not None else {}),
         )
     else:
         # Raw GEMM1 writes both gate/up columns when activation moves to quant.

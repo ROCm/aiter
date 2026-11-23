@@ -113,6 +113,7 @@ def _router_launcher(
     with_counts,
     chains,
     count_atomics,
+    quant_rows=0,
 ):
     from aiter.ops.flydsl.kernels.moe_router_topk_gfx1250 import (
         build_moe_router_topk_module,
@@ -129,7 +130,15 @@ def _router_launcher(
         with_counts=with_counts,
         chains=chains,
         count_atomics=count_atomics,
+        quant_rows=quant_rows,
     )
+
+
+def router_quant_rows_shapes(m: int, k: int) -> tuple:
+    """Shapes of ``flydsl_moe_router_topk``'s ``quant_rows`` (MXFP4 payload,
+    E8M0) and ``quant_rows8`` (MXFP8 payload, E8M0) uint8 rows; a buffer may
+    hold more rows than ``m`` (only the first ``m`` are written)."""
+    return ((m, k // 2), (m, k // 32)), ((m, k), (m, k // 32))
 
 
 def router_group_counts_shape(m: int) -> tuple[int, int]:
@@ -154,13 +163,21 @@ def flydsl_moe_router_topk(
     prefetch: int = 8,
     chains: int | None = None,
     count_atomics: bool | None = None,
+    quant_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
+    quant_rows8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(topk_weights fp32 [M, topk], topk_ids int32 [M, topk])`` of
     ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``;
     ``split_k`` must be ``router_split_k`` of the shape. ``group_counts``
     (``router_group_counts_shape(M)`` int32) also receives each 8-row
     group's routes per expert, which the grouped MoE's A1 route can take in
-    place of re-counting every id (``moe_route_group_counts``)."""
+    place of re-counting every id (``moe_route_group_counts``).
+
+    ``quant_rows`` (uint8 ``[>= M, K/2]`` payload, ``[>= M, K/32]`` E8M0,
+    row-contiguous) also receives every row of ``x`` as MXFP4 -- the bytes the
+    grouped MoE's A1 quant writes for each of its routed rows -- and
+    ``quant_rows8`` (``[>= M, K]``, ``[>= M, K/32]``; needs ``quant_rows``) as
+    MXFP8, the A1 quant's ``mxfp8_copy_out``. Rows ``>= M`` stay untouched."""
     m, k = x.shape
     assert (
         w.shape == (ROUTER_EXPERTS, k) and w.is_contiguous()
@@ -195,6 +212,25 @@ def flydsl_moe_router_topk(
             and group_counts.is_contiguous()
             and tuple(group_counts.shape) == router_group_counts_shape(m)
         ), "group_counts must be a contiguous int32 router_group_counts_shape(M)"
+    quant_mode = 0
+    q_ptrs = ()
+    if quant_rows is not None:
+        quant_mode = 2 if quant_rows8 is not None else 1
+        bufs = list(quant_rows) + list(
+            quant_rows8 if quant_rows8 is not None else quant_rows
+        )
+        widths = (k // 2, k // 32, k if quant_mode == 2 else k // 2, k // 32)
+        for t, wd in zip(bufs, widths):
+            assert (
+                t.dtype == torch.uint8
+                and t.dim() == 2
+                and t.shape[0] >= m
+                and t.shape[1] == wd
+                and t.is_contiguous()
+            ), "quant_rows / quant_rows8: contiguous uint8 [>= M, K/2|K, K/32] rows"
+        q_ptrs = tuple(ptr_arg(t) for t in bufs)
+    elif quant_rows8 is not None:
+        raise ValueError("quant_rows8 needs quant_rows")
     launch = _router_launcher(
         k,
         split_k,
@@ -206,6 +242,7 @@ def flydsl_moe_router_topk(
         with_counts,
         chains,
         count_atomics,
+        quant_mode,
     )
     _run_compiled(
         launch,
@@ -220,9 +257,15 @@ def flydsl_moe_router_topk(
         m,
         x.stride(0),
         int(num_valid_rows is not None),
+        *q_ptrs,
         current_stream_arg(),
     )
     return topk_weights, topk_ids
 
 
-__all__ = ["flydsl_moe_router_topk", "router_group_counts_shape", "router_split_k"]
+__all__ = [
+    "flydsl_moe_router_topk",
+    "router_group_counts_shape",
+    "router_quant_rows_shapes",
+    "router_split_k",
+]
