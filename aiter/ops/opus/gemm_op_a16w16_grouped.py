@@ -35,7 +35,7 @@ def _gen_opus_gemm_a16w16_grouped_launch_fake_tensors(
     WQ: torch.Tensor,
     Y: torch.Tensor,
     group: torch.Tensor,
-    ks: torch.Tensor | None,
+    workspace: torch.Tensor,
     kid: int,
     masked: bool,
 ) -> torch.Tensor:
@@ -53,7 +53,7 @@ def _opus_gemm_a16w16_grouped_launch_raw(
     WQ: torch.Tensor,
     Y: torch.Tensor,
     group: torch.Tensor,
-    ks: torch.Tensor | None,
+    workspace: torch.Tensor,
     kid: int,
     masked: bool,
 ) -> torch.Tensor: ...
@@ -85,9 +85,13 @@ def _kid_for(n: int) -> int:
     return kid
 
 
-def _launch(a, b, d, group, ks, kid, masked):
+def _launch(a, b, d, group, kid, masked):
+    # contiguous: the plan kernel's rows / first row per group (int32 [2 G])
+    workspace = torch.empty(
+        0 if masked else 2 * b.shape[0], dtype=torch.int32, device=a.device
+    )
     with torch.cuda.device(a.device):
-        _opus_gemm_a16w16_grouped_launch_raw(a, b, d, group, ks, kid, masked)
+        _opus_gemm_a16w16_grouped_launch_raw(a, b, d, group, workspace, kid, masked)
 
 
 def m_grouped_bf16_gemm_nt_contiguous(
@@ -95,17 +99,12 @@ def m_grouped_bf16_gemm_nt_contiguous(
     b: torch.Tensor,
     d: torch.Tensor,
     grouped_layout: torch.Tensor,
-    ks: torch.Tensor | None = None,
     kid: int | None = None,
 ) -> None:
-    """d[rows of group g] = a[rows of group g] @ b[g].T; b [G, N, K].
-
-    ks: optional int32 [G], the rows of each group (tokens per expert, the layout grouped_layout
-    describes): the kernel then numbers its tiles directly, no empty slots (faster).
-    """
+    """d[rows of group g] = a[rows of group g] @ b[g].T; b [G, N, K]."""
     if kid is None:
         kid = _kid_for(b.shape[1])
-    _launch(a, b, d, grouped_layout, ks, kid, False)
+    _launch(a, b, d, grouped_layout, kid, False)
 
 
 def m_grouped_bf16_gemm_nn_contiguous(
@@ -113,17 +112,12 @@ def m_grouped_bf16_gemm_nn_contiguous(
     b: torch.Tensor,
     d: torch.Tensor,
     grouped_layout: torch.Tensor,
-    ks: torch.Tensor | None = None,
     kid: int | None = None,
 ) -> None:
-    """d[rows of group g] = a[rows of group g] @ b[g]; b [G, K, N].
-
-    ks: optional int32 [G], the rows of each group (tokens per expert, the layout grouped_layout
-    describes): the kernel then numbers its tiles directly, no empty slots (faster).
-    """
+    """d[rows of group g] = a[rows of group g] @ b[g]; b [G, K, N]."""
     if kid is None:
         kid = _kid_for(b.shape[2])
-    _launch(a, b.transpose(1, 2), d, grouped_layout, ks, kid, False)
+    _launch(a, b.transpose(1, 2), d, grouped_layout, kid, False)
 
 
 def m_grouped_bf16_gemm_nt_masked(
@@ -138,7 +132,7 @@ def m_grouped_bf16_gemm_nt_masked(
     signature, the kernel sizes its tiles per group from masked_m."""
     if kid is None:
         kid = _kid_for(b.shape[1])
-    _launch(a, b, d, masked_m, None, kid, True)
+    _launch(a, b, d, masked_m, kid, True)
 
 
 # ---- K-grouped (weight gradient) -------------------------------------------

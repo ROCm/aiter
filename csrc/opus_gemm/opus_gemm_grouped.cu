@@ -65,24 +65,20 @@ constexpr GroupedKid k_grouped_kids[] = {OPUS_A16W16_K_GROUPED_KID_TABLE{-1, 0, 
 //   contiguous: XQ [M, K], Y [M, N], group = grouped_layout int32 [M]: the group of each row, -1 for
 //               padding rows; groups start at multiples of OPUS_A16W16_GROUP_ALIGN rows
 //   masked:     XQ [G, max_m, K], Y [G, max_m, N], group = masked_m int32 [G]
-// Each group is covered by tiles 256 / 192 / 128 rows high, picked by its rows.
-// ks (contiguous): optional int32 [G], the rows of each group (the layout of grouped_layout); the
-// kernel then numbers the tiles directly instead of one slot per chunk (masked: from masked_m).
+// Each group is covered by tiles 256 / 192 / 128 rows high, picked by its rows. Contiguous: the plan kernel
+// (<image>_plan) first counts the rows and the first row of every group into workspace (int32, >= 2 G).
 void opus_gemm_a16w16_grouped_launch(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
     aiter_tensor_t &group,
-    std::optional<aiter_tensor_t> ks,
+    aiter_tensor_t &workspace,
     int kid,
     bool masked)
 {
   aiter_detail::g_aiter_can_throw = true;
   const char* entry = "opus_gemm_a16w16_grouped_launch";
-  if (ks)
-    check_devices(entry, {&XQ, &WQ, &Y, &group, &*ks});
-  else
-    check_devices(entry, {&XQ, &WQ, &Y, &group});
+  check_devices(entry, {&XQ, &WQ, &Y, &group, &workspace});
 #ifdef OPUS_BUILD_HAS_GFX950
   const GroupedKid& k = find_kid(entry, m_grouped_kids, kid);
 
@@ -105,9 +101,10 @@ void opus_gemm_a16w16_grouped_launch(
   AITER_CHECK(K % 64 == 0 && K >= 128, entry, ": K=", K, " must be a multiple of 64 and >= 128");
   AITER_CHECK(masked || M % OPUS_A16W16_GROUP_ALIGN == 0, entry, ": contiguous M=", M,
               " must be a multiple of ", OPUS_A16W16_GROUP_ALIGN);
-  AITER_CHECK(!ks || (!masked && ks->dtype() == AITER_DTYPE_i32 && ks->dim() == 1 &&
-                      ks->stride(0) == 1 && ks->size(0) == G),
-              entry, ": ks: a contiguous int32 [G] tensor, contiguous layout only");
+  AITER_CHECK(masked || (G <= OPUS_M_GROUPED_PLAN_MAX_GROUPS && workspace.dtype() == AITER_DTYPE_i32 &&
+                         workspace.dim() == 1 && workspace.stride(0) == 1 && workspace.size(0) >= 2 * G),
+              entry, ": contiguous needs G <= ", OPUS_M_GROUPED_PLAN_MAX_GROUPS,
+              " and an int32 workspace of 2 G entries");
   if (M == 0 || N == 0 || G == 0)
     return;
 
@@ -134,10 +131,9 @@ void opus_gemm_a16w16_grouped_launch(
   kargs.ptr_a = XQ.data_ptr();
   kargs.ptr_b = WQ.data_ptr();
   kargs.ptr_c = Y.data_ptr();
-  kargs.ptr_group = static_cast<const int*>(group.data_ptr());
-  // the tiles are numbered from the rows per group: ks, or masked_m when masked
-  const bool dense = masked || ks;
-  kargs.ptr_ks = !dense ? nullptr : masked ? kargs.ptr_group : static_cast<const int*>(ks->data_ptr());
+  int* const ws = static_cast<int*>(workspace.data_ptr());
+  kargs.ptr_rows = masked ? static_cast<const int*>(group.data_ptr()) : ws;
+  kargs.ptr_first = masked ? nullptr : ws + G;
   kargs.groups = static_cast<int>(G);
   kargs.stride_b_group = WQ.stride(0);
   kargs.m = static_cast<int>(M);
@@ -148,22 +144,31 @@ void opus_gemm_a16w16_grouped_launch(
   kargs.stride_c = static_cast<int>(ldc);
   kargs.stride_a_batch = static_cast<int>(a_batch);
   kargs.stride_c_batch = static_cast<int>(c_batch);
-  kargs.masked = masked ? 1 : 0;
 
-  // Grid: x = M slots x N tiles. Tiles numbered from ks / masked_m: an upper bound of the tiles (the
-  // blocks past the real count exit at once, but each costs a launch): a group of R rows takes at most
-  // ceil(R / 256) tiles (MIXED_COST), i.e. contiguous at most its padded rows / 256 + 1/2, masked
-  // ceil(max_m / 256). Contiguous without ks: one slot per OPUS_A16W16_GROUP_ALIGN-row chunk (at most
-  // one tile starts in a chunk).
+  // Grid: x = an upper bound of the tiles x N tiles (the blocks past the real count exit at once). A group
+  // of R rows takes at most ceil(R / 256) tiles (MIXED_COST): contiguous at most its padded rows / 256 +
+  // 1/2, i.e. (chunks + G) / 2; masked ceil(max_m / 256) per group.
   const int64_t tiles_n = (N + k.b_n - 1) / k.b_n;
   const int64_t chunks = (M + OPUS_A16W16_GROUP_ALIGN - 1) / OPUS_A16W16_GROUP_ALIGN;
-  const int64_t slots = masked ? G * ((M + 255) / 256) : ks ? (chunks + G + 1) / 2 : chunks;
+  const int64_t slots = masked ? G * ((M + 255) / 256) : (chunks + G + 1) / 2;
   AITER_CHECK(slots * tiles_n <= INT_MAX, entry, ": grid too large");
   const std::string symbol = std::string(k.name) + (b_t ? "_nn" : "_nt");
+  const std::string image = symbol + ".co";
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  if (!masked) {
+    opus_gemm_a16w16_m_grouped_plan_kargs_gfx950 plan{};
+    plan.layout = static_cast<const int*>(group.data_ptr());
+    plan.rows = ws;
+    plan.first = ws + G;
+    plan.m = static_cast<int>(M);
+    plan.groups = static_cast<int>(G);
+    opus_co_launch_gfx950<sizeof(plan)>(
+        opus_gfx950_co::co_kernel(symbol + "_plan", image, OPUS_A16W16_GROUPED_CO_DIR), dim3(1),
+        dim3(OPUS_M_GROUPED_PLAN_THREADS), plan, stream);
+  }
   opus_co_launch_gfx950<sizeof(kargs)>(
-      opus_gfx950_co::co_kernel(symbol, symbol + ".co", OPUS_A16W16_GROUPED_CO_DIR),
-      dim3(static_cast<unsigned>(slots * tiles_n), 1, 1),
-      dim3(256), kargs, aiter::getCurrentHIPStream());
+      opus_gfx950_co::co_kernel(symbol, image, OPUS_A16W16_GROUPED_CO_DIR),
+      dim3(static_cast<unsigned>(slots * tiles_n), 1, 1), dim3(256), kargs, stream);
 #else
   AITER_CHECK(false, entry, ": the module was built without gfx950");
 #endif

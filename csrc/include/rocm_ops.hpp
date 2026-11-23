@@ -318,7 +318,7 @@ namespace py = pybind11;
           py::arg("WQ"),                       \
           py::arg("Y"),                        \
           py::arg("group"),                    \
-          py::arg("ks"),                       \
+          py::arg("workspace"),                \
           py::arg("kid"),                      \
           py::arg("masked"));
 

@@ -308,34 +308,29 @@ constexpr int c_reg() {
 // Grouped tile mapping
 // ============================================================================
 
-// Rows [row, m_end) of C computed by the tile, the group of its B and the batch of its A / C. row < 0: no tile.
-// K-grouped: the rows [k_row0, k_row0 + k_rows) of A / B summed by the tile, its segment seg of nseg.
+// The tile a block computes: C rows from `row` (valid below m_end), B of `group`, A / C slab `batch`
+// (masked). K-grouped: sums A / B rows [k_row0, k_row0 + k_rows), segment seg of nseg. row < 0: none.
 struct tile_t {
     int row, m_end, group, batch;
     int k_row0 = 0, k_rows = 0, seg = 0, nseg = 1;
 };
 
-// K-grouped GEMM: the tile of grid slot `slot` = item * tiles_m + tile_m; the work item (a segment of one
-// group) is entry `item` of the plan table: {group (< 0: none), first row, rows, seg | nseg << 16}.
+// K-grouped: slot = item * tiles_m + m tile; item = a plan table entry {group, first row, rows, seg | nseg << 16}.
 template<class T, class K>
 __device__ inline tile_t k_grouped_tile(const K& kargs, int slot) {
     const int tiles_m = ceil_div(kargs.m, T::B_M);
     const int* const e = kargs.table + 4 * (slot / tiles_m);
     const int group = e[0], rows = e[2];
-    // an empty group (rows 0) only writes C_g = src_g (or 0), when asked to
+    // an empty group only writes C_g = src_g (or 0), if write_empty
     if (group < 0 || (rows == 0 && !kargs.write_empty)) return {-1, 0, 0, 0};
     return {(slot % tiles_m) * T::B_M, kargs.m, group, 0, e[1], rows, e[3] & 0xffff, e[3] >> 16};
 }
 
-// Plan of the K-grouped GEMM (one workgroup of OPUS_K_GROUPED_PLAN_THREADS threads): group g starts at row
-// off_g (the rows of the groups before it, each rounded up to OPUS_A16W16_GROUP_ALIGN) and has
-// f_g = ks[g] / seg_len full segments plus a remainder of ks[g] % seg_len rows. Work items:
-//   [0, full_items)            the full segments of all groups, group by group (the longest items first);
-//                              slots past the last one: no work
-//   full_items + g             the remainder of group g (an empty group: 0 rows; none if it has 0 rows
-//                              but full segments)
-// so the segments of one group come in order (segment s waits for s - 1: always launched earlier).
-// Zeroes the turn counters.
+// K-grouped plan kernel (one workgroup): from ks, the first row of each group (prefix sum of the rows
+// rounded up to OPUS_A16W16_GROUP_ALIGN) and its split into seg_len-row segments. Table entries:
+//   [0, full_items)   full segments, group by group (unused slots: group -1)
+//   full_items + g    the remainder of group g
+// so segment s of a group always launches before s + 1. Also zeroes the turn counters.
 __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan_kargs_gfx950& k) {
     constexpr int NT = OPUS_K_GROUPED_PLAN_THREADS;
     constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
@@ -350,13 +345,13 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
         if (e[2] > k.max_rows) __builtin_trap();   // a segment past the 32-bit offsets: fail loudly
         e[3] = seg | (nseg << 16);
     };
-    int off = 0, full = 0;   // rows / full segments of the groups of the previous chunks
+    int off = 0, full = 0;   // rows / full segments of the previous chunks of NT groups
     for (int base = 0; base < k.groups; base += NT) {
         const int g = base + tid;
         const int ks = g < k.groups ? k.ks[g] : 0;
         const int rows = ks < 0 ? 0 : ks < k.rows ? ks : k.rows;
         const int f = rows / k.seg_len, padded = (rows + ALIGN - 1) / ALIGN * ALIGN;
-        int sum_rows = padded, sum_full = f;   // inclusive scans over the chunk
+        int sum_rows = padded, sum_full = f;   // inclusive prefix sums over the chunk
         for (int d = 1; d < NT; d <<= 1) {
             s_rows[tid] = sum_rows;
             s_full[tid] = sum_full;
@@ -390,14 +385,45 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
         k.turn[i] = 0;
 }
 
-// Mixed-height M-grouped tiles: one kernel holds the bodies of tiles H0 > H1 > H2 rows high (256, 192,
-// 128) and covers each group with a0 + a1 + a2 tiles of them (H0 tiles first), the combination of least
-// cost a0 C0 + a1 C1 + a2 C2 that holds the group's rows. C: a tile's run time in hundredths of an H0
-// tile, measured on gfx950 with 8 tiles per group over the GLM-5.3 / Kimi-K3 shapes (192 rows 87..96,
-// 128 rows 62..73: E_M = 3 reads B as often as the 256 tile). So a group of 2176 rows takes 8 x 256 + 128,
-// one of 146 rows a 192 tile, one of 64 a 128 tile, whatever the other groups' sizes. With these costs a
-// group of R rows never takes more than ceil(R / 256) tiles (checked for R <= 200000), the bound the host
-// sizes the grid by (opus_gemm_a16w16_grouped_launch): re-check it when changing a cost.
+// M-grouped plan kernel (one workgroup, contiguous): the rows and the first row of every group of
+// grouped_layout (groups padded to OPUS_A16W16_GROUP_ALIGN rows, any group order). A wave whose 64 rows
+// are all one group adds them at once.
+__device__ inline void m_grouped_plan_body(const opus_gemm_a16w16_m_grouped_plan_kargs_gfx950& k) {
+    __shared__ int s_rows[OPUS_M_GROUPED_PLAN_MAX_GROUPS], s_first[OPUS_M_GROUPED_PLAN_MAX_GROUPS];
+    const int tid = opus::thread_id_x(), lane_id = tid % 64;
+    auto add = [](int* p, int v) { __hip_atomic_fetch_add(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP); };
+    auto lower = [](int* p, int v) { __hip_atomic_fetch_min(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP); };
+    for (int g = tid; g < k.groups; g += OPUS_M_GROUPED_PLAN_THREADS) {
+        s_rows[g] = 0;
+        s_first[g] = k.m;
+    }
+    opus::sync_threads();
+    for (int base = tid - lane_id; base < k.m; base += OPUS_M_GROUPED_PLAN_THREADS) {
+        const int r = base + lane_id;
+        const int g = r < k.m ? k.layout[r] : -1;
+        const bool valid = g >= 0 && g < k.groups;
+        const int g0 = __builtin_amdgcn_readfirstlane(g);
+        if (__builtin_amdgcn_ballot_w64(g != g0) == 0) {   // one group (or padding) in the 64 rows
+            if (lane_id == 0 && valid) {
+                add(&s_rows[g], min(64, k.m - base));
+                lower(&s_first[g], r);
+            }
+        } else if (valid) {
+            add(&s_rows[g], 1);
+            lower(&s_first[g], r);
+        }
+    }
+    opus::sync_threads();
+    for (int g = tid; g < k.groups; g += OPUS_M_GROUPED_PLAN_THREADS) {
+        k.rows[g] = s_rows[g];
+        k.first[g] = s_rows[g] > 0 ? s_first[g] : 0;
+    }
+}
+
+// M-grouped tile heights H0 > H1 > H2 (256 / 192 / 128): each group takes the cheapest mix holding its
+// rows, cost = measured run time per tile (% of a 256 tile, gfx950). E.g. 2176 rows -> 8 x 256 + 128,
+// 146 -> 192, 64 -> 128. These costs keep a group at <= ceil(rows / 256) tiles, the grid bound of
+// opus_gemm_a16w16_grouped_launch: re-check it when changing a cost.
 constexpr int MIXED_COST[3] = {100, 91, 65};
 
 struct mixed_tile_t {
@@ -405,7 +431,7 @@ struct mixed_tile_t {
     int height;
 };
 
-// The tiling of a group of `rows` rows: counts[h] tiles of height H[h].
+// counts[h]: the number of H[h]-row tiles of a group of `rows` rows.
 template<int H0, int H1, int H2>
 __device__ inline void mixed_counts(int rows, int (&counts)[3]) {
     int best = 0x7fffffff;
@@ -433,10 +459,8 @@ __device__ inline int wave_inclusive_sum(int v, int lane_id) {
     return v;
 }
 
-// Block -> (M tile, N tile) of `tiles` M tiles: bands of MIXED_BAND consecutive M tiles, the M tile fastest
-// inside a band, so a B tile serves the band's tiles back to back and, workgroups being dealt to the XCDs
-// round-robin, each XCD keeps one A tile across the N tiles (gfx950 sweep of the GLM-5.3 / Kimi-K3 shapes:
-// mixed M-grouped kernels, bands of 2 or 4 +8% over N-fastest, 3 or 6 -3%; K-grouped +3.5%, 8 -1%).
+// Block -> (M tile, N tile): bands of MIXED_BAND M tiles, M fastest inside a band, so consecutive blocks
+// share a B tile (gfx950: +8% M-grouped, +3.5% K-grouped over N-fastest).
 constexpr int MIXED_BAND = 4;
 
 __device__ inline void mixed_band_order(int wgid, int tiles, int tiles_n, int& tile, int& n) {
@@ -447,134 +471,62 @@ __device__ inline void mixed_band_order(int wgid, int tiles, int tiles_n, int& t
     n = i / size;
 }
 
-// Mixed-height tiles numbered from the rows per group ks[G] (no empty slots between tiles): the groups'
-// tiles in group order, each group's H0 tiles first. Contiguous: group g starts at the rows of the groups
-// before it, each rounded up to GROUP_ALIGN, and its tiles end at its padded end; masked: group = batch
-// g, its tiles in rows [0, masked_m[g]). Block wgid -> (tile, N tile) by mixed_band_order over the tiles
-// counted here (the grid holds an upper bound: none past them).
-// One pass, one wave: lane l sums the tiles of groups [l c, l c + c) (c = ceil(G / 64), its ks loads
-// issued together), one prefix sum over the lanes gives the count and the lane holding the tile, whose
-// c groups the lanes then check in parallel. (Scanning 64 groups per step, twice, cost two dependent
-// loads per 64 groups per block: -10% with G = 896.)
+// M-grouped tile of block wgid: the tiles of all groups numbered densely in group order, then
+// mixed_band_order. Group g has ptr_rows[g] rows; contiguous: from row ptr_first[g] of A / C (its tiles
+// end at its padded end); masked (ptr_first nullptr): rows [0, ptr_rows[g]) of slab g.
+// One wave: lane l sums the tiles of groups [l c, l c + c), c = ceil(G / 64); a prefix sum over the lanes
+// finds the lane, then its c groups are checked in parallel.
 template<int H0, int H1, int H2, class K>
-__device__ inline mixed_tile_t dense_mixed_tile(const K& kargs, int wgid, int tiles_n, int& n_tile) {
+__device__ inline mixed_tile_t m_grouped_tile(const K& kargs, int wgid, int tiles_n, int& n_tile) {
     constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
     constexpr mixed_tile_t none = {{-1, 0, 0, 0}, 0};
     constexpr int H[3] = {H0, H1, H2};
     const int lane_id = opus::thread_id_x() % 64;
     const int groups = kargs.groups, c = ceil_div(groups, 64);
-    auto group_rows = [&](int g) { const int ks = kargs.ptr_ks[g]; return ks < 0 ? 0 : ks < kargs.m ? ks : kargs.m; };
+    auto group_rows = [&](int g) { const int m = kargs.ptr_rows[g]; return m < 0 ? 0 : m < kargs.m ? m : kargs.m; };
     auto group_tiles = [&](int rows) {
         int counts[3];
         mixed_counts<H0, H1, H2>(rows, counts);
         return rows > 0 ? counts[0] + counts[1] + counts[2] : 0;
     };
-    int lane_tiles = 0, lane_rows = 0;
+    int lane_tiles = 0;
 #pragma clang loop unroll_count(4)
     for (int i = 0; i < c; ++i) {
         const int g = lane_id * c + i;
-        const int rows = g < groups ? group_rows(g) : 0;
-        lane_tiles += group_tiles(rows);
-        lane_rows += (rows + ALIGN - 1) / ALIGN * ALIGN;
+        lane_tiles += group_tiles(g < groups ? group_rows(g) : 0);
     }
     const int tiles_incl = wave_inclusive_sum(lane_tiles, lane_id);
-    const int rows_incl = wave_inclusive_sum(lane_rows, lane_id);
     const int tiles = __builtin_amdgcn_readlane(tiles_incl, 63);
     if (wgid >= tiles * tiles_n) return none;
     int t;
     mixed_band_order(wgid, tiles, tiles_n, t, n_tile);
     const int l = __builtin_ctzll(__builtin_amdgcn_ballot_w64(t < tiles_incl));
     int tile_base = __builtin_amdgcn_readlane(tiles_incl, l) - __builtin_amdgcn_readlane(lane_tiles, l);
-    int row_base = __builtin_amdgcn_readlane(rows_incl, l) - __builtin_amdgcn_readlane(lane_rows, l);
     for (int b = 0; b < c; b += 64) {   // lane l's groups, 64 at a time (one step for G <= 4096)
         const int i = b + lane_id, g = l * c + i;
         const int rows = i < c && g < groups ? group_rows(g) : 0;
-        const int n = group_tiles(rows), padded = (rows + ALIGN - 1) / ALIGN * ALIGN;
+        const int n = group_tiles(rows);
         const int t_incl = wave_inclusive_sum(n, lane_id) + tile_base;
-        const int r_incl = wave_inclusive_sum(padded, lane_id) + row_base;
         const unsigned long long hit = __builtin_amdgcn_ballot_w64(t < t_incl);
         if (hit != 0) {
             const int q = __builtin_ctzll(hit);   // the group holding tile t
             const int group = l * c + b + q;
             const int grows = __builtin_amdgcn_readlane(rows, q);
             int local = t - (__builtin_amdgcn_readlane(t_incl, q) - __builtin_amdgcn_readlane(n, q));
-            const int row0 = kargs.masked ? 0
-                : __builtin_amdgcn_readlane(r_incl, q) - __builtin_amdgcn_readlane(padded, q);
-            const int m_end = kargs.masked ? grows : row0 + __builtin_amdgcn_readlane(padded, q);
+            const bool masked = kargs.ptr_first == nullptr;
+            const int row0 = masked ? 0 : kargs.ptr_first[group];
+            const int m_end = masked ? grows : min(row0 + (grows + ALIGN - 1) / ALIGN * ALIGN, kargs.m);
             int cnt[3];
             mixed_counts<H0, H1, H2>(grows, cnt);
             int ofs = 0;
             for (int h = 0; h < 3; ++h) {
-                if (local < cnt[h]) return {{row0 + ofs + local * H[h], m_end, group, kargs.masked ? group : 0}, H[h]};
+                if (local < cnt[h]) return {{row0 + ofs + local * H[h], m_end, group, masked ? group : 0}, H[h]};
                 local -= cnt[h];
                 ofs += cnt[h] * H[h];
             }
             return none;
         }
         tile_base = __builtin_amdgcn_readlane(t_incl, 63);
-        row_base = __builtin_amdgcn_readlane(r_incl, 63);
-    }
-    return none;
-}
-
-// Mixed-height tile of grid slot `slot` of a contiguous kernel without ks (one slot per GROUP_ALIGN-row
-// chunk, at most one tile starts in it): the even chunks, then the odd ones; the group's first / last
-// chunk found by searches over the chunk heads of grouped_layout (64 per step), its rows = the full
-// chunks + the valid rows of the last one. A tile ends at its group's last chunk (padding rows computed
-// and stored too).
-template<int H0, int H1, int H2, class K>
-__device__ inline mixed_tile_t mixed_tile(const K& kargs, int slot) {
-    constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
-    static_assert(H0 > H1 && H1 > H2 && H2 >= ALIGN, "at most one tile start per chunk");
-    constexpr mixed_tile_t none = {{-1, 0, 0, 0}, 0};
-    int group, first_row, rows, m_end, ofs;
-    {
-        const int* const layout = kargs.ptr_group;
-        const int chunks = kargs.m / ALIGN;
-        auto head = [&](int chunk) { return chunk < chunks ? layout[chunk * ALIGN] : -1; };
-        const int half = (chunks + 1) / 2;
-        const int c = slot < half ? 2 * slot : 2 * (slot - half) + 1;
-        group = head(c);
-        if (group < 0) return none;
-        const int lane_id = opus::thread_id_x() % 64;
-        int first = 0, last = chunks - 1;   // the group's first / last chunk
-        for (int base = c; base >= 0; base -= 64) {
-            const unsigned long long other =
-                __builtin_amdgcn_ballot_w64(base - lane_id < 0 || head(base - lane_id) != group);
-            if (other != 0) {
-                first = base - __builtin_ctzll(other) + 1;
-                break;
-            }
-        }
-        for (int base = c; base < chunks; base += 64) {
-            const unsigned long long other = __builtin_amdgcn_ballot_w64(head(base + lane_id) != group);
-            if (other != 0) {
-                last = base + __builtin_ctzll(other) - 1;
-                break;
-            }
-        }
-        // padding rows end the last chunk
-        const int* const tail = layout + last * ALIGN;
-        const int valid = __builtin_popcountll(__builtin_amdgcn_ballot_w64(tail[lane_id] == group))
-                        + __builtin_popcountll(__builtin_amdgcn_ballot_w64(tail[64 + lane_id] == group));
-        first_row = first * ALIGN;
-        rows = (last - first) * ALIGN + valid;
-        m_end = (last + 1) * ALIGN;
-        ofs = (c - first) * ALIGN;
-    }
-    int counts[3];
-    mixed_counts<H0, H1, H2>(rows, counts);
-    // the tile starting in rows [ofs, ofs + ALIGN) of the group: H0 tiles, then H1, then H2
-    constexpr int H[3] = {H0, H1, H2};
-    int base = 0;
-    for (int h = 0; h < 3; ++h) {
-        const int k = ofs > base ? (ofs - base + H[h] - 1) / H[h] : 0;
-        if (k < counts[h]) {
-            const int start = base + k * H[h];
-            if (start >= ofs + ALIGN) return none;
-            return {{first_row + start, m_end, group, 0}, H[h]};
-        }
-        base += counts[h] * H[h];
     }
     return none;
 }
@@ -1076,7 +1028,7 @@ __device__ __forceinline__ void gemm_a16w16_k_grouped_body(const Kargs& kargs) {
 }
 
 // M-grouped kernel: tiles T0 / T1 / T2 (B_M 256 / 192 / 128, same B_N and layout) chosen per group
-// (dense_mixed_tile with ks / masked_m, else mixed_tile), one LDS buffer for all three bodies.
+// (m_grouped_tile), one LDS buffer for all three bodies.
 template<typename T0, typename T1, typename T2, typename Kargs>
 __device__ __forceinline__ void gemm_a16w16_m_grouped_body(const Kargs& kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
@@ -1088,10 +1040,8 @@ __device__ __forceinline__ void gemm_a16w16_m_grouped_body(const Kargs& kargs) {
     constexpr int LDS_BYTES = LDS_01 > T2::LDS_BYTES ? LDS_01 : T2::LDS_BYTES;
     const int num_tiles_n = ceil_div(kargs.n, T0::B_N);
     const int wgid = opus::block_id_x();
-    int n_tile = wgid % num_tiles_n;   // without ks: one slot per chunk, the N tile fastest
-    const mixed_tile_t m = kargs.ptr_ks != nullptr
-        ? dense_mixed_tile<T0::B_M, T1::B_M, T2::B_M>(kargs, wgid, num_tiles_n, n_tile)
-        : mixed_tile<T0::B_M, T1::B_M, T2::B_M>(kargs, wgid / num_tiles_n);
+    int n_tile;
+    const mixed_tile_t m = m_grouped_tile<T0::B_M, T1::B_M, T2::B_M>(kargs, wgid, num_tiles_n, n_tile);
     if (m.tile.row < 0) return;
     __shared__ __attribute__((aligned(16))) char smem_ab[LDS_BYTES];
     const int col = n_tile * T0::B_N;

@@ -836,7 +836,7 @@ def build_one(k, args, llvm_bin, workdir):
 
 # ---------------------------------------------------------------------------
 # gfx950 grouped GEMM families (--family): one image per kid and layout,
-# <name>_<layout>.co; the K-grouped images also carry the plan kernel <symbol>_plan.
+# <name>_<layout>.co, each with its plan kernel <symbol>_plan.
 # ---------------------------------------------------------------------------
 _M_STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -857,7 +857,7 @@ void {symbol}(opus_gemm_a16w16_grouped_kargs_gfx950 kargs)
     (void)kargs;
 #endif
 }}
-"""
+{plan}"""
 
 _K_STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -877,6 +877,18 @@ void {symbol}(opus_gemm_a16w16_grouped_kargs_t<CoTraits> kargs)
 #endif
 }}
 {plan}"""
+
+_M_PLAN_TEMPLATE = """
+extern "C" __global__ __launch_bounds__(OPUS_M_GROUPED_PLAN_THREADS)
+void {symbol}_plan(opus_gemm_a16w16_m_grouped_plan_kargs_gfx950 kargs)
+{{
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    opus_a16w16_grouped::m_grouped_plan_body(kargs);
+#else
+    (void)kargs;
+#endif
+}}
+"""
 
 _PLAN_TEMPLATE = """
 extern "C" __global__ __launch_bounds__(OPUS_K_GROUPED_PLAN_THREADS)
@@ -906,7 +918,7 @@ def _a16w16_grouped_stub(job):
         k_grouped=_cpp_bool(k_grouped),
         c_f32=_cpp_bool(layout.endswith("_f32")),
         symbol=symbol,
-        plan=_PLAN_TEMPLATE.format(symbol=symbol) if k_grouped else "",
+        plan=(_PLAN_TEMPLATE if k_grouped else _M_PLAN_TEMPLATE).format(symbol=symbol),
     )
 
 
@@ -918,8 +930,8 @@ class GroupedFamily(NamedTuple):
     device_flags: tuple
 
 
-# sizeof(opus_gemm_a16w16_k_grouped_plan_kargs_gfx950)
-_GROUPED_PLAN_KARGS_BYTES = 3 * 8 + 6 * 4
+# sizeof(opus_gemm_a16w16_{m,k}_grouped_plan_kargs_gfx950)
+_GROUPED_PLAN_KARGS_BYTES = {"m_grouped": 3 * 8 + 2 * 4, "k_grouped": 3 * 8 + 6 * 4}
 # opus.hpp deduction guides carry __host__ __device__ (newer clang warns).
 _GROUPED_FLAGS = ("-Werror=ignored-attributes", "-Wno-deprecated-attributes")
 GROUPED_FAMILIES = {
@@ -946,7 +958,6 @@ def _grouped_jobs(fam, kids):
 def build_one_grouped(job, args, llvm_bin, workdir):
     """Build one grouped GEMM image (one of _grouped_jobs)."""
     fam, k, layout, symbol = job["fam"], job["k"], job["layout"], job["symbol"]
-    k_grouped = k.kind == "k_grouped"
     stub_path = os.path.join(workdir, f"{symbol}.cc")
     with open(stub_path, "w") as f:
         f.write(fam.stub(job))
@@ -957,13 +968,14 @@ def build_one_grouped(job, args, llvm_bin, workdir):
     unbundled = _unbundle_if_needed(out_path, llvm_bin, args.offload_arch)
 
     readelf = _tool(llvm_bin, "llvm-readelf")
-    symbols = (symbol, f"{symbol}_plan") if k_grouped else (symbol,)
+    symbols = (symbol, f"{symbol}_plan")
     md = _kernel_metadata(readelf, out_path, symbol, expected_symbols=symbols)
     target_md = _elf_target_metadata(out_path, args.offload_arch)
     target_md.update(_device_link_metadata(readelf, out_path))
-    expected = {symbol: fam.kargs_bytes[k.kind]}
-    if k_grouped:
-        expected[f"{symbol}_plan"] = _GROUPED_PLAN_KARGS_BYTES
+    expected = {
+        symbol: fam.kargs_bytes[k.kind],
+        f"{symbol}_plan": _GROUPED_PLAN_KARGS_BYTES[k.kind],
+    }
     for sym, kargs_bytes in expected.items():
         got = _kernel_metadata(readelf, out_path, sym, expected_symbols=symbols)
         if got["kernarg_segment_size"] != kargs_bytes:

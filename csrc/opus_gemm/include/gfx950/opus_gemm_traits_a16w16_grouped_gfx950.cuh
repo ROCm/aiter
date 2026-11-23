@@ -107,16 +107,18 @@ struct opus_gemm_a16w16_grouped_traits_gfx950 {
 //   ptr_a  bf16 A: contiguous [M][K] (row pitch stride_a); masked [G][max_m][K] (+ batch pitch stride_a_batch)
 //   ptr_b  bf16 B: [G][N][K] (B_T: [G][K][N]), row pitch stride_b, groups stride_b_group apart
 //   ptr_c  bf16 C: contiguous [M][N] (row pitch stride_c); masked [G][max_m][N] (+ stride_c_batch)
-//   ptr_group  contiguous: grouped_layout int32 [M], the group of each row of A / C, -1 for the padding rows;
-//              every group starts at a multiple of OPUS_A16W16_GROUP_ALIGN rows.
-//              masked: masked_m int32 [G], the valid rows of each group (m = max_m).
-//   masked     0 contiguous, 1 masked
+//   ptr_rows   int32 [G], the rows of each group: masked_m (masked, m = max_m), or counted from
+//              grouped_layout by the plan kernel (contiguous)
+//   ptr_first  int32 [G], the first row of each group in A / C (contiguous, from the plan kernel);
+//              nullptr: masked
+// grouped_layout (contiguous): int32 [M], the group of each row of A / C, -1 for the padding rows; every
+// group starts at a multiple of OPUS_A16W16_GROUP_ALIGN rows.
 struct opus_gemm_a16w16_grouped_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
-    const int* __restrict__ ptr_group;
-    const int* __restrict__ ptr_ks;     // rows per group [G] (masked: masked_m), or nullptr
+    const int* __restrict__ ptr_rows;
+    const int* __restrict__ ptr_first;
     long long stride_b_group;
     int m;
     int n;
@@ -126,10 +128,21 @@ struct opus_gemm_a16w16_grouped_kargs_gfx950 {
     int stride_c;
     int stride_a_batch;
     int stride_c_batch;
-    int masked;
-    int groups;                         // G (with ptr_ks)
+    int groups;                         // G
 };
 static_assert(sizeof(opus_gemm_a16w16_grouped_kargs_gfx950) == 88);
+
+// M-grouped plan kernel arguments (one workgroup of OPUS_M_GROUPED_PLAN_THREADS threads, contiguous only,
+// see m_grouped_plan_body): grouped_layout [m] -> rows [groups] / first [groups].
+struct opus_gemm_a16w16_m_grouped_plan_kargs_gfx950 {
+    const int* __restrict__ layout;
+    int* __restrict__ rows;
+    int* __restrict__ first;
+    int m;
+    int groups;
+};
+constexpr int OPUS_M_GROUPED_PLAN_THREADS = 1024;
+constexpr int OPUS_M_GROUPED_PLAN_MAX_GROUPS = 4096;
 
 // K-grouped kernel arguments (the DeepGEMM k_grouped interface, the weight gradient of a grouped linear
 // layer): G GEMMs C_g = A_g^T B_g whose K (rows) differ per group. A [R][M] and B [R][N] hold the rows

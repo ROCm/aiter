@@ -11,7 +11,7 @@
   "hipcc": "/opt/rocm/bin/hipcc",
   "kernels": [
     {
-      "co_sha256": "6e733f9860f411dd70cc954a91e1f155197d5b5243757a0e912347317c409205",
+      "co_sha256": "b791f0e0f7632cc81312a8b48c110d1d16dec3a5327c25a59142795479ad1cdf",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -39,7 +39,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "41c249f2e3beb407f4759d9bd8024ce597ef1485bd2cd4aff5f90379ad97cc05",
+      "co_sha256": "1498e71e64f218c0da3decbeac084bf46268f9ced0bd0dc77172844ac7025bfb",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -67,7 +67,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "cbc697dee7fde7b2f32f68c2bed71c0660466435c259bfee9541cf31813e02eb",
+      "co_sha256": "04454991d8dcbbde842766ca2994da53fc3a7ee4a4b1f4942cd0c9896e4e8002",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -81,7 +81,7 @@
       "kind": "m_grouped",
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 77,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_bf16_m_grouped_256x256x128x64_2x2_16x16x32_0x0x0_nn",
@@ -95,7 +95,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "30d55e62696b5d6cb00cc2e946836a7f92ae7cec749fa1e9d0f0c2b332a692e8",
+      "co_sha256": "fc16dc905ed60b80b545e688317b4742fa68e07289889f811e47b8e2583c0d0a",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -109,7 +109,7 @@
       "kind": "m_grouped",
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 77,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_bf16_m_grouped_256x256x128x64_2x2_16x16x32_0x0x0_nt",
@@ -123,7 +123,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "3640f030b02cf8364d5930cc56792509c524bd26bcb7c370cb68fb8b51371f1b",
+      "co_sha256": "29fafa3117e4e79c242ec361f5146329e6fb294681b13fdfd107d128b174144f",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -151,7 +151,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "023ad326bb9a502ed4f4e16ae350ccb8aeddeb3334fa228fd59a30570cc81bc6",
+      "co_sha256": "eb9e7230d303928a221bca4086fb051d695e246a86a3c8275f8553585a51ebd1",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -179,7 +179,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "3556b844245fa6f4386c8d248ce7071a88e2e8b92c755062728b1954d0351416",
+      "co_sha256": "f4ff57027b7851846efa08a1200ff3f57373c71405e29c0f988e54002bb43a0f",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -207,7 +207,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "55734ac8be89ead7afe691c3090bdb1b1e6db26d42de5487fc2d4e5ffc7be3f4",
+      "co_sha256": "5a7c3511849a05b9f0b94ec9262befa982fab65dd02dbc9174efb5027a6f667b",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -235,7 +235,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6d4aafdd3e77d63c4b5f49b90fdd2a8dba30bb4518e74bb0a69b51fcf11ae93d",
+      "co_sha256": "2fee59a75a62516115d6ff60183b56fd523112ca499ee40876103ccf0f72d890",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -263,7 +263,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "dbdecc2ecb8c5783135ba39831ded49d5a47d2b933d2ff0be0b648f4dddc3e34",
+      "co_sha256": "f64729d35cb342c976691922cfcd58107ffa0f6bbe5bd646526539c1042ef4d9",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -291,7 +291,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "a8d764a96ce50964b43ba6f80c84574f4061a71d956b22bd2c1fba674decea7a",
+      "co_sha256": "ba05d607a72c6928a91c7635a11cfd7d70eefcf9c94788b9c9c98ff84ce04043",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -319,7 +319,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "414e9490535d434f6b9b166f4b55b700a705f2d4ceed2e452b2adfed41f63adb",
+      "co_sha256": "1a4b813f8133f95e334e7ecc4a97188afd856126d8523be03afb465d8b0c6af7",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"

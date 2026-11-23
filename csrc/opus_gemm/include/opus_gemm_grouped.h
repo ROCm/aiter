@@ -7,12 +7,12 @@
 #include <optional>
 
 // M-grouped GEMM (DeepGEMM m_grouped interface); group = grouped_layout [M] or masked_m [G];
-// ks: optional rows per group [G] (contiguous).
+// workspace: int32 [2 G] (contiguous).
 void opus_gemm_a16w16_grouped_launch(aiter_tensor_t& XQ,
                                      aiter_tensor_t& WQ,
                                      aiter_tensor_t& Y,
                                      aiter_tensor_t& group,
-                                     std::optional<aiter_tensor_t> ks,
+                                     aiter_tensor_t& workspace,
                                      int kid,
                                      bool masked);
 
