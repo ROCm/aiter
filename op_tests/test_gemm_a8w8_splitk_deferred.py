@@ -4,18 +4,19 @@
 """gfx1250 PTPC bpreshuffle GEMM with its split-K reduction deferred.
 
 gemm_a8w8_bpreshuffle_splitk_deferred skips the standalone split-K reduce of a
-decode-size GEMM and leaves the fp32 partials (splitk_partials) to the kernel that
-reads the output. On gfx1250, outputs are checked bitwise against
-gemm_a8w8_bpreshuffle (GEMM + reduce); the err column is an allclose check against
-an fp32 torch reference:
+decode-size GEMM and leaves the fp32 partials (gemm_a8w8_bpreshuffle_splitk_partials,
+`splitk_partials` here) to the kernel that reads the output. On gfx1250, outputs
+are checked bitwise against gemm_a8w8_bpreshuffle (GEMM + reduce); the err column
+is an allclose check against an fp32 torch reference:
 
-* deferred_gemm: deferred GEMM + reduce_splitk_partials (MiniMax-M3 TP4 sparse QKV,
-  dense QKV, dense gate/up).
-* claim: the partials are handed out once; reduce_splitk_partials claims them itself,
-  and returns a tensor that holds its values as it is.
+* deferred_gemm: deferred GEMM + gemm_a8w8_bpreshuffle_splitk_reduce (`splitk_reduce`
+  here) on MiniMax-M3 TP4 sparse QKV, dense QKV and dense gate/up.
+* claim: the partials are handed out once; splitk_reduce claims them itself, and
+  returns a tensor that holds its values as it is.
 * handoff_table (host only, every arch; both FlyDSL launchers stubbed): claim once,
-  a leading row slice claims, any other view of a deferred output raises, and the
-  oldest unclaimed output is reduced when the table is full.
+  a leading row slice claims, any other view of a deferred output raises, the
+  oldest unclaimed output is reduced when the table is full, and off gfx1250
+  the deferred GEMM returns gemm_a8w8_bpreshuffle's output.
 
 Runs as `python3 <file>` (summary table) or under pytest (same cases and checks).
 """
@@ -43,6 +44,9 @@ SUPPORTED_GFX = ["gfx1250"]  # the split-K PTPC GEMM is the gfx1250 WMMA backend
 MAX_M = 64  # largest M the deferred path takes (its max_m default)
 M_LIST = [1, 4, 8, 16, 32, 48, 64]  # decode tokens per TP4 rank
 NK_LIST = [(2560, 6144), (2304, 6144), (6144, 6144)]  # sparse QKV, dense QKV, gate/up
+
+splitk_partials = aiter.gemm_a8w8_bpreshuffle_splitk_partials
+splitk_reduce = aiter.gemm_a8w8_bpreshuffle_splitk_reduce
 
 gfx1250_only = pytest.mark.skipif(
     get_gfx_runtime() not in SUPPORTED_GFX, reason="gfx1250 only"
@@ -77,13 +81,13 @@ def deferred_gemm(m, n, k):
     args, ref = gemm_inputs(m, n, k)
     base = aiter.gemm_a8w8_bpreshuffle(*args)
     y = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(*args, max_m=MAX_M)
-    partials = aiter.splitk_partials(y)
+    partials = splitk_partials(y)
     ret = {"gfx": get_gfx_runtime(), "split_k": split_of(partials)}
-    ret["bitwise"] = bitwise_equal(aiter.reduce_splitk_partials(y, partials), base)
+    ret["bitwise"] = bitwise_equal(splitk_reduce(y, partials), base)
     assert ret["bitwise"], f"deferred GEMM differs from gemm_a8w8_bpreshuffle {m=} {n=}"
     candidates = {
         "gemm+reduce": lambda: aiter.gemm_a8w8_bpreshuffle(*args),
-        "deferred+reduce": lambda: aiter.reduce_splitk_partials(
+        "deferred+reduce": lambda: splitk_reduce(
             aiter.gemm_a8w8_bpreshuffle_splitk_deferred(*args, max_m=MAX_M)
         ),
         "deferred": lambda: aiter.gemm_a8w8_bpreshuffle_splitk_deferred(
@@ -94,7 +98,7 @@ def deferred_gemm(m, n, k):
         out, us = run_perftest(fn)
         ret[f"{name} us"] = us
         if name == "deferred":
-            aiter.reduce_splitk_partials(out)  # the GEMM alone: its partials unread
+            splitk_reduce(out)  # the GEMM alone: its partials unread
             continue
         assert bitwise_equal(out, base), f"{name} differs from gemm+reduce {m=} {n=}"
         ret[f"{name} TFLOPS"] = 2 * m * n * k / us / 1e6
@@ -126,17 +130,17 @@ def test_claim():
     for m in M_LIST:
         args, _ = gemm_inputs(m, *NK_LIST[0])
         y = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(*args, max_m=MAX_M)
-        partials = aiter.splitk_partials(y)
+        partials = splitk_partials(y)
         if partials is not None:
             break
     else:
         pytest.fail(f"no M in {M_LIST} splits K for {NK_LIST[0]}")
     base = aiter.gemm_a8w8_bpreshuffle(*args)
-    assert aiter.splitk_partials(y) is None, "partials handed out twice"
-    assert bitwise_equal(aiter.reduce_splitk_partials(y, partials), base)
+    assert splitk_partials(y) is None, "partials handed out twice"
+    assert bitwise_equal(splitk_reduce(y, partials), base)
     y = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(*args, max_m=MAX_M)
-    assert aiter.reduce_splitk_partials(y) is y and bitwise_equal(y, base)
-    assert aiter.reduce_splitk_partials(base) is base  # holds its values already
+    assert splitk_reduce(y) is y and bitwise_equal(y, base)
+    assert splitk_reduce(base) is base  # holds its values already
 
 
 def test_handoff_table():
@@ -181,19 +185,27 @@ def test_handoff_table():
         for stub in stubs:
             stack.enter_context(stub)
         y = deferred()
-        partials = aiter.splitk_partials(y[: m // 2])  # leading row slice
+        partials = splitk_partials(y[: m // 2])  # leading row slice
         assert partials.shape == (split_k, m, n) and partials[-1].eq(split_k).all()
-        assert aiter.splitk_partials(y) is None, "partials handed out twice"
+        assert splitk_partials(y) is None, "partials handed out twice"
         y = deferred()
         for view in (y.view(m, 2, n // 2), y[:, : n // 2], y[1:], y[:, 8:], y.t()):
             with pytest.raises(ValueError):
-                aiter.splitk_partials(view)
-        assert aiter.reduce_splitk_partials(y) is y and y.eq(done).all()
-        assert aiter.reduce_splitk_partials(y) is y  # holds its values already
+                splitk_partials(view)
+        assert splitk_reduce(y) is y and y.eq(done).all()
+        assert splitk_reduce(y) is y  # holds its values already
         ys = [deferred() for _ in range(gemm_op_a8w8._SPLITK_DEFERRED_MAX + 1)]
         assert ys[0].eq(done).all(), "evicted output left unreduced"
-        assert aiter.splitk_partials(ys[0]) is None
-        assert all(aiter.splitk_partials(y) is not None for y in ys[1:])
+        assert splitk_partials(ys[0]) is None
+        assert all(splitk_partials(y) is not None for y in ys[1:])
+        plain = torch.zeros(m, n, dtype=dtypes.bf16, device="cpu")
+        stack.enter_context(
+            mock.patch.object(gemm_op_a8w8, "get_gfx", return_value="gfx950")
+        )
+        stack.enter_context(
+            mock.patch.object(gemm_op_a8w8, "gemm_a8w8_bpreshuffle", return_value=plain)
+        )
+        assert deferred() is plain and splitk_partials(plain) is None
 
 
 def main():

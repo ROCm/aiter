@@ -1177,7 +1177,9 @@ def _gemm_a8w8_bpreshuffle_into(
 # entry holds the allocation, so no other tensor can start at that address while
 # it is listed. An output nobody claims (a forward that skips its consumer) stays
 # until _SPLITK_DEFERRED_MAX newer ones are listed; the oldest is then finished
-# with the standalone reduce and dropped.
+# with the standalone reduce and dropped. That reduce runs on the stream current
+# at the eviction, so an output produced on another stream and never claimed must
+# not be read before that stream syncs with it.
 _SPLITK_DEFERRED: dict[int, tuple[int, int, int, Tensor]] = {}
 _SPLITK_DEFERRED_MAX = 64
 
@@ -1199,16 +1201,16 @@ def _splitk_views(entry) -> tuple[Tensor, Tensor]:
 
 def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
     """(kernelName, split_k) when gemm_a8w8_bpreshuffle would run the gfx1250
-    PTPC GEMM with split_k > 1 for this call and M <= max_m, else None. Anything
-    else goes through gemm_a8w8_bpreshuffle and its input checks."""
+    PTPC GEMM with split_k in (2, 4, 8) for this call and M <= max_m, else None.
+    Anything else goes through gemm_a8w8_bpreshuffle and its input checks."""
     if (
         XQ.dim() != 2
         or WQ.dim() != 2
         or dtype != dtypes.bf16
         or XQ.dtype != dtypes.fp8
         or WQ.dtype != dtypes.fp8
-        # A padded-K weight takes the padded-XQ path; leave it to the plain GEMM.
         or not 0 < XQ.shape[0] <= max_m
+        # A padded-K weight takes the padded-XQ path; leave it to the plain GEMM.
         or WQ.shape[1] != XQ.shape[1]
     ):
         return None
@@ -1243,11 +1245,15 @@ def gemm_a8w8_bpreshuffle_splitk_deferred(
     When the tuned kernel for this call is the gfx1250 PTPC GEMM with split_k in
     (2, 4, 8) and M <= max_m, the returned bf16 [M, N] tensor is NOT written yet:
     its allocation also holds the fp32 partials. Before anything reads it, pass
-    ``splitk_partials(Y)`` to a consumer that reduces them as it reads Y, or call
-    ``reduce_splitk_partials(Y)``. Any other call returns
-    gemm_a8w8_bpreshuffle's output. Same kernel, same partials either way, so the
-    finished tensor is bitwise what gemm_a8w8_bpreshuffle returns. Eager only: the
-    hand-off is host state, so a graph must capture producer and consumer together.
+    ``gemm_a8w8_bpreshuffle_splitk_partials(Y)`` to a consumer that reduces them as
+    it reads Y, or call ``gemm_a8w8_bpreshuffle_splitk_reduce(Y)``. Any other call
+    returns gemm_a8w8_bpreshuffle's output. Same kernel, same partials either way,
+    so the finished tensor is bitwise what gemm_a8w8_bpreshuffle returns.
+
+    The hand-off is host state, decided when this function runs. Under graph
+    capture, capture the producer and its consumer (or the reduce) in the same
+    graph: a replay reruns both with the hand-off recorded at capture, while a
+    consumer outside the graph would read an output its replay leaves unreduced.
     """
     deferred = _splitk_deferrable(XQ, WQ, dtype, max_m)
     if deferred is None:
@@ -1263,18 +1269,24 @@ def gemm_a8w8_bpreshuffle_splitk_deferred(
         XQ, WQ, x_scale, w_scale, Y, kernel_name, partials=partials
     )
     if len(_SPLITK_DEFERRED) >= _SPLITK_DEFERRED_MAX:
+        if XQ.is_cuda and torch.cuda.is_current_stream_capturing():
+            # A replay would reduce into an allocation the table no longer holds.
+            raise RuntimeError(
+                f"gemm_a8w8_bpreshuffle_splitk_deferred: {_SPLITK_DEFERRED_MAX} "
+                "deferred outputs left unclaimed during graph capture"
+            )
         oldest = _SPLITK_DEFERRED.pop(next(iter(_SPLITK_DEFERRED)))
-        reduce_splitk_partials(*_splitk_views(oldest))
+        gemm_a8w8_bpreshuffle_splitk_reduce(*_splitk_views(oldest))
     _SPLITK_DEFERRED[Y.data_ptr()] = entry
     return Y
 
 
-def splitk_partials(y: Tensor) -> Tensor | None:
+def gemm_a8w8_bpreshuffle_splitk_partials(y: Tensor) -> Tensor | None:
     """Claim the unreduced fp32 [split_k, M, N] partials of ``y``, an output (or a
     leading row slice of one) of gemm_a8w8_bpreshuffle_splitk_deferred, or None
     when ``y`` already holds its values. Raises for any other view of a deferred
-    output. The claimer must leave ``y`` reduced: hand the partials to a consumer
-    that writes the row back, or to reduce_splitk_partials."""
+    output; a copy of one (clone, dtype cast) is not recognised and reads as None. The claimer must leave ``y`` reduced: hand the partials to a consumer
+    that writes the row back, or to gemm_a8w8_bpreshuffle_splitk_reduce."""
     storage = y.untyped_storage()
     entry = _SPLITK_DEFERRED.get(storage.data_ptr())
     if entry is None:
@@ -1289,20 +1301,22 @@ def splitk_partials(y: Tensor) -> Tensor | None:
         or y.stride() != (n, 1)
     ):
         raise ValueError(
-            "splitk_partials: a deferred split-K output is claimed whole or as a "
-            f"leading row slice ({m}, {n}) bf16, got {y.dtype} {tuple(y.shape)} "
+            "gemm_a8w8_bpreshuffle_splitk_partials: a deferred split-K output is "
+            f"claimed whole or as a leading row slice ({m}, {n}) bf16, got {y.dtype} {tuple(y.shape)} "
             f"strides={tuple(y.stride())} at byte offset "
             f"{y.data_ptr() - buf.data_ptr()}"
         )
     return _splitk_views(_SPLITK_DEFERRED.pop(storage.data_ptr()))[1]
 
 
-def reduce_splitk_partials(y: Tensor, partials: Tensor | None = None) -> Tensor:
+def gemm_a8w8_bpreshuffle_splitk_reduce(
+    y: Tensor, partials: Tensor | None = None
+) -> Tensor:
     """Finish a deferred split-K output in place with the standalone reduce kernel
     (the one gemm_a8w8_bpreshuffle runs); ``partials`` are its claimed partials,
     claimed here when None. A tensor that holds its values is returned as is."""
     if partials is None:
-        partials = splitk_partials(y)
+        partials = gemm_a8w8_bpreshuffle_splitk_partials(y)
         if partials is None:
             return y
     from .flydsl.bpreshuffle_gemm_gfx1250 import reduce_splitk_partials_gfx1250

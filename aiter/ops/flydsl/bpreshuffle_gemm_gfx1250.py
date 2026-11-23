@@ -264,7 +264,7 @@ def reduce_splitk_partials_gfx1250(partials: Tensor, Out: Tensor) -> Tensor:
         or partials.dim() != 3
         or partials.dtype != torch.float32
         or not partials.is_contiguous()
-        or tuple(partials.shape[1:]) != tuple(Out.shape)
+        or partials.shape[1:] != Out.shape
         or not Out.is_contiguous()
     ):
         raise RuntimeError(
