@@ -5,12 +5,10 @@
 
 ``StoreCRows`` stores a wave's 128x128 tile of C as BF16 rows, from INT32 accumulators
 with row and column scales or from FP32 accumulators that a block-scaled MFMA has already
-scaled. It can add a bias, apply a Q/K prep (``PrepSpec``) and write per-head and
+scaled. It can add a bias, apply a Q/K prep (``qk_prep.PrepSpec``) and write per-head and
 per-column maxima. ``mfma_drain`` makes inline-asm MFMA accumulators readable before the
 epilogue reads them.
 """
-
-from dataclasses import dataclass
 
 import flydsl.expr as fx
 
@@ -18,137 +16,35 @@ import flydsl.expr as fx
 # accumulator hazard boundary.
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr import math as fmath
-from flydsl.expr.rocdl import update_dpp
-from flydsl.expr.typing import ReductionOp
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import StoreC
+from aiter.ops.flydsl.kernels.qk_prep import HEAD_DIM, _max_abs, _row_max, _vector
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_store, ptr_buf_tensor
 
 TILE = 16  # MFMA output tile
 WAVE_ROWS = 128  # rows (and columns) of C per wave
 WAVE_TILES = WAVE_ROWS // TILE
-HEAD_DIM = 128  # channels per head: 8 in each of 16 lanes
-ROPE_PAIRS = HEAD_DIM // 2  # rotation pairs per head, one cos and sin each
 
 
-# DPP moves within a 16-lane row and the lane bit that orders each pair: quad_perm
-# [1,0,3,2] and [2,3,0,1] pair lanes i ^ 1 and i ^ 2, row_half_mirror i ^ 7 and
-# row_ror:8 i ^ 8. The four masks span the row's lane bits, so a butterfly over them
-# is a Hadamard transform, with rows in a different order than Sylvester's.
-_ROW_BUTTERFLY = ((0xB1, 1), (0x4E, 2), (0x141, 4), (0x128, 8))
-_ROW_ROR8 = 0x128  # lane i of a 16-lane row reads lane i ^ 8
+class _PrepContext:
+    """What a ``PrepOp`` sees of the epilogue (``qk_prep``)."""
 
+    def __init__(self, store, columns, col_base):
+        self.lane = store.lane_id
+        self.row = None
+        self._store = store
+        self._columns = columns
+        self._col_base = col_base
 
-# PrepSpec's norms and RoPE kinds, with their kernel-name tags.
-_NORMS = {"none": "none", "rms_per_head": "head", "rms_across_heads": "across"}
-_ROPES = {"none": "none", "interleaved": "inter", "rotate_half": "half"}
+    def column(self, name):
+        return self._columns[name]
 
+    def table(self, name, row, index, count):
+        return self._store._load_table(name, row, index, count)
 
-@dataclass(frozen=True)
-class PrepSpec:
-    """The Q/K prep of ``StoreCRows``, fixed at compile time. Every field is required.
-
-    ``norm``:
-      - ``"rms_across_heads"``: RMSNorm over every head of a row. The epilogue applies the
-        norm weight and stores per-head sums of squares; the caller scales each row by
-        ``rsqrt(sum / N + eps)``.
-      - ``"rms_per_head"``: RMSNorm over each 128-wide head, applied in the epilogue.
-      - ``"none"``: no norm and no norm weights.
-
-    ``rope``: ``"interleaved"`` rotates channel pairs (2i, 2i + 1) of each head,
-    ``"rotate_half"`` pairs i and i + 64, ``"none"`` skips RoPE. The cos and sin tables hold
-    one value per token and rotation pair, ``[M, 64]``, the same for every head.
-
-    ``bias``: a per-column bias before the norm.
-
-    ``hadamard``: the per-head Hadamard after RoPE.
-    """
-
-    norm: str
-    rope: str
-    bias: bool
-    hadamard: bool
-
-    def __post_init__(self):
-        if self.norm not in _NORMS:
-            raise ValueError(f"unknown PrepSpec norm {self.norm!r}")
-        if self.rope not in _ROPES:
-            raise ValueError(f"unknown PrepSpec rope {self.rope!r}")
-
-    @property
-    def gammas(self):
-        """Whether B_scale holds norm weights."""
-        return self.norm != "none"
-
-    @property
-    def suffix(self):
-        """Kernel-name suffix after ``_prep``: the norm, the RoPE, and no Hadamard if off."""
-        hadamard = "" if self.hadamard else "_nohadamard"
-        return f"_n{_NORMS[self.norm]}_r{_ROPES[self.rope]}{hadamard}"
-
-
-def _row_move(value, ctrl):
-    # Every lane of the row has a source under these controls, so zero fill never
-    # shows; it lets LLVM fold the move into the instruction that consumes it.
-    return fx.Float32(
-        update_dpp(
-            fx.Float32.ir_type, value.ir_value(), value.ir_value(), ctrl, 0xF, 0xF, True
-        )
-    )
-
-
-def _butterfly_signs(lane):
-    """Per stage of _ROW_BUTTERFLY: +1 in the lane that keeps the sum, -1 in its partner."""
-    return [
-        ((lane & bit) == 0).select(fx.Float32(1.0), fx.Float32(-1.0))
-        for _, bit in _ROW_BUTTERFLY
-    ]
-
-
-def _row_sum(value):
-    """Sum over the 16 lanes of a DPP row, in every lane of it."""
-    for ctrl, _ in _ROW_BUTTERFLY:
-        value = value + _row_move(value, ctrl)
-    return value
-
-
-def _row_max(value):
-    """Maximum over the 16 lanes of a DPP row, in every lane of it."""
-    for ctrl, _ in _ROW_BUTTERFLY:
-        value = value.maximumf(_row_move(value, ctrl))
-    return value
-
-
-def _max_abs(values):
-    """Largest magnitude among the 8 values of a vector."""
-    result = fx.Float32(0.0)
-    for k in range(8):
-        result = result.maximumf(values[k].maximumf(-values[k]))
-    return result
-
-
-def _hadamard128(values, signs):
-    """Unnormalized Hadamard over one 128-wide head held as 8 values in each of 16 lanes.
-
-    Q and K go through the same transform, so their attention scores are unchanged.
-    ``signs`` comes from _butterfly_signs.
-    """
-    result = list(values)
-    for stage in range(3):
-        shift = 1 << stage
-        result = [
-            (
-                result[i ^ shift] - result[i]
-                if i & shift
-                else result[i] + result[i ^ shift]
-            )
-            for i in range(8)
-        ]
-    for (ctrl, _), sign in zip(_ROW_BUTTERFLY, signs):
-        result = [_row_move(value, ctrl) + sign * value for value in result]
-    return result
+    def leave(self, value):
+        self._store._leave(value, self.row, self._col_base)
 
 
 class StoreCRows(StoreC):
@@ -161,15 +57,24 @@ class StoreCRows(StoreC):
 
     ``fp32_acc`` takes FP32 accumulators that are already scaled, as a block-scaled
     MFMA leaves them, in the same layout: no row or column scales are loaded or applied.
-    B_scale keeps its column scales' place, so the biases and norm weights stay at the
-    same offsets.
+    B_scale keeps its column scales' place, so the bias and the prep's column vectors
+    stay at the same offsets.
+
+    ``prep`` is ``(tables, partials)``: the spec's tables, FP32 ``[M, table_width]``, and
+    the FP32 ``[2, M, N // 128]`` partials (``_init_partials``).
     """
 
     SCALE_LOADS = WAVE_TILES + 2
-    # B_scale holds the N column scales, then with a bias N FP32 biases, then with a
-    # normalizing prep N FP32 RMSNorm weights.
-    BIAS_LOADS = 2
-    GAMMA_LOADS = 2
+    # B_scale holds the N column scales, then with a bias N FP32 biases, then N FP32
+    # values per column vector of the prep, in spec order. A lane loads its 8 columns of
+    # each vector in two loads.
+    VECTOR_LOADS = 2
+
+    @classmethod
+    def load_count(cls, bias, spec, fp32_acc=False):
+        """How many loads ``scale_load_ops`` issues."""
+        vectors = bias + (len(spec.columns) if spec is not None else 0)
+        return (0 if fp32_acc else cls.SCALE_LOADS) + cls.VECTOR_LOADS * vectors
 
     def __init__(
         self,
@@ -182,7 +87,6 @@ class StoreCRows(StoreC):
         has_bias=False,
         prep=None,
         prep_spec=None,
-        eps=1e-6,
         amax_partials=None,
         planar_cols=0,
         fp32_acc=False,
@@ -193,35 +97,38 @@ class StoreCRows(StoreC):
         self.fp32_acc = fp32_acc
         self.prep = prep is not None
         self.spec = prep_spec
-        self.has_gamma = self.prep and prep_spec.gammas
-        # Indices of the first bias and norm-weight loads in scale_load_ops' result.
+        self.columns = prep_spec.columns if self.prep else ()
+        # Indices of the bias's and the first column vector's loads in scale_load_ops'
+        # result.
         self.bias_index = 0 if fp32_acc else WAVE_TILES + 2
-        self.gamma_index = self.bias_index + (self.BIAS_LOADS if has_bias else 0)
-        self.eps = eps
+        self.columns_index = self.bias_index + (self.VECTOR_LOADS if has_bias else 0)
         self.amax = self.prep or amax_partials is not None
         if self.amax and not self.prep:
             self._init_partials(c_rows, c_cols, amax_partials)
         if self.prep:
-            cos, sin, partials = prep
-            freq_bytes = fx.Int64(c_rows) * ROPE_PAIRS * 4
-            self.cos_div, self.sin_div = (
-                fx.logical_divide(
+            tables, partials = prep
+            # One buffer resource per table, based at the table's first column, so the
+            # loads of every table of a row share one offset register.
+            self.tables_div = {}
+            entries = fx.Int64(c_rows) * prep_spec.table_width
+            for name, _ in prep_spec.tables:
+                offset = prep_spec.table_offset(name)
+                view = fx.make_view(fx.get_iter(tables) + offset, fx.get_layout(tables))
+                self.tables_div[name] = fx.logical_divide(
                     fx.rocdl.make_buffer_tensor(
-                        table, max_size=False, num_records_bytes=freq_bytes
+                        view, max_size=False, num_records_bytes=(entries - offset) * 4
                     ),
                     fx.make_layout(1, 1),
                 )
-                for table in (cos, sin)
-            )
             self._init_partials(c_rows, c_cols, partials)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
         sa_tensor = fx.rocdl.make_buffer_tensor(
             A_scale, num_records_bytes=fx.Int64(c_rows) * 4
         )
+        vectors = 1 + has_bias + len(self.columns)
         sb_tensor = fx.rocdl.make_buffer_tensor(
-            B_scale,
-            num_records_bytes=fx.Int64(c_cols) * 4 * (1 + has_bias + self.has_gamma),
+            B_scale, num_records_bytes=fx.Int64(c_cols) * 4 * vectors
         )
         self.sa_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sa_tensor))
         self.sb_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sb_tensor))
@@ -260,7 +167,7 @@ class StoreCRows(StoreC):
             if self.fp32_acc:
                 # No LDS-DMA loads are in flight where an fp32_acc host issues these,
                 # so they are stable loads: LLVM waits for them before any use or copy.
-                return lambda: self._load_freq4(self.columns_div, element())
+                return lambda: self._load_vec4(self.columns_div, element())
             return lambda: self._load_f32x4(rsrc, element() * 4)
 
         def row(i):
@@ -275,9 +182,9 @@ class StoreCRows(StoreC):
             ops += [op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)]
         if self.has_bias:
             ops += [op(self.sb_rsrc, lambda h=h: self.c_cols + col(h)) for h in (0, 1)]
-        if self.has_gamma:
-            gamma_cols = (1 + self.has_bias) * self.c_cols
-            ops += [op(self.sb_rsrc, lambda h=h: gamma_cols + col(h)) for h in (0, 1)]
+        for k in range(len(self.columns)):
+            base = (1 + self.has_bias + k) * self.c_cols
+            ops += [op(self.sb_rsrc, lambda h=h, b=base: b + col(h)) for h in (0, 1)]
         return ops
 
     def _store_bf16x8(self, values, c_index):
@@ -310,7 +217,7 @@ class StoreCRows(StoreC):
         index = self.maxima_base + row * self.heads + col_base // HEAD_DIM
         self._store_f32(maximum, store.select(index, self.partials_oob))
 
-    def _load_freq4(self, div, index):
+    def _load_vec4(self, div, index):
         fx.copy(
             self.scale_atom_4, fx.slice(div, (None, fx.Int32(index))), self.reg_f32_4
         )
@@ -324,69 +231,34 @@ class StoreCRows(StoreC):
             fx.slice(self.partials_div, (None, fx.Int32(index))),
         )
 
-    def _load_freqs(self, row):
-        """cos and sin of the rotation pairs this lane's 8 channels of ``row`` take part in.
+    def _load_table(self, name, row, index, count):
+        """``count`` values (a multiple of 4) of table ``name`` from ``index`` in ``row``,
+        as a list."""
+        base = row * self.spec.table_width + index
+        values = []
+        for k in range(0, count, 4):
+            chunk = self._load_vec4(self.tables_div[name], base + k if k else base)
+            values += [chunk[j] for j in range(4)]
+        return values
 
-        Interleaved: the 4 pairs the lane holds. Rotate-half: lanes l and l ^ 8 hold the two
-        halves of 8 pairs, so both read the same 8 values.
-        """
+    def _load_row(self, ctx, row):
+        """Each op's data for ``row``; rows past M read row 0."""
         row = (row < self.c_rows).select(row, fx.Int32(0))
-        if const_expr(self.spec.rope == "rotate_half"):
-            index = row * ROPE_PAIRS + (self.lane_id % 8) * 8
-            return tuple(
-                [
-                    v[k]
-                    for v in (
-                        self._load_freq4(div, index),
-                        self._load_freq4(div, index + 4),
-                    )
-                    for k in range(4)
-                ]
-                for div in (self.cos_div, self.sin_div)
-            )
-        index = row * ROPE_PAIRS + (self.lane_id % 16) * 4
-        return self._load_freq4(self.cos_div, index), self._load_freq4(
-            self.sin_div, index
-        )
+        return [op.load(ctx, row) for op in self.spec.ops]
 
-    def _prep_row(self, x, gammas, freqs, signs, row, col_base):
-        """The spec's Q/K prep of the 8 channels this lane holds of one row.
-
-        A norm across heads is left to the caller: its factor is one scalar per row, and
-        RoPE and the Hadamard are linear, so the caller applies it later from the per-head
-        sums of squares stored here.
-        """
-        spec = self.spec
+    def _leave(self, value, row, col_base):
+        """Store the row-factor op's partial of this row's head."""
         store = (row < self.c_rows) & ((self.lane_id % 16) == 0)
-        if const_expr(spec.gammas):
-            sq = _row_sum(fx.Float32((x * x).reduce(ReductionOp.ADD)))
-        if const_expr(spec.norm == "rms_per_head"):
-            x = x * Vec.filled(
-                8, fmath.rsqrt(sq * (1.0 / HEAD_DIM) + self.eps), fx.Float32
-            )
-        y = x * gammas if const_expr(spec.gammas) else x
-        if const_expr(spec.rope == "interleaved"):
-            cos, sin = freqs
-            rotated = []
-            for k in range_constexpr(4):
-                even, odd = y[2 * k], y[2 * k + 1]
-                rotated += [even * cos[k] - odd * sin[k], odd * cos[k] + even * sin[k]]
-        elif const_expr(spec.rope == "rotate_half"):
-            cos, sin = freqs
-            # Channel c < 64 takes -x[c + 64] sin, channel c >= 64 takes +x[c - 64] sin.
-            low = (self.lane_id % 16) < 8
-            rotated = []
-            for k in range_constexpr(8):
-                partner = _row_move(y[k], _ROW_ROR8)
-                rotated.append(y[k] * cos[k] + low.select(-partner, partner) * sin[k])
-        else:
-            rotated = [y[k] for k in range(8)]
-        if const_expr(spec.norm == "rms_across_heads"):
-            p_index = row * self.heads + col_base // HEAD_DIM
-            self._store_f32(sq, store.select(p_index, self.partials_oob))
-        if const_expr(spec.hadamard):
-            rotated = _hadamard128(rotated, signs)
-        result = Vec.from_elements(rotated, fx.Float32)
+        index = row * self.heads + col_base // HEAD_DIM
+        self._store_f32(value, store.select(index, self.partials_oob))
+
+    def _prep_row(self, x, ctx, states, data, row, col_base):
+        """The spec's ops on the 8 channels this lane holds of one row, then the head's
+        maximum."""
+        ctx.row = row
+        for op, state, values in zip(self.spec.ops, states, data):
+            x = op.apply(x, ctx, state, values)
+        result = _vector(x)
         self._store_row_max(result, row, col_base)
         return result
 
@@ -398,51 +270,49 @@ class StoreCRows(StoreC):
         wave's 128 rows, as stored in BF16: FP32 at [row // 128][column within its plane].
         """
         prep = self.prep if prep is None else prep
-        if const_expr(self.has_gamma and not prep):
-            # Norm-weight loads went out for this tile too; their registers stay claimed
-            # until here, past the wait that lands them.
+        if const_expr(bool(self.columns) and not prep):
+            # Column-vector loads went out for this tile too; their registers stay
+            # claimed until here, past the wait that lands them.
+            claimed = scales[self.columns_index :]
             _llvm.inline_asm(
                 res=None,
-                operands_=[Vec(s).ir_value() for s in scales[self.gamma_index :]],
+                operands_=[Vec(s).ir_value() for s in claimed],
                 asm_string="",
-                constraints="v,v",
+                constraints=",".join("v" for _ in claimed),
                 has_side_effects=True,
             )
         row0 = row_base + (self.lane_id // 16) * 4
         col = col_base + (self.lane_id % 16) * 8
+
+        def vector(index):
+            """This lane's 8 columns of the vector whose two loads start at ``index``."""
+            lo, hi = (Vec(s) for s in scales[index : index + 2])
+            return Vec.from_elements(
+                [lo[j] for j in range(4)] + [hi[j] for j in range(4)], fx.Float32
+            )
+
         if const_expr(not self.fp32_acc):
             a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
-            b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES : WAVE_TILES + 2])
-            b_scales = Vec.from_elements(
-                [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
-            )
+            b_scales = vector(WAVE_TILES)
         if const_expr(self.has_bias):
-            bias_lo, bias_hi = (
-                Vec(s) for s in scales[self.bias_index : self.bias_index + 2]
-            )
-            biases = Vec.from_elements(
-                [bias_lo[j] for j in range(4)] + [bias_hi[j] for j in range(4)],
-                fx.Float32,
-            )
-        gammas = None
-        if const_expr(prep and self.has_gamma):
-            gamma_lo, gamma_hi = (Vec(s) for s in scales[self.gamma_index :])
-            gammas = Vec.from_elements(
-                [gamma_lo[j] for j in range(4)] + [gamma_hi[j] for j in range(4)],
-                fx.Float32,
-            )
+            biases = vector(self.bias_index)
+        ops = self.spec.ops if prep else ()
+        if const_expr(prep):
+            columns = {
+                name: vector(self.columns_index + self.VECTOR_LOADS * k)
+                for k, name in enumerate(self.columns)
+            }
+            ctx = _PrepContext(self, columns, col_base)
         oob = fx.Int32(self.c_rows * self.c_cols)
         col_valid = col < self.c_cols
-        signs = None
-        if const_expr(prep and self.spec.hadamard):
-            signs = _butterfly_signs(self.lane_id)
+        states = [op.setup(ctx) for op in ops]
         peaks = [fx.Float32(0.0) for _ in range(8)]
-        rope = prep and self.spec.rope != "none"
+        loads = any(op.tables for op in ops)
         for i in range_constexpr(WAVE_TILES):
-            tile_freqs = [None] * 4
-            if const_expr(rope):
+            tile_data = [[None] * len(ops)] * 4
+            if const_expr(loads):
                 # One wait for the tile's four rows rather than one per row.
-                tile_freqs = [self._load_freqs(row0 + i * TILE + r) for r in range(4)]
+                tile_data = [self._load_row(ctx, row0 + i * TILE + r) for r in range(4)]
             for r in range_constexpr(4):
                 if const_expr(self.fp32_acc):
                     scaled = Vec.from_elements(
@@ -459,7 +329,7 @@ class StoreCRows(StoreC):
                 row = row0 + i * TILE + r
                 if const_expr(prep):
                     scaled = self._prep_row(
-                        scaled, gammas, tile_freqs[r], signs, row, col_base
+                        scaled, ctx, states, tile_data[r], row, col_base
                     )
                 elif const_expr(self.amax):
                     self._store_row_max(scaled, row, col_base)

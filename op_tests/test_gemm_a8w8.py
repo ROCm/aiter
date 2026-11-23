@@ -1176,66 +1176,32 @@ INT8_PREP_HEAD = 128
 INT8_PREP_EPS = 1e-6
 
 
-def int8_4wave_prep_hadamard(x):
-    """The prep epilogue's per-head Hadamard over the last dimension.
-
-    Channel 8 * lane + k of a 128-wide head: three butterflies over a lane's 8
-    channels, then four across the head's 16 lanes, pairing lanes i ^ 1, i ^ 2,
-    i ^ 7 and i ^ 8 as the kernel's DPP moves do.
-    """
-    v = x.reshape(*x.shape[:-1], 16, 8)
-    k = torch.arange(8, device=x.device)
-    for shift in (1, 2, 4):
-        partner = v[..., k ^ shift]
-        v = torch.where((k & shift).bool(), partner - v, v + partner)
-    lane = torch.arange(16, device=x.device)
-    for mask, bit in ((1, 1), (2, 2), (7, 4), (8, 8)):
-        sign = torch.where((lane & bit).bool(), -1.0, 1.0)[:, None]
-        v = v[..., lane ^ mask, :] + sign * v
-    return v.reshape(x.shape)
-
-
 def int8_4wave_prep_reference(case, spec):
-    """Stored projection, per-head sums of squares and per-head maxima of the stored output."""
+    """Stored projection, the row-factor op's per-head partials and per-head maxima of
+    the stored output."""
     acc = F.linear(case["x"].float(), case["weight"].float())
     acc = acc * (case["x_scale"] * case["w_scale"])
     if case["bias"] is not None:
         acc = acc + case["bias"]
     m, n = acc.shape
     y = acc.view(m, n // INT8_PREP_HEAD, INT8_PREP_HEAD)
-    sq = (y * y).sum(-1)
-    if spec.norm == "rms_per_head":
-        y = y * torch.rsqrt(sq / INT8_PREP_HEAD + INT8_PREP_EPS)[..., None]
-    if spec.gammas:
-        y = y * case["gamma"].view(n // INT8_PREP_HEAD, INT8_PREP_HEAD)
-    cos, sin = case["cos"][:, None, :], case["sin"][:, None, :]
-    if spec.rope == "interleaved":
-        even, odd = y[..., 0::2], y[..., 1::2]
-        y = torch.stack((even * cos - odd * sin, odd * cos + even * sin), -1)
-        y = y.flatten(-2)
-    elif spec.rope == "rotate_half":
-        low, high = y[..., :64], y[..., 64:]
-        y = torch.cat((low * cos - high * sin, high * cos + low * sin), -1)
-    if spec.hadamard:
-        y = int8_4wave_prep_hadamard(y)
+    y, partials = spec.reference(y, case["params"], case["tables"])
     stored = y.reshape(m, n).to(dtypes.bf16)
     maxima = stored.float().abs().view(m, n // INT8_PREP_HEAD, INT8_PREP_HEAD)
-    return stored, sq, maxima.amax(-1)
+    return stored, partials, maxima.amax(-1)
 
 
-def make_int8_4wave_prep_case(m, n, k, bias, hadamard, seed):
+def make_int8_4wave_prep_case(m, n, k, bias, seed):
     case = make_int8_4wave_case((m, n, k), seed)
     generator = torch.Generator(device="cuda").manual_seed(seed + 1)
-    gamma = 1 + 0.1 * torch.randn(n, device="cuda", generator=generator)
+    weight = 1 + 0.1 * torch.randn(n, device="cuda", generator=generator)
     angles = torch.rand((m, 64), device="cuda", generator=generator) * 6.28
     case.update(
         bias=(
             torch.randn(n, device="cuda", generator=generator) * 0.1 if bias else None
         ),
-        # The caller folds the Hadamard's 128^-0.5 into the norm weights.
-        gamma=gamma * INT8_PREP_HEAD**-0.5 if hadamard else gamma,
-        cos=angles.cos().contiguous(),
-        sin=angles.sin().contiguous(),
+        params={"weight": weight},
+        tables={"cos": angles.cos(), "sin": angles.sin()},
     )
     return case
 
@@ -1249,25 +1215,23 @@ def int8_4wave_prep_launcher(case, spec, num_cu=0):
 
     m, k = case["x"].shape
     n = case["weight"].shape[0]
-    columns = [case["w_scale"].view(-1)]
-    if spec.bias:
-        columns.append(case["bias"])
-    if spec.gammas:
-        columns.append(case["gamma"])
-    columns = torch.cat(columns)
+    columns = spec.pack_columns(
+        case["w_scale"], case["bias"], [case["params"]], n // INT8_PREP_HEAD
+    )
+    tables = spec.pack_tables(case["tables"])
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda")
     partials = torch.full(
         (2, m, n // INT8_PREP_HEAD), float("nan"), dtype=dtypes.fp32, device="cuda"
     )
-    kernel = compile_int8_gemm_4w(K=k, num_cu=num_cu, eps=INT8_PREP_EPS, prep=spec)
+    kernel = compile_int8_gemm_4w(K=k, num_cu=num_cu, prep=spec)
     args = (
         case["x"].view(-1),
         case["weight_shuffled"].view(-1),
         out.view(-1),
         case["x_scale"].view(-1),
         columns,
-        case["cos"].view(-1),
-        case["sin"].view(-1),
+        # Without tables the kernel never reads its tables argument.
+        (tables if tables is not None else columns).view(-1),
         partials.view(-1),
         m,
         n,
@@ -1282,11 +1246,11 @@ def int8_4wave_prep_launcher(case, spec, num_cu=0):
 
 @benchmark()
 def test_int8_4wave_prep(m, n, k, norm, rope, hadamard, bias, persistent):
-    from aiter.ops.flydsl.kernels.qk_prep_epilogue import PrepSpec
+    from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
 
-    spec = PrepSpec(norm, rope, bias, hadamard)
-    case = make_int8_4wave_prep_case(m, n, k, bias, hadamard, seed=m + n + k)
-    stored, sq, maxima = int8_4wave_prep_reference(case, spec)
+    spec = PrepSpec(norm, rope, bias, hadamard, eps=INT8_PREP_EPS)
+    case = make_int8_4wave_prep_case(m, n, k, bias, seed=m + n + k)
+    stored, row_partials, maxima = int8_4wave_prep_reference(case, spec)
     launch = int8_4wave_prep_launcher(case, spec, get_cu_num() if persistent else 0)
     (out, partials), us = run_perftest(launch, num_iters=TEST_NUM_ITERS)
     # PyTorch rounds the FP32 math in another order, so a BF16 value may land one step away.
@@ -1298,11 +1262,11 @@ def test_int8_4wave_prep(m, n, k, norm, rope, hadamard, bias, persistent):
         maxima, partials[1], rtol=2**-7, atol=1e-6, msg=f"{spec}: head maxima"
     )
     assert err_max == 0, f"{spec}: {err_max:.2%} of the head maxima outside rtol/atol"
-    if spec.norm == "rms_across_heads":
-        err_sq = checkAllclose(
-            sq, partials[0], rtol=1e-5, atol=0, msg=f"{spec}: head sums of squares"
+    if spec.row_factor is not None:
+        err_row = checkAllclose(
+            row_partials, partials[0], rtol=1e-5, atol=0, msg=f"{spec}: row partials"
         )
-        assert err_sq == 0, f"{spec}: {err_sq:.2%} of the sums of squares outside rtol"
+        assert err_row == 0, f"{spec}: {err_row:.2%} of the row partials outside rtol"
     nbytes = m * k + n * k + 2 * m * n + 8 * m * (n // INT8_PREP_HEAD)
     return {
         "gfx": get_gfx(),
@@ -1315,7 +1279,7 @@ def test_int8_4wave_prep(m, n, k, norm, rope, hadamard, bias, persistent):
 
 @torch.no_grad()
 def run_int8_4wave_prep_correctness():
-    """Q/K prep epilogue variants (PrepSpec) against an FP32 PyTorch reference."""
+    """Q/K prep epilogue variants (PrepSpec) against the spec's FP32 PyTorch reference."""
     if get_gfx() != "gfx950":
         aiter.logger.info("INT8 4-wave prep: skipped, requires gfx950")
         return

@@ -42,11 +42,8 @@ from aiter.ops.flydsl.kernels.kernels_common import (
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
-from aiter.ops.flydsl.kernels.qk_prep_epilogue import (
-    PrepSpec,
-    StoreCRows,
-    mfma_drain,
-)
+from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
+from aiter.ops.flydsl.kernels.qk_prep_epilogue import StoreCRows, mfma_drain
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -249,7 +246,6 @@ def compile_int8_gemm_4w(
     amax: bool = False,
     roles: int = 1,
     role_cols: int = 0,
-    eps: float = 1e-6,
     hooks: GemmHooks | None = None,
     col_amax_offset: int | None = None,
 ):
@@ -259,14 +255,12 @@ def compile_int8_gemm_4w(
     N column scales followed by the N biases.
 
     ``prep``, a ``PrepSpec``, applies a Q/K prep in the epilogue; its ``bias`` replaces
-    ``bias``. With a norm, B_scale also holds the N norm weights after the scales and
-    biases, multiplied
-    by 128 ** -0.5 when the Hadamard is applied here. The launcher takes FP32 ``[M, 64]``
-    cos and sin tables (one value per rotation pair) and writes FP32 ``[2, M, N // 128]``:
-    per-head sums of squares of the projection (for a norm across heads), then per-head
-    maxima of the stored output. For a norm across heads the caller scales each row by
-    ``rsqrt(sum / N + eps)``. All three are flat: FlyDSL indexes a 2-D tensor argument
-    column-major.
+    ``bias``. B_scale then also holds the spec's column vectors after the scales and
+    biases (``PrepSpec.pack_columns``). The launcher takes the spec's FP32 tables
+    (``PrepSpec.pack_tables``) and writes FP32 ``[2, M, N // 128]``: the row-factor op's
+    per-head partials, then per-head maxima of the stored output. With a row-factor op
+    the caller scales each row by the op's factor of the sum of the row's partials. All
+    three are flat: FlyDSL indexes a 2-D tensor argument column-major.
 
     ``amax`` (without ``prep``) writes only the maxima half of that buffer, for a
     projection the consumer quantizes as it is, such as V.
@@ -362,11 +356,7 @@ def compile_int8_gemm_4w(
     # the next block's LDS-DMA loads, and add to that tile's phase 3 wait.
     # Tile K_ITERS - 1's phase 3 wait, or with no next block tile
     # K_ITERS - 2's wait for everything, then covers them.
-    SCALE_LOADS = (
-        StoreCRows.SCALE_LOADS
-        + (StoreCRows.BIAS_LOADS if bias else 0)
-        + (StoreCRows.GAMMA_LOADS if prep and prep_spec.gammas else 0)
-    )
+    SCALE_LOADS = StoreCRows.load_count(bias, prep_spec)
     FIRST_BLOCK = first_block_hook is not None
     assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
     # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
@@ -382,7 +372,6 @@ def compile_int8_gemm_4w(
         + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
         + ("_bias" if bias else "")
         + ("_prep" + prep_spec.suffix if prep else "")
-        + (f"_eps{eps:g}" if prep and eps != 1e-6 else "")
         + ("_amax" if amax and not prep else "")
         + (f"_roles{roles}x{role_cols}" if roles > 1 else "")
         + (f"_hook{hook_key}" if role_hook is not None else "")
@@ -407,8 +396,7 @@ def compile_int8_gemm_4w(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        Cos: fx.Tensor,
-        Sin: fx.Tensor,
+        Tables: fx.Tensor,
         Partials: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
@@ -860,9 +848,8 @@ def compile_int8_gemm_4w(
             WAVE_TILES,
             WAVE_TILES,
             has_bias=bias,
-            prep=(Cos, Sin, Partials) if prep else None,
+            prep=(Tables, Partials) if prep else None,
             prep_spec=prep_spec,
-            eps=eps,
             amax_partials=Partials if amax and not prep else None,
             planar_cols=role_cols if roles > 1 else 0,
         )
@@ -1185,14 +1172,13 @@ def compile_int8_gemm_4w(
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         if const_expr(persistent):
             grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
-        # Without prep the kernel never reads its cos, sin and partials arguments.
+        # Without prep the kernel never reads its tables and partials arguments.
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
             B_scale,
-            A_scale,
             A_scale,
             A_scale,
             c_m,
@@ -1214,8 +1200,7 @@ def compile_int8_gemm_4w(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        Cos: fx.Tensor,
-        Sin: fx.Tensor,
+        Tables: fx.Tensor,
         Partials: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
@@ -1230,8 +1215,7 @@ def compile_int8_gemm_4w(
             C,
             A_scale,
             B_scale,
-            Cos,
-            Sin,
+            Tables,
             Partials,
             c_m,
             c_n,
@@ -1260,14 +1244,13 @@ def compile_int8_gemm_4w(
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         if const_expr(persistent):
             grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
-        # Without prep the kernel never reads its cos and sin arguments.
+        # Without prep the kernel never reads its tables argument.
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
             B_scale,
-            A_scale,
             A_scale,
             Partials,
             c_m,
@@ -1289,8 +1272,7 @@ def compile_int8_gemm_4w(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        Cos: fx.Tensor,
-        Sin: fx.Tensor,
+        Tables: fx.Tensor,
         Partials: fx.Tensor,
         aux: fx.Int64,
         h0: fx.Int64,
@@ -1309,8 +1291,7 @@ def compile_int8_gemm_4w(
             C,
             A_scale,
             B_scale,
-            Cos,
-            Sin,
+            Tables,
             Partials,
             c_m,
             c_n,
