@@ -1849,10 +1849,14 @@ def _fused_config(
         config = _large_m_config(expert_waves)
         if layout == V41_FLASH_EP4_LAYOUT:
             # EP4 only (the EP2 / EP8 large tunes build on _tune_v41_flash_ep4_large): GEMM2 claims walk groups of
-            # 256 m-blocks, all n-blocks of a group before the next, so the CTAs in flight share W2 slabs;
-            # bit-identical.
+            # 256 m-blocks, all n-blocks of a group before the next, so the CTAs in flight share W2 slabs; 96
+            # dispatch CUs instead of 192. Bit-identical.
             config = _tune_v41_flash_ep4_large(config)
-            return replace(config, fused_stage2=replace(config.fused_stage2, m_group=256))
+            return replace(
+                config,
+                stage1=replace(config.stage1, num_dispatch_cu=96),
+                fused_stage2=replace(config.fused_stage2, m_group=256),
+            )
         if layout == V41_FLASH_EP2_LAYOUT:
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
