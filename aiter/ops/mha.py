@@ -3978,31 +3978,7 @@ def _flash_attn_varlen_backward(
     # Evaluated after maybe_contiguous: the gate checks contiguity.
     can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
 
-    if can_impl_fmha_bwd_flydsl_:
-        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
-
-        (
-            dq,
-            dk,
-            dv,
-            softmax_d,
-        ) = flydsl_flash_attn_varlen_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            cu_seqlens_q,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            deterministic,
-        )
-    elif can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -4036,6 +4012,30 @@ def _flash_attn_varlen_backward(
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
+        )
+    elif can_impl_fmha_bwd_flydsl_:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
+
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = flydsl_flash_attn_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            deterministic,
         )
     else:
         (
