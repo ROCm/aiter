@@ -154,11 +154,8 @@ def get_gfx_runtime_for_device(device=None) -> str:
 
     None (or an unindexed CUDA device) follows the current device each call,
     so this query must not use the node-wide get_gfx_runtime cache. Device
-    errors propagate. GPU_ARCHS is ignored except in an AOT replay process,
-    where get_gfx_runtime owns validation of the offline target.
+    errors propagate. Build-time GPU_ARCHS does not affect this query.
     """
-    if os.getenv("AITER_AOT_REPLAY") == "1":
-        return get_gfx_runtime()
     import torch
 
     return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0].lower()

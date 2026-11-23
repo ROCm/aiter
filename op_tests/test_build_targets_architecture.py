@@ -218,9 +218,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
             return type("Properties", (), {"gcnArchName": architectures[index]})()
 
         with (
-            mock.patch.dict(
-                os.environ, {"GPU_ARCHS": "gfx950", "AITER_AOT_REPLAY": "0"}
-            ),
+            mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx950"}),
             mock.patch.object(self.torch.cuda, "get_device_properties", properties),
             mock.patch.object(
                 self.chip_info,
@@ -242,7 +240,6 @@ class TestRuntimeArchitecture(unittest.TestCase):
 
     def test_selected_device_query_errors_propagate(self):
         with (
-            mock.patch.dict(os.environ, {"AITER_AOT_REPLAY": "0"}),
             mock.patch.object(
                 self.torch.cuda,
                 "get_device_properties",
@@ -251,26 +248,6 @@ class TestRuntimeArchitecture(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "device query failed"),
         ):
             self.chip_info.get_gfx_runtime_for_device(1)
-
-    def test_selected_device_reuses_aot_target_validation_without_gpu(self):
-        for arch in ("gfx950", "gfx1250-strict", "gfx942;gfx950", ""):
-            with (
-                self.subTest(arch=arch),
-                mock.patch.dict(
-                    os.environ, {"AITER_AOT_REPLAY": "1", "GPU_ARCHS": arch}
-                ),
-                mock.patch.object(
-                    self.torch.cuda,
-                    "get_device_properties",
-                    side_effect=AssertionError("device probe"),
-                ),
-            ):
-                self.chip_info.get_gfx_runtime.cache_clear()
-                if arch in ("gfx950", "gfx1250-strict"):
-                    self.assertEqual(self.chip_info.get_gfx_runtime_for_device(1), arch)
-                else:
-                    with self.assertRaises(RuntimeError):
-                        self.chip_info.get_gfx_runtime_for_device(1)
 
     def test_native_detection_preserves_strict_identity(self):
         # Regression lock: _detect_native must return the exact ROCr-reported
