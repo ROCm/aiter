@@ -1,19 +1,312 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 bf16 grouped GEMMs (the DeepGEMM interfaces) on the 4-wave pipeline: the layouts, MFMA, pinned
-// registers and schedule of opus_gemm_pipeline_a16w16_4wave_gfx950.cuh (namespace opus_a16w16_4wave),
-// this file's own tile mapping, K range, buffer views and write-back:
+// gfx950 bf16 grouped GEMMs (the DeepGEMM interfaces) on the bf16 4-wave pipeline: its layouts, MFMA,
+// pinned registers and schedule (the helpers below and the tile body's main loop, the text of the dense
+// 4-wave pipeline of #7933), this file's own tile mapping, K range, buffer views and write-back:
 //   M-grouped NT / NN (opus_gemm_a16w16_grouped_kargs_gfx950), K-grouped TN with its plan kernel
 //   (opus_gemm_a16w16_k_grouped_kargs_gfx950). Traits: opus_gemm_traits_a16w16_grouped_gfx950.cuh.
 #pragma once
 
-#include "opus_gemm_pipeline_a16w16_4wave_gfx950.cuh"
 #include "opus_gemm_traits_a16w16_grouped_gfx950.cuh"
 
+// ============================================================================
+// The 4-wave pipeline's layouts, swizzles, schedule, operand pinning and MFMA
+// ============================================================================
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
+// The operands and accumulators are pinned to fixed AGPR / VGPR ranges: needs the AGPR-pinning
+// toolchain (gen_co/build_co.py).
+#if !__has_cpp_attribute(clang::amdgpu_pin_agpr)
+#error "opus_gemm a16w16 grouped: [[clang::amdgpu_pin_agpr]] needs the AGPR-pinning toolchain"
+#endif
+
 namespace opus_a16w16_grouped {
+
+using opus::operator""_I;
+
+template<int E>
+__device__ __host__ inline constexpr int mn_swz(int k) {
+    if constexpr (E == 4) return (k & 7) ^ (((k >> 3) & 1) * 4);
+    else if constexpr (E == 2) return ((k >> 1) & 1) | (((k >> 3) & 1) << 1);
+    else return (k >> 3) & 1;
+}
+
+template<class T, int E, int T_W>
+__device__ inline int mn_r_xor(int lane_id, int wave, int e, int h) {
+    constexpr int tr_cols = T::W_M / T::VEC_TR;
+    const int k = (lane_id / T::W_M) * (T::W_K / (T::WARP_SIZE / T::W_M)) + h * T::VEC_TR + (lane_id % T::W_M) / tr_cols;
+    const int window = T_W * e + wave;
+    return ((window ^ mn_swz<E>(k)) - window) * T::W_M;              // window = W_M elements
+}
+
+enum { OPERAND_A = 0, OPERAND_B = 1 };
+
+// Each operand takes one of two paths, picked by its own storage:
+//   _nt: K-contiguous   (A [M, K], B [N, K]): ds_read_b128
+//   _tn: M/N-contiguous (A [K, M], B [K, N]): ds_read_b64_tr_b16
+//          A      B
+//   NT   _nt    _nt
+//   NN   _nt    _tn
+//   TT   _tn    _nt
+//   TN   _tn    _tn
+
+// ============================================================================
+// K-contiguous operand (_nt): A [M, K], B [N, K]
+// ============================================================================
+template<class T, int OP>
+__device__ inline auto make_layout_g_nt(int lane_id, int wave_id_m, int wave_id_n, int stride) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+    constexpr int threads_k = T::B_K / T::VEC_A;
+
+    const int wave_x = OP == OPERAND_A ? wave_id_m : wave_id_n;
+    const int wave_y = OP == OPERAND_A ? wave_id_n : wave_id_m;
+
+    constexpr auto g_block_shape = opus::make_tuple(
+        opus::number<E>{},
+        opus::number<T::T_N>{},
+        opus::number<T::WARP_SIZE / threads_k>{},
+        opus::number<T::T_M>{},
+        opus::number<threads_k>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto g_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_A>(
+        g_block_shape,
+        opus::unfold_x_stride(g_block_dim, g_block_shape, opus::tuple{stride, 1_I}),
+        opus::unfold_p_coord(g_block_dim, opus::tuple{wave_y, lane_id / threads_k, wave_x, (lane_id % threads_k) ^ (((lane_id / threads_k) ^ (wave_x << 2)) & 7)}));
+}
+
+template<class T, int OP>
+__device__ inline auto make_layout_s_nt(int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+
+    const int wave_x = OP == OPERAND_A ? wave_id_m : wave_id_n;
+    const int wave_y = OP == OPERAND_A ? wave_id_n : wave_id_m;
+
+    constexpr auto s_block_shape = opus::make_tuple(
+        opus::number<T::T_N>{},
+        opus::number<T::T_M>{},
+        opus::number<E>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto s_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        s_block_shape,
+        opus::unfold_x_stride(s_block_dim, s_block_shape, opus::tuple{opus::number<T::smem_linear_wave_a>{}, 1_I}),
+        opus::unfold_p_coord(s_block_dim, opus::tuple{wave_y, wave_x}));
+}
+
+template<class T, int OP>
+__device__ inline auto make_layout_r_nt(int lane_id, int wave_id_m, int wave_id_n, int kk) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+
+    const int wave = OP == OPERAND_A ? wave_id_m : wave_id_n;
+    const int lane_r = lane_id % T::W_M;
+
+    constexpr auto r_block_shape = opus::make_tuple(
+        opus::number<T::T_M>{},
+        opus::number<T::T_M>{},
+        opus::number<E>{},
+        opus::number<T::W_M / T::T_M>{},
+        opus::number<T::E_C>{},
+        opus::number<T::WARP_SIZE / T::W_M>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto r_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_A>(
+        r_block_shape,
+        opus::unfold_x_stride(r_block_dim, r_block_shape, opus::tuple{opus::number<T::smem_linear_wave_a>{}, 1_I}),
+        opus::unfold_p_coord(r_block_dim, opus::tuple{wave, lane_r % T::T_M, lane_r / T::T_M, 0_I, (4 * kk + lane_id / T::W_M) ^ (((lane_r / T::T_M) ^ ((lane_r % T::T_M) << 2)) & 7)}));
+}
+
+// ============================================================================
+// M/N-contiguous operand (_tn): A [K, M], B [K, N]
+// ============================================================================
+template<class T, int OP>
+__device__ inline auto make_layout_g_tn(int lane_id, int wave_id_m, int wave_id_n, int stride) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+    constexpr int row = OP == OPERAND_A ? T::HALF_B_M : T::HALF_B_N;
+    constexpr int threads_mn = row / T::VEC_A;
+    constexpr int rows_per_issue = T::WARP_SIZE / threads_mn;
+
+    const int kr = lane_id / threads_mn;
+    const int swz = mn_swz<E>(rows_per_issue * (wave_id_m * T::T_N + wave_id_n) + kr) * (T::W_M / T::VEC_A);
+
+    constexpr auto g_block_shape = opus::make_tuple(
+        opus::number<E>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
+        opus::number<rows_per_issue>{},
+        opus::number<threads_mn>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto g_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_A>(
+        g_block_shape,
+        opus::unfold_x_stride(g_block_dim, g_block_shape, opus::tuple{stride, 1_I}),
+        opus::unfold_p_coord(g_block_dim, opus::tuple{wave_id_m, wave_id_n, kr, (lane_id % threads_mn) ^ swz}));
+}
+
+template<class T, int OP>
+__device__ inline auto make_layout_s_tn(int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+
+    constexpr auto s_block_shape = opus::make_tuple(
+        opus::number<E>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto s_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        s_block_shape,
+        opus::unfold_x_stride(s_block_dim, s_block_shape, opus::tuple{opus::number<T::smem_linear_wave_a>{}, 1_I}),
+        opus::unfold_p_coord(s_block_dim, opus::tuple{wave_id_m, wave_id_n}));
+}
+
+template<class T, int OP>
+__device__ inline auto make_layout_r_tn(int lane_id, int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+    constexpr int T_W = OP == OPERAND_A ? T::T_M : T::T_N;
+    constexpr int row = OP == OPERAND_A ? T::HALF_B_M : T::HALF_B_N;
+
+    const int wave = OP == OPERAND_A ? wave_id_m : wave_id_n;
+
+    constexpr auto r_block_shape = opus::make_tuple(
+        opus::number<T::B_K / T::W_K>{},
+        opus::number<T::WARP_SIZE / T::W_M>{},
+        opus::number<T::VEC_A / T::VEC_TR>{},
+        opus::number<T::VEC_TR>{},
+        opus::number<E>{},
+        opus::number<T_W>{},
+        opus::number<T::W_M / T::VEC_TR>{},
+        opus::number<T::VEC_TR>{});
+
+    constexpr auto r_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_TR>(
+        r_block_shape,
+        opus::unfold_x_stride(r_block_dim, r_block_shape, opus::tuple{opus::number<row>{}, 1_I}),
+        opus::unfold_p_coord(r_block_dim, opus::tuple{lane_id / T::W_M, (lane_id % T::W_M) / (T::W_M / T::VEC_TR), wave, lane_id % (T::W_M / T::VEC_TR)}));
+}
+
+// ============================================================================
+// A / B layouts: each operand takes the _nt or _tn builder by its own storage (table above).
+// ============================================================================
+// Create layout for loading A matrix from global memory.
+template<class T>
+__device__ inline auto make_layout_ga(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
+    if constexpr (T::A_T) return make_layout_g_tn<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n, stride_a);
+    else return make_layout_g_nt<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n, stride_a);
+}
+
+// Create layout for storing A matrix to shared memory.
+template<class T>
+__device__ inline auto make_layout_sa(int wave_id_m, int wave_id_n) {
+    if constexpr (T::A_T) return make_layout_s_tn<T, OPERAND_A>(wave_id_m, wave_id_n);
+    else return make_layout_s_nt<T, OPERAND_A>(wave_id_m, wave_id_n);
+}
+
+// Create layout for loading B matrix from global memory.
+template<class T>
+__device__ inline auto make_layout_gb(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
+    if constexpr (T::B_T) return make_layout_g_tn<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n, stride_b);
+    else return make_layout_g_nt<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n, stride_b);
+}
+
+// Create layout for storing B matrix to shared memory.
+template<class T>
+__device__ inline auto make_layout_sb(int wave_id_m, int wave_id_n) {
+    if constexpr (T::B_T) return make_layout_s_tn<T, OPERAND_B>(wave_id_m, wave_id_n);
+    else return make_layout_s_nt<T, OPERAND_B>(wave_id_m, wave_id_n);
+}
+
+// Create layout for reading A matrix from shared memory to registers (K step kk; _tn: kk is an immediate).
+template<class T>
+__device__ inline auto make_layout_ra(int lane_id, int wave_id_m, int wave_id_n, int kk) {
+    if constexpr (T::A_T) return make_layout_r_tn<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n);
+    else return make_layout_r_nt<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n, kk);
+}
+
+// Create layout for reading B matrix from shared memory to registers (K step kk; _tn: kk is an immediate).
+template<class T>
+__device__ inline auto make_layout_rb(int lane_id, int wave_id_m, int wave_id_n, int kk) {
+    if constexpr (T::B_T) return make_layout_r_tn<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n);
+    else return make_layout_r_nt<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n, kk);
+}
+
+// sched_group_barrier masks (LLVM AMDGPU)
+constexpr int SCHED_MFMA = 0x008;
+constexpr int SCHED_VMEM_READ = 0x820;   // 0x020 VMEM read | 0x800 LDS DMA (buffer_load ... lds)
+constexpr int SCHED_DS_READ = 0x100;
+
+template<int SLOTS, int DS, int CAP, int VM>
+__device__ inline void sched_gen() {
+    opus::static_for<SLOTS>([&](auto j_) {
+        constexpr int j = decltype(j_)::value;
+        constexpr int left = DS - CAP * j;
+        constexpr int ds = CAP == 0 ? 0 : (left <= 0 ? 0 : (left > CAP ? CAP : left));
+        constexpr int vm = ((j + 1) * VM + SLOTS - 1) / SLOTS - (j * VM + SLOTS - 1) / SLOTS;
+        __builtin_amdgcn_sched_group_barrier(SCHED_MFMA, 2, 0);
+        if constexpr (ds > 0) __builtin_amdgcn_sched_group_barrier(SCHED_DS_READ, ds, 0);
+        if constexpr (vm > 0) __builtin_amdgcn_sched_group_barrier(SCHED_VMEM_READ, vm, 0);
+    });
+}
+
+// One MFMA operand per lane: 8 bf16 (16 bytes) for one 16x16x32 MFMA.
+using operand_t = opus::vector_t<opus::bf16_t, 8>;
+
+// The operand is pinned at a[AGPR .. AGPR + 3].
+template<int AGPR>
+__device__ inline void set_operand(operand_t& v, const operand_t& x) {
+    [[clang::amdgpu_pin_agpr(AGPR)]] v = x;
+}
+
+// One MFMA 16x16x32. C_REG >= 0: accumulator pinned at a[C_REG]; C_REG <= -2: at v[-C_REG - 2].
+template<int C_REG, class MMA, class CF>
+__device__ inline void mma_bf16(const operand_t& a, const operand_t& b, CF& c) {
+    using base_mma = typename MMA::MMA;
+    if constexpr (C_REG >= 0) {
+        [[clang::amdgpu_pin_agpr(C_REG)]] c = base_mma{}(a, b, c);
+    } else {
+        [[clang::amdgpu_pin_vgpr(-C_REG - 2)]] c = base_mma{}(a, b, c);
+    }
+}
+
+// Pinned registers, packed: A operands a[0 .. A_REGS), B operands a[A_REGS .. A_REGS + B_REGS), then the C
+// fragments (quadrant order C00, C10, C01, C11) up to a[255] and on in v[128 ..]. A_REGS = 2 halves x 2 kk x E_M x 4.
+template<class T> constexpr int A_REGS = 16 * T::E_M;
+template<class T> constexpr int B_REGS = 16 * T::E_N;
+
+template<class T, int HM, int HN, int M, int N>
+constexpr int c_reg() {
+    constexpr int idx = A_REGS<T> + B_REGS<T> + (HN * 2 + HM) * T::E_M * T::E_N * 4 + (M * T::E_N + N) * 4;
+    if constexpr (idx < 256) return idx;
+    else return -(idx - 128) - 2;                                     // v[idx - 128]
+}
+
+
+// ============================================================================
+// Grouped tile mapping
+// ============================================================================
 
 // Rows [row, m_end) of C computed by the tile, the group of its B and the batch of its A / C. row < 0: no tile.
 // K-grouped: the rows [k_row0, k_row0 + k_rows) of A / B summed by the tile, its segment seg of nseg.
@@ -300,7 +593,6 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     using namespace opus;
-    using namespace opus_a16w16_4wave;
     using namespace opus_a16w16_grouped;
 
     using T = opus::remove_cvref_t<Traits>;
