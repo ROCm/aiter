@@ -100,8 +100,10 @@ def test_gfx950_mimo_verify_and_prefill_configs():
         "TILE_SIZE": 64,
     }
 
-    # unchanged: decode, sliding-window prefill, and head sizes other than 192
-    # (these configs are tuned for the 128 + 64 split, which needs exactly 192)
+    # unchanged: decode, and everything that is not full-attention BF16 prefill at
+    # head size 192 (these configs are tuned for the 128 + 64 split, which needs
+    # exactly 192). Prefill at head sizes 129-256 keeps the defaults retuned for it
+    # (D_LEQ_256 entries), so the guards below must resolve to those same configs.
     assert config("attn_3d", sliding_window=0) == {
         "BLOCK_M": 16,
         "num_warps": 2,
@@ -111,15 +113,38 @@ def test_gfx950_mimo_verify_and_prefill_configs():
     prefill_2d_default = {
         "BLOCK_M": 128,
         "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": 1,
+        "SPLIT_UNMASKED_LOOP": True,
+        "TILE_SIZE": 64,
+    }
+    prefill_2d_sliding = {
+        "BLOCK_M": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "TILE_SIZE": 64,
+    }
+    prefill_2d_shuffled = {
+        "BLOCK_M": 128,
+        "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": 1,
+        "TILE_SIZE": 64,
+    }
+    prefill_2d_fp8 = {
+        "BLOCK_M": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "SPLIT_UNMASKED_LOOP": True,
         "TILE_SIZE": 64,
     }
     assert config("attn_2d", sliding_window=128, max_seqlen_q=32768) == (
-        prefill_2d_default
+        prefill_2d_sliding
     )
     # the prefill config is tuned for the split QK dot, which needs an unshuffled
-    # BF16/FP16 cache; shuffled and FP8 caches keep the padded dot and old config
+    # BF16/FP16 cache; shuffled and FP8 caches keep the padded dot and the defaults
     assert (
         config(
             "attn_2d",
@@ -128,7 +153,7 @@ def test_gfx950_mimo_verify_and_prefill_configs():
             shuffled_kv_cache=True,
             block_size=64,
         )
-        == prefill_2d_default
+        == prefill_2d_shuffled
     )
     assert (
         config(
@@ -138,7 +163,7 @@ def test_gfx950_mimo_verify_and_prefill_configs():
             q_dtype=e4m3_dtype,
             kv_cache_dtype=e4m3_dtype,
         )
-        == prefill_2d_default
+        == prefill_2d_fp8
     )
     # head sizes up to 128 have their own prefill and verify entries, so 160 is the
     # head size that must still get the defaults
