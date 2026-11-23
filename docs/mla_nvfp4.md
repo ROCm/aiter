@@ -167,7 +167,7 @@ fall back to FP8 kernels without an explicit conversion.
 The shipped `mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np.co` has an
 80-byte, ten-pointer ABI, fixed LDS of 262144 bytes and a 16KiB aligned
 instruction entry. Dynamic LDS is zero.
-It contains 90236 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
+It contains 73484 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
 SPI prefetch 255. Its public symbol is `mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np`.
 Both HIP producer kernels also request 16KiB instruction alignment.
 The kernel object/descriptor itself is a different address from the entry.
@@ -227,55 +227,97 @@ per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
 and unified dispatch, repeatability, guards, producer byte layouts, active-tail
 requantization, BF16-to-decode, dense-to-CSR, stream/graph and fullgraph compile.
 The optional test allocates approximately 12GiB to put both KV streams above
-4GiB offsets. The previous large-batch performance and accuracy sweeps measured
-an earlier code object. The validation below applies to the updated decoder.
+4GiB offsets. The validation and measurements below describe the current decoder;
+the earlier full-model result is identified separately.
 
-### Public integration validation (2026-11-22)
+### Public integration validation (2026-11-23)
 
 On gfx1250 B0 hardware, **44 selected GPU tests passed, with no skips** using a
-fresh v6 JIT build. This includes the standard BF16 reference, supplemental
-algorithm checks, constant V, guards, producer layouts, graph/fullgraph paths,
-KV offsets beyond 4 GiB and FP8 QH128 regression coverage. Existing test tolerances
-are unchanged. The loaded decoder instructions match those used in the
-full-model evaluation; decoder and both HIP producer entries are 16 KiB aligned.
+fresh v6 JIT build. Coverage includes the standard BF16-input FP32 attention
+reference, supplemental quantized-algorithm checks, constant V, guards, producer
+layouts, graph/fullgraph paths, KV offsets beyond 4 GiB and FP8 QH128 regression.
+Existing test tolerances are unchanged. The actual loaded decoder's 73,484
+instruction bytes match the version measured below; decoder and both HIP
+producer entries are 16 KiB aligned.
 
-### Full-model accuracy
+The current decoder also passed 1,042 randomized/constant-input requests around
+short-sequence, tail and loop boundaries against standard FP32 attention on the
+original BF16 inputs. All 22,528 requests in the performance cases below matched
+the preceding published decoder bitwise. Guards, empty outputs, retained LSE
+buffers and graph/eager consistency passed. These operator checks do not replace
+a full-model evaluation of this revision.
 
-One complete DeepSeek-R1 MLPerf accuracy evaluation used the updated decoder,
-N16 producers, threshold 1, output multiplier `1/89.6` and one KV split.
-It covered all **4388** unique samples and passed the supplied accuracy gate:
+### Full-model accuracy history
+
+The preceding published decoder, at commit
+`fbe834626cf7ee91ff07ccdcdb05cf43c14b5960`, completed one DeepSeek-R1 MLPerf
+accuracy evaluation using N16 producers, threshold 1, output multiplier `1/89.6`
+and one KV split:
 
 | Correct | Exact match | Tokens/sample | Result |
 |---:|---:|---:|---|
 | 3541 / 4388 | 80.697356% | 3931.095260 | PASS |
 
-The gate requires exact match >=80.545% and 3497.6–4274.9 tokens/sample.
-The earlier #7987 T1 evaluation scored 3557/4388 (81.061987%), so this run is
-**16 correct answers lower**, or **0.364631 percentage points**. Passing the
-acceptance gate is not a claim of zero regression versus that historical baseline.
-The result applies to the tested DeepSeek-R1 checkpoint and supplied MLPerf
-harness, using four gfx1250 GPUs. One run does not establish repeated-run
-accuracy stability or accuracy for other models and input distributions.
+The supplied gate requires exact match >=80.545% and 3497.6–4274.9 tokens/sample.
+This is historical evidence for the preceding decoder. The current revision has
+not had a new full-model evaluation; its bitwise operator checks above are not
+a claim of a new MLPerf score, repeated-run accuracy stability or model-throughput
+improvement.
 
-The model run's token-weighted time per output token after the first token was
-41.250 ms. Mean per-request decode duration (`latency - TTFT`) was 162.116 s.
-These timings include framework scheduling. The 732 s query window includes
-prefill and decode and excludes model loading and scoring. Concurrent request
-durations are not summed as wall time. No model-throughput improvement is
-established by this single accuracy run.
+### Decode timing (2026-11-22)
 
-### Decode timing
+Single-GPU measurements on gfx1250 B0 used the current decoder instructions,
+threshold 1, QH128 and page size 64. Both formats shared original BF16 Q/KV,
+request lengths and randomized physical page mappings, with their respective
+native shuffled layouts. NVFP4 produced output only; the existing FP8 API also
+produced LSE.
 
-Two single-GPU paired measurement blocks used batch 512, fixed KV length 2500,
-the same original BF16 inputs and physical page mapping. Each block retained
-all 30 rounds; each sample averaged 32 graph dispatches. NVFP4 produced output
-only, while the existing FP8 API also produced LSE.
+Each row contains two measurement blocks with opposite initialization orders.
+Each block uses 8 eager warmups, 32 dispatches per graph, 5 initial graph replays,
+and 30 alternating NVFP4/FP8 and FP8/NVFP4 rounds. A same-format warm graph
+precedes every sample. The table retains all 60 samples per format and reports
+the arithmetic mean in microseconds per dispatch. Input preparation, quantization,
+cache writes and reference checks are outside the timed region.
 
-| Block | NVFP4 mean (us) | FP8 mean (us) | NVFP4 time increase |
-|---|---:|---:|---:|
-| First | 79.481 | 78.169 | 1.678% |
-| Second | 83.008 | 80.627 | 2.953% |
+The first nine rows use a pool of **199,945 physical pages**. The target mean is
+not necessarily the actual mean after clipping:
 
-FP8 was faster in 25/30 paired rounds in each block. These measurements exclude
-input preparation, cache writes and model execution. Performance depends on
-the workload; the updated decoder is not faster than FP8 in this measured shape.
+| Batch | Target mean KV | Length distribution | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 faster rounds |
+|---:|---:|---|---:|---:|---:|---:|
+| 1536 | 2500 | Uniform | 240.100 | 247.501 | 1.0308x | 59/60 |
+| 1536 | 2500 | Lognormal | 285.748 | 280.372 | 0.9812x | 1/60 |
+| 1536 | 2500 | Few long | 242.439 | 254.359 | 1.0492x | 60/60 |
+| 1536 | 4000 | Uniform | 353.809 | 386.797 | 1.0932x | 59/60 |
+| 1536 | 4000 | Lognormal | 427.594 | 428.989 | 1.0033x | 38/60 |
+| 1536 | 4000 | Few long | 306.189 | 324.113 | 1.0585x | 60/60 |
+| 1024 | 4000 | Uniform | 240.659 | 251.416 | 1.0447x | 60/60 |
+| 1024 | 4000 | Lognormal | 293.424 | 287.514 | 0.9799x | 2/60 |
+| 1024 | 4000 | Few long | 222.339 | 232.322 | 1.0449x | 60/60 |
+
+Uniform means every request has exactly the target length. Lognormal lengths
+use NumPy `default_rng(0)`, log-space sigma 0.8, rescaling to the target mean,
+clipping to [200, 20000], and integer conversion; the three shapes are generated
+in the order shown. Their actual means are 2498.698, 3970.786 and 3955.996.
+For the few-long cases, `floor(batch/32)` requests receive the remaining target
+token budget after the others receive half the target mean; lengths are clipped
+to [200, 30000]. Their actual means are 2148.438, 2875 and 2875. Different
+distributions therefore do not have identical total token counts; compare the
+two formats within each row.
+
+Seven of these nine row means favor NVFP4. The 1.0033x result is close to parity,
+and FP8 remains faster in two lognormal cases. Performance is workload-dependent.
+The two blocks are from the same run, rather than independent repeated runs.
+
+The larger uniform workloads use **600,000 physical pages**, accommodating
+409,600 and 491,520 independent KV pages respectively:
+
+| Batch | Fixed KV | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 time reduction | NVFP4 faster rounds |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5120 | 5120 | 1390.817 | 1692.650 | 1.2170x | 17.83% | 60/60 |
+| 5120 | 6144 | 1643.160 | 2007.923 | 1.2220x | 18.17% | 60/60 |
+
+Both initialization-order blocks favor NVFP4 for both large workloads. Pool size
+changes between the two tables, so absolute timing differences cannot be
+attributed solely to batch size. These are decode-kernel comparisons with FP8,
+not a direct paired comparison with the preceding NVFP4 binary, and they do not
+establish end-to-end model-throughput gains.
