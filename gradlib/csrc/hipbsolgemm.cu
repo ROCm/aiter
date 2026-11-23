@@ -1563,8 +1563,8 @@ using W4A16PlanKey =
     std::tuple<bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t>;
 std::map<W4A16PlanKey, W4A16Plan> w4a16_plans;
 
-// The heuristic's choice depends on the batch size, so plans are keyed on it, bucketed to the next
-// power of two to bound the cache: decode (M = 1) and each prefill octave get their own query.
+// Next power of two of the batch: the batches hipb_w4a16_is_supported is usually asked about, and
+// the fallback plan when the heuristic has no kernel at an exact batch.
 int64_t w4a16_batch_bucket(int64_t m)
 {
     int64_t b = 1;
@@ -1761,9 +1761,11 @@ hipblasStatus_t w4a16_set_batch(W4A16Plan& plan, int64_t m)
     return status;
 }
 
-// The plan and workspace size for an exact batch, resolved once and without launching: the
-// power-of-two bucket's plan when hipBLASLt accepts its kernel for this batch (hand-written
-// kernels can exclude batches through their problem predicates), else a plan queried at the batch.
+// The plan and workspace size for an exact batch, resolved once and without launching. The
+// heuristic picks the macro tile for the batch it is given, so it is queried at the exact batch:
+// a kernel picked for the power-of-two bucket can quantize this batch badly (M = 412 queried as
+// 512). The bucket's plan is the fallback, which keeps hipb_w4a16_is_supported's answer for the
+// buckets valid at every batch they cover.
 W4A16Launch& w4a16_resolve(const W4A16Problem& p,
                            int64_t group_size,
                            bool has_zp,
@@ -1778,7 +1780,7 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
     W4A16Launch launch;
     const float alpha = 1.0f, beta = 0.0f;
     const int64_t bucket = w4a16_batch_bucket(p.m);
-    for(int64_t query_m : {bucket, p.m})
+    for(int64_t query_m : {p.m, bucket})
     {
         W4A16Plan& plan = w4a16_get_plan(p.bf16,
                                          p.n,
