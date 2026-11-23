@@ -22,9 +22,9 @@ short global loads and byte LDS stores (128 + 36 loads and 128 LDS byte stores a
 page and wave); here the page (8 KB payload + 1 KB scales) arrives by tensor DMA
 into a CTA-shared LDS ring (wave 0 the payload, wave 1 the scales, the decode
 tiles' one-copy-a-wave pattern: each wave waits on its own copies, then a CTA
-barrier) and every wave reads the A operands with 16-byte LDS loads. Eight waves
-own two 16-row query tiles each; a page is 8 key tiles x 2 query tiles = 16
-WMMAs a wave.
+barrier) and every wave reads the A operands with 16-byte LDS loads. Each wave
+owns ``block_q / (16 * waves)`` 16-row query tiles (4 for the wrapper's 256 rows
+over 4 waves); a page is 8 key tiles x that many WMMAs a wave.
 """
 
 import flydsl.compiler as flyc
@@ -34,29 +34,26 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp, T
 
+from .minimax_m3_index_score import DATA_BYTES, LOG2E, NVFP4_SCALE_BYTES, PAGE
 from .pa_decode.op_lds import Gfx1250Memory, _gptr
 from .pa_decode.pipeline_nvfp4 import _wmma_scale16
 
 WAVE = 32
-HEAD_DIM = 128
-PAGE = 128
-ROW = HEAD_DIM // 2  # payload bytes a key
-SROW = HEAD_DIM // 16  # scale bytes a key
+ROW, SROW = DATA_BYTES, NVFP4_SCALE_BYTES  # payload / scale bytes a key
 PAGE_BYTES = PAGE * ROW + PAGE * SROW  # 8 KB payload + 1 KB scales
 E4M3_MAX = 448.0
-LOG2E_TRITON = 1.4426950409  # the literal of ATOM's kernel (fp32 multiply)
 
 
 def sm_scale_log2e(sm_scale: float) -> float:
-    """``sm_scale * 1.4426950409`` in FP32, as the Triton kernel computes it."""
-    return float(np.float32(sm_scale) * np.float32(LOG2E_TRITON))
+    """``sm_scale * LOG2E`` multiplied in FP32, as ATOM's Triton kernel does."""
+    return float(np.float32(sm_scale) * np.float32(LOG2E))
 
 
 class _Lds(Gfx1250Memory):
     class _T:
         kv_dtype = fx.BFloat16
 
-    def __init__(self, base):  # noqa: D107
+    def __init__(self, base):
         self.base = base
         self.t = self._T
 
@@ -69,9 +66,7 @@ _CACHE = {}
 CHUNK_MAX = 32
 
 
-def compile_index_score_prefill_nvfp4(
-    *, block_q=256, waves=8, ring=4, chunk_max=0, _probe=""
-):
+def compile_index_score_prefill_nvfp4(*, block_q, waves, ring, chunk_max):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight."""
     tiles_per_wave = block_q // (16 * waves)
@@ -81,7 +76,7 @@ def compile_index_score_prefill_nvfp4(
         raise ValueError("ring must be in [2, 8]")
     if chunk_max not in (0, CHUNK_MAX):
         raise ValueError(f"chunk_max must be 0 or {CHUNK_MAX}")
-    key = (block_q, waves, ring, chunk_max, _probe)
+    key = (block_q, waves, ring, chunk_max)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
@@ -92,7 +87,7 @@ def compile_index_score_prefill_nvfp4(
     class SharedStorage:
         buf: fx.Array[fx.Int32, total // 4, 16]
 
-    name = f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}{_probe}"
+    name = f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}"
     if chunk_max:
         name += f"_lds{chunk_max}"
 
@@ -215,6 +210,49 @@ def compile_index_score_prefill_nvfp4(
                     words.extend([pair[0], pair[1]])
             q_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
 
+        def page_max(masked, base, unit, blk):
+            """Per query tile, this lane's max over its keys of the page
+            (causally masked on the diagonal pages only)."""
+            out = [fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)]
+            for kt in range_constexpr(PAGE // 16):
+                key = kt * 16 + lane16
+                at = base + key * ROW + half * 16
+                frags = [lds_load(at + j * 32, fx.Int32, 4) for j in range_constexpr(2)]
+                k_rows = fx.Vector.from_elements(
+                    [
+                        frags[j][i]
+                        for j in range_constexpr(2)
+                        for i in range_constexpr(4)
+                    ],
+                    dtype=fx.Int32,
+                )
+                k_scale = lds_load(base + PAGE * ROW + key * SROW, fx.Int64, 1)[0]
+                for rt in range_constexpr(tiles_per_wave):
+                    dots = _wmma_scale16(
+                        k_rows,
+                        q_ops[rt],
+                        fx.Vector.filled(8, 0.0, fx.Float32),
+                        k_scale,
+                        unit,
+                        "fp4_e2m1",
+                        "fp8_e4m3",
+                        "e8",
+                    )
+                    vals = [dots[e] for e in range_constexpr(8)]
+                    if const_expr(masked):
+                        r_pos = prefix + row0 + rt * 16 + lane16
+                        vals = [
+                            (blk * PAGE + kt * 16 + half * 8 + e <= r_pos).select(
+                                vals[e], fx.Float32(float("-inf"))
+                            )
+                            for e in range_constexpr(8)
+                        ]
+                    m = fx.Vector.from_elements(vals, dtype=fx.Float32).reduce(
+                        ReductionOp.MAX
+                    )
+                    out[rt] = fx.maxnumf(out[rt], m)
+            return out
+
         if live:
             for ahead in range_constexpr(ring - 1):
                 if blk_lo + ahead < blk_hi:
@@ -239,74 +277,16 @@ def compile_index_score_prefill_nvfp4(
                 unit = fx.Int64(0x7F7F7F7F7F7F7F7F) | fx.Int64((lane + blk) >> 31)
                 diagonal = q_start < (blk + 1) * PAGE
 
-                def page_max(masked):
-                    """Per query tile, this lane's max over its keys of the page
-                    (causally masked on the diagonal pages only)."""
-                    out = [
-                        fx.Float32(float("-inf"))
-                        for _ in range_constexpr(tiles_per_wave)
-                    ]
-                    for kt in range_constexpr(PAGE // 16):
-                        key = kt * 16 + lane16
-                        at = base + key * ROW + half * 16
-                        frags = [
-                            lds_load(at + j * 32, fx.Int32, 4)
-                            for j in range_constexpr(2)
-                        ]
-                        k_rows = fx.Vector.from_elements(
-                            [
-                                frags[j][i]
-                                for j in range_constexpr(2)
-                                for i in range_constexpr(4)
-                            ],
-                            dtype=fx.Int32,
-                        )
-                        k_scale = lds_load(base + PAGE * ROW + key * SROW, fx.Int64, 1)[
-                            0
-                        ]
-                        for rt in range_constexpr(tiles_per_wave):
-                            dots = _wmma_scale16(
-                                k_rows,
-                                q_ops[rt],
-                                fx.Vector.filled(8, 0.0, fx.Float32),
-                                k_scale,
-                                unit,
-                                "fp4_e2m1",
-                                "fp8_e4m3",
-                                "e8",
-                            )
-                            vals = [dots[e] for e in range_constexpr(8)]
-                            if const_expr(masked):
-                                r_pos = prefix + row0 + rt * 16 + lane16
-                                vals = [
-                                    (
-                                        blk * PAGE + kt * 16 + half * 8 + e <= r_pos
-                                    ).select(vals[e], fx.Float32(float("-inf")))
-                                    for e in range_constexpr(8)
-                                ]
-                            m = fx.Vector.from_elements(vals, dtype=fx.Float32).reduce(
-                                ReductionOp.MAX
-                            )
-                            out[rt] = fx.maxnumf(out[rt], m)
-                    return out
-
                 maxes = [
                     fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)
                 ]
                 if diagonal:
-                    maxes = page_max(True)
+                    maxes = page_max(True, base, unit, blk)
                 else:
-                    maxes = page_max(False)
+                    maxes = page_max(False, base, unit, blk)
                 for rt in range_constexpr(tiles_per_wave):
                     m = fx.maxnumf(maxes[rt], maxes[rt].shuffle_xor(16, WAVE))
                     r = row0 + rt * 16 + lane16
-                    # Debug probe ``_nostore``: the store's condition is false at
-                    # run time (the compiler cannot tell), so only the stores go.
-                    limit = (
-                        q_len - 1000000000
-                        if const_expr(_probe == "_nostore")
-                        else q_len
-                    )
                     if const_expr(chunk_max):
                         # Staged in LDS; a wave stores whole row chunks below.
                         if half == 0:
@@ -318,7 +298,7 @@ def compile_index_score_prefill_nvfp4(
                                 fx.Float32,
                             )
                     else:
-                        if (half == 0) & (r < limit):
+                        if (half == 0) & (r < q_len):
                             score[
                                 fx.Int64(pid_h) * stride_s_h
                                 + fx.Int64(seq_start + r) * stride_s_n

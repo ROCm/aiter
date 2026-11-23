@@ -7,13 +7,15 @@
 score[h, r, blk] = max over the block's keys at or before r's position of
 e4m3(clamp(q)) . dequant(K) times sm_scale * log2(e). The kernel's dots are the
 hardware's 128-deep scaled WMMA, the reference's an FP32 matmul: they agree to
-~2e-3 relative (MI455X: the WMMA's internal sum is not FP32-exact). (Bitwise equality with ATOM's Triton scorer, which issues
-the same WMMA, is checked on the ATOM side: ``index_check.py``.)
+~2e-3 relative (MI455X: the WMMA's internal sum is not FP32-exact). Bitwise
+equality with ATOM's Triton scorer, which issues the same WMMA, is checked on
+the ATOM side.
 
-Run with: python -m pytest -q op_tests/test_flydsl_index_score_prefill_nvfp4.py
+Run with: python3 op_tests/test_flydsl_index_score_prefill_nvfp4.py
 """
 
 import importlib.util
+import sys
 
 import pytest
 import torch
@@ -71,14 +73,15 @@ def make(reqs, device, seed=0):
 @pytest.mark.parametrize(
     "reqs", [[(64, 4096)], [(300, 0)], [(77, 1000), (259, 5000)], [(1024, 30000)]]
 )
-@pytest.mark.parametrize("variant", ["256:8:4", "256:4:8"])
+# block_q:waves:ring:lds_scores; the first is the wrapper's default.
+@pytest.mark.parametrize("variant", ["256:4:4:1", "256:8:4:1", "256:4:8:0"])
 def test_index_score_prefill_nvfp4(reqs, variant, device):
     from aiter.ops.flydsl.index_score_prefill import index_score_prefill_nvfp4
     from aiter.ops.flydsl.kernels.index_score_prefill_nvfp4_gfx1250 import (
         sm_scale_log2e,
     )
 
-    bq, waves, ring = (int(x) for x in variant.split(":"))
+    bq, waves, ring, lds = (int(x) for x in variant.split(":"))
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device)
     max_block = (int(seq.max()) + 127) // 128
     score = torch.full((1, q.shape[0], max_block), float("nan"), device=device)
@@ -97,6 +100,7 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
         block_q=bq,
         waves=waves,
         ring=ring,
+        lds_scores=bool(lds),
     )
     torch.cuda.synchronize()
     qe = q[:, 0].float().clamp(-448, 448).to(torch.float8_e4m3fn).float()
@@ -117,3 +121,20 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
         err = ((got - ref).abs() / ref.abs().clamp(min=1e-3))[valid]
         assert torch.isfinite(got[valid]).all()
         assert err.max().item() < 5e-3, err.max().item()
+
+
+def test_index_score_prefill_nvfp4_rejects(device):
+    from aiter.ops.flydsl.index_score_prefill import index_score_prefill_nvfp4
+
+    q, payload, scale, bt, cu, prefix, seq = make([(64, 0)], device)
+    score = torch.empty(1, 64, 1, device=device)
+    args = (q, payload, scale, score, bt, cu, seq, prefix, 0.1, 64, 32)
+    index_score_prefill_nvfp4(*args)
+    bad = list(args)
+    bad[6] = seq.long()  # an int64 seq_lens would be read as int32 pairs
+    with pytest.raises(ValueError, match="unsupported"):
+        index_score_prefill_nvfp4(*bad)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))

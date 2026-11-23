@@ -14,11 +14,10 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.index_score_prefill_nvfp4_gfx1250 import (
     CHUNK_MAX,
-    HEAD_DIM,
-    PAGE,
     compile_index_score_prefill_nvfp4,
     sm_scale_log2e,
 )
+from .kernels.minimax_m3_index_score import HEAD_DIM, PAGE
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 
@@ -36,6 +35,8 @@ def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
         and scale.stride()[1:] == (HEAD_DIM // 16, 1)
         and payload.stride(0) % 16 == 0
         and scale.stride(0) % 16 == 0
+        and payload.data_ptr() % 16 == 0
+        and scale.data_ptr() % 16 == 0
     )
 
 
@@ -65,10 +66,23 @@ def index_score_prefill_nvfp4(
     total_q, heads, _ = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
     max_block = score.shape[2]
-    assert score.stride(2) == 1 and block_table.stride(1) == 1
-    assert score.shape[0] == heads and score.dtype == torch.float32
     if total_q == 0 or batch == 0:
         return
+    # Everything reaches the kernel as a bare pointer: check what it assumes.
+    dev, meta = idx_q.device, (block_table, cu_seqlens_q, seq_lens, prefix_lens)
+    if not (
+        index_score_prefill_nvfp4_supported(idx_q, payload, scale)
+        and all(t.device == dev for t in (payload, scale, score) + meta)
+        and all(t.dtype == torch.int32 for t in meta)
+        and score.dtype == torch.float32
+        and score.shape[0] == heads
+        and score.shape[1] >= total_q
+        and score.stride(2) == 1
+        and block_table.stride(1) == 1
+    ):
+        raise ValueError(
+            "index_score_prefill_nvfp4: unsupported device, dtype or layout"
+        )
     if lds_scores:
         chunk_blocks = min(chunk_blocks, CHUNK_MAX)
     q_tiles = (max_query_len + block_q - 1) // block_q
@@ -79,7 +93,6 @@ def index_score_prefill_nvfp4(
         ring=ring,
         chunk_max=CHUNK_MAX if lds_scores else 0,
     )
-    dev = idx_q.device
     _run_compiled(
         compiled["launch"],
         ptr_arg(idx_q, fx.BFloat16),
