@@ -18,8 +18,8 @@ G_Q = 6.72
 G_KV = 89.6
 
 
-# v6 supports the O34a reserved LSE slot; do not reuse older JIT wrappers.
-@compile_ops("module_mla_nvfp4_v6", ffi_type="ctypes")
+# v7 loads the N128 CO name; do not reuse v6 wrappers with the old CO path.
+@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -34,13 +34,13 @@ def mla_nvfp4_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v6", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v6", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,

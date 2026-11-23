@@ -126,9 +126,10 @@ The cache writer only emits N16 AUX. Its `aux_layout` keyword and native layout
 flag have been removed. Existing calls should omit the keyword, and old N32 AUX
 caches must be rebuilt from original BF16 data. The layouts are incompatible
 despite having the same tensor shape. Q and NoPE layouts are unchanged.
-The ctypes module is `module_mla_nvfp4_v6`, so older JIT binaries cannot reuse
-an obsolete argument list or the wrapper that requires an LSE buffer. No manual cache
-deletion is needed.
+The ctypes module is `module_mla_nvfp4_v7`. This version loads the N128-named CO
+and prevents reuse of cached v6 wrappers that load the old N64-named file.
+Older argument lists and wrappers that require an LSE buffer also cannot be
+reused. No manual cache deletion is needed.
 
 Prepare immutable params and warm up all selected operators before graph
 capture. The current stream is selected from the input tensor's device.
@@ -164,13 +165,15 @@ fall back to FP8 kernels without an explicit conversion.
 
 ## Build and verification
 
-The shipped `mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np.co` has an
+The shipped `mla_a4w4_qh128_1tg_32mx4_128nx1_r1_np.co` has an
 80-byte, ten-pointer ABI, fixed LDS of 262144 bytes and a 16KiB aligned
 instruction entry. Dynamic LDS is zero.
-It contains 73484 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
-SPI prefetch 255. Its public symbol is `mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np`.
+It contains 73500 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
+SPI prefetch 255. Its public symbol is `mla_a4w4_qh128_1tg_32mx4_128nx1_r1_np`.
 Both HIP producer kernels also request 16KiB instruction alignment.
 The kernel object/descriptor itself is a different address from the entry.
+The first N128 tile skips the shared score-mask call when all 128 tokens are
+valid; partial first tiles retain masking before the softmax maximum reduction.
 
 The precompiled ASM CO is in the shared `hsa/gfx1250/mla/` directory.
 AITER loads the shipped CO and compiles the C++ wrapper and HIP producer
@@ -227,29 +230,29 @@ per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
 and unified dispatch, repeatability, guards, producer byte layouts, active-tail
 requantization, BF16-to-decode, dense-to-CSR, stream/graph and fullgraph compile.
 The optional test allocates approximately 12GiB to put both KV streams above
-4GiB offsets. The validation and measurements below describe the current decoder;
-the earlier full-model result is identified separately.
+4GiB offsets. Current validation and the full-tile mask comparison are reported
+separately from earlier FP8 comparisons and full-model accuracy results.
 
 ### Public integration validation (2026-11-23)
 
 On gfx1250 B0 hardware, **44 selected GPU tests passed, with no skips** using a
-fresh v6 JIT build. Coverage includes the standard BF16-input FP32 attention
-reference, supplemental quantized-algorithm checks, constant V, guards, producer
+fresh v7 JIT build with the previously built v6 cache still present. Coverage
+includes the standard BF16-input FP32 attention reference, supplemental quantized-algorithm checks, constant V, guards, producer
 layouts, graph/fullgraph paths, KV offsets beyond 4 GiB and FP8 QH128 regression.
-Existing test tolerances are unchanged. The actual loaded decoder's 73,484
-instruction bytes match the version measured below; decoder and both HIP
-producer entries are 16 KiB aligned.
+Existing test tolerances are unchanged. The actual loaded N128-named decoder's
+73,500 instruction bytes match the validated full-tile mask version; decoder
+and both HIP producer entries are 16 KiB aligned. The v7 wrapper loads the new
+CO even with a v6 cache present and the old CO absent.
 
-The current decoder also passed 1,042 randomized/constant-input requests around
-short-sequence, tail and loop boundaries against standard FP32 attention on the
-original BF16 inputs. All 22,528 requests in the performance cases below matched
-the preceding published decoder bitwise. Guards, empty outputs, retained LSE
-buffers and graph/eager consistency passed. These operator checks do not replace
-a full-model evaluation of this revision.
+The same decoder instructions also passed 17 GPU contract groups and standard
+FP32 attention checks on 646 requests spanning tails and 5K/8K contexts. Those
+outputs matched the preceding decoder bitwise, as did both paired timing
+workloads below. These operator checks do not replace a full-model evaluation
+of this revision.
 
 ### Full-model accuracy history
 
-The preceding published decoder, at commit
+An earlier published decoder, at commit
 `fbe834626cf7ee91ff07ccdcdb05cf43c14b5960`, completed one DeepSeek-R1 MLPerf
 accuracy evaluation using N16 producers, threshold 1, output multiplier `1/89.6`
 and one KV split:
@@ -259,14 +262,37 @@ and one KV split:
 | 3541 / 4388 | 80.697356% | 3931.095260 | PASS |
 
 The supplied gate requires exact match >=80.545% and 3497.6–4274.9 tokens/sample.
-This is historical evidence for the preceding decoder. The current revision has
+This is historical evidence for that earlier decoder. The current revision has
 not had a new full-model evaluation; its bitwise operator checks above are not
 a claim of a new MLPerf score, repeated-run accuracy stability or model-throughput
 improvement.
 
+### Full-tile mask timing (2026-11-22)
+
+The current instruction image was compared directly with the preceding NVFP4
+CO at `cff86078c5406990d0da57487a58e7d3b8051beb` on a single gfx1250 B0 GPU.
+Both use T1, QH128, page size 64, identical BF16 inputs and randomized independent
+page mappings in a pool of 400,000 physical pages. Each row retains 180 paired
+Graph32 samples across three blocks, both initialization orders and 30 AB/BA
+rounds per order. Means are microseconds per decode dispatch; input preparation,
+quantization and reference checks are excluded. Outputs matched bitwise.
+
+| Batch | Fixed KV | Previous NVFP4 (us) | Full-tile mask (us) | Time reduction | Faster rounds |
+|---:|---:|---:|---:|---:|---:|
+| 1536 | 5120 | 404.093 | 403.187 | 0.224% | 104/180 |
+| 512 | 2500 | 76.078 | 75.620 | 0.601% | 160/180 |
+
+These are small workload-specific improvements from one paired experiment.
+The renamed public CO preserves the measured instruction image and kernel
+descriptor; renaming did not introduce another performance measurement.
+
 ### Decode timing (2026-11-22)
 
-Single-GPU measurements on gfx1250 B0 used the current decoder instructions,
+The following FP8 comparison is historical: it measured the preceding NVFP4 CO
+at `cff86078c5406990d0da57487a58e7d3b8051beb`, before the full-tile mask fast path.
+It has not been rerun for the current CO.
+
+Single-GPU measurements on gfx1250 B0 used those preceding decoder instructions,
 threshold 1, QH128 and page size 64. Both formats shared original BF16 Q/KV,
 request lengths and randomized physical page mappings, with their respective
 native shuffled layouts. NVFP4 produced output only; the existing FP8 API also
