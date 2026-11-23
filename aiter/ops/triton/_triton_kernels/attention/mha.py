@@ -963,6 +963,7 @@ def _get_config(
     elif (
         head_dim_v == 256 and dtype in get_fp8_dtypes() and "fp8_large_head" in fwd_cfg
     ):
+        # matrix_instr_nonkdim=16 + num_warps=8 carry the gain; "default" spills VGPRs.
         # Above d256 the head dim pads to 512, where num_stages=2 exceeds LDS.
         return fwd_cfg["fp8_large_head"]
     elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:

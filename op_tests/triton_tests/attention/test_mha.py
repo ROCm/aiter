@@ -1461,9 +1461,10 @@ def test_mha_fwd_fp8_large_head_selection(
         # Arches without fp8_large_head keep the pre-existing selection.
         assert "fp8_large_head" not in fwd_cfg
         pytest.skip("fp8_large_head is only defined for gfx942")
-    dtype = get_fp8_dtypes()[1] if use_fp8 else torch.bfloat16
-    cfg = _get_config(enable_dropout, dtype, head_dim_v=head_dim_v)
-    assert cfg == fwd_cfg[expected]
+    dtypes = get_fp8_dtypes() if use_fp8 else (torch.bfloat16,)
+    for dtype in dtypes:
+        cfg = _get_config(enable_dropout, dtype, head_dim_v=head_dim_v)
+        assert cfg == fwd_cfg[expected], dtype
 
 
 @pytest.mark.parametrize("FP8_FMT", ["e5m2", "e4m3"])
