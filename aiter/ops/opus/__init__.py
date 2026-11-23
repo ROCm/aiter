@@ -102,7 +102,23 @@ def gemm_a16w16_opus(
     )
 
 
+def gemm_a16w16_layout_opus(
+    XQ: Tensor,
+    WQ: Tensor,
+    bias: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Run the gfx950 BF16 GEMM on NT (tuned path) / NN / TT / TN operands (kid picked by shape)."""
+    from .gemm_op_a16w16 import gemm_a16w16_layout_opus as _impl
+
+    return _impl(XQ, WQ, bias, dtype, kernelId=kernelId, out=out)
+
+
 __all__ = [
+    "gemm_a16w16_layout_opus",
     "gemm_a16w16_opus",
     "opus_bmm",
     "opus_gemm",

@@ -26,7 +26,7 @@ from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 
-from aiter.ops.opus import opus_bmm, opus_gemm
+from aiter.ops.opus import gemm_a16w16_layout_opus, opus_bmm, opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
 
 
@@ -331,6 +331,73 @@ def test_gfx950_batch_first_bmm_matches_torch():
     torch.cuda.synchronize()
     assert actual is Y
     _assert_matches_golden(actual, A, B)
+
+
+def _gfx950_layout_inputs(layout, M, N, K):
+    """bf16 A [M, K] / B [N, K] and the logical views stored as ``layout``."""
+    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    XQ = A if layout[0] == "N" else A.t().contiguous().t()
+    WQ = B if layout[1] == "T" else B.t().contiguous().t()
+    return A, B, XQ, WQ
+
+
+# gemm_a16w16_layout_opus: NT goes through the tuned gemm_a16w16_opus path; NN /
+# TT / TN pick the kid by shape (direct tiles for large outputs, split-K kids for
+# small outputs with a long K, split-K for a bias).
+@pytest.mark.parametrize("layout", ("NT", "NN", "TT", "TN"))
+@pytest.mark.parametrize(
+    ("M", "N", "K", "has_bias"),
+    (
+        (1, 1024, 7168, False),
+        (64, 2048, 7168, False),
+        (336, 784, 2112, True),
+        (4096, 1536, 512, False),
+        (2048, 7168, 1024, True),
+    ),
+)
+def test_gfx950_layout_api_matches_torch(layout, M, N, K, has_bias):
+    """NT / NN / TT / TN storage, read from the strides of the logical views."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    if layout[0] == "T" and M % 8:
+        pytest.skip("A stored [K, M] needs M % 8 == 0")
+    torch.manual_seed(0x4A7E + M + N + K)
+    A, B, XQ, WQ = _gfx950_layout_inputs(layout, M, N, K)
+    bias = torch.randn((N,), device="cuda", dtype=torch.bfloat16) if has_bias else None
+    actual = gemm_a16w16_layout_opus(XQ, WQ, bias)
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B, bias)
+
+
+def test_gfx950_layout_api_explicit_kid_and_out():
+    """kernelId runs that kid (split-K kids pick their split) into ``out``."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0x4A7F)
+    A, B, XQ, WQ = _gfx950_layout_inputs("TN", 256, 512, 4096)
+    for kid in (1003, 1011):
+        out = torch.empty((256, 512), device="cuda", dtype=torch.bfloat16)
+        actual = gemm_a16w16_layout_opus(XQ, WQ, kernelId=kid, out=out)
+        torch.cuda.synchronize()
+        assert actual is out
+        _assert_matches_golden(actual, A, B)
+
+
+def test_gfx950_layout_api_rejects():
+    """Unsupported storage, kids outside the 4-wave family, K and dtype."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    _, _, XQ, WQ = _gfx950_layout_inputs("NT", 64, 128, 256)
+    with pytest.raises(ValueError, match="NT / NN / TT / TN storage"):
+        gemm_a16w16_layout_opus(XQ[:, ::2], WQ[:, ::2])
+    with pytest.raises(ValueError, match="4-wave kids"):
+        gemm_a16w16_layout_opus(XQ, WQ, kernelId=6)
+    with pytest.raises(ValueError, match="BF16 only"):
+        gemm_a16w16_layout_opus(XQ, WQ, dtype=torch.float32)
+    _, _, XQ, WQ = _gfx950_layout_inputs("NN", 64, 128, 96)
+    with pytest.raises(ValueError, match="no NN BF16 4-wave kernel"):
+        gemm_a16w16_layout_opus(XQ, WQ)
 
 
 @pytest.mark.parametrize(

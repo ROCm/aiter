@@ -7,11 +7,19 @@ from functools import lru_cache
 import torch
 
 from aiter import logger
-from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance, get_kernel_instance
+from csrc.opus_gemm.opus_gemm_common import (
+    OpusGemmInstance,
+    get_kernel_instance,
+    get_registry,
+)
 
 from ...jit.core import compile_ops
 from ._arch import _device_arch_and_cu
-from .launch_plan import GFX950_4WAVE_TAGS, _get_cached_a16w16_launch_plan
+from .launch_plan import (
+    _GFX950_4WAVE_B_K,
+    GFX950_4WAVE_TAGS,
+    _get_cached_a16w16_launch_plan,
+)
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -542,4 +550,236 @@ def gemm_a16w16_opus(
     return _launch_a16w16_bmm(XQ, WQ, Y, kid=kid, bias=bias, split_k=split_k)
 
 
-__all__ = ["gemm_a16w16_opus", "opus_gemm_a16w16_tune"]
+# ---- BF16 NT / NN / TT / TN (gfx950 4-wave CO kids) --------------------------
+# XQ [M, K] / WQ [N, K] are logical views of the stored operands; the kid's
+# launcher picks the layout image from their strides. a16w16_4wave kids launch
+# directly; a16w16_4wave_ws kids are the same tiles with an fp32 split-K
+# workspace and take a bf16 [N] bias. Y [M, N] is bf16 in every layout.
+#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
+#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
+_A16W16_4WAVE_WS_TAG = "a16w16_4wave_ws"
+
+
+def _a16w16_direction(XQ: torch.Tensor, WQ: torch.Tensor) -> str | None:
+    """Storage of logical XQ [M, K] / WQ [N, K] as the kernel names spell it.
+
+    First letter A, second B. A "N" is stored [M, K] (strides (K, 1)), A "T"
+    [K, M] (strides (1, M)); B "T" is stored [N, K] (strides (K, 1)), B "N"
+    [K, N] (strides (1, N)). Returns "NN", "TT", "TN", "NT" or None.
+    """
+    (M, K), N = XQ.shape, WQ.shape[0]
+    if XQ.stride() == (K, 1):
+        a = "N"
+    elif XQ.stride() == (1, M):
+        a = "T"
+    else:
+        return None
+    if WQ.stride() == (K, 1):
+        b = "T"
+    elif WQ.stride() == (1, N):
+        b = "N"
+    else:
+        return None
+    return a + b
+
+
+def _a16w16_4wave_split(instance, M: int, N: int, K: int, cu_num: int) -> int:
+    """Split of an a16w16_4wave_ws launch: the largest S in {8, 4, 2} with
+    tiles * S <= 2 * CUs, K / S >= 768 and an fp32 workspace
+    [S][padded_M][padded_N] under 4 GiB; else 1."""
+    m_tiles, n_tiles = -(-M // instance.B_M), -(-N // instance.B_N)
+    padded = m_tiles * instance.B_M * n_tiles * instance.B_N
+    return next(
+        (
+            s
+            for s in (8, 4, 2)
+            if m_tiles * n_tiles * s <= 2 * cu_num
+            and K // s >= 768
+            and s * padded * 4 <= (1 << 32) - 1
+        ),
+        1,
+    )
+
+
+def a16w16_4wave_kid_runs(
+    instance, M: int, N: int, K: int, split_k: int = 0, layout: str = "NT"
+) -> bool:
+    """Whether gfx950 4-wave kid ``instance`` runs (M, N, K) in ``layout``
+    (NT / NN / TT / TN) with ``split_k``: K tiles of 64, at least two per split;
+    an A stored [K, M] needs M % 8 and a B stored [K, N] N % 8; split-K kids
+    keep the fp32 workspace under 4 GiB."""
+    if instance.kernel_tag not in GFX950_4WAVE_TAGS:
+        return False
+    if K % _GFX950_4WAVE_B_K or K < 2 * _GFX950_4WAVE_B_K:
+        return False
+    if (layout.upper()[0] == "T" and M % 8) or (layout.upper()[1] == "N" and N % 8):
+        return False
+    if instance.kernel_tag != _A16W16_4WAVE_WS_TAG:
+        return split_k <= 1
+    split = max(1, split_k)
+    padded = -(-M // instance.B_M) * instance.B_M * -(-N // instance.B_N) * instance.B_N
+    return K // _GFX950_4WAVE_B_K >= 2 * split and split * padded * 4 <= (1 << 32) - 1
+
+
+def _select_a16w16_4wave_kid(
+    direction: str,
+    M: int,
+    N: int,
+    K: int,
+    arch: str,
+    cu_num: int,
+    has_bias: bool = False,
+) -> int | None:
+    """Pick a gfx950 4-wave kid for the shape (fit to a sweep of every kid and
+    split on MI355X).
+
+    One tile per block, no wider than the smallest of 64 / 128 / 256 covering
+    M (B_M) and N (B_N): the largest tile whose tile count reaches 0.65 of the
+    CUs, else the tile with the most tiles. With K >= 2048 and fewer 128x128
+    tiles than CUs, the split-K kid with the least padding, then the most CUs
+    filled at its split (see :func:`_a16w16_4wave_split`), when that split is
+    above 1. A bias takes the split-K kid of the picked tile. Ties go to less
+    padding, the squarer tile, then the long side on the smaller of M / N.
+    """
+    kids = {
+        kid: instance
+        for kid, instance in get_registry("a16w16", arch, cu_num).items()
+        if a16w16_4wave_kid_runs(instance, M, N, K, 0, direction)
+    }
+
+    def shape(kid):
+        b_m, b_n = kids[kid].B_M, kids[kid].B_N
+        m_tiles, n_tiles = -(-M // b_m), -(-N // b_n)
+        tie = (abs(b_m - b_n), b_m - b_n if M >= N else b_n - b_m, kid)
+        # (tile area, tile count, padded output elements, tie-break)
+        return b_m * b_n, m_tiles * n_tiles, m_tiles * b_m * n_tiles * b_n, tie
+
+    def cover(x):
+        return next((t for t in (64, 128) if x <= t), 256)
+
+    direct = {
+        kid: shape(kid)
+        for kid, instance in kids.items()
+        if instance.kernel_tag != _A16W16_4WAVE_WS_TAG
+        and instance.B_M <= cover(M)
+        and instance.B_N <= cover(N)
+    }
+    split_kids = [
+        kid
+        for kid, instance in kids.items()
+        if instance.kernel_tag == _A16W16_4WAVE_WS_TAG
+    ]
+    if not direct:
+        return None
+    busy = [kid for kid, (_, tiles, _, _) in direct.items() if tiles >= 0.65 * cu_num]
+    if busy:
+        kid = min(busy, key=lambda k: (-direct[k][0], direct[k][2], direct[k][3]))
+    else:
+        kid = min(direct, key=lambda k: (-direct[k][1], direct[k][2], direct[k][3]))
+
+    if K >= 2048 and -(-M // 128) * -(-N // 128) < cu_num:
+        best = None
+        for candidate in split_kids:
+            area, tiles, padded, tie = shape(candidate)
+            split = _a16w16_4wave_split(kids[candidate], M, N, K, cu_num)
+            rank = (padded, -min(tiles * split, cu_num), area, tie)
+            if best is None or rank < best[0]:
+                best = (rank, candidate, split)
+        if best is not None and best[2] > 1:
+            return best[1]
+    if not has_bias:
+        return kid
+    return next(
+        (
+            k
+            for k in split_kids
+            if (kids[k].B_M, kids[k].B_N) == (kids[kid].B_M, kids[kid].B_N)
+        ),
+        None,
+    )
+
+
+def gemm_a16w16_layout_opus(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gfx950 BF16 GEMM for NT / NN / TT / TN operand storage.
+
+    Computes Y[M, N] = XQ[M, K] @ WQ[N, K]^T (+ bias) on logical shapes; the
+    storage is read from the strides (see ``_a16w16_direction``), so pass the
+    transposed view of a [K, M] A or of a [K, N] B, never a copy. K % 64 == 0
+    and K >= 128; A stored [K, M] needs M % 8, B stored [K, N] N % 8. bias is a
+    contiguous bf16 [N] (split-K kids only). Output is BF16.
+
+    ``kernelId`` runs that gfx950 4-wave kid (1000-1007 direct, 1008-1015
+    split-K, which pick their split). Otherwise NT goes through the tuned
+    ``gemm_a16w16_opus`` path and NN / TT / TN pick a kid by shape.
+    """
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError("gemm_a16w16_layout_opus expects 2D XQ / WQ")
+    if XQ.dtype != torch.bfloat16 or WQ.dtype != torch.bfloat16:
+        raise ValueError(
+            f"gemm_a16w16_layout_opus reads bf16 XQ / WQ; got {XQ.dtype}/{WQ.dtype}"
+        )
+    if dtype != torch.bfloat16:
+        raise ValueError("gemm_a16w16_layout_opus writes BF16 only")
+    direction = _a16w16_direction(XQ, WQ)
+    if direction is None:
+        raise ValueError(
+            "gemm_a16w16_layout_opus serves NT / NN / TT / TN storage; got "
+            f"XQ strides {tuple(XQ.stride())}, WQ strides {tuple(WQ.stride())}"
+        )
+    M, K = map(int, XQ.shape)
+    N = int(WQ.shape[0])
+    if bias is not None and (
+        bias.dtype != torch.bfloat16
+        or tuple(bias.shape) != (N,)
+        or not bias.is_contiguous()
+    ):
+        raise ValueError(
+            f"bias must be a contiguous bf16 [{N}], got {bias.dtype} {tuple(bias.shape)}"
+        )
+    if out is None:
+        out = torch.empty((M, N), dtype=dtype, device=XQ.device)
+    elif tuple(out.shape) != (M, N) or out.dtype != dtype:
+        raise ValueError(
+            f"out must be {dtype} [{M}, {N}], got {out.dtype} {tuple(out.shape)}"
+        )
+    if kernelId is None and direction == "NT":
+        gemm_a16w16_opus(XQ, WQ, bias, dtype, out=out.unsqueeze(0))
+        return out
+    arch, cu_num = _device_arch_and_cu(XQ.device)
+    if kernelId is None:
+        kernelId = _select_a16w16_4wave_kid(
+            direction, M, N, K, arch, cu_num, bias is not None
+        )
+        if kernelId is None:
+            raise ValueError(
+                f"no {direction} BF16 4-wave kernel supports M={M}, N={N}, K={K} on "
+                f"{arch} (K % 64 == 0 and K >= 128; A stored [K, M] needs M % 8, "
+                "B stored [K, N] N % 8)"
+            )
+    instance = get_kernel_instance(arch, "a16w16", int(kernelId), cu_num=cu_num)
+    if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
+        raise ValueError(
+            f"gemm_a16w16_layout_opus runs the gfx950 4-wave kids, got {kernelId}"
+        )
+    split_k = (
+        _a16w16_4wave_split(instance, M, N, K, cu_num)
+        if instance.kernel_tag == _A16W16_4WAVE_WS_TAG
+        else 0
+    )
+    return _launch_a16w16_gemm(XQ, WQ, out, bias, kid=int(kernelId), split_k=split_k)
+
+
+__all__ = [
+    "a16w16_4wave_kid_runs",
+    "gemm_a16w16_layout_opus",
+    "gemm_a16w16_opus",
+    "opus_gemm_a16w16_tune",
+]
