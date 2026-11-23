@@ -109,7 +109,7 @@ class MoeSharedFold:
     """A shared expert pending for the next grouped MoE call's GEMMs (see
     ``moe_shared_expert_fold``)."""
 
-    __slots__ = ("weights", "scale", "consumed")
+    __slots__ = ("consumed", "scale", "weights")
 
     def __init__(self, weights: dict, scale: float):
         self.weights = weights

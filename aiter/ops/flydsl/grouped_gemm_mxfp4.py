@@ -149,7 +149,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     gemm_stage=None,
     m_align=0,
     k_waves=1,
-    shared_fold: "SharedFoldTiles | None" = None,
+    shared_fold: SharedFoldTiles | None = None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -415,22 +415,22 @@ class SharedFoldTiles:
     """
 
     __slots__ = (
-        "out",
         "a",
-        "w",
         "a_scale",
-        "w_scale",
-        "quant_scale",
-        "rows",
         "cap",
-        "tile_m",
-        "tile_n",
-        "tile_k",
         "m_warp",
         "n_warp",
         "num_buffers",
+        "out",
+        "quant_scale",
         "quant_wmma_rep",
         "row_major_ascale",
+        "rows",
+        "tile_k",
+        "tile_m",
+        "tile_n",
+        "w",
+        "w_scale",
     )
 
     def __init__(self, **kw):
