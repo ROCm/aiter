@@ -149,6 +149,15 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
+    if(aiter::is_pad_row(num_valid_rows, block_row))
+    {
+        aiter::write_pad_row(output + output_row_stride * block_row,
+                             indices + index_row_stride * block_row,
+                             k,
+                             threadIdx.x,
+                             TPB);
+        return;
+    }
 
     float renorm_value           = 0.0f;
     const bool row_is_active     = finished ? !finished[block_row] : true;
@@ -211,17 +220,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
         {
             int64_t const idx = output_row_stride * block_row + k_idx;
             output[idx] *= renorm_value;
-        }
-    }
-
-    // A pad row's selections are overwritten last: each round above reads the
-    // row's earlier picks back from `indices`.
-    if(threadIdx.x == 0 && aiter::is_pad_row(num_valid_rows, block_row))
-    {
-        for(int k_idx = 0; k_idx < k; k_idx++)
-        {
-            output[output_row_stride * block_row + k_idx] = 0.f;
-            indices[index_row_stride * block_row + k_idx] = -1;
         }
     }
 }

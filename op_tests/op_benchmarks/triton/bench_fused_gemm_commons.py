@@ -3,8 +3,13 @@ import triton
 
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,
@@ -87,10 +92,14 @@ def run_fused_shape_benchmark(args, x_names, bench_fn, get_x_vals, plot_name):
     """Wrap bench_fn in a perf_report over the fused Benchmark object and run it."""
     benchmark = get_fused_shape_benchmark_object(plot_name, args, x_names, get_x_vals)
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def _run(**kwargs):
         shape = tuple(kwargs[name] for name in x_names)
-        return bench_fn(*shape, kwargs["metric"])
+        return bench_fn(bencher, *shape, kwargs["metric"])
 
     _run.run(save_path="." if args.o else None, print_data=True)
 

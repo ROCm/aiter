@@ -27,6 +27,8 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.test_common import checkAllclose
+from aiter.utility.graph_alloc import capture_scoped_cache
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction
@@ -142,27 +144,7 @@ def run_torch_gemm_afp8wfp8(
 SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
 
 
-def get_shapes():
-    # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
-    return [
-        (m, n, k)
-        for m in [16, 32, 64, 512]
-        for n, k in [
-            (2048, 7168),
-            (65536, 1536),
-            (16384, 1536),
-            (8192, 1536),
-            (7168, 16384),
-            (7168, 4096),
-            (6144, 7168),
-            (7168, 3072),
-            (1536, 7168),
-            (7168, 768),
-        ]
-    ]
-
-
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
 def test_gemm_afp8wfp8(
@@ -219,7 +201,7 @@ def _gluon_available() -> bool:
         return False
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
@@ -357,7 +339,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     )
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
 def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
@@ -1017,7 +999,8 @@ def test_fused_split_k_graph_replay_on_warmed_stream(variant):
 def test_fused_split_k_first_use_inside_capture(variant, monkeypatch):
     # Isolate the counter cache so earlier tests cannot warm the capture stream.
     torch.cuda.synchronize()
-    monkeypatch.setattr(afp8wfp8_op, "_split_counters_by_stream", {})
+    fresh = capture_scoped_cache(afp8wfp8_op._split_counters_keyed.__wrapped__)
+    monkeypatch.setattr(afp8wfp8_op, "_split_counters_keyed", fresh)
     # Before torch 2.10 counters cannot be allocated mid-capture: runs unfused.
     x, w, xs, ws = generate_group32_inputs(6, 1152, 5120)
     graph = torch.cuda.CUDAGraph()

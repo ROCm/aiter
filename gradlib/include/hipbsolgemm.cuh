@@ -67,6 +67,45 @@ std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
                                   std::optional<int64_t> scaleA_mode   = std::nullopt,
                                   std::optional<int64_t> scaleB_mode   = std::nullopt);
 
+// Set by the JIT (check_hipblaslt_has_w4a16 in aiter/jit/core.py) when the hipBLASLt headers
+// declare the w4a16 API (HIP_R_4I A with the VEC*_16{BF,F}[_ZP]_EXT scale modes); without it the
+// w4a16 entry points report no support.
+#ifndef AITER_HIPBLASLT_HAS_W4A16
+#define AITER_HIPBLASLT_HAS_W4A16 0
+#endif
+
+// Whether hipBLASLt has a w4a16 kernel on the current device for a [N, K] int4 weight with row
+// stride `lda` (in int4 elements), activations with row stride `ldb` and an output with row stride
+// `ldd` (in elements), at each batch size in `batch_sizes` exactly. False when aiter was built
+// against a hipBLASLt without the w4a16 API.
+bool hipb_w4a16_is_supported(bool bf16,
+                             int64_t n,
+                             int64_t k,
+                             int64_t lda,
+                             int64_t ldb,
+                             int64_t ldd,
+                             int64_t group_size,
+                             bool has_zp,
+                             int64_t int4_encoding,
+                             const std::vector<int64_t>& batch_sizes);
+
+// Bytes of workspace hipb_w4a16_mm needs for these tensors (0 when none).
+int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
+                                  const aiter_tensor_t& w_q,
+                                  const aiter_tensor_t& result,
+                                  int64_t group_size,
+                                  bool has_zp,
+                                  int64_t int4_encoding);
+
+void hipb_w4a16_mm(const aiter_tensor_t& x,
+                   const aiter_tensor_t& w_q,
+                   const aiter_tensor_t& scale,
+                   aiter_tensor_t& result,
+                   std::optional<aiter_tensor_t> workspace,
+                   int64_t group_size,
+                   bool has_zp,
+                   int64_t int4_encoding);
+
 std::string getHipblasltKernelName(int solution_index);
 
 int get_algoIdx_hip_tuning_csv(

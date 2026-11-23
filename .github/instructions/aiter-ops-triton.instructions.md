@@ -52,10 +52,10 @@ breaks and how to fix it. The author can be new to these rules.
   helper that only another kernel calls can stay with that kernel.
 - Flag a kernel path under `_triton_kernels/` or `_gluon_kernels/<arch>/` that
   is different from the folder of its wrapper. The kernel folder has the name
-  of the wrapper folder: `normalization/`, not `norm/`. Do not flag the old
-  `_triton_kernels/flash_attn_triton_amd/` folder (used by
-  `attention/mha.py`). A kernel that wrappers in several folders use stays
-  with the wrapper that owns it, or goes in `_triton_kernels/common/`.
+  of the wrapper folder: `normalization/`, not `norm/`. The FlashAttention
+  kernels now live under `_triton_kernels/attention/dao_ai/`. A kernel that
+  wrappers in several folders use stays with the wrapper that owns it, or
+  goes in `_triton_kernels/common/`.
 - Flag a new `@triton.jit` device helper that kernels in several folders use,
   when it is not in `_triton_kernels/common/`. Examples:
   `common/activation.py`, `common/pid_preprocessing.py`. Do not put such a
@@ -87,10 +87,17 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
-`<d_type>` is `config_name.lower().replace("-", "_")`. Flag:
+`<d_type>` is `config_name.lower().replace("-", "_")`. A family tuned on a
+CU count other than the arch's default can have its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
+`DEFAULT.json` (for example `gfx1250/96cu/`). Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
+- A `<cu_num>cu/` tree for the CU count the plain folder was tuned on. That
+  count reads the plain folder.
+- A `<cu_num>cu/` folder without `DEFAULT.json`. The loaders read a tree
+  whole or not at all, and a folder without `DEFAULT.json` is not a tree.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
@@ -152,6 +159,17 @@ In MOE dispatch tables, flag:
 - Triton keys (`BLOCK_SIZE_N`, `num_stages`) in a Gluon file, or Gluon keys
   (`block_n`, `num_buffers`, `persistent_iters`) in a Triton file.
 
+In unified attention configs, flag:
+
+- A table without an `"any"` entry.
+- A dtype tag that is not `bf16`, `fp8` or `nvfp4`. fp16 uses `bf16`.
+- A three-dtype key (`DT_<q>_<k>_<v>`) with `any` in it, or with the same V
+  and K tags. The loader tries a three-dtype key only when the V cache dtype
+  is not the K cache dtype, and only with exact tags.
+- A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
+  `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
+  `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
+
 ## Configs: Python code
 
 Tuning values are in JSON files in `configs/`, never in Python or CSV files.
@@ -186,7 +204,9 @@ This applies to Triton and Gluon. Flag:
   the only one.
 - A new arch or backend fallback chain in a loader. The only allowed fallbacks
   are MHC (gfx942) and Triton `fused_clamp_act_mul` (gfx950). Both use the
-  `arch=` argument.
+  `arch=` argument. The choice `resolve_config_dir()` makes between the
+  `<cu_num>cu/` tree and the plain folder is not a fallback chain: a loader
+  reads one tree whole.
 - A raw config list in `@triton.autotune`. Use `autotune_configs()`:
 
   ```python
@@ -272,7 +292,7 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   - `gemm/basic/gemm_a8w8.py` → `gemm/basic/test_gemm_a8w8.py`
   - `moe/moe_routing/routing.py` → `moe/moe_routing/test_moe_routing.py`
   - `attention/mha.py` → `attention/test_mha.py`, also if its kernels are in
-    `flash_attn_triton_amd/`
+    `_triton_kernels/attention/dao_ai/`
   - flat wrappers (`topk.py`, `softmax.py`) → the `triton_tests/` root
   - `utils/` helpers → `triton_tests/utils/`
 
