@@ -440,6 +440,9 @@ def unified_attention(
     v,
     out,
     cu_seqlens_q,
+    # upper bound on every sequence's query length; it must be at least the longest
+    # one. Short queries launch one query block per sequence, so rows past
+    # max_seqlen_q are left unwritten. This is not checked at runtime.
     max_seqlen_q,
     seqused_k,
     max_seqlen_k,
