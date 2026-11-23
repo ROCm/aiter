@@ -17,6 +17,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import T
@@ -297,13 +298,18 @@ def prefetch_direct_fixed_slot_route(
     }
 
 
+def _vgpr_i64(v):
+    """``v`` through an empty inline asm with a VGPR result: the same value, but divergent to the compiler."""
+    return fx.Int64(llvm.InlineAsmOp(T.i64, [fx.as_ir_value(fx.Int64(v))], "", "=v,0", has_side_effects=False).result)
+
+
 # fmt: off
 @flyc.jit
 def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0, running_half=None, late_epoch=None, active_done=False,
+    dedup=False, direct_done=0, running_half=None, late_epoch=None, active_done=False, disp_order=0,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots.
@@ -318,6 +324,12 @@ def emit_direct_fixed_slot_payload(
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
+    # disp_order bit 2: the destinations' source-flag pointers (one per lane) load before the routes, not behind
+    # the done count.
+    remote_done_pre = None
+    if const_expr(disp_order & 2):
+        remote_done_pre = load_at(AddrBuffer(p_source_done), (lane < fx.Int32(fz_npes)).select(lane, fx.Int32(0)),
+            fx.Int64, 1)
     route = producer_slot * fx.Int32(num_waves) + warp
     route_stride = fx.Int32(dispatch_blocks * num_waves)
     route_limit = i32_cur_tok * fx.Int32(fz_k)
@@ -342,13 +354,27 @@ def emit_direct_fixed_slot_payload(
             if const_expr(running_half is not None):
                 running_slot = running_slot + running_half * fx.Int32(fz_epr)
             offset_lane = fx.Int32(0)
+            running_addr = rpf["remote"]["running"] + fx.Int64(running_slot) * fx.Int64(4)
+            if const_expr(disp_order & 1):
+                # A per-lane (VGPR) address keeps the RMW out of LLVM's atomic optimizer, whose readfirstlane of the
+                # result would wait for the RMW right behind it, before the row stores below.
+                running_addr = _vgpr_i64(running_addr)
             if lane == fx.Int32(0):
                 if valid_expert:
-                    offset_lane = fx.Int32(
-                        comm_ops.atomic_add_system(
-                            rpf["remote"]["running"] + fx.Int64(running_slot) * fx.Int64(4), fx.Int32(1)
-                        )
-                    )
+                    offset_lane = fx.Int32(comm_ops.atomic_add_system(running_addr, fx.Int32(1)))
+            if const_expr(dedup and (disp_order & 1)):
+                # disp_order bit 1: the token row's place does not depend on the slot, so it goes out while the
+                # slot RMW is in flight (also when the route overflows its expert; nothing reads that row then).
+                if valid_expert & ~rpf["duplicate"]:
+                    token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+                    destination_rsrc = AddrBuffer(
+                        rpf["remote"]["rx"] + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes))
+                    for i in range_constexpr(len(row_values)):
+                        store_at(row_values[i], destination_rsrc, lane * fx.Int32(4) + fx.Int32(i * 256))
+                    if const_expr(fz_enable_scales):
+                        if lane < fx.Int32(fz_scale_n_i32):
+                            store_at(rpf["scale"], AddrBuffer(rpf["remote"]["sc"] + rpf["token_scales"]
+                                + token_row * fx.Int64(fz_scale_n_i32 * 4)), lane)
             expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
             publish = valid_expert & (expert_offset < fx.Int32(fz_cap))
             payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
@@ -356,7 +382,7 @@ def emit_direct_fixed_slot_payload(
             if const_expr(running_half is not None):
                 meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
 
-            if const_expr(dedup):
+            if const_expr(dedup and not (disp_order & 1)):
                 if publish & ~rpf["duplicate"]:
                     token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
                     destination_rsrc = AddrBuffer(
@@ -402,10 +428,12 @@ def emit_direct_fixed_slot_payload(
             if warp == fx.Int32(0):
                 if producer_slot < active:
                     if lane < fx.Int32(fz_npes):
-                        comm_ops.fence_system_release()
+                        if const_expr(not (disp_order & 4)):
+                            comm_ops.fence_system_release()
                         share = (producer_slot == fx.Int32(0)).select(
                             fx.Int32(_DIRECT_DONE_INC + 1) - active, fx.Int32(1))
-                        remote_done = load_at(AddrBuffer(p_source_done), lane, fx.Int64, 1)
+                        remote_done = remote_done_pre if const_expr(disp_order & 2) else load_at(
+                            AddrBuffer(p_source_done), lane, fx.Int64, 1)
                         done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
                         comm_ops.atomic_add_system(remote_done + fx.Int64(done_index) * fx.Int64(4), share)
         publish_last = publish_last & ~direct
@@ -417,15 +445,25 @@ def emit_direct_fixed_slot_payload(
     if publish_last:
         done_lane = fx.Int32(0)
         if lane == fx.Int32(0):
-            comm_ops.fence_system_release()
+            # disp_order bit 4: no L2 writeback here. Every route store and RMW of this producer went to the
+            # uncached symmetric heap and drained (the loop-end waitcnt) before this count.
+            if const_expr(not (disp_order & 4)):
+                comm_ops.fence_system_release()
             done_lane = fx.Int32(comm_ops.atomic_add_agent(a_producer_done, fx.Int32(1)))
         done = fx.Int32(fx.rocdl.readlane(T.i32, done_lane, 0))
         if done == done_target:
             comm_ops.fence_agent_acquire()
             if lane < fx.Int32(fz_npes):
-                remote_done = load_at(AddrBuffer(p_source_done), lane, fx.Int64, 1)
+                remote_done = remote_done_pre if const_expr(disp_order & 2) else load_at(
+                    AddrBuffer(p_source_done), lane, fx.Int64, 1)
                 done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
-                comm_ops.store_i32_system(remote_done, done_index, expected)
+                if const_expr(disp_order & 8):
+                    # disp_order bit 8: the producers' rows and metadata sit drained in the uncached heap, so the
+                    # source flag needs no L2 writeback before it either.
+                    comm_ops.store_i32_global_system_monotonic(
+                        fx.Int64(remote_done) + fx.Int64(done_index) * fx.Int64(4), expected)
+                else:
+                    comm_ops.store_i32_system(remote_done, done_index, expected)
 
 
 # Per-launch step of the expected source-flag value on a runtime whose buckets use direct_done (npes otherwise).
@@ -579,7 +617,7 @@ def _fc_store_row(acc, out_rsrc, index, shared_add):
 
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
-    n_blocks=1, bf16_head_tokens=0, m2_tail=frozenset(), lds_xt_off=0, shared_add=False):
+    n_blocks=1, bf16_head_tokens=0, m2_tail=frozenset(), lds_xt_off=0, shared_add=False, lean_publish=False):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
 
     ``shared_add``: ``arg_shared`` is the address of a caller-owned BF16 ``[cur_tok, N_OUT]`` tensor (the shared
@@ -686,13 +724,21 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     fx.barrier()
             if tx_i32 < fx.Int32(npes):
                 # Every other WG's stores completed before its ticket; acquire them, then publish to peer tx.
-                comm_ops.fence_system_acquire()
-                comm_ops.fence_system_release()
+                # lean_publish: those stores (P2P rows, counter resets) went to the uncached symmetric heap or
+                # through L2 (sc0 sc1) and drained before the tickets, so the flag goes out without the L2
+                # invalidate / writeback, as a relaxed system store.
+                if const_expr(not lean_publish):
+                    comm_ops.fence_system_acquire()
+                    comm_ops.fence_system_release()
                 if const_expr("tl" in m2_tail):
                     remote = remote_pre
                 else:
                     remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
-                comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
+                if const_expr(lean_publish):
+                    fx.generic_store(comm_ops._to_ptr_global(fx.Int64(remote) + fx.Int64(rank * 8), fx.Int64, 8),
+                        fx.Int64(flag), memory_order=fx.AtomicOrdering.Monotonic, syncscope="one-as")
+                else:
+                    comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
             fx.barrier()
             if tx_i32 == fx.Int32(0):
                 if const_expr(not flag_is_value):
@@ -926,7 +972,7 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, g2_b2stage: bool = False, probe: str = "",
-    expert_cached_w: int = 0, m2: str = "", shared_add: bool = False,
+    expert_cached_w: int = 0, m2: str = "", shared_add: bool = False, disp_order: int = 0,
 ):
     # ``shared_add`` (default False = unchanged kernel): the launch's ``addr_in_sc`` argument (otherwise
     # unused) is the address of the caller's BF16 shared-expert output; the combine adds each token's row to it in
@@ -941,6 +987,10 @@ def compile_mega_moe_stage1(
     # take the W slab from L2 instead of streaming it from HBM again; single-tile experts keep the streaming bodies.
     # 1: GEMM1 (W1) only, 2: GEMM1 and GEMM2 (W1 and W2). Only the cache policy of the weight loads changes.
     assert expert_cached_w in (0, 1, 2), expert_cached_w
+    # ``disp_order`` (FusedStage1Knobs.disp_order, default 0 = unchanged kernel): order of the producers' stores, see
+    # emit_direct_fixed_slot_payload. The same stores and flags, so the output is bit-identical and ranks need not
+    # agree.
+    assert 0 <= disp_order <= 31, disp_order
     probe_skip = frozenset(p for p in probe.split("+") if p)
     # "null" (benchmarks only): the launch runs an empty kernel of the same grid, block and arguments -- the
     # launch floor of the bench graph. It touches no protocol state, so launches of other variants stay in step.
@@ -1078,7 +1128,7 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
-        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens, m2_tail=m2f & {"tl", "nc", "xt"},
+        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens, m2_tail=m2f & {"tl", "nc", "xt"}, lean_publish=bool(disp_order & 16),
         lds_xt_off=g2_lay["bytes"] + 8, shared_add=bool(shared_add))
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
@@ -1148,6 +1198,7 @@ def compile_mega_moe_stage1(
         f"{'_m2' + ''.join(sorted(m2f)) if m2f else ''}"
         f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
         f"{'_sha' if shared_add else ''}"
+        f"{f'_do{disp_order}' if disp_order else ''}"
         f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
     )
 
@@ -1335,6 +1386,7 @@ def compile_mega_moe_stage1(
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                 parity=route_parity, expected=route_expected, prefetched=prefetched, route_rounds=pre_rounds,
                 prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
+                disp_order=disp_order,
             )
         payload_parity, payload_expected = _load_epoch()
         if owner:
@@ -1825,6 +1877,9 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     elif getattr(k1, "expert_cached_w", 0):
         # The per-bucket form: FusedStage1Knobs.expert_cached_w, e.g. AITER_MEGA_SMALL_M_OVERRIDE="64:fs1.expert_cached_w=2".
         extra["expert_cached_w"] = int(k1.expert_cached_w)
+    # FusedStage1Knobs.disp_order (default 0: no knob, kernel name and cache key unchanged).
+    if getattr(k1, "disp_order", 0):
+        extra["disp_order"] = int(k1.disp_order)
     # fmt: off
     return dict(  # noqa: C408
         **extra,

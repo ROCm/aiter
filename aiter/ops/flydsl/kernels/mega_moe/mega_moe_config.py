@@ -341,6 +341,14 @@ class FusedStage1Knobs:
     # single-tile experts keep the streaming bodies (0: off; 1: GEMM1 / W1; 2: GEMM1 and GEMM2 / W1 and W2). Only the
     # cache policy of the weight loads changes, so the output is bit-identical and ranks need not agree.
     expert_cached_w: int = 0
+    # Small-input fused kernel, producer store order (bits; 0: off). 1 (with dedup_rows): a route's token row goes out
+    # while its slot RMW is in flight, not after the RMW returned (the row's place does not depend on the slot).
+    # 2: the producers load the destinations' source-flag pointers before their routes, not behind the done count.
+    # 4: a producer counts itself done without an L2 writeback first (its stores and RMWs went to the uncached
+    # symmetric heap and drained); 8: the last producer's source flags are relaxed system stores (no writeback);
+    # 16: the same for the combine's publisher (its flags to the peers without the L2 invalidate / writeback).
+    # The same stores and flags, so the output is bit-identical and ranks need not agree.
+    disp_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1881,7 +1889,15 @@ def _fused_config(
     if layout == V41_FLASH_EP2_LAYOUT:
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
-        return _tune_v41_flash_ep8_small(config, bucket)
+        config = _tune_v41_flash_ep8_small(config, bucket)
+        if bucket in (64, 128, 256):
+            # Serving verify (graph bs 8-63, 48-383 rows a rank): the producers' token rows go out while their slot
+            # RMW is in flight, and the producers, the last producer's source flags and the combine publisher skip
+            # their L2 writebacks (every store they order sits drained in the uncached symmetric heap): -1.7..-2.5%
+            # at 60-150 rows a rank (kro_ep8_v3 decode routing, layers 21 / 10), bit-identical. Not on the draft
+            # layout, which reuses this tune (unmeasured there).
+            config = replace(config, fused_stage1=replace(config.fused_stage1, disp_order=31))
+        return config
     if layout in V41_DRAFT_LAYOUTS:
         return _tune_v41_draft_small(config, bucket, world_size)
     return config
