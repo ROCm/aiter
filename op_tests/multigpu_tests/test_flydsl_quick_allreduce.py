@@ -639,7 +639,7 @@ def _host_groups(world_size: int):
     production dispatch would find them (``AITER_FLY_AR_GROUPS`` first), or
     None when they do not split into two. As in ``probe_peer_topology``, an
     ``AITER_FLY_AR_GROUPS`` that does not hold *world_size* ranks is ignored."""
-    from aiter.ops.flydsl import allreduce_host_shared as H
+    from aiter.ops.flydsl import comm_collectives_host_shared as H
 
     groups = _env_groups(world_size)
     if groups is None:
@@ -652,7 +652,7 @@ def _host_groups(world_size: int):
 def _env_groups(world_size: int):
     """``AITER_FLY_AR_GROUPS`` parsed for *world_size* ranks, or None when it
     is unset or holds another number of ranks."""
-    from aiter.ops.flydsl import allreduce_host_shared as H
+    from aiter.ops.flydsl import comm_collectives_host_shared as H
 
     text = os.environ.get(H.GROUPS_ENV, "").strip()
     if not text:
@@ -1040,7 +1040,7 @@ def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
     reads its groups from there, as production would.
     """
     from aiter.ops.flydsl import FlyQuickAllReduce
-    from aiter.ops.flydsl.allreduce_host_shared import GROUPS_ENV
+    from aiter.ops.flydsl.comm_collectives_host_shared import GROUPS_ENV
 
     engine_kw = dict(engine_kw)
     groups_env = engine_kw.pop("groups_env", None)
@@ -2275,7 +2275,7 @@ def test_quick_allreduce_hier_forced(
     ``normal`` (the default codecs, held to the SQNR floor, on the expected
     super-tile) or ``run_ahead``.
     """
-    from aiter.ops.flydsl.allreduce_host_shared import parse_groups_env
+    from aiter.ops.flydsl.comm_collectives_host_shared import parse_groups_env
 
     groups_env = _forced_groups(tp, split)
     label = (
@@ -3259,7 +3259,7 @@ def _fused_threshold_cases(
     side of it. Each probe is the last payload before and the first at the threshold.
     """
     link = fly_policy.detect_link()
-    batched = has_release_fence(_resolve_inbox_flags("auto", tp, link)[1])
+    batched = has_release_fence(resolve_inbox_flags("auto", tp, link)[1])
     cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     have = {(c.hidden, c.tokens) for c in walk}
     # The policy window, as the walk takes it.
