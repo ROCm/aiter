@@ -72,7 +72,6 @@ import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
@@ -856,13 +855,7 @@ def _export(exe, args, out_dir: Path, sym: str) -> Path:
         # identifies kernels.
         raise RuntimeError("flyc.compile returned no function to export")
     cf.export_to_c(str(out_dir), sym)
-    obj = out_dir / f"{sym}.o"
-    # The FlyDSL AOT runtime embedded in every object carries about 240 KB of
-    # DWARF, against about 15 KB of kernel. Linux exports already need objcopy.
-    objcopy = shutil.which("llvm-objcopy") or shutil.which("objcopy")
-    if objcopy:
-        subprocess.run([objcopy, "--strip-debug", str(obj)], check=True)
-    return obj
+    return out_dir / f"{sym}.o"
 
 
 class _JitKernel:
