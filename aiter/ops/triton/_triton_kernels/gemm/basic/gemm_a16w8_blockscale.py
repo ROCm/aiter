@@ -181,10 +181,14 @@ def _gemm_a16w8_blockscale_kernel(
                 )
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator = tl.fma(
+                    tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator
+                )
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b) * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator = tl.fma(tl.dot(a, b), b_scale[None, :], accumulator)
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
