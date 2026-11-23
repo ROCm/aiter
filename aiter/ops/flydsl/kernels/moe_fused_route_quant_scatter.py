@@ -2509,6 +2509,7 @@ def build_moe_token_multidest_quant_module(
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
     tp_route_slots: int = 0,
+    route_expert_bits: int = 0,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2526,6 +2527,13 @@ def build_moe_token_multidest_quant_module(
     ``experts`` and ``tile_m`` after ``token_num`` and writes
     ``topids_to_rows`` (y == 0 blocks), ``masked_m`` and ``psum`` (block 0, 0).
     Ids outside ``[0, experts)`` keep ``DROPPED_ROUTE_ROW``.
+
+    ``route_expert_bits > 0`` takes ``topids_to_rows`` as
+    ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum_sc``: the
+    kernel then takes ``row_starts`` and ``final_rows`` after ``token_num``,
+    stores each route to ``row_starts[expert] + slot``, and its K-group-0
+    blocks write those rows to ``final_rows`` for the gather-reduce. The two
+    route modes are exclusive; without either the kernel is the plain one.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2541,6 +2549,8 @@ def build_moe_token_multidest_quant_module(
         )
     block_iters = row_iters // ksplit
     tp_route = tp_route_slots > 0
+    if tp_route and route_expert_bits:
+        raise ValueError("tp_route_slots and route_expert_bits are exclusive")
     n_own = warps_per_block * topk
     if tp_route and (ksplit < 2 or n_own > TP_ROUTE_MAX_OWN):
         raise ValueError(
@@ -2570,6 +2580,7 @@ def build_moe_token_multidest_quant_module(
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
         f"{f'_tproute{tp_route_slots}' if tp_route else ''}"
+        f"{f'_rr{route_expert_bits}' if route_expert_bits else ''}"
     )
 
     def _quant_ctx(
@@ -2679,14 +2690,18 @@ def build_moe_token_multidest_quant_module(
             hidden_preloaded=hidden_preloaded,
         )
 
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def token_multidest_kernel(
-        hidden: fx.Pointer,
-        grouped_payload: fx.Pointer,
-        grouped_scale: fx.Pointer,
-        topids_to_rows: fx.Pointer,
-        token_num: Int32,
+    @flyc.jit
+    def _token_multidest_entry(
+        hidden,
+        grouped_payload,
+        grouped_scale,
+        topids_to_rows,
+        token_num,
+        row_starts,
+        final_rows,
     ):
+        """The default entry; ``row_starts``/``final_rows`` are the
+        ``route_expert_bits`` operands, None without it."""
         i32 = T.i32
         c0_i32 = fx.Int32(0)
         c_wave = fx.Int32(wave_size)
@@ -2769,6 +2784,40 @@ def build_moe_token_multidest_quant_module(
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
+            # Scalar loads: the route is wave-uniform, and landing each row in
+            # an SGPR is what keeps its destination descriptor uniform.
+            raw_rows = [
+                fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                for k in range_constexpr(topk)
+            ]
+            if const_expr(route_expert_bits):
+                starts_t = ptr_buf_tensor(row_starts)
+                final_t = ptr_buf_tensor(final_rows)
+                c_expert_mask = fx.Int32((1 << route_expert_bits) - 1)
+                lives = [raw >= c0_i32 for raw in raw_rows]
+                # All start loads go out before any is used.
+                route_starts = [
+                    fx.Int32(
+                        buf_scalar_load(starts_t, live.select(raw & c_expert_mask, 0))
+                    )
+                    for raw, live in zip(raw_rows, lives)
+                ]
+                raw_rows = [
+                    live.select(
+                        start + (raw >> fx.Int32(route_expert_bits)),
+                        fx.Int32(DROPPED_ROUTE_ROW),
+                    )
+                    for raw, live, start in zip(raw_rows, lives, route_starts)
+                ]
+                # One K group publishes the rows; the others only store to them.
+                writer = valid & (lane < fx.Uint32(topk))
+                if const_expr(ksplit > 1):
+                    writer = writer & (fx.Uint32(fx.block_idx.y) == c0_i32)
+                if writer:
+                    lane_row = raw_rows[0]
+                    for k in range_constexpr(1, topk):
+                        lane_row = (lane == fx.Uint32(k)).select(raw_rows[k], lane_row)
+                    final_t[route0 + lane] = lane_row
             qc = _quant_ctx(
                 hidden,
                 grouped_payload,
@@ -2776,12 +2825,7 @@ def build_moe_token_multidest_quant_module(
                 token_eff,
                 valid,
                 lane,
-                # Scalar loads: the route is wave-uniform, and landing each row
-                # in an SGPR is what keeps its destination descriptor uniform.
-                [
-                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                    for k in range_constexpr(topk)
-                ],
+                raw_rows,
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
@@ -2796,6 +2840,24 @@ def build_moe_token_multidest_quant_module(
                 hidden_preloaded=None,
             )
             _emit_quant_block_loop(qc)
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def token_multidest_kernel(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        token_num: Int32,
+    ):
+        _token_multidest_entry(
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            token_num,
+            None,
+            None,
+        )
 
     @flyc.jit
     def launch_token_multidest(
@@ -2953,6 +3015,56 @@ def build_moe_token_multidest_quant_module(
             )
 
         launch_token_multidest = launch_token_multidest_tp_route
+
+    if route_expert_bits:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def token_multidest_route_rows_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,  # (token_num * topk,) encoded rows in
+            token_num: Int32,
+            row_starts: fx.Pointer,  # (experts,) int32 tile-aligned starts
+            final_rows: fx.Pointer,  # (token_num * topk,) int32 out
+        ):
+            _token_multidest_entry(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                row_starts,
+                final_rows,
+            )
+
+        @flyc.jit
+        def launch_token_multidest_route_rows(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: fx.Int32,
+            row_starts: fx.Pointer,
+            final_rows: fx.Pointer,
+            grid_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            token_multidest_route_rows_kernel(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                row_starts,
+                final_rows,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+        launch_token_multidest = launch_token_multidest_route_rows
 
     launch_token_multidest.compile_hints = {
         "llvm_options": {
