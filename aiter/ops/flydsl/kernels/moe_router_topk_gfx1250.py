@@ -98,7 +98,7 @@ def build_moe_router_topk_module(
         raise ValueError(f"K {K} is not a multiple of split_k * 32")
     if not 1 <= topk <= 4:
         raise ValueError("topk must be in [1, 4] (one slot per merge round)")
-    n_groups, tile_n, slices, csize = router_topk_geometry(split_k)
+    n_groups, _, slices, csize = router_topk_geometry(split_k)
     waves = slices // CHAINS
     chunk = K // split_k
     k_steps = chunk // WMMA_K
@@ -305,12 +305,12 @@ def build_moe_router_topk_module(
             score = fx.Float32(rocdl.rcp(T.f32, fx.Float32(1.0) + e2))
             # The reference flushes denormals (score >= 0 or NaN).
             score = (score < fx.Float32(FLT_MIN)).select(fx.Float32(0.0), score)
-            is_nan = score != score
+            is_nan = score != score  # noqa: PLR0124 -- traced value: the NaN test
             orig.append(is_nan.select(fx.Float32(0.0), score))
             v = score
             if has_bias:
                 v = v + bias_v[i]
-            v = (v != v).select(fx.Float32(neg_inf), v)
+            v = (v != v).select(fx.Float32(neg_inf), v)  # noqa: PLR0124
             vals.append(v)
             idxs.append(lane + WAVE * i)
 
