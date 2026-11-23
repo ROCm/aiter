@@ -107,6 +107,8 @@ from .fmha_utils import (
     _pick_num_q_tiles,
     _ring_drive,
     _ring_num_prefetch,
+    _SG_LDSDMA,
+    _SG_SALU,
     _setprio_inc_wg,
     _tree_reduce_multi,
     _warp_id,
@@ -258,6 +260,10 @@ PVQK_HEAD_CARRY = 20
 # pair is amortised over only 2 loads. Batching the refill spreads it over more. 0 keeps
 # the per-fragment cadence.
 PVQK_REFILL_BURST = 4
+# Describe each ring stretch to IGroupLP with sched_group_barrier instead of pinning it
+# with per-wmma sched_barrier. Only this lets a tap's SALU hoist across the wmma ahead of
+# it; the waits keep their hard fences either way.
+PVQK_USE_SCHED_GROUPS = False
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
@@ -500,6 +506,7 @@ def _pv_qk_gemm(
     phase="pvqk",
     tap=None,
     user_data=None,
+    use_groups=False,
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
     fragment streams, for all num_q_tiles q-WMMA-tiles this wave owns.
@@ -563,13 +570,19 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
+    def _fence():
+        # Source-order pin, dropped under ``use_groups`` so the stretch stays one
+        # scheduling region for its sched_group_barrier description.
+        if not use_groups:
+            rocdl.sched_barrier(0)
+
     def consume(i, *parts, boundary=None):
         # One gap per wmma, handed straight back to the ring's tap. The ring's own refill
         # burst is offered in the gap after this fragment's FIRST wmma, so the loads issue
         # under it instead of ahead of the stream; the tap decides what actually lands.
         def _mid(q_tile_idx):
             if boundary is not None and boundary(q_tile_idx):
-                rocdl.sched_barrier(0)
+                _fence()
 
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
@@ -588,7 +601,7 @@ def _pv_qk_gemm(
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
-                rocdl.sched_barrier(0)
+                _fence()
                 _mid(q_tile_idx)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
@@ -602,7 +615,7 @@ def _pv_qk_gemm(
             s_acc_list[q_tile_idx][kv] = _wmma(
                 k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
             )
-            rocdl.sched_barrier(0)
+            _fence()
             _mid(q_tile_idx)
 
     def dies(i):
@@ -628,6 +641,7 @@ def _pv_qk_gemm(
         dies=dies,
         tap=tap,
         user_data=user_data,
+        use_groups=use_groups,
         refill_burst=PVQK_REFILL_BURST,
     )
     # Hand the high-priority slot to this wave's SIMD-mate, which under anti-phase is
@@ -1159,13 +1173,22 @@ schedule_bank.func = None
 
 
 # Ring fragment that issues TDM copy k. A fragment is one refill (2 ds_load) plus the
-# Free-WMMA-slot schedule for this half's KV prefetch. Entries index the gaps the ring
-# leaves EMPTY -- every inter-wmma gap that carries no ds_load refill -- counted from the
-# top of the gemm. Each TDM copy takes TWO entries: the first places its descriptor SALU,
-# the second the ``tensor_load`` that reads it, so the ~10-deep address chain gets a whole
-# wmma to retire instead of stalling the issue it feeds. Sized for 4 copies, the widest
-# band we emit (paged at page_size=1); a pow2 hdim needs one copy, so just the first two.
-_TDM_FREE_SLOTS = (0, 1, 2, 3, 4, 5, 6, 9)
+# Free-WMMA-slot scheduling policy for this half's KV prefetch.
+#
+# One WMMA hides at most this many SALU: the thread trace shows a longer run pushing the
+# WMMA out instead of riding in its shadow, so a descriptor chain is split across slots
+# rather than dropped into one.
+_TDM_SALU_PER_SLOT = 4
+# Gaps between a copy's LAST descriptor SALU and the ``tensor_load`` that reads it. The
+# dependency bubble between them measures ~8 cycles -- one whole WMMA -- so the load goes
+# two gaps later. If that gap is carrying a ds_load the load takes the next free one,
+# i.e. +3; later is harmless, earlier is the stall this exists to avoid.
+_TDM_ISSUE_GAP = 2
+# How a descriptor chain is declared to IGroupLP: this many SALU in the gap it is emitted
+# in, the rest in the next one. Source order has them together -- the split is a REQUEST,
+# and the scheduler can honour it only by hoisting the first group above the WMMA ahead of
+# it, since every one of these SALU feeds the issue that reads them.
+_TDM_SALU_SPLIT = (_TDM_SALU_PER_SLOT, 3)
 
 
 # sched_group_barrier masks. TDM sets TENSOR_CNT, which puts it in LDSDMA and NOT in
@@ -1197,39 +1220,67 @@ def _tdm_tap(desc):
     """The gemm's free-WMMA-slot scheduler, as ``(tap, user_data)`` for ``_pv_qk_gemm``.
 
     One tap owns every inter-wmma gap. Where the ring says it is owed a refill the tap
-    issues it; the gaps left over are the free slots, and ``_TDM_FREE_SLOTS`` picks which
-    of them carry this half's KV-prefetch work. Placement is by source order, so the
-    scheduler is not involved and the ring pays no fence or wait depth for it.
+    issues it and the gap is spent; the gaps left over are free, and this is what goes in
+    them, in order per copy:
 
-    Returns ``(None, None)`` for a descriptor with no TDM copies (the V1 async transport),
-    which leaves the ring's own placement exactly as it was.
+      * one descriptor build STEP per free gap, never more, so no WMMA is asked to hide
+        more than ``_TDM_SALU_PER_SLOT`` SALU (see ``_tdm_load_view_builders`` for where
+        the chain comes apart);
+      * then that copy's ``tensor_load``, at the first free gap at least
+        ``_TDM_ISSUE_GAP`` gaps after its last build step.
+
+    Placement is by source order, so the scheduler is not involved and the ring pays no
+    fence or wait depth for it. Returns ``(None, None)`` for a descriptor with no TDM
+    copies (the V1 async transport), leaving the ring's own placement exactly as it was.
     """
     if desc is None or desc.tensorcnt == 0:
         return None, None
-    tasks = []
+
+    # (copy, step) in issue order. ``step is None`` is the load; ``step == "tail"`` emits
+    # nothing and only declares the second half of the preceding chain's SALU split.
+    plan = []
     for k in range(desc.tensorcnt):
-        tasks.append(functools.partial(desc.build_one, k))
-        tasks.append(functools.partial(desc.async_load_one, k))
-    assert len(tasks) <= len(_TDM_FREE_SLOTS), (
-        f"{desc.tensorcnt} TDM copies want {len(tasks)} free slots, schedule has "
-        f"{len(_TDM_FREE_SLOTS)}"
-    )
-    at = {_TDM_FREE_SLOTS[t]: t for t in range(len(tasks))}
+        for step in range(desc.num_build_steps(k)):
+            plan.append((k, step))
+            if PVQK_USE_SCHED_GROUPS:
+                # Only meaningful with a group description to carry it: on its own a tail
+                # entry just burns a free slot, which MOVES the load for no reason.
+                plan.append((k, "tail"))
+        plan.append((k, None))
 
     def tap(w, prev_cycles, next_cycles, ud):
         if ud["ring_due"] is not None:
             ud["ring_due"]()
             ud["emitted"] = True
             return
-        slot = ud["free_slot"]
-        ud["free_slot"] = slot + 1
-        task = at.get(slot)
-        if task is None:
+        if ud["done"] >= len(plan):
             return
-        tasks[task]()
+        copy, step = plan[ud["done"]]
+        if step is None and w < ud["ready_at"]:
+            # The load is next but its address chain is still too fresh: leave the gap
+            # empty rather than eat the bubble.
+            return
+        if step is None:
+            desc.async_load_one(copy)
+            ud["groups"].append((_SG_LDSDMA, 1))
+        elif step == "tail":
+            # Nothing to emit -- this gap's share of the previous chain is already in the
+            # instruction stream, and the group description is what moves it here.
+            ud["groups"].append((_SG_SALU, _TDM_SALU_SPLIT[1]))
+        else:
+            desc.build_step(copy, step)
+            ud["groups"].append((_SG_SALU, _TDM_SALU_SPLIT[0]))
+            ud["ready_at"] = w + _TDM_ISSUE_GAP
+        ud["done"] += 1
         ud["emitted"] = True
 
-    return tap, {"free_slot": 0, "ring_due": None, "emitted": False}
+    return tap, {
+        "done": 0,
+        "ready_at": 0,
+        "ring_due": None,
+        "emitted": False,
+        "groups": [],
+    }
 
 
 def _attention_core_multi_kv_tiles(
@@ -1771,6 +1822,7 @@ def _attention_core_multi_kv_tiles(
                 head=pvqk_head,
                 tap=_tap,
                 user_data=_tap_data,
+                use_groups=PVQK_USE_SCHED_GROUPS,
             )
             _phase_barrier()
             # Ahead of softmax: nothing here consumes it, so the whole softmax covers

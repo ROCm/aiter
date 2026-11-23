@@ -63,6 +63,16 @@ WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
 # rest, which is the shadow anything placed in the gap after it runs under.
 WMMA_ISSUE_CYCLES = 8
 
+# IGroupLP SchedGroupMask bits (AMDGPUIGroupLP.cpp). ``v_wmma`` is matched by MFMA
+# (isMFMAorWMMA) and TDM by LDSDMA. NOTE that s_wait_* is SOPP, which sets SALU=1, so a
+# SALU group can swallow a wait -- that is why the ring's waits keep a hard sched_barrier
+# around them and only the space BETWEEN them is described with groups.
+_SG_VALU = 0x002
+_SG_SALU = 0x004
+_SG_MFMA = 0x008
+_SG_DS_READ = 0x100
+_SG_LDSDMA = 0x800
+
 
 def _lane_id():
     """Lane index within the wave (wave32), matching opus ``lane_id()``."""
@@ -348,6 +358,7 @@ def _ring_drive(
     user_data=None,
     refill_burst=0,
     wmma_cycles=WMMA_ISSUE_CYCLES,
+    use_groups=False,
 ):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
@@ -370,6 +381,13 @@ def _ring_drive(
 
     ``wmma_cycles`` is what one WMMA occupies the SIMD for; the tap gets it for the WMMA
     on each side of the gap, so it can size the work it hides there.
+
+    ``use_groups`` swaps the per-WMMA ``sched_barrier`` fences inside a stretch for a
+    ``sched_group_barrier`` description of it. Source order then stops being binding, so
+    the scheduler may hoist a tap's SALU across the WMMA ahead of it -- which is the only
+    way to get a descriptor chain split over two WMMA shadows, since every one of those
+    SALU is a data dependency of the issue that reads them and so cannot move the other
+    way. The stretch is ONE region: the fences at its ends stay, everything inside goes.
 
     Under ``refill_burst`` the ring hands ``consume`` an ``after_first`` callback and
     expects it to be invoked once its FIRST wmma has been emitted; that is where the
@@ -413,9 +431,17 @@ def _ring_drive(
     )
 
     def _waitn(n):
+        # Unconditional: this is the stretch boundary, and the wait's depth is only
+        # meaningful where it stands.
         rocdl.sched_barrier(0)
         rocdl.s_wait_dscnt(max(n, 0))
         rocdl.sched_barrier(0)
+
+    def _fence():
+        """Pin by source order. Suppressed under ``use_groups``, where the stretch has to
+        stay one scheduling region for the group description to reach across it."""
+        if not use_groups:
+            rocdl.sched_barrier(0)
 
     a = [None] * ring
     if head is not None:
@@ -442,8 +468,9 @@ def _ring_drive(
             a[issued % ring] = schedule_bank(
                 emit(issued), bank=1, soft=True, reason="ring_frag"
             )
-            rocdl.sched_barrier(0)
+            _fence()
             issued += 1
+            _group(_SG_DS_READ, 1)
 
     def _release(i):
         j = i - rel
@@ -451,12 +478,24 @@ def _ring_drive(
             # Fenced: the release point IS the WAR distance the refill below gets
             # measured against, so the scheduler must not slide a ds_load above it
             # or the keepalive below one.
-            rocdl.sched_barrier(0)
+            _fence()
             _keepalive(held[j])  # regs read by fragment j die HERE, not at the wmma
-            rocdl.sched_barrier(0)
+            _fence()
             held[j] = None
+            _group(_SG_VALU, 1)
 
     wmma_index = 0
+    groups = []  # (mask, count) describing the stretch being emitted
+
+    def _group(mask, count):
+        """Append to the stretch's description. Consecutive same-class groups merge, which
+        is what IGroupLP expects -- a run of four SALU is one [SALU x4], not four [SALU x1]."""
+        if not use_groups or not count:
+            return
+        if groups and groups[-1][0] == mask:
+            groups[-1][1] += count
+        else:
+            groups.append([mask, count])
 
     def _boundary(due):
         """One inter-WMMA gap. Returns True if anything was emitted into it, which is what
@@ -464,6 +503,7 @@ def _ring_drive(
         nonlocal wmma_index
         w = wmma_index
         wmma_index += 1
+        _group(_SG_MFMA, 1)
         if tap is None:
             if due is None:
                 return False
@@ -471,7 +511,10 @@ def _ring_drive(
             return True
         user_data["ring_due"] = due
         user_data["emitted"] = False
+        user_data["groups"] = []
         tap(w, wmma_cycles, wmma_cycles, user_data)
+        for _mask, _count in user_data["groups"]:
+            _group(_mask, _count)
         return bool(user_data["emitted"])
 
     def _record(i, parts):
@@ -482,9 +525,9 @@ def _ring_drive(
 
     # Fragment runs between refills -- one STRETCH per burst. The ring takes a single
     # s_wait_dscnt at the head of each instead of one per fragment: a fence at every
-    # fragment head leaves anything scheduling the stream only ``wmma_per_frag`` wmma to
-    # work in. The refill cadence is a pure function of the counters, so the stretch
-    # boundaries are known here by replaying it.
+    # fragment head leaves the schedule only ``wmma_per_frag`` wmma to work in, which is
+    # not enough span to hide a descriptor chain. The ring's refill cadence is a pure
+    # function of the counters, so the stretch boundaries are known here by replaying it.
     stretches = []
     _sim, _first = num_prefetch, 0
     for i in range(num_frag):
@@ -507,7 +550,7 @@ def _ring_drive(
             or _target >= num_ld
         )
         parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
-        rocdl.sched_barrier(0)
+        _fence()
         if _do_refill and refill_burst:
             # The burst belongs INSIDE the wmma stream rather than ahead of it: a wmma owns
             # the SIMD for 8 cycles but issues in 1, so the loads ride its shadow and the
@@ -520,7 +563,7 @@ def _ring_drive(
             if _do_refill:
                 _refill(_target)
             consume(i, *parts, boundary=lambda q: _boundary(None))
-        rocdl.sched_barrier(0)
+        _fence()
         # Past the last refill nothing can clobber the slots, so holding them buys nothing.
         _record(i, parts if (ring_lag and refilling) else None)
 
@@ -530,8 +573,13 @@ def _ring_drive(
         # outstanding: everything issued past the end of the stretch may still be in
         # flight, and the refills inside it only add younger loads.
         _waitn(issued - starts[_last + 1])
+        del groups[:]
         for i in range(_first, _last + 1):
             _ring_fragment(i)
+        # The description goes AFTER the instructions it describes and before the next
+        # stretch's fence, so it applies to exactly this region.
+        for _mask, _count in groups:
+            rocdl.sched_group_barrier(_mask, _count, 0)
 
     for p in held:
         if p is not None:
