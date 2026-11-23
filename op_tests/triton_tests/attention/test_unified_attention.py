@@ -799,7 +799,8 @@ def test_triton_unified_attn_3d_length_aware_split(
         out_dtype=torch.bfloat16,
         shuffled_kv_cache=shuffled_kv_cache,
     )
-    sinks = sinks if option == "sinks" else None
+    # +10 puts exp(sink) near the 120K score sum, so each request moves >=24%
+    sinks = sinks + 10.0 if option == "sinks" else None
     # the scores here are ~0.1; a cap of 0.1 moves each request ~5%, past the bound
     soft_cap = 0.1 if option == "softcap" else None
     qq_bias = None
