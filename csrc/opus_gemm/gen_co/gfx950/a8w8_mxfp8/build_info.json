@@ -1,0 +1,2192 @@
+{
+  "arch": "gfx950",
+  "common_flags": [
+    "--cuda-device-only",
+    "-D__HIPCC_RTC__",
+    "-O3",
+    "-std=c++17",
+    "-cuid=<symbol>"
+  ],
+  "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
+  "hip_clang_path": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
+  "kernels": [
+    {
+      "co_sha256": "92968d67ea6d174aba81c8111885125bd4d5493f3fcdaa7486b65a617b306eb0",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 100,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_nn",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, false, true, 1, false",
+      "undefined_symbols": [],
+      "variant": "nob",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "3479650571315cffc8baf5b6d11269eb75c4fc649e20415b61bcb746f31fbdb0",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 100,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_nt",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, false, false, 1, false",
+      "undefined_symbols": [],
+      "variant": "nob",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "2ad2c74b009af4cb190435afc0f53f321c1219b2e064ca00ed32c68435e618ba",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 100,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_tn",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, true, true, 1, false",
+      "undefined_symbols": [],
+      "variant": "nob",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "617d99ab2626b8c0d0525e7919a1d936ddc93ee177874c63dfaaad392c1b3cf2",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 100,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_tt",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, true, false, 1, false",
+      "undefined_symbols": [],
+      "variant": "nob",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "64b00e907dff3cd07e37003c04259599b8870a5dd8c8b5bba5754565f21e410e",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 101,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_nn",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f4df0a182fd448537eaf1ec20f6bbfc05d0c71559e4fcfb792f570c4b8e9107d",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 101,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_nt",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 2
+    },
+    {
+      "co_sha256": "87411b7af0cb921713909f2aee1bedee9ff21fc125930644ff4069f3e2a13adb",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 101,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_tn",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "bac6ec02f140961e7a32ebc5ee1922313611d392701e09aad89976c16c933786",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 101,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_tt",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "traits_args": "256, 256, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "5e0446937613c34f4a08c9269820442813ba757ef178925c2338f58fe263e977",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 102,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_nn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "98892a65551751ec00da26d7d035ce7594de9ca18e1f8945b634025b3672acae",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 102,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_nt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "bc0bd83ffa8130418a7527d8c56a970d81befb5de81633dd270daea6f1a496ae",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 102,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_tn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "1ea42f2b0afd4cd3abbadd1ec4b8e5062ddb7f9a5d8ca774db7bc0e1b1bc34e7",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 102,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 69,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_tt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "c62ac47f09d87adde2a96f41cee05d9bf2740913fbe8d874fe6472b8da763886",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 103,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 71,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_nn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f9c2e08fdc3b8a5f6290476ac369d47390411ca08f384f1e8a2088d26551ca8b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 103,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 66,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_nt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "3eb217a835425cc40180defd031b3553c118ead231e513bee263e2d6e88506a8",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 103,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_tn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "7341edead0a99e1ae2cc9a34caafdacfe66334392003ac71029b71d1b8d03152",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 103,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_tt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "50bb20a2b7c014d357033b288796cf625bc851aea3b0970550edd30e4efa8b06",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 104,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 71,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_nn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "0dd1f83c1991e605e0e941c96629b7854e558e84ef2b79d27071bff92e4d6e6d",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 98304,
+      "kernarg_segment_size": 112,
+      "kid": 104,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_nt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "72692c43ce5c98aee960cb3a01905deaf179ce5baee79db1fcfc289f0be6f34b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 104,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_tn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "fc977e9bf1343fd47029b7e747607f2937573de4a4d21f9ca7e3d5d1b05bde2b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 104,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 69,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_tt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "9584e3ec086817ec8c49d122a8d9e69427f3569ca7d7bf18ec48bcb0c39b37be",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 105,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_nn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "d5549b9283d1dc886c7e9cb61cb7a4ec81c697c17381d6092f1ed8ae5bff1194",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 105,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 62,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_nt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "554f3cab8b4b50113038f504e9c29429513c0dec9c25373fb41727631023c830",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 105,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_tn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "41548b7294e6928a92c2d42d8324d1251a7473137afef607564c2245693866e1",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 105,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_tt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "488ba0a348e3d215d3fd82a8ef781919b3988cfea05c9400272af9acb2b716fc",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 106,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_nn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "333b0a377e5cc9d8f630e64a850c33a010667aa60fab21c5f9fc3fa868a9f599",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 106,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 66,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_nt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f1f9571246b3e9882a77c559e08fa3930be39cb1fa463b77bc1608df2b646a2e",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 106,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_tn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, true, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "7608e9038a867690d308cd5066fd25e052b34d8943d629708a82d2b56585cb4f",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 106,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_tt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, false, 1, true",
+      "undefined_symbols": [],
+      "variant": "np",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "93435738c69d974d9946ba0b994efa8f9b5ec2843b777fc8002dff3c768a4930",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 107,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 8,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_nn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "2fd8a607b659b6ce56d19901092e5a22f0ab32e629efe84c68a067a710c859fe",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 107,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 7,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_nt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "46f3fba3c0c1fd24666cef517f067c05e379be12a2d82f7f73327ae107da253b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 107,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 9,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_tn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f4af7de1d5f0cffc39ac14608f73beaca12b54843c8dbaa4edc3393cc6174eda",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 107,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 5,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_tt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "d7b058fbdcb539735389151787c8a5a9c8395b6b3a5decbac6c61a56c60ae093",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 108,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 8,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_nn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "e488455454bb78d3d114902a4b14000da2839f9d6cc0c9e567a070d2f2489cb9",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 108,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 9,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_nt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "ca095bbac81ebf7393c4b4ab41ffa27d2c188a24d234d6878ae76ea0492911ea",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 108,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 9,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_tn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "419a4111c773f01b7fe8c474ca6b588683510e17c30219b6f21feb5d5d6890d7",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 108,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 7,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_tt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "1723ac429f8fecdb102bcc319259406bc78bbab0dd565c56b451ec09f44745f3",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 109,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 7,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_nn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "b777c72fec69aa2ebd5ab4dcba3610c4fd2c051be083e5e3f09a52e499d0f340",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 98304,
+      "kernarg_segment_size": 112,
+      "kid": 109,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 5,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_nt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "c292140fe561fd3eb8114ac599a5a9a3acd709595d58605e35e250698dc0ef3c",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 109,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 9,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_tn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "2086ef2c1950366d763c9615123ade5e5b20167f41551e1e72bf6aad6ff9570b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 109,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 4,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_tt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "00a50c1b301eded729c871d93b16c0c4725f496157d89bbcd01ee4b46ad04545",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 110,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 3,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_nn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "2485486805b5595a6a779c48b9fef73ee78df80a58ba7a36ceecd53ee0316287",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 110,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 4,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_nt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "62eda3ccec0f7c192919e34591096afc3401f1ee0a06fa2cd684eb70cfe6f49b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 110,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 10,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_tn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "aedd7e47ca272ac3dc9b994be209882c6af3aca34db948b35a7ed81b42fd5fb8",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 110,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 7,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_tt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "c0021b9a148e92f1a7c10d2aa131bc0a65057c509d378012457a2440aee0d096",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 111,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 9,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_nn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "816b8e52ae4a610be88675b444ad927b9196e37af6503e024fcd1afb5194202c",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 111,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 4,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_nt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "8a5b54b0d7c123889ec2b2909abc806810b67ca03bdb066b4e5544b4fa1e4795",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 111,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 10,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_tn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, true, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "d505212913008eee16b4078eba2780fca66b4fedc3632a6e833312cc0ddba52c",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 111,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 106,
+      "sgpr_spill_count": 2,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_tt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, false, 0, true",
+      "undefined_symbols": [],
+      "variant": "",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "6567da2813bf3854c3f0054082d119c3f75037d7624d0aa33372486aa5c004e4",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 112,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 80,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_nn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "bddd1632251dad0aae17a46cf90e70b63167dcb00ff890de764d307a0417adb9",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 112,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 74,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_nt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, false, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f769375222bcd4c68c9133ffdd22fd286a3a460d2eb5c320fcd6ea219af54e4e",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 112,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 77,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_tn",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "1990cee29b7284d39c12d33fec90b5f5a8c0433b442bcf288da02305892e1982",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 112,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_tt",
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "traits_args": "256, 128, true, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "6b230cc5890551d90486bc14a2eb993f6edb169b4512f7bb5482d39d9098afc4",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 113,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_nn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "745c91d5585b7fe7ebf57e12311ce385ade743f9e31bda886a746dea4330f0b3",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 113,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 76,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_nt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, false, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "574650ae51a4edf07b2ed50721d93a3a948307faa77296cff425081c77386125",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 113,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 77,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_tn",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "acefff8880182960bb24fef6dd6cfe47bbaf102c8d243f685969137d6cc84bf5",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 113,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_tt",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 256, true, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 448,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "6f0a9de402a8be2da3bed154d72cd4fec00432220bda69fddf290848ba583b3c",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 114,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_nn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "a3a88263351719136b9d701c023bd0109655c9aa7d66e30f4cdb7cd115dd9571",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 98304,
+      "kernarg_segment_size": 112,
+      "kid": 114,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 74,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_nt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, false, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "9328fc871047b7bb74a13677c2526c5182060290a2039ad30fd617059f0532a2",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 114,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 77,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_tn",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "bc0b790636bed8a38a69817a8844cdd301ad6a8dcd9370c814d4a6e78bee8fe5",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 131072,
+      "kernarg_segment_size": 112,
+      "kid": 114,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_tt",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, true, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "906ae2caaff665a07db8a6291f9479c0b72e2d40a1db0e9c89ba12f45455cd46",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 115,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 76,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_nn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "5f1830d1f35152e9d327c44d3e06be4696dc94dfaecc9cd17084d602e855875b",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 115,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_nt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, false, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "82ac1a4d2705c7958dd6ce6fb96e4a03fa16672f586bb48e390103a200d5d5c5",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 115,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 77,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_tn",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "9a38dba2424d73ee158fc893cc07ddbc4219c1603e85bd5ec82e21d8b060ebd6",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 115,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 78,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_tt",
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "traits_args": "192, 256, true, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "807539cf061aabbf68b66d0ee9534d97b5bc6183c0a2546f8a742835ffd0b461",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 116,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 80,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_nn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f275602e6ea7907e7e201fa93b40520f0ba2dbad753e4d50ac8f1e98eefe46a2",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 116,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "nt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 74,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_nt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, false, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "f61309c6da40d9c7e2e8097ad5e4c6eca1ebb75493868009d99c4b3dfab231f5",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 163840,
+      "kernarg_segment_size": 112,
+      "kid": 116,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tn",
+      "offload_arch": "gfx950",
+      "sgpr_count": 77,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_tn",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, true, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "co_sha256": "54cd5e8fc5b4c6aa6c060ba2e57a5868ff5f2176e565883c7d1aff41a12a6c7d",
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "elf_flags": 1359,
+      "elf_machine": 224,
+      "elf_processor_id": 79,
+      "group_segment_fixed_size": 147456,
+      "kernarg_segment_size": 112,
+      "kid": 116,
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "layout": "tt",
+      "offload_arch": "gfx950",
+      "sgpr_count": 76,
+      "sgpr_spill_count": 0,
+      "status": "ready",
+      "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_tt",
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "traits_args": "256, 192, true, false, 2, true",
+      "undefined_symbols": [],
+      "variant": "sk",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    }
+  ],
+  "offload_arch": "gfx950",
+  "target_profile": "regular"
+}

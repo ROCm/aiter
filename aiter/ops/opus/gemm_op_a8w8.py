@@ -26,6 +26,8 @@ from .launch_plan import (
     _A8W8_BLOCKSCALE_FAMILY,
     _A8W8_BPRESHUFFLE_FAMILY,
     _A8W8_FAMILY,
+    _A8W8_MXFP8_1X32_BPRESHUFFLE_FAMILY,
+    _A8W8_MXFP8_1X32_FAMILY,
     _A8W8_MXFP8_FAMILY,
     _A8W8_MXSCALE_BMM_FAMILY,
     _FP8_DTYPES,
@@ -149,6 +151,55 @@ def _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
     Y: Tensor,
     kid: int,
     workspace: Tensor | None = None,
+) -> Tensor: ...
+
+
+def _gen_opus_gemm_a8w8_mxfp8_launch_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    workspace: Tensor | None,
+    kid: int,
+    split_k: int,
+) -> Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_mxfp8_launch",
+    gen_fake=_gen_opus_gemm_a8w8_mxfp8_launch_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_mxfp8_launch_raw(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    workspace: Tensor | None,
+    kid: int,
+    split_k: int,
+) -> Tensor: ...
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_mxfp8_bpreshuffle_launch",
+    gen_fake=_gen_opus_gemm_a8w8_mxfp8_launch_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_mxfp8_bpreshuffle_launch_raw(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    workspace: Tensor | None,
+    kid: int,
+    split_k: int,
 ) -> Tensor: ...
 
 
@@ -586,6 +637,143 @@ def gemm_a8w8_blockscale_opus(
     return _launch_a8w8_blockscale_mxfp8_gemm(
         XQ, WQ, x_scale, w_scale, out, kid=int(kernelId)
     )
+
+
+# a8w8_mxfp8 (plain): XQ [M, K] / WQ [N, K] are logical views of the stored
+# operands; the kid's launcher picks the layout image from their strides.
+# A stored [K, M] needs M % 16 and B stored [K, N] N % 16.
+#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
+#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
+# a8w8_mxfp8_bpreshuffle: NT, WQ = shuffle_weight(w, layout=(16, 16)) of B [N, K].
+# x_scale [M, K/32] and w_scale [N, K/32] are row-major e8m0 and Y [M, N] bf16
+# in every layout. Both families have the same kids (tiles / variants).
+_MXFP8_K_ALIGN = 256  # two K tiles of 128
+
+
+def a8w8_mxfp8_kid_runs(
+    instance, M: int, N: int, K: int, split_k: int = 0, layout: str = "NT"
+) -> bool:
+    """Whether a8w8_mxfp8(_bpreshuffle) kid ``instance`` runs (M, N, K) in
+    ``layout`` (NT / NN / TT / TN) with ``split_k``. The 32-bit buffer ranges
+    bound A / B to 2 GiB, one C tile to 2 GiB (C itself may exceed 4 GiB) and
+    the split-K workspace to 4 GiB."""
+    # A stored [K, M] needs M % 16 (B stored [K, N] N % 16, as every N below).
+    if layout.upper()[0] == "T" and M % 16:
+        return False
+    if K <= 0 or K % _MXFP8_K_ALIGN:
+        return False
+    if (
+        max(M * K, N * K, 2 * ((min(M, instance.B_M) - 1) * N + instance.B_N))
+        > (1 << 31) - 1
+    ):
+        return False
+    if instance.co_variant == "nob":
+        if M % instance.B_M or N % instance.B_N:
+            return False
+    elif N % 16:
+        return False
+    if instance.co_variant == "sk":
+        return split_k <= 1 or (
+            K % (split_k * _MXFP8_K_ALIGN) == 0
+            and _a8w8_mxfp8_workspace_bytes(instance, M, N, split_k) <= (1 << 32) - 1
+        )
+    return split_k <= 1
+
+
+def _a8w8_mxfp8_workspace_bytes(instance, M: int, N: int, split_k: int) -> int:
+    """fp32 partials [S][padded_M][padded_N] of a split-K launch, in bytes;
+    splitk_reduce_kernel addresses them through one 32-bit buffer range."""
+    padded_m = -(-M // instance.B_M) * instance.B_M
+    padded_n = -(-N // instance.B_N) * instance.B_N
+    return split_k * padded_m * padded_n * 4
+
+
+def _a8w8_mxfp8_plan(instance, M: int, N: int, K: int, split_k: int, cu_num: int):
+    """(ABI split_k, fp32 workspace elements; 0 = none) of one launch. Split-K
+    kids with split_k = 0 take the largest S in {8, 4, 2} with tiles * S <= CUs,
+    K % (S * 256) == 0 and a workspace under 4 GiB. S > 1 needs fp32 partials
+    [S][padded_M][padded_N], summed into Y by splitk_reduce_kernel; the launcher
+    checks split_k / K / the workspace size."""
+    if instance.co_variant != "sk":
+        return split_k, 0
+    padded_m = -(-M // instance.B_M) * instance.B_M
+    padded_n = -(-N // instance.B_N) * instance.B_N
+    tiles = (padded_m // instance.B_M) * (padded_n // instance.B_N)
+    S = split_k or next(
+        (
+            s
+            for s in (8, 4, 2)
+            if tiles * s <= cu_num
+            and K % (s * _MXFP8_K_ALIGN) == 0
+            and _a8w8_mxfp8_workspace_bytes(instance, M, N, s) <= (1 << 32) - 1
+        ),
+        1,
+    )
+    return S, S * padded_m * padded_n if S > 1 else 0
+
+
+def _launch_a8w8_mxfp8_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    *,
+    family: str = _A8W8_MXFP8_1X32_FAMILY,
+    kid: int,
+    split_k: int = 0,
+    workspace: Tensor | None = None,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D MXFP8 x MXFP8 GEMM (1x32 e8m0 scales, gfx950) on a kid
+    of ``family`` (a8w8_mxfp8 or a8w8_mxfp8_bpreshuffle). The kid's launcher
+    checks the shape / stride / workspace contract and picks the layout image
+    from the XQ / WQ strides.
+    ``split_k``: split-K kids only, 0 = auto (see :func:`_a8w8_mxfp8_plan`)."""
+    if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
+        raise ValueError(
+            f"opus_gemm {family} expects logical 2D XQ/WQ/Y/x_scale/w_scale; "
+            "this family is GEMM-only"
+        )
+    if x_scale.dtype not in _E8M0_DTYPES or w_scale.dtype not in _E8M0_DTYPES:
+        raise ValueError(
+            f"OPUS {family} requires e8m0 scales; got {x_scale.dtype}/{w_scale.dtype}"
+        )
+    resolved_kid = kid
+    device_arch, cu_num = _device_arch_and_cu(XQ.device)
+    if instance is None:
+        arch = route_arch or device_arch
+        resolved_kid = _require_registered_kid(
+            arch=arch,
+            family=family,
+            kid=kid,
+            output_dtype=Y.dtype,
+            cu_num=cu_num,
+        )
+        instance = get_registry(family, arch, cu_num)[resolved_kid]
+    m, k = XQ.shape
+    n = WQ.shape[0]
+    abi_split_k, ws_numel = _a8w8_mxfp8_plan(instance, m, n, k, int(split_k), cu_num)
+    if ws_numel and workspace is None:
+        workspace = torch.empty(ws_numel, dtype=torch.float32, device=XQ.device)
+    launch = (
+        _opus_gemm_a8w8_mxfp8_bpreshuffle_launch_raw
+        if family == _A8W8_MXFP8_1X32_BPRESHUFFLE_FAMILY
+        else _opus_gemm_a8w8_mxfp8_launch_raw
+    )
+    with torch.cuda.device(XQ.device):
+        launch(
+            XQ.unsqueeze(0),
+            WQ.unsqueeze(0),
+            Y.unsqueeze(0),
+            x_scale,
+            w_scale,
+            workspace,
+            resolved_kid,
+            abi_split_k,
+        )
+    return Y
 
 
 def _validate_a8w8_mxscale_bmm_tensors(

@@ -50,10 +50,11 @@ inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::strin
     return cache.get_or_create(cache_key, [&]() { return CoModule(symbol, image_name); }).kernel;
 }
 } // namespace opus_gfx950_co
-template<class Kargs>
+// KARGS_BYTES: the kernarg size the .co images were built with.
+template<int KARGS_BYTES = 96, class Kargs>
 inline void opus_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 block,
                                   Kargs& args, hipStream_t stream, unsigned dynamic_lds = 0) {
-    static_assert(sizeof(args) == 96);
+    static_assert(sizeof(args) == KARGS_BYTES);
     size_t arg_size = sizeof(args);
     kernel.launch_kernel({&args, &arg_size,
                           int(grid.x), int(grid.y), int(grid.z),
