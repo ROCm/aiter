@@ -99,3 +99,66 @@ def interleaved_rope(x, cos, sin):
     rotated = _get_gptj_rotated_x(x, is_even, NUM_ROWS, NUM_COLS, NUM_COLS // 2)
     # The helper reshapes x. convert_layout gives rotated the layout of x again.
     return x * cos + gl.convert_layout(rotated, x.type.layout) * sin
+
+
+@gluon.constexpr_function
+def cluster_shape(num_ctas, BLOCK_M, BLOCK_N, split="auto"):
+    """Split ``num_ctas`` CTAs over a (BLOCK_M, BLOCK_N) cluster tile.
+
+    The split decides which operand the cluster shares, which matters more than
+    tile squareness. Splitting M gives the CTAs different rows and the same
+    columns, so they share the B/W tile; splitting N shares the A/X tile.
+
+    ``split="auto"`` halves whichever per-CTA dimension is larger, so each CTA
+    gets as square a share as the tile allows. Note this picks N whenever
+    BLOCK_N >= BLOCK_M, which is the usual case, so B/W sharing is unreachable
+    unless it is asked for. ``split="m"`` or ``"n"`` forces the direction.
+    """
+    if num_ctas < 1 or num_ctas & (num_ctas - 1):
+        raise ValueError(f"num_ctas must be a power of 2, got {num_ctas}")
+    if split == "m":
+        return num_ctas, 1
+    if split == "n":
+        return 1, num_ctas
+    if split != "auto":
+        raise ValueError(f"split must be 'auto', 'm' or 'n', got {split!r}")
+    ctas_m, ctas_n = 1, 1
+    while ctas_m * ctas_n < num_ctas:
+        if BLOCK_N // ctas_n > BLOCK_M // ctas_m:
+            ctas_n *= 2
+        else:
+            ctas_m *= 2
+    return ctas_m, ctas_n
+
+
+@gluon.jit
+def consume_k_block(
+    acc,
+    a_slot,
+    b_slot,
+    DOT_LAYOUT_A: gl.constexpr,
+    DOT_LAYOUT_B: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_SUBTILES: gl.constexpr,
+):
+    """Accumulate one K block on gfx1250, reading LDS one subtile ahead of the dot.
+
+    ``a_slot`` is (BLOCK_M, BLOCK_K) and ``b_slot`` is (BLOCK_K, BLOCK_N), both
+    already in the WMMA operand orientation. With NUM_SUBTILES == 1 this is a
+    single read then a single wmma, so the dot waits on the whole LDS read.
+    Splitting K lets each read overlap the previous subtile's wmma, which is
+    what keeps the WMMA pipe fed.
+    """
+    SUB: gl.constexpr = BLOCK_K // NUM_SUBTILES
+    gl.static_assert(
+        SUB % 32 == 0, "BLOCK_K // NUM_SUBTILES must be a multiple of the WMMA K step"
+    )
+    a_cur = a_slot.slice(0, SUB, dim=1).load(layout=DOT_LAYOUT_A)
+    b_cur = b_slot.slice(0, SUB, dim=0).load(layout=DOT_LAYOUT_B)
+    for j in gl.static_range(NUM_SUBTILES - 1):
+        a_nxt = a_slot.slice((j + 1) * SUB, SUB, dim=1).load(layout=DOT_LAYOUT_A)
+        b_nxt = b_slot.slice((j + 1) * SUB, SUB, dim=0).load(layout=DOT_LAYOUT_B)
+        acc = gl.amd.gfx1250.wmma(a_cur, b_cur, acc)
+        a_cur = a_nxt
+        b_cur = b_nxt
+    return gl.amd.gfx1250.wmma(a_cur, b_cur, acc)
