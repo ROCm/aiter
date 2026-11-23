@@ -26,6 +26,7 @@ from .launch_plan import (
     _A8W8_BLOCKSCALE_FAMILY,
     _A8W8_BPRESHUFFLE_FAMILY,
     _A8W8_FAMILY,
+    _A8W8_MXFP8_FAMILY,
     _A8W8_MXSCALE_BMM_FAMILY,
     _FP8_DTYPES,
     _get_cached_a8w8_mxscale_bmm_plan,
@@ -105,6 +106,33 @@ def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_launch_fake_tensors(
     workspace: Tensor | None = None,
 ) -> Tensor:
     return Y
+
+
+def _gen_opus_gemm_a8w8_blockscale_mxfp8_launch_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+) -> Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_blockscale_mxfp8_launch",
+    gen_fake=_gen_opus_gemm_a8w8_blockscale_mxfp8_launch_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_blockscale_mxfp8_launch_raw(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+) -> Tensor: ...
 
 
 @compile_ops(
@@ -230,6 +258,12 @@ def _launch_a8w8_backend(
             kid,
             *((workspace,) if workspace is not None else ()),
         )
+        return
+
+    if family == _A8W8_MXFP8_FAMILY:
+        if workspace is not None or split_k != 0:
+            raise RuntimeError("A8W8 blockscale-mxfp8 backend received split-K state")
+        _opus_gemm_a8w8_blockscale_mxfp8_launch_raw(XQ, WQ, x_scale, w_scale, Y, kid)
         return
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
@@ -400,6 +434,51 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     return Y
 
 
+def _launch_a8w8_blockscale_mxfp8_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D MXFP8 blockscale GEMM with plain A / B.
+
+    ``XQ`` [M, K] / ``WQ`` [N, K] are logical views; the kid's layout (NT / NN /
+    TT / TN) must match their strides, which the generated launcher checks.
+    """
+    resolved_kid = kid
+    if instance is None:
+        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
+            raise ValueError(
+                "opus_gemm A8W8 blockscale mxfp8 expects logical 2D "
+                "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
+            )
+        device_arch, cu_num = _device_arch_and_cu(XQ.device)
+        resolved_kid = _require_registered_kid(
+            arch=route_arch or device_arch,
+            family=_A8W8_MXFP8_FAMILY,
+            kid=kid,
+            output_dtype=Y.dtype,
+            cu_num=cu_num,
+        )
+    _launch_a8w8_backend(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        Y.unsqueeze(0),
+        x_scale,
+        w_scale,
+        None,
+        _A8W8_MXFP8_FAMILY,
+        resolved_kid,
+        0,
+    )
+    return Y
+
+
 # ---- MXFP8 NT / NN / TT / TN, plain B (gfx950 CO kids) ------------------------
 
 
@@ -438,7 +517,7 @@ def _select_mxfp8_direction_kid(
     want_bn = 256 if N % 256 == 0 and M * N > 2048 * 2048 else 128
     want_group_m = 16 if M >= 16384 else 0
     best = None
-    for kid, instance in get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num).items():
+    for kid, instance in get_registry(_A8W8_MXFP8_FAMILY, arch, cu_num).items():
         if mxfp8_direction(instance.bpreshuffle_co) != direction:
             continue
         if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
@@ -475,7 +554,8 @@ def gemm_a8w8_blockscale_opus(
     [N/128, K/128] scale stored like WQ ([N/128, K/128] for B "T",
     [K/128, N/128] for B "N"). Output is BF16.
 
-    ``kernelId`` runs that kid (56-95); otherwise one is picked by shape.
+    ``kernelId`` runs that a8w8_blockscale_mxfp8 kid (0-39: NT 0-9, NN 10-19,
+    TT 20-29, TN 30-39); otherwise one is picked by shape.
     """
     if XQ.dim() != 2 or WQ.dim() != 2:
         raise ValueError("gemm_a8w8_blockscale_opus expects 2D XQ / WQ")
@@ -503,7 +583,7 @@ def gemm_a8w8_blockscale_opus(
                 f"no {direction} MXFP8 kernel supports M={M}, N={N}, K={K} on {arch} "
                 "(M % 16, N % 128 and K % 128 must be 0)"
             )
-    return _launch_a8w8_blockscale_bpreshuffle_gemm(
+    return _launch_a8w8_blockscale_mxfp8_gemm(
         XQ, WQ, x_scale, w_scale, out, kid=int(kernelId)
     )
 

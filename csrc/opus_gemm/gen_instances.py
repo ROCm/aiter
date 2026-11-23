@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_blockscale_mxfp8_kernels_list,
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
@@ -290,6 +291,7 @@ INPUT_DTYPE_MAP = {
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_mxfp8": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
@@ -896,6 +898,12 @@ class opus_gemm_codegen:
                 _rows("gfx950", A8W8_BPRESHUFFLE_TAGS, "bf16_t", workspace=True),
                 "bf16_t",
             )
+            _emit_map(
+                f,
+                "GENERATE_A8W8_BLOCKSCALE_MXFP8_KID_DISPATCH_GFX950",
+                _rows("gfx950", {"a8w8_blockscale_mxfp8"}, "bf16_t"),
+                "bf16_t",
+            )
 
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
@@ -1043,6 +1051,12 @@ void
                 parts.append(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
             elif k.kernel_tag == "a8w8_scale":
                 parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
+            elif k.kernel_tag == "a8w8_blockscale_mxfp8":
+                parts.append(
+                    MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(
+                        kernel_name=k.name, workspace_param=""
+                    )
+                )
             elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
                 workspace_param = (
                     ",\n    aiter_tensor_t &workspace"
@@ -1422,6 +1436,7 @@ if __name__ == "__main__":
 
     TAG_TO_LIST = {
         "a8w8_blockscale_mxscale_gemm_bpreshuffle": a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
+        "a8w8_blockscale_mxfp8": a8w8_blockscale_mxfp8_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,

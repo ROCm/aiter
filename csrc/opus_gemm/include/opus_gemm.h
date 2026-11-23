@@ -35,3 +35,12 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& Y,
     int kid,
     std::optional<aiter_tensor_t> workspace = std::nullopt);
+
+// gfx950 MXFP8 1x128 blockscale with plain A / B in the NT / NN / TT / TN layouts;
+// the layout is read from the XQ / WQ strides. BF16 Y.
+void opus_gemm_a8w8_blockscale_mxfp8_launch(aiter_tensor_t& XQ,
+                                            aiter_tensor_t& WQ,
+                                            aiter_tensor_t& x_scale,
+                                            aiter_tensor_t& w_scale,
+                                            aiter_tensor_t& Y,
+                                            int kid);

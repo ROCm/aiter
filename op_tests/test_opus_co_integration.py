@@ -125,13 +125,12 @@ def _gfx950_device() -> torch.device:
     # Match the parent package and JIT directory when CI installs a wheel.
     aiter_package_root = str(Path(aiter.__file__).resolve().parents[1])
     opus_dir = str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
-    build = f"""
+    build = """
 import sys
 sys.path.insert(0, sys.argv[3])
 sys.path.insert(0, sys.argv[1])
 from opus_gemm_tune import _ensure_kids_compiled
-_ensure_kids_compiled((0, 20, 3547, 7504, 7987, 7991, 7997, 8279) + {_MXFP8_DIRECTION_TEST_KIDS},
-                      family="a8w8_blockscale_bpreshuffle",
+_ensure_kids_compiled((0, 20, 3547, 7504, 7987, 7991, 7997, 8279), family="a8w8_blockscale_bpreshuffle",
                       gfx="gfx950", cu_num=int(sys.argv[2]))
 """
     subprocess.run(
@@ -240,28 +239,28 @@ def test_gfx950_mxscale_co_accepts_supported_shape(kid, shape, _gfx950_device):
     assert (backing[M * N :] == -7.0).all().item(), "CO modified output canary"
 
 
-# MXFP8 plain-B NT / NN / TT / TN COs: (direction, kid, shape), every shipped kid 56-95.
+# a8w8_blockscale_mxfp8 (plain-B NT / NN / TT / TN) COs: (direction, kid, shape), every
+# shipped kid: NT 0-9, NN 10-19, TT 20-29, TN 30-39.
 # 256x256 crosses the 64-column scale panel (K / 128 = 65), PadM takes
 # M % 16 == 0, 256x128 takes N an odd multiple of 128, and GroupM 4 / 8 / 16
 # runs a partial last group (17 M tiles).
 _MXFP8_DIRECTION_SHAPES = (
-    ((86, 56, 57, 58), (512, 512, 8320)),  # 256x256
-    ((87, 59, 60, 61), (272, 512, 256)),  # 256x256 PadM
-    ((88, 62, 63, 64), (512, 384, 256)),  # 256x128
-    ((89, 65, 66, 67), (272, 384, 256)),  # 256x128 PadM
-    ((90, 68, 69, 70), (4352, 768, 256)),  # 256x256 GroupM 4
-    ((91, 71, 72, 73), (4352, 768, 256)),  # 256x256 GroupM 8
-    ((92, 74, 75, 76), (4352, 768, 256)),  # 256x256 GroupM 16
-    ((93, 77, 78, 79), (4352, 768, 256)),  # 256x128 GroupM 4
-    ((94, 80, 81, 82), (4352, 768, 256)),  # 256x128 GroupM 8
-    ((95, 83, 84, 85), (4352, 768, 256)),  # 256x128 GroupM 16
+    ((0, 10, 20, 30), (512, 512, 8320)),  # 256x256
+    ((1, 11, 21, 31), (272, 512, 256)),  # 256x256 PadM
+    ((2, 12, 22, 32), (512, 384, 256)),  # 256x128
+    ((3, 13, 23, 33), (272, 384, 256)),  # 256x128 PadM
+    ((4, 14, 24, 34), (4352, 768, 256)),  # 256x256 GroupM 4
+    ((5, 15, 25, 35), (4352, 768, 256)),  # 256x256 GroupM 8
+    ((6, 16, 26, 36), (4352, 768, 256)),  # 256x256 GroupM 16
+    ((7, 17, 27, 37), (4352, 768, 256)),  # 256x128 GroupM 4
+    ((8, 18, 28, 38), (4352, 768, 256)),  # 256x128 GroupM 8
+    ((9, 19, 29, 39), (4352, 768, 256)),  # 256x128 GroupM 16
 )
 _MXFP8_DIRECTION_CASES = tuple(
     (direction, kid, shape)
     for kids, shape in _MXFP8_DIRECTION_SHAPES
     for direction, kid in zip(("NT", "NN", "TT", "TN"), kids)
 )
-_MXFP8_DIRECTION_TEST_KIDS = tuple(kid for _, kid, _ in _MXFP8_DIRECTION_CASES)
 
 
 def _gfx950_mxfp8_direction_inputs(direction, M, N, K, device):
@@ -299,9 +298,9 @@ def _gfx950_mxfp8_direction_run(xq, wq, x_scale, w_scale, kid):
         xq,
         wq,
         Y,
-        family="a8w8_blockscale_bpreshuffle",
+        family="a8w8_blockscale_mxfp8",
         kid=kid,
-        layout="bpreshuffle",
+        layout="plain",
         x_scale=x_scale,
         w_scale=w_scale,
     )
@@ -323,7 +322,7 @@ def test_gfx950_mxfp8_direction_co_matches_reference(
 
 
 @pytest.mark.parametrize(
-    ("direction", "other_kid"), (("NT", 56), ("NN", 57), ("TT", 56), ("TN", 56))
+    ("direction", "other_kid"), (("NT", 10), ("NN", 20), ("TT", 10), ("TN", 10))
 )
 def test_gfx950_mxfp8_direction_co_rejects_other_layout(
     direction, other_kid, _gfx950_device
@@ -366,13 +365,13 @@ def test_gfx950_mxfp8_direction_api_explicit_kid_and_out(_gfx950_device):
     out = torch.full(
         (512, 384), float("nan"), device=_gfx950_device, dtype=torch.bfloat16
     )
-    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=63, out=out)
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=22, out=out)
     torch.cuda.synchronize(_gfx950_device)
     assert Y.data_ptr() == out.data_ptr()
     assert (Y.float() - ref).abs().max().item() <= 2e-2 * ref.abs().max().item()
     # Another direction's kid rejects these strides in its launcher.
     with pytest.raises(RuntimeError, match="CO expects XQ strides"):
-        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=62)
+        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=12)
 
 
 def test_gfx950_mxfp8_direction_api_rejects_bad_layouts_and_shapes(_gfx950_device):

@@ -17,6 +17,7 @@ from codegen.common import (
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
+    "a8w8_blockscale_mxfp8": "gfx950/opus_gemm_pipeline_a8w8_blockscale_mxfp8_4wave_gfx950.cuh",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
@@ -56,6 +57,7 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 }
 
 TRAITS_HEADER_MAP = {
+    "a8w8_blockscale_mxfp8": "gfx950/opus_gemm_traits_a8w8_blockscale_mxfp8_4wave_gfx950.cuh",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -86,6 +88,7 @@ TRAITS_HEADER_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_mxfp8_4wave",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
@@ -123,6 +126,7 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 }
 
 TRAITS_NAME_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_mxfp8_4wave_tile_traits",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -153,6 +157,7 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
@@ -3506,6 +3511,8 @@ register_emit(
     "a8w8_blockscale_mxscale_gemm_bpreshuffle",
     gen_mxscale_bpreshuffle_instance,
 )
+# Plain-B MXFP8 NT / NN / TT / TN COs: the same CO launcher, its own family and table.
+register_emit("gfx950", "a8w8_blockscale_mxfp8", gen_mxscale_bpreshuffle_instance)
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
 register_emit("gfx950", "a8w8_mxscale", gen_scale_instance)

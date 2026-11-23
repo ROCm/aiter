@@ -463,6 +463,7 @@ def _get_cached_a16w16_launch_plan(
 _A8W8_FAMILY = "a8w8"
 _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
+_A8W8_MXFP8_FAMILY = "a8w8_blockscale_mxfp8"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
 # Derived, not restated. This used to be a second hand-kept copy of the tag list
@@ -503,12 +504,14 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
+    "a8w8_blockscale_mxfp8": _A8W8_MXFP8_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
 }
 _A8W8_FAMILY_LAYOUT = {
     _A8W8_FAMILY: "plain",
     _A8W8_BLOCKSCALE_FAMILY: "plain",
     _A8W8_BPRESHUFFLE_FAMILY: "bpreshuffle",
+    _A8W8_MXFP8_FAMILY: "plain",
     _A8W8_MXSCALE_BMM_FAMILY: "mxscale_bmm",
 }
 _FP8_DTYPES = frozenset(
@@ -561,11 +564,12 @@ def _validate_a8w8_public_contract(
     if input_dtype not in _FP8_DTYPES:
         raise ValueError(f"OPUS kid {kid} requires FP8 XQ/WQ; got {input_dtype}")
     if (
-        kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+        kernel_tag
+        in ("a8w8_blockscale_mxscale_gemm_bpreshuffle", "a8w8_blockscale_mxfp8")
         and input_dtype != torch.float8_e4m3fn
     ):
         raise ValueError(
-            f"OPUS gfx950 MXFP8 bpreshuffle requires float8_e4m3fn XQ/WQ; "
+            f"OPUS gfx950 MXFP8 {family} requires float8_e4m3fn XQ/WQ; "
             f"got {input_dtype}"
         )
 
@@ -576,7 +580,9 @@ def _validate_a8w8_public_contract(
             )
     else:
         expected_output_dtype = (
-            torch.bfloat16 if family == _A8W8_BPRESHUFFLE_FAMILY else torch.float32
+            torch.bfloat16
+            if family in (_A8W8_BPRESHUFFLE_FAMILY, _A8W8_MXFP8_FAMILY)
+            else torch.float32
         )
         if output_dtype != expected_output_dtype:
             raise ValueError(

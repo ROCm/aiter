@@ -34,10 +34,11 @@ gfx950 uses short image/launcher names while retaining each verified ELF symbol.
 Its preshuffled-B manifest is
 ``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``; its images and
 build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``. The
-plain-B MXFP8 NT / NN / TT / TN kernels are declared in
+plain-B MXFP8 NT / NN / TT / TN kernels (the a8w8_blockscale_mxfp8 family, its
+own kid space; select it with --family) are declared in
 ``gen_co/co_kernels_gfx950_a8w8_blockscale.json`` and live in
-``gen_co/gfx950/a8w8_blockscale/``. Without --out-dir, a build goes to its
-kids' directory (kids of both manifests must be built separately).
+``gen_co/gfx950/a8w8_blockscale/``. Without --out-dir, a build goes to the
+family's directory.
 The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
@@ -94,6 +95,7 @@ from codegen.gen_instances_gfx1250 import (
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
     gfx950_co_kernels_declared,
+    gfx950_mxfp8_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
     mxfp8_direction,
 )
@@ -861,6 +863,13 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
+# gfx950 CO families: their declared manifests (separate kid spaces) and image dirs.
+_GFX950_CO_FAMILIES = {
+    "a8w8_blockscale_bpreshuffle": gfx950_co_kernels_declared,
+    "a8w8_blockscale_mxfp8": gfx950_mxfp8_co_kernels_declared,
+}
+
+
 def _default_co_output_dir(arch, offload_arch, image_dir=None):
     if arch == "gfx950":
         return os.path.join(_HERE, arch, image_dir)
@@ -936,6 +945,13 @@ def main():
         help=JOBS_CLI_HELP,
     )
     p.add_argument(
+        "--family",
+        choices=sorted(_GFX950_CO_FAMILIES),
+        default="a8w8_blockscale_bpreshuffle",
+        help="gfx950 CO family (manifest) the --kids refer to; each has its own kid "
+        "space and image directory",
+    )
+    p.add_argument(
         "--kids",
         nargs="+",
         default=None,
@@ -955,7 +971,7 @@ def main():
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
     table = (
-        gfx950_co_kernels_declared
+        _GFX950_CO_FAMILIES[args.family]
         if args.arch == "gfx950"
         else gfx1250_4wave_co_kernels_declared
     )
@@ -979,19 +995,9 @@ def main():
     if not instances:
         raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
     if not args.out_dir:
-        # gfx950: each CO manifest has its own image directory (and build_info.json).
-        image_dirs = (
-            {entry["image_dir"] for entry in instances}
-            if args.arch == "gfx950"
-            else {None}
-        )
-        if len(image_dirs) != 1:
-            p.error(
-                f"--kids span CO directories {sorted(image_dirs)}; build them separately or pass --out-dir"
-            )
-        args.out_dir = _default_co_output_dir(
-            args.arch, args.offload_arch, image_dirs.pop()
-        )
+        # gfx950: each CO family has its own image directory (and build_info.json).
+        image_dir = instances[0]["image_dir"] if args.arch == "gfx950" else None
+        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch, image_dir)
     os.makedirs(args.out_dir, exist_ok=True)
     build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Register the four OPUS launch interfaces on the host pass only.
+// Register the OPUS launch interfaces on the host pass only.
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "rocm_ops.hpp"
@@ -16,6 +16,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     OPUS_GEMM_A8W8_LAUNCH_PYBIND;
     OPUS_GEMM_A8W8_BLOCKSCALE_LAUNCH_PYBIND;
     OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_LAUNCH_PYBIND;
+    OPUS_GEMM_A8W8_BLOCKSCALE_MXFP8_LAUNCH_PYBIND;
     OPUS_GEMM_A8W8_MXSCALE_BMM_LAUNCH_PYBIND;
 }
 

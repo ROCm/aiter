@@ -507,4 +507,31 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
   }
 }
 
+void opus_gemm_a8w8_blockscale_mxfp8_launch(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int kid)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  constexpr const char* entry = "opus_gemm_a8w8_blockscale_mxfp8_launch";
+  opus_check_a8_family_tensors(entry, XQ, WQ, Y);
+  opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              entry, ": expected bf16 Y, got ", AiterDtype_to_str(Y.dtype()));
+  const auto &info = opus_get_arch_info();
+#ifdef OPUS_BUILD_HAS_GFX950
+  if (info.arch == OpusGfxArch::Gfx950)
+  {
+    opus_a8w8_blockscale_mxfp8_kid_dispatch_gfx950(kid)(XQ, WQ, x_scale, w_scale, Y);
+    return;
+  }
+#endif
+  AITER_CHECK(false,
+              entry, ": no registered kernel for current device ", info.dev,
+              " with gcnArchName='", info.name, "' (gfx950 only)");
+}
+
 #endif // !__HIP_DEVICE_COMPILE__

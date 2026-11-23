@@ -480,7 +480,10 @@ class OpusGemmInstance:
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
-        if self.kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle":
+        if self.kernel_tag in (
+            "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+            "a8w8_blockscale_mxfp8",
+        ):
             entry = self.bpreshuffle_co or self.bpreshuffle_entry or {}
             return entry.get("m_align", 64 if self.pad_m else self.B_M)
         mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
@@ -2897,17 +2900,19 @@ GFX950_CO_KERNELS_JSON = os.path.join(
     "gen_co",
     "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json",
 )
-# MXFP8 NT / NN / TT / TN with plain (not shuffled) B. They share the CO kid space and
-# the a8w8_blockscale_bpreshuffle registry family with the preshuffled-B COs above.
-GFX950_PLAIN_CO_KERNELS_JSON = os.path.join(
+# MXFP8 NT / NN / TT / TN with plain (not shuffled) A and B: the a8w8_blockscale_mxfp8
+# family, with its own CO manifest, kid space and image directory.
+GFX950_MXFP8_CO_KERNELS_JSON = os.path.join(
     os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a8w8_blockscale.json"
 )
+_MXFP8_TAG = "a8w8_blockscale_mxfp8"
 # Manifest -> image directory under gen_co/gfx950/.
 _GFX950_CO_IMAGE_DIRS = {
     GFX950_CO_KERNELS_JSON: "a8w8_blockscale_bpreshuffle",
-    GFX950_PLAIN_CO_KERNELS_JSON: "a8w8_blockscale",
+    GFX950_MXFP8_CO_KERNELS_JSON: "a8w8_blockscale",
 }
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
+a8w8_blockscale_mxfp8_kernels_list = {}
 
 
 # Shared metadata and names
@@ -2971,6 +2976,7 @@ def _bpreshuffle_instance(
     max_k=None,
     max_m=None,
     name_suffix=None,
+    tag=_TAG,
 ):
     """Build a JIT or CO instance with the shared bpreshuffle geometry."""
     instance = OpusGemmInstance(
@@ -2989,7 +2995,7 @@ def _bpreshuffle_instance(
         1,
         128,
         128,
-        _TAG,
+        tag,
         ["bf16_t"],
         WG_PER_CU=wg,
         cachectl_a=ca if co is None else -1,
@@ -3048,7 +3054,7 @@ _MXFP8_DIRECTION_PIPELINES = {
 
 
 def mxfp8_direction(entry):
-    """Direction ("NT" / "NN" / "TT" / "TN") of a gfx950 MXFP8 plain-B CO manifest entry, else None."""
+    """Direction ("NT" / "NN" / "TT" / "TN") of an a8w8_blockscale_mxfp8 CO manifest entry."""
     return _MXFP8_DIRECTION_PIPELINES.get((entry or {}).get("pipeline"))
 
 
@@ -3892,12 +3898,9 @@ def _bpreshuffle_jit_instances():
 gfx950_co_kernels_declared = _load_gfx950_co_kernels(
     GFX950_CO_KERNELS_JSON, require_image=False
 )
-for _kid, _entry in _load_gfx950_co_kernels(
-    GFX950_PLAIN_CO_KERNELS_JSON, require_image=False
-).items():
-    if _kid in gfx950_co_kernels_declared:
-        raise ValueError(f"gfx950 CO kid {_kid} is declared in both CO manifests")
-    gfx950_co_kernels_declared[_kid] = _entry
+gfx950_mxfp8_co_kernels_declared = _load_gfx950_co_kernels(
+    GFX950_MXFP8_CO_KERNELS_JSON, require_image=False
+)
 
 
 for _kid, _instance in chain(
@@ -3921,6 +3924,12 @@ for _kid, _entry in gfx950_co_kernels_declared.items():
     _wm, _wn = _entry["wave_layout"]
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = _bpreshuffle_instance(
         _bm, _bn, _bk, _wm, _wn, wg=2, co=_entry
+    )
+for _kid, _entry in gfx950_mxfp8_co_kernels_declared.items():
+    _bm, _bn, _bk = _entry["tile"]
+    _wm, _wn = _entry["wave_layout"]
+    a8w8_blockscale_mxfp8_kernels_list[_kid] = _bpreshuffle_instance(
+        _bm, _bn, _bk, _wm, _wn, wg=2, co=_entry, tag=_MXFP8_TAG
     )
 
 
@@ -3982,8 +3991,7 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
         for kid, instance in sorted(
             get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
         )
-        if mxfp8_direction(instance.bpreshuffle_co) is None
-        and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
     ]
 
 
@@ -4030,6 +4038,7 @@ KERNEL_REGISTRY = {
         "gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)},
         "gfx950": {cu: dict(sorted(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list.items())) for cu in (128, 256)},
     },
+    "a8w8_blockscale_mxfp8": {"gfx950": {cu: dict(sorted(a8w8_blockscale_mxfp8_kernels_list.items())) for cu in (128, 256)}},
 }
 
 
@@ -4046,6 +4055,7 @@ for _cat in (
     gfx942_kernels_list,
     gfx1250_a16w16_kernels_list,
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
+    a8w8_blockscale_mxfp8_kernels_list,
 ):
     for _kid, _inst in _cat.items():
         _sig = repr(asdict(_inst))
@@ -4109,7 +4119,10 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             if instance.kernel_tag not in _A16W16_CO_TAGS
             or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
         }
-    if family == "a8w8_blockscale_bpreshuffle" and gfx == "gfx950":
+    if (
+        family in ("a8w8_blockscale_bpreshuffle", "a8w8_blockscale_mxfp8")
+        and gfx == "gfx950"
+    ):
         return {
             kid: instance
             for kid, instance in records.items()
@@ -4149,28 +4162,14 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
-    """Select the A16W16 compile floor from the current CU table.
-
-    On gfx950 the MXFP8 plain-B NT / NN / TT / TN CO kids are added as well: the
-    shape heuristic and the tuners never pick them, so no tuned row requests them,
-    and gemm_a8w8_blockscale_opus must find them compiled.
-    """
+    """Select the A16W16 compile floor from the current CU table."""
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    keys = {
+    return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
-    if lookup_gfx == "gfx950":
-        keys.update(
-            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
-            for kid, instance in get_registry(
-                "a8w8_blockscale_bpreshuffle", gfx, cu_num
-            ).items()
-            if mxfp8_direction(instance.bpreshuffle_co) is not None
-        )
-    return keys
 
 
 def _in_group(name, family, instance):
@@ -4366,6 +4365,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
         ),
+        "a8w8_blockscale_mxfp8": frozenset({"a8w8_blockscale_mxfp8"}),
     },
     "gfx942": {
         "a16w16": frozenset(
@@ -4389,6 +4389,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_bpreshuffle_singlebuf"}
         ),
+        "a8w8_blockscale_mxfp8": frozenset(),
     },
     "gfx1250": {
         "a16w16": frozenset(
@@ -4405,6 +4406,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale": frozenset(),
         "a8w8_mxscale_bmm": frozenset(),
         "a8w8_blockscale_bpreshuffle": frozenset(),
+        "a8w8_blockscale_mxfp8": frozenset(),
     },
 }
 
@@ -4488,7 +4490,7 @@ def get_kernel_instance(
     ):
         return None
     if (
-        family == "a8w8_blockscale_bpreshuffle"
+        family in ("a8w8_blockscale_bpreshuffle", "a8w8_blockscale_mxfp8")
         and arch == "gfx950"
         and instance.bpreshuffle_co is not None
         and not os.path.isfile(_gfx950_co_image_path(instance.bpreshuffle_co))
