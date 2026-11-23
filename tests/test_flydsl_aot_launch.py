@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import flydsl.compiler as flyc
@@ -86,6 +87,231 @@ def test_argument_the_cache_cannot_key_runs_the_jit():
     assert not isinstance(handle, _LazyLauncher)
     assert getattr(handle, _ATTR) is False
     assert isinstance(factory.lazy(8.0), _LazyLauncher)
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 binds nothing",
+)
+def test_specialization_key_the_cache_cannot_key_runs_the_jit(monkeypatch):
+    import enum
+
+    from aiter.ops.flydsl import aot_cache
+
+    class Mode(enum.Enum):
+        A = 1
+
+    # The real launch, as far as the disk key: nothing is built or loaded.
+    resolved = []
+
+    def resolve(self, key, make_exe, args):
+        self._disk_key(key, args)
+        resolved.append(key)
+        return lambda *a: None
+
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", resolve)
+    monkeypatch.setattr(aot_cache, "_load_module", object())
+    exe, cache = _Launcher(), aot_cache.FlyDSLAotCache("test_unkeyable_spec")
+    bind_aot(exe, cache, ("a",))
+    binding = getattr(exe, _ATTR)
+    assert binding((), None) is True
+    assert binding((), ("ok", 1)) is True
+    # Not raised on every launch: the JIT path takes this key, and the cache
+    # is not asked again.
+    assert binding((), Mode.A) is False
+    assert binding((), Mode.A) is False
+    assert resolved == [("a",), (("a",), ("ok", 1))]
+    assert binding.unkeyable == {Mode.A}
+    assert binding((), ("ok", 1)) is True
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 returns the factory itself",
+)
+def test_cache_clear_retraces_through_the_jit():
+    import functools
+
+    from aiter.ops.flydsl.aot_cache import _JitKernel
+    from aiter.ops.flydsl.aot_launch import aot_factory
+
+    @aot_factory("test_cache_clear")
+    @functools.cache
+    def factory(n):
+        return _Launcher()
+
+    cache = factory.aot_cache
+    handle = factory.lazy(1)
+    cache._mem[getattr(handle, _ATTR).key] = "loaded"
+    factory.cache_clear()
+    # A launcher loaded before the reset is not launched again, and no entry
+    # on disk is read or written for it: the factory's next launcher is traced.
+    assert not cache._mem
+    assert factory.lazy(1) is not handle
+    made = []
+    kernel = cache._kernel(("k",), lambda: made.append(1) or _Launcher(), ())
+    assert isinstance(kernel, _JitKernel) and made == [1]
+
+
+def test_constexpr_launch_arguments_select_the_entry():
+    import inspect
+
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.aot_cache import (
+        _arg_signature,
+        _baked_args,
+        _BakedArgumentError,
+        _BakedKernel,
+        _entry_current,
+    )
+
+    def launch(
+        out: fx.Int64,
+        n: fx.Int32,
+        tile: fx.Constexpr[int],
+        mode: fx.Constexpr[str] = "a",
+        dims: fx.Constexpr[tuple] = (1, 2),
+        stream: fx.Stream = None,
+    ):
+        pass
+
+    exe = _Launcher()
+    exe._sig = inspect.signature(launch)
+    args = (0, 4, 64, "b", (3, 4))
+    # A string or a tuple has no runtime type: it is keyed as a constexpr, and
+    # its value is recorded with the entry.
+    assert _arg_signature(args) == ("int", "int", "int", "const", "const")
+    baked = _baked_args(exe, args)
+    assert baked == {"2": "64", "3": "'b'", "4": "('tuple', 3, 4)"}
+
+    # An entry serves only the constexpr values it was built with; a runtime
+    # argument may differ.
+    meta = {"sources": {}, "env": {}, "baked": baked}
+    assert _entry_current(meta, (1, 8, 64, "b", (3, 4)))
+    assert not _entry_current(meta, (0, 4, 32, "b", (3, 4)))
+    assert not _entry_current(meta, (0, 4, 64, "c", (3, 4)))
+    assert not _entry_current(meta, (0, 4, 64, "b", (3, 5)))
+    assert not _entry_current(meta, (0, 4, 64))
+    # An entry written before values were recorded is not one to trust.
+    with pytest.raises(KeyError):
+        _entry_current({"sources": {}, "env": {}}, args)
+
+    # A constexpr left to its default is fixed by the launcher's source.
+    assert _baked_args(exe, (0, 4, 64)) == {"2": "64"}
+    # A value no later process can compare is not exported.
+    with pytest.raises(RuntimeError):
+        _baked_args(exe, (0, 4, lambda: 1))
+    # Nor is a string where the launcher takes a runtime argument.
+    with pytest.raises(RuntimeError):
+        _baked_args(exe, (0, "x", 64))
+
+    # Within a process, one key launched with another value raises instead of
+    # running the kernel built for the first.
+    ran = []
+    kernel = _BakedKernel(lambda *a: ran.append(a), "t", ("k",), args, [2, 3, 4])
+    kernel(1, 8, 64, "b", (3, 4))
+    for other in ((1, 8, 32, "b", (3, 4)), (1, 8, 64, "c", (3, 4)), (1, 8, 64, "b")):
+        with pytest.raises(_BakedArgumentError):
+            kernel(*other)
+    # Compared as the disk entry is: True is not 1, and NaN is itself.
+    with pytest.raises(_BakedArgumentError):
+        _BakedKernel(lambda *a: None, "t", ("k",), (True,), [0])(1)
+    _BakedKernel(lambda *a: ran.append(a), "t", ("k",), (float("nan"),), [0])(
+        float("nan")
+    )
+    assert len(ran) == 2
+
+
+def test_constexpr_of_a_bound_launcher():
+    import functools
+    import inspect
+
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.aot_cache import _baked_args
+
+    def launch(x: fx.Int32, tile: fx.Constexpr[int]):
+        pass
+
+    class _Jit:
+        def __call__(self, *args):
+            pass
+
+    # A @flyc.jit method is launched as partial(JitFunction.__call__, obj).
+    jit = _Jit()
+    jit._sig = inspect.signature(launch)
+    assert _baked_args(functools.partial(jit.__call__), (1, 64)) == {"1": "64"}
+    # Its constexprs cannot be missed silently when the signature is not there.
+    with pytest.raises(RuntimeError):
+        _baked_args(functools.partial(_Jit().__call__), (1, 64))
+
+
+def test_compile_hints_of_the_caller_select_the_entry():
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+
+    cache = FlyDSLAotCache("test_compile_hints")
+    plain = cache._disk_key(("k",), (1,))
+    with CompilationContext.compile_hints({"fastmath": "contract"}):
+        hinted = cache._disk_key(("k",), (1,))
+        assert hinted == cache._disk_key(("k",), (1,))
+    with CompilationContext.compile_hints({"fastmath": "fast"}):
+        assert cache._disk_key(("k",), (1,)) not in (plain, hinted)
+    assert hinted != plain == cache._disk_key(("k",), (1,))
+
+
+def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    lib = tmp_path / "device.bc"
+    lib.write_bytes(b"BC one")
+    old = time.time() - 3600  # written before this process, as an installed file
+    os.utime(lib, (old, old))
+
+    class Artifact:
+        _link_libs = [str(lib)]
+
+    class Compiled:
+        _keepalive = Artifact()
+
+        def export_to_c(self, out_dir, sym):
+            Path(out_dir, f"{sym}.o").write_bytes(b"object")
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: Compiled())
+    cache = aot_cache.FlyDSLAotCache("test_link_libs")
+
+    def make_exe():
+        return lambda: None
+
+    out_dir = tmp_path / "cache"
+    stem = cache._build(make_exe, (), out_dir, "sym", "digest")
+    meta = json.loads(stem.with_suffix(".json").read_text())
+    assert str(lib) in meta["sources"]
+    assert cache._find(out_dir, "digest", ()) == stem
+
+    # A rebuilt library (e.g. another MORI) no longer matches the entry.
+    lib.write_bytes(b"BC two")
+    os.utime(lib, (old, old))
+    aot_cache._file_digest.cache_clear()
+    assert cache._find(out_dir, "digest", ()) is None
+    rebuilt = cache._build(make_exe, (), out_dir, "sym", "digest")
+    assert rebuilt != stem and cache._find(out_dir, "digest", ()) == rebuilt
+
+
+def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
+    from flydsl.compiler import jit_function
+
+    from aiter.ops.flydsl import aot_cache
+
+    # FlyDSL's own cache is keyed on these; ours must be too.
+    names = set(jit_function._CACHE_INVALIDATING_ENV_VARS)
+    for arch_names in jit_function._TARGET_CACHE_INVALIDATING_ENV_VARS.values():
+        names.update(arch_names)
+    assert "LLVM_GFX1250_ANY_XNACK_CODEGEN" in names
+    for name in names:
+        assert aot_cache._env_in_fingerprint(name), name
 
 
 def child():

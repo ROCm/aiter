@@ -29,7 +29,17 @@ The cache key is the factory's arguments, so the factory's arguments must
 determine the launcher, which ``functools.cache`` on the factory already
 requires. The in-memory key is that key and ``_run_compiled``'s
 ``specialization_key``, as on the JIT path, which keeps one compiled function
-per launcher.
+per launcher. A ``specialization_key`` the cache cannot key on disk (an
+Enum, a numpy scalar) launches through the JIT path.
+
+A launcher's ``Constexpr`` launch arguments are compiled into the object, so
+each must be in ``specialization_key``, as on the JIT path. An entry on disk
+records their values and serves only calls that pass them; one key launched
+with two values raises.
+
+``factory.cache_clear()`` also drops the launchers the cache loaded and keeps
+the factory on the JIT path for the rest of the process: a caller that resets
+its factory wants a new trace, of state the cache may not track.
 
 Under ``AITER_FLYDSL_AOT_CACHE=0`` the launch takes ``_run_compiled``'s JIT
 path unchanged, and calling the launcher directly is unaffected.
@@ -63,7 +73,7 @@ _inside = _Inside()
 
 
 class _AotBinding:
-    __slots__ = ("cache", "key", "launcher", "make_exe")
+    __slots__ = ("cache", "key", "launcher", "make_exe", "unkeyable")
 
     def __init__(self, cache: FlyDSLAotCache, key, make_exe, launcher):
         self.cache = cache
@@ -72,12 +82,20 @@ class _AotBinding:
         self.make_exe = make_exe
         # The launcher _run_compiled's JIT path runs when this returns False.
         self.launcher = launcher
+        # Specialization keys the cache cannot key on disk; they launch
+        # through the JIT path, like a factory argument it cannot key.
+        self.unkeyable = set()
 
     def __call__(self, args, specialization_key) -> bool:
         """Launch through the cache. False leaves the launch to the JIT path."""
         if _inside.active:
             return False
-        key = self.key if specialization_key is None else (self.key, specialization_key)
+        if specialization_key is None:
+            key = self.key
+        elif self.unkeyable and specialization_key in self.unkeyable:
+            return False
+        else:
+            key = (self.key, specialization_key)
         # FlyDSLAotCache keys launch arguments by their FlyDSL type; a torch
         # stream has none. aiter launchers take the stream last, so only that
         # argument is checked (a stream elsewhere falls back to the JIT).
@@ -86,6 +104,17 @@ class _AotBinding:
         _inside.active = True
         try:
             self.cache.launch(key, self.make_exe, *args)
+        except _UsageError as e:
+            # Raised when the key is hashed for the disk, before any build or
+            # launch. self.key was checked when it was bound.
+            if specialization_key is None:
+                raise
+            logger.warning(
+                f"[FlyDSL AOT] {self.cache.name}: {e} in specialization_key; "
+                f"launching it through the JIT path"
+            )
+            self.unkeyable.add(specialization_key)
+            return False
         finally:
             _inside.active = False
         return True
@@ -218,12 +247,13 @@ def aot_factory(name: str, *, extra_sources=()):
         if hasattr(factory, "cache_clear"):
 
             def cache_clear():
-                # Resets the factory only: an entry already launched, like one
-                # on disk, stays keyed by the factory's arguments, so state a
-                # launcher bakes in beyond them must be part of the key.
+                # The caller wants its launchers traced again, so state the
+                # cache does not track may have changed: drop the launchers
+                # it loaded and keep this factory on the JIT path.
                 for calls in (seen, seen_kw, handles, handles_kw):
                     calls.clear()
                 factory.cache_clear()
+                cache.invalidate()
 
             wrapper.cache_clear = cache_clear
         return wrapper

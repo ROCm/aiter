@@ -6,6 +6,12 @@ SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
 
+# FlyDSL AOT cache: re-trace every entry a test loads from disk and compare it
+# byte for byte with the cached object, so an input missing from a cache key
+# fails here rather than loading a stale kernel in production. An export or
+# load failure also fails instead of falling back to the JIT path.
+export AITER_FLYDSL_AOT_CACHE="${AITER_FLYDSL_AOT_CACHE:-verify}"
+
 # Avoid per-invocation hipcc native arch probing (can timeout under heavy JIT
 # parallelism) by resolving the current GPU arch once for this job.
 if [[ -z "${GPU_ARCHS:-}" ]]; then

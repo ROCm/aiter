@@ -173,6 +173,9 @@ source:
   the same wheel (e.g. in a later Docker stage) keeps the fingerprint, or, for
   a source build without a `RECORD`, the name, size and mtime of its
   `.so`/`.a` files;
+- the ROCm device bitcode (`ocml.bc`, `ockl.bc`, …) FlyDSL links into a
+  kernel that calls it: FlyDSL's own digest of the files under the toolkit it
+  resolves (bundled, or `ROCM_PATH` / `/opt/rocm` without in-process LLD);
 - `torch.version.hip` and the target arch. That is
   `torch.cuda.get_device_properties().gcnArchName`, or FlyDSL's
   `get_rocm_arch()` when there is no device or `FLYDSL_GPU_ARCH` is set;
@@ -180,7 +183,9 @@ source:
   dry run sets from each tuned row's `cu_num`, so a prebuild for a CU count
   and a process on such a GPU use the same directory;
 - every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
-  `HSA_OVERRIDE_GFX_VERSION` and `COMPILE_OPT_LEVEL`. Variables that cannot
+  `HSA_OVERRIDE_GFX_VERSION`, `COMPILE_OPT_LEVEL` and the variables FlyDSL
+  keys its own artifact cache on without that prefix
+  (`LLVM_GFX1250_ANY_XNACK_CODEGEN`; the list is read from FlyDSL). Variables that cannot
   change code are excluded: dump dirs, the cache's own variables, the
   FlyDSL runtime-cache switches (`FLYDSL_RUNTIME_ENABLE_CACHE`, and
   `FLYDSL_RUNTIME_RUN_ONLY`, which the replay's `--check` sets, so it checks
@@ -217,6 +222,14 @@ over-records rather than under-records: an imported constant the kernel does
 not use costs a rebuild when its file changes. It is static, so a value built
 by code it cannot read (`globals()[name] = ...`, `importlib`) is not followed;
 an unresolved name records the module it was looked up in.
+
+A bitcode file the kernel links with `link_extern(..., bitcode_path=...)`
+(MORI's CCO device library, say) is stored with its sha256 among the sources,
+under its absolute path: a rebuilt library rebuilds the entries that link it.
+
+The sidecar stores, under `baked`, the values of the launcher's `Constexpr`
+launch arguments the entry was built with (§6); a lookup requires the call to
+pass the same ones.
 
 The sidecar also stores the environment variables the entry depends on, with
 their values (`null` if unset), and a lookup requires the same values. They
@@ -303,7 +316,9 @@ Known holes, and how they are handled:
 | A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
 | A variable read outside the build in a shared module | a module-level `os.getenv("X")` in `aiter/jit/` | Name it in kernel code under `aiter/ops/flydsl/`, or pass it in `key`. Today's shared reads are arch, CU count and config paths, all covered |
 | A variable read only by copying the environment | `env = dict(os.environ)` then `env["X"]` | Read it by name |
-| An incomplete hand-written `key` | a forgotten constexpr | The disk digest still covers the argument types. `verify` mode re-exports and compares |
+| An incomplete hand-written `key` | a value the factory closes over but does not take as an argument | The disk digest still covers the argument types. `verify` mode re-exports and compares |
+| A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Recorded per entry and compared on lookup (§6); two values under one key raise |
+| Compile hints set by the caller | `with CompilationContext.compile_hints(...)` around the launch | Hashed into the disk digest |
 | A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A load failure rebuilds the entry once |
 
 Recording the files the trace actually ran gets per-kernel granularity
@@ -340,7 +355,9 @@ alignment: a non-null pointer counts as a live device argument and
 or loaded (an argument type `export_to_c` does not support) use
 `_JitKernel`, which calls `_run_compiled(exe, *args,
 specialization_key=key)`. A fallback logs one warning per key. Caller bugs
-(`_UsageError`, e.g. an unsupported key element) and `verify` failures
+(`_UsageError`: an unsupported element in a key passed to `launch` directly;
+a bound launcher with such a `specialization_key` takes the JIT path, §6) and
+`verify` failures
 raise instead. On this path a handle only launches on the device it was
 compiled on (FlyDSL issue 4 in §7), so a wrapper whose factory is cached per
 device puts the device in `key`, as `gemm_a8w8_blockscale` does. A loaded
@@ -550,7 +567,11 @@ A launcher built inside a wrapper (no factory returning it) binds where it is
 built: `bind_aot(launch, FlyDSLAotCache("my_kernel"), (TOPK, N))`.
 
 A factory argument the cache cannot key (e.g. a numpy scalar) leaves that
-launcher on the JIT path. A module that imports `aot_launch` records it as a
+launcher on the JIT path, and so does such a `specialization_key` (an Enum),
+for that key. `factory.cache_clear()` drops the launchers the cache loaded and
+keeps the factory on the JIT path for the rest of the process: the caller
+wants a new trace, possibly of state the cache does not track (a patched
+module global), which an entry on disk would not reflect. A module that imports `aot_launch` records it as a
 source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
 
 0. **Launch `factory.lazy(...)` on hot paths.** It does not call the factory,
@@ -561,7 +582,16 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
 1. **Launch arguments are runtime only.** Every launcher parameter that
    varies per call is a tensor, an `fx` numeric (`Int32`, …) or an
    `fx.Stream` (a torch stream as the last argument is converted). Constexprs
-   go to the factory and so into the key.
+   go to the factory and so into the key. A launcher that keeps a
+   `Constexpr[T]` launch argument must pass it in `specialization_key`, as on
+   the JIT path. The object ignores such an argument, so each entry records
+   the values it was built with in its sidecar (`baked`) and serves only calls
+   that pass them: another process with another value builds its own variant.
+   Within a process, one key launched with two values raises, where the JIT
+   path would silently run the first. This holds for ints, floats, bools,
+   strings, `None` and tuples of those; a constexpr value the cache cannot
+   compare (a lambda, a `Type[T]`) leaves the key on the JIT path, which
+   keeps one compiled function per key and does not check.
 2. **The key covers the specialization.** The factory's arguments must
    determine its launcher, as `functools.cache` on it already requires. Pass
    anything else the compiled function depends on, e.g. a tensor dtype that
@@ -574,7 +604,11 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    imported from an aiter module are recorded already.
 4. **Keep the wrapper branch-free.** `_run_compiled` handles mode `0`, the
    fallback and compile-only.
-5. **Test it.** Run the op's test under `AITER_FLYDSL_AOT_CACHE=verify` once,
+5. **Test it.** CI runs every op test under `AITER_FLYDSL_AOT_CACHE=verify`
+   (`.github/scripts/aiter_test.sh`): an entry a test loads from disk, built by
+   an earlier test or a prebuild, is re-traced and compared. `verify` checks
+   disk hits only, so locally run the op's test twice on one cache directory,
+   the second time with another value of anything the kernel may depend on,
    and add a bitwise check against the JIT path.
 
 ## 7. Limitations and next steps

@@ -82,15 +82,17 @@ import flydsl
 import flydsl.compiler as flyc
 import torch
 from flydsl.compiler import JitArgumentRegistry
-from flydsl.compiler.jit_argument import PointerJitArg
+from flydsl.compiler.jit_argument import PointerJitArg, is_type_param_annotation
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import cache_signature
+from flydsl.expr.typing import Constexpr
 from flydsl.utils import env as fly_env
 
 from aiter import logger
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
-_SCHEMA = 5
+_SCHEMA = 6
 _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
@@ -114,7 +116,30 @@ _ENV_IGNORED = {
     # sets it, and the runtime, which reads the device, share a directory.
     "FLYDSL_GPU_ARCH",
 }
-_ENV_EXTRA = ("HSA_OVERRIDE_GFX_VERSION", "COMPILE_OPT_LEVEL")
+_ENV_EXTRA = (
+    "HSA_OVERRIDE_GFX_VERSION",
+    "COMPILE_OPT_LEVEL",
+    # Changes gfx1250 codegen; FlyDSL keys its own cache on it for that arch.
+    "LLVM_GFX1250_ANY_XNACK_CODEGEN",
+)
+
+
+def _flydsl_cache_env() -> tuple:
+    """The variables FlyDSL's own artifact cache is keyed on that the
+    ``FLYDSL_`` prefix does not already cover, for every arch: one a later
+    FlyDSL adds is then fingerprinted without a change here."""
+    try:
+        from flydsl.compiler import jit_function as jf
+
+        names = set(jf._CACHE_INVALIDATING_ENV_VARS)
+        for arch_names in jf._TARGET_CACHE_INVALIDATING_ENV_VARS.values():
+            names.update(arch_names)
+    except (ImportError, AttributeError):  # FlyDSL internals moved
+        return ()
+    return tuple(sorted(names))
+
+
+_ENV_EXTRA = tuple(sorted({*_ENV_EXTRA, *_flydsl_cache_env()}))
 # Variables that describe the build rather than the code it makes. The AOT dry
 # run sets them (CU_NUM and GPU_ARCHS to the target, hashed in the fingerprint
 # as _cu_num and _target_arch); recording them per entry would keep the
@@ -247,11 +272,24 @@ def _toolchain_digest() -> str:
     return h.hexdigest()
 
 
+@functools.cache
+def _device_bitcode_digest() -> str:
+    """Hash of the AMDGCN device libraries (ocml, ockl, ...) FlyDSL links into
+    a kernel that calls them. Bundled with FlyDSL they are in its wheel, but
+    without in-process LLD they come from ``ROCM_PATH`` or ``/opt/rocm``."""
+    try:
+        from flydsl.compiler.backends import rocm
+
+        return rocm._device_bitcode_fingerprint(rocm.rocm_toolkit_path())
+    except Exception as e:  # noqa: BLE001  FlyDSL internals moved
+        return f"unknown:{type(e).__name__}"
+
+
 def fingerprint() -> str:
     """Hash of the toolchain and environment every entry depends on.
 
-    It covers FlyDSL (version, Python sources, native libraries), torch HIP,
-    Python, the target arch and CU count, and the ``AITER_FLYDSL_*`` /
+    It covers FlyDSL (version, Python sources, native libraries), the ROCm
+    device bitcode, torch HIP, Python, the target arch and CU count, and the ``AITER_FLYDSL_*`` /
     ``FLYDSL_*`` environment variables. Changing any of them selects a new
     cache directory. Kernel sources and the other variables they read are
     tracked per entry instead (``_record_sources``). Only the FlyDSL hash is
@@ -271,6 +309,7 @@ def fingerprint() -> str:
         _target_arch(),
         _cu_num(),
         _toolchain_digest(),
+        _device_bitcode_digest(),
         env_items,
     ]
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
@@ -782,12 +821,74 @@ def _called_lines(calls) -> dict:
     return called
 
 
-def _entry_current(meta: dict) -> bool:
+def _baked_args(exe, args) -> dict:
+    """The launch arguments a build compiles into the object: ``Constexpr[T]``
+    and ``Type[T]`` parameters of the launcher, by position, each as the
+    ``repr`` of its normalized value.
+
+    A loaded object ignores these arguments, so an entry serves only calls
+    that pass the values it was built with (``_entry_current``).
+    """
+    if isinstance(exe, functools.partial):
+        # A @flyc.jit method reached through its instance: the JitFunction is
+        # the bound one, and its signature leaves ``self`` out, as ``args`` do.
+        exe = getattr(exe.func, "__self__", None)
+        if getattr(exe, "_sig", None) is None:
+            raise RuntimeError("cannot read the signature of a bound launcher")
+    sig = getattr(exe, "_sig", None)  # resolved by the compile that just ran
+    if sig is None:
+        try:
+            sig = inspect.signature(getattr(exe, "func", exe), eval_str=True)
+        except Exception as e:  # noqa: BLE001  annotations that do not evaluate
+            raise RuntimeError(f"cannot read the launcher's signature: {e}") from e
+    baked = {}
+    for index, param in enumerate(sig.parameters.values()):
+        ann = param.annotation
+        if ann is inspect.Parameter.empty:
+            continue
+        if not (
+            Constexpr.is_constexpr_annotation(ann) or is_type_param_annotation(ann)
+        ):
+            continue
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            raise RuntimeError(f"baked launch argument *{param.name} has no position")
+        if param.kind is param.KEYWORD_ONLY or index >= len(args):
+            # Left to its default, which the launcher's source (recorded) fixes.
+            continue
+        try:
+            baked[str(index)] = repr(_normalize_key(args[index]))
+        except _UsageError as e:
+            # A lambda or a type: nothing a later process can compare.
+            raise RuntimeError(f"baked launch argument {param.name!r}: {e}") from None
+    for index, value in enumerate(args):
+        if _const_only(value) and str(index) not in baked:
+            raise RuntimeError(
+                f"launch argument {index} = {value!r} is not a Constexpr parameter"
+            )
+    return baked
+
+
+def _baked_current(baked: dict, args) -> bool:
+    for index, value in baked.items():
+        i = int(index)
+        if i >= len(args):
+            return False
+        try:
+            if repr(_normalize_key(args[i])) != value:
+                return False
+        except _UsageError:
+            return False
+    return True
+
+
+def _entry_current(meta: dict, args) -> bool:
     root = _tracked_root()
     sources = meta["sources"].items()
     # os.path.join keeps an absolute path as it is.
-    return all(_file_digest(os.path.join(root, p)) == d for p, d in sources) and all(
-        _input(k) == v for k, v in meta["env"].items()
+    return (
+        _baked_current(meta["baked"], args)
+        and all(_file_digest(os.path.join(root, p)) == d for p, d in sources)
+        and all(_input(k) == v for k, v in meta["env"].items())
     )
 
 
@@ -836,9 +937,19 @@ def _arg_signature(args) -> tuple:
             sig.append(repr(cache_signature(v)))
         elif isinstance(v, (bool, int, float)):
             sig.append(type(v).__name__)
+        elif _const_only(v):
+            # No runtime type: only a Constexpr parameter takes it, and the
+            # build checks that it is one (_baked_args).
+            sig.append("const")
         else:
             raise TypeError(f"[FlyDSL AOT] unsupported launch argument {v!r}")
     return tuple(sig)
+
+
+def _const_only(v) -> bool:
+    """Whether ``v`` can only be a constexpr launch argument: a string, None,
+    or a tuple (of values the key can hold)."""
+    return v is None or isinstance(v, (str, tuple))
 
 
 def _placeholder(v):
@@ -862,14 +973,26 @@ def _placeholder(v):
     return v
 
 
-def _export(exe, args, out_dir: Path, sym: str) -> Path:
-    """Compile ``exe`` for ``args`` without launching and export ``<sym>.o``."""
+def _export(exe, args, out_dir: Path, sym: str, link_libs: set | None = None) -> Path:
+    """Compile ``exe`` for ``args`` without launching and export ``<sym>.o``.
+
+    ``link_libs`` collects the bitcode files the kernel links (``link_extern``).
+    """
     placeholders = [_placeholder(v) for v in args]
     cf = flyc.compile(exe, *placeholders, compile_only=True)
     if cf is None:
         # A hook stopped the compile, such as an AOT replay that only
         # identifies kernels.
         raise RuntimeError("flyc.compile returned no function to export")
+    if link_libs is not None:
+        # Private to FlyDSL (the CompiledArtifact a CompiledFunction keeps):
+        # without it a linked library would go unrecorded, so the entry is
+        # not written.
+        try:
+            libs = cf._keepalive._link_libs
+        except AttributeError as e:
+            raise RuntimeError(f"cannot read the kernel's linked bitcode: {e}") from e
+        link_libs.update(os.path.realpath(lib) for lib in libs)
     cf.export_to_c(str(out_dir), sym)
     return out_dir / f"{sym}.o"
 
@@ -885,6 +1008,40 @@ class _JitKernel:
         from .kernels.tensor_shim import _run_compiled
 
         _run_compiled(self._exe, *args, specialization_key=self._key)
+
+
+class _BakedKernel:
+    """A loaded launcher that has constexpr arguments. The object ignores
+    them, so a call passing other values than it was built with would run the
+    wrong kernel; the JIT path's cached function has the same limit, silently.
+    """
+
+    def __init__(self, kernel, name, key, args, indexes):
+        self._kernel = kernel
+        self._where = f"{name}: {key!r}"
+        self._baked = tuple(
+            (i, args[i], repr(_normalize_key(args[i]))) for i in indexes
+        )
+
+    def __call__(self, *args) -> None:
+        for i, value, normalized in self._baked:
+            arg = args[i] if i < len(args) else _BakedKernel
+            # The usual call passes the same object or an equal one of the
+            # same type; anything else is compared as the disk entry is.
+            if arg is value or (type(arg) is type(value) and arg == value):
+                continue
+            try:
+                same = repr(_normalize_key(arg)) == normalized
+            except _UsageError:
+                same = False
+            if not same:
+                raise _BakedArgumentError(
+                    f"[FlyDSL AOT] {self._where} was compiled with constexpr "
+                    f"launch argument {i} = {value!r} and is launched with "
+                    f"{arg!r}; pass every constexpr launch argument in "
+                    f"_run_compiled's specialization_key"
+                )
+        self._kernel(*args)
 
 
 # The loading counterpart of export_to_c; FlyDSL releases without it run every
@@ -911,6 +1068,10 @@ class _UsageError(TypeError):
     """A caller bug, such as an unsupported ``key``; never falls back."""
 
 
+class _BakedArgumentError(RuntimeError):
+    """One key launched with two values of a constexpr launch argument."""
+
+
 class _StaleEntryError(RuntimeError):
     """``verify`` found a cached object that no longer matches its sources."""
 
@@ -930,14 +1091,39 @@ class FlyDSLAotCache:
         self._jit = {}
         # Entries this process built; _prebuild skips the trace a build ran.
         self._builds = 0
-        self._lock = threading.Lock()
+        # Set by invalidate(): this process then runs every key through the JIT.
+        self._jit_only = False
+        # Reentrant: a factory may reset itself (invalidate) while it is built.
+        self._lock = threading.RLock()
 
     def directory(self) -> Path:
         return cache_root() / fingerprint() / self.name
 
     def _disk_key(self, key, args) -> str:
-        ident = repr((self.name, _normalize_key(key), _arg_signature(args)))
-        return hashlib.sha256(ident.encode()).hexdigest()[:32]
+        ident = (self.name, _normalize_key(key), _arg_signature(args))
+        # FlyDSL merges the caller's CompilationContext.compile_hints(...)
+        # into the compile; the launcher's own hints come from its sources.
+        hints = CompilationContext.get_compile_hints()
+        if hints:
+            try:
+                ident += (_normalize_key(hints),)
+            except _UsageError as e:
+                raise TypeError(f"compile hints the cache cannot key: {e}") from None
+        return hashlib.sha256(repr(ident).encode()).hexdigest()[:32]
+
+    def invalidate(self) -> None:
+        """Forget every launcher this process loaded, and run the cache's keys
+        through the JIT path from now on.
+
+        For a caller that resets its launcher factory (``cache_clear``) to
+        retrace after changing state the cache does not track, such as a
+        patched module global: an entry on disk would still be current, and a
+        build would store the patched code under the unpatched sources.
+        """
+        with self._lock:
+            self._jit_only = True
+            self._mem.clear()
+            self._jit.clear()
 
     def launch(self, key, make_exe, *args) -> None:
         """Launch the specialization ``key`` (built by ``make_exe()``) on ``args``.
@@ -970,7 +1156,7 @@ class FlyDSLAotCache:
         with self._lock:
             # The export first: a trace FlyDSL already cached in this process
             # would hide the sources the entry records.
-            if _MODE != "0" and _load_module is not None:
+            if _MODE != "0" and _load_module is not None and not self._jit_only:
                 builds = self._builds
                 self._kernel(key, make_exe, args)
                 if self._builds != builds:
@@ -981,7 +1167,7 @@ class FlyDSLAotCache:
         jit(*args)
 
     def _kernel(self, key, make_exe, args):
-        if _MODE == "0" or _load_module is None:
+        if _MODE == "0" or _load_module is None or self._jit_only:
             return _JitKernel(make_exe(), key)
         try:
             return self._resolve(key, make_exe, args)
@@ -1003,10 +1189,10 @@ class FlyDSLAotCache:
         digest = self._disk_key(key, args)
         sym = f"fly_{self.name}_{digest[:16]}"
         out_dir = self.directory()
-        found = self._find(out_dir, digest)
+        found = self._find(out_dir, digest, args)
         if found is None:
             with _file_lock(out_dir / f"{digest}.lock"):
-                found = self._find(out_dir, digest)
+                found = self._find(out_dir, digest, args)
                 if found is None:
                     found = self._build(make_exe, args, out_dir, sym, digest)
         elif _MODE == "verify":
@@ -1014,31 +1200,36 @@ class FlyDSLAotCache:
         if fly_env.compile.compile_only:
             return None
         try:
-            return _load_module(found.with_suffix(".o"))
+            kernel = _load_module(found.with_suffix(".o"))
         except (OSError, ValueError) as e:
             # A truncated or foreign object: rebuild once.
             logger.warning(f"[FlyDSL AOT] loading {found}.o failed ({e}); rebuilding")
             with _file_lock(out_dir / f"{digest}.lock"):
                 found.with_suffix(".o").unlink(missing_ok=True)
                 found = self._build(make_exe, args, out_dir, sym, digest)
-            return _load_module(found.with_suffix(".o"))
+            kernel = _load_module(found.with_suffix(".o"))
+        baked = json.loads(found.with_suffix(".json").read_text())["baked"]
+        if baked:
+            return _BakedKernel(kernel, self.name, key, args, sorted(map(int, baked)))
+        return kernel
 
     @staticmethod
-    def _find(out_dir: Path, digest: str):
+    def _find(out_dir: Path, digest: str, args):
         """The stem of the variant of ``digest`` built from the current sources
-        and environment.
+        and environment, with the constexpr values ``args`` pass.
 
-        An entry is stored per version of both, ``<digest>-<variant hash>``, so
-        switching a kernel file or a variable back and forth (e.g. between
+        An entry is stored per version of those, ``<digest>-<variant hash>``,
+        so switching a kernel file or a variable back and forth (e.g. between
         branches) reuses the earlier build instead of overwriting it.
         """
         for sidecar in sorted(out_dir.glob(f"{digest}-*.json")):
             stem = sidecar.with_suffix("")
             try:
                 meta = json.loads(sidecar.read_text())
-            except (OSError, ValueError):
+                current = _entry_current(meta, args)
+            except (OSError, ValueError, KeyError):
                 continue
-            if stem.with_suffix(".o").exists() and _entry_current(meta):
+            if current and stem.with_suffix(".o").exists():
                 return stem
         return None
 
@@ -1050,17 +1241,18 @@ class FlyDSLAotCache:
             files = set(self._extra)
             read = set()
             calls = set()
+            libs = set()
             _clear_get_gfx()
             with _record_sources(files, read, calls):
                 exe = make_exe()
-                tmp_obj = _export(exe, args, tmp, sym)
+                tmp_obj = _export(exe, args, tmp, sym, libs)
             # Parsed now, not from the per-process cache: the build read the
             # files as they are on disk at this point.
             _parse.cache_clear()
             _bindings.cache_clear()
             called = _called_lines(calls)
             files |= _import_sources(files, called)
-            changed = _changed_since_start(files)
+            changed = _changed_since_start(files | libs)
             if changed:
                 raise RuntimeError(
                     f"{changed[0]} changed after this process started; not caching "
@@ -1069,8 +1261,14 @@ class FlyDSLAotCache:
             # Hashed now, not from the per-process cache: the build read the
             # files as they are on disk at this point.
             _file_digest.cache_clear()
-            sources = {_portable(f): _file_digest(f) for f in sorted(files)}
-            meta = {"sources": sources, "env": _entry_env(files, read, calls, called)}
+            # A linked bitcode file is an input like a source: its code is in
+            # the object. It is not Python, so nothing above reads it.
+            sources = {_portable(f): _file_digest(f) for f in sorted(files | libs)}
+            meta = {
+                "sources": sources,
+                "env": _entry_env(files, read, calls, called),
+                "baked": _baked_args(exe, args),
+            }
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"
             sidecar = tmp / "meta.json"
