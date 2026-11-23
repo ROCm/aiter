@@ -68,7 +68,7 @@ void dispose(fptr_t _fa)
     delete fa;
 }
 
-int64_t meta_size() { return sizeof(aiter::Signal); }
+int64_t meta_size() { return sizeof(aiter::Signal) + aiter::kLLScratchBytes; }
 
 // ---- Lamport path of all_reduce ----
 

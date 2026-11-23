@@ -306,6 +306,27 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_naive(RankD
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Meta buffer layout: [Signal][LL / LL128 scratch][tmp]. The LL kernels write
+// into peers' scratch without a barrier, while the 2-stage kernels have no
+// final barrier, so peers may still read their tmp when the next LL kernel
+// starts. The two regions must not overlap.
+constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
+constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
+// LL sub-region size: 2 banks * ngpus * slotCap * 16B, sized for kLLMaxRanks
+// so the LL128 sub-region can start after it at a fixed offset.
+constexpr size_t kLLPocRegionBytes =
+    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
+// Max message (bytes) the LL128 fast path serves; bounds its scratch. The
+// dispatch sends at most 896 KB (gfx942 TP2).
+constexpr size_t kLL128PocCapBytes = (size_t)1024 * 1024;
+// Per-rank LL128 slot stride in uint32 words, sized for kLL128PocCapBytes so
+// that consecutive calls of different sizes never overlap a peer's unread slots.
+constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
+// LL128 sub-region: 2 banks * ngpus * kLL128SlotStride words.
+constexpr size_t kLLScratchBytes =
+    kLLPocRegionBytes + (size_t)2 * kLLMaxRanks * kLL128SlotStride * sizeof(uint32_t);
+static_assert(kLLScratchBytes % 16 == 0, "tmp buffer must stay 16B aligned");
+
 template <typename P>
 #ifdef USE_ROCM
 DINLINE P* get_tmp_buf(Signal* sg)
@@ -314,7 +335,7 @@ DINLINE P* get_tmp_buf(Signal* sg)
 DINLINE P* get_tmp_buf(volatile Signal* sg)
 {
 #endif
-    return (P*)(((Signal*)sg) + 1);
+    return (P*)((char*)(((Signal*)sg) + 1) + kLLScratchBytes);
 }
 
 // HAS_RESIDUAL adds residual (identical on every rank) to the reduced value
@@ -3716,23 +3737,11 @@ __global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
 //   * ar_ll_gfx9       — LL, 16B lines carrying 8B payload + epoch flags.
 //   * ar_ll128_unroll2 — LL128, 128B/16-lane lines, 15 payload words + 1 flag.
 // Both stage into a per-rank scratch that peers write into and the owner polls
-// (spinning on a per-epoch flag), then reduce in fp32. On this port the scratch
-// is NOT independently allocated: it reuses the meta/Signal buffer's post-Signal
-// region (the same region the 2-stage kernel uses as tmp), which is already
-// IPC-exchanged at construction. A peer's scratch base is therefore
-// (char*)sg_.signals[peer] + sizeof(Signal). LL and 2-stage never run on the
-// same message concurrently, and the per-epoch flag + double-buffered banks keep
-// scratch reuse safe across CUDA-graph replay.
-
-constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
-constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
-// LL sub-region size in the reused scratch: 2 banks * ngpus * slotCap * 16B.
-// Sized for the worst case (kLLMaxRanks) so the LL128 sub-region can start after
-// it at a fixed offset regardless of world size.
-constexpr size_t kLLPocRegionBytes =
-    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
-// Max message (bytes) the LL128 fast path serves; bounds its dynamic scratch.
-constexpr size_t kLL128PocCapBytes = (size_t)4 * 1024 * 1024;
+// (spinning on a per-epoch flag), then reduce in fp32. The scratch is the
+// meta/Signal buffer's kLLScratchBytes region between the Signal and the tmp
+// buffer, already IPC-exchanged at construction. A peer's scratch base is
+// therefore (char*)sg_.signals[peer] + sizeof(Signal). The per-epoch flag +
+// double-buffered banks keep scratch reuse safe across CUDA-graph replay.
 
 // 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
 union LLPackedMsg
@@ -4008,9 +4017,6 @@ constexpr int    kLL128LineElems = 16;
 constexpr int    kLL128DataElems = 15;
 constexpr int    kLL128FlagElem  = 15;
 constexpr int    kLL128Lanes     = 16;
-// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
-// consecutive calls of different sizes never overlap a peer's unread slots.
-constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
 
 struct LLLine128
 {
@@ -4833,7 +4839,7 @@ class CustomAllreduce
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char*> ipc_handles_;
 
-    // LL / LL128 fast-path staging (reuses the meta buffer's post-Signal region,
+    // LL / LL128 fast-path staging (the meta buffer's kLLScratchBytes region,
     // already IPC-exchanged via sg_). Device table of per-rank scratch bases,
     // computed in the constructor from sg_.signals[]; no second IPC exchange.
     //   [0, world_size_)              -> LL   scratch bases (signals[i]+sizeof(Signal))
@@ -4850,14 +4856,14 @@ class CustomAllreduce
     template <typename T>
     T* local_tmp_reduced_ptr() const
     {
-        return reinterpret_cast<T*>(self_sg_ + 1);
+        return reinterpret_cast<T*>(reinterpret_cast<char*>(self_sg_ + 1) + kLLScratchBytes);
     }
 
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
      *
-     * There's a total of sizeof(Signal) of prefix before the actual data,
-     * so meta + 1 points to actual temporary buffer.
+     * The Signal struct and the LL / LL128 scratch (kLLScratchBytes) precede
+     * the temporary buffer, see get_tmp_buf.
      *
      * note: this class does not own any device memory. Any required buffers
      * are passed in from the constructor
@@ -5256,13 +5262,11 @@ class CustomAllreduce
      */
 
     // -----------------------------------------------------------------------
-    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch reuses the
-    // meta buffer's post-Signal region (peer bases in d_ll_scratch_peers_, built
-    // at construction from sg_.signals[]); no separate alloc / IPC exchange. NOT
-    // wired into the size-based dispatch below yet — that lands in step 2 once
-    // the bench thresholds are in. The caller must keep the message within the
-    // LL / LL128 caps (kLLPocSlotCapPk / kLL128PocCapBytes) so the scratch fits
-    // the reused tmp region (2 * max_size).
+    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch is the
+    // meta buffer's kLLScratchBytes region (peer bases in d_ll_scratch_peers_,
+    // built at construction from sg_.signals[]); no separate alloc / IPC
+    // exchange. The caller must keep the message within the LL / LL128 caps
+    // (kLLPocSlotCapPk / kLL128PocCapBytes) so it fits that region.
     // -----------------------------------------------------------------------
     template <typename T>
     void allreduce_ll_poc(hipStream_t stream, const T* input, T* output,
@@ -5323,7 +5327,7 @@ class CustomAllreduce
 
     // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
     // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
-    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
+    // spans 2 * ngpus * kLL128SlotStride words of the LL scratch region.
     template <typename T>
     void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
                                  int numel, int threads_per_block = 512,
@@ -5669,10 +5673,8 @@ class CustomAllreduce
     // LL / LL128 small-message fast path (gfx9). Routes small messages to the
     // ar_ll_gfx9 / ar_ll128_unroll2 kernels per measured thresholds; anything
     // larger falls through to the existing 1-/2-stage dispatch below. Staging
-    // scratch reuses the meta buffer's post-Signal region (see
-    // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
-    // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
-    // ~38 MiB at tp4); true for the default max_size (1 GiB).
+    // scratch is the meta buffer's kLLScratchBytes region (see
+    // allreduce_ll_poc / allreduce_ll128_unroll2).
     //
     // `size` here is still the element count (numel); it is divided down to
     // 16-byte packs only after this block. Thresholds were measured on bf16, so

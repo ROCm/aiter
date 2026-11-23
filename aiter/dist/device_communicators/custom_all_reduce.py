@@ -1980,9 +1980,9 @@ class CustomAllreduce:
         #     Verified: 34816 B / 100 KB / 1.5 MB (non-page-multiple) FAIL with
         #     "invalid argument"; 36864 / 65536 (page-multiple) succeed.
         #
-        # old arch: meta_size() + 2x tmp region (2-stage kernel) is GB-scale, so
-        # it lands in the first regime and exports fine despite meta_size()=5504
-        # (not a page multiple).
+        # old arch: meta_size() (Signal + LL scratch) + 2x tmp region (2-stage
+        # kernel) is GB-scale, so it lands in the first regime and exports fine
+        # even though meta_size() is not a page multiple.
         # gfx1250: meta_size_gfx1250(world_size) = Signal (~34 KB) + LL staging
         # scratch (2 banks x world_size slots: 32 MiB at TP=2, 128 MiB at
         # TP=8, see kLLScratchOffset/llScratchBytes). Even the smallest is well
