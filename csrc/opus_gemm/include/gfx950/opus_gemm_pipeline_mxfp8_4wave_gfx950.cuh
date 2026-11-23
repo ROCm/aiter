@@ -35,7 +35,8 @@ __device__ __forceinline__ void schedule_step() {
 // ============================================================================
 // A [M, K] / B [N, K] (K-contiguous): the NT copy and LDS shuffle, plain ds_read_b128.
 // The reader follows the copy's even / odd row interleaving. B calls these with N as M
-// (HALF_B_N == HALF_B_M, E_N == E_M, ...), so its fragments map like A's.
+// (HALF_B_N == HALF_B_M, E_N == E_M, ...), so its fragments map like A's. Slots are
+// SMEM_SLOT_K apart and chunks XOR-swizzled by the kernel (see k_copy_lane_id).
 // ============================================================================
 // Create layout for loading A matrix from global memory.
 template<class T>
@@ -77,7 +78,7 @@ __device__ inline auto make_layout_sa_k(int wave_id_m, int wave_id_n) {
 
     return opus::make_layout<T::VEC_A>(
         sa_block_shape,
-        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
+        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<T::SMEM_SLOT_K>{}, 1_I}),
         opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_n, wave_id_m}));
 }
 
@@ -102,7 +103,7 @@ __device__ inline auto make_layout_ra_k(int lane_id, int wave_id_m) {
 
     return opus::make_layout<T::VEC_A>(
         ra_block_shape,
-        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::SMEM_SLOT_K>{}, 1_I}),
         opus::unfold_p_coord(ra_block_dim, opus::tuple{wave_id_m, lane_id_m % T::T_M, lane_id_m / T::T_M, lane_id / T::W_M}));
 }
 
@@ -508,14 +509,16 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     opus::array<typename MMA::vtype_c, T::E_M * T::E_N> v_c[T::H_M][T::H_N];
 
     // Global -> LDS: A / B copies (LDS DMA) into the two K slots.
-    // A_T / B_T: XOR swizzle for the TR8 reads. A slot holds 8 K rows of 128 M (N) bytes,
-    // so rows k and k+2 are 256 bytes apart and land on the same banks: the
-    // 16 lanes that read one M chunk from 8 rows conflict 4-way. Store chunk c
-    // of row k at chunk position c ^ (k / 2). The LDS DMA writes lane l to row
-    // l / 8, position l % 8, so that lane fetches source chunk (l % 8) ^ (l / 16).
+    // XOR swizzles of the LDS slots, which hold 8 rows of 128 bytes each, so rows land on
+    // the same banks. A_T / B_T (K rows of M / N, TR8 reads): rows k and k+2 are 256 bytes
+    // apart and the 16 lanes that read one chunk from 8 rows conflict 4-way; store chunk c
+    // of row k at c ^ (k / 2). K-contiguous (M / N rows of K, ds_read_b128): store chunk c
+    // of row r at c ^ (r % 4) (see SMEM_SLOT_K). The LDS DMA writes lane l to row l / 8,
+    // position l % 8, so that lane fetches source chunk (l % 8) ^ f(l / 8).
     const int tr_copy_lane_id = (lane_id & ~7) | ((lane_id & 7) ^ (lane_id >> 4));
-    auto u_ga = make_layout_ga<T>(T::A_T ? tr_copy_lane_id : lane_id, wave_id_m, wave_id_n, kargs.stride_a);
-    auto u_gb = make_layout_gb<T>(T::B_T ? tr_copy_lane_id : lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+    const int k_copy_lane_id = (lane_id & ~7) | ((lane_id & 7) ^ ((lane_id >> 3) & 3));
+    auto u_ga = make_layout_ga<T>(T::A_T ? tr_copy_lane_id : k_copy_lane_id, wave_id_m, wave_id_n, kargs.stride_a);
+    auto u_gb = make_layout_gb<T>(T::B_T ? tr_copy_lane_id : k_copy_lane_id, wave_id_m, wave_id_n, kargs.stride_b);
     auto u_sa = make_layout_sa<T>(wave_id_m, wave_id_n);
     auto u_sb = make_layout_sb<T>(wave_id_m, wave_id_n);
     auto ga_offset = [&](int half_tile_m, int tile_k) {
@@ -582,16 +585,20 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     // LDS -> registers: A / B operand fragment reads.
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
-    // A_T / B_T: TR8 lane l reads row (l % 16) / 2 of its slot; chunk c = mi * T_M + wave_id_m
-    // (ni * T_N + wave_id_n) moved to c ^ (row / 2). The shift is constant per lane and fragment.
+    // Lane l reads row (l % 16) / 2 of its slot. A_T / B_T (TR8): chunk c = mi * T_M +
+    // wave_id_m (ni * T_N + wave_id_n) moved to c ^ (row / 2). K-contiguous: the lane reads
+    // K chunks l / 16 and l / 16 + 4, moved to c ^ (row % 4); the XOR (< 4) leaves the + 4
+    // alone. Either way the shift is constant per lane and fragment.
     const int tr_read_xor = (lane_id % 16) / 4;
+    const int k_chunk = lane_id / 16;
+    const int k_shift = ((k_chunk ^ ((lane_id % 16) / 2 % 4)) - k_chunk) * 16;
     auto ra_shift = [&](int mi) {
         const int chunk = mi * T::T_M + wave_id_m;
-        return T::A_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : 0;
+        return T::A_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : k_shift;
     };
     auto rb_shift = [&](int ni) {
         const int chunk = ni * T::T_N + wave_id_n;
-        return T::B_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : 0;
+        return T::B_T ? ((chunk ^ tr_read_xor) - chunk) * 16 : k_shift;
     };
     // LDS reads of operand fragment chunks [first, first + count). A_T / B_T read with
     // ds_read_tr8 through the builtin (opus' tr_load is inline asm), so the result can

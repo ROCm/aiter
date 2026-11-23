@@ -61,6 +61,12 @@ struct opus_gemm_mxfp8_4wave_tile_traits {
     // A wave slot is one 16-byte-per-lane LDS-DMA pass (1024 bytes) plus padding.
     static constexpr int smem_linear_wave = WARP_SIZE * VEC_A;
     static constexpr int smem_padding = 32;
+    // K-contiguous ([M, K] / [N, K]) slots hold 8 rows of 128 bytes, so their rows share
+    // banks. With a 64-byte pad and chunk c of row r stored at c ^ (r % 4), the plain
+    // ds_read_b128 operand reads are free of bank conflicts (SQ_LDS_BANK_CONFLICT = 0 in
+    // a microbenchmark of the reader's addresses; 32 bytes of pad or c ^ (r / 2) are not).
+    static constexpr int smem_padding_k = 64;
+    static constexpr int SMEM_SLOT_K = smem_linear_wave + smem_padding_k;
     // Rows of B_K bytes per wave slot (M rows for a [M,K] slot).
     static constexpr int smem_sub = smem_linear_wave / B_K;
     // Slots per quadrant operand: 128 x B_K bytes / 1024.
@@ -77,8 +83,8 @@ struct opus_gemm_mxfp8_4wave_tile_traits {
     static constexpr int VEC_LDS_A = A_T ? 8 : 16;
     static constexpr int VEC_LDS_B = B_T ? 8 : 16;
     // Each quadrant occupies sixteen 1024-byte wave slots, with 32-byte padding.
-    static constexpr int SMEM_HALF_A_ELEMS = smem_m_rep * (smem_linear_wave + smem_padding);
-    static constexpr int SMEM_HALF_B_ELEMS = smem_n_rep * (smem_linear_wave + smem_padding);
+    static constexpr int SMEM_HALF_A_ELEMS = smem_m_rep * (A_T ? smem_linear_wave + smem_padding : SMEM_SLOT_K);
+    static constexpr int SMEM_HALF_B_ELEMS = smem_n_rep * (B_T ? smem_linear_wave + smem_padding : SMEM_SLOT_K);
     static_assert(HALF_B_N == HALF_B_M && VEC_B == VEC_A && E_N == E_M && W_N == W_M && T_N == T_M,
                   "B reuses the A copy / LDS / read layouts");
     // Two LDS stages of H_M A quadrants and H_N B quadrants.
@@ -97,4 +103,6 @@ using opus_gemm_mxfp8_tt_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<t
 template<int BM = 256, int BN = 256, bool PadM = false, int GroupM = 0>
 using opus_gemm_mxfp8_tn_4wave_tile_traits = opus_gemm_mxfp8_4wave_tile_traits<true, true, BM, BN, PadM, GroupM>;
 
-static_assert(opus_gemm_mxfp8_nt_4wave_tile_traits<256, 256>::LDS_BYTES == 152064);
+static_assert(opus_gemm_mxfp8_nt_4wave_tile_traits<256, 256>::LDS_BYTES == 156160);
+static_assert(opus_gemm_mxfp8_nn_4wave_tile_traits<256, 256>::LDS_BYTES == 154112);
+static_assert(opus_gemm_mxfp8_tn_4wave_tile_traits<256, 256>::LDS_BYTES == 152064);
