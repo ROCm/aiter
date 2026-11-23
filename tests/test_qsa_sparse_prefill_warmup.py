@@ -148,6 +148,65 @@ def test_every_layout_has_a_kernel_variant_the_warmup_runs(platform, arch, group
             assert variant(group, hk, lens, prefix) in warmed, (rows, lens, prefix)
 
 
+def _order_kernel_constants(monkeypatch, tiles):
+    """The constexpr values K3 (sparse_prefill_order_masks) compiles for a group-1 plan of
+    BQ32 tiles over 128 KV heads: tiles x 128 tasks of one slice."""
+    compiled = {}
+    monkeypatch.setattr(
+        prepare,
+        "_compiled",
+        lambda launch, args, grid, constants: compiled.setdefault(launch, constants),
+    )
+    one = torch.zeros(1, dtype=torch.int32)
+    inputs = SimpleNamespace(
+        indices=one,
+        query_positions=one,
+        block_indices=one,
+        q=one,
+        k=torch.zeros(1, 128, 1),
+        kv_slots=None,
+        topk=512,
+    )
+    tasks = tiles * 128
+    grid = min(tasks, 256)
+    plan = SimpleNamespace(
+        num_tiles=tiles,
+        query_tile=32,
+        group_padded=1,
+        block_capacity=8224,
+        max_blocks=8224,
+        grid=grid,
+        task_order=torch.zeros(-(-tasks // grid) * grid, dtype=torch.int32),
+        metadata=one,
+        blocks=one,
+        membership=one,
+        counts=one,
+        costs=one,
+        active=one,
+        score_masks=one,
+        query_tiles=one,
+        direct_flag=one,
+        union_ratio=1.0,
+        route_costs=(0.0, 0.0, 0.0),
+        routing=True,
+        route_model=(0.0, 0.0, 0.0, 0.0, False),
+        slotted=False,
+        direct_groups=0,
+    )
+    list(prepare._launches(inputs, plan, None))
+    return compiled[prepare._order_masks_launch]
+
+
+def test_the_task_count_compiles_no_new_order_kernel(monkeypatch):
+    # The warmup compiles K3 on small layouts only, so a K3 variant only a larger plan takes
+    # would compile while serving. 16385 one-row requests over 32895-token prefixes at 128
+    # KV heads hold 2,097,280 tasks (block capacity 8224), whose global rank no longer fits
+    # a 32-bit sort key beside the cost.
+    assert _order_kernel_constants(monkeypatch, 16385) == _order_kernel_constants(
+        monkeypatch, 1
+    )
+
+
 def test_the_selection_of_a_long_request_keeps_its_last_blocks_and_its_tail():
     # Position 1029 sees 1030 tokens: 257 blocks of 4 and 2 tail tokens. At most 256
     # blocks are kept, the last ones: tokens 4 .. 1027, then the tail 1028, 1029.
