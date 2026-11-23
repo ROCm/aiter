@@ -83,11 +83,10 @@ class WmmaKernelInstance:
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
     fused_splitk: bool = False
-    # LDS row pad (elements) of the fused epilogue staging; -1 = default.
+    # LDS row pad (elements) of the C staging tile; -1 = default.
     c_pad: int = -1
-    # Opt-in quadrant early-prefetch schedule (_qe), see the mxscale quadrant kernel.
+    # Opt-in schedules: _qe (quadrant early loads), _nlb (no in-loop cluster barrier).
     quad_early: bool = False
-    # Opt-in: no cluster barrier in the main loop (only with cluster_m == cluster_n == 1; see the kernel).
     no_loop_cbar: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
@@ -248,7 +247,7 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     extra += [
         ki for ki in wide if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
     ]
-    # Appended last: the tile_m=64 split-4 candidate with a 4-element LDS pad (K3 rows up to M=240).
+    # Single opt-in candidates used by K3 rows, appended last.
     extra.append(
         WmmaKernelInstance(
             tile_m=64,
@@ -264,8 +263,6 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
             c_pad=4,
         )
     )
-    # Appended last (ids 9716, 9717): the _qe twins that the K3 decode sweep confirmed on two GPUs
-    # (T01 M=512; T11/T05 M=320 and M=512, whose table name cm8 launches as cm1).
     extra.append(
         WmmaKernelInstance(
             tile_m=64,
@@ -294,7 +291,6 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
             quad_early=True,
         )
     )
-    # Appended last (id 9718): the _qe + _nlb twin that the K3 decode screen confirmed on two GPUs (T14 M=320).
     extra.append(
         WmmaKernelInstance(
             tile_m=64,

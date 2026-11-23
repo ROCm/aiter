@@ -197,6 +197,8 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             continue
         if ki.cluster_m != 1 or ki.cluster_n != 1:
             continue
+        if ki.quad_early or ki.no_loop_cbar or ki.c_pad >= 0:
+            continue  # opt-in generic schedules; the batched launch has none
         if not kernel_fits_shape(ki, m, n, k):
             continue
         out.append(

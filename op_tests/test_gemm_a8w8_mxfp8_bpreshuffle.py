@@ -110,7 +110,8 @@ def test_w_scale_layout(n=64, kb=16):
 
 
 # (scale block, kernelName without _fsk, N, K): the generic kernel at split_k 2/4/8,
-# a one-row tile, and clusters along M and N next to the K-split cluster.
+# a one-row tile, clusters along M and N next to the K-split cluster, and the _cp4
+# and _qe_nlb modes of the K3 rows.
 FUSED_SPLITK_CASES = (
     (
         128,
@@ -143,6 +144,18 @@ FUSED_SPLITK_CASES = (
         4096,
     ),
     (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t64x64x256_mw2_nw2_nb4_sk4_cm2_cn2_cp4",
+        1536,
+        7168,
+    ),
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t64x128x256_mw1_nw4_nb4_sk4_cm1_cn1_qe_nlb",
+        1536,
+        7168,
+    ),
+    (
         32,
         "flydsl_mxfp8_32_bpreshuffle_wmma_t32x64x256_mw1_nw4_nb3_sk4_cm1_cn1",
         1536,
@@ -157,6 +170,19 @@ FUSED_SPLITK_CASES = (
 )
 # M of each case: a single row, ragged tiles, and a tile count cluster_m divides or not.
 FUSED_SPLITK_M = (1, 7, 33, 300, 640)
+# (kernelName, N, K): the sk1 _qe kernels of the K3 rows.
+MX128_DIRECT_CASES = (
+    (
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t64x128x512_mw1_nw4_nb3_sk1_cm1_cn1_qe",
+        2176,
+        7168,
+    ),
+    (
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn2_qe",
+        7168,
+        1536,
+    ),
+)
 
 
 def _fused_splitk_operands(block, m, n, k):
@@ -212,7 +238,9 @@ def test_fused_splitk(block, kernel_name, m, n, k):
     fused, us_fused = launch(kernel_name + "_fsk")
     assert reduces[kernel_name] > 0 and reduces[kernel_name + "_fsk"] == 0, reduces
     assert torch.equal(fused, unfused), f"{kernel_name}: fused != unfused at M={m}"
-    err = assertAllclose(ref, fused.float(), msg=f"M={m} N={n} K={k} fused: ")
+    err = assertAllclose(
+        ref, fused.float(), tol_err_ratio=0, msg=f"M={m} N={n} K={k} fused: "
+    )
 
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
     entry(xq, w_shuf, x_scale, w_scale, out, kernel_name + "_fsk", **kw)
@@ -233,16 +261,15 @@ def test_fused_splitk(block, kernel_name, m, n, k):
 
 
 def test_mx128_kernel_direct(kernel_name, m, n, k):
-    """A non-split-K (sk1) generic mx128 kernel, named explicitly: the output matches the
-    torch reference, no reduce kernel is launched, and CUDA graph replay equals the eager
-    output. test_fused_splitk needs a split-K twin, so it does not apply to sk1 names."""
+    """An explicitly named sk1 generic mx128 kernel matches the reference, launches no
+    reduce kernel, and replays bitwise under a CUDA graph."""
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as flydsl_gemm
 
     flydsl_gemm._lazy_import()
     entry = flydsl_gemm.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250
     xq, x_scale, weight, w_scale = _fused_splitk_operands(128, m, n, k)
     ref = run_torch(xq, x_scale, weight, w_scale, (128, 128), x_block=128)
-    x_scale = x_scale.t().contiguous().view(*x_scale.shape)  # K-major A scale, as in test_fused_splitk
+    x_scale = x_scale.t().contiguous().view(*x_scale.shape)
     w_shuf = shuffle_weight(weight, layout=(16, 16))
 
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
@@ -253,7 +280,9 @@ def test_mx128_kernel_direct(kernel_name, m, n, k):
     ) as reduce:
         entry(xq, w_shuf, x_scale, w_scale, out, kernel_name)
     assert reduce.call_count == 0, f"{kernel_name}: sk1 launched a reduce kernel"
-    err = assertAllclose(ref, out.float(), msg=f"M={m} N={n} K={k} {kernel_name}: ")
+    err = assertAllclose(
+        ref, out.float(), tol_err_ratio=0, msg=f"M={m} N={n} K={k} {kernel_name}: "
+    )
 
     eager = out.clone()
     out.fill_(float("nan"))
@@ -290,7 +319,7 @@ def test_fused_splitk_whole_row_passes():
     flydsl_gemm.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         xq, shuffle_weight(weight, layout=(16, 16)), x_scale, w_scale, out, name
     )
-    assertAllclose(ref, out.float(), msg=f"{name}: ")
+    assertAllclose(ref, out.float(), tol_err_ratio=0, msg=f"{name}: ")
 
 
 def tuned_shapes():
@@ -303,26 +332,22 @@ def tuned_shapes():
 
 
 def test_untuned_fallback_pick():
-    """The pick for a shape without a tuned row: unfused, unsplit, fits the shape, lowest cost."""
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
-        kernel_fits_shape,
-    )
-    from aiter.ops.gemm_op_a8w8 import _flydsl_mxfp8_fallback_kernel
+    """Shapes without a tuned row keep the picks of main: the widened tuner candidates
+    must not reach the runtime fallback."""
+    from aiter.ops.gemm_op_a8w8 import _flydsl_mxfp8_fallback_kernel as pick
 
-    for m, n, k in (
-        (1, 1536, 7168),
-        (48, 6400, 7168),
-        (333, 4096, 1536),
-        (4097, 7168, 4224),
-        (20000, 2304, 1536),
+    w = "flydsl_mxfp8_128_bpreshuffle_wmma_"
+    c = "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_"
+    for m, n, k, mx32, apre, name in (  # (M, N, K, mx32, a_preshuffle, main's pick)
+        (1, 1536, 7168, False, False, w + "t16x512x256_mw1_nw4_nb2_sk1_cm1_cn1"),
+        (48, 6400, 7168, False, False, w + "t64x256x256_mw1_nw4_nb2_sk1_cm1_cn1"),
+        (4097, 7168, 1536, False, False, c + "cm1_cn4"),
+        (640, 7168, 2048, True, False, c + "cm1_cn4"),
+        (1024, 2176, 7168, False, True, w + "t256x128x256_mw2_nw2_nb2_sk1_cm1_cn1"),
     ):
-        ki = _flydsl_mxfp8_fallback_kernel(m, n, k)
-        assert ki is not None and kernel_fits_shape(ki, m, n, k), (m, n, k)
-        assert ki.split_k == 1 and not ki.fused_splitk, (m, n, k, ki.name)
-        # mx32 needs 32-aligned tiles and plain A; an odd M has no A-preshuffle pairing.
-        k32 = _flydsl_mxfp8_fallback_kernel(m, n, k, mx32=True)
-        assert k32 is None or (not k32.a_preshuffle and k32.tile_n % 32 == 0), (m, n, k)
-        assert _flydsl_mxfp8_fallback_kernel(m | 1, n, k, a_preshuffle=True) is None
+        ki = pick(m, n, k, a_preshuffle=apre, mx32=mx32)
+        assert ki is not None and ki.name == name, (m, n, k, mx32, apre, ki and ki.name)
+    assert pick(33, 1536, 7168, a_preshuffle=True) is None
 
 
 if __name__ == "__main__":
@@ -357,3 +382,6 @@ if __name__ == "__main__":
             ]
         )
         aiter.logger.info(f"fused split-K summary:\n{df.to_markdown(index=False)}")
+        for name, n, k in MX128_DIRECT_CASES:
+            for m in FUSED_SPLITK_M:
+                test_mx128_kernel_direct(name, m, n, k)

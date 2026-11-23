@@ -224,6 +224,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         raise ValueError(
             "quad_early applies to the generic mxscale quadrant kernel only"
         )
+    # Without the loop barrier, multicast loads could overwrite a peer's live buffer.
+    if no_loop_cbar and (compute_bound or cluster_m * cluster_n > 1):
+        raise ValueError(
+            "no_loop_cbar applies to the generic kernel with a 1x1 cluster"
+        )
     fuse_quant = y_scale_out is not None
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
@@ -492,9 +497,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
     constexpr_args = (*constexpr_args[:7], use_cluster, *constexpr_args[8:])
     if compute_bound:
-        # A launch of one workgroup is no cluster: it runs the plain kernel.
-        use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
-        specialization = (*constexpr_args[:7], use_cluster, *constexpr_args[8:]) + (
+        specialization = constexpr_args + (
             scale_block,
             split_k,
             a_preshuffle,
@@ -775,6 +778,9 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        c_pad=cfg["c_pad"],
+        quad_early=cfg["quad_early"],
+        no_loop_cbar=cfg["no_loop_cbar"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,

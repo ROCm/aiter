@@ -1703,16 +1703,13 @@ def _flydsl_mxfp8_fallback_kernel(
 ):
     """Best-effort gfx1250 mxfp8 kernel for a shape with no tuned row.
 
-    Picks the unfused, unsplit tile with the lowest ``waves * sqrt(tile area)`` (a compute
-    kernel counts 0.8x): fewer, bigger tiles while the CUs stay full. Ties go to the
-    (2, 4), (4, 2), (1, 2) clusters, then the larger tile_k, then more buffers.
-    ``mx32``: A scale is row-major 1x32 and B scale is 32x4 shuffled; tile_n must be a
-    multiple of 32.
+    ``mx32``: A scale is row-major 1x32 and B scale is 32x4 shuffled;
+    tile_n must be a multiple of 32.
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        fallback_kernels,
         is_compute_kernel,
         kernel_fits_shape,
-        kernels_list,
     )
 
     # A-preshuffle packs adjacent row pairs, so an odd M has no valid pairing.
@@ -1720,26 +1717,27 @@ def _flydsl_mxfp8_fallback_kernel(
         return None
     fits = [
         ki
-        for ki in kernels_list.values()
-        if ki.split_k == 1
-        and not ki.fused_splitk
-        and kernel_fits_shape(ki, m, n, k)
+        for ki in fallback_kernels()
+        if kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
     ]
     if not fits:
         return None
-    num_cu = get_cu_num() or 256
-    cluster_pref = ((2, 4), (4, 2), (1, 2))
-
-    def key(ki):
-        waves = -(-(-(-m // ki.tile_m) * -(-n // ki.tile_n)) // num_cu)
-        cost = waves * (ki.tile_m * ki.tile_n) ** 0.5
-        cost *= 0.8 if is_compute_kernel(ki) else 1.0
-        c = (ki.cluster_m, ki.cluster_n)
-        pref = cluster_pref.index(c) if c in cluster_pref else len(cluster_pref)
-        return (cost, pref, -ki.tile_k, -ki.num_buffers)
-
-    return min(fits, key=key)
+    want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+    compute = [ki for ki in fits if is_compute_kernel(ki)]
+    if compute:
+        return min(
+            compute,
+            key=lambda x: (
+                abs(x.tile_m - want_tm),
+                -(x.cluster_m * x.cluster_n),
+                x.split_k,
+                x.persistent_n_tiles,
+                -x.tile_n,
+                -x.num_buffers,
+            ),
+        )
+    return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
 
 
 def gemm_a8w8_blockscale_bpreshuffle_fake(

@@ -807,9 +807,8 @@ def launch_gemm_a8w8(
             return wt, None, None
 
         def _kstep(buf, sbuf, ks, cur, nxt_ks, prefetch_kt=None):
-            # The next sub-step's loads go out before this sub-step's WMMAs, so the waits below only
-            # cover loads that had a whole sub-step to land. With one A row (no _BACK rows) the next
-            # sub-step's A row is loaded ahead as well; with two the extra queue costs more than it hides.
+            # Issue the next sub-step's loads before this sub-step's WMMAs; with a single
+            # A row, prefetch the next A row too (with two, the longer queue costs more).
             state, act_f = cur
             wt, sb_k, sa_k = state
             if const_expr(act_f is None):
@@ -937,10 +936,9 @@ def launch_gemm_a8w8(
                     b_left, sb_k, sa_k = nxt_b_left, nxt_sb_k, nxt_sa_k
 
         def compute_ktile_quad_early(buf, sbuf, prefetch_kt):
-            # Opt-in (kernel name suffix _qe), mxscale quadrant schedule. The next sub-step's B and scale
-            # loads are issued before this sub-step's first block, after its A loads. Queue order is
-            # a_top, a_bot, b_right, next b_left, next scales; each wait counts only the newer loads that
-            # the following block does not need, so the next sub-step's loads overlap two blocks.
+            # _qe: issue the next sub-step's B and scale loads after this sub-step's A
+            # loads. Queue: a_top, a_bot, b_right, next b_left, next scales; each wait
+            # leaves only the loads the following block does not need.
             if const_expr(not is_mxscale):
                 raise ValueError(
                     "quad_early applies to the mxscale quadrant kernel only"
