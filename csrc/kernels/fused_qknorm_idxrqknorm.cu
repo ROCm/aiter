@@ -196,11 +196,26 @@ __device__ __forceinline__ uint2 roundPackElems(const float (&elems)[kElemsPerLa
     return packRawElems(v);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kSplitStore = false>
 __device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
                                            const float (&elems)[kElemsPerLane])
 {
-    *reinterpret_cast<uint2*>(dst) = roundPackElems<scalar_t>(elems);
+    const uint2 packed = roundPackElems<scalar_t>(elems);
+#if defined(__gfx1250__)
+    if constexpr(kSplitStore)
+    {
+        // Two 32-bit stores: with one 64-bit store per lane, the one-row non-insert kernel
+        // runs 0.3-0.7 us longer per call on gfx1250 (HIP graph, M <= 64). The compiler merges
+        // plain stores back into one 64-bit store; the empty asm, which takes the address
+        // as an operand and so may read dst, keeps them apart.
+        uint32_t* const words = reinterpret_cast<uint32_t*>(dst);
+        words[0] = packed.x;
+        asm volatile("" : : "v"(words) : "memory");
+        words[1] = packed.y;
+        return;
+    }
+#endif
+    *reinterpret_cast<uint2*>(dst) = packed;
 }
 
 // FP32 split-K partials of a bf16 qkv that a split-K GEMM left unreduced:
@@ -381,7 +396,7 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
 
 // index_q gather: qkv dtype, or unit-scale e4m3 (4787's q_idx contract; no scale tensor).
 // When neither gather buffer is provided, write the packed qkv index-Q row (inplace).
-template <typename scalar_t>
+template <typename scalar_t, bool kSplitStore = false>
 __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_out,
                                                  opus::fp8_t* __restrict__ index_q_fp8_out,
                                                  scalar_t* __restrict__ fallback_ptr,
@@ -400,11 +415,11 @@ __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_
     }
     else if(index_q_out != nullptr)
     {
-        storeElems(index_q_out + off, elems);
+        storeElems<scalar_t, kSplitStore>(index_q_out + off, elems);
     }
     else if(fallback_ptr != nullptr)
     {
-        storeElems(fallback_ptr, elems);
+        storeElems<scalar_t, kSplitStore>(fallback_ptr, elems);
     }
 }
 
@@ -1287,22 +1302,23 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         }
         else
         {
+            // No insert, one row per warp: two 32-bit row stores on gfx1250 (see storeElems).
             if constexpr(kProcessIndex)
             {
                 if(is_iq)
                 {
-                    storeIndexQElems(index_q_out,
-                                     index_q_fp8_out,
-                                     store_ptr + dim_base,
-                                     elems,
-                                     token_idx,
-                                     niq,
-                                     slot - iq_begin,
-                                     dim_base);
+                    storeIndexQElems<scalar_t, kRows == 1>(index_q_out,
+                                                           index_q_fp8_out,
+                                                           store_ptr + dim_base,
+                                                           elems,
+                                                           token_idx,
+                                                           niq,
+                                                           slot - iq_begin,
+                                                           dim_base);
                     return;
                 }
             }
-            storeElems(store_ptr + dim_base, elems);
+            storeElems<scalar_t, kRows == 1>(store_ptr + dim_base, elems);
         }
     };
 
