@@ -167,11 +167,11 @@ DEV buffer_desc_t make_buffer_desc(const void* p, int n = -1)
 // plain: X lines are reused by the WGs of all N groups.
 DEV v4i load_w16(buffer_desc_t d, int voff, int soff)
 {
-    return __builtin_amdgcn_raw_buffer_load_b128(d, voff, soff, 2);
+    return __builtin_bit_cast(v4i, __builtin_amdgcn_raw_buffer_load_b128(d, voff, soff, 2));
 }
 DEV v4i load_x16(buffer_desc_t d, int voff, int soff)
 {
-    return __builtin_amdgcn_raw_buffer_load_b128(d, voff, soff, 0);
+    return __builtin_bit_cast(v4i, __builtin_amdgcn_raw_buffer_load_b128(d, voff, soff, 0));
 }
 
 // Compile-time int argument.
@@ -461,13 +461,13 @@ load_scale_group(uint32_t (&dst)[N_PAIRS][NT], const Sources<NT>& s, const int (
             dst[p0][j] = __builtin_amdgcn_raw_buffer_load_b32(s.s_desc, lane_off, off, 2);
         else if constexpr(GPS == 2)
         {
-            const v2i t = __builtin_amdgcn_raw_buffer_load_b64(s.s_desc, lane_off, off, 2);
+            const auto t   = __builtin_amdgcn_raw_buffer_load_b64(s.s_desc, lane_off, off, 2);
             dst[p0][j]     = t[0];
             dst[p0 + 1][j] = t[1];
         }
         else if constexpr(GPS == 3)
         {
-            const v3i t = __builtin_amdgcn_raw_buffer_load_b96(s.s_desc, lane_off, off, 2);
+            const auto t = __builtin_amdgcn_raw_buffer_load_b96(s.s_desc, lane_off, off, 2);
 #pragma unroll
             for(int q = 0; q < 3; q++)
                 dst[p0 + q][j] = t[q];
@@ -475,7 +475,7 @@ load_scale_group(uint32_t (&dst)[N_PAIRS][NT], const Sources<NT>& s, const int (
         else
         {
             static_assert(GPS == 4, "GS 2, 4, 6 or 8");
-            const v4i t = __builtin_amdgcn_raw_buffer_load_b128(s.s_desc, lane_off, off, 2);
+            const auto t = __builtin_amdgcn_raw_buffer_load_b128(s.s_desc, lane_off, off, 2);
 #pragma unroll
             for(int q = 0; q < 4; q++)
                 dst[p0 + q][j] = t[q];

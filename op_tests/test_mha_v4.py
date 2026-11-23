@@ -22,6 +22,8 @@ import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    _K_SMOOTH_MIN_COMMON,
+    _K_SMOOTH_SAMPLE_ROWS,
     MHA_V4_BLOCK_SPARSE_MODES,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
@@ -50,6 +52,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP8_HD256_K_DATA_BYTES,
     MHA_V4_MXFP8_HD256_K_TILE_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
+    k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -766,6 +769,93 @@ def _mx_recipe_args(recipe):
         # MXFP8 rows are OCP E4M3 on every arch, and native_fp8_format() is FNUZ on gfx942.
         return (AttentionFormat.FP8_E4M3,) * 3, _MXFP8_SCALE_MODES
     return (_MX_RECIPE_FORMATS[recipe],) * 3, {}
+
+
+def _k_smooth_mean_reference(k):
+    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
+    sample = k[:, ::stride].float()
+    mean = sample.mean(dim=1)
+    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
+    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
+    return mean * gate.unsqueeze(-1)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 MHA v4 K smoothing",
+)
+@parametrize(
+    "batch,seq,heads,head_dim,misaligned",
+    [
+        (1, 100, 3, 128, False),
+        (2, 2048, 4, 256, False),
+        (1, 4096, 16, 256, False),
+        (1, 65536, 5, 128, False),
+        (1, 3000, 4, 128, True),
+    ],
+)
+def test_mha_v4_k_smooth_mean_matches_reference(
+    batch, seq, heads, head_dim, misaligned
+):
+    """The fused gate keeps the strided-sample definition, on a head-sliced (strided) K view."""
+    torch.manual_seed(5)
+    shape = (batch, seq, heads + 2, head_dim)
+    wide = torch.randn(shape, device="cuda")
+    direction = torch.randn((batch, 1, heads + 2, head_dim), device="cuda")
+    # Odd heads carry a dominant shared direction, so both gate outcomes run.
+    common = (torch.arange(heads + 2, device="cuda") % 2 * 16.0).view(1, 1, -1, 1)
+    wide = (wide + common * direction).to(torch.bfloat16)
+    if misaligned:
+        # One element of offset takes the rows off 16-byte alignment.
+        storage = torch.empty(wide.numel() + 1, device="cuda", dtype=torch.bfloat16)
+        storage[1:].view(shape).copy_(wide)
+        wide = storage[1:].view(shape)
+    k = wide[:, :, 1 : heads + 1]
+
+    expected = _k_smooth_mean_reference(k)
+    actual = _k_mean(k, _RawRecipeKind.FP8)
+
+    gated = expected.abs().amax(dim=-1) > 0
+    assert gated.any() and not gated.all(), "case must exercise both gate outcomes"
+    assert torch.equal(actual.abs().amax(dim=-1) > 0, gated)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950") or torch.cuda.device_count() < 2,
+    reason="gfx942/gfx950 MHA v4 K smoothing on two devices",
+)
+def test_mha_v4_k_smooth_mean_runs_on_k_device():
+    """K on another device than the current one, which has a side stream current."""
+    torch.manual_seed(5)
+    k = torch.randn((1, 2048, 4, 128), device="cuda:1").to(torch.bfloat16)
+    expected = _k_smooth_mean_reference(k)
+    with torch.cuda.device(0), torch.cuda.stream(torch.cuda.Stream(0)):
+        actual = _k_mean(k, _RawRecipeKind.FP8)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    assert actual.device == k.device
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 MHA v4 K smoothing",
+)
+def test_mha_v4_k_smooth_mean_rejects_unsupported_inputs():
+    """Arguments the HIP op would abort the process on raise instead."""
+    k = torch.zeros((1, 64, 2, 128), device="cuda", dtype=torch.bfloat16)
+    cases = [
+        (k.cpu(), _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k[0], _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k.float(), _K_SMOOTH_SAMPLE_ROWS, "BF16 or FP16 input"),
+        (k[..., :96], _K_SMOOTH_SAMPLE_ROWS, "head dimension 64, 128 or 256"),
+        (k[..., ::2], _K_SMOOTH_SAMPLE_ROWS, "contiguous last dimension"),
+        (k, 0, "positive sample_rows"),
+    ]
+    for bad, sample_rows, match in cases:
+        with expect_raises(ValueError, match=match):
+            k_smooth_mean(bad, sample_rows, _K_SMOOTH_MIN_COMMON)
 
 
 @skipif(
