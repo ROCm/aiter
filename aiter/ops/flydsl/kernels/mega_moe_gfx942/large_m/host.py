@@ -22,20 +22,20 @@ import torch
 
 from ..host import peer_table, symmetric
 from .comm import (
-    ARRIVED,
-    E_LOCAL,
     NPES,
-    PLAN_INTS,
     ROW_BITS,
     SCHED_EXPECTED,
     ep_finish,
     ep_plan,
     ep_prep,
+    layout,
 )
 from .gateup import OOB_OFFSET, SORT_BLOCK_M
 from .mega import ep_mega
 
-_MODEL_DIM, _INTER_DIM, _MAX_TOPK = 4096, 2048, 8
+# (H, I, experts) of the layers the mega kernel runs: DeepSeek-V4-Flash / MiMo-V2.6-Flash and DeepSeek-V4.1-Flash.
+_LAYERS = ((4096, 2048, 256), (5120, 2304, 384))
+_MAX_TOPK = 8
 # Producer workgroups of the mega kernel and the units Down lags GateUp by. On DSV4-Flash (8x MI300X, cold weights)
 # 32 producers are 3-5% faster at 512 tokens per rank and 2-4% slower at 8192 and all-to-one; lag 1 or 3 is within
 # 1.5% of 2.
@@ -43,13 +43,13 @@ _PRODUCERS, _LAG = 16, 2
 
 
 def eligible(*, world_size, model_dim, inter_dim, experts, topk, act="silu"):
-    """Whether the mega kernel runs the layer: gfx942, EP8 x 32 local experts, H 4096, I 2048, top-k <= 8, silu."""
+    """Whether the mega kernel runs the layer: gfx942, EP8, one of _LAYERS, top-k <= 8, silu."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return (
         get_gfx_runtime() == "gfx942"
-        and (world_size, model_dim, inter_dim, experts)
-        == (NPES, _MODEL_DIM, _INTER_DIM, NPES * E_LOCAL)
+        and world_size == NPES
+        and (model_dim, inter_dim, experts) in _LAYERS
         and 0 < topk <= _MAX_TOPK
         and act == "silu"
     )
@@ -60,7 +60,7 @@ def _on(stream):
 
 
 class LargeMRuntime:
-    """One rank's EP8 MoE layer (32 local experts) on the LDS mega kernel."""
+    """One rank's EP8 MoE layer on the LDS mega kernel."""
 
     def __init__(
         self,
@@ -101,13 +101,15 @@ class LargeMRuntime:
         import aiter
 
         self.rank, self.world, self.topk, self.experts = rank, world_size, topk, experts
+        self.e_local = e_local = experts // world_size
+        o = layout(e_local)
         self.hidden, self.inter = model_dim, inter_dim
         self.swiglu_limit = float(swiglu_limit)
         self.wq = wq
         self.token_shift = max(int(max_tok_per_rank - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
         # Every route of every rank to this rank, plus one partial block per local expert.
-        rows = world_size * self.tcap * topk + E_LOCAL * SORT_BLOCK_M
+        rows = world_size * self.tcap * topk + e_local * SORT_BLOCK_M
         self.s_cap = -(-rows // SORT_BLOCK_M) * SORT_BLOCK_M
         # send_info's row field, and the buffer descriptors: a masked lane's OOB_OFFSET must stay out of range.
         if self.s_cap > 1 << ROW_BITS or self.s_cap * model_dim >= OOB_OFFSET:
@@ -126,7 +128,7 @@ class LargeMRuntime:
         self.recv_scale = symmetric((S, H // 128), torch.float32)
         self.down_ids = symmetric((S,), torch.int32)
         self.recv_w = symmetric((S,), torch.float32)
-        self.ws = symmetric((ARRIVED + S // SORT_BLOCK_M,), torch.int32)
+        self.ws = symmetric((o["ARRIVED"] + S // SORT_BLOCK_M,), torch.int32)
         self.out = symmetric((self.tcap, H), torch.bfloat16)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -140,14 +142,14 @@ class LargeMRuntime:
 
         routes = self.tcap * topk
         self.route_idx = zeros(routes)
-        self.send_base = zeros(NPES * E_LOCAL)
+        self.send_base = zeros(experts)
         self.gu_ids = zeros(S)
         self.expert_ids = zeros(S // SORT_BLOCK_M)
         self.num_valid = zeros(1)
         self.status = zeros(1)
         self.send_route = zeros(routes)
         self.send_info = zeros(routes)
-        self.plan = zeros(PLAN_INTS)
+        self.plan = zeros(o["PLAN_INTS"])
         self.sched = zeros(SCHED_EXPECTED + 3 * (S // SORT_BLOCK_M))
         # The call epoch (ep_prep and ep_finish use epoch[0] + 1; ep_finish stores it).
         self.epoch = zeros(1)
@@ -161,24 +163,24 @@ class LargeMRuntime:
             self.bind_weights(w1, w1_scale, w2, w2_scale)
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale):
-        """This rank's experts: w1 [32, 2I, H] / w2 [32, H, I] FP8 (float8_e4m3fnuz) in aiter's
-        shuffle_weight(layout=(16, 16)) form, gate rows before up rows; w1_scale [32, 2I/128, H/128] and
-        w2_scale [32, H/128, I/128] FP32 dequant scales of the 128x128 blocks.
-        wq "fp4": a8w4's prepare_weights output instead, w1 [32, 2I, H/2] / w2 [32, H, I/2] bytes and
-        w1_scale [32 * 2I * (H/32 + 4)] / w2_scale [32 * H * (I/32 + 4)] bytes."""
-        H, I = self.hidden, self.inter
+        """This rank's experts: w1 [E, 2I, H] / w2 [E, H, I] FP8 (float8_e4m3fnuz) in aiter's
+        shuffle_weight(layout=(16, 16)) form, gate rows before up rows; w1_scale [E, 2I/128, H/128] and
+        w2_scale [E, H/128, I/128] FP32 dequant scales of the 128x128 blocks (E: experts per rank).
+        wq "fp4": a8w4's prepare_weights output instead, w1 [E, 2I, H/2] / w2 [E, H, I/2] bytes and
+        w1_scale [E * 2I * (H/32 + 4)] / w2_scale [E * H * (I/32 + 4)] bytes."""
+        H, I, E = self.hidden, self.inter, self.e_local
         expect = {
-            "w1": (w1, (E_LOCAL, 2 * I, H), torch.float8_e4m3fnuz),
-            "w1_scale": (w1_scale, (E_LOCAL, 2 * I // 128, H // 128), torch.float32),
-            "w2": (w2, (E_LOCAL, H, I), torch.float8_e4m3fnuz),
-            "w2_scale": (w2_scale, (E_LOCAL, H // 128, I // 128), torch.float32),
+            "w1": (w1, (E, 2 * I, H), torch.float8_e4m3fnuz),
+            "w1_scale": (w1_scale, (E, 2 * I // 128, H // 128), torch.float32),
+            "w2": (w2, (E, H, I), torch.float8_e4m3fnuz),
+            "w2_scale": (w2_scale, (E, H // 128, I // 128), torch.float32),
         }
         if self.wq == "fp4":
             expect = {
-                "w1": (w1, (E_LOCAL, 2 * I, H // 2), None),
-                "w1_scale": (w1_scale, (E_LOCAL * 2 * I * (H // 32 + 4),), None),
-                "w2": (w2, (E_LOCAL, H, I // 2), None),
-                "w2_scale": (w2_scale, (E_LOCAL * H * (I // 32 + 4),), None),
+                "w1": (w1, (E, 2 * I, H // 2), None),
+                "w1_scale": (w1_scale, (E * 2 * I * (H // 32 + 4),), None),
+                "w2": (w2, (E, H, I // 2), None),
+                "w2_scale": (w2_scale, (E * H * (I // 32 + 4),), None),
             }
         for name, (t, shape, dtype) in expect.items():
             if (
@@ -265,6 +267,7 @@ class LargeMRuntime:
         out.zero_()
         routes = T * self.topk
         ep_prep(
+            self.e_local,
             ids,
             routes,
             self.rank,
@@ -280,6 +283,7 @@ class LargeMRuntime:
             self.plan,
         )
         ep_plan(
+            self.e_local,
             self.slices,
             ids,
             self.route_idx,
@@ -296,7 +300,7 @@ class LargeMRuntime:
             self.sched,
         )
         ep_mega(self, x_q, x_scale, w, _PRODUCERS, _LAG)
-        ep_finish(self.rank, self.epoch, self.ws, t["ws"])
+        ep_finish(self.e_local, self.rank, self.epoch, self.ws, t["ws"])
         return out
 
     def rows_needed(self):

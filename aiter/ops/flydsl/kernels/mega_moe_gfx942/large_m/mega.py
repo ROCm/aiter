@@ -32,7 +32,7 @@ from ..atomic import _atomic_add_at, _atomic_load_at, _latomic_add, _xcc_id
 from ..host import launcher
 from ..hw import _readlane
 from ..hw import _u as _uniform
-from .comm import ARRIVED, E_LOCAL, NPES, ROW_BITS, SCHED_EXPECTED
+from .comm import NPES, ROW_BITS, SCHED_EXPECTED, layout
 from .down import down_task_emitter
 from .gateup import (
     OOB_OFFSET,
@@ -57,9 +57,17 @@ QUEUES = 8
 
 
 def compile_ep_mega(
-    hidden_dim, inter_dim, topk, token_shift, producers, lag, swiglu_limit=0.0, wq="fp8"
+    hidden_dim,
+    inter_dim,
+    topk,
+    e_local,
+    token_shift,
+    producers,
+    lag,
+    swiglu_limit=0.0,
+    wq="fp8",
 ):
-    """The mega kernel's launcher. lag counts units (block pairs) of one queue.
+    """The mega kernel's launcher. lag counts units (block pairs) of one queue; e_local: experts per rank.
 
     One task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a workgroup whose
     queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks, block pairs' tasks
@@ -72,21 +80,25 @@ def compile_ep_mega(
     GateUp and Down skip the MFMAs of a block's 64-row packets past its valid rows (see the emitters).
     swiglu_limit > 0: the GateUp activation clamps gate and up (see gateup_task_emitter).
     wq: "fp8" weights, or "fp4": a8w4's prepare_weights (fd2) output, decoded to FP8 in the loaders.
-    topk need not be a power of two: the producers then divide a route index by it instead of shifting.
+    topk need not be a power of two: the producers then divide a route index by it instead of shifting (likewise
+    a global expert id by e_local).
     """
     H, I = hidden_dim, inter_dim
     # A closure value: FlyDSL's cache key holds closure scalars but not the module globals that nested functions read,
     # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
     row_bits = ROW_BITS
+    ARRIVED = layout(e_local)["ARRIVED"]
     KB = H // 128
-    gateup = gateup_task_emitter(I, H, topk, E_LOCAL, float(swiglu_limit), wq)
-    down = down_task_emitter(H, I, topk, E_LOCAL, token_shift, wq)
+    gateup = gateup_task_emitter(I, H, topk, e_local, float(swiglu_limit), wq)
+    down = down_task_emitter(H, I, topk, e_local, token_shift, wq)
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
     NG, ND = gateup.n_tiles, down.n_tiles
     unit = NG + ND
     topk_shift = topk.bit_length() - 1
     topk_pow2 = 1 << topk_shift == topk
+    e_shift = e_local.bit_length() - 1
+    e_pow2 = 1 << e_shift == e_local
     assert 0 < topk <= 8 and H % 1024 == 0 and H // 128 * 4 <= 16 * 64
     # The transpose: each thread copies half a row's scales with dwordx4 loads.
     assert KB % 8 == 0
@@ -256,6 +268,12 @@ def compile_ep_mega(
                 token = fx.Int32(fx.Uint32(route) // topk)
                 return token, route - token * topk
 
+            def expert_rank(expert):
+                """Rank holding global expert `expert` (garbage for an id < 0)."""
+                if const_expr(e_pow2):
+                    return expert >> e_shift
+                return fx.Int32(fx.Uint32(expert) // e_local)
+
             # The send list is sorted by when the destinations' queues need the routes. Producer workgroup `index`
             # sends its chunks index, index + producers, ... of CHUNK routes, its waves taking the next one from a
             # counter in LDS word 2 (after the ticket slots): all producers send the earliest blocks first, and a
@@ -321,7 +339,7 @@ def compile_ep_mega(
                     )
                 for route, info, ok, token, slot, data, scales, weight in pending:
                     row = info & ((1 << row_bits) - 1)
-                    dest = ok.select(info >> (row_bits + 5), fx.Int32(0))
+                    dest = ok.select(expert_rank(info >> row_bits), fx.Int32(0))
                     a_dst = peer_rsrc(0, dest, rows_cap * H)
                     for part in range_constexpr(H // 1024):
                         buffer_store(
@@ -354,7 +372,7 @@ def compile_ep_mega(
                     )
                 rocdl.s_waitcnt(vmcnt=0)
                 expert = infos >> row_bits
-                source = (expert >> 5) & (NPES - 1)
+                source = expert_rank(expert) & (NPES - 1)
                 ws_lo, ws_hi = [
                     fx.Uint32(fx.gpu.shuffle_idx(half, source, 64)) for half in bases[4]
                 ]
@@ -777,6 +795,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         hidden_dim=op.hidden,
         inter_dim=op.inter,
         topk=op.topk,
+        e_local=op.e_local,
         token_shift=op.token_shift,
         producers=producers,
         lag=lag,

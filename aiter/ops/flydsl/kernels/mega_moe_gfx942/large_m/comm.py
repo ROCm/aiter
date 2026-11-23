@@ -27,50 +27,57 @@ from ..mem import _pointer
 from .util import _load_i32, _rsrc_of
 
 NPES = 8
-E_LOCAL = 32
-E_GLOBAL = NPES * E_LOCAL
 BLOCK_M = 256
-CFLAG = NPES * E_GLOBAL
-DFLAG = CFLAG + NPES
-FFLAG = DFLAG + NPES
-ARRIVED = FFLAG + NPES
 SCHED_EXPECTED = 16
 # Send-order keys: a route's block position in its destination's queue (the last key: later or dropped).
 MAX_KEYS = 64
 # Routes per thread with their loads issued together (ep_prep); ep_plan slices of up to 256 * SLICE_PER_THREAD.
 ROUTE_BATCH = 8
 SLICE_PER_THREAD = 4
-# ep_prep -> ep_plan tables (int32): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert bases
-# [E_GLOBAL + NPES], first block of each destination's 8 mega-kernel queues and its block count [NPES][9], first send
-# position of each key [MAX_KEYS], and the per-key cursors ep_plan's workgroups reserve their ranges with [MAX_KEYS].
 PLAN_TOTAL = 0
-PLAN_MIN = E_GLOBAL
-PLAN_BASE = 2 * E_GLOBAL
-PLAN_QSTART = 3 * E_GLOBAL + NPES
-PLAN_KEY_BASE = PLAN_QSTART + NPES * 9
-PLAN_KEY_CURSOR = PLAN_KEY_BASE + MAX_KEYS
-PLAN_INTS = PLAN_KEY_CURSOR + MAX_KEYS
 # send_info: destination row in bits [0, 19), global expert above.
 ROW_BITS = 19
 
 PREP_THREADS = 1024
 PLAN_THREADS = 256
 FINISH_THREADS = 64
-# ep_prep's LDS (int32): its own route counts, all count rows, expert bases (+ rows per destination), this rank's rows
-# before its own per expert, totals, fewest per source, queue starts, routes per send key.
-P_HIST = 0
-P_COUNTS = P_HIST + E_GLOBAL
-P_BASE = P_COUNTS + NPES * E_GLOBAL
-P_SBASE = P_BASE + E_GLOBAL + NPES
-P_TOTAL = P_SBASE + E_GLOBAL
-P_MIN = P_TOTAL + E_GLOBAL
-P_QSTART = P_MIN + E_GLOBAL
-P_KEY_HIST = P_QSTART + NPES * 9
-P_INTS = P_KEY_HIST + MAX_KEYS
-# ep_plan's LDS (int32): the plan tables, then routes and first send position per key of this workgroup.
-L_KEY_COUNT = PLAN_INTS
-L_KEY_NEXT = L_KEY_COUNT + MAX_KEYS
-L_INTS = L_KEY_NEXT + MAX_KEYS
+
+
+def layout(E_LOCAL):
+    """The int32 offsets of the buffers with E_LOCAL experts per rank (E_GLOBAL = NPES * E_LOCAL):
+    ws: counts [NPES][E_GLOBAL], flags CFLAG / DFLAG / FFLAG [NPES] each, ARRIVED [blocks].
+    ep_prep -> ep_plan tables (PLAN_INTS): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert
+    bases [E_GLOBAL + NPES], first block of each destination's 8 mega-kernel queues and its block count [NPES][9],
+    first send position of each key [MAX_KEYS], and the per-key cursors ep_plan's workgroups reserve their ranges
+    with [MAX_KEYS].
+    ep_prep's LDS (P_INTS): its own route counts, all count rows, expert bases (+ rows per destination), this rank's
+    rows before its own per expert, totals, fewest per source, queue starts, routes per send key.
+    ep_plan's LDS (L_INTS): the plan tables, then routes and first send position per key of this workgroup.
+    """
+    E_GLOBAL = NPES * E_LOCAL
+    o = {"E_GLOBAL": E_GLOBAL, "CFLAG": NPES * E_GLOBAL}
+    o["DFLAG"] = o["CFLAG"] + NPES
+    o["FFLAG"] = o["DFLAG"] + NPES
+    o["ARRIVED"] = o["FFLAG"] + NPES
+    o["PLAN_MIN"] = E_GLOBAL
+    o["PLAN_BASE"] = 2 * E_GLOBAL
+    o["PLAN_QSTART"] = 3 * E_GLOBAL + NPES
+    o["PLAN_KEY_BASE"] = o["PLAN_QSTART"] + NPES * 9
+    o["PLAN_KEY_CURSOR"] = o["PLAN_KEY_BASE"] + MAX_KEYS
+    o["PLAN_INTS"] = o["PLAN_KEY_CURSOR"] + MAX_KEYS
+    o["P_HIST"] = 0
+    o["P_COUNTS"] = E_GLOBAL
+    o["P_BASE"] = o["P_COUNTS"] + NPES * E_GLOBAL
+    o["P_SBASE"] = o["P_BASE"] + E_GLOBAL + NPES
+    o["P_TOTAL"] = o["P_SBASE"] + E_GLOBAL
+    o["P_MIN"] = o["P_TOTAL"] + E_GLOBAL
+    o["P_QSTART"] = o["P_MIN"] + E_GLOBAL
+    o["P_KEY_HIST"] = o["P_QSTART"] + NPES * 9
+    o["P_INTS"] = o["P_KEY_HIST"] + MAX_KEYS
+    o["L_KEY_COUNT"] = o["PLAN_INTS"]
+    o["L_KEY_NEXT"] = o["L_KEY_COUNT"] + MAX_KEYS
+    o["L_INTS"] = o["L_KEY_NEXT"] + MAX_KEYS
+    return o
 
 
 def _addr(ptr, index, elem_bytes=4):
@@ -169,34 +176,40 @@ def _signal_and_wait(ws_peers, ws, flag, me, epoch, peer):
     _wait_eq_sys(_addr(ws, flag + peer), epoch)
 
 
-def _valid_expert(g):
+def _valid_expert(g, E_GLOBAL):
     """Whether global expert id g routes anywhere (padding rows and slots carry ids outside [0, E_GLOBAL))."""
     return (g >= 0) & (g < E_GLOBAL)
 
 
-@flyc.jit
-def _mega_row(g, idx, me, fewest, base, lds=None, ws=None):
-    """Mega-kernel row of this rank's idx-th route to global expert g: source s's i-th route sits at virtual position
-    8 i + s (compacted where sources run out). Counts [NPES][E_GLOBAL] from LDS (ep_prep) or the workspace (ep_plan);
-    fewest and base are expert g's."""
-    pos = idx * NPES + me
-    if idx >= fewest:
-        pos = fx.Int32(0)
-        for s in range_constexpr(NPES):
-            if const_expr(lds is None):
-                c = _load(_addr(ws, s * E_GLOBAL + g))
-            else:
-                c = _lds_load(lds, P_COUNTS + s * E_GLOBAL + g)
-            k = idx + (me > s).select(fx.Int32(1), fx.Int32(0))
-            pos = pos + _min(c, k)
-    return base + pos
+def _mega_row_fn(E_GLOBAL, P_COUNTS):
+    """_mega_row for E_GLOBAL experts (P_COUNTS: ep_prep's LDS count rows)."""
+
+    @flyc.jit
+    def _mega_row(g, idx, me, fewest, base, lds=None, ws=None):
+        """Mega-kernel row of this rank's idx-th route to global expert g: source s's i-th route sits at virtual
+        position 8 i + s (compacted where sources run out). Counts [NPES][E_GLOBAL] from LDS (ep_prep) or the
+        workspace (ep_plan); fewest and base are expert g's."""
+        pos = idx * NPES + me
+        if idx >= fewest:
+            pos = fx.Int32(0)
+            for s in range_constexpr(NPES):
+                if const_expr(lds is None):
+                    c = _load(_addr(ws, s * E_GLOBAL + g))
+                else:
+                    c = _lds_load(lds, P_COUNTS + s * E_GLOBAL + g)
+                k = idx + (me > s).select(fx.Int32(1), fx.Int32(0))
+                pos = pos + _min(c, k)
+        return base + pos
+
+    return _mega_row
 
 
-def _route_key(g, row, s_cap, lds, qstart):
+def _route_key(g, row, s_cap, lds, qstart, E_LOCAL):
     """Send-order key of a route to `row` of global expert g: the block's position in its destination's queue (the
     [NPES][9] queue starts at LDS element `qstart`); MAX_KEYS - 1 for later positions and dropped routes.
     """
-    qs = qstart + _div_pow2(g, E_LOCAL) * 9
+    dest = _div_pow2(g, E_LOCAL) if E_LOCAL & (E_LOCAL - 1) == 0 else g // E_LOCAL
+    qs = qstart + dest * 9
     block = _div_pow2(row, BLOCK_M)
     q = (block >= _lds_load(lds, qs + 4)).select(fx.Int32(4), fx.Int32(0))
     q = q + (block >= _lds_load(lds, qs + q + 2)).select(fx.Int32(2), fx.Int32(0))
@@ -205,7 +218,7 @@ def _route_key(g, row, s_cap, lds, qstart):
     return (row >= s_cap).select(fx.Int32(MAX_KEYS - 1), key)
 
 
-def _compile_ep_prep():
+def _compile_ep_prep(E_LOCAL):
     """One workgroup of 1024 threads per rank: count exchange and plan tables (ep_plan then plans the routes).
     route_idx [T*TOPK]: rank of each route among this rank's routes to its global expert (unset for no route).
     send_base [E_GLOBAL]: first destination row of this rank's routes to each global expert.
@@ -213,6 +226,26 @@ def _compile_ep_prep():
     status [1]: rows needed by this rank (for the capacity check).
     plan [PLAN_INTS]: tables for ep_plan.
     epoch [1]: this call's epoch is epoch[0] + 1 (ep_finish stores it)."""
+    o = layout(E_LOCAL)
+    E_GLOBAL, CFLAG, ARRIVED = o["E_GLOBAL"], o["CFLAG"], o["ARRIVED"]
+    PLAN_MIN, PLAN_BASE, PLAN_QSTART = o["PLAN_MIN"], o["PLAN_BASE"], o["PLAN_QSTART"]
+    PLAN_KEY_BASE, PLAN_KEY_CURSOR = o["PLAN_KEY_BASE"], o["PLAN_KEY_CURSOR"]
+    P_HIST, P_COUNTS, P_BASE, P_SBASE = (
+        o["P_HIST"],
+        o["P_COUNTS"],
+        o["P_BASE"],
+        o["P_SBASE"],
+    )
+    P_TOTAL, P_MIN, P_QSTART, P_KEY_HIST = (
+        o["P_TOTAL"],
+        o["P_MIN"],
+        o["P_QSTART"],
+        o["P_KEY_HIST"],
+    )
+    P_INTS = o["P_INTS"]
+    # A thread per global expert; the count rows in whole passes of the workgroup.
+    assert E_GLOBAL + NPES <= PREP_THREADS and NPES * E_GLOBAL % PREP_THREADS == 0
+    _mega_row = _mega_row_fn(E_GLOBAL, P_COUNTS)
 
     @fx.struct
     class Shared:
@@ -254,7 +287,7 @@ def _compile_ep_prep():
             ]
             for j in range_constexpr(ROUTE_BATCH):
                 r = first + j * PREP_THREADS
-                if (r < num_routes) & _valid_expert(experts[j]):
+                if (r < num_routes) & _valid_expert(experts[j], E_GLOBAL):
                     _store(_addr(pRouteIdx, r), _lds_add(lds, P_HIST + experts[j], 1))
         _sync_threads()
         for j in range_constexpr(NPES * E_GLOBAL // PREP_THREADS):
@@ -356,7 +389,7 @@ def _compile_ep_prep():
                 hi = _min(hi, n_g)
                 _lds_add(
                     lds,
-                    P_KEY_HIST + _route_key(tid, row, s_cap, lds, P_QSTART),
+                    P_KEY_HIST + _route_key(tid, row, s_cap, lds, P_QSTART, E_LOCAL),
                     hi - lo,
                 )
                 lo = hi
@@ -406,7 +439,7 @@ def _compile_ep_prep():
     return launch
 
 
-def _compile_ep_plan():
+def _compile_ep_plan(E_LOCAL):
     """Routing plan, one workgroup of 256 threads per slice of this rank's routes:
     send_route / send_info [T*TOPK]: all routes sorted by when the destinations' mega-kernel queues need them (block
     position in the queue, the send key): workgroup j places the routes of slice j at their key's base (ep_prep) plus
@@ -418,6 +451,12 @@ def _compile_ep_plan():
     down_ids [s_cap] (symmetric, local view): padding rows set to -1 here; producers fill the valid rows.
     Mega-kernel rows of an expert interleave the sources (_mega_row), so every block holds about 32 routes of each
     source and the first blocks of all queues load all senders evenly."""
+    o = layout(E_LOCAL)
+    E_GLOBAL, PLAN_MIN, PLAN_BASE = o["E_GLOBAL"], o["PLAN_MIN"], o["PLAN_BASE"]
+    PLAN_QSTART, PLAN_KEY_BASE = o["PLAN_QSTART"], o["PLAN_KEY_BASE"]
+    PLAN_KEY_CURSOR, PLAN_INTS = o["PLAN_KEY_CURSOR"], o["PLAN_INTS"]
+    L_KEY_COUNT, L_KEY_NEXT, L_INTS = o["L_KEY_COUNT"], o["L_KEY_NEXT"], o["L_INTS"]
+    _mega_row = _mega_row_fn(E_GLOBAL, o["P_COUNTS"])
 
     @fx.struct
     class Shared:
@@ -463,7 +502,7 @@ def _compile_ep_plan():
                 g = _load(_addr(pTopkIds, route))
                 info = fx.Int32(-1)
                 key = fx.Int32(MAX_KEYS - 1)
-                if _valid_expert(g):
+                if _valid_expert(g, E_GLOBAL):
                     row = _mega_row(
                         g,
                         _load(_addr(pRouteIdx, route)),
@@ -473,7 +512,7 @@ def _compile_ep_plan():
                         ws=pWs,
                     )
                     info = (row < s_cap).select(row | (g << ROW_BITS), fx.Int32(-1))
-                    key = _route_key(g, row, s_cap, lds, PLAN_QSTART)
+                    key = _route_key(g, row, s_cap, lds, PLAN_QSTART, E_LOCAL)
                 rank = _lds_add(lds, L_KEY_COUNT + key, 1)
             routes.append(route)
             infos.append(info)
@@ -557,9 +596,10 @@ def _compile_ep_plan():
     return launch
 
 
-def _compile_ep_finish():
+def _compile_ep_finish(E_LOCAL):
     """After Down (same stream): tell every rank this rank's remote adds are done, wait for all ranks, then store
     this call's epoch (epoch[0] + 1) for the next call."""
+    FFLAG = layout(E_LOCAL)["FFLAG"]
 
     @flyc.kernel(known_block_size=[FINISH_THREADS, 1, 1])
     def ep_finish_kernel(
@@ -594,6 +634,7 @@ def _ptr(tensor):
 
 
 def ep_prep(
+    e_local,
     topk_ids,
     num_routes,
     me,
@@ -608,9 +649,9 @@ def ep_prep(
     sched,
     plan,
 ):
-    """epoch: the int32 [1] epoch buffer (device memory)."""
+    """e_local: experts per rank; epoch: the int32 [1] epoch buffer (device memory)."""
     _run_compiled(
-        launcher(_compile_ep_prep, topk_ids.device.index),
+        launcher(_compile_ep_prep, topk_ids.device.index, E_LOCAL=e_local),
         _ptr(topk_ids),
         _ptr(route_idx),
         _ptr(ws),
@@ -629,6 +670,7 @@ def ep_prep(
 
 
 def ep_plan(
+    e_local,
     num_slices,
     topk_ids,
     route_idx,
@@ -645,7 +687,7 @@ def ep_plan(
     sched,
 ):
     _run_compiled(
-        launcher(_compile_ep_plan, topk_ids.device.index),
+        launcher(_compile_ep_plan, topk_ids.device.index, E_LOCAL=e_local),
         _ptr(topk_ids),
         _ptr(route_idx),
         _ptr(plan),
@@ -664,10 +706,10 @@ def ep_plan(
     )
 
 
-def ep_finish(me, epoch, ws, ws_peers):
+def ep_finish(e_local, me, epoch, ws, ws_peers):
     """epoch: the int32 [1] epoch buffer ep_prep read; advanced here."""
     _run_compiled(
-        launcher(_compile_ep_finish, epoch.device.index),
+        launcher(_compile_ep_finish, epoch.device.index, E_LOCAL=e_local),
         _ptr(ws),
         _ptr(ws_peers),
         _ptr(epoch),

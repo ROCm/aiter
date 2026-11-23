@@ -14,8 +14,7 @@ nothing).
 DeepSeek-V4.1-Flash (H 5120, I 2304, 384 experts, top-6, silu with swiglu_limit 10),
 MiMo-V2.6-Flash (H 4096, I 2048, 256 experts, top-8, silu) or Kimi-K3 (routed experts
 in its 3584-wide latent space: H 3584, I 3072, 896 experts, top-16, SiTUv2 with beta 4
-and linear_beta 25). A layer that ``eligible()`` does not take is skipped, and so is a
-path the layer does not run (DeepSeek-V4.1-Flash: large_M).
+and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
 
 - test_mega_moe_gfx942: every path (main and large_M, each also on x quantized
   beforehand by aiter's per_1x128 quant ("main pq", "large pq", timed with that quant),
@@ -366,9 +365,7 @@ def test_mega_moe_gfx942(tokens, graph):
     seed = _STATE["case"] = _STATE.get("case", 0) + 2
     inputs = _make_inputs(tokens, rank, seed)
     stale = _make_inputs(tokens, rank, seed + 1, padding=False)
-    paths = ["main", "main pq"]
-    if layers["large"].large_m_available:
-        paths += ["large", "large pq"]
+    paths = ["main", "main pq", "large", "large pq"]
     # small_M takes decode batches only.
     if max(tokens) <= layers["large"].small_m_mtpr:
         paths.append("small")
@@ -384,9 +381,7 @@ def test_mega_moe_gfx942_capacity(mtpr, routing):
     seed = _STATE["case"] = _STATE.get("case", 0) + 2
     inputs = _make_inputs(tokens, rank, seed, routing, padding=False)
     stale = _make_inputs(tokens, rank, seed + 1, padding=False)
-    paths = ["main"] + (
-        ["large"] if _STATE["layers"]["large"].large_m_available else []
-    )
+    paths = ["main", "large"]
     return _run_paths(tokens, paths, inputs, stale, False, {"gfx": get_gfx_runtime()})
 
 

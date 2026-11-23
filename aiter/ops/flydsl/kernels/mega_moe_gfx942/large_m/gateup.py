@@ -96,8 +96,10 @@ def gateup_task_emitter(
     I, K = inter_dim, hidden_dim
     KB = K // TILE_K
     assert (
-        2 * KB <= 64
-    ), "B scales of all K blocks must fit in one VGPR (hidden_dim <= 4096)"
+        KB <= 64
+    ), "B scales of a side's K blocks must fit in one VGPR (hidden_dim <= 8192)"
+    # fp8 B scales: both sides in one VGPR (lane side * KB + K block) when they fit, else one VGPR per side.
+    split_scale_b = 2 * KB > 64
     n_tiles = I // TILE_N
     b_k_bytes = TILE_K * 16
     scale_rows_b = 2 * I // 128
@@ -223,9 +225,24 @@ def gateup_task_emitter(
             )
 
             def task_scale_b(expert, n_tile):
-                """B scale of (side, K block) in lane side * KB + block."""
+                """B scale of (side, K block) in lane side * KB + block (split_scale_b: [side] in lane block)."""
                 scale_lane = tid % 64
                 gate_scale_row = expert * scale_rows_b + n_tile
+                if const_expr(split_scale_b):
+                    return [
+                        fx.Float32(
+                            buffer_load(
+                                T.f32,
+                                scale_b_rsrc,
+                                (scale_lane < KB).select(
+                                    (gate_scale_row + side * (I // 128)) * (KB * 4)
+                                    + scale_lane * 4,
+                                    fx.Int32(OOB_OFFSET),
+                                ),
+                            )
+                        )
+                        for side in range_constexpr(2)
+                    ]
                 scale_side = scale_lane // KB
                 scale_b_offset = (gate_scale_row + scale_side * (I // 128)) * (
                     KB * 4
@@ -349,6 +366,8 @@ def gateup_task_emitter(
                 def scale_b(side, k_block):
                     if const_expr(FP4):  # folded into the decode and the epilogue
                         return fx.Float32(1.0)
+                    if const_expr(split_scale_b):
+                        return readlane_f32(sb_lanes[side], k_block)
                     return readlane_f32(sb_lanes, fx.Int32(side * KB) + k_block)
 
                 return SimpleNamespace(
