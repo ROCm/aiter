@@ -3,10 +3,9 @@
 
 """gfx942 EP8 MoE communication kernels of the mega MoE: routing plan + count exchange (ep_prep, ep_plan) and
 the combine completion barrier (ep_finish). Peers are MORI symmetric-heap buffers, passed as int64 tables of their
-addresses. From pyhip contrib/flydsl/ep_moe_comm_gfx942.py (branch luwei/942-fp8-megamoe) with two changes:
-- the call epoch lives in device memory (`epoch` [1], local int32): ep_prep and ep_finish use epoch[0] + 1 and
-  ep_finish stores it, so the calls can be captured in a CUDA graph (it was a host argument);
-- routes whose expert id is out of [0, E_GLOBAL) are not routed (padding rows and slots, idle ranks).
+addresses. The call epoch lives in device memory (`epoch` [1], local int32): ep_prep and ep_finish use epoch[0] + 1
+and ep_finish stores it, so the calls can be captured in a CUDA graph. Routes whose expert id is out of
+[0, E_GLOBAL) are not routed (padding rows and slots, idle ranks).
 
 Workspace `ws` (symmetric, int32): counts [NPES][E_GLOBAL] (row s written by rank s), then flags [3][NPES]: count
 row / dispatch (unused) / combine of rank s finished, each holding the call's epoch, then arrived [s_cap / BLOCK_M]:
@@ -16,18 +15,17 @@ sorted block b receives, [SCHED_EXPECTED + s_cap / BLOCK_M + b] GateUp tiles fin
 [SCHED_EXPECTED + 2 s_cap / BLOCK_M + b] set once the mega kernel transposed block b's A scales.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith, llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from ...tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+from ..host import launcher
 from .gateup import _load_i32, _rsrc_of
-from .util import atomic_add_i32, fence, global_ptr, run_compiled
+from .util import atomic_add_i32, fence, global_ptr
 
 NPES = 8
 E_LOCAL = 32
@@ -216,7 +214,6 @@ def _route_key(g, row, s_cap, lds, qstart):
     return (row >= s_cap).select(fx.Int32(MAX_KEYS - 1), key)
 
 
-@functools.cache
 def _compile_ep_prep():
     """One workgroup of 1024 threads per rank: count exchange and plan tables (ep_plan then plans the routes).
     route_idx [T*TOPK]: rank of each route among this rank's routes to its global expert (unset for no route).
@@ -426,7 +423,6 @@ def _compile_ep_prep():
     return launch
 
 
-@functools.cache
 def _compile_ep_plan():
     """Routing plan, one workgroup of 256 threads per slice of this rank's routes:
     send_route / send_info [T*TOPK]: all routes sorted by when the destinations' mega-kernel queues need them (block
@@ -578,7 +574,6 @@ def _compile_ep_plan():
     return launch
 
 
-@functools.cache
 def _compile_ep_finish():
     """After Down (same stream): tell every rank this rank's remote adds are done, wait for all ranks, then store
     this call's epoch (epoch[0] + 1) for the next call."""
@@ -612,7 +607,7 @@ def _compile_ep_finish():
 
 
 def _ptr(tensor):
-    return flyc.from_c_void_p(fx.Int32, tensor.data_ptr())
+    return ptr_arg(tensor, fx.Int32)
 
 
 def ep_prep(
@@ -631,8 +626,8 @@ def ep_prep(
     plan,
 ):
     """epoch: the int32 [1] epoch buffer (device memory)."""
-    run_compiled(
-        _compile_ep_prep(),
+    _run_compiled(
+        launcher(_compile_ep_prep, topk_ids.device.index),
         _ptr(topk_ids),
         _ptr(route_idx),
         _ptr(ws),
@@ -646,7 +641,7 @@ def ep_prep(
         num_routes,
         me,
         s_cap,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
 
 
@@ -666,8 +661,8 @@ def ep_plan(
     expert_ids,
     sched,
 ):
-    run_compiled(
-        _compile_ep_plan(),
+    _run_compiled(
+        launcher(_compile_ep_plan, topk_ids.device.index),
         _ptr(topk_ids),
         _ptr(route_idx),
         _ptr(plan),
@@ -682,17 +677,17 @@ def ep_plan(
         me,
         s_cap,
         num_slices,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
 
 
 def ep_finish(me, epoch, ws, ws_peers):
     """epoch: the int32 [1] epoch buffer ep_prep read; advanced here."""
-    run_compiled(
-        _compile_ep_finish(),
+    _run_compiled(
+        launcher(_compile_ep_finish, epoch.device.index),
         _ptr(ws),
         _ptr(ws_peers),
         _ptr(epoch),
         me,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )

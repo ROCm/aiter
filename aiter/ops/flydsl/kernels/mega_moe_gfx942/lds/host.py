@@ -11,10 +11,6 @@ Per call, on the current stream (x is first quantized to FP8 per 1x128 by aiter'
              into its source rank's out
   ep_finish  all ranks' adds done -> out is complete
 
-The kernels are pyhip's EPMoEGfx942 (branch luwei/942-fp8-megamoe, written for MiMo-V2.6-Flash prefill); comm.py
-and mega.py list the changes: the call epoch in device memory (CUDA graphs), ids out of [0, experts) not routed,
-swiglu_limit, and a topk that need not be a power of two.
-
 The receive buffers hold the worst case (every route of every rank to this rank), so no route is ever dropped.
 Construction is collective: every EP rank builds the same instances in the same order after MORI shmem is
 initialized, and calls forward the same number of times.
@@ -40,7 +36,9 @@ from .gateup import OOB_OFFSET, SORT_BLOCK_M
 from .mega import ep_mega
 
 _MODEL_DIM, _INTER_DIM, _MAX_TOPK = 4096, 2048, 8
-# Producer workgroups of the mega kernel and the units Down lags GateUp by (EPMoEGfx942's defaults).
+# Producer workgroups of the mega kernel and the units Down lags GateUp by. On DSV4-Flash (8x MI300X, cold weights)
+# 32 producers are 3-5% faster at 512 tokens per rank and 2-4% slower at 8192 and all-to-one; lag 1 or 3 is within
+# 1.5% of 2.
 _PRODUCERS, _LAG = 16, 2
 
 

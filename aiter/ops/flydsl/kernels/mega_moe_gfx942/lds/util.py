@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Helpers of the EP8 mega MoE kernels (from pyhip contrib/flydsl helpers.py and
-gemm_a8w8_blockscale_gfx942_common.py, branch luwei/942-fp8-megamoe) and the loader of a8w4's fd2 W.
-"""
+"""Device helpers of the LDS mega MoE kernels and the loader of a8w4's fd2 W."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
@@ -17,23 +14,6 @@ from flydsl.expr.typing import T, is_target_address_space
 from flydsl.expr.typing import Vector as Vec
 
 from ..cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
-
-
-def run_compiled(launch, *args):
-    """Runs a @flyc.jit launcher through its CompiledFunction for the current device.
-
-    Calling the JitFunction costs 60-90 us of host time per launch, the CompiledFunction a few us. The first call
-    on a device compiles (or loads from the FlyDSL cache) and runs it.
-    """
-    by_device = getattr(launch, "_compiled_by_device", None)
-    if by_device is None:
-        by_device = launch._compiled_by_device = {}
-    device = torch.cuda.current_device()
-    compiled = by_device.get(device)
-    if compiled is None:
-        by_device[device] = flyc.compile(launch, *args)
-    else:
-        compiled(*args)
 
 
 def global_ptr(addr):

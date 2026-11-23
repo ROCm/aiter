@@ -3,8 +3,6 @@
 
 """gfx942 EP8 MoE mega kernel: dispatch, GateUp and Down (with the combine) in one launch.
 
-From pyhip contrib/flydsl/ep_moe_mega_gfx942.py (branch luwei/942-fp8-megamoe; design in that branch's
-docs/megamoe_ep8_942/mega_moe_ep8_design.md), plus a swiglu_limit clamp and a topk that need not be a power of two.
 ep_prep and ep_plan (comm.py) run first and build the plan.
 Workgroups take task tickets from per-XCD queues (persistent: one workgroup per CU taking tickets until the queues
 are empty). A workgroup takes a ticket only when it is running and its current task (if any) waits for nothing more,
@@ -20,9 +18,6 @@ With transpose_scales, only GateUp(b, 0) waits for arrived[b]: it copies block b
 layout and sets scaled[b], which the block's other GateUp tiles wait for.
 """
 
-import functools
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -32,6 +27,8 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ...tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+from ..host import launcher
 from .comm import ARRIVED, E_LOCAL, NPES, ROW_BITS, SCHED_EXPECTED
 from .down import down_task_emitter
 from .gateup import (
@@ -47,7 +44,6 @@ from .util import (
     buffer_rsrc_at,
     fence,
     load_i32_atomic,
-    run_compiled,
     spin_wait_ge,
 )
 
@@ -57,7 +53,6 @@ CHUNK = 8
 P2P_AUX = 19
 
 
-@functools.cache
 def compile_ep_mega(
     hidden_dim,
     inter_dim,
@@ -1051,17 +1046,19 @@ def ep_mega(
     trace=None,
     transpose_scales=True,
 ):
-    """Run the mega kernel for an EPMoEGfx942 `op` whose ep_prep ran for this call.
+    """Run the mega kernel for an LdsMegaMoE `op` whose ep_prep and ep_plan ran for this call.
 
     trace: optional int32 tensor of trace_entries(op, producers) entries (see compile_ep_mega).
     """
-    launch = compile_ep_mega(
-        op.hidden,
-        op.inter,
-        op.topk,
-        op.token_shift,
-        producers,
-        lag,
+    launch = launcher(
+        compile_ep_mega,
+        x_fp8.device.index,
+        hidden_dim=op.hidden,
+        inter_dim=op.inter,
+        topk=op.topk,
+        token_shift=op.token_shift,
+        producers=producers,
+        lag=lag,
         xcd_queues=xcd_queues,
         relaxed=relaxed,
         persistent=persistent,
@@ -1074,17 +1071,18 @@ def ep_mega(
         wq=op.wq,
         skip_padding=op.skip_padding,
     )
-    grid = int(os.environ.get("MEGA_GRID", "0")) or -(
-        -mega_grid(op, producers) // tasks_per_wg
-    )
+    grid = -(-mega_grid(op, producers) // tasks_per_wg)
     if persistent:
         grid = min(
             grid, torch.cuda.get_device_properties(x_fp8.device).multi_processor_count
         )
     t = op.tables
     fp8 = op.combine == "fp8"
-    ptr = lambda tensor: flyc.from_c_void_p(fx.Int32, tensor.data_ptr())
-    run_compiled(
+
+    def ptr(tensor):
+        return ptr_arg(tensor, fx.Int32)
+
+    _run_compiled(
         launch,
         ptr(op.recv_a),
         ptr(op.w1),
@@ -1120,5 +1118,5 @@ def ep_mega(
         op.rank,
         op.s_cap // SORT_BLOCK_M,
         grid,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )

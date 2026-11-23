@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FP8 block-scale MoE GateUp (BM256) on 2x4 / 4x2 wave grids, A and B both staged through LDS.
-
-The task emitter of pyhip contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py (branch luwei/942-fp8-megamoe),
-plus a swiglu_limit clamp; the stand-alone kernel is not copied.
+"""gfx942 FP8 block-scale MoE GateUp (BM256) on 2x4 / 4x2 wave grids, A and B both staged through LDS: the
+mega kernel's GateUp task emitter, with a swiglu_limit clamp.
 
 out[token, slot] = BF16(SiLU(gate) * up) for every route, gate and up from one FP8 GEMM. B is aiter
 shuffle_weight(16,16) of [E, 2I, K] (gate rows, then up rows); scales are FP32: A [K/128, tokens], B
@@ -12,7 +10,7 @@ shuffle_weight(16,16) of [E, 2I, K] (gate rows, then up rows); scales are FP32: 
 invalid token or slot, and blocks past ceil(num_valid_ids[0] / 256) are never read, so sort buffers may keep
 spare capacity. Per K128 block, A rows are gathered by sorted ID with eight lanes per row (128 B per row per
 load) into a 32 KiB LDS tile, and the B packets gate0, gate1, up0, up1 (64 rows each) fill another 32 KiB.
-The pipeline follows gemm_a8w8_blockscale_gfx942_2x4_lds_pf1: one operand is read for the whole K block at
+The pipeline: one operand is read for the whole K block at
 stage 0 ("held"), the other streams one 64-row packet per stage, and each packet of the next K block is
 written to LDS one stage after its load. A layout names the wave grid (M x N) and that 1-stage lead:
   2x4_pf1: 2 waves along M (128 rows) x 4 along N (32 gate + 32 up columns); B is held, A streams.

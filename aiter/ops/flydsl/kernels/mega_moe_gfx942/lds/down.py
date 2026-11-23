@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FP8 block-scale MoE Down (GEMM2, BM256 x BN256) on 2x4 / 4x2 wave grids, A and B staged through LDS.
-
-The task emitter of pyhip contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py (branch luwei/942-fp8-megamoe);
-the stand-alone kernels are not copied.
+"""gfx942 FP8 block-scale MoE Down (GEMM2, BM256 x BN256) on 2x4 / 4x2 wave grids, A and B staged through LDS:
+the mega kernel's Down task emitter.
 
 Per route y = routing weight * (A2 row @ W2[expert]^T): A2 is FP8 [tokens, topk, I] gathered by sorted ID
 (row token * topk + slot), W2 is aiter shuffle_weight(16,16) of [E, H, I]. Scales are FP32: A2
 [I/128, tokens * topk], W2 [E, H/128, I/128]. With sorted_a2, A2 is [blocks * 256, I] in sorted-row order (scales
 [I/128, blocks * 256]): a block's rows are then contiguous instead of spread over the whole [tokens, topk, I]
-tensor, which thrashes the L1 TLB on every K block. The K loop is the one of moe_gateup_a8w8_blockscale_gfx942_lds;
+tensor, which thrashes the L1 TLB on every K block. The K loop is GateUp's;
 one workgroup takes a 256-row sorted block and 256 hidden columns.
   2x4_pf1: 2 waves along M (128 rows) x 4 along N (64 columns); B is held, A streams.
   4x2_pf1: 4 waves along M (64 rows) x 2 along N (128 columns); A is held, B streams.
