@@ -843,9 +843,9 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
-def _default_co_output_dir(arch, offload_arch, family):
+def _default_co_output_dir(arch, offload_arch, family=None):
     if arch == "gfx950":
-        return os.path.join(_HERE, arch, family)
+        return os.path.join(_HERE, arch, family or "a8w8_blockscale_bpreshuffle")
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
