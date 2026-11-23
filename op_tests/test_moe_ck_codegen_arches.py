@@ -14,6 +14,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 GEN = REPO / "csrc/ck_gemm_moe_2stages_codegen/gen_instances.py"
 LIMIT_CSV = (
@@ -98,3 +100,7 @@ def test_single_arch_codegen_is_unchanged():
     assert _GFX950_TILE not in lookup
     source = (out / "instances" / f"{_GFX942_TILE}.cu").read_text()
     assert "__HIP_DEVICE_COMPILE__" not in source
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
