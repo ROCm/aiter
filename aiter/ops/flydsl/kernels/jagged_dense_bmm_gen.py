@@ -249,8 +249,6 @@ def _build_launcher(
         start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
 
         if start_m < M_b:
-            # Each A and C buffer covers only this tile's valid rows, so no
-            # in-tile offset passes BLOCK_M rows and rows past L are never touched.
             tile_start = seq_start + start_m
             tile_rows = M_b - start_m
             tile_rows = (tile_rows < fx.Int32(BLOCK_M)).select(

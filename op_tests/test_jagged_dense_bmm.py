@@ -292,8 +292,6 @@ def _bad_count(got, ref):
     return int(((got - ref).abs() > 1e-2 + 1e-2 * ref.abs()).sum() + got.isnan().sum())
 
 
-# One group whose A or C spans more than a 32-bit buffer offset reaches; the
-# reference runs in chunks so no fp32 temporary crosses 4 GiB.
 @benchmark()
 def test_jdbba_wide_group(K, N, M, regime, dtype):
     torch.manual_seed(0)
