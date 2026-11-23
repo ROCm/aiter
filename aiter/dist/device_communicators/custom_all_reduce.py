@@ -283,6 +283,25 @@ _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 # gfx1250, CUDA graphs, bf16 and fp16 alike). Unmeasured world sizes take the
 # one-shot up to the cap, as the other Lamport ops do.
 _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
+# gfx1250 pushed two-shot AR + residual add + RMSNorm (ar2s_rms_gfx1250) for
+# prefill-sized inputs: the largest input one launch takes (larger inputs are
+# split by rows into balanced launches); it sizes the per-rank inbox to twice
+# this (RS + AG). 160 MiB takes 12288 tokens of hidden 6144 in one launch:
+# 246 us against 289 us in two (TP4, 4x MI455X). AITER_AR2S_RMS_MAX_SIZE
+# overrides it, 0 turns the path off. The smallest input it takes is
+# _AR2S_RMS_MIN_BYTES in communicator_cuda.py.
+_AR2S_RMS_MAX_BYTES = {2: 160 * 1024 * 1024, 4: 160 * 1024 * 1024, 8: 160 * 1024 * 1024}
+_AR2S_RMS_MAX_SIZE_ENV = "AITER_AR2S_RMS_MAX_SIZE"
+# gfx1250 TP4 one-shot AR + residual add + RMSNorm (+ MXFP8) for decode sizes (k5_fused_ar_rms,
+# csrc/kernels/ar_k5_gfx1250.cu), hidden 6144: AITER_K5_AR=1 turns it on (off by default; every
+# rank must agree). It takes the calls of up to _K5_AR_MAX_ROWS rows that the Gluon one-shot or
+# the Lamport fused kernel would take, with their bits; its inbox (3 x 4 x that many rows, 37.7 MB
+# a rank at 256) and counters follow the Lamport inbox in that allocation (no IPC buffer of its own). AITER_K5_AR_MAX_ROWS overrides the row cap, AITER_K5_AR_MAXIT the
+# poll bound (iterations, ~0.3 us each; a timeout counts in k5_ar_errors and the result is wrong).
+_K5_AR_ENV = "AITER_K5_AR"
+_K5_AR_HIDDEN = 6144
+_K5_AR_MAX_ROWS = int(os.environ.get("AITER_K5_AR_MAX_ROWS", "256"))
+_K5_AR_MAXIT = int(os.environ.get("AITER_K5_AR_MAXIT", "20000000"))
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -1342,6 +1361,11 @@ class CustomAllreduce:
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         # Lamport fused AR + RMSNorm size cap; 0 until its inbox is set up.
         self._lamport_max_bytes = 0
+        # pushed two-shot AR + RMSNorm (gfx1250): context, 0 until set up
+        self._ar2s_ctx = 0
+        self._ar2s_max_rows = {}
+        # one-shot decode AR + RMSNorm (gfx1250, TP4): context, 0 until set up
+        self._k5_ctx = 0
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
@@ -2013,6 +2037,7 @@ class CustomAllreduce:
         )
         if self._is_gfx1250:
             self._init_lamport_ar_rms(world_size)
+            self._init_ar2s_rms(world_size)
         else:
             self._initLamport(world_size)
 
@@ -2042,9 +2067,23 @@ class CustomAllreduce:
         _COARSE_GRAIN = 2 * 1024 * 1024
         size = ops.lamport_ar_rms_buffer_size_gfx1250(world_size, max_bytes)
         size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
-        self._pool.create("lamport", size, raw_cached=True)
+        # AITER_K5_AR=1: the k5 inbox and counters follow the Lamport inbox in the same
+        # allocation (no IPC buffer of their own)
+        k5_bytes = self._k5_ar_bytes(world_size)
+        k5_bytes = (k5_bytes + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create("lamport", size + k5_bytes, raw_cached=True)
         ptrs = self._pool.open_peer_buffers("lamport")
         ops.init_lamport_ar_rms_gfx1250(self._ptr, ptrs, max_bytes)
+        if k5_bytes:
+            self._k5_ctx = ops.init_k5_ar_gfx1250(
+                self.rank, [p + size for p in ptrs], _K5_AR_MAX_ROWS, _K5_AR_HIDDEN
+            )
+            logger.info(
+                "Custom allreduce gfx1250 one-shot decode AR + RMSNorm (k5): up to %d rows, "
+                "%d bytes after the Lamport inbox",
+                _K5_AR_MAX_ROWS,
+                k5_bytes,
+            )
         # every rank's 0xff memset must land before any rank's first push
         dist.barrier(group=self.group)
         self._lamport_max_bytes = max_bytes
@@ -2054,6 +2093,418 @@ class CustomAllreduce:
             max_bytes,
             size,
         )
+
+    def _k5_ar_bytes(self, world_size: int) -> int:
+        """Bytes the one-shot decode AR + RMSNorm (k5_fused_ar_rms) sets aside at the end of the
+        Lamport inbox allocation when AITER_K5_AR=1 (0 otherwise): its inbox and its counters.
+        Sharing that allocation adds no IPC buffer, export or peer mapping. TP4 only; every rank
+        must set the same environment."""
+        if os.environ.get(_K5_AR_ENV, "0") != "1" or world_size != 4 or _K5_AR_MAX_ROWS <= 0:
+            return 0
+        return ops.k5_ar_buffer_size_gfx1250(world_size, _K5_AR_MAX_ROWS, _K5_AR_HIDDEN)
+
+    def should_k5_ar(self, inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor) -> bool:
+        """Whether k5_fused_ar_rms can take this call: bf16 [rows, 6144], 0 < rows <= the cap.
+        Shapes and dtypes only, so every rank decides the same."""
+        if self.disabled or not self._k5_ctx:
+            return False
+        return (
+            inp.dim() == 2
+            and inp.dtype == res_inp.dtype == w.dtype == torch.bfloat16
+            and inp.shape[-1] == res_inp.shape[-1] == w.numel() == _K5_AR_HIDDEN
+            and res_inp.shape == inp.shape
+            and 0 < inp.shape[0] <= _K5_AR_MAX_ROWS
+        )
+
+    def k5_fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        lamport_order: bool = False,
+        fp8_out: bool = False,
+    ):
+        """One-shot all-reduce + residual add + RMSNorm (gfx1250, TP4, decode sizes). Returns
+        (out, residual_out), or with fp8_out (E4M3 out, residual_out, row-major E8M0 scale
+        [rows, hidden / 32]). lamport_order gives the bits of lamport_fused_ar_rms (and of
+        per_1x32_mx_quant_hip of its output), else those of the Gluon one-shot kernels. Check
+        should_k5_ar first. Runs the same eager and in a captured graph."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp.contiguous())
+        res_inp = _lamport_aligned(res_inp.contiguous())
+        w = _lamport_aligned(w.contiguous())
+        res_out = torch.empty_like(inp)
+        if fp8_out:
+            out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+            scale = torch.empty((rows, hidden // 32), dtype=fp8_e8m0, device=inp.device)
+            scale_ptr = scale.data_ptr()
+        else:
+            out = torch.empty_like(inp)
+            scale, scale_ptr = None, 0
+        ops.k5_ar_rms_gfx1250(
+            self._k5_ctx,
+            inp.data_ptr(),
+            res_inp.data_ptr(),
+            w.data_ptr(),
+            out.data_ptr(),
+            res_out.data_ptr(),
+            scale_ptr,
+            rows,
+            hidden,
+            eps,
+            gemma_norm,
+            lamport_order,
+            fp8_out,
+            _K5_AR_MAXIT,
+        )
+        if fp8_out:
+            return out, res_out, scale
+        return out, res_out
+
+    def k5_fused_ar_rms_tail(
+        self,
+        tail,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        lamport_order: bool = False,
+        fp8_out: bool = False,
+    ):
+        """k5_fused_ar_rms of a deferred routed-MoE output (aiter moe_deferred_tail): the
+        kernel computes the input rows from the tail's operands (the bits of the
+        gather-reduce launch it skips) instead of reading them. Same returns; None when the
+        tail's operands do not fit the kernel (the caller materializes it). Runs tail.before
+        first (the join of the stream producing its addend)."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        from aiter.ops.flydsl.moe_deferred_tail import _log_once
+
+        operands = tail.k5_operands()
+        if operands is None:
+            return None
+        g, rows_t, w_t, add = operands
+        _log_once(
+            f"k5_{int(lamport_order)}{int(fp8_out)}",
+            f"k5 one-shot AR computes the deferred MoE tail (lamport_order={lamport_order}, "
+            f"fp8_out={fp8_out}, {tail.out.shape[0]} rows)",
+        )
+        out_t = tail.out
+        rows, hidden = out_t.shape
+        res_inp = _lamport_aligned(res_inp.contiguous())
+        w = _lamport_aligned(w.contiguous())
+        tail.run_before()
+        res_out = torch.empty_like(res_inp)
+        if fp8_out:
+            out = torch.empty(out_t.shape, dtype=fp8, device=out_t.device)
+            scale = torch.empty((rows, hidden // 32), dtype=fp8_e8m0, device=out_t.device)
+            scale_ptr = scale.data_ptr()
+        else:
+            out = torch.empty_like(res_inp)
+            scale, scale_ptr = None, 0
+        ops.k5_ar_rms_tail_gfx1250(
+            self._k5_ctx,
+            res_inp.data_ptr(),
+            w.data_ptr(),
+            out.data_ptr(),
+            res_out.data_ptr(),
+            scale_ptr,
+            rows,
+            hidden,
+            eps,
+            gemma_norm,
+            lamport_order,
+            fp8_out,
+            _K5_AR_MAXIT,
+            rows_t.data_ptr(),
+            w_t.data_ptr(),
+            g.data_ptr(),
+            0 if add is None else add.data_ptr(),
+            tail.scale,
+        )
+        if fp8_out:
+            return out, res_out, scale
+        return out, res_out
+
+    def k5_ar_errors(self) -> int:
+        """Polls of k5_fused_ar_rms that timed out on this rank (synchronizes the device)."""
+        return ops.k5_ar_errors_gfx1250(self._k5_ctx) if self._k5_ctx else 0
+
+    def _init_ar2s_rms(self, world_size: int):
+        """Set up the pushed two-shot AR + RMSNorm (gfx1250, IPC transport):
+        an RS + AG inbox of 2 x the per-launch cap and a flag buffer, both
+        cached raw memory. The cap must be the same on every rank."""
+        default = _AR2S_RMS_MAX_BYTES.get(world_size, 0)
+        raw = os.environ.get(_AR2S_RMS_MAX_SIZE_ENV, "").strip()
+        try:
+            max_bytes = int(raw) if raw else default
+        except ValueError:
+            max_bytes = default
+        if max_bytes <= 0:
+            return
+        _COARSE_GRAIN = 2 * 1024 * 1024
+        rnd = lambda n: (n + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create(
+            "ar2s", rnd(ops.ar2s_rms_buffer_size_gfx1250(world_size, max_bytes)), raw_cached=True
+        )
+        self._pool.create("ar2s_flags", rnd(ops.ar2s_rms_flags_size_gfx1250()), raw_cached=True)
+        data_ptrs = self._pool.open_peer_buffers("ar2s")
+        flag_ptrs = self._pool.open_peer_buffers("ar2s_flags")
+        # two blocks a CU: a row a block, a block waits only for its peers' twin
+        grid = 2 * torch.cuda.get_device_properties(self.device).multi_processor_count
+        self._ar2s_ctx = ops.init_ar2s_rms_gfx1250(
+            self.rank, data_ptrs, flag_ptrs, max_bytes, grid
+        )
+        # every rank's flag buffer is clear before any rank's first push
+        dist.barrier(group=self.group)
+        logger.info(
+            "Custom allreduce gfx1250 two-shot AR + RMSNorm: up to %d bytes a launch",
+            max_bytes,
+        )
+
+    def should_ar2s_rms(
+        self, inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, min_bytes: int
+    ) -> bool:
+        """Whether ar2s_fused_ar_rms takes this call: bf16, contiguous, a hidden
+        of whole 256-element groups up to 8192, at least min_bytes. Shapes,
+        dtypes and sizes only, so every rank decides the same."""
+        if self.disabled or not self._ar2s_ctx:
+            return False
+        hidden = w.numel()
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype == torch.bfloat16
+            and res_inp.dtype == w.dtype == inp.dtype
+            and inp.dim() == 2
+            and inp.shape[-1] == res_inp.shape[-1] == hidden
+            and res_inp.shape == inp.shape
+            and inp.is_contiguous()
+            and res_inp.is_contiguous()
+            and w.is_contiguous()
+            and hidden % 256 == 0
+            and hidden <= 8192
+            and nbytes >= min_bytes
+        )
+
+    def ar2s_fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pushed two-shot all-reduce + residual add + RMSNorm. Returns (out,
+        residual_out). Rows beyond one launch's inbox are split into balanced
+        launches. Runs the same eager and in a captured graph."""
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        mr = self._ar2s_max_rows.get(hidden)
+        if mr is None:
+            mr = self._ar2s_max_rows[hidden] = ops.ar2s_rms_max_rows_gfx1250(self._ar2s_ctx, hidden)
+        n_launch = -(-rows // mr)
+        step = -(-rows // n_launch)
+        # 16-byte aligned sub-launches: hidden is a multiple of 256
+        for s in range(0, rows, step):
+            e = min(rows, s + step)
+            ops.ar2s_rms_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                out[s:e].data_ptr(),
+                res_out[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+            )
+        return out, res_out
+
+    def ar2s_fused_ar_rms_ex(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        fp8_out: bool = False,
+        sp_residual: bool = False,
+        aux_residual: bool = False,
+        grid: int = 0,
+    ):
+        """ar2s_fused_ar_rms with options. ``fp8_out``: return (E4M3 out,
+        residual_out, row-major E8M0 scale [rows, hidden // 32]), the bytes of
+        per_1x32_mx_quant_hip(fp8, e8m0) over the bf16 out, without writing it.
+        ``sp_residual``: each rank reads ``res_inp`` and writes residual_out
+        only on the rows it owns (``ar2s_sp_own_rows``); the normed out is whole
+        on every rank and bit-identical to the replicated path's.
+        ``aux_residual`` (with ``sp_residual``, bf16): no norm; returns the whole
+        residual_out ``all_reduce(inp) + res_inp`` on every rank from a
+        sequence-parallel ``res_inp`` (only its own rows read), the bits the
+        replicated path writes to residual_out. Rows beyond one launch are split as
+        ar2s_fused_ar_rms splits them."""
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        res_out = torch.empty_like(inp)
+        if aux_residual:
+            assert sp_residual and not fp8_out
+            out = out_q = out_s = None
+        elif fp8_out:
+            out = None
+            out_q = torch.empty((rows, hidden), dtype=fp8, device=inp.device)
+            out_s = torch.empty(
+                (rows, hidden // 32), dtype=torch.uint8, device=inp.device
+            )
+        else:
+            out = torch.empty_like(inp)
+            out_q = out_s = None
+        for s, e in self.ar2s_launch_rows(rows, hidden):
+            ops.ar2s_rms_ex_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                0 if out is None else out[s:e].data_ptr(),
+                res_out[s:e].data_ptr(),
+                0 if out_q is None else out_q[s:e].data_ptr(),
+                0 if out_s is None else out_s[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+                fp8_out,
+                sp_residual,
+                aux_residual,
+                grid,
+            )
+        if aux_residual:
+            return res_out
+        if fp8_out:
+            from aiter.utility.dtypes import fp8_e8m0
+
+            return out_q, res_out, out_s.view(fp8_e8m0)
+        return out, res_out
+
+    def ar2s_fused_ar_rms_moe(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        grid: int = 0,
+    ):
+        """The sequence-parallel AR + residual add + RMSNorm of ``ar2s_fused_ar_rms_ex(
+        sp_residual=True)`` for a MiniMax-M3 MoE layer: the owner quantizes its normalized
+        rows to the layer's inputs and the all-gather carries those (9600 B a row at hidden
+        6144 against 12288 B of bf16). TP2 / TP4, hidden % 512 == 0. Returns
+
+          x_own  [own rows, hidden] bf16: this rank's normalized rows (``ar2s_sp_own_rows``,
+                 launch by launch, compact): the router's input
+          res    [rows, hidden] bf16: residual_out, the own rows only (as sp_residual)
+          q8, s8 [rows, hidden] E4M3, [rows, hidden // 32] E8M0: the shared expert's MXFP8
+                 input, ATOM quantize_fp8's bytes (amax floored at 1e-10)
+          q4, s4 [rows, hidden // 2] uint8, [rows, hidden // 32] E8M0: the routed experts'
+                 MXFP4 A1 (row-major), the bytes the FlyDSL MoE A1 quant writes
+
+        q8 / s8 / q4 / s4 are whole on every rank. Rows beyond one launch are split as
+        ar2s_fused_ar_rms splits them."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        dev = inp.device
+        res_out = torch.empty_like(inp)
+        q8 = torch.empty((rows, hidden), dtype=fp8, device=dev)
+        s8 = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=dev)
+        q4 = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=dev)
+        s4 = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=dev)
+        launches = self.ar2s_launch_rows(rows, hidden)
+        own_counts = []
+        for s, e in launches:
+            r = -(-(e - s) // self.world_size)
+            a = s + self.rank * r
+            own_counts.append(max(0, min(e, a + r) - a))
+        x_own = torch.empty((sum(own_counts), hidden), dtype=inp.dtype, device=dev)
+        off = 0
+        for (s, e), m in zip(launches, own_counts):
+            ops.ar2s_rms_moe_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                x_own[off : off + m].data_ptr() if m else 0,
+                res_out[s:e].data_ptr(),
+                q8[s:e].data_ptr(),
+                s8[s:e].data_ptr(),
+                q4[s:e].data_ptr(),
+                s4[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+                grid,
+            )
+            off += m
+        return x_own, res_out, q8, s8.view(fp8_e8m0), q4, s4.view(fp8_e8m0)
+
+    def ar2s_sp_gather_rows(
+        self, own_parts: list[torch.Tensor], rows: int, hidden: int, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """All-gather of a per-row tensor computed on this rank's own rows: ``own_parts[i]``
+        holds the rows of launch i's own chunk (``ar2s_sp_own_rows``), padded to the launch's
+        chunk height ceil(launch rows / world) (the pad rows are dropped). Returns
+        [rows, *row_shape], every row from its owner, on every rank: one Lamport one-shot
+        all-gather a launch (exact for non-16-bit dtypes; the parts must be contiguous with
+        whole 16 B rows). Runs the same eager and in a captured graph."""
+        launches = self.ar2s_launch_rows(rows, hidden)
+        assert len(own_parts) == len(launches)
+        row_shape = tuple(own_parts[0].shape[1:])
+        # a launch's gather spans world * chunk >= its rows: up to world - 1 pad rows run into
+        # the next launch's first rows, which its own gather (later on the stream) rewrites
+        span = max(s + self.world_size * p.shape[0] for (s, _), p in zip(launches, own_parts))
+        if out is None or out.shape[0] < span:
+            out = torch.empty((max(span, rows),) + row_shape, dtype=own_parts[0].dtype, device=own_parts[0].device)
+        for (s, e), p in zip(launches, own_parts):
+            assert p.shape[0] == -(-(e - s) // self.world_size) and p.is_contiguous()
+            self.lamport_all_gather(p, 0, out=out[s : s + self.world_size * p.shape[0]])
+        return out[:rows]
+
+    def ar2s_launch_rows(self, rows: int, hidden: int) -> list[tuple[int, int]]:
+        """The [start, end) row ranges of the balanced launches ar2s splits
+        ``rows`` into (one when they fit one inbox)."""
+        mr = self._ar2s_max_rows.get(hidden)
+        if mr is None:
+            mr = self._ar2s_max_rows[hidden] = ops.ar2s_rms_max_rows_gfx1250(
+                self._ar2s_ctx, hidden
+            )
+        n_launch = -(-rows // mr)
+        step = -(-rows // n_launch)
+        return [(s, min(rows, s + step)) for s in range(0, rows, step)]
+
+    def ar2s_sp_own_rows(self, rows: int, hidden: int) -> list[tuple[int, int]]:
+        """The rows whose residual this rank keeps under ``sp_residual``: in
+        each launch, chunk ``rank`` of ceil(launch rows / world) rows."""
+        own = []
+        for s, e in self.ar2s_launch_rows(rows, hidden):
+            r = -(-(e - s) // self.world_size)
+            a, b = s + self.rank * r, min(e, s + (self.rank + 1) * r)
+            if a < b:
+                own.append((a, b))
+        return own
 
     # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
     # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above

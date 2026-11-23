@@ -102,6 +102,42 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
+def _tp_gather_args(tp_gather, block_threads: int):
+    """``(spec, pointer args)`` of a ``tp_gather`` launch (GEMM1 re-derives the
+    TP route and gathers token-major MXFP4 rows; see
+    ``build_gemm_a8w4_tdm_task``); without one, the off spec and null
+    pointers (the shared-fold launcher always takes them).
+
+    ``tp_gather``: ``{"topk_ids": int32 [T, 4], "topids_to_rows": int32 [T, 4]
+    (written), "masked_m": int32 [E] (written), "align": expert row alignment,
+    "row_to_route": optional int32 [contiguous_m] (written)}``. ``psum`` is
+    written to the GEMM's tile-map argument.
+    """
+    if tp_gather is None:
+        null = ptr_arg(None)
+        return (0, 1, 0, 0), (null, null, null, null, 0)
+    ids = tp_gather["topk_ids"]
+    rows = tp_gather["topids_to_rows"]
+    tokens, topk = ids.shape
+    assert topk == 4 and ids.dtype == torch.int32 and ids.is_contiguous()
+    assert rows.dtype == torch.int32 and rows.is_contiguous() and rows.numel() == ids.numel()
+    # Tokens per thread, rounded up to a power of two so a few builds serve
+    # every decode batch (the ids past ``tokens`` read as dropped).
+    slots = 1
+    while slots * block_threads < tokens:
+        slots *= 2
+    row_route = tp_gather.get("row_to_route")
+    spec = (1, slots, int(tp_gather["align"]), int(row_route is not None))  # gather, slots, align, row map
+    ptrs = (
+        ptr_arg(ids),
+        ptr_arg(rows),
+        ptr_arg(tp_gather["masked_m"]),
+        ptr_arg(row_route),
+        int(tokens),
+    )
+    return spec, ptrs
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -149,6 +185,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     rolled_drain=0,
     m_align=0,
     k_waves=1,
+    shared_fold: "SharedFoldTiles | None" = None,
+    tp_gather: dict | None = None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -156,7 +194,61 @@ def flydsl_grouped_gemm_a8w4_masked(
     buffer capacity. Workers traverse the live device-side tile range.
     Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
     innermost 32 FP4 values packed into 16 bytes.
+
+    ``shared_fold`` adds a dense FP8 x FP8 expert's tiles (same N, K, activation
+    and output kind) to the launch, see ``SharedFoldTiles``.
+
+    ``tp_gather`` (stage 1 only): ``a`` / ``a_scales`` are token-major MXFP4
+    rows and their E8M0 rows, no route/quant launch ran, and the GEMM derives
+    the TP route itself (``_tp_gather_args``); it runs unclustered and
+    non-persistent.
     """
+    if shared_fold is not None:
+        return _grouped_gemm_shared_fold(
+            out,
+            a,
+            w,
+            a_scales,
+            w_scales,
+            m_tile_map,
+            shared_fold,
+            n_experts=n_experts,
+            contiguous_m=contiguous_m,
+            N=N,
+            K=K,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            out_is_f16=out_is_f16,
+            a_is_fp4=a_is_fp4,
+            a_preshuffled=a_preshuffled,
+            stage1_act=stage1_act,
+            bias=bias,
+            swiglu_limit=swiglu_limit,
+            stream=stream,
+            stage1_quant_out=stage1_quant_out,
+            quant_scale=quant_scale,
+            quant_wmma_rep=quant_wmma_rep,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            stage2_scatter=stage2_scatter,
+            row_major_ascale=row_major_ascale,
+            a_row_stride_bytes=a_row_stride_bytes,
+            a_scale_row_stride_bytes=a_scale_row_stride_bytes,
+            persistent_workers=persistent_workers,
+            rolled_drain=rolled_drain,
+            m_align=m_align,
+            k_waves=k_waves,
+            tp_gather=tp_gather,
+        )
     if a_preshuffled and row_major_ascale:
         raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
     if a_preshuffled and not a_is_fp4:
@@ -226,6 +318,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
+    if tp_gather is not None:
+        if not (stage1_act and a_is_fp4) or a_preshuffled or row_major_ascale:
+            raise ValueError("tp_gather is the MXFP4 stage-1 GEMM on token-major rows")
+        # One tile per workgroup: the route is re-derived per workgroup.
+        persistent_workers = 0
+        cluster_n = cluster_m = 1
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -310,6 +408,52 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
+    if tp_gather is not None:
+        from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm_tpg
+
+        if tdm_spec[2] or tdm_spec[4] or k_waves != 1 or out_is_f16 or bias is not None:
+            raise ValueError("tp_gather: no next-stage prefetch, As prologue, k_waves, f16 out or bias")
+        if not stage1_quant_out or quant_scale is None:
+            raise ValueError("tp_gather is the quantized stage-1 GEMM")
+        tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+        tpg_spec = (
+            K, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, n_experts, stage1_act,
+            quant_wmma_rep, tdm_spec[3], tdm_spec[5], int(lds_soa_load_interleave), rolled_drain,
+        ) + tp_spec[1:]
+        _run_compiled(
+            launch_gemm_a8w4_tdm_tpg,
+            ptr_arg(out, out_dtype),
+            ptr_arg(a),
+            ptr_arg(w),
+            ptr_arg(a_scales, fx.Int32),
+            ptr_arg(w_scales, fx.Int32),
+            contiguous_m,
+            stream,
+            N,
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            num_buffers,
+            ptr_arg(m_tile_map),
+            n_experts,
+            stage1_act,
+            float(swiglu_limit),
+            quant_wmma_rep,
+            ptr_arg(quant_scale_tensor),
+            tdm_spec[3],
+            tdm_spec[5],
+            int(lds_soa_load_interleave),
+            rolled_drain,
+            float(situ_beta),
+            float(situ_linear_beta),
+            *tp_spec[1:],
+            *tp_ptrs,
+            specialization_key=("tpg", tpg_spec),
+        )
+        return out
     _run_compiled(
         launch_gemm_a8w4_tdm,
         ptr_arg(out, out_dtype),
@@ -341,5 +485,191 @@ def flydsl_grouped_gemm_a8w4_masked(
             ep_spec,
             layout_spec,
         ),
+    )
+    return out
+
+
+class SharedFoldTiles:
+    """A dense FP8 x FP8 expert's operands and tile for ``shared_fold``.
+
+    ``a``: FP8 E4M3 rows ``[cap, K]`` in token order, ``rows`` of them live;
+    ``a_scale``: their e8m0, row-major ``[cap, K/32]`` with ``row_major_ascale``,
+    else the M16K4 layout a stage-1 quant epilogue with ``quant_wmma_rep ==
+    tile_m // m_warp // 16`` writes; ``w``: FP8 E4M3 row-major ``[N, K]`` (gate
+    and up rows interleaved for a stage-1 GEMM, as the routed GUGU weights);
+    ``w_scale``: its e8m0 in the routed n32k4 layout (``shuffle_scale_n32k4``);
+    ``out``: ``[cap, N/2]`` FP8 (stage 1, with ``quant_scale`` its e8m0) or
+    ``[cap, N]`` BF16/FP16 (stage 2). ``cap`` is a multiple of ``tile_m`` and of
+    the e8m0 tile ``16 * quant_wmma_rep``.
+    """
+
+    __slots__ = (
+        "out",
+        "a",
+        "w",
+        "a_scale",
+        "w_scale",
+        "quant_scale",
+        "rows",
+        "cap",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "m_warp",
+        "n_warp",
+        "num_buffers",
+        "quant_wmma_rep",
+        "row_major_ascale",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.pop(k, None))
+        if kw:
+            raise TypeError(f"unknown SharedFoldTiles fields {sorted(kw)}")
+
+
+def _grouped_gemm_shared_fold(
+    out,
+    a,
+    w,
+    a_scales,
+    w_scales,
+    m_tile_map,
+    sh: SharedFoldTiles,
+    *,
+    n_experts,
+    contiguous_m,
+    N,
+    K,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    num_buffers,
+    out_is_f16,
+    a_is_fp4,
+    a_preshuffled,
+    stage1_act,
+    bias,
+    swiglu_limit,
+    stream,
+    stage1_quant_out,
+    quant_scale,
+    quant_wmma_rep,
+    cluster_m,
+    cluster_n,
+    waves_per_tensor_tdm,
+    next_stage_prefetch,
+    tdm_as_in_prologue,
+    tdm_b_th,
+    lds_soa_load_interleave,
+    stage2_scatter,
+    row_major_ascale,
+    a_row_stride_bytes,
+    a_scale_row_stride_bytes,
+    persistent_workers,
+    rolled_drain,
+    m_align,
+    k_waves,
+    tp_gather=None,
+):
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm_shared_fold
+
+    n_tiles = (N + tile_n - 1) // tile_n
+    if (
+        _select_cluster_n(n_tiles, cluster_n) != 1
+        or _select_cluster_m(cluster_m, 1, stage1_act) != 1
+        or int(k_waves) != 1
+        or stage2_scatter is not None
+        or bias is not None
+        or a_row_stride_bytes
+        or a_scale_row_stride_bytes
+        or m_align
+    ):
+        raise ValueError(
+            "shared fold takes a plain routed launch: no cluster, k_waves, EP "
+            "scatter, bias, padded A rows or m_align"
+        )
+    if stage1_act and not stage1_quant_out:
+        raise ValueError("shared fold stage 1 needs the quantized output")
+    if N % sh.tile_n or K % sh.tile_k or sh.cap % sh.tile_m:
+        raise ValueError("shared fold: the dense tile must divide N, K and cap")
+    if stage1_quant_out and sh.cap % (16 * sh.quant_wmma_rep):
+        raise ValueError("shared fold: cap must be whole e8m0 output tiles")
+    k_tiles = (K + tile_k - 1) // tile_k
+    num_buffers = min(num_buffers, max(1, k_tiles))
+    sh_buffers = min(int(sh.num_buffers), max(1, K // sh.tile_k))
+    if stream is None:
+        stream = current_stream_arg()
+    stage = 1 if stage1_act else 2
+    persistent_workers = int(
+        env_once(
+            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
+            env_once("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+        )
+    )
+    if tp_gather is not None:
+        if not (stage1_act and a_is_fp4) or a_preshuffled or row_major_ascale:
+            raise ValueError("tp_gather is the MXFP4 stage-1 GEMM on token-major rows")
+        persistent_workers = 0
+    out_dtype = fx.Uint8 if stage1_quant_out else (fx.Float16 if out_is_f16 else fx.BFloat16)
+    gemm_spec = (K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers, a_is_fp4)
+    route_spec = (n_experts, stage1_act)
+    quant_spec = (stage1_quant_out, quant_wmma_rep)
+    tdm_spec = (
+        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
+        _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm),
+        _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
+        _select_tdm_b_th(tdm_b_th),
+        int(row_major_ascale),
+        int(lds_soa_load_interleave),
+        persistent_workers,
+        int(rolled_drain),
+        int(a_preshuffled),
+    )
+    sh_spec = (
+        int(sh.tile_m),
+        int(sh.tile_n),
+        int(sh.tile_k),
+        int(sh.m_warp),
+        int(sh.n_warp),
+        sh_buffers,
+        int(sh.quant_wmma_rep or 1),
+        int(bool(sh.row_major_ascale)),
+    )
+    tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+    if tp_gather is not None and (tdm_spec[0] or tdm_spec[2]):
+        raise ValueError("tp_gather: no next-stage prefetch or As prologue")
+    _run_compiled(
+        launch_gemm_a8w4_tdm_shared_fold,
+        ptr_arg(out, out_dtype),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scales, fx.Int32),
+        ptr_arg(w_scales, fx.Int32),
+        contiguous_m,
+        stream,
+        N,
+        *gemm_spec,
+        ptr_arg(m_tile_map),
+        *route_spec,
+        float(swiglu_limit),
+        *quant_spec,
+        ptr_arg(out if quant_scale is None else quant_scale),
+        *tdm_spec,
+        ptr_arg(sh.out, out_dtype),
+        ptr_arg(sh.a),
+        ptr_arg(sh.w),
+        ptr_arg(sh.a_scale, fx.Int32),
+        ptr_arg(sh.w_scale, fx.Int32),
+        ptr_arg(sh.out if sh.quant_scale is None else sh.quant_scale),
+        int(sh.rows),
+        int(sh.cap),
+        *sh_spec,
+        *tp_spec,
+        *tp_ptrs,
+        specialization_key=(gemm_spec, route_spec, quant_spec, tdm_spec, sh_spec, tp_spec),
     )
     return out

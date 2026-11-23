@@ -60,12 +60,73 @@ def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
 
 # Below the Lamport one-shot AR + RMSNorm cap, the byte ranges (low, high] where
 # the Lamport two-shot all-reduce + split norm still beats the fused one-shot, by
-# hidden size. Measured for hidden 6144 only (TP4, bf16, CUDA graphs): the fused
-# one-shot steps up past 256 and past 512 rows, the two-shot past 4 MiB.
-#   rows  192  256  320  341 | 384  512 | 544  640  682
-#   fused 15.7 16.5 21.8 22.2 | 23.0 25.1 | 33.4 38.6 39.6 us
-#   split 12.9 13.7 14.6 14.8 | 25.0 26.7 | 27.3 28.4 28.9 us
-_LAMPORT_SPLIT_AR_NORM_RANGES = {6144: ((2 << 20, 4 << 20), (6 << 20, 8 << 20))}
+# hidden size. Measured for hidden 6144 only (TP4, bf16, CUDA graphs, 10 calls a
+# graph, gemma norm, 4x MI455X, 2026-11-21): the fused one-shot steps up past
+# 512 rows, the two-shot + split norm is flat up to 4 MiB and wins only above
+# 6 MiB. (2, 4] MiB used to take the split path, which made 192-341 rows a
+# 22-24 us step against 16-17 us for the fused one-shot.
+#   rows   192  256  320  341 | 384  512 | 544  600  640  682
+#   fused 16.0 16.8 23.2 23.4 | 23.9 26.3 | 34.1 39.4 40.2 41.2 us
+#   split 22.2 22.7 23.5 23.4 | 25.8 26.8 | 28.0 28.5 29.6 29.7 us
+_LAMPORT_SPLIT_AR_NORM_RANGES = {6144: ((6 << 20, 8 << 20),)}
+
+# gfx1250: fused_allreduce_rmsnorm takes the pushed two-shot AR + RMSNorm
+# (CustomAllreduce.ar2s_fused_ar_rms) from this many input bytes up, i.e. above
+# the Lamport two-shot's 32 MiB (4 x its 8 MiB cap), where RCCL + a separate
+# norm used to run. Hidden 6144 bf16, TP4, 4x MI455X: it is level with the
+# Lamport two-shot + split norm at 24 MiB and 3-10 us behind it at 12-21 and
+# 27-32 MiB; above 32 MiB it is 1.3-1.9x faster than RCCL + norm.
+# AITER_AR2S_RMS_MIN_SIZE overrides it (bytes); AITER_AR2S_RMS_MAX_SIZE=0 in
+# custom_all_reduce.py turns the kernel off.
+_AR2S_RMS_MIN_BYTES = int(
+    os.environ.get("AITER_AR2S_RMS_MIN_SIZE", str((32 << 20) + 1))
+)
+# ... and up to this many: RCCL + norm catches up at 192 MiB (350.5 vs 356.7 us)
+# and wins at 384 MiB (624.6 vs 686.2 us; 288 MiB: 537.4 vs 499.6 us).
+_AR2S_RMS_MAX_TOTAL_BYTES = int(
+    os.environ.get("AITER_AR2S_RMS_MAX_TOTAL", str(288 << 20))
+)
+# fused_allreduce_rmsnorm_mxfp8_quant in that range: ar2s quantizes to MXFP8
+# in its own epilogue (bit-identical to ar2s + per_1x32_mx_quant_hip) instead
+# of writing bf16 for a separate quant kernel. AITER_AR2S_MXFP8=0 keeps the two.
+# Off by default: measured level with ar2s + per_1x32_mx_quant_hip (14336 rows, TP4: 318.7 vs 317.7 us), the
+# quant only moves into ar2s's latency-bound phase 3. Kept for the sequence-parallel path, where it does pay.
+_AR2S_MXFP8 = os.environ.get("AITER_AR2S_MXFP8", "0") != "0"
+# The k5 one-shot decode AR (AITER_K5_AR=1, CustomAllreduce.k5_fused_ar_rms) quantizes to MXFP8
+# in its own Lamport-order epilogue only with AITER_K5_AR_FUSED_MXFP8=1 (diagnostics: its scale
+# bytes differ on some edge-case groups); by default its bf16 output goes to per_1x32_mx_quant_hip.
+_K5_AR_FUSED_MXFP8 = os.environ.get("AITER_K5_AR_FUSED_MXFP8", "0") == "1"
+
+
+# A routed MoE output whose last launch (gather-reduce + routed scale + shared add) was deferred
+# into its consumer (aiter.ops.flydsl.moe_deferred_tail, ATOM_MINIMAX_M3_MOE_TAIL_IN_AR): the k5
+# one-shot AR computes those rows in its prologue (same bits); every other path, and every
+# other entry point here, runs the deferred launch first.
+try:
+    from aiter.ops.flydsl.moe_deferred_tail import (
+        has_deferred_moe_tail as _has_deferred_tail,
+        materialize_deferred_moe_tail as _materialize_deferred_tail,
+        take_deferred_moe_tail as _take_deferred_tail,
+    )
+except ImportError:  # pragma: no cover - no FlyDSL
+    _has_deferred_tail = lambda: False  # noqa: E731
+    _materialize_deferred_tail = lambda x=None: None  # noqa: E731
+    _take_deferred_tail = lambda x: None  # noqa: E731
+
+
+def _take_tail(input_):
+    return _take_deferred_tail(input_) if _has_deferred_tail() else None
+
+
+def _settle_tail(tail) -> None:
+    """Write a taken tail's output for a path that reads it as is."""
+    if tail is not None:
+        tail.materialize()
+
+
+def _settle_input(input_) -> None:
+    if _has_deferred_tail():
+        _materialize_deferred_tail(input_)
 
 
 def _use_lamport_split_ar_norm(comm, input_, res_inp_, weight_, out_n: int) -> bool:
@@ -332,6 +393,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
         the pair as it sends, so the sum is never written; elsewhere the add
         and then all_reduce."""
+        _settle_input(input_)
+        _settle_input(other)
         ca_comm = self.ca_comm
         if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
             return ca_comm.lamport_ar_add(input_, other)
@@ -344,6 +407,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
+        _settle_input(input_)
         if (
             self.gluon_ar_plain is not None
             and input_.dtype == torch.bfloat16
@@ -406,6 +470,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         x_pad_to_multiple: int = 0,
         gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # A deferred MoE tail feeding this call: the k5 branch computes it, any other path
+        # writes it first (_settle_tail).
+        tail = _take_tail(input_)
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
             is_weak_contiguous,
@@ -455,6 +522,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 all_reduce_rmsnorm_quant,
             )
 
+            _settle_tail(tail)
             return all_reduce_rmsnorm_quant(
                 input_,
                 res_inp_,
@@ -466,12 +534,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 *self.gluon_ar,
             )
         ca_comm = self.ca_comm
+        if (
+            _AR2S_RMS_MIN_BYTES <= total_bytes <= _AR2S_RMS_MAX_TOTAL_BYTES
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and ca_comm is not None
+            and ca_comm.should_ar2s_rms(input_, res_inp_, weight_, _AR2S_RMS_MIN_BYTES)
+        ):
+            _settle_tail(tail)
+            return ca_comm.ar2s_fused_ar_rms(input_, res_inp_, weight_, eps, gemma_norm)
         if x_pad_to_multiple == 0 and _use_lamport_split_ar_norm(
             self, input_, res_inp_, weight_, out_n
         ):
             # Where the Lamport two-shot all-reduce and the split norm beat the
             # fused kernels (see _use_lamport_split_ar_norm).
             from aiter import rmsnorm2d_fwd_with_add
+
+            _settle_tail(tail)
 
             ar_out = ca_comm.lamport_all_reduce(input_, two_shot=True)
             out = torch.empty_like(ar_out)
@@ -488,9 +567,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and x_pad_to_multiple == 0
             and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
         )
-        if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
+        gluon = x_pad_to_multiple == 0 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
+        )
+        if (gluon or lamport) and ca_comm is not None and ca_comm.should_k5_ar(
+            input_, res_inp_, weight_
         ):
+            # AITER_K5_AR=1: the one-shot decode kernel, with the bits of the path it replaces
+            if tail is not None:
+                got = ca_comm.k5_fused_ar_rms_tail(
+                    tail, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon
+                )
+                if got is not None:
+                    return got
+                _settle_tail(tail)
+            return ca_comm.k5_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon
+            )
+        _settle_tail(tail)
+        tail = None
+        if gluon:
             # One launch instead of the plain Gluon all-reduce and the HIP
             # add_rmsnorm.
             from aiter.ops.triton.comms.all_reduce import (
@@ -654,6 +750,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "mxfp8"/"per_group"/"mxfp4") from the public API.
+        if quant_type != "mxfp8":
+            _settle_input(input_)
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "mxfp8":
@@ -877,6 +975,78 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
+    # ---- sequence-parallel residual (ar2s_rms_ex sp_residual), prefill sizes ----
+    # The residual stream lives on its owner rows only (CustomAllreduce.ar2s_sp_own_rows: chunk `rank`
+    # of every ar2s launch); the normed output is whole and bit-identical to the replicated path's.
+    # Every call of a forward has the same rows, so every call takes the same branch: below the ar2s
+    # range they all run the replicated path, whose whole residual is a valid superset.
+    def ar2s_sp_eligible(self, input_: torch.Tensor, weight_: torch.Tensor) -> bool:
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not getattr(ca_comm, "_ar2s_ctx", 0):
+            return False
+        hidden = weight_.numel()
+        return (
+            input_.dim() == 2
+            and input_.dtype == torch.bfloat16
+            and input_.shape[-1] == hidden
+            and hidden % 512 == 0
+            and hidden <= 8192
+            and input_.numel() * input_.element_size() >= _AR2S_RMS_MIN_BYTES
+        )
+
+    def sp_fused_allreduce_rmsnorm(self, input_, res_inp_, weight_, eps, gemma_norm=False):
+        # a deferred MoE tail: ar2s reads the input as is; the fallback below takes it
+        if self.ar2s_sp_eligible(input_, weight_):
+            _settle_input(input_)
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(), res_inp_.contiguous(), weight_, eps, gemma_norm,
+                sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm)
+
+    def sp_fused_allreduce_rmsnorm_mxfp8_quant(self, input_, res_inp_, weight_, eps, gemma_norm=False):
+        # a deferred MoE tail: ar2s reads the input as is; the fallback below takes it
+        if self.ar2s_sp_eligible(input_, weight_):
+            _settle_input(input_)
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(), res_inp_.contiguous(), weight_, eps, gemma_norm,
+                fp8_out=True, sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm_mxfp8_quant(input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm)
+
+    def sp_moe_front_eligible(self, input_: torch.Tensor, weight_: torch.Tensor) -> bool:
+        """Whether sp_fused_allreduce_rmsnorm_moe_front takes this call: the sequence-parallel
+        range at TP2 / TP4 (ar2s kernel 2) with the Lamport all-gather the owner-row routing
+        gathers with. Shapes and the group only, so every rank decides the same."""
+        ca_comm = self.ca_comm
+        return (
+            self.ar2s_sp_eligible(input_, weight_)
+            and ca_comm.world_size in (2, 4)
+            and getattr(ca_comm, "_lamport_max_bytes", 0) > 0
+        )
+
+    def sp_fused_allreduce_rmsnorm_moe_front(self, input_, res_inp_, weight_, eps, gemma_norm=False):
+        """MiniMax-M3 MoE front on the sequence-parallel residual (CustomAllreduce.
+        ar2s_fused_ar_rms_moe): (x_own, residual_out, q8, s8, q4, s4), or None outside
+        sp_moe_front_eligible -- the caller then takes sp_fused_allreduce_rmsnorm, which is the
+        replicated AR + norm there. Eager only (call it from inside a custom op)."""
+        if not self.sp_moe_front_eligible(input_, weight_):
+            return None
+        return self.ca_comm.ar2s_fused_ar_rms_moe(
+            input_.contiguous(), res_inp_.contiguous(), weight_, eps, gemma_norm
+        )
+
+    def sp_allreduce_add_residual(self, input_, res_inp_, weight_):
+        """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual
+        (the residual_out the next replicated AR + norm would write)."""
+        _settle_input(input_)
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(), res_inp_.contiguous(), weight_, 0.0, False,
+                sp_residual=True, aux_residual=True,
+            )
+        return self.all_reduce(input_) + res_inp_
+
     def fused_allreduce_rmsnorm_mxfp8_quant(
         self,
         input_: torch.Tensor,
@@ -904,10 +1074,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        # This one-shot has its own measured crossover, so it uses the plain
-        # Gluon all-reduce's 4 MiB eligibility bound rather than the Lamport
-        # per-token cutoff.
-        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=False):
+        # The Gluon AR + RMSNorm + MXFP8 one-shot takes up to
+        # _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot can take the
+        # call: above that the Lamport fused AR + RMSNorm and a separate MXFP8
+        # quant are faster (hidden 6144, TP4, CUDA graphs, 4x MI455X: 18.4 /
+        # 19.5 / 25.9 / 26.2 us against 25.7 / 26.1 / 28.4 / 28.7 us at 192 /
+        # 256 / 320 / 341 rows; level at 128-160 rows). Without the Lamport
+        # path it keeps the plain Gluon all-reduce's 4 MiB bound.
+        ca_comm = self.ca_comm
+        lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
+            input_, res_inp_, weight_, hidden
+        )
+        gluon = _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport)
+        # AITER_K5_AR=1: the one-shot decode kernel, with the bits of the path it replaces. In
+        # place of the Gluon one-shot it quantizes in its own epilogue; in place of the Lamport
+        # fused kernel it writes that kernel's bf16 output and per_1x32_mx_quant_hip quantizes it,
+        # as here below (its own Lamport-order MXFP8 epilogue, AITER_K5_AR_FUSED_MXFP8=1, does
+        # not yet match the scale bytes of every group).
+        tail = _take_tail(input_)
+        if (gluon or lamport) and ca_comm is not None and ca_comm.should_k5_ar(
+            input_, res_inp_, weight_
+        ):
+            fused_fp8 = gluon or _K5_AR_FUSED_MXFP8
+            got = None
+            if tail is not None:
+                # the deferred MoE tail computed in the k5 prologue (same bits)
+                got = ca_comm.k5_fused_ar_rms_tail(
+                    tail, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon,
+                    fp8_out=fused_fp8,
+                )
+                if got is None:
+                    _settle_tail(tail)
+            if fused_fp8:
+                if got is not None:
+                    return got
+                return ca_comm.k5_fused_ar_rms(
+                    input_, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon, fp8_out=True
+                )
+            from aiter.ops.quant import per_1x32_mx_quant_hip
+
+            normed, res_out = got if got is not None else ca_comm.k5_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm, lamport_order=True
+            )
+            out, scale = per_1x32_mx_quant_hip(normed, quant_dtype=fp8, scale_type=fp8_e8m0)
+            return out, res_out, scale
+        _settle_tail(tail)
+        if gluon:
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,
             )
@@ -924,6 +1136,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 calls=calls,
             )
 
+        # Prefill sizes: ar2s writes the MXFP8 bytes itself (the bf16 out it
+        # would hand per_1x32_mx_quant_hip below is never written).
+        total_bytes = input_.numel() * input_.element_size()
+        if (
+            _AR2S_MXFP8
+            and _AR2S_RMS_MIN_BYTES <= total_bytes <= _AR2S_RMS_MAX_TOTAL_BYTES
+            and hidden % 512 == 0
+            and ca_comm is not None
+            and ca_comm.should_ar2s_rms(input_, res_inp_, weight_, _AR2S_RMS_MIN_BYTES)
+        ):
+            return ca_comm.ar2s_fused_ar_rms_ex(
+                input_, res_inp_, weight_, eps, gemma_norm, fp8_out=True
+            )
         normed, res_out = self.fused_allreduce_rmsnorm(
             input_,
             res_inp_,

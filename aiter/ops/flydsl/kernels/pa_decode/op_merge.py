@@ -284,15 +284,17 @@ class Gfx1250ClusterMerge:
         self.t = t
         self.pmax, self.psum, self.pout, self.output = pmax, psum, pout, output
         self.stride_q_row, self.stride_q_head = stride_q_row, stride_q_head
+        # CTAs (tasks) a sequence: the cluster holds ``cluster_rows`` of them.
+        self.parts = t.cluster_merge // t.cluster_rows
         # Each CTA writes ``share`` rows of its query split, ``per_wave`` per wave.
-        self.share = -(-t.rows // t.cluster_merge)
+        self.share = -(-t.rows // self.parts)
         self.per_wave = -(-self.share // t.NWARP)
         self.quant = quant
         # Token-wide quants exchange maxima across the cluster; group-local
         # ones store like the BF16 output.
         self.token_quant = quant is not None and not quant.group_local
         if self.token_quant and (
-            self.per_wave != 1 or self.share * t.cluster_merge != t.rows
+            self.per_wave != 1 or self.share * self.parts != t.rows
         ):
             raise ValueError("quantized cluster merges need one row per wave")
 
@@ -303,7 +305,13 @@ class Gfx1250ClusterMerge:
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
         wave_begin = fx.Int32(fx.rocdl.wave_id()) * self.per_wave
-        if const_expr(not self.token_quant):
+        if const_expr(self.t.cluster_rows > 1):
+            # Every CTA took the barrier; only multi-task sequences merge.
+            if (wave_begin < self.share) & (count > 1):
+                self._merge_rows(
+                    seq, part * self.share, wave_begin, first, count, capacity
+                )
+        elif const_expr(not self.token_quant):
             if wave_begin < self.share:
                 self._merge_rows(
                     seq, part * self.share, wave_begin, first, count, capacity
@@ -321,7 +329,7 @@ class Gfx1250ClusterMerge:
         t, share, per_wave = self.t, self.share, self.per_wave
         elems = t.head_dim // t.WAVE
         # Rows whose partition loads are in flight together (64 VGPRs).
-        group = max(1, 128 // (t.cluster_merge * elems))
+        group = max(1, 128 // (self.parts * elems))
         lane = fx.Int32(gpu.thread_id("x")) % t.WAVE
         kv_query = fx.Int32(gpu.block_id("y"))
         kv_h = kv_query // t.query_splits
@@ -343,7 +351,7 @@ class Gfx1250ClusterMerge:
         # Partitions past the count reread the last one with zero weight.
         slots = [
             fx.Int64(first_slot + fx.min(fx.Int32(p), count - 1))
-            for p in range_constexpr(t.cluster_merge)
+            for p in range_constexpr(self.parts)
         ]
         lane_elem = lane * elems
         # Contiguous scratch can start at an offset, and final output heads
@@ -415,12 +423,12 @@ class Gfx1250ClusterMerge:
                     target = fx.recast_iter(vector, fx.add_offset(output, offset))
                     if const_expr(self.quant is not None):
                         # Group-local quant; the guard is wave-uniform.
-                        if const_expr(share % per_wave or t.rows % t.cluster_merge):
+                        if const_expr(share % per_wave or t.rows % self.parts):
                             if (local[i] < share) & (row_ids[i] < t.rows):
                                 self.quant.store_rows(acc.to(t.q_dtype), offset, target)
                         else:
                             self.quant.store_rows(acc.to(t.q_dtype), offset, target)
-                    elif const_expr(share % per_wave or t.rows % t.cluster_merge):
+                    elif const_expr(share % per_wave or t.rows % self.parts):
                         if (local[i] < share) & (row_ids[i] < t.rows):
                             fx.ptr_store(acc.to(t.q_dtype), target)
                     else:

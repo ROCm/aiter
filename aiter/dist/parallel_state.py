@@ -197,6 +197,65 @@ def fused_allreduce_rmsnorm_(
     )
 
 
+def _group(group_name: str):
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group
+
+
+def sp_fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(inp), torch.empty_like(res_inp)
+
+
+@torch_compile_guard(gen_fake=sp_fused_allreduce_rmsnorm_fake, mutates_args=[])
+def sp_fused_allreduce_rmsnorm_(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _group(group_name).device_communicator.sp_fused_allreduce_rmsnorm(inp, res_inp, w, eps, gemma_norm)
+
+
+def sp_fused_allreduce_rmsnorm_mxfp8_quant_fake(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8, fp8_e8m0
+
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(inp.shape[:-1] + (inp.shape[-1] // 32,), dtype=fp8_e8m0, device=inp.device),
+    )
+
+
+@torch_compile_guard(gen_fake=sp_fused_allreduce_rmsnorm_mxfp8_quant_fake, mutates_args=[])
+def sp_fused_allreduce_rmsnorm_mxfp8_quant_(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _group(group_name).device_communicator.sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        inp, res_inp, w, eps, gemma_norm
+    )
+
+
+def sp_allreduce_add_residual_fake(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(res_inp)
+
+
+@torch_compile_guard(gen_fake=sp_allreduce_add_residual_fake, mutates_args=[])
+def sp_allreduce_add_residual_(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return _group(group_name).device_communicator.sp_allreduce_add_residual(inp, res_inp, w)
+
+
 def fused_allreduce_rmsnorm_quant_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -933,6 +992,19 @@ class GroupCoordinator:
             x_pad_to_multiple=x_pad_to_multiple,
             gemma_norm=gemma_norm,
         )
+
+    def sp_fused_allreduce_rmsnorm(self, input_, residual_inp_, weight_, eps, gemma_norm=False):
+        return sp_fused_allreduce_rmsnorm_(
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name, gemma_norm=gemma_norm
+        )
+
+    def sp_fused_allreduce_rmsnorm_mxfp8_quant(self, input_, residual_inp_, weight_, eps, gemma_norm=False):
+        return sp_fused_allreduce_rmsnorm_mxfp8_quant_(
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name, gemma_norm=gemma_norm
+        )
+
+    def sp_allreduce_add_residual(self, input_, residual_inp_, weight_):
+        return sp_allreduce_add_residual_(input_, residual_inp_, weight_, group_name=self.unique_name)
 
     def fused_allreduce_rmsnorm_quant(
         self,

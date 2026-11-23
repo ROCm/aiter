@@ -136,7 +136,8 @@ class Gfx1250Nvfp4WavePipeline:
         return vh * 64 + ctx.warp * 16 + ctx.half * 8
 
     def _slot(self, slot):
-        return (slot * self.t.NWARP + self.ctx.warp) * WAVE_SLOT_BYTES
+        waves = self.t.NWARP * self.t.page_groups
+        return (slot * waves + self.ctx.wave) * WAVE_SLOT_BYTES
 
     @flyc.jit
     def _stage(self, token_base, slot):
@@ -146,8 +147,14 @@ class Gfx1250Nvfp4WavePipeline:
         block) arrive zero-filled, so they score and weigh zero."""
         ctx = self.ctx
         safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
-        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
-        page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128])
+        if const_expr(self.t.plan_free):
+            # The preloaded page ids: lane j holds page j of the sequence.
+            page = fx.Int32(fx.rocdl.readlane(T.i32, ctx.page_ids, safe // 128))
+        else:
+            table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+            page = fx.Int32(
+                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
+            )
         first = token_base + ctx.warp * _TOKENS
         valid = fx.max(
             fx.Int32(0), fx.min(fx.Int32(_TOKENS), ctx.planned_context - first)
@@ -204,20 +211,10 @@ class Gfx1250Nvfp4WavePipeline:
         scale = self.mem.load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
         return fx.Vector.from_elements(words, dtype=fx.Int32), scale
 
-    def _query(self):
-        """This lane's query row as FP8 terms for the B operand of K128 WMMA.
-
-        Lane (row lane16, half) holds dims 16 (2 j + half) + [0, 16), j < 4: four
-        whole 16-dim scale blocks. Term i scales block b by 2^(E_b - 7 - 4 i),
-        E_b = floor(log2(max |q|)), so the first term holds each block's maximum
-        in [128, 256] and every later term the previous residual (exact in FP32)
-        in at most 128: two terms reproduce BF16 and three FP16 to within 2^-21
-        of the block maximum. Returns per term (operand, i64 scales)."""
+    def _query_load(self):
+        """Issue this lane's query loads (four 16-element chunks)."""
         ctx, t = self.ctx, self.t
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
-        # Padding rows (lane16 >= rows) read row 0 and are zeroed: their scores
-        # are masked and never stored.
-        live = ctx.lane16 < t.rows
         row = fx.min(ctx.lane16, fx.Int32(t.rows - 1))
         qbase = (
             fx.Int64(ctx.planned_seq) * t.query_length
@@ -226,73 +223,77 @@ class Gfx1250Nvfp4WavePipeline:
         ) * ctx.stride_q_row + (
             ctx.kv_h * t.query_group_size + row % t.query_group_size
         ) * ctx.stride_q_head
-        blocks = []
-        for j in range_constexpr(4):
-            values = fx.Vector(
+        return [
+            fx.Vector(
                 fx.ptr_load(
                     fx.add_offset(query, qbase + j * 32 + ctx.half * 16),
                     result_type=fx.Vector.make_type(16, t.q_dtype),
                 )
-            ).to(fx.Float32)
-            keep = fx.Vector.from_elements(
-                [live.select(fx.Float32(1.0), fx.Float32(0.0))], dtype=fx.Float32
+            )
+            for j in range_constexpr(4)
+        ]
+
+    def _query_block(self, values, live, terms):
+        """Split one 16-element query block into ``terms`` FP8 terms: per term
+        four operand words and the E8M0 byte of its power-of-two scale."""
+        block = values.to(fx.Float32) * fx.Vector.from_elements(
+            [live.select(fx.Float32(1.0), fx.Float32(0.0))], dtype=fx.Float32
+        ).broadcast_to(16)
+        amax = fmath.absf(block).reduce(ReductionOp.MAX)
+        exponent = ((_f32_bits(amax) >> 23) & 0xFF) - 127
+        residual = block
+        out = []
+        for i in range_constexpr(terms):
+            # Zero blocks (exponent -127) clamp to any scale; nonzero
+            # FP32 exponents keep k well inside 2^k's normal range.
+            k = fx.max(fx.min(exponent - (7 + 4 * i), fx.Int32(120)), fx.Int32(-120))
+            scaled = residual * fx.Vector.from_elements(
+                [_pow2(-k)], dtype=fx.Float32
             ).broadcast_to(16)
-            blocks.append(values * keep)
-        terms = 3 if t.query_dtype == "f16" else 2
-        operands = [[] for _ in range_constexpr(terms)]
-        scale_words = [fx.Int32(0) for _ in range_constexpr(terms)]
-        for j in range_constexpr(4):
-            amax = fmath.absf(blocks[j]).reduce(ReductionOp.MAX)
-            exponent = ((_f32_bits(amax) >> 23) & 0xFF) - 127
-            residual = blocks[j]
-            for i in range_constexpr(terms):
-                # Zero blocks (exponent -127) clamp to any scale; nonzero
-                # FP32 exponents keep k well inside 2^k's normal range.
-                k = fx.max(fx.min(exponent - (7 + 4 * i), fx.Int32(120)), fx.Int32(-120))
-                scaled = residual * fx.Vector.from_elements(
-                    [_pow2(-k)], dtype=fx.Float32
-                ).broadcast_to(16)
-                words = []
-                for h in range_constexpr(2):
-                    pair = self.mem.fp8(
-                        fx.Vector.from_elements(
-                            [scaled[h * 8 + e] for e in range_constexpr(8)],
-                            dtype=fx.Float32,
-                        )
-                    )
-                    words.extend([pair[0], pair[1]])
-                    if const_expr(i + 1 < terms):
-                        back = fx.Vector(
-                            fx.rocdl.cvt_scale_pk8_f32_fp8(
-                                T.vec(8, T.f32),
-                                fx.as_ir_value(
-                                    fx.Vector.from_elements(
-                                        [pair[0], pair[1]], dtype=fx.Int32
-                                    )
-                                ),
-                                fx.as_ir_value(fx.Int32(0x7F7F7F7F)),
-                                0,
-                            )
-                        )
-                        if const_expr(h == 0):
-                            low = back
-                        else:
-                            high = back
-                operands[i].extend(words)
-                scale_words[i] = scale_words[i] | (_e8m0_pow2(k) << (8 * j))
-                if const_expr(i + 1 < terms):
-                    quantized = fx.Vector.from_elements(
-                        [low[e] for e in range_constexpr(8)]
-                        + [high[e] for e in range_constexpr(8)],
+            words = []
+            for h in range_constexpr(2):
+                pair = self.mem.fp8(
+                    fx.Vector.from_elements(
+                        [scaled[h * 8 + e] for e in range_constexpr(8)],
                         dtype=fx.Float32,
                     )
-                    residual = residual - quantized * fx.Vector.from_elements(
-                        [_pow2(k)], dtype=fx.Float32
-                    ).broadcast_to(16)
+                )
+                words.extend([pair[0], pair[1]])
+                if const_expr(i + 1 < terms):
+                    back = fx.Vector(
+                        fx.rocdl.cvt_scale_pk8_f32_fp8(
+                            T.vec(8, T.f32),
+                            fx.as_ir_value(
+                                fx.Vector.from_elements(
+                                    [pair[0], pair[1]], dtype=fx.Int32
+                                )
+                            ),
+                            fx.as_ir_value(fx.Int32(0x7F7F7F7F)),
+                            0,
+                        )
+                    )
+                    if const_expr(h == 0):
+                        low = back
+                    else:
+                        high = back
+            out.append((words, _e8m0_pow2(k)))
+            if const_expr(i + 1 < terms):
+                quantized = fx.Vector.from_elements(
+                    [low[e] for e in range_constexpr(8)]
+                    + [high[e] for e in range_constexpr(8)],
+                    dtype=fx.Float32,
+                )
+                residual = residual - quantized * fx.Vector.from_elements(
+                    [_pow2(k)], dtype=fx.Float32
+                ).broadcast_to(16)
+        return out
+
+    def _query_scales(self, scale_words):
+        """Per term, the i64 B-operand scales from each lane's four block bytes."""
+        ctx, t = self.ctx, self.t
         result = []
         lower = ctx.half == 0
-        for i in range_constexpr(terms):
-            mine = scale_words[i]
+        for mine in scale_words:
             other = fx.Int32(mine.shuffle_xor(16, t.WAVE))
             # Byte b of the row's scales is block b: even blocks from half 0.
             even = lower.select(mine, other)
@@ -309,11 +310,106 @@ class Gfx1250Nvfp4WavePipeline:
                 | (((even >> 24) & 0xFF) << 16)
                 | (((odd >> 24) & 0xFF) << 24)
             )
-            scale = fx.Vector.from_elements([lo, hi], dtype=fx.Int32).bitcast(
-                fx.Int64
-            )[0]
-            result.append((fx.Vector.from_elements(operands[i], dtype=fx.Int32), scale))
+            result.append(
+                fx.Vector.from_elements([lo, hi], dtype=fx.Int32).bitcast(fx.Int64)[0]
+            )
         return result
+
+    def _query(self, loaded=None):
+        """This lane's query row as FP8 terms for the B operand of K128 WMMA.
+
+        Lane (row lane16, half) holds dims 16 (2 j + half) + [0, 16), j < 4: four
+        whole 16-dim scale blocks. Term i scales block b by 2^(E_b - 7 - 4 i),
+        E_b = floor(log2(max |q|)), so the first term holds each block's maximum
+        in [128, 256] and every later term the previous residual (exact in FP32)
+        in at most 128: two terms reproduce BF16 and three FP16 to within 2^-21
+        of the block maximum. Returns per term (operand, i64 scales)."""
+        ctx, t = self.ctx, self.t
+        # Padding rows (lane16 >= rows) read row 0 and are zeroed: their scores
+        # are masked and never stored.
+        live = ctx.lane16 < t.rows
+        if loaded is None:
+            loaded = self._query_load()
+        terms = t.query_terms
+        operands = [[] for _ in range_constexpr(terms)]
+        scale_words = [fx.Int32(0) for _ in range_constexpr(terms)]
+        for j in range_constexpr(4):
+            for i, (words, code) in enumerate(self._query_block(loaded[j], live, terms)):
+                operands[i].extend(words)
+                scale_words[i] = scale_words[i] | (code << (8 * j))
+        scales = self._query_scales(scale_words)
+        return [
+            (fx.Vector.from_elements(operands[i], dtype=fx.Int32), scales[i])
+            for i in range_constexpr(terms)
+        ]
+
+    def _query_load_block(self):
+        """Plan-free tiles: wave ``warp`` of the first group loads only query
+        block ``warp`` of its lane's row (``_query_shared`` splits it)."""
+        ctx, t = self.ctx, self.t
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        row = fx.min(ctx.lane16, fx.Int32(t.rows - 1))
+        qbase = (
+            fx.Int64(ctx.planned_seq) * t.query_length
+            + ctx.query_begin
+            + row // t.query_group_size
+        ) * ctx.stride_q_row + (
+            ctx.kv_h * t.query_group_size + row % t.query_group_size
+        ) * ctx.stride_q_head
+        return fx.Vector(
+            fx.ptr_load(
+                fx.add_offset(query, qbase + ctx.warp * 32 + ctx.half * 16),
+                result_type=fx.Vector.make_type(16, t.q_dtype),
+            )
+        )
+
+    def _query_split_store(self, loaded):
+        """``_query`` computed once a CTA: the first group's wave w splits block
+        w of every lane's row into LDS (``_query_shared`` reads the terms back
+        after a barrier). The same arithmetic per block, so the operands are
+        bitwise ``_query``'s."""
+        ctx, t = self.ctx, self.t
+        terms = t.query_terms
+        words_at = t.q_share_offset
+        codes_at = words_at + terms * 4 * t.WAVE * 16
+        parts = self._query_block(loaded, ctx.lane16 < t.rows, terms)
+        for i in range_constexpr(terms):
+            words, code = parts[i]
+            self.mem.store(
+                words_at + ((i * 4 + ctx.warp) * t.WAVE + ctx.lane) * 16,
+                fx.Vector.from_elements(words, dtype=fx.Int32),
+                fx.Int32,
+            )
+            self.mem.store(
+                codes_at + (i * t.WAVE + ctx.lane) * 4 + ctx.warp,
+                fx.Vector.from_elements([fx.Int32(code).to(fx.Int8)], dtype=fx.Int8),
+                fx.Int8,
+            )
+
+    def _query_shared(self):
+        """The query terms ``_query_split_store`` left in LDS."""
+        ctx, t = self.ctx, self.t
+        terms = t.query_terms
+        words_at = t.q_share_offset
+        codes_at = words_at + terms * 4 * t.WAVE * 16
+        operands = []
+        scale_words = []
+        for i in range_constexpr(terms):
+            words = []
+            for j in range_constexpr(4):
+                frag = self.mem.load(
+                    words_at + ((i * 4 + j) * t.WAVE + ctx.lane) * 16, fx.Int32, 4
+                )
+                words.extend([frag[e] for e in range_constexpr(4)])
+            operands.append(words)
+            scale_words.append(
+                self.mem.load(codes_at + (i * t.WAVE + ctx.lane) * 4, fx.Int32, 1)[0]
+            )
+        scales = self._query_scales(scale_words)
+        return [
+            (fx.Vector.from_elements(operands[i], dtype=fx.Int32), scales[i])
+            for i in range_constexpr(terms)
+        ]
 
     def _selector(self):
         """B = 1.0 (e2m1 0b0010) where k = n mod 16: dword w of lane n holds
@@ -325,28 +421,80 @@ class Gfx1250Nvfp4WavePipeline:
         odd = (n >= 8).select(one, fx.Int32(0))
         return fx.Vector.from_elements([even, odd] * 4, dtype=fx.Int32)
 
+    def _mask(self, scores, token_base, upper, row):
+        """-inf for scores at or past a row's causal bound (and padding rows)."""
+        ctx, t = self.ctx, self.t
+        masked = []
+        for i in range_constexpr(16):
+            n, r = i // 8, i % 8
+            token = token_base + ctx.warp * _TOKENS + n * 16 + ctx.half * 8 + r
+            visible = (token < upper) & (row < t.rows)
+            masked.append(visible.select(scores[i], fx.Float32(float("-inf"))))
+        return fx.Vector.from_elements(masked, dtype=fx.Float32)
+
     @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
+        ng = t.page_groups
         ctx.tid = fx.Int32(gpu.thread_id("x"))
-        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        # wave = group * NWARP + warp: ``warp`` picks the 32 tokens of a page,
+        # ``group`` the pages (g, g + G, ...) of the task.
+        ctx.wave, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        if const_expr(ng > 1):
+            ctx.wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, ctx.wave))
+            ctx.warp, ctx.group = ctx.wave % t.NWARP, ctx.wave // t.NWARP
+        else:
+            ctx.warp, ctx.group = ctx.wave, fx.Int32(0)
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
         ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
         self.mem.allocate()
+        q_loaded = None
+        if const_expr(t.plan_free):
+            # The query loads issue first, then the page ids the prologue
+            # copied (lane j holds page j) are read.
+            q_loaded = self._query_load_block()
+            fx.rocdl.s_wait_asynccnt(0)
+            ctx.page_ids = self.mem.load(t.page_ids_offset + ctx.tid * 4, fx.Int32, 1)[0]
         nb = t.nvfp4_buffers
+        stride = 128 * ng
         begin, end = (
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
+        if const_expr(ng > 1):
+            begin = begin + ctx.group * 128
+        # One query token a CTA (every row sees the same keys): only the page
+        # holding the last key needs a mask, and pages past it hold none. The
+        # loop stops at that page (a page of masked keys leaves the state
+        # bitwise unchanged), and the tail page's mask is the QK start value
+        # (-inf + finite products stay -inf): a select per score on one page.
+        bias_mask = const_expr(t.query_length == 1 and t.rows == t.query_group_size)
+        if const_expr(bias_mask):
+            last_base = (ctx.planned_context - 1) // 128 * 128
+            end = fx.min(end, last_base + 128)
         # The first pages' DMA overlaps the query split.
-        self._stage(begin, fx.Int32(0))
+        if const_expr(ng > 1):
+            if begin < end:
+                self._stage(begin, fx.Int32(0))
+        else:
+            self._stage(begin, fx.Int32(0))
         for ahead in range_constexpr(1, nb - 1):
-            if begin + ahead * 128 < end:
-                self._stage(begin + ahead * 128, fx.Int32(ahead))
-        q_terms = self._query()
+            if begin + ahead * stride < end:
+                self._stage(begin + ahead * stride, fx.Int32(ahead))
+        if const_expr(t.plan_free):
+            # One split a CTA: the first group's waves, one query block each.
+            if const_expr(ng > 1):
+                if ctx.group == 0:
+                    self._query_split_store(q_loaded)
+            else:
+                self._query_split_store(q_loaded)
+            gpu.barrier()
+            q_terms = self._query_shared()
+        else:
+            q_terms = self._query()
         selector = self._selector()
         # Block scales of the selector: 1.0 (E4M3) on block b only. They must
         # reach the WMMA in VGPRs: a uniform i64 is emitted as an inline constant
@@ -369,25 +517,30 @@ class Gfx1250Nvfp4WavePipeline:
         initial = [fx.Float32(float("-inf")), fx.Float32(0.0)]
         initial.extend([fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)])
         zeros = fx.Vector.filled(8, 0.0, fx.Float32)
-        for token_i, state in range(begin, end, 128, init=initial):
+        zeros16 = fx.Vector.filled(16, 0.0, fx.Float32)
+        # The first visible bound over the rows: pages below it need no mask.
+        upper_min = ctx.planned_context - t.query_length + ctx.query_begin + 1
+        if const_expr(bias_mask):
+            tail_bias = self._mask(zeros16, last_base, upper, row)
+        for token_i, state in range(begin, end, stride, init=initial):
             token_base = fx.Int32(token_i)
-            page = (token_base - begin) // 128
+            page = (token_base - begin) // stride
             slot = page % nb
             # This wave's copies of the page are the oldest in flight.
-            ahead = token_base + (nb - 1) * 128
+            ahead = token_base + (nb - 1) * stride
             # Four copies a page; the pages issued after this one may stay in flight.
             if const_expr(nb == 2):
                 tdm_ops.tensor_wait(0)
             elif const_expr(nb == 3):
-                if token_base + 128 < end:
+                if token_base + stride < end:
                     tdm_ops.tensor_wait(4)
                 else:
                     tdm_ops.tensor_wait(0)
             else:
-                if token_base + 256 < end:
+                if token_base + 2 * stride < end:
                     tdm_ops.tensor_wait(8)
                 else:
-                    if token_base + 128 < end:
+                    if token_base + stride < end:
                         tdm_ops.tensor_wait(4)
                     else:
                         tdm_ops.tensor_wait(0)
@@ -396,22 +549,21 @@ class Gfx1250Nvfp4WavePipeline:
             base = self._slot(slot)
             units = []
             v_tiles = []
+            if const_expr(bias_mask):
+                bias = (token_base == last_base).select(tail_bias, zeros16)
             for n in range_constexpr(2):
                 k_rows, k_scale = self._rows(base, _PLANE_K, n)
                 scores = zeros
+                if const_expr(bias_mask):
+                    scores = fx.Vector.from_elements(
+                        [bias[n * 8 + r] for r in range_constexpr(8)], dtype=fx.Float32
+                    )
                 for operand, scale in q_terms:
                     scores = _wmma_scale16(
                         k_rows, operand, scores, k_scale, scale, "fp4_e2m1", "fp8_e4m3", "e8"
                     )
                 for r in range_constexpr(8):
-                    token = token_base + ctx.warp * _TOKENS + n * 16 + ctx.half * 8 + r
-                    visible = (token < upper) & (row < t.rows)
-                    units.append(
-                        visible.select(
-                            scores[r] * fx.Float32(t.softmax_scale * LOG2E),
-                            fx.Float32(float("-inf")),
-                        )
-                    )
+                    units.append(scores[r] * fx.Float32(t.softmax_scale * LOG2E))
                 v_rows, v_scale = self._rows(base, _PLANE_V, n)
                 v_tiles.append(
                     [
@@ -428,6 +580,8 @@ class Gfx1250Nvfp4WavePipeline:
                     ]
                 )
             scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+            if const_expr(not bias_mask):
+                scores = self._mask(scores, token_base, upper, row)
             tile_max = scores.reduce(ReductionOp.MAX)
             tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, t.WAVE))
             old_max = state[0]
@@ -451,56 +605,73 @@ class Gfx1250Nvfp4WavePipeline:
             # tokens 8 half + [0, 8) and 16 + 8 half + [0, 8) of this wave.
             p_operand = probs.to(fx.BFloat16)
             next_state = [new_max, state[1] * corr + tile_sum]
-            factor = fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(8)
+            # No branch in the page loop: one costs ~100 VGPRs of live values.
+            acc = fx.Vector.from_elements(
+                [state[2 + b][e] for b in range_constexpr(8) for e in range_constexpr(8)],
+                dtype=fx.Float32,
+            ) * fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(64)
             for b in range_constexpr(8):
                 v_operand = fx.Vector.from_elements(
                     [v_tiles[0][b][e] for e in range_constexpr(8)]
                     + [v_tiles[1][b][e] for e in range_constexpr(8)],
                     dtype=fx.Float32,
                 ).to(fx.BFloat16)
-                next_state.append(
-                    Gfx1250Gemm.mma(v_operand, p_operand, state[2 + b] * factor, 32, True)
+                acc_b = fx.Vector.from_elements(
+                    [acc[b * 8 + e] for e in range_constexpr(8)], dtype=fx.Float32
                 )
+                next_state.append(Gfx1250Gemm.mma(v_operand, p_operand, acc_b, 32, True))
             final = yield next_state
-        # Merge the four waves' (maximum, sum, output) through the idle slots.
+        # Merge the waves' (maximum, sum, output) through the idle slots.
+        waves = t.NWARP * ng
+        assert waves * (_MERGE_OUT + 16 * 8) <= t.stats_offset
         tdm_ops.tensor_wait(0)
         gpu.barrier()
         for b in range_constexpr(8):
             self.mem.store(
-                ctx.warp * _MERGE_OUT + (b * 32 + ctx.lane) * 32,
+                ctx.wave * _MERGE_OUT + (b * 32 + ctx.lane) * 32,
                 final[2 + b],
                 fx.Float32,
             )
-        stats = 4 * _MERGE_OUT
+        stats = waves * _MERGE_OUT
         if ctx.half == 0:
             self.mem.store(
-                stats + (ctx.warp * 16 + ctx.lane16) * 8,
+                stats + (ctx.wave * 16 + ctx.lane16) * 8,
                 fx.Vector.from_elements([final[0], final[1]], dtype=fx.Float32),
                 fx.Float32,
             )
         gpu.barrier()
+        if const_expr(ng > 1):
+            # The first group's waves merge every wave's partial and store.
+            if ctx.group == 0:
+                self._merge_store(stats, waves)
+        else:
+            self._merge_store(stats, waves)
+
+    def _merge_store(self, stats, waves):
+        # Traced inline (Python ints in range_constexpr bounds).
+        ctx = self.ctx
         wave_stats = [
             self.mem.load(stats + (w * 16 + ctx.lane16) * 8, fx.Float32, 2)
-            for w in range_constexpr(t.NWARP)
+            for w in range_constexpr(waves)
         ]
         row_max = wave_stats[0][0]
-        for w in range_constexpr(1, t.NWARP):
+        for w in range_constexpr(1, waves):
             row_max = fx.maxnumf(row_max, wave_stats[w][0])
         safe_max = (row_max > fx.Float32(float("-inf"))).select(
             row_max, fx.Float32(0.0)
         )
         weights = [
             fx.Float32(fx.exp2(wave_stats[w][0] - safe_max, fastmath="afn"))
-            for w in range_constexpr(t.NWARP)
+            for w in range_constexpr(waves)
         ]
         denom = fx.Float32(0.0)
-        for w in range_constexpr(t.NWARP):
+        for w in range_constexpr(waves):
             denom = denom + weights[w] * wave_stats[w][1]
         merged = [row_max, denom]
         for vh in range_constexpr(2):
             b = self._tile(vh)
             out = fx.Vector.filled(8, 0.0, fx.Float32)
-            for w in range_constexpr(t.NWARP):
+            for w in range_constexpr(waves):
                 out = out + self.mem.load(
                     w * _MERGE_OUT + (b * 32 + ctx.lane) * 32, fx.Float32, 8
                 ) * fx.Vector.from_elements([weights[w]], dtype=fx.Float32).broadcast_to(

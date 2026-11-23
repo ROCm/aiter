@@ -612,3 +612,32 @@ def custom_reduce_scatter(
     """
     _assert_has_custom_group()
     return get_custom_group(group).reduce_scatter_tensor(input_, use_custom, dim)
+
+
+# ---- sequence-parallel residual (prefill sizes; gfx1250 ar2s_rms_ex) ----
+# The residual stream returned by these lives on each rank's owner rows only once the input is at
+# prefill size (>= the ar2s floor, 32 MiB): feed it only to these ops. Below that they are the
+# replicated ops (whole residual). The normed outputs are whole and bit-identical either way.
+def tensor_model_parallel_sp_fused_allreduce_rmsnorm(
+    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor, eps: float,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return get_tp_group().sp_fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps, gemma_norm)
+
+
+def tensor_model_parallel_sp_fused_allreduce_rmsnorm_mxfp8_quant(
+    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor, eps: float,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(E4M3 out, residual_out, row-major E8M0 scale [rows, hidden // 32])."""
+    return get_tp_group().sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        input_, residual_inp_, weight_, eps, gemma_norm
+    )
+
+
+def tensor_model_parallel_sp_allreduce_add_residual(
+    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor
+) -> torch.Tensor:
+    """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual.
+    ``weight_`` is only the hidden size's witness (the norm weight of the layer)."""
+    return get_tp_group().sp_allreduce_add_residual(input_, residual_inp_, weight_)

@@ -3386,6 +3386,7 @@ def _get_compiled_token_multidest_tp_route_quant(
     ksplit: int,
     tp_route_slots: int,
     mxfp8_copy: bool = False,
+    count_slots: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_tp_route_quant_module,
@@ -3399,7 +3400,20 @@ def _get_compiled_token_multidest_tp_route_quant(
         ksplit=ksplit,
         tp_route_slots=tp_route_slots,
         mxfp8_copy=mxfp8_copy,
+        count_slots=count_slots,
     )
+
+
+# Groups (of a route/quant block's 8 tokens) each count-route thread sums, at
+# least: one build for every decode batch up to 8 * 2 * this many tokens.
+_COUNT_ROUTE_MIN_SLOTS = 8
+
+
+def _count_route_slots(n_groups: int) -> int:
+    slots = _COUNT_ROUTE_MIN_SLOTS
+    while 2 * slots < n_groups:
+        slots *= 2
+    return slots
 
 
 @functools.cache
@@ -3487,6 +3501,22 @@ def _tp_route_slots(numel: int) -> int:
     while slots * 256 < numel:
         slots *= 2
     return slots
+
+
+def _count_route_usable(group_counts, token_num, topk, experts, warps_per_block) -> bool:
+    """Whether the router's per-group expert counts can stand in for the TP
+    route's id count: int32 ``[groups, 128]`` rows of ``warps_per_block``
+    tokens covering every token, 128 experts, a block's routes in half a block."""
+    return (
+        group_counts.dtype == torch.int32
+        and group_counts.dim() == 2
+        and group_counts.is_contiguous()
+        and group_counts.shape[1] == 128
+        and experts == 128
+        and warps_per_block == 8
+        and group_counts.shape[0] * warps_per_block >= token_num
+        and warps_per_block * topk <= 128
+    )
 
 
 def _routeks_tp_route_args(tp_route_params: dict):
@@ -3823,6 +3853,42 @@ def flydsl_moe_fused_quant_preshuffle(
                 and row_to_token is None
                 and token_multidest_quant_enabled()
             ):
+                group_counts = tp_route_params.get("group_counts")
+                if group_counts is not None and _count_route_usable(
+                    group_counts, token_num, int(source_topk), tp_experts, warps_per_block
+                ):
+                    n_groups = int(group_counts.shape[0])
+                    launch = _get_compiled_token_multidest_tp_route_quant(
+                        feat_dim=feat_dim,
+                        wmma_rep=wmma_rep,
+                        topk=int(source_topk),
+                        quant_mode=quant_mode,
+                        ksplit=md_ksplit,
+                        # Unread by the count route: one build per count bucket.
+                        tp_route_slots=_TP_ROUTE_MIN_SLOTS,
+                        mxfp8_copy=want_copy,
+                        count_slots=_count_route_slots(n_groups),
+                    )
+                    copy_or_null = copy_ptrs if want_copy else (ptr_arg(None), ptr_arg(None))
+                    _dispatch_compiled(
+                        launch,
+                        ptr_arg(grouped_in.contiguous().view(-1)),
+                        ptr_arg(out_payload.view(-1)),
+                        ptr_arg(out_scale.view(-1)),
+                        ptr_arg(topids_to_rows_i32),
+                        token_num,
+                        ptr_arg(tp_ids_i32),
+                        ptr_arg(tp_route_params["masked_m"].reshape(-1)),
+                        ptr_arg(tp_route_params["psum"].reshape(-1)),
+                        tp_experts,
+                        int(tp_route_params["tile_m"]),
+                        (token_num + warps_per_block - 1) // warps_per_block,
+                        ptr_arg(group_counts.reshape(-1)),
+                        n_groups,
+                        *copy_or_null,
+                        current_stream_arg(),
+                    )
+                    return out_payload, out_scale
                 launch = _get_compiled_token_multidest_tp_route_quant(
                     feat_dim=feat_dim,
                     wmma_rep=wmma_rep,

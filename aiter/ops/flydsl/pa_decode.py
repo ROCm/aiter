@@ -550,6 +550,10 @@ def pa_decode(
     mask_unowned_kv: bool = True,
     store_output: bool = True,
     quantized_pad_rows: int = 0,
+    page_groups: int | None = None,
+    xcd_rows: int = 0,
+    plan_free: bool = False,
+    cluster_rows: int = 1,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -692,6 +696,22 @@ def pa_decode(
     tiny boundary-tile-only calls); the caller must then keep those bytes and
     scales finite. gfx1250 ignores it and always requires finite bytes.
 
+    NVFP4 wave-tile launch options (MiniMax-M3 sparse decode, gfx1250):
+    ``plan_free=True`` drops the plan lookups from the tile prologue: in the
+    one-partition direct output a CTA is a sequence, in a cluster merge a
+    cluster of P CTAs (P = the plan's ``max_partitions``, the plan built with
+    ``workgroup_budget = P x sequences``) takes min(P, tiles) even tile ranges;
+    the context lengths are read directly, every wave preloads the sequence's
+    page ids (``block_tables.shape[1] <= 32``) and the CTA splits the query
+    once. ``cluster_rows`` (2 or 4, plan-free clusters only) puts that many
+    sequences in one cluster of ``cluster_rows x P`` CTAs, so more rows stay
+    within the resident-cluster bound. ``page_groups`` (1, 2, 4) runs that many
+    groups of four waves a CTA, splitting a task's pages and merging in LDS.
+    ``xcd_rows`` dispatches that many consecutive sequences (one request's MTP
+    rows, which share most selected pages) on one XCD so they share its L2.
+    None of them changes the math of a row: the same split (one group, the
+    plan's tile ranges) gives the planned launch's bytes.
+
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
@@ -741,6 +761,10 @@ def pa_decode(
             mask_unowned_kv,
             store_output,
             quantized_pad_rows,
+            page_groups,
+            xcd_rows,
+            plan_free,
+            cluster_rows,
             # The direct merge path requires 8-byte aligned partials.
             (
                 temporary_output.data_ptr() % 8
@@ -766,6 +790,7 @@ def pa_decode(
                 work_plan,
                 quantized_output,
                 output_scale,
+                context_lengths,
             )
             return
 
@@ -1334,22 +1359,42 @@ def pa_decode(
     # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
     # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
     # later clusters run as a second wave, which is slower than the reducer.
+    # Plan-free clusters may hold ``cluster_rows`` sequences (R x P CTAs), so
+    # R times more sequences stay resident.
+    if cluster_rows not in (1, 2, 4) or (cluster_rows > 1 and not plan_free):
+        raise ValueError("cluster_rows must be 1, 2 or 4, and > 1 needs plan_free")
     cluster_merge = (
-        max_partitions
+        max_partitions * cluster_rows
         if (
             arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
             and not mx_reduce_only
             and sinks is None
             and output.stride() == query.stride()
-            and 2 <= max_partitions <= CLUSTER_PARTITIONS
+            and 2 <= max_partitions
+            and max_partitions * cluster_rows <= CLUSTER_PARTITIONS
             and num_seqs * max_partitions
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
-            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and -(-num_seqs * num_kv_heads // cluster_rows)
+            <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
         )
         else 0
     )
+    if plan_free and not (
+        (
+            one_partition_output
+            or (cluster_merge and work_plan.capacity >= num_seqs * max_partitions)
+        )
+        and nvfp4
+        and nvfp4_wave_tile(torch.float8_e4m3fn, query_length * query_group_size)
+        and max_blocks_per_seq <= 32
+    ):
+        raise NotImplementedError(
+            "plan_free takes the NVFP4 wave tile, a one-partition plan or a "
+            "cluster merge with sequences x P task slots, and at most 32 pages a "
+            "sequence"
+        )
     # The quant epilogue exists only in the one-partition direct output and the
     # cluster-of-8 merge. Any other output mode the plan picks (it depends on the
     # batch and context) writes the BF16 output as usual and quantizes it after
@@ -1417,6 +1462,17 @@ def pa_decode(
                 else {}
             ),
             **({"quant_mx": True} if quant_output and quant_mx else {}),
+            **({"page_groups": page_groups} if nvfp4 and page_groups else {}),
+            **(
+                {
+                    "xcd_rows": max(1, xcd_rows // (cluster_rows if cluster_merge else 1)),
+                    "xcds": get_num_xcds(),
+                }
+                if xcd_rows and (one_partition_output or cluster_merge)
+                else {}
+            ),
+            **({"plan_free": True} if plan_free else {}),
+            **({"cluster_rows": cluster_rows} if cluster_merge and cluster_rows > 1 else {}),
         )
 
     total_rows = query_length * query_group_size
@@ -1507,6 +1563,7 @@ def pa_decode(
                 if quant_output
                 else int(num_seqs)
             ),
+            plan_free=plan_free,
         )
     # NVFP4 caches and scales are byte planes whatever their torch view dtype,
     # so the launch signature does not depend on the view.
@@ -1571,7 +1628,7 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            ptr_arg(context_lengths if plan_free else work_plan.work_info, fx.Int32),
             work_plan.capacity,
             *merge_args,
             s,
@@ -1640,6 +1697,7 @@ def _validated_launch(
     ints,
     quant_rows,
     nvfp4=False,
+    plan_free=False,
 ):
     """The gfx1250 tile launch of a checked call (``pa_decode`` builds the same
     arguments in the same order), taking only the operands' addresses."""
@@ -1662,6 +1720,7 @@ def _validated_launch(
         work_plan,
         quantized_output,
         output_scale,
+        context_lengths=None,
     ):
         out_dtype = torch_to_fx_dtype(output.dtype)
         kv_fx = fx.Uint8 if nvfp4 else torch_to_fx_dtype(key_cache.dtype)
@@ -1684,7 +1743,7 @@ def _validated_launch(
             null_f32 if is_bf16_kv else ptr_arg(key_scale, scale_fx),
             null_f32 if is_bf16_kv else ptr_arg(value_scale, scale_fx),
             *ints,
-            ptr_arg(work_plan.work_info, fx.Int32),
+            ptr_arg(context_lengths if plan_free else work_plan.work_info, fx.Int32),
             work_plan.capacity,
             ptr_arg(output, out_dtype),
             ptr_arg(work_plan.reduce_info, fx.Int32),

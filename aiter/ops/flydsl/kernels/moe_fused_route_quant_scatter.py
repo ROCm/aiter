@@ -306,6 +306,134 @@ def _emit_tp_route(
     return start, pre, own, prefetched
 
 
+def _emit_tp_route_counts(
+    *,
+    tid,
+    ids,
+    numel,
+    counts,
+    n_groups,
+    group,
+    experts,
+    tile_m,
+    first,
+    n_own,
+    count_slots,
+    writer,
+    masked_m,
+    psum_out,
+    prefetch=None,
+):
+    """:func:`_emit_tp_route` from per-group expert counts instead of every id.
+
+    ``counts`` is int32 ``[n_groups, 128]``: group ``g`` holds how many of
+    routes ``[g * n_own, (g + 1) * n_own)`` go to each expert (the router
+    launch writes it, ``moe_router_topk_gfx1250``); this block is group
+    ``group``. Thread ``t`` sums expert ``t % 128`` over every other group
+    (``count_slots`` of them at most), so ``cnt`` and ``pre`` come out of two
+    halves added in LDS rather than an LDS atomic per route. Only the block's
+    own ids are loaded. The scan, the ``masked_m`` / ``psum`` stores and the
+    returns are :func:`_emit_tp_route`'s, so are the rows they give.
+    """
+    c0 = fx.Int32(0)
+    wave_size = 32
+    num_waves = BLOCK_THREADS // wave_size
+    half_experts = BLOCK_THREADS // 2
+    tp = fx.SharedAllocator().allocate(_TpRouteStorage).peek()
+    cnt = tp.cnt.ptr
+    pre = tp.pre.ptr
+    start = tp.start.ptr
+    wave_tot = tp.wave_tot.ptr
+    own = tp.own.ptr
+    ids_t = ptr_buf_tensor(ids)
+    cnt_t = ptr_buf_tensor(counts)
+    e = tid % fx.Uint32(half_experts)
+    h = tid // fx.Uint32(half_experts)
+    n_groups_u = fx.Uint32(n_groups)
+    last_group = n_groups_u - 1
+    group_u = fx.Uint32(group)
+    tot = c0
+    before = c0
+    loaded = []
+    for j in range_constexpr(count_slots):
+        g = h + fx.Uint32(2 * j)
+        used = g < n_groups_u
+        v = fx.Int32(cnt_t[used.select(g, last_group) * fx.Uint32(half_experts) + e])
+        loaded.append((used, g, v))
+    own_route = first + tid
+    own_live = (tid < fx.Uint32(n_own)) & (own_route < fx.Uint32(numel))
+    own_id = fx.Int32(ids_t[own_live.select(own_route, fx.Uint32(0))])
+    prefetched = prefetch() if prefetch is not None else None
+    for used, g, v in loaded:
+        tot = tot + used.select(v, c0)
+        before = before + (used & (g < group_u)).select(v, c0)
+    cnt[tid] = tot
+    pre[tid] = before
+
+    @flyc.jit
+    def _store_own():
+        if tid < fx.Uint32(n_own):
+            own[tid] = own_live.select(own_id, fx.Int32(-1))
+
+    _store_own()
+    gpu.barrier()
+
+    is_expert = tid < fx.Uint32(experts)
+    lo = is_expert.select(tid, fx.Uint32(0))
+    m = fx.Uint32(is_expert.select(fx.Int32(cnt[lo]) + fx.Int32(cnt[lo + half_experts]), c0))
+    p = is_expert.select(fx.Int32(pre[lo]) + fx.Int32(pre[lo + half_experts]), c0)
+
+    @flyc.jit
+    def _store_pre():
+        if is_expert:
+            pre[tid] = p
+
+    _store_pre()
+
+    tile = fx.Uint32(tile_m)
+    aligned = fx.Int32((m + tile - 1) // tile * tile)
+    lane = fx.Int32(tid % wave_size)
+    wave = fx.Int32(tid // wave_size)
+    incl = _warp_inclusive_prefix_i32(aligned, lane, wave_size)
+    last_lane = lane == fx.Int32(wave_size - 1)
+
+    @flyc.jit
+    def _publish_wave_total():
+        if last_lane:
+            wave_tot[wave] = incl
+
+    _publish_wave_total()
+    gpu.barrier()
+    first_wave = wave == c0
+
+    @flyc.jit
+    def _scan_wave_totals():
+        if first_wave:
+            active = lane < fx.Int32(num_waves)
+            total = active.select(wave_tot[active.select(lane, c0)], c0)
+            total = _warp_inclusive_prefix_i32(total, lane, wave_size)
+            if active:
+                wave_tot[lane] = total
+
+    _scan_wave_totals()
+    gpu.barrier()
+    has_prev = wave > c0
+    cross = has_prev.select(wave_tot[has_prev.select(wave - 1, c0)], c0)
+    excl = incl + cross - aligned
+    start[tid] = excl
+    store = writer & is_expert
+
+    @flyc.jit
+    def _store_counts():
+        if store:
+            ptr_buf_tensor(masked_m)[tid] = fx.Int32(m)
+            ptr_buf_tensor(psum_out)[tid] = excl + fx.Int32(m)
+
+    _store_counts()
+    gpu.barrier()
+    return start, pre, own, prefetched
+
+
 def _emit_hidden_prefetch(c, hidden_base, row, mx_group_base, n_iters):
     """The hidden dwordx4 loads ``_emit_quant_block_loop`` would issue, early.
 
@@ -3152,8 +3280,14 @@ def build_moe_token_multidest_tp_route_quant_module(
     ksplit: int = 2,
     tp_route_slots: int = 1,
     mxfp8_copy: bool = False,
+    count_slots: int = 0,
 ):
     """Token-multidest quant with the TP route folded in.
+
+    ``count_slots`` > 0: the route reads the router launch's per-group expert
+    counts (``_emit_tp_route_counts``, groups of this block's 8 tokens, at
+    most ``2 * count_slots`` of them) instead of counting every id; the
+    kernel then takes ``group_counts`` and ``n_groups`` after ``tile_m``.
 
     The K-split build of :func:`build_moe_token_multidest_quant_module` (no TDM
     staging), plus the route ``moe_route_psum_fused`` runs today: each block
@@ -3194,7 +3328,10 @@ def build_moe_token_multidest_tp_route_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"_ks{ksplit}_tproute{tp_route_slots}"
         f"{'_mx8cp' if mxfp8_copy else ''}"
+        f"{f'_gcnt{count_slots}' if count_slots else ''}"
     )
+    if count_slots and warps_per_block * topk > BLOCK_THREADS // 2:
+        raise ValueError("count route: a block's routes must fit half the block")
 
     # Shared by both kernel signatures below (``mxfp8_copy`` as in
     # build_moe_token_multidest_quant_module); inlined into the one built.
@@ -3212,6 +3349,8 @@ def build_moe_token_multidest_tp_route_quant_module(
         tile_m: Int32,
         copy_payload: fx.Pointer = None,
         copy_scale: fx.Pointer = None,
+        group_counts: fx.Pointer = None,
+        n_groups: Int32 = None,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -3253,7 +3392,7 @@ def build_moe_token_multidest_tp_route_quant_module(
             c_elems_per_lane=c_elems_per_lane,
         )
         k0 = fx.Uint32(fx.block_idx.y) == 0
-        start, pre, own, hidden_loads = _emit_tp_route(
+        route_args = dict(
             tid=tid,
             ids=topk_ids,
             numel=token_num * fx.Int32(topk),
@@ -3261,7 +3400,6 @@ def build_moe_token_multidest_tp_route_quant_module(
             tile_m=tile_m,
             first=fx.Uint32(token0) * fx.Uint32(topk),
             n_own=n_own,
-            slots=tp_route_slots,
             writer=(bid == 0) & k0,
             masked_m=masked_m,
             psum_out=psum_out,
@@ -3269,6 +3407,18 @@ def build_moe_token_multidest_tp_route_quant_module(
                 pf, hidden_base, token_eff, mx_group_base, block_iters
             ),
         )
+        if const_expr(count_slots > 0):
+            start, pre, own, hidden_loads = _emit_tp_route_counts(
+                counts=group_counts,
+                n_groups=n_groups,
+                group=bid,
+                count_slots=count_slots,
+                **route_args,
+            )
+        else:
+            start, pre, own, hidden_loads = _emit_tp_route(
+                slots=tp_route_slots, **route_args
+            )
 
         # Each route's rank among the block's earlier routes to its expert:
         # lanes hold the block's ids, one ballot per 32 of them.
@@ -3366,6 +3516,90 @@ def build_moe_token_multidest_tp_route_quant_module(
                 copy_payload, copy_scale, token_eff, valid, feat_dim
             )
         _emit_quant_block_loop(qc)
+
+    if count_slots:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def token_multidest_count_route_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: Int32,
+            topk_ids: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            experts: Int32,
+            tile_m: Int32,
+            group_counts: fx.Pointer,
+            n_groups: Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+        ):
+            token_multidest_tp_route_body(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                topk_ids,
+                masked_m,
+                psum_out,
+                experts,
+                tile_m,
+                copy_payload,
+                copy_scale,
+                group_counts,
+                n_groups,
+            )
+
+        @flyc.jit
+        def launch_token_multidest_count_route(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: fx.Int32,
+            topk_ids: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            experts: fx.Int32,
+            tile_m: fx.Int32,
+            grid_blocks: fx.Int32,
+            group_counts: fx.Pointer,
+            n_groups: fx.Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            token_multidest_count_route_kernel(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                topk_ids,
+                masked_m,
+                psum_out,
+                experts,
+                tile_m,
+                group_counts,
+                n_groups,
+                copy_payload,
+                copy_scale,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+        launch_token_multidest_count_route.compile_hints = {
+            "llvm_options": {
+                "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+                "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            },
+        }
+        return launch_token_multidest_count_route
 
     if mxfp8_copy:
 

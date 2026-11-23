@@ -4,6 +4,7 @@
 """FP8xFP8 preshuffle GEMM kernels for gfx1250."""
 
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -40,6 +41,10 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 # kernels. This null pointer is only a signature placeholder; the bf16 path
 # launches with arg_c and never loads it.
 _NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
+# The C tile leaves LDS by a ds_load read-back and plain global stores instead of
+# one TDM store per wave (see ``c_lds_store`` in the kernel's epilogue).
+# AITER_TDM_C_LDS_STORE=0 keeps the TDM store.
+_C_LDS_STORE = os.environ.get("AITER_TDM_C_LDS_STORE", "1") != "0"
 
 
 @flyc.jit
@@ -81,6 +86,7 @@ def launch_gemm_a8w8(
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     rank0_splitk: Constexpr[bool] = False,
+    c_lds_store: Constexpr[bool] = _C_LDS_STORE,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -279,6 +285,7 @@ def launch_gemm_a8w8(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
         + ("_fsk" if cluster_splitk else "")
+        + ("_clds" if c_lds_store and not (cluster_splitk or fuse_quant_out) else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -1133,26 +1140,64 @@ def launch_gemm_a8w8(
                 c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
             if const_expr(split_k > 1):
                 c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-            C_TILE = (tile_m, C_LDS_ROW)
-            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
-            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
-                gtC,
-                fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
-                C_TILE,
-                num_warps=num_waves,
-            )
-            blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
-            sC = _lv(
-                fx.recast_iter(out_cls, base_ptr),
-                (C_TILE, 1),
-                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
-            )
-            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
-            )
-            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
-            rocdl.s_wait_tensorcnt(0)
+            if const_expr(c_lds_store):
+                # Read C back from LDS and write it with plain global stores. Each
+                # wave's TDM store below covers a box of whole rows, i.e. columns
+                # the other waves ds_stored, and on gfx1250 its LDS read is not
+                # ordered behind those ds_stores by the barrier above: with another
+                # queue's kernels on the same CUs (the MiniMax-M3 shared MLP beside
+                # the routed MoE) a 16-byte piece of a box now and then left as the
+                # bytes LDS held before C, the FP8 A operand of the last k-tile
+                # (read as bf16: 1e25-1e38, never NaN). A ds_load after the barrier
+                # always sees the ds_stores. 16-byte chunks, consecutive lanes along
+                # a row; rows past M are dropped like the TDM store's extent drops
+                # them.
+                C_CHUNK = 16 // c_bytes
+                C_ROW_CHUNKS = tile_n // C_CHUNK
+                C_CHUNKS = tile_m * C_ROW_CHUNKS
+                lds_c = fx.recast_iter(out_cls, base_ptr)
+                out_c = fx.inttoptr(
+                    fx.PointerType.get(
+                        out_cls.ir_type, arg_c.address_space, alignment=c_bytes
+                    ),
+                    fx.ptrtoint(arg_c),
+                )
+                for cp in range_constexpr((C_CHUNKS + block - 1) // block):
+                    cq = fx.Int32(tid) + cp * block
+                    c_row = cq // C_ROW_CHUNKS
+                    c_col = (cq % C_ROW_CHUNKS) * C_CHUNK
+                    in_tile = (
+                        (cq < C_CHUNKS) if const_expr(C_CHUNKS % block != 0) else True
+                    )
+                    if (c_row < mn_oob) and in_tile:
+                        fx.ptr_store(
+                            fx.ptr_load(
+                                lds_c + c_row * C_LDS_ROW + c_col,
+                                result_type=T.vec(C_CHUNK, out_cls.ir_type),
+                            ),
+                            out_c + c_off_rt + fx.Int64(c_row) * ldc64 + c_col,
+                        )
+            else:
+                C_TILE = (tile_m, C_LDS_ROW)
+                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
+                    gtC,
+                    fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+                    C_TILE,
+                    num_warps=num_waves,
+                )
+                blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+                sC = _lv(
+                    fx.recast_iter(out_cls, base_ptr),
+                    (C_TILE, 1),
+                    ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+                )
+                tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                    atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+                )
+                fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+                rocdl.s_wait_tensorcnt(0)
         else:
             # Group-32 MXFP8 quant epilogue. The whole [tile_m, tile_n] C tile
             # is already staged in LDS as bf16 (out_cls); re-read 32 contiguous
