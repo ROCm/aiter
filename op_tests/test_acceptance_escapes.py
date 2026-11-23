@@ -21,6 +21,7 @@ Two escapes are covered, one per acceptance mechanism:
 CPU only. No kernels, no GPU, no build.
 """
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -29,7 +30,11 @@ from pathlib import Path
 
 import torch
 
-from aiter.test_common import checkAllclose
+from aiter.test_common import (
+    _STRICT_ALLCLOSE_ENV,
+    _strict_allclose_default,
+    checkAllclose,
+)
 from aiter.utility.cos_diff import (
     COS_DIFF_THRESHOLD,
     _whole,
@@ -149,6 +154,9 @@ def _run_looping_op_test(strict_value):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT)
     env.pop("AITER_STRICT_ALLCLOSE", None)
+    # The CI runner exports this for the file it is running, i.e. this one. The
+    # child is a different file and must be identified by its own argv[0].
+    env.pop("AITER_TEST_FILE", None)
     if strict_value is not None:
         env["AITER_STRICT_ALLCLOSE"] = strict_value
     return subprocess.run(
@@ -194,6 +202,33 @@ def test_strict_opt_in_leaves_other_files_alone():
     assert "comparison(s) failed" not in out
 
 
+@contextlib.contextmanager
+def _strict_selection(argv0, test_file=None):
+    """Set the inputs that decide which file strict mode believes it is in, and
+    restore them.
+
+    AITER_TEST_FILE is always set or cleared explicitly. aiter_test.sh exports
+    it for the file it runs, which is this one, so a test that only sets argv
+    would otherwise be overridden by the runner's value in CI.
+    """
+    names = (_STRICT_ALLCLOSE_ENV, "AITER_TEST_FILE")
+    saved_argv, saved_env = sys.argv, {k: os.environ.get(k) for k in names}
+    try:
+        sys.argv = [argv0]
+        os.environ.pop(_STRICT_ALLCLOSE_ENV, None)
+        os.environ.pop("AITER_TEST_FILE", None)
+        if test_file is not None:
+            os.environ["AITER_TEST_FILE"] = test_file
+        yield
+    finally:
+        sys.argv = saved_argv
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_strict_opt_in_is_per_file():
     """The switch names the files it applies to, so adoption can be gradual.
 
@@ -201,13 +236,11 @@ def test_strict_opt_in_is_per_file():
     recent green run, 79% of that in files whose own accuracy criterion had
     already passed. Naming files lets each one be gated when its tolerances are
     known to be right.
+
+    Run by hand, so the file is identified by argv[0]; the runner's
+    AITER_TEST_FILE is covered by the two tests after this one.
     """
-    from aiter.test_common import _STRICT_ALLCLOSE_ENV, _strict_allclose_default
-
-    argv, env = sys.argv, os.environ.get(_STRICT_ALLCLOSE_ENV)
-    try:
-        sys.argv = ["op_tests/test_mine.py"]
-
+    with _strict_selection("op_tests/test_mine.py"):
         for value, expected in (
             (None, False),
             ("", False),
@@ -226,11 +259,35 @@ def test_strict_opt_in_is_per_file():
         # A file not named by the switch keeps the shipped behaviour.
         os.environ[_STRICT_ALLCLOSE_ENV] = "test_other.py"
         assert checkAllclose(torch.ones(8) * 10.0, torch.ones(8), printLog=False) == 1.0
-    finally:
-        sys.argv = argv
-        os.environ.pop(_STRICT_ALLCLOSE_ENV, None)
-        if env is not None:
-            os.environ[_STRICT_ALLCLOSE_ENV] = env
+
+
+def test_strict_file_name_comes_from_the_runner_export():
+    """aiter_test.sh exports AITER_TEST_FILE because under pytest or torchrun
+    argv[0] is the launcher, not the test file. The export wins over argv[0]."""
+    # Launcher in argv[0], the runner's export names the file: gated.
+    with _strict_selection("/usr/bin/pytest", test_file="op_tests/test_mine.py"):
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_mine.py"
+        assert _strict_allclose_default() is True
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_other.py"
+        assert _strict_allclose_default() is False
+
+    # The export wins even when argv[0] happens to name a gated file.
+    with _strict_selection("op_tests/test_mine.py", test_file="op_tests/test_x.py"):
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_mine.py"
+        assert _strict_allclose_default() is False
+
+
+def test_strict_file_name_falls_back_to_argv_without_the_export():
+    """Run by hand there is no export, so argv[0] identifies the file. A
+    launcher in argv[0] and no export names nothing, which is why the runner
+    exports it."""
+    with _strict_selection("op_tests/test_mine.py"):
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_mine.py"
+        assert _strict_allclose_default() is True
+
+    with _strict_selection("/usr/bin/pytest"):
+        os.environ[_STRICT_ALLCLOSE_ENV] = "test_mine.py"
+        assert _strict_allclose_default() is False
 
 
 def test_nan_hides_under_the_mismatch_ratio():
@@ -428,6 +485,32 @@ def test_rowwise_metric_scores_low_magnitude_rows():
     out[0] = 0.0
 
     assert worst_row_cos_diff(ref, out) == 1.0
+
+
+def test_rowwise_metric_accepts_an_identical_low_magnitude_row():
+    """A correct row scores 0 however small it is, and a dropped one still
+    scores 1.
+
+    The score is scale-invariant. A fixed absolute floor on its denominator
+    made a row of 1e-8 over 32 columns score 0.9936 against itself, which
+    rejects a correct tuning candidate.
+    """
+    ref = torch.ones(128, 32, dtype=torch.float64)
+    ref[0] = 1e-8
+
+    assert worst_row_cos_diff(ref, ref.clone()) == 0.0
+
+    dropped = ref.clone()
+    dropped[0] = 0.0
+    assert worst_row_cos_diff(ref, dropped) == 1.0
+
+    # Same through the entry point the tuner calls.
+    os.environ["AITER_MOE_COS_DIFF_ROWWISE"] = "1"
+    try:
+        whole = _whole(ref.flatten(), ref.flatten())
+        assert combined_cos_diff(ref, ref.clone(), whole) == 0.0
+    finally:
+        os.environ.pop("AITER_MOE_COS_DIFF_ROWWISE", None)
 
 
 if __name__ == "__main__":

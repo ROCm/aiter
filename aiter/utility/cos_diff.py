@@ -76,6 +76,12 @@ def worst_row_cos_diff(x, y):
 
     ``x`` and ``y`` are 2-D float64 ``[rows, cols]``. Returns 0.0 when every
     reference row is zero.
+
+    The score is scale-invariant, so the denominator carries no absolute
+    floor: a fixed one would stop a small row from scoring 0 against itself
+    (a row of 1e-8 over 32 columns scored 0.9936). Rows with a nonzero
+    reference element already have a positive denominator; the clamp is the
+    smallest normal number, only so a row that underflows cannot divide by 0.
     """
     live = (x != 0).any(dim=1)
     if not bool(live.any()):
@@ -83,7 +89,9 @@ def worst_row_cos_diff(x, y):
 
     x, y = x[live], y[live]
     num = 2.0 * (x * y).sum(dim=1)
-    den = torch.clamp((x * x).sum(dim=1) + (y * y).sum(dim=1), min=1e-12)
+    den = torch.clamp(
+        (x * x).sum(dim=1) + (y * y).sum(dim=1), min=torch.finfo(x.dtype).tiny
+    )
     return float((1.0 - num / den).max().item())
 
 

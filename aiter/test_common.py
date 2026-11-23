@@ -547,6 +547,18 @@ def _relmag_catastrophic(actual_max_delta, b):
     return actual_max_delta > ref_abs_max * _CATASTROPHIC_REL_THRESHOLD
 
 
+def _nonfinite_mask(a, b, mask=None):
+    """True where either operand is NaN or Inf, optionally only where ``mask``
+    (bool, True = compared) selects the element.
+
+    ``torch.isfinite`` is safe on integer / byte tensors (returns all True).
+    Detection only: what to do about it (the catastrophic verdict, or strict
+    mode's immediate-vs-deferred failure) is the caller's decision.
+    """
+    bad = ~(torch.isfinite(a) & torch.isfinite(b))
+    return bad if mask is None else bad & mask
+
+
 def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_check):
     """Decide whether a checkAllclose mismatch is "catastrophic" (fail-fast).
 
@@ -569,7 +581,7 @@ def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_chec
     if max_abs_delta is not None:
         return actual_max_delta > max_abs_delta
     if catastrophic_check:
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        if _nonfinite_mask(a, b).any():
             return True
         return _relmag_catastrophic(actual_max_delta, b)
     return False
@@ -582,7 +594,7 @@ def _catastrophic_check_silent(a, b, max_abs_delta, catastrophic_check):
     if max_abs_delta is not None:
         return (a - b).abs().max().item() > max_abs_delta
     if catastrophic_check:
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        if _nonfinite_mask(a, b).any():
             return True
         return _relmag_catastrophic((a - b).abs().max().item(), b)
     return False
@@ -656,13 +668,11 @@ def checkAllclose(
     # Checked before the all-close branch: torch.isclose(inf, inf) is True, so a
     # tensor of matching Infs never reaches the mismatch path at all.
     if strict:
-        finite = torch.isfinite(a) & torch.isfinite(b)
-        if mask is not None:
-            finite = finite | ~mask
-        if not finite.all():
+        nonfinite = _nonfinite_mask(a, b, mask)
+        if nonfinite.any():
             _strict_fail(
                 f"{msg}non-finite values in the comparison "
-                f"({int((~finite).sum().item())} of {denom} elements)"
+                f"({int(nonfinite.sum().item())} of {denom} elements)"
             )
 
     if isClose.all():
