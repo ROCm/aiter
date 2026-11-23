@@ -757,13 +757,16 @@ def test_top_k_per_row_decode_short_rows(
     }
 
 
-def adaptive_band_cells(card):
+def adaptive_band_cells(card, next_n=1):
     """One bounded cell per band `card` ships, at the band's smallest corner, with
-    each k group's members taken in turn across its bands."""
+    each k group's members taken in turn across its bands. The batch counts
+    sequences of `next_n` rows; a band too narrow for one sequence is skipped."""
     for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
         for ks, bands in per_group.items():
-            for i, (min_width, _, min_rows, _) in enumerate(bands):
-                yield min_rows, min_width, ks[i % len(ks)], stable
+            for i, (min_width, _, min_rows, max_rows) in enumerate(bands):
+                batch = -(-min_rows // next_n)
+                if batch * next_n <= max_rows:
+                    yield batch, min_width, ks[i % len(ks)], stable
 
 
 def adaptive_ragged_cells(card):
@@ -3161,36 +3164,38 @@ def run_adaptive():
         return
     # The table picks these shapes and k, not the command line: every band this
     # card ships runs once, at a corner small enough to allocate here.
-    for name, run in (
-        ("bounded", test_top_k_per_row_decode_bounded),
-        ("bounded graph", test_top_k_per_row_decode_bounded_graph),
+    for name, next_n, run in (
+        ("bounded", 1, test_top_k_per_row_decode_bounded),
+        ("bounded graph", 1, test_top_k_per_row_decode_bounded_graph),
         (
             "bounded next_n=2",
-            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
-                max(1, m // 2), n, k, s, next_n=2
-            ),
+            2,
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(m, n, k, s, next_n=2),
         ),
         (
             "bounded packed",
+            1,
             lambda m, n, k, s: test_top_k_per_row_decode_bounded(
                 m, n, k, s, packed=True
             ),
         ),
         (
             "bounded packed next_n=2",
+            2,
             lambda m, n, k, s: test_top_k_per_row_decode_bounded(
-                max(1, m // 2), n, k, s, next_n=2, packed=True
+                m, n, k, s, next_n=2, packed=True
             ),
         ),
         (
             "bounded packed graph",
+            1,
             lambda m, n, k, s: test_top_k_per_row_decode_bounded_graph(
                 m, n, k, s, packed=True
             ),
         ),
     ):
         torch.manual_seed(0)
-        df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card)])
+        df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card, next_n)])
         df_md = df.to_markdown(index=False)
         aiter.logger.info("topk_per_row_decode %s summary (markdown):\n%s", name, df_md)
         assert df["all_close"].all(), f"topk_per_row_decode {name} mismatch:\n{df_md}"
