@@ -1830,6 +1830,11 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
             early_p_mid=0,
             early_xcd=False,
             comb_tok_wait=False,
+            # No GEMM2 fold (an m-block's <= 16-row tail computed by the m-block before it, and the single-CTA NT
+            # loads that go with it): small win on real prefill routes with a skewed expert placement, -0.2..-1.7% at
+            # 16k tokens a rank (2 batches); bit-identical (GEMM1's fold stays).
+            fold_tail=0,
+            nt_single=False,
         ),
     )
 
