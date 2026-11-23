@@ -29,6 +29,15 @@ _MMA_F32: gl.constexpr = gl.amd.AMDWMMALayout(
 )
 _A_F32: gl.constexpr = gl.DotOperandLayout(0, _MMA_F32, 2)
 _B_F32: gl.constexpr = gl.DotOperandLayout(1, _MMA_F32, 2)
+_MMA_T32: gl.constexpr = gl.amd.AMDWMMALayout(
+    version=3,
+    transposed=True,
+    warp_bases=[[1, 0, 0], [2, 0, 0]],
+    instr_shape=[16, 16, 4],
+    rank=3,
+)
+_A_T32: gl.constexpr = gl.DotOperandLayout(0, _MMA_T32, 2)
+_B_T32: gl.constexpr = gl.DotOperandLayout(1, _MMA_T32, 2)
 
 # bf16 [C, K] tiles as TDM writes them and the WMMA operands read them: a 16 B
 # pad per 256 B row spreads an operand read's 16 rows over the banks.
@@ -38,6 +47,9 @@ _SH_CK: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
 # fp32 [C, C] operands: an 8 B pad per 128 B row, for the same reason.
 _SH_CC: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
     [[32, 2]], [32, 32], [1, 0]
+)
+_SH_T: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    [[16, 2]], [4, 16, 16], [2, 1, 0]
 )
 _SH_ROWS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 _SH_VEC: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
@@ -187,7 +199,11 @@ def k1_prepare_gluon(
     b_g_last = s_g_last.load(gl.SliceLayout(0, _BLK_CK))
     b_gp = s_gp.load(gl.SliceLayout(0, _BLK_CK))
     b_g_total = gl.exp2(b_g_last_col)
-    b_exp_g = gl.exp2(b_gcum)
+    b_gm = b_gcum - b_gp[None, :]
+    b_dec = gl.exp2(b_gm)
+    b_inc = gl.exp2(-b_gm)
+    f_up = gl.exp2(b_gp)[None, :]
+    f_dn = gl.exp2(b_g_last - b_gp)[None, :]
 
     # Tail rows of q and k load as 0 and all factors below are finite, so the
     # tail rows store as 0 without a mask.
@@ -198,20 +214,17 @@ def k1_prepare_gluon(
     # The tile start goes in the 64-bit base: buffer offsets are 32-bit.
     ws_ck = ws_idx * (C * K)
     ck_off = o_c[:, None] * K + o_k[None, :]
+    b_kpiv = b_k * b_dec
+    b_kinv = b_k * b_inc
+    b_qpiv = b_q * b_dec * scale
     gl.amd.gfx1250.buffer_store(
-        (b_k * b_exp_g).to(ws_kd.dtype.element_ty), ws_kd + ws_ck, ck_off, cache=CM_WS
+        (b_kpiv * f_up).to(ws_kd.dtype.element_ty), ws_kd + ws_ck, ck_off, cache=CM_WS
     )
     gl.amd.gfx1250.buffer_store(
-        (b_q * b_exp_g * scale).to(ws_qd.dtype.element_ty),
-        ws_qd + ws_ck,
-        ck_off,
-        cache=CM_WS,
+        (b_qpiv * f_up).to(ws_qd.dtype.element_ty), ws_qd + ws_ck, ck_off, cache=CM_WS
     )
     gl.amd.gfx1250.buffer_store(
-        (b_k * gl.exp2(b_g_last[None, :] - b_gcum)).to(ws_kr.dtype.element_ty),
-        ws_kr + ws_ck,
-        ck_off,
-        cache=CM_WS,
+        (b_kinv * f_dn).to(ws_kr.dtype.element_ty), ws_kr + ws_ck, ck_off, cache=CM_WS
     )
     gl.amd.gfx1250.buffer_store(
         gl.convert_layout(b_g_total, _BLK1),
@@ -220,18 +233,15 @@ def k1_prepare_gluon(
         cache=CM_WS,
     )
 
-    b_gm = b_gcum - b_gp[None, :]
-    b_dec = gl.exp2(b_gm)
-    b_inc = gl.exp2(-b_gm)
     # All three operands go to LDS before any is read back: one barrier for all.
     s_kinv = gl.allocate_shared_memory(
-        gl.bfloat16, [C, K], _SH_CK, (b_k * b_inc).to(gl.bfloat16)
+        gl.bfloat16, [C, K], _SH_CK, b_kinv.to(gl.bfloat16)
     )
     s_kpiv = gl.allocate_shared_memory(
-        gl.bfloat16, [C, K], _SH_CK, (b_k * b_dec).to(gl.bfloat16)
+        gl.bfloat16, [C, K], _SH_CK, b_kpiv.to(gl.bfloat16)
     )
     s_qpiv = gl.allocate_shared_memory(
-        gl.bfloat16, [C, K], _SH_CK, (b_q * b_dec * scale).to(gl.bfloat16)
+        gl.bfloat16, [C, K], _SH_CK, b_qpiv.to(gl.bfloat16)
     )
     b_kinv_b = s_kinv.permute([1, 0]).load(_B_B16)
 
@@ -253,6 +263,115 @@ def k1_prepare_gluon(
         cache=CM_WS,
     )
 
+    if C == 2 * BC:
+        _inv_tiles(b_L, ws_cc, o_i_r, o_i_c, C, BC, NUM_DOUBLING, CM_WS)
+    else:
+        _inv_flat(b_L, ws_cc, o_i_r, o_i_c, C, BC, NUM_DOUBLING, NUM_MERGE, CM_WS)
+
+
+@gluon.jit
+def _inv_tiles(
+    b_L,
+    ws_cc,
+    o_i_r,
+    o_i_c,
+    C: gl.constexpr,
+    BC: gl.constexpr,
+    NUM_DOUBLING: gl.constexpr,
+    CM_WS: gl.constexpr,
+):
+    gl.static_assert(C == 2 * BC)
+    b_D = gl.where(o_i_r[:, None] // BC == o_i_c[None, :] // BC, b_L, 0.0)
+    b_D = gl.convert_layout(
+        gl.reshape(
+            gl.permute(gl.reshape(b_D, [2, BC, 2, BC]), [0, 2, 1, 3]), [4, BC, BC]
+        ),
+        _MMA_T32,
+    )
+    s_d = gl.allocate_shared_memory(gl.float32, [4, BC, BC], _SH_T, b_D)
+    s_inv = gl.allocate_shared_memory(gl.float32, [4, BC, BC], _SH_T)
+    b_DT = s_d.permute([0, 2, 1]).load(_MMA_T32)
+    o_t = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, _MMA_T32)))
+    o_u = gl.arange(0, BC, layout=gl.SliceLayout(0, gl.SliceLayout(2, _MMA_T32)))
+    o_v = gl.arange(0, BC, layout=gl.SliceLayout(0, gl.SliceLayout(1, _MMA_T32)))
+    o_t = o_t[:, None, None]
+    o_u = o_u[None, :, None]
+    o_v = o_v[None, None, :]
+    zero_t = gl.zeros([4, BC, BC], gl.float32, _MMA_T32)
+    b_INV = gl.where(o_u == o_v, 1.0, b_D)
+    b_Dp = gl.amd.gfx1250.wmma(
+        gl.convert_layout(b_D, _A_T32),
+        gl.convert_layout(gl.permute(b_DT, [0, 2, 1]), _B_T32),
+        zero_t,
+    )
+    b_DpT = gl.amd.gfx1250.wmma(
+        gl.convert_layout(b_DT, _A_T32),
+        gl.convert_layout(gl.permute(b_D, [0, 2, 1]), _B_T32),
+        zero_t,
+    )
+    for i in gl.static_range(NUM_DOUBLING):
+        b_INV = gl.amd.gfx1250.wmma(
+            gl.convert_layout(b_INV, _A_T32),
+            gl.convert_layout(gl.permute(b_DpT, [0, 2, 1]), _B_T32),
+            b_INV,
+        )
+        if i + 1 < NUM_DOUBLING:
+            b_Dp_next = gl.amd.gfx1250.wmma(
+                gl.convert_layout(b_Dp, _A_T32),
+                gl.convert_layout(gl.permute(b_DpT, [0, 2, 1]), _B_T32),
+                zero_t,
+            )
+            b_DpT = gl.amd.gfx1250.wmma(
+                gl.convert_layout(b_DpT, _A_T32),
+                gl.convert_layout(gl.permute(b_Dp, [0, 2, 1]), _B_T32),
+                zero_t,
+            )
+            b_Dp = b_Dp_next
+
+    s_inv.store(b_INV)
+    b_PT = gl.amd.gfx1250.wmma(
+        s_inv.slice(0, 1, 0).permute([0, 2, 1]).load(_A_T32).broadcast_to([4, BC, BC]),
+        gl.convert_layout(
+            gl.permute(
+                gl.convert_layout(
+                    gl.reshape(
+                        gl.permute(gl.reshape(b_L, [2, BC, 2, BC]), [0, 2, 1, 3]),
+                        [4, BC, BC],
+                    ),
+                    _MMA_T32,
+                ),
+                [0, 2, 1],
+            ),
+            _B_T32,
+        ),
+        zero_t,
+    )
+    b_A10 = gl.amd.gfx1250.wmma(
+        s_inv.slice(3, 1, 0).load(_A_T32).broadcast_to([4, BC, BC]),
+        gl.convert_layout(gl.permute(b_PT, [0, 2, 1]), _B_T32),
+        zero_t,
+    )
+    b_INV = gl.where(o_t == 2, b_A10, gl.where(o_t == 1, 0.0, b_INV))
+    gl.amd.gfx1250.buffer_store(
+        b_INV.to(ws_cc.dtype.element_ty),
+        ws_cc,
+        ((o_t // 2) * BC + o_u) * C + (o_t % 2) * BC + o_v,
+        cache=CM_WS,
+    )
+
+
+@gluon.jit
+def _inv_flat(
+    b_L,
+    ws_cc,
+    o_i_r,
+    o_i_c,
+    C: gl.constexpr,
+    BC: gl.constexpr,
+    NUM_DOUBLING: gl.constexpr,
+    NUM_MERGE: gl.constexpr,
+    CM_WS: gl.constexpr,
+):
     if BC == C:
         b_D = b_L
     else:
@@ -310,7 +429,7 @@ def k1_prepare_gluon(
     o_f_r = gl.arange(0, C, layout=gl.SliceLayout(1, _MMA_F32))
     o_f_c = gl.arange(0, C, layout=gl.SliceLayout(0, _MMA_F32))
     gl.amd.gfx1250.buffer_store(
-        b_INV.to(ws_inv_mqk.dtype.element_ty),
+        b_INV.to(ws_cc.dtype.element_ty),
         ws_cc,
         o_f_r[:, None] * C + o_f_c[None, :],
         cache=CM_WS,

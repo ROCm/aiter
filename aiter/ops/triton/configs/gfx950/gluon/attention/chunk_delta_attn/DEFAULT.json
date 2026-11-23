@@ -6,21 +6,28 @@
     "k2_ab_fused_gluon_wide": {
         "BW": 64,
         "num_warps": 4,
-        "MIN_BLOCKS_PER_CU": 2,
-        "waves_per_eu": 2
+        "MIN_BLOCKS_PER_CU": 0.125
     },
     "k2_ab_fused_gluon_narrow": {
-        "BW": 32,
-        "num_warps": 2,
-        "waves_per_eu": 2
+        "BW": 64,
+        "num_warps": 2
     },
     "k2_c_gluon": {
         "BW": 64,
-        "num_warps": 4,
-        "MIN_BLOCKS_PER_CU": 0.3
+        "num_warps": 4
     },
     "k2_c_gluon_segmented": {
         "BW": 128,
-        "num_warps": 4
+        "num_warps": 8
+    },
+    "flash_kda_gluon_plan": {
+        "SEG_FIXED_STEPS": 8,
+        "SEG_DEVICE_STEPS": 20,
+        "A8_MAX_SEGS": 21,
+        "A8_MIN_LEN": 5,
+        "TAPER_RATE": 0.21,
+        "TAPER_MIN_CHUNKS": 48,
+        "TAPER_SEG_CHUNKS": 12,
+        "SCAN_MAX_PROGS_PER_CU": 0.625
     }
 }
