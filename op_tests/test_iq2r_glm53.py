@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
+"""GLM-5.3 IQ2R-v2 packed MoE (TP4/TP8, 512- and 1,024-entry codebooks, gfx950)
+against a dense Torch reference.
 
 ``python3 op_tests/test_iq2r_glm53.py`` times the tuned and default launch
 configs over a token sweep, prints a summary table, then runs the tests.
@@ -19,32 +20,45 @@ import torch
 
 import aiter
 from aiter.iq2r_glm53 import (
+    DOWN_KERNELS,
+    FUSED_SHARED_TOKENS,
     MAX_CHUNK_TOKENS,
+    MAX_DECODE_TOKENS,
     IQ2RGlm53Config,
     IQ2RGlm53Workspace,
     _config_problem,
     _default_config,
+    _mxfp8_quantize,
     _tuned_table,
     iq2r_glm53_config,
+    iq2r_glm53_dequantize_shared,
     iq2r_glm53_moe_out,
     iq2r_glm53_pack,
-    iq2r_glm53_slice_gate,
+    iq2r_glm53_pack_shared,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
-from aiter.ops.iq2r import iq2r_encode_device, iq2r_materialize_device
-from aiter.ops.iq2r_encoder import iq2r_initial_codebook
-from aiter.ops.iq2r_format import (
-    IQ2RMetadata,
-    iq2r_slice_input_data,
-    iq2r_slice_output_auxiliary,
+from aiter.ops.iq2r_v2 import (
+    IQ2R_V2_CODEBOOK_MAX_BYTE,
+    IQ2R_V2_CODEBOOK_MIN_BYTE,
+    IQ2R_V2_LEVELS_C4,
+    iq2r_v2_check_codebook,
+    iq2r_v2_codebook_copies,
+    iq2r_v2_encode,
+    iq2r_v2_gains,
+    iq2r_v2_learn_codebook,
+    iq2r_v2_materialize,
+    iq2r_v2_seed_codebook,
+    iq2r_v2_write_auxiliary,
+    iq2r_v2_write_data,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx950"]
+LEVELS = IQ2R_V2_LEVELS_C4
 
-_EXPERTS = 257
-_TOPK = 9
+_EXPERTS = 256
+_TOPK = 8
 _HIDDEN = 6144
 
 
@@ -80,39 +94,72 @@ def _mxfp8(values: torch.Tensor) -> torch.Tensor:
     return quantized.flatten(-2)
 
 
+def _interleave(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.stack((a, b), dim=1).reshape(-1, *a.shape[1:])
+
+
+# A gain far from 1 makes a dropped or misapplied output gain fail the tests.
+_TEST_GAIN = 0.8
+
+
+def _encode_gate_up(gate, up, book, importance):
+    """Canonical IQ2R-v2 gate/up: rows interleaved, one shared codebook."""
+    weight = _interleave(gate, up)
+    enc = iq2r_v2_encode(weight, importance, book, LEVELS)
+    gains = iq2r_v2_gains(weight, enc.reconstruction, _TEST_GAIN, interleaved=True)
+    data = iq2r_v2_write_data(
+        enc.indices, enc.negative, enc.levels, LEVELS, book.shape[0]
+    )
+    return data, iq2r_v2_write_auxiliary(book[None], enc.d, gains)
+
+
+def _encode_down(weight, book, importance):
+    enc = iq2r_v2_encode(weight, importance, book, LEVELS)
+    gains = iq2r_v2_gains(weight, enc.reconstruction, _TEST_GAIN)
+    data = iq2r_v2_write_data(
+        enc.indices, enc.negative, enc.levels, LEVELS, book.shape[0]
+    )
+    return data, iq2r_v2_write_auxiliary(book[None], enc.d, gains)
+
+
 @functools.lru_cache(maxsize=1)
-def _glm53_layer(intermediate: int):
-    gate_metadata = IQ2RMetadata(logical_n=2 * intermediate, logical_k=_HIDDEN)
-    down_metadata = IQ2RMetadata(logical_n=_HIDDEN, logical_k=intermediate)
-    codebook = iq2r_initial_codebook("cuda")
+def _glm53_layer(intermediate: int, entries: int = 512):
+    seed = iq2r_v2_seed_codebook("cuda", entries)
+    books = (seed, (seed * 1.0625).to(torch.float8_e4m3fn).float())
 
-    def encode(n: int, k: int, seed: int):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        weight = torch.randn((n, k), generator=generator, device="cuda") * 0.02
-        importance = torch.ones((k,), dtype=torch.float32, device="cuda")
-        return iq2r_encode_device(weight, importance, codebook, exponent_radius=8)
+    def weight(n: int, k: int, s: int):
+        generator = torch.Generator(device="cuda").manual_seed(s)
+        return torch.randn((n, k), generator=generator, device="cuda") * 0.02
 
-    # Three distinct experts tiled over 257; expert 256 is the shared expert.
-    gate = [encode(2 * intermediate, _HIDDEN, 0x5330 + i) for i in range(3)]
-    down = [encode(_HIDDEN, intermediate, 0x5340 + i) for i in range(3)]
+    ones_h = torch.ones(_HIDDEN, device="cuda")
+    ones_i = torch.ones(intermediate, device="cuda")
+    gate = [
+        _encode_gate_up(
+            weight(intermediate, _HIDDEN, 0x5330 + i),
+            weight(intermediate, _HIDDEN, 0x5350 + i),
+            books[1],
+            ones_h,
+        )
+        for i in range(3)
+    ]
+    down = [
+        _encode_down(weight(_HIDDEN, intermediate, 0x5340 + i), books[i % 2], ones_i)
+        for i in range(3)
+    ]
     pick = torch.arange(_EXPERTS, device="cuda") % 3
 
     def stack(parts, index):
         return torch.stack([p[index].reshape(-1) for p in parts])[pick].contiguous()
 
+    def dense(data, aux, n, k):
+        return iq2r_v2_materialize(data, aux, n, k, LEVELS, codebook_entries=entries)
+
     layer = SimpleNamespace(
         intermediate=intermediate,
+        entries=entries,
         pick=pick,
-        gate_weights=[
-            iq2r_materialize_device(d.view(1, -1), a.view(1, -1), gate_metadata)
-            for d, a in gate
-        ],
-        down_weights=[
-            iq2r_materialize_device(d.view(1, -1), a.view(1, -1), down_metadata)
-            for d, a in down
-        ],
-        gate_metadata=gate_metadata,
-        down_metadata=down_metadata,
+        gate_weights=[dense(d, a, 2 * intermediate, _HIDDEN) for d, a in gate],
+        down_weights=[dense(d, a, _HIDDEN, intermediate) for d, a in down],
         gate_data=stack(gate, 0),
         gate_auxiliary=stack(gate, 1),
         down_data=stack(down, 0),
@@ -128,17 +175,19 @@ def _glm53_layer(intermediate: int):
     return layer
 
 
-@pytest.fixture(scope="module", params=[256, 512], ids=["tp8", "tp4"])
+@pytest.fixture(
+    scope="module",
+    params=[(256, 512), (512, 512), (256, 1024), (512, 1024)],
+    ids=["tp8", "tp4", "tp8-book1024", "tp4-book1024"],
+)
 def glm53_layer(request):
-    return _glm53_layer(request.param)
+    return _glm53_layer(*request.param)
 
 
 def _routing(tokens: int, seed: int):
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    scores = torch.rand((tokens, _EXPERTS - 1), generator=generator, device="cuda")
-    routed = scores.topk(_TOPK - 1, dim=-1).indices
-    shared = torch.full_like(routed[:, :1], _EXPERTS - 1)
-    topk_ids = torch.cat((routed, shared), dim=-1).to(torch.int32).contiguous()
+    scores = torch.rand((tokens, _EXPERTS), generator=generator, device="cuda")
+    topk_ids = scores.topk(_TOPK, dim=-1).indices.to(torch.int32).contiguous()
     topk_weights = torch.softmax(
         torch.randn((tokens, _TOPK), generator=generator, device="cuda"), dim=-1
     ).contiguous()
@@ -189,15 +238,133 @@ def test_glm53_moe_matches_reference(glm53_layer, tokens):
     _check_moe(actual, expected)
 
 
+def _one_hot_rows(rows: int, k: int, columns: torch.Tensor):
+    """FP8 activations with a single 1.0 per row (at ``columns``), E8M0 scales 1."""
+    activations = torch.zeros((rows, k), device="cuda")
+    activations[torch.arange(rows, device="cuda"), columns] = 1.0
+    scales = torch.full((rows, k // 32), 127, dtype=torch.uint8, device="cuda")
+    return activations.to(torch.float8_e4m3fn), scales
+
+
+def _decoded_columns(layer, experts: torch.Tensor, columns: torch.Tensor):
+    """BF16 of gain * W[:, k]: what a down kernel writes for a one-hot row.
+
+    The single product of the one-hot row is exact in the MFMA's FP32
+    accumulator, so the kernel's decode must match the reference bit for bit.
+    """
+    dense = torch.stack(layer.down_weights)[layer.pick[experts.long()]]
+    return dense[torch.arange(len(columns), device="cuda"), :, columns].to(
+        torch.bfloat16
+    )
+
+
+@pytest.mark.parametrize("kernel", ["m16", "m16_2wg", "m32", "per_token", "prefill"])
+def test_glm53_down_decode_bit_exact(glm53_layer, kernel):
+    """Every down kernel decodes the packed weights bit-exactly (vs iq2r_v2_materialize)."""
+    from aiter.ops.iq2r import (
+        iq2r_glm53_down_out,
+        iq2r_glm53_down_per_token_out,
+        iq2r_glm53_down_reduce_out,
+    )
+
+    layer = glm53_layer
+    k = layer.intermediate
+    _, _, data, aux = layer.packed
+    generator = torch.Generator(device="cuda").manual_seed(0x53D0)
+    if kernel in DOWN_KERNELS:
+        if kernel == "m32" and k != 256:
+            pytest.skip("the m32 down kernel is TP8 only")
+        if kernel == "m16_2wg" and k != 512:
+            pytest.skip("the m16_2wg down kernel is TP4 only")
+        tokens = 64
+        routes = tokens * 9
+        # Rows 32 at a time per expert; row r reads column 37 r mod K, so
+        # every column of every expert pattern is covered.
+        columns = (torch.arange(routes, device="cuda") * 37) % k
+        experts = (torch.arange(routes, device="cuda") // 32) % 3
+        activations, scales = _one_hot_rows(routes, k, columns)
+        tasks = torch.zeros(
+            (routes // 32 + _EXPERTS, 3), dtype=torch.int32, device="cuda"
+        )
+        for task in range(routes // 32):
+            tasks[task] = torch.tensor([task * 32, 32, task % 3], dtype=torch.int32)
+        count = torch.tensor([routes // 32], dtype=torch.int32, device="cuda")
+        output = torch.full(
+            (routes, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        none = torch.empty(0, dtype=torch.uint8, device="cuda")
+        iq2r_glm53_down_out(
+            activations, scales, data, aux, tasks, count, output,
+            DOWN_KERNELS[kernel], 4, none, none, none, none,
+        )  # fmt: skip
+        assert torch.equal(output, _decoded_columns(layer, experts, columns))
+        return
+
+    # per_token and prefill sum the eight routes of a token: a one-hot route
+    # weight makes the token's output exactly one route's.
+    for tokens in (1, 2, 4) if kernel == "per_token" else (64,):
+        routes = tokens * 9
+        for trial in range(4):
+            columns = torch.randint(0, k, (routes,), generator=generator, device="cuda")
+            route_experts = (torch.arange(routes, device="cuda") // 64) % 3
+            if kernel == "per_token":
+                route_experts = torch.randint(
+                    0, 3, (routes,), generator=generator, device="cuda"
+                )
+            activations, scales = _one_hot_rows(routes, k, columns)
+            chosen = torch.randint(
+                0, _TOPK, (tokens,), generator=generator, device="cuda"
+            )
+            weights = (
+                torch.nn.functional.one_hot(chosen.long(), _TOPK).float().contiguous()
+            )
+            scatter = torch.arange(routes, dtype=torch.int32, device="cuda")
+            picked = torch.arange(tokens, device="cuda") * 9 + chosen
+            output = torch.full(
+                (tokens, _HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
+            if kernel == "per_token":
+                ids = (
+                    route_experts.reshape(tokens, 9)[:, :_TOPK]
+                    .to(torch.int32)
+                    .contiguous()
+                )
+                none = torch.empty(0, dtype=torch.uint8, device="cuda")
+                iq2r_glm53_down_per_token_out(
+                    activations, scales, data, aux, ids, scatter, weights, output,
+                    none, none, none,
+                )  # fmt: skip
+            else:
+                tasks = torch.zeros(
+                    (routes // 64 + 1 + _EXPERTS, 3), dtype=torch.int32, device="cuda"
+                )
+                n_tasks = (routes + 63) // 64
+                for task in range(n_tasks):
+                    begin = task * 64
+                    tasks[task] = torch.tensor(
+                        [begin, min(64, routes - begin), task % 3], dtype=torch.int32
+                    )
+                count = torch.tensor([n_tasks], dtype=torch.int32, device="cuda")
+                route_output = torch.empty(
+                    (routes, _HIDDEN), dtype=torch.bfloat16, device="cuda"
+                )
+                iq2r_glm53_down_reduce_out(
+                    activations, scales, data, aux, tasks, count, route_output,
+                    scatter, weights, output, 1 + trial % 2,
+                )  # fmt: skip
+            expected = _decoded_columns(layer, route_experts[picked], columns[picked])
+            assert torch.equal(output, expected), (tokens, trial)
+
+
 # Each gate and down kernel at grids and chunk counts the shipped table and
 # the defaults do not use. Configs a token count cannot run are skipped.
 _EXPLICIT_CONFIGS = [
-    IQ2RGlm53Config("nobarrier", 4, "route9", 4, 1),
-    IQ2RGlm53Config("decode", 1, "single", 2, 1),
-    IQ2RGlm53Config("nobarrier", 2, "single", 16, 1),
-    IQ2RGlm53Config("decode", 4, "ordered", 8, 1),
-    IQ2RGlm53Config("nobarrier", 8, "ordered", 1, 1),
-    IQ2RGlm53Config("nobarrier", 1, "packed", 8, 1),
+    IQ2RGlm53Config("decode", 4, "per_token", 4, 1),
+    IQ2RGlm53Config("decode", 1, "m16", 2, 1),
+    IQ2RGlm53Config("decode", 2, "m16", 16, 1),
+    IQ2RGlm53Config("decode", 2, "m16_2wg", 4, 1),
+    IQ2RGlm53Config("decode", 4, "m32", 8, 1),
+    IQ2RGlm53Config("decode", 8, "m32", 1, 1),
     IQ2RGlm53Config("prefill", 1, "prefill", 0, 2),
     IQ2RGlm53Config("prefill", 8, "prefill", 0, 1),
 ]
@@ -257,9 +424,78 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
     assert relative_rmse < 1e-6
 
 
+@functools.lru_cache(maxsize=2)
+def _shared_expert(intermediate: int):
+    """Random shared expert, its packed MXFP8 form and its exact FP32 weights."""
+    generator = torch.Generator(device="cuda").manual_seed(0x53F0 + intermediate)
+    gate, up = (
+        torch.randn((intermediate, _HIDDEN), generator=generator, device="cuda") * 0.02
+        for _ in range(2)
+    )
+    down = (
+        torch.randn((_HIDDEN, intermediate), generator=generator, device="cuda") * 0.02
+    )
+    exact = [
+        iq2r_glm53_dequantize_shared(*_mxfp8_quantize(w)) for w in (gate, up, down)
+    ]
+    return iq2r_glm53_pack_shared(gate, up, down), exact
+
+
+def _reference_shared(exact, hidden):
+    """MXFP8 activations, SiLU(gate) * up in BF16, BF16 output (weight 1)."""
+    gate, up, down = exact
+    a1 = _mxfp8(hidden)
+    act = (torch.nn.functional.silu(a1 @ gate.T) * (a1 @ up.T)).to(torch.bfloat16)
+    return (_mxfp8(act) @ down.T).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 16, 33, 64, 100, 256, 1000, 1024])
+def test_glm53_moe_fused_shared_expert(glm53_layer, tokens):
+    """The MXFP8 shared expert as route slot 8: decode paths, deterministic."""
+    layer = glm53_layer
+    shared, exact = _shared_expert(layer.intermediate)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5370 + tokens)
+    expected = (
+        _reference_moe(layer, hidden, topk_weights, topk_ids).float()
+        + _reference_shared(exact, hidden).float()
+    ).to(torch.bfloat16)
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    actual, again = torch.empty_like(hidden), torch.empty_like(hidden)
+    for out in (actual, again):
+        iq2r_glm53_moe_out(
+            hidden, *layer.packed, topk_weights, topk_ids, out, workspace, shared=shared
+        )
+    _check_moe(actual, expected)
+    assert torch.equal(actual, again)
+
+
+def test_glm53_moe_fused_shared_expert_limits(glm53_layer):
+    layer = glm53_layer
+    shared, _ = _shared_expert(layer.intermediate)
+    hidden, topk_weights, topk_ids = _routing(1025, 0x53F8)
+    workspace = IQ2RGlm53Workspace.allocate(1025, layer.intermediate, device="cuda")
+    output = torch.empty_like(hidden)
+    with pytest.raises(ValueError, match="up to 1024 tokens"):
+        iq2r_glm53_moe_out(
+            hidden,
+            *layer.packed,
+            topk_weights,
+            topk_ids,
+            output,
+            workspace,
+            shared=shared,
+        )
+    prefill = IQ2RGlm53Config("prefill", 2, "prefill", 0, 1)
+    with pytest.raises(ValueError, match="decode kernels only"):
+        iq2r_glm53_moe_out(
+            hidden[:512], *layer.packed, topk_weights[:512], topk_ids[:512],
+            output[:512], workspace, prefill, shared=shared,
+        )  # fmt: skip
+
+
 @pytest.mark.parametrize("tokens", [1, 3, 4, 64, 1024])
 def test_glm53_moe_drops_invalid_routes(glm53_layer, tokens):
-    """Routes with ids outside 0..256 contribute nothing on every path."""
+    """Routes with ids outside 0..255 contribute nothing on every path."""
     layer = glm53_layer
     hidden, topk_weights, topk_ids = _routing(tokens, 0x53E0 + tokens)
     topk_ids[:, 0] = -1
@@ -289,12 +525,22 @@ def test_glm53_moe_rejects_unfit_configs(glm53_layer):
             output[rows], workspace, config,
         )  # fmt: skip
 
-    with pytest.raises(ValueError, match="M1 needs down route9"):
-        run(1, IQ2RGlm53Config("decode", 2, "single", 4, 1))
+    with pytest.raises(ValueError, match="M1 needs down per_token"):
+        run(1, IQ2RGlm53Config("decode", 2, "m16", 4, 1))
     with pytest.raises(ValueError, match="unknown decode down kernel"):
         run(8, IQ2RGlm53Config("decode", 2, "prefill", 0, 1))
-    with pytest.raises(ValueError, match="route9 covers"):
-        run(3, IQ2RGlm53Config("decode", 2, "route9", 4, 1))
+    with pytest.raises(ValueError, match="per_token covers"):
+        run(3, IQ2RGlm53Config("decode", 2, "per_token", 4, 1))
+    with pytest.raises(ValueError, match="unknown gate kernel"):
+        run(8, IQ2RGlm53Config("bogus", 2, "m16", 4, 1))
+    with pytest.raises(ValueError, match="unknown decode down kernel"):
+        run(8, IQ2RGlm53Config("decode", 2, "packed", 4, 1))
+    with pytest.raises(ValueError, match="top-8"):  # [tokens, 9] routing
+        iq2r_glm53_moe_out(
+            hidden[:8], *layer.packed, torch.ones((8, 9), device="cuda"),
+            torch.zeros((8, 9), dtype=torch.int32, device="cuda"), output[:8],
+            workspace,
+        )  # fmt: skip
     # The 1-token tail of a chunked batch cannot reuse an M8 config.
     with pytest.raises(ValueError, match="exceed"):
         run(9, _default_config(8))
@@ -316,82 +562,67 @@ def test_glm53_moe_rejects_other_archs(glm53_layer, monkeypatch):
     assert not output.any()
 
 
-@pytest.mark.parametrize("tp", [4, 8])
-def test_glm53_pack_commutes_with_tp_slicing(tp):
-    """Packing the full checkpoint then slicing equals slicing then packing."""
-    full_intermediate = 2048
-    intermediate = full_intermediate // tp
-    experts = 2
-    gate_metadata = IQ2RMetadata(logical_n=2 * full_intermediate, logical_k=_HIDDEN)
-    down_metadata = IQ2RMetadata(logical_n=_HIDDEN, logical_k=full_intermediate)
-    generator = torch.Generator(device="cuda").manual_seed(0x53D0 + tp)
+# Copy-formation deltas of the kernels (iq2r_v2_copy_words): copy c of
+# a codebook byte b is b + delta_c[b & 7].
+_FORMATION_DELTAS = (
+    (0,) * 8,
+    (2,) * 8,
+    (3, 4, 4, 5, 4, 4, 4, 4),
+    (5, 6, 6, 6, 6, 6, 6, 6),
+)
 
-    def random_bytes(columns: int):
-        return torch.randint(
-            0, 256, (experts, columns), generator=generator, device="cuda",
-            dtype=torch.uint8,
-        )  # fmt: skip
 
-    gate = random_bytes(gate_metadata.data_bytes)
-    gate_aux = random_bytes(gate_metadata.auxiliary_bytes)
-    down = random_bytes(down_metadata.data_bytes)
-    down_aux = random_bytes(down_metadata.auxiliary_bytes)
-    # The full gate/up checkpoint has 4096 columns: a multiple of 64.
-    packed = iq2r_glm53_pack(
-        gate, gate_aux, down, down_aux, intermediate_size=full_intermediate
+def test_glm53_copy_formation_matches_codebook_copies():
+    """The kernels form copies 1-3 from copy 0 with integer adds; on every byte
+    the encoder may emit they equal the packed copies E4M3(codebook * m[c])."""
+    allowed = torch.arange(
+        IQ2R_V2_CODEBOOK_MIN_BYTE, IQ2R_V2_CODEBOOK_MAX_BYTE + 1, dtype=torch.uint8
     )
-    for rank in range(tp):
-        gate_start, gate_len = rank * 2 * intermediate, 2 * intermediate
-        down_start = rank * intermediate
-        shard = iq2r_glm53_pack(
-            _slice_rows(gate, gate_metadata, gate_start, gate_len),
-            iq2r_slice_output_auxiliary(gate_aux, gate_metadata, gate_start, gate_len),
-            iq2r_slice_input_data(down, down_metadata, down_start, intermediate),
-            down_aux,
-            intermediate_size=intermediate,
-        )
-        assert torch.equal(
-            iq2r_glm53_slice_gate(packed[0], gate_start, gate_len), shard[0]
-        )
-        assert torch.equal(
-            iq2r_slice_output_auxiliary(packed[1], gate_metadata, gate_start, gate_len),
-            shard[1],
-        )
-        assert torch.equal(
-            iq2r_slice_input_data(packed[2], down_metadata, down_start, intermediate),
-            shard[2],
-        )
-        assert torch.equal(packed[3], shard[3])
+    deltas = torch.tensor(_FORMATION_DELTAS, dtype=torch.int32)
+    formed = (allowed.int()[None] + deltas[:, allowed.long() & 7]).to(torch.uint8)
+    book = allowed.view(torch.float8_e4m3fn).float()
+    copies = iq2r_v2_codebook_copies(book, LEVELS)
+    assert torch.equal(formed, copies.to(torch.float8_e4m3fn).view(torch.uint8))
+    # The range is tight: the subnormal byte below it already forms wrongly.
+    below = torch.tensor([IQ2R_V2_CODEBOOK_MIN_BYTE - 1], dtype=torch.uint8)
+    copies = iq2r_v2_codebook_copies(below.view(torch.float8_e4m3fn).float(), LEVELS)
+    formed = (below.int()[None] + deltas[:, below.long() & 7]).to(torch.uint8)
+    assert not torch.equal(formed, copies.to(torch.float8_e4m3fn).view(torch.uint8))
 
 
-def _atom_views(group: torch.Tensor, block: int):
-    """(8-byte record, metadata byte) views of one N=16 block in a K=128 group."""
-    triplet, atom = divmod(block % 6, 3)
-    base = triplet * 1792
-    third = group[..., base + 1024 : base + 1792].unflatten(-1, (64, 12))
-    if atom < 2:
-        pair = group[..., base : base + 1024].unflatten(-1, (64, 16))
-        record = pair[..., atom * 8 : atom * 8 + 8]
-    else:
-        record = third[..., :8]
-    return record, third[..., 8 + atom]
+def test_glm53_learned_codebook_stays_in_kernel_range():
+    """Zero and tiny weights pull k-means centroids towards 0 (below 2^-6, a
+    subnormal byte the kernels' copy formation gets wrong); the learner clamps."""
+    generator = torch.Generator(device="cuda").manual_seed(0x53F0)
+    weight = torch.randn((256, 1024), generator=generator, device="cuda") * 0.02
+    weight[:, :512] = 0.0
+    weight[:64, 512:768] *= 1e-4
+    book, _ = iq2r_v2_learn_codebook(
+        weight, torch.ones(1024, device="cuda"), LEVELS, rounds=3, sample_vectors=8192
+    )
+    raw = book.to(torch.float8_e4m3fn).view(torch.uint8)
+    assert int(raw.min()) >= IQ2R_V2_CODEBOOK_MIN_BYTE
+    assert int(raw.max()) <= IQ2R_V2_CODEBOOK_MAX_BYTE
+    iq2r_v2_check_codebook(book)
 
 
-def _slice_rows(data, metadata, start, length):
-    """Canonical output-column slice, regrouping blocks into six-block groups."""
-    target = IQ2RMetadata(logical_n=length, logical_k=metadata.logical_k)
-    experts, k_tiles = data.shape[0], metadata.k_tiles
-    source = data.view(experts, -1, k_tiles, 3584)
-    output = torch.zeros(
-        (experts, target.data_bytes), dtype=torch.uint8, device=data.device
-    ).view(experts, -1, k_tiles, 3584)
-    for block in range(length // 16):
-        source_block = start // 16 + block
-        src = _atom_views(source[:, source_block // 6], source_block)
-        dst = _atom_views(output[:, block // 6], block)
-        dst[0].copy_(src[0])
-        dst[1].copy_(src[1])
-    return output.view(experts, -1)
+@pytest.mark.parametrize("byte", [0x00, 0x05, 0x79, 0x80])
+def test_glm53_pack_rejects_codebook_outside_kernel_range(glm53_layer, byte):
+    layer = glm53_layer
+    for which in ("gate", "down"):
+        aux = {
+            "gate": layer.gate_auxiliary.clone(),
+            "down": layer.down_auxiliary.clone(),
+        }
+        aux[which][0, 17] = byte  # one codebook byte of expert 0
+        with pytest.raises(ValueError, match="codebook bytes"):
+            iq2r_glm53_pack(
+                layer.gate_data,
+                aux["gate"],
+                layer.down_data,
+                aux["down"],
+                intermediate_size=layer.intermediate,
+            )
 
 
 def test_glm53_tuned_config():
@@ -400,7 +631,10 @@ def test_glm53_tuned_config():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
-        assert iq2r_glm53_config(row.token, row.inter_dim) == IQ2RGlm53Config(
+        config = iq2r_glm53_config(
+            row.token, row.inter_dim, row.codebook, bool(row.shared)
+        )
+        assert config == IQ2RGlm53Config(
             row.gate_kernel,
             row.gate_grid,
             row.down_kernel,
@@ -408,20 +642,19 @@ def test_glm53_tuned_config():
             row.down_chunks,
         )
     for intermediate in (256, 512):
-        assert iq2r_glm53_config(77, intermediate) == iq2r_glm53_config(
-            128, intermediate
-        )
-        # route9 cannot run M3, so M3 rounds up past a route9 M4 row.
-        m4 = iq2r_glm53_config(4, intermediate)
-        assert iq2r_glm53_config(3, intermediate) == (
-            iq2r_glm53_config(8, intermediate) if m4.down_kernel == "route9" else m4
-        )
+        lookup = functools.partial(iq2r_glm53_config, intermediate_size=intermediate)
+        assert lookup(77) == lookup(128)
+        # per_token cannot run M3, so M3 rounds up past a per-token M4 row.
+        m4 = lookup(4)
+        assert lookup(3) == (lookup(8) if m4.down_kernel == "per_token" else m4)
         for tokens in range(1, MAX_CHUNK_TOKENS + 1):
-            for config in (
-                iq2r_glm53_config(tokens, intermediate),
-                _default_config(tokens),
-            ):
+            for config in (lookup(tokens), _default_config(tokens)):
                 assert _config_problem(config, tokens, intermediate) is None
+        # With the fused shared expert: decode kernels only.
+        for tokens in range(1, MAX_DECODE_TOKENS + 1):
+            config = lookup(tokens, codebook_entries=1024, shared=True)
+            assert config.gate_kernel != "prefill" or tokens > FUSED_SHARED_TOKENS
+            assert _config_problem(config, tokens, intermediate) is None
 
 
 def test_glm53_tuned_table_checks(tmp_path):
@@ -440,8 +673,8 @@ def test_glm53_tuned_table_checks(tmp_path):
         _tuned_table(str(path))
 
     path = tmp_path / "unfit.csv"
-    table.assign(down_kernel="single").to_csv(path, index=False)
-    with pytest.raises(ValueError, match="M1 needs down route9"):
+    table.assign(down_kernel="m16").to_csv(path, index=False)
+    with pytest.raises(ValueError, match="M1 needs down per_token"):
         _tuned_table(str(path))
 
 
@@ -499,7 +732,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Time the GLM-5.3 IQ2R MoE (hidden 6144, 257 experts, top-9)",
+        description="Time the GLM-5.3 IQ2R-v2 MoE (hidden 6144, 256 experts, top-8)",
     )
     parser.add_argument(
         "-t",
@@ -525,7 +758,7 @@ def main():
         for inter_dim, tokens in itertools.product(args.inter_dim, args.tokenNum)
     ]
     aiter.logger.info(
-        "GLM-5.3 IQ2R MoE summary (markdown):\n%s",
+        "GLM-5.3 IQ2R-v2 MoE summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
     pytest_status = pytest.main([__file__, "-v"])

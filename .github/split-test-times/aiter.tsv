@@ -107,13 +107,12 @@ op_tests/test_indexer_k_quant_and_cache.py	5
 op_tests/test_indexer_qk_rope_quant_and_cache.py	8
 op_tests/test_inverse_rope_group_quant.py	32
 op_tests/test_ipc_base_ptr.py	4
-op_tests/test_iq2r_encoder.py	5
 op_tests/test_iq2r_format.py	5
 op_tests/test_iq2r_glm53.py	10
+op_tests/test_iq2r_glm53_unpack.py	5
 op_tests/test_iq2r_glm5_calibrate.py	5
 op_tests/test_iq2r_glm5_compile.py	5
-op_tests/test_iq2r_hip.py	6
-op_tests/test_iq2r_reference.py	5
+op_tests/test_iq2r_ldlq.py	5
 op_tests/test_jit_arch_guard.py	4
 op_tests/test_jit_cache_transaction.py	8
 op_tests/test_jit_clone_config.py	1
