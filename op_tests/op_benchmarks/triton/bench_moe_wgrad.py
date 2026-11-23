@@ -7,16 +7,23 @@ Usage:
     python bench_moe_wgrad.py --metric bandwidth
 """
 
+import functools
+
 import torch
 import triton
 
 from aiter.ops.moe_op import moe_align_block_size
 from aiter.ops.triton.moe.moe_wgrad import moe_wgrad
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 # (num_tokens, E, N, K, top_k, label)
 _SHAPES = [
@@ -28,7 +35,12 @@ _BLOCK_SIZE_M = 64
 
 
 def _setup(num_tokens, E, N, K, top_k, device="cuda"):
-    torch.manual_seed(0)
+    """One rotating-buffer pool entry: fresh grad/input and a fresh routing.
+
+    Not seeded here -- each pool entry must be a different draw (main() seeds
+    once). sorted_ids/expert_ids are sized from max_blocks, which depends only
+    on the shape, so every entry has the same shapes and launch grid.
+    """
     grad = torch.randn(num_tokens, N, dtype=torch.bfloat16, device=device) * 0.1
     inp = torch.randn(num_tokens, K, dtype=torch.bfloat16, device=device) * 0.1
     scores = torch.randn(num_tokens, E, dtype=torch.float32, device=device)
@@ -36,11 +48,19 @@ def _setup(num_tokens, E, N, K, top_k, device="cuda"):
 
     # moe_align_block_size requires pre-allocated output buffers.
     max_blocks = triton.cdiv(num_tokens * top_k, _BLOCK_SIZE_M) + E
-    sorted_ids = torch.empty(
-        max_blocks * _BLOCK_SIZE_M, dtype=torch.int32, device=device
+    # moe_align_block_size only writes slots that real tokens land in, so the
+    # padding slots must be pre-filled with the >= num_valid_tokens sentinel
+    # moe_wgrad masks on (see its docstring).
+    sorted_ids = torch.full(
+        (max_blocks * _BLOCK_SIZE_M,),
+        num_tokens * top_k,
+        dtype=torch.int32,
+        device=device,
     )
-    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
-    token_nums = torch.empty(E, dtype=torch.int32, device=device)
+    expert_ids = torch.full((max_blocks,), -1, dtype=torch.int32, device=device)
+    # One entry per block, not per expert: the kernel writes token_nums[i] for
+    # every block i, so an E-sized buffer overflows into neighbouring tensors.
+    token_nums = torch.empty(max_blocks, dtype=torch.int32, device=device)
     ntpp = torch.empty(1, dtype=torch.int32, device=device)
     moe_align_block_size(
         topk_ids, E, _BLOCK_SIZE_M, sorted_ids, expert_ids, token_nums, ntpp
@@ -48,8 +68,14 @@ def _setup(num_tokens, E, N, K, top_k, device="cuda"):
     return grad, inp, sorted_ids, expert_ids, ntpp
 
 
+_POOL_KEYS = ["grad", "inp", "sorted_ids", "expert_ids", "ntpp"]
+
+
 def benchmark(args):
     unit = "ms" if args.metric == "time" else "GB/s"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     x_vals = list(_SHAPES)
 
     config = triton.testing.Benchmark(
@@ -66,21 +92,28 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(num_tokens, E, N, K, top_k, label, provider):
-        grad, inp, sorted_ids, expert_ids, ntpp = _setup(num_tokens, E, N, K, top_k)
-        fn = lambda: moe_wgrad(
-            grad,
-            inp,
-            sorted_ids,
-            expert_ids,
-            ntpp,
-            num_experts=E,
-            top_k=top_k,
-            weight_shape=(E, N, K),
-            block_size_m=_BLOCK_SIZE_M,
+        bencher.build_pool(
+            [functools.partial(_setup, num_tokens, E, N, K, top_k)], [_POOL_KEYS]
         )
+
+        def kernel_fn(grad, inp, sorted_ids, expert_ids, ntpp):
+            # dW is allocated (zero-filled) inside moe_wgrad, so that memset is
+            # part of every timed call, as it would be in training.
+            moe_wgrad(
+                grad,
+                inp,
+                sorted_ids,
+                expert_ids,
+                ntpp,
+                num_experts=E,
+                top_k=top_k,
+                weight_shape=(E, N, K),
+                block_size_m=_BLOCK_SIZE_M,
+            )
+
         # reads: grad(T*N) + inp(T*K); writes: dW(E*N*K); bf16 = 2 bytes
         mem = (num_tokens * N + num_tokens * K + E * N * K) * 2
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = bencher.bench(kernel_fn)
         if args.metric == "time":
             return ms
         return mem * 1e-9 / (ms * 1e-3)

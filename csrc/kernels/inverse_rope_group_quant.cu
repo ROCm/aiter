@@ -70,13 +70,6 @@ static inline bool is_cdna_arch()
 // The tensor engine the payload staging below rides on is gfx1250-only.
 static inline bool has_tdm_arch() { return (get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"); }
 
-static constexpr MxDtype kHwFp8E4m3 =
-#if defined(__gfx942__)
-    MxDtype::FP8_E4M3_FNUZ;
-#else
-    MxDtype::FP8_E4M3;
-#endif
-
 template <int N>
 using ic = std::integral_constant<int, N>;
 
@@ -950,7 +943,7 @@ __global__ void inverse_rope_group_quant_kernel(
                     fmaxf(native_amax, aiter::kAmaxFloor));
                 const E8m0BlockScale s8 =
                     fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp,
-                                               kHwFp8E4m3>(amax);
+                                               kHwFp8MxDtype>(amax);
                 store_scale(k_group, s8.byte);
                 store_vector<opus::fp8_t, opus::fp8_t, THREAD_DATA_SIZE, 0, false,
                              WARP_SIZE, 1, opus::fp8_t>(
@@ -1115,7 +1108,7 @@ __global__ void inverse_rope_group_quant_kernel(
 
         // --- E8M0 block scale ---
         const E8m0BlockScale s8 =
-            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kHwFp8E4m3>(amax);
+            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kHwFp8MxDtype>(amax);
         store_scale(k_group, s8.byte);
 
         // --- Quantize and store ---
