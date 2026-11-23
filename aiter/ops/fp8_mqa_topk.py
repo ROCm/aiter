@@ -15,9 +15,12 @@ Kernel design: see csrc/kernels/fp8_mqa_topk.cu.
 
 Fixed at n_heads=32, head_dim=128 -- the GLM-5.x indexer shape.
 ``is_supported()`` gates on that, so a caller that also has to serve other shapes
-can route them to the unfused path rather than trip a TORCH_CHECK.
+can route them to the unfused path rather than trip an AITER_CHECK.
 """
 
+import functools
+
+import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -38,7 +41,36 @@ def is_supported(num_heads: int, head_dim: int) -> bool:
     )
 
 
-@compile_ops(MD_NAME, fc_name="fp8_mqa_topk")
+# No C++ torch dependency: the module uses the ``aiter_tensor_t`` ABI and
+# ``develop=True`` converts each ``torch.Tensor`` before the call. All scratch memory
+# is one workspace allocated here (``fp8_mqa_topk`` below), so it comes from torch's
+# caching allocator on the current stream, as the outputs do.
+@compile_ops(MD_NAME, fc_name="fp8_mqa_topk_workspace_size", develop=True)
+def _fp8_mqa_topk_workspace_size(M: int, N: int, TotalCuCount: int) -> int: ...
+
+
+@functools.lru_cache(maxsize=1024)
+def _workspace_size(M: int, N: int, TotalCuCount: int) -> int:
+    """fp8_mqa_topk_workspace_size() memoised: a pure function of its arguments."""
+    return _fp8_mqa_topk_workspace_size(M, N, TotalCuCount)
+
+
+@compile_ops(MD_NAME, fc_name="fp8_mqa_topk", develop=True)
+def _fp8_mqa_topk(
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    kv_scale: Tensor,
+    weights: Tensor,
+    cu_seqlen_ks: Tensor,
+    cu_seqlen_ke: Tensor,
+    topk_indices: Tensor,
+    workspace: Tensor,
+    TotalCuCount: int,
+    fallback_rows: Tensor | None,
+    force_fallback: bool,
+) -> None: ...
+
+
 def fp8_mqa_topk(
     q_fp8: Tensor,
     k_fp8: Tensor,
@@ -73,3 +105,22 @@ def fp8_mqa_topk(
 
     Workspace (allocated per call): about M * (N / 8 + 32 KiB * SplitN) + 512 * N bytes.
     """
+    M = q_fp8.shape[0] if q_fp8.dim() else 0
+    N = k_fp8.shape[0] if k_fp8.dim() else 0
+    workspace = torch.empty(
+        _workspace_size(M, N, TotalCuCount), dtype=torch.uint8, device=q_fp8.device
+    )
+    _fp8_mqa_topk(
+        q_fp8,
+        k_fp8,
+        kv_scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices,
+        workspace,
+        TotalCuCount,
+        fallback_rows,
+        force_fallback,
+    )
+    return topk_indices
