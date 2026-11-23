@@ -293,6 +293,15 @@ _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
 # only TP4 takes it: 192 MiB holds a 14336-token prefill chunk of hidden 6144 in
 # one launch (12288 tokens: 246 us in one launch against 289 us in two, 4x MI455X).
 _AR2S_RMS_MAX_BYTES = {4: 192 * 1024 * 1024}
+# gfx1250 TP4 one-shot AR + residual add + RMSNorm (+ MXFP8) for decode sizes (k5_fused_ar_rms,
+# csrc/kernels/ar_k5_gfx1250.cu), hidden 6144: it takes the calls of up to _K5_AR_MAX_ROWS rows
+# that the Gluon one-shot or the Lamport fused kernel would take, with their bits. Its inbox
+# (3 x 4 x that many rows, 37.7 MB a rank at 256) and counters follow the Lamport inbox in that
+# allocation. A flag poll gives up after _K5_AR_MAXIT iterations (~0.3 us each; counted in
+# k5_ar_errors, the result is then wrong) instead of hanging.
+_K5_AR_HIDDEN = 6144
+_K5_AR_MAX_ROWS = 256
+_K5_AR_MAXIT = 20000000
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -1357,6 +1366,8 @@ class CustomAllreduce:
         # pushed two-shot AR + RMSNorm (gfx1250): context, 0 until set up
         self._ar2s_ctx = 0
         self._ar2s_max_rows = {}
+        # one-shot decode AR + RMSNorm (gfx1250, TP4): context, 0 until set up
+        self._k5_ctx = 0
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
@@ -2090,9 +2101,23 @@ class CustomAllreduce:
         _COARSE_GRAIN = 2 * 1024 * 1024
         size = ops.lamport_ar_rms_buffer_size_gfx1250(world_size, max_bytes)
         size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
-        self._pool.create("lamport", size, raw_cached=True)
+        # the k5 inbox and counters follow the Lamport inbox in the same
+        # allocation (no IPC buffer of their own)
+        k5_bytes = self._k5_ar_bytes(world_size)
+        k5_bytes = (k5_bytes + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create("lamport", size + k5_bytes, raw_cached=True)
         ptrs = self._pool.open_peer_buffers("lamport")
         ops.init_lamport_ar_rms_gfx1250(self._ptr, ptrs, max_bytes)
+        if k5_bytes:
+            self._k5_ctx = ops.init_k5_ar_gfx1250(
+                self.rank, [p + size for p in ptrs], _K5_AR_MAX_ROWS, _K5_AR_HIDDEN
+            )
+            logger.info(
+                "Custom allreduce gfx1250 one-shot decode AR + RMSNorm (k5): up to %d rows, "
+                "%d bytes after the Lamport inbox",
+                _K5_AR_MAX_ROWS,
+                k5_bytes,
+            )
         # every rank's 0xff memset must land before any rank's first push
         dist.barrier(group=self.group)
         self._lamport_max_bytes = max_bytes
@@ -2102,6 +2127,82 @@ class CustomAllreduce:
             max_bytes,
             size,
         )
+
+    def _k5_ar_bytes(self, world_size: int) -> int:
+        """Bytes the one-shot decode AR + RMSNorm (k5_fused_ar_rms) sets aside at the end of the
+        Lamport inbox allocation (TP4 only, the measured world size; 0 otherwise): its inbox and
+        its counters. Sharing that allocation adds no IPC buffer, export or peer mapping."""
+        if world_size != 4:
+            return 0
+        return ops.k5_ar_buffer_size_gfx1250(world_size, _K5_AR_MAX_ROWS, _K5_AR_HIDDEN)
+
+    def should_k5_ar(
+        self, inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor
+    ) -> bool:
+        """Whether k5_fused_ar_rms can take this call: bf16 [rows, 6144], 0 < rows <= the cap.
+        Shapes and dtypes only, so every rank decides the same."""
+        if self.disabled or not self._k5_ctx:
+            return False
+        return (
+            inp.dim() == 2
+            and inp.dtype == res_inp.dtype == w.dtype == torch.bfloat16
+            and inp.shape[-1] == res_inp.shape[-1] == w.numel() == _K5_AR_HIDDEN
+            and res_inp.shape == inp.shape
+            and 0 < inp.shape[0] <= _K5_AR_MAX_ROWS
+        )
+
+    def k5_fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        lamport_order: bool = False,
+        fp8_out: bool = False,
+    ):
+        """One-shot all-reduce + residual add + RMSNorm (gfx1250, TP4, decode sizes). Returns
+        (out, residual_out), or with fp8_out (E4M3 out, residual_out, row-major E8M0 scale
+        [rows, hidden / 32]). lamport_order gives the bits of lamport_fused_ar_rms (and of
+        per_1x32_mx_quant_hip of its output), else those of the Gluon one-shot kernels. Check
+        should_k5_ar first. Runs the same eager and in a captured graph."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp.contiguous())
+        res_inp = _lamport_aligned(res_inp.contiguous())
+        w = _lamport_aligned(w.contiguous())
+        res_out = torch.empty_like(inp)
+        if fp8_out:
+            out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+            scale = torch.empty((rows, hidden // 32), dtype=fp8_e8m0, device=inp.device)
+            scale_ptr = scale.data_ptr()
+        else:
+            out = torch.empty_like(inp)
+            scale, scale_ptr = None, 0
+        ops.k5_ar_rms_gfx1250(
+            self._k5_ctx,
+            inp.data_ptr(),
+            res_inp.data_ptr(),
+            w.data_ptr(),
+            out.data_ptr(),
+            res_out.data_ptr(),
+            scale_ptr,
+            rows,
+            hidden,
+            eps,
+            gemma_norm,
+            lamport_order,
+            fp8_out,
+            _K5_AR_MAXIT,
+        )
+        if fp8_out:
+            return out, res_out, scale
+        return out, res_out
+
+    def k5_ar_errors(self) -> int:
+        """Polls of k5_fused_ar_rms that timed out on this rank (synchronizes the device)."""
+        return ops.k5_ar_errors_gfx1250(self._k5_ctx) if self._k5_ctx else 0
 
     def _init_ar2s_rms(self, world_size: int):
         """Set up the pushed two-shot AR + RMSNorm (gfx1250, IPC transport):

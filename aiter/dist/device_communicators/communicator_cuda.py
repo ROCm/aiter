@@ -471,9 +471,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and x_pad_to_multiple == 0
             and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
         )
-        if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
+        gluon = x_pad_to_multiple == 0 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
+        )
+        if (
+            (gluon or lamport)
+            and ca_comm is not None
+            and ca_comm.should_k5_ar(input_, res_inp_, weight_)
         ):
+            # the one-shot decode kernel, with the bits of the path it replaces
+            return ca_comm.k5_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon
+            )
+        if gluon:
             return _gluon_ar_norm(
                 self, input_, res_inp_, weight_, eps, gemma_norm, quant=False
             )
@@ -892,7 +902,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
         lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
             input_, res_inp_, weight_, hidden
         )
-        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport):
+        gluon = _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport)
+        # The one-shot decode kernel, quantizing in its own epilogue with the bits of the path it
+        # replaces: the Gluon one-shot's, or the Lamport fused kernel + per_1x32_mx_quant_hip's.
+        if (
+            (gluon or lamport)
+            and ca_comm is not None
+            and ca_comm.should_k5_ar(input_, res_inp_, weight_)
+        ):
+            return ca_comm.k5_fused_ar_rms(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                lamport_order=not gluon,
+                fp8_out=True,
+            )
+        if gluon:
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,
             )

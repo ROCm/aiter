@@ -784,3 +784,42 @@ def ar2s_rms_ex_gfx1250(
     aux_residual: bool,
     grid: int = 0,
 ) -> None: ...
+
+
+# ---- gfx1250 TP4 one-shot all-reduce + residual add + RMSNorm (+ MXFP8), decode sizes ----
+# Every rank allocates k5_ar_buffer_size_gfx1250 inbox bytes (cached, IPC), maps every rank's
+# inbox, calls init_k5_ar_gfx1250 once (it arms its own inbox) and barriers before the first call.
+K5_AR_MD_NAME = "module_ar_k5_gfx1250"
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_buffer_size", develop=True)
+def k5_ar_buffer_size_gfx1250(world_size: int, max_rows: int, hidden: int) -> int: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="init_k5_ar", develop=True)
+def init_k5_ar_gfx1250(
+    rank: int, inbox_ptrs: list[int], max_rows: int, hidden: int
+) -> int: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_rms", develop=True)
+def k5_ar_rms_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    scale: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    lamport_order: bool,
+    fp8_out: bool,
+    maxit: int,
+) -> None: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_errors", develop=True)
+def k5_ar_errors_gfx1250(ctx: int) -> int: ...
