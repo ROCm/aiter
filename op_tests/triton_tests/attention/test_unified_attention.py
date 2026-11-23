@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import random
 import sys
 from types import SimpleNamespace
@@ -26,9 +27,13 @@ from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
+from op_tests.triton_tests.utils.test_common_utils import (
+    assert_no_gpu_memory_fault,
+    run_in_subprocess,
+)
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 
 
 def shuffle_kv_cache(
@@ -436,6 +441,7 @@ def test_triton_unified_attn_3d(
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         # gfx1250 -> Gluon
         # gfx950 -> Gluon
@@ -444,7 +450,7 @@ def test_triton_unified_attn_3d(
     if force_fp8_pv and kv_dtype != torch.uint8:
         pytest.skip("force_fp8_pv_on_fp4_kv_cache only applies to an NVFP4 KV cache")
     if kv_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
+        if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
             pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 KV cache requires shuffled KV cache")
@@ -773,7 +779,7 @@ def test_triton_unified_attn(
 def test_triton_unified_attn_qq_bias_padded_query_rows(
     num_heads: tuple[int, int], query_len: int, kv_len: int
 ) -> None:
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
     seq_lens = [(query_len, kv_len)] * 2
     (
@@ -1412,6 +1418,87 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
+def _run_block_table_before_unmapped_page(seq_lens, block_size, sliding_window):
+    # Runs in a child process: a GPU memory fault aborts the whole process.
+    from op_tests.test_batch_prefill import make_guarded_int32_tensor
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=128,
+            num_heads=(48, 8),
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    # The last sequence fills the last row, so a read past the row is a read
+    # past the table, and the page after the table is not mapped.
+    assert -(-kv_lens[-1] // block_size) == table.shape[1]
+    guarded = make_guarded_int32_tensor(table, device=torch.cuda.current_device())
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=guarded.view(table.shape),
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend="gluon",
+    )
+    torch.cuda.synchronize()
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    )
+    torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decoding verify: the last sequence ends 6 tokens short of the row
+        [(8, 1000), (8, 2045), (6, 4090)],
+        [(512, 512), (256, 4096)],
+        [(1, 1000), (1, 4096)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+def test_triton_unified_attn_block_table_before_unmapped_page(
+    seq_lens, block_size, sliding_window
+):
+    # The gfx950 kernel loads block IDs two tiles ahead. The load must stay in
+    # the block table also for the last row of the table.
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon block-table prefetch")
+    aiter_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    child = (
+        "import sys, torch\n"
+        f"sys.path.insert(0, {aiter_root!r})\n"
+        "from op_tests.triton_tests.attention.test_unified_attention import "
+        "_run_block_table_before_unmapped_page as run\n"
+        "with torch.inference_mode():\n"
+        f"    run({seq_lens!r}, {block_size!r}, {sliding_window!r})\n"
+    )
+    result = run_in_subprocess(child, timeout=600)
+    assert_no_gpu_memory_fault(
+        result, "unified attention read past the end of the block table"
+    )
+
+
 def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
     """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
     rng = random.Random(seed)
@@ -1443,7 +1530,7 @@ def test_unified_attn_spec_verify_gfx1250(
     split-KV kernel, where query rows of one block have different causal horizons
     so a split segment can be partly or wholly past a row's horizon, and the 2D
     kernel with a BLOCK_M sized to the query rows."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     if path != "auto":
         monkeypatch.setattr(
@@ -1542,7 +1629,7 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
     BLOCK_M), both KV layouts, and trailing pad seqs as a DP-padded batch has
     them: no query rows behind them and seqused_k == 0, which must neither
     shift the real seqs' rows nor write past them."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     if path == "3d" and not shuffled_kv_cache:
         pytest.skip("the gfx1250 3D Gluon kernel needs the shuffled KV cache")
@@ -1652,7 +1739,7 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
 def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
     """The optional attn_work hint (sum of q x (k - q / 2)) only steers the gfx1250
     prefill routing and config; the output must match the reference either way."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     block_size, head_size, num_heads = 64, 256, (4, 1)
     (
@@ -1964,7 +2051,7 @@ def test_triton_unified_attn_k4v8(
     min(128, page) rows) and fp8 V (shuffled), through the 2D and 3D kernels. The reference reads the dequantized
     K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
@@ -2158,7 +2245,7 @@ def test_unified_attn_output_gate_k4v8(
     select=True: only each sequence's last row (as the MTP drafter keeps), which the 2D
     kernel never fuses, so it runs the output epilogue; on the cu_seqlens_q search path.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     module = sys.modules[unified_attention.__module__]
     if path != "auto":
@@ -2283,7 +2370,7 @@ def test_unified_attn_split_rebalance_reduce_k4v8(
     the bf16 outputs match to within 2 ulps of the output (1e-6 of the values that
     differ), and the gate / row-selection epilogue is bitwise the Triton reduce's
     epilogue applied to the new reduce."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
@@ -2411,7 +2498,7 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     merge steps in the same order), on the 3D kernel's own partials under the gfx1250
     split rebalance, with and without the gate / row-selection epilogue, speculative or
     not, over one or several LDS passes."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
