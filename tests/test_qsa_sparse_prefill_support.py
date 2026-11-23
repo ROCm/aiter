@@ -5,7 +5,8 @@
 the op raises, in their order.
 
 These run on CPU tensors: the architecture and the ROCm device rule are injected, and a
-rejected call raises before any kernel or GPU API is reached. Each tensor names its
+rejected call raises before any kernel or GPU API is reached. FP8 K/V are gfx942's
+E4M3FNUZ (torch.float8_e4m3fnuz); other FP8 formats are rejected. Each tensor names its
 device, since a module imported in the same session may set a default device. Message
 texts are written out here, not taken from the code under test.
 
@@ -30,6 +31,7 @@ import torch
 
 import aiter.ops.flydsl.qsa_sparse_prefill as op
 from aiter.ops import qsa
+from aiter.ops.flydsl.kernels.qsa import sparse_prefill_common as common
 
 ROWS = 8
 GROUP = 12
@@ -37,7 +39,15 @@ DIM = 256
 TOPK = 256
 WIDTH = 4 * TOPK + 3
 
-SHAPE = "Q/K/V must be BF16 [tokens, heads, 256]"
+SHAPE = "Q/K/V must be BF16 [tokens, heads, 256] (K/V may be FP8 E4M3FNUZ on gfx942)"
+COMPUTE = 'compute must be "fp8" or "bf16"'
+SCALES_ON_BF16 = "k_scale/v_scale apply only to FP8 K/V"
+FP8_SCALES = (
+    "FP8 K/V require contiguous FP32 k_scale/v_scale on their device, of shape [1] or "
+    "[8, 1] (K's [N, HK], or [P, HK] for a pool)"
+)
+SCALE_LAYOUTS = "k_scale and v_scale must both be per tensor or per token"
+INVARIANT = "batch_invariant must be a bool"
 SCALE_TYPE = "softmax_scale must be a host scalar or None"
 SCALE_RANGE = "softmax_scale * log2(e) must be finite and positive in FP32"
 SLOTS = "kv_slots must be a contiguous device int32 [N] tensor"
@@ -55,12 +65,13 @@ GROUP_LIMIT = "At most 16 Q heads per KV head fit the direct fallback wave"
 SPAN = "Q and each request's K/V require byte spans <= 2**32 - 2**20"
 GFX = "QSA sparse attention requires gfx942 or gfx950"
 STRIDED_GFX = "Strided K/V rows are supported on gfx950 only"
+FP8_GFX = "FP8 K/V are supported on gfx942 only"
 INDICES = (
     "indices must be contiguous device int32 [M,4T+3], T = 256/512/768/1024, "
     "with byte span < 2**31"
 )
 OUT = "out must be aligned, contiguous and match Q"
-OVERLAP = "out must not overlap Q/K/V, indices or kv_slots"
+OVERLAP = "out must not overlap Q/K/V, indices, kv_slots or scales"
 
 
 def zeros(*shape, dtype=torch.bfloat16, device="cpu"):
@@ -95,6 +106,27 @@ def packed():
     }
 
 
+def fp8(per_token=True):
+    """FP8 K/V of packed() with FP32 scales per token and KV head [ROWS, 1], or per
+    tensor."""
+    return {
+        **packed(),
+        "k": zeros(ROWS, 1, DIM, dtype=torch.float8_e4m3fnuz),
+        "v": zeros(ROWS, 1, DIM, dtype=torch.float8_e4m3fnuz),
+        "k_scale": zeros(ROWS, 1, dtype=torch.float32) if per_token else ones(),
+        "v_scale": zeros(ROWS, 1, dtype=torch.float32) if per_token else ones(),
+    }
+
+
+def e4m3fn():
+    """K/V of fp8() in OCP E4M3FN, gfx950's FP8 (aiter's dtypes.fp8 there)."""
+    return {name: zeros(ROWS, 1, DIM, dtype=torch.float8_e4m3fn) for name in ("k", "v")}
+
+
+def ones():
+    return torch.ones(1, dtype=torch.float32, device="cpu")
+
+
 def interleaved():
     """K and V as the two halves of a [ROWS, 2, DIM] record per token (row stride 2 DIM)."""
     kv = zeros(ROWS, 2, DIM)
@@ -123,8 +155,40 @@ def inside_out(name):
         "v": out.reshape(-1)[: ROWS * DIM].view(ROWS, 1, DIM),
         "indices": ints[: ROWS * WIDTH].view(ROWS, WIDTH),
         "kv_slots": ints[:ROWS],
+        "k_scale": out.view(torch.float32).reshape(-1)[:ROWS].view(ROWS, 1),
     }
     return {"out": out, name: inside[name]}
+
+
+def fp8_k_and_out(start):
+    """FP8 K [ROWS, 1, DIM] (one byte per value) and an out starting `start` bytes after
+    K's first byte, in one buffer."""
+    out_bytes = ROWS * GROUP * DIM * 2
+    buffer = zeros(max(ROWS * DIM, start + out_bytes), dtype=torch.uint8)
+    return {
+        "k": buffer[: ROWS * DIM].view(torch.float8_e4m3fnuz).view(ROWS, 1, DIM),
+        "out": buffer[start : start + out_bytes]
+        .view(torch.bfloat16)
+        .view(ROWS, GROUP, DIM),
+    }
+
+
+def fp8_pool_over_the_span_limit(compute):
+    """FP8 K/V of a 208-row slot pool for one request of ROWS rows over a 200-token
+    prefix: its K span is past a _MAX_SPAN of Q's bytes (see SPAN_OF_Q)."""
+    return {
+        "k": zeros(208, 1, DIM, dtype=torch.float8_e4m3fnuz),
+        "v": zeros(208, 1, DIM, dtype=torch.float8_e4m3fnuz),
+        "k_scale": ones(),
+        "v_scale": ones(),
+        "kv_slots": torch.arange(208, dtype=torch.int32, device="cpu"),
+        "query_lens": (ROWS,),
+        "prefix_lens": (200,),
+        "compute": compute,
+    }
+
+
+SPAN_OF_Q = (("_MAX_SPAN", ROWS * GROUP * DIM * 2),)
 
 
 class Case(NamedTuple):
@@ -155,10 +219,37 @@ TENSOR_RULES = {
 }
 
 REJECTED = [
-    # Shapes, scale, slots, lengths: the rules before the device.
+    # Shapes, compute, FP8 scales, scale, batch mode, slots, lengths: the rules before
+    # the device.
     case("q_2d", lambda: {"q": zeros(ROWS, GROUP * DIM)}, SHAPE),
     case("k_2d", lambda: {"k": zeros(ROWS, DIM)}, SHAPE),
     case("v_2d", lambda: {"v": zeros(ROWS, DIM)}, SHAPE),
+    case("compute_fp16", lambda: {"compute": "fp16"}, COMPUTE),
+    case(
+        "scales_on_bf16", lambda: {"k_scale": ones(), "v_scale": ones()}, SCALES_ON_BF16
+    ),
+    case(
+        "fp8_without_scales",
+        lambda: {"k_scale": None, "v_scale": None},
+        FP8_SCALES,
+        base=fp8,
+    ),
+    case(
+        "fp8_scale_bf16",
+        lambda: {"k_scale": zeros(ROWS, 1)},
+        FP8_SCALES,
+        base=fp8,
+    ),
+    case(
+        "fp8_scale_rows",
+        lambda: {"k_scale": zeros(ROWS - 1, 1, dtype=torch.float32)},
+        FP8_SCALES,
+        base=fp8,
+    ),
+    case(
+        "fp8_scale_layouts_differ", lambda: {"k_scale": ones()}, SCALE_LAYOUTS, base=fp8
+    ),
+    case("invariant_int", lambda: {"batch_invariant": 1}, INVARIANT, error=TypeError),
     case(
         "scale_tensor",
         lambda: {"softmax_scale": torch.tensor(0.0625, device="cpu")},
@@ -203,6 +294,10 @@ REJECTED = [
     case("lens_keys", lambda: {"query_lens": (ROWS,), "prefix_lens": (1,)}, LENS),
     # The device rule runs the real predicate: a CPU tensor is not on a ROCm device.
     case("device_cpu", dict, ROCM, rocm=False),
+    # FP8 K/V of any format off gfx942.
+    case("fp8_on_gfx950", dict, FP8_GFX, base=fp8),
+    case("fp8_per_tensor_on_gfx950", dict, FP8_GFX, base=lambda: fp8(False)),
+    case("e4m3fn_on_gfx950", e4m3fn, FP8_GFX, base=fp8),
     # Q, K, V in turn: dtype, layout, last dimension, then alignment.
     *[
         case(f"{name}_{rule}", lambda name=name, make=make: {name: make()}, message)
@@ -217,6 +312,15 @@ REJECTED = [
         )
         for name in ("k", "v")
     ],
+    # On gfx942 FP8 K/V are E4M3FNUZ, both of them.
+    case("e4m3fn_on_gfx942", e4m3fn, SHAPE, gfx="gfx942", base=fp8),
+    case(
+        "fp8_k_bf16_v_on_gfx942",
+        lambda: {"v": zeros(ROWS, 1, DIM)},
+        SHAPE,
+        gfx="gfx942",
+        base=fp8,
+    ),
     case(
         "q_not_contiguous",
         lambda: {"q": zeros(GROUP, ROWS, DIM).transpose(0, 1)},
@@ -285,7 +389,7 @@ REJECTED = [
             "prefix_lens": (200,),
         },
         SPAN,
-        constants=(("_MAX_SPAN", ROWS * GROUP * DIM * 2),),
+        constants=SPAN_OF_Q,
     ),
     case("arch_unsupported", dict, GFX, gfx="gfx90a"),
     case("strided_on_gfx942", dict, STRIDED_GFX, gfx="gfx942", base=interleaved),
@@ -362,8 +466,34 @@ REJECTED = [
         case(f"out_overlaps_{name}", lambda name=name: inside_out(name), OVERLAP)
         for name in ("k", "v", "indices", "kv_slots")
     ],
-    # The first broken rule wins: the span rule precedes the architecture rules, the
-    # host lengths the device rule, the ranks the scale's type, the device the dtypes.
+    case(
+        "out_overlaps_k_scale",
+        lambda: inside_out("k_scale"),
+        OVERLAP,
+        gfx="gfx942",
+        base=fp8,
+    ),
+    # FP8 K rows hold one byte per value: an out 16 bytes before K's end overlaps it.
+    case(
+        "out_overlaps_fp8_k",
+        lambda: fp8_k_and_out(ROWS * DIM - 16),
+        OVERLAP,
+        gfx="gfx942",
+        base=fp8,
+    ),
+    # compute="bf16" runs FP8 K/V as packed BF16 copies, addressed per request: a slot
+    # pool does not lift the request's K span rule then.
+    case(
+        "fp8_compute_bf16_pool_over_the_span_limit",
+        lambda: fp8_pool_over_the_span_limit("bf16"),
+        SPAN,
+        gfx="gfx942",
+        base=fp8,
+        constants=SPAN_OF_Q,
+    ),
+    # The first broken rule wins: the span rule precedes the strided-row rule, the
+    # host lengths the device rule, the ranks the scale's type, the device the FP8
+    # architecture rule, which precedes the dtypes.
     case(
         "order_span_before_arch",
         dict,
@@ -377,6 +507,25 @@ REJECTED = [
         "order_ndim_before_scale",
         lambda: {"q": zeros(ROWS, GROUP * DIM), "softmax_scale": True},
         SHAPE,
+    ),
+    case(
+        "order_fp8_scales_before_scale",
+        lambda: {"k_scale": ones(), "v_scale": ones(), "softmax_scale": True},
+        SCALES_ON_BF16,
+    ),
+    case(
+        "order_scale_before_invariant",
+        lambda: {"softmax_scale": 0.0, "batch_invariant": 1},
+        SCALE_RANGE,
+    ),
+    case("order_device_before_fp8_arch", dict, ROCM, rocm=False, base=fp8),
+    # E4M3FN K/V without scales off gfx942: the scale rules come first.
+    case("order_fp8_scales_before_fp8_arch", e4m3fn, FP8_SCALES),
+    case(
+        "order_fp8_arch_before_dtype",
+        lambda: {"v": zeros(ROWS, 1, DIM)},
+        FP8_GFX,
+        base=fp8,
     ),
     case(
         "order_device_before_dtype",
@@ -477,12 +626,34 @@ ACCEPTED = [
             "query_lens": (ROWS,),
             "prefix_lens": (200,),
         },
-        constants=(("_MAX_SPAN", ROWS * GROUP * DIM * 2),),
+        constants=SPAN_OF_Q,
     ),
     accepted("out_apart", lambda: {"out": zeros(ROWS, GROUP, DIM)}),
     accepted("interleaved_on_gfx950", dict, base=interleaved),
     accepted("out_in_the_gap_between_kv_rows", out_in_kv_gap),
     accepted("group_16", lambda: {"q": zeros(ROWS, 16, DIM)}),
+    accepted("batch_invariant", lambda: {"batch_invariant": True}),
+    accepted("fp8_on_gfx942", dict, gfx="gfx942", base=fp8),
+    accepted("fp8_per_tensor_on_gfx942", dict, gfx="gfx942", base=lambda: fp8(False)),
+    accepted(
+        "fp8_compute_bf16_on_gfx942",
+        lambda: {"compute": "bf16"},
+        gfx="gfx942",
+        base=fp8,
+    ),
+    accepted(
+        "fp8_pool_over_the_span_limit",
+        lambda: fp8_pool_over_the_span_limit("fp8"),
+        gfx="gfx942",
+        base=fp8,
+        constants=SPAN_OF_Q,
+    ),
+    accepted(
+        "out_right_after_fp8_k",
+        lambda: fp8_k_and_out(ROWS * DIM),
+        gfx="gfx942",
+        base=fp8,
+    ),
     accepted(
         "topk_1024", lambda: {"indices": zeros(ROWS, 4 * 1024 + 3, dtype=torch.int32)}
     ),
@@ -537,6 +708,23 @@ def test_without_flydsl_the_op_is_unavailable_and_every_call_has_a_problem(monke
     assert not qsa.can_use_flydsl_qsa_sparse_prefill(**args)
     with pytest.raises(RuntimeError, match="requires FlyDSL"):
         qsa.qsa_sparse_prefill(**args)
+
+
+@pytest.mark.parametrize(
+    ("value", "switched"), [("1", True), ("0", False), ("true", None), ("2", None)]
+)
+def test_a_switch_of_the_platform_entry_is_written_0_or_1(monkeypatch, value, switched):
+    monkeypatch.setattr(common, "_calibrated", lambda: ("gfx950", 256))
+    monkeypatch.setenv(common.OVERRIDE, f"route_all_or_none={value}")
+    common.platform.cache_clear()
+    try:
+        if switched is None:
+            with pytest.raises(ValueError, match="written 0 or 1"):
+                common.platform()
+        else:
+            assert common.platform().route_all_or_none is switched
+    finally:
+        common.platform.cache_clear()
 
 
 # The support query of qsa_sparse_prefill.

@@ -192,6 +192,28 @@ def check_exponential_row_bounds(l_dtype=(torch.float32, torch.bfloat16)):
     )
 
 
+def check_exponential_is_positive(numel=1 << 27, chunk=1 << 25):
+    """Every exponential sample must be positive.
+
+    `exponential_func_impl` maps a uniform in its top float32 bucket
+    (rand >= 1 - eps/2) to a fixed tiny sample instead of -log(rand). That
+    sample must be +eps/2 / lambd, as in at::transformation::exponential; it
+    was -eps/2 / lambd. The bucket holds about 8.7e-8 of hiprand's uniforms, so
+    over 2**27 draws the old sign gives about 11 negatives (P(none) ~ 2e-5).
+    mixed_sample and random_sample share the function, and a negative sample
+    there turns `p / E` negative, so that token could never be drawn: on a
+    129,280-token vocab about 1.1% of rows lost one candidate, and the
+    low-probability tail was under-sampled by about 20% at T = 1.
+    """
+    negatives = 0
+    buf = torch.empty(1, chunk, dtype=torch.float32)
+    for _ in range(numel // chunk):
+        aiter.exponential(buf, lambd=1.0, eps=1e-10)
+        negatives += int((buf <= 0).sum())
+    assert negatives == 0, f"exponential: {negatives} of {numel} samples <= 0"
+    aiter.logger.info("exponential positivity check passed over %d samples", numel)
+
+
 def check_vocab_edges(l_dtype=(torch.bfloat16, torch.float32), eps=1e-10):
     """Every sampler must return a token id in [0, N) for any vocab size.
 
@@ -407,3 +429,4 @@ for test_func in list_sample_func:
 # regressed tree and change the inputs every table above is measured on.
 check_vocab_edges()
 check_exponential_row_bounds()
+check_exponential_is_positive()

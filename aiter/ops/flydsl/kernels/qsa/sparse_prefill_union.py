@@ -9,8 +9,6 @@ conversion and 64-bank K/V swizzles (sparse_prefill_common's gfx950 part), and
 double-buffers K and V in LDS (STAGES950).
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -18,6 +16,7 @@ from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -25,6 +24,7 @@ from .sparse_prefill_common import (
     _buffer_words,
     _copy_coordinates,
     _cross,
+    _exp,
     _exps,
     _join,
     _k_bases950,
@@ -42,7 +42,6 @@ from .sparse_prefill_common import (
     _lds_words,
     _LdsQueue,
     _load_lds,
-    _load_lds_tr,
     _max,
     _maximum,
     _min,
@@ -63,7 +62,6 @@ from .sparse_prefill_common import (
     _schedule_exps,
     _stage_end,
     _sum,
-    _target_features,
     _uniform,
     _v_lds_address,
     _v_operands,
@@ -106,7 +104,7 @@ def _kv_rows(ids, wave, row_bytes, slotted):
     With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
     rows = []
     for slot in range(4):
-        block = fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
+        block = fx.Uint32(prim.readlane(ids, slot))
         if not slotted:
             block = block * (4 * row_bytes) + (wave >> 2) * 256
         rows.append(fx.Int32(block))
@@ -165,12 +163,12 @@ def _read_packet_g2s(
     extent,
     tail_tile=None,
     reads=(),
-    load=_load_lds,
+    queue=None,
 ):
     """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127 (gfx942;
     gfx950: _read_block_g2s950).
 
-    The LDS reads (storage, address, immediate), issued with load, go just before it.
+    The LDS reads (storage, address, immediate), counted by queue, go just before it.
     """
     # Token k of a block reads SOFFSET min(row, limits[k]) + k rows: a partial final block re-reads
     # the request's last token, whose K is masked and V weighted 0; with fewer than k + 1 tokens
@@ -206,10 +204,10 @@ def _read_packet_g2s(
     else:
         row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
         soffset = _min(row, limit)
-    data = [load(*read) for read in reads]
+    data = [queue.load(*read) for read in reads]
     # Raw LDS DMA; the pipeline places the vmcnt waits. (BufferCopyLDS32b compiles to the
     # same code: the compiler's wait before the LDS reads falls where the pipeline's does.)
-    rocdl.raw_ptr_buffer_load_lds(
+    prim.buffer_load_lds(
         resource,
         fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
@@ -234,7 +232,8 @@ def _read_block_g2s950(
     extent,
     tail_tile=None,
     reads=(),
-    load=_load_lds,
+    queue=None,
+    transposed=False,
     lds_offset=0,
 ):
     """gfx950 x4 LDS DMA of the wave's block `block`: keys (wave & 3) * 16 + 4 * block + 0..3,
@@ -243,7 +242,8 @@ def _read_block_g2s950(
     buffer_load_dwordx4 ... lds writes 16 bytes per lane at M0 + 16 * lane (CDNA4 ISA 9.1.9):
     lane l moves chunk _dma_chunk950 of key l >> 4's half row to its chunk l & 15, so the four
     half rows are the 1 KiB at _dma_block950's offset. limit is limits[l >> 4] (None: slot
-    table). The LDS reads go just before it, as in _read_packet_g2s.
+    table). The LDS reads (transposed: ds_read_b64_tr_b16) go just before it, as in
+    _read_packet_g2s.
     """
     first, destination = _dma_block950(wave, block)
     key = lane >> 4
@@ -267,7 +267,7 @@ def _read_block_g2s950(
         voffset = (tail_tile * BN + token < compact_len).select(
             voffset, fx.Int32(extent)
         )
-    data = [load(*read) for read in reads]
+    data = [queue.load(*read, transposed) for read in reads]
     fx.copy(
         fx.make_copy_atom(rocdl.BufferCopyLDS128b(), fx.Int8),
         fx.make_view(resource + fx.Int32(voffset), fx.make_layout(16, 1)),
@@ -281,9 +281,7 @@ def _read_block_g2s950(
 def _read_mask_g2r(resource, tile, offset, bq):
     """Membership bits of this lane's query over the 16 keys it scores in a key tile."""
     # The next vmcnt(0) retires it before the compute stage that applies it.
-    bits = rocdl.raw_ptr_buffer_load(
-        fx.Int16.ir_type, resource, fx.Int32(offset), fx.Int32(tile * bq * 8), 0
-    )
+    bits = prim.buffer_load_i16(resource, fx.Int32(offset), fx.Int32(tile * bq * 8))
     # Only bits 0..15 are read, so the sign extension is harmless.
     return fx.Int16(bits).to(fx.Int32)
 
@@ -347,7 +345,7 @@ def _shuffle_o_r2s2r(o_lo, o_hi, inv, storages, tid, gfx950=False):
             _load_lds(storages[part // 4], (element ^ ((read_row & 7) * 8)) * 2)
         )
     rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.sched_barrier(0)
+    prim.sched_barrier(0)
     return parts
 
 
@@ -390,7 +388,7 @@ def _body(
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     STAGGER: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
@@ -424,6 +422,9 @@ def _body(
     K/V rows sit KV_STRIDE elements apart: HK * D values, then a gap of padding (e.g. the
     V half of an interleaved K|V record per token); only padded rows compile its terms.
     """
+    # Kept in a VGPR: the phase loop needs every SGPR, and a scale read from an SGPR there
+    # spills SGPRs and reorders the tuned MFMA/VALU interleave (about 4% slower).
+    scale = _pin_i32(fx.Float32(SCALE_LOG2).bitcast(fx.Int32)).bitcast(fx.Float32)
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
     row_offset = ((work // HK) % slices) * 128
@@ -449,10 +450,7 @@ def _body(
     gq = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * D, 1)), qextent)
     qoffset = valid_row.select(fx.Uint32((query * H * D + head * D) * 2), qextent)
     # Q stays in registers for all key tiles.
-    if fx.const_expr(GFX950):
-        q = _read_q_g2r(gq, qoffset, lane, 32)
-    else:
-        q = _read_q_g2r(gq, qoffset, lane)
+    q = _read_q_g2r(gq, qoffset, lane)
     row_bytes, gap = KV_STRIDE * 2, KV_STRIDE - HK * D
     if fx.const_expr(SLOTTED):
         # BLOCKS holds K3's pool blocks: each gets a descriptor from the pool's base (no 4 GiB
@@ -484,7 +482,6 @@ def _body(
     if fx.const_expr(GFX950 and not SLOTTED):
         key_bytes = fx.Uint32(lane >> 4) * row_bytes
         dma_limit = (limit > key_bytes).select(limit - key_bytes, fx.Uint32(0))
-    scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
     key_tiles = (compact_len + BN - 1) // BN
     last_tile = key_tiles - 1
@@ -492,7 +489,7 @@ def _body(
     if fx.const_expr(GFX950):
         k_s2r_base = _k_bases950(lane)
         v_s2r_base = _v_tr_bases950(lane)
-        k_reads, v_reads, v_load = _k_reads950, _v_tr_reads950, _load_lds_tr
+        k_reads, v_reads, v_transposed = _k_reads950, _v_tr_reads950, True
         k_operands, qk_mfma, pack_bf16 = _k_operands950, _qk950, _pack_bf16_950
         v_operands, pv = _v_operands950, _pv950
         qk_schedule, mask_schedule, pv_schedule, exp_mfmas = (
@@ -509,8 +506,12 @@ def _body(
             for parity in range(2)
         )
         v_s2r_base = _v_lds_address((lane >> 4) * 8, (lane & 15) * 8)
-        k_reads, v_reads, v_load = _k_reads, _v_reads, _load_lds
-        k_operands, qk_mfma, pack_bf16 = _k_operands, _qk, _pack_bf16
+        k_reads, v_reads, v_transposed = _k_reads, _v_reads, False
+        k_operands, pack_bf16 = _k_operands, _pack_bf16
+
+        def qk_mfma(q, operands):
+            return _qk(q, *operands)
+
         v_operands, pv = _v_operands, _pv
         qk_schedule, mask_schedule, pv_schedule, exp_mfmas = (
             (32, 3),
@@ -531,8 +532,8 @@ def _body(
     def stage_end(rendezvous, dropped):
         """_stage_end at rendezvous; one the double buffer made redundant keeps only its fences."""
         if fx.const_expr(rendezvous in dropped):
-            rocdl.sched_barrier(0)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
+            prim.sched_barrier(0)
         else:
             _stage_end()
 
@@ -548,20 +549,19 @@ def _body(
 
     def k_s2r(half, lower_first=False, offset=0):
         """Read plan of K keys 32 * half .. 32 * half + 31 of the K stage at byte offset."""
-        return _ReadPlan(
-            k_lds, _shift(k_reads(k_s2r_base, half, lower_first), offset), _load_lds
-        )
+        return _ReadPlan(k_lds, _shift(k_reads(k_s2r_base, half, lower_first), offset))
 
     def v_s2r(half, offset=0):
         """Read plan of V dims 128 * half .. 128 * half + 127 of the V stage at byte offset."""
-        return _ReadPlan(v_lds, _shift(v_reads(v_s2r_base, half), offset), v_load)
+        return _ReadPlan(v_lds, _shift(v_reads(v_s2r_base, half), offset), v_transposed)
 
     def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile, offset):
         # 16 LDS-DMA packets (gfx950: 4 x4 blocks); the s2r plan's reads go in plan order, an
         # equal share (one; gfx950: four K or eight V) just before each.
-        reads, load = (), _load_lds
+        reads, transposed = (), False
+        first = None if lgkm is None else lgkm.issued
         if fx.const_expr(s2r is not None):
-            reads, load = s2r.reads, s2r.load
+            reads, transposed = s2r.reads, s2r.transposed
         packets = (16, 4)[int(GFX950)]
         share = len(reads) // packets
         parts = [None] * len(reads)
@@ -585,7 +585,8 @@ def _body(
                     extent,
                     tail_tile,
                     issued,
-                    load,
+                    lgkm,
+                    transposed,
                     offset,
                 )
             else:
@@ -603,13 +604,13 @@ def _body(
                     extent,
                     tail_tile,
                     issued,
-                    load,
+                    lgkm,
                 )
             for i in fx.range_constexpr(share):
                 parts[batch[i][0]] = data[i]
         if fx.const_expr(s2r is None):
             return None
-        return _lds_words(parts), lgkm.issue(len(reads))
+        return _lds_words(parts), lgkm.ready(first, lgkm.issued - first)
 
     def read_k_g2s(rows, s2r=None, lgkm=None, offset=0):
         return read_tile_g2s(gk, k_lds, rows, False, s2r, lgkm, None, offset)
@@ -622,7 +623,7 @@ def _body(
 
     def prologue():
         """Ids of tiles 0-2 and mask(0) g2r; K(0) g2s, QK(0), m and S'(0); K(1) g2s."""
-        lgkm = _LdsQueue()
+        lgkm = _LdsQueue(capped=GFX950)
         ids_0 = read_ids_g2r(fx.Int32(0))
         ids_1 = read_ids_g2r(_min(fx.Int32(1), last_tile))
         ids_2 = read_ids_g2r(_min(fx.Int32(2), last_tile))
@@ -653,8 +654,8 @@ def _body(
         s_hi = qk(k_hi)
         s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * scale
         row_max = _max(s_0)
-        row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
-        row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 16, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 32, 64))
         row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         stage_end(4 + lag, dropped_prologue)
@@ -697,7 +698,7 @@ def _body(
         rows_prev = fx.Vector(rows_prev)
         rows_cur, rows_next = fx.Vector(rows_cur), fx.Vector(rows_next)
         # Each phase ends with every LDS op retired, so the ledger starts empty.
-        lgkm = _LdsQueue()
+        lgkm = _LdsQueue(capped=GFX950)
         cur, other = stage * odd, stage * (1 - odd)
 
         # Step 0 memory.
@@ -765,14 +766,18 @@ def _body(
             center=(s_cur, max_cur, max_others, scale, row_max),
         )
         _schedule(*pv_schedule, 4)
-        o_lo, o_hi, row_sum = _rescale(o_lo, o_hi, row_sum, row_max, new_max, ballot)
+        o_lo, o_hi, row_sum = _rescale(
+            (o_lo, o_hi, row_sum),
+            ballot,
+            lambda: _exp(fx.Float32(row_max) - fx.Float32(new_max)),
+        )
         stage_end((7 + lag) % 8, dropped_phase)
         return s_cur, new_max, row_sum, o_lo, o_hi, rows_cur, rows_next, rows_next2
 
     def epilogue(state):
         """V(last) g2s, keys past the list read 0; exp, row sum and PV of the last tile."""
         s_last, row_max, row_sum, o_lo, o_hi, rows_last, _, _ = state
-        lgkm = _LdsQueue()
+        lgkm = _LdsQueue(capped=GFX950)
         # V(last) goes to stage last & 1 (gfx950), not the stage V(last - 1) was read from.
         if fx.const_expr(GFX950):
             v_stage = (last_tile & 1) * stage
@@ -782,8 +787,8 @@ def _body(
         read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile, offset=v_stage)
         p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         sum_last = _sum(p_last)
-        sum_last = sum_last + sum_last.shuffle_xor(16, 64)
-        sum_last = sum_last + sum_last.shuffle_xor(32, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 16, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 32, 64)
         row_sum = fx.Float32(row_sum) + sum_last
         p_bf16 = pack_bf16(p_last).bitcast(fx.BFloat16)
         lgkm.wait(vmcnt=0)
@@ -854,7 +859,7 @@ def _kernel(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
     KV_STRIDE: fx.Constexpr[int],
@@ -898,7 +903,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     True,
                     SLOTTED,
                     GFX950,
@@ -924,7 +929,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     False,
                     SLOTTED,
                     GFX950,
@@ -939,6 +944,7 @@ def _launch(
     K: fx.Tensor,
     V: fx.Tensor,
     OUT: fx.Tensor,
+    SCALE_LOG2: fx.Float32,
     META: fx.Tensor,
     BLOCKS: fx.Tensor,
     MEMBERS: fx.Tensor,
@@ -954,7 +960,6 @@ def _launch(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
     KV_STRIDE: fx.Constexpr[int],
@@ -981,14 +986,11 @@ def _launch(
             GP,
             TASKS,
             GRID,
-            SCALE,
+            SCALE_LOG2,
             SLOTTED,
             GFX950,
             KV_STRIDE,
-            value_attrs={
-                "rocdl.waves_per_eu": 2,
-                "llvm.target_features": _target_features(),
-            },
+            value_attrs=prim.kernel_attrs(),
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -1002,6 +1004,7 @@ def _args(inputs, plan, out, stream):
         inputs.k,
         inputs.v,
         out.view(-1),
+        inputs.scale_log2,
         plan.metadata.view(-1),
         (plan.pool_blocks if plan.slotted else plan.blocks).view(-1),
         plan.score_masks.view(-1),
@@ -1019,7 +1022,6 @@ def _args(inputs, plan, out, stream):
         * inputs.k.shape[1]
         * ((plan.query_tile * plan.group_padded + 127) // 128),
         plan.grid,
-        inputs.scale,
         plan.slotted,
         get_gfx_runtime() == "gfx950",
         inputs.kv_stride,
@@ -1030,11 +1032,10 @@ def _args(inputs, plan, out, stream):
 def _compiled(inputs, args, stream):
     key = (
         inputs.q.device,
-        args[11],
         args[12],
-        args[15],
+        args[13],
         args[16],
-        args[19],
+        args[17],
         args[20],
         args[21],
         args[22],
@@ -1044,8 +1045,10 @@ def _compiled(inputs, args, stream):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-            compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, *args[19:23], stream
+            # Eight waves and 64 KiB LDS (gfx950: 128 KiB) per CTA: two waves per SIMD,
+            # 256 VGPRs each.
+            compiled = _COMPILED[key] = flyc.compile[{"waves_per_eu": 2}](
+                _launch, *args[:19], 0, *args[20:23], stream
             )
     return compiled
 
@@ -1060,8 +1063,9 @@ def run(*, inputs, plan, out):
 
 
 def launcher(*, inputs, plan, out):
-    """launch(q, k, v, out, slots) with flat Q/out and unflattened K/V; other arguments
-    prebuilt. Union reads pool rows through K3's table, so the slot table is unused here.
+    """launch(q, k, v, out, slots, scale_log2) with flat Q/out, unflattened K/V and the
+    FP32 softmax_scale * log2(e); other arguments prebuilt. Union reads pool rows through
+    K3's table, so the slot table is unused here.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
@@ -1070,5 +1074,5 @@ def launcher(*, inputs, plan, out):
     stream = torch.cuda.current_stream(inputs.q.device)
     args = _args(inputs, plan, out, stream)
     compiled = _compiled(inputs, args, stream)
-    tail = args[4:]
-    return lambda q, k, v, o, slots: compiled(q, k, v, o, *tail)
+    tail = args[5:]
+    return lambda q, k, v, o, slots, scale_log2: compiled(q, k, v, o, scale_log2, *tail)

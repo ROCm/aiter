@@ -252,9 +252,17 @@ def qsa_sparse_prefill(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     kv_slots: torch.Tensor | None = None,
+    batch_invariant: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    compute: str = "fp8",
 ) -> torch.Tensor:
     """Sparse prefill/extend attention over packed K/V, or a token pool read through
-    kv_slots; FlyDSL on gfx942 and gfx950.
+    kv_slots; FlyDSL on gfx942 and gfx950. batch_invariant=True makes each request's
+    result independent of the other requests in the call. On gfx942, K/V may be FP8
+    (dtypes.fp8) with FP32 k_scale / v_scale per tensor ([1]) or per token and KV head
+    ([N, HK]; [P, HK] with kv_slots), computed with FP8 MFMAs (compute="fp8"; per-token
+    V scales clamped to [2**-60, 2**60]) or dequantized to BF16 (compute="bf16").
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
@@ -270,6 +278,10 @@ def qsa_sparse_prefill(
         softmax_scale=softmax_scale,
         out=out,
         kv_slots=kv_slots,
+        batch_invariant=batch_invariant,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compute=compute,
     )
 
 
@@ -298,7 +310,8 @@ def qsa_paged_kv_pool(
     when the page holds a multiple of four tokens, and its row is a multiple of four
     when pages start a multiple of four rows apart. dtype, head dimension, row stride
     and the other operand rules are those of ``qsa_sparse_prefill_problem``, asked of
-    the pools.
+    the pools: per-token FP8 scales (gfx942) are [P, HK] over the pool's P rows, rows
+    between pages included.
     """
     if k_cache.ndim != 4 or k_cache.shape != v_cache.shape or 0 in k_cache.shape:
         return None
@@ -380,6 +393,10 @@ def qsa_sparse_prefill_problem(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     kv_slots: torch.Tensor | None = None,
+    batch_invariant: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    compute: str = "fp8",
 ) -> str | None:
     """The first operand rule a ``qsa_sparse_prefill`` call with these arguments breaks,
     as the message it raises, or None when the operands are accepted. States of the
@@ -399,6 +416,10 @@ def qsa_sparse_prefill_problem(
         softmax_scale=softmax_scale,
         out=out,
         kv_slots=kv_slots,
+        batch_invariant=batch_invariant,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compute=compute,
     )
 
 

@@ -48,7 +48,7 @@ def platform(monkeypatch):
             union_min_rows=union_min_rows, union_min_rows_per_head=per_head
         )
         monkeypatch.setattr(op, "get_gfx_runtime", lambda: runtime)
-        monkeypatch.setattr(op, "platform", lambda: config)
+        monkeypatch.setattr(op, "platform", lambda fp8=None: config)
         monkeypatch.setattr(prepare, "wide_tile_rows", lambda tile: wide[tile])
 
     inject(GFX950)
@@ -148,15 +148,17 @@ def test_every_layout_has_a_kernel_variant_the_warmup_runs(platform, arch, group
             assert variant(group, hk, lens, prefix) in warmed, (rows, lens, prefix)
 
 
-def _order_kernel_constants(monkeypatch, tiles):
-    """The constexpr values K3 (sparse_prefill_order_masks) compiles for a group-1 plan of
-    BQ32 tiles over 128 KV heads: tiles x 128 tasks of one slice."""
-    compiled = {}
-    monkeypatch.setattr(
-        prepare,
-        "_compiled",
-        lambda launch, args, grid, constants: compiled.setdefault(launch, constants),
-    )
+def _order_kernels(monkeypatch, tiles):
+    """The constexpr values of the K3 (sparse_prefill_order_masks) variants a group-1
+    plan of BQ32 tiles over 128 KV heads (tiles x 128 tasks of one slice) compiles on a
+    cold cache, and of the variant it launches."""
+    compiled = []
+
+    def compile_once(launch, args, grid, constants):
+        if launch is prepare._order_masks_launch:
+            compiled.append(constants)
+
+    monkeypatch.setattr(prepare, "_compiled", compile_once)
     one = torch.zeros(1, dtype=torch.int32)
     inputs = SimpleNamespace(
         indices=one,
@@ -171,6 +173,7 @@ def _order_kernel_constants(monkeypatch, tiles):
     grid = min(tasks, 256)
     plan = SimpleNamespace(
         num_tiles=tiles,
+        union_tiles=tiles,
         query_tile=32,
         group_padded=1,
         block_capacity=8224,
@@ -182,11 +185,14 @@ def _order_kernel_constants(monkeypatch, tiles):
         membership=one,
         counts=one,
         costs=one,
+        residual=one,
         active=one,
         score_masks=one,
         query_tiles=one,
         direct_flag=one,
         union_ratio=1.0,
+        core_ratio=0.0,
+        split=1,
         route_costs=(0.0, 0.0, 0.0),
         routing=True,
         route_model=(0.0, 0.0, 0.0, 0.0, False),
@@ -194,17 +200,18 @@ def _order_kernel_constants(monkeypatch, tiles):
         direct_groups=0,
     )
     list(prepare._launches(inputs, plan, None))
-    return compiled[prepare._order_masks_launch]
+    return compiled, compiled[-1]
 
 
 def test_the_task_count_compiles_no_new_order_kernel(monkeypatch):
-    # The warmup compiles K3 on small layouts only, so a K3 variant only a larger plan takes
-    # would compile while serving. 16385 one-row requests over 32895-token prefixes at 128
-    # KV heads hold 2,097,280 tasks (block capacity 8224), whose global rank no longer fits
-    # a 32-bit sort key beside the cost.
-    assert _order_kernel_constants(monkeypatch, 16385) == _order_kernel_constants(
-        monkeypatch, 1
-    )
+    # The warmup compiles K3 on small layouts only, so a K3 variant only a larger plan
+    # takes would compile while serving. 16385 one-row requests over 32895-token
+    # prefixes at 128 KV heads hold 2,097,280 tasks (block capacity 8224), more than one
+    # order CTA sorts (4096): K3 runs its CHUNKED variant there, which one tile's first
+    # compile covers too.
+    compiled, _ = _order_kernels(monkeypatch, 1)
+    _, launched = _order_kernels(monkeypatch, 16385)
+    assert launched in compiled
 
 
 def test_the_selection_of_a_long_request_keeps_its_last_blocks_and_its_tail():
