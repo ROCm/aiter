@@ -59,6 +59,9 @@ WAVE_SIZE = 32  # gfx1250 kernels run wave32
 NUM_WAVES = 8  # "m32x8" -- 8 waves per threadgroup
 BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
+# What one WMMA occupies the SIMD for. It issues in 1 cycle and holds the pipe for the
+# rest, which is the shadow anything placed in the gap after it runs under.
+WMMA_ISSUE_CYCLES = 8
 
 
 def _lane_id():
@@ -342,7 +345,9 @@ def _ring_drive(
     head=None,
     dies=None,
     tap=None,
+    user_data=None,
     refill_burst=0,
+    wmma_cycles=WMMA_ISSUE_CYCLES,
 ):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
@@ -355,9 +360,16 @@ def _ring_drive(
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
     wmma->ds_load issue bubble a burst-everything prefetch avoids.
 
-    ``tap(i)`` is called at the head of fragment ``i`` for a caller that wants its own
-    copies spread through the ring instead of clumped ahead of it. Placement is by source
-    order, so it costs the ring no fence or wait depth.
+    ``tap(w, prev_cycles, next_cycles, user_data)`` is called in EVERY inter-WMMA gap,
+    ``w`` counting the gaps from 0 across the whole stream. The ring decides when it is
+    OWED a refill but not where it goes: it offers the burst to the tap as
+    ``user_data["ring_due"]`` (None in a gap it owes nothing), and the tap chooses -- issue
+    the ring's loads, issue work of its own, or leave the gap empty. With no tap the ring
+    simply does its own work, which is the placement every measurement here was made
+    against. Placement is by source order, so a tap costs the ring no fence or wait depth.
+
+    ``wmma_cycles`` is what one WMMA occupies the SIMD for; the tap gets it for the WMMA
+    on each side of the gap, so it can size the work it hides there.
 
     Under ``refill_burst`` the ring hands ``consume`` an ``after_first`` callback and
     expects it to be invoked once its FIRST wmma has been emitted; that is where the
@@ -444,6 +456,24 @@ def _ring_drive(
             rocdl.sched_barrier(0)
             held[j] = None
 
+    wmma_index = 0
+
+    def _boundary(due):
+        """One inter-WMMA gap. Returns True if anything was emitted into it, which is what
+        tells the caller whether the gap needs a ``sched_barrier`` to pin it."""
+        nonlocal wmma_index
+        w = wmma_index
+        wmma_index += 1
+        if tap is None:
+            if due is None:
+                return False
+            due()
+            return True
+        user_data["ring_due"] = due
+        user_data["emitted"] = False
+        tap(w, wmma_cycles, wmma_cycles, user_data)
+        return bool(user_data["emitted"])
+
     def _record(i, parts):
         vals = list(parts) if parts is not None else []
         if dies is not None:
@@ -451,8 +481,6 @@ def _ring_drive(
         held.append(tuple(vals) if vals else None)
 
     for i in range(num_frag):
-        if tap is not None:
-            tap(i)
         # The wait is placed before the refill, so it is measured against what is already
         # outstanding: everything issued past the end of this fragment may still be in
         # flight, and the refill below only adds younger loads.
@@ -468,15 +496,17 @@ def _ring_drive(
         parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
         if _do_refill and refill_burst:
-            # Put the burst INSIDE the wmma stream rather than ahead of it: a wmma owns
+            # The burst belongs INSIDE the wmma stream rather than ahead of it: a wmma owns
             # the SIMD for 8 cycles but issues in 1, so the loads ride its shadow and the
             # fragments after it stay clean. ``parts`` is already captured, so the refill
-            # cannot alias what this fragment reads, and the WAR distance only grows.
-            consume(i, *parts, after_first=lambda: _refill(_target))
+            # cannot alias what this fragment reads, and the WAR distance only grows. The
+            # ring owes it from this fragment's FIRST gap; the tap places it.
+            _due = lambda: _refill(_target)  # noqa: E731
+            consume(i, *parts, boundary=lambda q: _boundary(_due if q == 0 else None))
         else:
             if _do_refill:
                 _refill(_target)
-            consume(i, *parts)
+            consume(i, *parts, boundary=lambda q: _boundary(None))
         rocdl.sched_barrier(0)
         # Past the last refill nothing can clobber the slots, so holding them buys nothing.
         _record(i, parts if (ring_lag and refilling) else None)

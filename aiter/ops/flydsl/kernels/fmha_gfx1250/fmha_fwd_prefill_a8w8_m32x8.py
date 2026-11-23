@@ -608,7 +608,12 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
-    def consume(i, *parts):
+    def consume(i, *parts, boundary=None):
+        # a8w8 passes the ring no tap, so every gap holds only the ring's own refill.
+        def _mid(q_tile_idx):
+            if boundary is not None and boundary(q_tile_idx):
+                rocdl.sched_barrier(0)
+
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
             v_frag = _concat(parts)
@@ -629,6 +634,7 @@ def _pv_qk_gemm(
                     v_frag, p_frag, acc, a_dtype=kv_dtype, b_dtype=P_DTYPE
                 )
                 rocdl.sched_barrier(0)
+                _mid(q_tile_idx)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
         k_frag = _concat(parts)
@@ -646,6 +652,7 @@ def _pv_qk_gemm(
                 b_dtype=q_dtype,
             )
             rocdl.sched_barrier(0)
+            _mid(q_tile_idx)
 
     def dies(i):
         # The PV half's B operands die on the final d-tile row, which is where the ring is

@@ -499,6 +499,7 @@ def _pv_qk_gemm(
     vld_per_frag=2,
     phase="pvqk",
     tap=None,
+    user_data=None,
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
     fragment streams, for all num_q_tiles q-WMMA-tiles this wave owns.
@@ -562,12 +563,12 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
-    def consume(i, *parts, after_first=None):
-        # ``after_first`` (the ring's refill burst) fires once this fragment's first wmma
-        # is out, so the loads issue under it instead of ahead of the stream.
+    def consume(i, *parts, boundary=None):
+        # One gap per wmma, handed straight back to the ring's tap. The ring's own refill
+        # burst is offered in the gap after this fragment's FIRST wmma, so the loads issue
+        # under it instead of ahead of the stream; the tap decides what actually lands.
         def _mid(q_tile_idx):
-            if after_first is not None and q_tile_idx == 0:
-                after_first()
+            if boundary is not None and boundary(q_tile_idx):
                 rocdl.sched_barrier(0)
 
         if i < num_v_frags:
@@ -626,6 +627,7 @@ def _pv_qk_gemm(
         head=head,
         dies=dies,
         tap=tap,
+        user_data=user_data,
         refill_burst=PVQK_REFILL_BURST,
     )
     # Hand the high-priority slot to this wave's SIMD-mate, which under anti-phase is
@@ -1157,9 +1159,13 @@ schedule_bank.func = None
 
 
 # Ring fragment that issues TDM copy k. A fragment is one refill (2 ds_load) plus the
-# wmma it feeds, so copies 0..2 land one per fragment and the last one trails further
-# back, where the stream has no issue of its own left to overlap.
-_TDM_TAP_FRAG = (0, 1, 2, 6)
+# Free-WMMA-slot schedule for this half's KV prefetch. Entries index the gaps the ring
+# leaves EMPTY -- every inter-wmma gap that carries no ds_load refill -- counted from the
+# top of the gemm. Each TDM copy takes TWO entries: the first places its descriptor SALU,
+# the second the ``tensor_load`` that reads it, so the ~10-deep address chain gets a whole
+# wmma to retire instead of stalling the issue it feeds. Sized for 4 copies, the widest
+# band we emit (paged at page_size=1); a pow2 hdim needs one copy, so just the first two.
+_TDM_FREE_SLOTS = (0, 1, 2, 3, 4, 5, 6, 9)
 
 
 # sched_group_barrier masks. TDM sets TENSOR_CNT, which puts it in LDSDMA and NOT in
@@ -1188,25 +1194,42 @@ def _hi_tdm_pipeline(tensorcnt):
 
 
 def _tdm_tap(desc):
-    """How this descriptor should issue: ``(tap, issue_now)``, exactly one of them set.
+    """The gemm's free-WMMA-slot scheduler, as ``(tap, user_data)`` for ``_pv_qk_gemm``.
 
-    ``tap`` spreads the copies across the ring per _TDM_TAP_FRAG, so a multi-issue batch
-    runs through the stream instead of clumping ahead of it; placement is by source
-    order, so the scheduler is not involved. A lone copy gets ``issue_now`` instead --
-    moving it past the gemm's s_setprio costs +0.3..+0.6% on the configs that have one.
+    One tap owns every inter-wmma gap. Where the ring says it is owed a refill the tap
+    issues it; the gaps left over are the free slots, and ``_TDM_FREE_SLOTS`` picks which
+    of them carry this half's KV-prefetch work. Placement is by source order, so the
+    scheduler is not involved and the ring pays no fence or wait depth for it.
+
+    Returns ``(None, None)`` for a descriptor with no TDM copies (the V1 async transport),
+    which leaves the ring's own placement exactly as it was.
     """
-    if desc.tensorcnt < 2:
-        return None, desc.async_load
-    assert desc.tensorcnt <= len(
-        _TDM_TAP_FRAG
-    ), f"{desc.tensorcnt} TDM copies but only {len(_TDM_TAP_FRAG)} tap slots"
-    at = {_TDM_TAP_FRAG[k]: k for k in range(desc.tensorcnt)}
+    if desc is None or desc.tensorcnt == 0:
+        return None, None
+    tasks = []
+    for k in range(desc.tensorcnt):
+        tasks.append(functools.partial(desc.build_one, k))
+        tasks.append(functools.partial(desc.async_load_one, k))
+    assert len(tasks) <= len(_TDM_FREE_SLOTS), (
+        f"{desc.tensorcnt} TDM copies want {len(tasks)} free slots, schedule has "
+        f"{len(_TDM_FREE_SLOTS)}"
+    )
+    at = {_TDM_FREE_SLOTS[t]: t for t in range(len(tasks))}
 
-    def tap(i):
-        if i in at:
-            desc.async_load_one(at[i])
+    def tap(w, prev_cycles, next_cycles, ud):
+        if ud["ring_due"] is not None:
+            ud["ring_due"]()
+            ud["emitted"] = True
+            return
+        slot = ud["free_slot"]
+        ud["free_slot"] = slot + 1
+        task = at.get(slot)
+        if task is None:
+            return
+        tasks[task]()
+        ud["emitted"] = True
 
-    return tap, None
+    return tap, {"free_slot": 0, "ring_due": None, "emitted": False}
 
 
 def _attention_core_multi_kv_tiles(
@@ -1300,10 +1323,12 @@ def _attention_core_multi_kv_tiles(
     ]
     q_frags = prologue["q_frags"]
 
-    def _get_kv_desc(slot, row0, valid, page_indices=None):
+    def _get_kv_desc(slot, row0, valid, page_indices=None, lazy=False):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
         V copy. Pure until ``.async_load()``; which transport it carries (async vs TDM) is
-        the manager's business, not this call site's."""
+        the manager's business, not this call site's. ``lazy`` additionally defers each
+        copy's address arithmetic to ``build_one``, for a caller placing the SALU and the
+        issue in different wmma gaps."""
         _extra = kv_policy.desc_kwargs(page_indices)
         if warp_type.is_lo:
             return k_mgr.load_descriptor(
@@ -1315,6 +1340,7 @@ def _attention_core_multi_kv_tiles(
                 row0=kv_policy.row_base + row0,
                 valid=valid,
                 ctx=_kv_ctx,
+                lazy=lazy,
                 **_extra,
             )
         return v_mgr.load_descriptor(
@@ -1326,6 +1352,7 @@ def _attention_core_multi_kv_tiles(
             row0=kv_policy.row_base + row0,
             valid=valid,
             ctx=_kv_ctx,
+            lazy=lazy,
             **_extra,
         )
 
@@ -1539,8 +1566,15 @@ def _attention_core_multi_kv_tiles(
         # oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
         # itself must stay after the barrier.
+        # Deferred only for the half that places it in the gemm's free wmma slots. The
+        # lagging half issues its copies inside softmax instead (``_hi_tdm_pipeline``),
+        # where there is no wmma to hide them under, so it keeps the eager build.
         prefetch_desc = _get_kv_desc(
-            write_slot, prefetch_row0, prefetch_valid, prefetch_page_indices
+            write_slot,
+            prefetch_row0,
+            prefetch_valid,
+            prefetch_page_indices,
+            lazy=USE_TDM_LOADER and not _is_lagging_softmax,
         )
 
         def _k_emit(j):
@@ -1721,9 +1755,9 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
-            _tap, _issue_now = _tdm_tap(prefetch_desc)
-            if _issue_now is not None:
-                _issue_now()
+            _tap, _tap_data = _tdm_tap(prefetch_desc)
+            if _tap is None:
+                prefetch_desc.async_load()
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
@@ -1736,6 +1770,7 @@ def _attention_core_multi_kv_tiles(
                 o_acc_list=o_acc,
                 head=pvqk_head,
                 tap=_tap,
+                user_data=_tap_data,
             )
             _phase_barrier()
             # Ahead of softmax: nothing here consumes it, so the whole softmax covers

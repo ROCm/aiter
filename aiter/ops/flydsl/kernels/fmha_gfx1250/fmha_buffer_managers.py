@@ -48,6 +48,7 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
@@ -275,6 +276,18 @@ class BufferOpDescriptor:
         the batch spread through surrounding work instead of issued as one clump."""
         raise NotImplementedError
 
+    def build_one(self, index):
+        """Emit copy ``index``'s address arithmetic. A no-op unless the descriptor is
+        lazy: an eager one built everything in its constructor."""
+        return None
+
+    def num_build_steps(self, index):
+        """Slots copy ``index``'s address arithmetic wants. Eager descriptors want none."""
+        return 0
+
+    def build_step(self, index, step):
+        return None
+
 
 class AsyncCopyDescriptor(BufferOpDescriptor):
     """A batch of ``cluster_load_async_to_lds_b128`` (V1 transport); on ``asynccnt``."""
@@ -311,6 +324,48 @@ class TdmCopyDescriptor(BufferOpDescriptor):
 
     def async_load_one(self, index):
         fx.copy(*self.views[index])
+
+
+class LazyTdmCopyDescriptor(BufferOpDescriptor):
+    """A TDM descriptor whose per-copy ADDRESS ARITHMETIC is deferred to ``build_one``.
+
+    Splitting the build from the issue is what lets a caller drop one copy's descriptor
+    SALU into a free WMMA slot and its ``tensor_load`` into a later one, so the chain has
+    a whole WMMA to retire instead of stalling the issue that reads it. ``async_load``
+    still issues the batch as one clump, for callers that do not place them."""
+
+    kind = "tdm"
+
+    def __init__(self, builders, issue):
+        # ``builders[k]`` is copy k's ORDERED list of build steps; a plain callable is
+        # taken as a single step.
+        self._steps = [b if isinstance(b, list) else [b] for b in builders]
+        self._issue = issue
+        self.asynccnt = 0
+        self.tensorcnt = len(self._steps)
+
+    def num_build_steps(self, index):
+        """How many slots copy ``index``'s address arithmetic wants, one per step."""
+        return len(self._steps[index])
+
+    def build_step(self, index, step):
+        """Emit one step of copy ``index``'s address arithmetic HERE. Steps are
+        idempotent and pull in whatever they depend on, so a caller that places only some
+        of them is still correct -- the rest just land with the step that needs them."""
+        return self._steps[index][step]()
+
+    def build_one(self, index):
+        """Every step of copy ``index``, here. Idempotent, so a caller that skips it is
+        still correct -- ``async_load_one`` builds on demand."""
+        for step in range(len(self._steps[index])):
+            self.build_step(index, step)
+
+    def async_load_one(self, index):
+        self._issue(self._steps[index][-1]())
+
+    def async_load(self):
+        for index in range(self.tensorcnt):
+            self.async_load_one(index)
 
 
 GATHER_ROWS = {32: 8, 16: 16}  # row indices per issue, by index width in bits
@@ -445,6 +500,118 @@ def _pow2_segments(width):
     return segs
 
 
+def _tdm_load_view_builders(
+    *,
+    ptr_x,
+    stride_seq,
+    stride_head,
+    head,
+    row0,
+    valid,
+    num_rows,
+    hdim,
+    pad_elems,
+    lds_base,
+    elem_dtype,
+    num_warps,
+    pin=False,
+):
+    """One CLOSURE per ``_pow2_segments`` column segment of a ``[num_rows, hdim]`` tile.
+
+    Each closure emits that copy's address arithmetic WHERE IT IS CALLED and returns the
+    ``(atom, t_g, t_lds)`` view ``fx.copy`` wants, so a caller can put the SALU chain and
+    the ``tensor_load`` that reads it in different scheduling slots. Calling them all in
+    order reproduces ``_tdm_load_views`` exactly.
+
+    The row/head byte offset is the one real dependency chain here (~10 dependent SALU:
+    clamp, scale by ``stride_seq``, add the base, set the descriptor bit), so it is shared
+    and rides with whichever segment is built first. ``pin`` anchors it where it is built;
+    without that the backend sinks the whole chain down to the ``tensor_load``, which is
+    the placement this split exists to avoid.
+    """
+    padded_row_elems = hdim + pad_elems
+    lds_ptr_ty = fx.PointerType.get(
+        elem_ty=elem_dtype.ir_type,
+        address_space=fx.AddressSpace.Shared,
+        alignment=16,
+    )
+    shared = {}
+
+    def _shared():
+        """The row/head byte offset and the iterators derived from it.
+
+        NOT split further. Splitting the multiply off into its own step was measured
+        WORSE (max SALU in one gap 5 -> 7): the pieces fold away and more of the tail
+        sinks. The tail that matters is emitted inside ``make_view`` /
+        ``make_tiled_tdm_atom`` / ``tdm_partition`` below, which offers no seam from out
+        here -- see ``_tdm_load_view_builders``."""
+        if "off" not in shared:
+            shared["off"] = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(
+                head
+            ) * fx.Int64(stride_head)
+            shared["base_iter"] = fx.get_iter(ptr_x)
+            # wave_id % num_warps reproduces make_tiled_tdm_atom's implicit folding:
+            # surplus waves redo a share rather than addressing past the tile.
+            shared["warp_coord"] = fx.Int32(rocdl.wave_id()) % fx.Int32(num_warps)
+            if pin:
+                _pin_sgpr([shared["off"]])
+        return shared
+
+    def _builder(c0, w):
+        held = {}
+
+        def build():
+            sh = _shared()
+            gbase = fx.add_offset(sh["base_iter"], sh["off"] + fx.Int64(c0))
+            tile = (num_rows, w)
+            lds_strides = (padded_row_elems, 1)
+            g_view = fx.Tensor(
+                fx.make_view(gbase, fx.make_layout((valid, w), (stride_seq, 1)))
+            )
+            atom, g_coord = make_tiled_tdm_atom(
+                TensorLoad(),
+                g_view,
+                fx.make_layout(tile, lds_strides),
+                tile,
+                num_warps=num_warps,
+            )
+            lds_iter = fx.inttoptr(
+                lds_ptr_ty, lds_base + fx.Int32(c0 * _width_params(elem_dtype)[0])
+            )
+            lds_view = fx.Tensor(
+                fx.make_view(lds_iter, fx.make_layout((tile, 1), (lds_strides, 0)))
+            )
+            t_lds, t_g = tdm_partition(
+                atom,
+                sh["warp_coord"],
+                fx.make_layout(num_warps, 1),
+                lds_view,
+                fx.zipped_divide(g_coord, tile),
+            )
+            held["view"] = (atom, t_g[None, 0], t_lds[None, 0])
+            return held["view"]
+
+        # Two steps: the offset chain, which ``pin`` holds in the slot it is placed in,
+        # and the view/atom/partition that the ``tensor_load`` reads. The ~7 SALU the
+        # second emits CANNOT be split from out here (they come from inside the FlyDSL
+        # atom and partition builders) and they sink to the load wherever the step is
+        # placed, so one WMMA is still asked to hide more than the budget.
+        return [_shared, build]
+
+    return [_builder(c0, w) for c0, w in _pow2_segments(hdim)]
+
+
+def _pin_sgpr(vals):
+    """Anchor uniform values HERE so the backend cannot sink the SALU that produced them
+    down to their use. An empty side-effecting asm with ``s`` constraints is a USE, which
+    ``sched_barrier`` is not -- the same trick as ``fmha_utils._keepalive_sgpr``, repeated
+    because this module is imported BY that one."""
+    ops = [_ir(v) for v in vals]
+    llvm_dialect.inline_asm(
+        None, ops, "", ",".join("s" for _ in ops), has_side_effects=True
+    )
+
+
 def _tdm_load_views(
     *,
     ptr_x,
@@ -474,48 +641,23 @@ def _tdm_load_views(
     the >1 path has never been exercised, and ``tdm_partition`` addresses past the tile if the
     warp coord does not match ``num_warps``.
     """
-    padded_row_elems = hdim + pad_elems
-    off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
-    base_iter = fx.get_iter(ptr_x)
-    lds_ptr_ty = fx.PointerType.get(
-        elem_ty=elem_dtype.ir_type,
-        address_space=fx.AddressSpace.Shared,
-        alignment=16,
-    )
-    # wave_id % num_warps reproduces make_tiled_tdm_atom's implicit folding: surplus waves
-    # redo a share rather than addressing past the tile.
-    warp_coord = fx.Int32(rocdl.wave_id()) % fx.Int32(num_warps)
-    warp_layout = fx.make_layout(num_warps, 1)
-    views = []
-    for c0, w in _pow2_segments(hdim):
-        gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
-        tile = (num_rows, w)
-        lds_strides = (padded_row_elems, 1)
-        g_view = fx.Tensor(
-            fx.make_view(gbase, fx.make_layout((valid, w), (stride_seq, 1)))
-        )
-        atom, g_coord = make_tiled_tdm_atom(
-            TensorLoad(),
-            g_view,
-            fx.make_layout(tile, lds_strides),
-            tile,
+    return [
+        steps[-1]()
+        for steps in _tdm_load_view_builders(
+            ptr_x=ptr_x,
+            stride_seq=stride_seq,
+            stride_head=stride_head,
+            head=head,
+            row0=row0,
+            valid=valid,
+            num_rows=num_rows,
+            hdim=hdim,
+            pad_elems=pad_elems,
+            lds_base=lds_base,
+            elem_dtype=elem_dtype,
             num_warps=num_warps,
         )
-        lds_iter = fx.inttoptr(
-            lds_ptr_ty, lds_base + fx.Int32(c0 * _width_params(elem_dtype)[0])
-        )
-        lds_view = fx.Tensor(
-            fx.make_view(lds_iter, fx.make_layout((tile, 1), (lds_strides, 0)))
-        )
-        t_lds, t_g = tdm_partition(
-            atom,
-            warp_coord,
-            warp_layout,
-            lds_view,
-            fx.zipped_divide(g_coord, tile),
-        )
-        views.append((atom, t_g[None, 0], t_lds[None, 0]))
-    return views
+    ]
 
 
 def _tdm_band_descriptor(
@@ -533,11 +675,15 @@ def _tdm_band_descriptor(
     valid,
     ctx,
     elem_dtype,
+    lazy=False,
 ):
     """This wave's band of a ``[n_block, hdim]`` tile as TDM copies (one per pow2 hdim
     segment: 1 for 128/256, 2 for 192). The wave copies its band ALONE (``num_warps=1``),
     so it issues one ``tensor_load`` per segment rather than a share of every band's copy.
-    Pure, like the async form. ``row0``/``valid`` describe the whole tile."""
+    Pure, like the async form. ``row0``/``valid`` describe the whole tile.
+
+    ``lazy`` defers each copy's address arithmetic to ``build_one`` -- see
+    ``LazyTdmCopyDescriptor``."""
     lds_base, band_r0, num_rows = _warp_band(
         bases=bases,
         n_block=n_block,
@@ -545,22 +691,24 @@ def _tdm_band_descriptor(
         producer_warp=ctx.producer_warp,
         num_producer_warps=ctx.num_producer_warps,
     )
-    return TdmCopyDescriptor(
-        _tdm_load_views(
-            ptr_x=ptr_x,
-            stride_seq=stride_seq,
-            stride_head=stride_head,
-            head=head,
-            row0=row0 + band_r0,
-            valid=fx.max(valid - band_r0, fx.Int32(0)),
-            num_rows=num_rows,
-            hdim=hdim,
-            pad_elems=pad_elems,
-            lds_base=lds_base,
-            elem_dtype=elem_dtype,
-            num_warps=1,
-        )
+    builders = _tdm_load_view_builders(
+        ptr_x=ptr_x,
+        stride_seq=stride_seq,
+        stride_head=stride_head,
+        head=head,
+        row0=row0 + band_r0,
+        valid=fx.max(valid - band_r0, fx.Int32(0)),
+        num_rows=num_rows,
+        hdim=hdim,
+        pad_elems=pad_elems,
+        lds_base=lds_base,
+        elem_dtype=elem_dtype,
+        num_warps=1,
+        pin=lazy,
     )
+    if lazy:
+        return LazyTdmCopyDescriptor(builders, lambda view: fx.copy(*view))
+    return TdmCopyDescriptor([steps[-1]() for steps in builders])
 
 
 def _tdm_gather_band_descriptor(
@@ -582,6 +730,7 @@ def _tdm_gather_band_descriptor(
     page_size,
     num_pool_rows,
     sentinel_row,
+    lazy=False,
 ):
     """This wave's band of a ``[n_block, hdim]`` tile, gathered from a PAGED K/V pool.
 
@@ -627,7 +776,7 @@ def _tdm_gather_band_descriptor(
             else:
                 row0_p = page_indices[p] * fx.Int32(page_size)
                 valid_p = fx.max(rows_left - fx.Int32(p * page_size), fx.Int32(0))
-            views += _tdm_load_views(
+            views += _tdm_load_view_builders(
                 ptr_x=ptr_x,
                 stride_seq=stride_seq,
                 stride_head=stride_head,
@@ -640,8 +789,11 @@ def _tdm_gather_band_descriptor(
                 lds_base=lds_base + fx.Int32(p * rows_per_page * padded_row_bytes),
                 elem_dtype=elem_dtype,
                 num_warps=1,
+                pin=lazy,
             )
-        return TdmCopyDescriptor(views)
+        if lazy:
+            return LazyTdmCopyDescriptor(views, lambda view: fx.copy(*view))
+        return TdmCopyDescriptor([steps[-1]() for steps in views])
 
     lds_span = num_rows * padded_row_bytes
     lds_view = fx.Tensor(
@@ -683,12 +835,15 @@ def _tdm_gather_band_descriptor(
         )
     row_index = [fx.Int32(r) for r in _band_if.results]
 
-    descs = []
+    # One BUILDER per gather issue. The row-index select above is an scf region, so it
+    # stays where it is; what defers is each issue's own descriptor arithmetic.
+    builders = []
     for c0, w in _pow2_segments(hdim):
         col_bytes = c0 * elem_bytes
         for op in range(num_rows // gather_rows):
             rows = [row_index[op * gather_rows + t] for t in range(gather_rows)]
-            descs.append(
+            builders.append(
+                lambda w=w, col_bytes=col_bytes, op=op, rows=rows: (
                 make_tensor_gather_descriptor(
                     global_ptr=ptr_x,
                     lds_memref=lds_view,
@@ -710,8 +865,11 @@ def _tdm_gather_band_descriptor(
                     * fx.Int64(elem_bytes)
                     + fx.Int64(col_bytes),
                 )
+                )
             )
-    return TdmGatherCopyDescriptor(descs)
+    if lazy:
+        return LazyTdmCopyDescriptor(builders, tdm_ops.tensor_load_gather)  # single-step
+    return TdmGatherCopyDescriptor([build() for build in builders])
 
 
 class _AsyncTransport:
@@ -732,9 +890,11 @@ class _AsyncTransport:
         row0,
         valid,
         ctx,
+        lazy=False,
     ):
         """An ``AsyncCopyDescriptor`` for this wave's band of one tile. See
         ``load_descriptor`` on the base managers for the argument contract."""
+        assert not lazy, "the V1 async transport has no deferred-build form"
         return _async_band_descriptor(
             bases=_as_bases(ptr_lds),
             n_block=self.n_block,
@@ -766,6 +926,7 @@ class _TdmTransport:
         row0,
         valid,
         ctx,
+        lazy=False,
     ):
         """A ``TdmCopyDescriptor`` for this wave's band of one tile. See
         ``load_descriptor`` on the base managers for the argument contract."""
@@ -783,6 +944,7 @@ class _TdmTransport:
             valid=valid,
             ctx=ctx,
             elem_dtype=self.elem_dtype,
+            lazy=lazy,
         )
 
 
@@ -806,6 +968,7 @@ class _TdmGatherTransport:
         page_size,
         num_pool_rows,
         sentinel_row,
+        lazy=False,
     ):
         """This wave's band of one tile. ``row0`` is a SEQUENCE-relative token, not a
         pool row -- the page table absorbs the base."""
@@ -827,6 +990,7 @@ class _TdmGatherTransport:
             page_size=page_size,
             num_pool_rows=num_pool_rows,
             sentinel_row=sentinel_row,
+            lazy=lazy,
         )
 
 
