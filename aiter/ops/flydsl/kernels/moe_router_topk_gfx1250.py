@@ -34,6 +34,17 @@ MI455X: ~0.1 us over an empty launch, where a software grid barrier costs
 ``with_counts`` also leaves, per 8-row group, how many of its routes go to
 each expert (the A1 route/quant of the grouped MoE reads these instead of
 re-counting every id in every block), counted after a second cluster barrier.
+
+``quant_rows`` (1: MXFP4, 2: MXFP4 + MXFP8) also writes every token row of
+``x`` quantized, token-major: MXFP4 payload ``[m, K/2]`` + E8M0 ``[m, K/32]``
+(the bytes the grouped MoE's A1 quant writes per routed row) and, with 2, the
+MXFP8 copy ``[m, K]`` + ``[m, K/32]`` (its ``mxfp8_copy_out``). Lane (kgrp,
+lane16) already holds columns ``kgrp*8 + 0..7`` and ``16 + kgrp*8 + 0..7`` of
+every 32-wide K step of its token as the WMMA B fragment, so one MX block is
+two lanes: the block amax is a max over both (order-free), the e8m0 rule and
+the pk8 converts are the A1 kernel's own helpers, and the two lanes swap one
+half so each stores contiguous bytes. The K steps of a (tile, K split) are
+spread over the ``n_groups * waves`` waves that all load them.
 """
 
 import struct
@@ -88,16 +99,22 @@ def build_moe_router_topk_module(
     has_bias: bool = True,
     prefetch: int = 8,
     with_counts: bool = False,
+    quant_rows: int = 0,
 ):
     """Launcher ``(x, w, bias, num_valid_rows, ws, topk_weights, topk_ids,
     group_counts, m, lda, has_nvr, stream)``; ``ws`` holds
     ``ceil(m/16) * split_k * 16 * 128`` fp32. ``with_counts`` also writes
     ``group_counts`` int32 ``[2 * ceil(m/16), 128]``: per 8-row group, its
-    routes per expert (ids outside [0, 128) and rows >= m count nowhere)."""
+    routes per expert (ids outside [0, 128) and rows >= m count nowhere).
+    ``quant_rows`` > 0: four more pointers before ``stream`` -- the MXFP4
+    payload and E8M0 rows, then the MXFP8 payload and E8M0 rows (unread at
+    ``quant_rows == 1``), see the module docstring."""
     if K % (split_k * WMMA_K):
         raise ValueError(f"K {K} is not a multiple of split_k * 32")
     if not 1 <= topk <= 4:
         raise ValueError("topk must be in [1, 4] (one slot per merge round)")
+    if quant_rows not in (0, 1, 2):
+        raise ValueError(f"quant_rows must be 0, 1 or 2, got {quant_rows}")
     n_groups, tile_n, slices, csize = router_topk_geometry(split_k)
     waves = slices // CHAINS
     chunk = K // split_k
@@ -110,8 +127,93 @@ def build_moe_router_topk_module(
     name = (
         f"moe_router_topk_k{K}_s{split_k}_t{topk}_r{int(need_renorm)}"
         f"_b{int(has_bias)}_pf{pf}_sc{scale_tag}{'_cnt' if with_counts else ''}"
+        f"{f'_q{quant_rows}' if quant_rows else ''}"
     )
     neg_inf = float("-inf")
+    # Quantized rows: the (tile, K split)'s k_steps MX blocks go to its
+    # n_groups * waves waves, q_steps consecutive blocks each.
+    q_workers = n_groups * waves
+    q_steps = -(-k_steps // q_workers)
+
+    def _quant_step(xf, blk, tok_row, kgrp, qrows):
+        """MX block ``blk`` of token row ``tok_row`` from this lane's 16 bf16:
+        MXFP4 (and MXFP8) bytes and E8M0 of the A1 kernel, see the docstring."""
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            _MXFP8_COPY_AMAX_FLOOR,
+            _ROUND_MODE,
+            _cvt_scalef32_pk8_fp4_bf16,
+            _cvt_scalef32_pk8_fp8_bf16,
+        )
+        from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+        from aiter.utility.mx_types import MxDtypeInt
+
+        xq_rsrc, xs_rsrc, x8_rsrc, x8s_rsrc = qrows
+        halves = [xf.shuffle(xf, list(range(h * 8, h * 8 + 8))) for h in range(2)]
+        amax = fx.Float32(0.0)
+        for h in range_constexpr(2):
+            f32x8 = halves[h].to(fx.Float32)
+            for i in range_constexpr(8):
+                amax = fx.max(amax, abs(f32x8[i]))
+        amax = fx.max(amax, amax.shuffle_xor(fx.Int32(TILE), fx.Int32(WAVE)))
+        is_k0 = kgrp == 0
+        e8m0 = fx.Int32(
+            emit_mx_e8m0_scale(amax, mode=_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1)
+        )
+        sc = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+        p = [
+            fx.Int32(_cvt_scalef32_pk8_fp4_bf16(halves[h], sc, i32_ty=T.i32))
+            for h in range(2)
+        ]
+        # kgrp0 owns bytes 0-3 / 8-11 of the block, kgrp1 4-7 / 12-15: swap
+        # one dword so kgrp0 stores bytes 0-7 and kgrp1 bytes 8-15.
+        recv = is_k0.select(p[1], p[0]).shuffle_xor(fx.Int32(TILE), fx.Int32(WAVE))
+        out = fx.Vector.from_elements(
+            [is_k0.select(p[0], recv), is_k0.select(recv, p[1])], fx.Int32
+        )
+        buffer_ops.buffer_store(
+            out, xq_rsrc, tok_row * (K // 2) + blk * 16 + kgrp * 8, offset_is_bytes=True
+        )
+        buffer_ops.buffer_store(
+            fx.Uint8(e8m0),
+            xs_rsrc,
+            tok_row * (K // 32) + blk,
+            mask=is_k0,
+            offset_is_bytes=True,
+        )
+        if const_expr(quant_rows == 2):
+            e8 = fx.Int32(
+                emit_mx_e8m0_scale(
+                    fx.max(amax, fx.Float32(_MXFP8_COPY_AMAX_FLOOR)),
+                    mode=_ROUND_MODE,
+                    dtype=MxDtypeInt.FP8_E4M3,
+                )
+            )
+            sc8 = (e8 << fx.Int32(23)).bitcast(fx.Float32)
+            q = [
+                fx.Vector(
+                    _cvt_scalef32_pk8_fp8_bf16(halves[h], sc8, v2i32_ty=T.vec(2, T.i32))
+                )
+                for h in range(2)
+            ]
+            # kgrp0 owns bytes 0-7 / 16-23, kgrp1 8-15 / 24-31: kgrp0 stores
+            # 0-15, kgrp1 16-31.
+            send = [is_k0.select(q[1][d], q[0][d]) for d in range(2)]
+            got = [v.shuffle_xor(fx.Int32(TILE), fx.Int32(WAVE)) for v in send]
+            out8 = fx.Vector.from_elements(
+                [is_k0.select(q[0][d], got[d]) for d in range(2)]
+                + [is_k0.select(got[d], q[1][d]) for d in range(2)],
+                fx.Int32,
+            )
+            buffer_ops.buffer_store(
+                out8, x8_rsrc, tok_row * K + blk * 32 + kgrp * 16, offset_is_bytes=True
+            )
+            buffer_ops.buffer_store(
+                fx.Uint8(e8),
+                x8s_rsrc,
+                tok_row * (K // 32) + blk,
+                mask=is_k0,
+                offset_is_bytes=True,
+            )
 
     @flyc.kernel(name=name, known_block_size=[block, 1, 1])
     def router_topk_kernel(
@@ -126,6 +228,7 @@ def build_moe_router_topk_module(
         m: Int32,
         lda: Int32,
         has_nvr: Int32,
+        qrows=(),  # quant_rows: (xq, xs, x8, x8s); empty, so no kernel args, otherwise
     ):
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -167,6 +270,34 @@ def build_moe_router_topk_module(
                 x_rsrc, x_dw, j
             )
 
+        q_rsrcs = None
+        q_wid = None
+        if const_expr(quant_rows):
+            # Rows >= m (the clamped tail lanes) fall outside the descriptors.
+            xq_p, xs_p, x8_p, x8s_p = qrows
+            q_rsrcs = (
+                buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(xq_p)), num_records_bytes=m * (K // 2)
+                ),
+                buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(xs_p)), num_records_bytes=m * (K // 32)
+                ),
+                buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(x8_p)), num_records_bytes=m * K
+                ),
+                buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(x8s_p)), num_records_bytes=m * (K // 32)
+                ),
+            )
+            q_wid = ng * waves + wave
+            q_tok_row = mt * TILE + lane16
+            # The K loop only keeps this wave's fragments (one conditional
+            # copy per step); they are quantized and stored after the cluster
+            # barrier, next to the gating. Quantizing inside the unrolled loop
+            # emits the convert once per K step and the code outgrows the
+            # instruction cache (measured +0.85 us at split_k 4).
+            q_x = [fx.make_rmem_tensor(8, fx.Int32) for _ in range(q_steps)]
+
         wmma = fx.make_mma_atom(fx.rocdl.WMMA(16, 16, 32, fx.BFloat16, fx.Float32))
         accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(CHAINS)]
         pending = [load_step(j) for j in range_constexpr(pf)]
@@ -180,6 +311,10 @@ def build_moe_router_topk_module(
                 acc_t = _rmem_vec(accs[ch], 8, fx.Float32)
                 fx.gemm(wmma, acc_t, _rmem_vec(wfs[ch], 16, fx.BFloat16), x_t, acc_t)
                 accs[ch] = acc_t.load()
+            if const_expr(quant_rows):
+                # Wave-uniform: this wave owns K steps [q_wid * q_steps, +q_steps).
+                if q_wid == j // q_steps:
+                    q_x[j % q_steps].store(xf.bitcast(fx.Int32))
             pending[j] = None
             rocdl.sched_barrier(0)
 
@@ -202,6 +337,17 @@ def build_moe_router_topk_module(
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
+        if const_expr(quant_rows):
+            for i in range_constexpr(q_steps):
+                blk_i = q_wid * q_steps + i
+                if blk_i < k_steps:
+                    _quant_step(
+                        fx.Vector(q_x[i].load()).bitcast(fx.BFloat16),
+                        s * k_steps + blk_i,
+                        q_tok_row,
+                        kgrp,
+                        q_rsrcs,
+                    )
 
         bias_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(fx.ptrtoint(bias))
@@ -364,6 +510,50 @@ def build_moe_router_topk_module(
         return out_w, out_id
 
     grid_per_tile = csize
+
+    if quant_rows:
+
+        @flyc.jit
+        def launch_q(
+            x: fx.Pointer,
+            w: fx.Pointer,
+            bias: fx.Pointer,
+            num_valid_rows: fx.Pointer,
+            ws: fx.Pointer,
+            topk_weights: fx.Pointer,
+            topk_ids: fx.Pointer,
+            group_counts: fx.Pointer,
+            m: fx.Int32,
+            lda: fx.Int32,
+            has_nvr: fx.Int32,
+            xq: fx.Pointer,
+            xs: fx.Pointer,
+            x8: fx.Pointer,
+            x8s: fx.Pointer,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            tiles = (m + (TILE - 1)) // TILE
+            router_topk_kernel(
+                x,
+                w,
+                bias,
+                num_valid_rows,
+                ws,
+                topk_weights,
+                topk_ids,
+                group_counts,
+                m,
+                lda,
+                has_nvr,
+                (xq, xs, x8, x8s),
+            ).launch(
+                grid=(fx.Int64(tiles * grid_per_tile), 1, 1),
+                block=(block, 1, 1),
+                cluster=(csize, 1, 1),
+                stream=stream,
+            )
+
+        return launch_q
 
     @flyc.jit
     def launch(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
@@ -101,6 +102,56 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
+def _opt_ptr_arg(t):
+    """``ptr_arg`` of an optional operand: a null pointer for None."""
+    return ptr_arg(t) if t is not None else flyc.from_c_void_p(fx.Uint8, 0)
+
+
+def _tp_gather_args(tp_gather, block_threads: int):
+    """``(spec, pointer args)`` of a ``tp_gather`` launch (GEMM1 re-derives the
+    TP route and gathers token-major MXFP4 rows; see
+    ``build_gemm_a8w4_tdm_task``); without one, the off spec and null
+    pointers (the shared-fold launcher always takes them).
+
+    ``tp_gather``: ``{"topk_ids": int32 [T, 4], "topids_to_rows": int32 [T, 4]
+    (written), "masked_m": int32 [E] (written), "align": expert row alignment,
+    "row_to_route": optional int32 [contiguous_m] (written)}``. ``psum`` is
+    written to the GEMM's tile-map argument.
+    """
+    if tp_gather is None:
+        null = _opt_ptr_arg(None)
+        return (0, 1, 0, 0), (null, null, null, null, 0)
+    ids = tp_gather["topk_ids"]
+    rows = tp_gather["topids_to_rows"]
+    tokens, topk = ids.shape
+    assert topk == 4 and ids.dtype == torch.int32 and ids.is_contiguous()
+    assert (
+        rows.dtype == torch.int32
+        and rows.is_contiguous()
+        and rows.numel() == ids.numel()
+    )
+    # Tokens per thread, rounded up to a power of two so a few builds serve
+    # every decode batch (the ids past ``tokens`` read as dropped).
+    slots = 1
+    while slots * block_threads < tokens:
+        slots *= 2
+    row_route = tp_gather.get("row_to_route")
+    spec = (
+        1,
+        slots,
+        int(tp_gather["align"]),
+        int(row_route is not None),
+    )  # gather, slots, align, row map
+    ptrs = (
+        ptr_arg(ids),
+        ptr_arg(rows),
+        ptr_arg(tp_gather["masked_m"]),
+        _opt_ptr_arg(row_route),
+        int(tokens),
+    )
+    return spec, ptrs
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -150,6 +201,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     m_align=0,
     k_waves=1,
     shared_fold: "SharedFoldTiles | None" = None,
+    tp_gather: dict | None = None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -160,6 +212,11 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     ``shared_fold`` adds a dense FP8 x FP8 expert's tiles (same N, K, activation
     and output kind) to the launch, see ``SharedFoldTiles``.
+
+    ``tp_gather`` (stage 1 only): ``a`` / ``a_scales`` are token-major MXFP4
+    rows and their E8M0 rows, no route/quant launch ran, and the GEMM derives
+    the TP route itself (``_tp_gather_args``); it runs unclustered and
+    non-persistent.
     """
     if shared_fold is not None:
         return _grouped_gemm_shared_fold(
@@ -205,6 +262,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             rolled_drain=rolled_drain,
             m_align=m_align,
             k_waves=k_waves,
+            tp_gather=tp_gather,
         )
     if a_preshuffled and row_major_ascale:
         raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
@@ -281,6 +339,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
+    if tp_gather is not None:
+        if not (stage1_act and a_is_fp4) or a_preshuffled or row_major_ascale:
+            raise ValueError("tp_gather is the MXFP4 stage-1 GEMM on token-major rows")
+        # One tile per workgroup: the route is re-derived per workgroup.
+        persistent_workers = 0
+        cluster_n = cluster_m = 1
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -365,6 +429,66 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
+    if tp_gather is not None:
+        from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm_tpg
+
+        if tdm_spec[2] or tdm_spec[4] or k_waves != 1 or out_is_f16 or bias is not None:
+            raise ValueError(
+                "tp_gather: no next-stage prefetch, As prologue, k_waves, f16 out or bias"
+            )
+        if not stage1_quant_out or quant_scale is None:
+            raise ValueError("tp_gather is the quantized stage-1 GEMM")
+        tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+        tpg_spec = (
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            num_buffers,
+            n_experts,
+            stage1_act,
+            quant_wmma_rep,
+            tdm_spec[3],
+            tdm_spec[5],
+            int(lds_soa_load_interleave),
+            rolled_drain,
+        ) + tp_spec[1:]
+        _run_compiled(
+            launch_gemm_a8w4_tdm_tpg,
+            ptr_arg(out, out_dtype),
+            ptr_arg(a),
+            ptr_arg(w),
+            ptr_arg(a_scales, fx.Int32),
+            ptr_arg(w_scales, fx.Int32),
+            contiguous_m,
+            stream,
+            N,
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            num_buffers,
+            ptr_arg(m_tile_map),
+            n_experts,
+            stage1_act,
+            float(swiglu_limit),
+            quant_wmma_rep,
+            ptr_arg(quant_scale_tensor),
+            tdm_spec[3],
+            tdm_spec[5],
+            int(lds_soa_load_interleave),
+            rolled_drain,
+            float(situ_beta),
+            float(situ_linear_beta),
+            *tp_spec[1:],
+            *tp_ptrs,
+            specialization_key=("tpg", tpg_spec),
+        )
+        return out
     _run_compiled(
         launch_gemm_a8w4_tdm,
         ptr_arg(out, out_dtype),
@@ -484,6 +608,7 @@ def _grouped_gemm_shared_fold(
     rolled_drain,
     m_align,
     k_waves,
+    tp_gather=None,
 ):
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm_shared_fold
 
@@ -520,6 +645,10 @@ def _grouped_gemm_shared_fold(
             os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
         )
     )
+    if tp_gather is not None:
+        if not (stage1_act and a_is_fp4) or a_preshuffled or row_major_ascale:
+            raise ValueError("tp_gather is the MXFP4 stage-1 GEMM on token-major rows")
+        persistent_workers = 0
     out_dtype = (
         fx.Uint8 if stage1_quant_out else (fx.Float16 if out_is_f16 else fx.BFloat16)
     )
@@ -557,6 +686,9 @@ def _grouped_gemm_shared_fold(
         int(sh.quant_wmma_rep or 1),
         int(bool(sh.row_major_ascale)),
     )
+    tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+    if tp_gather is not None and (tdm_spec[0] or tdm_spec[2]):
+        raise ValueError("tp_gather: no next-stage prefetch or As prologue")
     _run_compiled(
         launch_gemm_a8w4_tdm_shared_fold,
         ptr_arg(out, out_dtype),
@@ -583,6 +715,15 @@ def _grouped_gemm_shared_fold(
         int(sh.rows),
         int(sh.cap),
         *sh_spec,
-        specialization_key=(gemm_spec, route_spec, quant_spec, tdm_spec, sh_spec),
+        *tp_spec,
+        *tp_ptrs,
+        specialization_key=(
+            gemm_spec,
+            route_spec,
+            quant_spec,
+            tdm_spec,
+            sh_spec,
+            tp_spec,
+        ),
     )
     return out
