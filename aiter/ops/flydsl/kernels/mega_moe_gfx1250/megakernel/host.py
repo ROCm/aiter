@@ -123,9 +123,12 @@ class MegaKernel:
             device=device,
         )
         self._traced = 0
-        self._launch = None
-        self._act_key = None
-        self._lined_up = None
+        # One launcher per (activation, placed-B constants): the layers of a
+        # model can differ in placement, and a dropped launcher unloads its
+        # module, which a graph capture in progress cannot take.
+        self._launches = {}
+        # Launchers whose first launch the ranks already lined up for.
+        self._lined_up = set()
 
     def serves(self, recv_token_bound) -> bool:
         """Whether a step with this receive bound runs the megakernel: the
@@ -158,10 +161,10 @@ class MegaKernel:
 
     def _launcher(self, stage1_act, placed=(0, 1, 0, 1)):
         key = (stage1_act, placed)
-        if self._launch is None or self._act_key != key:
+        if key not in self._launches:
             config, arena = self.config, self.res.arena
             geo = config.geometry
-            self._launch = make_megakernel(
+            self._launches[key] = make_megakernel(
                 rank=config.rank,
                 npes=config.world_size,
                 experts=geo.experts,
@@ -191,8 +194,7 @@ class MegaKernel:
                 loc_group2=placed[3],
                 **self.tile,
             )
-            self._act_key = key
-        return self._launch
+        return self._launches[key]
 
     def forward(
         self,
@@ -280,13 +282,13 @@ class MegaKernel:
             sl,
             fx.Stream(torch.cuda.current_stream()),
         )
-        if launch is not self._lined_up:
+        if id(launch) not in self._lined_up:
             # Every rank compiles its own kernel (the rank is baked in), seconds
             # apart: line the ranks up before the first launch, so its waits do
             # not start long before a peer's kernel does.
             _preload_compiled(launch, *args)
             arena._communicator.barrier()
-            self._lined_up = launch
+            self._lined_up.add(id(launch))
         _run_compiled(launch, *args)
         if tracing:
             self._traced += 1

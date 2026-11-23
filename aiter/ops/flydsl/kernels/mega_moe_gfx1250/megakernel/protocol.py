@@ -410,7 +410,10 @@ def start(kc):
                     fx.Int32(CTL_XQ) + other * fx.Int32(XQ_PAR) + lane * fx.Int32(32),
                     cache_modifier=SCOPE_DEV,
                 )
-        if const_expr(STREAM and kc.XQ and kc.LOC):  # noqa: SIM102
+        # Every STREAM kernel, not only LOC ones: an instance mixes them (a
+        # layer whose weights stayed unplaced), and the next LOC launch of
+        # this parity claims from the head.
+        if const_expr(STREAM):  # noqa: SIM102 - preserve DSL staging
             if lane == fx.Int32(0):
                 buffer_store(
                     fx.Int32(0),
