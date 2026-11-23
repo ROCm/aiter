@@ -860,10 +860,15 @@ class _CompactDispatch(_Dispatch):
             # Stage-1: runs and tile_info per producer flag tile; experts are
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
+            compact_cap = geo.cap
             if plan_s1f:
                 from ..s1f_stage1 import s1f_flag_m
 
                 tile_m = s1f_flag_m(align_m)
+                # An S1F step's rows fit its receive cap; the arena's row
+                # count would size the plan's per-m-tile LDS table past the
+                # workgroup's LDS (s1f_ctl._Stage1Fusion.plan_cap).
+                compact_cap = self.fusion.plan_cap(align_m)
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,
@@ -871,8 +876,9 @@ class _CompactDispatch(_Dispatch):
                 topk=config.topk,
                 tile_m=tile_m,
                 # The arena's row count, not this step's: the plan bounds what
-                # it may write against the region it writes into.
-                compact_cap=geo.cap,
+                # it may write against the region it writes into. A stage-1
+                # plan takes the S1F receive cap's (above).
+                compact_cap=compact_cap,
                 off_hist=arena.offset("compact_hist") + slot * geo.hist_stride * 4,
                 off_done=arena.offset("compact_done") + slot * 4,
                 hist_stride=geo.hist_stride,

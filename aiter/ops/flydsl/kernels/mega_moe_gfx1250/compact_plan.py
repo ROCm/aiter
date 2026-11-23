@@ -274,6 +274,66 @@ def compact_tile_capacity(*, compact_cap: int, tile_m: int) -> int:
     return (int(compact_cap) + int(tile_m) - 1) // int(tile_m)
 
 
+#: LDS one gfx1250 workgroup can allocate (320 KiB). A launch asking for more
+#: fails with hipErrorInvalidValue before the kernel runs.
+PLAN_LDS_BYTES = 320 * 1024
+
+
+def compact_plan_lds_bytes(
+    *,
+    npes: int,
+    experts_per_rank: int,
+    max_routes: int,
+    plan_blocks: int = PLAN_BLOCKS,
+    emit_runs: bool = False,
+    s1f: bool = False,
+    compact_cap: int = 0,
+    tile_m: int = 1,
+) -> int:
+    """Dynamic LDS ``tdm_compact_plan`` allocates, in its allocation order.
+
+    The stage-1 tables are what grow: ``s1f`` keeps one word per destination
+    m-tile of ``compact_cap`` rows, so the plan's LDS follows the row bound it
+    is compiled with, not the step it runs.
+    """
+    epr = int(experts_per_rank)
+    segs = int(npes) * epr
+    hist_dwords = _align32(segs)
+    max_routes = max(1, int(max_routes))
+    row_dwords, _, use_sparse = compact_hist_layout(
+        npes=npes, experts_per_rank=epr, max_routes=max_routes
+    )
+    route_vec = 4 if max_routes % 4 == 0 else (2 if max_routes % 2 == 0 else 1)
+    per_block = -(-max_routes // int(plan_blocks))
+    chunk_cap = -(-per_block // route_vec) * route_vec
+    merge_routes = chunk_cap <= _LDS_ROUTE_CAP
+    emit_runs = bool(emit_runs) or bool(s1f)
+    sizes = [
+        (hist_dwords * 4, 128),
+        (segs * 4, 16),
+        (segs * 4, 16),
+        (int(npes) * hist_dwords * 4, 128),
+    ]
+    if merge_routes:
+        sizes.append((chunk_cap * 4, 16))
+    if use_sparse:
+        sizes += [(row_dwords * 4, 128), (int(npes) * row_dwords * 4, 128)]
+    if emit_runs:
+        n_chunks = (segs + WAVE - 1) // WAVE
+        sizes += [(segs * 4, 16)] * 4 + [(n_chunks * 4, 16), (4 * 4, 16)]
+        if s1f:
+            tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
+            sizes += [(tile_cap * 4, 16), (epr * (int(npes) + 1) * 4, 16)]
+        if merge_routes:
+            sizes.append((chunk_cap * 4, 16))
+            if int(plan_blocks) > 1:
+                sizes += [(segs * 4, 16)] * 2
+    off = 0
+    for size, align in sizes:
+        off = (off + align - 1) // align * align + size
+    return off
+
+
 @functools.cache
 def compile_tdm_compact_plan(
     *,
@@ -494,6 +554,23 @@ def compile_tdm_compact_plan(
     rr_shift = run_rows.bit_length() - 1
     per_tile = (tile_m + run_rows - 1) // run_rows
     bnd_n = npes + 1
+    lds_bytes = compact_plan_lds_bytes(
+        npes=npes,
+        experts_per_rank=epr,
+        max_routes=max_routes,
+        plan_blocks=plan_blocks,
+        emit_runs=emit_runs,
+        s1f=s1f,
+        compact_cap=compact_cap,
+        tile_m=tile_m,
+    )
+    if lds_bytes > PLAN_LDS_BYTES:
+        raise ValueError(
+            f"compact plan needs {lds_bytes} B of LDS, more than the "
+            f"{PLAN_LDS_BYTES} B a workgroup has: {segs} segments, "
+            f"{tile_cap} m-tiles of {tile_m} rows for compact_cap={compact_cap}, "
+            f"{plan_blocks} block(s), s1f={s1f}"
+        )
 
     def _lds_barrier():
         """Workgroup barrier ordering LDS only (and TDM data already waited on).

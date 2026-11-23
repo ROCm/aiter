@@ -254,6 +254,7 @@ class _Stage1Fusion:
         self.launches: dict = {}
         self.precompiled: set = set()
         self._packed_sc = None
+        self._plan_lds: dict = {}
 
     def arm(self) -> None:
         """Allocate the stage-1 buffers, or record why this instance cannot.
@@ -350,7 +351,60 @@ class _Stage1Fusion:
             )
         if int(self.d.config.experts_per_rank) > 255:
             reasons.append(f"{self.d.config.experts_per_rank} experts per rank > 255")
+        if not reasons:
+            from .compact_plan import PLAN_LDS_BYTES
+
+            lds = self.plan_lds_bytes(align_m)
+            if lds > PLAN_LDS_BYTES:
+                reasons.append(
+                    f"stage-1 plan for tile_m {align_m} needs {lds} B of LDS "
+                    f"> {PLAN_LDS_BYTES}"
+                )
         return reasons
+
+    def plan_cap(self, align_m: int) -> int:
+        """Rows a stage-1 plan bounds its tables by.
+
+        A step runs the stage-1 kernel only while its receive bound is within
+        ``max_recv()``, so its rows fit that bound at the step's alignment. The
+        arena's row count (every rank's ``max_tokens_per_rank`` at full top-k)
+        would size the plan's per-m-tile LDS table instead: about 2.1M rows on
+        Kimi-K3 EP8 at 16384 tokens a rank, 132K m-tiles of 16 rows, 572 KiB of
+        plan LDS in all.
+        """
+        from .compact_plan import compact_row_capacity
+
+        config, geo = self.d.config, self.d.compact
+        rows = compact_row_capacity(
+            max_recv=min(int(config.max_recv), int(self.max_recv())),
+            topk=config.topk,
+            experts_per_rank=config.experts_per_rank,
+            tile_m=max(int(geo.tile_m), int(align_m)),
+        )
+        return min(int(geo.cap), rows)
+
+    def plan_lds_bytes(self, align_m: int) -> int:
+        """LDS of the widest stage-1 plan launch for ``align_m``."""
+        lds = self._plan_lds.get(int(align_m))
+        if lds is None:
+            from .compact_plan import PLAN_MAX_BLOCKS, compact_plan_lds_bytes
+            from .s1f_stage1 import s1f_flag_m
+
+            config, geo = self.d.config, self.d.compact
+            lds = max(
+                compact_plan_lds_bytes(
+                    npes=config.world_size,
+                    experts_per_rank=config.experts_per_rank,
+                    max_routes=geo.max_routes,
+                    plan_blocks=blocks,
+                    s1f=True,
+                    compact_cap=self.plan_cap(align_m),
+                    tile_m=s1f_flag_m(align_m),
+                )
+                for blocks in range(1, PLAN_MAX_BLOCKS + 1)
+            )
+            self._plan_lds[int(align_m)] = lds
+        return lds
 
     def plan_mode(self, align_m: int) -> bool:
         """Whether the plan for ``align_m`` emits the stage-1 kernel's inputs."""
@@ -399,7 +453,11 @@ class _Stage1Fusion:
             if bias is not None and bias.numel() > 0:
                 reasons.append("bias is not supported")
         act = self.d.config.recipe.compute.activation
-        if act not in (ActivationType.Silu, ActivationType.Swiglu):
+        if act not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
             reasons.append(f"activation {act} is not supported")
         if os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0") not in (
             "",
@@ -682,7 +740,7 @@ class _Stage1Fusion:
             # fused_moe keeps the CSV GEMM1 tile; this step widened it.
             got["tile"] = (align_m,)
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
-        if bad or stage1_act not in (1, 2) or quant_scale is None:
+        if bad or stage1_act not in (1, 2, 3) or quant_scale is None:
             raise RuntimeError(
                 "AITER_MEGA_S1F: the stage-1 kernel embeds only its variants' "
                 f"GEMM1; mismatches (got, want): {bad}, stage1_act={stage1_act}. "
@@ -717,6 +775,8 @@ class _Stage1Fusion:
                 int(contiguous_m),
                 n_tok,
                 float(swiglu_limit),
+                float(situ_beta),
+                float(situ_linear_beta),
                 fx.Stream(stream),
             )
 
