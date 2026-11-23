@@ -291,12 +291,48 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
     ) -> torch.Tensor:
         """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
-        the pair as it sends, so the sum is never written; elsewhere the add
-        and then all_reduce."""
+        the pair as it sends, so the sum is never written. gfx9: where
+        all_reduce(input_ + other) would run a lamport one-shot / two-shot
+        kernel, that same kernel adds the pair as it loads
+        (shouldLamportAllReduceAdd). Elsewhere the add and then all_reduce.
+        Either way the bits of all_reduce(input_ + other)."""
         ca_comm = self.ca_comm
         if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
             return ca_comm.lamport_ar_add(input_, other)
+        if self.shouldLamportAllReduceAdd(
+            input_, other, use_new, ca_fp8_quant, prefill_support
+        ):
+            return ca_comm.lamportAllReduceAdd(input_, other)
         return self.all_reduce(input_ + other, use_new, ca_fp8_quant, prefill_support)
+
+    def shouldLamportAllReduceAdd(
+        self,
+        input_,
+        other,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> bool:
+        """gfx9: whether all_reduce_add fuses the add into the lamport kernel,
+        i.e. whether all_reduce(input_ + other) would run one: no path all_reduce
+        tries first (Gluon, quick reduce) takes the sum, and the custom
+        all-reduce would hand it to a lamport kernel
+        (CustomAllreduce.shouldLamportAllReduceAdd). Shapes, dtypes, sizes and
+        flags only, so every rank decides the same."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or not ca_comm.shouldLamportAllReduceAdd(
+            input_, other, use_new, ca_fp8_quant, prefill_support
+        ):
+            return False
+        if self.gluon_ar_plain is not None:
+            return False
+        qr_comm = self.qr_comm
+        if qr_comm is None or qr_comm.disabled:
+            return True
+        # quick reduce's FlyDSL gate looks at the address: ask about a fresh
+        # 16B-aligned tensor, as the sum would be
+        probe = input_ if input_.data_ptr() % 16 == 0 else torch.empty_like(input_)
+        return not qr_comm.should_quick_allreduce(probe)
 
     def all_reduce(
         self,

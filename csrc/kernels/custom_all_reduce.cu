@@ -136,6 +136,57 @@ void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_
     }
 }
 
+// out = all-reduce(inp + other) with the add fused into the lamport kernel
+// (gfx9, tensor_model_parallel_all_reduce_add): kernel 0 takes the kernel the
+// all-reduce dispatch would (lamportKernel) and throws when that is none, 1
+// one-shot, 2 two-shot. Bit for bit all_reduce(inp + other). Neither operand
+// needs IPC registration; both must be 16B aligned.
+void lamportAllReduceAdd(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& other,
+                         const aiter_tensor_t& out,
+                         int64_t kernel)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    for(const aiter_tensor_t* t : {&other, &out})
+        if(t->numel() != inp.numel() || t->dtype() != inp.dtype() || t->device_id != inp.device_id)
+            throw std::runtime_error(
+                "lamportAllReduceAdd: other and out must match the input's size, dtype and device");
+    if(!inp.is_contiguous() || !other.is_contiguous() || !out.is_contiguous())
+        throw std::runtime_error("lamportAllReduceAdd: tensors must be contiguous");
+    for(const aiter_tensor_t* t : {&inp, &other})
+        if(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 != 0)
+            throw std::runtime_error("lamportAllReduceAdd: inp and other must be 16B aligned");
+    auto lamport_kernel = static_cast<aiter::LamportKernel>(kernel);
+    if(kernel == 0)
+    {
+        lamport_kernel = fa->lamportKernel(inp.numel());
+        if(lamport_kernel == aiter::LamportKernel::none)
+            throw std::runtime_error("lamportAllReduceAdd: " + std::to_string(inp.numel() * 2) +
+                                     "B is outside the lamport all-reduce ranges");
+    }
+    else if(lamport_kernel != aiter::LamportKernel::one_shot &&
+            lamport_kernel != aiter::LamportKernel::two_shot)
+        throw std::runtime_error(
+            "lamportAllReduceAdd: kernel must be 0 (auto), 1 (one-shot) or 2 (two-shot)");
+#define RUN_LAMPORT_ADD(T)                                        \
+    fa->runLamport<T>(stream,                                     \
+                      reinterpret_cast<const T*>(inp.data_ptr()), \
+                      reinterpret_cast<T*>(out.data_ptr()),       \
+                      inp.numel(),                                \
+                      lamport_kernel,                             \
+                      reinterpret_cast<const T*>(other.data_ptr()))
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_ADD(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_ADD(opus::bf16_t); break;
+    default: throw std::runtime_error("lamportAllReduceAdd only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_ADD
+}
+
 // ---- Internal dispatch helpers ----
 
 // Whether _all_reduce takes the fp8 quant kernel instead of allreduce<T>.
