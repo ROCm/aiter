@@ -145,3 +145,7 @@ def test_ck_moe_stage2_rejects_weights_padded_past_preshuffle_tile():
 
     with pytest.raises(RuntimeError, match="expected 208"):
         _run_ck_stages(x, w1, w2, topk_weights, topk_ids, 256, 32)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
