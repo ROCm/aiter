@@ -59,6 +59,7 @@ from .config import (
 from .config import (
     _WAVE_SIZE as WAVE,
 )
+from .config import route_weight_bits
 
 #: gfx1250 LDS per workgroup. The payload tiles are the whole budget.
 _LDS_BUDGET = 327680
@@ -441,7 +442,9 @@ def _make_dispatch_tdm(
                 global_warp_id * etpi, inp_cur_tok, warps_total * etpi
             ):
                 tok, act, expert, slot_off, dest_pe, keep = resolve(tok_base)
-                wt = buffer_load(rsrc_inp_wts, slot_off, vec_width=1, dtype=T.f32)
+                wt_bits_rt = route_weight_bits(
+                    buffer_load(rsrc_inp_wts, slot_off, vec_width=1, dtype=T.i32)
+                )
                 j = arith.constant(0)
                 if keep:
                     j = comm_ops.atomic_add_lds(s_run(dest_pe), arith.constant(1))
@@ -466,7 +469,7 @@ def _make_dispatch_tdm(
                     if lane_act & (pub_e != 0):
                         buffer_store(expert, rsrc_stg_idx, slot_e * topk + e_lane)
                         buffer_store(
-                            arith.bitcast(T.i32, wt),
+                            wt_bits_rt,
                             rsrc_stg_wt,
                             slot_e * topk + e_lane,
                         )
@@ -785,14 +788,13 @@ def _make_dispatch_tdm(
                     wt_bits = arith.constant(0)
                     packed_meta = arith.constant(0)
                     if const_expr(compact_plan) and live:
-                        wt_bits = arith.bitcast(
-                            T.i32,
+                        wt_bits = route_weight_bits(
                             buffer_load(
                                 rsrc_inp_wts,
                                 tok * topk + lane,
                                 vec_width=1,
-                                dtype=T.f32,
-                            ),
+                                dtype=T.i32,
+                            )
                         )
                         packed_meta = (
                             fx.Int32(rank) * fx.Int32(max_tok_slot_stride)

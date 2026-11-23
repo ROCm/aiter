@@ -7,6 +7,29 @@ _WAVE_SIZE = 32
 _LANE_MASK = _WAVE_SIZE - 1
 _LOG2_WAVE_SIZE = 5
 
+
+def route_weight_bits(w_bits):
+    """A routing weight's f32 bits, rounded to bf16 precision (still f32 bits).
+
+    The non-compact grouped path applies ``topk_weight.to(bf16)`` (fused into
+    its route kernel as ``w_f32.to(BFloat16).to(Float32)``, see
+    ``moe_fused_route_quant_scatter``), and so does the DeepSeek reference gate
+    (``weights.type_as(x)``). The compact / S1F / megakernel dispatches must
+    round the same way, or every routed expert's gemm2 contribution differs by
+    up to one bf16 ulp from the mori path -- enough to cost DSR1 ~0.7 MLPerf
+    exact_match. Takes and returns an i32 (``fx.Int32``-convertible) value.
+    """
+    import flydsl.expr as fx
+
+    return (
+        fx.Int32(w_bits)
+        .bitcast(fx.Float32)
+        .to(fx.BFloat16)
+        .to(fx.Float32)
+        .bitcast(fx.Int32)
+    )
+
+
 # The FlyDSL dispatch uses TDM and has a tight LDS budget (one hidden-dim payload
 # tile per warp). From a gfx1250 EP4 hidden-7168 geometry sweep; topk does not
 # move the dispatch half.

@@ -26,6 +26,7 @@ from aiter.utility.mx_types import MxDtypeInt as _MxDtype
 
 from ..compact_plan import _wave32_inclusive_scan_i32
 from ..config import _WAVE_SIZE as WAVE
+from ..config import route_weight_bits
 from ..s1f_stage1 import (
     _OOB,
     S1F_SLOTS,
@@ -505,7 +506,7 @@ def produce(kc, n_mine, n_routes):
                 wait_gate(GATE_S, GATE_STRIDE, 1)
                 rk = fx.Int32((lane < fx.Int32(K)).select(lane, fx.Int32(0)))
                 rs = _load_i32_dev(rsrc_route, t * fx.Int32(K) + rk)
-                w_l = fx.Int32(
+                w_l = route_weight_bits(
                     buffer_load(
                         rsrc_wts, t * fx.Int32(K) + rk, vec_width=1, dtype=T.i32
                     )

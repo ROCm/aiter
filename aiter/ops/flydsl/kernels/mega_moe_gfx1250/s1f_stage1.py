@@ -109,6 +109,7 @@ from .compact_plan import (
     compact_tile_capacity,
 )
 from .config import _WAVE_SIZE as WAVE
+from .config import route_weight_bits
 
 #: gfx12 CPol SCOPE field (bits [4:3]); the same encoding for TDM and buffer ops.
 SCOPE_DEV = 2 << 3
@@ -883,7 +884,7 @@ def s1f_produce(pc):
             for kk in range_constexpr(R):
                 live = owned & (fx.Int32(kk) < n_l)
                 wts.append(
-                    fx.Int32(
+                    route_weight_bits(
                         buffer_load(
                             rsrc_wts,
                             routes[kk],

@@ -26,6 +26,7 @@ from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE as _MX_ROUND_UP
 from aiter.utility.mx_types import MxDtypeInt as _MxDtype
 
 from ..config import _WAVE_SIZE as WAVE
+from ..config import route_weight_bits
 from ..s1f_stage1 import (
     _OOB,
     SCOPE_SYS,
@@ -70,7 +71,7 @@ def produce(kc, n_mine):
         gid = fx.Int32(
             buffer_load(rsrc_ids, r, vec_width=1, dtype=T.i32, is_scalar=True)
         )
-        w_bits = fx.Int32(
+        w_bits = route_weight_bits(
             buffer_load(rsrc_wts, r, vec_width=1, dtype=T.i32, is_scalar=True)
         )
         valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
