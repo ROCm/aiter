@@ -11,7 +11,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import attention
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
@@ -32,6 +32,27 @@ QK_ROPE = 64
 KV_LENS = [100, 37]
 MAX_SPLIT_PER_BATCH = 16
 CP_WORLD_SIZE = 8
+
+
+def test_legacy_qo_tiles_use_runtime_arch_instead_of_build_targets(monkeypatch):
+    monkeypatch.setattr(attention, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(attention, "_mla_resolve_arch", lambda arch: arch or "gfx942")
+    parameters = {
+        "max_seqlen_qo": 3,
+        "num_head_qo": 32,
+        "q_dtype": dtypes.fp8,
+        "kv_dtype": dtypes.fp8,
+        "is_sparse": False,
+        "fast_mode": False,
+    }
+    assert attention._mla_legacy_max_qo_tiles_per_batch(**parameters) == 6
+    assert (
+        attention._mla_legacy_max_qo_tiles_per_batch(**parameters, _arch="gfx942") == 6
+    )
+    assert (
+        attention._mla_legacy_max_qo_tiles_per_batch(**parameters, _arch="gfx950") == 2
+    )
+
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() == 0,
@@ -175,7 +196,7 @@ def test_default_96_heads_fold_at_qlen_7_and_8(monkeypatch):
 def test_default_launch_plan_folds_96_heads_under_cprr(monkeypatch):
     # mla_decode_fwd's launch plan takes the fold unless the env opts in, and
     # follows the env var at call time.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
     args = (96, 8, dtypes.fp8, dtypes.fp8, True, False, 1, CP_WORLD_SIZE, True, True)
@@ -580,7 +601,7 @@ def test_planner_fold_agreement():
 @requires_gpu
 def test_default_metadata_info_sizes_96_heads_for_the_fold(monkeypatch):
     # Without the opt-in the buffers are main's: no qo tile per token for qlen 7/8.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
     for bs, msq in itertools.product((1, 56), (7, 8)):
@@ -606,7 +627,7 @@ def test_metadata_info_sizes_96_heads_for_both_plans():
     # and 6 one-tile pseudo-batches without it. get_mla_metadata_info_v1 cannot
     # tell which, so it sizes for both, and no more: mla_decode_fwd's fp32 logits
     # grow with these buffers.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     for bs, msq in itertools.product((1, 56), (7, 8)):
         info = aiter.get_mla_metadata_info_v1(
@@ -721,7 +742,7 @@ def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
     # DCP verify of a DSpark block-7 draft) on the asm route and, with
     # AITER_MLA_USE_OPUS=1, on the OPUS a8w8 k32mx4 route; the shape tests above
     # only check that it launches.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     if backend is MlaBackend.OPUS:
         monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
@@ -759,7 +780,7 @@ def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
 def test_default_96_head_cprr_decode_takes_the_fold(monkeypatch, backend):
     # Without the opt-in, round-robin CP at qlen 7 and 8 runs main's folded path
     # (planned with or without is_cp_round_robin) and matches the reference.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     monkeypatch.delenv("AITER_MLA_NATIVE_96H_CP", raising=False)
     if backend is MlaBackend.OPUS:
@@ -791,7 +812,7 @@ def test_decode_follows_the_planned_cp_mode(monkeypatch):
     # 96 fp8 heads at qlen 8 run natively under round-robin CP and folded without
     # it. mla_decode_fwd runs the head plan get_mla_metadata_v1 recorded, and
     # refuses a launch where the recorded plan is unknown or cannot run.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     folds = []
     fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
@@ -984,7 +1005,7 @@ def test_decode_update_rejects_cp_metadata_only_where_cp_changes_the_head_plan()
     # rewrite a native plan as the fold. Other CP metadata updates as before.
     bs, qd = 2, dtypes.fp8
     shapes = ((96, 8), (96, 6), (128, 8))
-    if get_gfx() == "gfx950":
+    if get_gfx_runtime() == "gfx950":
         assert [_cp_changes_head_fold(n, msq) for n, msq in shapes] == [
             True,
             False,
@@ -1025,7 +1046,7 @@ def test_decode_keeps_the_planned_opt_in_after_a_toggle(monkeypatch, planned_nat
     # get_mla_metadata_v1 plans 96 fp8 heads at qlen 7 and 8 under round-robin CP
     # natively or folded by AITER_MLA_NATIVE_96H_CP at planning time; toggling it
     # before decode must not run the other head plan on those descriptors.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     folds = []
     fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
@@ -1057,7 +1078,7 @@ def test_decode_update_keeps_the_planned_opt_in_after_a_toggle(
     # planned natively it must refuse even once the opt-in is cleared; on CP
     # metadata planned folded it must update as without the opt-in, even once it
     # is set.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     bs, n, qd = 2, 96, dtypes.fp8
 
@@ -1131,7 +1152,7 @@ def test_unrecorded_clone_fails_closed_after_the_opt_in_is_cleared(monkeypatch):
     # A clone has no record of the opt-in. Planned natively under round-robin CP
     # and then decoded or updated with the opt-in cleared, it must not run or
     # write the fold on native metadata: both refuse it.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     cp_rank = 3
     for msq in (7, 8):
@@ -1162,7 +1183,7 @@ def test_recorded_metadata_keeps_its_plan_after_the_opt_in_is_cleared(
     # The same toggle on the planned tensor, a view or a deep copy: they carry the
     # record, so decode runs the native plan and the update refuses it as CP
     # metadata (not as a clone).
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     folds = []
     fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
@@ -1198,7 +1219,7 @@ def test_default_unrecorded_clone_decodes_and_updates():
     # the tests above set it) keeps main's behaviour for a clone: under
     # round-robin CP, 96 fp8 heads at qlen 7 and 8 fold either way, so decode runs
     # the fold and the update rewrites it.
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
     assert not attention._mla_native_96h_cp_ever_planned
     cp_rank = 3
@@ -1294,7 +1315,7 @@ def test_decode_opus_needs_v_head_dim_512(monkeypatch):
 def test_decode_non_persistent_asm_needs_v_head_dim_512():
     # Non-persistent decode runs the same mla_decode_stage1_asm_fwd, which rejects
     # an output head dim other than 512, so v_head_dim 128 fails there too.
-    run = aiter.get_gfx() == "gfx950"
+    run = get_gfx_runtime() == "gfx950"
     for d in ("bf16", "fp8"):
         for v_dim, ok in ((128, False), (KV_LORA_RANK, True)):
             s = get_mla_decode_shape_support(

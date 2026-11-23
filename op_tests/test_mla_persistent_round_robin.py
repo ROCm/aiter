@@ -24,17 +24,14 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-torch.set_default_device("cuda")
-torch.set_printoptions(sci_mode=False)
 
 
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    return get_gfx() == "gfx950"
+    return get_gfx_runtime() == "gfx950"
 
 
 def cal_diff(
@@ -654,187 +651,195 @@ def test_mla_cp(
     return ret
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="round-robin context-parallel MLA decode test",
-)
-parser.add_argument(
-    "-k",
-    "--kv_lora_rank",
-    type=int,
-    default=512,
-    help="""kv lora rank.
+def main():
+    torch.set_default_device("cuda")
+    torch.set_printoptions(sci_mode=False)
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="round-robin context-parallel MLA decode test",
+    )
+    parser.add_argument(
+        "-k",
+        "--kv_lora_rank",
+        type=int,
+        default=512,
+        help="""kv lora rank.
     e.g.: -k 512""",
-)
-parser.add_argument(
-    "-qr",
-    "--qk_rope_head_dim",
-    type=int,
-    default=64,
-    help="""qk rope head dim.
+    )
+    parser.add_argument(
+        "-qr",
+        "--qk_rope_head_dim",
+        type=int,
+        default=64,
+        help="""qk rope head dim.
     e.g.: -qr 64""",
-)
-parser.add_argument(
-    "-vh",
-    "--v_head_dim",
-    type=int,
-    default=512,
-    help="""v head dim.
+    )
+    parser.add_argument(
+        "-vh",
+        "--v_head_dim",
+        type=int,
+        default=512,
+        help="""v head dim.
     e.g.: -vh 512""",
-)
-parser.add_argument(
-    "-blk",
-    "--block_size",
-    type=int,
-    default=1,
-    help="""Block size (round-robin requires 1).
+    )
+    parser.add_argument(
+        "-blk",
+        "--block_size",
+        type=int,
+        default=1,
+        help="""Block size (round-robin requires 1).
     e.g.: -blk 1""",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    nargs="*",
-    default=[dtypes.d_dtypes["bf16"]],
-    metavar="{bf16, fp8}",
-    help="""Data type of Q.
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+        nargs="*",
+        default=[dtypes.d_dtypes["bf16"]],
+        metavar="{bf16, fp8}",
+        help="""Data type of Q.
     e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-kvd",
-    "--kv_dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    nargs="*",
-    metavar="{bf16, fp8}",
-    default=[dtypes.d_dtypes["bf16"]],
-    help="""Data type of KV.
+    )
+    parser.add_argument(
+        "-kvd",
+        "--kv_dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+        nargs="*",
+        metavar="{bf16, fp8}",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="""Data type of KV.
     e.g.: -kvd bf16""",
-)
-parser.add_argument(
-    "-c",
-    "--ctxLen",
-    type=int,
-    nargs="*",
-    default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192],
-    help="""Context length (global KV length).
+    )
+    parser.add_argument(
+        "-c",
+        "--ctxLen",
+        type=int,
+        nargs="*",
+        default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192],
+        help="""Context length (global KV length).
     e.g.: -c 13""",
-)
-parser.add_argument(
-    "-b",
-    "--batchSize",
-    type=int,
-    nargs="*",
-    default=[1, 10, 32, 64, 128],
-    help="""Batch size.
+    )
+    parser.add_argument(
+        "-b",
+        "--batchSize",
+        type=int,
+        nargs="*",
+        default=[1, 10, 32, 64, 128],
+        help="""Batch size.
     e.g.: -b 1""",
-)
-parser.add_argument(
-    "-n",
-    "--nhead",
-    type=dtypes.str2tuple,
-    nargs="*",
-    const=None,
-    default=[
-        (16, 4),
-        (32, 3),
-        (64, 1),
-        (64, 2),
-        (128, 2),
-        (16, 8),
-        (96, 7),
-        (96, 8),
-        (64, 17),
-    ],
-    help="""Number of heads, decode_qlen pairs.
+    )
+    parser.add_argument(
+        "-n",
+        "--nhead",
+        type=dtypes.str2tuple,
+        nargs="*",
+        const=None,
+        default=[
+            (16, 4),
+            (32, 3),
+            (64, 1),
+            (64, 2),
+            (128, 2),
+            (16, 8),
+            (96, 7),
+            (96, 8),
+            (64, 17),
+        ],
+        help="""Number of heads, decode_qlen pairs.
     e.g.: -n 16,4""",
-)
-parser.add_argument(
-    "-ms",
-    "--max_split_per_batch",
-    type=int,
-    nargs="*",
-    default=[32],
-    help="""kv seqlens max split num for per batch.
+    )
+    parser.add_argument(
+        "-ms",
+        "--max_split_per_batch",
+        type=int,
+        nargs="*",
+        default=[32],
+        help="""kv seqlens max split num for per batch.
     e.g.: -ms 32""",
-)
-parser.add_argument(
-    "--varlen",
-    action="store_true",
-    help="""variable kv seqlens per batch. Default: False.
+    )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
-)
-parser.add_argument(
-    "-cp",
-    "--cp_round_robin",
-    action="store_true",
-    help="""accepted for backward compatibility; this file always runs the
+    )
+    parser.add_argument(
+        "-cp",
+        "--cp_round_robin",
+        action="store_true",
+        help="""accepted for backward compatibility; this file always runs the
     round-robin CP test.""",
-)
-parser.add_argument(
-    "-cpw",
-    "--cp_world_size",
-    type=int,
-    nargs="*",
-    default=[2, 3, 4, 7, 8],
-    help="""cp world size (number of round-robin ranks).
+    )
+    parser.add_argument(
+        "-cpw",
+        "--cp_world_size",
+        type=int,
+        nargs="*",
+        default=[2, 3, 4, 7, 8],
+        help="""cp world size (number of round-robin ranks).
     e.g.: -cpw 4""",
-)
-parser.add_argument(
-    "-lse",
-    "--return_lse",
-    action="store_true",
-    help="""also compare LSE results (per-rank cp_ref vs aiter, and golden vs
+    )
+    parser.add_argument(
+        "-lse",
+        "--return_lse",
+        action="store_true",
+        help="""also compare LSE results (per-rank cp_ref vs aiter, and golden vs
     aiter_merge). Default: False.
     --lse # True""",
-)
+    )
 
-args = parser.parse_args()
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for (
-        dtype,
-        kvtype,
-        ctx_len,
-        batch_size,
-        max_split_per_batch,
-        cp_world_size,
-    ) in itertools.product(
-        args.dtype,
-        args.kv_dtype,
-        args.ctxLen,
-        args.batchSize,
-        args.max_split_per_batch,
-        args.cp_world_size,
-    ):
-        if dtype == dtypes.bf16 and kvtype == dtypes.fp8:
-            # bf16 Q with fp8 KV has no round-robin CP kernel variant.
-            continue
-        if not check_support(dtype, kvtype, nhead):
-            continue
-        if ctx_len < cp_world_size:
-            continue
-        ret = test_mla_cp(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
+    args = parser.parse_args()
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for (
             dtype,
             kvtype,
-            page_size=args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-            cp_world_size=cp_world_size,
-            max_split_per_batch=max_split_per_batch,
-            return_lse=args.return_lse,
-        )
-        df.append(ret)
-    if df:
-        df = pd.DataFrame(df)
-        df_md = df.to_markdown(index=False)
-        aiter.logger.info(
-            "mla_persistent CP round-robin summary (markdown):\n%s", df_md
-        )
+            ctx_len,
+            batch_size,
+            max_split_per_batch,
+            cp_world_size,
+        ) in itertools.product(
+            args.dtype,
+            args.kv_dtype,
+            args.ctxLen,
+            args.batchSize,
+            args.max_split_per_batch,
+            args.cp_world_size,
+        ):
+            if dtype == dtypes.bf16 and kvtype == dtypes.fp8:
+                # bf16 Q with fp8 KV has no round-robin CP kernel variant.
+                continue
+            if not check_support(dtype, kvtype, nhead):
+                continue
+            if ctx_len < cp_world_size:
+                continue
+            ret = test_mla_cp(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                page_size=args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                cp_world_size=cp_world_size,
+                max_split_per_batch=max_split_per_batch,
+                return_lse=args.return_lse,
+            )
+            df.append(ret)
+        if df:
+            df = pd.DataFrame(df)
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info(
+                "mla_persistent CP round-robin summary (markdown):\n%s", df_md
+            )
+
+
+if __name__ == "__main__":
+    main()

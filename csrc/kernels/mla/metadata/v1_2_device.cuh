@@ -83,19 +83,20 @@ mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32
 
 template <typename Traits>
 __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
-                                                        QoState<Traits>& qo_state,
-                                                        const int32_t batch_idx)
+                                                        const int32_t seqlen_qo)
 {
     if constexpr(Traits::kQoSplits)
     {
-        const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
+        // An empty request (graph padding) still needs one tile; zero tiles never advance the
+        // planner past it.
         if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
         {
-            return seqlen_qo;
+            return max(seqlen_qo, 1);
         }
         const int32_t packed_qo_len = seqlen_qo * params.num_heads;
-        return integer_divide_ceil_power2(
-            packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
+        return max(integer_divide_ceil_power2(
+                       packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2),
+                   1);
     }
     else
     {
@@ -134,9 +135,21 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
                 params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         }
 
+        int32_t seqlen_qo;
+        if constexpr(QoState<Traits>::is_unique())
+        {
+            seqlen_qo = qo_state.get_seqlen(bid);
+        }
+        else
+        {
+            seqlen_qo =
+                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+            p_lds_seqlens_qo[bid] = seqlen_qo;
+        }
+
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
+        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
         const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
         sum_blocks += unit_blocks * num_qo_tiles;
     }
@@ -173,7 +186,7 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     // LDS, which is what lets one build serve gfx942's 64 KiB and gfx950's 160.
     const int32_t kBatchChunk = (kStaticChunk > 0) ? kStaticChunk : params.batch_chunk;
 
-    int32_t* p_lds_scalars        = p_lds_after;
+    int32_t* p_lds_scalars = p_lds_after;
     // Five slots for the scan state carried between chunks. They must sit
     // inside the reserved scalar block: writing past index 2 would land on
     // p_lds_start_cu and silently corrupt the chunk's own prefix.
@@ -184,8 +197,11 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     int32_t* p_lds_reduce_before  = p_lds_works_before + kBatchChunk;
     int32_t* p_lds_partial_before = p_lds_reduce_before + kBatchChunk;
 
-    QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     ori_seqlen_qo,
+                     params.qk_batch_ratio,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -220,7 +236,6 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
             params.p_work_metadata_ptrs[1] =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_work_info_set));
             p_lds_scalars[0] = payload;
-
         }
     }
 
@@ -259,11 +274,11 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
         // Phase 1 for this chunk (warp 0, lane 0): record the per-batch prefix.
         if(warp_id == 0 && lane_idx == 0)
         {
-            int32_t curr_cu             = scan_curr_cu;
-            int32_t remain_payload      = scan_remain_payload;
-            int32_t num_works           = scan_num_works;
-            int32_t last_reduce_indptr  = scan_reduce_indptr;
-            int32_t partial_idx         = scan_partial_idx;
+            int32_t curr_cu            = scan_curr_cu;
+            int32_t remain_payload     = scan_remain_payload;
+            int32_t num_works          = scan_num_works;
+            int32_t last_reduce_indptr = scan_reduce_indptr;
+            int32_t partial_idx        = scan_partial_idx;
             for(int32_t bid = chunk_lo; bid < chunk_hi; ++bid)
             {
                 p_lds_start_cu[bid - chunk_lo]       = curr_cu;
@@ -390,7 +405,8 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
 
             // Each fragment -> one work covering kv blocks [block_begin, block_end)
             // of this batch, landing in CU frag_cu.
-            for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
+            for(int32_t frag_idx = lane_idx; frag_idx < num_frags;
+                frag_idx += opus::get_warp_size())
             {
                 int32_t block_begin, block_end, frag_cu;
                 if(fits_current_cu)
@@ -411,9 +427,9 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                 else
                 {
                     block_begin = frag_idx * blocks_per_cu;
-                    block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
-                                                                   : num_kv_blocks;
-                    frag_cu     = start_cu + 1 + frag_idx;
+                    block_end = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
+                                                                 : num_kv_blocks;
+                    frag_cu   = start_cu + 1 + frag_idx;
                 }
 
                 const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
@@ -513,8 +529,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
 
-    QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     ori_seqlen_qo,
+                     params.qk_batch_ratio,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr);
 
     const int32_t lane_idx = opus::lane_id();
 
@@ -562,9 +581,9 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         int32_t remain_payload = payload;
         while(curr_batch < num_batches)
         {
-            const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, curr_batch);
-            const int32_t qo_tile_size =
-                integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+            const int32_t seqlen_qo     = qo_state.get_seqlen(curr_batch);
+            const int32_t num_qo_tiles  = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
+            const int32_t qo_tile_size  = integer_divide_ceil(seqlen_qo, num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -909,8 +928,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_j0          = p_lds_lane_works + num_xcd;
     int32_t* p_lds_wb          = p_lds_j0 + num_xcd * (rows + 1);
 
-    QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     params.ori_seqlen_qo,
+                     params.qk_batch_ratio,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -922,10 +944,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                                   num_batches,
                                                                   lane_idx);
 
+    const int32_t seqlen_qo0 = (num_batches > 0) ? qo_state.get_seqlen(0) : 0;
     const int32_t qo_tiles =
-        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, qo_state, 0) : 1;
-    const int32_t qo_tile_size =
-        (num_batches > 0) ? integer_divide_ceil(qo_state.get_seqlen(0), qo_tiles) : 1;
+        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, seqlen_qo0) : 1;
+    const int32_t qo_tile_size = (num_batches > 0) ? integer_divide_ceil(seqlen_qo0, qo_tiles) : 1;
 
     // kv blocks of a batch, and the extent the fragments are cut out of
     auto kv_len_of = [&](const int32_t bid) -> int32_t {
@@ -1357,14 +1379,15 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     const bool native_96h_cp = std::getenv("AITER_MLA_NATIVE_96H_CP") != nullptr &&
                                std::atoi(std::getenv("AITER_MLA_NATIVE_96H_CP")) != 0;
 
-    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_2(arch_id,
-                                                                  num_heads,
-                                                                  max_seqlen_qo,
-                                                                  q_dtype,
-                                                                  kv_dtype,
-                                                                  page_size,
-                                                                  is_cp_round_robin,
-                                                                  {enable_experimental, flydsl_ps1, native_96h_cp});
+    const MlaDecodeHeadPlan head_plan =
+        mla_decode_head_plan_v1_2(arch_id,
+                                  num_heads,
+                                  max_seqlen_qo,
+                                  q_dtype,
+                                  kv_dtype,
+                                  page_size,
+                                  is_cp_round_robin,
+                                  {enable_experimental, flydsl_ps1, native_96h_cp});
     const bool natively_supported = head_plan.natively_supported;
 
     qk_batch_ratio = head_plan.qk_batch_ratio;
