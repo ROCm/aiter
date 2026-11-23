@@ -13,7 +13,8 @@ W_SCALE_BK), repeated over each block in registers. Port of the MXFP4 kernel
 pipelines and opt-in keys: TDM ring with CTA-cluster multicast, NUM_KSUB (1, or 2 with
 BLOCK_SIZE_K >= 256), GROUP_M, B2B_WMMA, EPI_SPLIT. The input layouts are selected by
 the wrapper (gemm_afp8wfp8_preshuffle): SCALE_MODE (scale layout) and A_DATA_PRESHUFFLE
-(A from shuffle_weight), available in both pipelines.
+(A from shuffle_weight), available in both pipelines. With C_SCALE_GROUP = 128, C is fp8
+e4m3 with one e8m0 scale per 1x128 block (the batched wrapper's fp8 output).
 
 ``_gemm_mxfp8_block128_preshuffle_{bandwidth,compute}_bound_kernel`` are the block128
 variant, the gluon backend of gemm_afp8wfp8_block128_preshuffle: e4m3 X and W, 1x32 or
@@ -1787,6 +1788,7 @@ def get_gemm_afp8wfp8_preshuffle_layouts(
     a_scale_group=32,
     w_scale_block=(1, 32),
     a_scale_rowmajor=False,
+    c_elem_bytes=2,
 ):
     # Building the layouts costs ~1 ms of Python per call and depends only on
     # these ints: build once per config, return a copy (callers may mutate it).
@@ -1804,6 +1806,7 @@ def get_gemm_afp8wfp8_preshuffle_layouts(
             a_scale_group,
             tuple(w_scale_block),
             bool(a_scale_rowmajor),
+            c_elem_bytes,
         )
     )
 
@@ -1822,6 +1825,7 @@ def _build_gemm_afp8wfp8_preshuffle_layouts(
     a_scale_group=32,
     w_scale_block=(1, 32),
     a_scale_rowmajor=False,
+    c_elem_bytes=2,
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
     CTAS_M, CTAS_N = cluster_shape(num_ctas, BLOCK_M, BLOCK_N)
@@ -1925,9 +1929,10 @@ def _build_gemm_afp8wfp8_preshuffle_layouts(
             vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=cga_b
         )
 
-    # Output staging layout for the TDM store (acc -> LDS -> HBM)
+    # Output staging layout for the TDM store (acc -> LDS -> HBM), 16 B row padding
+    C_PAD = 16 // c_elem_bytes
     shared_C = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N // CTAS_N, 8]], [BLOCK_M, BLOCK_N], [1, 0], cga_layout
+        [[BLOCK_N // CTAS_N, C_PAD]], [BLOCK_M, BLOCK_N], [1, 0], cga_layout
     )
 
     # Register layouts for WMMA scale operands
@@ -1951,7 +1956,7 @@ def _build_gemm_afp8wfp8_preshuffle_layouts(
     # slice view [CTAS_N, BLOCK_M, Q]: the per-CTA size-1 dim must be outermost for TDM
     cga3 = [[bn, bm, 0] for bm, bn in cga_layout]
     shared_C_epi = gl.PaddedSharedLayout.with_identity_for(
-        [[Q, 8]], [CTAS_N, BLOCK_M, Q], [2, 1, 0], cga3
+        [[Q, C_PAD]], [CTAS_N, BLOCK_M, Q], [2, 1, 0], cga3
     )
 
     layouts = {}
@@ -2291,6 +2296,35 @@ def _split_n(x, AXIS: gl.constexpr, CTAS_N: gl.constexpr):
 
 
 @gluon.jit
+def _quant_c_1x128(acc):
+    # Quantize acc [R, C] to fp8 e4m3 with one e8m0 scale for each 1x128 block. Round to
+    # bf16 first, so that the bytes are the same as per_group_quant_hip on a bf16 C.
+    R: gl.constexpr = acc.shape[0]
+    C: gl.constexpr = acc.shape[1]
+    x = acc.to(gl.bfloat16).to(gl.float32).reshape([R, C // 128, 128])
+    # scale = 2^ceil(log2(amax / 448)), as in the HIP quant (mx_e8m0_scale rounds
+    # differently). The cap gives an inf block a finite scale.
+    amax = gl.minimum(gl.maximum(gl.max(gl.abs(x), axis=2), 1e-10), 448.0 * 2.0**119)
+    bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+    e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+    inv = ((254 - e) << 23).to(gl.float32, bitcast=True)  # 2^(127 - e), exact
+    q = (x * gl.expand_dims(inv, 2)).to(gl.float8e4nv)
+    return q.reshape([R, C]), e.to(gl.uint8)
+
+
+@gluon.jit
+def _store_c_scales(cs, c_scale_ptr, off_m, grp, M, N, stride_cs_m, stride_cs_n):
+    # Store cs [R, G], the scales of rows off_m + [0, R) and of C scale groups grp.
+    R: gl.constexpr = cs.shape[0]
+    rows = off_m + gl.arange(0, R, layout=gl.SliceLayout(1, cs.type.layout))
+    offs = gl.expand_dims(rows.to(gl.int64) * stride_cs_m, 1) + gl.expand_dims(
+        grp.to(gl.int64) * stride_cs_n, 0
+    )
+    mask = gl.expand_dims(rows < M, 1) & gl.expand_dims(grp < N // 128, 0)
+    gl.store(c_scale_ptr + offs, cs, mask=mask)
+
+
+@gluon.jit
 def _epi_slice(
     acc_s,
     cur_A,
@@ -2309,6 +2343,13 @@ def _epi_slice(
     b_scale_layout_epi: gl.constexpr,
     A_FMT: gl.constexpr = "e4m3",
     B_FMT: gl.constexpr = "e4m3",
+    C_SCALE_GROUP: gl.constexpr = 0,
+    c_scale_ptr=None,
+    stride_cs_m=0,
+    stride_cs_n=0,
+    M=0,
+    N=0,
+    BNc: gl.constexpr = 0,
 ):
     # last WMMA of slice s, then hand the slice to the TDM engine right away
     acc_s = gl.convert_layout(acc_s, wmma_acc_layout, assert_trivial=True)
@@ -2327,10 +2368,18 @@ def _epi_slice(
         )
     acc_s = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, A_FMT, b_s, bs_s, B_FMT, acc_s)
     BM: gl.constexpr = acc_s.shape[0]
-    c_bufs.index(s).store(
-        acc_s.to(c_bufs.dtype).reshape([BM, CTAS_N, Q]).permute((1, 0, 2))
-    )
+    if C_SCALE_GROUP:
+        c_s, cs = _quant_c_1x128(acc_s)
+    else:
+        c_s = acc_s.to(c_bufs.dtype)
+    c_bufs.index(s).store(c_s.reshape([BM, CTAS_N, Q]).permute((1, 0, 2)))
     gl.amd.gfx1250.tdm.async_store(c3_desc, [off_n3, off_m, s * Q], c_bufs.index(s))
+    if C_SCALE_GROUP:
+        # Scale group k is block k % QG of slice s in CTA k // QG of the cluster.
+        QG: gl.constexpr = Q // 128
+        k = gl.arange(0, CTAS_N * QG, layout=gl.SliceLayout(0, cs.type.layout))
+        grp = (off_n3 + k // QG) * (BNc // 128) + s * QG + k % QG
+        _store_c_scales(cs, c_scale_ptr, off_m, grp, M, N, stride_cs_m, stride_cs_n)
 
 
 @gluon.jit
@@ -2357,10 +2406,16 @@ def _sliced_final_wmma_store(
     shared_C_epi: gl.constexpr,
     A_FMT: gl.constexpr = "e4m3",
     B_FMT: gl.constexpr = "e4m3",
+    C_SCALE_GROUP: gl.constexpr = 0,
+    c_scale_ptr=None,
+    stride_cs_m=0,
+    stride_cs_n=0,
 ):
     gl.static_assert(EPI_SPLIT == 2 or EPI_SPLIT == 4)
     BNc: gl.constexpr = BLOCK_SIZE_N // CTAS_N
     Q: gl.constexpr = BNc // EPI_SPLIT
+    # a slice must hold whole 1x128 scale blocks
+    gl.static_assert(C_SCALE_GROUP == 0 or Q % 128 == 0)
     c_bufs = gl.allocate_shared_memory(
         c_ptr.type.element_ty, [EPI_SPLIT, CTAS_N, BLOCK_SIZE_M, Q], layout=shared_C_epi
     )
@@ -2378,8 +2433,8 @@ def _sliced_final_wmma_store(
     b0, b1 = _split_n(cur_B, 1, CTAS_N)
     s0, s1 = _split_n(cur_BS, 0, CTAS_N)
     if EPI_SPLIT == 2:
-        _epi_slice(a0, cur_A, cur_AS, b0, s0, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
-        _epi_slice(a1, cur_A, cur_AS, b1, s1, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
+        _epi_slice(a0, cur_A, cur_AS, b0, s0, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
+        _epi_slice(a1, cur_A, cur_AS, b1, s1, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
     else:
         # second split: halves of each half (CTAS_N * 2 groups of BNc / 2)
         a00, a01 = _split_n(a0, 1, CTAS_N)
@@ -2388,10 +2443,10 @@ def _sliced_final_wmma_store(
         b10, b11 = _split_n(b1, 1, CTAS_N)
         s00, s01 = _split_n(s0, 0, CTAS_N)
         s10, s11 = _split_n(s1, 0, CTAS_N)
-        _epi_slice(a00, cur_A, cur_AS, b00, s00, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
-        _epi_slice(a01, cur_A, cur_AS, b01, s01, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
-        _epi_slice(a10, cur_A, cur_AS, b10, s10, c_bufs, c3_desc, 2, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
-        _epi_slice(a11, cur_A, cur_AS, b11, s11, c_bufs, c3_desc, 3, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT)  # fmt: skip
+        _epi_slice(a00, cur_A, cur_AS, b00, s00, c_bufs, c3_desc, 0, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
+        _epi_slice(a01, cur_A, cur_AS, b01, s01, c_bufs, c3_desc, 1, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
+        _epi_slice(a10, cur_A, cur_AS, b10, s10, c_bufs, c3_desc, 2, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
+        _epi_slice(a11, cur_A, cur_AS, b11, s11, c_bufs, c3_desc, 3, off_m, off_n3, Q, CTAS_N, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n, M, N, BNc)  # fmt: skip
 
 
 _gemm_mxfp8_preshuffle_repr = make_kernel_repr(
@@ -2403,6 +2458,7 @@ _gemm_mxfp8_preshuffle_repr = make_kernel_repr(
         "num_warps",
         "NUM_BUFFERS",
         "num_ctas",
+        "C_SCALE_GROUP",
     ],
 )
 
@@ -2468,6 +2524,12 @@ def _gemm_mxfp8_preshuffle_kernel(
     BATCHED: gl.constexpr = 0,
     A_SCALE_ROWMAJOR: gl.constexpr = 0,
     A_SCALE_K_COLS: gl.constexpr = 1,
+    # 128: C is fp8 e4m3 with one e8m0 scale per 1x128 block, at c_scale_ptr
+    C_SCALE_GROUP: gl.constexpr = 0,
+    c_scale_ptr=None,
+    stride_cs_m=0,
+    stride_cs_n=0,
+    stride_csb=0,
 ):
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
@@ -2534,6 +2596,9 @@ def _gemm_mxfp8_preshuffle_kernel(
     gl.static_assert(K_GROUPS % SCALE_KWIDTH == 0)  # K_GROUPS divisible by SCALE_KWIDTH
     gl.static_assert((BLOCK_SIZE_M // CTAS_M) % A_PRESHUFFLE_FACTOR == 0)
     gl.static_assert((BLOCK_SIZE_N // CTAS_N) % PRESHUFFLE_FACTOR == 0)
+    gl.static_assert(C_SCALE_GROUP == 0 or C_SCALE_GROUP == 128)
+    # a 1x128 scale block of C must not span two CTAs
+    gl.static_assert(C_SCALE_GROUP == 0 or (BLOCK_SIZE_N // CTAS_N) % 128 == 0)
 
     if B2B_WMMA:
         # back-to-back WMMA scheduling (HW_REG_WAVE_SCHED_MODE bit 2), as in archGEMM
@@ -2554,6 +2619,8 @@ def _gemm_mxfp8_preshuffle_kernel(
         c_ptr = c_ptr + bid * stride_cb
         a_scale_ptr = a_scale_ptr + bid * stride_asb
         b_scale_ptr = b_scale_ptr + bid * stride_bsb
+        if C_SCALE_GROUP:
+            c_scale_ptr = c_scale_ptr + bid * stride_csb
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -2872,7 +2939,7 @@ def _gemm_mxfp8_preshuffle_kernel(
             # the sliced store waits on the TDM counter: keep it out of the arrive->wait window
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.wait()
-            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi, A_FMT, B_FMT)  # fmt: skip
+            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n)  # fmt: skip
         else:
             acc = gl.amd.gfx1250.wmma_scaled(
                 cur_A, cur_AS, A_FMT, cur_B, cur_BS, B_FMT, acc
@@ -2981,7 +3048,7 @@ def _gemm_mxfp8_preshuffle_kernel(
             # last WMMA in slices, each slice's TDM store issued as soon as it is done. It must
             # sit outside an arrive->wait window: the store path waits on the TDM counter, and a
             # CTA stalled on it inside the window can hang the GPU.
-            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi, A_FMT, B_FMT)  # fmt: skip
+            _sliced_final_wmma_store(acc, cur_A, cur_AS, cur_B, cur_BS, c_ptr, M, N, stride_c_m, stride_c_n, tile_m, tile_n, BLOCK_SIZE_M, BLOCK_SIZE_N, CTAS_N, EPI_SPLIT, wmma_acc_layout, dot_b_layout, b_scale_layout_epi, shared_C_epi, A_FMT, B_FMT, C_SCALE_GROUP, c_scale_ptr, stride_cs_m, stride_cs_n)  # fmt: skip
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
@@ -3004,10 +3071,29 @@ def _gemm_mxfp8_preshuffle_kernel(
             layout=shared_C,
         )
 
-        c_buffer.store(acc.to(c_ptr.type.element_ty))
+        if C_SCALE_GROUP:
+            c_val, cs = _quant_c_1x128(acc)
+        else:
+            c_val = acc.to(c_ptr.type.element_ty)
+        c_buffer.store(c_val)
 
         gl.amd.gfx1250.tdm.async_store(
             c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer
         )
+        if C_SCALE_GROUP:
+            k = gl.arange(
+                0, BLOCK_SIZE_N // 128, layout=gl.SliceLayout(0, cs.type.layout)
+            )
+            grp = tile_n * (BLOCK_SIZE_N // 128) + k
+            _store_c_scales(
+                cs,
+                c_scale_ptr,
+                tile_m * BLOCK_SIZE_M,
+                grp,
+                M,
+                N,
+                stride_cs_m,
+                stride_cs_n,
+            )
 
     gl.amd.gfx1250.tdm.async_wait(0)
