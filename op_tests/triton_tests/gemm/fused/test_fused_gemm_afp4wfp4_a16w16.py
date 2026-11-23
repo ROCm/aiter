@@ -19,6 +19,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_fp4,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def run_torch(
@@ -71,19 +72,7 @@ def run_triton(
     )
 
 
-def get_x_vals():
-
-    x_vals = [
-        (m, n1, n2, k)
-        for k in [1024, 8192, 7168]
-        for n2 in [256, 512]
-        for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
-    ]
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N1, N2, K", get_x_vals())
+@pytest.mark.parametrize("M, N1, N2, K", get_shapes(k_mult=256, n2=[256, 512]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
@@ -92,6 +81,12 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if fp4_shuffle and N1 % 16 != 0:
+        pytest.skip("Shuffled weight needs N1 % 16 == 0")
+    if fp4_shuffle and 16 < M < 32:
+        pytest.skip(
+            "Shuffled path needs BLOCK_SIZE_M <= 16 for M < 32, which the config does not give"
+        )
     torch.manual_seed(0)
 
     (

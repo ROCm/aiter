@@ -27,9 +27,16 @@ def _out_hw(H, W, R, S, stride, padding, dilation):
     return P, Q
 
 
+def _validate_conv2d_devices(x, w_oihw, bias=None):
+    """Require input, weight, and optional bias on one CUDA/ROCm device."""
+    if not x.is_cuda:
+        raise ValueError("conv2d input must be a CUDA/ROCm tensor")
+    if w_oihw.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("conv2d input, weight, and bias must be on the same device")
+
+
 def _conv_dims(x, w_oihw, stride, padding, dilation):
     """Shared wrapper preamble: validate inputs and return the conv dimensions."""
-    assert x.is_cuda and w_oihw.is_cuda
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -127,6 +134,41 @@ def _normalize_conv2d_params(stride, padding, dilation):
         _normalize_tuple(padding, 2, "padding", allow_zero=True),
         _normalize_tuple(dilation, 2, "dilation"),
     )
+
+
+def _validate_conv2d_padding_mode(
+    padding_mode: str, height: int, width: int, padding: tuple[int, int]
+) -> None:
+    """Validate the mode and spatial limits after non-negative normalization."""
+    modes = ("zeros", "reflect", "replicate", "circular")
+    if padding_mode not in modes:
+        raise ValueError(f"padding_mode must be one of {modes}, got {padding_mode!r}")
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"input spatial dimensions must be positive, got {(height, width)}"
+        )
+
+    pad_height, pad_width = padding
+    if padding_mode == "reflect" and (pad_height >= height or pad_width >= width):
+        raise ValueError(
+            "reflect padding must be less than each input spatial dimension, "
+            f"got padding={padding} for input {(height, width)}"
+        )
+    if padding_mode == "circular" and (pad_height > height or pad_width > width):
+        raise ValueError(
+            "circular padding must not exceed each input spatial dimension, "
+            f"got padding={padding} for input {(height, width)}"
+        )
+
+
+def _conv2d_padding_geometry(
+    height: int, width: int, padding: tuple[int, int], padding_mode: str
+) -> tuple[int, int, tuple[int, int]]:
+    """Return effective dimensions and kernel padding for normalized, valid inputs."""
+    if padding_mode == "zeros" or padding == (0, 0):
+        return height, width, padding
+    pad_height, pad_width = padding
+    return height + 2 * pad_height, width + 2 * pad_width, (0, 0)
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4/6/8 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense BF16 and MXFP4/6/8 on
+  GFX950.
 - BF16 BSHD output.
 - Dense, sorted block-sparse, and Sol-Attn inference.
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
@@ -20,7 +21,10 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
   format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
   nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
   mixed recipes.
-- No backward, dropout, RNG state, causal, or Q-side varlen support yet.
+- Whole documents in THD via `cu_seqlens`, causal or not, for all-BF16 operands at head dimension
+  256 on GFX950: Q `[total, Hq, 256]` and K/V `[total, Hkv, 256]` for any `Hq % Hkv == 0`, one
+  `cu_seqlens` for Q and K. Token offsets are 64-bit, so a pack may exceed 4 GiB.
+- No backward, dropout, RNG state, BSHD causal mask, or separate Q and K document lengths yet.
 
 Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
 same V packing and scale modes, and every Sol-Attn row uses that packing too.
@@ -42,8 +46,9 @@ GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-At
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
-Head dimension 256 exists only for all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands, dense, on
-GFX950. Every other recipe, sorted sparse, and GFX942 reject it.
+Head dimension 256 exists only for all-BF16, all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands,
+dense, on GFX950. Every other recipe, sorted sparse, and GFX942 reject it. All-BF16 also has the
+THD rows there, which exist at no other head dimension.
 
 ## Ownership
 
@@ -127,6 +132,28 @@ Formats and scale modes are independent manifest dimensions. Tensor dtype, shape
 storage validate a selected row; they never select one. Omitting raw scale modes selects the
 canonical recipe from `scale_modes_for_formats()`; supplying them requires all three modes and
 selects another explicitly supported recipe such as MXFP8.
+
+Pass `cu_seqlens` to `mha_v4` for documents concatenated along the token axis (THD):
+
+```python
+output, lse = mha_v4(
+    query,  # [total_tokens, Hq, 256]
+    key,  # [total_tokens, Hkv, 256]
+    value,
+    *(AttentionFormat.BF16,) * 3,
+    cu_seqlens=cu_seqlens,  # int32 [batch + 1], shared by Q and K
+    max_seqlen=max_seqlen,  # the longest document
+    causal=True,
+    return_lse=True,  # [Hq, total_tokens]
+    kv_splits="auto",
+)
+```
+
+The manifest's `mode` 3 rows serve it, one per `mask`. `kv_splits` slices each work-group's key
+walk inside the one launch on rows declaring `kv_range`, and the slices are merged by their LSE
+like the dense key ranges; a slice keeps at least 256 keys of the longest document's walk. The
+partials are FP32. On a row declaring `pair_split`, a causal pair's 2-5 slices run on one more
+work-group than slices when that fits the device's CUs, which the launcher passes in.
 
 ## Packed Layouts
 

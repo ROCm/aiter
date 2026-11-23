@@ -12,6 +12,8 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bpreshuffle_supports_shape,
+    bpreshuffle_workspace_bytes,
     get_registry,
 )
 
@@ -97,6 +99,7 @@ def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_launch_fake_tensors(
     w_scale: Tensor,
     Y: Tensor,
     kid: int,
+    workspace: Tensor | None = None,
 ) -> Tensor:
     return Y
 
@@ -114,6 +117,7 @@ def _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
     w_scale: Tensor,
     Y: Tensor,
     kid: int,
+    workspace: Tensor | None = None,
 ) -> Tensor: ...
 
 
@@ -210,7 +214,7 @@ def _launch_a8w8_backend(
         return
 
     if family == _A8W8_BPRESHUFFLE_FAMILY:
-        if workspace is not None or split_k != 0:
+        if split_k != 0:
             raise RuntimeError(
                 "A8W8 blockscale-bpreshuffle backend received split-K state"
             )
@@ -221,6 +225,7 @@ def _launch_a8w8_backend(
             w_scale,
             Y,
             kid,
+            *((workspace,) if workspace is not None else ()),
         )
         return
 
@@ -334,6 +339,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     kid: int,
     route_arch: str | None = None,
     instance: object | None = None,
+    workspace: Tensor | None = None,
 ) -> Tensor:
     """Launch logical 2D bpreshuffled blockscale A8W8 GEMM.
 
@@ -358,17 +364,36 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
             output_dtype=Y.dtype,
             cu_num=cu_num,
         )
+        instance = get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num)[resolved_kid]
+    launch_workspace = workspace
+    if instance.splitk_workspace_dtype is not None:
+        if launch_workspace is None:
+            M, K = map(int, XQ.shape)
+            N = int(WQ.shape[0])
+            if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
+                raise ValueError(
+                    f"OPUS bpreshuffle kid {resolved_kid}: "
+                    "shape exceeds this pipeline configuration"
+                )
+            required_bytes = bpreshuffle_workspace_bytes(instance, M, N, K)
+            launch_workspace = torch.empty(
+                (required_bytes // 4,), dtype=torch.float32, device=XQ.device
+            )
+    elif launch_workspace is not None:
+        raise ValueError(f"OPUS bpreshuffle kid {resolved_kid} does not use workspace")
     _launch_a8w8_backend(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
         x_scale,
         w_scale,
-        None,
+        launch_workspace,
         _A8W8_BPRESHUFFLE_FAMILY,
         resolved_kid,
         0,
     )
+    if workspace is not None:
+        workspace.record_stream(torch.cuda.current_stream(XQ.device))
     return Y
 
 
