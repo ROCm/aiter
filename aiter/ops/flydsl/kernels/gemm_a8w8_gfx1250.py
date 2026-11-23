@@ -326,9 +326,6 @@ def launch_gemm_a8w8(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
-        gC_base = fx.recast_iter(
-            fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
-        )
         a_off0 = blk_m64 * lda64
         b_off0 = blk_n64 // 16 * (k64 * 16)
         if const_expr(batched):
@@ -955,45 +952,92 @@ def launch_gemm_a8w8(
         accs = None
         if const_expr(is_mxscale):
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
-        pipeline_fence(outstanding=0, use_cluster=use_cluster)
+        # The C tile never reaches global memory through a TDM store: on gfx1250
+        # a tensor_store_from_lds now and then read 16-byte pieces of the
+        # ds_stored tile as LDS held them before (the last k-tile's FP8 A operand,
+        # 1e24-1e38 as bf16) despite s_wait_dscnt 0 + s_barrier, with another
+        # queue's kernels on the same CUs. bf16/f16 C is stored straight from the
+        # accumulators; split-K fp32 partials and the fused quant are staged in
+        # LDS and read back with ds_loads, which do see the ds_stores.
+        c_staged = fuse_quant_out or split_k > 1
+        if const_expr(c_staged or use_cluster):
+            pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
-        for wm in range_constexpr(wmma_m_rep):
-            row_rel = wmb + wm * 16 + lane16
-            for wn in range_constexpr(wmma_n_rep):
-                col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(out_cls)
-                fx.ptr_store(
-                    h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
-                )
-        workgroup_barrier(use_cluster=False)
+        if const_expr(c_staged):
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                for wn in range_constexpr(wmma_n_rep):
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    h = accs[wm * wmma_n_rep + wn].to(out_cls)
+                    fx.ptr_store(
+                        h.bitcast(fx.Int8),
+                        base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
+                    )
+            workgroup_barrier(use_cluster=False)
         if const_expr(not fuse_quant_out):
             c_off_rt = blk_m64 * ldc64 + blk_n64
             if const_expr(batched):
                 c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
             if const_expr(split_k > 1):
                 c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-            C_TILE = (tile_m, C_LDS_ROW)
-            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
-            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
-                gtC,
-                fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
-                C_TILE,
-                num_warps=num_waves,
+            out_c = fx.inttoptr(
+                fx.PointerType.get(
+                    out_cls.ir_type, arg_c.address_space, alignment=c_bytes
+                ),
+                fx.ptrtoint(arg_c),
             )
-            blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
-            sC = _lv(
-                fx.recast_iter(out_cls, base_ptr),
-                (C_TILE, 1),
-                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
-            )
-            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
-            )
-            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
-            rocdl.s_wait_tensorcnt(0)
+            if const_expr(split_k > 1):
+                # 16-byte chunks, consecutive lanes along a row; rows past M
+                # are dropped.
+                C_CHUNK = 16 // c_bytes
+                C_ROW_CHUNKS = tile_n // C_CHUNK
+                C_CHUNKS = tile_m * C_ROW_CHUNKS
+                lds_c = fx.recast_iter(out_cls, base_ptr)
+                # All ds_loads first, then the guarded stores.
+                N_CP = (C_CHUNKS + block - 1) // block
+                cqs = [fx.Int32(tid) + cp * block for cp in range_constexpr(N_CP)]
+                if const_expr(C_CHUNKS % block != 0):
+                    cqs_ld = [(cq < C_CHUNKS).select(cq, C_CHUNKS - 1) for cq in cqs]
+                else:
+                    cqs_ld = cqs
+                vals = [
+                    fx.ptr_load(
+                        lds_c
+                        + (cq // C_ROW_CHUNKS) * C_LDS_ROW
+                        + (cq % C_ROW_CHUNKS) * C_CHUNK,
+                        result_type=T.vec(C_CHUNK, out_cls.ir_type),
+                    )
+                    for cq in cqs_ld
+                ]
+                # No fx op pins the loads: without this fence LLVM sinks each one
+                # into its row guard and the stores wait for LDS once per chunk
+                # (gate_up t32x128x128 sk8, M=64: +5% vs +3% over the TDM store).
+                rocdl.sched_barrier(0)
+                for cp in range_constexpr(N_CP):
+                    cq = cqs[cp]
+                    c_row = cq // C_ROW_CHUNKS
+                    c_col = (cq % C_ROW_CHUNKS) * C_CHUNK
+                    in_tile = (
+                        (cq < C_CHUNKS) if const_expr(C_CHUNKS % block != 0) else True
+                    )
+                    if (c_row < mn_oob) and in_tile:
+                        fx.ptr_store(
+                            vals[cp], out_c + c_off_rt + fx.Int64(c_row) * ldc64 + c_col
+                        )
+            else:
+                # A lane holds 8 consecutive columns of one row per WMMA
+                # fragment. Wave-uniform base per 16-row group plus one lane
+                # offset, so the stores differ only in immediate offsets; rows
+                # past M are dropped.
+                w_out = out_c + c_off_rt + fx.Int64(wmb) * ldc64 + fx.Int64(wnb)
+                lane_off = fx.Int64(lane16 * i32_ldc + kgrp * 8)
+                hs = [accs[i].to(out_cls) for i in range_constexpr(n_acc)]
+                for wm in range_constexpr(wmma_m_rep):
+                    if wmb + wm * 16 + lane16 < mn_oob:
+                        row_out = w_out + fx.Int64(wm * 16) * ldc64 + lane_off
+                        for wn in range_constexpr(wmma_n_rep):
+                            fx.ptr_store(hs[wm * wmma_n_rep + wn], row_out + wn * 16)
         else:
             # Group-32 MXFP8 quant epilogue. The whole [tile_m, tile_n] C tile
             # is already staged in LDS as bf16 (out_cls); re-read 32 contiguous
