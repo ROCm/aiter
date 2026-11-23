@@ -1667,11 +1667,12 @@ class MLAProgram:
             dtype=tl.float32,
             layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
         )
-        k_lora = self.tdm_shared_load_kv_lora(LORA_WAIT, buffer_id)
-        S = self.compute_qk_lora(k_lora, None, None, S)
+        gl.amd.gfx1250.tdm.async_wait(LORA_WAIT)
         if FILL:
             self.tdm_load_global_to_shared_kv_lora(fill_row, fill_slot)
             self.tdm_load_global_to_shared_k_rope(fill_row, fill_slot)
+        k_lora = self.lds_unshuffle_kv_lora(buffer_id).load(layout=cfg.K_DOT_LAYOUT)
+        S = self.compute_qk_lora(k_lora, None, None, S)
         k_rope = self.tdm_shared_load_k_rope(ROPE_WAIT, buffer_id)
         S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
 
@@ -1952,7 +1953,7 @@ def _mla_decode_kv_ring(
     # Keeps NUM_STAGES - 1 tiles of this segment in flight. Each tile is two
     # TDM loads, LoRA then RoPE, and the wait counts below rely on that order.
     # Like the two-stage loop, a tile waits for its LoRA, issues the next fill
-    # behind the LoRA QK, then waits for its RoPE.
+    # right after that wait, then waits for its RoPE.
     PREFETCH: gl.constexpr = NUM_STAGES - 1
     num_tiles = pgm.tile_end - pgm.tile_start
     # Prime unconditionally, re-reading the last tile in a short segment: the
@@ -2527,20 +2528,25 @@ def _mla_decode_fwd_kernel(
                 layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
             )
 
+            next_buffer_id = pgm.get_next_buffer_id(buffer_id)
+            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
             if KV_CACHE_DTYPE == "nvfp4":
                 kv_lora = pgm.tdm_shared_load_kv_lora(3, buffer_id)
                 kv_lora_scales = pgm.tdm_shared_load_kv_lora_scales(
                     wait_count=2, buffer_id=buffer_id
                 ).to(e4m3_dtype, bitcast=True)
+                S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
+                pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
+                pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
             else:
-                kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
+                gl.amd.gfx1250.tdm.async_wait(1)
+                pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
+                pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
+                kv_lora = pgm.lds_unshuffle_kv_lora(buffer_id).load(
+                    layout=cfg.K_DOT_LAYOUT
+                )
                 kv_lora_scales = None
-            S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
-
-            next_buffer_id = pgm.get_next_buffer_id(buffer_id)
-            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
-            pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
+                S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
 
             if KV_CACHE_DTYPE == "nvfp4":
                 k_rope = pgm.tdm_shared_load_k_rope(5, buffer_id)
