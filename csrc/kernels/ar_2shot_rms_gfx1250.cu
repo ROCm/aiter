@@ -39,6 +39,8 @@
 // butterfly then a serial sum over the waves of the row, x * (rsqrt * w)).
 #include "ar_2shot_rms_gfx1250.h"
 #include "aiter_stream.h"
+#include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <stdexcept>
@@ -121,12 +123,81 @@ __device__ __forceinline__ void signal_flag(uint32_t* p, uint32_t v)
 }
 
 
+// MXFP8 1x32 quant of the 8 bf16 values a thread holds (one quarter of a group of 32; the
+// group is lanes 4g..4g+3 of a wave), bit for bit per_1x32_mx_quant_hip(fp8, e8m0) on gfx1250:
+// amax over the bf16 values from aiter::kAmaxFloor (an all-zero group's scale byte is 85, not
+// 0), the inf/NaN cap, the RoundUp E8M0 scale, the clamp of a degenerate group and
+// v_cvt_scalef32_pk8_fp8_bf16 with the scale as divisor.
+typedef __bf16 bf16x8_t __attribute__((ext_vector_type(8)));
+typedef int i32x2_t __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ void mxfp8_quant8(u32x4 bf, uint32_t& lo, uint32_t& hi, uint8_t& sbyte)
+{
+    float v[8];
+    unpack(bf, v);
+    float amax = aiter::kAmaxFloor;
+#pragma unroll
+    for(int j = 0; j < 8; ++j)
+        amax = fmaxf(amax, fabsf(v[j]));
+    amax = fmaxf(amax, __shfl_xor(amax, 1));
+    amax = fmaxf(amax, __shfl_xor(amax, 2));
+    const bool degenerate = !(amax < __builtin_inff());
+    amax                  = fminf(amax, 448.0f * 0x1.0p119f);
+    float scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::MxDtype::FP8_E4M3>(amax);
+    constexpr bool kScaleMayClip = aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
+                                   aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
+    if(kScaleMayClip || degenerate)
+    {
+        const float h      = 448.0f * scale;
+        const uint32_t hb  = f2bf(h);
+        const uint32_t nhb = f2bf(-h);
+        uint32_t w[4] = {bf[0], bf[1], bf[2], bf[3]};
+#pragma unroll
+        for(int j = 0; j < 8; ++j)
+        {
+            uint32_t e = (w[j / 2] >> (16 * (j % 2))) & 0xffffu;
+            if(v[j] > h)
+                e = hb;
+            if(v[j] < -h)
+                e = nhb;
+            w[j / 2] = (w[j / 2] & ~(0xffffu << (16 * (j % 2)))) | (e << (16 * (j % 2)));
+        }
+        bf = u32x4{w[0], w[1], w[2], w[3]};
+    }
+    const i32x2_t r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8_t, bf), scale);
+    lo              = (uint32_t)r[0];
+    hi              = (uint32_t)r[1];
+    sbyte           = (uint8_t)((__float_as_uint(scale) >> 23) & 0xffu);
+}
 
+
+// The MXFP8 row a block just normalized, staged in LDS (hidden E4M3 bytes, then hidden / 32
+// E8M0 bytes), as hidden / 16 + hidden / 512 16-byte packs. Callers sync before and after.
+__device__ __forceinline__ void stage_mxfp8(u32x4 out_pack, uint8_t* stage, int hidden, int t)
+{
+    uint32_t lo, hi;
+    uint8_t sb;
+    mxfp8_quant8(out_pack, lo, hi, sb);
+    *reinterpret_cast<uint2*>(stage + 8 * t) = make_uint2(lo, hi);
+    if((t & 3) == 0)
+        stage[hidden + t / 4] = sb;
+}
+
+// ar2s, templated on the output and on where the residual lives:
+//   FP8   out is MXFP8: E4M3 [rows, hidden] in out_q, row-major E8M0 [rows, hidden / 32] in
+//         out_s, the bytes per_1x32_mx_quant_hip(fp8, e8m0) gives for the bf16 out (which is
+//         not written).
+//   SP    sequence-parallel residual: each rank keeps the residual of its own chunk only
+//         (rows [rank * R, rank * R + R)); res is read and res_out written there alone. The
+//         owner normalizes (and quantizes) its rows and pushes the result instead of the
+//         bf16 sum, so phase 3 is a copy. out is bit-identical to the replicated path's.
+//   AUX   (with SP, bf16) no norm: the whole residual_out (sum + the owners' residual rows) on
+//         every rank, the bits the replicated path writes to residual_out; out is not written.
+//         It gathers a sequence-parallel residual stream (e.g. for a drafter's taps).
 // ---------------------------------------------------------------------------------------------
 // The kernel (gfx1250 ISA notes):
 //   - __syncthreads() is a workgroup release fence and compiles to s_wait_storecnt 0 before
-//     s_barrier, which would make every row wait for its own remote stores to be acked: the
-//     row-local norm-sum barrier is LDS-only, and the only store drains are the ones
+//     s_barrier, which would make every row wait for its own remote stores to be acked: row-local
+//     barriers (norm sum, MXFP8 staging) are LDS-only, and the only store drains are the ones
 //     before a flag;
 //   - loads are straight-line (no per-chunk `if` around each load);
 //   - pipeline: iteration i pushes step i's RS rows, reduces + AG-pushes step i - 1 once every
@@ -241,7 +312,7 @@ __device__ __forceinline__ int step_start(int s, int M, int r0, int step)
 // Phase 2 (stage B) reads its rows through a double-buffered LDS slot of NG + 1 packs a
 // thread (the NG summands and the residual, dynamic LDS), loaded asynchronously one row ahead:
 // the next row's loads are in flight during this row's arithmetic without holding VGPRs.
-template <int NG>
+template <int NG, bool FP8, bool SP, bool AUX = false>
 __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              int rank,
                                                              const u32x4* __restrict__ in,
@@ -249,6 +320,8 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              const u32x4* __restrict__ wgt,
                                                              u32x4* __restrict__ out,
                                                              u32x4* __restrict__ res_out,
+                                                             u32x4* __restrict__ out_q,
+                                                             u32x4* __restrict__ out_s,
                                                              int N,
                                                              int R,
                                                              int64_t slot_packs,
@@ -257,15 +330,19 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              bool gemma,
                                                              int maxit)
 {
+    constexpr int U = 2; // copy: rows of every peer chunk a pass
     __shared__ __align__(16) float partial[2][32];
     __shared__ uint32_t s_base;
     extern __shared__ __align__(16) u32x4 ar2s_pf[]; // [2][NG + 1][rp]
+    __shared__ __align__(16) uint8_t stage[FP8 ? 8192 + 256 : 16];
     int buf           = 0;
     const uint32_t t  = threadIdx.x;
     const uint32_t rp = blockDim.x; // 16B packs a row
     const int b       = blockIdx.x;
     const int G       = gridDim.x;
     const int hidden  = rp * 8;
+    const uint32_t qp = hidden / 16;  // E4M3 packs a row (FP8)
+    const uint32_t sp = hidden / 512; // E8M0 packs a row (FP8)
     // pack indices are 32-bit (a launch is < 2^32 packs of every buffer): one base a buffer
     const uint32_t slot = (uint32_t)slot_packs;
     const uint32_t agof = (uint32_t)ag_off_packs;
@@ -344,7 +421,7 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
             }
         }
         // ---- B: the own chunk's rows of step i - 1: sum in rank order (the own slot from `in`),
-        // AG push of the sum, residual add + norm
+        // residual add + norm (+ quant), AG push of the sum (or, SP, of the result)
         if(i >= 1 && i <= S && b + step_start(i - 1, M, r0, st) * G < own_rows)
         {
             const int s  = i - 1;
@@ -405,22 +482,56 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                 }
                 const u32x4 sum = pack(x);
                 const uint32_t ag = agof + (uint32_t)rank * slot + i0; // slot[rank] of a peer's AG inbox
+                auto push_ag      = [&](const u32x4& v) {
 #pragma unroll
-                for(int k = 1; k < NG; ++k)
-                    st_sys(peer(k) + ag, sum);
+                    for(int k = 1; k < NG; ++k)
+                        st_sys(peer(k) + ag, v);
+                };
+                if constexpr(!SP)
+                    push_ag(sum);
                 float r8[8];
                 unpack(sum, x);
                 unpack(rv, r8);
 #pragma unroll
                 for(int e = 0; e < 8; ++e)
                     x[e] += r8[e];
-                u32x4 rpk, opk;
-                norm_packs2(x, wgt[t], gemma ? 1.f : 0.f, eps, hidden, partial, buf, rpk, opk);
-                res_out[io] = rpk;
-                out[io]     = opk;
+                if constexpr(AUX)
+                {
+                    const u32x4 rpk = pack(x);
+                    res_out[io]     = rpk;
+                    push_ag(rpk);
+                }
+                else
+                {
+                    u32x4 rpk, opk;
+                    norm_packs2(x, wgt[t], gemma ? 1.f : 0.f, eps, hidden, partial, buf, rpk, opk);
+                    res_out[io] = rpk;
+                    if constexpr(FP8)
+                    {
+                        // the stage is rewritten only after the next row's norm barrier
+                        stage_mxfp8(opk, stage, hidden, t);
+                        lds_barrier();
+                        if(t < qp + sp)
+                        {
+                            const u32x4 q = reinterpret_cast<const u32x4*>(stage)[t];
+                            if(t < qp)
+                                out_q[(own0 + j) * qp + t] = q;
+                            else
+                                out_s[(own0 + j) * sp + (t - qp)] = q;
+                            if constexpr(SP)
+                                push_ag(q);
+                        }
+                    }
+                    else
+                    {
+                        out[io] = opk;
+                        if constexpr(SP)
+                            push_ag(opk);
+                    }
+                }
             }
         }
-        // ---- C: the peers' rows of step i - 2 from the AG inbox: add + norm
+        // ---- C: the peers' rows of step i - 2 from the AG inbox: a copy (SP / AUX) or add + norm
         if(i >= 2)
         {
             const int s  = i - 2;
@@ -435,29 +546,93 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                     wait_flag_bounded(&my_flags->ag[c][b * kFlagPad], base + s + 1, maxit, &my_flags->err);
             }
             poll_barrier();
-#pragma unroll
-            for(int k = 1; k < NG; ++k)
+            if constexpr(SP || AUX)
             {
-                const uint32_t c0 = (uint32_t)(chunk(k) * R);
-                for(int m = m0; m < m1; ++m)
+                const uint32_t packs = (FP8 && !AUX) ? qp + sp : rp;
+                if(t < packs)
                 {
-                    const int j = b + m * G;
-                    if(j >= rows_k[k])
-                        break;
-                    const uint32_t i0 = (uint32_t)j * rp + t;
-                    const uint32_t io = c0 * rp + i0;
-                    const u32x4 sv    = ld_sys(my_data + (agof + (uint32_t)chunk(k) * slot + i0));
-                    const u32x4 rv    = res[io];
-                    float x[8], r8[8];
-                    unpack(sv, x);
-                    unpack(rv, r8);
+                    for(int m = m0; m < m1; m += U)
+                    {
+                        u32x4 v[NG][U];
 #pragma unroll
-                    for(int e = 0; e < 8; ++e)
-                        x[e] += r8[e];
-                    u32x4 rpk, opk;
-                    norm_packs2(x, wgt[t], gemma ? 1.f : 0.f, eps, hidden, partial, buf, rpk, opk);
-                    res_out[io] = rpk;
-                    out[io]     = opk;
+                        for(int k = 1; k < NG; ++k)
+#pragma unroll
+                            for(int u = 0; u < U; ++u)
+                            {
+                                // past the step or the chunk: reload row b (never stored)
+                                const int jj = b + (m + u) * G;
+                                const int jl = m + u < m1 && jj < rows_k[k] ? jj : b;
+                                v[k][u]      = ld_sys(my_data + (agof + (uint32_t)chunk(k) * slot + (uint32_t)jl * rp + t));
+                            }
+#pragma unroll
+                        for(int k = 1; k < NG; ++k)
+                        {
+                            const uint32_t c0 = (uint32_t)(chunk(k) * R);
+#pragma unroll
+                            for(int u = 0; u < U; ++u)
+                            {
+                                const int jj = b + (m + u) * G;
+                                if(m + u < m1 && jj < rows_k[k])
+                                {
+                                    if constexpr(AUX)
+                                        res_out[(c0 + jj) * rp + t] = v[k][u];
+                                    else if constexpr(FP8)
+                                    {
+                                        if(t < qp)
+                                            out_q[(c0 + jj) * qp + t] = v[k][u];
+                                        else
+                                            out_s[(c0 + jj) * sp + (t - qp)] = v[k][u];
+                                    }
+                                    else
+                                        out[(c0 + jj) * rp + t] = v[k][u];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+#pragma unroll
+                for(int k = 1; k < NG; ++k)
+                {
+                    const uint32_t c0 = (uint32_t)(chunk(k) * R);
+                    for(int m = m0; m < m1; ++m)
+                    {
+                        const int j = b + m * G;
+                        if(j >= rows_k[k])
+                            break;
+                        const uint32_t i0 = (uint32_t)j * rp + t;
+                        const uint32_t io = c0 * rp + i0;
+                        const u32x4 sv    = ld_sys(my_data + (agof + (uint32_t)chunk(k) * slot + i0));
+                        const u32x4 rv    = res[io];
+                        float x[8], r8[8];
+                        unpack(sv, x);
+                        unpack(rv, r8);
+#pragma unroll
+                        for(int e = 0; e < 8; ++e)
+                            x[e] += r8[e];
+                        u32x4 rpk, opk;
+                        norm_packs2(x, wgt[t], gemma ? 1.f : 0.f, eps, hidden, partial, buf, rpk, opk);
+                        res_out[io] = rpk;
+                        if constexpr(FP8)
+                        {
+                            stage_mxfp8(opk, stage, hidden, t);
+                            lds_barrier();
+                            if(t < qp + sp)
+                            {
+                                const u32x4 q = reinterpret_cast<const u32x4*>(stage)[t];
+                                if(t < qp)
+                                    out_q[(c0 + j) * qp + t] = q;
+                                else
+                                    out_s[(c0 + j) * sp + (t - qp)] = q;
+                            }
+                        }
+                        else
+                        {
+                            out[io] = opk;
+                        }
+                    }
                 }
             }
         }
@@ -529,6 +704,90 @@ int64_t ar2s_rms_max_rows(fptr_t ctx, int64_t hidden)
     return c->max_bytes / c->world / (hidden * 2) * c->world;
 }
 
+void ar2s_rms_ex(fptr_t ctx,
+                 int64_t inp,
+                 int64_t res_inp,
+                 int64_t w,
+                 int64_t out,
+                 int64_t res_out,
+                 int64_t out_q,
+                 int64_t out_s,
+                 int64_t rows,
+                 int64_t hidden,
+                 double eps,
+                 bool gemma_norm,
+                 bool fp8_out,
+                 bool sp_residual,
+                 bool aux_residual,
+                 int64_t grid)
+{
+    auto* c      = reinterpret_cast<ar2s::Ctx*>(ctx);
+    const int rp = (int)(hidden / 8);
+    if(hidden % 256 != 0 || rp > 1024)
+        throw std::invalid_argument("ar2s_rms: hidden must be a multiple of 256 and at most 8192");
+    if(fp8_out && hidden % 512 != 0)
+        throw std::invalid_argument("ar2s_rms: the MXFP8 output needs hidden a multiple of 512");
+    if(aux_residual && (fp8_out || !sp_residual))
+        throw std::invalid_argument("ar2s_rms: aux_residual needs sp_residual and a bf16 output");
+    if(rows <= 0)
+        return;
+    const int64_t R          = (rows + c->world - 1) / c->world;
+    const int64_t slot_bytes = c->max_bytes / c->world / 16 * 16;
+    if(R * hidden * 2 > slot_bytes)
+        throw std::invalid_argument("ar2s_rms: " + std::to_string(rows) +
+                                    " rows exceed the inbox; split the call (ar2s_rms_max_rows)");
+    if(((inp | res_inp | w | res_out | (aux_residual ? 0 : fp8_out ? (out_q | out_s) : out)) & 15) != 0)
+        throw std::invalid_argument("ar2s_rms: operands must be 16-byte aligned");
+    // the whole grid even if the last round of rows leaves blocks idle: fewer,
+    // evenly loaded blocks measured slower (each block is latency bound)
+    // grid > 0 caps the blocks (CUs) of this call, e.g. to leave CUs to a concurrent kernel; every rank
+    // must pass the same value for a call (the per-block epochs then agree as for any grid change)
+    const int G = (int)std::min<int64_t>(grid > 0 ? std::min<int64_t>(grid, ar2s::kMaxBlocks) : c->grid, R);
+    const int64_t slot_packs  = slot_bytes / 16;
+    const int64_t ag_off      = (int64_t)c->world * slot_packs;
+    hipStream_t stream        = aiter::getCurrentHIPStream();
+    // the kernel indexes with 32-bit packs: both inboxes and every [rows, hidden] operand fit
+    if(2 * ag_off >= (int64_t(1) << 32) || rows * rp >= (int64_t(1) << 31))
+        throw std::invalid_argument("ar2s_rms: inbox or operand past 32-bit pack indexing");
+#define AR2S_K2_ARGS                                                                           \
+    c->peers, c->rank, (const ar2s::u32x4*)inp, (const ar2s::u32x4*)res_inp,                  \
+        (const ar2s::u32x4*)w, (ar2s::u32x4*)out, (ar2s::u32x4*)res_out, (ar2s::u32x4*)out_q, \
+        (ar2s::u32x4*)out_s, (int)rows, (int)R, slot_packs, ag_off, (float)eps, gemma_norm,    \
+        ar2s::kMaxPolls
+    // phase 2's prefetch: [2][NG + 1][rp] packs of dynamic LDS (122880 B at TP4, hidden 6144)
+    const size_t pf_bytes = (size_t)2 * (c->world + 1) * rp * 16;
+#define AR2S_LAUNCH(NG, F8, SPR, AX)                                                           \
+    do {                                                                                       \
+        auto* kp = ar2s::ar2s_rms_kernel<NG, F8, SPR, AX>;                                    \
+        (void)hipFuncSetAttribute((const void*)kp, hipFuncAttributeMaxDynamicSharedMemorySize, \
+                                  (int)pf_bytes);                                              \
+        kp<<<G, rp, pf_bytes, stream>>>(AR2S_K2_ARGS);                                         \
+    } while(0)
+#define AR2S_MODES(NG)                                         \
+    if(aux_residual)                                           \
+        AR2S_LAUNCH(NG, false, true, true);                    \
+    else if(fp8_out && sp_residual)                            \
+        AR2S_LAUNCH(NG, true, true, false);                    \
+    else if(fp8_out)                                           \
+        AR2S_LAUNCH(NG, true, false, false);                   \
+    else if(sp_residual)                                       \
+        AR2S_LAUNCH(NG, false, true, false);                   \
+    else                                                       \
+        AR2S_LAUNCH(NG, false, false, false);
+    switch(c->world)
+    {
+    case 2: AR2S_MODES(2); break;
+    case 4: AR2S_MODES(4); break;
+    default: throw std::invalid_argument("ar2s_rms: unsupported world size");
+    }
+#undef AR2S_MODES
+#undef AR2S_LAUNCH
+#undef AR2S_K2_ARGS
+    hipError_t e = hipGetLastError();
+    if(e != hipSuccess)
+        throw std::runtime_error(std::string("ar2s_rms launch: ") + hipGetErrorString(e));
+}
+
 void ar2s_rms(fptr_t ctx,
               int64_t inp,
               int64_t res_inp,
@@ -540,60 +799,7 @@ void ar2s_rms(fptr_t ctx,
               double eps,
               bool gemma_norm)
 {
-    auto* c      = reinterpret_cast<ar2s::Ctx*>(ctx);
-    const int rp = (int)(hidden / 8);
-    if(hidden % 256 != 0 || rp > 1024)
-        throw std::invalid_argument("ar2s_rms: hidden must be a multiple of 256 and at most 8192");
-    if(rows <= 0)
-        return;
-    const int64_t R          = (rows + c->world - 1) / c->world;
-    const int64_t slot_bytes = c->max_bytes / c->world / 16 * 16;
-    if(R * hidden * 2 > slot_bytes)
-        throw std::invalid_argument("ar2s_rms: " + std::to_string(rows) +
-                                    " rows exceed the inbox; split the call (ar2s_rms_max_rows)");
-    if(((inp | res_inp | w | out | res_out) & 15) != 0)
-        throw std::invalid_argument("ar2s_rms: operands must be 16-byte aligned");
-    // the whole grid even if the last round of rows leaves blocks idle: fewer,
-    // evenly loaded blocks measured slower (each block is latency bound)
-    const int G              = (int)std::min<int64_t>(c->grid, R);
-    const int64_t slot_packs = slot_bytes / 16;
-    const int64_t ag_off     = (int64_t)c->world * slot_packs;
-    hipStream_t stream       = aiter::getCurrentHIPStream();
-    // the kernel indexes with 32-bit packs: both inboxes and every [rows, hidden] operand fit
-    if(2 * ag_off >= (int64_t(1) << 32) || rows * rp >= (int64_t(1) << 31))
-        throw std::invalid_argument("ar2s_rms: inbox or operand past 32-bit pack indexing");
-    // phase 2's prefetch: [2][NG + 1][rp] packs of dynamic LDS (122880 B at TP4, hidden 6144)
-    const size_t pf_bytes = (size_t)2 * (c->world + 1) * rp * 16;
-#define AR2S_LAUNCH(NG)                                                                        \
-    do {                                                                                       \
-        auto* kp = ar2s::ar2s_rms_kernel<NG>;                                                  \
-        (void)hipFuncSetAttribute((const void*)kp, hipFuncAttributeMaxDynamicSharedMemorySize, \
-                                  (int)pf_bytes);                                              \
-        kp<<<G, rp, pf_bytes, stream>>>(c->peers,                                              \
-                                        c->rank,                                               \
-                                        (const ar2s::u32x4*)inp,                               \
-                                        (const ar2s::u32x4*)res_inp,                           \
-                                        (const ar2s::u32x4*)w,                                 \
-                                        (ar2s::u32x4*)out,                                     \
-                                        (ar2s::u32x4*)res_out,                                 \
-                                        (int)rows,                                             \
-                                        (int)R,                                                \
-                                        slot_packs,                                            \
-                                        ag_off,                                                \
-                                        (float)eps,                                            \
-                                        gemma_norm,                                            \
-                                        ar2s::kMaxPolls);                                      \
-    } while(0)
-    switch(c->world)
-    {
-    case 2: AR2S_LAUNCH(2); break;
-    case 4: AR2S_LAUNCH(4); break;
-    default: throw std::invalid_argument("ar2s_rms: unsupported world size");
-    }
-#undef AR2S_LAUNCH
-    hipError_t e = hipGetLastError();
-    if(e != hipSuccess)
-        throw std::runtime_error(std::string("ar2s_rms launch: ") + hipGetErrorString(e));
+    ar2s_rms_ex(ctx, inp, res_inp, w, out, res_out, 0, 0, rows, hidden, eps, gemma_norm, false, false, false, 0);
 }
 
 } // namespace aiter

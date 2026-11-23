@@ -787,6 +787,73 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
+    # ---- sequence-parallel residual (ar2s_rms_ex sp_residual), prefill sizes ----
+    # The residual stream lives on its owner rows only (CustomAllreduce.ar2s_sp_own_rows: chunk `rank`
+    # of every ar2s launch); the normed output is whole and bit-identical to the replicated path's.
+    # Every call of a forward has the same rows, so every call takes the same branch: below the ar2s
+    # range they all run the replicated path, whose whole residual is a valid superset.
+    def ar2s_sp_eligible(self, input_: torch.Tensor, weight_: torch.Tensor) -> bool:
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not getattr(ca_comm, "_ar2s_ctx", 0):
+            return False
+        hidden = weight_.numel()
+        return (
+            input_.dim() == 2
+            and input_.dtype == torch.bfloat16
+            and input_.shape[-1] == hidden
+            and hidden % 512 == 0
+            and hidden <= 8192
+            and input_.numel() * input_.element_size() >= _AR2S_RMS_MIN_BYTES
+        )
+
+    def sp_fused_allreduce_rmsnorm(
+        self, input_, res_inp_, weight_, eps, gemma_norm=False
+    ):
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                eps,
+                gemma_norm,
+                sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm
+        )
+
+    def sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        self, input_, res_inp_, weight_, eps, gemma_norm=False
+    ):
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                eps,
+                gemma_norm,
+                fp8_out=True,
+                sp_residual=True,
+            )
+        return self.fused_allreduce_rmsnorm_mxfp8_quant(
+            input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm
+        )
+
+    def sp_allreduce_add_residual(self, input_, res_inp_, weight_):
+        """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual
+        (the residual_out the next replicated AR + norm would write)."""
+        if self.ar2s_sp_eligible(input_, weight_):
+            return self.ca_comm.ar2s_fused_ar_rms_ex(
+                input_.contiguous(),
+                res_inp_.contiguous(),
+                weight_,
+                0.0,
+                False,
+                sp_residual=True,
+                aux_residual=True,
+            )
+        return self.all_reduce(input_) + res_inp_
+
     def fused_allreduce_rmsnorm_mxfp8_quant(
         self,
         input_: torch.Tensor,
