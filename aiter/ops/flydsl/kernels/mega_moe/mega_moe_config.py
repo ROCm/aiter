@@ -1896,7 +1896,18 @@ def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int, world_size: int = 
     n-tile (128: 36 units an m-tile) and GEMM2 n-block (128: 40 units) keep every CTA busy, and the 128-wide
     n-block puts the 64-row GEMM2 on the 2-stage weight pipeline; its pointers go to SGPRs (no spill at 256 VGPRs).
     """
-    config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket == 32:
+        # The verify layout's 256-wide GEMM2 n-blocks at 32 tokens were measured on verify rows only: the draft keeps
+        # the 64-token tune (GEMM1 tile_n 256, GEMM2 n-blocks as before).
+        config = _tune_v41_flash_ep4_small(config, bucket)
+        config = replace(config, stage1=replace(config.stage1, tile_n=256))
+    else:
+        config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket in (64, 128) and world_size == 8:
+        # 16 experts a rank receive a third of the verify layout's rows: 128 producer CTAs send them as fast as 224
+        # and leave more CTAs to the GEMMs (skewed routes: -2.7..-3.6% at 50-75 draft rows a rank,
+        # -1.8% at 100; bit-identical).
+        config = replace(config, stage1=replace(config.stage1, num_dispatch_cu=128))
     if bucket < 128:
         return config
     if bucket == 128 and world_size == 8:
