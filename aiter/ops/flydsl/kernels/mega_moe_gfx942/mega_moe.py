@@ -31,9 +31,9 @@ initialized) and makes the same calls in the same order, as with MegaMoEV2. Each
 receives at most every route of every rank (8 x max_tok_per_rank x topk rows plus one
 partial block per expert), so no route is dropped. The main path's buffers at
 max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
-(``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory; 8192 is the
-largest (the receive buffer stays below 2 GiB). large_M takes about the same, small_M at
-128 tokens per rank 0.18 GiB of the heap.
+(``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory (top-6); the
+largest is 8192 at top-6 and 4096 at top-8 (the receive buffer stays below 2 GiB).
+large_M takes about the same, small_M at 128 tokens per rank 0.18 GiB of the heap.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -51,7 +51,9 @@ import torch
 from ..mega_moe import envs
 from . import weights as _weights
 
-_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK, _NUM_CU = 8, 4096, 2048, 256, 6, 304
+_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _NUM_CU = 8, 4096, 2048, 256, 304
+# DeepSeek-V4-Flash routes each token to 6 experts, MiMo-V2.6-Flash to 8.
+_TOPKS = (6, 8)
 # a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (W in the
 # (16, 16) preshuffle)
 _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
@@ -61,14 +63,16 @@ def eligible(
     *, world_size, model_dim, inter_dim, experts, topk, quant="a8w4", act="silu"
 ):
     """Whether this build runs the layer: gfx942 with 304 CUs, EP8 and the MoE shape of
-    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6), a8w4 or a8w8."""
+    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6) or MiMo-V2.6-Flash (the same
+    with top-8), a8w4 or a8w8."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     return (
         get_gfx_runtime() == "gfx942"
         and get_cu_num() == _NUM_CU
-        and (world_size, model_dim, inter_dim, experts, topk)
-        == (_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK)
+        and (world_size, model_dim, inter_dim, experts)
+        == (_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS)
+        and topk in _TOPKS
         and quant in _WQ
         and act == "silu"
     )
@@ -120,7 +124,7 @@ class MegaMoEGfx942:
         ):
             raise ValueError(
                 "MegaMoEGfx942 runs gfx942 (304 CUs), EP8, H 4096, I 2048, 256 experts, "
-                f"top-6, a8w4 or a8w8 silu; got world_size={world_size} "
+                f"top-6 or top-8, a8w4 or a8w8 silu; got world_size={world_size} "
                 f"model_dim={model_dim} inter_dim={inter_dim} experts={experts} "
                 f"topk={topk} quant={quant} act={act}"
             )

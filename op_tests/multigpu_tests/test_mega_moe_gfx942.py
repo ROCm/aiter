@@ -10,6 +10,11 @@ at the small-input capacity for a8w8).
 ``--quant a8w8`` runs the layer on FP8 128x128 block-scale experts instead of MXFP4
 ones; some of their blocks have scale 0 over non-zero bytes (they must contribute
 nothing).
+``--model`` takes another model's MoE layer over the 8 ranks (``MODELS``):
+DeepSeek-V4.1-Flash (H 5120, I 2304, 384 experts, top-6, silu with swiglu_limit 10),
+MiMo-V2.6-Flash (H 4096, I 2048, 256 experts, top-8, silu) or Kimi-K3 (routed experts
+in its 3584-wide latent space: H 3584, I 3072, 896 experts, top-16, SiTUv2 with beta 4
+and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
 
 - test_mega_moe_gfx942: every path (main and large_M, each also on x quantized
   beforehand by aiter's per_1x128 quant ("main pq", "large pq", timed with that quant),
@@ -53,7 +58,16 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 WORLD = 8
-H, I, E, TOPK, SWIGLU_LIMIT = 4096, 2048, 256, 6, 10.0
+# Each model's MoE layer: H, I, experts, top-k, activation, swiglu_limit (0: no clamp).
+MODELS = {
+    "DeepSeek-V4-Flash": (4096, 2048, 256, 6, "silu", 10.0),
+    "DeepSeek-V4.1-Flash": (5120, 2304, 384, 6, "silu", 10.0),
+    "MiMo-V2.6-Flash": (4096, 2048, 256, 8, "silu", 0.0),
+    # H is routed_expert_hidden_size: the routed experts run in the latent space.
+    "Kimi-K3": (3584, 3072, 896, 16, "situv2", 0.0),
+}
+SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0  # Kimi-K3's SiTUv2
+H, I, E, TOPK, ACT, SWIGLU_LIMIT = MODELS["DeepSeek-V4-Flash"]
 E_LOCAL = E // WORLD
 MTPR, SMALL_MTPR = 1024, 128
 # Bound on |out - ref| / rms(reference row) over every element of a routed row. The
@@ -78,7 +92,14 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _skip_reason(quant):
+def _use_model(name):
+    """Point the layer shape (H, I, E, TOPK, ACT, SWIGLU_LIMIT, E_LOCAL) at ``name``'s."""
+    global H, I, E, TOPK, ACT, SWIGLU_LIMIT, E_LOCAL
+    H, I, E, TOPK, ACT, SWIGLU_LIMIT = MODELS[name]
+    E_LOCAL = E // WORLD
+
+
+def _skip_reason(quant, model="DeepSeek-V4-Flash"):
     gfx = get_gfx_runtime()
     if gfx != "gfx942":
         return f"MegaMoEGfx942 runs on gfx942, this is {gfx}"
@@ -97,8 +118,8 @@ def _skip_reason(quant):
         "experts": E,
         "topk": TOPK,
     }
-    if not eligible(**shape, quant=quant, act="silu"):
-        return f"MegaMoEGfx942 ({quant}) does not run this layer on this device"
+    if not eligible(**shape, quant=quant, act=ACT):
+        return f"MegaMoEGfx942 ({quant}) does not run {model}'s layer on this device"
     return None
 
 
@@ -171,9 +192,9 @@ def _make_weights_a8w4(rank):
 
 
 def _make_inputs(tokens, rank, seed, routing="uniform", padding=True):
-    """x bf16 [T, H], route weights f32 [T, 6], ids int32 [T, 6] of this rank's T rows.
-    ``routing``: "uniform" (top-6 of random scores), or "all_to_one" (six of rank 0's
-    experts per row). ``padding``: the last row is sglang padding (every id ==
+    """x bf16 [T, H], route weights f32 [T, k], ids int32 [T, k] of this rank's T rows
+    (k = TOPK). ``routing``: "uniform" (top-k of random scores), or "all_to_one" (k of
+    rank 0's experts per row). ``padding``: the last row is sglang padding (every id ==
     experts), the one before has no route (-1), and row 0 has an invalid slot of each
     kind."""
     n = tokens[rank]
@@ -213,9 +234,16 @@ def run_torch(x, wts, ids, tokens, rank, ref_weights):
         if not rows.numel():
             continue
         inp = x_all[rows].float()
-        gate = (inp @ w1[e, :I].T).clamp(max=SWIGLU_LIMIT)
-        up = (inp @ w1[e, I:].T).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        down = (F.silu(gate) * up) @ w2[e].T
+        gate, up = inp @ w1[e, :I].T, inp @ w1[e, I:].T
+        if SWIGLU_LIMIT > 0:
+            gate = gate.clamp(max=SWIGLU_LIMIT)
+            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        if ACT == "situv2":
+            act = SITU_BETA * torch.tanh(gate / SITU_BETA) * torch.sigmoid(gate)
+            act = act * SITU_LINEAR_BETA * torch.tanh(up / SITU_LINEAR_BETA)
+        else:
+            act = F.silu(gate) * up
+        down = act @ w2[e].T
         out.index_add_(0, rows, down * wts_all[rows, slots, None])
     dist.all_reduce(out)
     start = sum(tokens[:rank])
@@ -374,7 +402,7 @@ def _layer(rank, weights, mtpr, small, large):
         w2=w2,
         w2_scale=w2_scale,
         max_tok_per_rank=mtpr,
-        act="silu",
+        act=ACT,
         swiglu_limit=SWIGLU_LIMIT,
         small_m_mtprs=(SMALL_MTPR,),
         small_m_enabled=small,
@@ -404,6 +432,7 @@ def _watchdog(rank):
 
 
 def _worker(rank, port, args):
+    _use_model(args.model)
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "localhost", str(port)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -435,7 +464,8 @@ def _worker(rank, port, args):
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)
         ]
-        _summary(f"MegaMoEGfx942 {quant}, max_tok_per_rank {MTPR}", rows, rank)
+        title = f"MegaMoEGfx942 {quant} {args.model}"
+        _summary(f"{title}, max_tok_per_rank {MTPR}", rows, rank)
         rows = []
         for mtpr in args.mtpr:
             _STATE["layers"] = {
@@ -445,7 +475,7 @@ def _worker(rank, port, args):
             rows += [
                 test_mega_moe_gfx942_capacity(mtpr, routing) for routing in args.routing
             ]
-        _summary(f"MegaMoEGfx942 {quant} at full capacity", rows, rank)
+        _summary(f"{title} at full capacity", rows, rank)
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -465,6 +495,12 @@ def main():
         default="a8w4",
         help="the layer's quant: a8w4 (MXFP4 experts) or a8w8 (FP8 128x128 "
         "block-scale experts)",
+    )
+    parser.add_argument(
+        "--model",
+        choices=list(MODELS),
+        default="DeepSeek-V4-Flash",
+        help="whose MoE layer, split over the 8 ranks",
     )
     parser.add_argument(
         "-t",
@@ -488,8 +524,9 @@ def main():
         "--mtpr",
         type=int,
         nargs="*",
-        default=[2048, 8192],
-        help="max_tok_per_rank of the full-capacity layers",
+        default=None,
+        help="max_tok_per_rank of the full-capacity layers (default: 2048 and the "
+        "largest, 8192 at top-6, 4096 at top-8)",
     )
     parser.add_argument(
         "-r",
@@ -500,7 +537,10 @@ def main():
         help="routing of the full-capacity calls",
     )
     args = parser.parse_args()
-    reason = _skip_reason(args.quant)
+    _use_model(args.model)
+    # The worst-case receive buffer (8 x max_tok_per_rank x top-k rows) stays below 2 GiB.
+    args.mtpr = args.mtpr or [2048, 8192 if TOPK <= 6 else 4096]
+    reason = _skip_reason(args.quant, args.model)
     if reason:
         aiter.logger.warning("test_mega_moe_gfx942 skipped: %s", reason)
         return
