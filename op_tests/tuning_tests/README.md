@@ -6,7 +6,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 | File | Level | GPU | What it tests |
 |------|-------|-----|---------------|
-| `test_csv_validation.py` | 0 | No | Tuned CSV integrity and CPU regressions for hipBLASLt index/name validation, including child-process failure containment |
+| `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_arch_resolution.py` | 1 | No | GPU SKU resolution: `get_device_name` (MI300X/MI300A/MI308X), `_get_pci_chip_id`, `gfx_from_cu_num`, `get_build_targets` CU-count handling, `normalize_fp8_dtype` |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results`, auto-select removal, stale rows retuned |
@@ -83,42 +83,6 @@ python3 -m unittest op_tests.tuning_tests.test_run_config -v
 # Everything else
 python3 -m pytest op_tests/tuning_tests -v
 ```
-
-### Checking live hipBLASLt solution indexes
-
-On a Linux ROCm host with aiter installed and a visible GPU, run:
-
-```bash
-HIP_VISIBLE_DEVICES=0 \
-python3 -m op_tests.tuning_tests.validate_hipblaslt_config \
-  --report hipblaslt_config_report.json
-```
-
-This opt-in tool checks the runtime-merged BF16 family for the live device's
-exact gfx and CU count. It honors `AITER_CONFIG_GEMM_BF16`, including pathsep
-lists, and performs the real runtime merge on temporary copies so collision
-write-backs cannot modify source CSVs. It queries kernel names only; it does
-not launch GEMMs or establish numerical correctness, shape support or speed.
-
-The JSON report contains each original CSV row, saved/live kernel names and one of
-`match`, `mismatch`, `missing_name` or `query_failed`. An unknown native index
-can terminate its child process: completed results are retained and subsequent
-indexes are retried in a fresh child. Initialization failures, incomplete or
-malformed child output, cleanup failures and timeouts also fail the check;
-they are not proof of a stale index. `--timeout` bounds each child batch
-(default 300 seconds, including imports and any extension build).
-
-Exit code 0 means all selected rows match; 1 means at least one needs attention;
-2 means parent setup failed or this GPU has no hipBLASLt rows. Missing names
-(including the merge's legacy `0` placeholder) fail rather than being counted
-as verified. This is intentionally not a default live CI gate: CI's library
-matrix and migration of existing unnamed rows must be agreed first.
-
-Reports record the merged CSV digest, PyTorch/HIP version, extension header
-version and loaded hipBLASLt library paths/digests. The header and HIP versions
-are **not** the loaded hipBLASLt runtime version; these diagnostics are not
-per-row tuning-version provenance, nor a digest of external kernel databases.
-The runtime fallback in #8166 and tuning-time provenance are separate work.
 
 ### Tuning HY4 heterogeneous MoE
 
