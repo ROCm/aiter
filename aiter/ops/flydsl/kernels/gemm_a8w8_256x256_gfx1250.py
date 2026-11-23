@@ -22,7 +22,6 @@ from .gemm_common_gfx1250 import (
     pipeline_fence_wait,
     workgroup_barrier,
 )
-from .gemm_a8w8_gfx1250 import _C_LDS_STORE
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
@@ -72,7 +71,6 @@ def launch_gemm_a8w8_256x256(
     batch: fx.Int32 = 1,
     fuse_quant_out: Constexpr[bool] = False,
     ragged_n: Constexpr[bool] = False,
-    c_lds_store: Constexpr[bool] = _C_LDS_STORE,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -296,18 +294,6 @@ def launch_gemm_a8w8_256x256(
             f"Shared Memory Overflow: requested {ARENA_B} bytes on {arch}, "
             f"limit is {lds_cap} bytes"
         )
-    # The plain C store (bf16/f16 C or unfused split-K partials) as an LDS
-    # read-back + global stores, see ``c_lds_store`` in gemm_a8w8_gfx1250. The
-    # relocated store is each wave's own bytes; the ragged-N and persistent
-    # stores keep the TDM store.
-    c_lds_readback = (
-        c_lds_store
-        and not cluster_splitk
-        and not fuse_quant_out
-        and not c_relocate
-        and not ragged_n
-        and persistent_n_tiles == 1
-    )
     kernel_name = format_kernel_name(
         f"gemm_a8w8_mx{block_size}_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
@@ -325,7 +311,6 @@ def launch_gemm_a8w8_256x256(
         + ("_mbn" if batched else "")
         + ("_fq" if fuse_quant_out else "")
         + ("_rn" if ragged_n else "")
-        + ("_clds" if c_lds_readback else "")
     )
 
     def _run_tile(
@@ -1851,29 +1836,6 @@ def launch_gemm_a8w8_256x256(
                     flat_tile=_flat_tile,
                     bounded_m=bounded_m,
                 )
-            elif const_expr(c_lds_readback):
-                # The TDM store below reads LDS without being ordered behind
-                # the other waves' ds_stores (see gemm_a8w8_gfx1250): read the
-                # tile back after the barrier and write it with global stores.
-                C_CHUNK = 16 // partial_bytes
-                C_ROW_CHUNKS = tile_n // C_CHUNK
-                C_CHUNKS = tile_m * C_ROW_CHUNKS
-                lds_c = fx.recast_iter(partial_elem, base_ptr)
-                for cp in range_constexpr((C_CHUNKS + block - 1) // block):
-                    cq = fx.Int32(tid) + cp * block
-                    c_row = cq // C_ROW_CHUNKS
-                    c_col = (cq % C_ROW_CHUNKS) * C_CHUNK
-                    in_tile = (
-                        (cq < C_CHUNKS) if const_expr(C_CHUNKS % block != 0) else True
-                    )
-                    if (c_row < mn_oob) and in_tile:
-                        fx.ptr_store(
-                            fx.ptr_load(
-                                lds_c + c_row * C_LDS_ROW + c_col,
-                                result_type=T.vec(C_CHUNK, partial_elem.ir_type),
-                            ),
-                            gC_base + c_off_rt + fx.Int64(c_row) * ldc64 + c_col,
-                        )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
                 c_cols = (

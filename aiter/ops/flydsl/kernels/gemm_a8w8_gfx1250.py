@@ -42,8 +42,8 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 # launches with arg_c and never loads it.
 _NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
 # The C tile leaves LDS by a ds_load read-back and plain global stores instead of
-# one TDM store per wave (see ``c_lds_store`` in the kernel's epilogue; the same
-# switch as the grouped MXFP4 GEMM's). AITER_TDM_C_LDS_STORE=0 keeps the TDM store.
+# one TDM store per wave (see ``c_lds_store`` in the kernel's epilogue).
+# AITER_TDM_C_LDS_STORE=0 keeps the TDM store.
 _C_LDS_STORE = os.environ.get("AITER_TDM_C_LDS_STORE", "1") != "0"
 
 
