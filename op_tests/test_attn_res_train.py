@@ -42,7 +42,7 @@ def run_torch(inputs, eps, scale, dy):
     return y.detach(), {name: leaf.grad for name, leaf in leaves.items()}
 
 
-def make_inputs(n_tokens, hidden, num_bank, output_norm, dtype):
+def make_inputs(n_tokens, hidden, num_bank, output_norm, dtype, weight_dtype):
     # Candidates at different magnitudes, so the RMSNorm inside the score matters
     # and the softmax is neither uniform nor one-hot.
     mags = torch.rand(num_bank + 1) * 3 + 0.5
@@ -52,21 +52,23 @@ def make_inputs(n_tokens, hidden, num_bank, output_norm, dtype):
         else None
     )
     return {
-        "query": (torch.randn(1, hidden) * 0.05).to(dtype),
+        "query": (torch.randn(1, hidden) * 0.05).to(weight_dtype),
         "bank": bank,
         "prefix": (torch.randn(n_tokens, hidden) * mags[-1]).to(dtype),
-        "rms_weight": (1 + 0.1 * torch.randn(hidden)).to(dtype),
+        "rms_weight": (1 + 0.1 * torch.randn(hidden)).to(weight_dtype),
         "output_rms_weight": (
-            (1 + 0.1 * torch.randn(hidden)).to(dtype) if output_norm else None
+            (1 + 0.1 * torch.randn(hidden)).to(weight_dtype) if output_norm else None
         ),
     }
 
 
 @benchmark()
-def test_attn_res_train(n_tokens, hidden, num_bank, output_norm):
+def test_attn_res_train(n_tokens, hidden, num_bank, output_norm, weight_dtype):
     torch.manual_seed(0)
     dtype = dtypes.bf16
-    inputs = make_inputs(n_tokens, hidden, num_bank, output_norm, dtype)
+    inputs = make_inputs(
+        n_tokens, hidden, num_bank, output_norm, dtype, dtypes.d_dtypes[weight_dtype]
+    )
     dy = torch.randn(n_tokens, hidden, dtype=dtype)
     y_ref, grad_ref = run_torch(inputs, EPS, 1.0, dy)
 
@@ -116,10 +118,13 @@ def test_attn_res_train(n_tokens, hidden, num_bank, output_norm):
         assert errs[-1] == 0, f"flydsl bwd: {errs[-1]:.2%} of d{name} outside rtol/atol"
     ret["flydsl bwd us"] = us
     ret["flydsl bwd TFLOPS"] = 12 * n_tokens * num_src * hidden / us / 1e6
-    # dy, two passes over the candidates, one gradient row per candidate.
-    ret["flydsl bwd TB/s"] = (3 * num_src + 1) * row_bytes / us / 1e6
+    # dy, the candidates read once (not at all when dv is dy), one gradient row each.
+    reads = num_src if num_bank or output_norm else 0
+    ret["flydsl bwd TB/s"] = (1 + reads + num_src) * row_bytes / us / 1e6
     ret["flydsl bwd err"] = max(errs)
 
+    if weight_dtype != "bf16":
+        return ret
     # main's Triton forward on the same call, packed outside the timed region.
     packed = torch.cat(
         ([inputs["bank"]] if num_bank else []) + [inputs["prefix"].unsqueeze(1)], dim=1
@@ -173,12 +178,19 @@ def main():
         nargs="*",
         default=[True, False],
     )
+    parser.add_argument(
+        "--weight_dtype",
+        choices=["bf16", "fp32"],
+        nargs="*",
+        default=["bf16", "fp32"],
+        help="dtype of query, rms_weight and output_rms_weight",
+    )
     args = parser.parse_args()
 
     df = [
-        test_attn_res_train(n, h, k, o)
-        for n, h, k, o in itertools.product(
-            args.tokens, args.hidden, args.num_bank, args.output_norm
+        test_attn_res_train(n, h, k, o, w)
+        for n, h, k, o, w in itertools.product(
+            args.tokens, args.hidden, args.num_bank, args.output_norm, args.weight_dtype
         )
     ]
     df = pd.DataFrame(df)
