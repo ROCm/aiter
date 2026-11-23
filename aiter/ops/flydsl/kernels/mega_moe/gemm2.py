@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float4E2M1FN,
@@ -428,11 +429,16 @@ def gemm2_compute_v2(
     sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
 
     if const_expr(a_scale_lds):
-        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt).
+        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). Inline asm: plain FlyDSL 0.5.3
+        # LDS loads let LLVM fully unroll the K loop (VGPR spills 51 -> 57) or, with sched_barrier and unroll=1,
+        # issue the next A DMA after the first MFMA's wait; that version measured 0.5-1.6% slower on the
+        # V4.1-Flash EP8 large-input kernel (MI355X, 513..16384 rows a rank).
         assert BM == 64 and is_f8_a and kScaleSubBlocks == 2
         as_lds_off = aStages * slot_bytes
         # fold_rows: a third scale word (rows BM..BM+31, the folded tail) is read on every step (zeros unless folded).
         n_sc = 3 if const_expr(fold_rows) else 2
+        sc_struct_ty = llvm.StructType.get_literal([T.i32] * n_sc)
+        n_a_reads = kHalves * kMChunks * (2 if is_f8_a else 1)
 
         def issue_a_scale_tile_lds(kt):
             chunk_kt = (
@@ -440,11 +446,28 @@ def gemm2_compute_v2(
                 if const_expr(tilesPerScaleChunk == 1)
                 else kt // fx.Int32(tilesPerScaleChunk)
             )
-            addr0 = fx.Int32(as_lds_off) + (chunk_kt * fx.Int32(64) + lane) * fx.Int32(4)
-            return [
-                fx.Int32(lds_vec_load(s_aq_base, addr0 + kc_rt * fx.Int32(256 * k), T.i32, T.i32))
-                for k in range_constexpr(n_sc)
-            ]
+            addr0 = s_aq_base + fx.Int32(as_lds_off) + (chunk_kt * fx.Int32(64) + lane) * fx.Int32(4)
+            return llvm.inline_asm(
+                sc_struct_ty,
+                [(addr0 + kc_rt * fx.Int32(256 * k)).ir_value() for k in range_constexpr(n_sc)],
+                "\n".join(f"ds_read_b32 ${k}, ${k + n_sc}" for k in range(n_sc)),
+                ",".join(["=&v"] * n_sc + ["v"] * n_sc),
+                has_side_effects=True,
+            )
+
+        def wait_a_scale_tile_lds(pair):
+            # LDS returns in order: once at most n_a_reads (<= 15, the A operand reads issued after) are left,
+            # all n_sc scale reads are back. Inline asm: fx.rocdl.s_waitcnt has no data dependence on the scale
+            # registers; the tied outputs keep their uses below the wait. FlyDSL has no struct extract API.
+            i32 = T.i32
+            w = llvm.inline_asm(
+                sc_struct_ty,
+                [llvm.extractvalue(i32, pair, [k]) for k in range(n_sc)],
+                f"s_waitcnt lgkmcnt({min(n_a_reads, 15)})",
+                ",".join(["=v"] * n_sc + [str(k) for k in range(n_sc)]),
+                has_side_effects=True,
+            )
+            return [fx.Int32(llvm.extractvalue(i32, w, [k])) for k in range_constexpr(n_sc)]
 
     def load_a_scale_tile(kt):
         # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
@@ -635,8 +658,6 @@ def gemm2_compute_v2(
             K_TILES_RT,
             fx.Int32(1),
             init=load_c_carry(),
-            # With the A-scale LDS reads LLVM otherwise fully unrolls this loop (VGPR spills 51 -> 62).
-            unroll=1 if const_expr(a_scale_lds) else -1,
         ):
             store_c_carry(state)
             kt_rt = fx.Int32(kt_iv)
@@ -653,10 +674,7 @@ def gemm2_compute_v2(
                     + (1 if const_expr(fold_rows) else 0))
             gpu.barrier()
             if const_expr(a_scale_lds):
-                # Scale reads ahead of the A reads (LDS returns in order, so the first MFMA's lgkmcnt only
-                # covers them and its own A reads); unpinned they sink below most A reads.
-                sa = issue_a_scale_tile_lds(kt_rt)
-                rocdl.sched_barrier(0)
+                sa_pair = issue_a_scale_tile_lds(kt_rt)
             issue_a_ds_read(kt_rt % fx.Int32(aStages))
             if const_expr(fold_rows):  # noqa: SIM102
                 # Before the next A copy is issued, so these LDS reads do not wait for it.
@@ -674,8 +692,7 @@ def gemm2_compute_v2(
                 bqf, bsf = stream_b_tile(kt_rt)
                 sa = load_a_scale_tile(kt_rt)
             if const_expr(a_scale_lds):
-                # Issue the next A copy before the first MFMA's vmcnt wait, not after it.
-                rocdl.sched_barrier(0)
+                sa = wait_a_scale_tile_lds(sa_pair)
             mfma_cluster(bqf, bsf, sa[:kScaleSubBlocks], kt_rt)
             if const_expr(fold_rows):  # noqa: SIM102
                 if fold:
