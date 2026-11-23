@@ -251,6 +251,80 @@ def test_jdbba_k0(B, Kout, Mi, regime, dtype):
     return {"gfx": get_gfx_runtime(), "err": _check(d, out, dtype, f"K=0 {regime}")}
 
 
+@benchmark()
+def test_jdbba_rows_past_c(regime, dtype):
+    K = N = 256
+    lengths = (200, 150, 100)
+    L = 300
+    d = _build_inputs(3, K, N, max(lengths), regime, dtype, _offsets(lengths))
+    guard_rows = sum(lengths) - L
+    pool = torch.full(((L + guard_rows) * N,), 7.0, dtype=dtype)
+    out = pool[: L * N].view(L, N)
+    jagged = d["jagged"][:L]
+    jagged_dense_bmm_dispatched(
+        out,
+        jagged,
+        d["dense"],
+        d["bias"],
+        d["seq_offsets"],
+        3,
+        max(lengths),
+        uniform_seqlen=regime == "uniform",
+    )
+    torch.cuda.synchronize()
+    guard_changed = int((pool[L * N :] != 7.0).sum())
+    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
+    bad = _bad_count(out, ref[:L])
+    assert guard_changed == 0, f"{regime}: {guard_changed} elements past C written"
+    assert bad == 0, f"{regime}: {bad} wrong elements in C"
+    return {"gfx": get_gfx_runtime(), "guard changed": guard_changed, "bad": bad}
+
+
+def _offsets(lengths):
+    off = [0]
+    for n in lengths:
+        off.append(off[-1] + n)
+    return torch.tensor(off, dtype=torch.int32)
+
+
+def _bad_count(got, ref):
+    got, ref = got.float(), ref.float()
+    return int(((got - ref).abs() > 1e-2 + 1e-2 * ref.abs()).sum() + got.isnan().sum())
+
+
+# One group whose A or C spans more than a 32-bit buffer offset reaches; the
+# reference runs in chunks so no fp32 temporary crosses 4 GiB.
+@benchmark()
+def test_jdbba_wide_group(K, N, M, regime, dtype):
+    torch.manual_seed(0)
+    jagged = torch.randn(M, K, dtype=dtype)
+    dense = torch.randn(1, K, N, dtype=dtype)
+    bias = torch.randn(1, N, dtype=dtype)
+    out = _nan_out(M, N, dtype)
+    jagged_dense_bmm_dispatched(
+        out,
+        jagged,
+        dense,
+        bias,
+        _offsets((M,)),
+        1,
+        M,
+        uniform_seqlen=regime == "uniform",
+    )
+    torch.cuda.synchronize()
+    chunk = 2**26
+    rows = max(1, min(M, chunk // max(1, K, N)))
+    cols = max(1, min(N, chunk // max(1, K, rows)))
+    bad = 0
+    for r0 in range(0, M, rows):
+        a = jagged[r0 : r0 + rows].float()
+        for c0 in range(0, N, cols):
+            ref = a @ dense[0, :, c0 : c0 + cols].float() + bias[0, c0 : c0 + cols]
+            bad += _bad_count(out[r0 : r0 + rows, c0 : c0 + cols], ref.to(dtype))
+    assert bad == 0, f"K={K} N={N} M={M} {regime}: {bad} wrong elements"
+    return {"gfx": get_gfx_runtime(), "bad": bad}
+
+
 def _permute_group_lengths_(seq_offsets):
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     permuted = torch.zeros_like(seq_offsets)
@@ -854,16 +928,31 @@ def main():
             ("workgroups", 65536, 64, 128, 1, 2**22, "uniform"),
             ("grid z = N / 128", 1, 64, 65537 * BLOCK_N, 1, 1, "skew"),
             ("BIAS", 2**23, 0, 256, 1, 1, "skew"),
-            ("tile rows of C", 1, 0, 2**24 + BLOCK_N, 1, 1, "uniform"),
-            ("tile rows of C", 1, 64, 3 * 2**21, 341, 341, "uniform"),
+            ("tile rows of A or C", 1, 0, 2**24 + BLOCK_N, 1, 1, "uniform"),
             ("one group of B", 1, 16448, 131072, 1, 1, "uniform"),
-            ("one group of A or C", 1, 64, 128, 5, 2**24, "uniform"),
-            ("one group of A or C", 1, 4096, 128, 5, 2**19, "uniform"),
             ("N must be >= 1", 4, 64, 0, 5, 5, "uniform"),
         ),
     ):
         rows.append(test_jdbba_limit_invalid(*case, dtype))
     _summarize("jagged_dense_bmm launch limits", rows)
+
+    rows = []
+    for dtype, regime in itertools.product(args.dtype, args.regime):
+        rows.append(test_jdbba_rows_past_c(regime, dtype))
+    _summarize("jagged_dense_bmm rows past C", rows)
+
+    rows = []
+    for dtype, regime, (K, N, M) in itertools.product(
+        args.dtype,
+        args.regime,
+        (
+            (64, 3 * 2**21, 341),
+            (64, 128, 2**24 + 1024),
+            (4096, 128, 2**19 + 1024),
+        ),
+    ):
+        rows.append(test_jdbba_wide_group(K, N, M, regime, dtype))
+    _summarize("jagged_dense_bmm wide group", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi), regime in itertools.product(
