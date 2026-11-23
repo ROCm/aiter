@@ -8,9 +8,14 @@ import torch.nn.functional as F
 import triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.attention.kda_atom import fused_sigmoid_gating_delta_rule_update
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.triton_tests.attention.test_kda_one_token import (
+    make_one_token_inputs,
+    run_one_token,
+)
 
 try:
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd as fla_kda
@@ -23,7 +28,21 @@ except ImportError:
 BACKENDS = {
     "gluon": "aiter gluon",
     "fla": "fla triton",
+    "one_token": "one-token",
+    "generic": "packed",
+    "atom_same": "atom same",
+    "atom_split": "atom split",
+    "atom_fork": "atom fork",
 }
+# gfx1250 decode with one token per sequence. These columns need H=12, T=1,
+# BF16 activations and an FP32 V-first state; the default gluon sweep does not.
+ONE_TOKEN_BACKENDS = (
+    "one_token",
+    "generic",
+    "atom_same",
+    "atom_split",
+    "atom_fork",
+)
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -144,6 +163,64 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
+def make_one_token_case(tokens, provider, padded):
+    """Paged one-token inputs. Fork reads ``write + tokens`` from a second half."""
+    inputs = make_one_token_inputs(tokens, padded=padded)
+    if not provider.startswith("atom_"):
+        return inputs
+    write = inputs["ssm_state_indices"]
+    if provider == "atom_fork":
+        slots = 2 * tokens
+        row = 12 * 128 * 128 + (128 if padded else 0)
+        storage = torch.randn((slots, row), dtype=torch.float32, device=write.device)
+        inputs["initial_state"] = storage.as_strided(
+            (slots, 12, 128, 128), (row, 128 * 128, 128, 1)
+        )
+        inputs["ssm_state_indices_in"] = write + tokens
+    elif provider == "atom_split":
+        inputs["ssm_state_indices_in"] = write.clone()
+    else:
+        inputs["ssm_state_indices_in"] = write
+    return inputs
+
+
+def run_one_token_case(inputs, provider):
+    if provider == "generic":
+        return run_one_token(inputs, config={"use_one_token_decode": False})
+    if provider == "one_token":
+        return run_one_token(inputs)
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log=inputs["A_log"],
+        a=inputs["g"],
+        b=inputs["beta"],
+        dt_bias=inputs["dt_bias"],
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        o=inputs["out"],
+        initial_state=inputs["initial_state"],
+        cu_seqlens=inputs["cu_seqlens"],
+        ssm_state_indices=inputs["ssm_state_indices"],
+        ssm_state_indices_in=inputs["ssm_state_indices_in"],
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        lower_bound=K3_LOWER_BOUND,
+    )
+
+
+def one_token_bytes(inputs):
+    """q, k, v, g, beta, one state read, one state write, and the output."""
+    tokens, h, d = inputs["q"].shape[1:]
+    act = inputs["q"].element_size()
+    state = inputs["initial_state"].element_size()
+    return (
+        tokens * (4 * h * d) * act
+        + tokens * h * inputs["beta"].element_size()
+        + 2 * tokens * h * d * d * state
+        + tokens * h * d * inputs["out"].element_size()
+    )
+
+
 def _time(fn, args):
     """One measurement in ms; cudagraph keeps host launch cost out of the span."""
     if args.timing == "cudagraph":
@@ -254,6 +331,15 @@ def benchmark(args):
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
+        if provider in ONE_TOKEN_BACKENDS:
+            case = make_one_token_case(B, provider, args.padded)
+            mem = one_token_bytes(case)
+
+            def fn():
+                run_one_token_case(case, provider)
+
+            return _record(H, B, T, provider, fn, mem)
+
         inputs = make_inputs(
             B,
             T,
@@ -316,6 +402,9 @@ def benchmark(args):
             def fn():
                 fla_kda(**shared)
 
+        return _record(H, B, T, provider, fn, mem)
+
+    def _record(H, B, T, provider, fn, mem):
         runs = [_time(fn, args) for _ in range(args.runs)]
         med = sorted(r[0] for r in runs)[len(runs) // 2]
         lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
@@ -427,6 +516,12 @@ def parse_args():
     parser.add_argument("--paged", action="store_true", default=False)
     parser.add_argument("--fused", action="store_true", default=False)
     parser.add_argument(
+        "--padded",
+        action="store_true",
+        default=False,
+        help="one-token backends: pad beta's token stride and the state row",
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         nargs="+",
@@ -486,8 +581,29 @@ def parse_args():
     return parser.parse_args()
 
 
+def _check_one_token_shapes(args):
+    """The one-token kernel only launches for this decode shape."""
+    problems = []
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
+        problems.append(f"gfx1250 (got {arch_info.get_arch()})")
+    if args.num_heads != [12]:
+        problems.append("--num_heads 12")
+    if args.seq_lens != [1]:
+        problems.append("--seq_lens 1")
+    if args.head_dim != K3_HEAD_DIM:
+        problems.append(f"--head_dim {K3_HEAD_DIM}")
+    if args.dtype != "bf16" or args.state_dtype != "fp32":
+        problems.append("--dtype bf16 --state_dtype fp32")
+    if not args.gate or args.fused or args.num_accepted or args.state_k_first:
+        problems.append("gate on, and no --fused, --num_accepted, or --state_k_first")
+    if problems:
+        sys.exit("one-token backends need " + "; ".join(problems))
+
+
 def run_bench(args):
-    if arch_info.get_arch() not in ("gfx950", "gfx1250"):
+    if any(b in ONE_TOKEN_BACKENDS for b in args.backends):
+        _check_one_token_shapes(args)
+    if arch_info.get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
     if args.gluon_configs is None:
         # The gfx950 kernel holds the whole [V, K] state: BV == V.
