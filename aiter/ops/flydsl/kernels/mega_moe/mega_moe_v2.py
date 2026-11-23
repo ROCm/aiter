@@ -1133,7 +1133,7 @@ class MegaMoEV2:
 
     def forward(
         self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
-        max_tokens=None,
+        max_tokens=None, shared_add=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
         None or False leaves the check off (it costs prefill time); the small-
@@ -1151,6 +1151,24 @@ class MegaMoEV2:
         route took), of which rows past this rank's own are undefined.
         """
         route = self._route(int(x_bf16.shape[0]), max_tokens)
+        if shared_add is not None:
+            # ``shared_add`` (BF16 [rows, model_dim], this call's rows): the output is ``routed + shared_add``. The
+            # small-input route adds it inside its combine and returns ``shared_add`` itself (see
+            # SmallMRuntime.forward); the other routes add it here, as the caller would.
+            if route[0] == ROUTE_SMALL_M and slice_output:
+                check_forward_inputs(
+                    x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+                    topk=self.topk, device=self.dev,
+                )
+                with torch.cuda.stream(torch_stream(stream)):
+                    runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(route[1])]
+                    return runtime.forward(x_bf16, wts, topk_ids, slice_output=True, shared_add=shared_add)
+            out = self._forward_route(
+                route, x_bf16, wts, topk_ids, stream=stream, slice_output=True,
+                mask_invalid_slots=mask_invalid_slots,
+            )
+            with torch.cuda.stream(torch_stream(stream)):
+                return out + shared_add
         return self._forward_route(
             route, x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
             mask_invalid_slots=mask_invalid_slots,

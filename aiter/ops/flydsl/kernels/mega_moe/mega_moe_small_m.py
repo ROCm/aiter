@@ -560,10 +560,32 @@ def emit_direct_fixed_slot_finalize(
     fx.barrier()
 
 
+def _fc_out_addr(arg_out, arg_shared, shared_add):
+    """Where the fused combine's reducers write a token's row: the caller's shared-output tensor (shared_add) or
+    the combine buffer."""
+    return arg_shared if shared_add else arg_out
+
+
+def _fc_store_row(acc, out_rsrc, index, shared_add):
+    """Store one lane's 8 summed F32 values of a token row as BF16 at i32 ``index`` of ``out_rsrc``. ``shared_add``:
+    the row already holds the caller's BF16 values; the BF16-rounded sum is added to them and rounded again (the
+    two roundings of ``bf16(sum) + shared`` on BF16 tensors)."""
+    res = acc.to(fx.BFloat16)
+    if shared_add:
+        mine = fx.Vector(load_at(out_rsrc, index, fx.Int32, 4))
+        res = (res.to(fx.Float32) + mine.bitcast(fx.BFloat16).to(fx.Float32)).to(fx.BFloat16)
+    store_at(res.bitcast(fx.Int32).ir_value(), out_rsrc, index, 2)
+
+
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
-    n_blocks=1, bf16_head_tokens=0, m2_tail=frozenset(), lds_xt_off=0):
+    n_blocks=1, bf16_head_tokens=0, m2_tail=frozenset(), lds_xt_off=0, shared_add=False):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
+
+    ``shared_add``: ``arg_shared`` is the address of a caller-owned BF16 ``[cur_tok, N_OUT]`` tensor (the shared
+    expert's output); the reducers write ``bf16(f32(bf16(sum)) + f32(shared))`` back into it instead of writing
+    ``bf16(sum)`` to ``arg_out`` -- bit for bit the caller's ``combine_output + shared`` (two BF16 roundings), with
+    the BF16 add launch gone. The tensor is the call's output; ``arg_out`` is left untouched.
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
     of a counter the last WG advances.
@@ -595,7 +617,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     def fused_combine_tail(tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, arg_cnt: fx.Int64, arg_flag: fx.Int64,
         arg_xdb: fx.Int64, arg_p2p_xdb: fx.Int64, arg_inp: fx.Int64, arg_out: fx.Int64, arg_trecv: fx.Int64,
         arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32, arg_running: fx.Int64,
-        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64):
+        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64, arg_shared: fx.Int64):
     # fmt: on
         ticket_ptr = lds_typed_ptr(fx.Int32(lds_fc_off), T.i32, align=4)
         flag_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 8), T.i64, align=8)
@@ -706,7 +728,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     fp8_peers = fp8_peers | fx.Int32(fx.ptr_load(fmt_ptr(fx.Int32(peer)), result_type=T.i32))
             inp_rsrc = AddrBuffer(arg_inp)
             idx_rsrc = AddrBuffer(arg_idx)
-            out_rsrc = AddrBuffer(arg_out)
+            out_rsrc = AddrBuffer(_fc_out_addr(arg_out, arg_shared, shared_add))
             items = i32_cur_tok * fx.Int32(chunks)
             worker = (fx.Int32(ticket) - first) * fx.Int32(4) + wave
             if const_expr("nc" in m2_tail):
@@ -756,7 +778,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                             [valid.select(words[w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
                         )
                         acc = acc + words.bitcast(fx.BFloat16).to(fx.Float32)
-                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
+                    _fc_store_row(acc, out_rsrc, tok * fx.Int32(row_i32) + col, shared_add)
                     if const_expr(bf16_head_tokens):
                         if tok < fx.Int32(bf16_head_tokens):
                             for k in range_constexpr(topk):
@@ -789,7 +811,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                                 words = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, 2))
                                 contrib = words.bitcast(fx.BFloat16).to(fx.Float32)
                         acc = acc + contrib
-                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
+                    _fc_store_row(acc, out_rsrc, tok * fx.Int32(row_i32) + col, shared_add)
 
     return fused_combine_tail
 
@@ -904,8 +926,12 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, g2_b2stage: bool = False, probe: str = "",
-    expert_cached_w: int = 0, m2: str = "",
+    expert_cached_w: int = 0, m2: str = "", shared_add: bool = False,
 ):
+    # ``shared_add`` (default False = unchanged kernel): the launch's ``addr_in_sc`` argument (otherwise
+    # unused) is the address of the caller's BF16 shared-expert output; the combine adds each token's row to it in
+    # place (make_fused_combine_tail), so the caller's separate BF16 add launch goes away. Local to the rank: no
+    # protocol word changes, ranks need not agree on it.
     # Experiment knobs (default off, see _kernel_knobs): ``g2_b2stage`` runs the 64-row GEMM2 tile on the 2-stage B
     # pipeline (next K-tile's W2 prefetched during this one's MFMAs) instead of the 1-stage path; ``probe`` drops
     # GEMM bodies for phase timing ("g1": no GEMM1 tile body, "g2": no GEMM2 tile body; the protocol, claims,
@@ -1053,7 +1079,7 @@ def compile_mega_moe_stage1(
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
         n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens, m2_tail=m2f & {"tl", "nc", "xt"},
-        lds_xt_off=g2_lay["bytes"] + 8)
+        lds_xt_off=g2_lay["bytes"] + 8, shared_add=bool(shared_add))
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # (M2 xt keeps the work-head address in the 8 bytes after the two scratch words.)
@@ -1121,6 +1147,7 @@ def compile_mega_moe_stage1(
         f"{'_g2b2' if g2_b2stage else ''}{'_probe' + ''.join(sorted(probe_skip)) if probe_skip else ''}"
         f"{'_m2' + ''.join(sorted(m2f)) if m2f else ''}"
         f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
+        f"{'_sha' if shared_add else ''}"
         f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
     )
 
@@ -1700,7 +1727,8 @@ def compile_mega_moe_stage1(
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
             fx.Int32(launch_grid_x), fp8_rows,
-            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset)
+            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset,
+            addr_in_sc if const_expr(shared_add) else fx.Int64(0))
 
     @flyc.jit
     def launch(
@@ -2157,7 +2185,8 @@ class SmallMRuntime:
         self._active_config = config
         return config
 
-    def _launch(self, config: MegaMoEConfig, run_tokens, x_bf16, topk_ids, wts, stream, *, preload=False):
+    def _launch(self, config: MegaMoEConfig, run_tokens, x_bf16, topk_ids, wts, stream, *, preload=False,
+                shared_add=None):
         stage1, stage2 = config.stage1, config.stage2
         assert config.p2p_quant == "none" and stage2.block_m == stage1.sort_block_m
         fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
@@ -2167,7 +2196,8 @@ class SmallMRuntime:
             self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
             op.tile_row_base, op.sorted_expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
-            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(x_bf16.data_ptr()),
+            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()),
+            fx.Int64((x_bf16 if shared_add is None else shared_add).data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
             stream, model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
             experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
@@ -2180,7 +2210,7 @@ class SmallMRuntime:
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
-            preload=preload, **_kernel_knobs(config))
+            preload=preload, **_kernel_knobs(config), **({} if shared_add is None else {"shared_add": True}))
         # fmt: on
 
     def preload_aot_bundle(self):
@@ -2195,13 +2225,26 @@ class SmallMRuntime:
                 continue
             seen.add(key)
             self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True)
+            if os.environ.get("AITER_MEGA_SHARED_ADD", "0") == "1":
+                # The shared_add variant of the same bucket (the address is not dereferenced by a preload).
+                self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16)
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, shared_add=None):
+        """``shared_add``: a contiguous BF16 ``[rows, model_dim]`` tensor of this call's rows (the shared expert's
+        output). The combine adds each row's routed sum to it in place and it is returned as the output: bit for
+        bit ``forward(...) + shared_add``, without the separate add launch."""
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
         )
+        if shared_add is not None:
+            if (shared_add.dtype != torch.bfloat16 or tuple(shared_add.shape) != (run_tokens, self.model_dim)
+                    or not shared_add.is_contiguous() or shared_add.device != x_bf16.device):
+                raise ValueError("shared_add must be a contiguous BF16 [rows, model_dim] tensor on the call's device")
+        caller_out = shared_add
         if run_tokens == 0:
+            # An idle rank still takes part in the launch (no rows, so nothing to add).
             x_bf16, wts, topk_ids = self._idle_inputs
+            shared_add = None
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         elif hasattr(stream, "cuda_stream"):
@@ -2210,7 +2253,9 @@ class SmallMRuntime:
         self._s1_disp = self.w2_dispatch_table(self.w2, self.w2_scale)
         # Ranks may use different token buckets in one call; an idle rank uses the 1-token bucket.
         config = self._select_config(max(run_tokens, 1))
-        self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream)
+        self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream, shared_add=shared_add)
+        if caller_out is not None:
+            return caller_out
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
