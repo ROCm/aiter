@@ -4,7 +4,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
@@ -15,7 +14,6 @@ from flydsl.expr.typing import (
     T,
 )
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value as _raw
 
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
@@ -183,7 +181,7 @@ def issue_a_fold_rows_dt(arg_aq, s_aq_base, slot, kt, m_row, wave, lane, KH_TILE
     voffset = (((lane % lanes_per_row) * 16) ^ lds_swizzle_mask_f8(tile_row, KH_TILE_A)) + tile_row * K_BYTES
     off = fx.Int32(slot * (slot_rows * KH_TILE_A)) + lds_row * fx.Int32(KH_TILE_A)
     fx.copy(lds_dma_atom_128(), src[(voffset + kt * KH_TILE_A) // 4, None],
-        lds_dma_dst(s_aq_base, off, elem_ty=T.i32, align=16))
+        lds_dma_dst(s_aq_base, off))
 
 
 def issue_a_scale_lds_dt(arg_ascale, s_aq_base, lds_off, m_row, i32_inter, wave, lane, *, INTER_MAX, NW, chunks=2):
@@ -203,7 +201,7 @@ def issue_a_scale_lds_dt(arg_ascale, s_aq_base, lds_off, m_row, i32_inter, wave,
         fx.copy(
             lds_dma_atom_128(),
             src[(blk * fx.Int32(64) + lane) * fx.Int32(4), None],
-            lds_dma_dst(s_aq_base, fx.Int32(lds_off) + blk * fx.Int32(1024), elem_ty=T.i32, align=16),
+            lds_dma_dst(s_aq_base, fx.Int32(lds_off) + blk * fx.Int32(1024)),
         )
 
 
@@ -425,13 +423,14 @@ def gemm2_compute_v2(
     sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
 
     if const_expr(a_scale_lds):
-        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). The reads are inline asm so
-        # the compiler sees no LDS read that could alias the in-flight A copy (it would wait for that copy).
+        # The m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). Inline asm: FlyDSL 0.5.3 LDS
+        # reads (fx.ptr_load / fx.copy) cannot be marked noalias vs the in-flight A LDS DMA, so the backend would
+        # insert a vmcnt wait for that copy before them.
         assert BM == 64 and is_f8_a and kScaleSubBlocks == 2
         as_lds_off = aStages * slot_bytes
         # fold_rows: a third scale word (rows BM..BM+31, the folded tail) is read on every step (zeros unless folded).
         n_sc = 3 if fold_rows else 2
-        sc_struct_ty = ir.Type.parse("!llvm.struct<(" + ", ".join(["i32"] * n_sc) + ")>")
+        sc_struct_ty = llvm.StructType.get_literal([T.i32] * n_sc)
         n_a_reads = kHalves * kMChunks * (2 if is_f8_a else 1)
 
         def issue_a_scale_tile_lds(kt):
@@ -443,7 +442,7 @@ def gemm2_compute_v2(
             addr0 = s_aq_base + fx.Int32(as_lds_off) + (chunk_kt * fx.Int32(64) + lane) * fx.Int32(4)
             return llvm.inline_asm(
                 sc_struct_ty,
-                [_raw(addr0 + kc_rt * fx.Int32(256 * k)) for k in range_constexpr(n_sc)],
+                [(addr0 + kc_rt * fx.Int32(256 * k)).ir_value() for k in range_constexpr(n_sc)],
                 "\n".join(f"ds_read_b32 ${k}, ${k + n_sc}" for k in range(n_sc)),
                 ",".join(["=&v"] * n_sc + ["v"] * n_sc),
                 has_side_effects=True,
@@ -451,8 +450,9 @@ def gemm2_compute_v2(
 
         def wait_a_scale_tile_lds(pair):
             # LDS returns in order: once at most n_a_reads (<= 15, the A operand reads issued after) are left,
-            # all n_sc scale reads are back. The outputs are tied, so no use of the scales floats above the wait.
-            i32 = ir.IntegerType.get_signless(32)
+            # all n_sc scale reads are back. Inline asm: fx.rocdl.s_waitcnt has no data dependence on the scale
+            # registers; the tied outputs keep their uses below the wait. FlyDSL has no struct extract API.
+            i32 = T.i32
             w = llvm.inline_asm(
                 sc_struct_ty,
                 [llvm.extractvalue(i32, pair, [k]) for k in range(n_sc)],
