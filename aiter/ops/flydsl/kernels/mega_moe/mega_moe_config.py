@@ -268,9 +268,9 @@ class FusedStage1Knobs:
     # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
     # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
     no_chunk_release: bool = False
-    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
-    # the next step's A copy (False: the compiler makes it wait).
-    a_asm_reads: bool = False
+    # Large-input GEMM1 copies A to LDS with async LDS DMA, so a K-step's first A read does not wait for the next
+    # step's A copy (False: the compiler makes it wait, as it cannot tell the two LDS buffers apart).
+    a_async_lds: bool = False
     # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
     # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
     batch_rows: bool = False
@@ -1583,7 +1583,7 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
             skip_payload_ready=True,
             one_row_acquire=True,
             no_chunk_release=True,
-            a_asm_reads=True,
+            a_async_lds=True,
             payload_small_blocks=12,
             payload_small_tokens=640,
             lean_plan=True,

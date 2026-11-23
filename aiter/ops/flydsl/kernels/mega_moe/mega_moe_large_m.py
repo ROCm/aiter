@@ -1806,8 +1806,8 @@ def large_m_kernel_specs(
         s2_spec += (("g1_one_acq", 1),)
     if k1.no_chunk_release:
         s2_spec += (("disp_no_rel", 1),)
-    if k1.a_asm_reads:
-        s2_spec += (("g1_a_asm", 1),)
+    if k1.a_async_lds:
+        s2_spec += (("g1_a_async", 1),)
     if k1.ascale_packed:
         s2_spec += (("g1_as_pack", 1),)
     if k1.epi_lean:
@@ -1958,7 +1958,7 @@ def compile_mega_moe_stage1(
         k: v for k, v in _s2.items()
         if k not in ("max_g2_m_blocks", "inter_dim", "g2_xcd_chunk", "g1_short_rows", "g1_mid_rows", "g2_scale_stage",
             "g1_fold_tail", "plan_par", "g1_epi_vec", "g1_dedup", "disp_merge_rel",
-            "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_asm", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
+            "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_async", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
             "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
             "disp_early_clear")
@@ -1982,8 +1982,8 @@ def compile_mega_moe_stage1(
     G1_ONE_ACQ = bool(_s2.get("g1_one_acq", 0))
     # disp_no_rel: with disp_merge_rel, a payload chunk publishes its tiles after its drain without a system release.
     DISP_NO_REL = bool(_s2.get("disp_no_rel", 0))
-    # g1_a_asm: GEMM1 K-loop A operand reads in inline asm (no false wait on the next step's A copy).
-    G1_A_ASM = bool(_s2.get("g1_a_asm", 0))
+    # g1_a_async: GEMM1 A copies to LDS are async LDS DMA (no false wait of the A reads on the next step's A copy).
+    G1_A_ASYNC = bool(_s2.get("g1_a_async", 0))
     # g1_as_pack: GEMM1 A scales staged to LDS in K-loop order (one ds_read_b32 per row group and K-step).
     G1_AS_PACK = bool(_s2.get("g1_as_pack", 0))
     # g1_epi_lean: the GEMM1 epilogue's quantize/store pass without serial waits (SiluQuantEpilogue lean).
@@ -2447,7 +2447,7 @@ def compile_mega_moe_stage1(
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
             evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
             fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_SHORT_ROWS, fold_rows=G1_FOLD, row_map=g1_row_map,
-            a_asm_reads=G1_A_ASM, ascale_packed=G1_AS_PACK,
+            a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK,
         )
         _do_scheduled_tile = g1_runners[1]
         _do_short_tile = g1_runners[2] if G1_SHORT_ROWS else None
@@ -2468,7 +2468,7 @@ def compile_mega_moe_stage1(
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
                 evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
                 fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_MID_ROWS, row_map=g1_row_map,
-                a_asm_reads=G1_A_ASM, ascale_packed=G1_AS_PACK,
+                a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK,
             )[2]
 
         if tid == fx.Int32(0):
