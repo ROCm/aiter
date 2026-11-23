@@ -3846,45 +3846,45 @@ def launch_gemm_a8w4_tdm_shared_fold(
     ``sh_tile_m`` and of the e8m0 output tile); the dense A rows and A scales
     must be readable up to it.
     """
-    common = dict(
-        K=K,
-        out_is_f16=out_is_f16,
-        stage1_act=stage1_act,
-        has_bias=0,
-        stage1_quant_out=stage1_quant_out,
-        cluster_n=1,
-        cluster_m=1,
-        next_stage_prefetch=next_stage_prefetch,
-        num_waves_per_tensor_tdm=num_waves_per_tensor_tdm,
-        tdm_b_th=tdm_b_th,
-        enable_ep_scatter=0,
-        ep_arena_handle=0,
-        ep_combine_input_offset=0,
-        ep_slot_stride_bytes=0,
-        ep_destination_stride=0,
-        ep_world_size=0,
-        ep_quant_bits=0,
-        a_row_stride_bytes=0,
-        a_scale_row_stride_bytes=0,
-        lds_soa_load_interleave=lds_soa_load_interleave,
-        rolled_drain=rolled_drain,
-        m_align=0,
-        k_waves=1,
+    common = {
+        "K": K,
+        "out_is_f16": out_is_f16,
+        "stage1_act": stage1_act,
+        "has_bias": 0,
+        "stage1_quant_out": stage1_quant_out,
+        "cluster_n": 1,
+        "cluster_m": 1,
+        "next_stage_prefetch": next_stage_prefetch,
+        "num_waves_per_tensor_tdm": num_waves_per_tensor_tdm,
+        "tdm_b_th": tdm_b_th,
+        "enable_ep_scatter": 0,
+        "ep_arena_handle": 0,
+        "ep_combine_input_offset": 0,
+        "ep_slot_stride_bytes": 0,
+        "ep_destination_stride": 0,
+        "ep_world_size": 0,
+        "ep_quant_bits": 0,
+        "a_row_stride_bytes": 0,
+        "a_scale_row_stride_bytes": 0,
+        "lds_soa_load_interleave": lds_soa_load_interleave,
+        "rolled_drain": rolled_drain,
+        "m_align": 0,
+        "k_waves": 1,
         # The scf.if around each class and the dense tile's loop put a branch
         # right after a TDM issue (the gfx1250 hazard ``tdm_snop`` avoids).
-        tdm_snop=1,
+        "tdm_snop": 1,
         # Measured (routed GEMM2, T 128-256, dense tiles in the launch): the C
         # tile staged over input stage 0 came out holding stage 0's last A
         # bytes in a few rows in 1-6% of launches, never over stage 1 or 2
         # (0 in 800 each) nor past the stages; stage 1 costs no LDS.
-        c_stage_apart=1,
+        "c_stage_apart": 1,
         # GEMM2's bf16 C: an LDS read-back + buffer stores, not a TDM store.
         # Measured (MI455X, T 48-256, hot-expert routing): the TDM store wrote
         # the input stage's older A/B bytes into 0.2-10% of launches at T 48-80
         # (16x128 routed + 64x64 / 32x64 dense tiles); 0 in 84k launches with
         # the read-back, bitwise the clean output, +0.0-0.3 us per launch.
-        c_lds_store=0 if stage1_act else 1,
-    )
+        "c_lds_store": 0 if stage1_act else 1,
+    }
     holder = [None]
     routed_task, block, rname, _, rlay = build_gemm_a8w4_tdm_task(
         tile_m=tile_m,

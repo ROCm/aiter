@@ -52,7 +52,7 @@ class MoeOutputEpilogue:
     """A pending ``out = out * scale + addend`` for the next grouped MoE call's
     gather-reduce (see ``moe_output_epilogue``)."""
 
-    __slots__ = ("addend", "scale", "before", "consumed")
+    __slots__ = ("addend", "before", "consumed", "scale")
 
     def __init__(self, addend: torch.Tensor, scale: float, before):
         self.addend = addend
@@ -109,7 +109,7 @@ class MoeSharedFold:
     """A shared expert pending for the next grouped MoE call's GEMMs (see
     ``moe_shared_expert_fold``)."""
 
-    __slots__ = ("weights", "scale", "consumed")
+    __slots__ = ("consumed", "scale", "weights")
 
     def __init__(self, weights: dict, scale: float):
         self.weights = weights
@@ -2986,7 +2986,8 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
-        ptr_arg(addend),
+        # Without an addend the kernel never reads this pointer; pass null.
+        ptr_arg(addend if addend is not None else torch.empty(0, device=device)),
         current_stream_arg(),
     )
     return out
