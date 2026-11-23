@@ -249,6 +249,17 @@ def _keepalive(vals):
     )
 
 
+def _setprio_inc_wg(amount):
+    """``s_setprio_inc_wg N`` -- adds N (2-bit, wrapping) to USER_PRIORITY of every wave
+    of this WG on this SIMD, itself included. Seeded at distinct priorities, the LO/HI
+    pair therefore ROTATES which half is high. Static S_SETPRIO cannot express that: it
+    sets an ordering, not an alternation, and the older wave wins on the age tiebreak.
+    No rocdl binding; immediate-only, so the inline-asm Lo256 cage does not apply."""
+    llvm_dialect.inline_asm(
+        None, [], f"s_setprio_inc_wg {amount}", "", has_side_effects=True
+    )
+
+
 def _keepalive_sgpr(vals):
     """``_keepalive`` for uniform values. The wait the SMEM result needs lands HERE, not
     at the load, so placing this late is what buys the issue-to-wait distance."""
@@ -361,7 +372,8 @@ def _ring_drive(
     loads, which costs one s_set_vgpr_msb toggle OUT to the load bank and back IN for the
     wmma), defer until at least this many loads are owed and issue them in one run, so one
     toggle pair covers the whole burst. 0 keeps the per-fragment cadence. Must be <= NP or
-    a fragment could reach its wait before its own loads are issued.
+    a fragment could reach its wait before its own loads are issued. Measured on case 51:
+    4 is an interior optimum (1 and 2 are +1.5%, 6 and 10 worse).
 
     The per-fragment ``s_wait_dscnt`` STAYS, even though bursting leaves it in gaps that
     issue nothing: collapsing it to one stricter wait per run was measured 0.6% SLOWER on

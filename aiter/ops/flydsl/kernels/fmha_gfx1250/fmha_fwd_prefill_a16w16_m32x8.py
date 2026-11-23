@@ -107,6 +107,7 @@ from .fmha_utils import (
     _pick_num_q_tiles,
     _ring_drive,
     _ring_num_prefetch,
+    _setprio_inc_wg,
     _tree_reduce_multi,
     _warp_id,
     _wg_kv_span,
@@ -616,9 +617,6 @@ def _pv_qk_gemm(
             p_frags.pop((q_tile_idx, k_tile_idx)) for q_tile_idx in range(num_q_tiles)
         ]
 
-    # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
-    # in its softmax VALU here, and the gemm half must win issue arbitration.
-    rocdl.s_setprio(2)
     _ring_drive(
         widths=[vld_per_frag] * num_v_frags + [2] * num_k_frags,
         emit=emit,
@@ -630,7 +628,10 @@ def _pv_qk_gemm(
         tap=tap,
         refill_burst=PVQK_REFILL_BURST,
     )
-    rocdl.s_setprio(0 if warp_type.is_lo else 1)
+    # Hand the high-priority slot to this wave's SIMD-mate, which under anti-phase is
+    # entering its own gemm now. Its prologue (TDM issue, address SALU, ring head) then
+    # runs at high priority and its wmma chain starts earlier.
+    _setprio_inc_wg(2)
     return out_list, s_acc_list
 
 
@@ -1076,6 +1077,17 @@ def _attention_prologue(
     )
 
     _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
+
+    @flyc.jit
+    def _seed_prio(is_lo):
+        # Distinct seeds are mandatory: s_setprio_inc_wg adds the SAME amount to every
+        # wave on the SIMD, so equal seeds stay equal and never rotate.
+        if is_lo:
+            rocdl.s_setprio(3)
+        else:
+            rocdl.s_setprio(1)
+
+    _seed_prio(_is_lo)
     if USE_TDM_LOADER:
         # The halves issue different numbers of copies here, so the drain immediate is
         # per-half and rides the same branch. Both sit inside Q's global load.
