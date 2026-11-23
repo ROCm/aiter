@@ -15,7 +15,7 @@ DeepSeek-V4.1-Flash (H 5120, I 2304, 384 experts, top-6, silu with swiglu_limit 
 MiMo-V2.6-Flash (H 4096, I 2048, 256 experts, top-8, silu) or Kimi-K3 (routed experts
 in its 3584-wide latent space: H 3584, I 3072, 896 experts, top-16, SiTUv2 with beta 4
 and linear_beta 25). A layer that ``eligible()`` does not take is skipped, and so is a
-path the layer does not run (DeepSeek-V4.1-Flash: large_M and a8w4's small kernel).
+path the layer does not run (DeepSeek-V4.1-Flash: large_M).
 
 - test_mega_moe_gfx942: every path (main and large_M, each also on x quantized
   beforehand by aiter's per_1x128 quant ("main pq", "large pq", timed with that quant),

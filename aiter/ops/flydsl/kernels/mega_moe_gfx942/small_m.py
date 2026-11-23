@@ -17,9 +17,9 @@ streamed into VGPRs, fp8 A through LDS):
   trip), then the row, scales, weight and source id go to each destination (written
   through). Each producer, once its stores completed, adds DONE_UNIT / P to ``done[me]``
   on every rank.
-- Plan: every workgroup waits for ``done`` of all ranks (epoch x DONE_UNIT), reads the 32
-  ``run`` counts and derives the same tile list (BM-row m-tiles, expert order); nothing
-  is published.
+- Plan: every workgroup waits for ``done`` of all ranks (epoch x DONE_UNIT), reads the
+  ``run`` counts of its E_LOCAL experts and derives the same tile list (BM-row m-tiles,
+  expert order); nothing is published.
 - Units: XCD x takes, from its own counter, its eighth of the gemm1 units (m-tile x 128
   inter cols, m-major) and then its eighth of the gemm2 units (m-tile x NO out cols): the
   same m-tiles, so gemm2 mostly reads a2 rows its own XCD wrote (a2 is written through:
@@ -93,9 +93,6 @@ from .protocol import (
     small_sym_layout,
 )
 
-# The small kernel's layer: 32 local experts (and H 4096) per rank.
-E_LOCAL = 32
-E_GLOBAL = NPES * E_LOCAL
 P2P = CM_SYS | CM_NT  # stores into a rank's (uncached) heap: written through
 WT = CM_SC1  # a2: written through (a gemm2 unit on another XCD may read it)
 
@@ -122,6 +119,7 @@ def ep_mega_small_kernel(
     H,
     I,
     TOPK,
+    E_LOCAL,
     TMAX,
     BM=64,
     NO=256,
@@ -134,7 +132,8 @@ def ep_mega_small_kernel(
     BCM1=2,
     BCM2=2,
 ):
-    """The small megamoe kernel for (H, I, top-k) and batches of <= TMAX tokens over all
+    """The small megamoe kernel for (H, I, top-k), ``E_LOCAL`` experts per rank and
+    batches of <= TMAX tokens over all
     ranks (fixed slots of TMAX rows per expert). ``BM``: rows of an m-tile (row variants
     16 .. BM); ``NO``: gemm2 output cols per unit; ``ARB`` / ``PF``: K bytes per A tile /
     W prefetch distance of both GEMMs; ``P``: producer workgroups; ``WPC``: workgroups per
@@ -153,6 +152,7 @@ def ep_mega_small_kernel(
         NI // 128
     )  # gemm1 epilogue: groups per tile, waves per group
     GRID = NUM_CU * WPC
+    E_GLOBAL = NPES * E_LOCAL
     CAP = TMAX
     ROWS = E_LOCAL * CAP  # fixed-slot rows of a rank
     ROWV = tuple(r for r in (16, 32, 64) if r <= BM)
@@ -160,6 +160,7 @@ def ep_mega_small_kernel(
     A2_ROWS = MAXT * BM
     CH = H // 1024  # producer: 1 KB fp8 chunks of a row, 16 B per lane
     VW = NO // 128  # gemm2 scatter: i32 per lane of a row's NO bf16
+    UNITS = H // 8  # combine: a bf16 row in 16 B units, NT per pass
     LINE = SMALL_LINE
     off, _ = small_sym_layout(H, TOPK, TMAX, E_LOCAL)
     O_RX, O_RS, O_RW, O_RID = off["rx"], off["rs"], off["rw"], off["rid"]
@@ -167,12 +168,9 @@ def ep_mega_small_kernel(
     assert BM in (16, 32, 64) and CAP % BM == 0 and TMAX <= 1 << 16, (BM, TMAX)
     assert H % 1024 == 0 and G1N == 8 * CH and I % NI == 0 and NIW % 16 == 0
     assert H % NO == 0 and NO % 128 == 0 and NOW % 16 == 0, NO
-    assert H == 8 * NT, "combine: one workgroup pass of 16 B per thread is a row"
-    assert 1 <= TOPK <= 8 and E_LOCAL == 32 and 0 < P <= GRID and WPC in (1, 2), (
-        TOPK,
-        P,
-        WPC,
-    )
+    # a lane per row scale (producers) and per local expert (plan) in one wave
+    assert G1N <= 64 and E_LOCAL <= 64, (G1N, E_LOCAL)
+    assert 1 <= TOPK <= 8 and 0 < P <= GRID and WPC in (1, 2), (TOPK, P, WPC)
     # done[s] on every rank: each of source s's P producers adds DONE_UNIT / P, so a call
     # adds DONE_UNIT whatever P (the call with epoch k is complete at k DONE_UNIT)
     DONE_UNIT = 64
@@ -183,15 +181,17 @@ def ep_mega_small_kernel(
     LDS_GEMM = max(
         RATIO + (G1N + 1) * BM * 4, RATIO + (G2N + 1) * BM * 4, BM * NO * 2, BM * NW * 4
     )
-    L_CNT = LDS_GEMM // 4  # i32: rows per local expert [32]
-    L_TB = L_CNT + E_LOCAL  # first m-tile of each expert [32], then the m-tiles [1]
+    L_CNT = LDS_GEMM // 4  # i32: rows per local expert [E_LOCAL]
+    L_TB = (
+        L_CNT + E_LOCAL
+    )  # first m-tile of each expert [E_LOCAL], then the m-tiles [1]
     L_BC = L_TB + E_LOCAL + 1  # broadcast words [4]
     L_PEER = -(-(L_BC + 4) // 2) * 2  # every rank's heap base (i64 [NPES])
     LDS_BYTES = -(-(L_PEER + 2 * NPES) * 4 // 16) * 16
     assert LDS_BYTES <= LDS_BYTES_MAX // WPC, LDS_BYTES
     kname = (
-        f"a8w4_megamoe_small_h{H}_i{I}_k{TOPK}_t{TMAX}_bm{BM}_no{NO}_a{ARB}_pf{PF}"
-        f"_p{P}_w{WPC}"
+        f"a8w4_megamoe_small_h{H}_i{I}_k{TOPK}_e{E_LOCAL}_t{TMAX}_bm{BM}_no{NO}"
+        f"_a{ARB}_pf{PF}_p{P}_w{WPC}"
         + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
@@ -1079,27 +1079,42 @@ def ep_mega_small_kernel(
                 ids_p = global_typed_ptr(a["ids"], T.i32)
                 t = bid
                 while t < a["n"]:
-                    acc = Vec.filled(8, 0.0, fx.Float32)
-                    for k in range_constexpr(TOPK):
-                        g = _u(fx.Int32(ids_p[t * fx.Int32(TOPK) + fx.Int32(k)]))
-                        ok = (g >= fx.Int32(0)) & (g < fx.Int32(E_GLOBAL))
-                        v = Vec(
-                            buffer_load(
-                                cin_rs,
-                                (t * fx.Int32(TOPK) + fx.Int32(k)) * fx.Int32(H // 2)
-                                + tx0 * fx.Int32(4),
-                                vec_width=4,
-                                dtype=T.i32,
-                                mask=ok,
-                                cache_modifier=CM_SYS,
+                    for p in range_constexpr(-(-UNITS // NT)):
+                        # this thread's 16 B of the row; a pass past its end is masked
+                        u = tx0 if p == 0 else tx0 + fx.Int32(p * NT)
+                        full = (p + 1) * NT <= UNITS
+                        acc = Vec.filled(8, 0.0, fx.Float32)
+                        for k in range_constexpr(TOPK):
+                            g = _u(fx.Int32(ids_p[t * fx.Int32(TOPK) + fx.Int32(k)]))
+                            ok = (g >= fx.Int32(0)) & (g < fx.Int32(E_GLOBAL))
+                            if const_expr(not full):
+                                ok = ok & (u < fx.Int32(UNITS))
+                            v = Vec(
+                                buffer_load(
+                                    cin_rs,
+                                    (t * fx.Int32(TOPK) + fx.Int32(k))
+                                    * fx.Int32(H // 2)
+                                    + u * fx.Int32(4),
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                    mask=ok,
+                                    cache_modifier=CM_SYS,
+                                )
                             )
-                        )
-                        acc = acc + v.bitcast(fx.BFloat16).to(fx.Float32)
-                    buffer_store(
-                        acc.to(fx.BFloat16).bitcast(fx.Int32),
-                        out_rs,
-                        t * fx.Int32(H // 2) + tx0 * fx.Int32(4),
-                    )
+                            acc = acc + v.bitcast(fx.BFloat16).to(fx.Float32)
+                        if const_expr(full):
+                            buffer_store(
+                                acc.to(fx.BFloat16).bitcast(fx.Int32),
+                                out_rs,
+                                t * fx.Int32(H // 2) + u * fx.Int32(4),
+                            )
+                        else:
+                            buffer_store(
+                                acc.to(fx.BFloat16).bitcast(fx.Int32),
+                                out_rs,
+                                t * fx.Int32(H // 2) + u * fx.Int32(4),
+                                mask=u < fx.Int32(UNITS),
+                            )
                     t = t + fx.Int32(GRID)
 
         a0 = reload()
@@ -1228,16 +1243,27 @@ class SmallMRuntime:
     Negative ids are no routes (their rows stay 0)."""
 
     def __init__(
-        self, *, rank, world_size, model_dim, inter_dim, topk, tmax, act, x_quant
+        self,
+        *,
+        rank,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        tmax,
+        act,
+        x_quant,
     ):
         from . import host
         from .protocol import SC_TILE, qx_of
 
         self.rank, self.topk, self.tmax = int(rank), int(topk), int(tmax)
         H, I = int(model_dim), int(inter_dim)
+        e_local = int(experts) // int(world_size)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.sym = host.symmetric(
-            (small_sym_layout(H, topk, tmax, E_LOCAL)[1],), torch.uint8
+            (small_sym_layout(H, topk, tmax, e_local)[1],), torch.uint8
         )
         torch.cuda.synchronize()
         import mori.shmem as ms
@@ -1245,8 +1271,8 @@ class SmallMRuntime:
         ms.shmem_barrier_all()
         self.stab = host.peer_table(self.sym, self.rank, world_size)
         bms = (16, 32, 64)  # a2 rows / tile counters for every m-tile size
-        rows = max(small_max_tiles(topk, tmax, bm, E_LOCAL) * bm for bm in bms)
-        tiles = max(small_max_tiles(topk, tmax, bm, E_LOCAL) for bm in bms)
+        rows = max(small_max_tiles(topk, tmax, bm, e_local) * bm for bm in bms)
+        tiles = max(small_max_tiles(topk, tmax, bm, e_local) for bm in bms)
         self.ctl = torch.zeros(SC_TILE + 16 * tiles, dtype=torch.int32, device=dev)
         self.a2 = torch.empty((rows, I), dtype=torch.uint8, device=dev)
         self.a2s = torch.empty((rows, I // 128), dtype=torch.float32, device=dev)
@@ -1257,6 +1283,7 @@ class SmallMRuntime:
             H=H,
             I=I,
             TOPK=self.topk,
+            E_LOCAL=e_local,
             TMAX=self.tmax,
             ACT=act,
             QX=qx_of(x_quant),
