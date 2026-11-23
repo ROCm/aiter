@@ -5,7 +5,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
@@ -54,6 +53,48 @@ def _fp8_scale_for_leader(is_leader, local_max):
     return e8m0
 
 
+def _inv_e8m0_scale(e8m0):
+    """1 / 2^(e8m0 - 127) as an f32: the exact power of two 2^(127 - e8m0), for E8M0 scales in [0, 254]."""
+    return ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+
+
+def _pack_fp8_e4m3(vals, e8m0):
+    """Pack ``vals / 2^(e8m0 - 127)`` as E4M3 bytes, four per i32 word (RNE, as v_cvt_scalef32_pk_fp8_f32).
+
+    Multiplying by the exact power-of-two inverse scale first (one v_pk_mul_f32 per pair) matches the scaled
+    convert bit for bit for finite inputs. The first convert of a word seeds its tied destination with the
+    scaled value it consumes (the word_sel=True convert then overwrites the other half), so no zero seed is
+    materialized.
+    """
+    scaled = fx.Vector.from_elements(vals, fx.Float32) * _inv_e8m0_scale(e8m0)
+    words = []
+    for word in range_constexpr(len(vals) // 4):
+        v = [fx.Float32(scaled[word * 4 + q]) for q in range_constexpr(4)]
+        lo = fx.rocdl.cvt_pk_fp8_f32(T.i32, v[0], v[1], v[0].bitcast(fx.Int32), False)
+        words.append(fx.Int32(fx.rocdl.cvt_pk_fp8_f32(T.i32, v[2], v[3], lo, True)))
+    return fx.Vector.from_elements(words, fx.Int32)
+
+
+def _pack_offset_u8(vals, e8m0):
+    """Pack ``round(vals / 2^(e8m0 - 127)) + 128`` as u8 bytes, four per i32 word, as v_cvt_pk_u8_f32 does.
+
+    x = v * inv_scale + 128 lies in [1, 255] (the scale bounds |v| / scale by 127), so the RNE add of 2^23
+    leaves round_to_nearest_even(x) in the low byte, exactly the v_cvt_pk_u8_f32 result (whose [0, 255] clamp
+    never triggers here); v_perm_b32 gathers the four low bytes.
+    """
+    inv_scale = _inv_e8m0_scale(e8m0)
+    x = fx.Vector.from_elements(vals, fx.Float32) * inv_scale + fx.Float32(128.0)
+    y = (x + fx.Float32(8388608.0)).bitcast(fx.Int32)
+    words = []
+    for word in range_constexpr(len(vals) // 4):
+        b = [fx.Int32(y[word * 4 + q]) for q in range_constexpr(4)]
+        # Selector bytes 0-3 take src_lo, 4-7 src_hi, 0x0C a zero byte.
+        lo = fx.Int32(fx.rocdl.perm_b32(b[1], b[0], fx.Int32(0x0C0C0400)))
+        hi = fx.Int32(fx.rocdl.perm_b32(b[3], b[2], fx.Int32(0x0C0C0400)))
+        words.append((hi << fx.Int32(16)) + lo)
+    return fx.Vector.from_elements(words, fx.Int32)
+
+
 def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     """Quantize this lane's ``vals`` to FP8 with one E8M0 scale per 32-wide lane group.
 
@@ -77,26 +118,8 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
         is_leader = leader_gate & is_leader
     leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
     e8m0 = fx.Int32(fx.shuffle_idx(leader_e8m0, leader_lane, 64))
-    block_scale = (e8m0 << 23).bitcast(fx.Float32)
-    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32. .to(Float8E4M3FN) does
-    # not lower (arith.truncf, no arith-to-amdgpu); fx.rocdl.cvt_pk_fp8_f32 after a 1/scale multiply costs
-    # +1 v_pk_mul_f32 and ~1.5 v_mov_b32 per pair (gfx950 stage2_compact t64x256: 2561 -> 2737 instrs).
-    pk_ty = T.vec(2, T.i16)
-    packed_words = []
-    for word in range_constexpr(scatter_vec // 4):
-        packed_word = fx.full(2, 0, fx.Int16).ir_value()
-        for pair in range_constexpr(2):
-            value = word * 4 + pair * 2
-            packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
-                pk_ty,
-                packed_word,
-                vals[value].ir_value(),
-                vals[value + 1].ir_value(),
-                block_scale.ir_value(),
-                pair,
-            )
-        packed_words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
-    return e8m0, fx.Vector.from_elements(packed_words, fx.Int32), is_leader
+    packed_words = _pack_fp8_e4m3(vals, e8m0)
+    return e8m0, packed_words, is_leader
 
 
 def _fp8_scale_e8m0(local_max, qmax_inv_bits=0x3B124925):
@@ -126,56 +149,8 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
     local_max = fx.coop.warp_max(local_max, width=4)
     e8m0 = _fp8_scale_e8m0(local_max, 0x3C010204 if route_i8 else 0x3B124925)
     if const_expr(route_i8):
-        # v_cvt_pk_u8_f32 rounds to nearest and clamps to [0, 255].
-        inv_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
-        words = []
-        for w in range_constexpr(2):
-            word = fx.Int32(0)
-            for b in range_constexpr(4):
-                # Raw intrinsic: FlyDSL 0.5.3 has no rocdl op or fx wrapper for v_cvt_pk_u8_f32; the fx
-                # clampf/roundeven/.to(Uint8) form is med3 + rndne + cvt_i32 + or per byte (large_stage1 +207 instrs).
-                word = fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32,
-                        "llvm.amdgcn.cvt.pk.u8.f32",
-                        [
-                            (
-                                vals[4 * w + b] * inv_scale + fx.Float32(128.0)
-                            ).ir_value(),
-                            fx.Int32(b).ir_value(),
-                            word.ir_value(),
-                        ],
-                        [],
-                        [],
-                    )
-                )
-            words.append(word)
-        return e8m0, fx.Vector.from_elements(words, fx.Int32)
-    block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32. .to(Float8E4M3FN) does
-    # not lower (arith.truncf, no arith-to-amdgpu); fx.rocdl.cvt_pk_fp8_f32 after a 1/scale multiply costs
-    # +1 v_pk_mul_f32 and ~1.5 v_mov_b32 per pair (gfx950 stage2_compact t64x256: 2561 -> 2737 instrs).
-    pk_ty = T.vec(2, T.i16)
-    packed_lo = fx.Vector.filled(2, 0, fx.Int16).ir_value()
-    packed_hi = fx.Vector.filled(2, 0, fx.Int16).ir_value()
-    for pair in range_constexpr(4):
-        packed = rocdl.cvt_scalef32_pk_fp8_f32(
-            pk_ty,
-            packed_lo if pair < 2 else packed_hi,
-            vals[pair * 2].ir_value(),
-            vals[pair * 2 + 1].ir_value(),
-            block_scale.ir_value(),
-            pair % 2,
-        )
-        if pair < 2:
-            packed_lo = packed
-        else:
-            packed_hi = packed
-    words = [
-        fx.Vector(packed_lo).bitcast(fx.Int32)[0],
-        fx.Vector(packed_hi).bitcast(fx.Int32)[0],
-    ]
-    return e8m0, fx.Vector.from_elements(words, fx.Int32)
+        return e8m0, _pack_offset_u8(vals, e8m0)
+    return e8m0, _pack_fp8_e4m3(vals, e8m0)
 
 
 # fmt: off
