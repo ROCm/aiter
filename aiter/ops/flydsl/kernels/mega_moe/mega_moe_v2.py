@@ -30,6 +30,7 @@ from .mega_moe_config import (
     Stage1Config,
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
+    fused_layout_small_only,
     fused_layout_supported,
     large_m_mtprs_for,
     small_m_cu_supported,
@@ -137,6 +138,13 @@ class MegaMoEV2:
             large_m=(
                 fused
                 and large_m_enabled
+                # False for every layout unless AITER_MEGA_FUSED_DRAFT_LAYOUT=1 added small-input-only ones.
+                and not fused_layout_small_only(
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    experts=self.experts,
+                )
                 and self.mtpr
                 in large_m_mtprs_for(
                     world_size=self.world_size,
