@@ -14,8 +14,8 @@ needs no co-residency. Each queue holds:
                   traffic its epilogue sends, runs under the GateUp of later blocks instead of after all of it.
 GateUp(b) waits until arrived[b] reaches the routes block b receives, writes a2 and counts done[b];
 Down(b) waits until done[b] == NG and adds its rows into the source ranks' out with BF16 atomics.
-With transpose_scales, only GateUp(b, 0) waits for arrived[b]: it copies block b's A scales into the [K/128, rows]
-layout and sets scaled[b], which the block's other GateUp tiles wait for.
+Only GateUp(b, 0) waits for arrived[b]: it copies block b's A scales into the [K/128, rows] layout and sets
+scaled[b], which the block's other GateUp tiles wait for.
 """
 
 import flydsl.compiler as flyc
@@ -42,7 +42,6 @@ from .util import (
     _uniform,
     atomic_add_i32,
     buffer_rsrc_at,
-    fence,
     load_i32_atomic,
     spin_wait_ge,
 )
@@ -51,51 +50,26 @@ from .util import (
 CHUNK = 8
 # sc0 nt sc1: written through to the destination, so a vmcnt wait covers visibility before the signal.
 P2P_AUX = 19
+# Task queues: one per XCD.
+QUEUES = 8
 
 
 def compile_ep_mega(
-    hidden_dim,
-    inter_dim,
-    topk,
-    token_shift,
-    producers=32,
-    lag=2,
-    gateup_layout="2x4_pf1",
-    down_layout="4x2_pf1",
-    xcd_queues=True,
-    relaxed=True,
-    persistent=True,
-    queue_order="paired",
-    tasks_per_wg=1,
-    trace=False,
-    combine="bf16",
-    transpose_scales=True,
-    swiglu_limit=0.0,
-    wq="fp8",
-    skip_padding=False,
+    hidden_dim, inter_dim, topk, token_shift, producers, lag, swiglu_limit=0.0, wq="fp8"
 ):
-    """xcd_queues: one task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a
-    workgroup whose queue is empty takes tasks from the next queues. lag counts units (block groups) of one queue.
-    queue_order: blocks of queue q are "interleaved" (b % 8 == q), "contiguous" (an eighth of the blocks), or
-    "paired" (contiguous, block pairs' tasks alternating tile by tile so both read each B tile together).
-    relaxed: GateUp writes a2 through to memory (sc1) and both waits invalidate only the L1, instead of an L2
-    write-back per GateUp and scoped L2 invalidations per task. All data a task waits for is in local memory, whose L2
-    lines are kept coherent by probes, and nothing reads it before it is written within a launch.
-    persistent: workgroups loop over tickets (launch about one per CU) instead of running one task each, and take
-    the next ticket during the current task's epilogue.
-    combine: "bf16" adds every route into its source rank's out with BF16 atomics; "fp8" stores it as an FP8 row
-    with 1x128 scales into the source rank's comb[token, slot] (pOutTable / pOutScaleTable), summed afterwards.
-    transpose_scales: GateUp tile 0 of a block copies the block's A scales from the token-major recv_scale [rows, K/128]
-    into pRecvScaleT [K/128, rows], so that a K block's scale load of 16 rows touches one cache line instead of 16.
-    trace: every task writes int32 trace[8 s: 8 s + 8] (s = queue * queue_cap + ticket) = (start, wait done, end) in
-    100 MHz ticks (low 32 bits of s_memrealtime), XCC id << 24 | HW_ID bits [8, 16) | kind (1 producer, 2 GateUp,
-    3 Down), the time its workgroup began taking the ticket and, for producers, when wave 0 finished its first three
-    chunks; for GateUp and Down, the shader clocks (s_memtime) from wait done to the end, to the K loop's start and to
-    its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split).
+    """The mega kernel's launcher. lag counts units (block pairs) of one queue.
+
+    One task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a workgroup whose
+    queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks, block pairs' tasks
+    alternating tile by tile so both read each B tile together. Workgroups loop over tickets (launch about one per
+    CU) and take the next ticket during the current task's epilogue.
+    GateUp writes a2 through to memory (sc1) and both waits invalidate only the L1: all data a task waits for is in
+    local memory, whose L2 lines are kept coherent by probes, and nothing reads it before it is written within a
+    launch. GateUp tile 0 of a block copies the block's A scales from the token-major recv_scale [rows, K/128] into
+    pRecvScaleT [K/128, rows], so that a K block's scale load of 16 rows touches one cache line instead of 16.
+    GateUp and Down skip the MFMAs of a block's 64-row packets past its valid rows (see the emitters).
     swiglu_limit > 0: the GateUp activation clamps gate and up (see gateup_task_emitter).
     wq: "fp8" weights, or "fp4": a8w4's prepare_weights (fd2) output, decoded to FP8 in the loaders.
-    skip_padding: GateUp and Down skip the MFMAs of a block's 64-row packets past its valid rows (see the emitters);
-    Down then runs 2x4 (the skip is per streamed A packet; 2x4 and 4x2 Down time the same on full blocks).
     topk need not be a power of two: the producers then divide a route index by it instead of shifting.
     """
     H, I = hidden_dim, inter_dim
@@ -103,34 +77,8 @@ def compile_ep_mega(
     # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
     row_bits = ROW_BITS
     KB = H // 128
-    if skip_padding:
-        down_layout = "2x4_pf1"
-    gateup = gateup_task_emitter(
-        I,
-        H,
-        topk,
-        E_LOCAL,
-        gateup_layout,
-        fp8_out=True,
-        a_scale_token_major=not transpose_scales,
-        store_aux=16 if relaxed else 0,
-        swiglu_limit=float(swiglu_limit),
-        wq=wq,
-        skip_padding=skip_padding,
-    )
-    down = down_task_emitter(
-        H,
-        I,
-        topk,
-        E_LOCAL,
-        down_layout,
-        atomic=True,
-        sorted_a2=True,
-        remote_token_shift=token_shift,
-        fp8_routes=combine == "fp8",
-        wq=wq,
-        skip_padding=skip_padding,
-    )
+    gateup = gateup_task_emitter(I, H, topk, E_LOCAL, float(swiglu_limit), wq)
+    down = down_task_emitter(H, I, topk, E_LOCAL, token_shift, wq)
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
     NG, ND = gateup.n_tiles, down.n_tiles
@@ -139,18 +87,13 @@ def compile_ep_mega(
     topk_pow2 = 1 << topk_shift == topk
     assert 0 < topk <= 8 and H % 1024 == 0 and H // 128 * 4 <= 16 * 64
     # The transpose: each thread copies half a row's scales with dwordx4 loads.
-    assert not transpose_scales or KB % 8 == 0
+    assert KB % 8 == 0
     scale_lanes = H // 128 * 4 // 16
-    queues = 8 if xcd_queues else 1
+    queues = QUEUES
     assert producers % queues == 0
     queue_producers = producers // queues
-    contiguous = queue_order != "interleaved"
-    pair = 2 if queue_order == "paired" else 1
-    assert queue_order in ("interleaved", "contiguous", "paired"), queue_order
-
-    def queue_cap(num_blocks):
-        """Trace slots per queue (matches trace_entries): its producers and up to one empty pair partner."""
-        return queue_producers + unit * ((num_blocks + (queues - 1)) // queues + 1)
+    # Blocks of a queue go in pairs.
+    pair = 2
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def mega_kernel(
@@ -197,31 +140,6 @@ def compile_ep_mega(
         sched = fx.Int64(fx.ptrtoint(pSched))
         rows_cap = num_blocks * SORT_BLOCK_M
 
-        def clock():
-            if const_expr(not trace):
-                return fx.Int32(0)
-            ticks = llvm.inline_asm(
-                T.i32,
-                [],
-                "s_memrealtime s[0:1]\ns_waitcnt lgkmcnt(0)\ns_mov_b32 $0, s0",
-                "=s,~{s0},~{s1}",
-                has_side_effects=True,
-            )
-            return fx.Int32(ticks)
-
-        def cycles():
-            """Low word of the shader-clock counter (s_memtime), which runs at the current core clock."""
-            if const_expr(not trace):
-                return fx.Int32(0)
-            ticks = llvm.inline_asm(
-                T.i32,
-                [],
-                "s_memtime s[0:1]\ns_waitcnt lgkmcnt(0)\ns_mov_b32 $0, s0",
-                "=s,~{s0},~{s1}",
-                has_side_effects=True,
-            )
-            return fx.Int32(ticks)
-
         def hwreg(name):
             return fx.Int32(
                 llvm.inline_asm(
@@ -242,10 +160,8 @@ def compile_ep_mega(
 
         def queue_layout(queue):
             """(first block, block stride, blocks) of a queue."""
-            if const_expr(contiguous):
-                first = blocks * queue // queues
-                return first, 1, blocks * (queue + 1) // queues - first
-            return queue, queues, (blocks - queue + (queues - 1)) // queues
+            first = blocks * queue // queues
+            return first, 1, blocks * (queue + 1) // queues - first
 
         def queue_tasks(queue):
             return queue_producers + unit * pair * (
@@ -268,11 +184,10 @@ def compile_ep_mega(
             return taken
 
         def take_ticket(after_task=False, prefetched=None):
-            """(queue, ticket, entry time) of this workgroup's next task; ticket -1 when every queue is empty.
+            """(queue, ticket) of this workgroup's next task; ticket -1 when every queue is empty.
 
             prefetched: wave 0's ticket of the home queue taken during the previous task (possibly past its end).
             """
-            entry = clock()
             if const_expr(after_task):
                 # The previous task's last LDS reads are done before the slots are overwritten.
                 rocdl.s_barrier()
@@ -314,48 +229,9 @@ def compile_ep_mega(
             ticket = _uniform(Vec(ticket_slot(1).load())[0])
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_barrier()
-            return queue, ticket, entry
+            return queue, ticket
 
-        def record(
-            queue, ticket, entry, started, waited, kind, run_cycles=None, loop_cycles=()
-        ):
-            if const_expr(trace):
-                ended = clock()
-                where = (
-                    (hwreg("HW_REG_XCC_ID") << 24)
-                    | (hwreg("HW_REG_HW_ID") & 0xFF00)
-                    | kind
-                )
-                if wave == 0:
-                    rsrc = _rsrc_of(pTrace, queues * queue_cap(num_blocks) * 32)
-                    offset = (lane == 0).select(
-                        (queue * queue_cap(num_blocks) + ticket) * 32,
-                        fx.Int32(OOB_OFFSET),
-                    )
-                    tail = (
-                        entry
-                        if run_cycles is None
-                        else Vec.from_elements(
-                            [entry, run_cycles, *loop_cycles], fx.Int32
-                        )
-                    )
-                    for part, words in enumerate(
-                        [
-                            Vec.from_elements(
-                                [started, waited, ended, where], fx.Int32
-                            ),
-                            tail,
-                        ]
-                    ):
-                        rocdl.raw_ptr_buffer_store(
-                            words.ir_value(),
-                            rsrc,
-                            (offset + part * 16).ir_value(),
-                            zero,
-                            aux=ir.IntegerAttr.get(T.i32, 0),
-                        )
-
-        def produce(index, trace_slot):
+        def produce(index):
             x_rsrc = _rsrc_of(pX, num_tokens * H)
             xs_rsrc = _rsrc_of(pXScale, num_tokens * (scale_lanes * 16))
             w_rsrc = _rsrc_of(pTopkW, num_routes * 4)
@@ -427,7 +303,6 @@ def compile_ep_mega(
                 return taken
 
             chunk = index + producers * _uniform(claim())
-            done = fx.Int32(0)
             while chunk < chunks:
                 position = chunk * CHUNK + lane
                 claimed = claim()
@@ -531,19 +406,6 @@ def compile_ep_mega(
                 ) + fx.Int64((ARRIVED + block_of_row) * 4)
                 if send:
                     atomic_add_i32(arrived, 1, "one-as")
-                if const_expr(trace):
-                    # Wave 0 of the producer: end of its first three chunks in trace words 5, 6, 7.
-                    first = (wave == 0) & (lane == 0) & (done < 3)
-                    rocdl.raw_ptr_buffer_store(
-                        clock().ir_value(),
-                        _rsrc_of(pTrace, queues * queue_cap(num_blocks) * 32),
-                        first.select(
-                            (trace_slot + 5 + done) * 4, fx.Int32(OOB_OFFSET)
-                        ).ir_value(),
-                        zero,
-                        aux=ir.IntegerAttr.get(T.i32, 0),
-                    )
-                done = done + 1
                 chunk = index + producers * _uniform(claimed)
 
         def prefetch_hook():
@@ -551,8 +413,6 @@ def compile_ep_mega(
             left, so holding a ticket cannot delay one it depends on. Returns (hook, holder of wave 0's ticket).
             """
             holder = []
-            if const_expr(not persistent):
-                return None, holder
 
             def hook():
                 queue_addr = sched + fx.Int64(
@@ -565,23 +425,6 @@ def compile_ep_mega(
                 holder.append(taken)
 
             return hook, holder
-
-        def loop_marks(hook):
-            """Trace: (K-loop start hook, epilogue hook, marks); marks get wave 0's shader clocks at the K loop's start
-            and end (trace words 6, 7, relative to the end of the wait)."""
-            marks = []
-            if const_expr(not trace):
-                return None, hook, marks
-
-            def start():
-                marks.append(cycles())
-
-            def end():
-                marks.append(cycles())
-                if const_expr(hook is not None):
-                    hook()
-
-            return start, end, marks
 
         def transpose_block_scales(block, expected, flag):
             """GateUp tile 0: block's A scales from recv_scale [rows, KB] into pRecvScaleT [KB, rows] (padding rows 0),
@@ -621,16 +464,14 @@ def compile_ep_mega(
                     dst,
                     (sorted_row * 4).ir_value(),
                     ((half * (KB // 2) + i) * rows * 4).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 16 if relaxed else 0),
+                    aux=ir.IntegerAttr.get(T.i32, 16),
                 )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
             if wave == 0:
-                if const_expr(not relaxed):
-                    fence("release", "agent-one-as")
                 lane0_add(flag, 1)
 
-        def gateup_task(block, tile, expert, at):
+        def gateup_task(block, tile, expert):
             # Only this block's routes: about two sources' worth, not the whole expert.
             expected = _uniform(
                 _load_i32(
@@ -639,33 +480,24 @@ def compile_ep_mega(
                 )
             )
             arrived = fx.Int64(fx.ptrtoint(pWs)) + fx.Int64((ARRIVED + block) * 4)
-            if const_expr(transpose_scales):
-                scaled = sched + fx.Int64((SCHED_EXPECTED + 2 * num_blocks + block) * 4)
-                if wave == 0:
-                    # scaled[b] is set after arrived[b] was complete.
-                    if tile == 0:
-                        spin_wait_ge(arrived, expected, "one-as", relaxed)
-                    else:
-                        spin_wait_ge(scaled, 1, "agent-one-as", relaxed)
-            else:
-                if wave == 0:
-                    spin_wait_ge(arrived, expected, "one-as", relaxed)
-            rocdl.s_barrier()
-            waited = clock()
-            began = cycles()
-            # A compile-time switch around a runtime branch: not one `if`.
-            if const_expr(transpose_scales):  # noqa: SIM102
+            scaled = sched + fx.Int64((SCHED_EXPECTED + 2 * num_blocks + block) * 4)
+            if wave == 0:
+                # scaled[b] is set after arrived[b] was complete.
                 if tile == 0:
-                    transpose_block_scales(block, expected, scaled)
+                    spin_wait_ge(arrived, expected, "one-as", True)
+                else:
+                    spin_wait_ge(scaled, 1, "agent-one-as", True)
+            rocdl.s_barrier()
+            if tile == 0:
+                transpose_block_scales(block, expected, scaled)
             hook, holder = prefetch_hook()
-            loop_start, hook, marks = loop_marks(hook)
             emit_gateup(
                 lds,
                 pRecvA,
                 pW1,
                 pA2,
                 pA2Scale,
-                pRecvScaleT if transpose_scales else pRecvScale,
+                pRecvScaleT,
                 pW1Scale,
                 pGuIds,
                 rows_cap,
@@ -674,42 +506,33 @@ def compile_ep_mega(
                 lambda: (block, tile, expert),
                 tid=tid,
                 epilog_hook=hook,
-                kloop_hook=loop_start,
                 rows=expected,
             )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
             if wave == 0:
-                if const_expr(not relaxed):
-                    fence("release", "agent-one-as")
                 lane0_add(
                     sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4), 1
                 )
-            record(*at, waited, 2, cycles() - began, [mark - began for mark in marks])
-            return holder[0] if holder else fx.Int32(-1)
+            return holder[0]
 
-        def down_task(block, tile, expert, at):
-            rows = None
-            if const_expr(skip_padding):
-                # issued before the wait, which hides its latency
-                rows = _uniform(
-                    _load_i32(
-                        _rsrc_of(pSched, (SCHED_EXPECTED + 2 * num_blocks) * 4),
-                        (SCHED_EXPECTED + block) * 4,
-                    )
+        def down_task(block, tile, expert):
+            # issued before the wait, which hides its latency
+            rows = _uniform(
+                _load_i32(
+                    _rsrc_of(pSched, (SCHED_EXPECTED + 2 * num_blocks) * 4),
+                    (SCHED_EXPECTED + block) * 4,
                 )
+            )
             if wave == 0:
                 spin_wait_ge(
                     sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4),
                     NG,
                     "agent-one-as",
-                    relaxed,
+                    True,
                 )
             rocdl.s_barrier()
-            waited = clock()
-            began = cycles()
             hook, holder = prefetch_hook()
-            loop_start, hook, marks = loop_marks(hook)
             emit_down(
                 lds,
                 pA2,
@@ -719,31 +542,21 @@ def compile_ep_mega(
                 pW2Scale,
                 pDownIds,
                 pRecvW,
-                pOutTable,
-                pOutTable,
                 NPES << token_shift,
                 num_blocks,
                 True,
                 lambda: (block, tile, expert),
                 tid=tid,
                 epilog_hook=hook,
-                pOutScale=pOutScaleTable,
-                kloop_hook=loop_start,
                 rows=rows,
             )
-            record(*at, waited, 3, cycles() - began, [mark - began for mark in marks])
-            return holder[0] if holder else fx.Int32(-1)
+            return holder[0]
 
-        def run_task(queue, ticket, entry):
+        def run_task(queue, ticket):
             """Runs a task; returns the ticket prefetched during it (wave 0; -1 if none)."""
-            at = (queue, ticket, entry, clock())
             next_ticket = fx.Int32(-1)
             if ticket < queue_producers:
-                produce(
-                    queue * queue_producers + ticket,
-                    (queue * queue_cap(num_blocks) + ticket) * 8,
-                )
-                record(*at, at[3], 1)
+                produce(queue * queue_producers + ticket)
             else:
                 index = ticket - queue_producers
                 first, stride, own = queue_layout(queue)
@@ -785,9 +598,9 @@ def compile_ep_mega(
                         _load_i32(_rsrc_of(pExpertIds, num_blocks * 4), block * 4)
                     )
                     if is_gateup:
-                        next_ticket = gateup_task(block, tile, expert, at)
+                        next_ticket = gateup_task(block, tile, expert)
                     else:
-                        next_ticket = down_task(block, tile, expert, at)
+                        next_ticket = down_task(block, tile, expert)
             return next_ticket
 
         kernel_pointers = (
@@ -912,25 +725,16 @@ def compile_ep_mega(
             sched = fx.Int64(fx.ptrtoint(pSched))
             rows_cap = num_blocks * SORT_BLOCK_M
 
-        queue, ticket, entry = take_ticket()
-        if const_expr(persistent):
-            # A workgroup takes its next ticket in the epilogue of its task, when that task waits for nothing
-            # more: a task still only waits for tickets that running workgroups hold (or for producers, which
-            # never wait), and the ticket's atomic latency hides under the epilogue.
-            while ticket >= 0:
-                # Every task re-reads the arguments: with loop-invariant ones LLVM hoists all task kinds'
-                # address math out of the loop and runs out of registers.
-                rebind(reload_args())
-                next_ticket = run_task(queue, ticket, entry)
-                queue, ticket, entry = take_ticket(True, next_ticket)
-        else:
-            # Up to tasks_per_wg tasks back to back, unrolled: a loop would let LLVM hoist every task kind's
-            # invariants out of it and run out of registers.
-            for i in range_constexpr(tasks_per_wg):
-                if const_expr(i > 0):
-                    queue, ticket, entry = take_ticket(True)
-                if ticket >= 0:
-                    run_task(queue, ticket, entry)
+        # A workgroup takes its next ticket in the epilogue of its task, when that task waits for nothing more: a
+        # task still only waits for tickets that running workgroups hold (or for producers, which never wait), and
+        # the ticket's atomic latency hides under the epilogue.
+        queue, ticket = take_ticket()
+        while ticket >= 0:
+            # Every task re-reads the arguments: with loop-invariant ones LLVM hoists all task kinds' address math
+            # out of the loop and runs out of registers.
+            rebind(reload_args())
+            next_ticket = run_task(queue, ticket)
+            queue, ticket = take_ticket(True, next_ticket)
 
     @flyc.jit
     def launch(
@@ -1018,38 +822,8 @@ def mega_grid(op, producers):
     )
 
 
-def trace_entries(op, producers):
-    """int32 entries of a trace buffer for compile_ep_mega(trace=True), any queue count."""
-    return (
-        8
-        * 8
-        * (
-            producers // 8
-            + (op.hidden // 256 + op.inter // 128)
-            * (-(-op.s_cap // SORT_BLOCK_M // 8) + 1)
-        )
-    )
-
-
-def ep_mega(
-    op,
-    x_fp8,
-    x_scale,
-    topk_w,
-    producers=32,
-    lag=2,
-    xcd_queues=True,
-    relaxed=True,
-    persistent=True,
-    queue_order="paired",
-    tasks_per_wg=1,
-    trace=None,
-    transpose_scales=True,
-):
-    """Run the mega kernel for an LdsMegaMoE `op` whose ep_prep and ep_plan ran for this call.
-
-    trace: optional int32 tensor of trace_entries(op, producers) entries (see compile_ep_mega).
-    """
+def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
+    """Run the mega kernel for an LdsMegaMoE `op` whose ep_prep and ep_plan ran for this call."""
     launch = launcher(
         compile_ep_mega,
         x_fp8.device.index,
@@ -1059,25 +833,15 @@ def ep_mega(
         token_shift=op.token_shift,
         producers=producers,
         lag=lag,
-        xcd_queues=xcd_queues,
-        relaxed=relaxed,
-        persistent=persistent,
-        queue_order=queue_order,
-        tasks_per_wg=tasks_per_wg,
-        trace=trace is not None,
-        combine=op.combine,
-        transpose_scales=transpose_scales,
         swiglu_limit=op.swiglu_limit,
         wq=op.wq,
-        skip_padding=op.skip_padding,
     )
-    grid = -(-mega_grid(op, producers) // tasks_per_wg)
-    if persistent:
-        grid = min(
-            grid, torch.cuda.get_device_properties(x_fp8.device).multi_processor_count
-        )
+    # Persistent: about one workgroup per CU.
+    grid = min(
+        mega_grid(op, producers),
+        torch.cuda.get_device_properties(x_fp8.device).multi_processor_count,
+    )
     t = op.tables
-    fp8 = op.combine == "fp8"
 
     def ptr(tensor):
         return ptr_arg(tensor, fx.Int32)
@@ -1095,8 +859,8 @@ def ep_mega(
         ptr(op.w2_scale),
         ptr(op.down_ids),
         ptr(op.recv_w),
-        ptr(t["comb" if fp8 else "out"]),
-        ptr(t["comb_scale" if fp8 else "out"]),
+        ptr(t["out"]),
+        ptr(t["out"]),
         ptr(op.expert_ids),
         ptr(op.num_valid),
         ptr(op.sched),
@@ -1111,7 +875,7 @@ def ep_mega(
         ptr(t["down_ids"]),
         ptr(t["recv_w"]),
         ptr(t["ws"]),
-        ptr(op.sched if trace is None else trace),
+        ptr(op.sched),
         ptr(op.recv_scale_t),
         x_fp8.shape[0] * op.topk,
         x_fp8.shape[0],
