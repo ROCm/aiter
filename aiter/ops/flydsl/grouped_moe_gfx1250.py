@@ -16,6 +16,7 @@ import csv
 import functools
 import os
 import threading
+from typing import NamedTuple
 
 import flydsl.expr as fx
 import torch
@@ -24,11 +25,16 @@ from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.kernels.moe_route_maps import (
+    TP_ROUTE_PSUM_MAX_EXPERTS,
+    tp_route_expert_bits,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     current_stream_arg,
     ptr_arg,
 )
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -788,6 +794,7 @@ def _grouped_a8w4_tdm_moe(
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
+        token_multidest_quant_used,
     )
 
     device = hidden_states.device
@@ -924,6 +931,40 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     _fuse_ep_route_quant = False
     ep_rowmap = None
+    _is_fp4 = data_format == "fp4"
+    _quant_mode = "fp4" if _is_fp4 else "fp8"
+    _a_is_fp4 = 1 if _is_fp4 else 0
+
+    # Bound once, because the quant pass below rebinds a1_scale to the
+    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
+    # shape, so nothing downstream could tell which one it was handed.
+    src_a1_scale = a1_scale
+    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
+        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
+        # exponent bytes; reinterpret their storage without converting values.
+        src_a1_scale = src_a1_scale.view(torch.uint8)
+
+    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
+    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
+    # for this pair.
+    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
+        dtypes.fp8,
+        torch.uint8,
+        dtypes.fp4x2,
+    )
+    # Local quant instead writes one compact row-major row per token and rebuilds
+    # the interleaved layout gemm1 reads in a second pass, so neither write lands
+    # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
+    # dummy topk_ids, so its token count cannot size a per-token scale buffer.
+    _compact_ascale = (
+        not _compact
+        and not _prequantized
+        and not a_preshuffled
+        and not _is_ep
+        and _use_fused_quant_preshuffle(
+            model_dim, wmma_rep, _quant_mode, token_num, topk
+        )
+    )
     # Small TP batches: one workgroup counts, scans and remaps every route, in
     # place of the counter fill, route and psum-remap launches. By default the
     # activation quant does this itself (_fuse_tp_route_quant below); otherwise
@@ -963,6 +1004,28 @@ def _grouped_a8w4_tdm_moe(
         )
     else:
         _apre_row_to_token = None
+    # Larger TP batches (prefill): one route launch, whose last workgroup
+    # builds masked_m/starts/psum, and the token-multidest A1 quant resolves
+    # each route's row, in place of the counter fill, route and psum-remap
+    # launches. Not the compact-scale pair (no row decode) or other A1 paths.
+    # The encoded row (slot << expert_bits) | expert must stay a positive int32.
+    _route_in_quant = (
+        not _fused_tp_route
+        and not herd_topk
+        and not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and not _compact_ascale
+        and hidden_states.dtype == torch.bfloat16
+        and int(E) <= TP_ROUTE_PSUM_MAX_EXPERTS
+        and token_multidest_quant_used(
+            token_num,
+            topk,
+            prequantized=_prequantized,
+            payload_preshuffled=a_preshuffled,
+        )
+        and token_num * topk < 1 << (31 - tp_route_expert_bits(E))
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -1067,6 +1130,9 @@ def _grouped_a8w4_tdm_moe(
                 herd_routed_scaling_factor,
                 num_valid_rows=num_local_tokens,
             )
+        elif _route_in_quant:
+            _tp_route = tp_prefill_route_psum(topk_ids, E, _align_m)
+            _masked_m, topids_to_rows = _tp_route.masked_m, _tp_route.rows
         else:
             _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
@@ -1085,40 +1151,6 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
-    _is_fp4 = data_format == "fp4"
-    _quant_mode = "fp4" if _is_fp4 else "fp8"
-    _a_is_fp4 = 1 if _is_fp4 else 0
-
-    # Bound once, because the quant pass below rebinds a1_scale to the
-    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
-    # shape, so nothing downstream could tell which one it was handed.
-    src_a1_scale = a1_scale
-    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
-        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
-        # exponent bytes; reinterpret their storage without converting values.
-        src_a1_scale = src_a1_scale.view(torch.uint8)
-
-    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
-    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
-    # for this pair.
-    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
-        dtypes.fp8,
-        torch.uint8,
-        dtypes.fp4x2,
-    )
-    # Local quant instead writes one compact row-major row per token and rebuilds
-    # the interleaved layout gemm1 reads in a second pass, so neither write lands
-    # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
-    # dummy topk_ids, so its token count cannot size a per-token scale buffer.
-    _compact_ascale = (
-        not _compact
-        and not _prequantized
-        and not a_preshuffled
-        and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
-    )
     # The fused TP route then rides the activation quant: each quant workgroup
     # re-derives the counts and prefix in LDS, so the route launch disappears
     # without a grid-wide wait. bf16 in, no A-preshuffle, and not the batches
@@ -1192,6 +1224,8 @@ def _grouped_a8w4_tdm_moe(
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             "route_max_m": int(max_m),
         }
+    elif _route_in_quant:
+        psum = _tp_route.psum
     else:
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
@@ -1313,6 +1347,16 @@ def _grouped_a8w4_tdm_moe(
         _row_to_token = torch.full(
             (int(contiguous_m),), -1, dtype=torch.int32, device=device
         )
+    # The quant reads the encoded rows and writes the final ones.
+    _route_rows_kw = (
+        {
+            "route_starts": _tp_route.starts,
+            "route_expert_bits": _tp_route.expert_bits,
+            "route_rows_out": torch.empty_like(_tp_route.rows),
+        }
+        if _route_in_quant
+        else {}
+    )
     _a1_wire_stride = (
         int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
@@ -1381,7 +1425,11 @@ def _grouped_a8w4_tdm_moe(
                 _g2l_counter if _apre_route_fold and _direct_ep_mask else None
             ),
             tp_route_params=tp_route_params,
+            **_route_rows_kw,
         )
+        if _route_in_quant:
+            # The gather-reduce reads the rows the quant resolved.
+            topids_to_rows = _route_rows_kw["route_rows_out"]
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
                 _compact_ascale_buf,
@@ -1574,7 +1622,9 @@ def _grouped_a8w4_tdm_moe(
                     wmma_rep=wmma_rep,
                     quant_mode=_quant_mode,
                     masked_m=None,
-                    topids_to_rows=topids_to_rows,
+                    topids_to_rows=(
+                        _tp_route.rows if _route_in_quant else topids_to_rows
+                    ),
                     source_topk=topk,
                     num_valid_routes=_ep_nvr,
                     prequantized_scale=src_a1_scale if _prequantized else None,
@@ -1584,6 +1634,7 @@ def _grouped_a8w4_tdm_moe(
                     row_major_scale=_row_major_a1,
                     payload_preshuffled=a_preshuffled,
                     tp_route_params=tp_route_params,
+                    **_route_rows_kw,
                 ),
             )
         )
@@ -2288,6 +2339,85 @@ def fused_route_psum_remap(
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+class TpPrefillRoute(NamedTuple):
+    """``tp_prefill_route_psum`` outputs. ``rows`` hold
+    ``(slot << expert_bits) | expert`` until the A1 quant resolves them."""
+
+    masked_m: torch.Tensor
+    rows: torch.Tensor
+    psum: torch.Tensor
+    starts: torch.Tensor
+    expert_bits: int
+
+
+@capture_scoped_cache
+def _tp_route_state(experts: int, device: torch.device) -> torch.Tensor:
+    """Zeroed ``(experts + 1,)`` int32 route counts plus a ticket word.
+
+    ``moe_route_lds_psum_sc`` zeroes it again at the end of every launch, so no
+    launch fills it. One buffer serves every MoE layer with this expert count on
+    the device, eager calls and captures alike, so those calls must not overlap:
+    two in flight at once (e.g. on two streams) mix their counts, place rows
+    wrongly, and leave nonzero counts or ticket behind: every later call until
+    the process restarts then misplaces rows or leaves masked_m/starts/psum
+    unwritten. A capture that runs before any eager
+    call builds its own buffer, which needs torch >= 2.10 (``persistent_alloc``).
+    """
+    with persistent_alloc(device):
+        return torch.zeros(experts + 1, dtype=torch.int32, device=device)
+
+
+@functools.cache
+def _get_compiled_route_lds_psum(experts: int):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_psum_module,
+    )
+
+    return build_moe_topids_to_rows_lds_psum_module(experts)
+
+
+def tp_prefill_route_psum(
+    topk_ids: torch.Tensor, experts: int, tile_m: int
+) -> TpPrefillRoute:
+    """One route launch that also writes masked_m, starts and psum.
+
+    Rows come back encoded for
+    ``flydsl_moe_fused_quant_preshuffle(route_starts=...)``. The counter is
+    ``_tp_route_state``; see there for the calls that must not overlap.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    # The encoded row (slot << expert_bits) | expert must stay a positive int32.
+    if not 0 < numel < 1 << (31 - tp_route_expert_bits(experts)):
+        raise ValueError(f"TP prefill route: {numel} routes out of range")
+    rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    _run_compiled(
+        _get_compiled_route_lds_psum(experts),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(_tp_route_state(experts, device)),
+        ptr_arg(rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(numel),
+        int(tile_m),
+        (numel + 255) // 256,
+        current_stream_arg(),
+    )
+    return TpPrefillRoute(
+        masked_m,
+        rows.view(token_num, topk),
+        psum,
+        starts,
+        tp_route_expert_bits(experts),
+    )
 
 
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
