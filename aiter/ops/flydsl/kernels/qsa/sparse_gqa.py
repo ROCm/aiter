@@ -46,7 +46,12 @@ from aiter.ops.flydsl.kernels.kernels_common import (
     div_nonneg,
     kernel_signature,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+    buf_copy_atom,
+)
 
 # BN32 prefill workgroups per CU. Unlike the decode bands below, this does
 # not move with head_dim: halving D halves the LDS tile, so residency alone
@@ -1719,5 +1724,9 @@ def build_qsa_sparse_gqa_module(
     launch.compile_hints = {
         "fast_fp_math": True,
         "unsafe_fp_math": True,
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
     }
     return launch
