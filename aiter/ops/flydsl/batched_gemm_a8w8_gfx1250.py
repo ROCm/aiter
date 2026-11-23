@@ -789,6 +789,7 @@ _GATE_UP_SILU_TILES = (
 )
 # Largest row count the fused path was measured to win at.
 GATE_UP_SILU_MAX_ROWS = _GATE_UP_SILU_TILES[-1][0]
+_GATE_UP_SILU_NAMES = frozenset(name for _, name in _GATE_UP_SILU_TILES)
 _GFX1250_ARCHS = ("gfx1250", "gfx1250-strict")
 # 1-byte storage the launch reads / writes: e4m3 codes and e8m0 scales, or
 # their raw bytes.
@@ -798,19 +799,10 @@ _E8M0_STORAGE = (torch.float8_e8m0fnu, torch.uint8)
 
 def gate_up_silu_kernel_ok(name: str | None) -> bool:
     """Whether a batched mxfp8_32 kernelName can run the fused SiLU epilogue:
-    split-K/cluster 1, tile_n 128 or 256 and 64 columns per wave -- the tile
-    shapes of the table, the only ones the gfx1250 op test runs (wider waves or
-    a 192-column tile take epilogue code that has not run on gfx1250)."""
-    cfg = parse_bmm_mx32_kernel_name(name) if name else None
-    if cfg is None:
-        return False
-    return (
-        cfg["split_k"] == 1
-        and cfg["cluster_m"] == 1
-        and cfg["cluster_n"] == 1
-        and cfg["tile_n"] in (128, 256)
-        and cfg["tile_n"] // cfg["n_warp"] == 64
-    )
+    only the table's tile names, the ones the gfx1250 op test runs (another
+    tile shape, warp layout or K loop takes gather / epilogue code that has
+    not run on gfx1250)."""
+    return name in _GATE_UP_SILU_NAMES
 
 
 def _gate_up_silu_tiles_shape(cfg: dict[str, int], n2: int, k: int) -> bool:
@@ -825,10 +817,19 @@ def _gate_up_silu_tiles_shape(cfg: dict[str, int], n2: int, k: int) -> bool:
 
 def _check_gate_up_silu_tiles() -> None:
     # Every table name is checked once here, at import, so the per-call pick
-    # is a plain table walk.
+    # is a plain table walk: split-K / cluster 1, tile_n 128 or 256 with 64
+    # columns per wave, and the pipelined K loop.
     for _, name in _GATE_UP_SILU_TILES:
         cfg = parse_bmm_mx32_kernel_name(name)
-        if not gate_up_silu_kernel_ok(name) or cfg["pipelined"] != 1:
+        if not (
+            cfg is not None
+            and cfg["split_k"] == 1
+            and cfg["cluster_m"] == 1
+            and cfg["cluster_n"] == 1
+            and cfg["tile_n"] in (128, 256)
+            and cfg["tile_n"] // cfg["n_warp"] == 64
+            and cfg["pipelined"] == 1
+        ):
             raise AssertionError(f"bad fused gate_up tile {name!r}")
         for n2, k in _GATE_UP_SILU_SHAPES:
             if not _gate_up_silu_tiles_shape(cfg, n2, k):

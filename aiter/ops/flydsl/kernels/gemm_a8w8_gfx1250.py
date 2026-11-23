@@ -129,8 +129,9 @@ def launch_gemm_a8w8(
     # CTA's tile_n B rows are gathered as tile_n/64 blocks of [32 gate rows,
     # the 32 matching up rows] (one nested TDM view, no weight reorder), so a
     # wave's 64 columns hold 32 gate and their 32 up columns in the same
-    # lanes. The epilogue then forms bf16(silu(min(g, L)) * clamp(u, -L, L))
-    # from the bf16-rounded accumulators -- the math of aiter silu_and_mul,
+    # lanes. The epilogue then forms
+    # bf16(silu(bf16(min(g, L))) * clamp(u, -L, L)) from the bf16-rounded
+    # accumulators -- the math of aiter silu_and_mul,
     # where act_limit L = 0 means no clamp -- and quantizes it to group-32
     # MXFP8 like fuse_quant_out. arg_c is the e4m3 [M, I] activation, ldc its
     # row stride, arg_scale_out [M, I/32].

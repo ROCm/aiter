@@ -146,6 +146,11 @@ def test_table_tiles_pin_k_loop():
         "flydsl_bmm_mxfp8_32_wmma_t64x192x256_mw2_nw3_nb3_sk1_cm1_cn1_pl",
         # the mxfp8_128 family
         "flydsl_bmm_mxfp8_128_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+        # a table tile with the single-fence K loop
+        "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+        # table-like shapes the op test does not run (tile_k, m_warp)
+        "flydsl_bmm_mxfp8_32_wmma_t16x128x128_mw1_nw2_nb4_sk1_cm1_cn1_pl",
+        "flydsl_bmm_mxfp8_32_wmma_t256x256x512_mw4_nw4_nb3_sk1_cm1_cn1_pl",
     ],
 )
 def test_kernel_ok_rejects(name):
