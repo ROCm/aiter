@@ -94,6 +94,7 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
         )
     )
     block_scale = (e8m0 << 23).bitcast(fx.Float32)
+    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32.
     pk_ty = T.vec(2, T.i16)
     packed_words = []
     for word in range_constexpr(scatter_vec // 4):
@@ -146,7 +147,7 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
         for w in range_constexpr(2):
             word = fx.Int32(0)
             for b in range_constexpr(4):
-                # Raw intrinsic: FlyDSL 0.5.0 exposes no rocdl/fx wrapper for v_cvt_pk_u8_f32.
+                # Raw intrinsic: FlyDSL 0.5.3 has no rocdl op or fx wrapper for v_cvt_pk_u8_f32.
                 word = fx.Int32(
                     llvm.call_intrinsic(
                         T.i32,
@@ -165,6 +166,7 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
             words.append(word)
         return e8m0, fx.Vector.from_elements(words, fx.Int32)
     block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+    # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32.
     pk_ty = T.vec(2, T.i16)
     packed_lo = fx.Vector.filled(2, 0, fx.Int16).ir_value()
     packed_hi = fx.Vector.filled(2, 0, fx.Int16).ir_value()
@@ -256,7 +258,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     def store_peer(peer_base, byte_off, value, elem, unit_elems, cache_modifier):
         if const_expr(elem_view_stores):
             store_at(
-                value.ir_value() if const_expr(unit_elems > 1) else value,
+                value,
                 AddrBuffer(peer_base, comb_inp_nbytes),
                 byte_off,
                 cache_modifier,
@@ -327,9 +329,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         row = wave + fx.Int32(row_iter * NW)
         row_byte_off = row * fx.Int32(4)
         if const_expr(lean or epi_lean):
-            p = fx.Int32(rocdl.readlane(T.i32, p_lanes.ir_value(), fx.Int32(row_iter).ir_value()))
-            weight = fx.Int32(rocdl.readlane(T.i32, w_lanes.ir_value(), fx.Int32(row_iter).ir_value())).bitcast(
-                fx.Float32)
+            p = fx.Int32(rocdl.readlane(T.i32, p_lanes, row_iter))
+            weight = fx.Int32(rocdl.readlane(T.i32, w_lanes, row_iter)).bitcast(fx.Float32)
         else:
             p = fx.ptr_load(
                 lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
@@ -338,11 +339,11 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 weight = fx.ptr_load(
                     lds_typed_ptr(fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
                 )
-            p = rocdl.readfirstlane(T.i32, p.ir_value())
+            p = fx.Int32(rocdl.readfirstlane(T.i32, p))
             if const_expr(not g2_bf16_lds):
-                weight = rocdl.readfirstlane(T.f32, weight.ir_value())
+                weight = fx.Float32(rocdl.readfirstlane(T.f32, weight))
         t = p & fx.Int32(0x00FFFFFF)
-        if const_expr(topk <= 8):
+        if const_expr(topk <= 8 and (lean or epi_lean)):
             # Preserve the established DSV4-Pro instruction sequence.
             s = p >> fx.Int32(24)
         else:
@@ -353,8 +354,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (dest_pe < fx.Int32(npes))
         dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
         if const_expr(lean >= 2):
-            lo = rocdl.readlane(T.i32, peer_lo_l.ir_value(), fx.Int32(row_iter).ir_value())
-            hi = rocdl.readlane(T.i32, peer_hi_l.ir_value(), fx.Int32(row_iter).ir_value())
+            lo = fx.Uint32(rocdl.readlane(T.i32, peer_lo_l, row_iter))
+            hi = fx.Uint32(rocdl.readlane(T.i32, peer_hi_l, row_iter))
             peer_base = fx.Int64((fx.Uint64(hi) << 32) | fx.Uint64(lo))
         else:
             peer_base = fx.ptr_load(
@@ -364,7 +365,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                     align=8,
                 )
             )
-            peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
+            peer_base = fx.Int64(rocdl.readfirstlane(T.i64, peer_base))
         slot = dest_lid * fx.Int32(topk) + s
         row_base = slot * fx.Int32(token_nbytes)
         if const_expr(not dynamic):
