@@ -29,19 +29,24 @@ LONG_KV_CASES = (
     (1, 8, 4097, 0),
     (1, 9, 4097, 0),
     (1, 24, 4223, 0),
-    (1, 64, 573440, 0),
     (1, 8, 4097, 1),
     (1, 4098, 8192, 0),
-    (1, 4088, 8192, 0),
-    (1, 2048, 16384, 0),
-    (1, 1024, 49152, 0),
-    # Eight-row kernel at the smallest grids of the gate: 1 to 64 KV splits.
+    (1, 2040, 4096, 0),
+    (1, 1024, 9216, 0),
+    (1, 64, 193536, 0),
+    # Eight-row kernel at the smallest grids of the gate: 2 to 64 KV splits.
+    (1, 2048, 4096, 0),
+    (1, 1024, 9217, 0),
+    (1, 256, 46081, 0),
+    (1, 64, 193537, 0),
+    # Eight-row kernel, one request in a chunk: 3 to 342 KV splits.
     (1, 4096, 8192, 0),
     (1, 4104, 8192, 0),
+    (1, 4088, 8192, 0),
+    (1, 2048, 16384, 0),
     (1, 2048, 32768, 0),
+    (1, 1024, 49152, 0),
     (1, 1024, 65536, 0),
-    (1, 64, 1048576, 0),
-    # Eight-row kernel, one request in a chunk: 2 to 64 KV splits.
     (1, 4096, 32768, 0),
     (1, 2048, 65536, 0),
     (1, 1024, 131072, 0),
@@ -49,11 +54,16 @@ LONG_KV_CASES = (
     (1, 512, 262144, 0),
     (1, 256, 524288, 0),
     (1, 128, 1048576, 0),
+    (1, 64, 573440, 0),
+    (1, 64, 1048576, 0),
     (1, 936, 573440, 0),
-    # Eight-row kernel, four requests in a chunk.
+    # Eight-row kernel, equal requests in a chunk: resumed ones whose row
+    # count is and is not a multiple of 8, and fresh ones.
     (4, 1024, 8192, 0),
     (4, 1022, 8192, 0),
     (4, 256, 32768, 0),
+    (8, 511, 4096, 0),
+    (4, 2046, 2046, 0),
 )
 
 
