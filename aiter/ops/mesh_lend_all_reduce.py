@@ -10,7 +10,7 @@ MD_NAME = "module_mesh_lend_all_reduce"
 
 @compile_ops(MD_NAME, develop=True)
 def mesh_lend_create(
-    device_id: int, rank: int, world_size: int, max_bytes: int, lenders: str
+    device_id: int, rank: int, world_size: int, max_bytes: int, max_lenders: int
 ) -> int: ...
 
 
@@ -34,10 +34,6 @@ def mesh_lend_all_reduce(
 
 @compile_ops(MD_NAME, develop=True)
 def mesh_lend_num_lenders(fa: int) -> int: ...
-
-
-@compile_ops(MD_NAME, develop=True)
-def mesh_lend_num_grants(fa: int) -> int: ...
 
 
 @compile_ops(MD_NAME, develop=True)

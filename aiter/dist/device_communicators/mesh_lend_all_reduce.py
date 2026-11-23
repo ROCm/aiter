@@ -12,7 +12,6 @@ from aiter.ops.mesh_lend_all_reduce import (
     mesh_lend_destroy,
     mesh_lend_export,
     mesh_lend_export_size,
-    mesh_lend_num_grants,
     mesh_lend_num_lenders,
 )
 
@@ -20,31 +19,31 @@ MB = 1024 * 1024
 
 
 class MeshLendAllReduce:
-    """bfloat16 all-reduce for a TP group of 2 to 4 GPUs on an xGMI full mesh.
+    """bfloat16 all-reduce for a TP group of 2 or 4 GPUs on an xGMI full mesh.
 
     The payload moves on SDMA engines only: over the group's own links and
     through the GPUs outside the group (lenders), whose links to the group
     are otherwise idle. Nothing runs and nothing is stored on a lender.
 
     Two ranks reduce in one shot, exactly (``bits=0``) or with each input
-    quantized once to 4 or 8 bits per value. Three and four ranks reduce
-    exactly: reduce-scatter, then all-gather.
+    quantized once to 4 or 8 bits per value. Four ranks reduce exactly:
+    reduce-scatter, then all-gather.
 
     One instance per rank process. Calls must come in the same order on every
     rank, on one stream, and outside CUDA graph capture: each call
     synchronizes the caller's stream and posts packets from the host.
 
-    Needs bare metal and KFD ioctl 1.17. A lender has to be visible to ROCr
-    (no ``ROCR_VISIBLE_DEVICES`` restriction); it need not be visible to HIP.
+    Needs bare metal and KFD ioctl 1.17. The lenders are the GPUs outside the
+    group that ROCr sees in every rank (``ROCR_VISIBLE_DEVICES``) and that
+    have an xGMI link to every rank; they need not be visible to HIP.
 
     Args:
         group: CPU process group of the ranks, used once to exchange handles.
         device: this rank's GPU.
         max_bytes: largest payload. A two-rank instance holds 2.5 times this
-            in device memory, a larger one 2 times.
-        lenders: ``"auto"`` (every GPU outside the group that all ranks can
-            open), ``"none"``, or a comma list of HIP device indices and PCI
-            addresses.
+            in device memory, a four-rank one 2.25 times.
+        max_lenders: use at most this many lenders; 0 keeps the payload on
+            the group's own links.
 
     Raises:
         RuntimeError: if any rank cannot set the transport up. Every rank
@@ -57,7 +56,7 @@ class MeshLendAllReduce:
         device: int | str | torch.device,
         *,
         max_bytes: int = 256 * MB,
-        lenders: str = "auto",
+        max_lenders: int = 7,
     ) -> None:
         self._ptr = 0
         device = torch.device(f"cuda:{device}" if isinstance(device, int) else device)
@@ -72,7 +71,7 @@ class MeshLendAllReduce:
         export, error = None, None
         try:
             self._ptr = mesh_lend_create(
-                device.index, self.rank, self.world_size, max_bytes, lenders
+                device.index, self.rank, self.world_size, max_bytes, max_lenders
             )
             export = torch.empty(mesh_lend_export_size(), dtype=torch.uint8)
             mesh_lend_export(self._ptr, export.data_ptr())
@@ -114,17 +113,12 @@ class MeshLendAllReduce:
 
         ``bits=0`` is exact: the float32 sum in rank order, rounded once.
         ``bits=4`` or ``8`` (two ranks) adds the two dequantized inputs; both
-        ranks get the same bits. An exact call cannot run in place.
+        ranks get the same bits. ``out`` may be ``inp``.
         """
         if out is None:
             out = torch.empty_like(inp)
         mesh_lend_all_reduce(self._ptr, inp, out, bits)
         return out
-
-    def grants(self) -> int:
-        """Access grants made for caller tensors so far. One per allocation
-        that a lender's engine had not been given access to."""
-        return mesh_lend_num_grants(self._ptr)
 
     def close(self) -> None:
         if self._ptr:

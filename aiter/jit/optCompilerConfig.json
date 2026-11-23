@@ -260,7 +260,7 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
-        "extra_ldflags": "['-lhsa-runtime64']",
+        "extra_ldflags": "['-lhsa-runtime64', '-l:libhsakmt.a']",
         "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",

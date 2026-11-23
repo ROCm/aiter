@@ -7,7 +7,7 @@ has no xGMI mesh, too few GPUs or KFD older than 1.17.
 
 Per-call time of one configuration:
     python test_mesh_lend_all_reduce.py --bench --tp 2 --bits 4 --mb 16,80,256
-    python test_mesh_lend_all_reduce.py --bench --tp 4 --lenders none
+    python test_mesh_lend_all_reduce.py --bench --tp 4 --max-lenders 0
 """
 
 import argparse
@@ -107,7 +107,8 @@ def check_case(comm, rank, tp_size, case, salt, barrier) -> int:
 
     Fails if a block reads a piece before its arrival flag, a piece or slice
     boundary is off, the tail or an unaligned tensor is written past its
-    end, or call k + 1 lands in an inbox a slower rank still reads for call k.
+    end, call k + 1 lands in an inbox a slower rank still reads for call k, or
+    an in-place call writes over input that has not left.
     """
     numel, bits, offset = case["numel"], case["bits"], case["offset"]
     lo = 8 + offset  # odd offset: the data pointers are only 2-byte aligned
@@ -117,10 +118,11 @@ def check_case(comm, rank, tp_size, case, salt, barrier) -> int:
         for call in range(calls)
     ]
     bufs = [
-        torch.empty(numel + 16, dtype=torch.bfloat16, device=comm.device)
+        torch.full((numel + 16,), 3.0, dtype=torch.bfloat16, device=comm.device)
         for _ in range(calls)
     ]
-    pads = [torch.full_like(buf, 3.0) for buf in bufs]
+    # Odd calls run in place.
+    outs = [buf if call & 1 else buf.clone() for call, buf in enumerate(bufs)]
     torch.cuda.synchronize()
     barrier.wait()
     if rank == tp_size - 1:
@@ -131,17 +133,17 @@ def check_case(comm, rank, tp_size, case, salt, barrier) -> int:
             for _ in range(4):
                 load = load @ load
     for call in range(calls):
-        inp, out = bufs[call][lo : lo + numel], pads[call][lo : lo + numel]
+        inp = bufs[call][lo : lo + numel]
         # Written by a kernel right before the call, with no host
         # synchronization in between.
         inp.copy_(xs[call][rank])
-        comm.all_reduce(inp, out, bits=bits)
+        comm.all_reduce(inp, outs[call][lo : lo + numel], bits=bits)
     bad = 0
     for call in range(calls):
-        got = pads[call][lo : lo + numel] * 1.0
+        got = outs[call][lo : lo + numel] * 1.0
         bad += mismatches(got, reference(xs[call], bits))
-        bad += int((pads[call][:lo] != 3.0).sum().item())
-        bad += int((pads[call][lo + numel :] != 3.0).sum().item())
+        bad += int((outs[call][:lo] != 3.0).sum().item())
+        bad += int((outs[call][lo + numel :] != 3.0).sum().item())
     return bad
 
 
@@ -176,7 +178,7 @@ def bench_case(comm, rank, case, reps, barrier, start_at) -> dict:
 
 
 def rank_main(
-    rank, tp_size, devices, port, cases, lenders, reps, cycles, start_at, barrier, q
+    rank, tp_size, devices, port, cases, max_lenders, reps, cycles, start_at, barrier, q
 ):
     try:
         device = torch.device(f"cuda:{devices[rank]}")
@@ -191,13 +193,10 @@ def rank_main(
         )
         max_bytes = max(max(c["numel"] for c in cases) * 2, 4096)
         # Fails if destroy leaks an SDMA queue: an engine has 8.
+        kwargs = {"max_bytes": max_bytes, "max_lenders": max_lenders}
         for _ in range(cycles):
-            MeshLendAllReduce(
-                dist.group.WORLD, device, max_bytes=max_bytes, lenders=lenders
-            ).close()
-        comm = MeshLendAllReduce(
-            dist.group.WORLD, device, max_bytes=max_bytes, lenders=lenders
-        )
+            MeshLendAllReduce(dist.group.WORLD, device, **kwargs).close()
+        comm = MeshLendAllReduce(dist.group.WORLD, device, **kwargs)
         rows = []
         for i, case in enumerate(cases):
             row = {"lenders": comm.num_lenders}
@@ -207,18 +206,17 @@ def rank_main(
             row["mismatches"] = check_case(comm, rank, tp_size, case, 10 * i, barrier)
             rows.append(row)
         torch.cuda.synchronize()
-        grants = comm.grants()
         dist.barrier()
         comm.close()
         dist.destroy_process_group()
-        q.put((rank, rows, grants, None))
+        q.put((rank, rows, None))
     except Exception as e:  # noqa: BLE001  the parent must hear of any failure
         barrier.abort()
-        q.put((rank, None, 0, repr(e)))
+        q.put((rank, None, repr(e)))
 
 
 def test_mesh_lend_all_reduce(
-    tp_size, cases, devices=None, lenders="auto", reps=0, cycles=0, start_at=0.0
+    tp_size, cases, devices=None, max_lenders=7, reps=0, cycles=0, start_at=0.0
 ):
     """One TP group over `cases`; one row per case.
 
@@ -229,23 +227,9 @@ def test_mesh_lend_all_reduce(
     ctx = mp.get_context("spawn")
     barrier, q = ctx.Barrier(tp_size), ctx.Queue()
     port = get_open_port()
+    shared = (tp_size, devices, port, cases, max_lenders, reps, cycles, start_at)
     procs = [
-        ctx.Process(
-            target=rank_main,
-            args=(
-                r,
-                tp_size,
-                devices,
-                port,
-                cases,
-                lenders,
-                reps,
-                cycles,
-                start_at,
-                barrier,
-                q,
-            ),
-        )
+        ctx.Process(target=rank_main, args=(r, *shared, barrier, q))
         for r in range(tp_size)
     ]
     for p in procs:
@@ -253,7 +237,7 @@ def test_mesh_lend_all_reduce(
     results = sorted(q.get(timeout=900) for _ in procs)
     for p in procs:
         p.join(timeout=60)
-    errors = [f"rank {rank}: {err}" for rank, _, _, err in results if err]
+    errors = [f"rank {rank}: {err}" for rank, _, err in results if err]
     assert not errors, "; ".join(errors)
     rows = []
     for i, case in enumerate(cases):
@@ -269,7 +253,6 @@ def test_mesh_lend_all_reduce(
         if reps:
             for key in ("median_us", "best_us", "chained_us"):
                 row[key] = round(max(r[key] for r in per_rank), 1)
-            row["grants"] = max(r[2] for r in results)
         row["mismatches"] = sum(r["mismatches"] for r in per_rank)
         rows.append(row)
     bad = [r for r in rows if r["mismatches"]]
@@ -299,7 +282,7 @@ if __name__ == "__main__":
     parser.add_argument("--bench", action="store_true", help="time --mb sizes")
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--devices", type=str, default=None, help="e.g. 0,1")
-    parser.add_argument("--lenders", type=str, default="auto")
+    parser.add_argument("--max-lenders", type=int, default=7)
     parser.add_argument("--bits", type=int, default=0, choices=(0, 4, 8))
     parser.add_argument("--mb", type=str, default="1,4,16,64,80,256")
     parser.add_argument("--reps", type=int, default=200)
@@ -323,7 +306,7 @@ if __name__ == "__main__":
             args.tp,
             cases,
             devices,
-            args.lenders,
+            args.max_lenders,
             reps=args.reps,
             start_at=args.start_at,
         )
@@ -333,9 +316,9 @@ if __name__ == "__main__":
             if why:
                 print(f"SKIP mesh-lending all-reduce TP{tp_size}: {why}")
                 continue
-            for lenders in ("auto", "none"):
+            for max_lenders in (7, 0):
                 rows += test_mesh_lend_all_reduce(
-                    tp_size, default_cases(tp_size), devices, lenders, cycles=10
+                    tp_size, default_cases(tp_size), devices, max_lenders, cycles=10
                 )
     if rows:
         print(pd.DataFrame(rows).to_markdown(index=False))

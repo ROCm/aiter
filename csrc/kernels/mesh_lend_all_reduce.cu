@@ -10,12 +10,13 @@
 // to the destination. No compute unit moves a byte across a link, nothing is
 // staged on the lender and no kernel runs there.
 //
-// Each rank owns private SDMA queues: one per destination on its own GPU and
-// one on every lender. Per call the host writes COPY_LINEAR + FENCE + FENCE
-// into them: the first fence stamps an arrival flag at the receiver, the
-// second a departure flag at the sender. Kernels on the caller's stream wait
-// for the flags of the pieces they read, so everything queued behind them is
-// ordered after the transport.
+// Each rank owns SDMA queues: one per destination on its own GPU and one on
+// every lender. Per call the host writes COPY_LINEAR + FENCE + FENCE into
+// them: the first fence stamps an arrival flag at the receiver, the second a
+// departure flag at the sender. Kernels on the caller's stream wait for the
+// flags of the pieces they touch, so everything queued behind them is ordered
+// after the transport. The engines are not ordered with the stream, so the
+// host synchronizes the stream before it posts.
 //
 // Two ranks: one shot. Each rank's whole input goes to the peer in 1 + L equal
 // pieces, one per path, and one kernel adds. The peer's next call can start
@@ -24,16 +25,16 @@
 // scale byte per 16 values) and the engines move the packed buffer; the
 // result is deq(own codes) + deq(peer codes), identical on both ranks.
 //
-// Three or four ranks: reduce-scatter, then all-gather. Rank j owns slice j.
-// Phase 1 sends slice j of every input to rank j, which sums it in rank order.
-// Phase 2 sends the sum back to every rank. A rank cannot post call k + 1
-// before every rank has consumed call k, so one set of inboxes is enough.
-// The direct link carries 2 (n - 1) shares of a flow and each lender one: a
-// lender's engine serves a rank's n - 1 destinations in turn, and in that
-// time moved about half of what the engine of a direct link does (MI355X).
+// Four ranks: reduce-scatter, then all-gather. Rank j owns slice j. Phase 1
+// sends slice j of every input to rank j, which sums it in rank order. Phase 2
+// sends the sum back to every rank. A rank cannot post call k + 1 before
+// every rank has consumed call k, so one set of inboxes is enough. The direct
+// link carries 2 (n - 1) shares of a flow and each lender one: a lender's
+// engine serves a rank's n - 1 destinations in turn, and in that time moved
+// about half of what the engine of a direct link does (MI355X).
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
-#include "kfd_sdma_queue.h"
+#include "hsakmt_sdma_queue.h"
 #include "mesh_lend_all_reduce.h"
 
 #include <hsa/hsa.h>
@@ -49,16 +50,14 @@ namespace {
 constexpr int kMaxRanks      = 4;
 constexpr int kMaxSlots      = kMaxRanks - 1; // the peers of one rank
 constexpr int kMaxVia        = 8;             // own GPU + lenders
-constexpr int kFlagStride    = 16;            // ints: one flag per 64 bytes
-constexpr size_t kFlagBytes  = 2 * 2 * kMaxSlots * kMaxVia * kFlagStride * sizeof(int);
+constexpr uint32_t kMaxNodes = 64;            // KFD topology nodes, as the bits of a mask
 constexpr long kSpinLimit    = 2000000000L;
 constexpr size_t kPage       = 4096;
-constexpr size_t kVecBytes   = 16;  // exact payloads move in 16-byte vectors
-constexpr size_t kVecAlign   = 256; // vectors per 4 KiB: every piece starts on a page
-constexpr size_t kUnitValues = 64;  // quantized payloads: four groups of 16 values
-constexpr size_t kUnitAlign =
-    1024; // units per piece boundary: 36 KiB and 68 KiB are page multiples
-constexpr int kThreads = 256;
+constexpr size_t kVecBytes   = 16;   // exact payloads move in 16-byte vectors
+constexpr size_t kVecAlign   = 256;  // vectors per 4 KiB: every piece starts on a page
+constexpr size_t kUnitValues = 64;   // quantized payloads: four groups of 16 values
+constexpr size_t kUnitAlign  = 1024; // units per piece: 36 and 68 KiB are page multiples
+constexpr int kThreads       = 256;
 
 enum FlagDir
 {
@@ -66,10 +65,10 @@ enum FlagDir
     kDeparture = 1
 };
 
-// Flag of path `path` of the flow from or to peer slot `slot`, in ints from
-// the start of a rank's flag page.
+// A rank's block starts with its flag page. Flag of path `path` of the flow
+// from or to peer slot `slot`, in ints.
 __host__ __device__ inline int flag_index(int dir, int phase, int slot, int path)
-{ return (((dir * 2 + phase) * kMaxSlots + slot) * kMaxVia + path) * kFlagStride; }
+{ return ((dir * 2 + phase) * kMaxSlots + slot) * kMaxVia + path; }
 
 // Piece p of a flow covers units [bound[p], bound[p + 1]).
 struct Split
@@ -77,9 +76,6 @@ struct Split
     size_t bound[kMaxVia + 1];
     int npath;
 };
-
-// A caller's tensor is only guaranteed 2-byte alignment.
-typedef uint64_t __attribute__((aligned(2), may_alias)) bf16x4_t;
 
 __device__ inline float bf2f(uint16_t x)
 { return __builtin_bit_cast(float, static_cast<uint32_t>(x) << 16); }
@@ -91,39 +87,71 @@ __device__ inline uint16_t f2bf(float f)
     return static_cast<uint16_t>(u >> 16);
 }
 
+// Eight bf16 from element e of a tensor of nelem. Elements past the end read
+// as 0 and are not written. A caller's tensor is only 2-byte aligned.
+__device__ inline void load8(uint16_t* v, const uint16_t* p, size_t e, size_t nelem)
+{
+    if(e + 8 <= nelem)
+    {
+        __builtin_memcpy(v, p + e, 16);
+        return;
+    }
+    for(int k = 0; k < 8; ++k)
+        v[k] = e + k < nelem ? p[e + k] : 0;
+}
+
+__device__ inline void store8(uint16_t* p, size_t e, size_t nelem, const uint16_t* v)
+{
+    if(e + 8 <= nelem)
+    {
+        __builtin_memcpy(p + e, v, 16);
+        return;
+    }
+    for(int k = 0; k < 8; ++k)
+        if(e + k < nelem)
+            p[e + k] = v[k];
+}
+
 // Flags only grow, and a later fence in the same queue implies the earlier
-// copy: compare with >=, not ==.
+// copy: compare with >=, not ==. The load races with the engine's write on
+// purpose.
 __device__ inline bool wait_flag(const int* flag, int epoch)
 {
-    long spins = 0;
-    while(__atomic_load_n(flag, __ATOMIC_RELAXED) - epoch < 0)
-    {
+    for(long spins = 0; __atomic_load_n(flag, __ATOMIC_RELAXED) - epoch < 0;)
         if(++spins > kSpinLimit)
             return false;
-    }
     return true;
 }
 
+// Waits for the pieces of `s` that overlap units [lo, hi).
 __device__ inline bool wait_pieces(
     const int* flags, int dir, int phase, int slot, const Split& s, size_t lo, size_t hi, int epoch)
 {
     for(int p = 0; p < s.npath; ++p)
-    {
-        if(s.bound[p + 1] <= lo || s.bound[p] >= hi)
-            continue;
-        if(!wait_flag(flags + flag_index(dir, phase, slot, p), epoch))
+        if(s.bound[p + 1] > lo && s.bound[p] < hi &&
+           !wait_flag(flags + flag_index(dir, phase, slot, p), epoch))
             return false;
-    }
     return true;
+}
+
+// One thread waits for its block and tells the others here. False if it timed
+// out, which the host reads from err.
+__device__ inline bool block_ok(bool ok, int* err)
+{
+    __shared__ bool shared;
+    if(threadIdx.x == 0)
+        shared = ok;
+    __syncthreads();
+    if(!shared)
+        err[0] = 1;
+    return shared;
 }
 
 __device__ inline void block_range(size_t n, size_t* lo, size_t* hi)
 {
     const size_t per = (n + gridDim.x - 1) / gridDim.x;
-    *lo              = static_cast<size_t>(blockIdx.x) * per;
-    *hi              = *lo + per < n ? *lo + per : n;
-    if(*lo > n)
-        *lo = n;
+    *lo              = std::min(blockIdx.x * per, n);
+    *hi              = std::min(*lo + per, n);
 }
 
 // ---- two ranks, exact --------------------------------------------------------
@@ -132,7 +160,7 @@ struct PairArgs
 {
     const uint16_t* inp;
     const uint16_t* inbox;
-    uint16_t* out;
+    uint16_t* out; // may be inp
     const int* flags;
     int* err;
     Split split; // in vectors
@@ -144,43 +172,23 @@ __global__ void mesh_lend_reduce_pair(PairArgs a)
 {
     size_t lo, hi;
     block_range((a.nelem + 7) / 8, &lo, &hi);
-    if(!wait_pieces(a.flags, kArrival, 0, 0, a.split, lo, hi, a.epoch))
-    {
-        a.err[0] = 1;
+    // A block needs its pieces to have arrived, and to have left: the peer
+    // must hold inp before the block writes over it in place, or the caller
+    // frees it.
+    if(!block_ok(threadIdx.x != 0 ||
+                     (wait_pieces(a.flags, kArrival, 0, 0, a.split, lo, hi, a.epoch) &&
+                      wait_pieces(a.flags, kDeparture, 0, 0, a.split, lo, hi, a.epoch)),
+                 a.err))
         return;
-    }
     for(size_t i = lo + threadIdx.x; i < hi; i += blockDim.x)
     {
-        const size_t e0 = 8 * i;
-        if(e0 + 8 <= a.nelem)
-        {
-            const bf16x4_t* x = reinterpret_cast<const bf16x4_t*>(a.inp + e0);
-            const uint64_t* q = reinterpret_cast<const uint64_t*>(a.inbox + e0);
-            const uint64_t x0 = x[0], x1 = x[1];
-            const uint64_t w0 = __atomic_load_n(q, __ATOMIC_RELAXED);
-            const uint64_t w1 = __atomic_load_n(q + 1, __ATOMIC_RELAXED);
-            uint64_t r0 = 0, r1 = 0;
-            for(int j = 0; j < 4; ++j)
-            {
-                const int sh = 16 * j;
-                r0 |= static_cast<uint64_t>(f2bf(bf2f(x0 >> sh) + bf2f(w0 >> sh))) << sh;
-                r1 |= static_cast<uint64_t>(f2bf(bf2f(x1 >> sh) + bf2f(w1 >> sh))) << sh;
-            }
-            bf16x4_t* o = reinterpret_cast<bf16x4_t*>(a.out + e0);
-            o[0]        = r0;
-            o[1]        = r1;
-        }
-        else
-        {
-            for(size_t e = e0; e < a.nelem; ++e)
-                a.out[e] =
-                    f2bf(bf2f(a.inp[e]) + bf2f(__atomic_load_n(a.inbox + e, __ATOMIC_RELAXED)));
-        }
+        uint16_t x[8], w[8];
+        load8(x, a.inp, 8 * i, a.nelem);
+        __builtin_memcpy(w, a.inbox + 8 * i, 16);
+        for(int j = 0; j < 8; ++j)
+            x[j] = f2bf(bf2f(x[j]) + bf2f(w[j]));
+        store8(a.out, 8 * i, a.nelem, x);
     }
-    // The peer must hold all of inp before the caller may free it.
-    if(blockIdx.x == 0 && threadIdx.x == 0 &&
-       !wait_pieces(a.flags, kDeparture, 0, 0, a.split, 0, ~size_t(0), a.epoch))
-        a.err[0] = 2;
 }
 
 // ---- two ranks, quantized ----------------------------------------------------
@@ -207,30 +215,6 @@ struct DecodeArgs
     size_t nelem;
     int epoch;
 };
-
-// Four bf16 from element e; elements past nelem read as 0.
-__device__ inline uint64_t load4(const uint16_t* p, size_t e, size_t nelem)
-{
-    if(e + 4 <= nelem)
-        return *reinterpret_cast<const bf16x4_t*>(p + e);
-    uint64_t r = 0;
-    for(int k = 0; k < 4; ++k)
-        if(e + k < nelem)
-            r |= static_cast<uint64_t>(p[e + k]) << (16 * k);
-    return r;
-}
-
-__device__ inline void store4(uint16_t* p, size_t e, size_t nelem, uint64_t v)
-{
-    if(e + 4 <= nelem)
-    {
-        *reinterpret_cast<bf16x4_t*>(p + e) = v;
-        return;
-    }
-    for(int k = 0; k < 4; ++k)
-        if(e + k < nelem)
-            p[e + k] = static_cast<uint16_t>(v >> (16 * k));
-}
 
 // E5M2 code of a magnitude. Rounding up keeps the extremum inside the range,
 // which pays once the step is small (8 bits); at 4 bits a clipped extremum
@@ -292,18 +276,15 @@ __global__ void mesh_lend_encode(EncodeArgs a)
         for(int g = 0; g < 4; ++g)
         {
             const size_t e0 = kUnitValues * u + 16 * g;
-            float v[16];
-            for(int k = 0; k < 4; ++k)
+            uint16_t x[16];
+            load8(x, a.inp, e0, a.nelem);
+            load8(x + 8, a.inp, e0 + 8, a.nelem);
+            float v[16], mp = bf2f(x[0]), mn = -mp;
+            for(int j = 0; j < 16; ++j)
             {
-                const uint64_t x = load4(a.inp, e0 + 4 * k, a.nelem);
-                for(int j = 0; j < 4; ++j)
-                    v[4 * k + j] = bf2f(x >> (16 * j));
-            }
-            float mp = v[0], mn = -v[0];
-            for(int j = 1; j < 16; ++j)
-            {
-                mp = fmaxf(mp, v[j]);
-                mn = fmaxf(mn, -v[j]);
+                v[j] = bf2f(x[j]);
+                mp   = fmaxf(mp, v[j]);
+                mn   = fmaxf(mn, -v[j]);
             }
             const bool neg      = mn > mp;
             const uint32_t code = e5m2_of(neg ? mn : mp, BITS > 4) | (neg ? 0x80u : 0u);
@@ -332,26 +313,24 @@ __global__ void mesh_lend_decode_reduce(DecodeArgs a)
     const uint32_t mask = (1u << BITS) - 1;
     size_t lo, hi;
     block_range((a.nelem + kUnitValues - 1) / kUnitValues, &lo, &hi);
-    if(!wait_pieces(a.flags, kArrival, 0, 0, a.split, lo, hi, a.epoch))
-    {
-        a.err[0] = 1;
+    // Left: the peer must hold this rank's packed buffer before the next call rewrites it.
+    if(!block_ok(threadIdx.x != 0 ||
+                     (wait_pieces(a.flags, kArrival, 0, 0, a.split, lo, hi, a.epoch) &&
+                      wait_pieces(a.flags, kDeparture, 0, 0, a.split, lo, hi, a.epoch)),
+                 a.err))
         return;
-    }
     for(size_t u = lo + threadIdx.x; u < hi; u += blockDim.x)
     {
         const uint32_t* wo = a.own + static_cast<size_t>(NW) * u;
         const uint32_t* wp = a.inbox + static_cast<size_t>(NW) * u;
-        const uint32_t so  = wo[NW - 1];
-        const uint32_t sp  = __atomic_load_n(wp + NW - 1, __ATOMIC_RELAXED);
         for(int g = 0; g < 4; ++g)
         {
-            const float da = decode_step<BITS>(so >> (8 * g) & 0xFF);
-            const float db = decode_step<BITS>(sp >> (8 * g) & 0xFF);
+            const float da = decode_step<BITS>(wo[NW - 1] >> (8 * g) & 0xFF);
+            const float db = decode_step<BITS>(wp[NW - 1] >> (8 * g) & 0xFF);
             uint16_t r[16];
             for(int k = 0; k < BITS / 2; ++k)
             {
-                const uint32_t xo = wo[g * (BITS / 2) + k];
-                const uint32_t xp = __atomic_load_n(wp + g * (BITS / 2) + k, __ATOMIC_RELAXED);
+                const uint32_t xo = wo[g * (BITS / 2) + k], xp = wp[g * (BITS / 2) + k];
                 for(int j = 0; j < per_word; ++j)
                 {
                     const float fa =
@@ -362,22 +341,13 @@ __global__ void mesh_lend_decode_reduce(DecodeArgs a)
                 }
             }
             const size_t e0 = kUnitValues * u + 16 * g;
-            for(int k = 0; k < 4; ++k)
-                store4(a.out,
-                       e0 + 4 * k,
-                       a.nelem,
-                       static_cast<uint64_t>(r[4 * k]) | static_cast<uint64_t>(r[4 * k + 1]) << 16 |
-                           static_cast<uint64_t>(r[4 * k + 2]) << 32 |
-                           static_cast<uint64_t>(r[4 * k + 3]) << 48);
+            store8(a.out, e0, a.nelem, r);
+            store8(a.out, e0 + 8, a.nelem, r + 8);
         }
     }
-    // The peer must hold this rank's packed buffer before the next call rewrites it.
-    if(blockIdx.x == 0 && threadIdx.x == 0 &&
-       !wait_pieces(a.flags, kDeparture, 0, 0, a.split, 0, ~size_t(0), a.epoch))
-        a.err[0] = 2;
 }
 
-// ---- three or four ranks, exact ----------------------------------------------
+// ---- four ranks, exact -------------------------------------------------------
 
 struct SliceArgs
 {
@@ -400,74 +370,33 @@ __global__ void mesh_lend_reduce_slice(SliceArgs a)
 {
     size_t lo, hi;
     block_range((a.nelem + 7) / 8, &lo, &hi);
-    for(int k = 0; k < a.n - 1; ++k)
-    {
-        if(!wait_pieces(a.flags, kArrival, 0, k, a.split, lo, hi, a.epoch))
-        {
-            a.err[0] = 1;
-            return;
-        }
-    }
+    bool ok = true;
+    // Block 0 also waits for what this rank sent: every rank must hold its
+    // slice of inp before phase 2 writes out, or the caller frees inp.
+    for(int k = 0; k < a.n - 1 && threadIdx.x == 0 && ok; ++k)
+        ok = wait_pieces(a.flags, kArrival, 0, k, a.split, lo, hi, a.epoch) &&
+             (blockIdx.x != 0 ||
+              wait_pieces(a.flags, kDeparture, 0, k, a.sent[k], 0, ~size_t(0), a.epoch));
+    if(!block_ok(ok, a.err))
+        return;
     for(size_t i = lo + threadIdx.x; i < hi; i += blockDim.x)
     {
-        const size_t e0 = 8 * i;
-        const int cnt   = e0 + 8 <= a.nelem ? 8 : static_cast<int>(a.nelem - e0);
         float acc[8];
+        uint16_t x[8];
         for(int r = 0; r < a.n; ++r)
         {
-            uint64_t x0 = 0, x1 = 0;
             if(r == a.me)
-            {
-                if(cnt == 8)
-                {
-                    const bf16x4_t* x = reinterpret_cast<const bf16x4_t*>(a.inp + e0);
-                    x0                = x[0];
-                    x1                = x[1];
-                }
-                else
-                {
-                    x0 = load4(a.inp, e0, a.nelem);
-                    x1 = load4(a.inp, e0 + 4, a.nelem);
-                }
-            }
+                load8(x, a.inp, 8 * i, a.nelem);
             else
-            {
-                const int k = (r - a.me - 1 + a.n) % a.n;
-                const uint64_t* q =
-                    reinterpret_cast<const uint64_t*>(a.inbox + k * a.slot_elems + e0);
-                x0 = __atomic_load_n(q, __ATOMIC_RELAXED);
-                x1 = __atomic_load_n(q + 1, __ATOMIC_RELAXED);
-            }
-            for(int j = 0; j < 4; ++j)
-            {
-                const float f0 = bf2f(x0 >> (16 * j)), f1 = bf2f(x1 >> (16 * j));
-                acc[j]     = r == 0 ? f0 : acc[j] + f0;
-                acc[4 + j] = r == 0 ? f1 : acc[4 + j] + f1;
-            }
+                __builtin_memcpy(
+                    x, a.inbox + ((r - a.me - 1 + a.n) % a.n) * a.slot_elems + 8 * i, 16);
+            for(int j = 0; j < 8; ++j)
+                acc[j] = r == 0 ? bf2f(x[j]) : acc[j] + bf2f(x[j]);
         }
-        uint64_t r0 = 0, r1 = 0;
-        for(int j = 0; j < 4; ++j)
-        {
-            r0 |= static_cast<uint64_t>(f2bf(acc[j])) << (16 * j);
-            r1 |= static_cast<uint64_t>(f2bf(acc[4 + j])) << (16 * j);
-        }
-        uint64_t* red = reinterpret_cast<uint64_t*>(a.reduced + e0);
-        red[0]        = r0;
-        red[1]        = r1;
-        store4(a.out, e0, a.nelem, r0);
-        store4(a.out, e0 + 4, a.nelem, r1);
-    }
-    // Every rank must hold its slice of inp before the caller may free it.
-    if(blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        for(int k = 0; k < a.n - 1; ++k)
-        {
-            if(!wait_pieces(a.flags, kDeparture, 0, k, a.sent[k], 0, ~size_t(0), a.epoch))
-            {
-                a.err[0] = 2;
-                return;
-            }
-        }
+        for(int j = 0; j < 8; ++j)
+            x[j] = f2bf(acc[j]);
+        __builtin_memcpy(a.reduced + 8 * i, x, 16);
+        store8(a.out, 8 * i, a.nelem, x);
     }
 }
 
@@ -492,104 +421,73 @@ __global__ void mesh_lend_gather(GatherArgs a)
         total += (a.nelem[k] + 7) / 8;
     size_t lo, hi;
     block_range(total, &lo, &hi);
-    size_t base = 0;
+    // This block's vectors [s[k], e[k]) of slice k.
+    size_t s[kMaxSlots], e[kMaxSlots], base = 0;
+    bool ok = true;
     for(int k = 0; k < a.nslot; ++k)
     {
-        const size_t nvec = (a.nelem[k] + 7) / 8;
-        const size_t s    = (lo > base ? lo : base) - base;
-        const size_t e    = (hi < base + nvec ? hi : base + nvec) - base;
-        if(lo < base + nvec && hi > base && s < e)
-        {
-            if(!wait_pieces(a.flags, kArrival, 1, k, a.split[k], s, e, a.epoch))
-            {
-                a.err[0] = 3;
-                return;
-            }
-            const uint16_t* in = a.inbox + a.first[k];
-            uint16_t* out      = a.out + a.first[k];
-            for(size_t i = s + threadIdx.x; i < e; i += blockDim.x)
-            {
-                const uint64_t* q = reinterpret_cast<const uint64_t*>(in + 8 * i);
-                store4(out, 8 * i, a.nelem[k], __atomic_load_n(q, __ATOMIC_RELAXED));
-                store4(out, 8 * i + 4, a.nelem[k], __atomic_load_n(q + 1, __ATOMIC_RELAXED));
-            }
-        }
-        base += nvec;
+        const size_t end = base + (a.nelem[k] + 7) / 8;
+        s[k]             = std::min(std::max(lo, base), end) - base;
+        e[k]             = std::min(std::max(hi, base), end) - base;
+        base             = end;
+        // Block 0 also waits for what this rank sent: every rank must hold
+        // the reduced slice before the next call rewrites it.
+        if(threadIdx.x == 0 && ok)
+            ok = (s[k] == e[k] ||
+                  wait_pieces(a.flags, kArrival, 1, k, a.split[k], s[k], e[k], a.epoch)) &&
+                 (blockIdx.x != 0 ||
+                  wait_pieces(a.flags, kDeparture, 1, k, a.sent, 0, ~size_t(0), a.epoch));
     }
-    // Every rank must hold the reduced slice before the next call rewrites it.
-    if(blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        for(int k = 0; k < a.nslot; ++k)
+    if(!block_ok(ok, a.err))
+        return;
+    for(int k = 0; k < a.nslot; ++k)
+        for(size_t i = s[k] + threadIdx.x; i < e[k]; i += blockDim.x)
         {
-            if(!wait_pieces(a.flags, kDeparture, 1, k, a.sent, 0, ~size_t(0), a.epoch))
-            {
-                a.err[0] = 4;
-                return;
-            }
+            uint16_t x[8];
+            __builtin_memcpy(x, a.inbox + a.first[k] + 8 * i, 16);
+            store8(a.out + a.first[k], 8 * i, a.nelem[k], x);
         }
-    }
 }
 
 // ---- host --------------------------------------------------------------------
 
-constexpr uint32_t kMagic    = 0x4d4c4152; // "MLAR"
-constexpr uint32_t kVersion  = 1;
-constexpr int kMaxCandidates = 16;
-
+// What a rank tells the others.
 struct Export
 {
-    uint32_t magic, version, rank, world_size;
-    uint64_t max_bytes;
-    uint32_t gpu_id, ncandidates;
-    uint32_t candidates[kMaxCandidates]; // gpu_ids this rank can lend from
-    struct
-    {
-        hsa_amd_ipc_memory_t handle;
-        uint64_t len, off;
-    } buf[3]; // inbox 0, inbox 1, flags
-};
-
-struct Peer
-{
-    int node          = -1;
-    char* inbox[2]    = {nullptr, nullptr};
-    int* flags        = nullptr;
-    void* attached[3] = {nullptr, nullptr, nullptr};
+    uint32_t node; // KFD topology node of the rank's GPU
+    uint32_t max_lenders;
+    uint64_t block_bytes;
+    uint64_t lendable;           // nodes of the GPUs the rank's ROCr sees, as a bit mask
+    hsa_amd_ipc_memory_t handle; // the rank's block
 };
 
 struct Via
 {
-    kfd_sdma::Device dev;
-    int node = -1;
+    uint32_t node         = 0;
+    int engine[kMaxSlots] = {};
+    sdma::Queue queue[kMaxSlots];
 };
 
 struct Comm
 {
     int device_id = -1, rank = 0, n = 0;
-    size_t max_bytes = 0, slot_bytes = 0, wire_bytes = 0;
-    kfd_sdma::GpuNode self{};
-    std::vector<kfd_sdma::GpuNode> candidates;
+    size_t max_bytes = 0, slot_bytes = 0, inbox_bytes = 0;
+    hsa_agent_t gpu[kMaxNodes] = {}; // the process's GPU agents by KFD topology node
     Export exported{};
 
-    char* inbox[2]        = {nullptr, nullptr};
-    size_t inbox_bytes[2] = {0, 0};
-    uint16_t* reduced     = nullptr; // n > 2
-    uint32_t* wire        = nullptr; // n == 2
-    int* flags            = nullptr;
-    int* err              = nullptr;
+    char* block = nullptr; // the flag page and two inboxes: what the other ranks' engines write
+    char* send  = nullptr; // the packed input (n == 2) or the reduced slice: what the engines
+                           // read that is not the caller's
+    int* err              = nullptr; // host memory: a kernel that timed out says so here
+    char* peer[kMaxSlots] = {};      // the block of rank (rank + 1 + k) % n, attached
 
-    Peer peer[kMaxSlots]; // slot k is rank (rank + 1 + k) % n
     int nvia = 0;
     Via via[kMaxVia]; // 0: own GPU, then the lenders
-    kfd_sdma::Queue* route[kMaxVia][kMaxSlots] = {};
-    std::vector<std::unique_ptr<kfd_sdma::Queue>> queues;
-    std::vector<hsa_agent_t> engine_agents; // agents whose engines touch our buffers
-    std::vector<hsa_queue_t*> hsa_queues;   // keep ROCr's doorbell frame on a lender mapped
+    sdma::Queue* route[kMaxVia][kMaxSlots] = {};
+    bool connected                         = false;
+    uint32_t epoch                         = 0;
 
-    bool hsa_up = false, connected = false;
-    uint32_t epoch = 0;
-    uint64_t calls = 0, grants = 0;
-
+    char* inbox(char* of_block, int i) const { return of_block + kPage + i * inbox_bytes; }
     ~Comm();
 };
 
@@ -598,260 +496,128 @@ struct Comm
 
 size_t page_up(size_t n) { return (n + kPage - 1) & ~(kPage - 1); }
 
-bool pci_of_hip_device(int dev, uint32_t* domain, uint32_t* loc)
-{
-    char bus[32] = {};
-    unsigned d = 0, b = 0, s = 0, f = 0;
-    if(hipDeviceGetPCIBusId(bus, sizeof(bus), dev) != hipSuccess ||
-       sscanf(bus, "%x:%x:%x.%x", &d, &b, &s, &f) != 4)
-        return false;
-    *domain = d;
-    *loc    = ((b & 0xFF) << 8) | ((s & 0x1F) << 3) | (f & 0x7);
-    return true;
-}
+int* flags_of(char* block) { return reinterpret_cast<int*>(block); }
 
-struct AgentFind
+// Fills an array of the process's GPU agents, indexed by KFD topology node. A
+// GPU hidden by HIP_VISIBLE_DEVICES still has one; a GPU hidden by
+// ROCR_VISIBLE_DEVICES does not.
+hsa_status_t add_gpu(hsa_agent_t agent, void* by_node)
 {
-    uint32_t bdf, domain;
-    hsa_agent_t out;
-    bool found;
-};
-
-hsa_status_t agent_cb(hsa_agent_t agent, void* data)
-{
-    auto* f = static_cast<AgentFind*>(data);
     hsa_device_type_t type;
-    if(hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type) != HSA_STATUS_SUCCESS ||
-       type != HSA_DEVICE_TYPE_GPU)
-        return HSA_STATUS_SUCCESS;
-    uint32_t bdf = 0, domain = 0;
-    hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_BDFID), &bdf);
-    hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_DOMAIN), &domain);
-    if(bdf == f->bdf && domain == f->domain)
-    {
-        f->out   = agent;
-        f->found = true;
-        return HSA_STATUS_INFO_BREAK;
-    }
+    uint32_t node = 0;
+    if(hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type) == HSA_STATUS_SUCCESS &&
+       type == HSA_DEVICE_TYPE_GPU &&
+       hsa_agent_get_info(agent, HSA_AGENT_INFO_NODE, &node) == HSA_STATUS_SUCCESS &&
+       node < kMaxNodes)
+        static_cast<hsa_agent_t*>(by_node)[node] = agent;
     return HSA_STATUS_SUCCESS;
 }
 
-// The ROCr agent of a GPU. A GPU hidden by HIP_VISIBLE_DEVICES still has one;
-// a GPU hidden by ROCR_VISIBLE_DEVICES does not.
-bool agent_of(const kfd_sdma::GpuNode& g, hsa_agent_t* out)
+// The SDMA engine ROCr recommends for copies from `gpu` over its xGMI link to
+// `to`; -1 without such a link. ROCr names at most one, from KFD ioctl 1.17.
+int engine_for(hsa_agent_t gpu, hsa_agent_t to)
 {
-    AgentFind f{g.location_id, g.domain, {}, false};
-    hsa_iterate_agents(agent_cb, &f);
-    if(f.found)
-        *out = f.out;
-    return f.found;
-}
-
-const kfd_sdma::GpuNode* find_gpu(const std::vector<kfd_sdma::GpuNode>& all, uint32_t gpu_id)
-{
-    for(const auto& g : all)
-        if(g.gpu_id == gpu_id)
-            return &g;
-    return nullptr;
-}
-
-std::vector<kfd_sdma::GpuNode>
-parse_lenders(const std::string& spec, const std::vector<kfd_sdma::GpuNode>& all, uint32_t self_id)
-{
-    std::vector<kfd_sdma::GpuNode> out;
-    hsa_agent_t agent;
-    if(spec == "auto")
-    {
-        for(const auto& g : all)
-            if(g.gpu_id != self_id && agent_of(g, &agent))
-                out.push_back(g);
-        return out;
-    }
-    if(spec.empty() || spec == "none")
-        return out;
-    size_t pos = 0;
-    while(pos <= spec.size())
-    {
-        size_t end = spec.find(',', pos);
-        if(end == std::string::npos)
-            end = spec.size();
-        const std::string tok = spec.substr(pos, end - pos);
-        pos                   = end + 1;
-        if(tok.empty())
-            continue;
-        uint32_t domain = 0, loc = 0;
-        if(tok.find(':') != std::string::npos)
-        {
-            unsigned d = 0, b = 0, s = 0, f = 0;
-            if(sscanf(tok.c_str(), "%x:%x:%x.%x", &d, &b, &s, &f) != 4)
-                fail("lender '" + tok + "' is not a PCI address");
-            domain = d;
-            loc    = ((b & 0xFF) << 8) | ((s & 0x1F) << 3) | (f & 0x7);
-        }
-        else if(!pci_of_hip_device(atoi(tok.c_str()), &domain, &loc))
-        {
-            fail("lender '" + tok + "' is not a HIP device of this process; use its PCI address");
-        }
-        bool found = false;
-        for(const auto& g : all)
-        {
-            if(g.domain != domain || g.location_id != loc)
-                continue;
-            found = true;
-            if(g.gpu_id == self_id)
-                fail("lender '" + tok + "' is this rank's own GPU");
-            if(!agent_of(g, &agent))
-                fail("lender '" + tok + "' has no ROCr agent (ROCR_VISIBLE_DEVICES?)");
-            out.push_back(g);
-        }
-        if(!found)
-            fail("lender '" + tok + "' is not in the KFD topology of this process");
-    }
-    return out;
+    uint32_t mask = 0;
+    if(!gpu.handle || !to.handle ||
+       hsa_amd_memory_get_preferred_copy_engine(to, gpu, &mask) != HSA_STATUS_SUCCESS || !mask)
+        return -1;
+    return __builtin_ctz(mask);
 }
 
 // The allocation holding ptr must be mapped on every engine GPU: an engine
 // that touches an unmapped address faults. Asked on every call and never
 // remembered, because a freed block's address can come back as a new
 // allocation. hsa_amd_agents_allow_access replaces the access list, so the
-// grant is the union of the current list and the engine agents.
-void ensure_mapped(Comm* c, const void* ptr, const char* what)
+// grant is the union of the current list and the engine GPUs.
+void ensure_mapped(const Comm* c, const void* ptr, const char* what)
 {
-    hsa_amd_pointer_info_t info;
-    memset(&info, 0, sizeof(info));
-    info.size        = sizeof(info);
-    uint32_t n       = 0;
-    hsa_agent_t* acc = nullptr;
+    hsa_amd_pointer_info_t info = {};
+    info.size                   = sizeof(info);
+    uint32_t n                  = 0;
+    hsa_agent_t* acc            = nullptr;
     if(hsa_amd_pointer_info(ptr, &info, malloc, &n, &acc) != HSA_STATUS_SUCCESS ||
        info.type == HSA_EXT_POINTER_TYPE_UNKNOWN)
         fail(std::string(what) + " is not a ROCr allocation");
     std::vector<hsa_agent_t> grant(acc, acc + n);
     free(acc);
-    bool missing = false;
-    for(hsa_agent_t a : c->engine_agents)
+    for(int v = 0; v < c->nvia; ++v)
     {
-        bool ok = a.handle == info.agentOwner.handle;
-        for(uint32_t i = 0; i < n && !ok; ++i)
-            ok = grant[i].handle == a.handle;
-        if(!ok)
-        {
-            grant.push_back(a);
-            missing = true;
-        }
+        const uint64_t h = c->gpu[c->via[v].node].handle;
+        if(h != info.agentOwner.handle &&
+           std::none_of(
+               grant.begin(), grant.begin() + n, [h](hsa_agent_t a) { return a.handle == h; }))
+            grant.push_back(c->gpu[c->via[v].node]);
     }
-    if(!missing)
-        return;
-    const hsa_status_t s = hsa_amd_agents_allow_access(
-        static_cast<uint32_t>(grant.size()), grant.data(), nullptr, info.agentBaseAddress);
-    if(s != HSA_STATUS_SUCCESS)
-        fail(std::string(what) + " cannot be mapped on every engine GPU (hsa status " +
-             std::to_string(static_cast<int>(s)) + ")");
-    ++c->grants;
-}
-
-void device_alloc(void** p, size_t bytes, bool uncached, const char* what)
-{
-    hipError_t e =
-        uncached ? hipExtMallocWithFlags(p, bytes, hipDeviceMallocUncached) : hipMalloc(p, bytes);
-    if(e == hipSuccess)
-        e = hipMemset(*p, 0, bytes);
-    if(e != hipSuccess)
-        fail(std::string("allocating ") + what + ": " + hipGetErrorString(e));
-}
-
-void export_buffer(Comm* c, void* ptr, int i)
-{
-    hsa_amd_pointer_info_t info;
-    memset(&info, 0, sizeof(info));
-    info.size = sizeof(info);
-    if(hsa_amd_pointer_info(ptr, &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS ||
-       info.type == HSA_EXT_POINTER_TYPE_UNKNOWN)
-        fail("an inbox is not a ROCr allocation");
-    auto& b = c->exported.buf[i];
-    if(hsa_amd_ipc_memory_create(info.agentBaseAddress, info.sizeInBytes, &b.handle) !=
-       HSA_STATUS_SUCCESS)
-        fail("hsa_amd_ipc_memory_create");
-    b.len = info.sizeInBytes;
-    b.off =
-        static_cast<uint64_t>(static_cast<char*>(ptr) - static_cast<char*>(info.agentBaseAddress));
+    if(grant.size() != n &&
+       hsa_amd_agents_allow_access(
+           static_cast<uint32_t>(grant.size()), grant.data(), nullptr, info.agentBaseAddress) !=
+           HSA_STATUS_SUCCESS)
+        fail(std::string(what) + " cannot be mapped on every engine GPU");
 }
 
 // Runs with this rank's device current.
 Comm::~Comm()
 {
+    // After this no kernel reads the block; destroy_queue waits for the engines.
     (void)hipDeviceSynchronize();
-    for(auto& q : queues)
-        kfd_sdma::destroy_queue(q.get());
-    for(int k = 0; k < kMaxSlots; ++k)
-        for(void* a : peer[k].attached)
-            if(a)
-                hsa_amd_ipc_memory_detach(a);
-    for(hsa_queue_t* q : hsa_queues)
-        hsa_queue_destroy(q);
-    for(int v = 0; v < kMaxVia; ++v)
-        kfd_sdma::close_device(&via[v].dev);
-    for(void* p : {static_cast<void*>(inbox[0]),
-                   static_cast<void*>(inbox[1]),
-                   static_cast<void*>(reduced),
-                   static_cast<void*>(wire),
-                   static_cast<void*>(flags)})
+    for(Via& v : via)
+        for(sdma::Queue& q : v.queue)
+            sdma::destroy_queue(&q);
+    for(char* p : peer)
         if(p)
-            (void)hipFree(p);
-    if(err)
-        (void)hipHostFree(err);
-    if(hsa_up)
-        hsa_shut_down();
+            hsa_amd_ipc_memory_detach(p);
+    (void)hipFree(block);
+    (void)hipFree(send);
+    (void)hipHostFree(err);
 }
 
 // Path 0 is the direct link with `direct_weight` shares; each lender has one.
+// Every rank computes the same split, so piece p covers the same units in
+// both directions.
 Split make_split(size_t units, size_t align, int npath, int direct_weight)
 {
     Split s{};
     s.npath          = npath;
     const size_t den = static_cast<size_t>(direct_weight + npath - 1);
-    size_t acc       = 0;
-    for(int p = 0; p < npath; ++p)
-    {
-        acc += p == 0 ? direct_weight : 1;
-        s.bound[p + 1] = p == npath - 1 ? units : units * acc / den / align * align;
-    }
+    for(int p = 1; p < npath; ++p)
+        s.bound[p] = units * (direct_weight + p - 1) / den / align * align;
+    s.bound[npath] = units;
     return s;
 }
 
-// One flow: `bytes` from src to dst in the pieces of `split`, each followed by
-// the arrival fence at the receiver and the departure fence here. An empty
-// piece still gets its fences, so a kernel may wait for every flag.
+// One flow to peer slot `slot`: `bytes` from src to dst in the pieces of
+// `split`, each followed by the arrival fence at the receiver and the
+// departure fence here, also when the piece is empty.
 void post_flow(Comm* c,
                int slot,
+               int phase,
                const Split& split,
                size_t unit_bytes,
                const char* src,
                char* dst,
-               size_t bytes,
-               int* arrival,
-               int* departure,
-               int phase,
-               int slot_at_peer,
-               uint32_t epoch)
+               size_t bytes)
 {
+    const int slot_at_peer = c->n - 2 - slot; // the peer has this rank in that slot
     for(int i = 1; i <= split.npath; ++i)
     {
-        const int p = i % split.npath; // lenders first: their path is longer
-        size_t off = split.bound[p] * unit_bytes, end = split.bound[p + 1] * unit_bytes;
-        end                = end < bytes ? end : bytes;
-        off                = off < end ? off : end;
-        kfd_sdma::Queue& q = *c->route[p][slot];
+        const int p      = i % split.npath; // lenders first: their path is longer
+        const size_t end = std::min(split.bound[p + 1] * unit_bytes, bytes);
+        const size_t off = std::min(split.bound[p] * unit_bytes, end);
+        sdma::Queue& q   = *c->route[p][slot];
         if(end > off)
-            kfd_sdma::put_copy(q, src + off, dst + off, end - off);
-        kfd_sdma::put_fence(q, arrival + flag_index(kArrival, phase, slot_at_peer, p), epoch);
-        kfd_sdma::put_fence(q, departure + flag_index(kDeparture, phase, slot, p), epoch);
+            sdma::put_copy(q, src + off, dst + off, end - off);
+        sdma::put_fence(
+            q, flags_of(c->peer[slot]) + flag_index(kArrival, phase, slot_at_peer, p), c->epoch);
+        sdma::put_fence(q, flags_of(c->block) + flag_index(kDeparture, phase, slot, p), c->epoch);
     }
 }
 
 void ring_doorbells(Comm* c)
 {
-    for(auto& q : c->queues)
-        kfd_sdma::ring_doorbell(*q);
+    for(int v = 0; v < c->nvia; ++v)
+        for(sdma::Queue& q : c->via[v].queue)
+            if(q.created)
+                sdma::ring_doorbell(q);
 }
 
 void sync_stream(Comm* c, hipStream_t stream)
@@ -860,45 +626,35 @@ void sync_stream(Comm* c, hipStream_t stream)
     if(e != hipSuccess)
         fail(std::string("hipStreamSynchronize: ") + hipGetErrorString(e));
     if(c->err[0])
-        fail("a kernel timed out waiting for transport flag " + std::to_string(c->err[0]));
+        fail("a kernel timed out waiting for the transport");
 }
 
-int grid(size_t units)
-{
-    const size_t want = units / 1024;
-    return static_cast<int>(want < 64 ? 64 : want > 1024 ? 1024 : want);
-}
+int grid(size_t units) { return static_cast<int>(std::clamp<size_t>(units / 1024, 64, 1024)); }
 
 void all_reduce_pair(Comm* c, const uint16_t* inp, uint16_t* out, size_t nelem, hipStream_t stream)
 {
     // The engines read inp: everything that produces it must have run.
     sync_stream(c, stream);
     ensure_mapped(c, inp, "the input tensor");
-    const uint32_t epoch = ++c->epoch;
-    const int parity     = static_cast<int>(c->calls++ & 1);
+    const int parity   = ++c->epoch & 1;
     const size_t bytes = nelem * 2, nvec = (bytes + kVecBytes - 1) / kVecBytes;
-    PairArgs a{};
-    a.split = make_split(nvec, kVecAlign, c->nvia, 1);
+    const PairArgs a{inp,
+                     reinterpret_cast<const uint16_t*>(c->inbox(c->block, parity)),
+                     out,
+                     flags_of(c->block),
+                     c->err,
+                     make_split(nvec, kVecAlign, c->nvia, 1),
+                     nelem,
+                     static_cast<int>(c->epoch)};
     post_flow(c,
+              0,
               0,
               a.split,
               kVecBytes,
               reinterpret_cast<const char*>(inp),
-              c->peer[0].inbox[parity],
-              bytes,
-              c->peer[0].flags,
-              c->flags,
-              0,
-              0,
-              epoch);
+              c->inbox(c->peer[0], parity),
+              bytes);
     ring_doorbells(c);
-    a.inp   = inp;
-    a.inbox = reinterpret_cast<const uint16_t*>(c->inbox[parity]);
-    a.out   = out;
-    a.flags = c->flags;
-    a.err   = c->err;
-    a.nelem = nelem;
-    a.epoch = static_cast<int>(epoch);
     hipLaunchKernelGGL(mesh_lend_reduce_pair, dim3(grid(nvec)), dim3(kThreads), 0, stream, a);
 }
 
@@ -907,39 +663,28 @@ void all_reduce_pair_quantized(
 {
     const size_t nunit      = (nelem + kUnitValues - 1) / kUnitValues;
     const size_t unit_bytes = static_cast<size_t>(2 * bits + 1) * 4;
+    auto* wire              = reinterpret_cast<uint32_t*>(c->send);
     // Measured flat from 256 to 512 blocks at 80 MiB, slower above.
     const int blocks = std::min(grid(nunit), 512);
-    EncodeArgs q{inp, c->wire, nelem};
+    const EncodeArgs q{inp, wire, nelem};
     if(bits == 4)
         hipLaunchKernelGGL(mesh_lend_encode<4>, dim3(blocks), dim3(kThreads), 0, stream, q);
     else
         hipLaunchKernelGGL(mesh_lend_encode<8>, dim3(blocks), dim3(kThreads), 0, stream, q);
     // The engines read the packed buffer: the encode must have run.
     sync_stream(c, stream);
-    const uint32_t epoch = ++c->epoch;
-    const int parity     = static_cast<int>(c->calls++ & 1);
-    DecodeArgs a{};
-    a.split = make_split(nunit, kUnitAlign, c->nvia, 1);
-    post_flow(c,
-              0,
-              a.split,
-              unit_bytes,
-              reinterpret_cast<const char*>(c->wire),
-              c->peer[0].inbox[parity],
-              nunit * unit_bytes,
-              c->peer[0].flags,
-              c->flags,
-              0,
-              0,
-              epoch);
+    const int parity = ++c->epoch & 1;
+    const DecodeArgs a{wire,
+                       reinterpret_cast<const uint32_t*>(c->inbox(c->block, parity)),
+                       out,
+                       flags_of(c->block),
+                       c->err,
+                       make_split(nunit, kUnitAlign, c->nvia, 1),
+                       nelem,
+                       static_cast<int>(c->epoch)};
+    post_flow(
+        c, 0, 0, a.split, unit_bytes, c->send, c->inbox(c->peer[0], parity), nunit * unit_bytes);
     ring_doorbells(c);
-    a.own   = c->wire;
-    a.inbox = reinterpret_cast<const uint32_t*>(c->inbox[parity]);
-    a.out   = out;
-    a.flags = c->flags;
-    a.err   = c->err;
-    a.nelem = nelem;
-    a.epoch = static_cast<int>(epoch);
     if(bits == 4)
         hipLaunchKernelGGL(mesh_lend_decode_reduce<4>, dim3(blocks), dim3(kThreads), 0, stream, a);
     else
@@ -950,8 +695,7 @@ void all_reduce_group(Comm* c, const uint16_t* inp, uint16_t* out, size_t nelem,
 {
     sync_stream(c, stream);
     ensure_mapped(c, inp, "the input tensor");
-    const uint32_t epoch = ++c->epoch;
-    ++c->calls;
+    ++c->epoch;
     const int n = c->n, me = c->rank;
     const size_t bytes = nelem * 2, nvec = (bytes + kVecBytes - 1) / kVecBytes;
     // Slice j covers vectors [cut[j], cut[j + 1]); the last one ends at `bytes`.
@@ -964,73 +708,58 @@ void all_reduce_group(Comm* c, const uint16_t* inp, uint16_t* out, size_t nelem,
         slice_bytes[j] = (j == n - 1 ? bytes : cut[j + 1] * kVecBytes) - cut[j] * kVecBytes;
         split[j]       = make_split(cut[j + 1] - cut[j], kVecAlign, c->nvia, 2 * (n - 1));
     }
-    const char* in_bytes = reinterpret_cast<const char*>(inp);
+    auto* reduced = reinterpret_cast<uint16_t*>(c->send);
 
-    // Phase 1: slice j of this rank's input goes to rank j.
-    SliceArgs s{};
-    for(int k = 0; k < n - 1; ++k)
-    {
-        const int j = (me + 1 + k) % n, slot_at_peer = (me - j - 1 + n) % n;
-        post_flow(c,
-                  k,
-                  split[j],
-                  kVecBytes,
-                  in_bytes + cut[j] * kVecBytes,
-                  c->peer[k].inbox[0] + slot_at_peer * c->slot_bytes,
-                  slice_bytes[j],
-                  c->peer[k].flags,
-                  c->flags,
-                  0,
-                  slot_at_peer,
-                  epoch);
-        s.sent[k] = split[j];
-    }
-    ring_doorbells(c);
-    s.inp        = inp + cut[me] * 8;
-    s.inbox      = reinterpret_cast<const uint16_t*>(c->inbox[0]);
-    s.reduced    = c->reduced;
-    s.out        = out + cut[me] * 8;
-    s.flags      = c->flags;
-    s.err        = c->err;
-    s.split      = split[me];
+    // Phase 1: slice j of this rank's input goes to rank j, into inbox 0.
+    SliceArgs s{inp + cut[me] * 8,
+                reinterpret_cast<const uint16_t*>(c->inbox(c->block, 0)),
+                reduced,
+                out + cut[me] * 8,
+                flags_of(c->block),
+                c->err,
+                split[me]};
     s.slot_elems = c->slot_bytes / 2;
     s.nelem      = slice_bytes[me] / 2;
     s.n          = n;
     s.me         = me;
-    s.epoch      = static_cast<int>(epoch);
-    hipLaunchKernelGGL(
-        mesh_lend_reduce_slice, dim3(grid(cut[me + 1] - cut[me])), dim3(kThreads), 0, stream, s);
-
-    // Phase 2: the engines read the reduced slice, so it must exist.
-    sync_stream(c, stream);
-    GatherArgs g{};
+    s.epoch      = static_cast<int>(c->epoch);
+    // Phase 2: the reduced slice goes to every rank, into inbox 1.
+    GatherArgs g{reinterpret_cast<const uint16_t*>(c->inbox(c->block, 1)), out, s.flags, c->err};
+    g.sent  = split[me];
+    g.nslot = n - 1;
+    g.epoch = s.epoch;
     for(int k = 0; k < n - 1; ++k)
     {
-        const int j = (me + 1 + k) % n, slot_at_peer = (me - j - 1 + n) % n;
+        const int j = (me + 1 + k) % n; // rank j has this rank in slot n - 2 - k
         post_flow(c,
                   k,
-                  split[me],
+                  0,
+                  split[j],
                   kVecBytes,
-                  reinterpret_cast<const char*>(c->reduced),
-                  c->peer[k].inbox[1] + cut[me] * kVecBytes,
-                  slice_bytes[me],
-                  c->peer[k].flags,
-                  c->flags,
-                  1,
-                  slot_at_peer,
-                  epoch);
+                  reinterpret_cast<const char*>(inp) + cut[j] * kVecBytes,
+                  c->inbox(c->peer[k], 0) + (n - 2 - k) * c->slot_bytes,
+                  slice_bytes[j]);
+        s.sent[k]  = split[j];
         g.split[k] = split[j];
         g.first[k] = cut[j] * 8;
         g.nelem[k] = slice_bytes[j] / 2;
     }
     ring_doorbells(c);
-    g.inbox = reinterpret_cast<const uint16_t*>(c->inbox[1]);
-    g.out   = out;
-    g.flags = c->flags;
-    g.err   = c->err;
-    g.sent  = split[me];
-    g.nslot = n - 1;
-    g.epoch = static_cast<int>(epoch);
+    hipLaunchKernelGGL(
+        mesh_lend_reduce_slice, dim3(grid(cut[me + 1] - cut[me])), dim3(kThreads), 0, stream, s);
+
+    // The engines read the reduced slice, so it must exist.
+    sync_stream(c, stream);
+    for(int k = 0; k < n - 1; ++k)
+        post_flow(c,
+                  k,
+                  1,
+                  split[me],
+                  kVecBytes,
+                  c->send,
+                  c->inbox(c->peer[k], 1) + cut[me] * kVecBytes,
+                  slice_bytes[me]);
+    ring_doorbells(c);
     hipLaunchKernelGGL(
         mesh_lend_gather, dim3(grid(nvec - (cut[me + 1] - cut[me]))), dim3(kThreads), 0, stream, g);
 }
@@ -1044,100 +773,59 @@ Comm* comm_of(fptr_t fa)
 
 } // namespace
 
-fptr_t mesh_lend_create(int64_t device_id,
-                        int64_t rank,
-                        int64_t world_size,
-                        int64_t max_bytes,
-                        const std::string& lenders)
+fptr_t mesh_lend_create(
+    int64_t device_id, int64_t rank, int64_t world_size, int64_t max_bytes, int64_t max_lenders)
 {
-    if(world_size < 2 || world_size > kMaxRanks)
-        throw std::invalid_argument("mesh_lend_all_reduce: world size must be 2, 3 or 4");
+    if(world_size != 2 && world_size != 4)
+        throw std::invalid_argument("mesh_lend_all_reduce: world size must be 2 or 4");
     if(rank < 0 || rank >= world_size)
         throw std::invalid_argument("mesh_lend_all_reduce: invalid rank");
-    if(max_bytes < static_cast<int64_t>(kPage))
-        throw std::invalid_argument("mesh_lend_all_reduce: max_bytes below one page");
+    // One piece fits the 30-bit count of a copy packet.
+    if(max_bytes < static_cast<int64_t>(kPage) || max_bytes > int64_t(1) << 30)
+        throw std::invalid_argument("mesh_lend_all_reduce: max_bytes must be 4 KiB to 1 GiB");
+    if(max_lenders < 0)
+        throw std::invalid_argument("mesh_lend_all_reduce: max_lenders is negative");
     HipDeviceGuard guard(static_cast<int>(device_id));
-    auto c       = std::make_unique<Comm>();
-    c->device_id = static_cast<int>(device_id);
-    c->rank      = static_cast<int>(rank);
-    c->n         = static_cast<int>(world_size);
-    c->max_bytes = page_up(static_cast<size_t>(max_bytes));
-    if(hsa_init() != HSA_STATUS_SUCCESS)
-        fail("hsa_init");
-    c->hsa_up = true;
+    auto c         = std::make_unique<Comm>();
+    c->device_id   = static_cast<int>(device_id);
+    c->rank        = static_cast<int>(rank);
+    c->n           = static_cast<int>(world_size);
+    c->max_bytes   = page_up(static_cast<size_t>(max_bytes));
+    c->slot_bytes  = page_up(c->max_bytes / c->n) + 2 * kPage;
+    c->inbox_bytes = std::max(c->max_bytes, (c->n - 1) * c->slot_bytes);
+    // At 8 bits the packed input is 68 bytes per 64 values.
+    const size_t send_bytes = c->n == 2
+                                  ? page_up((c->max_bytes / 2 + kUnitValues - 1) / kUnitValues * 68)
+                                  : c->slot_bytes;
 
-    const std::vector<kfd_sdma::GpuNode> all = kfd_sdma::gpu_nodes();
-    uint32_t domain = 0, loc = 0;
-    if(!pci_of_hip_device(c->device_id, &domain, &loc))
-        fail("no PCI address for HIP device " + std::to_string(device_id));
-    bool found = false;
-    for(const auto& g : all)
-        if(g.domain == domain && g.location_id == loc)
-        {
-            c->self = g;
-            found   = true;
-        }
-    hsa_agent_t agent;
-    if(!found || !agent_of(c->self, &agent))
-        fail("HIP device " + std::to_string(device_id) + " is not in the KFD topology");
-    c->engine_agents.push_back(agent);
-    c->candidates = parse_lenders(lenders, all, c->self.gpu_id);
-    if(c->candidates.size() > static_cast<size_t>(kMaxCandidates))
-        c->candidates.resize(kMaxCandidates);
-
-    // Buffers the other ranks' engines write: uncached, so a kernel reads what landed.
-    if(c->n == 2)
-    {
-        c->wire_bytes     = page_up((c->max_bytes / 2 + kUnitValues - 1) / kUnitValues * 68);
-        c->inbox_bytes[0] = c->inbox_bytes[1] = std::max(c->max_bytes, c->wire_bytes);
-        device_alloc(reinterpret_cast<void**>(&c->wire), c->wire_bytes, false, "the packed buffer");
-    }
-    else
-    {
-        c->slot_bytes     = page_up(c->max_bytes / c->n) + 2 * kPage;
-        c->inbox_bytes[0] = static_cast<size_t>(c->n - 1) * c->slot_bytes;
-        c->inbox_bytes[1] = c->max_bytes;
-        device_alloc(
-            reinterpret_cast<void**>(&c->reduced), c->slot_bytes, false, "the reduced slice");
-    }
-    for(int i = 0; i < 2; ++i)
-        device_alloc(reinterpret_cast<void**>(&c->inbox[i]), c->inbox_bytes[i], true, "an inbox");
-    device_alloc(reinterpret_cast<void**>(&c->flags), page_up(kFlagBytes), true, "the flag page");
-    if(hipHostMalloc(reinterpret_cast<void**>(&c->err), kPage, 0) != hipSuccess)
-        fail("allocating the error page");
-    memset(c->err, 0, kPage);
-    if(hipDeviceSynchronize() != hipSuccess)
-        fail("hipDeviceSynchronize");
-
-    // HIP has run on this GPU by now, so its doorbell frame is mapped.
-    const std::string why = kfd_sdma::open_device(c->self.gpu_id, &c->via[0].dev);
-    if(!why.empty())
-        fail(why);
-    c->via[0].node = c->self.node;
-    c->nvia        = 1;
-
-    Export& e    = c->exported;
-    e.magic      = kMagic;
-    e.version    = kVersion;
-    e.rank       = static_cast<uint32_t>(c->rank);
-    e.world_size = static_cast<uint32_t>(c->n);
-    e.max_bytes  = c->max_bytes;
-    e.gpu_id     = c->self.gpu_id;
-    for(const auto& g : c->candidates)
-        e.candidates[e.ncandidates++] = g.gpu_id;
-    export_buffer(c.get(), c->inbox[0], 0);
-    export_buffer(c.get(), c->inbox[1], 1);
-    export_buffer(c.get(), c->flags, 2);
+    Export& e     = c->exported;
+    e.max_lenders = static_cast<uint32_t>(std::min<int64_t>(max_lenders, kMaxVia - 1));
+    e.block_bytes = kPage + 2 * c->inbox_bytes;
+    hsa_iterate_agents(add_gpu, c->gpu);
+    for(uint32_t node = 0; node < kMaxNodes; ++node)
+        e.lendable |= static_cast<uint64_t>(c->gpu[node].handle != 0) << node;
+    // The block is uncached: a kernel reads what the engines wrote.
+    hsa_amd_pointer_info_t info = {};
+    info.size                   = sizeof(info);
+    if(hipExtMallocWithFlags(reinterpret_cast<void**>(&c->block),
+                             e.block_bytes,
+                             hipDeviceMallocUncached) != hipSuccess ||
+       hipMemset(c->block, 0, kPage) != hipSuccess ||
+       hipMalloc(reinterpret_cast<void**>(&c->send), send_bytes) != hipSuccess ||
+       hipHostMalloc(reinterpret_cast<void**>(&c->err), kPage, 0) != hipSuccess)
+        fail("cannot allocate the inboxes");
+    c->err[0] = 0;
+    if(hsa_amd_pointer_info(c->block, &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS ||
+       hsa_agent_get_info(info.agentOwner, HSA_AGENT_INFO_NODE, &e.node) != HSA_STATUS_SUCCESS ||
+       hsa_amd_ipc_memory_create(c->block, e.block_bytes, &e.handle) != HSA_STATUS_SUCCESS)
+        fail("cannot export the inboxes");
     return reinterpret_cast<fptr_t>(c.release());
 }
 
 int64_t mesh_lend_export_size() { return sizeof(Export); }
 
 void mesh_lend_export(fptr_t fa, int64_t out_ptr)
-{
-    Comm* c = comm_of(fa);
-    memcpy(reinterpret_cast<void*>(out_ptr), &c->exported, sizeof(Export));
-}
+{ memcpy(reinterpret_cast<void*>(out_ptr), &comm_of(fa)->exported, sizeof(Export)); }
 
 void mesh_lend_connect(fptr_t fa, const std::vector<int64_t>& export_ptrs)
 {
@@ -1147,133 +835,76 @@ void mesh_lend_connect(fptr_t fa, const std::vector<int64_t>& export_ptrs)
     if(export_ptrs.size() != static_cast<size_t>(c->n))
         fail("expected one export per rank");
     HipDeviceGuard guard(c->device_id);
-    const std::vector<kfd_sdma::GpuNode> all = kfd_sdma::gpu_nodes();
-    std::vector<Export> ex(c->n);
-    std::vector<const kfd_sdma::GpuNode*> member(c->n);
+    Export ex[kMaxRanks];
+    hsa_agent_t member[kMaxRanks];
+    uint64_t lendable    = ~uint64_t(0);
+    uint32_t max_lenders = kMaxVia - 1;
     for(int r = 0; r < c->n; ++r)
     {
         memcpy(&ex[r], reinterpret_cast<const void*>(export_ptrs[r]), sizeof(Export));
-        if(ex[r].magic != kMagic || ex[r].version != kVersion ||
-           ex[r].rank != static_cast<uint32_t>(r) ||
-           ex[r].world_size != static_cast<uint32_t>(c->n) || ex[r].max_bytes != c->max_bytes)
+        if(ex[r].block_bytes != c->exported.block_bytes || ex[r].node >= kMaxNodes)
             fail("rank " + std::to_string(r) + " was created with different parameters");
-        member[r] = find_gpu(all, ex[r].gpu_id);
-        if(!member[r])
-            fail("the GPU of rank " + std::to_string(r) + " is not visible to this process's KFD");
+        member[r] = c->gpu[ex[r].node];
+        lendable &= ex[r].lendable & ~(uint64_t(1) << ex[r].node);
+        max_lenders = std::min(max_lenders, ex[r].max_lenders);
     }
     for(int a = 0; a < c->n; ++a)
         for(int b = 0; b < c->n; ++b)
-            if(a != b && kfd_sdma::link_between(member[a]->node, member[b]->node).type !=
-                             kfd_sdma::kIoLinkXgmi)
-                fail("ranks " + std::to_string(a) + " and " + std::to_string(b) +
-                     " have no direct xGMI link");
+            if(a != b && engine_for(member[a], member[b]) < 0)
+                fail("ROCr recommends no SDMA engine for a direct xGMI link from rank " +
+                     std::to_string(a) + " to rank " + std::to_string(b));
 
-    // The lenders: GPUs every rank can open, outside the group, with an xGMI
-    // link to every rank. Every rank derives the same list in the same order.
-    for(const auto& g : all)
+    // The lenders: GPUs outside the group that the ROCr of every rank sees,
+    // with an xGMI link to every rank. Every rank derives the same list.
+    c->via[0].node = ex[c->rank].node;
+    c->nvia        = 1;
+    for(uint32_t node = 0; node < kMaxNodes && c->nvia <= static_cast<int>(max_lenders); ++node)
     {
-        bool ok = c->nvia < kMaxVia;
+        bool ok = lendable >> node & 1;
         for(int r = 0; r < c->n && ok; ++r)
-        {
-            ok = g.gpu_id != ex[r].gpu_id &&
-                 std::find(ex[r].candidates, ex[r].candidates + ex[r].ncandidates, g.gpu_id) !=
-                     ex[r].candidates + ex[r].ncandidates &&
-                 kfd_sdma::link_between(g.node, member[r]->node).type == kfd_sdma::kIoLinkXgmi;
-        }
-        if(!ok)
-            continue;
-        hsa_agent_t agent;
-        if(!agent_of(g, &agent))
-            fail("no ROCr agent for lender gpu_id " + std::to_string(g.gpu_id));
-        // HIP may not drive this GPU in this process. KFD maps a GPU's doorbell
-        // frame with the process's first queue there, so have ROCr create one.
-        uint64_t base = 0, size = 0;
-        if(!kfd_sdma::find_doorbell_frame(g.gpu_id, &base, &size))
-        {
-            hsa_queue_t* q = nullptr;
-            if(hsa_queue_create(agent,
-                                4096,
-                                HSA_QUEUE_TYPE_MULTI,
-                                nullptr,
-                                nullptr,
-                                UINT32_MAX,
-                                UINT32_MAX,
-                                &q) != HSA_STATUS_SUCCESS)
-                fail("hsa_queue_create on lender gpu_id " + std::to_string(g.gpu_id));
-            c->hsa_queues.push_back(q);
-        }
-        Via& v                = c->via[c->nvia];
-        const std::string why = kfd_sdma::open_device(g.gpu_id, &v.dev);
-        if(!why.empty())
-            fail(why);
-        v.node = g.node;
-        ++c->nvia;
-        c->engine_agents.push_back(agent);
+            ok = engine_for(c->gpu[node], member[r]) >= 0;
+        if(ok)
+            c->via[c->nvia++].node = node;
     }
 
+    // A peer's block is mapped on exactly the GPUs whose engines write it:
+    // ours and the lenders.
+    hsa_agent_t agents[kMaxVia];
+    for(int v = 0; v < c->nvia; ++v)
+        agents[v] = c->gpu[c->via[v].node];
     for(int k = 0; k < c->n - 1; ++k)
     {
-        const int r   = (c->rank + 1 + k) % c->n;
-        Peer& p       = c->peer[k];
-        p.node        = member[r]->node;
-        void* ptrs[3] = {nullptr, nullptr, nullptr};
-        for(int i = 0; i < 3; ++i)
-        {
-            // Mapped on exactly the GPUs whose engines write it: ours and the lenders.
-            if(hsa_amd_ipc_memory_attach(&ex[r].buf[i].handle,
-                                         ex[r].buf[i].len,
-                                         static_cast<uint32_t>(c->engine_agents.size()),
-                                         c->engine_agents.data(),
-                                         &p.attached[i]) != HSA_STATUS_SUCCESS)
-                fail("hsa_amd_ipc_memory_attach of rank " + std::to_string(r));
-            ptrs[i] = static_cast<char*>(p.attached[i]) + ex[r].buf[i].off;
-        }
-        p.inbox[0] = static_cast<char*>(ptrs[0]);
-        p.inbox[1] = static_cast<char*>(ptrs[1]);
-        p.flags    = static_cast<int*>(ptrs[2]);
+        hsa_amd_ipc_memory_t handle = ex[(c->rank + 1 + k) % c->n].handle;
+        if(hsa_amd_ipc_memory_attach(&handle,
+                                     c->exported.block_bytes,
+                                     static_cast<uint32_t>(c->nvia),
+                                     agents,
+                                     reinterpret_cast<void**>(&c->peer[k])) != HSA_STATUS_SUCCESS)
+            fail("cannot map the inboxes of rank " + std::to_string((c->rank + 1 + k) % c->n));
     }
 
-    // Own GPU: one queue per destination, on the engine KFD recommends for the
-    // link to it. Lender: one queue, on the engine KFD recommends for the
-    // lender's link to this rank, so no two ranks share an engine there.
+    // Own GPU: a queue per destination, on the engine for the link to it.
+    // Lender: one queue, on the engine for the lender's link to this rank, so
+    // no two ranks share an engine there. Slots with the same engine share
+    // the queue of the first.
     for(int v = 0; v < c->nvia; ++v)
-    {
         for(int k = 0; k < c->n - 1; ++k)
         {
-            const int far       = v == 0 ? c->peer[k].node : c->self.node;
-            const uint32_t mask = kfd_sdma::link_between(c->via[v].node, far).engine_mask;
-            std::vector<uint32_t> engines, even;
-            for(uint32_t b = 0; b < 32; ++b)
-                if(mask >> b & 1)
-                    (b & 1 ? engines : even).push_back(b);
-            // Odd engines were seen to stall private queues on gfx942.
-            if(!even.empty())
-                engines = even;
-            if(engines.empty())
-                fail("KFD recommends no SDMA engine for a link of the group");
-            const uint32_t engine = engines[static_cast<size_t>(c->rank) % engines.size()];
-            kfd_sdma::Queue* q    = nullptr;
-            for(auto& have : c->queues)
-                if(have->dev == &c->via[v].dev && have->engine == engine)
-                    q = have.get();
-            if(!q)
-            {
-                auto fresh            = std::make_unique<kfd_sdma::Queue>();
-                const std::string why = kfd_sdma::create_queue(c->via[v].dev, engine, fresh.get());
-                c->queues.push_back(std::move(fresh));
-                if(!why.empty())
-                    fail(why);
-                q = c->queues.back().get();
-            }
-            c->route[v][k] = q;
+            Via& via = c->via[v];
+            via.engine[k] =
+                engine_for(agents[v], v == 0 ? member[(c->rank + 1 + k) % c->n] : agents[0]);
+            int first = 0;
+            while(via.engine[first] != via.engine[k])
+                ++first;
+            c->route[v][k] = &via.queue[first];
+            if(first == k && !sdma::create_queue(via.node, via.engine[k], &via.queue[k]))
+                fail("no SDMA queue on engine " + std::to_string(via.engine[k]) + " of node " +
+                     std::to_string(via.node));
         }
-    }
 
-    ensure_mapped(c, c->flags, "the flag page");
-    ensure_mapped(c,
-                  c->n == 2 ? static_cast<void*>(c->wire) : static_cast<void*>(c->reduced),
-                  "the send buffer");
-    c->grants    = 0;
+    // The engines stamp departures into the block and read the send buffer.
+    ensure_mapped(c, c->block, "the flag page");
+    ensure_mapped(c, c->send, "the send buffer");
     c->connected = true;
 }
 
@@ -1302,9 +933,10 @@ void mesh_lend_all_reduce(fptr_t fa,
         throw std::invalid_argument("mesh_lend_all_reduce: a quantized payload needs two ranks");
     const auto* in = static_cast<const uint16_t*>(inp.data_ptr());
     auto* o        = static_cast<uint16_t*>(out.data_ptr());
-    // The engines read inp while the kernel writes out.
-    if(bits == 0 && in < o + out.numel() && o < in + inp.numel())
-        throw std::invalid_argument("mesh_lend_all_reduce: an exact call cannot run in place");
+    // The engines read inp while a kernel writes out, vector by vector.
+    if(in != o && in < o + out.numel() && o < in + inp.numel())
+        throw std::invalid_argument(
+            "mesh_lend_all_reduce: out may be inp, but not overlap it otherwise");
     HipDeviceGuard guard(c->device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     if(c->n > 2)
@@ -1316,8 +948,6 @@ void mesh_lend_all_reduce(fptr_t fa,
 }
 
 int64_t mesh_lend_num_lenders(fptr_t fa) { return comm_of(fa)->nvia - 1; }
-
-int64_t mesh_lend_num_grants(fptr_t fa) { return static_cast<int64_t>(comm_of(fa)->grants); }
 
 void mesh_lend_destroy(fptr_t fa)
 {

@@ -1961,7 +1961,7 @@ namespace py = pybind11;
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
           py::arg("max_bytes"),                                                            \
-          py::arg("lenders"));                                                             \
+          py::arg("max_lenders"));                                                         \
     m.def("mesh_lend_export_size", &aiter::mesh_lend_export_size);                         \
     m.def("mesh_lend_export", &aiter::mesh_lend_export, py::arg("fa"), py::arg("out_ptr")); \
     m.def("mesh_lend_connect",                                                             \
@@ -1975,7 +1975,6 @@ namespace py = pybind11;
           py::arg("out"),                                                                  \
           py::arg("bits") = 0);                                                            \
     m.def("mesh_lend_num_lenders", &aiter::mesh_lend_num_lenders, py::arg("fa"));          \
-    m.def("mesh_lend_num_grants", &aiter::mesh_lend_num_grants, py::arg("fa"));            \
     m.def("mesh_lend_destroy", &aiter::mesh_lend_destroy, py::arg("fa"));
 
 #define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_fwd_impl", &rope_fwd_impl);
