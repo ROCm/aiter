@@ -337,7 +337,15 @@ def _run_compiled(exe, *args, specialization_key=None):
 
     A specialization key gives a multi-constexpr JitFunction one compiled
     callable per configuration. Factory-style launchers should leave it unset.
+
+    A launcher bound by ``aiter.ops.flydsl.aot_launch`` launches through its
+    ``FlyDSLAotCache`` instead.
     """
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if aot(args, specialization_key):
+            return
+        exe = aot.launcher()
     if env.compile.compile_only:
         # A callable warmed during execution must not dispatch when a later
         # preload switches to compile-only. Preserve it for execution to resume.
