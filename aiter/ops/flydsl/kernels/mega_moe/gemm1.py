@@ -382,7 +382,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
         kl = sp + fx.Int32(LA)
         if const_expr(a_issue):
             aq.append([v for _lb, v in a_gather.load_regs((sp + fx.Int32(a_ahead)) * fx.Int32(A_K_STEP_BYTES))])
-        sb_new = b_scale.load_step(b_row, kl, _LA_CM) if issue else None
+        sb_new = b_scale.load_step(b_row, kl, _LA_CM) if const_expr(issue) else None
         sa = a_scale.load_step(a_scale_lds, sp)
         a_regs = None
         if const_expr(a_next):
@@ -412,7 +412,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
 
     # a_ahead > 1 unrolls every K-step: a loop would rotate the register queues through phi copies, which wait for
     # the loads still in flight.
-    n_loop = 0 if a_ahead > 1 else (K_ITERS - LA) // LA
+    n_loop = 0 if const_expr(a_ahead > 1) else (K_ITERS - LA) // LA
     state = init
     if const_expr(n_loop > 0):
         for it_i, state in range(0, n_loop, 1, init=init):

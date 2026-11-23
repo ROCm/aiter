@@ -12,7 +12,6 @@ from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
 from ..kernels_common import LOG2E
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
-from .mega_moe_fused_gemm import _buffer_load
 
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
@@ -218,15 +217,12 @@ class ATileLoader:
         self._group_chunks = row_map is not None
 
     def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
-        """The srcmap words of this thread's chunk rows (``for_tile`` row_map)."""
+        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``)."""
         chunks_per_row = self._k_step_bytes // 16
         return [
-            _buffer_load(
-                srcmap_rsrc,
-                tile_row_base_i32
-                + (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(chunks_per_row),
-                fx.Int32,
-            )
+            srcmap_rsrc[
+                tile_row_base_i32 + (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
+            ]
             for c in range_constexpr(
                 0, self._sort_block_m * chunks_per_row, self._total_threads
             )
@@ -559,7 +555,7 @@ class AScaleLoader:
                     copy_group(lin, source_group)
 
             for i, c in enumerate(range_constexpr(0, n16, self._total_threads)):
-                lin = fx.Int32(c) + fx.Int32(self._tx)
+                lin = fx.Int32(c) + self._tx
                 row = lin // fx.Int32(row_chunks)
                 row_group = _token_offset(srcs[i], row_chunks, row_map["scale_token"])
                 if const_expr(valid_rows_i32 is None):
@@ -625,11 +621,11 @@ class AScaleLoader:
         for c in range_constexpr(
             0, self._sort_block_m * row_chunks, self._total_threads
         ):
-            row = (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(row_chunks)
+            row = (fx.Int32(c) + self._tx) // fx.Int32(row_chunks)
             row = (row < fx.Int32(self._sort_block_m)).select(
                 row, fx.Int32(self._sort_block_m - 1)
             )
-            out.append(_buffer_load(srcmap_rsrc, tile_row_base_i32 + row, fx.Int32))
+            out.append(srcmap_rsrc[tile_row_base_i32 + row])
         return out
 
     def load_step(self, lds_ascale, kstep_i32):
@@ -639,7 +635,7 @@ class AScaleLoader:
         out = []
         if const_expr(self._packed):
             i32_ptr = fx.recast_iter(fx.Int32, lds_ascale.ptr)
-            base = kstep_i32 * fx.Int32(self._n_groups * 64) + fx.Int32(self._lane)
+            base = kstep_i32 * fx.Int32(self._n_groups * 64) + self._lane
             for g in range_constexpr(self._n_groups):
                 v = fx.make_view(
                     fx.add_offset(i32_ptr, base + fx.Int32(g * 64)),
@@ -1200,9 +1196,8 @@ class SiluQuantEpilogue:
             fx.get_iter(self._out_tensor),
             fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
         )
-        tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
         out_vec = ptr_buf_tensor(
-            fx.get_iter(tile_view),
+            tile_iter,
             fx.Int32,
             unit_elems=2,
             num_records_bytes=(

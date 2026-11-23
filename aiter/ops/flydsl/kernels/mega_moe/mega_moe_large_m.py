@@ -2433,7 +2433,7 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_system_acquire()
 
             g1_row_map = {
-                "srcmap": _make_buffer_from_addr(_disp_ptr(DispatchSlot.SRCMAP), fx.Int32), "x_token": 0,
+                "srcmap": ptr_buf_tensor(_disp_ptr(DispatchSlot.SRCMAP), fx.Int32), "x_token": 0,
                 "x_bytes": fz_npes * fz_mtpr * model_dim, "scale_token": 0, "rows": fz_npes * fz_mtpr,
                 "wait": _wait_rows,
             }

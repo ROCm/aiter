@@ -1189,7 +1189,7 @@ def compile_mega_moe_stage1(
         row_map = None
         if const_expr(dedup_rows):
             row_map = {
-                "srcmap": _make_buffer_from_addr(_slot_meta_ptr(DispatchSlot.G2_STIDS), fx.Int32),
+                "srcmap": ptr_buf_tensor(_slot_meta_ptr(DispatchSlot.G2_STIDS), fx.Int32),
                 # A constant bound keeps the A buffer resource scalar.
                 "x_bytes": fx.Int32(_TOKEN_REGION_END),
             }

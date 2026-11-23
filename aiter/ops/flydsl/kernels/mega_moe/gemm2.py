@@ -25,6 +25,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
+from ..kernels_common import ceildiv
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
 from .gemm_util import wait_lds_barrier
 
@@ -166,6 +167,20 @@ def issue_a_load_lds_dt(
         )
 
 
+def a_scale_lds_rounds(INTER_MAX, NW):
+    """DMA rounds of issue_a_scale_lds_dt: each copies NW * 1024 bytes of a 64-row m-block's A scales."""
+    return ceildiv(2 * (INTER_MAX // 256) * 256, NW * 1024)
+
+
+def _a_rows_dma_src(addr_i64, row_dw, num_records_bytes):
+    """Buffer view of A rows ``row_dw`` dwords apart, indexed (None, row, 16-byte chunk) for one LDS DMA."""
+    view = fx.make_view(
+        global_typed_ptr(addr_i64, T.i32, align=16),
+        fx.make_layout((1, 1 << 15, 1 << 15), (1, row_dw, 4)),
+    )
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
+
+
 # fmt: off
 def issue_a_fold_rows_dt(arg_aq, s_aq_base, slot, kt, m_row, wave, lane, KH_TILE_A, K_BYTES, valid_rows, *, BM,
     slot_rows):
@@ -175,33 +190,24 @@ def issue_a_fold_rows_dt(arg_aq, s_aq_base, slot, kt, m_row, wave, lane, KH_TILE
     lanes_per_row = KH_TILE_A // 16
     lds_row = BM + (wave % fx.Int32(4)) * fx.Int32(64 // lanes_per_row)
     tile_row = lds_row + lane // lanes_per_row
-    src = flat_buffer_view(fx.Int64(arg_aq) + fx.Int64(m_row) * fx.Int64(K_BYTES), None, T.i32, align=16,
-        elem_bytes=4, fold=False, num_records_bytes=fx.Int64(valid_rows) * fx.Int64(K_BYTES))
-    voffset = (((lane % lanes_per_row) * 16) ^ lds_swizzle_mask_f8(tile_row, KH_TILE_A)) + tile_row * K_BYTES
+    src = _a_rows_dma_src(fx.Int64(arg_aq) + fx.Int64(m_row) * fx.Int64(K_BYTES), K_BYTES >> 2,
+        fx.Int64(valid_rows) * fx.Int64(K_BYTES))
+    # 16-byte chunk: the lds_swizzle_mask_f8 XOR stays explicit (K_BYTES need not be a power of two).
+    chunk = ((lane % lanes_per_row) ^ (tile_row & (lanes_per_row - 1))) + kt * (KH_TILE_A // 16)
     off = fx.Int32(slot * (slot_rows * KH_TILE_A)) + lds_row * fx.Int32(KH_TILE_A)
-    fx.copy(lds_dma_atom_128(), src[(voffset + kt * KH_TILE_A) // 4, None],
-        lds_dma_dst(s_aq_base, off))
+    fx.copy(lds_dma_atom_128(), fx.slice(src, (None, tile_row, chunk)), lds_dma_dst(s_aq_base, off))
 
 
 def issue_a_scale_lds_dt(arg_ascale, s_aq_base, lds_off, m_row, i32_inter, wave, lane, *, INTER_MAX, NW, chunks=2):
-    """Copy a 64-row m-block's A scales (two 32-row chunks x every K chunk, contiguous) to LDS at lds_off."""
+    """Copy a 64-row m-block's A scales (two 32-row chunks x every K chunk, contiguous) to LDS at byte lds_off."""
     kc_dw = fx.Int32(i32_inter) // fx.Int32(256) * fx.Int32(64)
-    src = flat_buffer_view(
-        fx.Int64(arg_ascale) + fx.Int64((m_row // fx.Int32(32)) * kc_dw) * fx.Int64(4),
-        None,
-        T.i32,
-        align=16,
-        elem_bytes=4,
-        fold=False,
-        num_records_bytes=fx.Int64(kc_dw * fx.Int32(4) * chunks),
-    )
-    for r in range_constexpr(-(-2 * (INTER_MAX // 256) * 256 // (NW * 1024))):
+    # 1 KiB blocks of 64 lanes x 16 bytes.
+    src = _a_rows_dma_src(fx.Int64(arg_ascale) + fx.Int64((m_row // fx.Int32(32)) * kc_dw) * fx.Int64(4), 256,
+        fx.Int64(kc_dw * fx.Int32(4) * chunks))
+    for r in range_constexpr(a_scale_lds_rounds(INTER_MAX, NW)):
         blk = fx.Int32(r * NW) + wave
-        fx.copy(
-            lds_dma_atom_128(),
-            src[(blk * fx.Int32(64) + lane) * fx.Int32(4), None],
-            lds_dma_dst(s_aq_base, fx.Int32(lds_off) + blk * fx.Int32(1024)),
-        )
+        fx.copy(lds_dma_atom_128(), fx.slice(src, (None, blk, lane)),
+            lds_dma_dst(s_aq_base, fx.Int32(lds_off) + blk * fx.Int32(1024)))
 
 
 @flyc.jit
@@ -360,7 +366,7 @@ def gemm2_compute_v2(
     def issue_a_ds_read(slot, chunks=None):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
         for k in range_constexpr(kHalves):
-            for i in range_constexpr(kMChunks) if chunks is None else chunks:
+            for i in range_constexpr(kMChunks) if const_expr(chunks is None) else chunks:
                 lds_row = lane_mod_16 + i * 16
                 row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
                 if const_expr(is_f8_a):
@@ -426,7 +432,7 @@ def gemm2_compute_v2(
         assert BM == 64 and is_f8_a and kScaleSubBlocks == 2
         as_lds_off = aStages * slot_bytes
         # fold_rows: a third scale word (rows BM..BM+31, the folded tail) is read on every step (zeros unless folded).
-        n_sc = 3 if fold_rows else 2
+        n_sc = 3 if const_expr(fold_rows) else 2
 
         def issue_a_scale_tile_lds(kt):
             chunk_kt = (
@@ -630,7 +636,7 @@ def gemm2_compute_v2(
             fx.Int32(1),
             init=load_c_carry(),
             # With the A-scale LDS reads LLVM otherwise fully unrolls this loop (VGPR spills 51 -> 62).
-            unroll=1 if a_scale_lds else -1,
+            unroll=1 if const_expr(a_scale_lds) else -1,
         ):
             store_c_carry(state)
             kt_rt = fx.Int32(kt_iv)
@@ -644,7 +650,7 @@ def gemm2_compute_v2(
                 # Step 0: the A-scale copy (older than the A preload) is done once only this step's B loads and
                 # the newest A copy are in flight; later steps have nothing older in flight (no wait).
                 fx.rocdl.s_waitcnt(vmcnt=numAccN * kHalves + nPairs + BM // NW // (64 // (KH_TILE_A // 16))
-                    + (1 if fold_rows else 0))
+                    + (1 if const_expr(fold_rows) else 0))
             gpu.barrier()
             if const_expr(a_scale_lds):
                 # Scale reads ahead of the A reads (LDS returns in order, so the first MFMA's lgkmcnt only
