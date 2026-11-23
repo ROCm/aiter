@@ -712,7 +712,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     if const_expr(bf16_head_tokens):
                         if tok < fx.Int32(bf16_head_tokens):
                             for k in range_constexpr(topk):
-                                store_at(Vec.filled(4, _ROW_POISON, fx.Int32).ir_value(), inp_rsrc,
+                                store_at(Vec.filled(4, _ROW_POISON, fx.Int32), inp_rsrc,
                                     src + fx.Int32(k * row_i32))
                 else:
                     # Some peer sent FP8 rows: the lane's 8 values are 2 i32 of its FP8 row (byte col * 2) plus the
@@ -792,7 +792,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_stids, arg_sweights, arg_trb, arg_tile_rows = (
                 fx.Int64(comm_ops.wave_uniform_i64(a)) for a in (arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids,
                     arg_stids, arg_sweights, arg_trb, arg_tile_rows))
-            i32_max_m_blocks = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(i32_max_m_blocks)))
+            i32_max_m_blocks = fx.Int32(rocdl.readfirstlane(T.i32, i32_max_m_blocks))
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
         vrows = None
@@ -1203,15 +1203,14 @@ def compile_mega_moe_stage1(
                 expert = fx.Int32(0)
                 for chunk in range_constexpr(plan_chunks):
                     incl = fx.ptr_load(lds_typed_ptr(plan_tab_base + (fx.Int32(chunk * 64) + lane) * fx.Int32(4),
-                        T.i32, align=4), result_type=T.i32)
-                    mask = rocdl.ballot(T.i64, fx.Int32(incl) <= m_tile)
+                        T.i32, align=4))
+                    mask = rocdl.ballot(T.i64, incl <= m_tile)
                     expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
-                expert = fx.Int32(rocdl.readfirstlane(T.i32, expert.ir_value()))
+                expert = fx.Int32(rocdl.readfirstlane(T.i32, expert))
                 incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
-                    plan_tab_base + expert * fx.Int32(4), T.i32, align=4), result_type=T.i32)))
+                    plan_tab_base + expert * fx.Int32(4), T.i32, align=4))))
                 count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
-                    plan_tab_base + fx.Int32(plan_chunks * 256) + expert * fx.Int32(4), T.i32, align=4),
-                    result_type=T.i32)))
+                    plan_tab_base + fx.Int32(plan_chunks * 256) + expert * fx.Int32(4), T.i32, align=4))))
                 tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
                 tile_rows_base = (m_tile - incl_e + tiles_e) * fx.Int32(fz_tile_m)
                 rows = count_e - tile_rows_base
@@ -1328,9 +1327,8 @@ def compile_mega_moe_stage1(
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
         num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
         if const_expr(dedup_rows):
-            row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0]).ir_value()))
-            row_map["scale_token"] = fx.Int32(
-                rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16)).ir_value()))
+            row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0])))
+            row_map["scale_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16))))
         cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
