@@ -305,7 +305,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "40b1f43476f615100eb46cecec9a1b62f681ce96aaa4eae9f860c6bfd2ce12d0"
+      "sha256": "f96670bad7c951ef0bc353e4312549aea4c75cffd0506a690bfd170cc5879e69"
     },
     "mhc_ps_bf16_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_bf16_hp0_ip1_cs2",
@@ -317,19 +317,19 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "f5ceaba1818eeae4c5a97b3080ddbb0576f9dbb319f563f3d8b38a9d37fb12fd"
+      "sha256": "54744d8fa734281df21a91017206c5829e3b3d5280e5f541ad2e4ea35d79b029"
     },
     "mhc_ps_bf16_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_bf16_hp1_ip0_cs2",
       "entry": 16384,
-      "code_bytes": 57472,
+      "code_bytes": 57600,
       "inst_pref_size": 255,
       "lds": 318976,
       "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "7fb1dc4b6b38290e9c2ca7106b06a4ac0c3563d01a870e7f15c69f53b0783c1a"
+      "sha256": "ed1cc5acec5eae899a1ff1d476176c597e0646f8dbff916443d345eee42d30c6"
     },
     "mhc_ps_bf16_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_bf16_hp1_ip1_cs2",
@@ -341,7 +341,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "4f1283c68afe20ef952f884fb55a151dce812152d8b26b94845a92d62b7dba69"
+      "sha256": "036353e170ccaf2bfb5275578c3b216d03ebde2370540fa8356e8fa62df77561"
     },
     "mhc_ps_mxfp8_hp0_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp0_ip0_cs2",
@@ -353,7 +353,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "7794652904f9f4e1ad51928b082b6fbaf19ac1668ea0aceece200cf393b03ee2"
+      "sha256": "b8978e538617c77742581f95b68054dcbeb770da3b13245b28e6f2559acebd4d"
     },
     "mhc_ps_mxfp8_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp0_ip1_cs2",
@@ -365,7 +365,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "9e9afea82f79e5a03bdc519381ee408b2b9fcf58965d82a324acc69273fbaf8a"
+      "sha256": "c36873db6e15dd41c71b255c5177cf9c82dadc7a6b1e07c4f7ec4e83eb6a399e"
     },
     "mhc_ps_mxfp8_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp1_ip0_cs2",
@@ -377,7 +377,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "5810a5322103d680c7311152823e5ce2499bac4516452616736560bd24476031"
+      "sha256": "f5e1af57ec40eb8aa53b10383306c09d33c0850524b92c912a292b8dd2b778f3"
     },
     "mhc_ps_mxfp8_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp1_ip1_cs2",
@@ -389,7 +389,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "8e3d59a6b47d6f58e636821075295a81ef09be6550fb595ca6deb3fe5c6a311c"
+      "sha256": "9d092672af42d66b5e0e96ef1cac4fb38def7c750121244d0123e784af19e257"
     },
     "mhc_ps_mxfp8m32k4_hp0_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp0_ip0_cs2",
@@ -401,7 +401,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "cc2e2a14cbe12e2ea0e945192641ed3184f7f5e7b72894fc1fa5b38ec74f6269"
+      "sha256": "b4ffaea224c879675d7b785d93263d087cecc92217ccf798c4c72e758801b289"
     },
     "mhc_ps_mxfp8m32k4_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp0_ip1_cs2",
@@ -413,7 +413,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "d5664bef781b01ce7e07488c96ed3bd4e497a40bd077eb2e9c065498965afa53"
+      "sha256": "385584e91cd4af5c3708103e45669d676c441f79c14827eb6a9228a07fb54844"
     },
     "mhc_ps_mxfp8m32k4_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp1_ip0_cs2",
@@ -425,7 +425,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "d4b464f472941f58f1ba321d848eb63ceae822a609d762e94c3ac709c9c3edd6"
+      "sha256": "f8795f55072757cf451cd316b5887cd673cd9c2ed7b6bc03e62ab5f3f3c24528"
     },
     "mhc_ps_mxfp8m32k4_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp1_ip1_cs2",
@@ -437,7 +437,7 @@
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "9f7fc1c16938091fd765862265314d473070d7ce5b1d4254ac2b9de8e96c8722"
+      "sha256": "a7bb1a8dbfa3c8ec0a2a1920bcf795b4792bffc4c64d77c6c5a4ac1df0b8afd8"
     }
   }
 }
