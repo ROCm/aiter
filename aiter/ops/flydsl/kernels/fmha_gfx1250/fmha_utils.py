@@ -72,6 +72,10 @@ _SG_SALU = 0x004
 _SG_MFMA = 0x008
 _SG_DS_READ = 0x100
 _SG_LDSDMA = 0x800
+# sched_group_barrier SyncID for ring stretches. 0 belongs to _hi_tdm_pipeline's softmax
+# groups; ordering is only enforced between groups sharing an id, so each stretch takes
+# its own and nothing couples them.
+_SG_SYNC_BASE = 1
 
 
 def _lane_id():
@@ -358,7 +362,8 @@ def _ring_drive(
     user_data=None,
     refill_burst=0,
     wmma_cycles=WMMA_ISSUE_CYCLES,
-    use_groups=False,
+    unfence=False,
+    describe=False,
 ):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
@@ -382,12 +387,17 @@ def _ring_drive(
     ``wmma_cycles`` is what one WMMA occupies the SIMD for; the tap gets it for the WMMA
     on each side of the gap, so it can size the work it hides there.
 
-    ``use_groups`` swaps the per-WMMA ``sched_barrier`` fences inside a stretch for a
-    ``sched_group_barrier`` description of it. Source order then stops being binding, so
-    the scheduler may hoist a tap's SALU across the WMMA ahead of it -- which is the only
-    way to get a descriptor chain split over two WMMA shadows, since every one of those
-    SALU is a data dependency of the issue that reads them and so cannot move the other
-    way. The stretch is ONE region: the fences at its ends stay, everything inside goes.
+    ``unfence`` drops the per-WMMA ``sched_barrier`` inside a stretch and lets the
+    scheduler place the stream. The fences at the stretch's ends stay, so the waits keep
+    their meaning. Measured a WIN on its own: -0.60% on case 51, 184 fewer instructions
+    and 10 fewer VGPR, with VOPD packing INTACT.
+
+    ``describe`` additionally emits a ``sched_group_barrier`` description of the stretch.
+    It requires ``unfence`` (a fence would block the reordering it asks for) and is the
+    only way to hoist a tap's SALU across the WMMA ahead of it, since every one of those
+    SALU feeds the issue that reads them and so cannot move the other way. Measured a LOSS
+    (+0.7%): handing the region to IGroupLP breaks VOPD pairing in softmax and inflates
+    waitcnt, for more than the bubble it removes.
 
     Under ``refill_burst`` the ring hands ``consume`` an ``after_first`` callback and
     expects it to be invoked once its FIRST wmma has been emitted; that is where the
@@ -438,9 +448,9 @@ def _ring_drive(
         rocdl.sched_barrier(0)
 
     def _fence():
-        """Pin by source order. Suppressed under ``use_groups``, where the stretch has to
-        stay one scheduling region for the group description to reach across it."""
-        if not use_groups:
+        """Pin by source order. Suppressed under ``unfence``, which hands placement inside
+        the stretch to the scheduler."""
+        if not unfence:
             rocdl.sched_barrier(0)
 
     a = [None] * ring
@@ -490,7 +500,7 @@ def _ring_drive(
     def _group(mask, count):
         """Append to the stretch's description. Consecutive same-class groups merge, which
         is what IGroupLP expects -- a run of four SALU is one [SALU x4], not four [SALU x1]."""
-        if not use_groups or not count:
+        if not describe or not count:
             return
         if groups and groups[-1][0] == mask:
             groups[-1][1] += count
@@ -567,7 +577,7 @@ def _ring_drive(
         # Past the last refill nothing can clobber the slots, so holding them buys nothing.
         _record(i, parts if (ring_lag and refilling) else None)
 
-    for _first, _last in stretches:
+    for _stretch, (_first, _last) in enumerate(stretches):
         # ONE wait for the whole stretch, at the depth its LAST fragment needs, so every
         # fragment in it is covered where it stands. Measured against what is already
         # outstanding: everything issued past the end of the stretch may still be in
@@ -576,10 +586,19 @@ def _ring_drive(
         del groups[:]
         for i in range(_first, _last + 1):
             _ring_fragment(i)
-        # The description goes AFTER the instructions it describes and before the next
-        # stretch's fence, so it applies to exactly this region.
+        # The description goes AFTER the instructions it describes, per the intrinsic's
+        # "applies to the code that precedes it".
+        #
+        # ITS OWN SyncID. Order is enforced between groups with MATCHING SyncID, and the
+        # scheduling region is the whole basic block (sched_barrier adds DAG edges, it
+        # does not split the region -- isSchedulingBoundary only breaks at terminators and
+        # labels). So a shared id does not give one constraint per stretch, it gives ONE
+        # ordering spanning the entire unrolled body -- softmax included, and colliding
+        # with _hi_tdm_pipeline, which uses id 0. Numbering from 1 keeps each stretch
+        # independent and leaves 0 to softmax.
+        _sync = _SG_SYNC_BASE + _stretch
         for _mask, _count in groups:
-            rocdl.sched_group_barrier(_mask, _count, 0)
+            rocdl.sched_group_barrier(_mask, _count, _sync)
 
     for p in held:
         if p is not None:

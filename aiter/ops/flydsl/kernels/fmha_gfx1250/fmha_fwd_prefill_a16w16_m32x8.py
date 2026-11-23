@@ -260,10 +260,15 @@ PVQK_HEAD_CARRY = 20
 # pair is amortised over only 2 loads. Batching the refill spreads it over more. 0 keeps
 # the per-fragment cadence.
 PVQK_REFILL_BURST = 4
-# Describe each ring stretch to IGroupLP with sched_group_barrier instead of pinning it
-# with per-wmma sched_barrier. Only this lets a tap's SALU hoist across the wmma ahead of
-# it; the waits keep their hard fences either way.
-PVQK_USE_SCHED_GROUPS = False
+# Stop pinning the gemm with a sched_barrier after every wmma and let the scheduler place
+# the stream. The stretch waits keep their fences, so the ring's depths still hold. On its
+# own this is a WIN -- the compiler packs VOPD better and needs fewer registers once it is
+# allowed to move things.
+PVQK_UNFENCE_GEMM = True
+# Additionally describe each stretch to IGroupLP. Needs PVQK_UNFENCE_GEMM. Measured a LOSS
+# and OFF: the pipeline solver reschedules the whole region, which costs more in broken
+# VOPD pairs and extra waitcnt than the TDM bubble it removes.
+PVQK_USE_SCHED_GROUPS = True
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
@@ -506,7 +511,8 @@ def _pv_qk_gemm(
     phase="pvqk",
     tap=None,
     user_data=None,
-    use_groups=False,
+    unfence=False,
+    describe=False,
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
     fragment streams, for all num_q_tiles q-WMMA-tiles this wave owns.
@@ -571,9 +577,8 @@ def _pv_qk_gemm(
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
     def _fence():
-        # Source-order pin, dropped under ``use_groups`` so the stretch stays one
-        # scheduling region for its sched_group_barrier description.
-        if not use_groups:
+        # Source-order pin, dropped under ``unfence`` so the scheduler places the stream.
+        if not unfence:
             rocdl.sched_barrier(0)
 
     def consume(i, *parts, boundary=None):
@@ -641,7 +646,8 @@ def _pv_qk_gemm(
         dies=dies,
         tap=tap,
         user_data=user_data,
-        use_groups=use_groups,
+        unfence=unfence,
+        describe=describe,
         refill_burst=PVQK_REFILL_BURST,
     )
     # Hand the high-priority slot to this wave's SIMD-mate, which under anti-phase is
@@ -1822,7 +1828,8 @@ def _attention_core_multi_kv_tiles(
                 head=pvqk_head,
                 tap=_tap,
                 user_data=_tap_data,
-                use_groups=PVQK_USE_SCHED_GROUPS,
+                unfence=PVQK_UNFENCE_GEMM,
+                describe=PVQK_USE_SCHED_GROUPS,
             )
             _phase_barrier()
             # Ahead of softmax: nothing here consumes it, so the whole softmax covers
