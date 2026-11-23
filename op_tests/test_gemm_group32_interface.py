@@ -599,12 +599,16 @@ def test_batched_untuned_1x32_matches_dequant(monkeypatch, m, k, backend):
     _assert_matches(out.float(), ref)
 
 
-def test_mxscale_bpreshuffle_table_reads_blank_and_merged_cells(monkeypatch, tmp_path):
+def test_mxscale_bpreshuffle_table_reads_blank_and_merged_cells(tmp_path):
     """A blank w_scale_block cell, or the 0 a config merge fills a missing
     column with, reads as 128x128, in AOT and at runtime; a blank row that
     repeats a 128x128 row's shape loads, and the faster of the two is used."""
     from aiter.aot.flydsl import gemm as aot
+    from aiter.aot.flydsl.common import override_env
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.replay import identified_kernels
     from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import make_mxfp8_8wave_kernel_name
+    from aiter.utility import dtypes
 
     mxfp8 = make_mxfp8_8wave_kernel_name(2, 0)
     csv_path = tmp_path / "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
@@ -615,26 +619,41 @@ def test_mxscale_bpreshuffle_table_reads_blank_and_merged_cells(monkeypatch, tmp
         f"gfx950,256,1,512,512,128x128,flydsl,bmm,4.0,{BMM_ROW['kernelName']}",
     ]
     csv_path.write_text("\n".join(lines) + "\n")
-    jobs = aot.parse_csv(str(csv_path))
-    blocks = [job["w_scale_block"] for job in jobs if job["kind"] == "mxfp8_8wave"]
-    assert blocks == ["128x128", "128x128"]
-
-    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(gemm_op_a8w8, "get_cu_num", lambda: 256)
-    monkeypatch.setenv(
-        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE", str(csv_path)
-    )
     caches = (
         AITER_CONFIGS.get_config_file,
         gemm_op_a8w8._load_mxscale_bpreshuffle_tuned,
+        gemm_op_a8w8._mxscale_bpreshuffle_tuned_nk,
         gemm_op_a8w8.get_mxscale_bpreshuffle_config,
     )
     for cache in caches:
         cache.cache_clear()
     try:
-        for n, kernel_id in ((256, "mxfp8"), (512, "bmm")):
-            config = gemm_op_a8w8.get_mxscale_bpreshuffle_config(1, n, 512, "128x128")
-            assert config["kernelId"] == kernel_id
+        with (
+            override_env(
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE", str(csv_path)
+            ),
+            dry_run("gfx950", 256, python_ops=True),
+        ):
+            for n, kernel_id in ((256, "mxfp8"), (512, "bmm")):
+                config = gemm_op_a8w8.get_mxscale_bpreshuffle_config(
+                    1, n, 512, "128x128"
+                )
+                assert config["kernelId"] == kernel_id
+            for job in aot.parse_csv(str(csv_path)):
+                if job["kernel_name"] != mxfp8:
+                    continue
+                with identified_kernels() as replayed:
+                    aot.replay(job)
+                with identified_kernels() as launched:
+                    gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
+                        torch.empty((1, 512), dtype=dtypes.fp8, device="cuda"),
+                        torch.empty((job["n"], 512), dtype=dtypes.fp8, device="cuda"),
+                        torch.empty((1, 4), dtype=dtypes.fp8_e8m0, device="cuda"),
+                        torch.empty(
+                            (job["n"] // 128, 4), dtype=dtypes.fp8_e8m0, device="cuda"
+                        ),
+                    )
+                assert replayed and replayed == launched
     finally:
         for cache in caches:
             cache.cache_clear()
@@ -792,6 +811,31 @@ def test_mxscale_bpreshuffle_mxfp8_rows(monkeypatch, m, n, k, block, kernel):
 
     monkeypatch.setattr(batched_gemm_a8w8, "run_bmm_a8w8_mxfp8", no_bmm)
     _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, block))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_op_a8w8.get_gfx() != "gfx950",
+    reason="the preshuffled e8m0 GEMM runs on gfx950",
+)
+@pytest.mark.parametrize("n_split", [2, 4])
+def test_mxscale_bpreshuffle_mxfp8_8wave_tail_split(monkeypatch, n_split):
+    """An 8-wave _ns row: 256x256 tiles that overrun the CUs by 4 run the
+    whole-wave columns unsplit and the last wave K-split into an fp32
+    workspace, reduced into the strided rest of Out (32x32 w_scale, as the
+    DSv4.1 _ns rows)."""
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
+        make_mxfp8_8wave_kernel_name,
+        tail_split_n1,
+    )
+
+    m, k = 300, 1024  # 2 M-tiles
+    n = 256 * (get_cu_num() // 2 + 2)  # cus + 4 tiles
+    assert tail_split_n1(m, n, k, n_split, False, "32x32") is not None
+    name = make_mxfp8_8wave_kernel_name(2, 4, n_split)
+    row = {"libtype": "flydsl", "kernelId": "mxfp8", "kernelName": name}
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, 32))
 
 
 @pytest.mark.skipif(
@@ -957,6 +1001,26 @@ def test_bmm_candidates_split_swizzled_seeds():
         assert cfg["splits"] == 1 or not (cfg["xcd_order"] or cfg["xcd_swizzle"])
 
 
+@pytest.mark.parametrize("w_scale_n", [1, 32])
+def test_bmm_candidates_time_xcd_swizzles(w_scale_n):
+    """Every unsplit seed is also timed with the XCD tile order and each
+    M-major swizzle that runs, whatever its own order: a plain or N-fastest
+    _xcd seed reads a B column block once per XCD its M tiles land on."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+        _XCD_SWIZZLES,
+        BMM_MFMA_NAME_PREFIX,
+        bmm_candidate_names,
+    )
+
+    stem = f"{BMM_MFMA_NAME_PREFIX}_t128x128x128_w1x4_nb4_sk1_bd2"
+    scales = {"x_scale_k": 32, "w_scale_n": w_scale_n, "w_scale_k": 32}
+    for seed in (stem, f"{stem}_xcd"):
+        names = bmm_candidate_names(1, 768, 5120, 8192, [seed], **scales)
+        assert seed in names and f"{stem}_xcd" in names
+        for g in _XCD_SWIZZLES:
+            assert f"{stem}_xcd{g}" in names
+
+
 @pytest.mark.parametrize("block", ["1x32", "32x32", "128x128"])
 def test_mxscale_table_tuner_times_bmm(block):
     """--mxscale_table times bmm on every w_scale block, 1x32's included; a
@@ -1016,13 +1080,15 @@ def test_bmm_rejects_wide_1_row_w_scale(monkeypatch):
         )
 
 
-def test_bmm_unrecognised_tuned_name_warns_and_runs_heuristic(
-    monkeypatch, tmp_path, capsys
-):
-    """A tuned kernelName that breaks a naming rule is skipped by AOT and runs
-    the heuristic's pick at runtime, with a warning on both sides."""
+def test_bmm_unrecognised_tuned_name_warns_and_runs_heuristic(tmp_path, caplog):
+    """A tuned kernelName that breaks a naming rule runs the heuristic's pick
+    at runtime, with a warning. AOT keeps the row: its replay goes through that
+    same runtime call."""
     from aiter.aot.flydsl import gemm as aot
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.replay import identified_kernels
     from aiter.ops.flydsl import batched_gemm_a8w8_gfx950 as gfx950
+    from aiter.utility import dtypes
 
     bad = "flydsl_bmm_mxfp8_mfma_t16x32x128_w1x2_nb4_sk2_xcd4"
     assert gfx950.parse_bmm_kernel_name(bad) is None
@@ -1031,41 +1097,42 @@ def test_bmm_unrecognised_tuned_name_warns_and_runs_heuristic(
         "gfx,b,m,n,k,w_scale_block,libtype,kernelId,kernelName\n"
         f"gfx950,1,3,256,512,1x32,flydsl,0,{bad}\n"
     )
-    assert aot.parse_csv(str(csv_path)) == []
-    assert f"Unknown FlyDSL BMM kernel name: {bad}" in capsys.readouterr().out
+    assert [job["kernel_name"] for job in aot.parse_csv(str(csv_path))] == [bad]
 
-    launched, warned = [], []
-    monkeypatch.setattr(gfx950, "_launch", lambda t, m, s, key: launched.append(key))
-    monkeypatch.setattr(gfx950.torch.cuda, "current_stream", lambda *a: None)
-    monkeypatch.setattr(gfx950, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(gfx950.logger, "warning", warned.append)
+    m, n, k = 3, 256, 512
+    picks = []
     gfx950._warn_unrecognised.cache_clear()
-    x, w, xs, ws = _mxscale_operands(w_rows=1)
-    m, k = x.shape
-    operands = (x.view(m, 1, k), w.view(1, *w.shape), xs.view(m, 1, -1))
-    operands += (ws.view(1, *ws.shape),)
-    for name in (bad, None):
-        out = torch.empty((m, 1, w.shape[0]), dtype=torch.bfloat16)
-        gfx950.run_bmm_a8w8_mxfp8_gfx950(*operands, out, kernel_name=name)
-    assert launched[0] == launched[1]
-    assert len(warned) == 1 and bad in warned[0]
+    # aiter's logger does not propagate to the root logger caplog listens on.
+    gfx950.logger.addHandler(caplog.handler)
+    try:
+        with dry_run("gfx950", 256):
+            operands = (
+                torch.empty((m, 1, k), dtype=dtypes.fp8, device="cuda"),
+                torch.empty((1, n, k), dtype=dtypes.fp8, device="cuda"),
+                torch.empty((m, 1, k // 32), dtype=dtypes.fp8_e8m0, device="cuda"),
+                torch.empty((1, n, k // 32), dtype=dtypes.fp8_e8m0, device="cuda"),
+            )
+            for name in (bad, None):
+                out = torch.empty((m, 1, n), dtype=torch.bfloat16, device="cuda")
+                with identified_kernels() as launched:
+                    gfx950.run_bmm_a8w8_mxfp8_gfx950(*operands, out, kernel_name=name)
+                picks.append(launched)
+    finally:
+        gfx950.logger.removeHandler(caplog.handler)
+    assert picks[0] and picks[0] == picks[1]
+    assert len([message for message in caplog.messages if bad in message]) == 1
 
 
-def test_aot_bmm_rows_cover_their_dispatch(monkeypatch, tmp_path):
-    """AOT compiles the launcher every tuned GEMM bmm row dispatches, at M = 1
-    and M > 1; both read a blank w_scale_block cell (left by merging a table
-    from before the column) as 128x128."""
+def test_aot_bmm_rows_cover_their_dispatch(tmp_path):
+    """AOT's replay of every tuned GEMM bmm row requests the kernel its
+    dispatch launches, at M = 1 and M > 1; both read a blank w_scale_block
+    cell (left by merging a table from before the column) as 128x128."""
     from aiter.aot.flydsl import gemm as aot
-    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
-    from aiter.ops.flydsl import batched_gemm_a8w8_gfx950 as gfx950
+    from aiter.aot.flydsl.common import override_env
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.replay import identified_kernels
+    from aiter.utility import dtypes
 
-    launched = []
-    monkeypatch.setattr(gfx950, "_launch", lambda t, m, s, key: launched.append(key))
-    monkeypatch.setattr(gfx950.torch.cuda, "current_stream", lambda *a: None)
-    for module in (gemm_op_a8w8, bmm, gfx950):
-        monkeypatch.setattr(module, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(gemm_op_a8w8, "get_cu_num", lambda: 256)
-    monkeypatch.setattr(bmm, "_runner", functools.cache(bmm._runner.__wrapped__))
     k = 512
     # (w_scale_block cell, N, the scale block it reads as)
     rows = [("1x32", 256, (1, 32)), ("32x32", 256, (32, 32))]
@@ -1078,32 +1145,42 @@ def test_aot_bmm_rows_cover_their_dispatch(monkeypatch, tmp_path):
         for m in (1, 37)
     ]
     csv_path.write_text("\n".join(lines) + "\n")
-    jobs = aot.parse_csv(str(csv_path))
-    assert {job["w_scale_block"] for job in jobs} == {"1x32", "32x32", "128x128"}
-    for job in jobs:
-        aot._compile_bmm_mfma_to_cache(**job)
-    compiled, launched[:] = set(launched), []
-
-    monkeypatch.setenv(
-        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE", str(csv_path)
-    )
     caches = (
         AITER_CONFIGS.get_config_file,
         gemm_op_a8w8._load_mxscale_bpreshuffle_tuned,
+        gemm_op_a8w8._mxscale_bpreshuffle_tuned_nk,
         gemm_op_a8w8.get_mxscale_bpreshuffle_config,
     )
     for cache in caches:
         cache.cache_clear()
     try:
-        for _, n, (w_rows, w_block) in rows:
-            for m in (1, 37):
-                block = f"{w_rows}x{w_block}"
-                assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, n, k, block)
-                x, w, xs, ws = _mxscale_operands(
-                    m=m, n=n, k=k, x_block=w_block, w_rows=w_rows, w_block=w_block
-                )
-                gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(x, w, xs, ws)
+        with (
+            override_env(
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE", str(csv_path)
+            ),
+            dry_run("gfx950", 256, python_ops=True),
+        ):
+            with identified_kernels() as replayed:
+                for job in aot.parse_csv(str(csv_path)):
+                    aot.replay(job)
+            for _, n, (w_rows, w_block) in rows:
+                for m in (1, 37):
+                    block = f"{w_rows}x{w_block}"
+                    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, n, k, block)
+                    with identified_kernels() as launched:
+                        gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
+                            torch.empty((m, k), dtype=dtypes.fp8, device="cuda"),
+                            torch.empty((n, k), dtype=dtypes.fp8, device="cuda"),
+                            torch.empty(
+                                (m, k // w_block), dtype=dtypes.fp8_e8m0, device="cuda"
+                            ),
+                            torch.empty(
+                                (n // w_rows, k // w_block),
+                                dtype=dtypes.fp8_e8m0,
+                                device="cuda",
+                            ),
+                        )
+                    assert launched and launched <= replayed
     finally:
         for cache in caches:
             cache.cache_clear()
-    assert len(launched) == 8 and set(launched) <= compiled

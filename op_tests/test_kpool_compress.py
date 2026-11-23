@@ -13,8 +13,11 @@ dequantized keys agree to one fp8 ulp and the bytes agree exactly for all but
 a handful of tokens. Every case asserts that all dequantized keys are within
 that ulp, all scales are exact and the tail ring is exact. With
 ``--vllm-ref <path to vllm kpool_compress.py>`` the Triton production kernels
-are run too and every case with ``ring == pool_size`` (the only ring the Triton
-decode accepts) must match them byte for byte.
+are run too and every insert, decode and mixed case must match them byte for
+byte (cache and tail), for every tail ring: ``ring == pool_size`` and the larger
+power-of-two production rings of MTP (``production_ring``). This needs a vLLM
+whose decode and tail seeding take ``ring = tail_kv_cache.shape[2]`` (any
+multiple of ``pool_size``, e.g. v0.31.0); older copies assert ``ring == pool_size``.
 
     python3 test_kpool_compress.py                 # all three writers
     python3 test_kpool_compress.py --only insert   # insert | decode | mixed
@@ -308,6 +311,11 @@ def make_decode(
     }
 
 
+def production_ring(pool, next_n):
+    """vLLM's tail ring for ``next_n`` tokens per step: pool * pow2(ceil((pool + next_n - 1) / pool))."""
+    return pool * (1 << (-(-(pool + next_n - 1) // pool) - 1).bit_length())
+
+
 def tail_clone(d):
     """Copy of the tail that keeps a padded tail's strides (clone() would compact the view)."""
     base = d["tail_base"].clone()
@@ -469,37 +477,40 @@ def test_decode(
     }
     assert tail_ok, "tail ring mismatch"
     if _VLLM is not None:
-        if d["tail"].shape[2] == pool:
-            kv_e, tail_e = d["kv"].clone(), tail_clone(d)
-            vllm_decode(
-                kv_e,
-                tail_e,
-                d["tail_slot"],
-                d["key"],
-                d["score"],
-                d["ape"],
-                d["slot_map"],
-                d["pos"],
-                pool,
-                round_scale,
-            )
-            ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int(
-                (tail_e != tail_got).sum()
-            )
-            assert_vllm_exact(ret["vllm diff bytes"], "decode (cache + tail)")
-        else:
-            # vLLM's Triton decode asserts ring == pool_size; the larger
-            # production rings are covered by the torch reference above (exact
-            # tail, keys within one fp8 ulp, exact scales). -1: not compared.
-            ret["vllm diff bytes"] = -1
+        kv_e, tail_e = d["kv"].clone(), tail_clone(d)
+        vllm_decode(
+            kv_e,
+            tail_e,
+            d["tail_slot"],
+            d["key"],
+            d["score"],
+            d["ape"],
+            d["slot_map"],
+            d["pos"],
+            pool,
+            round_scale,
+        )
+        ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int(
+            (tail_e != tail_got).sum()
+        )
+        assert_vllm_exact(ret["vllm diff bytes"], "decode (cache + tail)")
     return ret
 
 
 @benchmark()
 def test_mixed(
-    lens, B, next_n, pool, page=64, round_scale=True, idx_dtype=torch.int64, tail_pad=1
+    lens,
+    B,
+    next_n,
+    pool,
+    page=64,
+    round_scale=True,
+    idx_dtype=torch.int64,
+    tail_pad=1,
+    ring=None,
 ):
-    ring = pool
+    # default: the production ring for next_n (== pool_size for next_n = 1)
+    ring = ring or production_ring(pool, next_n)
     # one index dtype per launch: prefill slot_mapping, seed slots and decode metadata
     d = make_decode(
         B,
@@ -577,6 +588,7 @@ def test_mixed(
     tail_ok = torch.equal(tail_ref, tail_got)
     assert tail_ok, "tail ring mismatch"
     ret = {
+        "ring": ring,
         "prefill tokens": k.shape[0],
         "err": err,
         "scale err": err_s,
@@ -586,7 +598,7 @@ def test_mixed(
     }
     if _VLLM is not None:
         # the vLLM sequence the one launch replaces: insert, kpool_seed_tail_cache,
-        # then the decode update (ring == pool_size, as the Triton decode requires)
+        # then the decode update, on the same tail ring
         kv_e, tail_e = kv.clone(), tail_clone(d)
         vllm_insert(kv_e, k, gate, ape, slot, pool, round_scale)
         _VLLM.kpool_seed_tail_cache(
@@ -779,6 +791,9 @@ if args.only in (None, "decode"):
         (3, 16, 32),
     ):
         rows.append(test_decode(B, next_n, 4, ring=ring))
+    # ring > pool_size for the other power-of-two pools
+    for B, next_n, pool in ((6, 2, 2), (4, 3, 8), (2, 4, 16)):
+        rows.append(test_decode(B, next_n, pool, ring=production_ring(pool, next_n)))
     # int64 metadata (vLLM): same kernels with an 8 B element stride
     for B, next_n, ring in ((4, 1, 4), (5, 4, 8), (3, 2, 4), (5, 8, 16)):
         rows.append(test_decode(B, next_n, 4, ring=ring, idx_dtype=torch.int64))
@@ -799,16 +814,24 @@ if args.only in (None, "decode"):
         )
     tables["decode"] = pd.DataFrame(rows)
 if args.only in (None, "mixed"):
+    # next_n > 1 uses the production ring (8 for next_n 2..5, 16 for 6..8 at
+    # pool 4); ring=pool keeps the generic decode path covered
     rows = [
         test_mixed([64, 9], 1, 1, 4),
         test_mixed([4096, 17, 300], 8, 4, 4),
+        test_mixed([4096, 17, 300], 8, 4, 4, ring=4),
         test_mixed([64, 9], 1, 1, 4, idx_dtype=torch.int32),
         test_mixed([300, 17], 8, 4, 4, idx_dtype=torch.int32),
+        test_mixed([300, 17, 5], 5, 8, 4),
+        test_mixed([300, 77], 4, 3, 8),
+        test_mixed([130, 9], 6, 2, 2),
     ]
     if not args.quick:
         rows.append(test_mixed([2048] * 4, 32, 2, 4))
+        rows.append(test_mixed([2048] * 4, 32, 2, 4, ring=4))
         # vLLM layout: padded tail pages (strided view) for the seed + decode roles
         rows.append(test_mixed([4096, 17, 300], 8, 1, 4, tail_pad=16))
+        rows.append(test_mixed([4096, 17, 300], 8, 4, 4, tail_pad=16))
         rows.append(test_mixed([300, 77], 256, 1, 4, tail_pad=512))
     tables["mixed"] = pd.DataFrame(rows)
 for name, df in tables.items():
