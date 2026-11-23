@@ -83,7 +83,16 @@ def _pack_offset_u8(vals, e8m0):
     never triggers here); v_perm_b32 gathers the four low bytes.
     """
     inv_scale = _inv_e8m0_scale(e8m0)
-    x = fx.Vector.from_elements(vals, fx.Float32) * inv_scale + fx.Float32(128.0)
+    n = len(vals)
+    # One v_pk_fma_f32 per pair: v * inv_scale is exact (a power-of-two scaling of a finite f32 that stays below
+    # 128 in magnitude), so the fused multiply-add rounds once exactly where the separate add rounded.
+    x = fx.Vector(
+        fx.math.fma(
+            fx.Vector.from_elements(vals, fx.Float32),
+            fx.Vector.from_elements([inv_scale] * n, fx.Float32),
+            fx.Vector.filled(n, 128.0, fx.Float32),
+        )
+    )
     y = (x + fx.Float32(8388608.0)).bitcast(fx.Int32)
     words = []
     for word in range_constexpr(len(vals) // 4):
