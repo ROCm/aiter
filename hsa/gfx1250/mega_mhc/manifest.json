@@ -12,432 +12,432 @@
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "54f35c97f90aeb98c828f1446c50ba7f3b54ecfefc900be40845029ad61d67ae"
+      "sha256": "9460f6927d4a9a6c456d3d8b5ff99867035900529b7ca15b89cddfc777d8519f"
     },
     "mhc_ns16_bf16_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns16_bf16_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "a8d559c0cb837049e11b694019c2bf010a4733c67ba62238c35ff34a9fae81ad"
+      "sha256": "a17974f4875f39dc5595211090f587a1a947e3c374d57e70beaaba02fd55674f"
     },
     "mhc_ns16_bf16_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns16_bf16_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "51e6d75f156fd6ee8bc427ad2f9ddfb89d066349064a687dd4f0c2633777c462"
+      "sha256": "f2f007e3eb98bd600484cddc57523751631807099384a06c4f7a78478adda41d"
     },
     "mhc_ns16_bf16_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns16_bf16_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "a616edcbd2b6023cfa127e2cf83df67d736178d9d437661b1e5123835dec4972"
+      "sha256": "926d184ea89b6ffda3fd8cf360d459fff66ff3881025325c2a07011d4a8d36aa"
     },
     "mhc_ns16_mxfp8_hp0_ip0_cs2.co": {
       "symbol": "mhc_ns16_mxfp8_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "dcd486ff2f874cc26f1287fe7226b721bf01c399ddfbcf6dae4061b934d74e3b"
+      "sha256": "8063e7892ce8a5ca6dfe4dad2c982d62137d58f702feaacaa7653d0089fe7771"
     },
     "mhc_ns16_mxfp8_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns16_mxfp8_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "890e844c8a719f1e2d76120aa9ab00abbbf7cf36c596a34bb90985dbbaa51c54"
+      "sha256": "95f1faeaad9adda27164532ffa13a01395e482e1baf3a3fb97ecb0660b63a221"
     },
     "mhc_ns16_mxfp8_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns16_mxfp8_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "b699a67413857c23ebe43a6acd9d03575d1bcc37a34b2bb71177552badfddc89"
+      "sha256": "5c720fb79377d242fbf3b083c1dfdcf5adde9c32de65f6f9dfe8ebae9dd7c382"
     },
     "mhc_ns16_mxfp8_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns16_mxfp8_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 26624,
       "inst_pref_size": 208,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "91320ade594abd9d2f14612fdc5fff36dc2ff060e447a5a201ec266065138c4f"
+      "sha256": "a994809f9a6b3a467e7321e20f5534fad040d9303ff24827167983a40d42a113"
     },
     "mhc_ns16_mxfp8m32k4_hp0_ip0_cs2.co": {
       "symbol": "mhc_ns16_mxfp8m32k4_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 27648,
       "inst_pref_size": 216,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "209edc1d8925523b00a5c4636b23a33b43974975507b7132b64d62c1bdc1c010"
+      "sha256": "8cc33eefd0d065230043c04fe0fb0e3ff0b978188f14838c1a42c07661b341f5"
     },
     "mhc_ns16_mxfp8m32k4_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns16_mxfp8m32k4_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 27648,
       "inst_pref_size": 216,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "a3c9fd93dcfefeabf4814798ce4fb4116fbc364f23aef58fcf1acdb8313baf61"
+      "sha256": "b210903e7d1cd6700db0dbc03e3f51c93c60821ee82a75df81d40268f37a68e4"
     },
     "mhc_ns16_mxfp8m32k4_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns16_mxfp8m32k4_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 27648,
       "inst_pref_size": 216,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "18d7886a60a67aa768a516097c9e423255328acb237b9f271d6ccb49d11d2521"
+      "sha256": "4543b83ece8d8a7380899fc40685b9c8eaf610f5d5944a2833588e4fdd84c41a"
     },
     "mhc_ns16_mxfp8m32k4_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns16_mxfp8m32k4_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 27648,
       "inst_pref_size": 216,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 295680,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "781b823899c77381c2bbbe4d5d43885b51f11a3f25b9ee79c0a11fc12bbdd227"
+      "sha256": "9d192b2bff437a033cd3cd8c97bc139c6432cb0f4474709dff4870c43b3e82d8"
     },
     "mhc_ns32_bf16_hp0_ip0_cs2.co": {
       "symbol": "mhc_ns32_bf16_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 22528,
       "inst_pref_size": 176,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "d98442dd621028638db0a6e69cff9aa67ed2c5ac720e3b06e61d4c49dae9552d"
+      "sha256": "1a48027341b2491a53e4bde1ebe19bc00d8b04ea583d9d73350570cc61d51048"
     },
     "mhc_ns32_bf16_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns32_bf16_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 22528,
       "inst_pref_size": 176,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "67fe8cc8f927c27ac7af9524b78b47876100240735d50eee0f52fedd70fce301"
+      "sha256": "9239c4f6961337032fdb8b6710aaab8c6ea1e5487998a77cb391d66f622ff9bb"
     },
     "mhc_ns32_bf16_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns32_bf16_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 33792,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "ccc99ec6fd7eb84a6eb16b23b339ded3130981fb8a78247a61c92e802934ba3a"
+      "sha256": "671f92394c3a25c509d1e91e9db6cb292250b46deb125680afb41643f947f8cb"
     },
     "mhc_ns32_bf16_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns32_bf16_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 33792,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "d8003e6ea2dde7d02d4abb263813dfe3c4fa51f1468ee6234bc0bdf3de63fa1d"
+      "sha256": "02f0c0e53fc9aad81c57077b84d6563471b7123f11ea7b7842c52e3aacc7b31c"
     },
     "mhc_ns32_mxfp8_hp0_ip0_cs2.co": {
       "symbol": "mhc_ns32_mxfp8_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 22528,
       "inst_pref_size": 176,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "a95ca286b3adf95ecc297d34ef1b0a43c4f635868ba8f56f5b0be60ffca38842"
+      "sha256": "430137f07621bfce9d7d6ba692812f80333132838cd97969e58cd21b7c0d95cd"
     },
     "mhc_ns32_mxfp8_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns32_mxfp8_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 22528,
       "inst_pref_size": 176,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "237e1832fc2791ff022f12547aa057f969557105f22ec44791a0f269b7e848d7"
+      "sha256": "cfabe83b22387dadec80e46f798f9e33cd8bb97d45ea0dd52c71b02a39d4fe99"
     },
     "mhc_ns32_mxfp8_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns32_mxfp8_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 33792,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "2a403e00bd2725f966075c6da9040487f12147afc0b10108dc93000aa2ccf3e3"
+      "sha256": "52adb00a17cec9c96ed22ee0b653d5399bda9b17007a8629f5c1c9b20128a786"
     },
     "mhc_ns32_mxfp8_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns32_mxfp8_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 33792,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "eee45a0c6d7f07ae93895608874bf1176c3266c72a6558d230127d7319bc96ba"
+      "sha256": "4cb0cf193a2818532dbd2f9b0a62366469904911f0d0db7e0a06535b801fe9fa"
     },
     "mhc_ns32_mxfp8m32k4_hp0_ip0_cs2.co": {
       "symbol": "mhc_ns32_mxfp8m32k4_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 23552,
       "inst_pref_size": 184,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "74a5e7922fb7b4bcf38ac35b7876b2495c8ad856bb768325f9fd0507ebabf961"
+      "sha256": "92fd53b4ce2e199dee4ec40c22ea090791d8cdafabaa3f260f8a7876b3b6c489"
     },
     "mhc_ns32_mxfp8m32k4_hp0_ip1_cs2.co": {
       "symbol": "mhc_ns32_mxfp8m32k4_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 23552,
       "inst_pref_size": 184,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "12cc1cef06b503a384954c2df3f62f2c7321d1e34d006c4e68e23752c1cabb6c"
+      "sha256": "15fb85b8f34cfb63a3e030b013702bd1e101dfcaeed1d81d8535506f6eca248a"
     },
     "mhc_ns32_mxfp8m32k4_hp1_ip0_cs2.co": {
       "symbol": "mhc_ns32_mxfp8m32k4_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 34816,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "f824a2fdd133d88a010ea061bf2d97dc48114f6b1c8b47e73d1e3372ad83dc13"
+      "sha256": "a9278b652b1f40bb2386c0e1ef44bfb8a7fa181b9581cd00233b6f254396adf2"
     },
     "mhc_ns32_mxfp8m32k4_hp1_ip1_cs2.co": {
       "symbol": "mhc_ns32_mxfp8m32k4_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 34816,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 306176,
+      "vgpr": 880,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "b82f94a1101636834b1cd78b43293200cd7fb7491db444f130fa345bd780b1ed"
+      "sha256": "f66f7cb3263a88ec570ed09c79349b59f68566afaa0b811f70cf47981e9fa477"
     },
     "mhc_ps_bf16_hp0_ip0_cs2.co": {
       "symbol": "mhc_ps_bf16_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 35712,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "8604a4ac562469d7c3b8e23df24471e335279a7565a0eee84a68130ea48103d1"
+      "sha256": "40b1f43476f615100eb46cecec9a1b62f681ce96aaa4eae9f860c6bfd2ce12d0"
     },
     "mhc_ps_bf16_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_bf16_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 35712,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "4e255fe3946f05c66c7b12a9f1e24e40ccf0e9527e7ff8330b38faab999b32a0"
+      "sha256": "f5ceaba1818eeae4c5a97b3080ddbb0576f9dbb319f563f3d8b38a9d37fb12fd"
     },
     "mhc_ps_bf16_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_bf16_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 57472,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "0d80db4de9d8631091c831d579418b62e4e16ea04173db977441bda8a0ac4d25"
+      "sha256": "7fb1dc4b6b38290e9c2ca7106b06a4ac0c3563d01a870e7f15c69f53b0783c1a"
     },
     "mhc_ps_bf16_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_bf16_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 57472,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 912,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "c0f0c88a2244351d51c976fb034461af5bd2723af117c5929d5c74e7431bf009"
+      "sha256": "4f1283c68afe20ef952f884fb55a151dce812152d8b26b94845a92d62b7dba69"
     },
     "mhc_ps_mxfp8_hp0_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 39808,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "9091dff823060a3787960326e965789cdfb8839a6b3bf1ed2b29677782036168"
+      "sha256": "7794652904f9f4e1ad51928b082b6fbaf19ac1668ea0aceece200cf393b03ee2"
     },
     "mhc_ps_mxfp8_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 39808,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "fb07bd212f4b94aa5531d59dc68d9eb621b553659103719bef666a6ad9600528"
+      "sha256": "9e9afea82f79e5a03bdc519381ee408b2b9fcf58965d82a324acc69273fbaf8a"
     },
     "mhc_ps_mxfp8_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 61568,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "ef3a0a8ad8844a60be6e8b553a63389107eadc607bd5b1f9a652268088de22f1"
+      "sha256": "5810a5322103d680c7311152823e5ce2499bac4516452616736560bd24476031"
     },
     "mhc_ps_mxfp8_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 61568,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "1e7f165198e15cebf4ab97ea67a07544f27e4aa9185d3d3891e8fbeee8bde5dc"
+      "sha256": "8e3d59a6b47d6f58e636821075295a81ef09be6550fb595ca6deb3fe5c6a311c"
     },
     "mhc_ps_mxfp8m32k4_hp0_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp0_ip0_cs2",
       "entry": 16384,
       "code_bytes": 40320,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "06da0303550e8a66bd6fb4453ee502b4a9694bdd3b805064fbb92089c9a7e676"
+      "sha256": "cc2e2a14cbe12e2ea0e945192641ed3184f7f5e7b72894fc1fa5b38ec74f6269"
     },
     "mhc_ps_mxfp8m32k4_hp0_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp0_ip1_cs2",
       "entry": 16384,
       "code_bytes": 40320,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "b7df2758f0a7d6790f291ba06b59ade8a0d669035566dc3327f20b2a90cdfe6b"
+      "sha256": "d5664bef781b01ce7e07488c96ed3bd4e497a40bd077eb2e9c065498965afa53"
     },
     "mhc_ps_mxfp8m32k4_hp1_ip0_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp1_ip0_cs2",
       "entry": 16384,
       "code_bytes": 62080,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "d3b99dc45d1c204c9c41ea22cd50a975b0c7156b865173ed94c1375b0bdb1d18"
+      "sha256": "d4b464f472941f58f1ba321d848eb63ceae822a609d762e94c3ac709c9c3edd6"
     },
     "mhc_ps_mxfp8m32k4_hp1_ip1_cs2.co": {
       "symbol": "mhc_ps_mxfp8m32k4_hp1_ip1_cs2",
       "entry": 16384,
       "code_bytes": 62080,
       "inst_pref_size": 255,
-      "lds": 327680,
-      "vgpr": 1024,
+      "lds": 318976,
+      "vgpr": 928,
       "sgpr": 128,
       "kernarg": 192,
       "wavefront": 32,
-      "sha256": "e7d47f76526ababb52ce3a2146b863bc12703ad750295da1fa7669918df2d7d2"
+      "sha256": "9f7fc1c16938091fd765862265314d473070d7ce5b1d4254ac2b9de8e96c8722"
     }
   }
 }

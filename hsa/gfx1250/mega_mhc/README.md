@@ -32,7 +32,11 @@ config table of `csrc/py_itfs_cu/asm_mega_mhc.cu`.
   cluster each own 320 columns of H and meet through the partials.
 - `ns16`/`ns32`: `ceil(T/tile)` clusters. `ps`: `min(16, ceil(T/64))` clusters;
   each round advances 16 tiles (1024 tokens), so T>1024 runs several rounds on 16.
-- 327680-byte static LDS, launch with zero dynamic LDS; 1024 VGPRs, 128 SGPRs.
+- Static LDS and VGPRs are what each kernel uses (`manifest.json`): `ns16`
+  295680 B / 912, `ns32` 306176 B / 880, `ps` 318976 B / 928 (BF16 912); launch
+  with zero dynamic LDS; 128 SGPRs. One workgroup still fills a CU, and the
+  remainder lets small kernels (one wave, a few VGPRs, one 2 KiB LDS granule)
+  stay resident beside it.
 - 192-byte arguments: the argument record of the gfx1250 HIP Mega-MHC kernel
   (`MegaMhcKernelArgs` in `asm_mega_mhc.cu`), with `split_arg=16`,
   `hidden_arg=5120` and `counters` unused.
