@@ -128,7 +128,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 )
 
             def a_load(mi, ks, _base=cur_off):
-                return a_s2r.load_operand(a_buf, mi, ks, _base)
+                return a_s2r.load_operand_in_flight(a_buf, mi, ks, _base)
 
             if const_expr(async_a_copy):
                 rocdl.sched_barrier(0)
@@ -439,7 +439,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_asm_reads=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -447,7 +447,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     ``out_cache_modifier`` is the epilogue store cache policy (not used with ``lookahead > 0``, whose stores use
     ``_LA_CM``) and ``tile_zero`` is forwarded to :func:`do_tile`.
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
-    (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
+    (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_asm_reads`` /
     ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
     the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s.
 
@@ -468,11 +468,11 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     a_pack = 2 if a_dtype == "fp4" else 1
     a_gather = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_tensor=x_tensor, async_copy=async_a_copy, async_lds=a_async_lds,
+        x_tensor=x_tensor, async_copy=async_a_copy,
         indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
         source_rows=source_rows, a_dtype=a_dtype)
     # fmt: on
-    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype)
+    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype, asm_reads=a_asm_reads)
     b_loader = BWeightLoader(
         w_rsrc=w_rsrc,
         num_acc_n=num_acc_n,
@@ -544,8 +544,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     s_repeat = short_rows // 16
     # fmt: off
     a_gather_s = ATileLoader(row_bytes=model_dim, sort_block_m=short_rows, k_step_bytes=a_k_step_bytes,
-        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy,
-        async_lds=a_async_lds)
+        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy)
     a_scale_s = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=s_repeat, model_dim=model_dim, sort_block_m=short_rows,
         total_threads=total_threads, packed=ascale_packed)
     # fmt: on
@@ -570,8 +569,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     f_rows = sort_block_m + short_rows
     # fmt: off
     a_gather_f = ATileLoader(row_bytes=model_dim, sort_block_m=f_rows, k_step_bytes=a_k_step_bytes,
-        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy,
-        async_lds=a_async_lds)
+        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy)
     a_scale_f = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=f_rows // 16, model_dim=model_dim, sort_block_m=f_rows,
         total_threads=total_threads, packed=ascale_packed)
     # fmt: on

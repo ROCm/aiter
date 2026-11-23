@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -70,7 +71,6 @@ class ATileLoader:
         swizzle=False,
         x_tensor=None,
         async_copy=False,
-        async_lds=False,
         indexed_input=False,
         row_map_rsrc=None,
         source_rows=0,
@@ -99,14 +99,8 @@ class ATileLoader:
             assert total_chunks % 64 == 0
             assert total_chunks < total_threads or total_chunks % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
-            # async_lds: the A copies are async LDS DMA, which the compiler does not make an LDS read wait for, so
-            # the K-step's A reads do not drain this step's copy into the other buffer (a read of either buffer
-            # looks alike to it). Every read of a copied buffer must then follow an explicit vmcnt wait covering
-            # the copy: do_tile's prologue / K-step closing wait_lds_barrier.
             self._dma_atom = fx.make_copy_atom(
-                fx.rocdl.cdna4.BufferLoadAsyncLDS128b()
-                if async_lds
-                else fx.rocdl.BufferCopyLDS128b(),
+                fx.rocdl.BufferCopyLDS128b(),
                 128,
             )
 
@@ -328,12 +322,15 @@ class ATileLoader:
 class AS2RLoader:
     """Load one FP8/FP4 scaled-MFMA A operand from row-major LDS."""
 
-    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8"):
+    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8", asm_reads=False):
         self._k_step_bytes = k_step_bytes
         self._swizzle = swizzle
         self._lane = fx.thread_idx.x % 64
         self._is_fp4 = a_dtype == "fp4"
         assert self._is_fp4 or a_dtype == "fp8"
+        # asm_reads: load_operand_in_flight reads through inline asm (see there).
+        assert not (asm_reads and self._is_fp4)
+        self.asm_reads = asm_reads
 
     def _load_16b(self, lds_src, i32_off, narrow_copy=False):
         if const_expr(narrow_copy):
@@ -373,6 +370,48 @@ class AS2RLoader:
         hi = self._load_16b(lds_src, row_i32 + _c(col_lo + 16), narrow_copy).bitcast(
             fx.Int64
         )
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
+            fx.Int32
+        )
+
+    def load_operand_in_flight(self, lds_src, mi, ksub, base_i32=0):
+        """load_operand while this K-step's A copy into the other LDS buffer is in flight.
+
+        With asm_reads the two ds_read_b128 (and their lgkmcnt wait) are inline asm: the compiler sees no LDS read,
+        so it does not make the first read of the K-step wait (vmcnt) for the next step's LDS DMA, which it
+        cannot tell apart from this step's buffer. The K-step's closing vmcnt wait + barrier orders the DMA.
+        """
+        if const_expr(not self.asm_reads):
+            return self.load_operand(lds_src, mi, ksub, base_i32)
+        row = fx.Int32(self._lane % 16)
+        row_i32 = row * fx.Int32(self._k_step_bytes // 4) + fx.Int32(base_i32)
+        klane4 = fx.Int32(self._lane // 16) * fx.Int32(4)
+
+        def _c(col):
+            if const_expr(self._swizzle):
+                return col ^ (row << fx.Int32(2))
+            return col
+
+        col_lo = klane4 + fx.Int32(ksub * 32)
+        lds_base = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        addr_lo = lds_base + (row_i32 + _c(col_lo)) * fx.Int32(4)
+        addr_hi = lds_base + (row_i32 + _c(col_lo + fx.Int32(16))) * fx.Int32(4)
+        # Row mi * 16 + lane % 16: the swizzle only sees lane % 16, so mi is an immediate offset.
+        imm = mi * 16 * self._k_step_bytes
+        # Inline asm: FlyDSL 0.5.3 has no LDS load or LDS-DMA copy atom carrying alias scopes, so every
+        # compiler-visible LDS read (view .load(), fx.copy UniversalCopy, generic_load, llvm.load with scopes on
+        # the read only) gets an s_waitcnt vmcnt that drains this step's 4 buffer_load ... lds before the first
+        # ds_read_b128 (gfx950 v41_ep4 large_stage1 K-loops: vmcnt(0) vs vmcnt(7) here; -1.5% E2E measured).
+        v4 = fx.Vector.make_type(4, fx.Int32)
+        pair = llvm.inline_asm(
+            llvm.StructType.get_literal([v4, v4]),
+            [addr_lo.ir_value(), addr_hi.ir_value()],
+            f"ds_read_b128 $0, $2 offset:{imm}\nds_read_b128 $1, $3 offset:{imm}\ns_waitcnt lgkmcnt(0)",
+            "=&v,=&v,v,v",
+            has_side_effects=True,
+        )
+        lo = Vec(llvm.extractvalue(v4, pair, [0])).bitcast(fx.Int64)
+        hi = Vec(llvm.extractvalue(v4, pair, [1])).bitcast(fx.Int64)
         return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
             fx.Int32
         )
