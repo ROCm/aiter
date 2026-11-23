@@ -89,9 +89,9 @@ from codegen.gen_instances_gfx1250 import (
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
-    MXFP8_DIRECTION_PATTERN,
     gfx950_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
+    mxfp8_direction,
 )
 
 from aiter_worker_limits import (
@@ -354,7 +354,7 @@ def _check_gfx950_pin(
             path,
         ]
     ).stdout
-    if MXFP8_DIRECTION_PATTERN.search(entry["name"]):
+    if mxfp8_direction(entry):
         # NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
         # every MFMA A / B operand must be an AGPR range that an LDS read filled.
         reads = {

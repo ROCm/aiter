@@ -4,7 +4,6 @@
 
 import json
 import os
-import re
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -3030,7 +3029,12 @@ def _gfx950_co_image_path(path, entry):
     return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
-MXFP8_DIRECTION_PATTERN = re.compile(r"_mxfp8_(nn|tt|tn)_")
+_MXFP8_DIRECTION_PIPELINES = {"mxfp8_nn": "NN", "mxfp8_tt": "TT", "mxfp8_tn": "TN"}
+
+
+def mxfp8_direction(entry):
+    """Direction ("NN" / "TT" / "TN") of a gfx950 MXFP8 CO manifest entry, else None."""
+    return _MXFP8_DIRECTION_PIPELINES.get((entry or {}).get("pipeline"))
 
 
 def _load_gfx950_co_kernels(path, require_image=True):
@@ -3956,7 +3960,7 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
         for kid, instance in sorted(
             get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
         )
-        if not MXFP8_DIRECTION_PATTERN.search(instance.name)
+        if mxfp8_direction(instance.bpreshuffle_co) is None
         and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
     ]
 
@@ -4144,8 +4148,7 @@ def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
             for kid, instance in get_registry(
                 "a8w8_blockscale_bpreshuffle", gfx, cu_num
             ).items()
-            if instance.bpreshuffle_co is not None
-            and MXFP8_DIRECTION_PATTERN.search(instance.name)
+            if mxfp8_direction(instance.bpreshuffle_co) is not None
         )
     return keys
 

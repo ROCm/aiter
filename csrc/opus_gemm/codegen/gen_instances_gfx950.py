@@ -4,7 +4,7 @@
 
 import os
 
-from opus_gemm_common import OpusGemmInstance
+from opus_gemm_common import OpusGemmInstance, mxfp8_direction
 
 from codegen.common import (
     WARP_SIZE,
@@ -3269,14 +3269,11 @@ def gen_mxscale_bpreshuffle_instance(
 ):
     workspace_extra = ""
     split_k = 1
-    direction = "NT"
     if k.bpreshuffle_co is not None:
         if any(row["kid_name"] == k.name for row in cg._host_instantiations):
             return
         entry = k.bpreshuffle_co
         symbol = entry["symbol"]
-        if entry["pipeline"] in ("mxfp8_nn", "mxfp8_tt", "mxfp8_tn"):
-            direction = entry["pipeline"][-2:].upper()
         grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
         # Some COs bake shape-dependent strides into the device code. Enforce
         # their manifest contract here, including for direct exact-kid callers.
@@ -3477,7 +3474,7 @@ struct {alias} : {entry["traits"]} {{}};
         host_header=host_header,
         name=k.name,
         workspace_extra=workspace_extra,
-        arguments=_bpreshuffle_arguments(direction),
+        arguments=_bpreshuffle_arguments(mxfp8_direction(k.bpreshuffle_co) or "NT"),
         body=body,
     )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), source)

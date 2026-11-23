@@ -14,10 +14,10 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
-    MXFP8_DIRECTION_PATTERN,
     a8w8_mxscale_bpreshuffle_supports_shape,
     bpreshuffle_workspace_bytes,
     get_registry,
+    mxfp8_direction,
 )
 
 from ...jit.core import compile_ops
@@ -439,8 +439,7 @@ def _select_mxfp8_direction_kid(
     want_group_m = 16 if M >= 16384 else 0
     best = None
     for kid, instance in get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num).items():
-        match = MXFP8_DIRECTION_PATTERN.search(instance.name)
-        if match is None or match[1].upper() != direction:
+        if mxfp8_direction(instance.bpreshuffle_co) != direction:
             continue
         if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
             continue
