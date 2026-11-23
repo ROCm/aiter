@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Kid table of the gfx950 bf16 grouped GEMMs (gen_co/co_kernels_gfx950_a16w16_grouped.json).
 
-Read by gen_co/build_co_a16w16_grouped.py (offline .co images), gen_instances.py (the host kid
+Read by gen_co/build_co.py --family a16w16_grouped (offline .co images), gen_instances.py (the host kid
 table header) and aiter/ops/opus/gemm_op_a16w16_grouped.py (tile choice). The grouped kids are
 launched by their own entries (opus_gemm_grouped.cu), outside KERNEL_REGISTRY.
 """

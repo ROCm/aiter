@@ -2,7 +2,7 @@
   "_comment": [
     "gfx950 bf16 grouped GEMMs (the DeepGEMM interfaces) on the 4-wave pipeline,",
     "include/gfx950/opus_gemm_pipeline_a16w16_grouped_gfx950.cuh. READ BY opus_gemm_grouped_common.py.",
-    "Built offline: gen_co/build_co_a16w16_grouped.py --llvm-bin <AGPR-pinning LLVM>/bin.",
+    "Built offline: gen_co/build_co.py --arch gfx950 --family a16w16_grouped (AGPR-pinning LLVM).",
     "",
     "Per-entry fields:",
     "  kid   local kid of the grouped entries (opus_gemm_grouped.cu): m_grouped 0-9, k_grouped 10-19.",

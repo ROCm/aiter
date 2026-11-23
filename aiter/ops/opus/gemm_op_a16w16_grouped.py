@@ -80,7 +80,7 @@ def _kid_for(n: int) -> int:
     if kid is None:
         raise RuntimeError(
             f"no M-grouped a16w16 kid with B_N {b_n}: build its images with "
-            "csrc/opus_gemm/gen_co/build_co_a16w16_grouped.py"
+            "csrc/opus_gemm/gen_co/build_co.py --arch gfx950 --family a16w16_grouped"
         )
     return kid
 
@@ -197,7 +197,7 @@ def _k_kid_for(m: int, n: int) -> int:
     if kid is None:
         raise RuntimeError(
             f"no K-grouped a16w16 kid with tile {tile[0]}x{tile[1]}: build its images with "
-            "csrc/opus_gemm/gen_co/build_co_a16w16_grouped.py"
+            "csrc/opus_gemm/gen_co/build_co.py --arch gfx950 --family a16w16_grouped"
         )
     return kid
 
