@@ -585,7 +585,7 @@ def _a16w16_direction(XQ: torch.Tensor, WQ: torch.Tensor) -> str | None:
 
 def _a16w16_4wave_split(instance, M: int, N: int, K: int, cu_num: int) -> int:
     """Split of an a16w16_4wave_ws launch: the largest S in {8, 4, 2} with
-    tiles * S <= 2 * CUs, K / S >= 768 and an fp32 workspace
+    tiles * S <= CUs, K / S >= 1024 and an fp32 workspace
     [S][padded_M][padded_N] under 4 GiB; else 1."""
     m_tiles, n_tiles = -(-M // instance.B_M), -(-N // instance.B_N)
     padded = m_tiles * instance.B_M * n_tiles * instance.B_N
@@ -593,8 +593,8 @@ def _a16w16_4wave_split(instance, M: int, N: int, K: int, cu_num: int) -> int:
         (
             s
             for s in (8, 4, 2)
-            if m_tiles * n_tiles * s <= 2 * cu_num
-            and K // s >= 768
+            if m_tiles * n_tiles * s <= cu_num
+            and K // s >= 1024
             and s * padded * 4 <= (1 << 32) - 1
         ),
         1,
@@ -631,15 +631,15 @@ def _select_a16w16_4wave_kid(
     has_bias: bool = False,
 ) -> int | None:
     """Pick a gfx950 4-wave kid for the shape (fit to a sweep of every kid and
-    split on MI355X).
+    split in all four layouts on MI355X).
 
-    One tile per block, no wider than the smallest of 64 / 128 / 256 covering
-    M (B_M) and N (B_N): the largest tile whose tile count reaches 0.65 of the
-    CUs, else the tile with the most tiles. With K >= 2048 and fewer 128x128
-    tiles than CUs, the split-K kid with the least padding, then the most CUs
-    filled at its split (see :func:`_a16w16_4wave_split`), when that split is
-    above 1. A bias takes the split-K kid of the picked tile. Ties go to less
-    padding, the squarer tile, then the long side on the smaller of M / N.
+    Each tile, no wider than the smallest of 64 / 128 / 256 covering M (B_M)
+    and N (B_N), runs at the split of :func:`_a16w16_4wave_split`, or unsplit
+    when some tile alone already has 1.25x as many tiles as CUs. Of the tiles
+    whose blocks (tiles * split) reach 0.55 of the CUs the largest wins, else
+    the one with the most blocks; ties go to less padding, the squarer tile,
+    then the long side on the smaller of M / N. A split above 1 runs the
+    a16w16_4wave_ws kid of that tile, as does a bias.
     """
     kids = {
         kid: instance
@@ -647,56 +647,55 @@ def _select_a16w16_4wave_kid(
         if a16w16_4wave_kid_runs(instance, M, N, K, 0, direction)
     }
 
-    def shape(kid):
-        b_m, b_n = kids[kid].B_M, kids[kid].B_N
-        m_tiles, n_tiles = -(-M // b_m), -(-N // b_n)
-        tie = (abs(b_m - b_n), b_m - b_n if M >= N else b_n - b_m, kid)
-        # (tile area, tile count, padded output elements, tie-break)
-        return b_m * b_n, m_tiles * n_tiles, m_tiles * b_m * n_tiles * b_n, tie
-
     def cover(x):
         return next((t for t in (64, 128) if x <= t), 256)
 
-    direct = {
-        kid: shape(kid)
-        for kid, instance in kids.items()
-        if instance.kernel_tag != _A16W16_4WAVE_WS_TAG
-        and instance.B_M <= cover(M)
-        and instance.B_N <= cover(N)
-    }
-    split_kids = [
-        kid
+    def tile(instance):
+        return instance.B_M, instance.B_N
+
+    split_kid = {
+        tile(instance): kid
         for kid, instance in kids.items()
         if instance.kernel_tag == _A16W16_4WAVE_WS_TAG
-    ]
-    if not direct:
+    }
+    candidates = []
+    for kid, instance in kids.items():
+        b_m, b_n = tile(instance)
+        if (
+            instance.kernel_tag == _A16W16_4WAVE_WS_TAG
+            or b_m > cover(M)
+            or b_n > cover(N)
+        ):
+            continue
+        m_tiles, n_tiles = -(-M // b_m), -(-N // b_n)
+        ws = kids.get(split_kid.get((b_m, b_n)))
+        split = _a16w16_4wave_split(ws, M, N, K, cu_num) if ws is not None else 1
+        tie = (abs(b_m - b_n), b_m - b_n if M >= N else b_n - b_m, kid)
+        # [kid, tile area, tiles, padded output elements, tie-break, split]
+        candidates.append(
+            [
+                kid,
+                b_m * b_n,
+                m_tiles * n_tiles,
+                m_tiles * b_m * n_tiles * b_n,
+                tie,
+                split,
+            ]
+        )
+    if not candidates:
         return None
-    busy = [kid for kid, (_, tiles, _, _) in direct.items() if tiles >= 0.65 * cu_num]
+    if any(c[2] >= 1.25 * cu_num for c in candidates):
+        for c in candidates:
+            c[5] = 1
+    busy = [c for c in candidates if c[2] * c[5] >= 0.55 * cu_num]
     if busy:
-        kid = min(busy, key=lambda k: (-direct[k][0], direct[k][2], direct[k][3]))
+        best = min(busy, key=lambda c: (-c[1], c[3], c[4]))
     else:
-        kid = min(direct, key=lambda k: (-direct[k][1], direct[k][2], direct[k][3]))
-
-    if K >= 2048 and -(-M // 128) * -(-N // 128) < cu_num:
-        best = None
-        for candidate in split_kids:
-            area, tiles, padded, tie = shape(candidate)
-            split = _a16w16_4wave_split(kids[candidate], M, N, K, cu_num)
-            rank = (padded, -min(tiles * split, cu_num), area, tie)
-            if best is None or rank < best[0]:
-                best = (rank, candidate, split)
-        if best is not None and best[2] > 1:
-            return best[1]
-    if not has_bias:
-        return kid
-    return next(
-        (
-            k
-            for k in split_kids
-            if (kids[k].B_M, kids[k].B_N) == (kids[kid].B_M, kids[kid].B_N)
-        ),
-        None,
-    )
+        best = min(candidates, key=lambda c: (-c[2] * c[5], c[3], c[4]))
+    kid, split = best[0], best[5]
+    if split > 1 or has_bias:
+        return split_kid.get(tile(kids[kid]))
+    return kid
 
 
 def gemm_a16w16_layout_opus(
