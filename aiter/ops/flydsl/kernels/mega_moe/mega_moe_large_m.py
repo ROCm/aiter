@@ -32,8 +32,8 @@ from ..buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
-    build_p2p_table,
     _zeroed_sym,
+    build_p2p_table,
     group_major_capacity,
 )
 from ..kernels_common import ceildiv

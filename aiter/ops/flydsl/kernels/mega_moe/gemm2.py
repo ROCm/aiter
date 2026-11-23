@@ -15,6 +15,7 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
+from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,
@@ -26,7 +27,6 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
-from ..kernels_common import ceildiv
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
 from .gemm_util import wait_lds_barrier
 
