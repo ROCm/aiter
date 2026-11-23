@@ -1025,9 +1025,11 @@ def launch_gemm_a8w8(
             N_MMA = len(_MMA_ORDER)
             _HALF = N_MMA // 2
             _NLD = wmma_m_rep * DS_A + wmma_n_rep * DS_B + sa_loads + sb_loads
-            # Per-stage LDS read bases are formed a whole tile ahead: VALU
-            # address math right before the boundary reads would make them
-            # wait for every WMMA still in flight.
+            # When `early`, the per-stage LDS read bases are formed a whole
+            # tile ahead: VALU address math right before the boundary reads
+            # would make them wait for every WMMA still in flight. Otherwise
+            # (a_preshuffle, a_scale_preshuffled, or warp_tile_n % 32 != 0)
+            # _stage_bases forms them inline.
             early = (
                 not a_preshuffle and not a_scale_preshuffled and warp_tile_n % 32 == 0
             )
@@ -1195,8 +1197,10 @@ def launch_gemm_a8w8(
             _put(_load_frags(buf0, 0))
             # Tile kt refills its stage with tile kt + num_buffers; the last
             # num_buffers tiles have nothing left to load. Tail tile j's fence
-            # waits for max(num_buffers - 2 - j, 0) outstanding TDM tiles: j = 0
-            # waits like the steady loop, later ones for fewer.
+            # waits for num_buffers - 2 - j outstanding TDM tiles: j = 0 waits
+            # like the steady loop, later ones for fewer. The last tail tile
+            # (j = num_buffers - 1, last=True) has no fence, so the max(..., 0)
+            # below only keeps its unused count non-negative.
             n_steady = K_TILES - num_buffers
             for kt in range(n_steady):
                 tile(kt, num_buffers - 2, True, False)

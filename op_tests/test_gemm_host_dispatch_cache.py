@@ -13,8 +13,10 @@
   `torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle` and `_eager_body` are
   still there for callers that use them.
 * the mxfp8_32 kernelName suffix ``_pl`` (batched and 2-D) is the only switch
-  of the software-pipelined K loop, and the kernel rejects it, or any value
-  other than 0 / 1, where that loop does not apply.
+  of the software-pipelined K loop: a name without it, including every such
+  row of the shipped tuned tables, runs the single-fence loop, and the kernel
+  rejects ``_pl``, or any value other than 0 / 1, where that loop does not
+  apply.
 
 The first two, the ``_pl`` checks and the routing contract run on CPU; the
 numerical checks run on any GPU whose arch has the kernel and skip elsewhere.
@@ -129,6 +131,62 @@ def test_mx32_pl_suffix_round_trip():
     name128 = f"{dense.WMMA_NAME_PREFIX}_{suffix}"
     assert dense.parse_wmma_kernel_name(name128 + "_pl") is None
     assert dense.parse_wmma_kernel_name(name128)["pipelined"] == 0
+
+
+def test_mx32_name_without_pl_runs_single_fence_loop():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as dense
+
+    def resolved(name, m):
+        return dict(dense._resolved_wmma_config(name, m, True, True))["pipelined"]
+
+    # tile_k >= 256, split_k 1, no cluster: the pipelined loop would apply,
+    # but only ``_pl`` takes it, also after cluster_m is fitted to M.
+    prefix = dense.MX32_WMMA_NAME_PREFIX
+    for suffix, m in (
+        ("t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1", 64),
+        ("t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1", 192),
+        ("t64x128x256_mw2_nw2_nb3_sk1_cm2_cn1", 64),
+    ):
+        assert resolved(f"{prefix}_{suffix}", m) == 0, suffix
+        assert resolved(f"{prefix}_{suffix}_pl", m) == 1, suffix
+    # No suffix other than ``_pl`` names a K loop.
+    bname = bmm.bmm_mx32_kernel_name(192, 128, 256, 2, 2, 3)
+    for tail in ("_nopl", "_pl0", "_PL"):
+        assert bmm.parse_bmm_mx32_kernel_name(bname + tail) is None
+        assert (
+            dense.parse_mxfp8_32_wmma_kernel_name(
+                f"{prefix}_t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1{tail}"
+            )
+            is None
+        )
+
+
+def test_mx32_shipped_rows_take_the_k_loop_their_name_asks():
+    """Every mxfp8_32 kernelName in the shipped tuned tables runs the
+    pipelined K loop exactly when it ends in ``_pl``."""
+    import csv
+    import pathlib
+
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as dense
+
+    root = pathlib.Path(dense.__file__).resolve().parents[2] / "configs"
+    names = set()
+    for path in root.rglob("*.csv"):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("kernelName"):
+                    names.add(row["kernelName"])
+    parsed = {}
+    for name in names:
+        cfg = bmm.parse_bmm_mx32_kernel_name(name)
+        if cfg is None:
+            cfg = dense.parse_mxfp8_32_wmma_kernel_name(name)
+        if cfg is not None:
+            parsed[name] = cfg["pipelined"]
+    assert any(not n.endswith("_pl") for n in parsed)
+    assert any(n.endswith("_pl") for n in parsed)
+    wrong = sorted(n for n, p in parsed.items() if p != int(n.endswith("_pl")))
+    assert not wrong, wrong[:5]
 
 
 _PIPE_OK = {
