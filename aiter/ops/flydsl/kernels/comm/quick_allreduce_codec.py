@@ -106,6 +106,9 @@ _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 _FP16_MAX = 65504.0
 # Exponent bias of the E5M2 group scale.
 _SCALE_BIAS = 12
+# Largest scale exponent field written. 31 with a sign bit and mantissa 3 is
+# 0xFF, and four such bytes are the Lamport sentinel; finite fp16 stops at 28.
+_SCALE_MAX_E5 = 30
 # Names the group-scale codec in every mesh and ring launch name. FlyDSL 0.5.0
 # keys its cache on the traced IR, so a codec change rebuilds the kernels
 # without a new tag; the tag only labels the binaries.
@@ -441,15 +444,17 @@ def _f32_to_e4m3(x, min_e5=0, round_up=False):
     unchanged; the function names keep "e4m3" for a small diff.
 
     Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
-    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+    (no denorms). ``0x7B`` / ``0xFB`` are the largest bytes
+    written (``±Inf`` and NaN land there too), so no scale byte is ``0xFF``
+    and four of them never form ``LAMPORT_SENTINEL``.
 
     *min_e5* floors the exponent field (see :attr:`Codec.scale_min_e5`), and
     *round_up* rounds the mantissa up instead of to nearest (see
     :attr:`Codec.scale_rounds_up`).
     ``0x00`` is +0 only. Any other value that would land there (positive
     underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
-    and mantissa.
+    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps the exponent
+    to ``_SCALE_MAX_E5`` and sets the mantissa to 3.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
@@ -461,10 +466,10 @@ def _f32_to_e4m3(x, min_e5=0, round_up=False):
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m2 = carry.select(fx.Int32(0), m2)
     e5 = e + fx.Int32(_SCALE_BIAS)
-    overflow = e5 > fx.Int32(31)
+    overflow = e5 > fx.Int32(_SCALE_MAX_E5)
     m2 = overflow.select(fx.Int32(3), m2)
     e5 = (e5 < fx.Int32(min_e5)).select(
-        fx.Int32(min_e5), overflow.select(fx.Int32(31), e5)
+        fx.Int32(min_e5), overflow.select(fx.Int32(_SCALE_MAX_E5), e5)
     )
     byte = sign | (e5 << fx.Int32(2)) | (m2 & fx.Int32(3))
     return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
@@ -656,8 +661,9 @@ def lamport_fix(codec, words, tid):
     is not ``0xFFFFFFFF``, so the producer must never write that value. Per
     plane:
 
-    * Scale: four signed E5M2 bytes of fp16 extrema, exponent field at most
-      28, so no byte is ``0xFF``. Never the sentinel.
+    * Scale: four signed E5M2 bytes of fp16 extrema. A finite extremum gives
+      an exponent field of at most 28, and :func:`_f32_to_e4m3` clamps ``±Inf``
+      to ``_SCALE_MAX_E5`` (30), so no byte is ``0xFF``. Never the sentinel.
     * INT6 extra plane: the dword is one scale group (a lane pair). The group's
       extremum maps to ``q <= 0``, code ``<= 32``, extra field ``<= 2``; all
       sixteen fields 3 cannot happen.

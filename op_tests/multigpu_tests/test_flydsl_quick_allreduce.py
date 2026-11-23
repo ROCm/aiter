@@ -28,7 +28,8 @@ sweep ends in a markdown table:
   minutes; raise ``FLYDSL_QR_TIMEOUT`` if a spawn times out compiling.
 * ``test_quick_allreduce_edge_inputs`` -- payloads that land on the group
   scale's edge cases, sums above E4M3's old ceiling of 480 on every rank, and
-  degenerate groups that must stay finite.
+  degenerate groups that must stay finite, and ``-Inf``/``+Inf``/NaN inputs,
+  which a Lamport build must return from rather than spin on (completion only).
 * ``test_quick_allreduce_divisor`` -- the mesh's shared divisor at TP8: an
   outlier fill must reach the SQNR floor at divisor 1 (the E5M2 scale does not
   clip it) and lose at most ``DIVISOR_MAX_LOSS_DB`` at divisor 8, and a
@@ -322,6 +323,12 @@ EDGE_CASES = (
     (8, "ring", 512, 5120, "degenerate"),
     (8, "hier", 512, 5120, "large_every_rank"),
     (8, "hier", 512, 5120, "degenerate"),
+    (2, "mesh", 16, 1024, "neg_inf"),
+    (2, "mesh", 16, 1024, "inf_mix"),
+    (8, "mesh", 512, 5120, "neg_inf"),
+    (8, "ring", 512, 5120, "neg_inf"),
+    (8, "ring", 512, 5120, "inf_mix"),
+    (8, "hier", 512, 5120, "neg_inf"),
 )
 
 # (tp, algorithm, tokens, hidden, rs_codec, ag_codec). ``--extended`` only:
@@ -526,7 +533,13 @@ _FILLS = (
     "overflow_512",
     "large_every_rank",
     "zeros",
+    "neg_inf",
+    "inf_mix",
 )
+
+# Fills with Inf or NaN. Only completion is asserted: a Lamport build must not
+# spin on a scale dword that four -Inf pairs make equal to the sentinel.
+NON_FINITE_FILLS = ("neg_inf", "inf_mix")
 
 
 def _make_inp(
@@ -573,6 +586,18 @@ def _make_inp(
             "zeros": 0.0,
         }[fill]
         return torch.full(shape, val, device=device, dtype=torch.bfloat16)
+    elif fill == "neg_inf":
+        # Every pair extremum is -Inf, so every scale byte is the overflow byte
+        # and every scale dword four of them.
+        return torch.full(shape, float("-inf"), device=device, dtype=torch.bfloat16)
+    elif fill == "inf_mix":
+        # -Inf, +Inf, NaN and a finite value in turn: every 16-value pair holds
+        # a -Inf, and the +Inf and NaN take the other overflow paths.
+        src = torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1
+        flat = src.view(-1)
+        flat[0::4] = float("-inf")
+        flat[1::4] = float("inf")
+        flat[2::4] = float("nan")
     else:
         raise ValueError(f"unknown fill {fill!r}; expected one of {_FILLS}")
     return src.to(device=device, dtype=torch.bfloat16)
@@ -1979,6 +2004,11 @@ def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
+    if fill in NON_FINITE_FILLS:
+        # Getting here is the check: the call returned on every rank. The
+        # output is garbage by design, so no accuracy metric means anything.
+        _check(label, [])
+        return {"gfx": ARCH, "completed": len(rows)}
     if fill == "degenerate":
         # A group whose extremum is zero decodes to a zero scale, so the encode
         # reciprocal saturates; before it was clamped, that reached the codec
