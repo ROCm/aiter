@@ -269,9 +269,9 @@ class FusedStage1Knobs:
     # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
     # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
     no_chunk_release: bool = False
-    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
-    # the next step's A copy (False: the compiler makes it wait).
-    a_asm_reads: bool = False
+    # Large-input GEMM1 copies A to LDS with async LDS DMA, so a K-step's first A read does not wait for the next
+    # step's A copy (False: the compiler makes it wait, as it cannot tell the two LDS buffers apart).
+    a_async_lds: bool = False
     # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
     # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
     batch_rows: bool = False
@@ -1593,7 +1593,7 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     # chunk's chunk_done RMW reuses its tile-ready release (-1.8%), and an expert's last chunk skips the
     # unread payload_ready release and RMW (-1.9%). One wave, not every wave, invalidates the caches once a
     # GEMM1 tile's rows landed (-1.1%). A chunk's drained peer stores (uncached heap) need no release before its
-    # tile-ready RMW (-1.7%). GEMM1 reads its A operands in inline asm, so a K-step's first read does not wait for
+    # tile-ready RMW (-1.7%). GEMM1 copies A to LDS asynchronously, so a K-step's first read does not wait for
     # the next step's A copy, which the compiler cannot tell from this step's buffer (-1.5%). GEMM2 drops an
     # all-padding m-block at its claim instead of after its GEMM1 tile, and issues its A copy on every K-step so
     # the MFMAs do not wait for the copy two steps ahead (-1.4% together). A payload chunk resolves its routes one
@@ -1654,7 +1654,7 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
             skip_payload_ready=True,
             one_row_acquire=True,
             no_chunk_release=True,
-            a_asm_reads=True,
+            a_async_lds=True,
             payload_small_blocks=12,
             payload_small_tokens=640,
             lean_plan=True,
@@ -1779,7 +1779,7 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     per-token combine wait: 1.5-1.8x at 513-2048 tokens a rank and 1.15-1.3x at 4096-16384 on uniform routes,
     1.15-1.6x up to 2048 on zipf routes (0.96-0.97x at 8192-16384, where the GEMM2 m-blocks of the hot experts
     dominate), 1.1-1.3x on routes skewed to one rank. Each of its parts pays at EP8 too: without the dedup rows
-    -2..-8% (-20% at 513 zipf tokens), the tail tiles -2..-7%, the lean epilogues -5..-7%, the asm A reads -3..-5%.
+    -2..-8% (-20% at 513 zipf tokens), the tail tiles -2..-7%, the lean epilogues -5..-7%, the async A copies -3..-5%.
     """
     config = _tune_v41_flash_ep4_large(config)
     # Twice the rows an expert of EP4 make the hot experts of a skewed launch many GEMM2 m-blocks: claimed XCD-affine

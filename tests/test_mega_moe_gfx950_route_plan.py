@@ -437,7 +437,7 @@ def _knob_table(config):
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
 # small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
 # table.
-_EP4_FUSED_DIGEST = "a254254df36be0ddd5969ca3085404cab4624ea7ca7590a1912257436e71808b"
+_EP4_FUSED_DIGEST = "bc90461aa6bf712787a59363f7f54b6d9cc79b9b20027ffad260c2d8ea4ec7f7"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -495,7 +495,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table.
 _V41EP8_FUSED_DIGEST = (
-    "b8baf6dd7e37c64092de0b0303c8fc49cbfa3aa977f81ce115e090d5c05f4121"
+    "947797b9716d90a9387f6489c9558eaa24d002f63f104c4be9354cda0bc8d5f3"
 )
 
 
@@ -744,7 +744,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "5c841f7a20b8a13a3b717d64cbf858ec686049299df575cd4c21ea2c0cf485a3"
+_EP2_FUSED_DIGEST = "654385c77002fe9ae5fbbab22e2d4a9e4638fcf4cb534af0120810a447de51b7"
 
 
 def test_ep2_fused_configs_unchanged():
