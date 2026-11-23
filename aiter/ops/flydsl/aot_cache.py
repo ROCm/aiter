@@ -171,12 +171,19 @@ def _target_arch() -> str:
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return props.gcnArchName.split(":")[0]
-    # No device: an AOT build sets FLYDSL_GPU_ARCH (aiter/aot/flydsl/dry_run.py).
-    # Without it there is no target to key the cache on; guessing one (FlyDSL
-    # < 0.5.1 fell back to gfx942) would file entries under the wrong arch.
+    # No device visible to torch: resolve the target as FlyDSL's compiler does
+    # (HSA_OVERRIDE_GFX_VERSION, then rocm_agent_enumerator / rocminfo). FlyDSL
+    # >= 0.5.1 raises when none of them names a target; 0.5.0 guessed gfx942
+    # instead, which would file entries under the wrong arch, so refuse that.
+    from flydsl.runtime.device import get_rocm_arch
+    from packaging.version import Version
+
+    fly_version = Version(Version(flydsl.__version__).base_version)
+    if os.environ.get("HSA_OVERRIDE_GFX_VERSION") or fly_version >= Version("0.5.1"):
+        return get_rocm_arch()
     raise RuntimeError(
-        "FlyDSL AOT cache: no GPU is visible and FLYDSL_GPU_ARCH is unset; "
-        "set FLYDSL_GPU_ARCH to the target gfx arch"
+        "FlyDSL AOT cache: no GPU is visible and neither FLYDSL_GPU_ARCH nor "
+        "HSA_OVERRIDE_GFX_VERSION is set; set FLYDSL_GPU_ARCH to the target gfx arch"
     )
 
 
