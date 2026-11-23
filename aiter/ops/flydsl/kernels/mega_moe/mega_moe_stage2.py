@@ -252,22 +252,15 @@ class Stage2Meta:
         return fx.Int32(v[0]), fx.Int32(v[1])
 
 
-def _absolute_lds_meta(lds_packed_off, lds_weight_off, lds_peer_off):
-    """Stage2Meta over a pool at LDS address 0, for callers that still pass absolute offsets."""
-    return Stage2Meta(0, lds_packed_off, lds_weight_off, lds_peer_off)
-
-
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
-    log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, meta=None, lds_packed_off=None,
-    lds_weight_off=None, lds_peer_off=None, g2_bf16_lds=False, p2p_quant_type="none", scatter_vec=8, NW=4, store_cm=2,
-    fp8_store_cm=None, fp8_rows=None, elem_view_stores=False, lean=0, tok_off=None, bf16_head_tokens=0,
+    log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, meta, g2_bf16_lds=False, p2p_quant_type="none",
+    scatter_vec=8, NW=4, store_cm=2, fp8_store_cm=None, fp8_rows=None, elem_view_stores=False, lean=0, tok_off=None, bf16_head_tokens=0,
     row_nbytes=None, scale_stage=None, epi_lean=False, route_i8=False):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
-    ``meta`` (Stage2Meta) holds the tile's route rows and peer bases; the ``lds_*_off`` absolute LDS offsets
-    are the legacy spelling of the same tables.
+    ``meta`` (Stage2Meta) holds the tile's route rows and peer bases.
     ``NW`` is the wave count: each wave owns ``BN // NW`` accumulator columns and
     scatters rows ``wave + row_iter * NW``.  ``store_cm`` is the cache policy of the
     BF16 row stores (2 = NT) and ``fp8_store_cm`` (default ``store_cm``) that of the
@@ -298,8 +291,6 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     wave_n = BN // NW
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
-    if const_expr(meta is None):
-        meta = _absolute_lds_meta(lds_packed_off, lds_weight_off, lds_peer_off)
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
     lds_base_bf16 = (
         lds_typed_ptr(lds_acc_base, T.bf16, align=2)
