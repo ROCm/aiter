@@ -116,9 +116,21 @@ class DispatchSlot(IntEnum):
     # Byte offset (the same on every rank) from FC_INP to the per-token GEMM2 completion counters: two
     # parity halves of mtpr i32 (tok_done).
     TOK_DONE_OFF = 38
+    # shared_in: the shared expert's MXFP8 weights and 32x32 scales (gate_up, down), the rank-local
+    # activation buffers between its two GEMMs and its counters (compile_mega_moe_stage1). 0 in every other table.
+    SH_GU_W = 39
+    SH_GU_S = 40
+    SH_DN_W = 41
+    SH_DN_S = 42
+    SH_ACT = 43
+    SH_ACT_SCALE = 44
+    SH_SYNC = 45
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
+# shared_in: byte offsets in the SH_SYNC words (int32) -- an m-tile's GEMM1 unit count at 4 m, its ready epoch at
+# _SH_READY + 4 m; the launch's GEMM2 unit count and the done epoch.
+_SH_READY, _SH_G2_COUNT, _SH_DONE, _SH_SYNC_WORDS = 64, 128, 132, 64
 
 
 def _quantize_row_mxfp8(row_rsrc, lane, fz_n_i32, fz_scale_n_i32):
@@ -978,7 +990,25 @@ def compile_mega_moe_stage1(
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, g2_b2stage: bool = False, probe: str = "",
     expert_cached_w: int = 0, m2: str = "", shared_add: bool = False, disp_order: int = 0, sync_lean: int = 0,
+    shared_in: int = 0,
 ):
+    # ``shared_in`` (default 0 = unchanged kernel; 1 / 2 = the K split of its GEMM1, see
+    # shared_expert.dense_gate_up_ksplit): the kernel also computes the model's shared expert for this rank's rows
+    # and its combine adds the routed sum to it (``shared_add``'s combine; ``addr_in_sc`` is the BF16 output, which
+    # the kernel now writes itself). The work needs nothing from the launch protocol, so it runs as a pre-phase: the
+    # first consumer workgroups (by entry ticket) each take one GEMM1 unit (32 rows x 128 activation columns) and
+    # then one GEMM2 unit (32 rows x 256 output columns) before they join the routed work pool, while the grid
+    # waits for the sources and the plan anyway. Inputs: the MXFP8 pair of this call's rows through the kernel's
+    # ``sorted_token_ids`` (E4M3 rows) and ``expert_ids`` (their row-major 1x32 E8M0 scales) arguments, which a
+    # plan_local kernel does not read; the shared weights, the rank-local activation buffers and the counters
+    # through the dispatch table (DispatchSlot.SH_*). Numerics: ops/mega_moe/shared_expert.py, the dense launches'.
+    # Rank-local: no protocol word changes, ranks need not agree. Synchronization (SH_SYNC, int32): [m] counts an
+    # m-tile's finished GEMM1 units and [16 + m] takes the launch epoch once all are in (each count rewinds itself);
+    # [32] counts finished GEMM2 units and [33] takes the epoch once all are in. Every workgroup reads [33] before
+    # its exit ticket, so the reducers add to finished rows. All of it is local to the rank and never waits on a
+    # peer; a rank without rows has no units and skips the wait.
+    assert shared_in in (0, 1, 2), shared_in
+    assert not shared_in or (shared_add and plan_local and not tok_done), "shared_in needs shared_add and plan_local"
     # ``shared_add`` (default False = unchanged kernel): the launch's ``addr_in_sc`` argument (otherwise
     # unused) is the address of the caller's BF16 shared-expert output; the combine adds each token's row to it in
     # place (make_fused_combine_tail), so the caller's separate BF16 add launch goes away. Local to the rank: no
@@ -1146,6 +1176,22 @@ def compile_mega_moe_stage1(
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
     # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
     assert grid_mult <= 2 and 2 * lds_pool_bytes <= 160 * 1024, (grid_mult, lds_pool_bytes)
+    if shared_in:
+        # Imported here only: no kernel without shared_in needs the module (or the AITER helpers it imports).
+        from ..tensor_shim import buf_base_i64 as _base_i64
+
+        from . import shared_expert as _se
+
+        # One consumer workgroup per shared GEMM1 / GEMM2 unit of the largest call (shared_in_fits).
+        sh_n1, sh_n2 = (2 * inter_dim) // 256, model_dim // 256
+        sh_tiles_max = ceildiv(fz_mtpr, sort_block_m)
+        assert sort_block_m == 32 and tile_n == 256 and tile_k == 256 and swiglu_limit > 0
+        assert sh_tiles_max <= 16 and sh_tiles_max * max(sh_n1, sh_n2) <= launch_grid_x - 1 - dispatch_blocks, (
+            "shared_in: too few consumer workgroups", fz_mtpr, launch_grid_x, dispatch_blocks)
+        # Pool: the shared GEMM2 epilogue's 32 x 256 fp32 tile (the pre-phase ends before the kernel keeps any
+        # state in the pool); A scales: the tile-layout staging (3 rounds).
+        lds_pool_bytes = max(lds_pool_bytes, sort_block_m * 256 * 4)
+        assert 2 * lds_pool_bytes <= 160 * 1024 and n_scale_bytes >= 3 * 4 * NUM_WAVES * 64
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1181,6 +1227,9 @@ def compile_mega_moe_stage1(
         if plan_local:
             # Per expert slot (64-expert chunks): its inclusive tile count, then its row count.
             plan_tab: fx.Array[fx.Int8, plan_chunks * 64 * 8, 16]
+        if shared_in == 2:
+            # shared_in: the first K half's partials of a split GEMM1 tile (16 bytes per accumulator and thread).
+            sh_partial: fx.Array[fx.Int8, NUM_WAVES * 64 * M_REPEAT * NUM_ACC_N * 16, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -1206,6 +1255,7 @@ def compile_mega_moe_stage1(
         f"{'_m2' + ''.join(sorted(m2f)) if m2f else ''}"
         f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
         f"{'_sha' if shared_add else ''}"
+        f"{f'_shi{shared_in}' if shared_in else ''}"
         f"{f'_do{disp_order}' if disp_order else ''}"
         f"{f'_snc{sync_lean}' if sync_lean else ''}"
         f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
@@ -1359,6 +1409,67 @@ def compile_mega_moe_stage1(
                     _wait_gate()
             fx.barrier()
 
+        if const_expr(shared_in):
+            # The shared expert's pre-phase (see the comment at shared_in): consumer c runs GEMM1 unit c, then
+            # GEMM2 unit c, of this rank's ceil(rows / 32) m-tiles.
+            def _sh_ptr(slot):
+                return fx.Int64(comm_ops.wave_uniform_i64(_buffer_load(disp_rsrc, fx.Int32(int(slot)), fx.Int64)))
+
+            sh_c = fx.Int32(rocdl.readfirstlane(T.i32, (ticket - fx.Int32(dispatch_blocks + 1)).ir_value()))
+            sh_epoch = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(gate_epoch).ir_value()))
+            sh_sync = _sh_ptr(DispatchSlot.SH_SYNC)
+            sh_act, sh_act_scale = _sh_ptr(DispatchSlot.SH_ACT), _sh_ptr(DispatchSlot.SH_ACT_SCALE)
+            sh_tiles = (i32_cur_tok + fx.Int32(sort_block_m - 1)) // fx.Int32(sort_block_m)
+            sh_lds_out = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
+            sh_partial_lds = None
+            if const_expr(shared_in == 2):
+                sh_partial_lds = lds.sh_partial
+            # Stores past L2 (sc0 sc1): the unit that reads them may sit on another XCD. Every workgroup's stores
+            # fill whole cache lines of its own (activation rows by 128 columns, tile-layout scales, 256 BF16
+            # columns), and its counter is touched only after they drained.
+            sh_run_g1 = _se.build_shared_tile(
+                x_addr=_base_i64(fx.get_iter(sorted_token_ids)), scale_x_addr=_base_i64(fx.get_iter(expert_ids)),
+                w_addr=_sh_ptr(DispatchSlot.SH_GU_W), scale_w_addr=_sh_ptr(DispatchSlot.SH_GU_S), rows=i32_cur_tok,
+                k_dim=model_dim,
+                epilogue=_se.RefActQuantEpilogue(out_addr=sh_act, out_scale_addr=sh_act_scale, rows=i32_cur_tok,
+                    inter_dim=inter_dim, limit=swiglu_limit, lds_out=sh_lds_out, store_cm=_SC0_SC1_CACHE,
+                    scale_layout="tile"),
+                a_buf=lds.pool, a_scale_lds=lds.A_scale, gate_up_half=inter_dim, ksplit=shared_in,
+                partial_lds=sh_partial_lds)
+            sh_run_g2 = _se.build_shared_tile(
+                x_addr=sh_act, scale_x_addr=sh_act_scale, w_addr=_sh_ptr(DispatchSlot.SH_DN_W),
+                scale_w_addr=_sh_ptr(DispatchSlot.SH_DN_S), rows=i32_cur_tok, k_dim=inter_dim,
+                epilogue=_se.Bf16RowsEpilogue(out_addr=addr_in_sc, rows=i32_cur_tok, n_out=model_dim,
+                    lds_out=sh_lds_out, store_cm=_SC0_SC1_CACHE),
+                a_buf=lds.pool, a_scale_lds=lds.A_scale, a_scale_layout="tile", a_scale_lds_bytes=n_scale_bytes)
+            if (sh_c >= fx.Int32(0)) & (sh_c < sh_tiles * fx.Int32(sh_n1)):
+                sh_m1 = sh_c // fx.Int32(sh_n1)
+                sh_run_g1(sh_m1, sh_c - sh_m1 * fx.Int32(sh_n1))
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                fx.barrier()
+                if tid == fx.Int32(0):
+                    sh_cnt = sh_sync + fx.Int64(sh_m1) * fx.Int64(4)
+                    if fx.Int32(comm_ops.atomic_add_agent(sh_cnt, fx.Int32(1))) == fx.Int32(sh_n1 - 1):
+                        # The m-tile's last GEMM1 unit: its GEMM2 units may start; rewind for the next launch.
+                        comm_ops.store_i32_global_agent_release(sh_cnt + fx.Int64(_SH_READY), sh_epoch)
+                        comm_ops.atomic_add_agent(sh_cnt, fx.Int32(-sh_n1))
+            if (sh_c >= fx.Int32(0)) & (sh_c < sh_tiles * fx.Int32(sh_n2)):
+                sh_m2 = sh_c // fx.Int32(sh_n2)
+                if tid == fx.Int32(0):
+                    comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_READY) + fx.Int64(sh_m2) * fx.Int64(4), sh_epoch)
+                fx.barrier()
+                # The activation rows went through to memory before the epoch: only this CU's L1 can be stale.
+                comm_ops.invalidate_l1()
+                sh_run_g2(sh_m2, sh_c - sh_m2 * fx.Int32(sh_n2))
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                fx.barrier()
+                if tid == fx.Int32(0):
+                    sh_total = sh_tiles * fx.Int32(sh_n2)
+                    if fx.Int32(comm_ops.atomic_add_agent(sh_sync + fx.Int64(_SH_G2_COUNT), fx.Int32(1))) == sh_total - fx.Int32(1):
+                        # The launch's last shared unit: the output rows are complete.
+                        comm_ops.store_i32_global_agent_release(sh_sync + fx.Int64(_SH_DONE), sh_epoch)
+                        comm_ops.atomic_add_agent(sh_sync + fx.Int64(_SH_G2_COUNT), fx.Int32(0) - sh_total)
+
         if producer:
             prefetch_args = dict(  # noqa: C408
                 num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr,
@@ -1414,6 +1525,10 @@ def compile_mega_moe_stage1(
         sw_rsrc = ptr_buf_tensor(fx.get_iter(scale_w), fx.Int32)
         trb_rsrc = ptr_buf_tensor(fx.get_iter(sorted_token_ids), fx.Int32)
         expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
+        if const_expr(shared_in):
+            # These two arguments carry the shared expert's input pair: the routed tiles must not read them (a
+            # plan_local kernel takes its tile metadata from its own plan; any other use fails at trace time).
+            trb_rsrc = expert_rsrc = None
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
         os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
         if const_expr(use_tile_resource):
@@ -1793,6 +1908,12 @@ def compile_mega_moe_stage1(
         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
         # the combine op's own flag values in the shared xdb slots.
         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
+        if const_expr(shared_in):
+            # No workgroup takes its exit ticket before the shared expert's rows are complete, so the reducers
+            # (the last tickets) add to finished rows. One lane of wave 1 waits; the tail's first barrier joins it.
+            if tid == fx.Int32(64):
+                if i32_cur_tok > fx.Int32(0):
+                    comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_DONE), sh_epoch)
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
@@ -1911,6 +2032,25 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         ascale_packed=k1.ascale_packed, stream_w=k1.stream_w,
     )
     # fmt: on
+
+
+def shared_in_fits(config: MegaMoEConfig, mtpr: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+    """Whether the fused kernel of ``config`` can also run the shared expert (compile_mega_moe_stage1's shared_in):
+    its own plan in every CTA, the 32 x 256 x 256 tiles, and one consumer workgroup for every shared GEMM1 / GEMM2
+    unit of a ``mtpr``-row call."""
+    stage1, knobs = config.stage1, config.fused_stage1
+    tiles = ceildiv(mtpr, 32)
+    consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
+    return (
+        knobs.plan_local and not knobs.tok_done
+        and (stage1.sort_block_m, stage1.tile_n, stage1.tile_k, stage1.num_waves) == (32, 256, 256, 4)
+        and tiles <= 16 and tiles * max((2 * inter_dim) // 256, model_dim // 256) <= consumers
+    )
+
+
+def _arg_view(tensor):
+    """A fixed-shape byte view of a tensor's start, for a kernel tensor argument that only carries an address."""
+    return tensor.view(torch.uint8).reshape(-1)[:16]
 
 
 class SmallMRuntime:
@@ -2261,16 +2401,23 @@ class SmallMRuntime:
         return config
 
     def _launch(self, config: MegaMoEConfig, run_tokens, x_bf16, topk_ids, wts, stream, *, preload=False,
-                shared_add=None):
+                shared_add=None, shared_in=None):
+        """``shared_in = (ksplit, x_fp8 view, x_scale view, dispatch table)``: the shared_in kernel of this config;
+        the two views ride in the kernel's tile-metadata tensor arguments, which that kernel does not read."""
         stage1, stage2 = config.stage1, config.stage2
         assert config.p2p_quant == "none" and stage2.block_m == stage1.sort_block_m
         fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
         op = self._s1_op
+        tile_row_base, expert_ids, disp = op.tile_row_base, op.sorted_expert_ids, self._s1_disp
+        variant = {} if shared_add is None else {"shared_add": True}
+        if shared_in is not None:
+            assert shared_add is not None
+            variant["shared_in"], tile_row_base, expert_ids, disp = shared_in
         # fmt: off
         self._s1_mega(
             self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
-            op.tile_row_base, op.sorted_expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
-            fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
+            tile_row_base, expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
+            fx.Int64(disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()),
             fx.Int64((x_bf16 if shared_add is None else shared_add).data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
@@ -2285,8 +2432,73 @@ class SmallMRuntime:
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
-            preload=preload, **_kernel_knobs(config), **({} if shared_add is None else {"shared_add": True}))
+            preload=preload, **_kernel_knobs(config), **variant)
         # fmt: on
+
+    # ---- shared_in: the shared expert inside the kernel ----
+
+    def _bucket_of(self, tokens: int) -> int:
+        return fused_bucket_override(max(tokens, 1), self.mtpr) or nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)
+
+    def shared_in_supported(self, tokens: int) -> bool:
+        """Whether the kernel a ``tokens``-row call launches can also compute the shared expert."""
+        return tokens > 0 and self.swiglu_limit > 0 and shared_in_fits(
+            self._configs[self._bucket_of(tokens)], self.mtpr, self._s1_num_cu, self.model_dim, self.inter_dim)
+
+    def shared_in_ready(self, tokens: int, shared) -> bool:
+        """``shared_in_supported`` and ``shared`` (a weights.SharedExpertInput) is what the kernel reads; under a
+        graph capture also that this layer's table and the buffers were built by an eager call before."""
+        if not (self.shared_in_supported(tokens) and shared.fits(tokens, self.model_dim, self.inter_dim)):
+            return False
+        return not torch.cuda.is_current_stream_capturing() or (
+            getattr(self, "_sh_workspace", None) is not None and self._shared_key(shared) in self._sh_disp_by_key)
+
+    def _shared_key(self, shared):
+        return tuple(t.data_ptr() for t in (
+            self.w2, self.w2_scale, shared.gate_up, shared.gate_up_scale, shared.down, shared.down_scale))
+
+    def _shared_workspace(self):
+        """The activation rows between the shared expert's two GEMMs, their scales (tile layout) and the counters."""
+        workspace = getattr(self, "_sh_workspace", None)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the shared_in buffers were not built before graph capture")
+            tiles = ceildiv(self.mtpr, 32)
+            workspace = self._sh_workspace = {
+                "act": torch.zeros(tiles * 32 * self.inter_dim, dtype=torch.uint8, device=self.dev),
+                "act_scale": torch.zeros(tiles * self.inter_dim + 64, dtype=torch.uint8, device=self.dev),
+                "sync": torch.zeros(_SH_SYNC_WORDS, dtype=torch.int32, device=self.dev),
+            }
+            self._sh_disp_by_key = {}
+        return workspace
+
+    def shared_dispatch_table(self, shared):
+        """The dispatch table of the bound W2 with this shared expert's weights, built on first (eager) use."""
+        workspace = self._shared_workspace()
+        key = self._shared_key(shared)
+        disp = self._sh_disp_by_key.get(key)
+        if disp is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the shared_in dispatch table of these weights was not built before graph capture")
+            table = list(self._s1_disp_template)
+            table[DispatchSlot.G2_BQ], table[DispatchSlot.G2_BSCALE] = key[0], key[1]
+            table[DispatchSlot.SH_GU_W], table[DispatchSlot.SH_GU_S] = key[2], key[3]
+            table[DispatchSlot.SH_DN_W], table[DispatchSlot.SH_DN_S] = key[4], key[5]
+            table[DispatchSlot.SH_ACT] = workspace["act"].data_ptr()
+            table[DispatchSlot.SH_ACT_SCALE] = workspace["act_scale"].data_ptr()
+            table[DispatchSlot.SH_SYNC] = workspace["sync"].data_ptr()
+            # The table keeps the weights it points at alive (a captured graph replays these addresses).
+            disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
+            self._sh_disp_by_key[key] = disp
+            self._sh_keepalive = getattr(self, "_sh_keepalive", [])
+            self._sh_keepalive.append((shared.gate_up, shared.gate_up_scale, shared.down, shared.down_scale))
+        return disp
+
+    def _shared_in_ksplits(self, bucket: int):
+        """The GEMM1 K splits (shared_expert.dense_gate_up_ksplit) of the row counts that select ``bucket``."""
+        from .shared_expert import dense_gate_up_ksplit
+
+        return sorted({dense_gate_up_ksplit(t) for t in range(1, self.mtpr + 1) if self._bucket_of(t) == bucket})
 
     def preload_aot_bundle(self):
         """Load the kernel of every token bucket this runtime selects, without GPU dispatch."""
@@ -2303,14 +2515,42 @@ class SmallMRuntime:
             if os.environ.get("AITER_MEGA_SHARED_ADD", "0") == "1":
                 # The shared_add variant of the same bucket (the address is not dereferenced by a preload).
                 self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16)
+        if os.environ.get("AITER_MEGA_SHARED_IN", "0") == "1" and self.swiglu_limit > 0:
+            # The shared_in variants: per bucket whose kernel fits it, the K splits its row counts take. (Buckets
+            # that share a launch config share the kernel; the compile is cached.)
+            stand_in = torch.zeros(16, dtype=torch.uint8, device=self.dev)
+            for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= self.mtpr):
+                config = self._select_config(bucket)
+                if not shared_in_fits(config, self.mtpr, self._s1_num_cu, self.model_dim, self.inter_dim):
+                    continue
+                for ksplit in self._shared_in_ksplits(bucket):
+                    self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16,
+                        shared_in=(ksplit, stand_in, stand_in, self._s1_disp))
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, shared_add=None):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, shared_add=None, shared_in=None):
         """``shared_add``: a contiguous BF16 ``[rows, model_dim]`` tensor of this call's rows (the shared expert's
         output). The combine adds each row's routed sum to it in place and it is returned as the output: bit for
-        bit ``forward(...) + shared_add``, without the separate add launch."""
+        bit ``forward(...) + shared_add``, without the separate add launch.
+
+        ``shared_in`` (instead of ``shared_add``): a weights.SharedExpertInput for which ``shared_in_ready`` holds.
+        The kernel computes the shared expert's output itself and the returned tensor is ``routed + shared``, as
+        above, without the shared expert's three launches."""
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
         )
+        fused_shared = None
+        if shared_in is not None:
+            if shared_add is not None:
+                raise ValueError("shared_in computes the shared output: pass either shared_add or shared_in")
+            # The kernel writes the shared expert's rows here, then its combine adds the routed sum to them.
+            shared_add = torch.empty((run_tokens, self.model_dim), dtype=torch.bfloat16, device=x_bf16.device)
+            if run_tokens:
+                from .shared_expert import dense_gate_up_ksplit
+
+                if not self.shared_in_ready(run_tokens, shared_in):
+                    raise ValueError("shared_in: this call cannot fuse the shared expert (see shared_in_ready)")
+                fused_shared = (dense_gate_up_ksplit(run_tokens), _arg_view(shared_in.x_fp8),
+                    _arg_view(shared_in.x_scale), self.shared_dispatch_table(shared_in))
         if shared_add is not None:
             if (shared_add.dtype != torch.bfloat16 or tuple(shared_add.shape) != (run_tokens, self.model_dim)
                     or not shared_add.is_contiguous() or shared_add.device != x_bf16.device):
@@ -2328,7 +2568,7 @@ class SmallMRuntime:
         self._s1_disp = self.w2_dispatch_table(self.w2, self.w2_scale)
         # Ranks may use different token buckets in one call; an idle rank uses the 1-token bucket.
         config = self._select_config(max(run_tokens, 1))
-        self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream, shared_add=shared_add)
+        self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream, shared_add=shared_add, shared_in=fused_shared)
         if caller_out is not None:
             return caller_out
         out_tok = self.comb_op.combine_output(self.mtpr)

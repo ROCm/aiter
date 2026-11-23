@@ -32,11 +32,13 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
 from .. import silu_mul_quant_epilogue as sq
+from ..mxfp4_gemm_common import lds_typed_ptr
 from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .gemm1 import _LdsF32View, do_tile_la
 from .gemm_util import _PACK, AS2RLoader, AScaleLoader, ATileLoader, MfmaScaleGU, wait_lds_barrier
 
-__all__ = ["shared_gemm1", "shared_gemm2", "compile_shared_gemm1", "compile_shared_gemm2"]
+__all__ = ["shared_gemm1", "shared_gemm2", "compile_shared_gemm1", "compile_shared_gemm2", "build_shared_tile",
+    "RefActQuantEpilogue", "Bf16RowsEpilogue", "dense_gate_up_ksplit"]
 
 SORT_BLOCK_M = 32
 TILE_N = 256
@@ -71,6 +73,19 @@ def scale32_dword(row32, kstep, ksub, k_dim):
     """Dword index, in a row-major [rows / 32, k_dim / 32] E8M0 scale, of the four K-group scales of scale row
     ``row32`` at 128-K step ``ksub`` of 256-K step ``kstep`` (byte g = K group g)."""
     return row32 * (k_dim // 32 // 4) + kstep * 2 + ksub
+
+
+def dense_gate_up_ksplit(rows):
+    """The K split of the dense gate_up GEMM AITER's tuned dsv41 table serves ``rows`` with (N 4608, K 5120): its
+    48- and 64-row tiers are split-K 2 kernels, every other tier up to 576 rows is unsplit."""
+    return 2 if 33 <= int(rows) <= 64 else 1
+
+
+def tile_scale_byte(m_tile, n_tile, row, group, inter_dim):
+    """Byte of the E8M0 scale of activation columns ``128 n_tile + 32 group ..+32`` of tile row ``row`` in the
+    "tile" scale layout: [m-tile][128-column tile][32 rows][4 groups]. One GEMM1 workgroup writes the 128 bytes of
+    its (m-tile, n-tile), i.e. whole cache lines of its own."""
+    return m_tile * inter_dim + n_tile * 128 + row * 4 + group
 
 
 def _byte_tensor(addr):
@@ -244,6 +259,32 @@ class _KOffsetB:
         return self._inner.load_ni(row_base_i32, ni, self._k(kstep_i32))
 
 
+class AScaleTileLoader(AScaleLoader):
+    """AScaleLoader over the "tile" scale layout (tile_scale_byte): stages a 32-row tile's scales to LDS in the
+    row-major order ``load_step`` reads, one dword (four K groups) a thread and round."""
+
+    def __init__(self, *, scale_addr, rows, k_dim, lds_bytes):
+        assert k_dim % 128 == 0
+        tiles = (rows + fx.Int32(SORT_BLOCK_M - 1)) // fx.Int32(SORT_BLOCK_M)
+        super().__init__(
+            scale_rsrc=ptr_buf_tensor(fx.Int64(scale_addr), fx.Int32, num_records_bytes=tiles * fx.Int32(k_dim)),
+            m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
+        self._blocks = k_dim // 128  # dwords a row
+        self._rounds = -(-SORT_BLOCK_M * self._blocks // THREADS)
+        # The last round also copies dwords past the tile (rows the MFMAs never read).
+        assert self._rounds * THREADS * 4 <= lds_bytes, "the A-scale LDS is too small for the tile-layout staging"
+
+    def stage(self, lds_ascale, tile_row_base_i32, *args, **kwargs):
+        base = fx.Int32(fx.ptrtoint(lds_ascale.ptr))
+        tile_dword = (tile_row_base_i32 // fx.Int32(SORT_BLOCK_M)) * fx.Int32(SORT_BLOCK_M * self._blocks)
+        for r in range_constexpr(self._rounds):
+            d = fx.Int32(r * THREADS) + fx.Int32(self._tx)
+            row = d // fx.Int32(self._blocks)
+            block = d - row * fx.Int32(self._blocks)
+            word = buf_copy_load(self._rsrc, tile_dword + block * fx.Int32(SORT_BLOCK_M) + row, fx.Int32)
+            fx.ptr_store(fx.Int32(word), lds_typed_ptr(base + d * fx.Int32(4), T.i32, align=4))
+
+
 class _KeepPartial:
     """Epilogue stand-in of a split-K tile's first half: parks its accumulators in LDS (16 bytes each, one slot
     per thread), so the second half's loop has the registers of an unsplit tile."""
@@ -308,16 +349,21 @@ class RefActQuantEpilogue:
     the store pass owns eight consecutive columns of a row and four adjacent lanes one 32-column group (a DPP quad).
     """
 
-    def __init__(self, *, out_addr, out_scale_addr, rows, inter_dim, limit, lds_out, store_cm=0):
-        assert inter_dim % 128 == 0 and float(limit) > 0.0
+    def __init__(self, *, out_addr, out_scale_addr, rows, inter_dim, limit, lds_out, store_cm=0, scale_layout="row"):
+        assert inter_dim % 128 == 0 and float(limit) > 0.0 and scale_layout in ("row", "tile")
         self._inter = inter_dim
         self._limit = float(limit)
         self._lds_out = lds_out
         self._store_cm = int(store_cm)
+        # "tile": tile_scale_byte's layout (AScaleTileLoader reads it), whose bytes no two workgroups share a
+        # cache line of; "row": row-major [rows, inter / 32], what the dense down GEMM reads.
+        self._tile_scales = scale_layout == "tile"
         self._out = ptr_buf_tensor(fx.Int64(out_addr), fx.Int32, unit_elems=2,
             num_records_bytes=rows * fx.Int32(inter_dim))
-        self._out_scale = ptr_buf_tensor(fx.Int64(out_scale_addr), fx.Int8,
-            num_records_bytes=rows * fx.Int32(inter_dim // 32))
+        scale_bytes = rows * fx.Int32(inter_dim // 32)
+        if self._tile_scales:
+            scale_bytes = ((rows + fx.Int32(SORT_BLOCK_M - 1)) // fx.Int32(SORT_BLOCK_M)) * fx.Int32(inter_dim)
+        self._out_scale = ptr_buf_tensor(fx.Int64(out_scale_addr), fx.Int8, num_records_bytes=scale_bytes)
 
     def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
         tx = fx.thread_idx.x
@@ -377,8 +423,12 @@ class RefActQuantEpilogue:
             out_byte = valid.select(row_g * fx.Int32(self._inter) + gcol, fx.Int32(_OOB))
             buf_copy_store(self._out, out_byte // fx.Int32(8), Vec.from_elements(quant, fx.Int32), fx.Int32,
                 unit_elems=2, cache_modifier=self._store_cm)
-            scale_byte = (valid & is_writer).select(
-                row_g * fx.Int32(self._inter // 32) + (gcol >> fx.Int32(5)), fx.Int32(_OOB))
+            if self._tile_scales:
+                scale_at = tile_scale_byte(tile_i32, gcol >> fx.Int32(7), row, (gcol >> fx.Int32(5)) & fx.Int32(3),
+                    self._inter)
+            else:
+                scale_at = row_g * fx.Int32(self._inter // 32) + (gcol >> fx.Int32(5))
+            scale_byte = (valid & is_writer).select(scale_at, fx.Int32(_OOB))
             buf_copy_store(self._out_scale, scale_byte, fx.Int8(code), fx.Int8, cache_modifier=self._store_cm)
         wait_lds_barrier()
         _set_fp32_denormals(_FP32_DENORM_KEPT)
@@ -435,13 +485,15 @@ class Bf16RowsEpilogue:
 
 
 def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim, epilogue, a_buf, a_scale_lds,
-    gate_up_half=0, ksplit=1, b_cache_modifier=0, partial_lds=None):
+    gate_up_half=0, ksplit=1, b_cache_modifier=0, partial_lds=None, a_scale_layout="row", a_scale_lds_bytes=0):
     """``run(m_tile, n_tile)``: one 32-row x 256-column tile of ``x [rows, k_dim] @ w.T`` through ``epilogue``.
 
     ``x_addr`` / ``scale_x_addr``: E4M3 rows and their row-major 1x32 E8M0 scales (readable up to the next 16-byte
     boundary past ``rows * k_dim / 32``); ``w_addr`` / ``scale_w_addr``: the (16, 16)-preshuffled E4M3 weight and
     its row-major 32x32 E8M0 scales. ``gate_up_half``: BWeightLoaderF8's. ``ksplit``: 1, or 2 for the split-K 2
     association (``partial_lds``: 16 bytes per accumulator and thread of LDS for the first half's partials).
+    ``a_scale_layout="tile"``: the A scales are in tile_scale_byte's layout (``a_scale_lds_bytes``: the size of
+    ``a_scale_lds``), as RefActQuantEpilogue(scale_layout="tile") writes them.
     """
     k_iters = k_dim // K_STEP
     assert k_dim % K_STEP == 0 and ksplit in (1, 2) and k_iters % ksplit == 0 and k_iters // ksplit >= 2
@@ -450,9 +502,12 @@ def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim
     a_gather = ATileLoader(row_bytes=k_dim, sort_block_m=SORT_BLOCK_M, k_step_bytes=K_STEP, total_threads=THREADS,
         swizzle=True, x_tensor=_byte_tensor(x_addr), async_copy=False, a_dtype="fp8")
     a_s2r = AS2RLoader(k_step_bytes=K_STEP, swizzle=True, a_dtype="fp8")
-    a_scale = AScaleLoader(
-        scale_rsrc=ptr_buf_tensor(fx.Int64(scale_x_addr), fx.Int32, unit_elems=4, num_records_bytes=scale_bytes),
-        m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
+    if a_scale_layout == "tile":
+        a_scale = AScaleTileLoader(scale_addr=scale_x_addr, rows=rows, k_dim=k_dim, lds_bytes=a_scale_lds_bytes)
+    else:
+        a_scale = AScaleLoader(
+            scale_rsrc=ptr_buf_tensor(fx.Int64(scale_x_addr), fx.Int32, unit_elems=4, num_records_bytes=scale_bytes),
+            m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
     b_loader = BWeightLoaderF8(w_rsrc=ptr_buf_tensor(fx.Int64(w_addr), fx.Int32, unit_elems=4), num_acc_n=NUM_ACC_N,
         k_dim=k_dim, cache_modifier=b_cache_modifier, gate_up_half=gate_up_half)
     b_scale = BScaleLoaderRow32(scale_rsrc=ptr_buf_tensor(fx.Int64(scale_w_addr), fx.Int32), num_acc_n=NUM_ACC_N,
