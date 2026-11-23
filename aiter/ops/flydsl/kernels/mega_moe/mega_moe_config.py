@@ -1900,7 +1900,7 @@ def _fused_config(
             # their L2 writebacks (every store they order sits drained in the uncached symmetric heap): -1.7..-2.5%
             # at 60-150 rows a rank (kro_ep8_v3 decode routing, layers 21 / 10), bit-identical. Not on the draft
             # layout, which reuses this tune (unmeasured there).
-            config = replace(config, fused_stage1=replace(config.fused_stage1, disp_order=31))
+            config = replace(config, fused_stage1=replace(config.fused_stage1, disp_order=31, sync_lean=1))
         return config
     if layout in V41_DRAFT_LAYOUTS:
         return _tune_v41_draft_small(config, bucket, world_size)
