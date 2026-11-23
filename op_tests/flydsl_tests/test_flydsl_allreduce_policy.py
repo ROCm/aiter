@@ -795,6 +795,20 @@ def _widths(link, ws, arch):
 
 
 @pytest.mark.parametrize("cell", CELLS)
+def test_fused_rungs_sharing_an_engine_state_the_cap_that_runs(cell):
+    """Rungs with one engine key share one engine, built at the first such
+    rung's ``grid_cap``; a later rung must state that cap, not another."""
+    link, ws, arch = cell
+    for ladder in (fused_mesh_st_ladder, fused_ring_st_ladder):
+        for hidden in _widths(link, ws, arch):
+            caps = {}
+            for rung in ladder(world_size=ws, link=link, arch=arch, hidden=hidden):
+                key = (rung.super_tile, rung.low_latency, rung.knobs)
+                first = caps.setdefault(key, rung.grid_cap)
+                assert rung.grid_cap == first, (ladder.__name__, hidden, rung)
+
+
+@pytest.mark.parametrize("cell", CELLS)
 def test_fused_disabled_ring_is_reachable_by_env_override(cell):
     """A fused family whose default window is empty keeps its ladder because
     the window variables can enable it: the ring is off by default on xGMI and

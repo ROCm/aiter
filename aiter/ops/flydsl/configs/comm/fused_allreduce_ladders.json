@@ -413,7 +413,7 @@
               {"min_bytes": 0, "super_tile": 16, "grid_cap": 128, "handshake": "lamport"},
               {"min_bytes": "8 MiB", "super_tile": 8, "grid_cap": 128, "handshake": "lamport"},
               {"min_bytes": "16 MiB", "super_tile": 1, "grid_cap": 96, "handshake": "lamport"},
-              {"min_bytes": "24 MiB", "super_tile": 1, "grid_cap": 128, "handshake": "lamport"}
+              {"min_bytes": "24 MiB", "super_tile": 1, "grid_cap": 96, "handshake": "lamport"}
             ]
           },
           "8192": {
@@ -546,7 +546,7 @@
             "rungs": [
               {"min_bytes": 0, "super_tile": 2, "grid_cap": 48, "handshake": "lamport", "knobs": "fanout=peer;recv_order=per_source;lds_bufs=2"},
               {"min_bytes": "4 MiB", "super_tile": 1, "grid_cap": 96, "handshake": "lamport", "knobs": "fanout=peer;poll_sleep=1;recv_order=per_source;lds_bufs=2"},
-              {"min_bytes": "8 MiB", "super_tile": 2, "grid_cap": 96, "handshake": "lamport", "knobs": "fanout=peer;recv_order=per_source;lds_bufs=2"},
+              {"min_bytes": "8 MiB", "super_tile": 2, "grid_cap": 48, "handshake": "lamport", "knobs": "fanout=peer;recv_order=per_source;lds_bufs=2"},
               {"min_bytes": "24 MiB", "super_tile": 4, "grid_cap": 64, "handshake": "lamport", "knobs": "fanout=peer;recv_order=per_source;lds_bufs=2"}
             ]
           },
@@ -557,7 +557,7 @@
               {"min_bytes": 0, "super_tile": 1, "grid_cap": 64, "handshake": "lamport", "knobs": "fanout=peer;poll_sleep=2;lds_bufs=2"},
               {"min_bytes": "6 MiB", "super_tile": 1, "grid_cap": 128, "handshake": "lamport", "knobs": "poll_sleep=2"},
               {"min_bytes": "12 MiB", "super_tile": 4, "grid_cap": 128, "handshake": "lamport", "knobs": "fanout=peer;poll_sleep=1;lds_bufs=2;prio=1"},
-              {"min_bytes": "24 MiB", "super_tile": 1, "grid_cap": 64, "handshake": "lamport", "knobs": "poll_sleep=2"}
+              {"min_bytes": "24 MiB", "super_tile": 1, "grid_cap": 128, "handshake": "lamport", "knobs": "poll_sleep=2"}
             ]
           }
         }
