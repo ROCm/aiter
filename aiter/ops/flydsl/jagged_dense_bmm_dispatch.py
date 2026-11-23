@@ -244,13 +244,10 @@ def jagged_dense_bmm_dispatched(
         C: ``(L, N)`` bf16 output. Rows of a group are all written; rows past
             ``SEQ_OFFSETS[-1]`` in an over-allocated ``C`` are left untouched.
             Must not overlap any input.
-        A: ``(L, K)`` bf16 packed jagged rows. Requires
-            ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
-            read. One group's rows of ``A`` and of ``C`` must each stay under
-            4 GiB, the 32-bit buffer bound. A group's rows of ``C``, rounded
-            up to whole 128-row tiles, must span at most 4 GiB. The uniform
-            path checks both through ``max_seq_len``; the skew path checks
-            only one tile.
+        A: ``(L, K)`` bf16 packed jagged rows. Rows past ``L`` are neither
+            read nor written, so a group cut short by ``L < SEQ_OFFSETS[-1]``
+            is computed only up to row ``L``. One 128-row tile,
+            ``128 * max(K, N) * 2`` bytes, must be at most 4 GiB.
         B: bf16 dense weights ``(n_groups, K, N)``. One group,
             ``K * N * 2`` bytes, must be at most 4 GiB.
         BIAS: ``(n_groups, N)`` or ``(n_groups * N,)`` bf16.
@@ -259,9 +256,8 @@ def jagged_dense_bmm_dispatched(
         n_groups: Uniform path: at most the device's grid z limit (65536 on
             gfx942). The skew path has no such limit.
         max_seq_len: Uniform path: must be >= the longest group, which is
-            not checked; rows past it are not computed.
-            ``max_seq_len * max(K, N) * 2`` must be under 4 GiB. Skew path:
-            only a tuning-table key.
+            not checked; rows past it are not computed. Skew path: only a
+            tuning-table key.
         stream: Defaults to the current torch stream on A's device. A
             ``torch.cuda.Stream`` must be on A's device. One launch and no
             host sync, so the call can be captured in a graph.

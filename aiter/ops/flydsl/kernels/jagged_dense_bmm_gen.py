@@ -181,6 +181,7 @@ def _build_launcher(
         B: fx.Tensor,  # dense  (n_groups * K, N) bf16, view of (n_groups, K, N)
         BIAS: fx.Tensor,  # bias   (n_groups * N,)   bf16
         SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
+        L: fx.Int32,
         n_groups: fx.Int32,
         search_steps: fx.Int32,
         tiled_mma: fx.TiledMma,
@@ -248,8 +249,20 @@ def _build_launcher(
         start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
 
         if start_m < M_b:
-            a_row_off = fx.Int64(seq_start) * fx.Int64(K)
-            c_row_off = fx.Int64(seq_start) * fx.Int64(N)
+            # Each A and C buffer covers only this tile's valid rows, so no
+            # in-tile offset passes BLOCK_M rows and rows past L are never touched.
+            tile_start = seq_start + start_m
+            tile_rows = M_b - start_m
+            tile_rows = (tile_rows < fx.Int32(BLOCK_M)).select(
+                tile_rows, fx.Int32(BLOCK_M)
+            )
+            rows_left = L - tile_start
+            tile_rows = (rows_left < tile_rows).select(rows_left, tile_rows)
+            tile_rows = (tile_rows < fx.Int32(0)).select(fx.Int32(0), tile_rows)
+            # A VGPR num_records makes every buffer access a waterfall loop.
+            tile_rows = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_rows))
+            a_row_off = fx.Int64(tile_start) * fx.Int64(K)
+            c_row_off = fx.Int64(tile_start) * fx.Int64(N)
             A_g = fx.make_view(
                 fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)),
                 fx.get_layout(A),
@@ -264,24 +277,20 @@ def _build_launcher(
                 fx.make_layout((N, K), (1, N)),
             )
 
-            # Rows >= M_b fall outside num_records: loads read 0, stores drop.
+            # Rows past tile_rows fall outside num_records: loads read 0, stores drop.
             A_buf = fx.rocdl.make_buffer_tensor(
-                A_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(K * 2)
+                A_g, num_records_bytes=fx.Int64(tile_rows) * fx.Int64(K * 2)
             )
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
             C_buf = fx.rocdl.make_buffer_tensor(
-                C_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(N * 2)
+                C_g, num_records_bytes=fx.Int64(tile_rows) * fx.Int64(N * 2)
             )
 
-            gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
-                None, None, block_m_idx, None
-            ]
+            gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[None, None, 0, None]
             gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[
                 None, None, block_n_idx, None
             ]
-            gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[
-                None, None, block_m_idx, block_n_idx
-            ]
+            gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[None, None, 0, block_n_idx]
 
             bias_elem_off = fx.Int32(off_b) * fx.Int32(N)
             BIAS_g = fx.make_view(
@@ -379,7 +388,7 @@ def _build_launcher(
                     ),
                     fx.make_composed_layout(a_swizzle, a_phys),
                 )
-                a_dma_src = fx.add_offset(fx.get_iter(A_buf), start_m * K)
+                a_dma_src = fx.get_iter(A_buf)
                 a_dma_off = [
                     fx.get_scalar(fx.crd2idx((0, tid, rnd, 0), a_slot_to_global))
                     for rnd in fx.range_constexpr(dma_rounds)
@@ -548,6 +557,7 @@ def _build_launcher(
         B: fx.Tensor,
         BIAS: fx.Tensor,
         SEQ_OFFSETS: fx.Tensor,
+        L: int,
         grid_m: int,
         n_groups: int,
         search_steps: int,
@@ -590,6 +600,7 @@ def _build_launcher(
             B,
             BIAS,
             SEQ_OFFSETS,
+            L,
             n_groups,
             search_steps,
             tiled_mma,
@@ -631,6 +642,7 @@ def _check_launch(
     block_n: int,
     n_groups: int,
     max_seq_len: int,
+    L: int,
     K: int,
     N: int,
     compact: bool,
@@ -664,26 +676,29 @@ def _check_launch(
             f"n_groups * N = {n_groups * N} overflows the kernel's Int32 BIAS "
             f"offset (max {_INT32_MAX})"
         )
-    if compact:
-        c_rows, rows = block_m, f"{block_m}"
-    else:
-        c_rows = -(-max_seq_len // block_m) * block_m
-        rows = f"ceil(max_seq_len / {block_m}) * {block_m}"
-    if c_rows * N * 2 > _BUFFER_OFFSET_SPAN:
+    if L > _INT32_MAX:
+        raise ValueError(f"L = {L} rows overflows the kernel's Int32 row index")
+    if block_m * max(K, N) * 2 > _BUFFER_OFFSET_SPAN:
         raise ValueError(
-            f"the tile rows of C span {rows} * N * 2 = {c_rows * N * 2} bytes, "
-            "past the 4 GiB a 32-bit buffer offset reaches"
+            f"the {block_m} tile rows of A or C span {block_m} * max(K, N) * 2 = "
+            f"{block_m * max(K, N) * 2} bytes, past the 4 GiB a 32-bit buffer "
+            "offset reaches"
+        )
+    if compact:
+        tile_rows, rows = block_m, f"{block_m}"
+    else:
+        tile_rows = min(block_m, max_seq_len)
+        rows = f"min({block_m}, max_seq_len)"
+    if tile_rows * max(K, N) * 2 > _MAX_BUFFER_BYTES:
+        raise ValueError(
+            f"one tile of A or C is {rows} * max(K, N) * 2 = "
+            f"{tile_rows * max(K, N) * 2} bytes, past the 4 GiB of a 32-bit "
+            "buffer descriptor"
         )
     if K * N * 2 > _BUFFER_OFFSET_SPAN:
         raise ValueError(
             f"one group of B is K * N * 2 = {K * N * 2} bytes, past the 4 GiB "
             "a 32-bit buffer offset reaches"
-        )
-    if not compact and max_seq_len * max(K, N) * 2 > _MAX_BUFFER_BYTES:
-        raise ValueError(
-            f"max_seq_len * max(K, N) * 2 = {max_seq_len * max(K, N) * 2} bytes "
-            "bounds one group of A or C, which must stay under the 4 GiB of a "
-            "32-bit buffer descriptor"
         )
 
 
@@ -825,6 +840,7 @@ def jagged_dense_bmm(
             block_n=bnn,
             n_groups=n_groups,
             max_seq_len=max_seq_len,
+            L=C.shape[0],
             K=K,
             N=N,
             compact=compact,
@@ -833,6 +849,7 @@ def jagged_dense_bmm(
         search_steps = (n_groups - 1).bit_length()
         launch_args = (
             *map(_row_major, (C, A, B, BIAS, SEQ_OFFSETS)),
+            C.shape[0],
             grid_m,
             n_groups,
             search_steps,
