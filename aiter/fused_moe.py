@@ -5109,20 +5109,22 @@ def get_2stage_cfgs(
                 f"sort block_m={cfg.get('block_m', BLOCK_SIZE_M)} and GEMM2 {kn2!r} "
                 f"must both match GEMM1 BM={parsed_g1['BM']}"
             )
+        # BM16 makes the masked Opus aux sort use dispatch_policy=1, which hangs
+        # at >= 819 experts (#8014).
+        elif is_ep and parsed_g1["BM"] == 16:
+            reject_reason = "BM16 MXMOE is not supported under EP yet"
+        # MXMOE under EP is validated only for SiTUv2 with an atomic or reduce
+        # layout GEMM2.
+        elif is_ep and activation != ActivationType.Situv2:
+            reject_reason = (
+                f"MXMOE under EP is only validated for SiTUv2, got {activation}"
+            )
         # Under EP `expert` is the local count, and the masked Opus sort plus the
-        # prequant/inline-quant GEMM1 replace every NE-keyed aux kernel; only the
-        # scatter epilog's scatter_reduce, keyed on (model_dim, topk), remains.
+        # prequant GEMM1 replace every NE-keyed aux kernel.
         elif is_ep and parse_flydsl_v2_gemm2_kernel(kn2) is None:
             reject_reason = f"EP requires a flydsl_moe2_layout_ GEMM2, got {kn2!r}"
-        elif (
-            is_ep
-            and parse_flydsl_v2_gemm2_kernel(kn2)["epilog"] == "scatter"
-            and not aiter.is_mxfp4_moe_scatter_supported(model_dim, topk)
-        ):
-            reject_reason = (
-                "generated MXFP4 scatter_reduce kernels do not cover "
-                f"(model_dim={model_dim}, topk={topk})"
-            )
+        elif is_ep and parse_flydsl_v2_gemm2_kernel(kn2)["epilog"] == "scatter":
+            reject_reason = "the scatter GEMM2 epilog is not validated under EP"
         elif not is_ep and not aiter.is_mxfp4_moe_shape_supported(
             expert, model_dim, inter_dim, topk
         ):
