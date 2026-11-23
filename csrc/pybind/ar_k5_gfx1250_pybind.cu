@@ -18,5 +18,11 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"), py::arg("res_out"), py::arg("scale"), py::arg("rows"),
           py::arg("hidden"), py::arg("eps"), py::arg("gemma_norm"), py::arg("lamport_order"),
           py::arg("fp8_out"), py::arg("maxit"));
+    m.def("k5_ar_rms_tail", &aiter::k5_ar_rms_tail,
+          py::arg("ctx"), py::arg("res_inp"), py::arg("w"), py::arg("out"),
+          py::arg("res_out"), py::arg("scale"), py::arg("rows"), py::arg("hidden"),
+          py::arg("eps"), py::arg("gemma_norm"), py::arg("lamport_order"), py::arg("fp8_out"),
+          py::arg("maxit"), py::arg("tail_rows"), py::arg("tail_w"), py::arg("tail_g"),
+          py::arg("tail_add"), py::arg("tail_scale"));
     m.def("k5_ar_errors", &aiter::k5_ar_errors, py::arg("ctx"));
 }

@@ -34,6 +34,29 @@ void k5_ar_rms(fptr_t ctx,
                bool lamport_order,
                bool fp8_out,
                int64_t maxit);
+// k5_ar_rms whose input rows are the deferred routed-MoE tail (aiter moe_defer_tail) instead of
+// inp: row t is bf16(sum_k w[t, k] * g[rows[t, k]]) (a route with rows < 0 adds 0), then
+// bf16(. * tail_scale) when tail_scale != 1 and tail_add is set, then bf16(. + tail_add[t]), with
+// the bits of the gather-reduce launch it replaces. rows / w: int32 / fp32 [rows, 4]; tail_g: the
+// bf16 GEMM2 rows [*, hidden]; tail_add: bf16 [rows, hidden] or 0.
+void k5_ar_rms_tail(fptr_t ctx,
+                    int64_t res_inp,
+                    int64_t w,
+                    int64_t out,
+                    int64_t res_out,
+                    int64_t scale,
+                    int64_t rows,
+                    int64_t hidden,
+                    double eps,
+                    bool gemma_norm,
+                    bool lamport_order,
+                    bool fp8_out,
+                    int64_t maxit,
+                    int64_t tail_rows,
+                    int64_t tail_w,
+                    int64_t tail_g,
+                    int64_t tail_add,
+                    double tail_scale);
 // polls that timed out so far (synchronizes the device)
 int64_t k5_ar_errors(fptr_t ctx);
 } // namespace aiter

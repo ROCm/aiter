@@ -94,6 +94,9 @@ def _take_output_epilogue(
     if epi is None or epi.consumed:
         return None
     a = epi.addend
+    # A caller may set the addend late (after the router launch); none yet: not taken.
+    if a is None:
+        return None
     if (
         a.shape != (token_num, model_dim)
         or a.dtype != dtype
@@ -2040,6 +2043,24 @@ def _grouped_a8w4_tdm_moe(
     if _fold is not None:
         # The folded shared expert is the addend, after the routed scale.
         addend, addend_scale = _sh_out[:token_num], _fold.scale
+        # Inside moe_defer_tail(): left to the consumer of moe_out, as below.
+        from aiter.ops.flydsl.moe_deferred_tail import (
+            MoeDeferredTail,
+            register_deferred_moe_tail,
+        )
+
+        if register_deferred_moe_tail(
+            MoeDeferredTail(
+                moe_out,
+                grouped_out,
+                topids_to_rows,
+                gather_w,
+                addend,
+                addend_scale,
+                None,
+            )
+        ):
+            return moe_out
     else:
         # A caller's pending `* scale + addend` (shared expert add) rides along.
         epi = (
@@ -2047,6 +2068,26 @@ def _grouped_a8w4_tdm_moe(
             if _is_ep
             else _take_output_epilogue(token_num, model_dim, moe_out.dtype)
         )
+        if epi is not None:
+            # Inside moe_defer_tail(): the consumer of moe_out (the next all-reduce)
+            # runs this launch's work instead, or this launch before it.
+            from aiter.ops.flydsl.moe_deferred_tail import (
+                MoeDeferredTail,
+                register_deferred_moe_tail,
+            )
+
+            if register_deferred_moe_tail(
+                MoeDeferredTail(
+                    moe_out,
+                    grouped_out,
+                    topids_to_rows,
+                    gather_w,
+                    epi.addend,
+                    epi.scale,
+                    epi.before,
+                )
+            ):
+                return moe_out
         if epi is not None and epi.before is not None:
             epi.before()
         addend = None if epi is None else epi.addend

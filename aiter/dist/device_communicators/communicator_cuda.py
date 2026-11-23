@@ -83,6 +83,37 @@ _AR2S_RMS_MIN_BYTES = (32 << 20) + 1
 _AR2S_RMS_MAX_TOTAL_BYTES = 288 << 20
 
 
+# A routed MoE output whose last launch (gather-reduce + routed scale + shared add) was deferred
+# into its consumer (aiter.ops.flydsl.moe_deferred_tail, ATOM_MINIMAX_M3_MOE_TAIL_IN_AR): the k5
+# one-shot AR computes those rows in its prologue (same bits); every other path, and every
+# other entry point here, runs the deferred launch first.
+try:
+    from aiter.ops.flydsl.moe_deferred_tail import (
+        has_deferred_moe_tail as _has_deferred_tail,
+        materialize_deferred_moe_tail as _materialize_deferred_tail,
+        take_deferred_moe_tail as _take_deferred_tail,
+    )
+except ImportError:  # pragma: no cover - no FlyDSL
+    _has_deferred_tail = lambda: False  # noqa: E731
+    _materialize_deferred_tail = lambda x=None: None  # noqa: E731
+    _take_deferred_tail = lambda x: None  # noqa: E731
+
+
+def _take_tail(input_):
+    return _take_deferred_tail(input_) if _has_deferred_tail() else None
+
+
+def _settle_tail(tail) -> None:
+    """Write a taken tail's output for a path that reads it as is."""
+    if tail is not None:
+        tail.materialize()
+
+
+def _settle_input(input_) -> None:
+    if _has_deferred_tail():
+        _materialize_deferred_tail(input_)
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
     _ar_1stage_override = {"1": True, "0": False}.get(
@@ -302,6 +333,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
         the pair as it sends, so the sum is never written; elsewhere the add
         and then all_reduce."""
+        _settle_input(input_)
+        _settle_input(other)
         ca_comm = self.ca_comm
         if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
             return ca_comm.lamport_ar_add(input_, other)
@@ -314,6 +347,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
+        _settle_input(input_)
         if (
             self.gluon_ar_plain is not None
             and input_.dtype == torch.bfloat16
@@ -395,6 +429,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         x_pad_to_multiple: int = 0,
         gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # A deferred MoE tail feeding this call: the k5 branch computes it, any other path
+        # writes it first (_settle_tail).
+        tail = _take_tail(input_)
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
             is_weak_contiguous,
@@ -444,6 +481,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 all_reduce_rmsnorm_quant,
             )
 
+            _settle_tail(tail)
             return all_reduce_rmsnorm_quant(
                 input_,
                 res_inp_,
@@ -462,6 +500,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm is not None
             and ca_comm.should_ar2s_rms(input_, res_inp_, weight_, _AR2S_RMS_MIN_BYTES)
         ):
+            _settle_tail(tail)
             return ca_comm.ar2s_fused_ar_rms(input_, res_inp_, weight_, eps, gemma_norm)
         # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
         # it beats the routes below up to its size cap (see
@@ -480,9 +519,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_k5_ar(input_, res_inp_, weight_)
         ):
             # the one-shot decode kernel, with the bits of the path it replaces
+            if tail is not None:
+                got = ca_comm.k5_fused_ar_rms_tail(
+                    tail, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon
+                )
+                if got is not None:
+                    return got
+                _settle_tail(tail)
             return ca_comm.k5_fused_ar_rms(
                 input_, res_inp_, weight_, eps, gemma_norm, lamport_order=not gluon
             )
+        _settle_tail(tail)
+        tail = None
         if gluon:
             return _gluon_ar_norm(
                 self, input_, res_inp_, weight_, eps, gemma_norm, quant=False
@@ -650,6 +698,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "mxfp8"/"per_group"/"mxfp4") from the public API.
+        if quant_type != "mxfp8":
+            _settle_input(input_)
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "mxfp8":
@@ -819,7 +869,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def sp_fused_allreduce_rmsnorm(
         self, input_, res_inp_, weight_, eps, gemma_norm=False
     ):
+        # a deferred MoE tail: ar2s reads the input as is; the fallback below takes it
         if self.ar2s_sp_eligible(input_, weight_):
+            _settle_input(input_)
             return self.ca_comm.ar2s_fused_ar_rms_ex(
                 input_.contiguous(),
                 res_inp_.contiguous(),
@@ -835,7 +887,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def sp_fused_allreduce_rmsnorm_mxfp8_quant(
         self, input_, res_inp_, weight_, eps, gemma_norm=False
     ):
+        # a deferred MoE tail: ar2s reads the input as is; the fallback below takes it
         if self.ar2s_sp_eligible(input_, weight_):
+            _settle_input(input_)
             return self.ca_comm.ar2s_fused_ar_rms_ex(
                 input_.contiguous(),
                 res_inp_.contiguous(),
@@ -852,6 +906,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def sp_allreduce_add_residual(self, input_, res_inp_, weight_):
         """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual
         (the residual_out the next replicated AR + norm would write)."""
+        _settle_input(input_)
         if self.ar2s_sp_eligible(input_, weight_):
             return self.ca_comm.ar2s_fused_ar_rms_ex(
                 input_.contiguous(),
@@ -905,11 +960,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
         gluon = _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport)
         # The one-shot decode kernel, quantizing in its own epilogue with the bits of the path it
         # replaces: the Gluon one-shot's, or the Lamport fused kernel + per_1x32_mx_quant_hip's.
+        tail = _take_tail(input_)
         if (
             (gluon or lamport)
             and ca_comm is not None
             and ca_comm.should_k5_ar(input_, res_inp_, weight_)
         ):
+            if tail is not None:
+                # the deferred MoE tail computed in the k5 prologue (same bits)
+                got = ca_comm.k5_fused_ar_rms_tail(
+                    tail,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    gemma_norm,
+                    lamport_order=not gluon,
+                    fp8_out=True,
+                )
+                if got is not None:
+                    return got
+                _settle_tail(tail)
             return ca_comm.k5_fused_ar_rms(
                 input_,
                 res_inp_,
@@ -919,6 +989,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 lamport_order=not gluon,
                 fp8_out=True,
             )
+        _settle_tail(tail)
         if gluon:
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,

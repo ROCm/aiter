@@ -2200,6 +2200,73 @@ class CustomAllreduce:
             return out, res_out, scale
         return out, res_out
 
+    def k5_fused_ar_rms_tail(
+        self,
+        tail,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        lamport_order: bool = False,
+        fp8_out: bool = False,
+    ):
+        """k5_fused_ar_rms of a deferred routed-MoE output (aiter moe_deferred_tail): the
+        kernel computes the input rows from the tail's operands (the bits of the
+        gather-reduce launch it skips) instead of reading them. Same returns; None when the
+        tail's operands do not fit the kernel (the caller materializes it). Runs tail.before
+        first (the join of the stream producing its addend)."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        from aiter.ops.flydsl.moe_deferred_tail import _log_once
+
+        operands = tail.k5_operands()
+        if operands is None:
+            return None
+        g, rows_t, w_t, add = operands
+        _log_once(
+            f"k5_{int(lamport_order)}{int(fp8_out)}",
+            f"k5 one-shot AR computes the deferred MoE tail (lamport_order={lamport_order}, "
+            f"fp8_out={fp8_out}, {tail.out.shape[0]} rows)",
+        )
+        out_t = tail.out
+        rows, hidden = out_t.shape
+        res_inp = _lamport_aligned(res_inp.contiguous())
+        w = _lamport_aligned(w.contiguous())
+        tail.run_before()
+        res_out = torch.empty_like(res_inp)
+        if fp8_out:
+            out = torch.empty(out_t.shape, dtype=fp8, device=out_t.device)
+            scale = torch.empty(
+                (rows, hidden // 32), dtype=fp8_e8m0, device=out_t.device
+            )
+            scale_ptr = scale.data_ptr()
+        else:
+            out = torch.empty_like(res_inp)
+            scale, scale_ptr = None, 0
+        ops.k5_ar_rms_tail_gfx1250(
+            self._k5_ctx,
+            res_inp.data_ptr(),
+            w.data_ptr(),
+            out.data_ptr(),
+            res_out.data_ptr(),
+            scale_ptr,
+            rows,
+            hidden,
+            eps,
+            gemma_norm,
+            lamport_order,
+            fp8_out,
+            _K5_AR_MAXIT,
+            rows_t.data_ptr(),
+            w_t.data_ptr(),
+            g.data_ptr(),
+            0 if add is None else add.data_ptr(),
+            tail.scale,
+        )
+        if fp8_out:
+            return out, res_out, scale
+        return out, res_out
+
     def k5_ar_errors(self) -> int:
         """Polls of k5_fused_ar_rms that timed out on this rank (synchronizes the device)."""
         return ops.k5_ar_errors_gfx1250(self._k5_ctx) if self._k5_ctx else 0

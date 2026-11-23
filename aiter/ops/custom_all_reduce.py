@@ -821,5 +821,28 @@ def k5_ar_rms_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_rms_tail", develop=True)
+def k5_ar_rms_tail_gfx1250(
+    ctx: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    scale: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    lamport_order: bool,
+    fp8_out: bool,
+    maxit: int,
+    tail_rows: int,
+    tail_w: int,
+    tail_g: int,
+    tail_add: int,
+    tail_scale: float,
+) -> None: ...
+
+
 @compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_errors", develop=True)
 def k5_ar_errors_gfx1250(ctx: int) -> int: ...

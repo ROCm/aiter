@@ -27,6 +27,17 @@
 //            no fused multiply-adds, its E8M0 / E4M3 steps.
 //   LAMPORT: lamport_ar_rmsnorm_gfx1250 (custom_all_reduce_gfx1250.cuh) and, for MXFP8,
 //            per_1x32_mx_quant_hip of its bf16 output (the steps of ar2s's mxfp8_quant8).
+//
+// TAIL (the deferred routed-MoE tail, aiter moe_defer_tail): the input rows are not read from x
+// but computed where they are loaded, by the sender (for its peers) and again by the receiver
+// (its own rows), with the bits of the gather-reduce launch they replace
+// (kernels/moe_gather_reduce.py, f32 route weights, split_k 1, the moeglue epilogue):
+//   acc = 0; for k < 4: acc = acc + w[t, k] * (0 + bf16 g[rows[t, k]])   (no fused multiply-add;
+//         a route with rows < 0 adds w * 0), x = bf16(acc); with an addend: x = bf16(x * scale)
+//         when scale != 1, then x = bf16(x + addend[t]).
+// That launch runs with IEEE fp32 denormals (FlyDSL's kernel descriptor), as the Gluon-order
+// kernels are built; the Lamport-order kernels (flushed) switch the MODE register's fp32
+// denormal field to IEEE around the tail arithmetic.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
@@ -52,6 +63,19 @@ typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x8_t __attribute__((ext_vector_type(8)));
 typedef int i32x2_t __attribute__((ext_vector_type(2)));
 
+// the deferred MoE tail of a TAIL kernel (see the file comment)
+struct Tail
+{
+    const u32x4* g;      // GEMM2 output rows [*, hidden] bf16 (the grouped output, flat)
+    const int32_t* rows; // [rows, 4] the GEMM2 row of route (t, k), < 0: none (adds w * 0)
+    const float* w;      // [rows, 4] route weights
+    const u32x4* add;    // [rows, hidden] bf16 addend, or null
+    float scale;         // applied (and rounded) only with an addend and scale != 1
+    int flags;           // kTailAdd | kTailScale
+};
+constexpr int kTailAdd   = 1;
+constexpr int kTailScale = 2;
+
 struct Args
 {
     const u32x4* x;
@@ -74,6 +98,7 @@ struct Args
     int rank;
     int maxit;
     int gemma;
+    Tail tail;
 };
 
 __device__ __forceinline__ void st_sys(char* p, u32x4 v)
@@ -124,18 +149,136 @@ __device__ __forceinline__ void lds_barrier()
 }
 
 // ---------------------------------------------------------------------------------------------
-// protocol
+// the deferred MoE tail: the input packs of a slab, computed (see the file comment)
 // ---------------------------------------------------------------------------------------------
-// sends the slab of wave w of row r: x, 0xffff -> 0x7fff, into slot[rank] of every peer
-__device__ __forceinline__ void send_slab(const Args& a, int r, int w, int lane)
+// s_setreg / s_getreg field of the MODE register's fp32 denormal bits ([5:4])
+constexpr int kModeF32Denorm = 1 | (4 << 6) | ((2 - 1) << 11);
+
+// the arithmetic of tail_slab for one addend / scale case (uniform: one branch a slab, none a pack)
+template <bool ADD, bool SCALE>
+__device__ __forceinline__ void tail_math(const u32x4 (&gv)[4][kJ],
+                                          const u32x4 (&av)[kJ],
+                                          const float (&ww)[4],
+                                          float scale,
+                                          u32x4 (&x)[kJ])
 {
-    const int g          = r * kWaves + w;
-    const long p0        = (long)r * kRowPacks + w * kSlabPacks + lane;
-    const uint32_t round = __builtin_amdgcn_readfirstlane(a.send_ctr[g]);
-    u32x4 v[kJ];
+#pragma clang fp contract(off)
 #pragma unroll
     for(int j = 0; j < kJ; ++j)
-        v[j] = a.x[p0 + 32 * j];
+    {
+#pragma unroll
+        for(int c = 0; c < 4; ++c)
+        {
+            float acc[2];
+#pragma unroll
+            for(int h = 0; h < 2; ++h)
+            {
+                float s_ = 0.0f;
+#pragma unroll
+                for(int k = 0; k < 4; ++k)
+                {
+                    const float red = bf2f(gv[k][j][c], h) + 0.0f;
+                    s_              = s_ + ww[k] * red;
+                }
+                acc[h] = s_;
+            }
+            uint32_t o = f2bf2(acc[0], acc[1]);
+            if constexpr(ADD)
+            {
+                if constexpr(SCALE)
+                    o = f2bf2(bf2f(o, 0) * scale, bf2f(o, 1) * scale);
+                o = f2bf2(bf2f(o, 0) + bf2f(av[j][c], 0), bf2f(o, 1) + bf2f(av[j][c], 1));
+            }
+            x[j][c] = o;
+        }
+    }
+}
+
+template <bool SWITCH_DENORM>
+__device__ __forceinline__ void tail_slab(const Args& a, int r, int w, int lane, u32x4 (&x)[kJ])
+{
+    // every scalar of the tail read once, up front (the route of row r is workgroup-uniform)
+    const u32x4* g    = a.tail.g;
+    const u32x4* add  = a.tail.add;
+    const int flags   = a.tail.flags;
+    const float scale = a.tail.scale;
+    // scalar loads (constant address space): one s_load_b128 each, no VMEM round trip + readfirstlane
+    typedef int i32x4_v __attribute__((ext_vector_type(4)));
+    typedef const __attribute__((address_space(4))) i32x4_v* c_i32x4_p;
+    const i32x4_v rv  = *(c_i32x4_p)(a.tail.rows + 4 * (long)r);
+    const i32x4_v wv  = *(c_i32x4_p)(reinterpret_cast<const int*>(a.tail.w) + 4 * (long)r);
+    const int rw[4]   = {rv[0], rv[1], rv[2], rv[3]};
+    const float ww[4] = {__int_as_float(wv[0]), __int_as_float(wv[1]), __int_as_float(wv[2]), __int_as_float(wv[3])};
+    const long pk0 = (long)w * kSlabPacks + lane; // + 32 j: this lane's packs of a row
+    u32x4 av[kJ];
+    if(flags & kTailAdd)
+    {
+        const u32x4* src = add + (long)r * kRowPacks + pk0;
+#pragma unroll
+        for(int j = 0; j < kJ; ++j)
+            av[j] = src[32 * j];
+    }
+    u32x4 gv[4][kJ];
+#pragma unroll
+    for(int k = 0; k < 4; ++k)
+    {
+        if(rw[k] >= 0)
+        {
+            const u32x4* src = g + (long)rw[k] * kRowPacks + pk0;
+#pragma unroll
+            for(int j = 0; j < kJ; ++j)
+                gv[k][j] = src[32 * j];
+        }
+        else
+        {
+#pragma unroll
+            for(int j = 0; j < kJ; ++j)
+                gv[k][j] = u32x4{0u, 0u, 0u, 0u};
+        }
+    }
+    uint32_t saved_mode = 0;
+    if constexpr(SWITCH_DENORM)
+    {
+        saved_mode = __builtin_amdgcn_s_getreg(kModeF32Denorm);
+        __builtin_amdgcn_s_setreg(kModeF32Denorm, 3u);
+    }
+    if(!(flags & kTailAdd))
+        tail_math<false, false>(gv, av, ww, scale, x);
+    else if(flags & kTailScale)
+        tail_math<true, true>(gv, av, ww, scale, x);
+    else
+        tail_math<true, false>(gv, av, ww, scale, x);
+    if constexpr(SWITCH_DENORM)
+        __builtin_amdgcn_s_setreg(kModeF32Denorm, saved_mode);
+}
+
+// ---------------------------------------------------------------------------------------------
+// protocol
+// ---------------------------------------------------------------------------------------------
+// sends the slab of wave w of row r: x (TAIL: computed), 0xffff -> 0x7fff, into slot[rank] of
+// every peer
+template <bool TAIL = false, bool SWITCH_DENORM = false>
+__device__ __forceinline__ void send_slab(const Args& a, int r, int w, int lane)
+{
+    const int g   = r * kWaves + w;
+    const long p0 = (long)r * kRowPacks + w * kSlabPacks + lane;
+    u32x4 v[kJ];
+    uint32_t round;
+    if constexpr(TAIL)
+    {
+        // The round counter by a scalar load (written by the previous call, visible at dispatch):
+        // a vector load + readfirstlane here would hold the tail's row loads back by a round trip.
+        typedef const __attribute__((address_space(4))) uint32_t* c_u32_p;
+        round = *(c_u32_p)(a.send_ctr + __builtin_amdgcn_readfirstlane(g));
+        tail_slab<SWITCH_DENORM>(a, r, w, lane, v);
+    }
+    else
+    {
+        round = __builtin_amdgcn_readfirstlane(a.send_ctr[g]);
+#pragma unroll
+        for(int j = 0; j < kJ; ++j)
+            v[j] = a.x[p0 + 32 * j];
+    }
 #pragma unroll
     for(int j = 0; j < kJ; ++j)
 #pragma unroll
@@ -185,6 +328,7 @@ struct Slab
     u32x4 in[kRanks - 1][kJ];
 };
 
+template <bool TAIL = false, bool SWITCH_DENORM = false>
 __device__ __forceinline__ void receive_slab(const Args& a, int r, int w, int lane, Slab& sl)
 {
     const int g          = r * kWaves + w;
@@ -195,10 +339,14 @@ __device__ __forceinline__ void receive_slab(const Args& a, int r, int w, int la
 #pragma unroll
     for(int j = 0; j < kJ; ++j)
     {
-        sl.own[j] = a.x[sl.p0 + 32 * j];
-        sl.rs[j]  = a.res[sl.p0 + 32 * j];
-        sl.wt[j]  = a.w[w * kSlabPacks + 32 * j + lane];
+        if constexpr(!TAIL)
+            sl.own[j] = a.x[sl.p0 + 32 * j];
+        sl.rs[j] = a.res[sl.p0 + 32 * j];
+        sl.wt[j] = a.w[w * kSlabPacks + 32 * j + lane];
     }
+    // TAIL: this rank's own rows, computed as the sender computes them (the same bits)
+    if constexpr(TAIL)
+        tail_slab<SWITCH_DENORM>(a, r, w, lane, sl.own);
     // re-arm before the wait, which hides the acks of these stores
     {
         const long rearm = ((long)((round + 2) % kBuf) * kRanks * a.slot + sl.p0) * 16;
@@ -539,19 +687,21 @@ __device__ __forceinline__ void lamport_epilogue(const Args& a, const Slab& sl, 
 // ---------------------------------------------------------------------------------------------
 // the kernel
 // ---------------------------------------------------------------------------------------------
-template <bool LAMPORT, bool FP8>
+// TAIL: the input rows are the deferred MoE tail (a.tail), not a.x; the Lamport-order kernels
+// (flushed denormals) run the tail arithmetic with IEEE fp32 denormals, as its launch does
+template <bool LAMPORT, bool FP8, bool TAIL = false>
 __global__ void __launch_bounds__(kThreads) k5_ar_rms_kernel(Args a)
 {
     const int wave = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     if((int)blockIdx.x < a.rows)
     {
-        send_slab(a, blockIdx.x, wave, lane);
+        send_slab<TAIL, LAMPORT>(a, blockIdx.x, wave, lane);
         return;
     }
     const int r = blockIdx.x - a.rows;
     Slab sl;
-    receive_slab(a, r, wave, lane, sl);
+    receive_slab<TAIL, LAMPORT>(a, r, wave, lane, sl);
     if constexpr(LAMPORT)
         lamport_epilogue<FP8>(a, sl, r, wave, lane);
     else

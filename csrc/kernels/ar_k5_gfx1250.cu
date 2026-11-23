@@ -15,12 +15,19 @@
 namespace aiter {
 namespace k5ar {
 
-void launch_gluon(const Args& a, bool fp8_out, hipStream_t stream);
+void launch_gluon(const Args& a, bool fp8_out, bool tail, hipStream_t stream);
 
-void launch_lamport(const Args& a, bool fp8_out, hipStream_t stream)
+void launch_lamport(const Args& a, bool fp8_out, bool tail, hipStream_t stream)
 {
     const dim3 grid(2 * a.rows), block(kThreads);
-    if(fp8_out)
+    if(tail)
+    {
+        if(fp8_out)
+            k5_ar_rms_kernel<true, true, true><<<grid, block, 0, stream>>>(a);
+        else
+            k5_ar_rms_kernel<true, false, true><<<grid, block, 0, stream>>>(a);
+    }
+    else if(fp8_out)
         k5_ar_rms_kernel<true, true><<<grid, block, 0, stream>>>(a);
     else
         k5_ar_rms_kernel<true, false><<<grid, block, 0, stream>>>(a);
@@ -77,22 +84,24 @@ fptr_t init_k5_ar(int64_t rank, const std::vector<int64_t>& inbox_ptrs, int64_t 
     return reinterpret_cast<fptr_t>(c);
 }
 
-void k5_ar_rms(fptr_t ctx,
-               int64_t inp,
-               int64_t res_inp,
-               int64_t w,
-               int64_t out,
-               int64_t res_out,
-               int64_t scale,
-               int64_t rows,
-               int64_t hidden,
-               double eps,
-               bool gemma_norm,
-               bool lamport_order,
-               bool fp8_out,
-               int64_t maxit)
+namespace k5ar {
+// the launch of k5_ar_rms and k5_ar_rms_tail (inp == 0 with a tail)
+static void run(fptr_t ctx,
+                int64_t inp,
+                int64_t res_inp,
+                int64_t w,
+                int64_t out,
+                int64_t res_out,
+                int64_t scale,
+                int64_t rows,
+                int64_t hidden,
+                double eps,
+                bool gemma_norm,
+                bool lamport_order,
+                bool fp8_out,
+                int64_t maxit,
+                const Tail* tail)
 {
-    using namespace k5ar;
     auto* c = reinterpret_cast<Ctx*>(ctx);
     if(hidden != kHidden)
         throw std::invalid_argument("k5_ar: hidden 6144 only");
@@ -124,14 +133,71 @@ void k5_ar_rms(fptr_t ctx,
     a.rank     = c->rank;
     a.maxit    = (int)std::min<int64_t>(std::max<int64_t>(maxit, 1), 0x7fffffff);
     a.gemma    = gemma_norm ? 1 : 0;
+    if(tail)
+        a.tail = *tail;
     hipStream_t stream = aiter::getCurrentHIPStream();
     if(lamport_order)
-        launch_lamport(a, fp8_out, stream);
+        launch_lamport(a, fp8_out, tail != nullptr, stream);
     else
-        launch_gluon(a, fp8_out, stream);
+        launch_gluon(a, fp8_out, tail != nullptr, stream);
     const hipError_t e = hipGetLastError();
     if(e != hipSuccess)
         throw std::runtime_error(std::string("k5_ar launch: ") + hipGetErrorString(e));
+}
+} // namespace k5ar
+
+void k5_ar_rms(fptr_t ctx,
+               int64_t inp,
+               int64_t res_inp,
+               int64_t w,
+               int64_t out,
+               int64_t res_out,
+               int64_t scale,
+               int64_t rows,
+               int64_t hidden,
+               double eps,
+               bool gemma_norm,
+               bool lamport_order,
+               bool fp8_out,
+               int64_t maxit)
+{
+    k5ar::run(ctx, inp, res_inp, w, out, res_out, scale, rows, hidden, eps, gemma_norm,
+              lamport_order, fp8_out, maxit, nullptr);
+}
+
+void k5_ar_rms_tail(fptr_t ctx,
+                    int64_t res_inp,
+                    int64_t w,
+                    int64_t out,
+                    int64_t res_out,
+                    int64_t scale,
+                    int64_t rows,
+                    int64_t hidden,
+                    double eps,
+                    bool gemma_norm,
+                    bool lamport_order,
+                    bool fp8_out,
+                    int64_t maxit,
+                    int64_t tail_rows_ptr,
+                    int64_t tail_w,
+                    int64_t tail_g,
+                    int64_t tail_add,
+                    double tail_scale)
+{
+    using namespace k5ar;
+    if(tail_rows_ptr == 0 || tail_w == 0 || tail_g == 0 ||
+       ((tail_rows_ptr | tail_w | tail_g | tail_add) & 15) != 0)
+        throw std::invalid_argument("k5_ar tail: route rows, weights and GEMM2 rows required, "
+                                    "16-byte aligned");
+    Tail t{};
+    t.g     = reinterpret_cast<const u32x4*>(tail_g);
+    t.rows  = reinterpret_cast<const int32_t*>(tail_rows_ptr);
+    t.w     = reinterpret_cast<const float*>(tail_w);
+    t.add   = reinterpret_cast<const u32x4*>(tail_add);
+    t.scale = (float)tail_scale;
+    t.flags = (tail_add ? kTailAdd : 0) | (tail_add && (float)tail_scale != 1.0f ? kTailScale : 0);
+    run(ctx, 0, res_inp, w, out, res_out, scale, rows, hidden, eps, gemma_norm, lamport_order,
+        fp8_out, maxit, &t);
 }
 
 int64_t k5_ar_errors(fptr_t ctx)
