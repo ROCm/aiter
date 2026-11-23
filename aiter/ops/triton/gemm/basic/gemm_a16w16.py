@@ -597,7 +597,6 @@ def _gemm_a16w16_native(
         # WMMA layout, 2 = coalesced register store (convert_layout, 16-byte buffer stores). For A/B only,
         # AITER_GFX1250_A16W16_STORE overrides the entry's value for this (non-persistent gluon compute_bound)
         # kernel; it must be unset in serving.
-        extra_kwargs = {}
         if kernel_type == "compute_bound":
             store_mode = int(
                 os.environ.get("AITER_GFX1250_A16W16_STORE", register_store)
