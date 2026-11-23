@@ -11,7 +11,6 @@ from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
-from ..dpp_utils import dpp_xor_f32
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import (
     global_typed_ptr,
@@ -116,7 +115,7 @@ def _fp8_scale_e8m0(local_max, qmax_inv_bits=0x3B124925):
 
 
 def _fp8_quant_1x32_lean(vals, route_i8=False):
-    """_fp8_quant_1x32 for 8 values a lane without LDS round trips: the 4-lane |max| goes through DPP and every
+    """_fp8_quant_1x32 for 8 values a lane without LDS round trips: the 4-lane |max| is a width-4 warp_max and every
     lane derives the E8M0 scale itself. ``route_i8``: the values are packed as offset int8 (u8 = q + 128,
     q = round(v / scale) in [-127, 127], max / scale <= 127) instead of E4M3. Returns the scale and the packed
     words."""
@@ -124,8 +123,7 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
     local_max = fabs_f32(vals[0])
     for q in range_constexpr(1, 8):
         local_max = local_max.maximumf(fabs_f32(vals[q]))
-    for xor_lane in (1, 2):
-        local_max = local_max.maximumf(fx.Float32(dpp_xor_f32(local_max, xor_lane)))
+    local_max = fx.coop.warp_max(local_max, width=4)
     e8m0 = _fp8_scale_e8m0(local_max, 0x3C010204 if route_i8 else 0x3B124925)
     if const_expr(route_i8):
         # v_cvt_pk_u8_f32 rounds to nearest and clamps to [0, 255].
@@ -209,8 +207,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     ``scale_stage = (AddrBuffer, first 16-byte group)`` writes the FP8 row scales of
     this tile to rank-local 16-byte groups (one per row) instead of to the peers.
     ``epi_lean`` (FP8): lean ids / weights (as ``lean`` 1, with an offset opaque per
-    unit so it is not hoisted out of the caller's loop), the 4-lane scale max through
-    DPP with every lane deriving the scale itself (_fp8_quant_1x32_lean) and a
+    unit so it is not hoisted out of the caller's loop), the 4-lane scale max as a
+    width-4 warp_max with every lane deriving the scale itself (_fp8_quant_1x32_lean) and a
     branch-free staged scale store (non-leaders store out of bounds).
     ``route_i8`` (epi_lean): offset int8 row values instead of E4M3.
     """
