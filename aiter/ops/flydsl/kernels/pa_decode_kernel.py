@@ -80,6 +80,7 @@ from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from .kernels_common import create_llvm_ptr
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.op_merge import (
     MERGE_HEAD_DIM,
@@ -96,6 +97,7 @@ from .pa_decode.pipeline import (
     PaDecodePipeline,
 )
 from .pa_decode.pipeline_nvfp4 import Gfx1250Nvfp4WavePipeline
+from .tensor_shim import buf_base_i64
 from .pa_decode.traits import (
     FP8_KV_DTYPES,
     FP8_PACK_K,
@@ -228,6 +230,10 @@ def compile_pa_decode_tile(
     store_output: bool = True,
     kv_scale_dtype: torch.dtype | None = None,
     quant_mx: bool = False,
+    page_groups: int | None = None,
+    xcd_rows: int = 0,
+    xcds: int = 0,
+    plan_free: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -243,6 +249,11 @@ def compile_pa_decode_tile(
     instead of the per-token FP8 one. Only the NVFP4 wave tile has it; it takes
     every gfx1250 output mode that writes final rows (direct, last-arriver and
     cluster merges, clusters shared by several sequences included).
+    The NVFP4 wave tile also takes ``page_groups`` (2 or 4 groups of four
+    waves a CTA that split a task's pages and merge in LDS), ``xcd_rows`` /
+    ``xcds`` (``xcd_rows`` consecutive sequences, or clusters, dispatched on
+    one of the ``xcds`` XCDs) and ``plan_free`` (no plan lookups; see
+    ``compile_gfx1250_pa_decode``).
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
 
@@ -352,10 +363,18 @@ def compile_pa_decode_tile(
                 wide_bf16_page128=False,
                 narrow_fp8_page16=False,
                 quant_mx=quant_mx,
+                page_groups=page_groups or 1,
+                xcd_rows=xcd_rows if xcds > 1 else 0,
+                xcds=xcds if xcd_rows and xcds > 1 else 0,
+                plan_free=plan_free,
             )
         )
     if quant_mx:
         raise ValueError("quant_mx (MXFP8 output) requires the NVFP4 wave tile")
+    if page_groups not in (None, 1) or xcd_rows or plan_free:
+        raise ValueError(
+            "page_groups, xcd_rows and plan_free require the NVFP4 wave tile"
+        )
     if architecture in ("gfx1250", "gfx1250-strict"):
         if not trans_k:
             raise NotImplementedError("NHD pa_decode requires gfx950")
@@ -1027,6 +1046,15 @@ def compile_gfx1250_pa_decode(t):
     [p * run_tiles, (p + 1) * run_tiles), ``run_tiles`` sized by the host from
     the length bound. In all modes a sequence's single task stores final rows
     directly, and empty sequences clear their rows.
+    ``plan_free`` (NVFP4 wave tile, direct or cluster output) reads no plan:
+    ``work`` holds the context lengths, the direct output runs one CTA a
+    sequence, a cluster gives a sequence's tiles to min(P, tiles) CTAs split
+    evenly (the planner's split for a plan with P tasks a sequence), and every
+    wave preloads the sequence's page ids (at most 32) while the context
+    length loads. ``xcd_rows`` remaps the direct and cluster grids so that
+    ``xcd_rows`` consecutive sequences (or clusters) run on one XCD.
+    ``page_groups`` G runs G groups of four waves a CTA over pages g, g + G, ...
+    of the task, merged in LDS after the loop.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
     """
@@ -1104,6 +1132,29 @@ def compile_gfx1250_pa_decode(t):
             "quant_output requires the direct or cluster_merge output, one "
             "query split and one sequence per cluster"
         )
+    if t.page_groups != 1 and not (
+        t.nvfp4_wave
+        and t.page_groups in (2, 4)
+        and not t.merge_partitions
+        and (t.quant_mx or not t.quant_output)
+    ):
+        # Only the first group stores: an epilogue with a CTA barrier (the
+        # per-token FP8 maxima, the last-arriver merge) would diverge.
+        raise ValueError(
+            "page_groups 2/4 take the NVFP4 wave tile without the per-token FP8 "
+            "output or the last-arriver merge"
+        )
+    if t.xcd_rows and not t.plan_free:
+        raise ValueError("xcd_rows remaps the plan-free direct and cluster grids")
+    if t.plan_free and not (
+        t.nvfp4_wave
+        and (t.direct_output or t.cluster_merge)
+        and (t.quant_mx or not t.quant_output)
+    ):
+        raise ValueError(
+            "plan_free takes the NVFP4 wave tile's direct or cluster output, "
+            "with the BF16 or MXFP8 output"
+        )
     if not (t.store_output or t.quant_output):
         raise ValueError("store_output=False requires quant_output")
     if t.total_bytes > 327680:
@@ -1137,6 +1188,12 @@ def compile_gfx1250_pa_decode(t):
     )
     if t.nvfp4_wave and t.nvfp4_buffers != 3:
         kernel_name += f"_ring{t.nvfp4_buffers}"
+    if t.page_groups != 1:
+        kernel_name += f"_pg{t.page_groups}"
+    if t.xcd_rows:
+        kernel_name += f"_xcd{t.xcd_rows}"
+    if t.plan_free:
+        kernel_name += "_planfree"
 
     # Every argument that reducer-fed and direct-output kernels read fits in
     # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
@@ -1215,6 +1272,43 @@ def compile_gfx1250_pa_decode(t):
                 row + sequences * t.query_length, 1, fx.Float32(1.0), sq_row, sq_head
             )
 
+        def xcd_remap(index):
+            # A bijection of [0, grid) (padded to xcd_rows * xcds) that puts
+            # xcd_rows consecutive indices (one request's MTP rows, which share
+            # most selected pages) on the XCD that dispatches them, so they
+            # share its L2: dispatch index i runs on XCD i % xcds.
+            xcd, slot = index % t.xcds, index // t.xcds
+            return (
+                (slot // t.xcd_rows) * t.xcds + xcd
+            ) * t.xcd_rows + slot % t.xcd_rows
+
+        lds_base = None
+        page_ids = None
+        if const_expr(t.plan_free):
+            # The pipeline's LDS, taken here so the page ids can land in it
+            # before the CTA branches on the context length.
+            lds_base = fx.recast_iter(
+                fx.Uint8,
+                fx.SharedAllocator().allocate(SharedStorage).peek().buf.ptr,
+            )
+
+        def preload_pages(seq_id):
+            # Lane j of each wave copies the sequence's page j (<= 32 pages)
+            # into the wave's LDS slot with an async load: it has a side
+            # effect, so it issues here, overlapping the context length load
+            # the branch below waits for (a register load would sink into the
+            # branch, a second round trip). The pipeline reads the slot.
+            tid = fx.Int32(gpu.thread_id("x"))
+            entry = seq_id * max_blocks + fx.min(tid % t.WAVE, max_blocks - 1)
+            src = create_llvm_ptr(
+                buf_base_i64(table) + fx.Int64(entry) * 4, address_space=1
+            )
+            dst = create_llvm_ptr(
+                fx.Int64(fx.ptrtoint(lds_base)) + fx.Int64(t.page_ids_offset + tid * 4),
+                address_space=3,
+            )
+            fx.rocdl.global_load_async_to_lds_b32(src, dst, 0)
+
         task_slot = fx.Int32(gpu.block_id("x"))
         if const_expr(t.cluster_merge):
             # Cluster s runs sequence s's tasks on its leading CTAs. Their
@@ -1222,15 +1316,42 @@ def compile_gfx1250_pa_decode(t):
             # plan_pa_decode splits them: ``work`` holds the context lengths,
             # read alongside reduce_info instead of after it.
             seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            if const_expr(t.xcd_rows):
+                # Whole clusters move: cluster c's sequences are its
+                # cluster_seqs consecutive ones.
+                size = t.cluster_merge * t.cluster_seqs
+                seq = (
+                    xcd_remap(task_slot // size) * t.cluster_seqs
+                    + task_slot % size // t.cluster_merge
+                )
             # The last cluster pads the grid past the batch; with quant_output,
-            # whole clusters past it write padded FP8 rows (below).
-            pad_grid = t.cluster_seqs > 1 or t.quant_output
+            # whole clusters past it write padded FP8 rows (below). XCD-remapped
+            # grids pad to whole XCD groups.
+            pad_grid = t.cluster_seqs > 1 or t.quant_output or t.xcd_rows or t.plan_free
             if const_expr(pad_grid):
+                grid_seq = seq
                 present = seq < sequences
                 seq = present.select(seq, fx.Int32(0))
+            if const_expr(t.plan_free):
+                preload_pages(seq)
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
             step_bounds = None
-            if const_expr(t.cluster_steps):
+            if const_expr(t.plan_free):
+                # No plan: the sequence's min(P, tiles) tasks split its tiles
+                # evenly, task p in slot seq * P + p of the partials, which is
+                # how the planner splits a plan with P tasks a sequence.
+                length = fx.max(task_context, fx.Int32(0))
+                tiles = (length + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
+                count = fx.min(tiles, fx.Int32(t.cluster_merge))
+                count = present.select(count, fx.Int32(0))
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                n_tasks = fx.max(count, fx.Int32(1))
+                task_seq = seq
+                task_begin = part * tiles // n_tasks
+                task_end = (part + 1) * tiles // n_tasks
+                active = part < count
+            elif const_expr(t.cluster_steps):
                 # Block tables hold at most CLUSTER_PARTITIONS steps, so CTA p
                 # takes steps [p chunk, (p + 1) chunk). Its first page ids
                 # depend on no load, so they load with the context length
@@ -1338,6 +1459,24 @@ def compile_gfx1250_pa_decode(t):
                 task_begin = first_tile + part * tiles // parts
                 task_end = first_tile + (part + 1) * tiles // parts
                 active = part < count
+        elif const_expr(t.plan_free):
+            # Direct output, CTA = sequence: ``work`` holds the context
+            # lengths, no plan lookups. The length and the sequence's page ids
+            # load together, so the first page DMAs issue one memory round trip
+            # after launch. Padded grids (quant pad rows, XCD groups) hold CTAs
+            # past the sequences.
+            if const_expr(t.xcd_rows):
+                task_slot = xcd_remap(task_slot)
+            direct_seq = task_slot
+            in_range = task_slot < sequences
+            task_seq = in_range.select(task_slot, fx.Int32(0))
+            preload_pages(task_seq)
+            task_context = in_range.select(
+                fx.Int32(fx.recast_iter(fx.Int32, work)[task_seq]), fx.Int32(0)
+            )
+            task_begin = fx.Int32(0)
+            task_end = (task_context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
+            active = task_end > 0
         else:
             if const_expr(t.direct_output):
                 # One task per nonempty sequence; reduce_info supplies its slot.
@@ -1395,6 +1534,8 @@ def compile_gfx1250_pa_decode(t):
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.
             ctx.task_slot, ctx.capacity = task_slot, capacity
+            ctx.page_ids = page_ids
+            ctx.lds_base = lds_base
             ctx.n_kv = kv_heads
             ctx.quant = quant
             if const_expr(t.merge_partitions):
@@ -1423,6 +1564,15 @@ def compile_gfx1250_pa_decode(t):
                 Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
+        elif const_expr(t.plan_free and t.direct_output):
+            # Empty sequences clear their rows; CTAs past them write the padded
+            # FP8 rows or, in XCD padding, nothing.
+            if direct_seq < sequences:
+                zero_output(direct_seq, pout)
+            elif const_expr(t.quant_output):
+                pad_row = direct_seq - sequences
+                if pad_row < quant_rows - sequences * t.query_length:
+                    pad_output(pad_row)
         elif const_expr(t.direct_output):
             if const_expr(t.quant_output):
                 block = fx.Int32(gpu.block_id("x"))
@@ -1457,6 +1607,31 @@ def compile_gfx1250_pa_decode(t):
                 ).merge(seq, part, first, count, capacity)
             elif (count == 0) & (part == 0) & present:
                 zero_output(seq, output)
+        elif const_expr(t.cluster_merge and (t.plan_free or t.xcd_rows)):
+            # Every CTA of a cluster reaches its barrier exactly once. The
+            # grid's clusters past the sequences write the padded FP8 rows
+            # (P a cluster) or, in XCD padding, nothing.
+            if count > 1:
+                merge = Gfx1250ClusterMerge(
+                    t,
+                    pmax,
+                    psum,
+                    pout,
+                    output,
+                    sq_row,
+                    sq_head,
+                    quant if t.quant_output else None,
+                )
+                merge.run(seq, part, first, count, capacity)
+            else:
+                if present:
+                    if (count == 0) & (part == 0):
+                        zero_output(seq, output)
+                else:
+                    if const_expr(t.quant_output):
+                        pad_row = (grid_seq - sequences) * t.cluster_merge + part
+                        if pad_row < quant_rows - sequences * t.query_length:
+                            pad_output(pad_row)
         elif const_expr(t.cluster_merge):
             # Every CTA of a cluster reaches its barrier exactly once.
             if count > 1:
@@ -1480,6 +1655,9 @@ def compile_gfx1250_pa_decode(t):
                     zero_output(seq, output)
             elif (count == 0) & (part == 0):
                 zero_output(seq, output)
+        if const_expr(t.plan_free):
+            # The page-id copy has landed before any wave leaves the CTA.
+            fx.rocdl.s_wait_asynccnt(0)
 
     @flyc.jit
     def launch(
@@ -1516,6 +1694,10 @@ def compile_gfx1250_pa_decode(t):
             if const_expr(t.quant_output):
                 # One CTA per padded FP8 row past the sequences' tokens.
                 grid_x = quant_rows - sequences * (t.query_length - 1)
+            if const_expr(t.xcd_rows):
+                # Whole XCD groups of xcd_rows CTAs.
+                pad = t.xcd_rows * t.xcds
+                grid_x = (grid_x + pad - 1) // pad * pad
         if const_expr(t.cluster_merge):
             # Whole clusters of cluster_seqs sequences.
             grid_x = ((sequences + t.cluster_seqs - 1) // t.cluster_seqs) * (
@@ -1528,6 +1710,12 @@ def compile_gfx1250_pa_decode(t):
                 grid_x = (
                     sequences + (pads + t.cluster_merge - 1) // t.cluster_merge
                 ) * t.cluster_merge
+            if const_expr(t.xcd_rows):
+                # Whole XCD groups of xcd_rows clusters.
+                size = t.cluster_merge * t.cluster_seqs
+                pad = t.xcd_rows * t.xcds
+                clusters = (grid_x // size + pad - 1) // pad * pad
+                grid_x = clusters * size
         pa_decode_tile_kernel(
             work,
             table,
@@ -1572,10 +1760,11 @@ def compile_gfx1250_pa_decode(t):
     if t.bf16_wave_query_tiles:
         # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
         llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
-    if not t.merged_output:
+    if not t.merged_output or t.plan_free:
         # Argument loads that a preload leaves behind are slower than those of
         # an unpreloaded kernel (cluster merges ran 2-6% slower), so merging
-        # kernels, whose arguments do not all fit, keep loading them.
+        # kernels, whose arguments do not all fit, keep loading them. Plan-free
+        # merges read their first arguments preloaded (+-0.1 us, MI455X).
         llvm_options["amdgpu-kernarg-preload"] = AITER_FLYDSL_KERNARG_PRELOAD
         llvm_options["amdgpu-kernarg-preload-count"] = (
             AITER_FLYDSL_KERNARG_PRELOAD_COUNT

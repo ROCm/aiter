@@ -665,6 +665,10 @@ def pa_decode(
     mask_unowned_kv: bool = True,
     store_output: bool = True,
     quantized_pad_rows: int = 0,
+    page_groups: int | None = None,
+    xcd_rows: int = 0,
+    plan_free: bool = False,
+    cluster_rows: int = 1,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -828,6 +832,24 @@ def pa_decode(
     any bytes, including NaN. False skips that masking (slightly faster on
     tiny boundary-tile-only calls); the caller must then keep those bytes and
     scales finite. gfx1250 ignores it and always requires finite bytes.
+
+    NVFP4 wave-tile launch options (MiniMax-M3 sparse decode, gfx1250), BF16
+    or MXFP8 output:
+    ``plan_free=True`` drops the plan lookups from the tile prologue: in the
+    one-partition direct output a CTA is a sequence, in a cluster merge a
+    cluster of P CTAs (P = min(the plan's ``max_partitions``, 8); the plan
+    built with ``workgroup_budget = P x sequences``) gives the sequence's
+    tiles to min(P, tiles) CTAs split evenly; the context lengths are read
+    directly, every wave preloads the sequence's page ids
+    (``block_tables.shape[1] <= 32``) and the CTA splits the query once.
+    ``cluster_rows`` (2 or 4, plan-free clusters only) puts that many
+    sequences in one cluster (``cluster_seqs``), so more rows stay within the
+    resident-cluster bound. ``page_groups`` (1, 2, 4) runs that many groups of
+    four waves a CTA, splitting a task's pages and merging in LDS.
+    ``xcd_rows`` (plan-free only) dispatches that many consecutive sequences
+    (one request's MTP rows, which share most selected pages) on one XCD so
+    they share its L2. None of them changes the math of a row: the same split
+    (one group, the plan's tile ranges) gives the planned launch's bytes.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -1475,6 +1497,15 @@ def pa_decode(
         and 2 * cluster_seqs * cluster_size <= CLUSTER_PARTITIONS
     ):
         cluster_seqs *= 2
+    # A plan-free caller may ask for ``cluster_rows`` sequences a cluster.
+    if cluster_rows not in (1, 2, 4) or (cluster_rows > 1 and not plan_free):
+        raise ValueError("cluster_rows must be 1, 2 or 4, and > 1 needs plan_free")
+    if cluster_rows > 1:
+        if cluster_rows * cluster_size > CLUSTER_PARTITIONS:
+            raise ValueError(
+                f"cluster_rows x partitions must be at most {CLUSTER_PARTITIONS}"
+            )
+        cluster_seqs = max(cluster_seqs, cluster_rows)
     cluster_merge = (
         cluster_size
         if (
@@ -1574,6 +1605,23 @@ def pa_decode(
         and bound_tiles <= 4 * cluster_merge
     )
     run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
+    if plan_free and not (
+        (
+            one_partition_output
+            or (cluster_merge and work_plan.capacity >= num_seqs * cluster_merge)
+        )
+        and nvfp4
+        and query_length * query_group_size <= 16
+        and max_blocks_per_seq <= 32
+        and (quant_mx or not quant_output)
+    ):
+        raise NotImplementedError(
+            "plan_free takes the NVFP4 wave tile with a BF16 or MXFP8 output, a "
+            "one-partition plan or a cluster merge with sequences x P task "
+            "slots, and at most 32 pages a sequence"
+        )
+    if xcd_rows and not plan_free:
+        raise ValueError("xcd_rows requires plan_free")
     # Unfused plans write the BF16 output as usual and quantize it after with
     # the standalone per-token kernel, which is exactly the unfused path.
     quant_after_output = (
@@ -1643,6 +1691,18 @@ def pa_decode(
                 else {}
             ),
             **({"quant_mx": True} if quant_output and quant_mx else {}),
+            **({"page_groups": page_groups} if nvfp4 and page_groups else {}),
+            **(
+                {
+                    "xcd_rows": max(
+                        1, xcd_rows // (cluster_seqs if cluster_merge else 1)
+                    ),
+                    "xcds": get_num_xcds(),
+                }
+                if xcd_rows
+                else {}
+            ),
+            **({"plan_free": True} if plan_free else {}),
         )
 
     total_rows = query_length * query_group_size
@@ -1763,9 +1823,14 @@ def pa_decode(
             int(query.stride(0)),
             int(query.stride(1)),
             *nhd_strides,
-            # Cluster grids derive their tiles from the context lengths.
+            # Cluster and plan-free grids derive their tiles from the context
+            # lengths.
             ptr_arg(
-                (context_lengths if cluster_merge else work_plan.work_info),
+                (
+                    context_lengths
+                    if cluster_merge or plan_free
+                    else work_plan.work_info
+                ),
                 fx.Int32,
             ),
             work_plan.capacity,
