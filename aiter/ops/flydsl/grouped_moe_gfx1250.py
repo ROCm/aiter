@@ -274,6 +274,28 @@ def _tp_route_quant_enabled() -> bool:
 
 
 @functools.cache
+def _router_rows_min_tokens() -> int | None:
+    """AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS (unset: None): the smallest decode
+    batch that takes the router's rows. Unset, the rows go only where the A1
+    launch would be the TP route token-multidest quant (``token_multidest_eligible``,
+    T >= 64); a smaller value also lets GEMM1 gather them in place of the small-T
+    route-ksplit A1 launch (``moe_fused_quant_preshuffle_routeks``), whose rows
+    are the same MXFP4 bytes."""
+    raw = os.environ.get("AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS", "").strip()
+    return int(raw) if raw else None
+
+
+def _router_rows_eligible(token_num: int, topk: int) -> bool:
+    """Whether a decode batch of ``token_num`` routes takes router rows (above)."""
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    lo = _router_rows_min_tokens()
+    if lo is None:
+        return token_multidest_eligible(int(token_num), int(topk))
+    return 1 < int(topk) <= 8 and int(token_num) >= max(1, lo)
+
+
+@functools.cache
 def _router_rows_enabled() -> bool:
     """AITER_MOE_ROUTER_QUANT_ROWS (default 1): whether a grouped MoE call may
     take the router's rows when a caller hands them in."""
@@ -284,16 +306,16 @@ def router_quant_rows_buffers(
     tokens: int, model_dim: int, device, topk: int = 4, mxfp8=None
 ) -> MoeRouterQuantRows | None:
     """Buffers for ``moe_router_quant_rows``, or None where a grouped MoE call
-    would not take them (its A1 launch is not the TP route token-multidest
-    quant at this batch, or AITER_MOE_ROUTER_QUANT_ROWS=0). ``mxfp8`` None:
+    would not take them (its A1 launch is not the TP route-in-quant at this
+    batch: the token-multidest kernel from 64 tokens, or the route-indexed
+    one from AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS; or
+    AITER_MOE_ROUTER_QUANT_ROWS=0). ``mxfp8`` None:
     also the MXFP8 copy when a shared expert fold is pending
     (``moe_shared_expert_fold``), sized for the fold's row capacity."""
-    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
-
     if (
         not _router_rows_enabled()
         or int(topk) != 4
-        or not token_multidest_eligible(int(tokens), int(topk))
+        or not _router_rows_eligible(int(tokens), int(topk))
         or int(tokens) * int(topk) > _FUSED_ROUTE_PSUM_MAX_NUMEL
         or not _tp_route_quant_enabled()
     ):
@@ -1646,9 +1668,7 @@ def _grouped_a8w4_tdm_moe(
         )
         and not _as_bool(os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False)
     ):
-        from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
-
-        if token_multidest_eligible(token_num, topk):
+        if _router_rows_eligible(token_num, topk):
             _tp_rows = _take_router_rows(topk_ids, token_num, model_dim)
     if _tp_rows is not None and _fold is not None:
         _t1, _t2 = _fold_tiles
