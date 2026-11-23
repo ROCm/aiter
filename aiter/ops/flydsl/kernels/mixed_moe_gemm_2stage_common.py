@@ -211,6 +211,12 @@ def compile_mixed_moe_gemm1_common(
     mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
     gate_up_interleave = gate_mode is GateMode.INTERLEAVE
     gate_only = gate_mode is GateMode.GATE_ONLY
+    # The launcher adds tile2_pad output columns to the stage-1 grid; the XCD remap
+    # below must count the same N blocks, or the last launched N block is never computed.
+    _remap_tile2_pad = 0
+    if not gate_only:
+        _tk2 = tile_k // 2
+        _remap_tile2_pad = (_tk2 - (inter_dim - inter_dim_pad) % _tk2) % _tk2
 
     is_splitk = k_batch > 1
     if mock_gate_only and not is_splitk:
@@ -517,7 +523,7 @@ def compile_mixed_moe_gemm1_common(
                 num_xcds = 8
                 one = 1
                 tile_n_idx = tile_n
-                inter_pad_idx = 2 * inter_dim_pad
+                inter_pad_idx = 2 * inter_dim_pad - _remap_tile2_pad
                 if const_expr(mock_gate_only or gate_up_interleave):
                     grid_x = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
                 else:
