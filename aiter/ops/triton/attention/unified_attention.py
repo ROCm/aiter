@@ -276,6 +276,54 @@ def gfx950_gluon_supported(
     )
 
 
+def unified_attention_gluon_supported(
+    *,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    head_size_v: int | None = None,
+    shuffled_kv_cache: bool = False,
+    k_width: int | None = None,
+    softcap: float = 0.0,
+    use_alibi_slopes: bool = False,
+    use_qq_bias: bool = False,
+) -> bool:
+    """Return True if `unified_attention` runs these arguments on a Gluon kernel on this device.
+
+    Args:
+        q_dtype (torch.dtype): Dtype of q.
+        kv_cache_dtype (torch.dtype): Dtype of the K cache.
+        head_size (int): Head size of q and k. Double it for an fp4-packed q.
+        block_size (int): Page size of the KV cache.
+        head_size_v (int | None): Head size of v. Default: head_size.
+        shuffled_kv_cache (bool): True if the KV cache uses the shuffled layout.
+        k_width (int | None): Last dimension of the shuffled K cache. Required if
+            shuffled_kv_cache is True.
+        softcap (float): Softcap of the call.
+        use_alibi_slopes (bool): True if the call gives alibi_slopes.
+        use_qq_bias (bool): True if the call gives qq_bias.
+
+    Returns:
+        bool: True on gfx950 if its Gluon kernel supports the call. False on other
+            architectures: this function does not check their kernels yet.
+    """
+    if DEVICE_ARCH == "gfx950":
+        return gfx950_gluon_supported(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            head_size=head_size,
+            block_size=block_size,
+            head_size_v=head_size_v,
+            shuffled_kv_cache=shuffled_kv_cache,
+            k_width=k_width,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+            use_qq_bias=use_qq_bias,
+        )
+    return False
+
+
 def _gfx950_gluon_supported(params: _UAParams):
     """GFX950 Gluon supported configs."""
     return gfx950_gluon_supported(
