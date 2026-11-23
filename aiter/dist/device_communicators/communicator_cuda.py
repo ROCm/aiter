@@ -839,6 +839,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, res_inp_, weight_, eps, False, gemma_norm=gemma_norm
         )
 
+    def sp_moe_front_eligible(
+        self, input_: torch.Tensor, weight_: torch.Tensor
+    ) -> bool:
+        """Whether sp_fused_allreduce_rmsnorm_moe_front takes this call: the sequence-parallel
+        range at TP2 / TP4 (ar2s) with the Lamport all-gather the owner-row routing
+        gathers with. Shapes and the group only, so every rank decides the same."""
+        ca_comm = self.ca_comm
+        return (
+            self.ar2s_sp_eligible(input_, weight_)
+            and ca_comm.world_size in (2, 4)
+            and getattr(ca_comm, "_lamport_max_bytes", 0) > 0
+        )
+
+    def sp_fused_allreduce_rmsnorm_moe_front(
+        self, input_, res_inp_, weight_, eps, gemma_norm=False
+    ):
+        """MiniMax-M3 MoE front on the sequence-parallel residual (CustomAllreduce.
+        ar2s_fused_ar_rms_moe): (x_own, residual_out, q8, s8, q4, s4), or None outside
+        sp_moe_front_eligible -- the caller then takes sp_fused_allreduce_rmsnorm, which is the
+        replicated AR + norm there. Eager only (call it from inside a custom op)."""
+        if not self.sp_moe_front_eligible(input_, weight_):
+            return None
+        return self.ca_comm.ar2s_fused_ar_rms_moe(
+            input_.contiguous(), res_inp_.contiguous(), weight_, eps, gemma_norm
+        )
+
     def sp_allreduce_add_residual(self, input_, res_inp_, weight_):
         """all_reduce(input_) + residual, whole on every rank, from a sequence-parallel residual
         (the residual_out the next replicated AR + norm would write)."""

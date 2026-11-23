@@ -765,6 +765,26 @@ def ar2s_rms_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_moe", develop=True)
+def ar2s_rms_moe_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out_own: int,
+    res_out: int,
+    q8: int,
+    s8: int,
+    q4: int,
+    s4: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    grid: int = 0,
+) -> None: ...
+
+
 @compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_ex", develop=True)
 def ar2s_rms_ex_gfx1250(
     ctx: int,

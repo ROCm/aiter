@@ -54,4 +54,27 @@ void ar2s_rms_ex(fptr_t ctx,
                  bool sp_residual,
                  bool aux_residual,
                  int64_t grid); // > 0: cap the blocks of this call (same on every rank)
+// MiniMax-M3 MoE front (sequence-parallel residual, TP2 / TP4, hidden % 512 == 0): the
+// all-reduce + residual add + RMSNorm of ar2s_rms_ex(sp_residual) whose owner quantizes its rows
+// to the MoE layer's inputs and all-gathers those instead of the bf16 rows. Whole on every rank:
+// q8 [rows, hidden] E4M3 + s8 [rows, hidden / 32] E8M0 (the shared expert's MXFP8 input, the bytes
+// of ATOM quantize_fp8: amax floored at 1e-10) and q4 [rows, hidden / 2] + s4 [rows, hidden / 32]
+// (the routed experts' MXFP4 A1, the bytes of the FlyDSL MoE A1 quant; E2M1 element 2i in the low
+// nibble). Own rows only: res_out (as sp_residual) and out_own [own rows, hidden] bf16, the
+// normalized own rows, compact (row j of the own chunk at row j; null when the chunk is empty).
+void ar2s_rms_moe(fptr_t ctx,
+                  int64_t inp,
+                  int64_t res_inp,
+                  int64_t w,
+                  int64_t out_own,
+                  int64_t res_out,
+                  int64_t q8,
+                  int64_t s8,
+                  int64_t q4,
+                  int64_t s4,
+                  int64_t rows,
+                  int64_t hidden,
+                  double eps,
+                  bool gemma_norm,
+                  int64_t grid);
 } // namespace aiter

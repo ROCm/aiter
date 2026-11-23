@@ -2269,6 +2269,103 @@ class CustomAllreduce:
             return out_q, res_out, out_s.view(fp8_e8m0)
         return out, res_out
 
+    def ar2s_fused_ar_rms_moe(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        grid: int = 0,
+    ):
+        """The sequence-parallel AR + residual add + RMSNorm of ``ar2s_fused_ar_rms_ex(
+        sp_residual=True)`` for a MiniMax-M3 MoE layer: the owner quantizes its normalized
+        rows to the layer's inputs and the all-gather carries those (9600 B a row at hidden
+        6144 against 12288 B of bf16). TP2 / TP4, hidden % 512 == 0. Returns
+
+          x_own  [own rows, hidden] bf16: this rank's normalized rows (``ar2s_sp_own_rows``,
+                 launch by launch, compact): the router's input
+          res    [rows, hidden] bf16: residual_out, the own rows only (as sp_residual)
+          q8, s8 [rows, hidden] E4M3, [rows, hidden // 32] E8M0: the shared expert's MXFP8
+                 input, ATOM quantize_fp8's bytes (amax floored at 1e-10)
+          q4, s4 [rows, hidden // 2] uint8, [rows, hidden // 32] E8M0: the routed experts'
+                 MXFP4 A1 (row-major), the bytes the FlyDSL MoE A1 quant writes
+
+        q8 / s8 / q4 / s4 are whole on every rank. Rows beyond one launch are split as
+        ar2s_fused_ar_rms splits them."""
+        from aiter.utility.dtypes import fp8_e8m0
+
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        dev = inp.device
+        res_out = torch.empty_like(inp)
+        q8 = torch.empty((rows, hidden), dtype=fp8, device=dev)
+        s8 = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=dev)
+        q4 = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=dev)
+        s4 = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=dev)
+        launches = self.ar2s_launch_rows(rows, hidden)
+        own_counts = []
+        for s, e in launches:
+            r = -(-(e - s) // self.world_size)
+            a = s + self.rank * r
+            own_counts.append(max(0, min(e, a + r) - a))
+        x_own = torch.empty((sum(own_counts), hidden), dtype=inp.dtype, device=dev)
+        off = 0
+        for (s, e), m in zip(launches, own_counts):
+            ops.ar2s_rms_moe_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                x_own[off : off + m].data_ptr() if m else 0,
+                res_out[s:e].data_ptr(),
+                q8[s:e].data_ptr(),
+                s8[s:e].data_ptr(),
+                q4[s:e].data_ptr(),
+                s4[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+                grid,
+            )
+            off += m
+        return x_own, res_out, q8, s8.view(fp8_e8m0), q4, s4.view(fp8_e8m0)
+
+    def ar2s_sp_gather_rows(
+        self,
+        own_parts: list[torch.Tensor],
+        rows: int,
+        hidden: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """All-gather of a per-row tensor computed on this rank's own rows: ``own_parts[i]``
+        holds the rows of launch i's own chunk (``ar2s_sp_own_rows``), padded to the launch's
+        chunk height ceil(launch rows / world) (the pad rows are dropped). Returns
+        [rows, *row_shape], every row from its owner, on every rank: one Lamport one-shot
+        all-gather a launch (exact for non-16-bit dtypes; the parts must be contiguous with
+        whole 16 B rows). Runs the same eager and in a captured graph."""
+        launches = self.ar2s_launch_rows(rows, hidden)
+        assert len(own_parts) == len(launches)
+        row_shape = tuple(own_parts[0].shape[1:])
+        # a launch's gather spans world * chunk >= its rows: up to world - 1 pad rows run into
+        # the next launch's first rows, which its own gather (later on the stream) rewrites
+        span = max(
+            s + self.world_size * p.shape[0] for (s, _), p in zip(launches, own_parts)
+        )
+        if out is None or out.shape[0] < span:
+            out = torch.empty(
+                (max(span, rows),) + row_shape,
+                dtype=own_parts[0].dtype,
+                device=own_parts[0].device,
+            )
+        for (s, e), p in zip(launches, own_parts):
+            assert p.shape[0] == -(-(e - s) // self.world_size) and p.is_contiguous()
+            self.lamport_all_gather(p, 0, out=out[s : s + self.world_size * p.shape[0]])
+        return out[:rows]
+
     def ar2s_launch_rows(self, rows: int, hidden: int) -> list[tuple[int, int]]:
         """The [start, end) row ranges of the balanced launches ar2s splits
         ``rows`` into (one when they fit one inbox)."""

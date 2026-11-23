@@ -182,6 +182,69 @@ __device__ __forceinline__ void stage_mxfp8(u32x4 out_pack, uint8_t* stage, int 
         stage[hidden + t / 4] = sb;
 }
 
+// NaN-propagating max (IEEE maximum, v_maximum_f32): FlyDSL's fx.max, which the MoE A1 quant
+// reduces its group amax with
+__device__ __forceinline__ float max_nan(float a, float b) { return __builtin_elementwise_maximum(a, b); }
+
+// MXFP4 1x32 quant of the 8 bf16 values a thread holds (lanes 4g..4g+3 of a wave share a group),
+// bit for bit the gfx1250 FlyDSL MoE A1 quant (moe_fused_route_quant_scatter, pk8 path): the amax
+// of |x| over the bf16 values from 0 with a NaN-propagating max, the RoundUp E8M0 FP4 scale and
+// v_cvt_scalef32_pk8_fp4_bf16 (8 E2M1 nibbles, element 2i in the low nibble of byte i).
+__device__ __forceinline__ void mxfp4_quant8(u32x4 bf, uint32_t& q, uint8_t& sbyte)
+{
+    float v[8];
+    unpack(bf, v);
+    float amax = 0.f;
+#pragma unroll
+    for(int j = 0; j < 8; ++j)
+        amax = max_nan(amax, fabsf(v[j]));
+    amax = max_nan(amax, __shfl_xor(amax, 1));
+    amax = max_nan(amax, __shfl_xor(amax, 2));
+    const float scale =
+        aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp, aiter::MxDtype::FP4_E2M1>(amax);
+    q     = (uint32_t)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(bf16x8_t, bf), scale);
+    sbyte = (uint8_t)((__float_as_uint(scale) >> 23) & 0xffu);
+}
+
+// MoE-front staging (MOE): the normalized row as the MiniMax-M3 MoE layer's inputs, as
+// 16-byte packs in the AG slot's order: [0, qp) E4M3 and [qp, qp + sp) E8M0 of the shared expert's
+// MXFP8 input (ATOM quantize_fp8's bytes: the group amax floored at kAmaxFloor), then
+// [qp + sp, qp + sp + qp4) the routed experts' MXFP4 A1 payload and [.., + sp) its E8M0 (the A1
+// quant's bytes); qp = hidden / 16, sp = hidden / 512, qp4 = hidden / 32 (hidden * 25 / 32
+// bytes). Callers sync before and after.
+__device__ __forceinline__ void stage_moe(u32x4 out_pack, uint8_t* stage, int hidden, int t)
+{
+    stage_mxfp8(out_pack, stage, hidden, t);
+    uint32_t q4;
+    uint8_t sb4;
+    mxfp4_quant8(out_pack, q4, sb4);
+    uint8_t* s4 = stage + hidden + hidden / 32;
+    *reinterpret_cast<uint32_t*>(s4 + 4 * t) = q4;
+    if((t & 3) == 0)
+        s4[hidden / 2 + t / 4] = sb4;
+}
+// pack p of a staged MoE-front row to its output row (p < qp + sp + qp4 + sp)
+__device__ __forceinline__ void store_moe_pack(uint32_t p,
+                                               uint32_t row,
+                                               u32x4 v,
+                                               uint32_t qp,
+                                               uint32_t sp,
+                                               u32x4* __restrict__ q8,
+                                               u32x4* __restrict__ s8,
+                                               u32x4* __restrict__ q4,
+                                               u32x4* __restrict__ s4)
+{
+    const uint32_t qp4 = qp / 2;
+    if(p < qp)
+        q8[row * qp + p] = v;
+    else if(p < qp + sp)
+        s8[row * sp + (p - qp)] = v;
+    else if(p < qp + sp + qp4)
+        q4[row * qp4 + (p - qp - sp)] = v;
+    else
+        s4[row * sp + (p - qp - sp - qp4)] = v;
+}
+
 // ar2s, templated on the output and on where the residual lives:
 //   FP8   out is MXFP8: E4M3 [rows, hidden] in out_q, row-major E8M0 [rows, hidden / 32] in
 //         out_s, the bytes per_1x32_mx_quant_hip(fp8, e8m0) gives for the bf16 out (which is
@@ -312,7 +375,13 @@ __device__ __forceinline__ int step_start(int s, int M, int r0, int step)
 // Phase 2 (stage B) reads its rows through a double-buffered LDS slot of NG + 1 packs a
 // thread (the NG summands and the residual, dynamic LDS), loaded asynchronously one row ahead:
 // the next row's loads are in flight during this row's arithmetic without holding VGPRs.
-template <int NG, bool FP8, bool SP, bool AUX = false>
+// MOE (with FP8 and SP): the MiniMax-M3 MoE layer's inputs instead of one normalized output. The
+// owner quantizes its rows to the shared expert's MXFP8 (out_q / out_s, ATOM quantize_fp8's
+// bytes) and to the routed experts' MXFP4 A1 (out_q4 / out_s4, the A1 quant's bytes), pushes both
+// (qp + sp + qp4 + sp packs a row, 9600 B at hidden 6144 against 12288 B of bf16) and writes its
+// rows' bf16 normalized values to out, the own rows only ([own rows, hidden], row j of the own
+// chunk at row j: the router's input, computed on the owner). Every other output is whole.
+template <int NG, bool FP8, bool SP, bool AUX = false, bool MOE = false>
 __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              int rank,
                                                              const u32x4* __restrict__ in,
@@ -322,6 +391,8 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              u32x4* __restrict__ res_out,
                                                              u32x4* __restrict__ out_q,
                                                              u32x4* __restrict__ out_s,
+                                                             u32x4* __restrict__ out_q4,
+                                                             u32x4* __restrict__ out_s4,
                                                              int N,
                                                              int R,
                                                              int64_t slot_packs,
@@ -330,11 +401,13 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              bool gemma,
                                                              int maxit)
 {
+    static_assert(!MOE || (FP8 && SP && !AUX), "MOE is a sequence-parallel MXFP8 mode");
     constexpr int U = 2; // copy: rows of every peer chunk a pass
     __shared__ __align__(16) float partial[2][32];
     __shared__ uint32_t s_base;
     extern __shared__ __align__(16) u32x4 ar2s_pf[]; // [2][NG + 1][rp]
-    __shared__ __align__(16) uint8_t stage[FP8 ? 8192 + 256 : 16];
+    // MOE stages in the prefetch slot (see below)
+    __shared__ __align__(16) uint8_t stage[FP8 && !MOE ? 8192 + 256 : 16];
     int buf           = 0;
     const uint32_t t  = threadIdx.x;
     const uint32_t rp = blockDim.x; // 16B packs a row
@@ -343,6 +416,8 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
     const int hidden  = rp * 8;
     const uint32_t qp = hidden / 16;  // E4M3 packs a row (FP8)
     const uint32_t sp = hidden / 512; // E8M0 packs a row (FP8)
+    // packs a quantized row pushes / copies: MXFP8, or (MOE) MXFP8 + MXFP4
+    const uint32_t qpk = MOE ? qp + sp + qp / 2 + sp : qp + sp;
     // pack indices are 32-bit (a launch is < 2^32 packs of every buffer): one base a buffer
     const uint32_t slot = (uint32_t)slot_packs;
     const uint32_t agof = (uint32_t)ag_off_packs;
@@ -506,7 +581,26 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                     u32x4 rpk, opk;
                     norm_packs2(x, wgt[t], gemma ? 1.f : 0.f, eps, hidden, partial, buf, rpk, opk);
                     res_out[io] = rpk;
-                    if constexpr(FP8)
+                    if constexpr(MOE)
+                    {
+                        // the router's input: the own rows, compact
+                        out[i0] = opk;
+                        // the stage is the LDS slot this row's loads came through. Every thread
+                        // read its packs there before the norm barrier, and the slot is next
+                        // written by the row after next's loads, issued after this row's stage
+                        // read, each thread into its own pack positions (t + g rp): of the stage
+                        // (qpk <= rp packs) only pack t, which thread t alone reads.
+                        uint8_t* stg = reinterpret_cast<uint8_t*>(ar2s_pf + (uint32_t)(n & 1) * (NG + 1) * rp);
+                        stage_moe(opk, stg, hidden, t);
+                        lds_barrier();
+                        if(t < qpk)
+                        {
+                            const u32x4 q = reinterpret_cast<const u32x4*>(stg)[t];
+                            store_moe_pack(t, own0 + j, q, qp, sp, out_q, out_s, out_q4, out_s4);
+                            push_ag(q);
+                        }
+                    }
+                    else if constexpr(FP8)
                     {
                         // the stage is rewritten only after the next row's norm barrier
                         stage_mxfp8(opk, stage, hidden, t);
@@ -548,7 +642,7 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
             poll_barrier();
             if constexpr(SP || AUX)
             {
-                const uint32_t packs = (FP8 && !AUX) ? qp + sp : rp;
+                const uint32_t packs = (FP8 && !AUX) ? qpk : rp;
                 if(t < packs)
                 {
                     for(int m = m0; m < m1; m += U)
@@ -576,6 +670,8 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                 {
                                     if constexpr(AUX)
                                         res_out[(c0 + jj) * rp + t] = v[k][u];
+                                    else if constexpr(MOE)
+                                        store_moe_pack(t, c0 + jj, v[k][u], qp, sp, out_q, out_s, out_q4, out_s4);
                                     else if constexpr(FP8)
                                     {
                                         if(t < qp)
@@ -752,8 +848,8 @@ void ar2s_rms_ex(fptr_t ctx,
 #define AR2S_K2_ARGS                                                                           \
     c->peers, c->rank, (const ar2s::u32x4*)inp, (const ar2s::u32x4*)res_inp,                  \
         (const ar2s::u32x4*)w, (ar2s::u32x4*)out, (ar2s::u32x4*)res_out, (ar2s::u32x4*)out_q, \
-        (ar2s::u32x4*)out_s, (int)rows, (int)R, slot_packs, ag_off, (float)eps, gemma_norm,    \
-        ar2s::kMaxPolls
+        (ar2s::u32x4*)out_s, nullptr, nullptr, (int)rows, (int)R, slot_packs, ag_off,          \
+        (float)eps, gemma_norm, ar2s::kMaxPolls
     // phase 2's prefetch: [2][NG + 1][rp] packs of dynamic LDS (122880 B at TP4, hidden 6144)
     const size_t pf_bytes = (size_t)2 * (c->world + 1) * rp * 16;
 #define AR2S_LAUNCH(NG, F8, SPR, AX)                                                           \
@@ -800,6 +896,69 @@ void ar2s_rms(fptr_t ctx,
               bool gemma_norm)
 {
     ar2s_rms_ex(ctx, inp, res_inp, w, out, res_out, 0, 0, rows, hidden, eps, gemma_norm, false, false, false, 0);
+}
+
+void ar2s_rms_moe(fptr_t ctx,
+                  int64_t inp,
+                  int64_t res_inp,
+                  int64_t w,
+                  int64_t out_own,
+                  int64_t res_out,
+                  int64_t q8,
+                  int64_t s8,
+                  int64_t q4,
+                  int64_t s4,
+                  int64_t rows,
+                  int64_t hidden,
+                  double eps,
+                  bool gemma_norm,
+                  int64_t grid)
+{
+    auto* c      = reinterpret_cast<ar2s::Ctx*>(ctx);
+    const int rp = (int)(hidden / 8);
+    if(hidden % 512 != 0 || rp > 1024)
+        throw std::invalid_argument("ar2s_rms_moe: hidden must be a multiple of 512 and at most 8192");
+    if(rows <= 0)
+        return;
+    const int64_t R          = (rows + c->world - 1) / c->world;
+    const int64_t slot_bytes = c->max_bytes / c->world / 16 * 16;
+    if(R * hidden * 2 > slot_bytes)
+        throw std::invalid_argument("ar2s_rms_moe: " + std::to_string(rows) +
+                                    " rows exceed the inbox; split the call (ar2s_rms_max_rows)");
+    // out_own is not touched by a rank whose chunk is empty (it may be null there)
+    if(((inp | res_inp | w | res_out | out_own | q8 | s8 | q4 | s4) & 15) != 0)
+        throw std::invalid_argument("ar2s_rms_moe: operands must be 16-byte aligned");
+    const int G              = (int)std::min<int64_t>(grid > 0 ? std::min<int64_t>(grid, ar2s::kMaxBlocks) : c->grid, R);
+    const int64_t slot_packs = slot_bytes / 16;
+    const int64_t ag_off     = (int64_t)c->world * slot_packs;
+    hipStream_t stream       = aiter::getCurrentHIPStream();
+    // the kernel indexes with 32-bit packs (sizes only, so every rank decides the same)
+    if(!(2 * ag_off < (int64_t(1) << 32) && rows * rp < (int64_t(1) << 31)))
+        throw std::invalid_argument("ar2s_rms_moe: the inbox or the rows exceed 32-bit pack indexing");
+    const size_t pf_bytes = (size_t)2 * (c->world + 1) * rp * 16;
+#define AR2S_MOE_ARGS                                                                               \
+    c->peers, c->rank, (const ar2s::u32x4*)inp, (const ar2s::u32x4*)res_inp, (const ar2s::u32x4*)w, \
+        (ar2s::u32x4*)out_own, (ar2s::u32x4*)res_out, (ar2s::u32x4*)q8, (ar2s::u32x4*)s8,           \
+        (ar2s::u32x4*)q4, (ar2s::u32x4*)s4, (int)rows, (int)R, slot_packs, ag_off, (float)eps,      \
+        gemma_norm, ar2s::kMaxPolls
+#define AR2S_MOE_LAUNCH(NG)                                                                        \
+    do {                                                                                           \
+        auto* kp = ar2s::ar2s_rms_kernel<NG, true, true, false, true>;                            \
+        (void)hipFuncSetAttribute((const void*)kp, hipFuncAttributeMaxDynamicSharedMemorySize,     \
+                                  (int)pf_bytes);                                                  \
+        kp<<<G, rp, pf_bytes, stream>>>(AR2S_MOE_ARGS);                                            \
+    } while(0)
+    switch(c->world)
+    {
+    case 2: AR2S_MOE_LAUNCH(2); break;
+    case 4: AR2S_MOE_LAUNCH(4); break;
+    default: throw std::invalid_argument("ar2s_rms_moe: TP2 / TP4 only");
+    }
+#undef AR2S_MOE_LAUNCH
+#undef AR2S_MOE_ARGS
+    hipError_t e = hipGetLastError();
+    if(e != hipSuccess)
+        throw std::runtime_error(std::string("ar2s_rms_moe launch: ") + hipGetErrorString(e));
 }
 
 } // namespace aiter
