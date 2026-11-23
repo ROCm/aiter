@@ -1208,15 +1208,13 @@ void
         `splitk_reduce_kernel_fallback` because exact-N row-block reduce
         is the preferred fast path when its constraints hold.
         """
-        # Bucket present archs from splitk kids. Host-only (pre-built .co)
-        # workspace kids have no device row but still launch the reducer.
-        rows = self._device_instantiations + self._host_instantiations
+        # Bucket present archs from splitk kids.
         present_archs = {
             row["splitk_reduce_arch"]
-            for row in rows
+            for row in self._device_instantiations
             if row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
         }
-        for row in rows:
+        for row in self._device_instantiations:
             name = row["kid_name"]
             for arch_prefix in SPLITK_REDUCE_ARCHES:
                 if f"opus_gemm_{arch_prefix}_splitk_" in name:
@@ -1318,14 +1316,11 @@ void
         self._emit_device_tus()
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
-        # Host rows count too: a pre-built (.co) split-K kid, e.g. gfx950
-        # a16w16_4wave_ws, has no device instantiation of its own but its
-        # launcher still <<<>>>s the arch's splitk_reduce_kernel.
         needs_reduce_tu = any(
             row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
             or ("flatmm_splitk" in row["kid_name"])
             or ("_splitk_" in row["kid_name"])
-            for row in self._device_instantiations + self._host_instantiations
+            for row in self._device_instantiations
         )
         if needs_reduce_tu:
             self._emit_splitk_reduce_tu()
