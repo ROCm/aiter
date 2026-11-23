@@ -29,6 +29,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_store, ptr_buf_tensor
 TILE = 16  # MFMA output tile
 WAVE_ROWS = 128  # rows (and columns) of C per wave
 WAVE_TILES = WAVE_ROWS // TILE
+HEAD_DIM = 128  # channels per head: 8 in each of 16 lanes
+ROPE_PAIRS = HEAD_DIM // 2  # rotation pairs per head, one cos and sin each
 
 
 # DPP moves within a 16-lane row and the lane bit that orders each pair: quad_perm
@@ -200,7 +202,7 @@ class StoreCRows(StoreC):
             self._init_partials(c_rows, c_cols, amax_partials)
         if self.prep:
             cos, sin, partials = prep
-            freq_bytes = fx.Int64(c_rows) * 64 * 4
+            freq_bytes = fx.Int64(c_rows) * ROPE_PAIRS * 4
             self.cos_div, self.sin_div = (
                 fx.logical_divide(
                     fx.rocdl.make_buffer_tensor(
@@ -287,7 +289,7 @@ class StoreCRows(StoreC):
 
     def _init_partials(self, c_rows, c_cols, partials):
         """[2, M, N // 128] FP32: per-head sums of squares, then per-head maxima."""
-        self.heads = c_cols // 128
+        self.heads = c_cols // HEAD_DIM
         self.maxima_base = fx.Int32(c_rows * self.heads)
         self.partials_oob = fx.Int32(c_rows * self.heads * 2)
         self.partials_div = fx.logical_divide(
@@ -304,7 +306,7 @@ class StoreCRows(StoreC):
         stored = values.to(fx.BFloat16).to(fx.Float32)
         maximum = _row_max(_max_abs(stored))
         store = (row < self.c_rows) & ((self.lane_id % 16) == 0)
-        index = self.maxima_base + row * self.heads + col_base // 128
+        index = self.maxima_base + row * self.heads + col_base // HEAD_DIM
         self._store_f32(maximum, store.select(index, self.partials_oob))
 
     def _load_freq4(self, div, index):
@@ -329,7 +331,7 @@ class StoreCRows(StoreC):
         """
         row = (row < self.c_rows).select(row, fx.Int32(0))
         if const_expr(self.spec.rope == "rotate_half"):
-            index = row * 64 + (self.lane_id % 8) * 8
+            index = row * ROPE_PAIRS + (self.lane_id % 8) * 8
             return tuple(
                 [
                     v[k]
@@ -341,7 +343,7 @@ class StoreCRows(StoreC):
                 ]
                 for div in (self.cos_div, self.sin_div)
             )
-        index = row * 64 + (self.lane_id % 16) * 4
+        index = row * ROPE_PAIRS + (self.lane_id % 16) * 4
         return self._load_freq4(self.cos_div, index), self._load_freq4(
             self.sin_div, index
         )
@@ -358,7 +360,9 @@ class StoreCRows(StoreC):
         if const_expr(spec.gammas):
             sq = _row_sum(fx.Float32((x * x).reduce(ReductionOp.ADD)))
         if const_expr(spec.norm == "rms_per_head"):
-            x = x * Vec.filled(8, fmath.rsqrt(sq * (1.0 / 128) + self.eps), fx.Float32)
+            x = x * Vec.filled(
+                8, fmath.rsqrt(sq * (1.0 / HEAD_DIM) + self.eps), fx.Float32
+            )
         y = x * gammas if const_expr(spec.gammas) else x
         if const_expr(spec.rope == "interleaved"):
             cos, sin = freqs
@@ -377,7 +381,7 @@ class StoreCRows(StoreC):
         else:
             rotated = [y[k] for k in range(8)]
         if const_expr(spec.norm == "rms_across_heads"):
-            p_index = row * self.heads + col_base // 128
+            p_index = row * self.heads + col_base // HEAD_DIM
             self._store_f32(sq, store.select(p_index, self.partials_oob))
         if const_expr(spec.hadamard):
             rotated = _hadamard128(rotated, signs)

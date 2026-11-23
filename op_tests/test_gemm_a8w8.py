@@ -1240,11 +1240,8 @@ def make_int8_4wave_prep_case(m, n, k, bias, hadamard, seed):
     return case
 
 
-def int8_4wave_prep_launcher(case, spec, num_cu=0, as_bool=False):
-    """A launch of the prep GEMM into NaN-filled outputs, so unwritten elements fail.
-
-    ``as_bool`` compiles Wan's spec through the older ``prep=True`` form.
-    """
+def int8_4wave_prep_launcher(case, spec, num_cu=0):
+    """A launch of the prep GEMM into NaN-filled outputs, so unwritten elements fail."""
     import flydsl.expr as fx
 
     from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import compile_int8_gemm_4w
@@ -1262,11 +1259,7 @@ def int8_4wave_prep_launcher(case, spec, num_cu=0, as_bool=False):
     partials = torch.full(
         (2, m, n // INT8_PREP_HEAD), float("nan"), dtype=dtypes.fp32, device="cuda"
     )
-    if as_bool:
-        prep = {"prep": True, "bias": spec.bias, "prep_hadamard": spec.hadamard}
-    else:
-        prep = {"prep": spec}
-    kernel = compile_int8_gemm_4w(K=k, num_cu=num_cu, eps=INT8_PREP_EPS, **prep)
+    kernel = compile_int8_gemm_4w(K=k, num_cu=num_cu, eps=INT8_PREP_EPS, prep=spec)
     args = (
         case["x"].view(-1),
         case["weight_shuffled"].view(-1),
@@ -1326,8 +1319,6 @@ def run_int8_4wave_prep_correctness():
     if get_gfx() != "gfx950":
         aiter.logger.info("INT8 4-wave prep: skipped, requires gfx950")
         return
-    from aiter.ops.flydsl.kernels.qk_prep_epilogue import PrepSpec
-
     rows = [
         test_int8_4wave_prep(257, 512, 512, norm, rope, hadamard, True, False)
         for norm, rope, hadamard in itertools.product(
@@ -1351,14 +1342,6 @@ def run_int8_4wave_prep_correctness():
         "INT8 4-wave prep summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
-
-    # prep=True is Wan's spec, bit for bit.
-    for hadamard in (True, False):
-        spec = PrepSpec(hadamard=hadamard)
-        case = make_int8_4wave_prep_case(257, 512, 512, True, hadamard, seed=7)
-        new = int8_4wave_prep_launcher(case, spec)()
-        old = int8_4wave_prep_launcher(case, spec, as_bool=True)()
-        assert all(map(torch.equal, new, old)), f"prep=True differs from {spec}"
 
 
 def _iter_flydsl_csv_cases(compare_hipblaslt=False):

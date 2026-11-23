@@ -31,14 +31,10 @@ import flydsl.expr as fx
 # and the K64 INT8 MFMA.
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
-from aiter.ops.flydsl.kernels.communication_ops_utils import (
-    _to_ptr_global,
-    spin_until_ge_i32_agent,
-)
+from aiter.ops.flydsl.kernels.communication_ops_utils import _to_ptr_global
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import S2RLoader, _xcd_swizzle_any
 from aiter.ops.flydsl.kernels.gemm_hooks import GemmHooks
 from aiter.ops.flydsl.kernels.kernels_common import (
@@ -51,7 +47,6 @@ from aiter.ops.flydsl.kernels.qk_prep_epilogue import (
     StoreCRows,
     mfma_drain,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_store, ptr_buf_tensor
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -69,12 +64,6 @@ B_BLOCK_STRIDE = A_BLOCK_STRIDE + 16  # shifts block b by b bank groups
 A_REGION_BYTES = ROW_BLOCKS * A_BLOCK_STRIDE
 B_REGION_BYTES = ROW_BLOCKS * B_BLOCK_STRIDE
 LOADS_PER_REGION = BLOCK_M * BLOCK_K // (N_WAVES * 1024)
-
-
-def _load_f32x4(view, index, atom, reg):
-    """Four FP32 values of ``view`` from element ``index``."""
-    fx.copy(atom, fx.slice(view, (None, fx.Int32(index))), reg)
-    return Vec(fx.memref_load_vec(reg))
 
 
 def _a_chunk_swizzle(row):
@@ -256,18 +245,12 @@ def compile_int8_gemm_4w(
     num_cu: int = 0,
     num_xcds: int | None = None,
     bias: bool = False,
-    prep: "bool | PrepSpec" = False,
-    prep_hadamard: bool = True,
+    prep: PrepSpec | None = None,
     amax: bool = False,
     roles: int = 1,
     role_cols: int = 0,
-    consumers: int = 0,
     eps: float = 1e-6,
     hooks: GemmHooks | None = None,
-    role_hook=None,
-    hook_key: str = "",
-    first_block_hook=None,
-    tile_hook=None,
     col_amax_offset: int | None = None,
 ):
     """``num_cu > 0`` makes the kernel persistent over that many workgroups.
@@ -275,10 +258,9 @@ def compile_int8_gemm_4w(
     ``bias`` adds a per-column FP32 bias in the epilogue. B_scale then holds the
     N column scales followed by the N biases.
 
-    ``prep`` applies a Q/K prep in the epilogue: a ``PrepSpec``, whose ``bias`` replaces
-    ``bias``, or True for Wan's (``PrepSpec(bias=bias, hadamard=prep_hadamard)``: RMSNorm
-    across heads, interleaved RoPE and the per-head Hadamard, without the RMS factor). With
-    a norm, B_scale also holds the N norm weights after the scales and biases, multiplied
+    ``prep``, a ``PrepSpec``, applies a Q/K prep in the epilogue; its ``bias`` replaces
+    ``bias``. With a norm, B_scale also holds the N norm weights after the scales and
+    biases, multiplied
     by 128 ** -0.5 when the Hadamard is applied here. The launcher takes FP32 ``[M, 64]``
     cos and sin tables (one value per rotation pair) and writes FP32 ``[2, M, N // 128]``:
     per-head sums of squares of the projection (for a norm across heads), then per-head
@@ -289,17 +271,13 @@ def compile_int8_gemm_4w(
     ``amax`` (without ``prep``) writes only the maxima half of that buffer, for a
     projection the consumer quantizes as it is, such as V.
 
-    ``roles > 1`` (with ``prep`` and ``num_cu``) runs a fused weight of ``roles`` blocks of
-    ``role_cols`` columns, Q/K/V for 3, and stores C planar, ``[roles, M, role_cols]``. The
-    prep applies to every role but the last. ``aux`` starts with an Int32 tile counter per
-    role (``gemm_hooks``). Without hooks, the last ``consumers`` workgroups write the RMS
-    factors of the prep roles to ``aux + 64``, FP32 ``[roles - 1, M]``, for a norm across
-    heads.
+    ``roles > 1`` (with ``prep``, ``hooks`` and ``num_cu``) runs a fused weight of ``roles``
+    blocks of ``role_cols`` columns, Q/K/V for 3, and stores C planar,
+    ``[roles, M, role_cols]``. The prep applies to every role but the last. ``aux`` starts
+    with an Int32 tile counter per role.
 
-    ``hooks`` (with ``roles > 1``) are ``GemmHooks``, code run inside the GEMM under the
-    contract in ``gemm_hooks``; with hooks, ``consumers`` may be 0. ``role_hook``,
-    ``hook_key``, ``first_block_hook`` and ``tile_hook`` are the same, one by one.
-    ``col_amax_offset`` (with ``roles > 1``) makes the last role's epilogue also write FP32
+    ``hooks`` are ``GemmHooks``, code run inside the GEMM under the contract in
+    ``gemm_hooks``. ``col_amax_offset`` (with ``roles > 1``) makes the last role's epilogue also write FP32
     ``[M / 128, role_cols]`` per-column maxima of its stored output to ``aux`` plus that many
     bytes, one row per 128 rows of C; they land before the tile is counted.
 
@@ -309,31 +287,16 @@ def compile_int8_gemm_4w(
     the next block's first tile lands in LDS buffer 0; otherwise each
     workgroup takes one block.
     """
-    if hooks is not None:
-        if (
-            role_hook is not None
-            or first_block_hook is not None
-            or tile_hook is not None
-        ):
-            raise ValueError(
-                "pass hooks or role_hook, first_block_hook and tile_hook, not both"
-            )
-        role_hook, first_block_hook, tile_hook = (
-            hooks.role,
-            hooks.first_block,
-            hooks.tile,
-        )
-        hook_key = hooks.key
-    if prep is True:
-        prep_spec = PrepSpec(bias=bias, hadamard=prep_hadamard)
-    elif prep is False or prep is None:
-        prep_spec = None
-    elif isinstance(prep, PrepSpec):
-        if bias and not prep.bias:
-            raise ValueError("bias=True conflicts with a PrepSpec without bias")
-        prep_spec = prep
-    else:
-        raise TypeError(f"prep must be a bool or a PrepSpec, got {prep!r}")
+    role_hook, first_block_hook, tile_hook, hook_key = (
+        (hooks.role, hooks.first_block, hooks.tile, hooks.key)
+        if hooks is not None
+        else (None, None, None, "")
+    )
+    if prep is not None and not isinstance(prep, PrepSpec):
+        raise TypeError(f"prep must be a PrepSpec or None, got {prep!r}")
+    if prep is not None and bias and not prep.bias:
+        raise ValueError("bias=True conflicts with a PrepSpec without bias")
+    prep_spec = prep
     prep = prep_spec is not None
     if prep:
         bias = prep_spec.bias
@@ -350,18 +313,14 @@ def compile_int8_gemm_4w(
         raise ValueError(f"persistent mode requires an even K128 tile count, got K={K}")
     persistent = num_cu > 0
     assert not persistent or num_cu % num_xcds == 0
-    producers = num_cu - consumers
     if roles > 1 and (
         not (prep and persistent)
         or role_cols % BLOCK_N
-        or (consumers < 1 and role_hook is None)
-        or producers <= 0
-        or producers % num_xcds
+        or role_hook is None
         or xcd_swizzle <= 0
     ):
         raise ValueError(
-            "roles needs prep, a persistent swizzled grid, role_cols % 256 == 0 "
-            "and 0 < consumers < num_cu with producers a multiple of the XCDs"
+            "roles needs prep, hooks, a persistent swizzled grid and role_cols % 256 == 0"
         )
 
     # Quadrants of the wave's tile grid by (A half, B half).
@@ -408,8 +367,6 @@ def compile_int8_gemm_4w(
         + (StoreCRows.BIAS_LOADS if bias else 0)
         + (StoreCRows.GAMMA_LOADS if prep and prep_spec.gammas else 0)
     )
-    # Only a norm across heads leaves a per-row factor to the consumers.
-    ACROSS_HEADS = prep and prep_spec.norm == "rms_across_heads"
     FIRST_BLOCK = first_block_hook is not None
     assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
     # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
@@ -425,9 +382,9 @@ def compile_int8_gemm_4w(
         + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
         + ("_bias" if bias else "")
         + ("_prep" + prep_spec.suffix if prep else "")
-        + (f"_eps{eps:g}" if (prep or consumers) and eps != 1e-6 else "")
+        + (f"_eps{eps:g}" if prep and eps != 1e-6 else "")
         + ("_amax" if amax and not prep else "")
-        + (f"_roles{roles}x{role_cols}c{consumers}" if roles > 1 else "")
+        + (f"_roles{roles}x{role_cols}" if roles > 1 else "")
         + (f"_hook{hook_key}" if role_hook is not None else "")
         + ("_fb" if first_block_hook is not None else "")
         + ("_th" if tile_hook is not None else "")
@@ -920,9 +877,6 @@ def compile_int8_gemm_4w(
             # workgroup counts on an epilogue before it, so the first block also
             # waits for tile 1 here.
             block0 = fx.Int32(fx.block_idx.x)
-            if const_expr(roles > 1):
-                # Consumer workgroups run no output blocks.
-                block0 = (block0 < producers).select(block0, block_end)
             coords = list(block_coords(block0, role))
             voffsets = ([], [])
             for _, operand, emit in voffset_ops():
@@ -1006,7 +960,7 @@ def compile_int8_gemm_4w(
 
             n_pairs = max(0, (K_ITERS - 4) // 2)
             if const_expr(roles > 1):
-                grid = fx.Int32(producers)
+                grid = fx.Int32(num_cu)
             else:
                 grid = fx.Int32(fx.grid_dim.x)
             for block, bstate in range(
@@ -1212,83 +1166,6 @@ def compile_int8_gemm_4w(
             if const_expr(role_hook is not None):
                 role_hook(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
 
-        if const_expr(roles > 1 and consumers > 0):
-            partials_view = store_c.partials_div
-            maxima_base = store_c.maxima_base
-            load_atom = store_c.scale_atom_4
-            load_reg = store_c.reg_f32_4
-            if fx.Int32(fx.block_idx.x) >= producers:
-                tid = fx.Int32(fx.thread_idx.x)
-                worker = (fx.Int32(fx.block_idx.x) - producers) * (N_WAVES * 64) + tid
-                heads = c_n // 128
-                tiles_per_role = m_blocks * (role_cols // BLOCK_N)
-                factors_out = ptr_buf_tensor(
-                    aux + 64, fx.Float32, num_records_bytes=c_m * 4 * (roles - 1)
-                )
-                for role in range_constexpr(roles):
-                    if tid == 0:
-                        spin_until_ge_i32_agent(aux + role * 4, tiles_per_role)
-                    fx.barrier()
-                    fx.memory_fence(
-                        ordering=fx.AtomicOrdering.Acquire,
-                        syncscope=fx.rocdl.SyncScope.Agent,
-                    )
-                    for row, state in range(
-                        worker,
-                        c_m,
-                        fx.Int32(consumers * N_WAVES * 64),
-                        init=[fx.Float32(0.0)],
-                    ):
-                        row = fx.Int32(row)
-                        current = state[0]
-                        sq = fx.Float32(0.0)
-                        peak = fx.Float32(0.0)
-                        for quad in range_constexpr(role_cols // 512):
-                            head = role * (role_cols // 128) + quad * 4
-                            maxima = _load_f32x4(
-                                partials_view,
-                                maxima_base + row * heads + head,
-                                load_atom,
-                                load_reg,
-                            )
-                            for k in range_constexpr(4):
-                                peak = peak.maximumf(maxima[k])
-                            if const_expr(role < roles - 1 and ACROSS_HEADS):
-                                sums = _load_f32x4(
-                                    partials_view,
-                                    row * heads + head,
-                                    load_atom,
-                                    load_reg,
-                                )
-                                for k in range_constexpr(4):
-                                    sq = sq + sums[k]
-                        if const_expr(role < roles - 1 and ACROSS_HEADS):
-                            factor = fmath.rsqrt(sq * (1.0 / role_cols) + eps)
-                            buf_copy_store(
-                                factors_out, role * c_m + row, factor, fx.Float32
-                            )
-                            peak = peak * factor
-                        elif const_expr(role < roles - 1):
-                            # The epilogue already normalized (or there is no norm).
-                            buf_copy_store(
-                                factors_out,
-                                role * c_m + row,
-                                fx.Float32(1.0),
-                                fx.Float32,
-                            )
-                        current = current.maximumf(peak)
-                        result = yield [current]
-                    local = fx.Float32(result)
-                    for shift in (32, 16, 8, 4, 2, 1):
-                        local = local.maximumf(local.shuffle_xor(shift, 64))
-                    if tid % 64 == 0:
-                        fx.atomic_fmax(
-                            _to_ptr_global(aux + 16 + role * 4, fx.Float32),
-                            local,
-                            is_positive=True,
-                            syncscope=fx.rocdl.SyncScope.Agent,
-                        )
-
     value_attrs = {
         "rocdl.waves_per_eu": 1,
         "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
@@ -1406,42 +1283,6 @@ def compile_int8_gemm_4w(
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
     @flyc.jit
-    def launch_gemm_roles(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        Cos: fx.Tensor,
-        Sin: fx.Tensor,
-        Partials: fx.Tensor,
-        aux: fx.Int64,
-        c_m: fx.Int32,
-        c_n: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel_gemm(
-            A,
-            B_T,
-            C,
-            A_scale,
-            B_scale,
-            Cos,
-            Sin,
-            Partials,
-            c_m,
-            c_n,
-            aux,
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            value_attrs=value_attrs,
-        ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
-
-    @flyc.jit
     def launch_gemm_roles_hook(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -1483,10 +1324,8 @@ def compile_int8_gemm_4w(
             value_attrs=value_attrs,
         ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
-    if roles > 1 and role_hook is not None:
+    if roles > 1:
         launcher = launch_gemm_roles_hook
-    elif roles > 1:
-        launcher = launch_gemm_roles
     elif prep:
         launcher = launch_gemm_prep
     elif amax:
