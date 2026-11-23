@@ -26,7 +26,7 @@ The host classes are in `aiter/ops/flydsl/`:
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
 | `quick_allreduce_relay.py` | Uncached IPC bounce buffers on lending GPUs for the TP2 mesh relay. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
-| `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+| `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 The dispatchers are in `aiter/dist/device_communicators/`:
 
