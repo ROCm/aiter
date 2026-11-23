@@ -204,6 +204,8 @@ def aot_factory(name: str, *, extra_sources=()):
         # runs on every launch of some callers, so a key is built once per
         # call. Calls with and without keyword arguments are kept apart.
         seen, seen_kw = set(), set()
+        # Calls whose result cannot be bound (not one launcher).
+        unbound = set()
         handles, handles_kw = {}, {}
 
         def key_of(bound):
@@ -221,11 +223,16 @@ def aot_factory(name: str, *, extra_sources=()):
                 calls, call = seen, args
             # A bounded factory cache may hand out a new launcher for a call
             # already seen: bind every launcher not yet bound.
-            if call not in calls or getattr(exe, _ATTR, None) is None:
+            if call not in calls or (
+                getattr(exe, _ATTR, None) is None
+                and (bool(kwargs), call) not in unbound
+            ):
                 calls.add(call)
                 bound = signature.bind(*args, **kwargs)
                 bound.apply_defaults()
                 bind_aot(exe, cache, key_of(bound))
+                if getattr(exe, _ATTR, None) is None:
+                    unbound.add((bool(kwargs), call))
             return exe
 
         def lazy(*args, **kwargs):
@@ -260,7 +267,7 @@ def aot_factory(name: str, *, extra_sources=()):
                 # The caller wants its launchers traced again, so state the
                 # cache does not track may have changed: drop the launchers
                 # it loaded and keep this factory on the JIT path.
-                for calls in (seen, seen_kw, handles, handles_kw):
+                for calls in (seen, seen_kw, handles, handles_kw, unbound):
                     calls.clear()
                 factory.cache_clear()
                 cache.invalidate()

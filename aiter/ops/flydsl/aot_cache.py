@@ -276,8 +276,7 @@ def _device_bitcode_digest() -> str:
     """Hash of the AMDGCN device libraries (ocml, ockl, ...) FlyDSL links into
     a kernel that calls them. Bundled with FlyDSL they are in its wheel, but
     without in-process LLD they come from ``ROCM_PATH`` or ``/opt/rocm``.
-    Not cached here: the toolkit follows the environment, and FlyDSL caches
-    the digest of each."""
+    FlyDSL caches the toolkit it resolves and the digest of each."""
     try:
         from flydsl.compiler.backends import rocm
 
@@ -1017,20 +1016,22 @@ class _BakedKernel:
     wrong kernel; the JIT path's cached function has the same limit, silently.
     """
 
-    __slots__ = ("_baked", "_kernel", "_nargs", "_where")
+    __slots__ = ("_baked", "_kernel", "_min_args", "_nargs", "_where")
 
     def __init__(self, kernel, name, key, args, indexes):
         self._kernel = kernel
         self._where = f"{name}: {key!r}"
-        # A call with another number of arguments passes a constexpr this one
-        # left to its default, or leaves one out.
+        # A call with more arguments may pass a constexpr this one left to
+        # its default; one with fewer may leave a baked one out. Trailing
+        # runtime arguments (a stream) may be left to their defaults.
         self._nargs = len(args)
+        self._min_args = max(indexes, default=-1) + 1
         self._baked = tuple(
             (i, args[i], repr(_normalize_key(args[i]))) for i in indexes
         )
 
     def __call__(self, *args) -> None:
-        if len(args) != self._nargs:
+        if not self._min_args <= len(args) <= self._nargs:
             raise _BakedArgumentError(
                 f"[FlyDSL AOT] {self._where} was compiled for {self._nargs} launch "
                 f"arguments and is launched with {len(args)}; a launcher with "
@@ -1039,11 +1040,13 @@ class _BakedKernel:
             )
         for i, value, normalized in self._baked:
             arg = args[i]
-            # The usual call passes the same object or an equal scalar of the
-            # same type; anything else (a tuple may hold True for 1) is
-            # compared as the disk entry is.
+            # The usual call passes the same object or an equal int, bool or
+            # string; anything else (a tuple may hold True for 1, and -0.0
+            # equals 0.0) is compared as the disk entry is.
             if arg is value or (
-                type(arg) is type(value) and type(arg) is not tuple and arg == value
+                type(arg) is type(value)
+                and type(arg) in (int, bool, str)
+                and arg == value
             ):
                 continue
             try:

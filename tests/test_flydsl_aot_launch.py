@@ -213,10 +213,17 @@ def test_constexpr_launch_arguments_select_the_entry():
     for other in ((1, 8, 32, "b", (3, 4)), (1, 8, 64, "c", (3, 4)), (1, 8, 64, "b")):
         with pytest.raises(_BakedArgumentError):
             kernel(*other)
-    # A constexpr the first call left to its default cannot be passed later.
-    short = _BakedKernel(lambda *a: None, "t", ("k",), (0, 4, 64), [2])
+    # A constexpr the first call left to its default cannot be passed later;
+    # a trailing runtime argument (a stream) may be left to its default.
+    short = _BakedKernel(lambda *a: ran.append(a), "t", ("k",), (0, 4, 64, 7), [2])
     with pytest.raises(_BakedArgumentError):
-        short(0, 4, 64, "b")
+        short(0, 4, 64, 7, "b")
+    short(0, 4, 64)
+    with pytest.raises(_BakedArgumentError):
+        short(0, 4)
+    # -0.0 equals 0.0 and is another constexpr.
+    with pytest.raises(_BakedArgumentError):
+        _BakedKernel(lambda *a: None, "t", ("k",), (0.0,), [0])(-0.0)
     # Compared as the disk entry is: True is not 1 (in a tuple too), and NaN
     # is itself.
     with pytest.raises(_BakedArgumentError):
@@ -226,7 +233,7 @@ def test_constexpr_launch_arguments_select_the_entry():
     _BakedKernel(lambda *a: ran.append(a), "t", ("k",), (float("nan"),), [0])(
         float("nan")
     )
-    assert len(ran) == 2
+    assert len(ran) == 3
 
 
 def test_constexpr_of_a_bound_launcher():
@@ -316,6 +323,34 @@ def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
     assert "LLVM_GFX1250_ANY_XNACK_CODEGEN" in names
     for name in names:
         assert aot_cache._env_in_fingerprint(name), name
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 returns the factory itself",
+)
+def test_factory_of_several_launchers_runs_the_jit(monkeypatch):
+    import functools
+
+    from aiter.ops.flydsl import aot_launch
+
+    binds = []
+    bind = aot_launch.bind_aot
+    monkeypatch.setattr(
+        aot_launch, "bind_aot", lambda *a, **k: binds.append(a) or bind(*a, **k)
+    )
+
+    @aot_launch.aot_factory("test_tuple_factory")
+    @functools.cache
+    def factory(n):
+        return (_Launcher(), _Launcher())
+
+    # A tuple cannot be bound: its launchers take the JIT path, and the
+    # factory is not asked to bind it again on every launch.
+    pair = factory(1)
+    assert isinstance(pair, tuple) and factory(1) is pair and factory(1) is pair
+    assert len(binds) == 1
+    assert not hasattr(pair[0], _ATTR)
 
 
 def child():

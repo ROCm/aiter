@@ -614,6 +614,11 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    definitions (a few hundred ms of AST rewriting per kernel module in a fresh
    process). `_run_compiled(factory(...), ...)` works too, and is what an
    unchanged call site does; it calls the factory once per process and key.
+   The factory then runs before the build that records sources (§4.2): the
+   kernel's own files are recorded as its trace runs them, but a helper file
+   that only the factory calls is not, unless its values are imported.
+   `factory.lazy(...)` runs the factory inside the build, and
+   `bind_aot(..., make_exe=...)` does so for a launcher bound by hand.
 1. **Launch arguments are runtime only.** Every launcher parameter that
    varies per call is a tensor, an `fx` numeric (`Int32`, …) or an
    `fx.Stream` (a torch stream as the last argument is converted). Constexprs
@@ -624,8 +629,9 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    that pass them: another process with another value builds its own variant.
    Within a process, one key launched with two values raises, where the JIT
    path would silently run the first. This holds for ints, floats, bools,
-   strings, `None` and tuples of those, and so does a launch with another
-   number of arguments (a constexpr the first launch left to its default).
+   strings, `None` and tuples of those, and so does a launch with more
+   arguments (it may pass a constexpr the first launch left to its default)
+   or too few for the constexprs the entry was built with.
    A constexpr value the cache cannot compare (a lambda, a `Type[T]`) leaves
    the key on the JIT path, which keeps one compiled function per key and
    does not check; under `verify` it raises, as every fallback does.
