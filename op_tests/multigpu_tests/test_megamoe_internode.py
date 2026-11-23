@@ -411,6 +411,10 @@ class Weights:
     w1_scale: torch.Tensor
     w2: torch.Tensor
     w2_scale: torch.Tensor
+    # The a8w4 small-op baseline's w1: the same values, gate/up interleaved in
+    # the A16W4 preshuffle. Its w2 is the operator's A16W4 w2 as is.
+    w1_gate_up: torch.Tensor | None = None
+    w1_gate_up_scale: torch.Tensor | None = None
 
 
 @dataclass
@@ -783,8 +787,11 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
 # --------------------------------------------------------------------------
 
 
-def prepare_weights(shape, rank, device, *, seed):
-    """Random FP4 w1/w2 with E8M0 scales, in the operator's packed layouts."""
+def prepare_weights(shape, rank, device, *, seed, gate_up_w1=False):
+    """Random FP4 w1/w2 with E8M0 scales, in the operator's packed layouts.
+
+    gate_up_w1 also lays the same w1 out gate/up interleaved for the a8w4
+    small-op fused_moe (INTERLEAVE gating)."""
     import torch
 
     from aiter.ops.quant import per_1x32_f4_quant
@@ -807,6 +814,10 @@ def prepare_weights(shape, rank, device, *, seed):
     w1.mul_(shape.hidden**-0.25)
     w1q, w1s = per_1x32_f4_quant(w1, shuffle=False)
     del w1
+    w1g = w1gs = None
+    if gate_up_w1:
+        w1g = shuffle_weight_a16w4(w1q, 16, True)
+        w1gs = shuffle_scale_a16w4(w1s, shape.local_experts, True)
     w1q, w1s = shuffle_weight(w1q, layout=(16, 16)), e8m0_shuffle(w1s)
     torch.cuda.empty_cache()
     w2 = torch.randn(
@@ -821,7 +832,7 @@ def prepare_weights(shape, rank, device, *, seed):
     w2q = shuffle_weight_a16w4(w2q, 16, False)
     w2s = shuffle_scale_a16w4(w2s, shape.local_experts, False)
     torch.cuda.empty_cache()
-    return Weights(w1q, w1s, w2q, w2s)
+    return Weights(w1q, w1s, w2q, w2s, w1g, w1gs)
 
 
 def coalesce_reference_routes(ids, weights, *, experts_per_rank, num_experts):
@@ -1091,7 +1102,7 @@ class MoriSmallOp:
 
     a4w4: FP4 activations on the fused operator's own weights; it is also the
     accuracy reference of the fused path.  a8w4 (DSV4): FP8 activations and
-    the gate/up interleaved FP4 weights of test_wide_ep_moe.py.  No fake expert
+    the operator's FP4 weights with w1 gate/up interleaved.  No fake expert
     slot is appended: fused_moe keys its tune table on topk_ids.shape[1], and
     the EP16 rows of the model tables use the real TopK.
     """
@@ -1637,22 +1648,22 @@ class Runner:
         self.comm = None  # created by the first fused case
         self._smallop_paths = []
         # Weights depend on the shape only: prepare them once for every case.
+        smallop_a8w4 = "smallop" in args.paths and net["smallop_quant"] == "a8w4"
         self.weights = prepare_weights(
-            self.shape(1), self.rank, self.device, seed=args.seed
+            self.shape(1),
+            self.rank,
+            self.device,
+            seed=args.seed,
+            gate_up_w1=smallop_a8w4,
         )
-        self.a8w4_weights = None
-        if "smallop" in args.paths and net["smallop_quant"] == "a8w4":
-            from op_tests.multigpu_tests.test_wide_ep_moe import _quantize_local_weights
-
-            self.a8w4_weights, _ = _quantize_local_weights(
-                net["model_dim"],
-                net["inter_dim"],
-                net["experts"] // EP_SIZE,
-                self.rank,
-                args.seed,
-                self.device,
-                quant="a8w4",
-            )
+        # The a8w4 small-op runs the operator's own weight values: gate/up
+        # interleaved w1, and the A16W4 w2 both paths read.
+        w = self.weights
+        self.a8w4_weights = (
+            (w.w1_gate_up, w.w1_gate_up_scale, w.w2, w.w2_scale)
+            if smallop_a8w4
+            else None
+        )
         self.results = []
 
     def shape(self, tpr):
