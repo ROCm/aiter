@@ -47,8 +47,10 @@ def _gluon_rms_norm_kernel(
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         x_ptr, [M, N], [x_stride_m, 1], [1, BLOCK_SIZE_N], smem_layout
     )
+    # The 1-D weight is viewed as a single row so it shares x's 2-D smem layout;
+    # the row stride is never used because the load is always at [0, 0].
     w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        weight_ptr, [1, N], [0, 1], [1, BLOCK_SIZE_N], smem_layout
+        weight_ptr, [1, N], [N, 1], [1, BLOCK_SIZE_N], smem_layout
     )
 
     smem_x = gl.allocate_shared_memory(
