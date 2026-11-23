@@ -151,7 +151,8 @@ T=512. That attention entry has its own limits, including an indices byte span
 below 2 GiB; a 1M context normally uses smaller query chunks.
 
 ```bash
-python op_tests/test_flydsl_qsa_indexer.py --modes prefill decode verify -b 1
+python op_tests/test_flydsl_qsa_indexer.py --interfaces full prepared --modes prefill decode verify -b 1
+python -m pytest -q op_tests/test_flydsl_qsa_indexer.py -k dual
 python -m pytest -q op_tests/triton_tests/attention/test_qsa_indexer.py
 python op_tests/op_benchmarks/triton/bench_qsa_indexer.py
 ```
@@ -161,3 +162,39 @@ boundaries, 16/32-bit chosen IDs, YaRN, graph replay, row ranges, workspace
 budgets, and captured-plan lifetime. The standalone op test also prints a
 correctness/performance table. Its timing method is separate from the original
 [PyHIP benchmark protocol](https://github.com/tingqli/pyhip/blob/8027faad29415747707670db7776528c6b72db81/benchmarks/qsa/readme.md).
+
+## Keeping both interfaces during a framework migration
+
+The complete and prepared APIs are independent public contracts. The complete
+entry owns preparation and state writes. Prepared selection consumes a caller's
+Q/cache and must not update them. Both use the same selection kernels.
+
+The `dual` tests start from the same QK, norm weights, RoPE table and logical
+history. One branch runs the complete entry. The other receives Q and cache
+contents from the independent reference in separate storage, with a different
+physical page order. They compare Q, logical compressed groups and token
+selections and check that prepared inputs remain unchanged. Short prepared
+outputs are normalized to the full width only inside validation; the public
+output-width rule is unchanged.
+
+Decode tests advance actual and reference state separately for four steps,
+including partial acceptance and ring wrap, then run normal decode from the
+remaining state. Actual state is not reset to the reference between steps.
+Both eager and graph paths cover one to four queries per request, padding,
+MRoPE and YaRN. Other shared cases cover row ranges, wide IDs and 1M context.
+These tests do not import a framework or claim to test its cache allocator.
+
+`--interfaces full prepared` selects the timing boundaries and prints a separate
+table for each. `full` measures QK through indices. `prepared` measures only
+Q/cache through indices; reference prep, page conversion and buffer refresh are
+outside timing. Both use `run_perftest`, with raw microseconds, dot-product
+TFLOPS, logical TB/s and checked errors. Prepared correctness includes the
+maximum per-row FP64 top-k boundary gap, with a tolerance of 1e-5.
+The two times are not a same-boundary framework speedup comparison.
+
+Changing a framework to the complete API also requires a compatible raw-state
+contract. Current complete prep uses valid dump slots and the eight-slot ring;
+prepared selection supports a caller-owned paged raw-state implementation.
+Negative write slots, a live physical slot zero, prefix-cache restoration and
+speculative acceptance need explicit adaptation before that framework switches
+prep ownership. The prepared API remains available throughout that migration.
