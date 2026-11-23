@@ -542,7 +542,7 @@ def fmha_fwd_bf16_opus_paged_fwd(
 ) -> Tensor | tuple[Tensor, Tensor]:
     """OPUS gfx950 bf16 D=128 group/varlen forward over a paged KV cache. q is packed
     [total_q, H, 128]; k_cache / v_cache are [num_blocks, 128, H_KV, 128] views of a page
-    pool (any strides with a contiguous head dim and a row stride below 2^25 elements,
+    pool (any strides with a contiguous head dim and a row stride in [128, 2^25) elements,
     e.g. vLLM's K and V halves of one cache); block_table [num_groups, max_pages] int32 maps each group's pages, and
     seqstart_k gives the per-group KV lengths as cumulative sums (pool offsets are not
     used).

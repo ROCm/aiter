@@ -2154,6 +2154,29 @@ def test_fmha_fwd_bf16_opus_d128_paged_row_stride_bound(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("row_stride", [0, 64])
+def test_fmha_fwd_bf16_opus_d128_paged_rejects_overlapping_rows(
+    row_stride, monkeypatch
+):
+    """A paged tile's extent is rows * row stride, so a row stride below the head dim (0 for
+    an expand()-ed cache, or overlapping rows) would read valid rows as 0; it is rejected.
+    """
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s, d = 128, 128
+    cu = _opus_cumsum([s])
+    q = torch.randn(s, 1, d, device="cuda", dtype=dtypes.bf16)
+    base = torch.randn(1, s, 1, d, device="cuda", dtype=dtypes.bf16)
+    bad = base.as_strided((1, s, 1, d), (s * d, row_stride, d, 1))
+    bt = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    for k_cache, v_cache in ((bad, base), (base, bad)):
+        with pytest.raises(RuntimeError, match="below the head dim"):
+            fmha_fwd_bf16_opus_paged_fwd(
+                q, k_cache, v_cache, d**-0.5, True, cu, cu, bt, s, s, num_splits=1
+            )
+
+
 # Paged sliding window and attention sink (D=128). A window narrower than the longest
 # group runs the SWA kernel; a wider one folds to the causal kernel.
 #   (q seqlens, kv seqlens, nheads, nheads_k, window_size_left)

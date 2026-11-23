@@ -51,7 +51,7 @@
 //   max_seqlen_q / max_seqlen_k      : upper bounds driving the grid (group mode only)
 //
 // Paged KV (D=128, group mode): k/v are [num_blocks, 128, H_KV, D] views of a page pool
-// (row stride below 2^25 elements) and block_table [num_groups, max_pages] int32 maps
+// (row stride in [128, 2^25) elements) and block_table [num_groups, max_pages] int32 maps
 // each group's pages; seqstart_k still gives the lengths. `num_splits` (paged only) cuts
 // each Q block's KV range into shares merged by a combine kernel: 1 = off, 0 = auto,
 // max 16.

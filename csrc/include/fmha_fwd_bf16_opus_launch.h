@@ -345,6 +345,9 @@ inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
     const long long kv_rows = a.block_table_ptr != nullptr ? 64LL : a.seqlen_k;
     if(kv_rows * kv_stride_n * 2LL >= (1LL << 32))
         return false;
+    // A paged tile's extent is rows * row stride, so rows must not overlap.
+    if(a.block_table_ptr != nullptr && (a.stride_k_n < a.hdim_q || a.stride_v_n < a.hdim_q))
+        return false;
     ok = true;
     // Nothing to launch, but not an error.
     return !(a.batch == 0 || a.seqlen_q == 0 || a.nhead == 0);

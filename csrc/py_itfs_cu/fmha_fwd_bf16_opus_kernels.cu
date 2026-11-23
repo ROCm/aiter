@@ -157,6 +157,10 @@ void launch_d128(at::Tensor& q,
             TORCH_CHECK(64LL * kv_stride_n * 2LL < (1LL << 32) && kv_stride_h <= INT_MAX,
                         "OPUS D=128: paged k/v row stride ", kv_stride_n, " or head stride ",
                         kv_stride_h, " is too large for a 32-bit KV tile descriptor");
+            // The tile's extent is rows * row stride, so rows must not overlap.
+            const long long kv_stride_n_min = std::min(k.stride(1), v.stride(1));
+            TORCH_CHECK(kv_stride_n_min >= D, "OPUS D=128: paged k/v row stride ",
+                        kv_stride_n_min, " is below the head dim (overlapping or broadcast rows)");
             args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(1)); args.stride_k_h = static_cast<int>(k.stride(2));
             args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(1)); args.stride_v_h = static_cast<int>(v.stride(2));
             args.stride_k_page   = k.stride(0);
