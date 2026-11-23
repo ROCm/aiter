@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import random
 import sys
 from types import SimpleNamespace
@@ -25,6 +26,10 @@ from aiter.ops.triton.utils.unified_attention_utils import (
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
+)
+from op_tests.triton_tests.utils.test_common_utils import (
+    assert_no_gpu_memory_fault,
+    run_in_subprocess,
 )
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -1165,6 +1170,108 @@ def test_triton_unified_attn_asym_head(
     )
 
 
+# gfx950 gives head sizes 129-256 their own attn_2d prefill entries; 320 is the
+# first size past them. The prefills are long enough to run the 2D kernel.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1100, 2048)], [(1, 1500), (777, 1200), (600, 600)]],
+)
+@pytest.mark.parametrize("head_size", [160, 192, 256, 320])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, e4m3_dtype),
+        (e4m3_dtype, e4m3_dtype),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_prefill_head_sizes(
+    seq_lens: list[tuple[int, int]],
+    head_size: int,
+    sliding_window: int | None,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=64,
+        head_size=head_size,
+        num_heads=(16, 2),
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
 @pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
 @torch.inference_mode()
 def test_triton_unified_attn_asym_head_guards(case: str) -> None:
@@ -1308,6 +1415,87 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         out_dtype=dtype,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _run_block_table_before_unmapped_page(seq_lens, block_size, sliding_window):
+    # Runs in a child process: a GPU memory fault aborts the whole process.
+    from op_tests.test_batch_prefill import make_guarded_int32_tensor
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=128,
+            num_heads=(48, 8),
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    # The last sequence fills the last row, so a read past the row is a read
+    # past the table, and the page after the table is not mapped.
+    assert -(-kv_lens[-1] // block_size) == table.shape[1]
+    guarded = make_guarded_int32_tensor(table, device=torch.cuda.current_device())
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=guarded.view(table.shape),
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend="gluon",
+    )
+    torch.cuda.synchronize()
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    )
+    torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decoding verify: the last sequence ends 6 tokens short of the row
+        [(8, 1000), (8, 2045), (6, 4090)],
+        [(512, 512), (256, 4096)],
+        [(1, 1000), (1, 4096)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+def test_triton_unified_attn_block_table_before_unmapped_page(
+    seq_lens, block_size, sliding_window
+):
+    # The gfx950 kernel loads block IDs two tiles ahead. The load must stay in
+    # the block table also for the last row of the table.
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon block-table prefetch")
+    aiter_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    child = (
+        "import sys, torch\n"
+        f"sys.path.insert(0, {aiter_root!r})\n"
+        "from op_tests.triton_tests.attention.test_unified_attention import "
+        "_run_block_table_before_unmapped_page as run\n"
+        "with torch.inference_mode():\n"
+        f"    run({seq_lens!r}, {block_size!r}, {sliding_window!r})\n"
+    )
+    result = run_in_subprocess(child, timeout=600)
+    assert_no_gpu_memory_fault(
+        result, "unified attention read past the end of the block table"
+    )
 
 
 def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
