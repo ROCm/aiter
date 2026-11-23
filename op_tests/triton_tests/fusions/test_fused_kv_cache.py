@@ -2,6 +2,7 @@ import pytest
 import torch
 import triton
 
+from aiter.ops.triton.fusions import fused_kv_cache
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_cat_and_cache_mla,
     fused_qk_rope_cat_and_cache_mla,
@@ -1703,9 +1704,12 @@ def test_seg_packed_mla_cache_rejects_noncontiguous():
 
 def test_q_nope_prestored_supported_matches_the_wrapper():
     # The query and the wrapper's q_nope_prestored check agree: the option is
-    # accepted on gfx1250 and rejected on other archs.
+    # accepted on gfx1250 with the Gluon head-tile kernel and rejected otherwise.
     supported = q_nope_prestored_supported()
-    assert supported == (arch_info.get_arch() in ("gfx1250", "gfx1250-strict"))
+    assert supported == (
+        arch_info.get_arch() in ("gfx1250", "gfx1250-strict")
+        and fused_kv_cache.gluon_qpe_htile_kernel is not None
+    )
     if supported:
         return
     case = _seg_case(7, 7, 8, torch.bfloat16)
