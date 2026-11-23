@@ -301,8 +301,28 @@ constexpr int kItemTiles = 6;
 // tiles; then the requests are cut into equal consecutive XCD shares. Below ~10 % the clocks absorb
 // the imbalance at the power cap and the cuts cost more than they save.
 constexpr double kXcdSplit = 0.10;
+// A unit's partials are written by stage 1 and merged as one chain of round trips (4 partials
+// each, 16 with `balance`), so every further piece of a unit costs time after stage 1, while
+// stage 1 only gains the tiles a further column takes off the others. The cost of one more piece
+// in the plan tiles of stage 1, fitted on MI355X at batch 1-32 (0.4-6.4 swept for the 4-deep
+// merge, 0.15-2.4 for the 16-deep one):
+constexpr double kMergePieceTiles     = 0.8;
+constexpr double kMergePieceTilesDeep = 0.15;
 
 using PlanItem = std::array<int, 10>;
+
+// Most columns worth cutting an XCD's `total_tiles` into, with `request_tiles` the KV of its
+// longest request. Stage 1 plus the merge of a request of R tiles is shortest at sqrt(R / m)
+// pieces (m = the merge's cost per piece in tiles), which is a column of sqrt(m * R) tiles.
+// Only a small batch has columns shorter than that: with 8k local tokens per request and the
+// 4-deep merge the cap binds below ~15 one-chunk requests (below 3 at 5 chunks), and a plan it
+// does not bind is unchanged.
+inline int column_cap(int total_tiles, int request_tiles, bool deep_merge)
+{
+    const double m         = deep_merge ? kMergePieceTilesDeep : kMergePieceTiles;
+    const double min_tiles = std::max(1.0, std::sqrt(m * request_tiles));
+    return std::max(1, static_cast<int>(std::lround(total_tiles / min_tiles)));
+}
 
 struct Segment
 {
@@ -460,6 +480,16 @@ int build_plan_default_impl(const int* kv_indptr,
         const int total_tiles                = xtiles[x];
         if(total_tiles == 0)
             continue;
+        // always the most columns the merge can afford: their nch workers read the same KV tiles
+        // together (L2 hits), tail workers do not (fewer columns can price lower here but cost
+        // ~10 points of L2 hit rate). An XCD whose columns are capped leaves its other workers
+        // idle: as tail workers they would cut the same chunks again.
+        int longest = 0;
+        for(const Segment& segment : segments)
+            longest = std::max(longest, tiles[segment.request]);
+        const int most_columns = std::min(wg_per_xcd / nch, total_tiles);
+        const int full_columns = std::min(most_columns, column_cap(total_tiles, longest, balance));
+        const int xcd_workers  = full_columns < most_columns ? full_columns * nch : wg_per_xcd;
 
         auto emit = [&](int worker, int b, int chunk, int tile_begin, int tile_end) {
             const int kv_len      = kv_indptr[b + 1] - kv_indptr[b];
@@ -542,7 +572,7 @@ int build_plan_default_impl(const int* kv_indptr,
         };
         auto feasible = [&](double cap, int columns) {
             int pos           = 0;
-            const int workers = wg_per_xcd - columns * nch;
+            const int workers = xcd_workers - columns * nch;
             for(int column = 0; column < columns; ++column)
                 pos = column_end(pos, cap, workers == 0 && column + 1 == columns);
             if(workers == 0)
@@ -558,13 +588,9 @@ int build_plan_default_impl(const int* kv_indptr,
             }
             return hi;
         };
-        // always the most columns: their nch workers read the same KV tiles together (L2 hits),
-        // tail workers do not (fewer columns can price lower here but cost ~10 points of L2 hit
-        // rate)
-        const int full_columns = std::min(wg_per_xcd / nch, total_tiles);
-        const double cap       = min_cap(full_columns);
+        const double cap = min_cap(full_columns);
 
-        const int extra_after = wg_per_xcd - full_columns * nch;
+        const int extra_after = xcd_workers - full_columns * nch;
         int tail_begin        = 0;
         for(int column = 0; column < full_columns; ++column)
         {
@@ -586,7 +612,7 @@ int build_plan_default_impl(const int* kv_indptr,
                          chunk,
                          std::max(tail_begin, segment.begin) - segment.begin + segment.tile0,
                          segment.end - segment.begin + segment.tile0});
-        const int extra_workers = wg_per_xcd - full_columns * nch;
+        const int extra_workers = xcd_workers - full_columns * nch;
         std::size_t p           = 0;
         int at                  = tail.empty() ? 0 : tail[0].begin;
         for(int extra = 0; extra < extra_workers && p < tail.size(); ++extra)
@@ -614,7 +640,10 @@ int build_plan_default_impl(const int* kv_indptr,
     for(const auto& worker_items : per_wg)
         flat.insert(flat.end(), worker_items.begin(), worker_items.end());
     if(static_cast<int>(flat.size()) > item_cap)
+    {
+        *out_items = static_cast<int>(flat.size()); // what the plan needs, for the error
         return -5;
+    }
     if(balance)
     {
         // every row of a piece must see a key: a piece that ends at its request's end must start
@@ -835,6 +864,14 @@ int build_plan_bucketed_impl(const int* kv_indptr,
                       int n_workers) {
         if(total_tiles == 0 || n_workers <= 0 || depth <= 0)
             return;
+        // the merge-aware column cap of build_plan_default_impl
+        int longest = 0;
+        for(const Segment& segment : segments)
+            longest = std::max(longest, tiles[segment.request]);
+        const int most_columns = std::min(n_workers / depth, total_tiles);
+        const int full_columns = std::min(most_columns, column_cap(total_tiles, longest, balance));
+        if(full_columns < most_columns)
+            n_workers = full_columns * depth;
 
         // The k-th of this group's workers. Two groups share a workgroup only when an XCD owns
         // more depths than it has workgroups, which costs balance but keeps the plan valid; with
@@ -924,8 +961,7 @@ int build_plan_bucketed_impl(const int* kv_indptr,
             }
             return hi;
         };
-        const int full_columns = std::min(n_workers / depth, total_tiles);
-        const double cap       = min_cap(full_columns);
+        const double cap = min_cap(full_columns);
 
         const int extra_workers = n_workers - full_columns * depth;
         int tail_begin          = 0;
@@ -1068,7 +1104,10 @@ int build_plan_bucketed_impl(const int* kv_indptr,
     for(const auto& worker_items : per_wg)
         flat.insert(flat.end(), worker_items.begin(), worker_items.end());
     if(static_cast<int>(flat.size()) > item_cap)
+    {
+        *out_items = static_cast<int>(flat.size()); // what the plan needs, for the error
         return -5;
+    }
     if(balance)
     {
         for(const PlanItem& item : flat)
@@ -1737,6 +1776,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                         st,
                         st + 1);
     }
+    AITER_CHECK(rc != -5,
+                kFn,
+                ": the plan needs ",
+                st[0],
+                " work items, item_cap is ",
+                item_cap,
+                " (bs ",
+                bs,
+                ", heads ",
+                num_heads,
+                ")");
     AITER_CHECK(rc == 0,
                 kFn,
                 ": planner failed (",

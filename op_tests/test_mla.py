@@ -1328,6 +1328,22 @@ def check_opus_flat_decode():
     with pytest.raises(RuntimeError, match="fp8"):
         case.run(dec)
 
+    # A plan past item_cap names the cap and leaves an empty plan published.
+    dec = _of_decoder(max_batch=128)
+    kvp = _of_indptr(_of_local_lens(_of_ctxs("mixed", seed=9, bs=128), True))
+    with pytest.raises(ValueError, match="item_cap is 1024"):
+        dec.plan(kvp, 8, 128, _OF_CP_WORLD)
+    assert dec.last == {"bs": 128, "items": 0, "units": 0}
+    assert not dec._host[(dec._step - 1) & 1].any()
+
+    # A small batch is not cut into more pieces than its merge pays for: one request of one
+    # chunk used to take a piece on nearly every workgroup (216 here).
+    for cp_rr, nhead, q_len, most in ((True, 96, 1, 48), (False, 12, 6, 200)):
+        lens = _of_local_lens([66000 if cp_rr else 66000 * _OF_CP_WORLD], cp_rr)
+        dec = _of_decoder()
+        dec.plan(_of_indptr(lens), q_len, nhead, _OF_CP_WORLD if cp_rr else 1)
+        assert 8 <= dec.last["items"] <= most, dec.last
+
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

@@ -2381,7 +2381,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mllvm --amdgpu-mfma-vgpr-form'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

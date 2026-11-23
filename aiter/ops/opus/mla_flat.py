@@ -25,7 +25,22 @@ only the planner distinguishes the two.
 
 Requirements: fp8 Q / KV with per-tensor descales, page_size 1, one KV head, a KV cache below
 4 GiB, causal decode, and at most ``128 * max_chunks`` rows (``q_len * num_heads``) for the widest
-request.
+request. A plan that needs more than ``item_cap`` work items (1024 by default; 128 heads x 8
+tokens x batch 128 under CP needs 1216) makes ``plan`` raise a ``ValueError`` naming both numbers.
+
+When to use it. Measured on MI355X against ``mla_decode_fwd`` at 66k tokens of context per request:
+
+- round-robin CP, requests of 96 rows or more (``q_len * num_heads``): within 8% either way at
+  batch 1-8 when the request is a single chunk, faster from batch 16; requests of 2+ chunks are
+  on par at batch 1-4 and 1.3-2.7x faster from batch 8;
+- no CP, 12 or 16 heads: 1.1-1.2x faster from batch 8 with several tokens per request; at batch
+  4 and below ``mla_decode_fwd`` is up to 1.6x faster, and one token at 16 heads is on par at best;
+- round-robin CP, requests under 96 rows (a few tokens at 12-64 heads): keep ``mla_decode_fwd``
+  below batch 32 (64 rows) to batch 64 (12-16 rows), where it is up to 2x faster.
+
+Toolchain: the kernel keeps O in all 256 AccVGPRs and issues its PV MFMAs as inline asm, so the
+module is built with ``--amdgpu-mfma-vgpr-form`` to keep the compiler's own MFMA results out of
+the AccVGPRs. Validated with ROCm 7.2.4 and ROCm 10.1.
 """
 
 import numpy as np
@@ -86,13 +101,14 @@ class OpusMlaFlatDecode:
             item_cap * SLOT_ROWS, dtype=torch.float32, device=self.device
         )
         # Two pinned staging buffers: one is rewritten while the other's copy may be in flight.
+        # The planner's buffers are host memory whatever the caller's default device is.
         self._host = [
-            torch.zeros(self.plan_ints, dtype=torch.int32).pin_memory()
+            torch.zeros(self.plan_ints, dtype=torch.int32, device="cpu").pin_memory()
             for _ in range(2)
         ]
         self._events = [torch.cuda.Event(), torch.cuda.Event()]
         self._busy = [False, False]
-        self._stats = torch.zeros(2, dtype=torch.int32)
+        self._stats = torch.zeros(2, dtype=torch.int32, device="cpu")
         self._step = 0
         self.last = {}
 
@@ -126,7 +142,7 @@ class OpusMlaFlatDecode:
         XCD's requests by chunk depth so no worker idles above a shallow request; it has no effect
         when every request is the same width.
         """
-        kv = torch.as_tensor(np.asarray(kv_indptr), dtype=torch.int32)
+        kv = torch.as_tensor(np.asarray(kv_indptr), dtype=torch.int32, device="cpu")
         if not kv.is_contiguous():
             kv = kv.contiguous()
         bs = kv.numel() - 1
@@ -159,20 +175,35 @@ class OpusMlaFlatDecode:
             )
 
         host = self._staging()
-        opus_mla_decode_flat_plan(
-            kv,
-            qo,
-            scalar_q,
-            num_heads,
-            self.num_workers,
-            cp_world_size == 1,
-            bucketed,
-            NUM_XCD,
-            self.item_cap,
-            self.max_units,
-            host,
-            self._stats,
-        )
+        try:
+            opus_mla_decode_flat_plan(
+                kv,
+                qo,
+                scalar_q,
+                num_heads,
+                self.num_workers,
+                cp_world_size == 1,
+                bucketed,
+                NUM_XCD,
+                self.item_cap,
+                self.max_units,
+                host,
+                self._stats,
+            )
+        except RuntimeError as err:
+            # Publish an empty plan, so a later __call__ cannot run the previous step's plan
+            # on this step's tensors.
+            host.zero_()
+            self._publish(host)
+            self.last = {"bs": bs, "items": 0, "units": 0}
+            if "item_cap" in str(err):
+                raise ValueError(
+                    f"batch {bs} x {max_q} tokens x {num_heads} heads (cp_world_size "
+                    f"{cp_world_size}) needs {int(self._stats[0])} work items, item_cap is "
+                    f"{self.item_cap}: build OpusMlaFlatDecode with a larger item_cap, or run "
+                    "this step through mla_decode_fwd"
+                ) from err
+            raise
         self._publish(host)
         items, units = self._stats.tolist()
         self.last = {"bs": bs, "items": items, "units": units}
