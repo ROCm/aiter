@@ -272,11 +272,12 @@ def _toolchain_digest() -> str:
     return h.hexdigest()
 
 
-@functools.cache
 def _device_bitcode_digest() -> str:
     """Hash of the AMDGCN device libraries (ocml, ockl, ...) FlyDSL links into
     a kernel that calls them. Bundled with FlyDSL they are in its wheel, but
-    without in-process LLD they come from ``ROCM_PATH`` or ``/opt/rocm``."""
+    without in-process LLD they come from ``ROCM_PATH`` or ``/opt/rocm``.
+    Not cached here: the toolkit follows the environment, and FlyDSL caches
+    the digest of each."""
     try:
         from flydsl.compiler.backends import rocm
 
@@ -1016,19 +1017,34 @@ class _BakedKernel:
     wrong kernel; the JIT path's cached function has the same limit, silently.
     """
 
+    __slots__ = ("_baked", "_kernel", "_nargs", "_where")
+
     def __init__(self, kernel, name, key, args, indexes):
         self._kernel = kernel
         self._where = f"{name}: {key!r}"
+        # A call with another number of arguments passes a constexpr this one
+        # left to its default, or leaves one out.
+        self._nargs = len(args)
         self._baked = tuple(
             (i, args[i], repr(_normalize_key(args[i]))) for i in indexes
         )
 
     def __call__(self, *args) -> None:
+        if len(args) != self._nargs:
+            raise _BakedArgumentError(
+                f"[FlyDSL AOT] {self._where} was compiled for {self._nargs} launch "
+                f"arguments and is launched with {len(args)}; a launcher with "
+                f"constexpr launch arguments takes the same ones at every launch "
+                f"of one key"
+            )
         for i, value, normalized in self._baked:
-            arg = args[i] if i < len(args) else _BakedKernel
-            # The usual call passes the same object or an equal one of the
-            # same type; anything else is compared as the disk entry is.
-            if arg is value or (type(arg) is type(value) and arg == value):
+            arg = args[i]
+            # The usual call passes the same object or an equal scalar of the
+            # same type; anything else (a tuple may hold True for 1) is
+            # compared as the disk entry is.
+            if arg is value or (
+                type(arg) is type(value) and type(arg) is not tuple and arg == value
+            ):
                 continue
             try:
                 same = repr(_normalize_key(arg)) == normalized
@@ -1252,7 +1268,7 @@ class FlyDSLAotCache:
             _bindings.cache_clear()
             called = _called_lines(calls)
             files |= _import_sources(files, called)
-            changed = _changed_since_start(files | libs)
+            changed = _changed_since_start(files)
             if changed:
                 raise RuntimeError(
                     f"{changed[0]} changed after this process started; not caching "
@@ -1262,7 +1278,8 @@ class FlyDSLAotCache:
             # files as they are on disk at this point.
             _file_digest.cache_clear()
             # A linked bitcode file is an input like a source: its code is in
-            # the object. It is not Python, so nothing above reads it.
+            # the object. It is not Python, so nothing above reads it, and the
+            # compile read it just now, whenever it was written.
             sources = {_portable(f): _file_digest(f) for f in sorted(files | libs)}
             meta = {
                 "sources": sources,

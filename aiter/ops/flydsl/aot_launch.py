@@ -143,8 +143,18 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
         return exe
     current = getattr(exe, _ATTR, None)
     if current is None:
-        if not _storable(cache, key):
+        try:
             setattr(exe, _ATTR, False)
+        except (AttributeError, TypeError):
+            # Not one launcher (a factory returning a tuple or a dict of them):
+            # nothing to bind, so its launchers take the JIT path. Bind each
+            # with bind_aot where it is built.
+            logger.info(
+                f"[FlyDSL AOT] {cache.name}: cannot bind a "
+                f"{type(exe).__name__}; launching through the JIT path"
+            )
+            return exe
+        if not _storable(cache, key):
             return exe
 
         def launcher():

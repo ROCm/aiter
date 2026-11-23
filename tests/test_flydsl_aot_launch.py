@@ -22,7 +22,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import flydsl.compiler as flyc
@@ -214,7 +213,14 @@ def test_constexpr_launch_arguments_select_the_entry():
     for other in ((1, 8, 32, "b", (3, 4)), (1, 8, 64, "c", (3, 4)), (1, 8, 64, "b")):
         with pytest.raises(_BakedArgumentError):
             kernel(*other)
-    # Compared as the disk entry is: True is not 1, and NaN is itself.
+    # A constexpr the first call left to its default cannot be passed later.
+    short = _BakedKernel(lambda *a: None, "t", ("k",), (0, 4, 64), [2])
+    with pytest.raises(_BakedArgumentError):
+        short(0, 4, 64, "b")
+    # Compared as the disk entry is: True is not 1 (in a tuple too), and NaN
+    # is itself.
+    with pytest.raises(_BakedArgumentError):
+        _BakedKernel(lambda *a: None, "t", ("k",), ((1, 2),), [0])((True, 2))
     with pytest.raises(_BakedArgumentError):
         _BakedKernel(lambda *a: None, "t", ("k",), (True,), [0])(1)
     _BakedKernel(lambda *a: ran.append(a), "t", ("k",), (float("nan"),), [0])(
@@ -265,10 +271,9 @@ def test_compile_hints_of_the_caller_select_the_entry():
 def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
+    # Written after this process started, as a library extracted on first use.
     lib = tmp_path / "device.bc"
     lib.write_bytes(b"BC one")
-    old = time.time() - 3600  # written before this process, as an installed file
-    os.utime(lib, (old, old))
 
     class Artifact:
         _link_libs = [str(lib)]
@@ -293,7 +298,6 @@ def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
 
     # A rebuilt library (e.g. another MORI) no longer matches the entry.
     lib.write_bytes(b"BC two")
-    os.utime(lib, (old, old))
     aot_cache._file_digest.cache_clear()
     assert cache._find(out_dir, "digest", ()) is None
     rebuilt = cache._build(make_exe, (), out_dir, "sym", "digest")
