@@ -107,9 +107,11 @@ def _make_core(
     assert KG >= 1, "a K tile holds whole 128-K W chunks"
     KT = K // TK
     STEPS = TK // 32  # MFMA K steps per tile
-    assert PF >= 1 and KT % (2 * PF) == 0 and KT // (2 * PF) >= 2, (
-        f"K loop: K={K} gives {KT} K tiles of {TK}, prefetch {PF} needs a multiple of "
-        f"{2 * PF} and at least {4 * PF}: K is too short for this config"
+    # tiles past the last whole loop body (2 * PF tiles): unrolled after the loop
+    KT_REST = KT % (2 * PF)
+    assert PF >= 1 and KT >= 4 * PF, (
+        f"K loop: K={K} gives {KT} K tiles of {TK}, prefetch {PF} needs at least "
+        f"{4 * PF}: K is too short for this config"
     )
     W_STEP = 0
     ST_STEP = STEPS // 2 if ST_STEP is None else ST_STEP
@@ -397,18 +399,17 @@ def _make_core(
 
         @flyc.jit
         def _k_loop():
-            for it in range(KT // (2 * PF) - 1):
+            for it in range((KT - KT_REST) // (2 * PF) - 1):
                 for q in range_constexpr(2 * PF):
                     kt = fx.Int32(it) * fx.Int32(2 * PF) + fx.Int32(q)
                     tile_step(kt, q % PF, q // PF, True, True, True)
 
         _k_loop()
-        for q in range_constexpr(2 * PF):  # last 2*PF tiles
-            kt = KT - 2 * PF + q
+        for kt in range_constexpr(KT - 2 * PF - KT_REST, KT):  # the last tiles
             tile_step(
                 fx.Int32(kt),
-                q % PF,
-                q // PF,
+                kt % PF,
+                kt // PF % 2,
                 kt + PF < KT,
                 kt + 1 < KT,
                 kt + 2 < KT,

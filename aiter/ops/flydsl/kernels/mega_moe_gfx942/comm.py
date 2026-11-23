@@ -40,16 +40,12 @@ from .mem import (
     lds_typed_ptr,
 )
 from .protocol import (
-    ARRIVED,
     BLOCK_M,
-    CFLAG,
-    E_GLOBAL,
-    E_LOCAL,
-    FFLAG,
     NPES,
-    ROW_BITS,
     SCHED_EXPECTED,
     STATUS_EPOCH,
+    row_bits,
+    ws_layout,
 )
 
 # plan (int32): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert bases
@@ -57,11 +53,20 @@ from .protocol import (
 # destination's 8 mega-kernel queues and its block count [NPES][9], the counts
 # [NPES][E_GLOBAL]. The plan kernel stages [0, PLAN_COUNTS) in LDS.
 PLAN_TOTAL = 0
-PLAN_MIN = E_GLOBAL
-PLAN_BASE = 2 * E_GLOBAL
-PLAN_QSTART = 3 * E_GLOBAL + NPES
-PLAN_COUNTS = PLAN_QSTART + NPES * 9
-PLAN_INTS = PLAN_COUNTS + NPES * E_GLOBAL
+
+
+def plan_layout(E_LOCAL):
+    """(PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, PLAN_INTS) with ``E_LOCAL``
+    experts per rank: the i32 offsets of the plan tables after the totals and their
+    size."""
+    E_GLOBAL = NPES * E_LOCAL
+    PLAN_MIN = E_GLOBAL
+    PLAN_BASE = 2 * E_GLOBAL
+    PLAN_QSTART = 3 * E_GLOBAL + NPES
+    PLAN_COUNTS = PLAN_QSTART + NPES * 9
+    return PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, PLAN_COUNTS + NPES * E_GLOBAL
+
+
 MAX_KEYS = 64  # send-order keys: a route's block position in its destination's queue
 ROUTE_BATCH = 8  # prep kernel: routes per thread with their loads issued together
 SLICE_PER_THREAD = 4  # plan kernel: routes per thread (slices of up to 1024 routes)
@@ -242,14 +247,19 @@ def mega_quant_kernel(*, H, QX=1):
 # =============================================================================
 
 
-def mega_prep_kernel():
+def mega_prep_kernel(*, E_LOCAL):
     """route_idx [T*TOPK]: rank of each route among this rank's routes to its global
     expert (a negative id is no route: padding, not counted, route_idx not written).
     Writes this rank's count row to every rank, waits for all rows, and fills
     ``plan``, num_valid [1] (rows this rank receives, capped at s_cap) and status[1] (rows
     needed). Zeroes this rank's arrived counters (before its count flag: no source adds to
-    them before it has seen the flag) and the mega kernel's ticket and done counters."""
+    them before it has seen the flag) and the mega kernel's ticket and done counters.
+    ``E_LOCAL``: experts per rank."""
     NT = 1024
+    E_GLOBAL, CFLAG, _, ARRIVED = ws_layout(E_LOCAL)
+    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL)
+    # a destination's experts in one wave: a shuffle scan of each power-of-two segment
+    WAVE_SCAN = E_LOCAL & (E_LOCAL - 1) == 0 and E_LOCAL <= 64
     L_HIST = 0
     L_CNT = L_HIST + E_GLOBAL
     L_BASE = L_CNT + NPES * E_GLOBAL
@@ -262,7 +272,7 @@ def mega_prep_kernel():
     class SharedStorage:
         raw: fx.Array[fx.Uint8, LDS_INTS * 4, 16]
 
-    @flyc.kernel(name="a8w4_megamoe_prep", known_block_size=[NT, 1, 1])
+    @flyc.kernel(name=f"a8w4_megamoe_prep_e{E_LOCAL}", known_block_size=[NT, 1, 1])
     def kernel(
         topk_ids: fx.Int64,
         route_idx: fx.Int64,
@@ -356,23 +366,41 @@ def mega_prep_kernel():
             _store(plan_p, fx.Int32(PLAN_MIN) + tid, fewest)
         gpu.barrier()
         # destination d's experts start on BLOCK_M-row boundaries in expert order:
-        # an exclusive scan of the padded totals over the 32 lanes of a destination
-        if tid < fx.Int32(E_GLOBAL):
-            pad = (
-                (lds[fx.Int32(L_TOT) + tid] + fx.Int32(BLOCK_M - 1))
-                // fx.Int32(BLOCK_M)
-                * fx.Int32(BLOCK_M)
-            )
-            inc = _scan(pad, lane, E_LOCAL)
-            _store(lds, fx.Int32(L_BASE) + tid, inc - pad)
-            _store(plan_p, fx.Int32(PLAN_BASE) + tid, inc - pad)
-            if tid % fx.Int32(E_LOCAL) == fx.Int32(E_LOCAL - 1):
-                _store(lds, fx.Int32(L_BASE + E_GLOBAL) + tid // fx.Int32(E_LOCAL), inc)
-                _store(
-                    plan_p,
-                    fx.Int32(PLAN_BASE + E_GLOBAL) + tid // fx.Int32(E_LOCAL),
-                    inc,
+        # an exclusive scan of the padded totals over the experts of a destination
+        if const_expr(WAVE_SCAN):
+            if tid < fx.Int32(E_GLOBAL):
+                pad = (
+                    (lds[fx.Int32(L_TOT) + tid] + fx.Int32(BLOCK_M - 1))
+                    // fx.Int32(BLOCK_M)
+                    * fx.Int32(BLOCK_M)
                 )
+                inc = _scan(pad, lane, E_LOCAL)
+                _store(lds, fx.Int32(L_BASE) + tid, inc - pad)
+                _store(plan_p, fx.Int32(PLAN_BASE) + tid, inc - pad)
+                if tid % fx.Int32(E_LOCAL) == fx.Int32(E_LOCAL - 1):
+                    _store(
+                        lds, fx.Int32(L_BASE + E_GLOBAL) + tid // fx.Int32(E_LOCAL), inc
+                    )
+                    _store(
+                        plan_p,
+                        fx.Int32(PLAN_BASE + E_GLOBAL) + tid // fx.Int32(E_LOCAL),
+                        inc,
+                    )
+        else:
+            # a destination's experts span waves: one thread per destination
+            if tid < fx.Int32(NPES):
+                base = fx.Int32(0)
+                for k in range_constexpr(E_LOCAL):
+                    g = tid * fx.Int32(E_LOCAL) + fx.Int32(k)
+                    _store(lds, fx.Int32(L_BASE) + g, base)
+                    _store(plan_p, fx.Int32(PLAN_BASE) + g, base)
+                    base = base + (
+                        (lds[fx.Int32(L_TOT) + g] + fx.Int32(BLOCK_M - 1))
+                        // fx.Int32(BLOCK_M)
+                        * fx.Int32(BLOCK_M)
+                    )
+                _store(lds, fx.Int32(L_BASE + E_GLOBAL) + tid, base)
+                _store(plan_p, fx.Int32(PLAN_BASE + E_GLOBAL) + tid, base)
         for b in range(tid, blocks_cap, NT):
             _store(sched_p, fx.Int32(SCHED_EXPECTED) + blocks_cap + b, fx.Int32(0))
         if tid < fx.Int32(SCHED_EXPECTED):
@@ -431,7 +459,7 @@ def mega_prep_kernel():
 # =============================================================================
 
 
-def mega_plan_kernel():
+def mega_plan_kernel(*, E_LOCAL):
     """send_route / send_info [T*TOPK]: workgroup j sorts routes [j S, (j + 1) S) (S =
     ceil(routes / grid)) by when the destination's mega-kernel queues need them (block
     position in the queue) into the same range; the producer wave j sends that range in
@@ -440,8 +468,12 @@ def mega_plan_kernel():
     expert_ids [s_cap / BLOCK_M] / sched expected rows per block: this rank's sorted
     blocks; down_ids (symmetric, local view): padding rows set to -1 (producers fill the
     valid ones). The rows of an expert interleave the sources: source s's i-th route sits
-    at virtual position 8 i + s (compacted where sources run out)."""
+    at virtual position 8 i + s (compacted where sources run out). ``E_LOCAL``: experts
+    per rank."""
     NT = PLAN_THREADS
+    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL)
+    E_GLOBAL = NPES * E_LOCAL
+    ROW_BITS = row_bits(E_GLOBAL)
     L_KC = PLAN_COUNTS
     L_KN = L_KC + MAX_KEYS
     LDS_INTS = L_KN + MAX_KEYS
@@ -450,7 +482,7 @@ def mega_plan_kernel():
     class SharedStorage:
         raw: fx.Array[fx.Uint8, LDS_INTS * 4, 16]
 
-    @flyc.kernel(name="a8w4_megamoe_plan", known_block_size=[NT, 1, 1])
+    @flyc.kernel(name=f"a8w4_megamoe_plan_e{E_LOCAL}", known_block_size=[NT, 1, 1])
     def kernel(
         topk_ids: fx.Int64,
         route_idx: fx.Int64,
@@ -597,11 +629,13 @@ def mega_plan_kernel():
 # =============================================================================
 
 
-def mega_finish_kernel():
+def mega_finish_kernel(*, E_LOCAL):
     """After the mega kernel (same stream): tell every rank this rank's remote adds are
-    done, wait for all ranks, then advance the epoch (status[STATUS_EPOCH])."""
+    done, wait for all ranks, then advance the epoch (status[STATUS_EPOCH]).
+    ``E_LOCAL``: experts per rank (the workspace layout)."""
+    _, _, FFLAG, _ = ws_layout(E_LOCAL)
 
-    @flyc.kernel(name="a8w4_megamoe_finish", known_block_size=[64, 1, 1])
+    @flyc.kernel(name=f"a8w4_megamoe_finish_e{E_LOCAL}", known_block_size=[64, 1, 1])
     def kernel(ws: fx.Int64, ws_tab: fx.Int64, status: fx.Int64, me: fx.Int32):
         tid = fx.Int32(gpu.thread_id("x"))
         status_p = global_typed_ptr(status, T.i32)

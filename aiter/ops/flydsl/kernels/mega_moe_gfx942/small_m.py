@@ -82,8 +82,6 @@ from .mem import (
     lds_vec_load,
 )
 from .protocol import (
-    E_GLOBAL,
-    E_LOCAL,
     NPES,
     SC_EPOCH,
     SC_HEAD,
@@ -95,6 +93,9 @@ from .protocol import (
     small_sym_layout,
 )
 
+# The small kernel's layer: 32 local experts (and H 4096) per rank.
+E_LOCAL = 32
+E_GLOBAL = NPES * E_LOCAL
 P2P = CM_SYS | CM_NT  # stores into a rank's (uncached) heap: written through
 WT = CM_SC1  # a2: written through (a gemm2 unit on another XCD may read it)
 
@@ -155,12 +156,12 @@ def ep_mega_small_kernel(
     CAP = TMAX
     ROWS = E_LOCAL * CAP  # fixed-slot rows of a rank
     ROWV = tuple(r for r in (16, 32, 64) if r <= BM)
-    MAXT = small_max_tiles(TOPK, TMAX, BM)
+    MAXT = small_max_tiles(TOPK, TMAX, BM, E_LOCAL)
     A2_ROWS = MAXT * BM
     CH = H // 1024  # producer: 1 KB fp8 chunks of a row, 16 B per lane
     VW = NO // 128  # gemm2 scatter: i32 per lane of a row's NO bf16
     LINE = SMALL_LINE
-    off, _ = small_sym_layout(H, TOPK, TMAX)
+    off, _ = small_sym_layout(H, TOPK, TMAX, E_LOCAL)
     O_RX, O_RS, O_RW, O_RID = off["rx"], off["rs"], off["rw"], off["rid"]
     O_RUN, O_DONE, O_CIN, O_CFLAG = off["run"], off["done"], off["cin"], off["cflag"]
     assert BM in (16, 32, 64) and CAP % BM == 0 and TMAX <= 1 << 16, (BM, TMAX)
@@ -1235,15 +1236,17 @@ class SmallMRuntime:
         self.rank, self.topk, self.tmax = int(rank), int(topk), int(tmax)
         H, I = int(model_dim), int(inter_dim)
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.sym = host.symmetric((small_sym_layout(H, topk, tmax)[1],), torch.uint8)
+        self.sym = host.symmetric(
+            (small_sym_layout(H, topk, tmax, E_LOCAL)[1],), torch.uint8
+        )
         torch.cuda.synchronize()
         import mori.shmem as ms
 
         ms.shmem_barrier_all()
         self.stab = host.peer_table(self.sym, self.rank, world_size)
         bms = (16, 32, 64)  # a2 rows / tile counters for every m-tile size
-        rows = max(small_max_tiles(topk, tmax, bm) * bm for bm in bms)
-        tiles = max(small_max_tiles(topk, tmax, bm) for bm in bms)
+        rows = max(small_max_tiles(topk, tmax, bm, E_LOCAL) * bm for bm in bms)
+        tiles = max(small_max_tiles(topk, tmax, bm, E_LOCAL) for bm in bms)
         self.ctl = torch.zeros(SC_TILE + 16 * tiles, dtype=torch.int32, device=dev)
         self.a2 = torch.empty((rows, I), dtype=torch.uint8, device=dev)
         self.a2s = torch.empty((rows, I // 128), dtype=torch.float32, device=dev)

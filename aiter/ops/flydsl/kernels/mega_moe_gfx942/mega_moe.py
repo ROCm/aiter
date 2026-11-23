@@ -26,6 +26,12 @@ The main path is built only while large_M is off: unlike MegaMoEV2, an instance 
 either the main path or large_M, and ``set_large_m_enabled`` cannot switch to the other
 one. ``x_quant="per_token"`` runs every call on the main path.
 
+Layers (``eligible``): DeepSeek-V4-Flash's (H 4096, I 2048, 256 experts, top-6) and
+MiMo-V2.6-Flash's (the same with top-8) on every path; DeepSeek-V4.1-Flash's (H 5120,
+I 2304, 384 experts, top-6) on the main path, small_M and large_M reporting unavailable
+(``small_m_mtpr`` 0, ``large_m_available`` False) as MegaMoEV2 does for a path it
+cannot run.
+
 Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
 receives at most every route of every rank (8 x max_tok_per_rank x topk rows plus one
@@ -51,9 +57,15 @@ import torch
 from ..mega_moe import envs
 from . import weights as _weights
 
-_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _NUM_CU = 8, 4096, 2048, 256, 304
-# DeepSeek-V4-Flash routes each token to 6 experts, MiMo-V2.6-Flash to 8.
-_TOPKS = (6, 8)
+_EP, _NUM_CU = 8, 304
+# The layers this build runs: (H, I, experts) -> (their top-k values, whether the small
+# kernel and large_M run them too; the main path runs them all). DeepSeek-V4-Flash
+# (top-6) and MiMo-V2.6-Flash (top-8): every path; DeepSeek-V4.1-Flash: the main path
+# (small_M / large_M report unavailable, except a8w8's small_M, which is the main path).
+_LAYERS = {
+    (4096, 2048, 256): ((6, 8), True),
+    (5120, 2304, 384): ((6,), False),
+}
 # a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (W in the
 # (16, 16) preshuffle)
 _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
@@ -62,17 +74,19 @@ _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
 def eligible(
     *, world_size, model_dim, inter_dim, experts, topk, quant="a8w4", act="silu"
 ):
-    """Whether this build runs the layer: gfx942 with 304 CUs, EP8 and the MoE shape of
-    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6) or MiMo-V2.6-Flash (the same
-    with top-8), a8w4 or a8w8."""
+    """Whether this build runs the layer: gfx942 with 304 CUs, EP8 and the MoE layer of
+    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6), MiMo-V2.6-Flash (the same
+    with top-8) or DeepSeek-V4.1-Flash (H 5120, I 2304, 384 experts, top-6), a8w4 or
+    a8w8."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
+    layer = _LAYERS.get((model_dim, inter_dim, experts))
     return (
         get_gfx_runtime() == "gfx942"
         and get_cu_num() == _NUM_CU
-        and (world_size, model_dim, inter_dim, experts)
-        == (_EP, _MODEL_DIM, _INTER_DIM, _EXPERTS)
-        and topk in _TOPKS
+        and world_size == _EP
+        and layer is not None
+        and topk in layer[0]
         and quant in _WQ
         and act == "silu"
     )
@@ -123,8 +137,9 @@ class MegaMoEGfx942:
             act=act,
         ):
             raise ValueError(
-                "MegaMoEGfx942 runs gfx942 (304 CUs), EP8, H 4096, I 2048, 256 experts, "
-                f"top-6 or top-8, a8w4 or a8w8 silu; got world_size={world_size} "
+                "MegaMoEGfx942 runs gfx942 (304 CUs), EP8, a8w4 or a8w8 silu, H 4096, "
+                "I 2048, 256 experts, top-6 or top-8, or H 5120, I 2304, 384 experts, "
+                f"top-6; got world_size={world_size} "
                 f"model_dim={model_dim} inter_dim={inter_dim} experts={experts} "
                 f"topk={topk} quant={quant} act={act}"
             )
@@ -158,9 +173,11 @@ class MegaMoEGfx942:
             large_m_enabled = envs.AITER_MEGA_LARGE_M
         if small_m_enabled is None:
             small_m_enabled = envs.AITER_MEGA_SMALL_M
-        # large_M quantizes x per 1x128 only.
+        # The small kernel and large_M run only some layers (_LAYERS); large_M
+        # quantizes x per 1x128 only.
+        every_path = _LAYERS[(self.model_dim, self.inter_dim, self.experts)][1]
         self._large = None
-        if large_m_enabled and x_quant == "per_1x128":
+        if large_m_enabled and x_quant == "per_1x128" and every_path:
             from .large_m.host import LargeMRuntime
 
             self._large = LargeMRuntime(
@@ -181,7 +198,7 @@ class MegaMoEGfx942:
         self._large_on = self._large is not None
         self._main = None if self._large_on else self._main_runtime(self.mtpr)
         self._small, self._small_mtpr = None, 0
-        if small_m_enabled:
+        if small_m_enabled and (every_path or quant != "a8w4"):
             self._small_mtpr = max(int(m) for m in small_m_mtprs)
             if quant == "a8w4":
                 from .small_m import SmallMRuntime
@@ -208,6 +225,7 @@ class MegaMoEGfx942:
             world_size=self.world_size,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
+            experts=self.experts,
             topk=self.topk,
             mtpr=mtpr,
             wq=_WQ[self.quant],

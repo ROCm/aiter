@@ -15,18 +15,10 @@ def qx_of(x_quant):
 
 
 # ---- main path: workspace / sched of comm.py and main.py (layout: comm.py) ----------
-NPES, E_LOCAL = 8, 32
-E_GLOBAL = NPES * E_LOCAL
-CFLAG = NPES * E_GLOBAL
-FFLAG = CFLAG + NPES
-ARRIVED = FFLAG + NPES
+NPES = 8
 QUEUES = 8
 QSTRIDE = 16  # i32 between two ticket counters (separate cache lines)
 SCHED_EXPECTED = QUEUES * QSTRIDE
-# a route's send info (plan kernel -> the main kernel's producers): destination row |
-# global expert << ROW_BITS; 8 expert bits and the sign bit (-1: not sent) leave 23 row
-# bits
-ROW_BITS = 23
 BLOCK_M = 128
 # A buffer the kernels address by row stays below 2 GiB: byte offsets are i32, and a
 # masked lane's buffer access goes to offset 0x7FFFFFFF, out of range only below 2 GiB.
@@ -35,11 +27,28 @@ BUFFER_BYTES_MAX = 1 << 31
 # calls completed (the finish kernel advances it; prep / finish flag the call with it + 1)
 STATUS_EPOCH = 2
 
+
+def ws_layout(E_LOCAL):
+    """(E_GLOBAL, CFLAG, FFLAG, ARRIVED) with ``E_LOCAL`` experts per rank: the experts
+    of all ranks and the i32 offsets of the main path's workspace regions after the
+    count matrix [NPES][E_GLOBAL] (see comm.py)."""
+    E_GLOBAL = NPES * E_LOCAL
+    CFLAG = NPES * E_GLOBAL
+    return E_GLOBAL, CFLAG, CFLAG + NPES, CFLAG + 2 * NPES
+
+
+def row_bits(E_GLOBAL):
+    """Row bits of a route's send info (plan kernel -> the main kernel's producers):
+    destination row | global expert << ROW_BITS; the expert bits and the sign bit (-1:
+    not sent) take the rest of the i32 (256 experts: 23 row bits)."""
+    return 31 - (E_GLOBAL - 1).bit_length()
+
+
 # ---- small path (small_m.py): a rank's symmetric buffer, its control block ----------
 SMALL_LINE = 64  # bytes per cross-rank flag / counter (one cache line each)
 
 
-def small_sym_layout(H, TOPK, TMAX):
+def small_sym_layout(H, TOPK, TMAX, E_LOCAL):
     """(byte offset of each region, total bytes) of a rank's symmetric buffer: fixed slots
     of TMAX rows per local expert (``rx`` fp8 rows, ``rs`` f32 scale per (row, 128 cols),
     ``rw`` route weight, ``rid`` source id), ``run`` (rows the sources took per expert,
@@ -64,8 +73,9 @@ def small_sym_layout(H, TOPK, TMAX):
     return off, pos
 
 
-def small_max_tiles(TOPK, TMAX, BM):
-    """m-tiles a rank can receive: TMAX tokens, each with <= min(topk, 32) routes here."""
+def small_max_tiles(TOPK, TMAX, BM, E_LOCAL):
+    """m-tiles a rank can receive: TMAX tokens, each with <= min(topk, E_LOCAL) routes
+    here."""
     return TMAX * min(TOPK, E_LOCAL) // BM + E_LOCAL
 
 

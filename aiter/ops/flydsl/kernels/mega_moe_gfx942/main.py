@@ -73,15 +73,14 @@ from .mem import (
     lds_vec_load,
 )
 from .protocol import (
-    ARRIVED,
     BLOCK_M,
     BUFFER_BYTES_MAX,
-    E_LOCAL,
     NPES,
     QSTRIDE,
     QUEUES,
-    ROW_BITS,
     SCHED_EXPECTED,
+    row_bits,
+    ws_layout,
 )
 
 CHUNK = 8  # routes per producer wave between two signals
@@ -97,6 +96,7 @@ def ep_mega_kernel(
     H,
     I,
     TOPK,
+    E_LOCAL,
     token_shift,
     producers=16,
     lag=2,
@@ -111,7 +111,8 @@ def ep_mega_kernel(
     BCM2=2,
     WQ="fp4",
 ):
-    """The mega kernel for (H, I, top-k); ``token_shift``: bits of the source
+    """The mega kernel for (H, I, top-k) and ``E_LOCAL`` experts per rank;
+    ``token_shift``: bits of the source
     token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``WQ``: "fp4" fd2 mxfp4 W
@@ -149,7 +150,10 @@ def ep_mega_kernel(
     TOPK_SHIFT = TOPK.bit_length() - 1
     SCALE_LANES = H // 128 * 4 // 16  # 16 B lanes of a row's x scales
     TOKEN_MASK = (1 << token_shift) - 1
+    E_GLOBAL, _, _, ARRIVED = ws_layout(E_LOCAL)
+    ROW_BITS = row_bits(E_GLOBAL)
     ROW_MASK = (1 << ROW_BITS) - 1
+    E_SHIFT = E_LOCAL.bit_length() - 1
     assert 1 << TOPK_SHIFT == TOPK and TOPK <= 8 and token_shift + 3 <= 24
     assert H % 1024 == 0 and I % NI == 0 and H % NO == 0 and NO % 64 == 0
     assert NI % 128 == 0 and 128 % NIW == 0 and NIW % 16 == 0 and NOW % 16 == 0
@@ -164,7 +168,7 @@ def ep_mega_kernel(
     GPW = NI // 128  # gemm1 epilogue: quant groups per WG row, waves per group
     WPG = NW // GPW
     kname = (
-        f"a8w{8 if FP8W else 4}_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}"
+        f"a8w{8 if FP8W else 4}_megamoe_ep_h{H}_i{I}_k{TOPK}_e{E_LOCAL}_t{token_shift}"
         f"_p{producers}_l{lag}_r{'x'.join(map(str, ROWV))}_ni{NI}_no{NO}_pf{PF}"
         + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
         + ("" if QX else "_xrow")
@@ -174,6 +178,12 @@ def ep_mega_kernel(
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, LDS_BYTES, 16]
+
+    def dest_rank(info):
+        """The rank of a send info's global expert (the route's destination)."""
+        if const_expr(E_LOCAL == 1 << E_SHIFT):
+            return info >> fx.Int32(ROW_BITS + E_SHIFT)
+        return (info >> fx.Int32(ROW_BITS)) // fx.Int32(E_LOCAL)
 
     N64 = 27  # i64 kernel args (in kernel() order), then 4 i32 and 5 f32
     NAMES64 = (
@@ -500,7 +510,7 @@ def ep_mega_kernel(
                     )
                 for rt, inf, ok, token, data, scales, weight in pending:
                     row = inf & fx.Int32(ROW_MASK)
-                    dest = ok.select(inf >> fx.Int32(ROW_BITS + 5), fx.Int32(0))
+                    dest = ok.select(dest_rank(inf), fx.Int32(0))
                     a_dst = peer_rsrc(0, dest, fx.Int64(rows_cap) * fx.Int64(H))
                     for part in range_constexpr(H // 1024):
                         buffer_store(
@@ -541,7 +551,7 @@ def ep_mega_kernel(
                         cache_modifier=P2P_AUX,
                     )
                 rocdl.s_waitcnt(vmcnt=0)
-                src = (infos >> fx.Int32(ROW_BITS + 5)) & fx.Int32(NPES - 1)
+                src = dest_rank(infos) & fx.Int32(NPES - 1)
                 ws_lo, ws_hi = [
                     fx.Uint32(fx.gpu.shuffle_idx(h, src, 64)) for h in bases[4]
                 ]
@@ -1228,7 +1238,18 @@ class MainRuntime:
     collective (MORI symmetric buffers)."""
 
     def __init__(
-        self, *, rank, world_size, model_dim, inter_dim, topk, mtpr, wq, act, qx
+        self,
+        *,
+        rank,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        mtpr,
+        wq,
+        act,
+        qx,
     ):
         import mori.shmem as ms
 
@@ -1236,12 +1257,14 @@ class MainRuntime:
         self.dev = dev = torch.device("cuda", torch.cuda.current_device())
         H, I, topk = int(model_dim), int(inter_dim), int(topk)
         self.model_dim, self.topk = H, topk
+        e_local = int(experts) // self.world_size
+        _, _, _, arrived = ws_layout(e_local)
         self.token_shift = max((int(mtpr) - 1).bit_length(), 1)
         self.tcap = tcap = 1 << self.token_shift
         # Every route of every rank (the real top-k; the padding slots take no row),
         # plus one partial block per local expert.
-        s_cap = -(-(NPES * tcap * topk + E_LOCAL * BLOCK_M) // BLOCK_M) * BLOCK_M
-        if s_cap >= 1 << ROW_BITS or s_cap * H >= BUFFER_BYTES_MAX:
+        s_cap = -(-(NPES * tcap * topk + e_local * BLOCK_M) // BLOCK_M) * BLOCK_M
+        if s_cap >= 1 << row_bits(int(experts)) or s_cap * H >= BUFFER_BYTES_MAX:
             raise ValueError(
                 f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
                 "the 2 GiB the kernels address with i32 offsets"
@@ -1253,7 +1276,7 @@ class MainRuntime:
             "recv_scale": sym((s_cap, H // 128), torch.float32),
             "down_ids": sym((s_cap,), torch.int32),
             "recv_w": sym((s_cap,), torch.float32),
-            "ws": sym((ARRIVED + self.nblk,), torch.int32),
+            "ws": sym((arrived + self.nblk,), torch.int32),
             "out": sym((tcap, H), torch.bfloat16),
         }
         torch.cuda.synchronize()
@@ -1274,7 +1297,7 @@ class MainRuntime:
         self.send_info = torch.empty(tcap * kt, **i32)
         self.num_valid = torch.zeros(1, **i32)
         self.status = torch.zeros(8, **i32)
-        self.plan = torch.empty(comm.PLAN_INTS, **i32)
+        self.plan = torch.empty(comm.plan_layout(e_local)[-1], **i32)
         self.expert_ids = torch.zeros(self.nblk, **i32)
         self.sched = torch.zeros(SCHED_EXPECTED + 2 * self.nblk, **i32)
         # the plan kernel: one workgroup per producer wave, up to 1024 routes each
@@ -1293,6 +1316,7 @@ class MainRuntime:
             "H": H,
             "I": I,
             "TOPK": kt,
+            "E_LOCAL": e_local,
             "token_shift": self.token_shift,
             "producers": _PRODUCERS,
             "lag": _LAG,
@@ -1308,11 +1332,11 @@ class MainRuntime:
         # expert's rows span several blocks) the blocks of an expert re-read its W:
         # cache gemm1's W, and gemm2's with cache modifier 1.
         self.mega_big_k = host.launcher(ep_mega_kernel, d, **key, BCM1=0, BCM2=1)
-        self.big_tokens = BLOCK_M * E_LOCAL // kt
+        self.big_tokens = BLOCK_M * e_local // kt
         self.quant_k = host.launcher(comm.mega_quant_kernel, d, H=H, QX=qx)
-        self.prep_k = host.launcher(comm.mega_prep_kernel, d)
-        self.plan_k = host.launcher(comm.mega_plan_kernel, d)
-        self.finish_k = host.launcher(comm.mega_finish_kernel, d)
+        self.prep_k = host.launcher(comm.mega_prep_kernel, d, E_LOCAL=e_local)
+        self.plan_k = host.launcher(comm.mega_plan_kernel, d, E_LOCAL=e_local)
+        self.finish_k = host.launcher(comm.mega_finish_kernel, d, E_LOCAL=e_local)
 
     def forward(self, x, ids, wts, W, situ, x_scale=None):
         """x bf16 [T, H] (or fp8 with ``x_scale``), ids int32 / wts f32 [T, 8] (the
