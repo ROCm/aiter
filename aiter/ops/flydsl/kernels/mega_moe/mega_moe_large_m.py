@@ -33,6 +33,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
     build_p2p_table,
+    _zeroed_sym,
     group_major_capacity,
 )
 from ..kernels_common import ceildiv
@@ -3256,21 +3257,21 @@ class LargeMRuntime:
             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "group_done": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
         }
-        workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
-        workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["my_base"] = op._sym((total_experts,), torch.int32)
-        workspace["plan_ready"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["payload_ready"] = op._sym((2 * self.epr,), torch.int32)
-        workspace["launch_ready"] = op._sym((self.world_size,), torch.int32)
-        workspace["tile_ready"] = op._sym((metadata_blocks,), torch.int32)
-        workspace["tile_expected_shared"] = op._sym((metadata_blocks,), torch.int32)
-        workspace["ready_tile_queue"] = op._sym((metadata_blocks,), torch.int32)
-        workspace["ready_tile_epoch"] = op._sym((metadata_blocks,), torch.int32)
-        workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
-        workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
+        workspace["bigcnt"] = _zeroed_sym((self.world_size * self.epr,), torch.int32)
+        workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["my_base"] = _zeroed_sym((total_experts,), torch.int32)
+        workspace["plan_ready"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["payload_ready"] = _zeroed_sym((2 * self.epr,), torch.int32)
+        workspace["launch_ready"] = _zeroed_sym((self.world_size,), torch.int32)
+        workspace["tile_ready"] = _zeroed_sym((metadata_blocks,), torch.int32)
+        workspace["tile_expected_shared"] = _zeroed_sym((metadata_blocks,), torch.int32)
+        workspace["ready_tile_queue"] = _zeroed_sym((metadata_blocks,), torch.int32)
+        workspace["ready_tile_epoch"] = _zeroed_sym((metadata_blocks,), torch.int32)
+        workspace["ready_tile_tail"] = _zeroed_sym((2,), torch.int32)
+        workspace["payload_ready_rows"] = _zeroed_sym((1,), torch.int32)
         if knobs.dedup_rows:
             # Per (source rank, token) row arrival stamps.
-            workspace["row_arrived"] = op._sym((self.world_size * self.mtpr,), torch.int32)
+            workspace["row_arrived"] = _zeroed_sym((self.world_size * self.mtpr,), torch.int32)
         return workspace
 
     def _wire_dispatch_workspace(self, op, workspace):
@@ -3520,11 +3521,11 @@ class LargeMRuntime:
         self._fused_max_blocks = (nvm + 15) // 16
         # Counters take system-scope atomics, so they live on the (fine-grained) symmetric heap.
         # [0, max_g2_m_blocks): G1 m-tile completion entries; then 8 x 64-byte G2 claim heads.
-        self._fused_mtile_ctr_arena = self._s1_op._sym(
+        self._fused_mtile_ctr_arena = _zeroed_sym(
             (self.state_slots, self._fused_max_blocks + 8 * 16), torch.int32
         )
         # Per-G2-m-block n-block close counters (self-clearing by the closing block).
-        self._fused_comb_mtile_ctr_arena = self._s1_op._sym(
+        self._fused_comb_mtile_ctr_arena = _zeroed_sym(
             (self.state_slots, self._fused_max_blocks + 16), torch.int32
         )
         # Rank-local FP8 row scales of the GEMM2 m-blocks (FusedStage2Knobs.scale_stage), rewritten by every
@@ -3540,10 +3541,10 @@ class LargeMRuntime:
             if nbytes >= _BUFFER_OFFSET_ABI_BYTES:
                 raise ValueError("the GEMM2 scale staging buffer exceeds the 32-bit buffer-resource ABI")
             self._fused_scale_stage = torch.empty(nbytes, dtype=torch.uint8, device=self.dev)
-        self._fused_comb_ctr_arena = self._s1_op._sym(
+        self._fused_comb_ctr_arena = _zeroed_sym(
             (self.state_slots, 4), torch.int32
         )
-        self._tok_ready_arena = self._s1_op._sym(
+        self._tok_ready_arena = _zeroed_sym(
             (self.state_slots, self.mtpr + 8), torch.int32
         )
         torch.cuda.synchronize()

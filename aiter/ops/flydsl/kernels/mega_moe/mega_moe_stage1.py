@@ -61,8 +61,8 @@ def _validate_fixed_slot_geometry(
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
     """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
     out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
-    prows = (rows + 255) // 256 * 256
-    pcols = ((inter_dim // 32) + 7) // 8 * 8
+    prows = ceildiv(rows, 256) * 256
+    pcols = ceildiv(inter_dim // 32, 8) * 8
     return out, prows * pcols + inter_dim
 
 

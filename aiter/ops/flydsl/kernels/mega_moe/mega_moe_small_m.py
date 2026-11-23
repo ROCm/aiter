@@ -28,6 +28,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
     GroupMajorPayloadArena,
+    _zeroed_sym,
     group_major_capacity,
 )
 from ..kernels_common import ceildiv
@@ -1816,20 +1817,20 @@ class SmallMRuntime:
             "plan_nv": zeros(1, torch.int64),
             "xcd_acq": zeros(8 * 16, torch.int64),  # one 128-byte line per XCD
         }
-        workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
+        workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
         if self._protocol.tok_counters:
             # Two parity halves of per-token GEMM2 completion counts, reached through each peer's FC_INP.
-            workspace["tok_done"] = op._sym((2 * self.mtpr,), torch.int32)
+            workspace["tok_done"] = _zeroed_sym((2 * self.mtpr,), torch.int32)
             # Two launch-parity halves of the per-expert receive counters (compile_mega_moe_stage1), in place of
             # the combine op's single one; allocated after tok_done, so its distance from FC_INP is unchanged.
-            workspace["running"] = op._sym((2 * self.epr,), torch.int32)
+            workspace["running"] = _zeroed_sym((2 * self.epr,), torch.int32)
             # The routes' srcmap and weight slots, in the same two halves (fz_epr * fz_cap apart).
             # Half 1 starts epr * ll_cap past half 0; the non-compact slot layout (num_valid_max >= epr * ll_cap)
             # keeps it clear of half 0.
             assert op.num_valid_max >= self.epr * op.ll_cap, "double-buffered slots need the non-compact layout"
             meta_rows = op.num_valid_max + self.epr * op.ll_cap
-            workspace["srcmap"] = op._sym((meta_rows,), torch.int32)
-            workspace["wts"] = op._sym((meta_rows,), torch.float32)
+            workspace["srcmap"] = _zeroed_sym((meta_rows,), torch.int32)
+            workspace["wts"] = _zeroed_sym((meta_rows,), torch.float32)
         ms.shmem_barrier_all()
         workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
         if self._protocol.tok_counters:

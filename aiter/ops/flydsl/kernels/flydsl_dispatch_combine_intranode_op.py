@@ -25,6 +25,7 @@ from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
     make_dispatch_jit,
 )
+from .kernels_common import ceildiv
 from .tensor_shim import _preload_compiled
 
 # Reject unsupported token dtypes at construction, not deep in JIT codegen.
@@ -382,7 +383,7 @@ def group_major_capacity(
 ):
     """Row capacities of a group-major op: (num_valid_max, payload_rows_max, row_bytes, scale_n_i32)."""
     # Fixed-slot capacity covers the all-to-one routing case.
-    ll_cap = (world_size * max_tok_per_rank + unit_size - 1) // unit_size * unit_size
+    ll_cap = ceildiv(world_size * max_tok_per_rank, unit_size) * unit_size
     # Compact fanout may materialize the shared pair as two independently
     # padded expert sections in addition to every normal expert section.
     if compact:
@@ -397,7 +398,7 @@ def group_major_capacity(
         world_size * max_tok_per_rank + 1 if indexed_payload else num_valid_max
     )
     scale_bytes = scale_dim * scale_type_size
-    scale_n_i32 = (scale_bytes + 3) // 4 if scale_bytes > 0 else 0
+    scale_n_i32 = ceildiv(scale_bytes, 4)
     return (
         int(num_valid_max),
         int(payload_rows_max),
@@ -495,29 +496,26 @@ class FlyDSLDispatchGroupMajorOp:
             compact=self.compact,
             indexed_payload=self.indexed_payload,
         )
-        self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
+        self.max_blocks = ceildiv(self.num_valid_max, unit_size)
         self.payload_arena = payload_arena
 
         self._alloc()
         ms.shmem_barrier_all()
         self._build_p2p()
 
-    def _sym(self, shape, dtype):
-        return _zeroed_sym(shape, dtype)
-
     def _alloc(self):
         npes, epr = self.npes, self.epr
         nvm = self.num_valid_max
         payload_rows = self.payload_rows_max
-        self.done2 = self._sym((npes,), torch.int32)
-        self.running = self._sym((epr,), torch.int32)
-        self.ll_count = self._sym((epr,), torch.int32)
+        self.done2 = _zeroed_sym((npes,), torch.int32)
+        self.running = _zeroed_sym((epr,), torch.int32)
+        self.ll_count = _zeroed_sym((epr,), torch.int32)
         rx_bytes = payload_rows * self.row_bytes
         scale_i32 = max(1, payload_rows * self.scale_n_i32)
         arena = self.payload_arena
         if arena is None:
-            self.rx_em = self._sym((rx_bytes,), torch.int8)
-            self.scale_em = self._sym((scale_i32,), torch.int32)
+            self.rx_em = _zeroed_sym((rx_bytes,), torch.int8)
+            self.scale_em = _zeroed_sym((scale_i32,), torch.int32)
         else:
             if (
                 rx_bytes > arena.rx_bytes
@@ -527,10 +525,10 @@ class FlyDSLDispatchGroupMajorOp:
                 raise ValueError("the payload arena is smaller than this op needs")
             self.rx_em = arena.rx[:rx_bytes]
             self.scale_em = arena.scale[:scale_i32]
-        self.idx_em = self._sym((nvm,), torch.int32)
+        self.idx_em = _zeroed_sym((nvm,), torch.int32)
         if arena is None:
-            self.wts_em = self._sym((nvm,), torch.float32)
-            self.srcmap_em = self._sym((nvm,), torch.int32)
+            self.wts_em = _zeroed_sym((nvm,), torch.float32)
+            self.srcmap_em = _zeroed_sym((nvm,), torch.int32)
         else:
             self.wts_em = arena.wts[:nvm]
             self.srcmap_em = arena.srcmap[:nvm]
@@ -549,7 +547,7 @@ class FlyDSLDispatchGroupMajorOp:
         self.dest_ctr = torch.zeros(
             self.npes, dtype=torch.int32, device=self._dev
         )  # local send-count/dest
-        self.recv_num = self._sym(
+        self.recv_num = _zeroed_sym(
             (self.npes,), torch.int32
         )  # symmetric: peers signal here
         self.compact_base = None
@@ -558,10 +556,10 @@ class FlyDSLDispatchGroupMajorOp:
         self.meta2 = None
         self.write_cursor = None
         if self.compact:
-            self.compact_base = self._sym(
+            self.compact_base = _zeroed_sym(
                 (epr,), torch.int32
             )  # dense prefix-sum base per local expert
-            self.done2c = self._sym(
+            self.done2c = _zeroed_sym(
                 (npes,), torch.int32
             )  # COUNT cross-PE done-barrier (vs done2 WRITE)
             self.gb_cnt = torch.zeros(
@@ -570,18 +568,22 @@ class FlyDSLDispatchGroupMajorOp:
             self.meta2 = torch.zeros(
                 1, dtype=torch.int32, device=self._dev
             )  # payload-ready flag
-            self.write_cursor = self._sym(
+            self.write_cursor = _zeroed_sym(
                 (epr,), torch.int32
             )  # phase-2 write cursor (reset only at kernel end)
-            self.done2cb = self._sym(
+            self.done2cb = _zeroed_sym(
                 (npes,), torch.int32
             )  # cross-PE#1b: gate compact_base read in phase-2
             _te = npes * epr
             self.local_hist = torch.zeros(
                 _te, dtype=torch.int32, device=self._dev
             )  # per-launch reset
-            self.bigcnt = self._sym((npes * _te,), torch.int32)  # [src][ge] all-gather
-            self.cnt_done = self._sym((npes,), torch.int32)  # all-gather epoch barrier
+            self.bigcnt = _zeroed_sym(
+                (npes * _te,), torch.int32
+            )  # [src][ge] all-gather
+            self.cnt_done = _zeroed_sym(
+                (npes,), torch.int32
+            )  # all-gather epoch barrier
             self.my_base = torch.zeros(
                 _te, dtype=torch.int32, device=self._dev
             )  # my tokens' base in each dest
@@ -800,7 +802,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
         comb_tb = max(cfg.combine_token_bytes, legacy_tb)
         tok_i16_mr = (mr * disp_tb + 1) // 2  # dispatch output (dispatch_dtype)
-        # combine input, worst-case (combine_dtype)
         tok_i16_mr_worst, wts_mr_worst = self.combine_input_numel(cfg)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
 
