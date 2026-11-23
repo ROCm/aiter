@@ -6,6 +6,7 @@ import ctypes
 import itertools
 import math
 import os
+import sys
 import weakref
 
 import pandas as pd
@@ -17,6 +18,13 @@ import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
+)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from op_tests.triton_tests.utils.test_common_utils import (
+    is_gpu_memory_fault,
+    run_in_subprocess,
 )
 
 
@@ -3663,40 +3671,6 @@ def make_guarded_int32_tensor(values, device: int = 0):
 # Subprocess isolation is REQUIRED: GPU memory fault sends SIGABRT/SIGPIPE to
 # the entire process; no try/except in pytest can catch it.
 # ---------------------------------------------------------------------------
-def _aick1171_run_in_subprocess(child_code: str, timeout: int = 180):
-    """Run AICK-1171-shaped test body in a fresh Python subprocess.
-    HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 prevents multi-GB GPU coredump files
-    when the host has the coredump tool installed (verified env var name on
-    ROCm 7.2.0 via `strings libhsa-runtime64.so | grep coredump`)."""
-    import subprocess as _sub
-    import sys as _sys
-
-    env = dict(os.environ)
-    env["HSA_DISABLE_COREDUMP_ON_EXCEPTION"] = "1"
-    return _sub.run(
-        [_sys.executable, "-c", child_code],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-        check=False,
-    )
-
-
-def _aick1171_fault_signature(rc: int, stderr: str) -> bool:
-    """Detect HSA GPU memory-fault death.
-
-    Empirically on ROCm 7.2.0 / MI300X the signal is SIGABRT (-6); on
-    ROCm 7.x with different coredump-tool config it can be SIGPIPE (-13).
-    Match on (process killed by ANY signal) AND (HSA fault keyword in
-    stderr) -- both conditions must hold to avoid false positives from
-    unrelated SIGPIPE / SIGABRT.
-    """
-    killed_by_signal = (rc < 0) or (128 <= rc < 256)
-    if not killed_by_signal:
-        return False
-    msg = stderr.lower()
-    return "memory access fault" in msg or "hsa_status_error_memory_fault" in msg
 
 
 # The OOB read at page_idx[128] overruns the kv_page_indices buffer (not
@@ -3803,9 +3777,9 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
         print('AICK1171_GUARD_PAGE_OK', flush=True)
     """)
 
-    result = _aick1171_run_in_subprocess(child_code)
+    result = run_in_subprocess(child_code)
 
-    if _aick1171_fault_signature(result.returncode, result.stderr):
+    if is_gpu_memory_fault(result.returncode, result.stderr):
         pytest.fail(
             "AICK-1171 hard fault detected -- V prefetch read past "
             "kv_page_indices buffer end and hit guard page.\n"

@@ -2664,6 +2664,43 @@ def check_nvfp4_bit_exact(S, H, lens, qdt, k_round):
     assert not torch.equal(got[live], other[live]), "data does not separate the modes"
 
 
+def check_nvfp4_cp_shards_match_unsharded(S, H, lens, qdt, k_round, tied):
+    """cp_world=4: rank r's shard scores (its blocks b % 4 == r, at local column b // 4)
+    equal the cp_world=1 scores bit for bit on every block it owns, and it scores exactly
+    the blocks the unsharded call scores there. `tied`: every token holds the same K, so
+    the blocks of a row tie on one score (what a top-k merge over shards must keep)."""
+    world = 4
+    q8, data, scale, _, _, bt, seq, mb = exact_sum_case(len(lens), S, H, lens)
+    if tied:
+        data.copy_(data[:1, :1].expand_as(data))
+        scale.copy_(scale[:1, :1].expand_as(scale))
+    q = q8 if qdt == "e4m3" else q8.to(torch.bfloat16)
+    whole = run_nvfp4(q, data, scale, bt, seq, S, H, mb, k_round)
+    local = (mb + world - 1) // world
+    for rank in range(world):
+        shard = run_nvfp4(
+            q, data, scale, bt, seq, S, H, local, k_round, cp_world=world, cp_rank=rank
+        )
+        cols = torch.arange(rank, mb, world, device="cuda")
+        want = whole[:, :, cols]
+        got = shard[:, :, : cols.numel()]
+        live = torch.isfinite(want)
+        assert torch.equal(torch.isfinite(got), live), f"rank {rank}: scored blocks"
+        err = checkAllclose(
+            want[live].float(),
+            got[live].float(),
+            atol=0,
+            rtol=0,
+            tol_err_ratio=0,
+            msg=f"cp rank {rank}",
+        )
+        assert err == 0, f"rank {rank}: shard score mismatch fraction {err}"
+        assert torch.equal(got[live].view(torch.int32), want[live].view(torch.int32)), (
+            f"rank {rank}: {int((got[live] != want[live]).sum())}/{int(live.sum())} "
+            "shard scores differ from the unsharded ones"
+        )
+
+
 def check_nvfp4_split_and_single_region_views_agree_bitwise():
     q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
     kd, ks, _, _ = nvfp4_cache_of(cache8)
@@ -2906,6 +2943,16 @@ def build_nvfp4_checks():
     ):
         name = f"every_geometry_{geom_id(point)}_{qdt}_{r}"
         checks.append((name, check_fp4_every_geometry_matches_oracle, (point, qdt, r)))
+    for (S, H, lens), qdt, r, tied in itertools.product(
+        [(8, 4, [9000, 129, 4096]), (1, 1, [130, 4096, 513, 0])],
+        QDTS,
+        K_ROUNDS,
+        (False, True),
+    ):
+        name = f"cp4_shards_S{S}H{H}_{qdt}_{r}{'_tied' if tied else ''}"
+        checks.append(
+            (name, check_nvfp4_cp_shards_match_unsharded, (S, H, lens, qdt, r, tied))
+        )
     for r in K_ROUNDS:
         checks.append((f"tuned_geometry_map_{r}", check_nvfp4_tuned_geometry_map, (r,)))
     for fn in (
