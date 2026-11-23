@@ -236,6 +236,7 @@ def build_gemm_a8w4_tdm_task(
     inline_task=0,
     dense_rows=0,
     c_stage_apart=0,
+    c_lds_store=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -304,7 +305,17 @@ def build_gemm_a8w4_tdm_task(
     - ``c_stage_apart``: stage the output tile in LDS over input stage 1
       (or, if it does not fit there, past the input stages) instead of over
       stage 0.
+    - ``c_lds_store`` (bf16/f16 output without EP scatter): after the barrier
+      that follows the C restage, the waves read the tile back from LDS in
+      whole-row 16-byte chunks and write it with buffer stores, instead of
+      one TDM store per wave. On gfx1250 a TDM store can read LDS bytes that
+      predate ds_stores the workgroup issued before ``s_wait_dscnt 0`` and
+      ``s_barrier`` (seen in the shared-fold GEMM2: the C pieces of the last
+      ds_store in each wave's first box rows came out as the input stage's
+      older A/B bytes); a ds_load after that barrier always sees them.
     """
+    if c_lds_store:
+        assert not (stage1_act or enable_ep_scatter), "c_lds_store is for bf16 C"
     if b_fp8:
         assert not a_is_fp4 and not a_preshuffled, "b_fp8 is FP8 x FP8 only"
         assert not enable_ep_scatter, "b_fp8 has no EP scatter epilogue"
@@ -642,6 +653,7 @@ def build_gemm_a8w4_tdm_task(
     _malign = f"_ma{m_align}" if m_align else ""
     _afp = "fp8w8" if b_fp8 else _afp
     _dense = "_dense" if dense_rows else ""
+    _c_lds_store = "_cldsst" if c_lds_store else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}{_dense}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -655,6 +667,7 @@ def build_gemm_a8w4_tdm_task(
         f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
         f"{_prefence}_earlyacc"
         f"{_malign}{_kwaves}"
+        f"{_c_lds_store}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -2755,7 +2768,36 @@ def build_gemm_a8w4_tdm_task(
                 rocdl.s_barrier_wait(-1)
             else:
                 workgroup_barrier()
-            if const_expr(enable_ep_scatter):
+            if const_expr(c_lds_store):
+                # Read C back from LDS (ordered behind every wave's ds_stores by
+                # the barrier above, which a TDM store's LDS read is not) in
+                # row-major 16-byte chunks, consecutive lanes along a row, so
+                # each buffer_store_b128 writes whole 128-byte lines. Rows past
+                # mn_oob are dropped, like the TDM store's row extent drops them.
+                C_ROW_CHUNKS = tile_n // 8
+                C_CHUNKS = tile_m * C_ROW_CHUNKS
+                assert C_CHUNKS % block == 0, "c_lds_store needs whole chunk passes"
+                c_rsrc = create_buffer_resource_from_addr(
+                    fx.ptrtoint(
+                        fx.recast_iter(oc, arg_c)
+                        + (c_outer_off * fx.Int64(c_stride) + c_inner_off)
+                    ),
+                    num_records_bytes=(fx.Int64(c_stride) * (tile_m * 2)).ir_value(),
+                )
+                for cp in range_constexpr(C_CHUNKS // block):
+                    q = fx.Int32(tid) + cp * block
+                    c_row = q // C_ROW_CHUNKS
+                    c_col = (q % C_ROW_CHUNKS) * 8
+                    buffer_store(
+                        Vec(
+                            lds_load_b128(stC_ep_idx, (c_row * STORE_PITCH + c_col) * 2)
+                        ).ir_value(),
+                        c_rsrc,
+                        (c_row * c_stride + c_col) * 2,
+                        mask=c_row < mn_oob,
+                        offset_is_bytes=True,
+                    )
+            elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
                 # are padded to a pow2 so perRankSize divides by the slot stride
@@ -3286,6 +3328,12 @@ def launch_gemm_a8w4_tdm_shared_fold(
         # bytes in a few rows in 1-6% of launches, never over stage 1 or 2
         # (0 in 800 each) nor past the stages; stage 1 costs no LDS.
         c_stage_apart=1,
+        # GEMM2's bf16 C: an LDS read-back + buffer stores, not a TDM store.
+        # Measured (MI455X, T 48-256, hot-expert routing): the TDM store wrote
+        # the input stage's older A/B bytes into 0.2-10% of launches at T 48-80
+        # (16x128 routed + 64x64 / 32x64 dense tiles); 0 in 84k launches with
+        # the read-back, bitwise the clean output, +0.0-0.3 us per launch.
+        c_lds_store=0 if stage1_act else 1,
     )
     holder = [None]
     routed_task, block, rname, _, rlay = build_gemm_a8w4_tdm_task(
