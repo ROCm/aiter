@@ -484,6 +484,19 @@ def emit_direct_fixed_slot_payload(
                     comm_ops.store_i32_system(remote_done, done_index, expected)
 
 
+# shared_in_opt bit 8: m-tiles whose ready epochs a GEMM2 claim's side read covers (one read each, one lane), and the
+# byte offsets of the loop's LDS words (lean_tab): three results -- the plan CTA's flag is this launch's, the m-tile
+# of the GEMM2 unit just claimed is ready, the shared expert's rows are complete -- then what the reads need: the
+# launch epoch, the XCD's GEMM2 slice (first unit, unit count), the last m-tile a window may start at, and the
+# addresses of the plan flag, of the ready epochs and of the shared expert's done epoch.
+_LEAN_EPOCHS = 4
+_LEAN_PLAN_SEEN, _LEAN_UNIT_READY, _LEAN_SHARED_DONE, _LEAN_EPOCH = 0, 4, 8, 12
+_LEAN_BASE, _LEAN_UNITS, _LEAN_LIMIT = 16, 20, 24
+_LEAN_PLAN_ADDR, _LEAN_READY_ADDR, _LEAN_DONE_ADDR, _LEAN_BYTES = 32, 40, 48, 64
+# shared_in_opt bit 16: how far m-tile m's shared GEMM1 units start behind m-tile 0's, in s_sleep units (64 clocks) per
+# m-tile: about one K-step of the tile body, so the lines the first reader of a weight slab fetched are in the XCD's L2.
+_PAIR_STAGGER_UNITS = 48
+
 # Per-launch step of the expected source-flag value on a runtime whose buckets use direct_done (npes otherwise).
 # direct_done reaches it with up to this many positive adds, so the flag equals the expected value only once all
 # of them landed. Every bucket of such a runtime uses direct_done, as the ranks of a launch may run different
@@ -1024,11 +1037,36 @@ def compile_mega_moe_stage1(
     #   2  the pre-phase starts at entry instead of after the rank's gate: it reads nothing the gate orders (its
     #      inputs and counters are the rank's own and the previous launch on this rank has ended). Consumers wait
     #      for the gate after it.
+    #   4  (not with bit 1) the units of one weight slab on one XCD: consumer c takes column tile 8 q + (c & 7) of
+    #      m-tile (c >> 3) % tiles, q = (c >> 3) // tiles (shared_pair_unit), instead of unit c in m-major order. The
+    #      m-tiles' units of a column tile then sit 8 workgroups apart -- with static roles (M2 st) on the same XCD
+    #      -- and read the same weight lines through one L2 (the tile bodies load the shared weights through the
+    #      cache), where m-major order puts them 18 / 20 workgroups = 2 / 4 XCDs apart and every XCD streams the
+    #      slab itself. The same units, counters and epochs: only which workgroup runs which unit. Needs a consumer
+    #      for the highest index (shared_in_fits_pair).
+    #  16  (with bit 4) the GEMM1 units of m-tile m start m x _PAIR_STAGGER_UNITS x 64 clocks behind those of m-tile
+    #      0, so a slab's later readers find its lines in the L2 instead of asking for them at the same moment as
+    #      the first one. The GEMM2 units follow their m-tile's ready epoch and need no delay of their own. The
+    #      pre-phase ends that much later; nothing waits for it before the exit tickets.
+    #   8  the routed unit loop without the round trips that only observe: a GEMM1 claim and the finished tile's
+    #      count go out together (through per-lane addresses, past LLVM's atomic optimizer, whose readfirstlane
+    #      waits behind each one); the plan CTA's flag is read next to every GEMM1 claim and the GEMM2 loop spins on
+    #      it only if the last read did not show this launch's; the ready epochs of the next _LEAN_EPOCHS m-tiles
+    #      of the XCD's slice are read next to every GEMM2 claim and the unit spins on its m-tile's only if that
+    #      read did not show it (a CTA's first GEMM2 unit, claimed by a GEMM1 fetch, waits as before); the shared
+    #      expert's done epoch is read next to every claim too and the exit spins only if needed. Every wait is
+    #      satisfied by the flag it was satisfied by before, read one round trip earlier. For kernels without an
+    #      early GEMM2 start (g2_early) and without per-XCD exit tickets (M2 xt).
     assert shared_in in (0, 1, 2), shared_in
-    assert shared_in_opt in (0, 1, 2, 3) and (not shared_in_opt or shared_in), (shared_in, shared_in_opt)
+    assert 0 <= shared_in_opt <= 31 and (not shared_in_opt or shared_in), (shared_in, shared_in_opt)
     assert not (shared_in_opt & 1) or shared_in == 2, "shared_in_opt bit 1 is for the split-K variant"
+    assert not (shared_in_opt & 4 and shared_in_opt & 1), "shared_in_opt bit 4 is for whole-unit workgroups"
+    assert not (shared_in_opt & 16) or shared_in_opt & 4, "shared_in_opt bit 16 staggers the pairs of bit 4"
     sh_split_wg = bool(shared_in_opt & 1)
     sh_pre_gate = bool(shared_in_opt & 2)
+    sh_pair = bool(shared_in_opt & 4)
+    sh_lean = bool(shared_in_opt & 8)
+    sh_stagger = bool(shared_in_opt & 16)
     assert not shared_in or (shared_add and plan_local and not tok_done), "shared_in needs shared_add and plan_local"
     # ``shared_add`` (default False = unchanged kernel): the launch's ``addr_in_sc`` argument (otherwise
     # unused) is the address of the caller's BF16 shared-expert output; the combine adds each token's row to it in
@@ -1215,13 +1253,19 @@ def compile_mega_moe_stage1(
         # state in the pool); A scales: the shared GEMM1's 32 x model_dim / 32 bytes and the tile-layout staging.
         lds_pool_bytes = max(lds_pool_bytes, 32 * 256 * 4)
         sh_partial_bytes = NUM_WAVES * 64 * _se.M_REPEAT * _se.NUM_ACC_N * 16 if shared_in == 2 and not sh_split_wg else 0
+        if sh_pair:
+            # The pair map's highest consumer of the largest call this kernel serves must exist (the host checks
+            # the call's own row count: shared_in_fits_pair); here: one m-tile's worth.
+            assert shared_pair_consumers(1, max(sh_n1, sh_n2)) <= launch_grid_x - 1 - dispatch_blocks, (
+                "shared_in_opt 4: too few consumer workgroups", launch_grid_x, dispatch_blocks)
         if sh_split_wg:
             # 33..64 rows: 2 m-tiles, a consumer workgroup per K half of each GEMM1 unit.
             assert 2 * 2 * sh_n1 <= launch_grid_x - 1 - dispatch_blocks and 2 * sh_n1 <= _SH_PART_UNITS, (
                 "shared_in_opt 1: too few consumer workgroups", launch_grid_x, dispatch_blocks)
         assert n_scale_bytes >= max(32 * (model_dim // 32), 3 * 4 * NUM_WAVES * 64)
         # Two workgroups a CU stay resident (see above): this kernel's whole LDS, not only its pool.
-        assert 2 * (lds_pool_bytes + n_scale_bytes + 16 + plan_chunks_bytes + sh_partial_bytes) <= 160 * 1024
+        assert 2 * (lds_pool_bytes + n_scale_bytes + 16 + plan_chunks_bytes + sh_partial_bytes
+            + (_LEAN_BYTES if sh_lean else 0)) <= 160 * 1024
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1246,6 +1290,7 @@ def compile_mega_moe_stage1(
     # the GEMM1 units on the GEMM1 counter.
     G2_EARLY_K, G2_EARLY_P = (int(v) for v in g2_early)
     assert G2_EARLY_K == 0 or (G2_EARLY_K >= 2 and 0 < G2_EARLY_P < 16)
+    assert not sh_lean or (G2_EARLY_K == 0 and "xt" not in m2f and plan_local), "shared_in_opt 8: see its comment"
 
     @fx.struct
     class SharedStorage:
@@ -1260,6 +1305,9 @@ def compile_mega_moe_stage1(
         if shared_in == 2 and not sh_split_wg:
             # shared_in: the first K half's partials of a split GEMM1 tile (16 bytes per accumulator and thread).
             sh_partial: fx.Array[fx.Int8, sh_partial_bytes, 16]
+        if sh_lean:
+            # shared_in_opt bit 8: what tid 0's side reads showed and what they need (_LEAN_*).
+            lean_tab: fx.Array[fx.Int8, _LEAN_BYTES, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -1518,6 +1566,29 @@ def compile_mega_moe_stage1(
                                 # The m-tile's last GEMM1 unit: its GEMM2 units may start; rewind for the next launch.
                                 comm_ops.store_i32_global_agent_release(sh_cnt + fx.Int64(_SH_READY), sh_epoch)
                                 comm_ops.atomic_add_agent(sh_cnt, fx.Int32(-sh_n1))
+            elif const_expr(sh_pair):
+                # shared_in_opt bit 4 (shared_pair_unit): consumer c's place, the same for both GEMMs; a rank
+                # without rows has no m-tile (the divisor is then 1 and no unit is valid).
+                sh_octet = sh_c >> fx.Int32(3)
+                sh_div = (sh_tiles > fx.Int32(1)).select(sh_tiles, fx.Int32(1))
+                sh_q = sh_octet // sh_div
+                sh_pm = sh_octet - sh_q * sh_div
+                sh_pn = sh_q * fx.Int32(8) + (sh_c & fx.Int32(7))
+                sh_pv = (sh_c >= fx.Int32(0)) & (sh_pm < sh_tiles)
+                if sh_pv & (sh_pn < fx.Int32(sh_n1)):
+                    if const_expr(sh_stagger):
+                        # shared_in_opt bit 16: every wave of an m-tile m unit sleeps m beats first.
+                        for _beat in range(fx.Int32(0), sh_pm, 1):
+                            llvm.InlineAsmOp(None, [], f"s_sleep {_PAIR_STAGGER_UNITS}", "", has_side_effects=True)
+                    sh_run_g1(sh_pm, sh_pn)
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+                    if tid == fx.Int32(0):
+                        sh_cnt = sh_sync + fx.Int64(sh_pm) * fx.Int64(4)
+                        if fx.Int32(comm_ops.atomic_add_agent(sh_cnt, fx.Int32(1))) == fx.Int32(sh_n1 - 1):
+                            # The m-tile's last GEMM1 unit: its GEMM2 units may start; rewind for the next launch.
+                            comm_ops.store_i32_global_agent_release(sh_cnt + fx.Int64(_SH_READY), sh_epoch)
+                            comm_ops.atomic_add_agent(sh_cnt, fx.Int32(-sh_n1))
             else:
                 if (sh_c >= fx.Int32(0)) & (sh_c < sh_tiles * fx.Int32(sh_n1)):
                     sh_m1 = sh_c // fx.Int32(sh_n1)
@@ -1530,7 +1601,23 @@ def compile_mega_moe_stage1(
                             # The m-tile's last GEMM1 unit: its GEMM2 units may start; rewind for the next launch.
                             comm_ops.store_i32_global_agent_release(sh_cnt + fx.Int64(_SH_READY), sh_epoch)
                             comm_ops.atomic_add_agent(sh_cnt, fx.Int32(-sh_n1))
-            if (sh_c >= fx.Int32(0)) & (sh_c < sh_tiles * fx.Int32(sh_n2)):
+            if const_expr(sh_pair):
+                if sh_pv & (sh_pn < fx.Int32(sh_n2)):
+                    if tid == fx.Int32(0):
+                        comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_READY) + fx.Int64(sh_pm) * fx.Int64(4), sh_epoch)
+                    fx.barrier()
+                    # The activation rows went through to memory before the epoch: only this CU's L1 can be stale.
+                    comm_ops.invalidate_l1()
+                    sh_run_g2(sh_pm, sh_pn)
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+                    if tid == fx.Int32(0):
+                        sh_total = sh_tiles * fx.Int32(sh_n2)
+                        if fx.Int32(comm_ops.atomic_add_agent(sh_sync + fx.Int64(_SH_G2_COUNT), fx.Int32(1))) == sh_total - fx.Int32(1):
+                            # The launch's last shared unit: the output rows are complete.
+                            comm_ops.store_i32_global_agent_release(sh_sync + fx.Int64(_SH_DONE), sh_epoch)
+                            comm_ops.atomic_add_agent(sh_sync + fx.Int64(_SH_G2_COUNT), fx.Int32(0) - sh_total)
+            elif (sh_c >= fx.Int32(0)) & (sh_c < sh_tiles * fx.Int32(sh_n2)):
                 sh_m2 = sh_c // fx.Int32(sh_n2)
                 if tid == fx.Int32(0):
                     comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_READY) + fx.Int64(sh_m2) * fx.Int64(4), sh_epoch)
@@ -1826,6 +1913,11 @@ def compile_mega_moe_stage1(
             early_cta = ((fx.Int32(fx.block_idx.x) >> fx.Int32(3)) % fx.Int32(G2_EARLY_K)) == fx.Int32(0)
             early_thr = early_cta.select(shard_work * fx.Int32(G2_EARLY_P) // fx.Int32(16), shard_work)
 
+        # shared_in_opt bit 8: the unit loop's atomics take per-lane addresses, which keeps them out of LLVM's atomic
+        # optimizer (its readfirstlane of a result waits for the RMW right behind it), so that two atomics issued
+        # one after the other share a round trip.
+        _unit_addr = _vgpr_i64 if const_expr(sh_lean) else (lambda address: address)
+
         def _count_tile(m):
             # Count a finished tile of m-tile m (its stores completed before the loop-end barrier); the last of
             # the m-tile's N_TILES tiles raises its GEMM2 ready epoch. A cut m-tile runs on two XCDs: each counts
@@ -1837,12 +1929,12 @@ def compile_mega_moe_stage1(
                     shard_end, (m + fx.Int32(1)) * fx.Int32(N_TILES))
                 own_lo = (shard_base > m * fx.Int32(N_TILES)).select(shard_base, m * fx.Int32(N_TILES))
                 old_own = fx.Int32(comm_ops.atomic_add_agent(
-                    a_work_head + fx.Int64(work_shard) * fx.Int64(64) + fx.Int64(side), fx.Int32(1)))
+                    _unit_addr(a_work_head + fx.Int64(work_shard) * fx.Int64(64) + fx.Int64(side)), fx.Int32(1)))
                 inc = (old_own + fx.Int32(1) == own_hi - own_lo).select(own_hi - own_lo, fx.Int32(0))
                 if inc != fx.Int32(0):
                     comm_ops.fence_agent_release()
             if inc != fx.Int32(0):
-                cnt_addr = a_g2_cnt + fx.Int64(m) * fx.Int64(4)
+                cnt_addr = _unit_addr(a_g2_cnt + fx.Int64(m) * fx.Int64(4))
                 old_cnt = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, inc))
                 if old_cnt + inc == fx.Int32(N_TILES):
                     # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
@@ -1859,8 +1951,82 @@ def compile_mega_moe_stage1(
                     # All counts of this launch are in: rewind to 0, since the next launch's config may use another
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
-        while consumer_active:
+        if const_expr(sh_lean):
+            # shared_in_opt bit 8: tid 0 reads the three flags next to its claims and leaves what they showed in LDS
+            # (lean_tab; the exit's tid 64 reads its word behind a barrier). The fetches take their operands from
+            # LDS as well, so that the loop keeps no register for them across the tile bodies.
+            lean_tab = fx.Int32(fx.ptrtoint(lds.lean_tab.ptr))
+
+            def _lean_word(offset):
+                return lds_typed_ptr(lean_tab + fx.Int32(offset), T.i32, align=4)
+
+            def _lean_i32(offset):
+                return fx.Int32(fx.ptr_load(_lean_word(offset), result_type=T.i32))
+
+            def _lean_i64(offset):
+                return fx.Int64(fx.ptr_load(lds_typed_ptr(lean_tab + fx.Int32(offset), T.i64, align=8)))
+
             if tid == fx.Int32(0):
+                lean_base = (shard_base * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES)
+                lean_limit = g2_max_m_blocks - fx.Int32(_LEAN_EPOCHS)
+                for offset, value in (
+                    (_LEAN_PLAN_SEEN, fx.Int32(0)), (_LEAN_UNIT_READY, fx.Int32(0)), (_LEAN_SHARED_DONE, fx.Int32(0)),
+                    (_LEAN_EPOCH, fx.Int32(gate_epoch)), (_LEAN_BASE, lean_base),
+                    (_LEAN_UNITS, (shard_end * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES) - lean_base),
+                    (_LEAN_LIMIT, (lean_limit > fx.Int32(0)).select(lean_limit, fx.Int32(0))),
+                ):
+                    fx.ptr_store(value, _lean_word(offset))
+                for offset, value in (
+                    (_LEAN_PLAN_ADDR, _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_NV)), fx.Int64)),
+                    (_LEAN_READY_ADDR, a_g2_ready), (_LEAN_DONE_ADDR, sh_sync + fx.Int64(_SH_DONE)),
+                ):
+                    fx.ptr_store(fx.Int64(value), lds_typed_ptr(lean_tab + fx.Int32(offset), T.i64, align=8))
+
+            def _lean_epochs(last_index):
+                # Next to a GEMM2 claim: the ready epochs of _LEAN_EPOCHS m-tiles from the one that holds the
+                # slice's GEMM2 unit after ``last_index`` (the unit this CTA ran last), kept inside the epoch array
+                # -- where the claim in flight most likely lands. Read as the unit's own wait reads them. Returns
+                # the window's first m-tile and the epochs.
+                first = (_lean_i32(_LEAN_BASE) + last_index + fx.Int32(1)) // fx.Int32(g2_n_blocks)
+                limit = _lean_i32(_LEAN_LIMIT)
+                first = (first < limit).select(first, limit)
+                ready = _lean_i64(_LEAN_READY_ADDR)
+                return first, [
+                    fx.Int32(comm_ops.load_i32_acquire(ready + fx.Int64(first + fx.Int32(k)) * fx.Int64(4)))
+                    for k in range_constexpr(_LEAN_EPOCHS)]
+
+            def _lean_ready(first, epochs, g2_index):
+                # 1 when ``g2_index`` is a GEMM2 unit of the slice and the window read showed this launch's epoch on
+                # its m-tile.
+                epoch = _lean_i32(_LEAN_EPOCH)
+                rel = (_lean_i32(_LEAN_BASE) + g2_index) // fx.Int32(g2_n_blocks) - first
+                hit = fx.Int32(0)
+                for k in range_constexpr(_LEAN_EPOCHS):
+                    hit = hit | ((rel == fx.Int32(k)) & (epochs[k] == epoch)).select(fx.Int32(1), fx.Int32(0))
+                return ((g2_index >= fx.Int32(0)) & (g2_index < _lean_i32(_LEAN_UNITS))).select(hit, fx.Int32(0))
+
+            def _lean_flag(seen, offset):
+                fx.ptr_store(seen.select(fx.Int32(1), fx.Int32(0)), _lean_word(offset))
+        while consumer_active:
+            if const_expr(sh_lean):
+                # Every fetch after the first has a finished tile to count (the loop ends with the first fetch
+                # that finds no work), so the claim, the count and the two reads go out in one round trip. (No
+                # epoch window here: with one, LLVM schedules the GEMM1 K loops differently; isa_loops check.)
+                if tid == fx.Int32(0):
+                    local_work = first_local
+                    if g1_fetch != fx.Int32(0):
+                        local_work = fx.Int32(comm_ops.atomic_add_agent(
+                            _unit_addr(a_work_head + fx.Int64(work_shard) * fx.Int64(64)), fx.Int32(1)))
+                        lean_plan = fx.Int64(comm_ops.load_i64_acquire(_lean_i64(_LEAN_PLAN_ADDR)))
+                        lean_shared = fx.Int32(comm_ops.load_i32_acquire(_lean_i64(_LEAN_DONE_ADDR)))
+                        _count_tile(pend_m)
+                        lean_epoch = _lean_i32(_LEAN_EPOCH)
+                        _lean_flag((lean_plan >> fx.Int64(32)) == fx.Int64(lean_epoch), _LEAN_PLAN_SEEN)
+                        _lean_flag(lean_shared == lean_epoch, _LEAN_SHARED_DONE)
+                    work = (local_work < shard_work).select(shard_base + local_work, total_work)
+                    fx.ptr_store(local_work - shard_work, g2_scratch)
+                    fx.ptr_store(Vec.from_elements([work], fx.Int32), work_scratch)
+            elif tid == fx.Int32(0):
                 local_work = first_local
                 if g1_fetch != fx.Int32(0):
                     if const_expr(G2_EARLY_K > 0):
@@ -1938,13 +2104,30 @@ def compile_mega_moe_stage1(
             tok_par = fx.Int64(gate_epoch & fx.Int32(1))
             tok_off = tok_base + tok_par * fx.Int64(fz_mtpr * 4)
             tok_reset = tok_base + (fx.Int64(1) - tok_par) * fx.Int64(fz_mtpr * 4)
-        if const_expr(plan_local):
+        if const_expr(sh_lean):
+            # GEMM2 reads the plan CTA's metadata: spin only if the read next to the last GEMM1 claim did not show
+            # this launch's flag.
+            if tid == fx.Int32(0):
+                if _lean_i32(_LEAN_PLAN_SEEN) == fx.Int32(0):
+                    comm_ops.spin_until_shifted_eq_i64(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32)
+        elif const_expr(plan_local):
             # GEMM2 reads the plan CTA's metadata (its first unit drops the L1 after its ready wait).
             if tid == fx.Int32(0):
                 comm_ops.spin_until_shifted_eq_i64(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32)
         while g2_active:
             fx.barrier()
-            if tid == fx.Int32(0):
+            if const_expr(sh_lean):
+                if tid == fx.Int32(0):
+                    if g2_fetch != fx.Int32(0):
+                        lean_claim = fx.Int32(comm_ops.atomic_add_agent(_unit_addr(g2_head), fx.Int32(1)))
+                        lean_shared = fx.Int32(comm_ops.load_i32_acquire(_lean_i64(_LEAN_DONE_ADDR)))
+                        lean_first, lean_window = _lean_epochs(
+                            fx.Int32(fx.ptr_load(g2_scratch, result_type=T.i32)))
+                        fx.ptr_store(lean_claim - g2_claim_base, g2_scratch)
+                        _lean_flag(lean_shared == _lean_i32(_LEAN_EPOCH), _LEAN_SHARED_DONE)
+                        fx.ptr_store(_lean_ready(lean_first, lean_window, lean_claim - g2_claim_base),
+                            _lean_word(_LEAN_UNIT_READY))
+            elif tid == fx.Int32(0):
                 if g2_fetch != fx.Int32(0):
                     fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - g2_claim_base,
                         g2_scratch)
@@ -1954,7 +2137,12 @@ def compile_mega_moe_stage1(
                 g2_u = g2_base + g2_local
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
-                if tid == fx.Int32(0):
+                if const_expr(sh_lean):
+                    # The epoch map read next to this unit's claim may have shown its m-tile already.
+                    if tid == fx.Int32(0):
+                        if _lean_i32(_LEAN_UNIT_READY) == fx.Int32(0):
+                            comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
+                elif tid == fx.Int32(0):
                     comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
                 fx.barrier()
                 # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back
@@ -1994,7 +2182,12 @@ def compile_mega_moe_stage1(
         if const_expr(shared_in):
             # No workgroup takes its exit ticket before the shared expert's rows are complete, so the reducers
             # (the last tickets) add to finished rows. One lane of wave 1 waits; the tail's first barrier joins it.
-            if tid == fx.Int32(64):
+            if const_expr(sh_lean):
+                if tid == fx.Int32(64):
+                    if i32_cur_tok > fx.Int32(0):
+                        if _lean_i32(_LEAN_SHARED_DONE) == fx.Int32(0):
+                            comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_DONE), sh_epoch)
+            elif tid == fx.Int32(64):
                 if i32_cur_tok > fx.Int32(0):
                     comm_ops.wait_i32_until_equals(sh_sync + fx.Int64(_SH_DONE), sh_epoch)
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
@@ -2138,12 +2331,50 @@ def shared_in_fits_split(config: MegaMoEConfig, rows: int, num_cu: int, model_di
     return shared_in_fits(config, rows, num_cu, model_dim, inter_dim) and 2 * units <= consumers and units <= _SH_PART_UNITS
 
 
+def shared_pair_unit(consumer: int, tiles: int, n_tiles: int):
+    """shared_in_opt bit 4: the unit ``(m_tile, n_tile)`` of consumer workgroup ``consumer`` in a call of ``tiles``
+    m-tiles with ``n_tiles`` column tiles each, or None. Column tile ``8 q + r`` of m-tile ``m`` is consumer
+    ``8 (q tiles + m) + r``: every unit has one consumer, and the m-tiles' units of a column tile are 8 consumers
+    apart (the kernel computes the same in compile_mega_moe_stage1)."""
+    if consumer < 0 or tiles <= 0:
+        return None
+    q, m = divmod(consumer >> 3, tiles)
+    n = 8 * q + (consumer & 7)
+    return (m, n) if n < n_tiles else None
+
+
+def shared_pair_consumers(tiles: int, n_tiles: int) -> int:
+    """shared_in_opt bit 4: consumer workgroups the pair map needs (one past its highest consumer with a unit)."""
+    if tiles <= 0:
+        return 0
+    return 8 * (((n_tiles - 1) >> 3) * tiles + tiles - 1) + ((n_tiles - 1) & 7) + 1
+
+
+def shared_in_fits_pair(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+    """``shared_in_fits`` and room for shared_in_opt bit 4 (the units of a weight slab on one XCD): a consumer
+    workgroup at every index the pair map uses."""
+    stage1 = config.stage1
+    consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
+    n_tiles = max((2 * inter_dim) // 256, model_dim // 256)
+    return (shared_in_fits(config, rows, num_cu, model_dim, inter_dim)
+        and shared_pair_consumers(ceildiv(rows, 32), n_tiles) <= consumers)
+
+
+def shared_in_lean_fits(config: MegaMoEConfig) -> bool:
+    """Whether shared_in_opt bit 8 (the unit loop without the observing round trips) applies to a config's kernel:
+    its own plan in every CTA and no early GEMM2 start (compile_mega_moe_stage1's assertion; the per-XCD exit
+    tickets of M2 xt are a process-wide experiment switch and are refused there)."""
+    return bool(config.fused_stage1.plan_local) and not config.fused_stage2.early_k
+
+
 def shared_in_opt_env() -> int:
     """AITER_MEGA_SHARED_IN_OPT (default 0; bits, see compile_mega_moe_stage1's shared_in_opt): 1 = the K
-    halves of a split shared GEMM1 unit on two workgroups, 2 = the pre-phase before the gate. Read per call."""
+    halves of a split shared GEMM1 unit on two workgroups, 2 = the pre-phase before the gate, 4 = the units of one
+    weight slab on one XCD, 8 = the routed unit loop without the observing round trips, 16 = bit 4's later m-tiles
+    start a beat behind. Read per call."""
     value = os.environ.get("AITER_MEGA_SHARED_IN_OPT", "0").strip() or "0"
-    if value not in ("0", "1", "2", "3"):
-        raise ValueError(f"AITER_MEGA_SHARED_IN_OPT={value!r}: 0, 1, 2 or 3")
+    if value not in tuple(str(v) for v in range(32)):
+        raise ValueError(f"AITER_MEGA_SHARED_IN_OPT={value!r}: 0..31 (bits 1, 2, 4, 8, 16)")
     return int(value)
 
 
@@ -2568,6 +2799,19 @@ class SmallMRuntime:
         if opt & 1 and not (self._shared_ksplit(tokens) == 2 and shared_in_fits_split(
                 self._configs[self._bucket_of(tokens)], tokens, self._s1_num_cu, self.model_dim, self.inter_dim)):
             opt &= ~1
+        if opt & 28:
+            # Bit 4 (the units of a weight slab on one XCD): only for calls of two or more m-tiles (a one-tile
+            # call's map is the m-major one), only where the map's highest consumer exists, and not next to bit 1,
+            # whose workgroups take half units. Bit 16 (its stagger): only with bit 4. Bit 8 (lean unit loop): only
+            # kernels it is written for.
+            config = self._configs[self._bucket_of(tokens)]
+            if opt & 4 and (opt & 1 or tokens <= 32 or not shared_in_fits_pair(
+                    config, tokens, self._s1_num_cu, self.model_dim, self.inter_dim)):
+                opt &= ~4
+            if opt & 16 and not opt & 4:
+                opt &= ~16
+            if opt & 8 and not shared_in_lean_fits(config):
+                opt &= ~8
         return opt
 
     def shared_in_supported(self, tokens: int) -> bool:
@@ -2657,6 +2901,18 @@ class SmallMRuntime:
             if self._bucket_of(t) == bucket and self.shared_in_supported(t)
         })
 
+    def _shared_in_variants(self, bucket: int):
+        """The (K split, shared_in_opt) pairs of the shared_in kernels ``bucket``'s calls launch, in the order the
+        bundle preloads them. Without the option bits that depend on a call's m-tile count (4): one per K split,
+        with the option of the split's first row count, as before those bits existed; with them: every pair a row
+        count of the bucket takes."""
+        rows = [t for t in range(1, self.mtpr + 1) if self._bucket_of(t) == bucket and self.shared_in_supported(t)]
+        opt = getattr(self, "shared_in_opt", None)
+        if not (shared_in_opt_env() if opt is None else int(opt)) & 4:
+            return [(ksplit, self._shared_opt(next(t for t in rows if self._shared_ksplit(t) == ksplit)))
+                    for ksplit in self._shared_in_ksplits(bucket)]
+        return sorted({(self._shared_ksplit(t), self._shared_opt(t)) for t in rows})
+
     def preload_aot_bundle(self):
         """Load the kernel of every token bucket this runtime selects, without GPU dispatch."""
         stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -2678,12 +2934,9 @@ class SmallMRuntime:
             stand_in = torch.zeros(16, dtype=torch.uint8, device=self.dev)
             for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= self.mtpr):
                 config = self._select_config(bucket)
-                for ksplit in self._shared_in_ksplits(bucket):
-                    # (The option of this bucket's calls with that split: rows 33..64 are the split ones.)
-                    rows = next(t for t in range(1, self.mtpr + 1)
-                                if self._bucket_of(t) == bucket and self.shared_in_supported(t) and self._shared_ksplit(t) == ksplit)
+                for ksplit, opt in self._shared_in_variants(bucket):
                     self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16,
-                        shared_in=(ksplit, stand_in, stand_in, self._s1_disp), shared_in_opt=self._shared_opt(rows))
+                        shared_in=(ksplit, stand_in, stand_in, self._s1_disp), shared_in_opt=opt)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, shared_add=None, shared_in=None):
         """``shared_add``: a contiguous BF16 ``[rows, model_dim]`` tensor of this call's rows (the shared expert's
