@@ -5,6 +5,7 @@
 
 import functools
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.moe_common import GateMode
 
 # a16w4 (bf16 A x mxfp4 W) SiTUv2 is now served by the ported FlyDSL kernel
@@ -26,6 +27,7 @@ __all__ = [
 ]
 
 
+@aot_factory("mixed_moe_gemm1")
 @functools.cache
 def compile_mixed_moe_gemm1(
     *,
@@ -87,6 +89,7 @@ def compile_mixed_moe_gemm1(
     )
 
 
+@aot_factory("mixed_moe_gemm2")
 @functools.cache
 def compile_mixed_moe_gemm2(
     *,

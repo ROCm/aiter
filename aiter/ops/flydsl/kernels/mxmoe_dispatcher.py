@@ -10,6 +10,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 
 from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
@@ -718,6 +720,7 @@ def compile_gemm2_a4w4_port(
 
 # ---- launcher cache + dispatch (compile once per config, fast-dispatch after) ----
 G2_CACHE = {}
+_G2_AOT_CACHE = FlyDSLAotCache("mxmoe_gemm2")
 
 
 def get_g2(
@@ -809,7 +812,9 @@ def get_g2(
             use_valid_token_count=use_valid_token_count,
             g2_scatter_lds_pairs=g2_scatter_lds_pairs,
         )
-        G2_CACHE[key] = launch
+        # The key holds every compile argument, the env knobs resolved above
+        # included.
+        G2_CACHE[key] = bind_aot(launch, _G2_AOT_CACHE, key)
     return launch
 
 

@@ -318,7 +318,7 @@ Known holes, and how they are handled:
 | A variable read only by copying the environment | `env = dict(os.environ)` then `env["X"]` | Read it by name |
 | An incomplete hand-written `key` | a value the factory closes over but does not take as an argument | The disk digest still covers the argument types. `verify` mode re-exports and compares |
 | A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Recorded per entry and compared on lookup (§6); two values under one key raise |
-| Compile hints set by the caller | `with CompilationContext.compile_hints(...)` around the launch | Hashed into the disk digest |
+| Compile hints set by the caller | `with CompilationContext.compile_hints(...)` around the launch | Hashed into the disk digest. In memory a key keeps the function of its first launch in the process, as on the JIT path, so one key must launch under one set of hints |
 | A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A load failure rebuilds the entry once |
 
 Recording the files the trace actually ran gets per-kernel granularity
@@ -550,6 +550,41 @@ aiter.aot.flydsl.gemm` on two tuned CSVs: 20 a8w8 mxfp8 rows (bmm split-K
 Runtime on gfx950 hardware is still to be checked. gfx1250 mxfp8 kernels are
 not converted.
 
+### 5.4 gfx942 / gfx950: every GEMM and 2-stage MoE launcher of the AOT replays
+
+The replays in `aiter/aot/flydsl` (`gemm.py`, `moe.py`) name the FlyDSL
+launchers a build precompiles. On gfx942 and gfx950 every one of them now
+launches through this cache:
+
+| Cache | Launcher | How |
+|---|---|---|
+| `gemm_a16w16_gfx950` | the default HGEMM, one module-level launcher for every config | `bind_aot`; the config items its constexpr param struct is made from are the `specialization_key` |
+| `gemm_a16w16_band_gfx950`, `gemm_a16w16_skinny_gfx950` | band and skinny HGEMM | `aot_factory` |
+| `gemm_a8w8_fp8_8wave`, `gemm_a8w8_int8_4wave` | per-token-per-channel a8w8 | `aot_factory` |
+| `mixed_moe_gemm1`, `mixed_moe_gemm2`, `mixed_fhmoe_gemm1`, `mixed_fhmoe_gemm2` | MX 2-stage MoE and FHMoE | `aot_factory` |
+| `mxfp4_moe_gemm1` | a4w4 stage 1 | `aot_factory` |
+| `mxmoe_gemm2` | MX stage 2 (`mxmoe_dispatcher.get_g2`) | `bind_aot` under `get_g2`'s own key |
+| `moe_reduction` | stage-2 reduce | `aot_factory` |
+
+Their call sites are unchanged, except the HGEMM, which launched through its
+own `flyc.compile` cache and now calls `_run_compiled`.
+
+Validated compile-only on gfx942 (FlyDSL 0.5.3) with the full replays, each
+run twice on one cache directory, recording every `flyc.compile`:
+
+| Replay | Entries | Second run builds | Launchers still compiled by the JIT path |
+|---|--:|--:|--:|
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm` | 5240 | 0 | 0 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.moe` | 2882 | 0 | 0 |
+| `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.gemm` | 80 | 0 | 0 |
+| `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.moe` | 132 | 0 | 0 |
+
+No launch fell back to the JIT path. The HGEMM passes its tensors as
+dynamic-layout `flyc.from_dlpack` arguments and its constexprs in an
+`fx.struct`; a launcher of that shape was run on gfx942 through
+`flyc.load_module`, with the same results as the JIT path across processes.
+Runtime on gfx950 hardware is still to be checked.
+
 ## 6. Adopting it for another op
 
 Opt in at the launcher factory, not at the call site:
@@ -589,9 +624,11 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    that pass them: another process with another value builds its own variant.
    Within a process, one key launched with two values raises, where the JIT
    path would silently run the first. This holds for ints, floats, bools,
-   strings, `None` and tuples of those; a constexpr value the cache cannot
-   compare (a lambda, a `Type[T]`) leaves the key on the JIT path, which
-   keeps one compiled function per key and does not check.
+   strings, `None` and tuples of those, and so does a launch with another
+   number of arguments (a constexpr the first launch left to its default).
+   A constexpr value the cache cannot compare (a lambda, a `Type[T]`) leaves
+   the key on the JIT path, which keeps one compiled function per key and
+   does not check; under `verify` it raises, as every fallback does.
 2. **The key covers the specialization.** The factory's arguments must
    determine its launcher, as `functools.cache` on it already requires. Pass
    anything else the compiled function depends on, e.g. a tensor dtype that
@@ -644,9 +681,10 @@ path's). Issue 4 is in the JIT path and remains.
 - The prebuild replays tuned CSV rows only. A shape with no tuned row, such
   as a batched mxfp8 GEMM that falls back to its heuristic config, is built
   at its first call; tuning the shape adds it to the prebuild.
-- Only the launchers in §5 are converted. Other FlyDSL kernels, e.g.
-  `gemm_a16w16` (hgemm), the a8w4 `comm_fused_moe` and the gfx1250 mxfp8
-  GEMM, still trace and compile on their first call in each process.
+- Only the launchers in §5 are converted: the GEMMs and the 2-stage MoE of
+  gfx942 and gfx950. Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
+  the attention kernels, MegaMoE and the a8w4 `comm_fused_moe`, still trace
+  and compile on their first call in each process.
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
   24136 rows) writes about 3790 entries, 1 GB, in about 15 minutes. Rows
   tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to

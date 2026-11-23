@@ -16,6 +16,7 @@ from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx_runtime,
 )
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -124,6 +125,7 @@ def _validate_compile_config(
         )
 
 
+@aot_factory("gemm_a8w8_int8_4wave")
 @functools.lru_cache(maxsize=1024)
 def compile_4wave_gemm(
     *,
