@@ -599,6 +599,9 @@ def skinny_gemm(
     import aiter as ops
 
     assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
+    # The skinny kernels take no row stride: they read row n of inp at n * K.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
     # The skinny kernels write the input dtype, so a caller's buffer of another
     # dtype takes the result by copy rather than as the kernels' output.
     direct = out if out is not None and out.dtype == inp.dtype else None
