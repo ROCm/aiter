@@ -344,8 +344,9 @@ __device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ cache,
 
 // ---- NVFP4 row write (index K, main K/V) -----------------------------------------------
 // e2m1 data + one e4m3 scale per 16 elements (4 lanes), no per-token scale. The arithmetic is
-// integer/compare arithmetic (see the torch reference in op_tests/test_fused_qknorm_nvfp4.py),
-// not a hardware convert, so the bytes are the same on every arch. Pages:
+// that of the torch reference in op_tests/test_fused_qknorm_nvfp4.py, written as integer/compare
+// routines (nv*Int) and, on gfx950, as the same conversions in hardware; the bytes are the same
+// on every arch. Pages:
 //   index page, 9216 B : [128 tok x 64 B e2m1][128 tok x 8 B e4m3]
 //   KV page, 2*nkv*9216 B : [K: nkv x 8192 B data | nkv x 1024 B scale][V: same]
 //     K data  t*64 + d/2           K scale in MFMA lane order (nvKScaleOff)
@@ -358,7 +359,7 @@ constexpr int kNvHeadSide      = kNvHeadData + kNvHeadScale;  // 9216 == an inde
 constexpr int kNvIndexPage     = kNvHeadSide;
 
 // e4m3fn byte of x in [0, 448], round to nearest even.
-__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+__device__ __forceinline__ uint32_t nvE4m3ByteInt(float x)
 {
     const uint32_t bits   = __builtin_bit_cast(uint32_t, x);
     const uint32_t normal = ((bits + 0x7FFFFu + ((bits >> 20) & 1u)) >> 20) - 960u;
@@ -368,7 +369,7 @@ __device__ __forceinline__ uint32_t nvE4m3Byte(float x)
     return x >= 0.015625f ? normal : sub;
 }
 
-__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+__device__ __forceinline__ float nvE4m3ValueInt(uint32_t byte)
 {
     const uint32_t e = byte >> 3, m = byte & 7u;
     return e > 0 ? __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20))
@@ -376,7 +377,7 @@ __device__ __forceinline__ float nvE4m3Value(uint32_t byte)
 }
 
 // e2m1 code (sign in bit 3): nearest grid value, ties to the even code.
-__device__ __forceinline__ uint32_t nvE2m1Code(float y)
+__device__ __forceinline__ uint32_t nvE2m1CodeInt(float y)
 {
     const float a = fabsf(y);
     const int mag = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) +
@@ -384,10 +385,82 @@ __device__ __forceinline__ uint32_t nvE2m1Code(float y)
     return static_cast<uint32_t>(mag) | ((__builtin_bit_cast(uint32_t, y) >> 31) << 3);
 }
 
-// One lane's kElemsPerLane elements (already scalar_t-rounded) -> codes + the group's scale byte.
+// The same three on gfx950's converts (RNE, the same grids), which are a few instructions each
+// instead of a compare / select chain. They give the same bytes as the integer routines for every
+// input of the quantizer below: the e2m1 code on all 2^32 fp32 bit patterns, the e4m3 byte on all
+// of [0, 448], the e4m3 value on every byte it is given (0 .. 0x7E). op_tests/test_fused_qknorm_nvfp4.py
+// checks the kernel against a torch oracle. The integer routines stay as the other arches' path.
+// Like them, the quantizer needs gs > 0 (a negative scale gives a negative sf, which is outside
+// the e4m3 byte's [0, 448] and where the two differ).
+#if defined(__gfx950__)
+
+// x in [0, 448] (the mask drops the sign of -0). Past 448 the convert gives NaN.
+__device__ __forceinline__ uint32_t nvE4m3ByteHw(float x)
+{
+    int w = 0;
+    w     = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, 0);
+    return static_cast<uint32_t>(w) & 0x7Fu;
+}
+
+__device__ __forceinline__ float nvE4m3ValueHw(uint32_t byte)
+{
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<int>(byte), 0);
+}
+
+// Four e2m1 codes as nibbles, element 0 lowest. The convert gives a NaN the largest magnitude;
+// the integer code gives it magnitude 0 (every compare is false), so a NaN is first replaced by
+// the zero of its sign. Infinities saturate to the largest magnitude in both.
+__device__ __forceinline__ uint32_t nvE2m1PackHw(const float (&y)[kElemsPerLane])
+{
+    float t[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        t[i] = y[i] != y[i] ? __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, y[i]) &
+                                                            0x80000000u)
+                            : y[i];
+    }
+    uint32_t w = 0;
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[0], t[1], 1.0f, 0);
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[2], t[3], 1.0f, 1);
+    return w & 0xFFFFu;
+}
+#endif
+
+__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+{
+#if defined(__gfx950__)
+    return nvE4m3ByteHw(x);
+#else
+    return nvE4m3ByteInt(x);
+#endif
+}
+
+__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+{
+#if defined(__gfx950__)
+    return nvE4m3ValueHw(byte);
+#else
+    return nvE4m3ValueInt(byte);
+#endif
+}
+
+// Four e2m1 codes of y as nibbles, element 0 lowest.
+__device__ __forceinline__ uint32_t nvE2m1Pack(const float (&y)[kElemsPerLane])
+{
+#if defined(__gfx950__)
+    return nvE2m1PackHw(y);
+#else
+    return nvE2m1CodeInt(y[0]) | (nvE2m1CodeInt(y[1]) << 4) | (nvE2m1CodeInt(y[2]) << 8) |
+           (nvE2m1CodeInt(y[3]) << 12);
+#endif
+}
+
+// One lane's kElemsPerLane elements (already scalar_t-rounded) -> its four codes as nibbles
+// (element 0 lowest) + the group's scale byte.
 __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
                                                 float gs,
-                                                uint32_t (&code)[kElemsPerLane])
+                                                uint32_t& packed)
 {
     float amax = 0.0f;
 #pragma unroll
@@ -405,24 +478,22 @@ __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
     const uint32_t sbyte  = nvE4m3Byte(sf);
     const float sv        = nvE4m3Value(sbyte);
     const float quant     = sv != 0.0f ? __fdiv_rn(1.0f, sv * gs) : 0.0f;
+    float y[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        code[i] = nvE2m1Code(v[i] * quant);
+        y[i] = v[i] * quant;
     }
+    packed = nvE2m1Pack(y);
     return sbyte;
-}
-
-__device__ __forceinline__ uint16_t nvPackBytes(const uint32_t (&code)[kElemsPerLane])
-{
-    return static_cast<uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
 }
 
 // token-major data (low nibble = even element); the callers write the scale bytes.
 __device__ __forceinline__ void
-nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, const uint32_t (&code)[kElemsPerLane])
+nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, uint32_t packed)
 {
-    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) = nvPackBytes(code);
+    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) =
+        static_cast<uint16_t>(packed);
 }
 
 // K scale byte offset (MFMA lane order) of token pos, group g, inside a head's scale region.
@@ -446,9 +517,9 @@ __device__ __forceinline__ void storeNvfp4IndexRow(uint8_t* __restrict__ page,
     {
         v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, 1.0f, code);
-    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, 1.0f, packed);
+    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[kNvHeadData + pos * (kHeadDim / 16) + lane_id / kNvLanesPerGroup] = sb;
@@ -470,9 +541,9 @@ __device__ __forceinline__ void storeNvfp4KRow(uint8_t* __restrict__ page,
     {
         v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
-    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, gs, packed);
+    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[nkv * kNvHeadData + head * kNvHeadScale +
@@ -493,8 +564,8 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
 {
     float v[kElemsPerLane];
     loadElems(row, v);
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, gs, packed);
     uint32_t* words   = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
                                                   (pos / 8) * 512) +
                       lane_id * kElemsPerLane;
@@ -503,7 +574,7 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
     for(int i = 0; i < kElemsPerLane; ++i)
     {
         atomicAnd(words + i, ~(0xFu << shift));
-        atomicOr(words + i, code[i] << shift);
+        atomicOr(words + i, ((packed >> (4 * i)) & 0xFu) << shift);
     }
     if(lane_id % kNvLanesPerGroup == 0)
     {
