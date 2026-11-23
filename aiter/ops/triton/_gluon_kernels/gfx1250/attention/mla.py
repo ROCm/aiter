@@ -2229,6 +2229,10 @@ def _mla_decode_fwd_kernel(
 
     context_len = seq_len - num_tokens_per_seq
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
+    if not USE_LDS_PIPELINE and num_stages <= 2:
+        first_physical_block_idx = gl.load(
+            block_tables_ptr_shifted + segm_idx * tiles_per_segment
+        )
 
     e4m3_dtype = gl.float8e4nv
     if QUERY_DTYPE == "nvfp4":
@@ -2289,11 +2293,6 @@ def _mla_decode_fwd_kernel(
         ),
         other=None if USE_LDS_PIPELINE else 0.0,
     )
-    q_lora_shared.store(Q_lora_load)
-    if Q_FROM_LDS:
-        Q_lora = q_lora_shared
-    else:
-        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     query_pos_rope = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
@@ -2321,6 +2320,13 @@ def _mla_decode_fwd_kernel(
         ),
         other=None if USE_LDS_PIPELINE else 0.0,
     )
+
+    q_lora_shared.store(Q_lora_load)
+    if Q_FROM_LDS:
+        Q_lora = q_lora_shared
+    else:
+        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+
     q_rope_shared.store(Q_rope_load)
     if Q_FROM_LDS:
         Q_rope = q_rope_shared
@@ -2506,9 +2512,8 @@ def _mla_decode_fwd_kernel(
         j_hbm: gl.int32 = 0
         buffer_id: gl.int32 = 0
 
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start
-        )
+        physical_block_idx = first_physical_block_idx
+        j_hbm += 1
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
