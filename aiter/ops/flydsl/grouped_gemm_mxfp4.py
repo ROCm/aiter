@@ -101,6 +101,36 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
+def _c_lds_store(
+    stage1_act,
+    stage1_quant_out,
+    enable_ep_scatter,
+    tile_m,
+    tile_n,
+    m_warp,
+    n_warp,
+    k_waves,
+) -> int:
+    """1: the C tile leaves LDS by a ds_load read-back + buffer stores instead of the
+    TDM store -- GEMM2's bf16 tile (the shared-fold GEMM2's ``c_lds_store``) and a
+    stage-1 GEMM's quantized FP4/FP8 tile (``cq_lds_store``; the kernel keeps the TDM
+    store where its chunking does not fit). On gfx1250 a TDM store's LDS read is not
+    ordered behind the other waves' ds_stores, barrier or not, so a piece of the tile
+    can leave as the bytes LDS held before (the input stage's FP4/FP8 operands): bf16
+    values of 1e25-1e38 in GEMM2's output, or garbage activations and E8M0 scales
+    GEMM2 then multiplies by. Proven byte for byte in the MXFP8 GEMM
+    (gemm_a8w8_gfx1250, the MiniMax-M3 shared MLP's down_proj running beside the
+    routed MoE on the other stream) and seen in the shared-fold GEMM2; these launches
+    store the same way and run in that same window. AITER_TDM_C_LDS_STORE=0 keeps
+    the TDM store."""
+    if enable_ep_scatter or os.environ.get("AITER_TDM_C_LDS_STORE", "1") == "0":
+        return 0
+    if stage1_act:
+        return int(bool(stage1_quant_out))
+    block = m_warp * n_warp * 32 * k_waves
+    return int((tile_m * (tile_n // 8)) % block == 0)
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -364,6 +394,16 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
         k_waves,
+        _c_lds_store(
+            stage1_act,
+            stage1_quant_out,
+            enable_ep_scatter,
+            tile_m,
+            tile_n,
+            m_warp,
+            n_warp,
+            k_waves,
+        ),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,

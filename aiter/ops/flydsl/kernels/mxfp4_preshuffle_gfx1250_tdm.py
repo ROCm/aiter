@@ -237,6 +237,7 @@ def build_gemm_a8w4_tdm_task(
     dense_rows=0,
     c_stage_apart=0,
     c_lds_store=0,
+    cq_lds_store=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -653,7 +654,9 @@ def build_gemm_a8w4_tdm_task(
     _malign = f"_ma{m_align}" if m_align else ""
     _afp = "fp8w8" if b_fp8 else _afp
     _dense = "_dense" if dense_rows else ""
-    _c_lds_store = "_cldsst" if c_lds_store else ""
+    _c_lds_store = ("_cldsst" if c_lds_store else "") + (
+        "_cqldsst" if cq_lds_store else ""
+    )
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}{_dense}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -2797,6 +2800,44 @@ def build_gemm_a8w4_tdm_task(
                         mask=c_row < mn_oob,
                         offset_is_bytes=True,
                     )
+            elif const_expr(
+                cq_lds_store
+                and stage1_quant_out
+                and stage1_act
+                and not a_preshuffled
+                and not enable_ep_scatter
+                and (tile_m * (STORE_N // 16)) % block == 0
+            ):
+                # The quantized stage-1 tile (FP4/FP8 bytes) leaves LDS the way
+                # c_lds_store's bf16 tile does: ds_load read-back behind the
+                # dscnt barrier above, then buffer stores. A TDM store here can
+                # read the tile before the last ds_stores land and write the
+                # input stage's stale bytes, which GEMM2 then dequantizes.
+                Q_ROW_CHUNKS = STORE_N // 16
+                Q_CHUNKS = tile_m * Q_ROW_CHUNKS
+                q_out_stride = i32_n // (4 if is_fp4_quant else 2)
+                q_col_off = blk_n64 // (4 if is_fp4_quant else 2)
+                cq_rsrc = create_buffer_resource_from_addr(
+                    fx.ptrtoint(
+                        fx.recast_iter(fx.Int8, arg_c)
+                        + (c_outer_off * fx.Int64(q_out_stride) + q_col_off)
+                    ),
+                    num_records_bytes=(fx.Int64(q_out_stride) * tile_m).ir_value(),
+                )
+                for cp in range_constexpr(Q_CHUNKS // block):
+                    q = fx.Int32(tid) + cp * block
+                    q_row = q // Q_ROW_CHUNKS
+                    q_col = (q % Q_ROW_CHUNKS) * 16
+                    buffer_store(
+                        Vec(
+                            lds_load_b128(stC_q_idx, q_row * STORE_PITCH + q_col)
+                        ).ir_value(),
+                        cq_rsrc,
+                        q_row * q_out_stride + q_col,
+                        mask=q_row < mn_oob,
+                        offset_is_bytes=True,
+                    )
+                rocdl.s_wait_storecnt(0)
             elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
@@ -3045,6 +3086,7 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
     k_waves: Constexpr[int] = 1,
+    c_lds_store: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3109,6 +3151,8 @@ def launch_gemm_a8w4_tdm(
         a_preshuffled=a_preshuffled,
         m_align=m_align,
         k_waves=k_waves,
+        c_lds_store=0 if stage1_act else c_lds_store,
+        cq_lds_store=c_lds_store if (stage1_act and stage1_quant_out) else 0,
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
