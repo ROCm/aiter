@@ -337,6 +337,55 @@ __global__ void add_rmsnorm_quant_kernel(
         core_loop(std::false_type{});
     }
 
+// Plain RMSNorm, one wave per row: lane l holds chunks of 8 elements at (c * WARP_SIZE + l) * 8,
+// the row sum is a wave reduction (no LDS, no barrier). n % 8 == 0; chunks past n are outside
+// the buffer range. Plain loads: the last-use hint of the interleaved path above costs
+// bandwidth on gfx1250 at large M.
+template <typename DTYPE, int chunks>
+__global__ __launch_bounds__(64) void rmsnorm_wave_row_kernel(DTYPE* __restrict__ out,
+                                                              const DTYPE* __restrict__ input,
+                                                              const DTYPE* __restrict__ weight,
+                                                              double epsilon,
+                                                              bool gemma_norm,
+                                                              int n,
+                                                              int input_stride,
+                                                              int out_stride)
+{
+    constexpr int wave_size = WARP_SIZE;
+    constexpr int vec_size  = chunks * 8;
+    using vec_i             = opus::vector_t<DTYPE, vec_size>;
+    using vec_f             = opus::vector_t<float, vec_size>;
+    const int64_t row       = blockIdx.x;
+    const int row_offset    = threadIdx.x * 8;
+    const int nbytes        = n * static_cast<int>(sizeof(DTYPE));
+
+    auto buffer_i = opus::make_gmem<DTYPE>(const_cast<DTYPE*>(input) + row * input_stride, nbytes);
+    auto buffer_w = opus::make_gmem<DTYPE>(const_cast<DTYPE*>(weight), nbytes);
+    vec_i x = load_vector_nbytes<DTYPE, vec_size, 16, RT, true, wave_size>(buffer_i, row_offset);
+    vec_i w = load_vector_nbytes<DTYPE, vec_size, 16, RT, true, wave_size>(buffer_w, row_offset);
+
+    vec_f f;
+    float square_sum = 0.0f;
+#pragma unroll
+    for(int i = 0; i < vec_size; i++)
+    {
+        f[i] = static_cast<float>(x[i]);
+        square_sum += f[i] * f[i];
+    }
+    auto sum_f        = [](float a, float b) { return a + b; };
+    square_sum        = wave_reduce<float, decltype(sum_f), wave_size, true>(square_sum, sum_f);
+    const float rcp   = rsqrtf(square_sum / n + epsilon);
+    const float w_off = gemma_norm ? 1.0f : 0.0f;
+#pragma unroll
+    for(int i = 0; i < vec_size; i++)
+    {
+        f[i] *= rcp;
+        f[i] *= static_cast<float>(w[i]) + w_off;
+    }
+    auto buffer_o = opus::make_gmem<DTYPE>(out + row * out_stride, nbytes);
+    store_vector<DTYPE, float, vec_size, RT, true, wave_size, chunks, DTYPE>(buffer_o, f, row_offset);
+}
+
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
     ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, false)
 
@@ -686,6 +735,62 @@ __global__ void add_rmsnorm_quant_kernel(
         AITER_CHECK(false, __func__, " not support n: ", n); \
     }
 
+    // gfx1250, n <= 4096: rmsnorm_wave_row_kernel. On MI455X it is faster from ~1K rows up and
+    // within ~0.2 us below that. Chosen by n only, so a row's result does not depend on M.
+    static inline bool use_rmsnorm_wave_row(int n)
+    {
+        static const bool is_gfx1250 = [] {
+            const std::string arch = get_gpu_arch();
+            return arch == "gfx1250" || arch == "gfx1250-strict";
+        }();
+        return is_gfx1250 && n % 8 == 0 && n <= 4096;
+    }
+
+#define RMSNORM_WAVE_ROW_IMPL(CHUNKS)                                                           \
+    rmsnorm_wave_row_kernel<DTYPE_I, CHUNKS><<<m, wave_size, 0, stream>>>(                      \
+        reinterpret_cast<DTYPE_I*>(out.data_ptr()), reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(weight.data_ptr()), epsilon, gemma_norm, n, input_stride,     \
+        out_stride);                                                                            \
+    break;
+
+    static void rmsnorm_wave_row(aiter_tensor_t& out,
+                                 aiter_tensor_t& input,
+                                 aiter_tensor_t& weight,
+                                 double epsilon,
+                                 bool gemma_norm,
+                                 int m,
+                                 int n,
+                                 int input_stride,
+                                 int out_stride,
+                                 hipStream_t stream)
+    {
+        const int wave_size = get_warp_size_func();
+        // Up to 8 chunks exactly; beyond that rounded up to even, to keep the instance count low.
+        int chunks = (n + wave_size * 8 - 1) / (wave_size * 8);
+        if(chunks > 8)
+            chunks = (chunks + 1) / 2 * 2;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rmsnorm_wave_row", [&] {
+            using DTYPE_I = typename hip2opus<scalar_t>::type;
+            switch(chunks)
+            {
+            case 1: RMSNORM_WAVE_ROW_IMPL(1)
+            case 2: RMSNORM_WAVE_ROW_IMPL(2)
+            case 3: RMSNORM_WAVE_ROW_IMPL(3)
+            case 4: RMSNORM_WAVE_ROW_IMPL(4)
+            case 5: RMSNORM_WAVE_ROW_IMPL(5)
+            case 6: RMSNORM_WAVE_ROW_IMPL(6)
+            case 7: RMSNORM_WAVE_ROW_IMPL(7)
+            case 8: RMSNORM_WAVE_ROW_IMPL(8)
+            case 10: RMSNORM_WAVE_ROW_IMPL(10)
+            case 12: RMSNORM_WAVE_ROW_IMPL(12)
+            case 14: RMSNORM_WAVE_ROW_IMPL(14)
+            case 16: RMSNORM_WAVE_ROW_IMPL(16)
+            default: AITER_CHECK(false, __func__, " not support n: ", n);
+            }
+        });
+    }
+#undef RMSNORM_WAVE_ROW_IMPL
+
     void rmsnorm(
         aiter_tensor_t& out,
         aiter_tensor_t& input,
@@ -711,6 +816,17 @@ __global__ void add_rmsnorm_quant_kernel(
         const HipDeviceGuard device_guard(input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
+
+        if(use_rmsnorm_wave_row(n))
+        {
+            AITER_CHECK(out.dtype() == input.dtype(), __func__, " output type ",
+                        AiterDtype_to_str(out.dtype()), " differs from input type ",
+                        AiterDtype_to_str(input.dtype()));
+            if(m > 0)
+                rmsnorm_wave_row(out, input, weight, epsilon, gemma_norm, m, n, input_stride,
+                                 out_stride, stream);
+            return;
+        }
 
         if(out.dtype() == AITER_DTYPE_bf16)
         {

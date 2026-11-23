@@ -143,6 +143,29 @@ def test_rmsnorm2d_row_tail(dtype, m, n):
         assert err == 0, msg + name
 
 
+def test_rmsnorm2d_rows(dtype, n, ms=(1, 3, 857, 1024)):
+    """rms_norm (no residual) matches torch, on strided rows too, and a row's result does not
+    depend on how many rows share the call. gfx1250 runs n <= 4096 one wave per row."""
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    x = torch.randn((4099, n), dtype=dtype, device="cuda")
+    y = aiter.rms_norm(x, weight, 1e-5)
+    ref = F.rms_norm(x.float(), (n,), weight.float(), 1e-5)
+    msg = f"[rows] n: {n}, dtype: {dtype}, "
+    assert checkAllclose(ref, y.float(), atol=0.03, msg=msg + "contiguous") == 0, msg
+    for m in ms:
+        assert torch.equal(aiter.rms_norm(x[:m].contiguous(), weight, 1e-5), y[:m]), (
+            msg + f"m={m} differs from the same rows at m={x.shape[0]}"
+        )
+    wide = torch.randn((64, n + 64), dtype=dtype, device="cuda")
+    ys = aiter.rms_norm(wide[:, :n], weight, 1e-5)
+    refs = F.rms_norm(wide[:, :n].float(), (n,), weight.float(), 1e-5)
+    assert checkAllclose(refs, ys.float(), atol=0.03, msg=msg + "strided") == 0, msg
+    yg = torch.empty_like(x)
+    rmsnorm_ops.rmsnorm(yg, x, weight, 1e-5, gemma_norm=True)
+    refg = F.rms_norm(x.float(), (n,), weight.float() + 1, 1e-5)
+    assert checkAllclose(refg, yg.float(), atol=0.03, msg=msg + "gemma") == 0, msg
+
+
 def test_rmsnorm2d_fuseAdd_deterministic(dtype, m, n, runs=5):
     """The block reduction does not race: repeated calls on the same inputs agree bit for bit."""
     x = torch.randn((m, n), dtype=dtype, device="cuda")
@@ -245,6 +268,11 @@ for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+print("\nstart plain rmsnorm tests")
+for dtype in [d for d in l_dtype if d in (dtypes.fp16, dtypes.bf16)]:
+    for n in [512, 1536, 3584, 4096, 4104]:
+        test_rmsnorm2d_rows(dtype, n)
 
 print("\nstart row tail and determinism tests")
 test_rmsnorm2d_tail_dispatch_follows_device()
