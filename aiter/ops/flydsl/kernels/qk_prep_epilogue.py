@@ -41,18 +41,23 @@ _ROW_BUTTERFLY = ((0xB1, 1), (0x4E, 2), (0x141, 4), (0x128, 8))
 _ROW_ROR8 = 0x128  # lane i of a 16-lane row reads lane i ^ 8
 
 
+# PrepSpec's norms and RoPE kinds, with their kernel-name tags.
+_NORMS = {"none": "none", "rms_per_head": "head", "rms_across_heads": "across"}
+_ROPES = {"none": "none", "interleaved": "inter", "rotate_half": "half"}
+
+
 @dataclass(frozen=True)
 class PrepSpec:
-    """The Q/K prep of ``StoreCRows``, fixed at compile time.
+    """The Q/K prep of ``StoreCRows``, fixed at compile time. Every field is required.
 
     ``norm``:
-      - ``"rms_across_heads"`` (Wan): RMSNorm over every head of a row. The epilogue applies
-        the norm weight and stores per-head sums of squares; the caller scales each row by
+      - ``"rms_across_heads"``: RMSNorm over every head of a row. The epilogue applies the
+        norm weight and stores per-head sums of squares; the caller scales each row by
         ``rsqrt(sum / N + eps)``.
       - ``"rms_per_head"``: RMSNorm over each 128-wide head, applied in the epilogue.
       - ``"none"``: no norm and no norm weights.
 
-    ``rope``: ``"interleaved"`` (Wan) rotates channel pairs (2i, 2i + 1) of each head,
+    ``rope``: ``"interleaved"`` rotates channel pairs (2i, 2i + 1) of each head,
     ``"rotate_half"`` pairs i and i + 64, ``"none"`` skips RoPE. The cos and sin tables hold
     one value per token and rotation pair, ``[M, 64]``, the same for every head.
 
@@ -61,15 +66,15 @@ class PrepSpec:
     ``hadamard``: the per-head Hadamard after RoPE.
     """
 
-    norm: str = "rms_across_heads"
-    rope: str = "interleaved"
-    bias: bool = True
-    hadamard: bool = True
+    norm: str
+    rope: str
+    bias: bool
+    hadamard: bool
 
     def __post_init__(self):
-        if self.norm not in ("none", "rms_per_head", "rms_across_heads"):
+        if self.norm not in _NORMS:
             raise ValueError(f"unknown PrepSpec norm {self.norm!r}")
-        if self.rope not in ("none", "interleaved", "rotate_half"):
+        if self.rope not in _ROPES:
             raise ValueError(f"unknown PrepSpec rope {self.rope!r}")
 
     @property
@@ -79,13 +84,9 @@ class PrepSpec:
 
     @property
     def suffix(self):
-        """Kernel-name suffix after ``_prep``. Wan's prep keeps the names it had."""
-        suffix = "" if self.hadamard else "_nohadamard"
-        if self.norm != "rms_across_heads":
-            suffix += "_n" + ("head" if self.norm == "rms_per_head" else "none")
-        if self.rope != "interleaved":
-            suffix += "_r" + ("half" if self.rope == "rotate_half" else "none")
-        return suffix
+        """Kernel-name suffix after ``_prep``: the norm, the RoPE, and no Hadamard if off."""
+        hadamard = "" if self.hadamard else "_nohadamard"
+        return f"_n{_NORMS[self.norm]}_r{_ROPES[self.rope]}{hadamard}"
 
 
 def _row_move(value, ctrl):
