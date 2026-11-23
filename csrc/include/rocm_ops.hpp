@@ -523,6 +523,19 @@ namespace py = pybind11;
           py::arg("is_neox"),                                                       \
           py::arg("is_nope_first"),                                                 \
           py::arg("compute_all_q_rope") = false);                                   \
+    m.def("fused_qk_concat_and_cache_mla",                                          \
+          &aiter::fused_qk_concat_and_cache_mla,                                    \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q") = false);                                        \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -1626,7 +1639,8 @@ namespace py = pybind11;
           py::arg("seqstart_k_pad")   = std::nullopt, \
           py::arg("max_seqlen_q")     = 0,            \
           py::arg("max_seqlen_k")     = 0,            \
-          py::arg("window_size_left") = -1);
+          py::arg("window_size_left") = -1,           \
+          py::arg("sink")             = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
