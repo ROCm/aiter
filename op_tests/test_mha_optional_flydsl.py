@@ -80,6 +80,7 @@ def _dispatcher(name, *, available, flydsl=None, triton=None):
         "_IS_GFX1250_ASM_DEVICE": False,
         "get_mha_fwd_tuned_backend": lambda **_kwargs: None,
         "record_mha_fwd_selection": lambda _backend: None,
+        "_reject_sink_autograd": lambda *_args: None,
     }
     node = _top_level_node(name, ast.FunctionDef)
     exec(  # noqa: S102 - compiles one function parsed from this local module
