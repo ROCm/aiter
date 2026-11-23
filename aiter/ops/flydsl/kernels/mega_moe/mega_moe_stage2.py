@@ -70,6 +70,7 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     max_bits = local_max.bitcast(fx.Int32)
     for xor_lane in (1, 2):
         if xor_lane < 32 // scatter_vec:
+            # ds_bpermute: fx.shuffle_xor lowers to ds_swizzle_b32 here (different ISA and schedule).
             remote_bits = rocdl.ds_bpermute(
                 T.i32,
                 (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
@@ -86,13 +87,7 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     if leader_gate is not None:
         is_leader = leader_gate & is_leader
     leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
-    e8m0 = fx.Int32(
-        rocdl.ds_bpermute(
-            T.i32,
-            leader_lane * fx.Int32(4),
-            leader_e8m0,
-        )
-    )
+    e8m0 = fx.Int32(fx.shuffle_idx(leader_e8m0, leader_lane, 64))
     block_scale = (e8m0 << 23).bitcast(fx.Float32)
     # Raw ROCDL op: FlyDSL 0.5.3 has no fx.rocdl wrapper for v_cvt_scalef32_pk_fp8_f32.
     pk_ty = T.vec(2, T.i16)
