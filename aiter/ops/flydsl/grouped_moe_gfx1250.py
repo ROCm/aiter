@@ -12,6 +12,7 @@ Set AITER_FLYDSL_DISABLE_GEMM1_ACT=1 to move gate/up activation out of GEMM1
 into the separate quant/preshuffle kernel (also disables GEMM1 requantization).
 """
 
+import contextlib
 import csv
 import functools
 import os
@@ -45,6 +46,325 @@ kernel_bench_callable = None
 # fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
 # (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
 _MEGA_DISPATCH_TLS = threading.local()
+
+
+class MoeOutputEpilogue:
+    """A pending ``out = out * scale + addend`` for the next grouped MoE call's
+    gather-reduce (see ``moe_output_epilogue``)."""
+
+    __slots__ = ("addend", "scale", "before", "consumed")
+
+    def __init__(self, addend: torch.Tensor, scale: float, before):
+        self.addend = addend
+        self.scale = float(scale)
+        self.before = before
+        self.consumed = False
+
+
+_OUTPUT_EPILOGUE_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_output_epilogue(addend: torch.Tensor, scale: float = 1.0, before=None):
+    """Fold ``out = out * scale + addend`` into the gather-reduce of the grouped
+    MoE call run inside the block, e.g. a routed scale and a shared expert's
+    output added to the routed output. Each step is rounded to the output dtype,
+    so the bytes are those of ``moe_out * scale`` then ``+ addend`` as separate
+    torch ops (the multiply is skipped at scale 1.0). ``before`` runs right
+    before that launch, e.g. the wait for the stream producing ``addend``.
+
+    Yields the epilogue; ``consumed`` says whether a gather-reduce took it. A
+    call that ends elsewhere (EP scatter, other MoE paths) leaves it unconsumed
+    and the caller applies it itself. Python-side state: use it in eager code
+    (an opaque custom op), not under torch.compile tracing.
+    """
+    epi = MoeOutputEpilogue(addend, scale, before)
+    prev = getattr(_OUTPUT_EPILOGUE_TLS, "value", None)
+    _OUTPUT_EPILOGUE_TLS.value = epi
+    try:
+        yield epi
+    finally:
+        _OUTPUT_EPILOGUE_TLS.value = prev
+
+
+def _take_output_epilogue(
+    token_num: int, model_dim: int, dtype
+) -> MoeOutputEpilogue | None:
+    epi = getattr(_OUTPUT_EPILOGUE_TLS, "value", None)
+    if epi is None or epi.consumed:
+        return None
+    a = epi.addend
+    if (
+        a.shape != (token_num, model_dim)
+        or a.dtype != dtype
+        or not a.is_contiguous()
+        or dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return None
+    epi.consumed = True
+    return epi
+
+
+class MoeSharedFold:
+    """A shared expert pending for the next grouped MoE call's GEMMs (see
+    ``moe_shared_expert_fold``)."""
+
+    __slots__ = ("weights", "scale", "consumed")
+
+    def __init__(self, weights: dict, scale: float):
+        self.weights = weights
+        self.scale = float(scale)
+        self.consumed = False
+
+
+_SHARED_FOLD_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_shared_expert_fold(weights: dict, scale: float = 1.0):
+    """Fold a shared MXFP8 expert into the grouped MoE call run inside the block:
+    ``out = routed * scale + shared(x)``, the shared expert taken as one more
+    expert every token routes to with weight 1.
+
+    ``weights`` is ``prepare_shared_fold_weights``'s dict. Its gate/up tiles run
+    in the routed GEMM1 launch (FP8 x FP8 on the MXFP8 copy of the input the A1
+    quant writes, SwiGLU and the MXFP8 quant in the epilogue), its down tiles in
+    the routed GEMM2 launch (BF16 rows), and the gather-reduce adds them after
+    the routed scale, each step rounded to BF16 as ``routed * scale + shared``.
+    Not bitwise the separate shared MLP: no BF16 rounding of the gate/up and
+    SwiGLU outputs before the quant, and its own K order.
+
+    Yields the fold; ``consumed`` says whether a call took it. A call that
+    cannot (prefill tiles, EP, other MoE paths) leaves it, and the caller runs
+    the shared expert itself. Python-side state: eager code only (an opaque
+    custom op), not under torch.compile tracing.
+    """
+    fold = MoeSharedFold(weights, scale)
+    prev = getattr(_SHARED_FOLD_TLS, "value", None)
+    _SHARED_FOLD_TLS.value = fold
+    try:
+        yield fold
+    finally:
+        _SHARED_FOLD_TLS.value = prev
+
+
+def prepare_shared_fold_weights(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> dict:
+    """A shared expert's MXFP8 weights in the fold's layouts, once at load.
+
+    In: ``w13`` E4M3 ``[2I, D]`` (gate rows, then up rows), ``w2`` E4M3
+    ``[D, I]``, their e8m0 scales per 1x32 along K, row-major. Out: W13 rows
+    interleaved gate/up (the routed GUGU order) with K row-major, W2 as is, both
+    scales n32k4 (``shuffle_scale_n32k4``) -- a bit-exact permutation.
+    """
+    from aiter.ops.shuffle import shuffle_scale_n32k4
+
+    two_i, d = w13.shape
+    i = two_i // 2
+    if (
+        w13.element_size() != 1
+        or w2.shape != (d, i)
+        or w13_scale.shape != (two_i, d // 32)
+        or w2_scale.shape != (d, i // 32)
+    ):
+        raise ValueError(
+            "shared fold weights: FP8 w13 [2I, D], w2 [D, I] with row-major "
+            "1x32 e8m0 scales"
+        )
+    w13i = w13.view(torch.uint8).view(2, i, d).permute(1, 0, 2).reshape(two_i, d)
+    # Every tensor owns its storage: a caller may still shuffle the source
+    # parameters in place afterwards (ATOM's linears do, after this runs).
+    return {
+        "w13": w13i.clone(memory_format=torch.contiguous_format),
+        "w13_scale": shuffle_scale_n32k4(
+            w13_scale.view(torch.uint8).reshape(1, two_i, d // 32),
+            1,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        .reshape(-1)
+        .clone(),
+        "w2": w2.view(torch.uint8).clone(memory_format=torch.contiguous_format),
+        "w2_scale": shuffle_scale_n32k4(
+            w2_scale.view(torch.uint8).reshape(1, d, i // 32), 1
+        )
+        .reshape(-1)
+        .clone(),
+        "inter_dim": i,
+        "model_dim": d,
+    }
+
+
+def _shared_fold_tile(token_num: int, stage: int, waves: int):
+    """(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) of the shared tiles
+    in a routed launch of ``waves`` waves per workgroup, or None to not fold."""
+    override = os.environ.get(f"AITER_MOE_SHARED_FOLD_TILE{stage}")
+    if override:
+        tile = tuple(int(v) for v in override.split("x"))
+        return tile if tile[3] * tile[4] == waves else None
+    # Measured with the M3.1 TP4 decode routed configs (2-wave workgroups,
+    # T 64-256, gfx1250): two waves along M, 64 columns. GEMM1 64x64 adds
+    # 1.3-2.4 us to the routed launch, GEMM2 64x64 at T <= 64 0.7 us and 32x64
+    # above 1.5-2.9 us; wider N tiles or more stages raise the launch's VGPR /
+    # LDS and slow the occupancy-bound routed GEMM2 (3-stage 64x128 GEMM1
+    # tiles: +17 us at T 192-256).
+    if waves != 2:
+        return None
+    if stage == 1:
+        return (64, 64, 128, 2, 1, 2)
+    return (64, 64, 128, 2, 1, 2) if token_num <= 64 else (32, 64, 128, 2, 1, 2)
+
+
+@functools.cache
+def _log_shared_fold_once(token_num: int, tile1: tuple, tile2: tuple) -> None:
+    logger.info(
+        "[grouped-moe] shared expert folded into the routed GEMMs: tokens=%d "
+        "gemm1 tile=%s gemm2 tile=%s",
+        token_num,
+        "x".join(map(str, tile1)),
+        "x".join(map(str, tile2)),
+    )
+
+
+def _take_shared_fold(token_num, model_dim, inter_dim, dtype) -> MoeSharedFold | None:
+    fold = getattr(_SHARED_FOLD_TLS, "value", None)
+    if fold is None or fold.consumed:
+        return None
+    w = fold.weights
+    if (
+        w.get("model_dim") != model_dim
+        or w.get("inter_dim") != inter_dim
+        or dtype not in (torch.bfloat16,)
+    ):
+        return None
+    return fold
+
+
+class MoeRouterQuantRows:
+    """Token-major MX rows of a MoE layer's input, written by the router
+    launch (``flydsl_moe_router_topk(quant_rows=..., quant_rows8=...)``):
+    MXFP4 payload ``[>= T, K/2]`` + E8M0 ``[>= T, K/32]`` and, optionally, the
+    MXFP8 copy ``[cap, K]`` + ``[cap, K/32]`` a folded shared expert reads."""
+
+    __slots__ = ("xq", "xs", "x8", "x8s")
+
+    def __init__(self, xq, xs, x8=None, x8s=None):
+        self.xq, self.xs, self.x8, self.x8s = xq, xs, x8, x8s
+
+    @property
+    def quant_rows(self):
+        return (self.xq, self.xs)
+
+    @property
+    def quant_rows8(self):
+        return None if self.x8 is None else (self.x8, self.x8s)
+
+
+_ROUTER_ROWS_TLS = threading.local()
+
+
+def _tp_route_quant_enabled() -> bool:
+    """The switch of the TP route-in-quant (#7543's ``_fuse_tp_route_quant``):
+    the router's rows replace exactly that A1 launch, so they follow it."""
+    return os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1") in ("1", "true", "True")
+
+
+@functools.cache
+def _router_rows_min_tokens() -> int | None:
+    """AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS (unset: None): the smallest decode
+    batch that takes the router's rows. Unset, the rows go only where the A1
+    launch would be the TP route token-multidest quant (``token_multidest_eligible``,
+    T >= 64); a smaller value also lets GEMM1 gather them in place of the small-T
+    route-ksplit A1 launch (``moe_fused_quant_preshuffle_routeks``), whose rows
+    are the same MXFP4 bytes."""
+    raw = os.environ.get("AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS", "").strip()
+    return int(raw) if raw else None
+
+
+def _router_rows_eligible(token_num: int, topk: int) -> bool:
+    """Whether a decode batch of ``token_num`` routes takes router rows (above)."""
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    lo = _router_rows_min_tokens()
+    if lo is None:
+        return token_multidest_eligible(int(token_num), int(topk))
+    return 1 < int(topk) <= 8 and int(token_num) >= max(1, lo)
+
+
+@functools.cache
+def _router_rows_enabled() -> bool:
+    """AITER_MOE_ROUTER_QUANT_ROWS (default 1): whether a grouped MoE call may
+    take the router's rows when a caller hands them in."""
+    return os.environ.get("AITER_MOE_ROUTER_QUANT_ROWS", "1") in _TRUTHY_ENV
+
+
+def router_quant_rows_buffers(
+    tokens: int, model_dim: int, device, topk: int = 4, mxfp8=None
+) -> MoeRouterQuantRows | None:
+    """Buffers for ``moe_router_quant_rows``, or None where a grouped MoE call
+    would not take them (its A1 launch is not the TP route-in-quant at this
+    batch: the token-multidest kernel from 64 tokens, or the route-indexed
+    one from AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS; or
+    AITER_MOE_ROUTER_QUANT_ROWS=0). ``mxfp8`` None:
+    also the MXFP8 copy when a shared expert fold is pending
+    (``moe_shared_expert_fold``), sized for the fold's row capacity."""
+    if (
+        not _router_rows_enabled()
+        or int(topk) != 4
+        or not _router_rows_eligible(int(tokens), int(topk))
+        or int(tokens) * int(topk) > _FUSED_ROUTE_PSUM_MAX_NUMEL
+        or not _tp_route_quant_enabled()
+    ):
+        return None
+    if mxfp8 is None:
+        fold = getattr(_SHARED_FOLD_TLS, "value", None)
+        mxfp8 = fold is not None and not fold.consumed
+    xq = torch.empty((tokens, model_dim // 2), dtype=torch.uint8, device=device)
+    xs = torch.empty((tokens, model_dim // 32), dtype=torch.uint8, device=device)
+    if not mxfp8:
+        return MoeRouterQuantRows(xq, xs)
+    cap = _tdm_align_up(max(int(tokens), 1), 64)
+    x8 = torch.empty((cap, model_dim), dtype=torch.uint8, device=device)
+    x8s = torch.empty((cap, model_dim // 32), dtype=torch.uint8, device=device)
+    return MoeRouterQuantRows(xq, xs, x8, x8s)
+
+
+@contextlib.contextmanager
+def moe_router_quant_rows(topk_ids: torch.Tensor, rows: MoeRouterQuantRows):
+    """Hand the grouped MoE run inside the block the router's token-major MX
+    rows of its input (``MoeRouterQuantRows``), so the decode A1 route/quant
+    launch is skipped: GEMM1 re-derives the route from ``topk_ids`` and
+    gathers these rows (bit-exact GEMM1 output). Taken only by a call routed
+    by that very ``topk_ids`` tensor and only where the A1 launch would be
+    the TP route token-multidest quant; otherwise the rows go unused.
+    Python-side state: eager code only (an opaque custom op)."""
+    prev = getattr(_ROUTER_ROWS_TLS, "value", None)
+    _ROUTER_ROWS_TLS.value = (topk_ids, rows)
+    try:
+        yield
+    finally:
+        _ROUTER_ROWS_TLS.value = prev
+
+
+def _take_router_rows(topk_ids, token_num, model_dim) -> MoeRouterQuantRows | None:
+    held = getattr(_ROUTER_ROWS_TLS, "value", None)
+    if held is None or not _router_rows_enabled():
+        return None
+    ids, rows = held
+    if (
+        ids.data_ptr() != topk_ids.data_ptr()
+        or tuple(ids.shape) != tuple(topk_ids.shape)
+        or ids.dtype != topk_ids.dtype
+        or rows.xq.shape[0] < token_num
+        or tuple(rows.xq.shape[1:]) != (model_dim // 2,)
+        or tuple(rows.xs.shape[1:]) != (model_dim // 32,)
+    ):
+        return None
+    return rows
 
 
 def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
@@ -763,6 +1083,7 @@ def _grouped_a8w4_tdm_moe(
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
     output=None,
+    mxfp8_copy_out=None,
 ):
     import functools
 
@@ -773,6 +1094,7 @@ def _grouped_a8w4_tdm_moe(
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
+        mxfp8_row_copy,
     )
 
     device = hidden_states.device
@@ -857,6 +1179,11 @@ def _grouped_a8w4_tdm_moe(
         tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2 = fitted
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    # Whether the A1 quant takes the compact-scale pair; the TP route gate and
+    # the quant dispatch below both ask.
+    _compact_quant_pair = _use_fused_quant_preshuffle(
+        model_dim, wmma_rep, "fp4" if data_format == "fp4" else "fp8", token_num, topk
+    )
     _align_m = max(tile_m, tile_m2)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
@@ -920,6 +1247,20 @@ def _grouped_a8w4_tdm_moe(
         and not enable_ep_scatter
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
+    # ...and that route then rides the activation quant: each quant workgroup
+    # re-derives the counts and prefix in LDS, so the route launch disappears
+    # without a grid-wide wait. bf16 in, no A-preshuffle, and not the batches
+    # that take the compact-scale quant pair.
+    _fuse_tp_route_quant = (
+        _fused_tp_route
+        and int(E) <= _FUSE_TP_ROUTE_QUANT_MAX_EXPERTS
+        and a1_scale is None
+        and hidden_states.dtype == torch.bfloat16
+        and not _a_preshuffle_requested
+        and not _compact_quant_pair
+        and os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1")
+        in ("1", "true", "True")
     )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
@@ -1053,12 +1394,27 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
+    tp_route_params = None
     if _compact:
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
     elif herd_psum is not None:
         psum = herd_psum
+    elif _fuse_tp_route_quant:
+        # Written by the quant launch below, which owns the route.
+        _masked_m = torch.empty(int(E), dtype=torch.int32, device=device)
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        topids_to_rows = torch.empty(
+            (token_num, topk), dtype=torch.int32, device=device
+        )
+        tp_route_params = {
+            "topk_ids": topk_ids,
+            "masked_m": _masked_m,
+            "psum": psum,
+            "experts": int(E),
+            "tile_m": int(_align_m),
+        }
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
@@ -1224,9 +1580,7 @@ def _grouped_a8w4_tdm_moe(
         and not _prequantized
         and not a_preshuffled
         and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
+        and _compact_quant_pair
     )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
@@ -1241,7 +1595,178 @@ def _grouped_a8w4_tdm_moe(
     _a1_wire_stride = (
         int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
-    if _compact and _prequantized:
+    # Shared expert fold: its tiles ride both routed GEMM launches, its input is
+    # the MXFP8 copy the A1 quant writes, its output the gather-reduce addend.
+    _fold = None
+    _fold_tiles = None
+    if (
+        not _is_ep
+        and not enable_ep_scatter
+        and not _compact
+        and not herd_topk
+        and not _prequantized
+        and not a_preshuffled
+        and mxfp8_copy_out is None
+        and hidden_states.dtype == torch.bfloat16
+        and activation == ActivationType.Swiglu
+        and _b1 is None
+        and _b2 is None
+        and int(k_waves1) == 1
+        and int(k_waves2) == 1
+        and not _as_bool(os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False)
+    ):
+        _fold = _take_shared_fold(token_num, model_dim, inter_dim, dtype)
+    if _fold is not None:
+        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+            SharedFoldTiles,
+            _select_cluster_m,
+            _select_cluster_n,
+        )
+
+        _t1 = _shared_fold_tile(token_num, 1, m_warp * n_warp)
+        _t2 = _shared_fold_tile(token_num, 2, m_warp2 * n_warp2)
+        _unclustered = all(
+            _select_cluster_n((n + tn - 1) // tn, cn) == 1
+            and _select_cluster_m(cm, 1, act) == 1
+            for n, tn, cn, cm, act in (
+                (two_inter, tile_n, cluster_n, cluster_m, stage1_act),
+                (model_dim, tile_n2, cluster_n2, cluster_m2, 0),
+            )
+        )
+        if (
+            _t1 is not None
+            and _t2 is not None
+            and _unclustered
+            and two_inter % _t1[1] == 0
+            and model_dim % _t2[1] == 0
+            and model_dim % _t1[2] == 0
+            and inter_dim % _t2[2] == 0
+        ):
+            _fold.consumed = True
+            _fold_tiles = (_t1, _t2)
+            _log_shared_fold_once(int(token_num), tuple(_t1), tuple(_t2))
+        else:
+            _fold = None
+    # Decode GEMM1 straight off the router's token-major MXFP4 rows: no A1
+    # route/quant launch (moe_router_quant_rows). Where the A1 would be the TP
+    # route token-multidest quant, on a plain post-compute GEMM1 pipeline; a
+    # shared fold also needs the router's MXFP8 copy at the fold's capacity.
+    _tp_rows = None
+    if (
+        _fuse_tp_route_quant
+        and _is_fp4
+        and int(topk) == 4
+        and mxfp8_copy_out is None
+        and int(k_waves1) == 1
+        and not tdm_as_in_prologue
+        and not _row_major_ascale
+        and (int(tile_m) <= 32 or int(num_buffers) <= 2)
+        and model_dim % int(tile_k) == 0
+        and _align_m % int(tile_m) == 0
+        and not _as_bool(
+            os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH"), bool(next_stage_prefetch)
+        )
+        and not _as_bool(os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False)
+    ):
+        if _router_rows_eligible(token_num, topk):
+            _tp_rows = _take_router_rows(topk_ids, token_num, model_dim)
+    if _tp_rows is not None and _fold is not None:
+        _t1, _t2 = _fold_tiles
+        _sh_rep2 = get_wmma_m_rep(_t2[0], _t2[1], _t2[3], _t2[4], "shared gemm2")
+        _need = _tdm_align_up(token_num, max(_t1[0], _t2[0], 16 * _sh_rep2))
+        if _tp_rows.x8 is None or _tp_rows.x8.shape[0] < _need:
+            _tp_rows = None
+    if _fold is not None:
+        _t1, _t2 = _fold_tiles
+        _sh_rep2 = get_wmma_m_rep(_t2[0], _t2[1], _t2[3], _t2[4], "shared gemm2")
+        get_wmma_m_rep(_t1[0], _t1[1], _t1[3], _t1[4], "shared gemm1")
+        _sh_align = max(_t1[0], _t2[0], 16 * _sh_rep2)
+        _sh_cap = _tdm_align_up(token_num, _sh_align)
+        # Rows past token_num: the A rows are clamped to the live rows, the
+        # row-major A scales are read whole, so both are allocated to the cap.
+        if _tp_rows is not None:
+            # The router wrote the MXFP8 copy already.
+            _sh_xq = _tp_rows.x8[:_sh_cap]
+            _sh_xs = _tp_rows.x8s[:_sh_cap]
+        else:
+            _sh_xq = torch.empty((_sh_cap, model_dim), dtype=torch.uint8, device=device)
+            _sh_xs = torch.empty(
+                (_sh_cap, model_dim // 32), dtype=torch.uint8, device=device
+            )
+            mxfp8_copy_out = (_sh_xq[:token_num], _sh_xs[:token_num])
+        _sh_hq = torch.empty((_sh_cap, inter_dim), dtype=torch.uint8, device=device)
+        _sh_hs = torch.empty(
+            (_sh_cap // _sh_rep2, (inter_dim + 127) // 128 * 4 * _sh_rep2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        _sh_out = torch.empty((_sh_cap, model_dim), dtype=dtype, device=device)
+        _fw = _fold.weights
+        _shared_fold1 = SharedFoldTiles(
+            out=_sh_hq,
+            a=_sh_xq,
+            w=_fw["w13"],
+            a_scale=_sh_xs,
+            w_scale=_fw["w13_scale"],
+            quant_scale=_sh_hs,
+            rows=token_num,
+            cap=_sh_cap,
+            tile_m=_t1[0],
+            tile_n=_t1[1],
+            tile_k=_t1[2],
+            m_warp=_t1[3],
+            n_warp=_t1[4],
+            num_buffers=_t1[5],
+            quant_wmma_rep=_sh_rep2,
+            row_major_ascale=1,
+        )
+        _shared_fold2 = SharedFoldTiles(
+            out=_sh_out,
+            a=_sh_hq,
+            w=_fw["w2"],
+            a_scale=_sh_hs,
+            w_scale=_fw["w2_scale"],
+            quant_scale=None,
+            rows=token_num,
+            cap=_sh_cap,
+            tile_m=_t2[0],
+            tile_n=_t2[1],
+            tile_k=_t2[2],
+            m_warp=_t2[3],
+            n_warp=_t2[4],
+            num_buffers=_t2[5],
+            quant_wmma_rep=1,
+            row_major_ascale=0,
+        )
+        _fold_kw1 = {"shared_fold": _shared_fold1}
+        _fold_kw2 = {"shared_fold": _shared_fold2}
+    else:
+        _fold_kw1 = _fold_kw2 = {}
+    if mxfp8_copy_out is not None and (
+        (_compact and _prequantized) or _fuse_ep_route_quant
+    ):
+        # These A1 paths take no MXFP8 copy; it goes out on its own.
+        mxfp8_row_copy(hidden_states, mxfp8_copy_out)
+    _tp_gather = None
+    if _tp_rows is not None:
+        # The A1 launch's outputs, written by GEMM1 instead (psum by its
+        # workgroup 0 into the tile-map argument).
+        _masked_m = torch.empty(int(E), dtype=torch.int32, device=device)
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        topids_to_rows = torch.empty(
+            (token_num, topk), dtype=torch.int32, device=device
+        )
+        _tp_gather = {
+            "topk_ids": (
+                topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+            ),
+            "topids_to_rows": topids_to_rows,
+            "masked_m": _masked_m,
+            "align": int(_align_m),
+        }
+        a1_payload = _tp_rows.xq
+        a1_scale = _tp_rows.xs
+    elif _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
         if _row_gather:
@@ -1302,6 +1827,8 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            mxfp8_copy_out=mxfp8_copy_out,
+            tp_route_params=tp_route_params,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1386,6 +1913,8 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
+            **_fold_kw1,
+            **({"tp_gather": _tp_gather} if _tp_gather is not None else {}),
         )
     else:
         # Raw GEMM1 writes both gate/up columns when activation moves to quant.
@@ -1481,6 +2010,7 @@ def _grouped_a8w4_tdm_moe(
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
+        **_fold_kw2,
     )
 
     if kernel_bench_callable is not None:
@@ -1570,6 +2100,7 @@ def _grouped_a8w4_tdm_moe(
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
                         **_situ_kw,
+                        **_fold_kw1,
                     ),
                 )
             )
@@ -1653,6 +2184,7 @@ def _grouped_a8w4_tdm_moe(
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
+                    **_fold_kw2,
                 ),
             )
         )
@@ -1682,12 +2214,28 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
+    if _fold is not None:
+        # The folded shared expert is the addend, after the routed scale.
+        addend, addend_scale = _sh_out[:token_num], _fold.scale
+    else:
+        # A caller's pending `* scale + addend` (shared expert add) rides along.
+        epi = (
+            None
+            if _is_ep
+            else _take_output_epilogue(token_num, model_dim, moe_out.dtype)
+        )
+        if epi is not None and epi.before is not None:
+            epi.before()
+        addend = None if epi is None else epi.addend
+        addend_scale = 1.0 if epi is None else epi.scale
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
+        addend=addend,
+        addend_scale=addend_scale,
     )
     return moe_out
 
@@ -1725,6 +2273,7 @@ def grouped_gemm_gfx1250_a8w4(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1735,7 +2284,9 @@ def grouped_gemm_gfx1250_a8w4(
 
     Returns ``None`` when the shape/dtype/arch is not served here, so the caller
     can fall back to the generic MoE. ``output``, a [token_num, model_dim]
-    buffer, receives the result in place of a fresh tensor.
+    buffer, receives the result in place of a fresh tensor. ``mxfp8_copy_out``
+    is filled as in ``flydsl_moe_fused_quant_preshuffle`` when this path runs;
+    on ``None`` it is the caller's.
     """
 
     # Read once per call (still honours a runtime change of the variable): when
@@ -2075,6 +2626,7 @@ def grouped_gemm_gfx1250_a8w4(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            mxfp8_copy_out=mxfp8_copy_out,
             **_tdm_kw,
         )
 
@@ -2097,6 +2649,7 @@ def _get_compiled_gather_reduce(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    addend_scale: float | None = None,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -2104,7 +2657,7 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype, addend_scale
     )
 
 
@@ -2160,6 +2713,9 @@ def _get_compiled_route_psum_fused():
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+# The route fused into the quant launch: one LDS counter per thread of the
+# 256-thread quant block (moe_fused_route_quant_scatter.TP_ROUTE_MAX_EXPERTS).
+_FUSE_TP_ROUTE_QUANT_MAX_EXPERTS = 256
 
 
 def fused_route_psum_remap(
@@ -2368,8 +2924,14 @@ def flydsl_moe_gather_reduce(
     num_valid_tokens: (
         torch.Tensor | None
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+    addend: torch.Tensor | None = None,  # (token_num, model_dim), out's dtype
+    addend_scale: float = 1.0,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
+
+    With ``addend``, ``out[t] = out[t] * addend_scale + addend[t]`` folded into
+    the same pass, rounded to the output dtype after the reduce, after the
+    scale and after the add -- the bytes of the three separate torch ops.
 
     ``gather_w`` may be f32 (native route weights, no host-side cast) or match
     ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way. Slots
@@ -2406,9 +2968,21 @@ def flydsl_moe_gather_reduce(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
+    if addend is not None:
+        assert (
+            addend.shape == (token_num, model_dim)
+            and addend.dtype == grouped_out.dtype
+            and addend.is_contiguous()
+        ), f"addend must be a contiguous ({token_num}, {model_dim}) {grouped_out.dtype}"
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        gather_vec,
+        w_dtype,
+        None if addend is None else float(addend_scale),
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
@@ -2432,6 +3006,7 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
+        ptr_arg(addend),
         current_stream_arg(),
     )
     return out
