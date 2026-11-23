@@ -2317,6 +2317,22 @@ namespace py = pybind11;
           py::arg("quant_group_size") = 128,           \
           py::arg("scale_layout")     = 0);
 
+#define MLA_NVFP4_DECODE_PREP_PYBIND                 \
+    m.def("mla_nvfp4_decode_prep",                   \
+          &aiter::mla_nvfp4_decode_prep,             \
+          py::arg("q_rope"),                         \
+          py::arg("q_aux"),                          \
+          py::arg("ring"),                           \
+          py::arg("req_ids"),                        \
+          py::arg("k_nope"),                         \
+          py::arg("k_rope"),                         \
+          py::arg("positions"),                      \
+          py::arg("slots"),                          \
+          py::arg("kv_nope"),                        \
+          py::arg("kv_aux"),                         \
+          py::arg("cos_cache") = std::nullopt,       \
+          py::arg("sin_cache") = std::nullopt);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
