@@ -8,7 +8,6 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.common import utils  # noqa: F401
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 
 try:

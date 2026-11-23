@@ -9,8 +9,6 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
-from aiter.ops.triton._gluon_kernels.common import utils  # noqa: F401
-
 # tdm.async_gather with whichever signature this Triton has (see unified_attention_2d.py)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
     _tdm_gather,

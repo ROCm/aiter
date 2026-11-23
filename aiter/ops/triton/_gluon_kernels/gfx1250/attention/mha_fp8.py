@@ -3,8 +3,6 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
-from aiter.ops.triton._gluon_kernels.common import utils  # noqa: F401
-
 
 @gluon.jit
 def fast_maximum(a, b):
