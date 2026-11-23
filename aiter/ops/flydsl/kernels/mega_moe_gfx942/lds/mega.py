@@ -109,7 +109,6 @@ def compile_ep_mega(
         pDownIds: fx.Pointer,
         pRecvW: fx.Pointer,
         pOutTable: fx.Pointer,
-        pOutScaleTable: fx.Pointer,
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pSched: fx.Pointer,
@@ -124,7 +123,6 @@ def compile_ep_mega(
         pPeerIds: fx.Pointer,
         pPeerW: fx.Pointer,
         pPeerWs: fx.Pointer,
-        pTrace: fx.Pointer,
         pRecvScaleT: fx.Pointer,
         num_routes: fx.Int32,
         num_tokens: fx.Int32,
@@ -616,7 +614,6 @@ def compile_ep_mega(
             pDownIds,
             pRecvW,
             pOutTable,
-            pOutScaleTable,
             pExpertIds,
             pNumValid,
             pSched,
@@ -631,7 +628,6 @@ def compile_ep_mega(
             pPeerIds,
             pPeerW,
             pPeerWs,
-            pTrace,
             pRecvScaleT,
         )
 
@@ -681,8 +677,8 @@ def compile_ep_mega(
 
         def rebind(values):
             nonlocal pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW
-            nonlocal pOutTable, pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute
-            nonlocal pSendInfo, pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, pRecvScaleT, num_routes, num_tokens
+            nonlocal pOutTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute
+            nonlocal pSendInfo, pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pRecvScaleT, num_routes, num_tokens
             nonlocal me, num_blocks, tid, lane, wave, sched, rows_cap
             (
                 pRecvA,
@@ -697,7 +693,6 @@ def compile_ep_mega(
                 pDownIds,
                 pRecvW,
                 pOutTable,
-                pOutScaleTable,
                 pExpertIds,
                 pNumValid,
                 pSched,
@@ -712,7 +707,6 @@ def compile_ep_mega(
                 pPeerIds,
                 pPeerW,
                 pPeerWs,
-                pTrace,
                 pRecvScaleT,
                 num_routes,
                 num_tokens,
@@ -750,7 +744,6 @@ def compile_ep_mega(
         pDownIds: fx.Pointer,
         pRecvW: fx.Pointer,
         pOutTable: fx.Pointer,
-        pOutScaleTable: fx.Pointer,
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pSched: fx.Pointer,
@@ -765,7 +758,6 @@ def compile_ep_mega(
         pPeerIds: fx.Pointer,
         pPeerW: fx.Pointer,
         pPeerWs: fx.Pointer,
-        pTrace: fx.Pointer,
         pRecvScaleT: fx.Pointer,
         num_routes: fx.Int32,
         num_tokens: fx.Int32,
@@ -787,7 +779,6 @@ def compile_ep_mega(
             pDownIds,
             pRecvW,
             pOutTable,
-            pOutScaleTable,
             pExpertIds,
             pNumValid,
             pSched,
@@ -802,7 +793,6 @@ def compile_ep_mega(
             pPeerIds,
             pPeerW,
             pPeerWs,
-            pTrace,
             pRecvScaleT,
             num_routes,
             num_tokens,
@@ -860,7 +850,6 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         ptr(op.down_ids),
         ptr(op.recv_w),
         ptr(t["out"]),
-        ptr(t["out"]),
         ptr(op.expert_ids),
         ptr(op.num_valid),
         ptr(op.sched),
@@ -875,7 +864,6 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         ptr(t["down_ids"]),
         ptr(t["recv_w"]),
         ptr(t["ws"]),
-        ptr(op.sched),
         ptr(op.recv_scale_t),
         x_fp8.shape[0] * op.topk,
         x_fp8.shape[0],

@@ -18,7 +18,7 @@ sorted block b receives, [SCHED_EXPECTED + s_cap / BLOCK_M + b] GateUp tiles fin
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -140,12 +140,6 @@ def _fence_system():
     llvm.FenceOp(llvm.AtomicOrdering.seq_cst)
 
 
-def _clock():
-    """Low 32 bits of s_memrealtime (100 MHz)."""
-    ticks = llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
-    return fx.Int32(arith.TruncIOp(T.i32, ticks).result)
-
-
 def _min(a, b):
     return (a < b).select(a, b)
 
@@ -219,8 +213,7 @@ def _compile_ep_prep():
     route_idx [T*TOPK]: rank of each route among this rank's routes to its global expert (unset for no route).
     send_base [E_GLOBAL]: first destination row of this rank's routes to each global expert.
     num_valid [1]: rows this rank receives (capped at s_cap).
-    status [8]: 0 dispatch counter (reset), 1 rows needed by this rank (for the capacity check), 2 / 3 / 4 low 32 bits
-    of s_memrealtime when the count exchange finished / at entry / at exit.
+    status [1]: rows needed by this rank (for the capacity check).
     plan [PLAN_INTS]: tables for ep_plan.
     epoch [1]: this call's epoch is epoch[0] + 1 (ep_finish stores it)."""
 
@@ -248,8 +241,6 @@ def _compile_ep_prep():
         lds = _lds_base(fx.SharedAllocator().allocate(Shared).peek())
         epoch = _load(_addr(pEpoch, 0)) + 1
         blocks = s_cap // BLOCK_M
-        if tid == 0:
-            _store(_addr(pStatus, 3), _clock())
         if tid < E_GLOBAL:
             _lds_store(lds, P_HIST + tid, 0)
         # Before the count flag: no source adds to `arrived` until it has seen this rank's flag.
@@ -283,9 +274,6 @@ def _compile_ep_prep():
         if tid < NPES:
             _signal_and_wait(pWsPeers, pWs, CFLAG, me, epoch, tid)
         _sync_threads()
-        # Every rank leaves the count exchange at about the same time: a common instant for traces (100 MHz clock).
-        if tid == 0:
-            _store(_addr(pStatus, 2), _clock())
         for j in range_constexpr(NPES * E_GLOBAL // PREP_THREADS):
             i = tid + j * PREP_THREADS
             _lds_store(lds, P_COUNTS + i, _load(_addr(pWs, i), "monotonic"))
@@ -383,9 +371,7 @@ def _compile_ep_prep():
                 acc = acc + _lds_load(lds, P_KEY_HIST + key)
             my_rows = _lds_load(lds, P_BASE + E_GLOBAL + me)
             _store(_addr(pNumValid, 0), _min(my_rows, s_cap))
-            _store(_addr(pStatus, 0), 0)
-            _store(_addr(pStatus, 1), my_rows)
-            _store(_addr(pStatus, 4), _clock())
+            _store(_addr(pStatus, 0), my_rows)
 
     @flyc.jit
     def launch(

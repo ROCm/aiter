@@ -144,7 +144,7 @@ class LdsMegaMoE:
         self.gu_ids = zeros(S)
         self.expert_ids = zeros(S // SORT_BLOCK_M)
         self.num_valid = zeros(1)
-        self.status = zeros(8)
+        self.status = zeros(1)
         self.send_route = zeros(routes)
         self.send_info = zeros(routes)
         self.plan = zeros(PLAN_INTS)
@@ -301,4 +301,4 @@ class LdsMegaMoE:
 
     def rows_needed(self):
         """Rows the last call sent to this rank (synchronizes)."""
-        return int(self.status[1].item())
+        return int(self.status[0].item())
