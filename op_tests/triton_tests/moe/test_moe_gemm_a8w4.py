@@ -402,7 +402,13 @@ def test_op_unpadded_scale_swizzle_gfx1250(
     bias[:, n:] = 0
     w_tri, w_scale_tri = downcast_to_mxfp(w, torch.uint8, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
-    w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
+    w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+        w_scale_tri,
+        arch="gfx1250",
+        preshuffle_factor=32,
+        scale_kwidth=4,
+        return_layout=True,
+    )
     x_static_scale = x.abs().max().float() / 448.0
     x_tri = downcast_to_static_fp8(x, x_static_scale)
     ref_y = moe_gemm_torch(x, w_ref, bias, rdata, gindx, None, None, apply_swiglu)
@@ -418,7 +424,7 @@ def test_op_unpadded_scale_swizzle_gfx1250(
         gindx,
         None,
         None,
-        "GFX1250_SCALE",
+        swizzle_mx_scale,
         torch.bfloat16,
         apply_swiglu,
         unpadded_N=n,
