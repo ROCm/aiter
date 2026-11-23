@@ -1068,22 +1068,18 @@ def _iter_csv_cases():
             or kernel_name2.startswith("opus_")
             or kwargs["disable_stage1_bias"]
         )
-        if (
-            kwargs["inter_dim"] % 256 != 0
-            and kwargs["AQDType"] == dtypes.bf16
-            and _can_reroute_mxfp4_to_flydsl(
-                model_dim=kwargs["model_dim"],
-                inter_dim=kwargs["inter_dim"],
-                dtype=kwargs["dtype"],
-                q_dtype_a=kwargs["AQDType"],
-                q_dtype_w=kwargs["WQDType"],
-                q_type=kwargs["qType"],
-                activation=kwargs["actType"],
-                is_shuffled=kwargs["preshuffle"],
-                use_g1u1=kwargs["use_g1u1"],
-                doweight_stage1=kwargs["doweight_stage1"],
-                gate_mode=GateMode(kwargs["gateMode"]),
-            )
+        if kwargs["inter_dim"] % 256 != 0 and _can_reroute_mxfp4_to_flydsl(
+            model_dim=kwargs["model_dim"],
+            inter_dim=kwargs["inter_dim"],
+            dtype=kwargs["dtype"],
+            q_dtype_a=kwargs["AQDType"],
+            q_dtype_w=kwargs["WQDType"],
+            q_type=kwargs["qType"],
+            activation=kwargs["actType"],
+            is_shuffled=kwargs["preshuffle"],
+            use_g1u1=kwargs["use_g1u1"],
+            doweight_stage1=kwargs["doweight_stage1"],
+            gate_mode=GateMode(kwargs["gateMode"]),
         ):
             # Same guard fused_moe uses to reroute a row onto the a16w4 FlyDSL
             # kernels, which take no per-expert bias.
