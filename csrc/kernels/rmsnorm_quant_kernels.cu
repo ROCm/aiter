@@ -255,13 +255,8 @@ __global__ void add_rmsnorm_quant_kernel(
                     float max= multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
                     if(use_e8m0)
                     {
-                        constexpr aiter::MxDtype kMxDtype = is_fp4_out
-                            ? aiter::MxDtype::FP4_E2M1
-#if defined(__gfx942__)
-                            : aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-                            : aiter::MxDtype::FP8_E4M3;
-#endif
+                        constexpr aiter::MxDtype kMxDtype =
+                            is_fp4_out ? aiter::MxDtype::FP4_E2M1 : aiter::kHwFp8MxDtype;
                         quant_scale =
                             aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(max);
                     }
