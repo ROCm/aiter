@@ -70,6 +70,8 @@ CHUNK_MAX = 32
 def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight."""
+    if waves < 2:  # wave 0 copies a page's payload, wave 1 its scales
+        raise ValueError("waves must be at least 2")
     tiles_per_wave = block_q // (16 * waves)
     if block_q % (16 * waves) or tiles_per_wave < 1:
         raise ValueError("block_q must be a multiple of 16 * waves")

@@ -29,6 +29,7 @@ def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
         and idx_q.dtype == torch.bfloat16
         and idx_q.stride(2) == 1
         and payload.dtype == torch.uint8
+        and scale.dtype in (torch.uint8, torch.float8_e4m3fn)
         and payload.shape[1:] == (PAGE, HEAD_DIM // 2)
         and payload.stride()[1:] == (HEAD_DIM // 2, 1)
         and scale.shape[1:] == (PAGE, HEAD_DIM // 16)
@@ -57,10 +58,16 @@ def index_score_prefill_nvfp4(
     waves: int = 4,
     ring: int = 4,
 ) -> None:
-    """``score[h, r, blk]`` for every block up to the last row of r's 256-row
-    tile, exactly as ATOM's Triton prefill scorer (same bits). A CTA scores at
-    most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the scores do not
-    depend on the chunking) and stores each row's chunk with one coalesced store."""
+    """``score[h, r, blk]`` for every block up to the last row of r's
+    ``block_q``-row tile, exactly as ATOM's Triton prefill scorer (same bits). A
+    CTA scores at most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the
+    scores do not depend on the chunking) and stores each row's chunk with one
+    coalesced store.
+
+    What only the device can see is the caller's to guarantee, as with Triton:
+    ``cu_seqlens_q`` ends at ``total_q``, ``max_query_len`` covers every request,
+    and ``block_table`` and ``score`` hold ``ceil(seq_len / 128)`` blocks of each
+    request (pages inside the cache)."""
     total_q, heads, _ = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
     max_block = score.shape[2]
@@ -68,19 +75,23 @@ def index_score_prefill_nvfp4(
         return
     # Everything reaches the kernel as a bare pointer: check what it assumes.
     dev, meta = idx_q.device, (block_table, cu_seqlens_q, seq_lens, prefix_lens)
+    scaled = sm_scale_log2e(sm_scale)
     if not (
         index_score_prefill_nvfp4_supported(idx_q, payload, scale)
         and all(t.device == dev for t in (payload, scale, score) + meta)
         and all(t.dtype == torch.int32 for t in meta)
+        and min(block_table.shape[0], seq_lens.shape[0], prefix_lens.shape[0]) >= batch
         and score.dtype == torch.float32
         and score.shape[0] == heads
         and score.shape[1] >= total_q
         and score.stride(2) == 1
         and score.stride(0) <= 0x7FFFFFFF  # the kernel takes int32 strides
         and block_table.stride(1) == 1
+        and chunk_blocks >= 1
+        and 0.0 < scaled < float("inf")  # the max is taken before the scale
     ):
         raise ValueError(
-            "index_score_prefill_nvfp4: unsupported device, dtype or layout"
+            "index_score_prefill_nvfp4: unsupported device, dtype, layout or scale"
         )
     chunk_blocks = min(chunk_blocks, CHUNK_MAX)
     q_tiles = (max_query_len + block_q - 1) // block_q
@@ -101,7 +112,7 @@ def index_score_prefill_nvfp4(
         ptr_arg(seq_lens, fx.Int32),
         ptr_arg(prefix_lens, fx.Int32),
         heads,
-        sm_scale_log2e(sm_scale),
+        scaled,
         chunk_blocks,
         idx_q.stride(0),
         idx_q.stride(1),
