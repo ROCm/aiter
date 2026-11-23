@@ -479,22 +479,29 @@ def flydsl_grouped_gemm_a8w4_masked(
         if not stage1_quant_out or quant_scale is None:
             raise ValueError("tp_gather is the quantized stage-1 GEMM")
         tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+        cq_lds = _c_lds_store(
+            stage1_act, stage1_quant_out, 0, tile_m, tile_n, m_warp, n_warp, 1
+        )
         tpg_spec = (
-            K,
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            num_buffers,
-            n_experts,
-            stage1_act,
-            quant_wmma_rep,
-            tdm_spec[3],
-            tdm_spec[5],
-            int(lds_soa_load_interleave),
-            rolled_drain,
-        ) + tp_spec[1:]
+            (
+                K,
+                tile_m,
+                tile_n,
+                tile_k,
+                m_warp,
+                n_warp,
+                num_buffers,
+                n_experts,
+                stage1_act,
+                quant_wmma_rep,
+                tdm_spec[3],
+                tdm_spec[5],
+                int(lds_soa_load_interleave),
+                rolled_drain,
+            )
+            + tp_spec[1:]
+            + (cq_lds,)
+        )
         _run_compiled(
             launch_gemm_a8w4_tdm_tpg,
             ptr_arg(out, out_dtype),
@@ -526,6 +533,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             float(situ_linear_beta),
             *tp_spec[1:],
             *tp_ptrs,
+            cq_lds,
             specialization_key=("tpg", tpg_spec),
         )
         return out

@@ -3734,6 +3734,7 @@ def launch_gemm_a8w4_tdm_tpg(
     arg_tp_masked_m: fx.Pointer,
     arg_tp_row_route: fx.Pointer,
     i32_tp_tokens: fx.Int32,
+    cq_lds_store: Constexpr[int] = 0,
 ):
     """``launch_gemm_a8w4_tdm`` for the ``tp_gather`` GEMM1 (MXFP4 A gathered
     from token-major rows, the TP route re-derived per workgroup, fused
@@ -3780,6 +3781,7 @@ def launch_gemm_a8w4_tdm_tpg(
         tp_slots=tp_slots,
         tp_align=tp_align,
         tp_row_route=tp_row_route,
+        cq_lds_store=cq_lds_store,
     )
     grid = (ceildiv(i32_m, tile_m) * ceildiv(N, tile_n), 1, 1)
     gemm_task(
