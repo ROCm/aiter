@@ -1848,7 +1848,11 @@ def _fused_config(
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
         if layout == V41_FLASH_EP4_LAYOUT:
-            return _tune_v41_flash_ep4_large(config)
+            # EP4 only (the EP2 / EP8 large tunes build on _tune_v41_flash_ep4_large): GEMM2 claims walk groups of
+            # 256 m-blocks, all n-blocks of a group before the next, so the CTAs in flight share W2 slabs;
+            # bit-identical.
+            config = _tune_v41_flash_ep4_large(config)
+            return replace(config, fused_stage2=replace(config.fused_stage2, m_group=256))
         if layout == V41_FLASH_EP2_LAYOUT:
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
