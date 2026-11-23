@@ -80,7 +80,8 @@ FUSED_LAYOUTS = frozenset(
 FUSED_DRAFT_LAYOUT = os.environ.get("AITER_MEGA_FUSED_DRAFT_LAYOUT", "0") == "1"
 V41_DRAFT_TOPK = 3
 # (world_size, experts_per_rank, model_dim, inter_dim)
-V41_DRAFT_LAYOUTS = ((8, 16, 5120, 2304), (4, 16, 5120, 2304)) if FUSED_DRAFT_LAYOUT else ()
+# (4, 32): the same draft MoE on EP4, 32 experts a rank; matches no EP8 call.
+V41_DRAFT_LAYOUTS = ((8, 16, 5120, 2304), (4, 16, 5120, 2304), (4, 32, 5120, 2304)) if FUSED_DRAFT_LAYOUT else ()
 # (world_size, experts_per_rank) pairs the small-input kernel's direct fixed-slot dispatch additionally accepts.
 EXTRA_FIXED_SLOT_LAYOUTS = tuple((world, epr) for world, epr, _, _ in V41_DRAFT_LAYOUTS)
 if FUSED_DRAFT_LAYOUT:
