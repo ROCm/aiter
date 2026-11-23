@@ -30,6 +30,7 @@ from flydsl.expr import math as fmath
 
 from .communication_ops_utils import spin_until_ge_i32_agent, spin_until_ge_i64
 from .pre_attention_monokernel_quant import THREADS, make_row_quantize
+from .qk_prep_epilogue import HEAD_DIM
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 # Window control words, bytes from the control region, for up to 8 ranks: amax
@@ -57,11 +58,35 @@ AMAXED, DONE, FLUSHED, READY = 0, 4, 8, 12
 # [M / 128][heads * 128] and the per-channel V scales [heads * 128] (Plan.vpc,
 # Plan.scale_pc).
 FACTORS = 64
-HEAD_DIM = 128
 
 
 def _align(value, to=256):
     return (value + to - 1) // to * to
+
+
+def _head_chunks(table, base, count):
+    """``count`` FP32 values of ``table`` from element ``base``: one list per load of 4, then
+    2, then 1 values."""
+    offset = 0
+    for width in (4, 2, 1):
+        while count - offset >= width:
+            value = buf_copy_load(table, base + offset, fx.Float32, width)
+            yield [value] if width == 1 else [fx.Vector(value)[k] for k in range(width)]
+            offset += width
+
+
+def _head_sum(table, base, count):
+    """The sum of ``_head_chunks``, adding each load's values as it lands."""
+    total = fx.Float32(0.0)
+    for chunk in _head_chunks(table, base, count):
+        for value in chunk:
+            total = total + value
+    return total
+
+
+def _head_values(table, base, count):
+    """The values of ``_head_chunks``, as one list."""
+    return [value for chunk in _head_chunks(table, base, count) for value in chunk]
 
 
 class Plan:
@@ -116,7 +141,7 @@ def make_hooks(
     workgroups,
     xcds,
     across_heads=True,
-    head_dim=128,
+    head_dim=HEAD_DIM,
     eps=1e-6,
 ):
     """The role, first-block and tile hooks for ``layouts`` (``role_layouts``).
@@ -134,8 +159,6 @@ def make_hooks(
     pc_val = plan.pc_val
     coord = workgroups - 1
     factor_scratch = FACTORS // 4 + 2 * rows
-    if heads_role % 4:
-        raise ValueError(f"heads per role must be a multiple of 4, got {heads_role}")
     if workgroups % xcds or workgroups < xcds:
         raise ValueError(f"{workgroups} workgroups do not cover {xcds} XCDs evenly")
     # Lane l of a workgroup takes rows bid + (l + 64 * chunk) * workgroups.
@@ -265,18 +288,7 @@ def make_hooks(
             row = valid.select(row, fx.Int32(0))
             factor = fx.Float32(1.0)
             if const_expr(role < 2 and across_heads):
-                sq = fx.Float32(0.0)
-                for q in range_constexpr(heads_role // 4):
-                    v = fx.Vector(
-                        buf_copy_load(
-                            tables,
-                            row * heads_all + role * heads_role + 4 * q,
-                            fx.Float32,
-                            4,
-                        )
-                    )
-                    for k in range_constexpr(4):
-                        sq = sq + v[k]
+                sq = _head_sum(tables, row * heads_all + role * heads_role, heads_role)
                 factor = fmath.rsqrt(sq * (1.0 / role_cols) + eps)
                 index = valid.select(
                     fx.Int32(FACTORS // 4 + role * rows) + row, fx.Int32(factor_scratch)
@@ -285,17 +297,9 @@ def make_hooks(
                     ptr_buf_tensor(aux, fx.Float32), index, factor, fx.Float32
                 )
             if const_expr(kinds[role] == "tensor"):
-                maxima = []
-                for q in range_constexpr(heads_role // 4):
-                    v = fx.Vector(
-                        buf_copy_load(
-                            tables,
-                            (rows + row) * heads_all + role * heads_role + 4 * q,
-                            fx.Float32,
-                            4,
-                        )
-                    )
-                    maxima += [v[k] for k in range(4)]
+                maxima = _head_values(
+                    tables, (rows + row) * heads_all + role * heads_role, heads_role
+                )
                 for d in range_constexpr(world):
                     peak = maxima[d * heads_local]
                     for h in range_constexpr(1, heads_local):

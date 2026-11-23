@@ -89,8 +89,6 @@ def pre_attention_monokernel_unsupported(
         return "the Ulysses group must be on one node"
     if heads % world_size:
         return f"{heads} heads do not split over {world_size} ranks"
-    if heads % 4:
-        return f"heads must be a multiple of 4, got {heads}"
     host = HOSTS[gemm]
     if heads * HEAD_DIM % host.BLOCK_N:
         return f"heads * {HEAD_DIM} must be a multiple of {host.BLOCK_N}"
@@ -148,8 +146,8 @@ class PreAttentionMonokernel:
 
     ``rows``: tokens per rank. ``heads``: heads of each role before the exchange, 128
     channels each. ``K``: input width of the projection. ``profile``: an Attention A2A
-    profile, by name or ``AttentionA2AProfile``. ``prep``: the Q/K prep, by default
-    ``PrepSpec(hadamard=profile.hadamard)``. ``valid_kv_len``: global tokens before the
+    profile, by name or ``AttentionA2AProfile``. ``prep``: the Q/K prep, a ``PrepSpec``;
+    its ``hadamard`` follows the profile's. ``valid_kv_len``: global tokens before the
     sequence padding, trimming K/V for profiles with direct K/V output. ``gemm``: the host
     GEMM, ``"int8"`` or ``"a6w6"``.
     """
@@ -165,7 +163,7 @@ class PreAttentionMonokernel:
         profile,
         group,
         gemm,
-        prep=None,
+        prep,
         valid_kv_len=None,
         softmax_scale=None,
         eps=1e-6,
@@ -179,7 +177,9 @@ class PreAttentionMonokernel:
         from .kernels.pre_attention_monokernel_hooks import FACTORS, Plan, make_hooks
 
         self.profile = _resolve_profile(profile)
-        self.prep = PrepSpec(hadamard=self.profile.hadamard) if prep is None else prep
+        if not isinstance(prep, PrepSpec):
+            raise TypeError(f"prep must be a PrepSpec, got {prep!r}")
+        self.prep = prep
         reason = pre_attention_monokernel_unsupported(
             world_size=world_size,
             rows=rows,
