@@ -1788,6 +1788,10 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             stage1=replace(config.stage1, tile_n=128),
             stage2=replace(config.stage2, block_n=128),
         )
+    if bucket == 32:
+        # As at 64, and the 256-wide GEMM2 n-blocks of 64 / 128 tokens: serving decode (graph bs 4-7, 24-42 rows a
+        # rank, a skewed expert placement) streams every local expert's W2 once, in half as many units (-1.4..-2.4%).
+        return replace(config, stage1=replace(config.stage1, tile_n=256), stage2=replace(config.stage2, block_n=256))
     if bucket in (32, 64):
         # Half the GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab (-3% uniform, -10..-18%
         # skewed, neutral zipf).
