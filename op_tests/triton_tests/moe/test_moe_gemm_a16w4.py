@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields
 
 import pytest
 import torch
+import triton
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
@@ -23,7 +24,10 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.moe.moe_test_utils import assert_close
+from op_tests.triton_tests.moe.moe_test_utils import (
+    assert_close,
+    ep_routing,
+)
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
@@ -412,3 +416,56 @@ def test_op_expert_parallel_rejects_bad_inputs():
             expert_map=expert_map[:-1].contiguous(),
             gate_valid=gate_valid,
         )
+
+
+# ---------------
+# SwiGLU activation correctness at block_m 128 vs fp32 torch reference.
+# ---------------
+
+_SKIP_SWIGLU = pytest.mark.skipif(
+    arch_info.get_arch() != "gfx1250",
+    reason="SwiGLU inline-asm regression is gfx1250-only",
+)
+
+
+def _a16w4_gemm1_swiglu_gather_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m, device):
+    """a16w4 GEMM1 with SwiGLU: in-kernel gather must match pre-gathered."""
+    g = torch.Generator(device=device).manual_seed(0)
+    x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, dtype=torch.float32, device=device), TOPK, dim=-1)
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+
+    g_w = torch.Generator(device=device).manual_seed(1)
+    w_bf = torch.randn(E_LOCAL, D, 2 * I, generator=g_w, device=device, dtype=torch.bfloat16) / D**0.5
+    wq, ws = downcast_to_mxfp(w_bf, torch.uint8, axis=1)
+    ws_swz, swizzle_name = shuffle_scale_moe(
+        ws, preshuffle_factor=32, scale_kwidth=4, return_layout=True,
+    )
+
+    bm = max(16, min(triton.next_power_of_2(max(1, M * TOPK // E)), block_m))
+    rd, gidx, _, _, _ = ep_routing(M, E, E_LOCAL, TOPK, bm, ids, wts, device)
+    n = int(rd.expt_data.hist.sum())
+    tok = gidx.long()[:n] // TOPK
+
+    gemm_kw = {
+        "swizzle_mx_scale": swizzle_name,
+        "apply_swiglu": True, "alpha": 1.0, "limit": 1e4, "swiglu_add_residual": False,
+    }
+    y_ikg = moe_gemm_a16w4(x, wq, None, ws_swz, routing_data=rd, gather_indx=gidx, **gemm_kw)
+    y_pg = moe_gemm_a16w4(x[tok], wq, None, ws_swz, routing_data=rd, gather_indx=None, **gemm_kw)
+
+    cos = torch.nn.functional.cosine_similarity(
+        y_ikg[:n].float().flatten(), y_pg[:n].float().flatten(), dim=0,
+    ).item()
+    assert cos > 0.999, (
+        f"a16w4 GEMM1 SwiGLU gather vs pregathered cosine={cos:.6f} (block_m={rd.block_m})"
+    )
+
+
+@_SKIP_SWIGLU
+@pytest.mark.parametrize("M", [4096, 8192])
+def test_a16w4_gluon_swiglu_gather_vs_pregathered(M, device="cuda"):
+    """a16w4 GEMM1 SwiGLU at block_m 128: in-kernel gather must match pre-gathered."""
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    _a16w4_gemm1_swiglu_gather_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, 128, device)

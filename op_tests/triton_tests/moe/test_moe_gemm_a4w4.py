@@ -24,7 +24,13 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
-from op_tests.triton_tests.moe.moe_test_utils import assert_close
+from op_tests.triton_tests.moe.moe_test_utils import (
+    assert_close,
+    dequant_e2m1,
+    ep_routing,
+    gemm1_swiglu_torch_ref,
+    make_mxfp4_weight,
+)
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
@@ -59,10 +65,6 @@ def alloc_rand(shape, device, dtype):
         tmp = 2 ** -(torch.randint(4, 8, shape, device=device, dtype=torch.bfloat16))
         return tmp
     return torch.randn(shape, device=device, dtype=dtype)
-
-
-def alloc_rand_like(x):
-    return alloc_rand(x.shape, x.device, x.dtype)
 
 
 def init_routing_data(
@@ -291,3 +293,65 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------
+# Gluon gather and SwiGLU correctness: kernel output must match the fp32 torch
+# reference from scripts/test_moe_gather.py. Tests GEMM1 with SwiGLU (where
+# the inline-asm bug was) using per-row cosine, following repro_row12_gemm1.py.
+# ---------------
+
+_SKIP_GATHER = pytest.mark.skipif(
+    get_arch() != "gfx1250",
+    reason="In-kernel gather via gluon prefill kernel is gfx1250-only",
+)
+
+
+def _a4w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gather, device):
+    """a4w4 GEMM1 with SwiGLU vs fp32 torch reference. 0 bad rows required."""
+    import triton
+
+    g = torch.Generator(device=device).manual_seed(0)
+    x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, dtype=torch.float32, device=device), TOPK, dim=-1)
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+
+    w1k, s1k, w1r = make_mxfp4_weight(E_LOCAL, 2 * I, D, seed=1, device=device)
+    bm = max(16, min(triton.next_power_of_2(max(1, M * TOPK // E)), block_m))
+    rd, gidx, _, _, _ = ep_routing(M, E, E_LOCAL, TOPK, bm, ids, wts, device)
+
+    xq, xs = mxfp4_quant(x)
+    xr = dequant_e2m1(xq, xs)
+    n = int(rd.expt_data.hist.sum())
+    ref, tok, _ = gemm1_swiglu_torch_ref(xr, w1r, E_LOCAL, ids, gidx, n, TOPK)
+    ref_rq = dequant_e2m1(*mxfp4_quant(ref.bfloat16()))
+
+    gemm_kw = {
+        "swizzle_mx_scale": "GFX1250_SCALE", "preshuffle_weights": True,
+        "out_mx_quant": True, "apply_swiglu": True, "alpha": 1.0, "limit": 1e4,
+        "swiglu_add_residual": False,
+    }
+    if in_kernel_gather:
+        y, ys = moe_gemm_a4w4(xq, w1k, xs, s1k, None, rd, gather_indx=gidx, **gemm_kw)
+    else:
+        y, ys = moe_gemm_a4w4(xq[tok], w1k, xs[tok], s1k, None, rd, gather_indx=None, **gemm_kw)
+
+    got = dequant_e2m1(y[:n], ys[:n])
+    rc = torch.nn.functional.cosine_similarity(got, ref_rq, dim=1)
+    bad = ~(rc > 0.99)
+    n_bad = int(bad.sum())
+    cos = torch.nn.functional.cosine_similarity(got.flatten(), ref_rq.flatten(), dim=0).item()
+    assert n_bad == 0 and cos > 0.999, (
+        f"a4w4 GEMM1 SwiGLU {'gather' if in_kernel_gather else 'pregathered'} "
+        f"block_m={rd.block_m}: cos={cos:.6f} bad_rows={n_bad}/{n}"
+    )
+
+
+@_SKIP_GATHER
+@pytest.mark.parametrize("M", [4096, 8192])
+@pytest.mark.parametrize("in_kernel_gather", [True, False], ids=["gather", "pregathered"])
+def test_a4w4_gluon_swiglu_vs_torch_ref(M, in_kernel_gather, device="cuda"):
+    """a4w4 GEMM1 SwiGLU must produce 0 bad rows vs fp32 torch reference at block_m 128."""
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    _a4w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, 128, in_kernel_gather, device)
