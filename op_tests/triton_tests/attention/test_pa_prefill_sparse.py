@@ -19,7 +19,9 @@ def _gather_valid(pool, indices, start, end):
     ``[0, len(pool))`` zeroed and reported invalid."""
     slots = indices[start:end].to(torch.int64)
     valid = (slots >= 0) & (slots < pool.shape[0])
-    rows = torch.zeros(slots.numel(), pool.shape[1], device=pool.device)
+    rows = torch.zeros(
+        slots.numel(), pool.shape[1], device=pool.device, dtype=torch.float32
+    )
     rows[valid] = pool[slots[valid]].float()
     return rows, valid
 

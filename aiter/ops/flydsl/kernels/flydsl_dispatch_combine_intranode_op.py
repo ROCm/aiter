@@ -19,6 +19,7 @@ from mori.shmem import mori_shmem_create_tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
+from ..communication_ops_host_utils import build_p2p_table
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
@@ -37,7 +38,7 @@ _SUPPORTED_TOK_DTYPES = (
 
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
 # "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
-# (mega_moe_gfx1250/mega_moe.py).
+# (mega_moe_gfx1250/recipe.py).
 _SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
@@ -357,14 +358,6 @@ class FlyDSLDispatchCombineConfig:
         return self.scale_dim * self.scale_type_size
 
 
-def build_p2p_table(t, rank, npes, dev):
-    """i64[npes] table of intra-node P2P pointers to ``t`` on every peer (self incl.)."""
-    tbl = torch.zeros(npes, dtype=torch.int64, device=dev)
-    for pe in range(npes):
-        tbl[pe] = ms.shmem_ptr_p2p(t.data_ptr(), rank, pe)
-    return tbl
-
-
 class FlyDSLDispatchGroupMajorOp:
     """Own expert-major dispatch buffers and metadata for fused stage1."""
 
@@ -562,7 +555,6 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-
     def __init__(self, config):
         self.cfg = config
         self._check_config()

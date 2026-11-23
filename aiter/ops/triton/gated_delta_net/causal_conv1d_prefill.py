@@ -32,6 +32,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_
     _causal_conv1d_fwd_split_qkv_kernel,
     _causal_conv1d_fwd_split_qkv_tile_kernel,
 )
+from aiter.plugin import route as _route
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -147,21 +148,25 @@ def _build_chunk_schedule(
     ``arange(tot) - repeat_interleave(exclusive_prefix_sum(nums), nums)``.
     """
     device = query_start_loc.device
-    seqlens = query_start_loc.diff().to("cpu")
+    seqlens = query_start_loc.diff()
     nums = (-(-seqlens // block_m)).to(torch.int64)  # ceil-div per sequence
     n_seqs = nums.numel()
     tot = int(nums.sum().item())
     if tot == 0:
         z = torch.zeros(0, dtype=torch.int32, device=device)
         return 0, z, z
-    seq_ids = torch.arange(n_seqs, dtype=torch.int32)
-    batch_ptr = torch.repeat_interleave(seq_ids, nums)
+    seq_ids = torch.arange(n_seqs, dtype=torch.int32, device=device)
+    batch_ptr = torch.repeat_interleave(seq_ids, nums, output_size=tot)
     starts = nums.cumsum(0) - nums  # exclusive prefix sum
-    base = torch.repeat_interleave(starts, nums)
-    tco = (torch.arange(tot, dtype=torch.int64) - base).to(torch.int32)
-    return tot, batch_ptr.to(device), tco.to(device)
+    base = torch.repeat_interleave(starts, nums, output_size=tot)
+    tco = (torch.arange(tot, dtype=torch.int64, device=device) - base).to(torch.int32)
+    return tot, batch_ptr, tco
 
 
+# Routed on this public entry, the one KDA's vLLM prefill imports. The op name
+# drops the backend: a provider serves the split conv, not this Triton tiling,
+# so block_m, block_n and num_warps are hints it may ignore.
+@_route(op="causal_conv1d_split_qkv")
 def causal_conv1d_split_qkv_triton_tile_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -189,6 +194,15 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
 
     preserve_input_dtype: return q/k/v in x's dtype to match vLLM
+
+    Contract for a provider: returns three new tensors (q, k, v) in x's dtype
+    when ``preserve_input_dtype`` else in ``conv_states``' dtype, and writes
+    ``conv_states`` in place -- each sequence's line ``cache_indices[i]`` ends
+    holding its last ``width - 1`` inputs, read first when
+    ``has_initial_state[i]``. A ``cache_indices`` entry equal to
+    ``pad_slot_id`` marks a padded sequence: its state line is neither read
+    nor written and its q/k/v rows are left unwritten. ``metadata`` only memoizes AITER's own chunk schedule; a provider
+    reads ``query_start_loc`` instead.
     """
     # Cast back only when asked; a no-op when cache and activations share a dtype
     out_dtype = x.dtype if preserve_input_dtype else conv_states.dtype

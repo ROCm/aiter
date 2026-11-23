@@ -123,8 +123,15 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             v = fx.memref_load_vec(tr_reg)
             lds_store_vec8(rc * _TR_LDS_S + sv, v)
 
-        fx.rocdl.s_waitcnt(lgkmcnt=0)
-        fx.rocdl.s_barrier()
+        # gfx1250 rejects s_waitcnt(lgkmcnt=...); a workgroup barrier is enough
+        # for LDS visibility after the stores above. gfx950 keeps the waitcnt.
+        from flydsl.runtime.device import get_rocm_arch
+
+        if str(get_rocm_arch()).startswith("gfx1250"):
+            gpu.barrier()
+        else:
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            fx.rocdl.s_barrier()
 
         for i in range_constexpr(_TR_ITERS):
             lin = tid + i * TR_THREADS

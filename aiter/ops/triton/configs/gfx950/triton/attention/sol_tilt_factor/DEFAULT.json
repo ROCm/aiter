@@ -1,0 +1,18 @@
+{
+    "fp8": {
+        "any": {
+            "num_warps": 1,
+            "waves_per_eu": 1
+        }
+    },
+    "bf16": {
+        "BLOCK_N_LEQ_64": {
+            "num_warps": 1,
+            "waves_per_eu": 1
+        },
+        "any": {
+            "num_warps": 2,
+            "waves_per_eu": 0
+        }
+    }
+}

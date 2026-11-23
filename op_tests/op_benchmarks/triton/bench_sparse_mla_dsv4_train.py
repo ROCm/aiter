@@ -6,10 +6,8 @@
 Usage:
     python bench_sparse_mla_dsv4_train.py
     python bench_sparse_mla_dsv4_train.py --op bwd
-    python bench_sparse_mla_dsv4_train.py -metric bandwidth
+    python bench_sparse_mla_dsv4_train.py --metric bandwidth
 """
-
-import argparse
 
 import torch
 import triton
@@ -17,6 +15,10 @@ import triton
 from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
     sparse_mla_bwd,
     sparse_mla_fwd,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
@@ -101,21 +103,16 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark DSV4 sparse-MLA training", allow_abbrev=False
-    )
+    parser = get_parser(kernel_name="Benchmark DSV4 sparse-MLA training")
     parser.add_argument(
         "--op",
         choices=["fwd", "bwd"],
         default="fwd",
         help="Which op to benchmark (default: fwd)",
     )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

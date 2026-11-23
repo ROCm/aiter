@@ -26,6 +26,23 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 
 ## More Options
 
+### Triton / FlyDSL preshuffle candidates (gfx950)
+
+Add `--backends ck,asm,triton,flydsl -k` to the existing tuner command to compare
+all four backends. The default remains `ck,asm`. Winners use the same CSV schema;
+`triton_preshuffle_*` and `flydsl_mxpsh_*` kernel names encode their launch settings.
+Triton cache modifiers are explicit: `_cmcg` selects `.cg`, `_cmca` selects `.ca`,
+and `_cmnone` or no `_cm` suffix uses the Triton default (`None`).
+
+`aiter/configs/model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv` contains the
+qualified narrow-N rows. These select the new backends only at exact M, with
+BF16 output, row-major MXFP4 activations, preshuffled weights and the default
+shuffled per-1x32 scales. `fallbackKernelName` / `fallbackSplitK` retain the prior
+CK/ASM choice for padded M, unsupported arguments or an absent FlyDSL dependency.
+Absent fallback columns select the default ASM path. Compilation failures propagate.
+Set `AITER_LOG_TUNED_CONFIG=1` to log a rejected backend choice once per shape,
+dtype and kernel. The default gfx950 op test also runs these CSV-selected shapes.
+
 **Note**: All commands require setting `GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH=/work/llvm-project/build/bin/` environment variable.
 
 ### Output Configuration

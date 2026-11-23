@@ -1,3 +1,4 @@
+import functools
 import math
 import random
 import sys
@@ -7,35 +8,48 @@ import triton
 
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     get_dtype_bytes,
     get_model_configs,
     print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.attention.test_pa_prefill import seed_everything
 
 
-def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+def _get_alibi_slopes(total_num_heads: int, device: str) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
     base = torch.tensor(
         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
         dtype=torch.float32,
+        device=device,
     )
-    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32, device=device)
     slopes = torch.pow(base, powers)
 
     if closest_power_of_2 != total_num_heads:
         extra_base = torch.tensor(
             2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
             dtype=torch.float32,
+            device=device,
         )
         num_remaining_heads = min(
             closest_power_of_2, total_num_heads - closest_power_of_2
         )
         extra_powers = torch.arange(
-            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
+            start=1,
+            end=1 + 2 * num_remaining_heads,
+            step=2,
+            dtype=torch.int32,
+            device=device,
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
@@ -57,16 +71,9 @@ def input_helper(
     use_alibi_slope: bool,
 ):
     seed_everything(0)
-    torch.set_default_device(device)
-
-    # Need this, otherwise when we capture the graph the process
-    # for GPU 1 would run on both GPU0 and GPU1 and things would hang
-    #
-    # see also similar issue: https://github.com/Dao-AILab/flash-attention/issues/523
-    torch.cuda.set_device(device)
 
     if use_alibi_slope:
-        alibi_slopes = _get_alibi_slopes(num_heads).to(device)
+        alibi_slopes = _get_alibi_slopes(num_heads, device)
 
     query_lens = [random.randint(16, MAX_SEQ_LEN) for _ in range(BS)]
     ctx_lens = [random.randint(16, MAX_CTX_LEN) for _ in range(BS)]
@@ -74,11 +81,13 @@ def input_helper(
     num_kv_heads = num_heads // num_queries_per_kv
 
     num_tokens = sum(query_lens)
-    query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+    query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
     query.uniform_(-1e-3, 1e-3)
-    output = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+    output = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
 
-    kv = torch.empty(sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype)
+    kv = torch.empty(
+        sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype, device=device
+    )
     kv.uniform_(-1e-3, 1e-3)
     key, value = kv.unbind(dim=1)
 
@@ -87,23 +96,39 @@ def input_helper(
     else:
         cache_dtype = str_to_torch_dtype[kv_cache_dtype]
     k_cache = torch.zeros(
-        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+        cache_size,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=cache_dtype,
+        device=device,
     )
     v_cache = torch.zeros(
-        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+        cache_size,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=cache_dtype,
+        device=device,
     )
-    k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    values = torch.arange(0, cache_size, dtype=torch.long)
-    values = values[torch.randperm(cache_size)]
+    k = torch.zeros(
+        sum(query_lens), num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    v = torch.zeros(
+        sum(query_lens), num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    values = torch.arange(0, cache_size, dtype=torch.long, device=device)
+    values = values[torch.randperm(cache_size, device=device)]
     block_table = values[: BS * max_block_per_request].view(BS, max_block_per_request)
-    b_seq_len = torch.tensor(seq_lens, dtype=torch.long)
-    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
-    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0)
+    b_seq_len = torch.tensor(seq_lens, dtype=torch.long, device=device)
+    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long, device=device)
+    b_start_loc = torch.cumsum(
+        torch.tensor([0] + query_lens, dtype=torch.long, device=device), dim=0
+    )
     max_input_len = MAX_SEQ_LEN
     # copy kv to cache
     b_seq_start_loc = torch.cumsum(
-        torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0
+        torch.tensor([0] + seq_lens[:-1], dtype=torch.long, device=device), dim=0
     )
     for i in range(BS):
         for j in range(query_lens[i]):
@@ -239,8 +264,48 @@ def run_benchmark(args):
             torch_kv_cache_dtype = str_to_torch_dtype[kv_cache_dtype]
 
         num_queries_per_kv = HQ // HK
+        device = next(
+            f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+        )
 
-        (
+        _p_gen = functools.partial(
+            input_helper,
+            BS=BS,
+            MAX_SEQ_LEN=MAX_SEQ_LEN,
+            MAX_CTX_LEN=MAX_CTX_LEN,
+            cache_size=cache_size,
+            block_size=block_size,
+            max_block_per_request=max_block_per_request,
+            num_heads=HQ,
+            head_size=HEAD_DIM,
+            num_queries_per_kv=num_queries_per_kv,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            device=device,
+            use_alibi_slope=use_alibi_slope,
+        )
+        _out_val_keys = [
+            "query",
+            "k",
+            "v",
+            "output",
+            "k_cache",
+            "v_cache",
+            "block_table",
+            "b_start_loc",
+            "b_seq_len",
+            "max_input_len",
+            "k_scale",
+            "v_scale",
+            "alibi_slopes",
+        ]
+        bencher = RotatingBufferBench.from_dict(
+            {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+        )
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+        num_tokens = rot_bufs[0]["query"].shape[0]
+
+        def _run(
             query,
             k,
             v,
@@ -254,42 +319,25 @@ def run_benchmark(args):
             k_scale,
             v_scale,
             alibi_slopes,
-        ) = input_helper(
-            BS=BS,
-            MAX_SEQ_LEN=MAX_SEQ_LEN,
-            MAX_CTX_LEN=MAX_CTX_LEN,
-            cache_size=cache_size,
-            block_size=block_size,
-            max_block_per_request=max_block_per_request,
-            num_heads=HQ,
-            head_size=HEAD_DIM,
-            num_queries_per_kv=num_queries_per_kv,
-            dtype=dtype,
-            kv_cache_dtype=kv_cache_dtype,
-            device=next(
-                f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ),
-            use_alibi_slope=use_alibi_slope,
-        )
+        ):
+            context_attention_fwd(
+                query,
+                k,
+                v,
+                output,
+                kv_cache_dtype,
+                k_cache,
+                v_cache,
+                block_table,
+                b_start_loc,
+                b_seq_len,
+                max_input_len,
+                k_scale,
+                v_scale,
+                alibi_slopes=alibi_slopes,
+            )
 
-        num_tokens = query.shape[0]
-        fn = lambda: context_attention_fwd(
-            query,
-            k,
-            v,
-            output,
-            kv_cache_dtype,
-            k_cache,
-            v_cache,
-            block_table,
-            b_start_loc,
-            b_seq_len,
-            max_input_len,
-            k_scale,
-            v_scale,
-            alibi_slopes=alibi_slopes,
-        )
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = bencher.bench(_run)
 
         # query and output
         mem = (num_tokens * HQ * HEAD_DIM) * get_dtype_bytes(dtype) * 2
@@ -321,7 +369,6 @@ def run_benchmark(args):
         )
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active

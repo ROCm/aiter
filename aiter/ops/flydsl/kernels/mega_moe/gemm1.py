@@ -34,7 +34,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -83,9 +83,9 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             b_prev = [
                 [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)] for ni in range(NUM_ACC_N)
             ]
-            cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            spn = sp + fx.Int32(1)
+            cur_off = (sp & 1) * fx.Int32(a_lds_i32)
+            nxt_off = ((sp + 1) & 1) * fx.Int32(a_lds_i32)
+            spn = sp + 1
             if const_expr(async_a_copy):
                 sb = [
                     fx.Int32(
@@ -171,8 +171,8 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             pairs = (K_ITERS - 1) // 2
             for pr_i, state in range(0, pairs, 1, init=init):
                 pr = fx.Int32(pr_i)
-                mid = _kstep(pr * fx.Int32(2), state)
-                yv = _kstep(pr * fx.Int32(2) + fx.Int32(1), mid)
+                mid = _kstep(pr * 2, state)
+                yv = _kstep(pr * 2 + 1, mid)
                 state = yield yv
             if const_expr((K_ITERS - 1) % 2):
                 state = _kstep(fx.Int32(K_ITERS - 2), state)
@@ -185,10 +185,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)]
             for ni in range(NUM_ACC_N)
         ]
-        final_off = (last & fx.Int32(1)) * fx.Int32(a_lds_i32)
+        final_off = (last & 1) * fx.Int32(a_lds_i32)
 
         def final_a_load(mi, ks, _base=final_off):
-            return a_s2r.load_operand(a_buf, mi, ks, _base)
+            return a_s2r.load_operand(a_buf, mi, ks, _base, narrow_copy=narrow_final_a)
 
         if const_expr(async_a_copy):
             sb = [
@@ -239,10 +239,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
         for sp_i, state in range(0, K_ITERS, 1, init=init):
             sp = fx.Int32(sp_i)
             acc = [Vec(a) for a in state]
-            cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            spn = (sp + fx.Int32(1) < last).select(
-                sp + fx.Int32(1),
+            cur_off = (sp & 1) * fx.Int32(a_lds_i32)
+            nxt_off = ((sp + 1) & 1) * fx.Int32(a_lds_i32)
+            spn = (sp + 1 < last).select(
+                sp + 1,
                 last,
             )
 
@@ -291,7 +291,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
-    act="silu", situ_beta=1.0, situ_linear_beta=1.0):
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -353,7 +353,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, pair_k)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
@@ -430,7 +430,7 @@ def compile_gemm1(
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale),
             fx.Int8,
-            num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192),
+            num_records_bytes=num_valid * fx.Int32(scale_cols) + 8192,
         )
         wave_id = fx.thread_idx.x // 64
 

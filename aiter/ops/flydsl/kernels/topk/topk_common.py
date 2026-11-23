@@ -3,14 +3,16 @@
 
 """Scalar, load and wave helpers shared by the FlyDSL TopK kernels."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import Float32, Int32, arith, as_ir_value, const_expr
+from flydsl.expr import Float32, Int32, arith, as_ir_value, const_expr, gpu
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
+_DPP_ROW_SHR = 0x110  # row_shr:n is _DPP_ROW_SHR | n
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
@@ -23,7 +25,22 @@ def _f32_to_ord(val):
     return is_nan.select(fx.Int32(0x7FFFFFFF), ords)
 
 
-def _row_length(row, row_ends, width, next_n):
+def _bounded_row_len(row_lens, row, width, full_rows):
+    """Row `row`'s live length, never past `width`.
+
+    A full-rows build reads no tensor. Otherwise the row's own entry, clamped:
+    a length past the row would read the zeros an out-of-bounds buffer load
+    returns, and select them as scores.
+    """
+    if const_expr(full_rows):
+        return width
+    return fx.min(row_lens[row], width)
+
+
+def _row_length(row, row_ends, width, next_n, full_rows=False):
+    """Row `row`'s live length; `full_rows` builds read none and use `width`."""
+    if const_expr(full_rows):
+        return width
     request = row // next_n
     offset = row % next_n
     row_len = row_ends[request] - next_n + offset + 1
@@ -31,12 +48,14 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
-def _row_view(input, row_starts, row_ends, row, width, next_n, packed):
+def _row_view(input, row_starts, row_ends, row, width, next_n, packed, full_rows=False):
     """Return a regular row or its packed slice from the input's first row."""
     if const_expr(packed):
         return fx.make_view(
             fx.add_offset(fx.get_iter(input), row_starts[row]),
-            fx.make_layout((_row_length(row, row_ends, width, next_n),), (1,)),
+            fx.make_layout(
+                (_row_length(row, row_ends, width, next_n, full_rows),), (1,)
+            ),
         )
     return fx.slice(input, (row, None))
 
@@ -51,16 +70,11 @@ def _load_f32x4(tensor, vec_idx, cache_modifier=0):
 def _warp_inclusive_prefix_i32(val, lane, wave_size):
     val_raw = as_ir_value(val)
     zero_raw = as_ir_value(fx.Int32(0))
-    for dpp_op, threshold in (
-        (0x111, 1),
-        (0x112, 2),
-        (0x114, 4),
-        (0x118, 8),
-    ):
+    for shift in (1, 2, 4, 8):
         remote = update_dpp_i32(
-            zero_raw, val_raw, dpp_op, _DPP_ROW_MASK, _DPP_BANK_MASK, True
+            zero_raw, val_raw, _DPP_ROW_SHR | shift, _DPP_ROW_MASK, _DPP_BANK_MASK, True
         )
-        val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+        val = (lane >= fx.Int32(shift)).select(val + fx.Int32(remote), val)
         val_raw = as_ir_value(val)
 
     remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 1) * 4, val)
@@ -69,3 +83,37 @@ def _warp_inclusive_prefix_i32(val, lane, wave_size):
         remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 17) * 4, val)
         val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote), val)
     return val
+
+
+def _wave32_inclusive_sum_i32(value, lane):
+    """Each lane's inclusive prefix sum of `value` across a wave32."""
+    zero = fx.Int32(0)
+    # DPP shifts stay inside 16-lane rows: a lane whose source falls outside
+    # its row reads `old`, zero. Lane 15's sum then crosses into the upper row.
+    for shift in (1, 2, 4, 8):
+        value = value + fx.Int32(update_dpp_i32(zero, value, _DPP_ROW_SHR | shift))
+    row_total = fx.coop.warp_broadcast(value, 15)
+    return value + (lane >= fx.Int32(16)).select(row_total, zero)
+
+
+@flyc.jit
+def _wave32_block_exclusive_sum_i32(value, slots, lane, NUM_WAVES: fx.Constexpr[int]):
+    """Each thread's exclusive prefix sum of `value` across the block, and the total.
+
+    `slots` holds one int32 per wave and is read after this call's barrier:
+    another barrier must pass before the next call writes it.
+    """
+    zero = fx.Int32(0)
+    value = fx.Int32(value)
+    wave = fx.Int32(fly_rocdl.wave_id())
+    inclusive = _wave32_inclusive_sum_i32(value, lane)
+    if lane == fx.Int32(31):
+        slots[wave] = inclusive
+    gpu.barrier()
+    has_slot = lane < fx.Int32(NUM_WAVES)
+    slot = has_slot.select(slots[has_slot.select(lane, zero)], zero)
+    slot_inclusive = _wave32_inclusive_sum_i32(slot, lane)
+    # warp_broadcast from a runtime lane would shuffle through LDS.
+    wave_prefix = fx.Int32(fly_rocdl.readlane(T.i32, slot_inclusive - slot, wave))
+    total = fx.coop.warp_broadcast(slot_inclusive, NUM_WAVES - 1)
+    return wave_prefix + inclusive - value, total
