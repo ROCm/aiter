@@ -998,7 +998,8 @@ def compile_mega_moe_stage1(
     # the kernel now writes itself). The work needs nothing from the launch protocol, so it runs as a pre-phase: the
     # first consumer workgroups (by entry ticket) each take one GEMM1 unit (32 rows x 128 activation columns) and
     # then one GEMM2 unit (32 rows x 256 output columns) before they join the routed work pool, while the grid
-    # waits for the sources and the plan anyway. Inputs: the MXFP8 pair of this call's rows through the kernel's
+    # waits for the sources and the plan anyway. The host launches this kernel only for row counts with a consumer
+    # per unit (shared_in_fits): a unit without a workgroup would leave its counter short and the launch waiting. Inputs: the MXFP8 pair of this call's rows through the kernel's
     # ``sorted_token_ids`` (E4M3 rows) and ``expert_ids`` (their row-major 1x32 E8M0 scales) arguments, which a
     # plan_local kernel does not read; the shared weights, the rank-local activation buffers and the counters
     # through the dispatch table (DispatchSlot.SH_*). Numerics: ops/mega_moe/shared_expert.py, the dense launches'.
@@ -1182,16 +1183,21 @@ def compile_mega_moe_stage1(
 
         from . import shared_expert as _se
 
-        # One consumer workgroup per shared GEMM1 / GEMM2 unit of the largest call (shared_in_fits).
+        plan_chunks_bytes = ((fz_epr + 63) // 64) * 64 * 8
+        # The tile bodies are shared_expert's own (32 rows x 256 columns x 256 K, 4 waves), whatever this kernel's
+        # routed tiles are. The host launches this kernel only for row counts whose units all find a consumer
+        # workgroup (shared_in_fits); here: at least one m-tile's worth.
         sh_n1, sh_n2 = (2 * inter_dim) // 256, model_dim // 256
-        sh_tiles_max = ceildiv(fz_mtpr, sort_block_m)
-        assert sort_block_m == 32 and tile_n == 256 and tile_k == 256 and swiglu_limit > 0
-        assert sh_tiles_max <= 16 and sh_tiles_max * max(sh_n1, sh_n2) <= launch_grid_x - 1 - dispatch_blocks, (
-            "shared_in: too few consumer workgroups", fz_mtpr, launch_grid_x, dispatch_blocks)
+        assert NUM_WAVES == 4 and sort_block_m == 32 and swiglu_limit > 0 and fz_mtpr <= 16 * 32
+        assert max(sh_n1, sh_n2) <= launch_grid_x - 1 - dispatch_blocks, (
+            "shared_in: too few consumer workgroups", launch_grid_x, dispatch_blocks)
         # Pool: the shared GEMM2 epilogue's 32 x 256 fp32 tile (the pre-phase ends before the kernel keeps any
-        # state in the pool); A scales: the tile-layout staging (3 rounds).
-        lds_pool_bytes = max(lds_pool_bytes, sort_block_m * 256 * 4)
-        assert 2 * lds_pool_bytes <= 160 * 1024 and n_scale_bytes >= 3 * 4 * NUM_WAVES * 64
+        # state in the pool); A scales: the shared GEMM1's 32 x model_dim / 32 bytes and the tile-layout staging.
+        lds_pool_bytes = max(lds_pool_bytes, 32 * 256 * 4)
+        sh_partial_bytes = NUM_WAVES * 64 * _se.M_REPEAT * _se.NUM_ACC_N * 16 if shared_in == 2 else 0
+        assert n_scale_bytes >= max(32 * (model_dim // 32), 3 * 4 * NUM_WAVES * 64)
+        # Two workgroups a CU stay resident (see above): this kernel's whole LDS, not only its pool.
+        assert 2 * (lds_pool_bytes + n_scale_bytes + 16 + plan_chunks_bytes + sh_partial_bytes) <= 160 * 1024
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1229,7 +1235,7 @@ def compile_mega_moe_stage1(
             plan_tab: fx.Array[fx.Int8, plan_chunks * 64 * 8, 16]
         if shared_in == 2:
             # shared_in: the first K half's partials of a split GEMM1 tile (16 bytes per accumulator and thread).
-            sh_partial: fx.Array[fx.Int8, NUM_WAVES * 64 * M_REPEAT * NUM_ACC_N * 16, 16]
+            sh_partial: fx.Array[fx.Int8, sh_partial_bytes, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -2034,17 +2040,15 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     # fmt: on
 
 
-def shared_in_fits(config: MegaMoEConfig, mtpr: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
-    """Whether the fused kernel of ``config`` can also run the shared expert (compile_mega_moe_stage1's shared_in):
-    its own plan in every CTA, the 32 x 256 x 256 tiles, and one consumer workgroup for every shared GEMM1 / GEMM2
-    unit of a ``mtpr``-row call."""
+def shared_in_fits(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+    """Whether the fused kernel of ``config`` can also run the shared expert of a ``rows``-row call
+    (compile_mega_moe_stage1's shared_in): its own plan in every CTA, 4 waves, 32-row routed tiles (the LDS the
+    two workgroups of a CU share), and a consumer workgroup for each of the call's shared GEMM1 / GEMM2 units."""
     stage1, knobs = config.stage1, config.fused_stage1
-    tiles = ceildiv(mtpr, 32)
     consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
     return (
-        knobs.plan_local and not knobs.tok_done
-        and (stage1.sort_block_m, stage1.tile_n, stage1.tile_k, stage1.num_waves) == (32, 256, 256, 4)
-        and tiles <= 16 and tiles * max((2 * inter_dim) // 256, model_dim // 256) <= consumers
+        rows > 0 and knobs.plan_local and not knobs.tok_done and stage1.num_waves == 4 and stage1.sort_block_m == 32
+        and ceildiv(rows, 32) * max((2 * inter_dim) // 256, model_dim // 256) <= consumers
     )
 
 
@@ -2442,8 +2446,8 @@ class SmallMRuntime:
 
     def shared_in_supported(self, tokens: int) -> bool:
         """Whether the kernel a ``tokens``-row call launches can also compute the shared expert."""
-        return tokens > 0 and self.swiglu_limit > 0 and shared_in_fits(
-            self._configs[self._bucket_of(tokens)], self.mtpr, self._s1_num_cu, self.model_dim, self.inter_dim)
+        return 0 < tokens <= self.mtpr and self.mtpr <= 512 and self.swiglu_limit > 0 and shared_in_fits(
+            self._configs[self._bucket_of(tokens)], tokens, self._s1_num_cu, self.model_dim, self.inter_dim)
 
     def shared_in_ready(self, tokens: int, shared) -> bool:
         """``shared_in_supported`` and ``shared`` (a weights.SharedExpertInput) is what the kernel reads; under a
@@ -2495,10 +2499,14 @@ class SmallMRuntime:
         return disp
 
     def _shared_in_ksplits(self, bucket: int):
-        """The GEMM1 K splits (shared_expert.dense_gate_up_ksplit) of the row counts that select ``bucket``."""
+        """The GEMM1 K splits (shared_expert.dense_gate_up_ksplit) of the row counts that select ``bucket`` and
+        whose shared expert its kernel can run."""
         from .shared_expert import dense_gate_up_ksplit
 
-        return sorted({dense_gate_up_ksplit(t) for t in range(1, self.mtpr + 1) if self._bucket_of(t) == bucket})
+        return sorted({
+            dense_gate_up_ksplit(t) for t in range(1, self.mtpr + 1)
+            if self._bucket_of(t) == bucket and self.shared_in_supported(t)
+        })
 
     def preload_aot_bundle(self):
         """Load the kernel of every token bucket this runtime selects, without GPU dispatch."""
@@ -2521,8 +2529,6 @@ class SmallMRuntime:
             stand_in = torch.zeros(16, dtype=torch.uint8, device=self.dev)
             for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= self.mtpr):
                 config = self._select_config(bucket)
-                if not shared_in_fits(config, self.mtpr, self._s1_num_cu, self.model_dim, self.inter_dim):
-                    continue
                 for ksplit in self._shared_in_ksplits(bucket):
                     self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True, shared_add=x_bf16,
                         shared_in=(ksplit, stand_in, stand_in, self._s1_disp))
