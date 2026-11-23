@@ -47,9 +47,11 @@ def q_nope_prestored_supported() -> bool:
     """Return True when ``fused_qk_rope_cat_and_cache_mla`` accepts
     ``q_nope_prestored=True`` on this device.
 
-    The option needs the gfx1250 Gluon head-tile kernel. Callers must also
-    keep its call limits: one KV head, pure decode (``num_decode_toks_for_zeros``
-    is 0) and one slot for each token.
+    The option needs the gfx1250 Gluon head-tile kernel. A caller must also
+    keep the wrapper's other limits for it: one KV head, one slot for each
+    token (``len(slot_mapping) == B``, pure decode), no zero-filled decode
+    outputs (``num_decode_toks_for_zeros == 0``) and a ``q_out`` that already
+    holds q_nope.
     """
     return (
         DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
