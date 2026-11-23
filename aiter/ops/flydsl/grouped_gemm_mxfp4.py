@@ -37,12 +37,9 @@ def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
     return temporal_hint
 
 
-def _select_cluster_n(
-    n_tiles: int, csv_cluster_n: int, gemm_stage: int | None = None
-) -> int:
+def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
-    env_name = "AITER_FLYDSL_MXFP4_CLUSTER_N"
-    env_cluster_n = os.environ.get(f"{env_name}{gemm_stage}", os.environ.get(env_name))
+    env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
         if env_cluster_n is not None:
             requested_cluster_n = int(env_cluster_n)
@@ -57,15 +54,9 @@ def _select_cluster_n(
     return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
 
 
-def _select_cluster_m(
-    csv_cluster_m: int,
-    cluster_n: int,
-    stage1_act: int,
-    gemm_stage: int | None = None,
-) -> int:
+def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> int:
     """Selects the M cluster degree, preserving the legacy automatic policy."""
-    env_name = "AITER_FLYDSL_MXFP4_CLUSTER_M"
-    env_cluster_m = os.environ.get(f"{env_name}{gemm_stage}", os.environ.get(env_name))
+    env_cluster_m = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_M")
     try:
         requested_cluster_m = (
             int(env_cluster_m) if env_cluster_m is not None else int(csv_cluster_m)
@@ -108,18 +99,6 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 
 
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
-
-
-def _bounded_buffer_arg(tensor, dtype=None, tensor_abi=False):
-    """Keep persistent launch Tensor metadata bounded, without copying buffers."""
-    if not tensor_abi:
-        return ptr_arg(tensor, dtype)
-    if dtype is fx.Int32:
-        size = tensor.element_size()
-        if tensor.numel() * size < 4 or (tensor.storage_offset() * size) % 4:
-            return ptr_arg(tensor, dtype)
-        return tensor.as_strided((max(1, 4 // size),), (1,)).view(torch.int32)
-    return tensor.as_strided((min(tensor.numel(), 1),), (1,))
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -209,9 +188,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
         SUPPORT_EXPLICIT_VGPR_PARTITION,
-        _supports_clustered_persistent,
-        get_gemm_a8w4_tdm_register_launcher,
-        is_explicit_vgpr_partition_available,
         launch_gemm_a8w4_tdm,
     )
 
@@ -253,8 +229,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
-    cluster_n = _select_cluster_n(n_tiles, cluster_n, stage)
-    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1, stage)
+    cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     if m_align:
         # A tile skipped for starting in an expert's padding never reaches the
         # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
@@ -267,26 +243,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
-    persistent_prefill = bool(
-        persistent_workers
-        and _supports_clustered_persistent(
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            num_buffers,
-            a_is_fp4,
-            a_preshuffled,
-            stage1_act,
-            stage1_quant_out,
-            cluster_n,
-            cluster_m,
-        )
-    )
     if persistent_workers:
-        if cluster_m != 1 and not persistent_prefill:
-            raise ValueError("clustered persistent workers require pinned A4W4 prefill")
+        if cluster_m != 1:
+            raise ValueError("persistent workers require cluster_m == 1")
         if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
@@ -381,9 +340,16 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     # The accepted Flash receive bucket favors a bounded live-route grid.
     # Explicit worker overrides keep their requested dispatch.
-    if fixed_n_ep and stage == 2 and not any(
-        name in os.environ
-        for name in ("AITER_FLYDSL_PERSISTENT_WORKERS", "AITER_FLYDSL_PERSISTENT_WORKERS2")
+    if (
+        fixed_n_ep
+        and stage == 2
+        and not any(
+            name in os.environ
+            for name in (
+                "AITER_FLYDSL_PERSISTENT_WORKERS",
+                "AITER_FLYDSL_PERSISTENT_WORKERS2",
+            )
+        )
     ):
         persistent_workers = 4096
     layout_spec = (
@@ -399,69 +365,16 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     launch_spec = (
         int(quant_payload_preshuffled),
-        int(N) if persistent_prefill or fixed_n_ep else 0,
-    )
-    # Paired gfx1250 profiling favors Tensor packing for clustered workers.
-    # Only the base address reaches the kernel; extents use the explicit sizes.
-    # Small views retain main's large-buffer ABI and pitched/offset support.
-    c_arg, sa_arg, sb_arg, qs_arg, ep_arg = (
-        _bounded_buffer_arg(tensor, dtype, persistent_prefill)
-        for tensor, dtype in (
-            (out, out_dtype),
-            (a_scales, fx.Int32),
-            (w_scales, fx.Int32),
-            (quant_scale_tensor, None),
-            (ep_row_map_tensor, fx.Int32),
-        )
-    )
-    buffer_spec = tuple(
-        (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
-        for value in (c_arg, sa_arg, sb_arg, qs_arg, ep_arg)
+        int(N) if fixed_n_ep else 0,
     )
     explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
-    if (
-        a_is_fp4
-        and a_preshuffled
-        and not persistent_workers
-        and tile_m == 64
-        and m_warp == 1
-        and n_warp == 4
-        and num_buffers == 3
-        and (tile_n, tile_k) in ((256, 256), (512, 128))
-    ):
-        # The narrow-N tile fits the automatic allocation without spilling;
-        # high fixed registers unnecessarily restrict its wave residency.
-        # The wide-N tile needs the larger register budget to avoid scratch
-        # spills. Tune the tile, independently of expert count or routing.
-        explicit_vgpr_partition = int(
-            tile_n == 512 and is_explicit_vgpr_partition_available()
-        )
-        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(
-            explicit_vgpr_partition
-        )
-    elif (
-        a_is_fp4
-        and a_preshuffled
-        and not persistent_workers
-        and not enable_ep_scatter
-        and not stage1_act
-        and not stage1_quant_out
-        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-        == (256, 256, 256, 2, 2, 4)
-        and cluster_m == 1
-        and is_explicit_vgpr_partition_available()
-    ):
-        # The new allocator's automatic layout is slower for this output tile.
-        # Use its explicit SSA placement under either global register policy.
-        explicit_vgpr_partition = 1
-        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        c_arg,
+        ptr_arg(out, out_dtype),
         ptr_arg(a),
         ptr_arg(w),
-        sa_arg,
-        sb_arg,
+        ptr_arg(a_scales, fx.Int32),
+        ptr_arg(w_scales, fx.Int32),
         contiguous_m,
         stream,
         N,
@@ -471,10 +384,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         bias_ptr,
         float(swiglu_limit),
         *quant_spec,
-        qs_arg,
+        ptr_arg(quant_scale_tensor),
         *tdm_spec,
         *ep_spec,
-        ep_arg,
+        ptr_arg(ep_row_map_tensor, fx.Int32),
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
@@ -490,7 +403,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             launch_spec,
             explicit_vgpr_partition,
             out.device,
-            buffer_spec,
         ),
     )
     return out

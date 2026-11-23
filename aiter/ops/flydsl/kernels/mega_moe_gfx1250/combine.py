@@ -136,9 +136,6 @@ def _combine_direct_threads(hidden_dim, block_threads=0):
                 and lanes_per_tok % block_threads == 0):
             raise ValueError("explicit combine threads must divide one token's lanes")
         return block_threads
-    for threads in range(DIRECT_BLOCK_THREADS, WAVE - 1, -WAVE):
-        if lanes_per_tok % threads == 0:
-            return threads
     return DIRECT_BLOCK_THREADS
 
 

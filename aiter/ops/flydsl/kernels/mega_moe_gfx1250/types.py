@@ -113,7 +113,6 @@ class Stage2ScatterContext:
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
     # S1F has not dispatched the wire yet: its consumer owns A/scale repacking.
-    stage1_a_row_major: bool = False
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

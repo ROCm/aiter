@@ -331,10 +331,6 @@ class _Dispatch:
         hidden_states and 0 on bf16, else its MX rows."""
         if self._quant_payload is None:
             return hidden_states, 0
-        if token_count == 0:
-            # An idle source still consumes peer routes and joins collectives.
-            # Its quantizer has no rows; the HIP launcher rejects a zero grid.
-            return self._quant_payload[:0], self._quant_scales.data_ptr()
         # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
         # copy on the far side. Destination-independent, so the bytes are the
         # same either way; the preshuffle cannot move with it, because its

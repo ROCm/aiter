@@ -788,13 +788,8 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
-    _apre_override = os.environ.get("AITER_TDM_A_PRESHUFFLE")
-    if _apre_override not in (None, ""):
-        if _apre_override not in ("0", "1"):
-            raise ValueError("AITER_TDM_A_PRESHUFFLE must be 0 or 1")
-        a_preshuffle = int(_apre_override)
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
-    a_preshuffled = bool(_a_preshuffle_requested)
+    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -1060,7 +1055,7 @@ def _grouped_a8w4_tdm_moe(
             }
     _apre_row_to_token = (
         torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
-        if a_preshuffled and not _compact
+        if a_preshuffled
         else None
     )
     _fuse_psum_quant = (
@@ -1267,7 +1262,9 @@ def _grouped_a8w4_tdm_moe(
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
         if _row_gather:
-            # Deduplicated dispatch needs one scatter into expert-row order.
+            # The wire carries one deduplicated payload per token/peer. Scatter
+            # it once into final expert-row order so GEMM1 remains a contiguous
+            # TDM load instead of repeating indexed gathers for every K tile.
             a1_payload, a1_scale = flydsl_moe_scatter_copy_compact(
                 a1_payload,
                 a1_scale,
@@ -1279,24 +1276,6 @@ def _grouped_a8w4_tdm_moe(
             )
             _row_gather = False
             _a1_wire_stride = 0
-        if a_preshuffled and not getattr(stage2_scatter, "stage1_a_row_major", False):
-            from .kernels.mega_moe_gfx1250.compact_preshuffle import (
-                compact_fp4_preshuffle,
-            )
-
-            a1_payload, a1_scale = compact_fp4_preshuffle(
-                a1_payload,
-                a1_scale,
-                psum,
-                rows=contiguous_m,
-                k=model_dim,
-                experts=E,
-                align=_align_m,
-                wmma_rep=wmma_rep,
-            )
-            _a1_wire_stride = 0
-            _row_major_ascale = False
-        # Active S1F reads and repacks the current wire only after dispatch flags.
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
         (
@@ -1523,30 +1502,29 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
-        if not _compact:
-            kernel_bench_callable.append(
-                (
-                    "quant_a1",
-                    functools.partial(
-                        flydsl_moe_fused_quant_preshuffle,
-                        hidden_states.reshape(1, token_num, _src_width),
-                        1,
-                        contiguous_m,
-                        wmma_rep=wmma_rep,
-                        quant_mode=_quant_mode,
-                        masked_m=None,
-                        topids_to_rows=topids_to_rows,
-                        source_topk=topk,
-                        num_valid_routes=_ep_nvr,
-                        prequantized_scale=src_a1_scale if _prequantized else None,
-                        out_payload=a1_payload,
-                        out_scale=a1_scale,
-                        row_to_token=_apre_row_to_token,
-                        row_major_scale=_row_major_a1,
-                        payload_preshuffled=a_preshuffled,
-                    ),
-                )
+        kernel_bench_callable.append(
+            (
+                "quant_a1",
+                functools.partial(
+                    flydsl_moe_fused_quant_preshuffle,
+                    hidden_states.reshape(1, token_num, _src_width),
+                    1,
+                    contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode,
+                    masked_m=None,
+                    topids_to_rows=topids_to_rows,
+                    source_topk=topk,
+                    num_valid_routes=_ep_nvr,
+                    prequantized_scale=src_a1_scale if _prequantized else None,
+                    out_payload=a1_payload,
+                    out_scale=a1_scale,
+                    row_to_token=_apre_row_to_token,
+                    row_major_scale=_row_major_a1,
+                    payload_preshuffled=a_preshuffled,
+                ),
             )
+        )
         if not _fuse_quant:
             kernel_bench_callable.append(
                 (
@@ -1694,7 +1672,6 @@ def _grouped_a8w4_tdm_moe(
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
-                    **_ep_gemm2_kwargs,
                 ),
             )
         )
@@ -1918,7 +1895,7 @@ def grouped_gemm_gfx1250_a8w4(
     n_warp = 4
     num_buffers = 2
     cfg_row = _find_grouped_config(
-        token_num=_csv_tokens,
+        token_num=_get_padded_m(_csv_tokens),
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,

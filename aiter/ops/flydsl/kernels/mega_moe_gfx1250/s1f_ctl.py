@@ -63,17 +63,11 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: VGPRs and LDS allow would hang, not just run slow.
 _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
-_S1F_GROUP_M = int(os.environ.get("AITER_MEGA_S1F_GROUP_M", "8"))
-if _S1F_GROUP_M < 1:
-    raise ValueError("AITER_MEGA_S1F_GROUP_M must be >= 1")
-_S1F_APRE_INPUT = os.environ.get("AITER_MEGA_S1F_APRE_INPUT")
-if _S1F_APRE_INPUT is not None and _S1F_APRE_INPUT not in ("0", "1"):
-    raise ValueError("AITER_MEGA_S1F_APRE_INPUT must be 0 or 1")
+_S1F_GROUP_M = 8
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
-#: Automatic steps over this bound keep dispatch + GEMM1. Explicit
-#: AITER_TDM_A_PRESHUFFLE=1 lets M256 prefill steps use the APRE S1F variant.
+#: Automatic steps over this bound keep dispatch + GEMM1.
 _S1F_MAX_RECV = 4096
 #: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
 #: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
@@ -413,15 +407,6 @@ class _Stage1Fusion:
 
     def max_recv(self) -> int:
         config = self.d.config
-        step = getattr(self.d, "_step", None)
-        if (
-            step is not None
-            and int(step.align_m) == 256
-            and os.environ.get("AITER_TDM_A_PRESHUFFLE") == "1"
-        ):
-            # Explicit APRE prefill opts into the wide M256 variant. All other
-            # tile, shape, activation and hook checks still apply.
-            return 0x7FFFFFFF
         return s1f_max_recv(config.world_size, config.topk)
 
     def step_off(self) -> bool:
@@ -499,13 +484,6 @@ class _Stage1Fusion:
         payload = d._quant_payload[:token_count]
         scale_rows = d._quant_scales[:token_count]
         wire = self.wire if run else None
-        if token_count == 0:
-            scales_ptr = (
-                wire.data_ptr() + config.dispatch_token_nbytes
-                if wire is not None
-                else d._quant_scales.data_ptr()
-            )
-            return payload, scales_ptr, None
         if self.wants_fused_quant(run):
             return (
                 payload,
@@ -550,8 +528,8 @@ class _Stage1Fusion:
 
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
-    def _apre_settings(self) -> tuple[int, int]:
-        """Resolve GEMM1 buffers/input once for its validator and launcher."""
+    def _apre_buffers(self) -> int:
+        """Resolve GEMM1 buffers once for its validator and launcher."""
         config = self.d.config
         step = getattr(self.d, "_step", None)
         tuned = (
@@ -573,10 +551,7 @@ class _Stage1Fusion:
         )
         if num_buffers not in (3, 4):
             raise ValueError("APRE S1F needs three or four input buffers")
-        input_preshuffled = (
-            int(_S1F_APRE_INPUT) if _S1F_APRE_INPUT is not None else int(not tuned)
-        )
-        return num_buffers, input_preshuffled
+        return num_buffers
 
     def _launcher(
         self,
@@ -594,9 +569,8 @@ class _Stage1Fusion:
         from .s1f_stage1 import make_s1f_stage1
 
         num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
-        input_preshuffled = 0
         if a_preshuffled:
-            num_buffers, input_preshuffled = self._apre_settings()
+            num_buffers = self._apre_buffers()
         config = self.d.config
         step = getattr(self.d, "_step", None)
         recv_bound = config.max_recv if step is None else step.recv_bound
@@ -607,7 +581,6 @@ class _Stage1Fusion:
             2
             if (
                 a_preshuffled
-                and not input_preshuffled
                 and num_buffers == 3
                 and int(recv_bound) >= 65536
                 and config.combine_slot_stride_for(0) == 10240
@@ -624,7 +597,6 @@ class _Stage1Fusion:
             m_warp,
             n_warp,
             a_preshuffled,
-            input_preshuffled,
             num_buffers,
             pair_cluster_n,
         )
@@ -657,7 +629,6 @@ class _Stage1Fusion:
                 m_warp=m_warp,
                 n_warp=n_warp,
                 a_preshuffled=a_preshuffled,
-                a_input_preshuffled=input_preshuffled,
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
@@ -758,6 +729,7 @@ class _Stage1Fusion:
         swiglu_limit=7.0,
         stream=None,
         stage1_quant_out=0,
+        quant_payload_preshuffled=0,
         quant_scale=None,
         quant_wmma_rep=1,
         cluster_m=-1,
@@ -777,6 +749,8 @@ class _Stage1Fusion:
         **_unused,
     ):
         """GEMM1 launch stand-in: runs this layer's dispatch and GEMM1."""
+        # This hook consumes row-major wire; the flag selects APRE A2 output.
+        a_preshuffled = quant_payload_preshuffled
         step = self.step
         if step is None:
             raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
@@ -804,7 +778,7 @@ class _Stage1Fusion:
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
         if a_preshuffled:
-            apre_buffers, _ = self._apre_settings()
+            apre_buffers = self._apre_buffers()
             got.update(m_warp=m_warp, n_warp=n_warp, num_buffers=num_buffers)
             want.update(
                 m_warp=2,
