@@ -776,6 +776,98 @@ def _launch_a8w8_mxfp8_gemm(
     return Y
 
 
+def _select_a8w8_mxfp8_kid(
+    direction: str, M: int, N: int, K: int, arch: str, cu_num: int
+) -> int | None:
+    """Pick an a8w8_mxfp8 (plain) kid for the shape.
+
+    One tile per block: the largest of 256x256 / 256x128 / 128x128 whose tile
+    count exceeds half the CUs (else 128x128); the boundary-free 256x256
+    ("nob") when M and N are multiples of 256. When that leaves CUs idle and
+    K >= 4096, the split-K kid whose auto split (see :func:`_a8w8_mxfp8_plan`)
+    fills the most CUs, larger tiles first.
+    """
+    kids = get_registry(_A8W8_MXFP8_1X32_FAMILY, arch, cu_num)
+    sizes = ((256, 256), (256, 128), (128, 128))
+    want = next(
+        (s for s in sizes if -(-M // s[0]) * -(-N // s[1]) > cu_num // 2), sizes[-1]
+    )
+    best = None
+    for kid, instance in kids.items():
+        if instance.co_variant not in ("nob", "np"):
+            continue
+        if not a8w8_mxfp8_kid_runs(instance, M, N, K, 0, direction):
+            continue
+        rank = ((instance.B_M, instance.B_N) != want, instance.co_variant != "nob", kid)
+        if best is None or rank < best[0]:
+            best = (rank, kid)
+    if best is None or -(-M // want[0]) * -(-N // want[1]) >= cu_num or K < 4096:
+        return None if best is None else best[1]
+    best_sk = None
+    for kid, instance in kids.items():
+        if instance.co_variant != "sk":
+            continue
+        split, _ = _a8w8_mxfp8_plan(instance, M, N, K, 0, cu_num)
+        if split <= 1 or not a8w8_mxfp8_kid_runs(instance, M, N, K, split, direction):
+            continue
+        tiles = -(-M // instance.B_M) * -(-N // instance.B_N)
+        rank = (-tiles * split, -instance.B_M * instance.B_N, kid)
+        if best_sk is None or rank < best_sk[0]:
+            best_sk = (rank, kid)
+    return best[1] if best_sk is None else best_sk[1]
+
+
+def gemm_a8w8_mxfp8_opus(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """gfx950 MXFP8 1x32 GEMM for plain NT / NN / TT / TN operand storage.
+
+    Computes Y[M, N] = XQ[M, K] @ WQ[N, K]^T on logical shapes; the storage is
+    read from the strides (see ``_mxfp8_direction``), so pass the transposed
+    view of a [K, M] A or of a [K, N] B, never a copy. WQ is not shuffled
+    (the shuffle_weight NT input belongs to ``gemm_a8w8_mxfp8_bpreshuffle``).
+    x_scale [M, K/32] and w_scale [N, K/32] are row-major E8M0 in every layout.
+    Output is BF16.
+
+    ``kernelId`` runs that kid (split-K kids pick their split); otherwise one
+    is picked by shape.
+    """
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError("gemm_a8w8_mxfp8_opus expects 2D XQ / WQ")
+    if dtype != torch.bfloat16:
+        raise ValueError("gemm_a8w8_mxfp8_opus writes BF16 only")
+    direction = _mxfp8_direction(XQ, WQ)
+    if direction is None:
+        raise ValueError(
+            f"gemm_a8w8_mxfp8_opus needs dense [M, K] / [K, M] XQ and [N, K] / [K, N] "
+            f"WQ storage; got XQ strides {tuple(XQ.stride())}, WQ strides {tuple(WQ.stride())}"
+        )
+    M, K = map(int, XQ.shape)
+    N = int(WQ.shape[0])
+    if out is None:
+        out = torch.empty((M, N), dtype=dtype, device=XQ.device)
+    elif tuple(out.shape) != (M, N) or out.dtype != dtype:
+        raise ValueError(
+            f"out must be {dtype} [{M}, {N}], got {out.dtype} {tuple(out.shape)}"
+        )
+    if kernelId is None:
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+        kernelId = _select_a8w8_mxfp8_kid(direction, M, N, K, arch, cu_num)
+        if kernelId is None:
+            raise ValueError(
+                f"no {direction} MXFP8 1x32 kernel supports M={M}, N={N}, K={K} on "
+                f"{arch} (K % 256 and N % 16 must be 0; A stored [K, M] needs M % 16)"
+            )
+    return _launch_a8w8_mxfp8_gemm(XQ, WQ, out, x_scale, w_scale, kid=int(kernelId))
+
+
 def _validate_a8w8_mxscale_bmm_tensors(
     XQ: Tensor,
     WQ: Tensor,

@@ -13,8 +13,8 @@ by shuffle_mxfp8_bpreshuffle_scale (whose layout test_w_scale_layout checks).
 gfx950 also checks the OPUS MXFP8 1x32 backends: every kid of a8w8_mxfp8
 (plain NT / NN / TT / TN) and of a8w8_mxfp8_bpreshuffle (NT, shuffled B)
 (split-K kids at S = 2 / 4), the public route of a libtype "opus" tuned row
-(injected, not read from the production CSVs), outputs of 4 GiB and more and
-the shapes the launchers must reject.
+(injected, not read from the production CSVs), outputs of 4 GiB and more, the
+shapes the launchers must reject and the gemm_a8w8_mxfp8_opus API.
 """
 
 import argparse
@@ -312,6 +312,55 @@ def check_opus_rejects():
     return rows
 
 
+@benchmark()
+def test_opus_api(m, n, k, layout):
+    """gemm_a8w8_mxfp8_opus on plain NT / NN / TT / TN storage, kid picked by shape."""
+    from aiter.ops.opus import gemm_a8w8_mxfp8_opus
+    from aiter.ops.opus.gemm_op_a8w8 import _select_a8w8_mxfp8_kid
+
+    xq, x_scale, wq, w_scale, a, b = opus_inputs(m, n, k, layout)
+    y, us = run_perftest(gemm_a8w8_mxfp8_opus, a, b, x_scale, w_scale)
+    err = opus_err(xq, x_scale, wq, w_scale, y)
+    assert err == 0, f"API {layout} M={m} N={n} K={k}: err {err}"
+    kid = _select_a8w8_mxfp8_kid(layout, m, n, k, get_gfx(), get_cu_num())
+    return {"kernel": opus_registry()[kid].name, "us": round(us, 2), "err": err}
+
+
+def check_opus_api():
+    """gemm_a8w8_mxfp8_opus: explicit kernelId + out, unsupported storage and
+    shapes rejected."""
+    from aiter.ops.opus import gemm_a8w8_mxfp8_opus
+
+    kids = opus_registry()
+    sk = next(kid for kid, inst in kids.items() if inst.co_variant == "sk")
+    rows = []
+    # A split-K kid by kernelId (it picks its split) into the caller's buffer.
+    xq, x_scale, wq, w_scale, a, b = opus_inputs(304, 416, 1024, "TN")
+    out = torch.full((304, 416), float("nan"), dtype=dtypes.bf16)
+    y = gemm_a8w8_mxfp8_opus(a, b, x_scale, w_scale, kernelId=sk, out=out)
+    err = opus_err(xq, x_scale, wq, w_scale, y)
+    assert (
+        y.data_ptr() == out.data_ptr() and err == 0
+    ), f"kernelId {sk} + out: err {err}"
+    rows.append({"case": "kernelId (split-K) + out", "kid": sk, "ok": True})
+    padded = torch.empty(416, 1024 + 64, dtype=wq.dtype)[:, :1024]
+    padded.copy_(wq)
+    cases = {
+        "non-dense WQ": (xq, padded, "needs dense"),
+        # A stored [K, M] needs M % 16; 312 % 16 = 8.
+        "TT with M % 16": (*opus_inputs(312, 416, 768, "TT")[4:], "no TT MXFP8"),
+    }
+    for case, (aa, bb, match) in cases.items():
+        try:
+            gemm_a8w8_mxfp8_opus(aa, bb, x_scale, w_scale)
+            rejected = False
+        except ValueError as e:
+            rejected = match in str(e)
+        assert rejected, f"API accepted: {case}"
+        rows.append({"case": case, "kid": None, "ok": rejected})
+    return rows
+
+
 def opus_cases(mnks, family, layouts):
     """(m, n, k, family, layout, kid, split_k) for every kid of ``family`` that
     runs the shape."""
@@ -433,6 +482,15 @@ def main():
         "gemm_a8w8_mxfp8_bpreshuffle OPUS route", [test_opus_route(*r) for r in route]
     )
     summarize("OPUS MXFP8 1x32 rejects", check_opus_rejects())
+    summarize(
+        "gemm_a8w8_mxfp8_opus",
+        [
+            test_opus_api(*mnk, layout)
+            for mnk in args.opus_mnk
+            for layout in args.layout
+        ],
+    )
+    summarize("gemm_a8w8_mxfp8_opus checks", check_opus_api())
 
 
 if __name__ == "__main__":
