@@ -4,12 +4,10 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value as _raw
 
 from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
@@ -410,10 +408,11 @@ class AS2RLoader:
         addr_hi = lds_base + (row_i32 + _c(col_lo + fx.Int32(16))) * fx.Int32(4)
         # Row mi * 16 + lane % 16: the swizzle only sees lane % 16, so mi is an immediate offset.
         imm = mi * 16 * self._k_step_bytes
-        v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+        # Inline asm: FlyDSL 0.5.3 LDS reads cannot be marked noalias vs the in-flight A LDS DMA.
+        v4 = fx.Vector.make_type(4, fx.Int32)
         pair = llvm.inline_asm(
-            ir.Type.parse("!llvm.struct<(vector<4xi32>, vector<4xi32>)>"),
-            [_raw(addr_lo), _raw(addr_hi)],
+            llvm.StructType.get_literal([v4, v4]),
+            [addr_lo.ir_value(), addr_hi.ir_value()],
             f"ds_read_b128 $0, $2 offset:{imm}\nds_read_b128 $1, $3 offset:{imm}\ns_waitcnt lgkmcnt(0)",
             "=&v,=&v,v,v",
             has_side_effects=True,
