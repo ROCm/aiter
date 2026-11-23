@@ -1805,6 +1805,13 @@ def plan_query_tile(group, hk, query_lens, prefix_lens, query_tile: int) -> int:
     return _tile_rows(group, query_tile, int(query_lens[0]) if full else 0, full)
 
 
+def whole_task_rows(group, hk, query_tile: int) -> int:
+    """Rows of one request, in whole `query_tile`-row tiles, whose FP8 plan keeps its tasks
+    whole: allocate_plan splits a plan of fewer tasks than min(CUs, SPLIT_TASKS)."""
+    slices = _cdiv(query_tile * group, 128)
+    return query_tile * _cdiv(min(get_cu_num(), SPLIT_TASKS), hk * slices)
+
+
 def packed_block_starts(query_lens, prefix_lens):
     """Each request's first block in the FP8 pack's four-token blocks of every request with
     queries (a request's ceil(length / 4) blocks, in request order)."""

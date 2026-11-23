@@ -11,8 +11,9 @@ direct kernels compile in). A call "compiles" when it adds a .pkl file to the ca
 directory (FlyDSL writes one per compiled kernel) or a key to the kernels' ``_COMPILED``
 tables (AITER's guard of every compile).
 
-    warm       warmup, then a sweep of layouts: no sweep call compiles (the warmup did)
-    cold       the sweep alone: its first call compiles (the counter works)
+    warm            warmup, then a sweep of layouts: none of its calls compiles
+    warm-invariant  the same with batch_invariant=True in both
+    cold            the sweep alone: its first call compiles (the counter works)
 
 gfx950 only: the cache (K|V records, strided rows) is read in place there only,
 and the layouts below are those of gfx950's 1536-row union gate; other architectures
@@ -124,6 +125,7 @@ def child(mode, group, wide, cache_dir):
             "softmax_scale": SCALE,
             "out": torch.empty_like(q),
             "kv_slots": slots,
+            "batch_invariant": mode == "warm-invariant",
         }
         if qsa.qsa_sparse_prefill_problem(q, pool.k, pool.v, indices, **kwargs):
             return False
@@ -184,15 +186,16 @@ def compiles(record):
     }
 
 
-def check(group, wide):
-    warm = run_child("warm", group, wide)
+def check(group, wide, mode="warm"):
+    warm = run_child(mode, group, wide)
     layouts = 2 + (group in (6, 3))
-    assert len(warm["warmed"]) == layouts, f"g{group}: warmed {warm['warmed']}"
+    assert len(warm["warmed"]) == layouts, f"{mode} g{group}: warmed {warm['warmed']}"
     assert warm["after_warmup"][0] > 0 and warm["after_warmup"][1] > 0, warm
     busy = {k: v for k, v in compiles(warm).items() if v != (0, 0)}
-    assert not busy, f"g{group} wide={wide}: served calls compiled after warmup: {busy}"
+    assert not busy, f"{mode} g{group} wide={wide}: compiled after warmup: {busy}"
     print(
-        f"g{group} wide={wide}: warmup {warm['after_warmup']}, 0 compiles in {len(SWEEP)} calls"
+        f"{mode} g{group} wide={wide}: warmup {warm['after_warmup']}, "
+        f"0 compiles in {len(SWEEP)} calls"
     )
     return warm
 
@@ -211,6 +214,7 @@ def main():
         return
     for group in args.group:
         check(group, False)
+        check(group, False, "warm-invariant")
     if 6 in args.group:
         check(6, True)
         cold = compiles(run_child("cold", 6, False))

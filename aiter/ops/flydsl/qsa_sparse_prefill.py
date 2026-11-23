@@ -658,31 +658,52 @@ def qsa_sparse_prefill_problem(
     return checked.message if isinstance(checked, _Rejected) else None
 
 
+# A prefix keeps a request off the full-prefill tiles (BQ21/BQ42) in both batch modes.
+_WARMUP_PREFIX = 4
+
+
 def _warmup_layouts(group, hk):
-    """Request lengths, none with a prefix, of one call per kernel-variant class of Q
-    heads per KV head `group` and `hk` KV heads. A call's variants follow from whether
-    it gets a union plan (from `_union_min_rows` rows) and that plan's query tile; the
-    rest of what a variant compiles in (heads, scale, width, stride, pool span) is the
-    caller's and fixed across calls."""
-    union_rows = _union_min_rows(group)
-    # Direct kernels only; then the base tile (a second request keeps a full prefill off
-    # the wide tiles).
-    layouts = [(max(union_rows - 1, 1),), (-(-union_rows // 2),) * 2]
-    for tile in (21, 42):
-        # The first row count that has a union plan and takes the wide tile (a device
-        # with few CUs takes it from fewer rows than the union gate).
-        rows = max(prepare.wide_tile_rows(tile), union_rows)
-        if prepare.plan_query_tile(group, hk, (rows,), (0,), 32) == tile:
-            layouts.append((rows,))
-    return tuple(layouts)
+    """(query_lens, prefix_lens) of one call per kernel-variant class of Q heads per KV
+    head `group` and `hk` KV heads, in both batch modes and for every K/V dtype the
+    architecture takes. A call's variants follow from whether it gets a union plan (from
+    `_union_min_rows` rows; with batch_invariant=True per request), that plan's query
+    tile, and for FP8 K/V whether the plan splits its tasks (below
+    `prepare.whole_task_rows`); the rest of what a variant compiles in (heads, width,
+    stride, pool span, K/V dtype and scale layout, batch mode) is the caller's and fixed
+    across calls."""
+    layouts = []
+    for fp8 in (None, "tensor", "token") if get_gfx_runtime() == "gfx942" else (None,):
+        union_rows = _union_min_rows(group, fp8)
+        # Direct kernels only; then the base tile and each wide tile the policy takes.
+        layouts.append(((max(union_rows - 1, 1),), (0,)))
+        union = [((union_rows,), (_WARMUP_PREFIX,))]
+        for tile in (21, 42):
+            # The first row count that has a union plan and takes the wide tile (a device
+            # with few CUs takes it from fewer rows than the union gate).
+            rows = max(prepare.wide_tile_rows(tile), union_rows)
+            if prepare.plan_query_tile(group, hk, (rows,), (0,), 32) == tile:
+                union.append(((rows,), (0,)))
+        for query_lens, prefix_lens in union:
+            layouts.append((query_lens, prefix_lens))
+            if fp8 is not None:
+                # And the same tile with whole tasks (a split plan keeps whole union
+                # tiles; an unsplit one may take core tiles).
+                tile = prepare.plan_query_tile(group, hk, query_lens, prefix_lens, 32)
+                rows = max(query_lens[0], prepare.whole_task_rows(group, hk, tile))
+                layouts.append(((rows,), prefix_lens))
+    return tuple(dict.fromkeys(layouts))
 
 
-def _prefill_selection(query_lens, topk, device):
-    """indices [rows, 4 topk + 3] of requests without a prefix, in the layout the op
-    takes: the row at request position p (v = p + 1 tokens) selects its last
-    min(v // 4, topk) complete four-token blocks, then its v % 4 tail tokens; the rest of
-    the row is -1."""
-    visible = torch.cat([torch.arange(1, n + 1, device=device) for n in query_lens])
+def _prefill_selection(query_lens, prefix_lens, topk, device):
+    """indices [rows, 4 topk + 3] in the layout the op takes: the row at request position
+    p (v = prefix + p + 1 tokens) selects its last min(v // 4, topk) complete four-token
+    blocks, then its v % 4 tail tokens; the rest of the row is -1."""
+    visible = torch.cat(
+        [
+            torch.arange(p + 1, p + n + 1, device=device)
+            for n, p in zip(query_lens, prefix_lens)
+        ]
+    )
     first = 4 * (visible // 4 - topk).clamp(min=0)
     indices = first[:, None] + torch.arange(4 * topk + 3, device=device)
     return torch.where(indices < visible[:, None], indices, -1).to(torch.int32)
@@ -694,13 +715,16 @@ def qsa_sparse_prefill_warmup(
     """Compile the kernels the op's calls can use, so that no served call compiles them.
 
     ``run(q, indices, query_lens, prefix_lens)`` makes one call to the op the way the
-    caller serves it (its K/V, scale, slot table and out), and returns whether it did;
-    the compile keys are those of that call. It is called once per kernel-variant
-    class, on synthetic Q (zeros) and indices, with requests of no prefix: below the
-    union threshold, over it, and at each wide tile's first row count where the tile
-    policy takes one. Returns the request lengths for which ``run`` returned true; none
-    on an architecture other than gfx942 and gfx950 (which have no tile policy), or when
-    `selection_width` is not a width the op takes.
+    caller serves it (its K/V of each request's prefix_lens[i] + query_lens[i] tokens,
+    scale, slot table, out, batch mode and K/V dtype), and returns whether it did; the
+    compile keys are those of that call. It is called once per kernel-variant class of
+    either batch mode and every K/V dtype the architecture takes, on synthetic Q (zeros)
+    and indices: below the union threshold, over it with a short prefix, at each wide
+    tile's first row count where the tile policy takes one, and (gfx942, for FP8 K/V)
+    with as many tasks as keep a plan unsplit. K/V values are not read for compiling,
+    so any values do. Returns the (query_lens, prefix_lens) for which ``run`` returned
+    true; none on an architecture other than gfx942 and gfx950 (which have no tile
+    policy), or when `selection_width` is not a width the op takes.
     """
     if get_gfx_runtime() not in ("gfx942", "gfx950"):
         return ()
@@ -708,13 +732,14 @@ def qsa_sparse_prefill_warmup(
     if rest or topk % 256 or not 256 <= topk <= 1024:
         return ()
     warmed = []
-    for query_lens in _warmup_layouts(num_q_heads // num_kv_heads, num_kv_heads):
+    for layout in _warmup_layouts(num_q_heads // num_kv_heads, num_kv_heads):
+        query_lens, prefix_lens = layout
         q = torch.zeros(
             sum(query_lens), num_q_heads, 256, dtype=torch.bfloat16, device=device
         )
-        indices = _prefill_selection(query_lens, topk, device)
-        if run(q, indices, query_lens, (0,) * len(query_lens)):
-            warmed.append(query_lens)
+        indices = _prefill_selection(query_lens, prefix_lens, topk, device)
+        if run(q, indices, query_lens, prefix_lens):
+            warmed.append(layout)
     torch.cuda.synchronize(device)
     return tuple(warmed)
 
