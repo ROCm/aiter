@@ -143,6 +143,19 @@ def test_rmsnorm2d_row_tail(dtype, m, n):
         assert err == 0, msg + name
 
 
+def test_rmsnorm2d_plain(dtype, n):
+    """rms_norm (no residual) matches torch, and a row's result does not depend on M."""
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    x = torch.randn((4099, n), dtype=dtype, device="cuda")
+    y = aiter.rms_norm(x, weight, 1e-5)
+    ref = F.rms_norm(x.float(), (n,), weight.float(), 1e-5)
+    msg = f"[plain] n: {n}, dtype: {dtype}"
+    assert checkAllclose(ref, y.float(), atol=0.03, msg=msg) == 0, msg
+    for m in (1, 3, 1024):
+        part = aiter.rms_norm(x[:m].contiguous(), weight, 1e-5)
+        assert torch.equal(part, y[:m]), f"{msg}, M={m} differs from M=4099"
+
+
 def test_rmsnorm2d_fuseAdd_deterministic(dtype, m, n, runs=5):
     """The block reduction does not race: repeated calls on the same inputs agree bit for bit."""
     x = torch.randn((m, n), dtype=dtype, device="cuda")
@@ -245,6 +258,11 @@ for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+print("\nstart plain rmsnorm tests")
+for dtype in [d for d in l_dtype if d in (dtypes.fp16, dtypes.bf16)]:
+    for n in [1024, 2048, 3584, 4096]:
+        test_rmsnorm2d_plain(dtype, n)
 
 print("\nstart row tail and determinism tests")
 test_rmsnorm2d_tail_dispatch_follows_device()

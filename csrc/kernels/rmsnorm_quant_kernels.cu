@@ -44,7 +44,13 @@ __global__ void add_rmsnorm_quant_kernel(
         static_assert(thread_data_size * sizeof(DTYPE_I) % load_chunk_bytes == 0, "thread_data_size * sizeof(DTYPE_I) must be a multiple of load_chunk_bytes");
         static constexpr int32_t load_vec_size = load_chunk_bytes / sizeof(DTYPE_I);
         static constexpr int32_t num_load_inst = thread_data_size / load_vec_size;
-        static constexpr int32_t load_aux = (num_load_inst > 1 && !interleave) ? RT : GROUP_NT;
+#if defined(__gfx1250__)
+        // The last-use hint costs the plain norm bandwidth at large M on gfx1250.
+        static constexpr bool plain_load = !ADD_RESIDUAL && !FUSE_QUANT;
+#else
+        static constexpr bool plain_load = false;
+#endif
+        static constexpr int32_t load_aux = ((num_load_inst > 1 && !interleave) || plain_load) ? RT : GROUP_NT;
         int64_t idx = blockIdx.x * num_row;
         if (idx >= m)
         {
@@ -669,15 +675,19 @@ __global__ void add_rmsnorm_quant_kernel(
         }
     }
 
+// gfx1250: half the threads per row up to n = 4096, faster from M ~1K rows up.
 #define RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 1024) { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 128, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        if (is_gfx1250) { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 16, ADD_RESIDUAL, FUSE_QUANT); } \
+        else { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 128, 8, ADD_RESIDUAL, FUSE_QUANT); } \
     } else if (n <= 2048) { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        if (is_gfx1250) { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 128, 16, ADD_RESIDUAL, FUSE_QUANT); } \
+        else { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 8, ADD_RESIDUAL, FUSE_QUANT); } \
     } else if (n <= 4096){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); \
+        if (is_gfx1250) { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 128, 32, ADD_RESIDUAL, FUSE_QUANT); } \
+        else { ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); } \
     } else if (n <= 6144){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 8192){ \
@@ -711,6 +721,7 @@ __global__ void add_rmsnorm_quant_kernel(
         const HipDeviceGuard device_guard(input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
+        static const bool is_gfx1250 = get_gpu_arch() == "gfx1250";
 
         if(out.dtype() == AITER_DTYPE_bf16)
         {
