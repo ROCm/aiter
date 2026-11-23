@@ -67,19 +67,9 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
     local_max = fabs_f32(vals[0])
     for q in range_constexpr(1, scatter_vec):
         local_max = local_max.maximumf(fabs_f32(vals[q]))
-    max_bits = local_max.bitcast(fx.Int32)
-    for xor_lane in (1, 2):
-        if xor_lane < 32 // scatter_vec:
-            # ds_bpermute: fx.shuffle_xor lowers to ds_swizzle_b32 here (different ISA and schedule).
-            remote_bits = rocdl.ds_bpermute(
-                T.i32,
-                (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
-                max_bits,
-            )
-            remote_max = fx.Int32(remote_bits).bitcast(fx.Float32)
-            local_max = local_max.maximumf(remote_max)
-            max_bits = local_max.bitcast(fx.Int32)
     scale_group_lanes = 32 // scatter_vec
+    # Lowers to v_mov_b32_dpp quad_perm (xor 1, 2) + v_maximum3: no ds_bpermute address VGPRs or lgkmcnt waits.
+    local_max = fx.coop.warp_max(local_max, width=scale_group_lanes)
     leader_lane = lane & fx.Int32(~(scale_group_lanes - 1))
     if group_lane is None:
         group_lane = lane
