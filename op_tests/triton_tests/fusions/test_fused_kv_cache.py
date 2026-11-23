@@ -262,6 +262,66 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.parametrize("T, QH", [(36864, 128)])
+def test_fused_qk_rope_cat_and_cache_mla_int64_offsets(T: int, QH: int):
+    # q_out row offsets (T * QH * 576) and transposed q_nope head offsets
+    # ((QH - 1) * T * 512) both pass 2**31 - 1 in one launch.
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("gfx1250 runs the gluon kernel")
+    if torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3:
+        pytest.skip("Needs 32 GiB of device memory")
+    D_lora, D_pe, chunk = 512, 64, 4096
+    assert T * QH * (D_lora + D_pe) > 2**31 - 1
+    assert (QH - 1) * T * D_lora > 2**31 - 1
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    # SGLang passes q_nope as the transposed (QH, T, D_lora) output of a BMM.
+    q_nope = torch.randn((QH, T, D_lora), dtype=dtype, device="cuda").transpose(0, 1)
+    q_pe = torch.randn((T, QH, D_pe), dtype=dtype, device="cuda")
+    k_lora = torch.randn((T, 1, D_lora), dtype=dtype, device="cuda") / 20
+    k_pe = torch.randn((T, 1, D_pe), dtype=dtype, device="cuda") / 20
+    positions = torch.arange(T, dtype=torch.int64, device="cuda")
+    inv_freq = 1e4 ** (-torch.arange(0, D_pe, 2, device="cuda") / D_pe)
+    freqs = positions[:, None].float() * inv_freq[None, :]
+    cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    slot_mapping = torch.randperm(T, device="cuda")
+
+    def run(chunk_size):
+        q_out = torch.empty((T, QH, D_lora + D_pe), dtype=e4m3_dtype, device="cuda")
+        k_pe_out = torch.empty_like(k_pe)
+        kv_cache = torch.zeros((T, 1, D_lora + D_pe), dtype=e4m3_dtype, device="cuda")
+        for s in range(0, T, chunk_size):
+            e = min(s + chunk_size, T)
+            # A contiguous q_nope chunk keeps all reference offsets below 2**31.
+            q_nope_s = q_nope[s:e] if chunk_size == T else q_nope[s:e].contiguous()
+            fused_qk_rope_cat_and_cache_mla(
+                q_nope_s,
+                q_pe[s:e],
+                k_lora[s:e],
+                k_pe[s:e],
+                kv_cache,
+                slot_mapping[s:e],
+                positions[s:e],
+                cos,
+                sin,
+                k_scale,
+                False,
+                q_out=q_out[s:e],
+                k_pe_out=k_pe_out[s:e],
+            )
+        return q_out, k_pe_out, kv_cache
+
+    for name, out, ref in zip(("q_out", "k_pe_out", "kv_cache"), run(T), run(chunk)):
+        torch.testing.assert_close(
+            out.view(torch.uint8),
+            ref.view(torch.uint8),
+            atol=0,
+            rtol=0,
+            msg=lambda m, name=name: f"{name}: {m}",
+        )
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH", [12, 16])  # 12: Kimi-K3's 96 heads at TP8
 @pytest.mark.parametrize("D_pe", [64])
@@ -971,7 +1031,7 @@ def test_fused_qk_rope_cosine_cache_llama(
     torch_value_cache = value_cache.clone()
     # slot_t = slot_mapping // block_size
     # slot_b = slot_mapping % block_size
-    slot_t = torch.arange(slot_mapping.shape[0], device="cuda")
+    slot_t = torch.arange(slot_mapping.shape[0]).to(slot_mapping.device)
     slot_b = slot_mapping
     if cache_dtype == torch.uint8:
         torch_key_cache = torch_key_cache.view(cache_dtype_actual)
@@ -1445,3 +1505,196 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     )
     n_written = int(valid.sum()) * KH * D
     assert n_ties <= n_written // 100, f"{n_ties} tie flips of {n_written} K values"
+
+
+_SEG_PAGE = 64
+_Q_PAD = 768
+
+
+def _skip_unless_gfx1250():
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("seg-packed KV pages are gfx1250 only")
+
+
+def _pack_mla_pages(token_major, page_size, d_nope):
+    """Relocate token-major (tokens, 1, D) rows into nope-then-rope pages."""
+    n, kh, d = token_major.shape
+    pages = token_major.reshape(n // page_size, page_size, kh, d)
+    nope = pages[..., :d_nope].reshape(n // page_size, page_size * kh * d_nope)
+    rope = pages[..., d_nope:].reshape(n // page_size, page_size * kh * (d - d_nope))
+    return torch.cat((nope, rope), dim=-1).reshape(n, kh, d)
+
+
+def _seg_case(b, b_slot, qh, cache_dtype):
+    d_lora, d_pe = 512, 64
+    dtype = torch.bfloat16
+    _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        b_slot,
+        1,
+        qh,
+        d_pe,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q = torch.randn((b_slot, qh, d_lora + d_pe), dtype=dtype, device="cuda")
+    q_nope, q_pe = q[:b].split((d_lora, d_pe), dim=-1)
+    k = torch.randn((b_slot, 1, d_lora + d_pe), dtype=dtype, device="cuda")
+    k_nope, k_pe = k.split((d_lora, d_pe), dim=-1)
+    slots = torch.tensor([62, 63, 64, 65, 127, 128, 200], device="cuda")
+    assert slots.numel() == b_slot
+    return {
+        "q_nope": q_nope.contiguous(),
+        "q_pe": q_pe.contiguous(),
+        "k_nope": k_nope.contiguous(),
+        "k_pe": k_pe.contiguous(),
+        "positions": positions,
+        "cos": cos,
+        "sin": sin,
+        "slots": slots,
+        "d_lora": d_lora,
+        "d_pe": d_pe,
+        "cache_dtype": cache_dtype,
+        "k_scale": torch.ones((), dtype=torch.float32, device="cuda"),
+    }
+
+
+def _run_seg(case, cache, seg_page_size, q_nope_prestored, q_pad):
+    d = case["d_lora"] + case["d_pe"]
+    q_out = None if q_pad is None else q_pad[..., :d]
+    if q_nope_prestored:
+        if q_out is None:
+            q_out = torch.empty(
+                (case["q_nope"].shape[0], case["q_nope"].shape[1], d),
+                dtype=case["q_nope"].dtype,
+                device="cuda",
+            )
+        q_out[..., : case["d_lora"]].copy_(case["q_nope"].to(q_out.dtype))
+    # The registered op rejects an explicit q_out_dtype=None. Omit it unless
+    # the caller allocated q_out in a dtype other than q_nope's.
+    extra = {}
+    if q_out is not None:
+        extra["q_out"] = q_out
+        if q_out.dtype != case["q_nope"].dtype:
+            extra["q_out_dtype"] = q_out.dtype
+    return fused_qk_rope_cat_and_cache_mla(
+        case["q_nope"],
+        case["q_pe"],
+        case["k_nope"],
+        case["k_pe"],
+        cache,
+        case["slots"],
+        case["positions"],
+        case["cos"],
+        case["sin"],
+        case["k_scale"],
+        False,
+        num_decode_toks_for_zeros=0,
+        apply_scale=(case["k_pe"].dtype != cache.dtype),
+        shuffled_kv_cache=False,
+        q_nope_prestored=q_nope_prestored,
+        seg_page_size=seg_page_size,
+        **extra,
+    )
+
+
+def _fresh_cache(n, cache_dtype):
+    return torch.full((n, 1, 576), 0.5, dtype=cache_dtype, device="cuda")
+
+
+@pytest.mark.parametrize(
+    "route,mixed,qh,cache_dtype,padded_q",
+    [
+        ("full", True, 8, torch.bfloat16, False),
+        ("full", False, 16, e4m3_dtype, True),
+        ("prestored", False, 8, e4m3_dtype, True),
+    ],
+)
+def test_seg_packed_mla_cache(route, mixed, qh, cache_dtype, padded_q):
+    _skip_unless_gfx1250()
+    b_slot = 7
+    b = 4 if mixed else b_slot
+    torch.manual_seed(0)
+    case = _seg_case(b, b_slot, qh, cache_dtype)
+    d = case["d_lora"] + case["d_pe"]
+    n = 256
+
+    def pads():
+        if not padded_q:
+            return None, None
+        major = torch.empty((b, qh, _Q_PAD), dtype=e4m3_dtype, device="cuda")
+        seg = torch.empty((b, qh, _Q_PAD), dtype=e4m3_dtype, device="cuda")
+        major.fill_(torch.tensor(2.0, dtype=e4m3_dtype, device="cuda"))
+        seg.copy_(major)
+        return major, seg
+
+    q_pad_major, q_pad_seg = pads()
+    tail = None if q_pad_seg is None else q_pad_seg[..., d:].clone()
+    cache_major = _fresh_cache(n, cache_dtype)
+    cache_seg = cache_major.clone()
+    prestored = route == "prestored"
+    nope_before = None
+    if prestored and q_pad_seg is not None:
+        nope_before = case["q_nope"].to(q_pad_seg.dtype).clone()
+
+    q_major, _, _, _ = _run_seg(case, cache_major, 0, prestored, q_pad_major)
+    q_seg, _, _, _ = _run_seg(case, cache_seg, _SEG_PAGE, prestored, q_pad_seg)
+
+    packed = _pack_mla_pages(cache_major, _SEG_PAGE, case["d_lora"])
+    torch.testing.assert_close(cache_seg, packed, atol=0, rtol=0)
+    # Unwritten slots stay at the sentinel, including across the page boundary.
+    assert not torch.equal(cache_seg.view(torch.uint8), cache_major.view(torch.uint8))
+    if prestored:
+        torch.testing.assert_close(
+            q_seg[..., case["d_lora"] :],
+            q_major[..., case["d_lora"] :],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            q_seg[..., : case["d_lora"]], nope_before, atol=0, rtol=0
+        )
+    else:
+        torch.testing.assert_close(q_seg, q_major, atol=0, rtol=0)
+    if tail is not None:
+        torch.testing.assert_close(q_pad_seg[..., d:], tail, atol=0, rtol=0)
+        torch.testing.assert_close(q_pad_major[..., d:], tail, atol=0, rtol=0)
+
+
+def test_seg_packed_mla_cache_cuda_graph():
+    _skip_unless_gfx1250()
+    torch.manual_seed(1)
+    case = _seg_case(7, 7, 8, torch.bfloat16)
+    sentinel = _fresh_cache(256, torch.bfloat16)
+    eager = sentinel.clone()
+    _run_seg(case, eager, _SEG_PAGE, False, None)
+
+    graphed = sentinel.clone()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _run_seg(case, graphed, _SEG_PAGE, False, None)
+    torch.cuda.current_stream().wait_stream(stream)
+    graphed.copy_(sentinel)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_seg(case, graphed, _SEG_PAGE, False, None)
+    # Capture itself does not publish the stores. Replay does.
+    graphed.copy_(sentinel)
+    graph.replay()
+    torch.testing.assert_close(graphed, eager, atol=0, rtol=0)
+
+
+def test_seg_packed_mla_cache_rejects_noncontiguous():
+    _skip_unless_gfx1250()
+    case = _seg_case(7, 7, 8, torch.bfloat16)
+    base = torch.zeros((256, 2, 576), dtype=torch.bfloat16, device="cuda")
+    view = base[:, :1, :]
+    assert not view.is_contiguous()
+    with pytest.raises(AssertionError, match="contiguous"):
+        _run_seg(case, view, _SEG_PAGE, False, None)

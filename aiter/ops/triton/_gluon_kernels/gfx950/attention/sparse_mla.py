@@ -47,7 +47,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
-from triton.language.target_info import is_hip_cdna4
+from triton.language.target_info import is_hip_cdna3, is_hip_cdna4
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -154,6 +154,9 @@ def _cache_load(
 
 @gluon.jit
 def _fp8_to_f32(x_u8):
+    # Scaled caches hold the arch's native fp8, which is fnuz on gfx942.
+    if is_hip_cdna3():
+        return x_u8.to(gl.float8e4b8, bitcast=True).to(gl.float32)
     return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
 
 

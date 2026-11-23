@@ -14,7 +14,7 @@ _MANIFESTS = (
         "f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         "mxfp6_mxfp4_c0_256_padk2",
         "a6w4_asm_tuned_gemm.csv",
-        25,
+        33,
         6,
     ),
     (
