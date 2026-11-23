@@ -3472,6 +3472,7 @@ def _get_compiled_token_multidest_compact_quant(
     topk: int,
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
+    mxfp8_copy: bool = False,
 ):
     """Compile and cache the compact-scale quant kernel (first of the pair)."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -3484,6 +3485,7 @@ def _get_compiled_token_multidest_compact_quant(
         topk=topk,
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
+        mxfp8_copy=mxfp8_copy,
     )
 
 
@@ -3495,6 +3497,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    mxfp8_copy: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3507,6 +3510,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        mxfp8_copy=mxfp8_copy,
     )
 
 
@@ -3555,6 +3559,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    mxfp8_copy: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3572,6 +3577,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         fuse_ep_psum=fuse_ep_psum,
         row_major_scale=row_major_scale,
         payload_preshuffled=payload_preshuffled,
+        mxfp8_copy=mxfp8_copy,
     )
 
 
@@ -3604,6 +3610,43 @@ def _routeks_ep_psum_args(device, ep_psum_params: dict | None):
         int(ep_psum_params["max_tok"]),
         int(ep_psum_params["slot_stride"]),
     )
+
+
+def _check_mxfp8_copy_out(hidden: torch.Tensor, mxfp8_copy_out) -> tuple:
+    rows, feat_dim = hidden.shape[0], hidden.shape[-1]
+    payload, scale = mxfp8_copy_out
+    if hidden.dtype != torch.bfloat16 or feat_dim % 32:
+        raise ValueError("the MXFP8 copy quantizes bf16 rows with K divisible by 32")
+    for t, shape in ((payload, (rows, feat_dim)), (scale, (rows, feat_dim // 32))):
+        if (
+            t.shape != shape
+            or t.element_size() != 1
+            or not t.is_contiguous()
+            or t.device != hidden.device
+        ):
+            raise ValueError(
+                f"mxfp8_copy_out wants contiguous 1-byte {shape} tensors on "
+                f"{hidden.device}, got {tuple(t.shape)} {t.dtype} on {t.device}"
+            )
+    return payload, scale
+
+
+def mxfp8_row_copy(hidden: torch.Tensor, mxfp8_copy_out) -> None:
+    """``mxfp8_copy_out`` filled by its own launch, for a quant that has no
+    copy to fold it into: the same bytes, from per_1x32_mx_quant_hip's kernel."""
+    from aiter import dtypes
+    from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+    hidden = hidden.reshape(-1, hidden.shape[-1])
+    payload, scale = _check_mxfp8_copy_out(hidden, mxfp8_copy_out)
+    if hidden.shape[0]:
+        dynamic_per_group_scaled_quant(
+            payload.view(dtypes.fp8),
+            hidden.contiguous(),
+            scale.view(dtypes.fp8_e8m0),
+            32,
+            shuffle_scale=False,
+        )
 
 
 def flydsl_moe_fused_quant_preshuffle(
@@ -3641,6 +3684,12 @@ def flydsl_moe_fused_quant_preshuffle(
     situ_linear_beta: float = 1.0,
     # (n,) int32 zeroed by the A-preshuffle scatter (route counter reset).
     clear_counter: torch.Tensor | None = None,
+    # (payload, scale): also write every source row as MXFP8, row-major
+    # (tokens, K) E4M3 + (tokens, K/32) E8M0 -- per_1x32_mx_quant_hip(fp8,
+    # e8m0)'s bytes -- e.g. for a shared expert reading the unrouted rows.
+    # Folded into the quant launch where the kernel takes it, its own launch
+    # otherwise; filled either way.
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3717,6 +3766,19 @@ def flydsl_moe_fused_quant_preshuffle(
             "fused grouped quant+preshuffle requires bf16 input "
             f"(got {grouped_in.dtype})"
         )
+    want_copy = mxfp8_copy_out is not None
+    copy_ptrs = ()
+    if want_copy:
+        if prequantized:
+            raise ValueError("mxfp8_copy_out quantizes bf16 rows, not a payload")
+        if activation:
+            raise ValueError("mxfp8_copy_out quantizes the input rows, not gate/up")
+        copy_ptrs = tuple(
+            ptr_arg(t.view(-1))
+            for t in _check_mxfp8_copy_out(
+                grouped_in.reshape(-1, grouped_in.shape[-1]), mxfp8_copy_out
+            )
+        )
     device = grouped_in.device
     # feat_dim is the FEATURE count, and a prequantized fp4 row carries two
     # features per byte -- taking shape[-1] there would halve every derived
@@ -3784,6 +3846,13 @@ def flydsl_moe_fused_quant_preshuffle(
         ).reshape(-1)
         numel = int(topids_to_rows_i32.numel())
         grid_blocks = (numel + warps_per_block - 1) // warps_per_block
+        if want_copy and source_topk > 0:
+            rows = grouped_in.numel() // grouped_in.shape[-1]
+            if numel != rows * int(source_topk):
+                raise ValueError(
+                    "mxfp8_copy_out needs one route map entry per source row "
+                    f"and route: {numel} != {rows} x {source_topk}"
+                )
         remap_rows = row_starts is not None
         fuse_ep_psum = ep_psum_params is not None
         if fuse_ep_psum:
@@ -3831,6 +3900,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 tdm_hidden_chunks=token_multidest_tdm_chunks(
                     feat_dim, wmma_rep, quant_mode, 1
                 ),
+                mxfp8_copy=want_copy,
             )
             _dispatch_compiled(
                 compact_launcher,
@@ -3841,6 +3911,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
+                *copy_ptrs,
                 current_stream_arg(),
             )
             return out_payload, out_scale
@@ -3862,6 +3933,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                mxfp8_copy=want_copy,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(
@@ -3872,6 +3944,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                *copy_ptrs,
                 current_stream_arg(),
             )
             return out_payload, out_scale
@@ -3884,6 +3957,8 @@ def flydsl_moe_fused_quant_preshuffle(
             and not fuse_ep_psum
         )
         if payload_preshuffled and (not prequantized or use_prequantized_apre_scatter):
+            if want_copy:
+                mxfp8_row_copy(grouped_in, mxfp8_copy_out)
             if row_to_token is None:
                 raise ValueError(
                     "A-preshuffle tile quant requires grouped-row -> token mapping"
@@ -3940,6 +4015,18 @@ def flydsl_moe_fused_quant_preshuffle(
         use_ksplit = (
             not row_major_scale and grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         )
+        # The modes the route-indexed build writes the copy in; an EP dead
+        # tail would leave its rows unwritten, so it takes the separate launch.
+        routeks_copy = (
+            want_copy
+            and source_topk > 0
+            and not remap_rows
+            and not fuse_ep_psum
+            and not row_major_scale
+            and num_valid_routes is None
+        )
+        if want_copy and not routeks_copy:
+            mxfp8_row_copy(grouped_in, mxfp8_copy_out)
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -3954,6 +4041,7 @@ def flydsl_moe_fused_quant_preshuffle(
             fuse_ep_psum=fuse_ep_psum,
             row_major_scale=row_major_scale,
             payload_preshuffled=payload_preshuffled,
+            mxfp8_copy=routeks_copy,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3982,10 +4070,13 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
+            *(copy_ptrs if routeks_copy else ()),
             current_stream_arg(),
         )
         return out_payload, out_scale
 
+    if want_copy:
+        mxfp8_row_copy(grouped_in, mxfp8_copy_out)
     grid_blocks = (n_rows + warps_per_block - 1) // warps_per_block
 
     launch = _get_compiled_fused_quant_preshuffle(
