@@ -582,6 +582,8 @@ void mhc_post_project_gfx950(aiter_tensor_t& projection,
                              aiter_tensor_t& post_mix,
                              aiter_tensor_t& comb_mix)
 {
+    // A failed check raises in the caller instead of ending the process.
+    aiter_detail::AiterThrowGuard throw_guard;
     const HipDeviceGuard guard(x.device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "mHC packed producer requires gfx950");
     const int m          = x.size(0);
@@ -630,6 +632,8 @@ void mhc_finalize_gfx950(aiter_tensor_t& post,
                          float post_mult,
                          int repeats)
 {
+    // A failed check raises in the caller instead of ending the process.
+    aiter_detail::AiterThrowGuard throw_guard;
     const HipDeviceGuard guard(out.device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "mHC finalizer requires gfx950");
     const int m          = out.size(0);

@@ -1492,6 +1492,57 @@ def test_mhc_post_pre_prefill_dispatch(
     return ret
 
 
+def test_mhc_prefill_launchers_raise():
+    """The two launchers of the gfx950 packed prefill route answer a tensor they
+    cannot take with RuntimeError. They are exported, so a direct call with a
+    wrong shape must not end the process."""
+    from aiter.ops import mhc as mhc_ops
+
+    m = 4096
+
+    def zeros(shape, dtype):
+        return torch.zeros(shape, dtype=dtype, device="cuda")
+
+    f32, b16 = dtypes.fp32, dtypes.bf16
+    # hidden 4096 where the producer takes 7168, and a (m, 4, 2) post mix
+    calls = {
+        "mhc_post_project_gfx950": lambda: mhc_ops.mhc_post_project_gfx950(
+            zeros((4, m, 32), f32),
+            zeros((4, m, 4), f32),
+            zeros((m, 4, 4096), b16),
+            zeros((m, 4096), b16),
+            zeros((m, 4, 4096), b16),
+            zeros((24, 4 * 4096), torch.int32),
+            zeros((m, 4), f32),
+            zeros((m, 4, 4), f32),
+        ),
+        "mhc_finalize_gfx950": lambda: mhc_ops.mhc_finalize_gfx950(
+            zeros((m, 4, 2), f32),
+            zeros((m, 4, 4), f32),
+            zeros((m, 7168), b16),
+            zeros((4, m, 32), f32),
+            zeros((4, m, 4), f32),
+            zeros((3,), f32),
+            zeros((24,), f32),
+            zeros((m, 4, 7168), b16),
+            zeros((7168,), b16),
+            1e-6,
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+        ),
+    }
+    for name, call in calls.items():
+        try:
+            call()
+        except RuntimeError as e:
+            assert "mHC gfx950" in str(e), str(e)
+        else:
+            raise AssertionError(f"{name} accepted a tensor of the wrong shape")
+
+
 def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     from aiter.ops.mhc import (
         mhc_res_ks,
@@ -1786,6 +1837,7 @@ if not args.hc_head:
             )
         ]
         print_json_table("mhc_post_pre prefill dispatch summary", df)
+        test_mhc_prefill_launchers_raise()
     else:
         aiter.logger.warning(
             "skip mhc_post_pre prefill dispatch cases: unmasked 256-CU gfx950 only"
