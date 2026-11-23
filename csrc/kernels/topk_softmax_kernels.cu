@@ -119,11 +119,16 @@ __launch_bounds__(TPB) __global__
     }
     __syncthreads();
 
+    // A row with no finite logit (all NaN or -inf) would normalize to a uniform
+    // 1/num_cols; it routes nowhere instead, with probability 0 everywhere.
+    const bool dead_row = float_max <= -FLT_MAX;
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const float val =
-            exp((fmaxf(static_cast<float>(input[thread_row_offset + ii]), -FLT_MAX) - float_max)) *
-            normalizing_factor;
+            dead_row ? 0.f
+                     : exp((fmaxf(static_cast<float>(input[thread_row_offset + ii]), -FLT_MAX) -
+                            float_max)) *
+                           normalizing_factor;
         output[output_row_offset + ii] = val;
     }
 }
@@ -411,6 +416,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
     thread_max        = thread_kvp.value;
     first_topk_expert = thread_kvp.key;
+    // A row with no finite logit (all NaN or -inf) loads as -FLT_MAX everywhere and
+    // would softmax to a uniform 1/E. It routes nowhere instead: k distinct ids at
+    // weight 0, as topk_gating weights a dead row.
+    const bool dead_row = thread_max <= -FLT_MAX;
 
     // From this point, thread max in all the threads have the max within the row.
     // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
@@ -470,7 +479,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            const float numer     = expf(max_val - thread_max);
+            const float numer     = dead_row ? 0.f : expf(max_val - thread_max);
             output[output_idx]    = pad ? 0.f : numer;
             indices[indices_idx]  = pad                  ? -1
                                     : should_process_row ? (expert - start_expert)
@@ -1043,6 +1052,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
     thread_max        = thread_kvp.value;
     first_topk_expert = thread_kvp.key;
+    // A row with no finite logit (all NaN or -inf) loads as -FLT_MAX everywhere and
+    // would softmax to a uniform 1/E. It routes nowhere instead: k distinct ids at
+    // weight 0, as topk_gating weights a dead row.
+    const bool dead_row = thread_max <= -FLT_MAX;
 
     // From this point, thread max in all the threads have the max within the row.
     // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
@@ -1102,7 +1115,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            const float numer     = expf(max_val - thread_max);
+            const float numer     = dead_row ? 0.f : expf(max_val - thread_max);
             output[output_idx]    = pad ? 0.f : numer;
             // Filtered-slot marker must sit OUTSIDE the valid id space
             // [0, NUM_EXPERTS + NUM_SHARED_EXPERTS): the shared ids occupy
