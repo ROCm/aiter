@@ -29,7 +29,9 @@ from .mega_moe_config import (
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
+    draft_shipped_precision,
     fixed_stage1_epoch_slot_count,
+    fused_layout_small_only,
     fused_layout_supported,
     large_m_mtprs_for,
     small_m_cu_supported,
@@ -137,6 +139,13 @@ class MegaMoEV2:
             large_m=(
                 fused
                 and large_m_enabled
+                # False for every layout unless AITER_MEGA_FUSED_DRAFT_LAYOUT=1 added small-input-only ones.
+                and not fused_layout_small_only(
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    experts=self.experts,
+                )
                 and self.mtpr
                 in large_m_mtprs_for(
                     world_size=self.world_size,
@@ -145,6 +154,20 @@ class MegaMoEV2:
                 )
             ),
         )
+        # MEGA_MOE_DRAFT_SHIPPED_PRECISION=1 on a draft layout: only the small-input route, whose kernels are then
+        # built without the FP8-row send, returns BF16 rows as the native path does. Refuse here what could only
+        # ever take the staged route (FP8 rows from capacity 1024), before anything is allocated.
+        self._bf16_return_only = draft_shipped_precision(
+            world_size=self.world_size, experts_per_rank=self.epr, model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+        )
+        if self._bf16_return_only and not self._bundle_plan.small_m_mtprs:
+            raise RuntimeError(
+                "MEGA_MOE_DRAFT_SHIPPED_PRECISION=1: this draft MoE instance "
+                f"(experts={self.experts} topk={self.topk} mtpr={self.mtpr}) has no small-input route, the only one "
+                "that returns BF16 rows; set AITER_MEGA_FUSED_DRAFT_LAYOUT=1 (routed=True, 256-CU gfx950), or serve "
+                "the draft natively"
+            )
         self._active_bundle_entry = None
         self.max_recv = self.world_size * self.mtpr
         compact = not self._bundle_plan.fixed_slot_dispatch
@@ -304,6 +327,26 @@ class MegaMoEV2:
         return self._bundle_plan.route_for(
             max_tokens, small_m=small_m, large_m=self._large_m_choice is not False
         )
+
+    @property
+    def bf16_return_only(self) -> bool:
+        """Whether this instance may only return BF16 rows (a draft layout under
+        MEGA_MOE_DRAFT_SHIPPED_PRECISION=1): it serves small-input calls only."""
+        return self._bf16_return_only
+
+    def _check_return_format(self, route):
+        """Refuse a call a BF16-return-only instance would send down a route with FP8 rows."""
+        if self._bf16_return_only and route[0] != ROUTE_SMALL_M:
+            raise RuntimeError(
+                f"MEGA_MOE_DRAFT_SHIPPED_PRECISION=1: refusing the {route[0]} route (capacity {route[1]}) for the "
+                f"draft MoE (experts={self.experts} topk={self.topk}): it returns FP8 rows, the native path BF16. "
+                f"Only calls with max_tokens <= {self.small_m_mtpr} are served (the small-input route)"
+            )
+
+    def row_stats(self) -> dict:
+        """Small-input capacity -> SmallMRuntime.row_stats() (empty without MEGA_MOE_DRAFT_SHIPPED_PRECISION=1)."""
+        stats = {runtime.mtpr: runtime.row_stats() for runtime in self._small_m_runtimes}
+        return {capacity: counts for capacity, counts in stats.items() if counts is not None}
 
     def _fused_runtimes(self):
         # Weights are first bound while __init__ is still building the routes.
@@ -1167,6 +1210,7 @@ class MegaMoEV2:
     def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots):
         # Every launch takes stream None: _forward_route has set the current stream.
         run_tokens = int(x_bf16.shape[0])
+        self._check_return_format(route)
         route, capacity = route
         if route == ROUTE_LARGE_M:
             return self._large_m.forward(
@@ -1234,7 +1278,8 @@ class MegaMoEV2:
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        route, _ = self._route(run_tokens, max_tokens, small_m=False)
+        route, capacity = self._route(run_tokens, max_tokens, small_m=False)
+        self._check_return_format((route, capacity))
         if route == ROUTE_LARGE_M:
             return self._large_m.forward_prequant(
                 x_q,

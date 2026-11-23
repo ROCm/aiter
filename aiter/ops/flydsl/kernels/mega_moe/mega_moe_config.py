@@ -72,6 +72,108 @@ FUSED_LAYOUTS = frozenset(
         ),
     }
 )
+# Tuned switch presets (default off: with AITER_MEGA_PRESET unset no switch below takes a value from here, so every
+# config, kernel name and cache key is unchanged). AITER_MEGA_PRESET=<name> gives every MegaMoE switch listed in
+# the preset that value unless the environment sets the switch itself (the environment wins, also when set empty).
+# The values are the ones the DeepSeek-V4.1-Flash DEP8 serving points on 8 x MI355X (gfx950) were measured with:
+# EP8, 384 routed experts top-6 (target MoE) and 128 experts top-3 (DSpark draft MoE), AgentX traffic. They are
+# switch values, not layout-keyed tunes: select a preset only for that deployment. Read once, at import; every rank
+# must select the same preset.
+#   dsv41_flash_dep8_c128_c512    client concurrency 128 .. 512 (decode buckets 16 .. 128 tuned apart)
+#   dsv41_flash_dep8_c768_c1024   client concurrency 768 / 1024 (buckets 32 .. 128 share one entry, bucket 16 and
+#                                 the large-input plan keep the tune's values)
+_PRESET_SMALL_256_512 = (
+    "256+512:s2.block_m=32,s1.sort_block_m=32,s1.tile_n=256,fs1.g2_uniform=1,s1.use_tile_resource=1,"
+    "fs1.epi_evec=8,fs1.epi_lean=1,fs1.head_uniform=1,fs1.g2_epi_lean=2,fs1.expert_cached_w=2"
+)
+TUNED_PRESETS = {
+    "dsv41_flash_dep8_c128_c512": {
+        "AITER_MEGA_FUSED_DRAFT_LAYOUT": "1",
+        "MEGA_MOE_DRAFT_SHIPPED_PRECISION": "1",
+        "AITER_MEGA_LARGE_PRESEND": "24",
+        "AITER_MEGA_LARGE_V3": "qf+pw",
+        "AITER_MEGA_SMALL_M2": "st+pg+ad+tl",
+        "AITER_MEGA_SMALL_R2": "dw+lr+rg",
+        "AITER_MEGA_SMALL_M_OVERRIDE": (
+            "16:fs1.epi_evec=8,fs1.epi_lean=1,fs1.head_uniform=1,fs1.g2_epi_lean=2,fs1.expert_cached_w=2;"
+            "32:s1.use_tile_resource=1,fs1.epi_evec=8,fs1.epi_lean=3,fs1.head_uniform=1,fs1.g2_epi_lean=2,"
+            "fs1.expert_cached_w=2,fs1.hot_cached_w_min=1024,s1.waves_per_eu_hint=1,s2.block_n=256;"
+            "64+128:s1.use_tile_resource=1,fs1.epi_evec=8,fs1.epi_lean=3,fs1.head_uniform=1,fs1.g2_epi_lean=2,"
+            "fs1.expert_cached_w=2,fs1.hot_cached_w_min=1024,s1.waves_per_eu_hint=1;" + _PRESET_SMALL_256_512
+        ),
+    },
+    "dsv41_flash_dep8_c768_c1024": {
+        "AITER_MEGA_FUSED_DRAFT_LAYOUT": "1",
+        "MEGA_MOE_DRAFT_SHIPPED_PRECISION": "1",
+        "AITER_MEGA_LARGE_PRESEND": "24",
+        "AITER_MEGA_LARGE_V3": "qf",
+        "AITER_MEGA_SMALL_M2": "st+pg+ad+tl",
+        "AITER_MEGA_SMALL_R2": "dw+lr+rg",
+        "AITER_MEGA_SMALL_M_OVERRIDE": (
+            "32+64+128:s1.use_tile_resource=1,fs1.epi_evec=8,fs1.epi_lean=3,fs1.head_uniform=1,fs1.g2_epi_lean=2,"
+            "fs1.expert_cached_w=2,fs1.hot_cached_w_min=1024;" + _PRESET_SMALL_256_512
+        ),
+    },
+}
+PRESET = os.environ.get("AITER_MEGA_PRESET", "")
+if PRESET and PRESET not in TUNED_PRESETS:
+    raise ValueError(f"AITER_MEGA_PRESET={PRESET!r}: not one of {sorted(TUNED_PRESETS)}")
+
+
+def switch_env(name: str, default: str = "") -> str:
+    """Value of the MegaMoE switch ``name``: the environment's if it is set, else the selected preset's
+    (AITER_MEGA_PRESET), else ``default``."""
+    value = os.environ.get(name)
+    if value is None:
+        value = TUNED_PRESETS.get(PRESET, {}).get(name, default)
+    return value
+
+
+# Experiment switch (default off: unset leaves FUSED_LAYOUTS, every config and every kernel unchanged).
+# AITER_MEGA_FUSED_DRAFT_LAYOUT=1 admits the DeepSeek-V4.1-Flash DSpark draft MoE (128 routed experts, top-3,
+# V4.1-Flash dims) to the small-input fused kernel: EP8 (16 experts a rank) and its 4-rank proxy (4 x 16).
+# Small-input only: the large-input kernel is never built for these layouts (fused_layout_small_only). Not
+# validated on a GPU. Read once, at import; every rank must set the same value.
+FUSED_DRAFT_LAYOUT = switch_env("AITER_MEGA_FUSED_DRAFT_LAYOUT", "0") == "1"
+V41_DRAFT_TOPK = 3
+# (world_size, experts_per_rank, model_dim, inter_dim)
+_V41_DRAFT_SHAPES = ((8, 16, 5120, 2304), (4, 16, 5120, 2304))
+V41_DRAFT_LAYOUTS = _V41_DRAFT_SHAPES if FUSED_DRAFT_LAYOUT else ()
+# Compliance switch (default off: unset leaves every route, config, kernel name and cache key unchanged).
+# MEGA_MOE_DRAFT_SHIPPED_PRECISION=1 gives the DSpark draft MoE (_V41_DRAFT_SHAPES) the expert-output return of
+# the native path, BF16 rows, on every call:
+#   - its small-input kernels are built without the FP8-row send (compile_mega_moe_stage1's bf16_rows_only, kernel
+#     suffix _b16r): a hot expert or many routed rows no longer switch a rank's GEMM2 rows to FP8;
+#   - its MegaMoEV2 instance refuses every other route with an error (the staged route returns FP8 rows from
+#     capacity P2P_FP8_MIN_MTPR; the large-input route is never built for it), and is refused at construction when
+#     it has no small-input route (AITER_MEGA_FUSED_DRAFT_LAYOUT unset);
+#   - every small-input kernel, draft and target, counts its launches and those that sent FP8 rows (row_stats,
+#     kernel suffix _rst; SmallMRuntime.row_stats()), so a run can show how often the FP8 return was taken.
+# The GEMM1 SiLU is not touched: FusedStage1Knobs.epi_lean bit 1 is aiter.ops.flydsl.kernels.act.sigmoid_f32, the
+# helper the native FlyDSL MoE GEMM1 (mixed_moe_gemm_2stage_common.activate_pair -> silu_mul_batch) activates with.
+# Read once, at import; every rank must set the same value.
+DRAFT_SHIPPED_PRECISION = switch_env("MEGA_MOE_DRAFT_SHIPPED_PRECISION", "0") == "1"
+
+
+def draft_shipped_precision(*, world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int) -> bool:
+    """Whether this layout is a draft MoE that must return BF16 rows (MEGA_MOE_DRAFT_SHIPPED_PRECISION=1)."""
+    return DRAFT_SHIPPED_PRECISION and (world_size, experts_per_rank, model_dim, inter_dim) in _V41_DRAFT_SHAPES
+
+
+# (world_size, experts_per_rank) pairs the small-input kernel's direct fixed-slot dispatch additionally accepts.
+EXTRA_FIXED_SLOT_LAYOUTS = tuple((world, epr) for world, epr, _, _ in V41_DRAFT_LAYOUTS)
+if FUSED_DRAFT_LAYOUT:
+    FUSED_LAYOUTS = FUSED_LAYOUTS | {
+        (world, model_dim, inter_dim, world * epr, V41_DRAFT_TOPK)
+        for world, epr, model_dim, inter_dim in V41_DRAFT_LAYOUTS
+    }
+
+
+def fused_layout_small_only(*, world_size: int, model_dim: int, inter_dim: int, experts: int) -> bool:
+    """A fused layout served by the small-input kernel only (AITER_MEGA_FUSED_DRAFT_LAYOUT)."""
+    return (world_size, experts // world_size, model_dim, inter_dim) in V41_DRAFT_LAYOUTS
+
+
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -312,6 +414,18 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input fused kernel: an expert whose rows span more than one m-tile reads its weights through the cache (the
+    # cached-weight bodies), so its later m-tiles take the W slab from L2 instead of streaming it from HBM again; the
+    # single-tile experts keep the streaming bodies (0: off; 1: GEMM1 / W1; 2: GEMM1 and GEMM2 / W1 and W2). Only the
+    # cache policy of the weight loads changes, so the output is bit-identical and ranks need not agree.
+    expert_cached_w: int = 0
+    # Small-input fused kernel: rows of a rank's largest expert from which the rank takes the cached-weight bodies for
+    # all its tiles (hot_cached_w_min) / sends FP8 GEMM2 rows (hot_fp8_min); 0: mega_moe_small_m's
+    # _HOT_CACHED_W_MIN_ROWS / _HOT_FP8_MIN_ROWS (256 unless their switches moved them). Tuned at 512-token buckets:
+    # at 60-78 rows a rank a rank holding a hot expert crosses 256 rows and both cost time (1024 cannot be reached on
+    # a 128-row instance). Rank-local decisions: the row format travels in the published flag.
+    hot_cached_w_min: int = 0
+    hot_fp8_min: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1770,6 +1884,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+# Experiment switch (default off: unset or 0 leaves every config, kernel name and cache key unchanged).
+# AITER_MEGA_LARGE_PRESEND=24: the EP8 DeepSeek-V4.1-Flash large-input kernel presends the token rows of each
+# destination's first 24 experts while the plan runs (the tune's value is 8). On AgentX prefill steps with few source
+# ranks the dispatch is producer-bound and ends earlier (-13..-15% per launch); steps with 6-8 sources are unchanged.
+# Read once, at import; a sender-local schedule choice, but every rank must set the same value (one kernel name).
+_LARGE_PRESEND = int(switch_env("AITER_MEGA_LARGE_PRESEND", "0") or 0)
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off). It serves
@@ -1790,7 +1912,7 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     # The combine waits for every rank's GEMM2 (comb_tok_wait off): the per-token wait gains 1.5-5% at 513-2048
     # uniform tokens a rank and under 1.6% from 4096 (the prefill chunks), but a runtime whose ranks can end apart
     # keeps its own route-major payload, 3.9 GiB more per GPU at MTPR 16384.
-    return replace(
+    config = replace(
         config,
         stage1=replace(config.stage1, b_nt=0),
         fused_stage2=replace(
@@ -1803,6 +1925,11 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
             comb_tok_wait=False,
         ),
     )
+    if _LARGE_PRESEND:
+        config = replace(
+            config, fused_stage1=replace(config.fused_stage1, presend_experts=_LARGE_PRESEND)
+        )
+    return config
 
 
 @cache
@@ -1836,7 +1963,45 @@ def _fused_config(
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
+    if layout in V41_DRAFT_LAYOUTS:
+        return _tune_v41_draft_small(config, bucket)
     return config
+
+
+def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """DSpark draft MoE (16 experts a rank, top-3) small-input kernel: a starting point, NOT measured.
+
+    The EP8 V4.1-Flash tune and its launch protocol. A draft pass of 160 rows a rank gives each of the 16 local
+    experts ~30 rows: a 32-row tile would split about a third of them in two and stream their weights twice, so the
+    128-token bucket takes the 64-row tile of the 256 one. 16 m-tiles are few units for 512 CTAs: the narrow GEMM1
+    n-tile (128: 36 units an m-tile) and GEMM2 n-block (128: 40 units) keep every CTA busy, and the 128-wide
+    n-block puts the 64-row GEMM2 on the 2-stage weight pipeline; its pointers go to SGPRs (no spill at 256 VGPRs).
+    """
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket < 128:
+        return config
+    return replace(
+        config,
+        stage1=replace(config.stage1, sort_block_m=64, tile_n=128),
+        stage2=replace(config.stage2, block_m=64, block_n=128),
+        fused_stage1=replace(config.fused_stage1, g2_uniform=True),
+    )
+
+
+def fused_bucket_override(tokens: int, mtpr: int) -> int:
+    """Launch-config bucket forced for a row range of the small-input route:
+    ``AITER_MEGA_FUSED_BUCKET_MAP="161-255:128,..."`` (tokens lo-hi : bucket). 0: none."""
+    spec = switch_env("AITER_MEGA_FUSED_BUCKET_MAP", "")
+    if not spec or mtpr > SMALL_M_MAX_MTPR:
+        return 0
+    for item in spec.split(","):
+        rows, bucket = item.split(":")
+        lo, _, hi = rows.partition("-")
+        if int(lo) <= tokens <= int(hi or lo):
+            if int(bucket) not in FUSED_TOKEN_BUCKETS:
+                raise ValueError(f"AITER_MEGA_FUSED_BUCKET_MAP: {bucket} is not a fused token bucket")
+            return int(bucket)
+    return 0
 
 
 def select_fused_config(
@@ -1864,11 +2029,52 @@ def select_fused_config(
         raise ValueError(
             f"experts_per_rank must be in [1, 256], got {experts_per_rank}"
         )
-    return _fused_config(
-        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS),
+    bucket = nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)
+    config = _fused_config(
+        bucket,
         mtpr,
         world_size,
         experts_per_rank,
         model_dim,
         inter_dim,
     )
+    if _SMALL_M_OVERRIDE and mtpr <= SMALL_M_MAX_MTPR:
+        config = _small_m_override(config, bucket)
+    return config
+
+
+# Experiment switch (default off: unset leaves every config, kernel name and cache key unchanged).
+# AITER_MEGA_SMALL_M_OVERRIDE="256:s1.tile_n=256,s2.block_n=128;128+64:fs1.g1_a_ahead=2" replaces fields of the
+# small-input launch config of the listed token buckets ("*": every bucket). Keys: s1.<Stage1Config field>,
+# s2.<Stage2Config field>, fs1.<FusedStage1Knobs field>, fs2.<FusedStage2Knobs field>; values are ints (bools 0/1).
+# Read once, at import. Protocol knobs (dedup_rows, plan_local, direct_done, tok_counters, bf16_head_tokens) must
+# stay equal on every bucket and rank (SmallMRuntime asserts it); every rank must set the same value.
+_SMALL_M_OVERRIDE = switch_env("AITER_MEGA_SMALL_M_OVERRIDE", "")
+_SMALL_M_OVERRIDE_SECTIONS = {
+    "s1": "stage1",
+    "s2": "stage2",
+    "fs1": "fused_stage1",
+    "fs2": "fused_stage2",
+}
+
+
+@cache
+def _small_m_override(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    for item in _SMALL_M_OVERRIDE.split(";"):
+        if not item.strip():
+            continue
+        buckets, _, fields = item.partition(":")
+        if buckets.strip() != "*" and bucket not in {
+            int(b) for b in buckets.split("+")
+        }:
+            continue
+        for assign in fields.split(","):
+            path, _, value = assign.partition("=")
+            section, _, field = path.strip().partition(".")
+            name = _SMALL_M_OVERRIDE_SECTIONS[section]
+            sub = getattr(config, name)
+            cast = type(getattr(sub, field))  # bool or int
+            config = replace(
+                config, **{name: replace(sub, **{field: cast(int(value))})}
+            )
+    return config

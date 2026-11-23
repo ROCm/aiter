@@ -414,6 +414,8 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 # Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
 # them changes only where a config sets one.
 _EP2_KNOBS = ("stream_w",)
+# Fused knobs only a switch sets (AITER_MEGA_SMALL_M_OVERRIDE, AITER_MEGA_PRESET): the same rule.
+_SWITCH_KNOBS = ("expert_cached_w", "hot_cached_w_min", "hot_fp8_min")
 
 
 def _knob_table(config):
@@ -424,7 +426,7 @@ def _knob_table(config):
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
             for f in fields(FusedStage1Knobs)
-            if f.name not in _EP2_KNOBS
+            if f.name not in _EP2_KNOBS + _SWITCH_KNOBS
             or getattr(config.fused_stage1, f.name) != f.default
         ),
         tuple(

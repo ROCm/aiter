@@ -18,8 +18,11 @@ import mori.shmem as ms
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8, ds_bpermute
+from flydsl._mlir import ir as _qf_ir
+from flydsl._mlir.dialects import llvm as _qf_llvm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value as _qf_raw
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility import dtypes
@@ -53,6 +56,7 @@ from .mega_moe_config import (
     fused_layout_supported,
     large_m_mtprs_for,
     select_fused_config,
+    switch_env,
 )
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -80,6 +84,20 @@ from .weights import (
     contiguous_weights,
     weight_spec,
 )
+
+
+# Default off (unset = every kernel and kernel name is unchanged); read at import, every rank must set the same value.
+#   AITER_MEGA_LARGE_V3=qf   the Combine tail's offset correction of the 8-bit (route_i8) rows, c_acc - 128 * c_sc_sum, is done
+#                            with four scalar v_sub_f32 (inline asm) instead of leaving the vector subtract to the compiler,
+#                            which packs it into v_pk_add_f32 reading the high half of a source register -- the gfx950 pattern
+#                            of ROCm/aiter#7818 (lanes 48-63 can read 0 next to another wave's MFMA). Same arithmetic, same bits.
+#   AITER_MEGA_LARGE_V3=pw   the plan's per-tile words and real-row marks of a local expert are written by the whole wave that plans
+#                            the expert (lane l takes tiles l, l + 64, ... and marks l, l + 64, ...) instead of by the expert's one
+#                            lane: the plan of a rank whose hottest expert holds R rows took 0.06 ms + 8 us per 1000 R (0.9 ms at
+#                            120k rows) and every source's payload producers for that rank wait for it. Same words, same values;
+#                            rank-local (no wire or layout change); the kernel is renamed through its fused spec (plan_ww).
+_V3_LARGE = frozenset(p for p in switch_env("AITER_MEGA_LARGE_V3", "").split("+") if p)
+assert _V3_LARGE <= {"qf", "pw"}, _V3_LARGE
 
 
 class DispatchSlot(IntEnum):
@@ -399,11 +417,18 @@ def _plan_expert_slice(
     hoist_loads=False,
     count_tag=None,
     g2_fold_mark=0,
+    wave_wide=False,
 ):
     """emit_dispatch_plan's per-expert plan for wave `wave`'s slice of the local experts.
 
     Every wave sums the padded rows of the experts before its slice itself (no cross-wave exchange), and the
     payload chunks each tile waits for are counted in registers rather than by read-modify-write chains.
+
+    ``wave_wide``: the per-tile words and the real-row marks of each expert of the slice are written by all 64 lanes
+    of the wave (lane l: tiles and marks l, l + 64, ...) instead of by the expert's own lane, whose walk over a hot
+    expert's tiles (5 stores each) and rows (2 stores per g2_skip_bm rows) was the plan's serial path. Every word is
+    still written exactly once with the same value: tiles and rows of different experts are disjoint ranges, and
+    inside an expert lanes take different residues mod 64.
     """
     slice_experts = (fz_epr + num_waves - 1) // num_waves
     assert slice_experts <= 64
@@ -514,67 +539,136 @@ def _plan_expert_slice(
             store_at(local_row_base + sender_prefix, AddrBuffer(remote_my_base), ge)
         sender_prefix = sender_prefix + source_counts[source]
 
-    if valid_expert:
-        base_tile = local_row_base // tile_m
+    if const_expr(not wave_wide):
+        if valid_expert:
+            base_tile = local_row_base // tile_m
+            chunk = fx.Int32(payload_chunk_rows)
+            for tile in range(fx.Int32(0), num_tiles, 1):
+                # One payload chunk per tile, plus one per chunk start inside it (a source's first row or a
+                # payload_chunk_rows step into a source) that is not the tile's first row.
+                tile_lo = tile * tile_m
+                tile_hi = tile_lo + tile_m
+                expected_chunks = fx.Int32(1)
+                sender_prefix = fx.Int32(0)
+                for source in range_constexpr(fz_npes):
+                    source_count = source_counts[source]
+                    starts_inside = (
+                        (source_count > fx.Int32(0))
+                        & (sender_prefix > tile_lo)
+                        & (sender_prefix < tile_hi)
+                    )
+                    expected_chunks = expected_chunks + starts_inside.select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    # Chunk starts sender_prefix + k * chunk for 1 <= k <= last_k, counted strictly inside the tile.
+                    last_k = (source_count > fx.Int32(0)).select(
+                        (source_count - fx.Int32(1)) // chunk, fx.Int32(0)
+                    )
+                    below = tile_lo - sender_prefix
+                    first_k = (below >= fx.Int32(0)).select(
+                        below // chunk + fx.Int32(1), fx.Int32(1)
+                    )
+                    above = tile_hi - fx.Int32(1) - sender_prefix
+                    top_k = (above >= fx.Int32(0)).select(above // chunk, fx.Int32(-1))
+                    top_k = (top_k < last_k).select(top_k, last_k)
+                    inside = top_k - first_k + fx.Int32(1)
+                    expected_chunks = expected_chunks + (inside > fx.Int32(0)).select(
+                        inside, fx.Int32(0)
+                    )
+                    sender_prefix = sender_prefix + source_count
+                tile_index = base_tile + tile
+                store_at(fx.Int32(0), AddrBuffer(a_tile_ready), tile_index)
+                store_at(expected_chunks, AddrBuffer(a_tile_expected), tile_index)
+                store_at(expected_chunks, AddrBuffer(a_tile_expected_shared), tile_index)
+                store_at(ge, AddrBuffer(a_se), tile_index)
+                store_at(tile_lo + local_row_base, AddrBuffer(a_trb), tile_index)
+            store_at(
+                (local_row_base + padded_rows) // tile_m,
+                AddrBuffer(a_expert_tile_end),
+                local_expert,
+            )
+            if const_expr(g2_skip_bm > 0):
+                # GEMM2 skips an m-block whose first srcmap row is padding before its payload lands, so the first
+                # row of every real m-block must not keep a padding entry of an earlier launch: mark it real now
+                # (the payload, sent only after this plan publishes, overwrites it).
+                for real_row in range(fx.Int32(0), total_count, fx.Int32(g2_skip_bm)):
+                    store_at(fx.Int32(0), AddrBuffer(a_sm), local_row_base + real_row)
+                    if const_expr(g2_fold_mark > 0):  # noqa: SIM102
+                        # GEMM2 folds an m-block whose row g2_fold_mark is padding into its expert's previous one.
+                        if real_row + fx.Int32(g2_fold_mark) < total_count:
+                            store_at(
+                                fx.Int32(0),
+                                AddrBuffer(a_sm),
+                                local_row_base + real_row + fx.Int32(g2_fold_mark),
+                            )
+    else:
         chunk = fx.Int32(payload_chunk_rows)
-        for tile in range(fx.Int32(0), num_tiles, 1):
-            # One payload chunk per tile, plus one per chunk start inside it (a source's first row or a
-            # payload_chunk_rows step into a source) that is not the tile's first row.
-            tile_lo = tile * tile_m
-            tile_hi = tile_lo + tile_m
-            expected_chunks = fx.Int32(1)
-            sender_prefix = fx.Int32(0)
-            for source in range_constexpr(fz_npes):
-                source_count = source_counts[source]
-                starts_inside = (
-                    (source_count > fx.Int32(0))
-                    & (sender_prefix > tile_lo)
-                    & (sender_prefix < tile_hi)
-                )
-                expected_chunks = expected_chunks + starts_inside.select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-                # Chunk starts sender_prefix + k * chunk for 1 <= k <= last_k, counted strictly inside the tile.
-                last_k = (source_count > fx.Int32(0)).select(
-                    (source_count - fx.Int32(1)) // chunk, fx.Int32(0)
-                )
-                below = tile_lo - sender_prefix
-                first_k = (below >= fx.Int32(0)).select(
-                    below // chunk + fx.Int32(1), fx.Int32(1)
-                )
-                above = tile_hi - fx.Int32(1) - sender_prefix
-                top_k = (above >= fx.Int32(0)).select(above // chunk, fx.Int32(-1))
-                top_k = (top_k < last_k).select(top_k, last_k)
-                inside = top_k - first_k + fx.Int32(1)
-                expected_chunks = expected_chunks + (inside > fx.Int32(0)).select(
-                    inside, fx.Int32(0)
-                )
-                sender_prefix = sender_prefix + source_count
-            tile_index = base_tile + tile
-            store_at(fx.Int32(0), AddrBuffer(a_tile_ready), tile_index)
-            store_at(expected_chunks, AddrBuffer(a_tile_expected), tile_index)
-            store_at(expected_chunks, AddrBuffer(a_tile_expected_shared), tile_index)
-            store_at(ge, AddrBuffer(a_se), tile_index)
-            store_at(tile_lo + local_row_base, AddrBuffer(a_trb), tile_index)
-        store_at(
-            (local_row_base + padded_rows) // tile_m,
-            AddrBuffer(a_expert_tile_end),
-            local_expert,
-        )
-        if const_expr(g2_skip_bm > 0):
-            # GEMM2 skips an m-block whose first srcmap row is padding before its payload lands, so the first
-            # row of every real m-block must not keep a padding entry of an earlier launch: mark it real now
-            # (the payload, sent only after this plan publishes, overwrites it).
-            for real_row in range(fx.Int32(0), total_count, fx.Int32(g2_skip_bm)):
-                store_at(fx.Int32(0), AddrBuffer(a_sm), local_row_base + real_row)
-                if const_expr(g2_fold_mark > 0):  # noqa: SIM102
-                    # GEMM2 folds an m-block whose row g2_fold_mark is padding into its expert's previous one.
-                    if real_row + fx.Int32(g2_fold_mark) < total_count:
-                        store_at(
-                            fx.Int32(0),
-                            AddrBuffer(a_sm),
-                            local_row_base + real_row + fx.Int32(g2_fold_mark),
-                        )
+        ww_tiles = valid_expert.select(num_tiles, fx.Int32(0))
+        ww_base = valid_expert.select(local_row_base, fx.Int32(0))
+        ww_total = valid_expert.select(total_count, fx.Int32(0))
+        ww_counts = [valid_expert.select(source_counts[source], fx.Int32(0)) for source in range_constexpr(fz_npes)]
+        if valid_expert:
+            store_at(
+                (local_row_base + padded_rows) // tile_m,
+                AddrBuffer(a_expert_tile_end),
+                local_expert,
+            )
+        for slot in range_constexpr(slice_experts):
+            # Expert `slot` of the slice (lane `slot`'s): its counts, wave-uniform.
+            e_tiles = fx.Int32(fx.rocdl.readlane(T.i32, ww_tiles, slot))
+            e_base = fx.Int32(fx.rocdl.readlane(T.i32, ww_base, slot))
+            e_total = fx.Int32(fx.rocdl.readlane(T.i32, ww_total, slot))
+            e_ge = fx.Int32(fx.rocdl.readlane(T.i32, ge, slot))
+            e_counts = [fx.Int32(fx.rocdl.readlane(T.i32, ww_counts[source], slot)) for source in range_constexpr(fz_npes)]
+            e_base_tile = e_base // tile_m
+            for tile in range(lane, e_tiles, 64):
+                # As above: one payload chunk per tile, plus one per chunk start strictly inside it.
+                tile_lo = tile * tile_m
+                tile_hi = tile_lo + tile_m
+                expected_chunks = fx.Int32(1)
+                sender_prefix = fx.Int32(0)
+                for source in range_constexpr(fz_npes):
+                    source_count = e_counts[source]
+                    starts_inside = (
+                        (source_count > fx.Int32(0))
+                        & (sender_prefix > tile_lo)
+                        & (sender_prefix < tile_hi)
+                    )
+                    expected_chunks = expected_chunks + starts_inside.select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    last_k = (source_count > fx.Int32(0)).select(
+                        (source_count - fx.Int32(1)) // chunk, fx.Int32(0)
+                    )
+                    below = tile_lo - sender_prefix
+                    first_k = (below >= fx.Int32(0)).select(
+                        below // chunk + fx.Int32(1), fx.Int32(1)
+                    )
+                    above = tile_hi - fx.Int32(1) - sender_prefix
+                    top_k = (above >= fx.Int32(0)).select(above // chunk, fx.Int32(-1))
+                    top_k = (top_k < last_k).select(top_k, last_k)
+                    inside = top_k - first_k + fx.Int32(1)
+                    expected_chunks = expected_chunks + (inside > fx.Int32(0)).select(
+                        inside, fx.Int32(0)
+                    )
+                    sender_prefix = sender_prefix + source_count
+                tile_index = e_base_tile + tile
+                store_at(fx.Int32(0), AddrBuffer(a_tile_ready), tile_index)
+                store_at(expected_chunks, AddrBuffer(a_tile_expected), tile_index)
+                store_at(expected_chunks, AddrBuffer(a_tile_expected_shared), tile_index)
+                store_at(e_ge, AddrBuffer(a_se), tile_index)
+                store_at(tile_lo + e_base, AddrBuffer(a_trb), tile_index)
+            if const_expr(g2_skip_bm > 0):
+                # The first row of every real m-block (and its row g2_fold_mark) marked real, as above.
+                for real_row in range(lane * fx.Int32(g2_skip_bm), e_total, 64 * g2_skip_bm):
+                    store_at(fx.Int32(0), AddrBuffer(a_sm), e_base + real_row)
+                    if const_expr(g2_fold_mark > 0):  # noqa: SIM102
+                        if real_row + fx.Int32(g2_fold_mark) < e_total:
+                            store_at(
+                                fx.Int32(0),
+                                AddrBuffer(a_sm),
+                                e_base + real_row + fx.Int32(g2_fold_mark),
+                            )
     # The whole wave writes each expert's padding srcmap rows (fewer than tile_m, contiguous): the expert's own
     # lane storing them one by one, up to tile_m - 1 stores, was the longest part of the plan.
     pad_end = valid_expert.select(local_row_base + padded_rows, fx.Int32(0))
@@ -605,7 +699,7 @@ def _plan_expert_slice(
 def emit_dispatch_plan(
     *, num_waves, fz_npes, fz_epr, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp, parity, expected,
     dispatch_blocks, payload_chunk_rows, payload_min_blocks=0, parallel_plan=False, g2_skip_bm=0, g2_fold_mark=0,
-    lean_plan=False, tag_counts=False, bucket_pairs=False, payload_small=None,
+    lean_plan=False, tag_counts=False, bucket_pairs=False, payload_small=None, plan_wave_wide=False,
 ):
 # fmt: on
     """Build a destination-owned compact plan in one producer-only CTA.
@@ -880,7 +974,7 @@ def emit_dispatch_plan(
             a_tile_expected, a_tile_expected_shared, a_expert_tile_end, lane)
         slice_kw = {"fz_npes": fz_npes, "fz_epr": fz_epr, "fz_mtpr": fz_mtpr, "fz_rank": fz_rank,
             "fz_tile_m": fz_tile_m, "payload_chunk_rows": payload_chunk_rows, "g2_skip_bm": g2_skip_bm,
-            "g2_fold_mark": g2_fold_mark, "hoist_loads": lean_plan,
+            "g2_fold_mark": g2_fold_mark, "hoist_loads": lean_plan, "wave_wide": plan_wave_wide,
             "count_tag": _count_tag(expected, parity, fz_npes) if tag_counts else None}
         if const_expr(bucket_pairs):
             # Warp 1 sized the geometry and published the pair order; the other waves plan, so the barrier below
@@ -1784,6 +1878,8 @@ def large_m_kernel_specs(
     if k1.tag_counts:
         assert k1.lean_plan
         s2_spec += (("plan_tag", 1),)
+    if "pw" in _V3_LARGE and k1.parallel_plan:
+        s2_spec += (("plan_ww", 1),)
     if k1.bucket_pairs:
         assert k1.batch_rows and k1.lean_plan and k1.early_hist
         s2_spec += (("disp_bucket", 1),)
@@ -1913,6 +2009,9 @@ def compile_mega_moe_stage1(
     PLAN_LEAN = bool(_s2.get("plan_lean", 0))
     # plan_tag: with plan_lean, count words carry the launch tag; plan waves spin on them (no count_done round).
     PLAN_TAG = bool(_s2.get("plan_tag", 0))
+    # plan_ww: the plan's per-tile words and real-row marks of an expert are written wave-wide (_plan_expert_slice).
+    PLAN_WW = bool(_s2.get("plan_ww", 0))
+    assert not PLAN_WW or PLAN_PAR
     # disp_bucket: the pair order is per-expert buckets of fz_mtpr routes, filled by the histogram RMWs.
     DISP_BUCKET = bool(_s2.get("disp_bucket", 0))
     # disp_early_hist (with disp_bucket): the producers count their routes and bump group_done before the launch gate.
@@ -1959,7 +2058,7 @@ def compile_mega_moe_stage1(
         if k not in ("max_g2_m_blocks", "inter_dim", "g2_xcd_chunk", "g1_short_rows", "g1_mid_rows", "g2_scale_stage",
             "g1_fold_tail", "plan_par", "g1_epi_vec", "g1_dedup", "disp_merge_rel",
             "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_asm", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
-            "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
+            "plan_lean", "plan_tag", "plan_ww", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
             "disp_early_clear")
     }
@@ -2053,6 +2152,7 @@ def compile_mega_moe_stage1(
     C_TOK_WAIT = bool(_c.get("tok_wait", False))
     # route_i8: the rows hold offset int8 (u8 = q + 128) instead of E4M3.
     C_ROUTE_I8 = bool(_c.get("route_i8", False))
+    C_I8_QF = C_ROUTE_I8 and "qf" in _V3_LARGE  # only kernels with the 8-bit offset correction change (and are renamed)
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
@@ -2090,6 +2190,7 @@ def compile_mega_moe_stage1(
         f"{f'_pmb{payload_min_blocks}' if payload_min_blocks else ''}"
         f"{swiglu_suffix}"
         f"_s2bm{S2_BM}bn{S2_BN}nw{S2_NW}c{G2_CHUNK}_{S2_KEY}_combu{C_U}"
+        f"{'_v3qf' if C_I8_QF else ''}"
     )
 
     def _g2_decode(unit, total_m):
@@ -2153,7 +2254,14 @@ def compile_mega_moe_stage1(
                     c_lo = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=c_word, word_sel=False)
                     c_hi = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=c_word, word_sel=True)
                     c_acc = c_acc + c_lo.shuffle(c_hi, [0, 1, 2, 3]) * c_sc
-            if const_expr(C_ROUTE_I8):
+            if const_expr(C_I8_QF):
+                # The same subtraction, one scalar instruction per value (see AITER_MEGA_LARGE_V3=qf above).
+                c_off = fx.Float32(128.0) * c_sc_sum
+                c_acc = Vec.from_elements(
+                    [fx.Float32(_qf_llvm.inline_asm(_qf_ir.F32Type.get(), [_qf_raw(c_acc[e]), _qf_raw(c_off)],
+                        "v_sub_f32 $0, $1, $2", "=v,v,v", has_side_effects=True)) for e in range_constexpr(4)],
+                    fx.Float32)
+            elif const_expr(C_ROUTE_I8):
                 c_acc = c_acc - Vec.filled(4, 128.0, fx.Float32) * c_sc_sum
             skw = {"soffset_bytes": u * 512} if u > 0 else {}
             buffer_store(c_acc.to(fx.BFloat16).bitcast(fx.Int32), c_out_rsrc, c_ec * fx.Int32(2),
@@ -2336,7 +2444,7 @@ def compile_mega_moe_stage1(
                 expected=payload_expected, dispatch_blocks=dispatch_blocks, payload_chunk_rows=payload_chunk_rows,
                 payload_min_blocks=payload_min_blocks, payload_small=DISP_PMB_SMALL, parallel_plan=PLAN_PAR,
                 g2_skip_bm=S2_BM if G2_SKIP_PAD else 0, g2_fold_mark=G2_FOLD, lean_plan=PLAN_LEAN, tag_counts=PLAN_TAG,
-                bucket_pairs=DISP_BUCKET,
+                bucket_pairs=DISP_BUCKET, plan_wave_wide=PLAN_WW,
             )
 
         presend_limit = None

@@ -37,13 +37,18 @@ from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
 from .mega_moe_config import (
+    DRAFT_SHIPPED_PRECISION,
+    EXTRA_FIXED_SLOT_LAYOUTS,
     FUSED_TOKEN_BUCKETS,
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
+    draft_shipped_precision,
     fused_layout_supported,
+    fused_bucket_override,
     nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
+    switch_env,
 )
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -112,9 +117,40 @@ class DispatchSlot(IntEnum):
     # Byte offset (the same on every rank) from FC_INP to the per-token GEMM2 completion counters: two
     # parity halves of mtpr i32 (tok_done).
     TOK_DONE_OFF = 38
+    # Round-2 switches (AITER_MEGA_SMALL_R2, see compile_mega_moe_stage1); 0 when the switch is off.
+    # stamp: i64 device-clock stamps, [_STAMP_LAUNCHES launches][_STAMP_GRID CTAs][_STAMP_SLOTS].
+    STAMPS = 39
+    # dw: every rank's row format of the launch in flight ((flag << 1) | fp8, published at plan time): this rank's
+    # npes i64 words, and the table of the peers' addresses of theirs.
+    DW_FMT = 40
+    P2P_DW_FMT = 41
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
+
+# Round-2 stamp probe (AITER_MEGA_SMALL_R2=stamp): wave 0 lane 0 of every CTA stores comm_ops.memrealtime() (10 ns
+# ticks of the device clock) at these points of the launch, in the row of its block index and of the launch epoch
+# (mod _STAMP_LAUNCHES). Timing analysis only: the output is unchanged, the launch is a little slower.
+_STAMP_LAUNCHES = 64
+_STAMP_GRID = 512
+_STAMP_SLOTS = 16
+ST_ENTRY = 0       # first instruction of the CTA
+ST_GATE = 1        # epoch gate passed (owner: published)
+ST_SENT = 2        # producer: its routes are sent and the source flag chain is done
+ST_PLAN = 3        # plan built: GEMM1 may start
+ST_G1_END = 4      # no GEMM1 unit left for this CTA
+ST_G2_END = 5      # no GEMM2 unit left for this CTA
+ST_TICKET = 6      # P2P stores drained, exit ticket taken
+ST_PUBLISHED = 7   # last WG: the combine flags are on their way to the peers
+ST_FLAGS = 8       # reducer: every peer's flag (dw: format word) is in
+ST_REDUCED = 9     # reducer: its tokens are reduced
+ST_ATOMIC = 10     # producer: the slot of its first route came back from the destination
+ST_DRAINED = 11    # producer: its row / srcmap / weight stores are complete
+ST_SRC_DONE = 12   # every source's done flag is in (before the counts are read)
+ST_G1_FIRST = 13   # this CTA's first GEMM1 unit is done
+ST_G2_FIRST = 14   # this CTA's first GEMM2 unit is done
+# The combine input holds this word wherever no row of the launch in flight has landed yet (dw).
+_DW_SENTINEL = -1
 
 
 def _quantize_row_mxfp8(row_rsrc, lane, fz_n_i32, fz_scale_n_i32):
@@ -300,13 +336,22 @@ def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0, running_half=None,
+    dedup=False, direct_done=0, running_half=None, late_epoch=None, active_done=False, stamp_row=None,
+    light_release=False, rows_ahead=False,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots.
 
+    ``rows_ahead`` (round 2, rg; dedup): the token rows of the first round were sent by emit_token_rows_ahead before
+    the epoch gate; this function sends only their srcmap and weight (after the slot allocation).
+
     ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one,
     and their srcmap and weight go to the same half of the destinations' two halves of fz_epr * fz_cap slots.
+    ``stamp_row``: this CTA's row of the round-2 stamp probe (None: no stamps).
+    ``light_release`` (round 2, lr): a producer counts in on the source flag without a system release. Its rows,
+    scales, srcmap and weight stores go to the peers' uncached symmetric heap and are complete (the drain above), so
+    they are in the destinations' memory; the release only wrote this XCD's L2 back (the GEMM1 output the previous
+    launch left there), once per producer CTA, on the path every destination's plan waits for.
     """
     # prefetch_direct_fixed_slot_route loaded this wave's first len(prefetched) routes before the epoch gate.
     p_source_done = prefetched[0]["tables"]["source_done"]
@@ -347,13 +392,16 @@ def emit_direct_fixed_slot_payload(
                         )
                     )
             expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
+            if const_expr(stamp_row is not None and rr == 0):
+                if tid == fx.Int32(0):
+                    comm_ops.store_i64_global(stamp_row + fx.Int64(ST_ATOMIC * 8), comm_ops.memrealtime())
             publish = valid_expert & (expert_offset < fx.Int32(fz_cap))
             payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
             meta_row = payload_row
             if const_expr(running_half is not None):
                 meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
 
-            if const_expr(dedup):
+            if const_expr(dedup and not (rows_ahead and rr == 0)):
                 if publish & ~rpf["duplicate"]:
                     token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
                     destination_rsrc = AddrBuffer(
@@ -383,6 +431,12 @@ def emit_direct_fixed_slot_payload(
 
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
+    if const_expr(stamp_row is not None):
+        if tid == fx.Int32(0):
+            comm_ops.store_i64_global(stamp_row + fx.Int64(ST_DRAINED * 8), comm_ops.memrealtime())
+    if const_expr(late_epoch is not None):
+        # M2 pg: the routes above went out before the epoch gate; the done flag needs this launch's parity.
+        parity, expected = late_epoch()
     # direct_done: producers 0..active-1 carry every route; when there are few of them, each adds its share of
     # the source flag (active - 1 ones and a remainder, all positive, summing to _DIRECT_DONE_INC) to every
     # destination right after its drain.
@@ -396,26 +450,71 @@ def emit_direct_fixed_slot_payload(
             if warp == fx.Int32(0):
                 if producer_slot < active:
                     if lane < fx.Int32(fz_npes):
-                        comm_ops.fence_system_release()
+                        if const_expr(not light_release):
+                            comm_ops.fence_system_release()
                         share = (producer_slot == fx.Int32(0)).select(
                             fx.Int32(_DIRECT_DONE_INC + 1) - active, fx.Int32(1))
                         remote_done = load_at(AddrBuffer(p_source_done), lane, fx.Int64, 1)
                         done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
                         comm_ops.atomic_add_system(remote_done + fx.Int64(done_index) * fx.Int64(4), share)
         publish_last = publish_last & ~direct
+        if const_expr(active_done):
+            # M2 ad: only the producers that carry a route count in; the last of them publishes.
+            publish_last = publish_last & (producer_slot < active)
+    done_target = active - fx.Int32(1) if const_expr(active_done) else fx.Int32(dispatch_blocks - 1)
     # The last producer publishes; one lane per destination, so the remote release stores overlap.
     if publish_last:
         done_lane = fx.Int32(0)
         if lane == fx.Int32(0):
-            comm_ops.fence_system_release()
+            if const_expr(not light_release):
+                comm_ops.fence_system_release()
             done_lane = fx.Int32(comm_ops.atomic_add_agent(a_producer_done, fx.Int32(1)))
         done = fx.Int32(fx.rocdl.readlane(T.i32, done_lane, 0))
-        if done == fx.Int32(dispatch_blocks - 1):
+        if done == done_target:
             comm_ops.fence_agent_acquire()
             if lane < fx.Int32(fz_npes):
                 remote_done = load_at(AddrBuffer(p_source_done), lane, fx.Int64, 1)
                 done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
                 comm_ops.store_i32_system(remote_done, done_index, expected)
+
+
+# fmt: off
+@flyc.jit
+def emit_token_rows_ahead(
+    *, num_waves, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_scale_n_i32, fz_enable_scales,
+    i32_cur_tok, producer_slot, rpf,
+):
+# fmt: on
+    """Round 2 (rg, dedup_rows): send this wave's first-round token row and its scales before the epoch gate and
+    the slot allocation.
+
+    The row's place in the destination's token-row region is its source rank and token, the same in every launch:
+    it depends neither on the remote slot counter nor on the launch parity, and the ~2.5 us of gate wait and counter
+    round trip are spent with the XGMI links idle otherwise. No peer still reads this rank's rows of the previous
+    launch: this rank's previous launch ended only after every row of its tokens came back from GEMM2, which runs an
+    m-tile after all of that m-tile's GEMM1 units read their rows. The source flag still follows the drain of every
+    store of the wave (emit_direct_fixed_slot_payload), so the rows are in the destination's memory before its plan.
+    Sent for every valid first route of a token to a destination, whether or not the slot allocation then overflows
+    (a launch that overflows publishes no plan).
+    """
+    tid = fx.thread_idx.x
+    lane = tid & fx.Int32(63)
+    warp = tid >> fx.Int32(6)
+    route = producer_slot * fx.Int32(num_waves) + warp
+    route_limit = i32_cur_tok * fx.Int32(fz_k)
+    global_expert = rpf["global_expert"]
+    valid_expert = (global_expert >= fx.Int32(0)) & (global_expert < fx.Int32(fz_total_experts))
+    if (route < route_limit) & valid_expert & ~rpf["duplicate"]:
+        source_token = route // fx.Int32(fz_k)
+        token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+        destination_rsrc = AddrBuffer(rpf["remote"]["rx"] + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes))
+        row_values = rpf["row_values"]
+        for i in range_constexpr(len(row_values)):
+            store_at(row_values[i], destination_rsrc, lane * fx.Int32(4) + fx.Int32(i * 256))
+        if const_expr(fz_enable_scales):
+            if lane < fx.Int32(fz_scale_n_i32):
+                store_at(rpf["scale"], AddrBuffer(rpf["remote"]["sc"] + rpf["token_scales"]
+                    + token_row * fx.Int64(fz_scale_n_i32 * 4)), lane)
 
 
 # Per-launch step of the expected source-flag value on a runtime whose buckets use direct_done (npes otherwise).
@@ -462,13 +561,22 @@ def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
     return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
 
 
-def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False):
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False, max_count=None,
+    hot_min=None):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
-    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does)."""
+    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does).
+    ``max_count`` (the rank's largest expert) serves the two hot-expert thresholds ``hot_min`` = (cached-weight
+    bodies, FP8 rows) when they were moved off _HOT_EXPERT_MIN_ROWS; at the default both are ``hot_expert``."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-    cached_w = hot_expert if stream_w else hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))
+    hot_cw_min, hot_f8_min = hot_min or (_HOT_CACHED_W_MIN_ROWS, _HOT_FP8_MIN_ROWS)
+    hot_cw = hot_f8 = hot_expert
+    if hot_cw_min != _HOT_EXPERT_MIN_ROWS:
+        hot_cw = max_count >= fx.Int32(hot_cw_min)
+    if hot_f8_min != _HOT_EXPERT_MIN_ROWS:
+        hot_f8 = max_count >= fx.Int32(hot_f8_min)
+    cached_w = hot_cw if stream_w else hot_cw | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))
     nv_flag = nv_flag | cached_w.select(fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0))
-    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+    return nv_flag | (hot_f8 | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
         fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
     )
 
@@ -476,7 +584,7 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, str
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, hot_min=None, row_stats=None,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -484,6 +592,9 @@ def emit_direct_fixed_slot_finalize(
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
     ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
+    ``row_stats`` (MEGA_MOE_DRAFT_SHIPPED_PRECISION, None: off): the plan CTA counts this launch in the i32 words
+    after the plan word (_ROW_STAT_*), and its FP8-row plan bit as sent (True: this kernel's GEMM2 follows the bit)
+    or as kept BF16 (False: a tok_done or bf16_rows_only kernel).
     """
     assert 0 < fz_epr <= 256, "direct fixed-slot finalize requires 1..256 experts per rank"
     rdisp = AddrBuffer(addr_disp)
@@ -544,16 +655,34 @@ def emit_direct_fixed_slot_finalize(
         if const_expr(not plan_wt):
             comm_ops.fence_system_release()
         if lane == fx.Int32(0):
-            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w, max_count,
+                hot_min)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
+            if const_expr(row_stats is not None):
+                # One thread of one CTA a launch; atomics, as the entry tickets, so the counts carry across launches.
+                comm_ops.atomic_add_agent(plan_nv[0] + fx.Int64(_ROW_STAT_LAUNCHES * 4), fx.Int32(1))
+                if ((nv_flag >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)) != fx.Int32(0):
+                    comm_ops.atomic_add_agent(
+                        plan_nv[0] + fx.Int64((_ROW_STAT_FP8_SENT if row_stats else _ROW_STAT_FP8_KEPT_BF16) * 4),
+                        fx.Int32(1))
     fx.barrier()
 
 
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
-    n_blocks=1, bf16_head_tokens=0):
+    n_blocks=1, bf16_head_tokens=0, m2_tail=frozenset(), lds_xt_off=0, stamps=False, dw=False):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
+
+    ``dw`` (round 2, a protocol knob of the whole runtime): the combine waits for data, not for the peers' flags.
+    The combine input holds _DW_SENTINEL words wherever no row of the launch in flight has landed (the runtime
+    fills it once; every reducer puts the sentinel back into the 16-byte groups it summed), so a reducer takes a
+    group as soon as none of its words is the sentinel, and re-reads (from memory, system scope) only groups that
+    still hold it; the first read is the base's non-temporal load behind the reducer's L1 drop. No finite row
+    holds that word (two BF16 NaNs with every bit set, four FP8 NaNs, an E8M0 scale byte of 255). The peers' row
+    formats come from ``arg_fmt`` (published by each rank's plan), and the flags stay as the way out for a row that
+    is never sent or does hold the word: once the sending rank's flag is in, its groups are final as they read.
+    ``stamps``: the round-2 stamp probe (``arg_stamp``: this CTA's row).
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
     of a counter the last WG advances.
@@ -579,22 +708,29 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     assert row_i32 % 256 == 0
     assert flag_is_value or not row_format
     assert not bf16_head_tokens or row_format
-
+    assert not dw or (flag_is_value and row_format and l1_acquire and "xt" not in m2_tail)
     # fmt: off
     @flyc.jit
     def fused_combine_tail(tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, arg_cnt: fx.Int64, arg_flag: fx.Int64,
         arg_xdb: fx.Int64, arg_p2p_xdb: fx.Int64, arg_inp: fx.Int64, arg_out: fx.Int64, arg_trecv: fx.Int64,
         arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32, arg_running: fx.Int64,
-        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64):
+        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64, arg_stamp: fx.Int64, arg_fmt: fx.Int64):
     # fmt: on
         ticket_ptr = lds_typed_ptr(fx.Int32(lds_fc_off), T.i32, align=4)
         flag_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 8), T.i64, align=8)
+        if const_expr("xt" in m2_tail):
+            # M2 xt: "this WG is the launch's last" (the +4 word of the fc scratch is otherwise unused).
+            xt_last_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 4), T.i32, align=4)
 
         def fmt_ptr(peer):
             # One word per peer: its format bit, already shifted to the peer's position.
             return lds_typed_ptr(fx.Int32(lds_fc_off + 16) + peer * fx.Int32(4), T.i32, align=4)
 
         last = i32_grid - fx.Int32(1)
+        if const_expr("tl" in m2_tail):
+            # M2 tl: the publisher's peer pointers, loaded under the store drain instead of after the ticket.
+            remote_pre = load_at(AddrBuffer(arg_p2p_xdb), (tx_i32 < fx.Int32(npes)).select(tx_i32, fx.Int32(0)),
+                fx.Int64, 1)
         # Every wave waits for its own P2P stores before the WG takes its ticket.
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         fx.barrier()
@@ -607,23 +743,74 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                 flag_lane = fx.Int64(comm_ops.load_i64_global(arg_flag))
             # The P2P rows target the uncached shmem heap, so store completion makes them visible to peers
             # (a per-WG system release would write back L2 thousands of times). The publisher releases below.
-            ticket_lane = fx.Int32(comm_ops.atomic_add_agent(arg_cnt, fx.Int32(1)))
+            if const_expr("xt" in m2_tail):
+                # M2 xt: exit tickets per XCD (word 4 of the XCD's work-head line, zeroed by the owner at entry; the
+                # grid holds i32_grid / 8 WGs per XCD, WG b on XCD b & 7), so 8 short atomic queues replace one of
+                # i32_grid. The last WG of each XCD then counts in on arg_cnt; the 8th of those is the launch's last.
+                # Reducers: the last reducers / 8 WGs of every XCD, with the same dense worker numbering.
+                xt_xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
+                xt_base = fx.Int64(fx.ptr_load(lds_typed_ptr(fx.Int32(lds_xt_off), T.i64, align=8)))
+                xt_per = i32_grid // fx.Int32(8)
+                xt_local = fx.Int32(comm_ops.atomic_add_agent(
+                    xt_base + fx.Int64(xt_xcd) * fx.Int64(64) + fx.Int64(16), fx.Int32(1)))
+                xt_is_last = fx.Int32(0)
+                if xt_local == xt_per - fx.Int32(1):
+                    xt_glob = fx.Int32(comm_ops.atomic_add_agent(arg_cnt, fx.Int32(1)))
+                    xt_is_last = (xt_glob == fx.Int32(7)).select(fx.Int32(1), fx.Int32(0))
+                xt_red0 = xt_per - fx.Int32(reducers // 8)
+                ticket_lane = (xt_local >= xt_red0).select(
+                    i32_grid - fx.Int32(reducers) + (xt_local - xt_red0) * fx.Int32(8) + xt_xcd, fx.Int32(0))
+                fx.ptr_store(xt_is_last, xt_last_ptr)
+            else:
+                ticket_lane = fx.Int32(comm_ops.atomic_add_agent(arg_cnt, fx.Int32(1)))
             fx.ptr_store(ticket_lane, ticket_ptr)
             fx.ptr_store(flag_lane, flag_ptr)
+            if const_expr(stamps):
+                comm_ops.store_i64_global(arg_stamp + fx.Int64(ST_TICKET * 8), comm_ops.memrealtime())
         fx.barrier()
         ticket = rocdl.readfirstlane(T.i32, fx.ptr_load(ticket_ptr).ir_value())
         flag = fx.ptr_load(flag_ptr)
-        if fx.Int32(ticket) == last:
+        if const_expr("xt" in m2_tail):
+            am_last = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(xt_last_ptr).ir_value())) != fx.Int32(0)
+        else:
+            am_last = fx.Int32(ticket) == last
+        if am_last:
             if const_expr(reset_running > 0):
                 if tx_i32 < fx.Int32(reset_running):
                     store_at(fx.Int32(0), AddrBuffer(arg_running), tx_i32, cache_modifier=_SC0_SC1_CACHE)
-                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                if const_expr("tl" not in m2_tail):
+                    # (M2 tl: this half of the counters is next counted into two launches from now, and these
+                    # stores complete before this kernel ends: the flag need not wait for them.)
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+            if const_expr(dw):
+                # dw: no reducer waits for the flags. This rank's own one goes first and is awaited here, since the
+                # next launch takes its epoch from it: it has to be in memory before this launch can end. The
+                # peers' copies (their way out for a group that keeps the sentinel) follow and are not awaited.
+                if tx_i32 == fx.Int32(rank):
+                    comm_ops.fence_system_acquire()
+                    comm_ops.fence_system_release()
+                    if const_expr("tl" in m2_tail):
+                        own = remote_pre
+                    else:
+                        own = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
+                    comm_ops.store_i64_global_system(fx.Int64(own) + fx.Int64(rank * 8), flag)
+                    comm_ops.spin_until_shifted_eq_i64(arg_xdb + fx.Int64(rank * 8), arg_flag, shift=1)
                 fx.barrier()
-            if tx_i32 < fx.Int32(npes):
+                if (tx_i32 < fx.Int32(npes)) & (tx_i32 != fx.Int32(rank)):
+                    if const_expr("tl" in m2_tail):
+                        remote = remote_pre
+                    else:
+                        remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
+                    comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
+            elif tx_i32 < fx.Int32(npes):
                 # Every other WG's stores completed before its ticket; acquire them, then publish to peer tx.
                 comm_ops.fence_system_acquire()
                 comm_ops.fence_system_release()
-                remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
+                if const_expr("tl" in m2_tail):
+                    remote = remote_pre
+                else:
+                    remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
                 comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
             fx.barrier()
             if tx_i32 == fx.Int32(0):
@@ -631,6 +818,8 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     comm_ops.store_i64_global(arg_flag, flag + fx.Int64(1))
                 store_at(fx.Int32(0), AddrBuffer(arg_cnt), fx.Int32(0))
                 store_at(fx.Int32(0), AddrBuffer(arg_trecv), fx.Int32(0))
+                if const_expr(stamps):
+                    comm_ops.store_i64_global(arg_stamp + fx.Int64(ST_PUBLISHED * 8), comm_ops.memrealtime())
             if const_expr(reset_tok > 0):
                 for i in range_constexpr((reset_tok + 255) // 256):
                     if tx_i32 + fx.Int32(i * 256) < fx.Int32(reset_tok):
@@ -638,14 +827,25 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                             cache_modifier=_SC0_SC1_CACHE)
         nred = (i32_grid < fx.Int32(reducers)).select(i32_grid, fx.Int32(reducers))
         first = i32_grid - nred
-        if fx.Int32(ticket) >= first:
+        is_reducer = fx.Int32(ticket) >= first
+        if const_expr(dw):
+            # dw: the last WG publishes and does not reduce (its tokens would wait behind its flag stores); the
+            # reducers are the WGs that finished just before it.
+            nred = (i32_grid - fx.Int32(1) < fx.Int32(reducers)).select(i32_grid - fx.Int32(1), fx.Int32(reducers))
+            first = i32_grid - fx.Int32(1) - nred
+            is_reducer = (fx.Int32(ticket) >= first) & (fx.Int32(ticket) < last)
+        if is_reducer:
             # tok_done: each reducer wave waits for its own token below instead.
             if const_expr(not tok_done):
                 if tx_i32 < fx.Int32(npes):
                     if const_expr(row_format):
-                        # This launch's flag with either format bit (flag << 1 | fp8).
+                        # This launch's flag with either format bit (flag << 1 | fp8). dw: the same word as the
+                        # peer's plan published it, long before its flag; the flag itself is not awaited.
+                        fmt_src = arg_xdb
+                        if const_expr(dw):
+                            fmt_src = arg_fmt
                         seen = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
-                            arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1))
+                            fmt_src + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1))
                         fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
                     else:
                         comm_ops.wait_i64_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
@@ -654,6 +854,15 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     else:
                         comm_ops.fence_system_acquire()
             fx.barrier()
+            if const_expr(stamps):
+                if tx_i32 == fx.Int32(0):
+                    comm_ops.store_i64_global(arg_stamp + fx.Int64(ST_FLAGS * 8), comm_ops.memrealtime())
+
+            def dw_peer_done(peer_rank):
+                # The sending rank's flag of this launch is in: each of its rows landed before its last WG published.
+                seen_f = fx.Int64(comm_ops.load_i64_acquire(arg_xdb + fx.Int64(peer_rank) * fx.Int64(8)))
+                return (seen_f >> fx.Int64(1)) == arg_flag
+
             fp8_peers = fx.Int32(0)
             if const_expr(row_format and not tok_done):
                 for peer in range_constexpr(npes):
@@ -663,6 +872,8 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
             out_rsrc = AddrBuffer(arg_out)
             items = i32_cur_tok * fx.Int32(chunks)
             worker = (fx.Int32(ticket) - first) * fx.Int32(4) + wave
+            if const_expr("nc" in m2_tail):
+                items = fx.Int32(0)
             for item in range(worker, items, nred * fx.Int32(4)):
                 tok = item // fx.Int32(chunks)
                 col = (item - tok * fx.Int32(chunks)) * fx.Int32(256) + lane * fx.Int32(4)
@@ -699,17 +910,45 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     # The first tokens' rows are BF16 from every sender.
                     fp8_tok = (tok < fx.Int32(bf16_head_tokens)).select(fx.Int32(0), fp8_peers)
                 if fp8_tok == fx.Int32(0):
-                    vals = [load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2) for k in range_constexpr(topk)]
+                    vals = [load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2)
+                        for k in range_constexpr(topk)]
                     acc = Vec.filled(8, 0.0, fx.Float32)
                     for k in range_constexpr(topk):
                         valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
                         words = fx.Vector(vals[k])
+                        if const_expr(dw):
+                            # The lane's group of slot k: wait until none of its words is the sentinel.
+                            w0 = fx.Int32(words[0])
+                            w1 = fx.Int32(words[1])
+                            w2 = fx.Int32(words[2])
+                            w3 = fx.Int32(words[3])
+                            pend = valid & ((w0 == fx.Int32(_DW_SENTINEL)) | (w1 == fx.Int32(_DW_SENTINEL))
+                                | (w2 == fx.Int32(_DW_SENTINEL)) | (w3 == fx.Int32(_DW_SENTINEL)))
+                            src_rank = valid.select(eids[k], fx.Int32(0)) // fx.Int32(experts_per_rank)
+                            while pend:
+                                # The sender's flag first: once it is in, the group read after it is final.
+                                fx.rocdl.s_sleep(1)
+                                fin = dw_peer_done(src_rank)
+                                again = fx.Vector(load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, _SC0_SC1_CACHE))
+                                w0 = fx.Int32(again[0])
+                                w1 = fx.Int32(again[1])
+                                w2 = fx.Int32(again[2])
+                                w3 = fx.Int32(again[3])
+                                pend = ((w0 == fx.Int32(_DW_SENTINEL)) | (w1 == fx.Int32(_DW_SENTINEL))
+                                    | (w2 == fx.Int32(_DW_SENTINEL)) | (w3 == fx.Int32(_DW_SENTINEL))) & ~fin
+                            words = fx.Vector.from_elements([w0, w1, w2, w3], fx.Int32)
                         words = fx.Vector.from_elements(
                             [valid.select(words[w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
                         )
                         acc = acc + words.bitcast(fx.BFloat16).to(fx.Float32)
                     store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
-                    if const_expr(bf16_head_tokens):
+                    if const_expr(dw):
+                        # Every group this lane summed (and the never-written ones of invalid slots) holds the
+                        # sentinel again for the next launch.
+                        for k in range_constexpr(topk):
+                            store_at(Vec.filled(4, _DW_SENTINEL, fx.Int32).ir_value(), inp_rsrc,
+                                src + fx.Int32(k * row_i32))
+                    elif const_expr(bf16_head_tokens):
                         if tok < fx.Int32(bf16_head_tokens):
                             for k in range_constexpr(topk):
                                 store_at(Vec.filled(4, _ROW_POISON, fx.Int32).ir_value(), inp_rsrc,
@@ -729,6 +968,31 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                                 words = fx.Vector(load_at(inp_rsrc, row_k + col // fx.Int32(2), fx.Int32, 2, 2))
                                 sc_word = load_at(inp_rsrc, row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4),
                                     fx.Int32, 1, 2)
+                                if const_expr(dw):
+                                    # The lane's two FP8 words and its scale byte (stored on its own by the sender).
+                                    sc_sh = (sc_byte & fx.Int32(3)) * fx.Int32(8)
+                                    f0 = fx.Int32(words[0])
+                                    f1 = fx.Int32(words[1])
+                                    fs = fx.Int32(sc_word)
+                                    pend8 = ((f0 == fx.Int32(_DW_SENTINEL)) | (f1 == fx.Int32(_DW_SENTINEL))
+                                        | (((fs >> sc_sh) & fx.Int32(0xFF)) == fx.Int32(0xFF)))
+                                    while pend8:
+                                        fx.rocdl.s_sleep(1)
+                                        fin8 = dw_peer_done(peer)
+                                        again8 = fx.Vector(load_at(inp_rsrc, row_k + col // fx.Int32(2), fx.Int32, 2,
+                                            _SC0_SC1_CACHE))
+                                        f0 = fx.Int32(again8[0])
+                                        f1 = fx.Int32(again8[1])
+                                        fs = fx.Int32(load_at(inp_rsrc,
+                                            row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4), fx.Int32, 1, _SC0_SC1_CACHE))
+                                        pend8 = ((f0 == fx.Int32(_DW_SENTINEL)) | (f1 == fx.Int32(_DW_SENTINEL))
+                                            | (((fs >> sc_sh) & fx.Int32(0xFF)) == fx.Int32(0xFF))) & ~fin8
+                                    words = fx.Vector.from_elements([f0, f1], fx.Int32)
+                                    sc_word = fs
+                                    store_at(Vec.filled(2, _DW_SENTINEL, fx.Int32).ir_value(), inp_rsrc,
+                                        row_k + col // fx.Int32(2))
+                                    store_at(fx.Int32(_DW_SENTINEL), inp_rsrc,
+                                        row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4))
                                 e8m0 = (sc_word >> ((sc_byte & fx.Int32(3)) * fx.Int32(8))) & fx.Int32(0xFF)
                                 scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
                                 quads = []
@@ -739,9 +1003,34 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                                 contrib = quads[0].shuffle(quads[1], [0, 1, 2, 3, 4, 5, 6, 7])
                             else:
                                 words = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, 2))
+                                if const_expr(dw):
+                                    b0 = fx.Int32(words[0])
+                                    b1 = fx.Int32(words[1])
+                                    b2 = fx.Int32(words[2])
+                                    b3 = fx.Int32(words[3])
+                                    pendb = ((b0 == fx.Int32(_DW_SENTINEL)) | (b1 == fx.Int32(_DW_SENTINEL))
+                                        | (b2 == fx.Int32(_DW_SENTINEL)) | (b3 == fx.Int32(_DW_SENTINEL)))
+                                    while pendb:
+                                        fx.rocdl.s_sleep(1)
+                                        finb = dw_peer_done(peer)
+                                        againb = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, _SC0_SC1_CACHE))
+                                        b0 = fx.Int32(againb[0])
+                                        b1 = fx.Int32(againb[1])
+                                        b2 = fx.Int32(againb[2])
+                                        b3 = fx.Int32(againb[3])
+                                        pendb = ((b0 == fx.Int32(_DW_SENTINEL)) | (b1 == fx.Int32(_DW_SENTINEL))
+                                            | (b2 == fx.Int32(_DW_SENTINEL)) | (b3 == fx.Int32(_DW_SENTINEL))) & ~finb
+                                    words = fx.Vector.from_elements([b0, b1, b2, b3], fx.Int32)
+                                    store_at(Vec.filled(4, _DW_SENTINEL, fx.Int32).ir_value(), inp_rsrc, row_k + col)
                                 contrib = words.bitcast(fx.BFloat16).to(fx.Float32)
                         acc = acc + contrib
                     store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
+            # (dw: the sentinel stores are not awaited. They are issued before this launch ends, and the next rows
+            # for these groups leave a peer only after this rank's next dispatch and that peer's GEMM1 and GEMM2.)
+            if const_expr(stamps):
+                fx.barrier()
+                if tx_i32 == fx.Int32(0):
+                    comm_ops.store_i64_global(arg_stamp + fx.Int64(ST_REDUCED * 8), comm_ops.memrealtime())
 
     return fused_combine_tail
 
@@ -760,7 +1049,7 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0):
+    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, g2_b2stage=False):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
 
@@ -819,7 +1108,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows)
+            expert_offset=expert_offset, valid_rows=vrows, **({"g2_b2stage": True} if g2_b2stage else {}))
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
@@ -835,7 +1124,8 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192)) and cap == required_cap
+    layouts = ((8, 48), (4, 96), (2, 192)) + EXTRA_FIXED_SLOT_LAYOUTS  # the latter empty unless switched on
+    return (npes, experts_per_rank) in layouts and cap == required_cap
 
 
 # fmt: off
@@ -851,8 +1141,58 @@ def compile_mega_moe_stage1(
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False,
+    ascale_packed: bool = False, stream_w: bool = False, g2_b2stage: bool = False, probe: str = "",
+    expert_cached_w: int = 0, m2: str = "", hot_cached_w_min: int = 0, hot_fp8_min: int = 0, r2: str = "", bf16_rows_only: bool = False, row_stats: bool = False,
 ):
+    # MEGA_MOE_DRAFT_SHIPPED_PRECISION knobs (default off = unchanged kernel; see mega_moe_config):
+    # ``bf16_rows_only``: this rank's GEMM2 never sends FP8 rows, whatever its plan's FP8-row bit says (as a tok_done
+    # kernel); the format bit it publishes stays 0, so every peer's combine reads its rows as BF16.
+    # ``row_stats``: the plan CTA counts the launch and its FP8-row decision (emit_direct_fixed_slot_finalize).
+    # Round-2 switches (AITER_MEGA_SMALL_R2, '+'-joined, default off: unset leaves the kernel unchanged; every rank
+    # and every bucket of a runtime must set the same):
+    #   dw     the combine waits for data instead of the closing all-rank flag exchange (make_fused_combine_tail):
+    #          a rank's launch ends once its own tokens are reduced, and the flags of the peers still in their GEMM2
+    #          are met by the next launch (its plan waits for every source). Needs the tok_done launch discipline
+    #          (dedup rows, double-buffered expert counters and slots), which every bucket of this layout has.
+    #   lr     light release: the producers count in on the source flag without a system release (see
+    #          emit_direct_fixed_slot_payload); not a protocol knob, the ranks need not agree
+    #   rg     rows before the gate: a producer sends its first-round token row right after quantizing it, before
+    #          the epoch gate and the remote slot allocation (emit_token_rows_ahead); needs dedup_rows; not a
+    #          protocol knob (the destinations see the same rows in the same places before the same source flag)
+    #   stamp  the stamp probe (_STAMP_*): device-clock stamps of the protocol points of every CTA
+    r2f = frozenset(p for p in r2.split("+") if p)
+    assert r2f <= {"dw", "lr", "rg", "stamp"}, r2
+    DW, STAMPS = "dw" in r2f, "stamp" in r2f
+    ROWS_AHEAD = "rg" in r2f and dedup_rows
+    assert not DW or (tok_counters and plan_local and dedup_rows), "dw needs the run-ahead launch discipline"
+    # Experiment knobs (default off, see _kernel_knobs): ``g2_b2stage`` runs the 64-row GEMM2 tile on the 2-stage B
+    # pipeline (next K-tile's W2 prefetched during this one's MFMAs) instead of the 1-stage path; ``probe`` drops
+    # GEMM bodies for phase timing ("g1": no GEMM1 tile body, "g2": no GEMM2 tile body; the protocol, claims,
+    # ready epochs and combine still run, the output is garbage).
+    # ``expert_cached_w`` (M1-a, default 0 = unchanged kernel): an expert whose rows span more than one m-tile reads its
+    # weights through the cache (the cached-weight bodies the hot ranks already use), so its second and later m-tiles
+    # take the W slab from L2 instead of streaming it from HBM again; single-tile experts keep the streaming bodies.
+    # 1: GEMM1 (W1) only, 2: GEMM1 and GEMM2 (W1 and W2). Only the cache policy of the weight loads changes.
+    assert expert_cached_w in (0, 1, 2), expert_cached_w
+    # ``hot_cached_w_min`` / ``hot_fp8_min`` (FusedStage1Knobs, per bucket; 0: the module thresholds): rows of the rank's
+    # largest expert from which the rank takes the cached-weight bodies for all its tiles / sends FP8 GEMM2 rows.
+    hot_min = (int(hot_cached_w_min) or _HOT_CACHED_W_MIN_ROWS, int(hot_fp8_min) or _HOT_FP8_MIN_ROWS)
+    probe_skip = frozenset(p for p in probe.split("+") if p)
+    assert probe_skip <= {"g1", "g2"}, probe
+    # M2 fixed-base prototype switches (AITER_MEGA_SMALL_M2, '+'-joined, default off; every rank must set the same):
+    #   st  static roles: owner / producers / consumers by block index, the launch epoch read from this rank's own
+    #       combine flag of the previous launch instead of one entry-ticket atomic per CTA (the owner still advances
+    #       the shared entry counter by a whole launch so launches of other variants stay in step)
+    #   pg  producers send their routes before the epoch gate; they wait for the gate only before the done flag
+    #   ad  the producer-done chain counts only producers that carry a route
+    #   tl  combine tail: the peers' flag pointers are loaded before the exit ticket and the publisher does not wait
+    #       for its counter-zeroing stores (double-buffered halves)
+    #   xt  exit tickets per XCD (8 queues of grid / 8 WGs) instead of one agent-scope atomic queue of the whole grid
+    #   nw / nc  probes (wrong output): no GEMM work units after the real dispatch / no combine reduce pass
+    m2f = frozenset(p for p in m2.split("+") if p)
+    assert m2f <= {"st", "pg", "ad", "tl", "xt", "nw", "nc"}, m2
+    assert "ad" not in m2f or direct_done, "ad needs the direct_done flag arithmetic"
+    assert "tl" not in m2f or (tok_counters and plan_local), "tl needs the double-buffered expert counters"
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise RuntimeError(f"MegaMoE stage1 requires gfx950, got {arch}")
@@ -951,7 +1291,7 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, g2_b2stage=g2_b2stage,
     )
     g2_tile_cached, _ = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
@@ -959,7 +1299,7 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, g2_b2stage=g2_b2stage,
     )
     # The combine's last WG zeroes the expert counters one per thread.
     assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
@@ -968,9 +1308,13 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
-        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
+        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens, m2_tail=m2f & {"tl", "nc", "xt"},
+        lds_xt_off=g2_lay["bytes"] + 8, stamps=STAMPS, dw=DW)
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
+    # (M2 xt keeps the work-head address in the 8 bytes after the two scratch words.)
+    xt_lds_off = g2_scratch_off + 8
+    assert "xt" not in m2f or xt_lds_off % 8 == 0
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
     # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
     assert grid_mult <= 2 and 2 * lds_pool_bytes <= 160 * 1024, (grid_mult, lds_pool_bytes)
@@ -989,6 +1333,7 @@ def compile_mega_moe_stage1(
     entry_inc = 2 // grid_mult
     entry_unit = 2 * num_cu
     assert launch_grid_x * entry_inc == entry_unit
+    assert "xt" not in m2f or (launch_grid_x % 8 == 0 and fused_reducers % 8 == 0 and fused_reducers <= launch_grid_x)
 
     plan_chunks = (fz_epr + 63) // 64
     # g2_early = (K, P): one CTA in K (by in-XCD workgroup index) leaves GEMM1 for GEMM2 after a unit claimed past
@@ -1029,7 +1374,17 @@ def compile_mega_moe_stage1(
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
+        f"{'_g2b2' if g2_b2stage else ''}{'_probe' + ''.join(sorted(probe_skip)) if probe_skip else ''}"
+        f"{'_m2' + ''.join(sorted(m2f)) if m2f else ''}"
+        f"{f'_ecw{expert_cached_w}' if expert_cached_w else ''}"
+        f"{'' if _FP8_ROWS_MIN_ROWS == _FP8_ROWS_MIN_DEFAULT else f'_f8r{_FP8_ROWS_MIN_ROWS}'}"
+        f"{'_b16r' if bf16_rows_only else ''}{'_rst' if row_stats else ''}"
+        f"{'_dfmt1' if DW and bf16_rows_only else ''}"
+        f"{'' if hot_min[0] == _HOT_EXPERT_MIN_ROWS else f'_hcw{hot_min[0]}'}"
+        f"{'' if hot_min[1] == _HOT_EXPERT_MIN_ROWS else f'_hf8{hot_min[1]}'}"
+        f"{'_r2' + ''.join(sorted(r2f)) if r2f else ''}"
     )
+    assert not STAMPS or launch_grid_x <= _STAMP_GRID
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
     def kernel(
@@ -1040,6 +1395,10 @@ def compile_mega_moe_stage1(
         addr_expected: fx.Int64,
     ):
         tid = fx.thread_idx.x
+        if const_expr(STAMPS):
+            t_entry = fx.Int64(0)
+            if tid == fx.Int32(0):
+                t_entry = comm_ops.memrealtime()
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_buf = lds.pool
         a_scale_lds = lds.A_scale
@@ -1063,11 +1422,24 @@ def compile_mega_moe_stage1(
 
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
-        if tid == fx.Int32(0):
-            ticket64 = fx.Int64(
-                comm_ops.atomic_add_agent(a_entry_count + fx.Int64(entry_slot * 8), fx.Int64(entry_inc))
-            )
-            fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
+        if const_expr("st" in m2f):
+            # Static roles. The previous launch's last WG left (epoch + 2^40) << 1 | fmt in this rank's own combine
+            # flag slot; it is stable until this launch's own last WG, so every CTA reads the same epoch.
+            if tid == fx.Int32(0):
+                blk = fx.Int32(fx.block_idx.x)
+                if blk == fx.Int32(0):
+                    comm_ops.atomic_add_agent(a_entry_count + fx.Int64(entry_slot * 8), fx.Int64(entry_unit))
+                prev_flag = fx.Int64(comm_ops.load_i64_acquire(
+                    _disp_ptr(DispatchSlot.FC_XDB) + fx.Int64(fz_rank * 8)))
+                prev_epoch = (prev_flag >> fx.Int64(1)) & fx.Int64(0xFFFFFFFF)
+                ticket64 = prev_epoch * fx.Int64(entry_unit) + fx.Int64(blk) * fx.Int64(entry_inc)
+                fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
+        else:
+            if tid == fx.Int32(0):
+                ticket64 = fx.Int64(
+                    comm_ops.atomic_add_agent(a_entry_count + fx.Int64(entry_slot * 8), fx.Int64(entry_inc))
+                )
+                fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
         fx.barrier()
         ticket64 = Vec(ticket_view.load())[0]
         generation = ticket64 // fx.Int64(entry_unit)
@@ -1078,6 +1450,20 @@ def compile_mega_moe_stage1(
         gate_epoch = fx.Int32(generation + fx.Int64(1))
         owner = ticket == fx.Int32(0)
         producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
+        stamp_row = None
+        if const_expr(STAMPS):
+            # This CTA's row of the stamp probe: [launch epoch mod _STAMP_LAUNCHES][block index][slot].
+            stamp_row = fx.Int64(comm_ops.wave_uniform_i64(
+                _disp_ptr(DispatchSlot.STAMPS)
+                + (fx.Int64(gate_epoch & fx.Int32(_STAMP_LAUNCHES - 1)) * fx.Int64(_STAMP_GRID)
+                    + fx.Int64(fx.Int32(fx.block_idx.x))) * fx.Int64(_STAMP_SLOTS * 8)))
+            if tid == fx.Int32(0):
+                comm_ops.store_i64_global(stamp_row + fx.Int64(ST_ENTRY * 8), t_entry)
+
+        def _stamp(slot):
+            if const_expr(STAMPS):
+                if tid == fx.Int32(0):
+                    comm_ops.store_i64_global(stamp_row + fx.Int64(slot * 8), comm_ops.memrealtime())
 
         def _wait_gate():
             comm_ops.wait_i32_until_equals(gate_addr, gate_epoch)
@@ -1109,6 +1495,8 @@ def compile_mega_moe_stage1(
                     _buffer_store(work_head_rsrc, tid * fx.Int32(16) + fx.Int32(2), fx.Int32(0), fx.Int32)
                     if const_expr(G2_EARLY_K > 0):
                         _buffer_store(work_head_rsrc, tid * fx.Int32(16) + fx.Int32(3), fx.Int32(0), fx.Int32)
+                    if const_expr("xt" in m2f):
+                        _buffer_store(work_head_rsrc, tid * fx.Int32(16) + fx.Int32(4), fx.Int32(0), fx.Int32)
                 if tid == fx.Int32(16):
                     _buffer_store(_make_buffer_from_addr(a_group_done, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
                 old_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32)
@@ -1133,6 +1521,7 @@ def compile_mega_moe_stage1(
                 if ticket > fx.Int32(dispatch_blocks):
                     _wait_gate()
             fx.barrier()
+        _stamp(ST_GATE)
 
         if producer:
             prefetch_args = dict(  # noqa: C408
@@ -1145,11 +1534,32 @@ def compile_mega_moe_stage1(
             )
             # Only the first round loads before the gate; the payload loop loads the later rounds itself.
             prefetched = [prefetch_direct_fixed_slot_route(**prefetch_args, route_offset=0)]
-            if tid == fx.Int32(0):
-                _wait_gate()
-            fx.barrier()
-            route_parity, route_expected = _load_epoch()
+            if const_expr(ROWS_AHEAD):
+                emit_token_rows_ahead(
+                    num_waves=NUM_WAVES, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                    fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_scale_n_i32=fz_scale_n_i32,
+                    fz_enable_scales=fz_enable_scales, i32_cur_tok=i32_cur_tok, producer_slot=producer_slot,
+                    rpf=prefetched[0],
+                )
+            late_epoch = None
+            if const_expr("pg" in m2f):
+                route_parity = None
+                route_expected = None
+
+                def late_epoch():
+                    if tid == fx.Int32(0):
+                        _wait_gate()
+                    fx.barrier()
+                    return _load_epoch()
+            else:
+                if tid == fx.Int32(0):
+                    _wait_gate()
+                fx.barrier()
+                _stamp(ST_GATE)
+                route_parity, route_expected = _load_epoch()
             emit_direct_fixed_slot_payload(
+                late_epoch=late_epoch, active_done="ad" in m2f, stamp_row=stamp_row, light_release="lr" in r2f,
+                rows_ahead=ROWS_AHEAD,
                 num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
                 fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
                 fz_n_i32=fz_n_i32,
@@ -1159,6 +1569,7 @@ def compile_mega_moe_stage1(
                 parity=route_parity, expected=route_expected, prefetched=prefetched, route_rounds=pre_rounds,
                 prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
             )
+            _stamp(ST_SENT)
         payload_parity, payload_expected = _load_epoch()
         if owner:
             emit_direct_fixed_slot_finalize(
@@ -1166,7 +1577,7 @@ def compile_mega_moe_stage1(
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w,
+                stream_w=stream_w, hot_min=hot_min, row_stats=(not (tok_done or bf16_rows_only)) if row_stats else None,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1217,6 +1628,23 @@ def compile_mega_moe_stage1(
                 rows = count_e - tile_rows_base
                 rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
                 return expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows
+        plan_multi_tile = None
+        if const_expr(expert_cached_w and plan_local):
+
+            def plan_multi_tile(m_tile):
+                # 1 when m-tile ``m_tile`` belongs to an expert with more than one m-tile (plan_lookup's expert search).
+                lane = tid & fx.Int32(63)
+                expert = fx.Int32(0)
+                for chunk in range_constexpr(plan_chunks):
+                    incl = fx.ptr_load(lds_typed_ptr(plan_tab_base + (fx.Int32(chunk * 64) + lane) * fx.Int32(4),
+                        T.i32, align=4), result_type=T.i32)
+                    mask = rocdl.ballot(T.i64, fx.Int32(incl) <= m_tile)
+                    expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
+                expert = fx.Int32(rocdl.readfirstlane(T.i32, expert.ir_value()))
+                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
+                    plan_tab_base + fx.Int32(plan_chunks * 256) + expert * fx.Int32(4), T.i32, align=4),
+                    result_type=T.i32)))
+                return (count_e > fx.Int32(fz_tile_m)).select(fx.Int32(1), fx.Int32(0))
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
@@ -1287,6 +1715,7 @@ def compile_mega_moe_stage1(
             for source in range(lane, fz_npes, 64):
                 done_index = payload_parity * fx.Int32(fz_npes) + source
                 comm_ops.wait_i32_until_equals(a_done + fx.Int64(done_index) * fx.Int64(4), payload_expected)
+            _stamp(ST_SRC_DONE)
             comm_ops.invalidate_l1()
             a_running = _disp_ptr(DispatchSlot.RUNNING)
             if const_expr(tok_counters):
@@ -1300,7 +1729,8 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(safe_count, lds_typed_ptr(plan_tab_base + fx.Int32(plan_chunks * 256) + slot, T.i32,
                     align=4))
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w, max_count,
+                hot_min)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
@@ -1326,7 +1756,26 @@ def compile_mega_moe_stage1(
                     fx.ptr_store(plan_low_local, nv_ptr)
         fx.barrier()
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
+        _stamp(ST_PLAN)
+        if const_expr(DW):
+            # dw: this rank's row format of the launch goes to every peer now, as the word its combine flag will
+            # be (flag << 1 | fp8), into the peers' format words: their reducers need it long before the flag.
+            # A peer reads it in this launch's reduce, and this rank's next plan (which overwrites it) waits for
+            # that peer's next dispatch.
+            if owner:
+                if tid < fx.Int32(fz_npes):
+                    dw_fmt_bit = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
+                    # Early format announcement must match GEMM2's actual wire format.
+                    if const_expr(tok_done or bf16_rows_only):
+                        dw_fmt_bit = fx.Int32(0)
+                    dw_remote = _buffer_load(
+                        _make_buffer_from_addr(_disp_ptr(DispatchSlot.P2P_DW_FMT), fx.Int64), tid, fx.Int64)
+                    comm_ops.store_i64_global_system(
+                        fx.Int64(dw_remote) + fx.Int64(fz_rank * 8),
+                        ((fx.Int64(gate_epoch) + fx.Int64(1 << 40)) << fx.Int64(1)) | fx.Int64(dw_fmt_bit))
         num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
+        if const_expr("nw" in m2f):
+            num_valid = fx.Int32(0)
         if const_expr(dedup_rows):
             row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0]).ir_value()))
             row_map["scale_token"] = fx.Int32(
@@ -1421,8 +1870,13 @@ def compile_mega_moe_stage1(
             work = Vec(work_scratch_view.load())[0]
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
             if has_work != fx.Int32(0):
-                if const_expr(b_cache_modifier != 0):
-                    if cached_w != fx.Int32(0):
+                if const_expr("g1" in probe_skip):
+                    pass
+                elif const_expr(b_cache_modifier != 0):
+                    g1_cached = cached_w
+                    if const_expr(plan_multi_tile is not None):
+                        g1_cached = g1_cached | plan_multi_tile(work // fx.Int32(N_TILES))
+                    if g1_cached != fx.Int32(0):
                         _do_cached_tile(work)
                     else:
                         _do_scheduled_tile(work)
@@ -1432,12 +1886,16 @@ def compile_mega_moe_stage1(
                 # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 fx.barrier()
+                if const_expr(STAMPS):
+                    if g1_fetch == fx.Int32(0):
+                        _stamp(ST_G1_FIRST)
             pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
             consumer_active = has_work != fx.Int32(0)
             g1_fetch = fx.Int32(1)
             if const_expr(G2_EARLY_K > 0):
                 g1_leave = ((has_work != fx.Int32(0)) & (work - shard_base >= early_thr)).select(
                     fx.Int32(1), fx.Int32(0))
+        _stamp(ST_G1_END)
 
         if tid < fx.Int32(fz_npes):
             fx.ptr_store(g2_peer_base, lds_typed_ptr(fx.Int32(g2_lay["peer"]) + tid * fx.Int32(8), T.i64, align=8))
@@ -1458,7 +1916,7 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
-        if const_expr(tok_done):
+        if const_expr(tok_done or bf16_rows_only):
             fp8_rows = fx.Int32(0)
         tok_off = tok_reset = fx.Int64(0)
         if const_expr(tok_counters):
@@ -1491,7 +1949,12 @@ def compile_mega_moe_stage1(
                 # CU's L1 can be stale.
                 comm_ops.invalidate_l1()
                 # As in GEMM1, a rank that receives many rows reads W2 through the cache.
-                if cached_w != fx.Int32(0):
+                g2_cached = cached_w
+                if const_expr(expert_cached_w == 2 and plan_multi_tile is not None):
+                    g2_cached = g2_cached | plan_multi_tile(g2_m)
+                if const_expr("g2" in probe_skip):
+                    pass
+                elif g2_cached != fx.Int32(0):
                     g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
                         g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
                         fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
@@ -1499,8 +1962,12 @@ def compile_mega_moe_stage1(
                     g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
                         g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
                         fx.Int32(model_dim), fp8_rows, tok_off)
+                if const_expr(STAMPS):
+                    if g2_fetch == fx.Int32(0):
+                        _stamp(ST_G2_FIRST)
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
+        _stamp(ST_G2_END)
 
         def reset_running_addr():
             a_running = _disp_ptr(DispatchSlot.RUNNING)
@@ -1509,6 +1976,9 @@ def compile_mega_moe_stage1(
                 a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
             return a_running
 
+        if const_expr("xt" in m2f):
+            if tid == fx.Int32(0):
+                fx.ptr_store(a_work_head, lds_typed_ptr(fx.Int32(xt_lds_off), T.i64, align=8))
         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
         # the combine op's own flag values in the shared xdb slots.
         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
@@ -1516,7 +1986,9 @@ def compile_mega_moe_stage1(
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
             fx.Int32(launch_grid_x), fp8_rows,
-            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset)
+            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset,
+            stamp_row if const_expr(STAMPS) else fx.Int64(0),
+            _disp_ptr(DispatchSlot.DW_FMT) if const_expr(DW) else fx.Int64(0))
 
     @flyc.jit
     def launch(
@@ -1574,14 +2046,39 @@ _CACHED_W_MIN_ROWS = 2560
 # Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
 # path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
 _FP8_ROWS_MIN_ROWS = 3584
+# Experiment switch (default off: unset keeps 3584 and the kernel unchanged): AITER_MEGA_SMALL_FP8_ROWS_MIN=<rows>
+# moves that threshold, e.g. 1 makes every rank send FP8 GEMM2 rows (half the XGMI scatter bytes, FP8 transport
+# rounding); the kernel name gains _f8r<rows>. Read once, at import; every rank must set the same value.
+_FP8_ROWS_MIN_DEFAULT = _FP8_ROWS_MIN_ROWS
+_FP8_ROWS_MIN_ROWS = int(switch_env("AITER_MEGA_SMALL_FP8_ROWS_MIN", str(_FP8_ROWS_MIN_DEFAULT)))
 # Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
 # (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256
+# Experiment switches (default off: unset keeps both at _HOT_EXPERT_MIN_ROWS and the kernel unchanged):
+# AITER_MEGA_SMALL_HOT_CACHED_W_MIN=<rows> / AITER_MEGA_SMALL_HOT_FP8_MIN=<rows> move, each on its own, the row count
+# of a rank's largest expert from which the rank takes the cached-weight bodies for all its tiles / sends FP8 GEMM2
+# rows (e.g. 1000000: never; the per-expert expert_cached_w and the routed-row thresholds above still apply). At
+# 60-78 rows a rank (DEP8 decode) a rank that holds a hot expert crosses 256 rows, and both cost time there: cached
+# W for its single-tile experts and the FP8 row epilogue (-5 % to -7 % a layer call with both off, kopt gpu0). The
+# kernel name gains _hcw<rows> / _hf8<rows>. Both decisions are rank-local (the row format travels in the published
+# flag). Read once, at import; every rank should set the same value.
+_HOT_CACHED_W_MIN_ROWS = int(switch_env("AITER_MEGA_SMALL_HOT_CACHED_W_MIN", str(_HOT_EXPERT_MIN_ROWS)))
+_HOT_FP8_MIN_ROWS = int(switch_env("AITER_MEGA_SMALL_HOT_FP8_MIN", str(_HOT_EXPERT_MIN_ROWS)))
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
+# row_stats (MEGA_MOE_DRAFT_SHIPPED_PRECISION): i32 word indices from the plan word of the counters the plan CTA
+# keeps behind it: launches, launches whose GEMM2 sent FP8 rows, launches whose plan set the FP8-row bit while the
+# kernel sends BF16 rows only (tok_done or bf16_rows_only). They start 128 bytes past the plan word, on a line of
+# their own: nothing but these atomics touches it, and the plan word's line is accessed exactly as without them.
+_ROW_STAT_LAUNCHES, _ROW_STAT_FP8_SENT, _ROW_STAT_FP8_KEPT_BF16 = 32, 33, 34
+_ROW_STAT_I64 = 18  # i64 words of the plan-word buffer of a row_stats runtime (144 bytes)
 # The word the combine leaves in the rows of the bf16_head_tokens tokens (FusedStage1Knobs) once it summed them.
 _ROW_POISON = -1
+# Round-2 switches, '+'-joined (default off: unset leaves kernels, names and cache keys unchanged). Read once, at
+# import: dw changes what the launches of a runtime leave behind for each other, so it cannot change per launch.
+_R2 = "+".join(sorted(p for p in switch_env("AITER_MEGA_SMALL_R2", "").split("+") if p))
+assert set(_R2.split("+")) <= {"", "dw", "lr", "rg", "stamp"}, f"AITER_MEGA_SMALL_R2={_R2!r}"
 # dedup_rows: byte offset (from the payload / scale buffer base) that the token-row regions end below.
 _TOKEN_REGION_END = (1 << 31) - (1 << 16)
 
@@ -1589,8 +2086,39 @@ _TOKEN_REGION_END = (1 << 31) - (1 << 16)
 def _kernel_knobs(config: MegaMoEConfig) -> dict:
     """compile_mega_moe_stage1's fused-kernel knobs of a config."""
     k1, k2 = config.fused_stage1, config.fused_stage2
+    # Experiment switches, read at launch-config time (default off: unset adds no knob, so the kernel name and the
+    # compile cache key are unchanged). AITER_MEGA_SMALL_G2_B2STAGE=1: 2-stage B pipeline for the 64-row GEMM2 tile
+    # (kernel suffix _g2b2). AITER_MEGA_SMALL_PROBE=g1 | g2 | g1+g2: phase-timing kernels without those GEMM
+    # bodies (suffix _probe*; wrong output, benchmarks only). Every rank must set the same values.
+    extra = {}
+    if switch_env("AITER_MEGA_SMALL_G2_B2STAGE", "0") == "1" and config.stage2.block_m == 64:
+        extra["g2_b2stage"] = True
+    if switch_env("AITER_MEGA_SMALL_PROBE", ""):
+        extra["probe"] = switch_env("AITER_MEGA_SMALL_PROBE")
+    # M2 fixed-base prototype switches (see compile_mega_moe_stage1): AITER_MEGA_SMALL_M2=st+pg+ad+tl (default off).
+    if switch_env("AITER_MEGA_SMALL_M2", ""):
+        extra["m2"] = switch_env("AITER_MEGA_SMALL_M2")
+    # Round-2 switches (see compile_mega_moe_stage1): AITER_MEGA_SMALL_R2=dw | stamp | dw+stamp (default off: unset adds
+    # no knob). dw is a protocol knob: every rank sets the same value, and it must be set before the runtime is built
+    # (SmallMRuntime fills the combine input with the sentinel then).
+    if _R2:
+        extra["r2"] = _R2
+    # AITER_MEGA_SMALL_EXPERT_CACHED_W=1 | 2 (default off: unset adds no knob): cached weight loads per multi-tile expert
+    # on every bucket (see compile_mega_moe_stage1's expert_cached_w; kernel suffix _ecw1 / _ecw2). Not a protocol knob.
+    if switch_env("AITER_MEGA_SMALL_EXPERT_CACHED_W", "0") not in ("", "0"):
+        extra["expert_cached_w"] = int(switch_env("AITER_MEGA_SMALL_EXPERT_CACHED_W"))
+    elif getattr(k1, "expert_cached_w", 0):
+        # The per-bucket form: FusedStage1Knobs.expert_cached_w, e.g. AITER_MEGA_SMALL_M_OVERRIDE="64:fs1.expert_cached_w=2".
+        extra["expert_cached_w"] = int(k1.expert_cached_w)
+    # Per-bucket hot-expert thresholds (unset adds no knob), e.g.
+    # AITER_MEGA_SMALL_M_OVERRIDE="32+64+128:fs1.hot_cached_w_min=1024,fs1.hot_fp8_min=1024".
+    if getattr(k1, "hot_cached_w_min", 0):
+        extra["hot_cached_w_min"] = int(k1.hot_cached_w_min)
+    if getattr(k1, "hot_fp8_min", 0):
+        extra["hot_fp8_min"] = int(k1.hot_fp8_min)
     # fmt: off
     return dict(  # noqa: C408
+        **extra,
         dedup_rows=k1.dedup_rows, plan_wt=k1.plan_wt, plan_local=k1.plan_local,
         g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), g2_uniform=k1.g2_uniform,
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
@@ -1653,8 +2181,10 @@ class SmallMRuntime:
 
         A tok_done bucket's combine takes each token once its own rows are counted, so a rank can leave, and start
         its next call's dispatch into its peers, while a peer still reads its payload: such a runtime cannot share
-        payload storage with another route.
+        payload storage with another route. The same holds for every bucket of a runtime under AITER_MEGA_SMALL_R2=dw.
         """
+        if "dw" in _R2.split("+"):
+            return False
         return not any(
             select_fused_config(
                 bucket,
@@ -1728,6 +2258,14 @@ class SmallMRuntime:
         tok_done_block_n = {config.stage2.block_n for config in self._configs.values() if config.fused_stage1.tok_done}
         assert len(tok_done_block_n) <= 1, f"tok_done buckets disagree on the GEMM2 block_n: {tok_done_block_n}"
         self._protocol = self._configs[1].fused_stage1
+        # MEGA_MOE_DRAFT_SHIPPED_PRECISION (unset: no knob, so every kernel name and cache key is unchanged): every
+        # kernel of the runtime counts its launches and FP8-row sends; a draft layout's kernels send BF16 rows only.
+        self._precision_knobs = {}
+        if DRAFT_SHIPPED_PRECISION:
+            self._precision_knobs["row_stats"] = True
+            if draft_shipped_precision(world_size=self.world_size, experts_per_rank=self.epr,
+                    model_dim=self.model_dim, inter_dim=self.inter_dim):
+                self._precision_knobs["bf16_rows_only"] = True
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.
         self._reducers = _COMBINE_REDUCERS
@@ -1757,6 +2295,7 @@ class SmallMRuntime:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
             self.comb_cfg, gm_payload_arena=payload_arena, combine_input=combine_input
         )
+        self._shared_combine_input = combine_input is not None
         self._s1_output_arena = s1_output_arena
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -1827,7 +2366,8 @@ class SmallMRuntime:
             "tile_rows": zeros(metadata_blocks),
             "g2_cnt": zeros(metadata_blocks),
             "g2_ready": zeros(metadata_blocks),
-            "plan_nv": zeros(1, torch.int64),
+            # row_stats kernels keep their i32 counters behind the plan word (_ROW_STAT_*).
+            "plan_nv": zeros(_ROW_STAT_I64 if self._precision_knobs else 1, torch.int64),
             "xcd_acq": zeros(8 * 16, torch.int64),  # one 128-byte line per XCD
         }
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
@@ -1844,13 +2384,33 @@ class SmallMRuntime:
             meta_rows = op.num_valid_max + self.epr * op.ll_cap
             workspace["srcmap"] = op._sym((meta_rows,), torch.int32)
             workspace["wts"] = op._sym((meta_rows,), torch.float32)
+        r2 = frozenset(_R2.split("+"))
+        if "dw" in r2:
+            # dw: every rank's row-format word of the launch in flight (allocated last: the symmetric heap of a
+            # runtime without the switch is laid out as before).
+            workspace["dw_fmt"] = op._sym((self.world_size,), torch.int64)
         ms.shmem_barrier_all()
         workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
         if self._protocol.tok_counters:
             workspace["p2p_running"] = op._p2p_table(workspace["running"])
             workspace["p2p_srcmap"] = op._p2p_table(workspace["srcmap"])
             workspace["p2p_wts"] = op._p2p_table(workspace["wts"])
+        if "dw" in r2:
+            workspace["p2p_dw_fmt"] = op._p2p_table(workspace["dw_fmt"])
+            # The combine input starts as sentinel words (all bytes 0xFF); every reducer leaves it so.
+            if self._shared_combine_input:
+                raise ValueError("AITER_MEGA_SMALL_R2=dw needs a small-input runtime with its own combine input")
+            self.comb_op.shmem_comb_inp_tok.fill_(-1)
+            torch.cuda.synchronize()
+        if "stamp" in r2:
+            workspace["stamps"] = zeros(_STAMP_LAUNCHES * _STAMP_GRID * _STAMP_SLOTS, torch.int64)
         self._s1_dispatch_workspace = workspace
+
+    def stamp_tensor(self):
+        """The stamp probe's buffer as [launch epoch mod _STAMP_LAUNCHES, block, slot] i64 device-clock ticks of
+        10 ns (0: not stamped); None unless AITER_MEGA_SMALL_R2 has ``stamp``."""
+        stamps = self._s1_dispatch_workspace.get("stamps")
+        return None if stamps is None else stamps.view(_STAMP_LAUNCHES, _STAMP_GRID, _STAMP_SLOTS)
 
     def _build_disp_table(self):
         op = self._s1_op
@@ -1905,6 +2465,12 @@ class SmallMRuntime:
                 assert peer_tok - peer_inp == tok_off, "tok_done is not heap-symmetric"
             table[DispatchSlot.TOK_DONE_OFF] = tok_off
         table[DispatchSlot.TOKEN_ROWS], table[DispatchSlot.TOKEN_SCALES] = self._s1_token_offsets
+        # Round-2 switches (0 when off).
+        if "stamps" in workspace:
+            table[DispatchSlot.STAMPS] = workspace["stamps"].data_ptr()
+        if "dw_fmt" in workspace:
+            table[DispatchSlot.DW_FMT] = workspace["dw_fmt"].data_ptr()
+            table[DispatchSlot.P2P_DW_FMT] = workspace["p2p_dw_fmt"].data_ptr()
         self._s1_disp_template = table
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
         self._s1_disp_by_w2[(self.w2.data_ptr(), self.w2_scale.data_ptr())] = self._s1_disp
@@ -1941,7 +2507,10 @@ class SmallMRuntime:
         self._s1_disp = disp
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
-        config = self._configs[nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)]
+        config = self._configs[
+            fused_bucket_override(max(tokens, 1), self.mtpr)
+            or nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)
+        ]
         self._active_config = config
         return config
 
@@ -1968,8 +2537,23 @@ class SmallMRuntime:
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
-            preload=preload, **_kernel_knobs(config))
+            preload=preload, **_kernel_knobs(config), **self._precision_knobs)
         # fmt: on
+
+    @property
+    def bf16_rows_only(self) -> bool:
+        """Whether this runtime's kernels were built without the FP8-row send (a draft layout under
+        MEGA_MOE_DRAFT_SHIPPED_PRECISION=1)."""
+        return bool(self._precision_knobs.get("bf16_rows_only"))
+
+    def row_stats(self):
+        """(launches, launches that sent FP8 rows, launches whose plan asked for FP8 rows and sent BF16) of this
+        runtime on this rank since it was built, graph replays included; None without
+        MEGA_MOE_DRAFT_SHIPPED_PRECISION=1. Reads device memory (a stream sync): never call it during a capture."""
+        if not self._precision_knobs:
+            return None
+        words = self._s1_dispatch_workspace["plan_nv"].view(torch.int32).tolist()
+        return words[_ROW_STAT_LAUNCHES], words[_ROW_STAT_FP8_SENT], words[_ROW_STAT_FP8_KEPT_BF16]
 
     def preload_aot_bundle(self):
         """Load the kernel of every token bucket this runtime selects, without GPU dispatch."""
