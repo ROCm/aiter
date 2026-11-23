@@ -606,7 +606,6 @@ def _mxfp4_inline_sort_unsupported(
     if bias2 is not None and not metadata.stage2_has_bias:
         return "stage2 kernel does not support bias2"
     for name, value in (
-        ("expert_mask", expert_mask),
         ("a1_scale", a1_scale),
         ("a2_scale", a2_scale),
         ("stage2_scatter", stage2_scatter),
@@ -637,7 +636,8 @@ def _mxfp4_inline_sort_unsupported(
         return "cross-device tensors"
 
     p2 = parse_flydsl_v2_gemm2_kernel(metadata.stage2.keywords["kernelName2"])
-    if not _mxfp4_aux_instance_supported(
+    # EP sorts with the masked Opus kernel instead of this generated one.
+    if expert_mask is None and not _mxfp4_aux_instance_supported(
         experts,
         topk_ids.shape[1],
         hidden,
@@ -2404,6 +2404,8 @@ def _fused_moe_impl(
         )
     prequantized_a1 = None
     prequantized_a1_scale = None
+    moe_buf_zeroed = False
+    reverse_masked = False
     # The a4w4 aux-sort families already fuse activation quantization into GEMM1,
     # so the fused sort+quant kernel has nothing left to save there.
     fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
@@ -2454,24 +2456,19 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     elif metadata.output_aux:
-        # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
-        # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
-        # route tokens to the wrong experts, so fail loudly there.
-        if expert_mask is not None and (
-            getattr(metadata.stage2, "func", metadata.stage2)
-            is not _flydsl_v2_stage2_wrapper
-        ):
-            raise NotImplementedError(
-                "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
-                "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
-            )
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
+        _is_opus = _is_mxmoe_opus_metadata(metadata)
+        _g2 = None if _is_opus else parse_g2_kname_any(_kn2)
+        if expert_mask is not None and (_is_opus or not _g2["v2"]):
+            raise NotImplementedError(
+                f"MXMOE GEMM2 {_kn2!r} does not support expert-parallel; "
+                "use a flydsl_moe2_layout_ GEMM2."
+            )
         _atomic = (
-            not stage2_uses_route_reduce(metadata.stage2)
-            if _is_mxmoe_opus_metadata(metadata)
-            else parse_g2_kname_any(_kn2)["atomic"]
+            not stage2_uses_route_reduce(metadata.stage2) if _is_opus else _g2["atomic"]
         )
+        moe_buf_zeroed = _atomic and not runtime_stage2_reduce
         # The presort layout has to match both the selected kernels' tile size
         # and the block size the stages are given, which a caller's
         # block_size_M can override.
@@ -2546,6 +2543,8 @@ def _fused_moe_impl(
                 sort_reverse_sorted,
             ) = sorting_ret[:7]
             local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+            # The Opus EP aux sort initializes all reverse routes to -1.
+            reverse_masked = expert_mask is not None
     elif fused_sort_quant:
         (
             sorted_ids,
@@ -2647,6 +2646,15 @@ def _fused_moe_impl(
             kernel_bench_callable.append(("stage1", _stage1_call))
         return _return_output(_stage1_call(), output)
     else:
+        if stage2_func is _mxfp4_a4w4_stage2_fw:
+            from aiter.ops.flydsl.mxmoe_native_reduce import _OPUS_REVERSE_SOURCE
+
+            _stage2_extra_args = dict(_stage2_extra_args or {})
+            _stage2_extra_args["output_zeroed"] = moe_buf_zeroed
+            _stage2_extra_args["reverse_masked"] = reverse_masked
+            _stage2_extra_args["_ep32_reverse_source"] = (
+                _OPUS_REVERSE_SOURCE if reverse_masked else None
+            )
         ret = fused_moe_2stages(
             hidden_states,
             w1,
@@ -3830,7 +3838,8 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
+    _p1 = _parse_mxfp4_g1_kname(kernelName1)
+    _xcd1 = _p1.get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -3865,6 +3874,7 @@ def _mxfp4_a4w4_stage1(
         bias=bias1,
         num_waves=num_waves,
         k_wave=k_wave,
+        ep32=_p1.get("ep32", False),
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -4139,6 +4149,11 @@ def _mxfp4_a4w4_stage2_fw(
     kernelName2="",
     reverse_sorted=None,
     use_valid_token_count=False,
+    expert_mask=None,
+    topk_ids=None,
+    output_zeroed=False,
+    reverse_masked=False,
+    _ep32_reverse_source=None,
     **_kwargs,
 ):
 
@@ -4188,8 +4203,13 @@ def _mxfp4_a4w4_stage2_fw(
             topk_weights=topk_weights,
             bias2=bias2,
             block_m=block_m,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
             reverse_sorted=reverse_sorted,
             use_valid_token_count=use_valid_token_count,
+            output_zeroed=output_zeroed,
+            reverse_masked=reverse_masked,
+            _ep32_reverse_source=_ep32_reverse_source,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -4286,6 +4306,9 @@ def _flydsl_v2_stage2_wrapper(
     reverse_sorted=None,
     use_valid_token_count=False,
     per_slot_out=None,
+    output_zeroed=False,
+    reverse_masked=False,
+    _ep32_reverse_source=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -4330,7 +4353,21 @@ def _flydsl_v2_stage2_wrapper(
             f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
         )
     epilog = cfg["epilog"]
+    ep32_native = (
+        cfg.get("ep32", False) and (bm == 96 or (bm == 160 and out.shape[0] == 8192))
+        and out.shape[1] == 3584 and inter_dim == 3072 and not cfg["use_nt"]
+        and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1"
+    )
+    ep32_sorted_reduce = ep32_native
+    ep32_native_bf16 = ep32_native and bm in (96, 160) and os.environ.get("G2_NATIVE_BF16", "1") == "1"
+    if ep32_sorted_reduce:
+        epilog = "reduce"
     max_sorted = inter_states.shape[0]
+    if ep32_native:
+        if out.dtype != torch.bfloat16 or topk not in (16, 17):
+            raise ValueError("EP32 native GEMM2 requires BF16 output and top-k16/17")
+        if max_sorted % 16:
+            raise ValueError("EP32 native GEMM2 staging capacity must be padded to 16 rows")
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
@@ -4342,7 +4379,7 @@ def _flydsl_v2_stage2_wrapper(
             f"(model_dim={model_dim_runtime}, topk={topk})"
         )
     target = out
-    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
+    _s2_fp8_inter = epilog == "reduce" and not ep32_sorted_reduce and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
     # AITER_MXFP4_INTERMEDIATE: the same deferred-weight route rows, values in MXFP4.
@@ -4380,6 +4417,12 @@ def _flydsl_v2_stage2_wrapper(
             target = _stage2_scratch(
                 "target", (max_sorted, model_dim_runtime), out.dtype, out.device
             )
+    elif ep32_sorted_reduce:
+        if reverse_sorted is None or expert_mask is None or topk_ids is None:
+            raise ValueError("EP32 native sorted reduction requires EP reverse routes")
+        target = _stage2_scratch(
+            "target", (max_sorted, model_dim_runtime), torch.bfloat16 if ep32_native_bf16 else (torch.float32 if ep32_native else out.dtype), out.device
+        )
     elif epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
@@ -4464,6 +4507,8 @@ def _flydsl_v2_stage2_wrapper(
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        ep32=cfg.get("ep32", False),
+        native_bf16=ep32_native_bf16,
         g2_scatter_lds_pairs=cfg["scatter_lds_pairs"]
         and not _s2_fp4_scatter
         and bias2 is None,
@@ -4491,6 +4536,34 @@ def _flydsl_v2_stage2_wrapper(
             TOPK=topk,
             D_HIDDEN=model_dim_runtime,
             MB=bm,
+        )
+        return out
+    if ep32_sorted_reduce:
+        if ep32_native:
+            from aiter.ops.flydsl.mxmoe_native_reduce import (
+                _NATIVE_BF16_SOURCE,
+                _NATIVE_FP32_SOURCE,
+                ep32_native_reduce,
+            )
+            native_view = target.view(max_sorted // 16, 224, 64, 4)
+            ep32_native_reduce(native_view, reverse_sorted, sorted_weights, expert_mask,
+                topk_ids, num_valid_ids, out, preweighted_bf16=ep32_native_bf16,
+                output_zeroed=output_zeroed, reverse_masked=reverse_masked,
+                _native_source=_NATIVE_BF16_SOURCE if ep32_native_bf16 else _NATIVE_FP32_SOURCE,
+                _reverse_source=_ep32_reverse_source)
+            return out
+        # Remote routes were not written. Mask their reverse indices before
+        # the existing gather/reduce, avoiding a clear of the staging buffer.
+        ids = topk_ids.long()
+        local = expert_mask[ids.clamp(0, expert_mask.numel() - 1)] != 0
+        local = local & (ids >= 0) & (ids < expert_mask.numel())
+        local = local & (torch.arange(token_num, device=out.device)[:, None] < num_valid_ids[1])
+        reverse = torch.where(local.reshape(-1), reverse_sorted, -1)
+        # GEMM2 already applied the route weight before BF16 rounding.
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=target, reverse_sorted=reverse,
+            sorted_weights=torch.ones_like(sorted_weights), out=out,
+            NE=num_experts, TOPK=topk, D_HIDDEN=model_dim_runtime, MB=bm,
         )
         return out
     if epilog == "reduce":
@@ -5548,11 +5621,6 @@ def get_2stage_cfgs(
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
-        elif _is_inline_sort_cfg(kn1, kn2) and is_ep:
-            cfg = None
-            logger.warning(
-                "[fused_moe] discarding tuned inline-sort config with expert_mask"
-            )
         elif _is_inline_sort_cfg(kn1, kn2):
             inline_metadata = _make_mxfp4_metadata(
                 kn1,
@@ -5684,7 +5752,23 @@ def get_2stage_cfgs(
                 f"sort block_m={cfg.get('block_m', BLOCK_SIZE_M)} and GEMM2 {kn2!r} "
                 f"must both match GEMM1 BM={parsed_g1['BM']}"
             )
-        elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
+        # Under EP `expert` is the local count, and the masked Opus sort plus the
+        # prequant/inline-quant GEMM1 replace every NE-keyed aux kernel; only the
+        # scatter epilog's scatter_reduce, keyed on (model_dim, topk), remains.
+        elif is_ep and parse_flydsl_v2_gemm2_kernel(kn2) is None:
+            reject_reason = f"EP requires a flydsl_moe2_layout_ GEMM2, got {kn2!r}"
+        elif (
+            is_ep
+            and parse_flydsl_v2_gemm2_kernel(kn2)["epilog"] == "scatter"
+            and not aiter.is_mxfp4_moe_scatter_supported(model_dim, topk)
+        ):
+            reject_reason = (
+                "generated MXFP4 scatter_reduce kernels do not cover "
+                f"(model_dim={model_dim}, topk={topk})"
+            )
+        elif not is_ep and not aiter.is_mxfp4_moe_shape_supported(
+            expert, model_dim, inter_dim, topk
+        ):
             reject_reason = (
                 "generated MXFP4 auxiliary kernels do not cover "
                 f"(expert={expert}, model_dim={model_dim}, "
@@ -5694,8 +5778,6 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
             )
-        elif is_ep:
-            reject_reason = "the MXMOE output_aux sort drops expert_mask"
         if reject_reason is not None:
             cfg = None
             logger.warning(
@@ -6460,7 +6542,7 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    # The fallback's layout GEMM2 writes bf16 only, and its output_aux sort drops expert_mask.
+    # The fallback's layout GEMM2 writes bf16 only, and it is not validated under EP.
     _mxmoe_fallback_ok = (
         dtype == dtypes.bf16
         and not is_ep
@@ -7079,6 +7161,7 @@ def fused_moe_2stages(
         in (
             _flydsl_stage2_wrapper,
             _flydsl_v2_stage2_wrapper,
+            _mxfp4_a4w4_stage2_fw,
         )
         and expert_mask is not None
     ):
