@@ -135,3 +135,68 @@ class PaGluonProcessLimitTest(unittest.TestCase):
             ):
                 self.assertEqual(cpp_itfs_utils._build_command(3), [*command, "-j1"])
         self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
+
+
+class FlyDSLMoeDeploymentTest(unittest.TestCase):
+    def test_buckets_follow_get_padded_m(self):
+        from aiter.aot.flydsl import moe
+        from aiter.fused_moe import get_padded_M
+
+        for max_token in (1, 3, 1000, 16384, 16385, 40000, 131071, 131072, 200000):
+            buckets = moe._buckets(max_token)
+            starts = [low for _, low, _ in buckets[1:]] + [max_token + 1]
+            self.assertEqual(buckets[0][1], 1)
+            for (bucket, low, high), next_low in zip(buckets, starts):
+                with self.subTest(max_token=max_token, bucket=bucket):
+                    self.assertEqual(next_low, high + 1)
+                    self.assertEqual(get_padded_M(low), bucket)
+                    self.assertEqual(get_padded_M(high), bucket)
+
+    def test_default_deployments_derive_rank_calls(self):
+        import operator
+
+        from aiter.aot.flydsl import deployments
+
+        rank_call = operator.attrgetter(
+            "local_experts", "topk_cols", "mask_size", "inter_dim", "shared_expert_id"
+        )
+        by_id = {d.id: d for d in deployments.load().fused_moe}
+        expected = {
+            "deepseek-v4-pro/gfx950/a8w4/ep8-r32": (52, 6, 417, 3072, -1),
+            "glm-5.3-flash/gfx950/a4w4/ep8-fused": (37, 10, 290, 2048, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp8": (384, 6, 0, 384, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp8-fhmoe": (385, 7, 0, 384, 384),
+        }
+        for name, shape in expected.items():
+            with self.subTest(name):
+                self.assertEqual(rank_call(by_id[name]), shape)
+
+    def test_deployment_validation(self):
+        import json
+        import tempfile
+
+        from aiter.aot.flydsl import deployments
+
+        def load(deployment):
+            with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+                json.dump({"schema_version": 1, "fused_moe": [deployment]}, f)
+                f.flush()
+                return deployments.load([f.name])
+
+        dsv4 = {
+            "model": "deepseek-v4-pro",
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "quant": "a8w4",
+            "max_tokens": 1024,
+            "source": "test",
+        }
+        cases = {
+            "do not split over EP8": dict(dsv4, ep=8, redundant_experts=36),
+            "does not split over TP7": dict(dsv4, tp=7),
+            "over TP or over EP, not both": dict(dsv4, ep=8, tp=2),
+            "unknown keys": dict(dsv4, ep=8, redundant=32),
+        }
+        for message, deployment in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                load(deployment)
