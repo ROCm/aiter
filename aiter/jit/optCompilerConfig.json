@@ -1,4 +1,38 @@
 {
+    "module_sparse_mla_fp8": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/sparse_mla_fp8.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/kv_layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/online_common.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/order.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/pad16_factored.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/params.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/partial_io.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/partial_layout.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/prefetch.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/pv_pipe.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/q_encode.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/reduce.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/rotating.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/small.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/softmax_lane.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/fp8/streaming.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''",
+        "third_party": [],
+        "is_experimental": "True"
+    },
     "module_aiter_core": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
@@ -91,6 +125,19 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_nvfp4": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_nvfp4.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/quantize.cuh'"
+        ],
+        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_hip": ["'-DENABLE_CK=0'", "'-ffp-contract=off'"],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -419,7 +466,7 @@
         "torch_exclude": "True",
         "is_python_module": "True",
         "is_standalone": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE} --compiled_kids_sidecar={{0}}/compiled_kids_opus.json'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE} --compiled_kids_sidecar={{0}}/compiled_kids_opus.json'"
     },
     "module_gemm_a8w8_bpreshuffle_cktile": {
         "srcs": [
@@ -623,6 +670,18 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
         ]
     },
+    "module_moe_g1u1_bf16_small_m": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/fmoe_g1u1_bf16_small_m.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_ck2stages": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_ck_2stages_pybind.cu'",
@@ -816,6 +875,25 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_moe_nvfp4": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_entry.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-gpu-flush-denormals-to-zero'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/gen_instances.py --working_path {{}}'",
+        "is_experimental": "True"
     },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
@@ -1936,7 +2014,8 @@
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'",
-            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
+            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' ",
+            "'-DAITER_HIPBLASLT_HAS_W4A16=1' if check_hipblaslt_has_w4a16() else ''"
         ],
         "extra_ldflags": "['-lhipblaslt', '-lhipblas']",
         "extra_include": [
@@ -2168,7 +2247,8 @@
     "module_mhc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -2301,6 +2381,23 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_fp8_mqa_logits": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fp8_mqa_logits_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_logits.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-honor-nans'",
+            "'-fno-slp-vectorize'",
+            "'-mllvm -disable-machine-sink'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
