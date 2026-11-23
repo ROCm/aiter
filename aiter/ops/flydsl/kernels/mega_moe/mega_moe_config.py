@@ -81,7 +81,11 @@ FUSED_DRAFT_LAYOUT = os.environ.get("AITER_MEGA_FUSED_DRAFT_LAYOUT", "0") == "1"
 V41_DRAFT_TOPK = 3
 # (world_size, experts_per_rank, model_dim, inter_dim)
 # (4, 32): the same draft MoE on EP4, 32 experts a rank; matches no EP8 call.
-V41_DRAFT_LAYOUTS = ((8, 16, 5120, 2304), (4, 16, 5120, 2304), (4, 32, 5120, 2304)) if FUSED_DRAFT_LAYOUT else ()
+V41_DRAFT_LAYOUTS = (
+    ((8, 16, 5120, 2304), (4, 16, 5120, 2304), (4, 32, 5120, 2304))
+    if FUSED_DRAFT_LAYOUT
+    else ()
+)
 # (world_size, experts_per_rank) pairs the small-input kernel's direct fixed-slot dispatch additionally accepts.
 EXTRA_FIXED_SLOT_LAYOUTS = tuple((world, epr) for world, epr, _, _ in V41_DRAFT_LAYOUTS)
 if FUSED_DRAFT_LAYOUT:
@@ -91,9 +95,16 @@ if FUSED_DRAFT_LAYOUT:
     }
 
 
-def fused_layout_small_only(*, world_size: int, model_dim: int, inter_dim: int, experts: int) -> bool:
+def fused_layout_small_only(
+    *, world_size: int, model_dim: int, inter_dim: int, experts: int
+) -> bool:
     """A fused layout served by the small-input kernel only (AITER_MEGA_FUSED_DRAFT_LAYOUT)."""
-    return (world_size, experts // world_size, model_dim, inter_dim) in V41_DRAFT_LAYOUTS
+    return (
+        world_size,
+        experts // world_size,
+        model_dim,
+        inter_dim,
+    ) in V41_DRAFT_LAYOUTS
 
 
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
@@ -1803,7 +1814,11 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     if bucket == 32:
         # As at 64, and the 256-wide GEMM2 n-blocks of 64 / 128 tokens: serving decode (graph bs 4-7, 24-42 rows a
         # rank, a skewed expert placement) streams every local expert's W2 once, in half as many units (-1.4..-2.4%).
-        return replace(config, stage1=replace(config.stage1, tile_n=256), stage2=replace(config.stage2, block_n=256))
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
+        )
     if bucket in (32, 64):
         # Half the GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab (-3% uniform, -10..-18%
         # skewed, neutral zipf).
@@ -1900,14 +1915,19 @@ def _fused_config(
             # their L2 writebacks (every store they order sits drained in the uncached symmetric heap): -1.7..-2.5%
             # at 60-150 rows a rank (kro_ep8_v3 decode routing, layers 21 / 10), bit-identical. Not on the draft
             # layout, which reuses this tune (unmeasured there).
-            config = replace(config, fused_stage1=replace(config.fused_stage1, disp_order=31, sync_lean=1))
+            config = replace(
+                config,
+                fused_stage1=replace(config.fused_stage1, disp_order=31, sync_lean=1),
+            )
         return config
     if layout in V41_DRAFT_LAYOUTS:
         return _tune_v41_draft_small(config, bucket, world_size)
     return config
 
 
-def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int, world_size: int = 8) -> MegaMoEConfig:
+def _tune_v41_draft_small(
+    config: MegaMoEConfig, bucket: int, world_size: int = 8
+) -> MegaMoEConfig:
     """DSpark draft MoE (16 experts a rank, top-3) small-input kernel: a starting point, NOT measured.
 
     The EP8 V4.1-Flash tune and its launch protocol. A draft pass of 160 rows a rank gives each of the 16 local
@@ -1945,7 +1965,8 @@ def _tune_v41_draft_small(config: MegaMoEConfig, bucket: int, world_size: int = 
 
 def fused_bucket_override(tokens: int, mtpr: int) -> int:
     """Launch-config bucket forced for a row range of the small-input route:
-    ``AITER_MEGA_FUSED_BUCKET_MAP="161-255:128,..."`` (tokens lo-hi : bucket). 0: none."""
+    ``AITER_MEGA_FUSED_BUCKET_MAP="161-255:128,..."`` (tokens lo-hi : bucket). 0: none.
+    """
     spec = os.environ.get("AITER_MEGA_FUSED_BUCKET_MAP", "")
     if not spec or mtpr > SMALL_M_MAX_MTPR:
         return 0
@@ -1954,7 +1975,9 @@ def fused_bucket_override(tokens: int, mtpr: int) -> int:
         lo, _, hi = rows.partition("-")
         if int(lo) <= tokens <= int(hi or lo):
             if int(bucket) not in FUSED_TOKEN_BUCKETS:
-                raise ValueError(f"AITER_MEGA_FUSED_BUCKET_MAP: {bucket} is not a fused token bucket")
+                raise ValueError(
+                    f"AITER_MEGA_FUSED_BUCKET_MAP: {bucket} is not a fused token bucket"
+                )
             return int(bucket)
     return 0
 

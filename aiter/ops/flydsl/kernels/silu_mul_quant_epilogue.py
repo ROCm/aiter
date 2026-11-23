@@ -40,12 +40,12 @@ a kernel body is, so a kernel calls them like its own nested functions.
 """
 
 import flydsl.expr as fx
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir.dialects import llvm as llvm_ops
 from flydsl._mlir.dialects import rocdl as rocdl_ops
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import BFloat16, Float32, Int8, Int16, Int32, T
+from flydsl.expr.typing import BFloat16, Float32, Int16, Int32, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.communication_ops_utils import atomic_add_agent
@@ -129,9 +129,7 @@ def silu_mul_bf16(gate_words, up_words, limit):
         u = Vec.from_elements([up_words[w]], Int32).bitcast(BFloat16).to(Float32)
         # The clamped gate is rounded to bf16 before the SiLU reads it.
         x = (
-            Vec.from_elements(
-                [fx.minnumf(lim, g[0]), fx.minnumf(lim, g[1])], Float32
-            )
+            Vec.from_elements([fx.minnumf(lim, g[0]), fx.minnumf(lim, g[1])], Float32)
             .to(BFloat16)
             .to(Float32)
         )

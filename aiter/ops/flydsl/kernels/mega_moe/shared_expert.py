@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# ruff: noqa: SIM102
 """MXFP8-weight tile bodies for the DeepSeek-V4.1 shared expert (default off).
 
 Nothing on a served path imports this module: the MegaMoE kernels, their names and their compile-cache keys are
@@ -35,10 +34,27 @@ from .. import silu_mul_quant_epilogue as sq
 from ..mxfp4_gemm_common import lds_typed_ptr
 from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .gemm1 import _LdsF32View, do_tile_la
-from .gemm_util import _PACK, AS2RLoader, AScaleLoader, ATileLoader, MfmaScaleGU, wait_lds_barrier
+from .gemm_util import (
+    _PACK,
+    AS2RLoader,
+    AScaleLoader,
+    ATileLoader,
+    MfmaScaleGU,
+    wait_lds_barrier,
+)
 
-__all__ = ["shared_gemm1", "shared_gemm2", "compile_shared_gemm1", "compile_shared_gemm2", "build_shared_tile",
-    "build_shared_half_tiles", "RefActQuantEpilogue", "Bf16RowsEpilogue", "dense_gate_up_ksplit", "PARTIAL_UNIT_BYTES"]
+__all__ = [
+    "PARTIAL_UNIT_BYTES",
+    "Bf16RowsEpilogue",
+    "RefActQuantEpilogue",
+    "build_shared_half_tiles",
+    "build_shared_tile",
+    "compile_shared_gemm1",
+    "compile_shared_gemm2",
+    "dense_gate_up_ksplit",
+    "shared_gemm1",
+    "shared_gemm2",
+]
 
 SORT_BLOCK_M = 32
 TILE_N = 256
@@ -58,7 +74,8 @@ _FP32_DENORM_KEPT = 3
 def f8_weight_group(row, k128, half, k_lane, row_lane, k_dim):
     """16-byte group index, in a shuffle_weight(., (16, 16)) FP8 weight of ``k_dim`` columns, of the chunk
     W[row + row_lane][128 k128 + 64 half + 16 k_lane ..+16] (``row`` a multiple of 16). Lane ``16 k_lane +
-    row_lane`` of the MFMA B operand of 128-K step ``k128`` is the chunks of half 0 and 1."""
+    row_lane`` of the MFMA B operand of 128-K step ``k128`` is the chunks of half 0 and 1.
+    """
     return row * (k_dim // 16) + (k128 * 2 + half) * 64 + k_lane * 16 + row_lane
 
 
@@ -87,12 +104,14 @@ def dense_kernel_ksplit(rows, n, k):
     """The K split of the kernel AITER's dense group-32 MXFP8 GEMM on (16, 16)-preshuffled weights runs for
     ``rows x k -> n`` (32x32 weight scales): the ``_sk<N>`` of the tuned row's kernel name, the lookup the dense
     launch itself makes (aiter.ops.gemm_op_a8w8._gemm_mxscale_bpreshuffle). 0: no tuned row (the launch runs a
-    heuristic kernel) or a name without a split. None: no AITER lookup in this process (stub tests)."""
+    heuristic kernel) or a name without a split. None: no AITER lookup in this process (stub tests).
+    """
     try:
         from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config
 
         row = get_mxscale_bpreshuffle_config(int(rows), int(n), int(k), "32x32")
-    except Exception:  # noqa: BLE001 -- no AITER, or no device description to key the table with
+    except Exception:  # noqa: BLE001
+        # no AITER, or no device description to key the table with
         return None
     if row is None:
         return 0
@@ -126,7 +145,9 @@ def tile_scale_byte(m_tile, n_tile, row, group, inter_dim):
 def _byte_tensor(addr):
     """A byte tensor view of a raw device address (what ATileLoader takes as ``x_tensor``)."""
     ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global, 1)
-    return fx.Tensor(fx.make_view(fx.inttoptr(ptr_ty, fx.Int64(addr)), fx.make_layout(1 << 30, 1)))
+    return fx.Tensor(
+        fx.make_view(fx.inttoptr(ptr_ty, fx.Int64(addr)), fx.make_layout(1 << 30, 1))
+    )
 
 
 class _NoExpert:
@@ -146,7 +167,15 @@ class MfmaScaleF8B(MfmaScaleGU):
         self._is_fp4 = False
         self._atoms = {
             (osa, osb): fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN, fx.Float8E4M3FN, opsel_a=osa, opsel_b=osb)
+                fx.rocdl.cdna4.MFMA_Scale(
+                    16,
+                    16,
+                    128,
+                    fx.Float8E4M3FN,
+                    fx.Float8E4M3FN,
+                    opsel_a=osa,
+                    opsel_b=osb,
+                )
             )
             for osa in range(4)
             for osb in range(4)
@@ -160,8 +189,15 @@ class MfmaScaleF8B(MfmaScaleGU):
         a_frag.store(Vec(a_op))
         b_frag.store(Vec(b_op))
         c_frag.store(Vec(acc))
-        fx.gemm(self._atoms[(ksub * _PACK + ia, ksub * _PACK + jb)], c_frag, a_frag, b_frag, c_frag,
-            scale_a=sa_v, scale_b=sb_v)
+        fx.gemm(
+            self._atoms[(ksub * _PACK + ia, ksub * _PACK + jb)],
+            c_frag,
+            a_frag,
+            b_frag,
+            c_frag,
+            scale_a=sa_v,
+            scale_b=sb_v,
+        )
         return c_frag.load()
 
 
@@ -191,25 +227,44 @@ class BWeightLoaderF8:
             Vec(
                 buf_copy_load(
                     self._w_rsrc,
-                    f8_weight_group(row, k128, p, fx.Int32(self._lane // 16), fx.Int32(self._lane % 16), self._k_dim),
-                    fx.Int32, unit_elems=4, cache_modifier=self._cache_modifier)
+                    f8_weight_group(
+                        row,
+                        k128,
+                        p,
+                        fx.Int32(self._lane // 16),
+                        fx.Int32(self._lane % 16),
+                        self._k_dim,
+                    ),
+                    fx.Int32,
+                    unit_elems=4,
+                    cache_modifier=self._cache_modifier,
+                )
             ).bitcast(fx.Int64)
             for p in range_constexpr(2)
         ]
         lo, hi = halves
-        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(fx.Int32)
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
+            fx.Int32
+        )
 
     def load_step(self, row_base_i32, kstep_i32):
-        return [self.load_ni(row_base_i32, ni, kstep_i32) for ni in range_constexpr(self._num_acc_n)]
+        return [
+            self.load_ni(row_base_i32, ni, kstep_i32)
+            for ni in range_constexpr(self._num_acc_n)
+        ]
 
     def load_ni(self, row_base_i32, ni, kstep_i32):
-        return [self._load_pack(row_base_i32, ni, kstep_i32, ks) for ks in range_constexpr(_PACK)]
+        return [
+            self._load_pack(row_base_i32, ni, kstep_i32, ks)
+            for ks in range_constexpr(_PACK)
+        ]
 
 
 class BScaleLoaderRow32:
     """Row-major 32x32-block E8M0 weight scales [rows / 32, K / 32] as the packed words the scaled MFMA takes: one
     i32 per accumulator pair and K-step, byte ``2 ksub + (ni % 2)`` = the block scale of that accumulator's rows at
-    K group ``lane // 16`` of 128-K step ``ksub`` (all 16 row lanes of a block share it)."""
+    K group ``lane // 16`` of 128-K step ``ksub`` (all 16 row lanes of a block share it).
+    """
 
     def __init__(self, *, scale_rsrc, num_acc_n, k_dim, gate_up_half=0):
         assert num_acc_n % _PACK == 0 and (k_dim // 32) % 8 == 0
@@ -223,25 +278,45 @@ class BScaleLoaderRow32:
         """The lane's two scale bytes (128-K steps 0 and 1) of scale row ``row32`` at this K-step."""
         out = []
         for ks in range_constexpr(_PACK):
-            off = scale32_dword(fx.Int32(row32_i32), fx.Int32(kstep_i32), ks, self._k_dim)
+            off = scale32_dword(
+                fx.Int32(row32_i32), fx.Int32(kstep_i32), ks, self._k_dim
+            )
             if cache_modifier == 0:
                 word = self._rsrc[off]
             else:
-                word = buf_copy_load(self._rsrc, off, fx.Int32, cache_modifier=cache_modifier)
+                word = buf_copy_load(
+                    self._rsrc, off, fx.Int32, cache_modifier=cache_modifier
+                )
             out.append((fx.Int32(word) >> fx.Int32(self._shift)) & fx.Int32(0xFF))
         return out
 
     def load_step(self, base_row_i32, kstep_i32, cache_modifier=0):
         if self._half:
-            first = base_row_i32 // fx.Int32(64)  # the wave's 32 activation columns are one 32-row gate block
+            first = base_row_i32 // fx.Int32(
+                64
+            )  # the wave's 32 activation columns are one 32-row gate block
             gate = self._bytes(first, kstep_i32, cache_modifier)
-            up = self._bytes(first + fx.Int32(self._half // 32), kstep_i32, cache_modifier)
-            word = gate[0] | (up[0] << fx.Int32(8)) | (gate[1] << fx.Int32(16)) | (up[1] << fx.Int32(24))
+            up = self._bytes(
+                first + fx.Int32(self._half // 32), kstep_i32, cache_modifier
+            )
+            word = (
+                gate[0]
+                | (up[0] << fx.Int32(8))
+                | (gate[1] << fx.Int32(16))
+                | (up[1] << fx.Int32(24))
+            )
             return [word for _ in range_constexpr(self._n_pairs)]
         out = []
         for pair in range_constexpr(self._n_pairs):
-            s = self._bytes(base_row_i32 // fx.Int32(32) + fx.Int32(pair), kstep_i32, cache_modifier)
-            out.append(s[0] | (s[0] << fx.Int32(8)) | (s[1] << fx.Int32(16)) | (s[1] << fx.Int32(24)))
+            s = self._bytes(
+                base_row_i32 // fx.Int32(32) + fx.Int32(pair), kstep_i32, cache_modifier
+            )
+            out.append(
+                s[0]
+                | (s[0] << fx.Int32(8))
+                | (s[1] << fx.Int32(16))
+                | (s[1] << fx.Int32(24))
+            )
         return out
 
 
@@ -259,7 +334,9 @@ class _KOffsetA:
         return self._inner.for_tile(*args, **kwargs)
 
     def load_regs(self, k_step_byte_off):
-        return self._inner.load_regs(fx.Int32(k_step_byte_off) + fx.Int32(self._k_bytes))
+        return self._inner.load_regs(
+            fx.Int32(k_step_byte_off) + fx.Int32(self._k_bytes)
+        )
 
     def store(self, *args, **kwargs):
         return self._inner.store(*args, **kwargs)
@@ -275,7 +352,9 @@ class _KOffsetAScale:
         return None
 
     def load_step(self, lds_ascale, kstep_i32):
-        return self._inner.load_step(lds_ascale, fx.Int32(kstep_i32) + fx.Int32(self._k_steps))
+        return self._inner.load_step(
+            lds_ascale, fx.Int32(kstep_i32) + fx.Int32(self._k_steps)
+        )
 
 
 class _KOffsetAScaleOwn(_KOffsetAScale):
@@ -303,28 +382,45 @@ class _KOffsetB:
 
 class AScaleTileLoader(AScaleLoader):
     """AScaleLoader over the "tile" scale layout (tile_scale_byte): stages a 32-row tile's scales to LDS in the
-    row-major order ``load_step`` reads, one dword (four K groups) a thread and round."""
+    row-major order ``load_step`` reads, one dword (four K groups) a thread and round.
+    """
 
     def __init__(self, *, scale_addr, rows, k_dim, lds_bytes):
         assert k_dim % 128 == 0
         tiles = (rows + fx.Int32(SORT_BLOCK_M - 1)) // fx.Int32(SORT_BLOCK_M)
         super().__init__(
-            scale_rsrc=ptr_buf_tensor(fx.Int64(scale_addr), fx.Int32, num_records_bytes=tiles * fx.Int32(k_dim)),
-            m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
+            scale_rsrc=ptr_buf_tensor(
+                fx.Int64(scale_addr),
+                fx.Int32,
+                num_records_bytes=tiles * fx.Int32(k_dim),
+            ),
+            m_repeat=M_REPEAT,
+            model_dim=k_dim,
+            sort_block_m=SORT_BLOCK_M,
+            total_threads=THREADS,
+        )
         self._blocks = k_dim // 128  # dwords a row
         self._rounds = -(-SORT_BLOCK_M * self._blocks // THREADS)
         # The last round also copies dwords past the tile (rows the MFMAs never read).
-        assert self._rounds * THREADS * 4 <= lds_bytes, "the A-scale LDS is too small for the tile-layout staging"
+        assert (
+            self._rounds * THREADS * 4 <= lds_bytes
+        ), "the A-scale LDS is too small for the tile-layout staging"
 
     def stage(self, lds_ascale, tile_row_base_i32, *args, **kwargs):
         base = fx.Int32(fx.ptrtoint(lds_ascale.ptr))
-        tile_dword = (tile_row_base_i32 // fx.Int32(SORT_BLOCK_M)) * fx.Int32(SORT_BLOCK_M * self._blocks)
+        tile_dword = (tile_row_base_i32 // fx.Int32(SORT_BLOCK_M)) * fx.Int32(
+            SORT_BLOCK_M * self._blocks
+        )
         for r in range_constexpr(self._rounds):
             d = fx.Int32(r * THREADS) + fx.Int32(self._tx)
             row = d // fx.Int32(self._blocks)
             block = d - row * fx.Int32(self._blocks)
-            word = buf_copy_load(self._rsrc, tile_dword + block * fx.Int32(SORT_BLOCK_M) + row, fx.Int32)
-            fx.ptr_store(fx.Int32(word), lds_typed_ptr(base + d * fx.Int32(4), T.i32, align=4))
+            word = buf_copy_load(
+                self._rsrc, tile_dword + block * fx.Int32(SORT_BLOCK_M) + row, fx.Int32
+            )
+            fx.ptr_store(
+                fx.Int32(word), lds_typed_ptr(base + d * fx.Int32(4), T.i32, align=4)
+            )
 
 
 class _KeepPartial:
@@ -336,7 +432,12 @@ class _KeepPartial:
         self.count = 0
 
     def _slot(self, index):
-        return fx.add_offset(self._base, fx.make_int_tuple(fx.thread_idx.x * fx.Int32(self.count * 4) + fx.Int32(index * 4)))
+        return fx.add_offset(
+            self._base,
+            fx.make_int_tuple(
+                fx.thread_idx.x * fx.Int32(self.count * 4) + fx.Int32(index * 4)
+            ),
+        )
 
     def store(self, acc, *args, **kwargs):
         self.count = len(acc)
@@ -344,7 +445,9 @@ class _KeepPartial:
             fx.ptr_store(Vec(a), self._slot(index))
 
     def load(self, index):
-        view = fx.make_view(fx.recast_iter(fx.Float32, self._slot(index)), fx.make_layout(4, 1))
+        view = fx.make_view(
+            fx.recast_iter(fx.Float32, self._slot(index)), fx.make_layout(4, 1)
+        )
         return Vec(view.load())
 
 
@@ -356,7 +459,8 @@ class _SumPartials:
 
     def store(self, acc, *args, **kwargs):
         total = [
-            (Vec.filled(4, 0.0, fx.Float32) + self._first.load(index)) + Vec(p1) for index, p1 in enumerate(acc)
+            (Vec.filled(4, 0.0, fx.Float32) + self._first.load(index)) + Vec(p1)
+            for index, p1 in enumerate(acc)
         ]
         self._epilogue.store(total, *args, **kwargs)
 
@@ -369,7 +473,8 @@ def partial_slot(unit, thread, index):
 
 class _StorePartials:
     """Epilogue stand-in of a split-K tile's first half when another workgroup runs the second: the accumulators
-    go to memory as raw FP32 (``partial_slot``), written through so that the other workgroup's XCD reads them."""
+    go to memory as raw FP32 (``partial_slot``), written through so that the other workgroup's XCD reads them.
+    """
 
     def __init__(self, rsrc, unit, store_cm):
         self._rsrc, self._unit, self._store_cm = rsrc, unit, int(store_cm)
@@ -377,13 +482,20 @@ class _StorePartials:
     def store(self, acc, *args, **kwargs):
         assert len(acc) == M_REPEAT * NUM_ACC_N
         for index, a in enumerate(acc):
-            buf_copy_store(self._rsrc, partial_slot(self._unit, fx.thread_idx.x, index), Vec(a).bitcast(fx.Int32),
-                fx.Int32, unit_elems=4, cache_modifier=self._store_cm)
+            buf_copy_store(
+                self._rsrc,
+                partial_slot(self._unit, fx.thread_idx.x, index),
+                Vec(a).bitcast(fx.Int32),
+                fx.Int32,
+                unit_elems=4,
+                cache_modifier=self._store_cm,
+            )
 
 
 class _SumStoredPartials:
     """Epilogue of a split-K tile's second half on its own workgroup: ``wait()`` (the first half's partials are in
-    memory), then ``0 + p0 + p1`` (the dense split-K merge, as _SumPartials) and the real epilogue."""
+    memory), then ``0 + p0 + p1`` (the dense split-K merge, as _SumPartials) and the real epilogue.
+    """
 
     def __init__(self, rsrc, unit, wait, epilogue):
         self._rsrc, self._unit, self._wait, self._epilogue = rsrc, unit, wait, epilogue
@@ -393,14 +505,28 @@ class _SumStoredPartials:
         self._wait()
         total = []
         for index, p1 in enumerate(acc):
-            p0 = Vec(buf_copy_load(self._rsrc, partial_slot(self._unit, fx.thread_idx.x, index), fx.Int32, unit_elems=4))
-            total.append((Vec.filled(4, 0.0, fx.Float32) + p0.bitcast(fx.Float32)) + Vec(p1))
+            p0 = Vec(
+                buf_copy_load(
+                    self._rsrc,
+                    partial_slot(self._unit, fx.thread_idx.x, index),
+                    fx.Int32,
+                    unit_elems=4,
+                )
+            )
+            total.append(
+                (Vec.filled(4, 0.0, fx.Float32) + p0.bitcast(fx.Float32)) + Vec(p1)
+            )
         self._epilogue.store(total, *args, **kwargs)
 
 
 def _set_fp32_denormals(mode):
-    llvm_ops.call_intrinsic(None, "llvm.amdgcn.s.setreg",
-        [fx.Int32(sq._HWREG_MODE_FP32_DENORM).ir_value(), fx.Int32(mode).ir_value()], [], [])
+    llvm_ops.call_intrinsic(
+        None,
+        "llvm.amdgcn.s.setreg",
+        [fx.Int32(sq._HWREG_MODE_FP32_DENORM).ir_value(), fx.Int32(mode).ir_value()],
+        [],
+        [],
+    )
 
 
 def _pinned(words):
@@ -409,7 +535,9 @@ def _pinned(words):
     behind the mode switch. It does not order ``v_cvt_pk_bf16_f32`` against the switch: this compiler schedules
     that instruction across ``s_setreg`` (see RefActQuantEpilogue)."""
     ty = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
-    return Vec(llvm_ops.inline_asm(ty, [_raw(words)], "", "=v,0", has_side_effects=True))
+    return Vec(
+        llvm_ops.inline_asm(ty, [_raw(words)], "", "=v,0", has_side_effects=True)
+    )
 
 
 class RefActQuantEpilogue:
@@ -428,8 +556,23 @@ class RefActQuantEpilogue:
     the store pass owns eight consecutive columns of a row and four adjacent lanes one 32-column group (a DPP quad).
     """
 
-    def __init__(self, *, out_addr, out_scale_addr, rows, inter_dim, limit, lds_out, store_cm=0, scale_layout="row"):
-        assert inter_dim % 128 == 0 and float(limit) > 0.0 and scale_layout in ("row", "tile")
+    def __init__(
+        self,
+        *,
+        out_addr,
+        out_scale_addr,
+        rows,
+        inter_dim,
+        limit,
+        lds_out,
+        store_cm=0,
+        scale_layout="row",
+    ):
+        assert (
+            inter_dim % 128 == 0
+            and float(limit) > 0.0
+            and scale_layout in ("row", "tile")
+        )
         self._inter = inter_dim
         self._limit = float(limit)
         self._lds_out = lds_out
@@ -437,14 +580,30 @@ class RefActQuantEpilogue:
         # "tile": tile_scale_byte's layout (AScaleTileLoader reads it), whose bytes no two workgroups share a
         # cache line of; "row": row-major [rows, inter / 32], what the dense down GEMM reads.
         self._tile_scales = scale_layout == "tile"
-        self._out = ptr_buf_tensor(fx.Int64(out_addr), fx.Int32, unit_elems=2,
-            num_records_bytes=rows * fx.Int32(inter_dim))
+        self._out = ptr_buf_tensor(
+            fx.Int64(out_addr),
+            fx.Int32,
+            unit_elems=2,
+            num_records_bytes=rows * fx.Int32(inter_dim),
+        )
         scale_bytes = rows * fx.Int32(inter_dim // 32)
         if self._tile_scales:
-            scale_bytes = ((rows + fx.Int32(SORT_BLOCK_M - 1)) // fx.Int32(SORT_BLOCK_M)) * fx.Int32(inter_dim)
-        self._out_scale = ptr_buf_tensor(fx.Int64(out_scale_addr), fx.Int8, num_records_bytes=scale_bytes)
+            scale_bytes = (
+                (rows + fx.Int32(SORT_BLOCK_M - 1)) // fx.Int32(SORT_BLOCK_M)
+            ) * fx.Int32(inter_dim)
+        self._out_scale = ptr_buf_tensor(
+            fx.Int64(out_scale_addr), fx.Int8, num_records_bytes=scale_bytes
+        )
 
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
+    def store(
+        self,
+        acc,
+        tile_i32,
+        tile_row_base_i32,
+        n_tile_base_i32,
+        valid_rows_i32=None,
+        store_cm=None,
+    ):
         tx = fx.thread_idx.x
         wave = tx // fx.Int32(64)
         lane = tx % fx.Int32(64)
@@ -464,18 +623,32 @@ class RefActQuantEpilogue:
         _set_fp32_denormals(0)
         # Everything from here to the stores reads the BF16 words through a second pin, behind the switch.
         rounded = [_pinned(words) for words in rounded]
-        gate = [[rounded[i][0], rounded[i][1]] for i in range_constexpr(0, len(rounded), _PACK)]
-        up = [[rounded[i][0], rounded[i][1]] for i in range_constexpr(1, len(rounded), _PACK)]
+        gate = [
+            [rounded[i][0], rounded[i][1]]
+            for i in range_constexpr(0, len(rounded), _PACK)
+        ]
+        up = [
+            [rounded[i][0], rounded[i][1]]
+            for i in range_constexpr(1, len(rounded), _PACK)
+        ]
         for mi in range_constexpr(M_REPEAT):
-            gate_words = [w for p in range_constexpr(pairs) for w in gate[mi * pairs + p]]
+            gate_words = [
+                w for p in range_constexpr(pairs) for w in gate[mi * pairs + p]
+            ]
             up_words = [w for p in range_constexpr(pairs) for w in up[mi * pairs + p]]
             act = sq.silu_mul_bf16(gate_words, up_words, self._limit)
             for w in range_constexpr(len(act)):
-                vals = Vec.from_elements([act[w]], fx.Int32).bitcast(fx.BFloat16).to(fx.Float32)
+                vals = (
+                    Vec.from_elements([act[w]], fx.Int32)
+                    .bitcast(fx.BFloat16)
+                    .to(fx.Float32)
+                )
                 col = cbase + fx.Int32((w // 2) * 16) + l16
                 for e in range_constexpr(2):
                     row = fx.Int32(mi * 16 + (w % 2) * 2 + e) + ld4
-                    ptr = fx.add_offset(cptr, fx.make_int_tuple(row * fx.Int32(cs_tile_n) + col))
+                    ptr = fx.add_offset(
+                        cptr, fx.make_int_tuple(row * fx.Int32(cs_tile_n) + col)
+                    )
                     fx.ptr_store(Vec.from_elements([vals[e]], fx.Float32), ptr)
         gpu.barrier()
 
@@ -489,43 +662,81 @@ class RefActQuantEpilogue:
         for mr in range_constexpr(SORT_BLOCK_M // rows_per_iter):
             row = fx.Int32(mr * rows_per_iter) + mlane
             row_g = tile_i32 * fx.Int32(SORT_BLOCK_M) + row
-            f32_iter = fx.recast_iter(fx.Float32,
-                fx.add_offset(cptr, fx.make_int_tuple(row * fx.Int32(cs_tile_n) + col0)))
+            f32_iter = fx.recast_iter(
+                fx.Float32,
+                fx.add_offset(
+                    cptr, fx.make_int_tuple(row * fx.Int32(cs_tile_n) + col0)
+                ),
+            )
             frag = fx.make_view(f32_iter, fx.make_layout(sq.LANE_VALUES, 1)).load()
             words = [
-                Vec.from_elements([frag[2 * w], frag[2 * w + 1]], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                Vec.from_elements([frag[2 * w], frag[2 * w + 1]], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0]
                 for w in range_constexpr(sq.LANE_VALUES // 2)
             ]
             code = sq.group_code(words)
             quant = sq.quant_words(words, code)
             valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
-            out_byte = valid.select(row_g * fx.Int32(self._inter) + gcol, fx.Int32(_OOB))
-            buf_copy_store(self._out, out_byte // fx.Int32(8), Vec.from_elements(quant, fx.Int32), fx.Int32,
-                unit_elems=2, cache_modifier=self._store_cm)
+            out_byte = valid.select(
+                row_g * fx.Int32(self._inter) + gcol, fx.Int32(_OOB)
+            )
+            buf_copy_store(
+                self._out,
+                out_byte // fx.Int32(8),
+                Vec.from_elements(quant, fx.Int32),
+                fx.Int32,
+                unit_elems=2,
+                cache_modifier=self._store_cm,
+            )
             if self._tile_scales:
-                scale_at = tile_scale_byte(tile_i32, gcol >> fx.Int32(7), row, (gcol >> fx.Int32(5)) & fx.Int32(3),
-                    self._inter)
+                scale_at = tile_scale_byte(
+                    tile_i32,
+                    gcol >> fx.Int32(7),
+                    row,
+                    (gcol >> fx.Int32(5)) & fx.Int32(3),
+                    self._inter,
+                )
             else:
                 scale_at = row_g * fx.Int32(self._inter // 32) + (gcol >> fx.Int32(5))
             scale_byte = (valid & is_writer).select(scale_at, fx.Int32(_OOB))
-            buf_copy_store(self._out_scale, scale_byte, fx.Int8(code), fx.Int8, cache_modifier=self._store_cm)
+            buf_copy_store(
+                self._out_scale,
+                scale_byte,
+                fx.Int8(code),
+                fx.Int8,
+                cache_modifier=self._store_cm,
+            )
         wait_lds_barrier()
         _set_fp32_denormals(_FP32_DENORM_KEPT)
 
 
 class Bf16RowsEpilogue:
     """GEMM2 epilogue of the shared expert: the tile's accumulators rounded to BF16 into one row-major
-    ``[rows, n_out]`` tensor (no route weight, no scatter). Rows past the tile's valid count are not stored."""
+    ``[rows, n_out]`` tensor (no route weight, no scatter). Rows past the tile's valid count are not stored.
+    """
 
     def __init__(self, *, out_addr, rows, n_out, lds_out, store_cm=0):
         assert n_out % TILE_N == 0
         self._n_out = n_out
         self._lds_out = lds_out
         self._store_cm = int(store_cm)
-        self._out = ptr_buf_tensor(fx.Int64(out_addr), fx.Int32, unit_elems=4,
-            num_records_bytes=rows * fx.Int32(n_out * 2))
+        self._out = ptr_buf_tensor(
+            fx.Int64(out_addr),
+            fx.Int32,
+            unit_elems=4,
+            num_records_bytes=rows * fx.Int32(n_out * 2),
+        )
 
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
+    def store(
+        self,
+        acc,
+        tile_i32,
+        tile_row_base_i32,
+        n_tile_base_i32,
+        valid_rows_i32=None,
+        store_cm=None,
+    ):
         tx = fx.thread_idx.x
         wave = tx // fx.Int32(64)
         lane = tx % fx.Int32(64)
@@ -539,7 +750,9 @@ class Bf16RowsEpilogue:
                 col = wave_base + fx.Int32(ni * 16) + l16
                 for ii in range_constexpr(4):
                     row = fx.Int32(mi * 16 + ii) + ld4
-                    ptr = fx.add_offset(cptr, fx.make_int_tuple(row * fx.Int32(TILE_N) + col))
+                    ptr = fx.add_offset(
+                        cptr, fx.make_int_tuple(row * fx.Int32(TILE_N) + col)
+                    )
                     fx.ptr_store(Vec.from_elements([v4[ii]], fx.Float32), ptr)
         gpu.barrier()
 
@@ -552,19 +765,47 @@ class Bf16RowsEpilogue:
         for mr in range_constexpr(SORT_BLOCK_M // rows_per_iter):
             row = fx.Int32(mr * rows_per_iter) + mlane
             row_g = tile_i32 * fx.Int32(SORT_BLOCK_M) + row
-            f32_iter = fx.recast_iter(fx.Float32,
-                fx.add_offset(cptr, fx.make_int_tuple(row * fx.Int32(TILE_N) + col0)))
+            f32_iter = fx.recast_iter(
+                fx.Float32,
+                fx.add_offset(cptr, fx.make_int_tuple(row * fx.Int32(TILE_N) + col0)),
+            )
             frag = fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
-            res = Vec.from_elements([frag[i] for i in range_constexpr(8)], fx.Float32).to(fx.BFloat16)
+            res = Vec.from_elements(
+                [frag[i] for i in range_constexpr(8)], fx.Float32
+            ).to(fx.BFloat16)
             valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
-            out_byte = valid.select((row_g * fx.Int32(self._n_out) + gcol) * fx.Int32(2), fx.Int32(_OOB))
-            buf_copy_store(self._out, out_byte // fx.Int32(16), res.bitcast(fx.Int32), fx.Int32, unit_elems=4,
-                cache_modifier=self._store_cm)
+            out_byte = valid.select(
+                (row_g * fx.Int32(self._n_out) + gcol) * fx.Int32(2), fx.Int32(_OOB)
+            )
+            buf_copy_store(
+                self._out,
+                out_byte // fx.Int32(16),
+                res.bitcast(fx.Int32),
+                fx.Int32,
+                unit_elems=4,
+                cache_modifier=self._store_cm,
+            )
         wait_lds_barrier()
 
 
-def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim, epilogue, a_buf, a_scale_lds,
-    gate_up_half=0, ksplit=1, b_cache_modifier=0, partial_lds=None, a_scale_layout="row", a_scale_lds_bytes=0):
+def build_shared_tile(
+    *,
+    x_addr,
+    scale_x_addr,
+    w_addr,
+    scale_w_addr,
+    rows,
+    k_dim,
+    epilogue,
+    a_buf,
+    a_scale_lds,
+    gate_up_half=0,
+    ksplit=1,
+    b_cache_modifier=0,
+    partial_lds=None,
+    a_scale_layout="row",
+    a_scale_lds_bytes=0,
+):
     """``run(m_tile, n_tile)``: one 32-row x 256-column tile of ``x [rows, k_dim] @ w.T`` through ``epilogue``.
 
     ``x_addr`` / ``scale_x_addr``: E4M3 rows and their row-major 1x32 E8M0 scales (readable up to the next 16-byte
@@ -575,22 +816,55 @@ def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim
     ``a_scale_lds``), as RefActQuantEpilogue(scale_layout="tile") writes them.
     """
     k_iters = k_dim // K_STEP
-    assert k_dim % K_STEP == 0 and ksplit in (1, 2) and k_iters % ksplit == 0 and k_iters // ksplit >= 2
+    assert (
+        k_dim % K_STEP == 0
+        and ksplit in (1, 2)
+        and k_iters % ksplit == 0
+        and k_iters // ksplit >= 2
+    )
     n_scale = k_dim // 32
     scale_bytes = (rows * fx.Int32(n_scale) + fx.Int32(15)) & fx.Int32(-16)
-    a_gather = ATileLoader(row_bytes=k_dim, sort_block_m=SORT_BLOCK_M, k_step_bytes=K_STEP, total_threads=THREADS,
-        swizzle=True, x_tensor=_byte_tensor(x_addr), async_copy=False, a_dtype="fp8")
+    a_gather = ATileLoader(
+        row_bytes=k_dim,
+        sort_block_m=SORT_BLOCK_M,
+        k_step_bytes=K_STEP,
+        total_threads=THREADS,
+        swizzle=True,
+        x_tensor=_byte_tensor(x_addr),
+        async_copy=False,
+        a_dtype="fp8",
+    )
     a_s2r = AS2RLoader(k_step_bytes=K_STEP, swizzle=True, a_dtype="fp8")
     if a_scale_layout == "tile":
-        a_scale = AScaleTileLoader(scale_addr=scale_x_addr, rows=rows, k_dim=k_dim, lds_bytes=a_scale_lds_bytes)
+        a_scale = AScaleTileLoader(
+            scale_addr=scale_x_addr, rows=rows, k_dim=k_dim, lds_bytes=a_scale_lds_bytes
+        )
     else:
         a_scale = AScaleLoader(
-            scale_rsrc=ptr_buf_tensor(fx.Int64(scale_x_addr), fx.Int32, unit_elems=4, num_records_bytes=scale_bytes),
-            m_repeat=M_REPEAT, model_dim=k_dim, sort_block_m=SORT_BLOCK_M, total_threads=THREADS)
-    b_loader = BWeightLoaderF8(w_rsrc=ptr_buf_tensor(fx.Int64(w_addr), fx.Int32, unit_elems=4), num_acc_n=NUM_ACC_N,
-        k_dim=k_dim, cache_modifier=b_cache_modifier, gate_up_half=gate_up_half)
-    b_scale = BScaleLoaderRow32(scale_rsrc=ptr_buf_tensor(fx.Int64(scale_w_addr), fx.Int32), num_acc_n=NUM_ACC_N,
-        k_dim=k_dim, gate_up_half=gate_up_half)
+            scale_rsrc=ptr_buf_tensor(
+                fx.Int64(scale_x_addr),
+                fx.Int32,
+                unit_elems=4,
+                num_records_bytes=scale_bytes,
+            ),
+            m_repeat=M_REPEAT,
+            model_dim=k_dim,
+            sort_block_m=SORT_BLOCK_M,
+            total_threads=THREADS,
+        )
+    b_loader = BWeightLoaderF8(
+        w_rsrc=ptr_buf_tensor(fx.Int64(w_addr), fx.Int32, unit_elems=4),
+        num_acc_n=NUM_ACC_N,
+        k_dim=k_dim,
+        cache_modifier=b_cache_modifier,
+        gate_up_half=gate_up_half,
+    )
+    b_scale = BScaleLoaderRow32(
+        scale_rsrc=ptr_buf_tensor(fx.Int64(scale_w_addr), fx.Int32),
+        num_acc_n=NUM_ACC_N,
+        k_dim=k_dim,
+        gate_up_half=gate_up_half,
+    )
     mfma = MfmaScaleF8B(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N)
     sched = _NoExpert()
     a_lds_i32 = SORT_BLOCK_M * K_STEP // 4
@@ -606,15 +880,39 @@ def build_shared_tile(*, x_addr, scale_x_addr, w_addr, scale_w_addr, rows, k_dim
         n_tile_base = wave_base + n_tile * fx.Int32(TILE_N)
         tile_row_base = m_tile * fx.Int32(SORT_BLOCK_M)
         left = rows - tile_row_base
-        meta = (tile_row_base, (left < fx.Int32(SORT_BLOCK_M)).select(left, fx.Int32(SORT_BLOCK_M)))
+        meta = (
+            tile_row_base,
+            (left < fx.Int32(SORT_BLOCK_M)).select(left, fx.Int32(SORT_BLOCK_M)),
+        )
         if ksplit == 1:
-            tile(m_tile, n_tile_base, meta, a_gather, a_scale, b_loader, b_scale, epilogue, k_iters)
+            tile(
+                m_tile,
+                n_tile_base,
+                meta,
+                a_gather,
+                a_scale,
+                b_loader,
+                b_scale,
+                epilogue,
+                k_iters,
+            )
             return
         half = k_iters // 2
         first = _KeepPartial(partial_lds)
-        tile(m_tile, n_tile_base, meta, a_gather, a_scale, b_loader, b_scale, first, half)
-        tile(m_tile, n_tile_base, meta, _KOffsetA(a_gather, half * K_STEP), _KOffsetAScale(a_scale, half),
-            _KOffsetB(b_loader, half), _KOffsetB(b_scale, half), _SumPartials(first, epilogue), half)
+        tile(
+            m_tile, n_tile_base, meta, a_gather, a_scale, b_loader, b_scale, first, half
+        )
+        tile(
+            m_tile,
+            n_tile_base,
+            meta,
+            _KOffsetA(a_gather, half * K_STEP),
+            _KOffsetAScale(a_scale, half),
+            _KOffsetB(b_loader, half),
+            _KOffsetB(b_scale, half),
+            _SumPartials(first, epilogue),
+            half,
+        )
 
     return run
 

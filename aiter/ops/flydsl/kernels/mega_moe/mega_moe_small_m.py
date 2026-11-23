@@ -43,9 +43,9 @@ from .mega_moe_config import (
     FUSED_TOKEN_BUCKETS,
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
+    fused_bucket_override,
     fused_layout_small_only,
     fused_layout_supported,
-    fused_bucket_override,
     nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
@@ -136,7 +136,14 @@ DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
 # _SH_READY + 4 m; the launch's GEMM2 unit count and the done epoch.
 # shared_in_opt bit 1: the epoch of tile u's first-half partials at _SH_PART_READY + 4 u (u < _SH_PART_UNITS:
 # the 2 m-tiles of 33..64 rows).
-_SH_READY, _SH_G2_COUNT, _SH_DONE, _SH_PART_READY, _SH_PART_UNITS, _SH_SYNC_WORDS = 64, 128, 132, 256, 64, 128
+_SH_READY, _SH_G2_COUNT, _SH_DONE, _SH_PART_READY, _SH_PART_UNITS, _SH_SYNC_WORDS = (
+    64,
+    128,
+    132,
+    256,
+    64,
+    128,
+)
 
 
 def _quantize_row_mxfp8(row_rsrc, lane, fz_n_i32, fz_scale_n_i32):
@@ -318,7 +325,11 @@ def prefetch_direct_fixed_slot_route(
 
 def _vgpr_i64(v):
     """``v`` through an empty inline asm with a VGPR result: the same value, but divergent to the compiler."""
-    return fx.Int64(llvm.InlineAsmOp(T.i64, [fx.as_ir_value(fx.Int64(v))], "", "=v,0", has_side_effects=False).result)
+    return fx.Int64(
+        llvm.InlineAsmOp(
+            T.i64, [fx.as_ir_value(fx.Int64(v))], "", "=v,0", has_side_effects=False
+        ).result
+    )
 
 
 # fmt: off
@@ -1238,7 +1249,6 @@ def compile_mega_moe_stage1(
     if shared_in:
         # Imported here only: no kernel without shared_in needs the module (or the AITER helpers it imports).
         from ..tensor_shim import buf_base_i64 as _base_i64
-
         from . import shared_expert as _se
 
         plan_chunks_bytes = ((fz_epr + 63) // 64) * 64 * 8
@@ -2257,7 +2267,9 @@ _FP8_ROWS_MIN_ROWS = 3584
 # moves that threshold, e.g. 1 makes every rank send FP8 GEMM2 rows (half the XGMI scatter bytes, FP8 transport
 # rounding); the kernel name gains _f8r<rows>. Read once, at import; every rank must set the same value.
 _FP8_ROWS_MIN_DEFAULT = _FP8_ROWS_MIN_ROWS
-_FP8_ROWS_MIN_ROWS = int(os.environ.get("AITER_MEGA_SMALL_FP8_ROWS_MIN", _FP8_ROWS_MIN_DEFAULT))
+_FP8_ROWS_MIN_ROWS = int(
+    os.environ.get("AITER_MEGA_SMALL_FP8_ROWS_MIN", _FP8_ROWS_MIN_DEFAULT)
+)
 # Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
 # (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256
@@ -2278,7 +2290,10 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     # (kernel suffix _g2b2). AITER_MEGA_SMALL_PROBE=g1 | g2 | g1+g2: phase-timing kernels without those GEMM
     # bodies (suffix _probe*; wrong output, benchmarks only). Every rank must set the same values.
     extra = {}
-    if os.environ.get("AITER_MEGA_SMALL_G2_B2STAGE", "0") == "1" and config.stage2.block_m == 64:
+    if (
+        os.environ.get("AITER_MEGA_SMALL_G2_B2STAGE", "0") == "1"
+        and config.stage2.block_m == 64
+    ):
         extra["g2_b2stage"] = True
     if os.environ.get("AITER_MEGA_SMALL_PROBE", ""):
         extra["probe"] = os.environ["AITER_MEGA_SMALL_PROBE"]
@@ -2298,7 +2313,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     if getattr(k1, "sync_lean", 0):
         extra["sync_lean"] = int(k1.sync_lean)
     # fmt: off
-    return dict(  # noqa: C408
+    return dict(
         **extra,
         dedup_rows=k1.dedup_rows, plan_wt=k1.plan_wt, plan_local=k1.plan_local,
         g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), g2_uniform=k1.g2_uniform,
@@ -2310,25 +2325,39 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     # fmt: on
 
 
-def shared_in_fits(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+def shared_in_fits(
+    config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int
+) -> bool:
     """Whether the fused kernel of ``config`` can also run the shared expert of a ``rows``-row call
     (compile_mega_moe_stage1's shared_in): its own plan in every CTA, 4 waves, 32-row routed tiles (the LDS the
-    two workgroups of a CU share), and a consumer workgroup for each of the call's shared GEMM1 / GEMM2 units."""
+    two workgroups of a CU share), and a consumer workgroup for each of the call's shared GEMM1 / GEMM2 units.
+    """
     stage1, knobs = config.stage1, config.fused_stage1
     consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
     return (
-        rows > 0 and knobs.plan_local and not knobs.tok_done and stage1.num_waves == 4 and stage1.sort_block_m == 32
-        and ceildiv(rows, 32) * max((2 * inter_dim) // 256, model_dim // 256) <= consumers
+        rows > 0
+        and knobs.plan_local
+        and not knobs.tok_done
+        and stage1.num_waves == 4
+        and stage1.sort_block_m == 32
+        and ceildiv(rows, 32) * max((2 * inter_dim) // 256, model_dim // 256)
+        <= consumers
     )
 
 
-def shared_in_fits_split(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+def shared_in_fits_split(
+    config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int
+) -> bool:
     """``shared_in_fits`` and room for shared_in_opt bit 1 (the K halves of a GEMM1 unit on two workgroups): a
     consumer workgroup per half and an epoch word per unit."""
     stage1 = config.stage1
     consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
     units = ceildiv(rows, 32) * ((2 * inter_dim) // 256)
-    return shared_in_fits(config, rows, num_cu, model_dim, inter_dim) and 2 * units <= consumers and units <= _SH_PART_UNITS
+    return (
+        shared_in_fits(config, rows, num_cu, model_dim, inter_dim)
+        and 2 * units <= consumers
+        and units <= _SH_PART_UNITS
+    )
 
 
 def shared_pair_unit(consumer: int, tiles: int, n_tiles: int):
@@ -2350,14 +2379,18 @@ def shared_pair_consumers(tiles: int, n_tiles: int) -> int:
     return 8 * (((n_tiles - 1) >> 3) * tiles + tiles - 1) + ((n_tiles - 1) & 7) + 1
 
 
-def shared_in_fits_pair(config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int) -> bool:
+def shared_in_fits_pair(
+    config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int
+) -> bool:
     """``shared_in_fits`` and room for shared_in_opt bit 4 (the units of a weight slab on one XCD): a consumer
     workgroup at every index the pair map uses."""
     stage1 = config.stage1
     consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
     n_tiles = max((2 * inter_dim) // 256, model_dim // 256)
-    return (shared_in_fits(config, rows, num_cu, model_dim, inter_dim)
-        and shared_pair_consumers(ceildiv(rows, 32), n_tiles) <= consumers)
+    return (
+        shared_in_fits(config, rows, num_cu, model_dim, inter_dim)
+        and shared_pair_consumers(ceildiv(rows, 32), n_tiles) <= consumers
+    )
 
 
 def shared_in_lean_fits(config: MegaMoEConfig) -> bool:
@@ -2374,18 +2407,27 @@ def shared_in_opt_env() -> int:
     start a beat behind. Read per call."""
     value = os.environ.get("AITER_MEGA_SHARED_IN_OPT", "0").strip() or "0"
     if value not in tuple(str(v) for v in range(32)):
-        raise ValueError(f"AITER_MEGA_SHARED_IN_OPT={value!r}: 0..31 (bits 1, 2, 4, 8, 16)")
+        raise ValueError(
+            f"AITER_MEGA_SHARED_IN_OPT={value!r}: 0..31 (bits 1, 2, 4, 8, 16)"
+        )
     return int(value)
 
 
-def shared_in_layout_enabled(world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int) -> bool:
+def shared_in_layout_enabled(
+    world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int
+) -> bool:
     """AITER_MEGA_SHARED_IN for a layout: ``1`` = the target (verify) layers only, ``2`` = also the DSpark
-    draft layers' MoE (the small-input-only layouts; not validated on a GPU). Read per call: tests set it."""
+    draft layers' MoE (the small-input-only layouts; not validated on a GPU). Read per call: tests set it.
+    """
     value = os.environ.get("AITER_MEGA_SHARED_IN", "0")
     if value not in ("1", "2"):
         return False
     return value == "2" or not fused_layout_small_only(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim, experts=world_size * experts_per_rank)
+        world_size=world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=world_size * experts_per_rank,
+    )
 
 
 def _arg_view(tensor):
