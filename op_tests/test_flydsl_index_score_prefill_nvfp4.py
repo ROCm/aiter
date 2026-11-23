@@ -71,7 +71,10 @@ def make(reqs, device, seed=0):
 
 
 @pytest.mark.parametrize(
-    "reqs", [[(64, 4096)], [(300, 0)], [(77, 1000), (259, 5000)], [(1024, 30000)]]
+    "reqs",
+    # The ragged case ends on an empty request: its CTAs must not read idx_q,
+    # which ends where that request starts.
+    [[(64, 4096)], [(300, 0)], [(77, 1000), (259, 5000), (0, 700)], [(1024, 30000)]],
 )
 # block_q:waves:ring; the first is the wrapper's default.
 @pytest.mark.parametrize("variant", ["256:4:4", "256:8:4", "256:4:8"])
@@ -105,6 +108,8 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
     qe = q[:, 0].float().clamp(-448, 448).to(torch.float8_e4m3fn).float()
     c = sm_scale_log2e(128**-0.5)
     for b, (n, cached) in enumerate(reqs):
+        if n == 0:
+            continue
         nb = (cached + n + 127) // 128
         k = dequant(payload[bt[b, :nb].long()], scale[bt[b, :nb].long()]).reshape(
             -1, 128

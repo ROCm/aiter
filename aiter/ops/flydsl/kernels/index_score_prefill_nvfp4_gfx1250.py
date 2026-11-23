@@ -145,6 +145,9 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
         def lds_store(offset, value, dtype):
             mem.store(offset, value, dtype)
 
+        def to_fp8(values):
+            return mem.fp8(values)
+
         bt = fx.recast_iter(fx.Int32, block_table_ptr)
 
         def stage(blk, slot):
@@ -174,42 +177,9 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
                     8,
                 )
 
-        # Query: e4m3(clamp(q)) as the B operand of each of this wave's tiles
-        # (lane (row, half): dims 32 j + 16 half + [0, 16), j < 4).
-        q_bf16 = fx.recast_iter(fx.BFloat16, q_ptr)
         row0 = pid_q * block_q + warp * (16 * tiles_per_wave)
-        q_ops = []
-        for rt in range_constexpr(tiles_per_wave):
-            r = row0 + rt * 16 + lane16
-            safe_r = (r < q_len).select(r, fx.Int32(0))
-            qbase = fx.Int64(seq_start + safe_r) * stride_q_n + pid_h * stride_q_h
-            words = []
-            for j in range_constexpr(4):
-                vals = fx.Vector(
-                    fx.ptr_load(
-                        fx.add_offset(q_bf16, qbase + j * 32 + half * 16),
-                        result_type=fx.Vector.make_type(16, fx.BFloat16),
-                    )
-                ).to(fx.Float32)
-                live_row = (r < q_len).select(fx.Float32(1.0), fx.Float32(0.0))
-                for h in range_constexpr(2):
-                    eight = fx.Vector.from_elements(
-                        [
-                            fx.maxnumf(
-                                fx.minnumf(
-                                    vals[h * 8 + e] * live_row, fx.Float32(E4M3_MAX)
-                                ),
-                                fx.Float32(-E4M3_MAX),
-                            )
-                            for e in range_constexpr(8)
-                        ],
-                        dtype=fx.Float32,
-                    )
-                    pair = mem.fp8(eight)
-                    words.extend([pair[0], pair[1]])
-            q_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
 
-        def page_max(masked, base, unit, blk):
+        def page_max(masked, base, unit, blk, q_ops):
             """Per query tile, this lane's max over its keys of the page
             (causally masked on the diagonal pages only)."""
             out = [fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)]
@@ -253,6 +223,40 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
             return out
 
         if live:
+            # Query: e4m3(clamp(q)) as the B operand of each of this wave's tiles
+            # (lane (row, half): dims 32 j + 16 half + [0, 16), j < 4). Loaded by live
+            # CTAs only: a dead one's request may be empty and end at idx_q's end.
+            q_bf16 = fx.recast_iter(fx.BFloat16, q_ptr)
+            q_ops = []
+            for rt in range_constexpr(tiles_per_wave):
+                r = row0 + rt * 16 + lane16
+                safe_r = (r < q_len).select(r, fx.Int32(0))
+                qbase = fx.Int64(seq_start + safe_r) * stride_q_n + pid_h * stride_q_h
+                words = []
+                for j in range_constexpr(4):
+                    vals = fx.Vector(
+                        fx.ptr_load(
+                            fx.add_offset(q_bf16, qbase + j * 32 + half * 16),
+                            result_type=fx.Vector.make_type(16, fx.BFloat16),
+                        )
+                    ).to(fx.Float32)
+                    live_row = (r < q_len).select(fx.Float32(1.0), fx.Float32(0.0))
+                    for h in range_constexpr(2):
+                        eight = fx.Vector.from_elements(
+                            [
+                                fx.maxnumf(
+                                    fx.minnumf(
+                                        vals[h * 8 + e] * live_row, fx.Float32(E4M3_MAX)
+                                    ),
+                                    fx.Float32(-E4M3_MAX),
+                                )
+                                for e in range_constexpr(8)
+                            ],
+                            dtype=fx.Float32,
+                        )
+                        pair = to_fp8(eight)
+                        words.extend([pair[0], pair[1]])
+                q_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
             for ahead in range_constexpr(ring - 1):
                 if blk_lo + ahead < blk_hi:
                     stage(blk_lo + ahead, fx.Int32(ahead))
@@ -280,9 +284,9 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
                     fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)
                 ]
                 if diagonal:
-                    maxes = page_max(True, base, unit, blk)
+                    maxes = page_max(True, base, unit, blk, q_ops)
                 else:
-                    maxes = page_max(False, base, unit, blk)
+                    maxes = page_max(False, base, unit, blk, q_ops)
                 for rt in range_constexpr(tiles_per_wave):
                     m = fx.maxnumf(maxes[rt], maxes[rt].shuffle_xor(16, WAVE))
                     r = row0 + rt * 16 + lane16

@@ -76,6 +76,7 @@ def index_score_prefill_nvfp4(
         and score.shape[0] == heads
         and score.shape[1] >= total_q
         and score.stride(2) == 1
+        and score.stride(0) <= 0x7FFFFFFF  # the kernel takes int32 strides
         and block_table.stride(1) == 1
     ):
         raise ValueError(
