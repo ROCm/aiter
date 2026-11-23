@@ -667,6 +667,57 @@ void init_lamport_ar_rms(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64
     fa->init_lamport_ar_rms(all_ptrs, max_bytes);
 }
 
+// out is FP8 when scale_out is not null
+static void _fused_allreduce_rmsnorm_lamport(fptr_t _fa,
+                                             const aiter_tensor_t& inp,
+                                             const aiter_tensor_t& res_inp,
+                                             const aiter_tensor_t& res_out,
+                                             void* out,
+                                             const aiter_tensor_t& w,
+                                             float* scale_out,
+                                             void* bf16_out,
+                                             double eps,
+                                             bool gemma_norm)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const int hidden   = (int)w.numel();
+    const int64_t rows = inp.numel() / hidden;
+
+#define RUN_LAMPORT_RMS(T, OutT)                                               \
+    fa->fused_allreduce_rmsnorm_lamport<T, OutT>(                              \
+        stream,                                                                \
+        reinterpret_cast<const T*>(inp.data_ptr()),                            \
+        reinterpret_cast<const T*>(res_inp.data_ptr()),                        \
+        reinterpret_cast<T*>(res_out.data_ptr()),                              \
+        reinterpret_cast<OutT*>(out),                                          \
+        reinterpret_cast<const T*>(w.data_ptr()),                              \
+        scale_out,                                                             \
+        reinterpret_cast<T*>(bf16_out),                                        \
+        rows,                                                                  \
+        hidden,                                                                \
+        (float)eps,                                                            \
+        gemma_norm)
+#define LAMPORT_RMS_DISPATCH(T)                                                \
+    if(scale_out == nullptr)                                                   \
+        RUN_LAMPORT_RMS(T, T);                                                 \
+    else                                                                       \
+        RUN_LAMPORT_RMS(T, opus::fp8_t);                                       \
+    break
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: LAMPORT_RMS_DISPATCH(opus::fp16_t);
+    case AITER_DTYPE_bf16: LAMPORT_RMS_DISPATCH(opus::bf16_t);
+    default:
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_lamport only supports float16 and bfloat16");
+    }
+#undef LAMPORT_RMS_DISPATCH
+#undef RUN_LAMPORT_RMS
+}
+
 void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      const aiter_tensor_t& inp,
                                      const aiter_tensor_t& res_inp,
@@ -676,39 +727,45 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      double eps,
                                      bool gemma_norm)
 {
-    HipDeviceGuard device_guard(inp.device_id);
-    hipStream_t stream = aiter::getCurrentHIPStream();
-    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     _validate_fused_allreduce_rmsnorm(inp, res_inp, res_out, w);
     if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || !out.is_contiguous() ||
        out.device_id != inp.device_id)
         throw std::runtime_error(
             "fused_allreduce_rmsnorm_lamport requires a matching contiguous output");
-    const int hidden   = (int)w.numel();
-    const int64_t rows = inp.numel() / hidden;
+    _fused_allreduce_rmsnorm_lamport(
+        _fa, inp, res_inp, res_out, out.data_ptr(), w, nullptr, nullptr, eps, gemma_norm);
+}
 
-#define RUN_LAMPORT_RMS(T)                                                     \
-    fa->fused_allreduce_rmsnorm_lamport<T>(                                    \
-        stream,                                                                \
-        reinterpret_cast<const T*>(inp.data_ptr()),                            \
-        reinterpret_cast<const T*>(res_inp.data_ptr()),                        \
-        reinterpret_cast<T*>(res_out.data_ptr()),                              \
-        reinterpret_cast<T*>(out.data_ptr()),                                  \
-        reinterpret_cast<const T*>(w.data_ptr()),                              \
-        rows,                                                                  \
-        hidden,                                                                \
-        (float)eps,                                                            \
-        gemma_norm)
-
-    switch(inp.dtype())
-    {
-    case AITER_DTYPE_fp16: RUN_LAMPORT_RMS(opus::fp16_t); break;
-    case AITER_DTYPE_bf16: RUN_LAMPORT_RMS(opus::bf16_t); break;
-    default:
+void fused_allreduce_rmsnorm_quant_lamport(fptr_t _fa,
+                                           const aiter_tensor_t& inp,
+                                           const aiter_tensor_t& res_inp,
+                                           const aiter_tensor_t& res_out,
+                                           const aiter_tensor_t& out,
+                                           const aiter_tensor_t& scale_out,
+                                           const aiter_tensor_t& w,
+                                           double eps,
+                                           bool gemma_norm,
+                                           int64_t bf16_out_ptr)
+{
+    _validate_fused_allreduce_rmsnorm(inp, res_inp, res_out, w);
+    const int64_t rows = inp.numel() / w.numel();
+    if(out.numel() != inp.numel() || out.dtype() != AITER_DTYPE_fp8 || !out.is_contiguous() ||
+       out.device_id != inp.device_id || scale_out.numel() != rows ||
+       scale_out.dtype() != AITER_DTYPE_fp32 || !scale_out.is_contiguous() ||
+       scale_out.device_id != inp.device_id)
         throw std::runtime_error(
-            "fused_allreduce_rmsnorm_lamport only supports float16 and bfloat16");
-    }
-#undef RUN_LAMPORT_RMS
+            "fused_allreduce_rmsnorm_quant_lamport requires contiguous FP8 output and one "
+            "contiguous FP32 scale per row");
+    _fused_allreduce_rmsnorm_lamport(_fa,
+                                     inp,
+                                     res_inp,
+                                     res_out,
+                                     out.data_ptr(),
+                                     w,
+                                     reinterpret_cast<float*>(scale_out.data_ptr()),
+                                     reinterpret_cast<void*>(bf16_out_ptr),
+                                     eps,
+                                     gemma_norm);
 }
 
 void allreduce_add_lamport(fptr_t _fa,
@@ -742,6 +799,35 @@ void allreduce_add_lamport(fptr_t _fa,
         throw std::runtime_error("allreduce_add_lamport only supports float16 and bfloat16");
     }
 #undef RUN_LAMPORT_ADD
+}
+
+void allreduce_lamport(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& out,
+                       bool two_shot)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || !out.is_contiguous() ||
+       out.device_id != inp.device_id || !inp.is_contiguous())
+        throw std::runtime_error(
+            "allreduce_lamport requires a contiguous input and a matching contiguous out");
+
+#define RUN_LAMPORT_AR(T)                                                      \
+    fa->allreduce_lamport<T>(stream,                                           \
+                             reinterpret_cast<const T*>(inp.data_ptr()),       \
+                             reinterpret_cast<T*>(out.data_ptr()),             \
+                             inp.numel(),                                      \
+                             two_shot)
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_AR(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_AR(opus::bf16_t); break;
+    default: throw std::runtime_error("allreduce_lamport only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_AR
 }
 
 void all_gather_lamport(fptr_t _fa,
@@ -864,6 +950,49 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
         fa->sg_, fa->self_sg_, fa->rank_)
     DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
 #undef LAUNCH_TWO_SYNC
+}
+
+// ---- DCP merge (see dcp_merge_ll_gfx1250) ----
+
+int64_t dcp_merge_max_rows(fptr_t _fa)
+{
+    return reinterpret_cast<aiter::CustomAllreduce*>(_fa)->dcp_merge_max_rows();
+}
+
+void dcp_merge(fptr_t _fa,
+               const aiter_tensor_t& o,
+               const aiter_tensor_t& lse,
+               int64_t owned_ptr,
+               const aiter_tensor_t& out,
+               int64_t out_lse_ptr)
+{
+    HipDeviceGuard device_guard(o.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(o.dim() != 3 || o.dtype() != AITER_DTYPE_bf16 || o.size(2) != 128 || o.stride(2) != 1 ||
+       o.stride(0) % 4 != 0 || o.stride(1) % 4 != 0 || reinterpret_cast<uintptr_t>(o.data_ptr()) % 8 != 0)
+        throw std::invalid_argument("gfx1250 DCP merge: o must be [B, H, 128] bf16 with 8-byte aligned rows");
+    const int64_t B = o.size(0), H = o.size(1);
+    if(lse.dim() != 2 || lse.dtype() != AITER_DTYPE_fp32 || lse.size(0) != B || lse.size(1) != H)
+        throw std::invalid_argument("gfx1250 DCP merge: lse must be [B, H] fp32");
+    const int64_t ws = fa->world_size_;
+    if(H % ws != 0 || B * (H / ws) > fa->dcp_merge_max_rows())
+        throw std::invalid_argument("gfx1250 DCP merge: " + std::to_string(B) + " x " + std::to_string(H) +
+                                    " heads do not fit world size " + std::to_string(ws));
+    if(out.dtype() != AITER_DTYPE_bf16 || (int64_t)out.numel() != B * (H / ws) * 128 || !out.is_contiguous())
+        throw std::invalid_argument("gfx1250 DCP merge: out must be a contiguous [B, H / world_size, 128] bf16");
+    fa->dcp_merge(stream,
+                  o.data_ptr(),
+                  reinterpret_cast<const float*>(lse.data_ptr()),
+                  reinterpret_cast<const int*>(owned_ptr),
+                  out.data_ptr(),
+                  reinterpret_cast<float*>(out_lse_ptr),
+                  (int)B,
+                  (int)H,
+                  o.stride(0),
+                  o.stride(1),
+                  lse.stride(0),
+                  lse.stride(1));
 }
 
 } // namespace aiter

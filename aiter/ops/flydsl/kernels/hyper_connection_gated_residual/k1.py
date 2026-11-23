@@ -968,6 +968,9 @@ _SKINNY_TWO_KERNEL = os.environ.get("AITER_GR_SKINNY_TWO_KERNEL", "1") == "1"
 # Chunked partial stores keep the two-kernel path within its register budget
 # through M=8. The unchunked fallback is limited to M=4.
 DECODE_MAX_M = 8 if _SKINNY_TWO_KERNEL else 4
+# Whether the skinny decode path takes `fold_w=False` and applies the norm
+# weight itself. Callers can check it to skip `fold_norm_weight`.
+SKINNY_DECODE_UNFOLDED = _SKINNY_TWO_KERNEL
 
 
 @lru_cache(maxsize=64)
@@ -1005,7 +1008,7 @@ def flydsl_k1k2_skinny_decode(
     injection: torch.Tensor,
     norm_weight: torch.Tensor,
     w_up: torch.Tensor,
-    w_down_merged: torch.Tensor,  # MUST be fold_w (1+w baked into each column)
+    w_down_merged: torch.Tensor,  # (1+w) baked into each column iff fold_w
     lowrank: int,
     hc_count: int,
     eps: float,
@@ -1014,16 +1017,18 @@ def flydsl_k1k2_skinny_decode(
     split_k_per_stream: int = 2,
     waves_per_block: int = 4,
     stream: torch.cuda.Stream | None = None,
+    fold_w: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """MMA-free skinny GEMV two-stage for decode M (combine+RMS -> down GEMV ->
     reduce/SiLU -> up GEMV + gated mean). No 64-row tile padding; ``xn`` never
     materialized. Returns ``(r2, block_input, inj_next)``.
 
-    ``w_down_merged`` must be the ``(1+w)``-folded merged weight (see
-    :func:`op.fold_norm_weight`). The down GEMV bakes that in -- it forms
-    ``xn = r2*rrms`` with **no** ``(1+w)`` multiply -- so passing an unfolded merged
-    weight here produces silently wrong output (no shape/dtype tripwire catches it).
-    The op only routes here when ``fold_w=True``; do not call it directly otherwise.
+    With ``fold_w=True``, ``w_down_merged`` must be the ``(1+w)``-folded merged
+    weight (see :func:`op.fold_norm_weight`): the down GEMV then forms
+    ``xn = r2*rrms`` with **no** ``(1+w)`` multiply, and an unfolded weight gives
+    silently wrong output. With ``fold_w=False`` the down GEMV scales the merged
+    weight by ``(1+w)`` in fp32 instead. ``fold_w=False`` needs the two-kernel
+    schedule (the default); the op only routes it here then.
 
     Inputs must satisfy :func:`validate_k1_inputs`; the op checks them before
     dispatch. ``block_output=None`` normalizes ``residual`` without a combine.
@@ -1045,6 +1050,7 @@ def flydsl_k1k2_skinny_decode(
             split_k_per_stream,
             waves_per_block,
             stream,
+            fold_w,
         )
 
 
@@ -1062,6 +1068,7 @@ def _skinny_decode(
     split_k_per_stream,
     waves_per_block,
     stream,
+    fold_w=True,
 ):
     from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
         _build_reduce_silu,
@@ -1101,10 +1108,13 @@ def _skinny_decode(
             hc_count,
             eps,
             stream,
+            fold_w=fold_w,
             **skinny_kwargs,
         )
         inj_next = packed[:, lowrank : lowrank + hc_count] if need_inj else None
         return r2, x, inj_next
+    if not fold_w:
+        raise ValueError("the single-kernel skinny schedule requires fold_w=True")
     dev = residual.device
     r2 = (
         torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
