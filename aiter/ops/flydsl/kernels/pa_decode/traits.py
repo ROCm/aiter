@@ -48,6 +48,15 @@ _NHD_V_BUF_BYTES = 4 * 64 * 256
 # bytes are MXFP4 too.
 FP8_KV_DTYPES = (fx.Float8E4M3FN, fx.Float8E4M3FNUZ)
 MXFP4_KV_DTYPE = fx.Float4E2M1FNx2
+# NVFP4 K/V (gfx1250): the same packed e2m1 bytes with one E4M3 scale per 16 values
+# (``kv_scale_dtype=torch.float8_e4m3fn``). Per (page, kv head) the caches are
+# token-major: [128, D // 2] payload bytes and [128, D // 16] scale bytes. The
+# wave pipeline keeps NVFP4_RING pages in flight per wave, NVFP4_SLOT_BYTES each
+# (K and V payload [32, 64], K and V scales [32, 8] padded to 256 B). Rings of
+# 2/3/4 pages measured 75.3/74.9/74.3 us at 512 rows; 4 costs 18 KB more LDS
+# and over 256 VGPRs.
+NVFP4_RING = 3
+NVFP4_SLOT_BYTES = 4608
 PA_KV_DTYPES = (*FP8_KV_DTYPES, fx.BFloat16, MXFP4_KV_DTYPE)
 PA_QUERY_DTYPES = (fx.Float16, fx.BFloat16, fx.Float8E4M3FN)
 
@@ -1651,8 +1660,14 @@ class Gfx1250Traits:
         )
 
     @property
+    def nvfp4_wave(self):
+        # NVFP4 K/V on the wave pipeline (one query tile, scaled WMMA); its
+        # QK/PV operands are BF16, so ``bf16`` holds too.
+        return self.compute_dtype == "nvfp4w"
+
+    @property
     def bf16(self):
-        return self.compute_dtype == "bf16"
+        return self.compute_dtype in ("bf16", "nvfp4w")
 
     @property
     def elem_bytes(self):
@@ -1804,6 +1819,9 @@ class Gfx1250Traits:
 
     @property
     def stats_offset(self):
+        if self.nvfp4_wave:
+            # Past the wave rings; only the merge's arrival flag lives here.
+            return NVFP4_RING * self.NWARP * NVFP4_SLOT_BYTES
         return self.p_offset + self.p_bytes
 
     @property
@@ -1811,6 +1829,10 @@ class Gfx1250Traits:
         # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
         # No loop stage uses them, so a wave can publish its maxima while
         # others still read P.
+        if self.nvfp4_wave:
+            # Past the merge's arrival flag: the post-loop wave merge aliases
+            # the rings, which other waves may still read.
+            return self.stats_offset + 16
         return self.stats_offset + 576
 
     @property
@@ -1821,9 +1843,14 @@ class Gfx1250Traits:
         return math.gcd(self.query_group_size, 16)
 
     @property
+    def quant_bytes(self):
+        if not self.quant_output:
+            return 0
+        return self.m_tiles * 16 // self.quant_unit * self.NWARP * 4
+
+    @property
     def total_bytes(self):
-        units = self.m_tiles * 16 // self.quant_unit
-        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
+        return self.quant_offset + self.quant_bytes
 
     @property
     def use_tdm(self):

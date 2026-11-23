@@ -3038,3 +3038,177 @@ def test_pa_decode_nhd_partial_tile_zero_logits(device):
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+# NVFP4 K/V (gfx1250 wave tile), the MiniMax-M3 sparse KV pool layout: per (page,
+# KV head) [128, D / 2] e2m1 bytes (element 2j in the low nibble) and [128, D / 16]
+# E4M3 scales. Every row is its own sequence over a compacted table of its top-16
+# pages, the partial tail page last, as ATOM builds it.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _nvfp4_dequant(payload, scales):
+    codes = torch.stack([payload & 15, payload >> 4], -1).flatten(-2).long()
+    values = torch.tensor(_E2M1, device=payload.device)[codes & 7]
+    values = values * (1 - 2 * (codes >> 3)).float()
+    return (values.unflatten(-1, (-1, 16)) * scales.float()[..., None]).flatten(-2)
+
+
+def _nvfp4_inputs(
+    rows, device, dtype, kv_heads=1, group=16, max_len=2048, query_length=1
+):
+    """Query, (K, K scales, V, V scales), table, lengths and the fp32 reference."""
+    g = torch.Generator(device=device).manual_seed(0)
+    seqs, pages = rows // query_length, rows // query_length * 16 + 8
+    shape = (2, pages, kv_heads, 128)
+    payload = torch.randint(0, 256, (*shape, 64), generator=g, device=device)
+    # K head rows spread over E4M3's range, as real activations are.
+    spread = torch.randint(-6, 4, (*shape, 1), generator=g, device=device)
+    spread[1] = -1
+    scales = torch.rand(*shape, 8, generator=g, device=device) * torch.exp2(spread)
+    payload, scales = payload.to(torch.uint8), scales.to(torch.float8_e4m3fn)
+    perm = torch.randperm(pages, generator=g, device=device)
+    table = perm[: seqs * 16].view(seqs, 16).int()
+    lengths = torch.randint(1, max_len + 1, (seqs,), generator=g, device=device)
+    lengths[::7], lengths[3::11] = max_len, 0
+    lengths[5::13] = lengths[5::13] % 128 + 1
+    if query_length > 1:  # MTP rows need their own query tokens in context
+        lengths = lengths.clamp(min=query_length)
+    lengths = lengths.int()
+    query = torch.randn(rows, kv_heads * group, 128, generator=g, device=device)
+    query[:, ::5] *= 8  # o_proj inputs of very different magnitude per head
+    query = query.to(dtype)
+    kv = _nvfp4_dequant(payload, scales)
+    expected = torch.zeros(query.shape, device=device)
+    for seq, n in enumerate(lengths.tolist()):
+        pages_n = table[seq, : -(-n // 128)].long()
+        k, v = (x[pages_n].transpose(0, 1).flatten(1, 2)[:, :n] for x in kv)
+        for qi in range(query_length):
+            q = query[seq * query_length + qi].float().view(kv_heads, group, 128)
+            visible = n - query_length + qi + 1
+            s = (q @ k[:, :visible].transpose(1, 2)) * 128**-0.5
+            out = s.softmax(-1) @ v[:, :visible]
+            expected[seq * query_length + qi] = out.flatten(0, 1)
+        if n % 128:  # never-written tail bytes must not be read
+            scales[:, table[seq, (n - 1) // 128], :, n % 128 :] = float("nan")
+    k, v = payload.unbind(0)
+    ks, vs = scales.unbind(0)
+    return query, (k, ks, v, vs), table, lengths, expected
+
+
+def _nvfp4_mode(kwargs):
+    if kwargs.get("cluster_merge"):
+        shared = kwargs.get("cluster_seqs", 1)
+        return f"cluster{kwargs['cluster_merge']}" + (
+            f"x{shared}" if shared > 1 else ""
+        )
+    if kwargs.get("direct_output"):
+        return "direct" if kwargs["num_partitions"] == 1 else "merge"
+    return "reduce"
+
+
+# name: (rows, plan kwargs, input kwargs, output mode). M3.1 TP4 shapes (GQA 16,
+# D128, top-16 pages); MTP rows are flattened to one row each.
+_NVFP4_CASES = {
+    "decode-c4": (4, {}, {}, "cluster8"),
+    "decode-c64": (64, {}, {}, "cluster8"),
+    "mtp8-c4": (32, {}, {}, "cluster8"),
+    "mtp8-c64": (512, {}, {}, "merge"),
+    "direct": (32, {"max_partitions": 1}, {}, "direct"),
+    "direct-prefill": (1024, {"max_partitions": 1}, {"max_len": 1024}, "direct"),
+    "cluster8-c64": (64, {"max_partitions": 8, "workgroup_budget": 512}, {}, "cluster8"),
+    "cluster4-short": (64, {"max_partitions": 8, "workgroup_budget": 512}, {"max_len": 1024}, "cluster4"),
+    "last-arriver-merge": (8, {"max_partitions": 8, "workgroup_budget": 1}, {}, "merge"),
+    "shared-cluster2": (512, {"max_partitions": 2, "workgroup_budget": 1024}, {}, "cluster2x4"),
+    "shared-cluster3": (512, {"max_partitions": 3, "workgroup_budget": 1536}, {}, "cluster3x4"),
+    "shared-cluster8": (300, {"max_partitions": 8, "workgroup_budget": 4096}, {}, "cluster8x2"),
+    "reducer": (600, {"max_partitions": 8, "workgroup_budget": 4800}, {}, "reduce"),
+    "short-rows": (96, {}, {"max_len": 200}, "reduce"),
+    "f16-query": (32, {"max_partitions": 1}, {"dtype": torch.float16}, "direct"),
+    "fp4x2-view": (16, {}, {"view": dtypes.fp4x2}, "cluster8"),
+    "gqa8-two-kv-heads": (32, {}, {"kv_heads": 2, "group": 8}, "cluster8"),
+    "mtp2-gqa8": (16, {}, {"group": 8, "query_length": 2}, "cluster8"),
+    "mtp2-two-kv-heads-reducer": (600, {"max_partitions": 8, "workgroup_budget": 4800}, {"kv_heads": 2, "group": 8, "query_length": 2}, "reduce"),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", list(_NVFP4_CASES))
+def test_pa_decode_nvfp4(case, device, monkeypatch):
+    """NVFP4 K/V against an fp32 reference over the dequantized cache, then the
+    FP8 output bit for bit against the standalone quant of the same call."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("NVFP4 pa_decode runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    rows, plan_kwargs, kwargs, mode = _NVFP4_CASES[case]
+    kwargs = dict(kwargs)
+    dtype, view = kwargs.pop("dtype", torch.bfloat16), kwargs.pop("view", torch.uint8)
+    query, (k, ks, v, vs), table, lengths, expected = _nvfp4_inputs(
+        rows, device, dtype, **kwargs
+    )
+    query_length = kwargs.get("query_length", 1)
+    plan = pa.plan_pa_decode(
+        lengths, k.shape[1], query_length=query_length, **plan_kwargs
+    )
+    compiled = []
+    compile_tile = pa.compile_pa_decode_tile
+    monkeypatch.setattr(
+        pa,
+        "compile_pa_decode_tile",
+        lambda **kw: compiled.append(kw) or compile_tile(**kw),
+    )
+    output = torch.empty_like(query)
+    launch = partial(
+        pa.pa_decode, output, query, k.view(view), v.view(view), lengths, table,
+        128**-0.5, query_length, key_scale=ks, value_scale=vs, work_plan=plan,
+        max_context_length=kwargs.get("max_len", 2048),
+    )  # fmt: skip
+    for _ in range(2):  # the second call takes the recorded-launch path
+        output.fill_(float("nan"))
+        launch()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    assert compiled[-1]["kv_scale_dtype"] == torch.float8_e4m3fn
+    assert _nvfp4_mode(compiled[-1]) == mode
+    # Empty rows free slots, so merge plans split some row over several tasks.
+    assert mode != "merge" or (plan.reduce_info[:, 1] > 1).any()
+    # One KV head a CTA, or a cluster merging one sequence, holds whole tokens.
+    fused = k.shape[1] == 1 and mode in ("direct", "cluster4", "cluster8")
+    quant = {"quant": "fused" if fused else "fallback", "capture": True}
+    _check_quant_output(launch, query, output, compiled, quant)
+
+
+def test_pa_decode_nvfp4_rejects(device):
+    """Sinks, partial scale planes and more than one 16-row query tile raise."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("NVFP4 pa_decode runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query, (k, ks, v, vs), table, lengths, _ = _nvfp4_inputs(4, device, torch.bfloat16)
+    plan = pa.plan_pa_decode(lengths, 1)
+    call = partial(
+        pa.pa_decode, torch.empty_like(query), query, k, v, lengths, table, 0.1, 1
+    )
+    with pytest.raises(NotImplementedError):
+        call(
+            key_scale=ks,
+            value_scale=vs,
+            work_plan=plan,
+            sinks=torch.zeros(16, device=device),
+        )
+    with pytest.raises(ValueError):
+        call(key_scale=ks[..., :4], value_scale=vs[..., :4], work_plan=plan)
+    lengths = lengths[:2].clamp(min=2)
+    plan2 = pa.plan_pa_decode(lengths, 1, query_length=2)
+    with pytest.raises(ValueError):  # 2 query tokens x GQA 16 = 32 rows
+        pa.pa_decode(
+            torch.empty_like(query),
+            query,
+            k,
+            v,
+            lengths,
+            table[:2],
+            0.1,
+            2,
+            key_scale=ks,
+            value_scale=vs,
+            work_plan=plan2,
+        )

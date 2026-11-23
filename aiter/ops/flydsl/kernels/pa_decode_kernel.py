@@ -33,6 +33,14 @@ row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 
 e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
 tile and all dims, so the tile loop has no barrier; the waves merge once after it.
 
+NVFP4 K/V (``kv_dtype=dtypes.fp4x2`` with ``kv_scale_dtype=torch.float8_e4m3fn``,
+gfx1250, head_dim 128, page 128, one query tile of at most 16 rows) are e2m1 with one
+E4M3 scale per 16 values, stored token-major per (page, KV head): [128, 64] payload
+and [128, 8] scale bytes. ``Gfx1250Nvfp4WavePipeline`` runs them: each wave owns 32
+tokens of every page, DMAs them itself, computes QK and dequantizes V with
+``v_wmma_scale16_f32_16x16x128_f8f6f4`` straight from the raw rows and keeps softmax
+and P in registers, so the page loop has no CTA barrier.
+
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
@@ -60,6 +68,8 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 this module keeps the compilation API and launch wrappers.
 """
 
+import dataclasses
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -83,6 +93,7 @@ from .pa_decode.pipeline import (
     Gfx1250WavePipeline,
     PaDecodePipeline,
 )
+from .pa_decode.pipeline_nvfp4 import Gfx1250Nvfp4WavePipeline
 from .pa_decode.traits import (
     FP8_KV_DTYPES,
     FP8_PACK_K,
@@ -206,6 +217,7 @@ def compile_pa_decode_tile(
     cluster_runs: bool = False,
     quant_output: bool = False,
     store_output: bool = True,
+    kv_scale_dtype: torch.dtype | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -214,6 +226,9 @@ def compile_pa_decode_tile(
     ``dtypes.fp4x2`` for MXFP4. ``dtypes.fp4x2`` is ``torch.uint8`` on torch
     builds without ``float4_e2m1fn_x2``, so a uint8 ``kv_dtype`` also selects
     MXFP4. ``query_dtype`` is the query's: f16 or bf16, or e4m3fn with MXFP4 KV.
+    ``kv_scale_dtype=torch.float8_e4m3fn`` with an fp4x2/uint8 ``kv_dtype`` selects
+    NVFP4 (gfx1250 only): E4M3 block scales of 16 values instead of MXFP4's E8M0
+    of 32.
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
 
@@ -273,6 +288,56 @@ def compile_pa_decode_tile(
     the head term, and the in-page term stays i32.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    nvfp4 = kv_scale_dtype == torch.float8_e4m3fn
+    if kv_scale_dtype is not None and not nvfp4:
+        raise ValueError(f"Unsupported PA KV scale dtype {kv_scale_dtype}")
+    if nvfp4:
+        kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
+        if architecture not in ("gfx1250", "gfx1250-strict"):
+            raise NotImplementedError(
+                f"NVFP4 PA decode supports gfx1250, not {architecture}"
+            )
+        if kv_fx != MXFP4_KV_DTYPE or query_fx not in (fx.Float16, fx.BFloat16):
+            raise ValueError(
+                "NVFP4 PA decode takes fp4x2/uint8 KV with an f16/bf16 query, "
+                f"got {kv_dtype} and {query_dtype}"
+            )
+        if not trans_k or not trans_v or per_token_kv:
+            raise ValueError("NVFP4 PA decode takes HND K/V without per-token scales")
+        t = gfx1250_tile_traits(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            num_seqs=num_seqs,
+            num_kv_heads=num_kv_heads,
+            num_compute_units=num_compute_units,
+            work_capacity=work_capacity,
+            num_partitions=num_partitions,
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            kv_dtype=torch.bfloat16,
+            query_length=query_length,
+            query_splits=1,
+            max_context_length=max_context_length,
+            sliding_window=sliding_window,
+            direct_output=direct_output,
+            cluster_merge=cluster_merge,
+            cluster_seqs=cluster_seqs,
+            quant_output=quant_output,
+            store_output=store_output,
+        )
+        # The wave pipeline stages its own pages: no BF16 step or staging
+        # policy applies.
+        return compile_gfx1250_pa_decode(
+            dataclasses.replace(
+                t,
+                compute_dtype="nvfp4w",
+                wide_bf16_page16=False,
+                wide_fp8_page128=False,
+                wide_bf16_page128=False,
+                narrow_fp8_page16=False,
+            )
+        )
     if architecture in ("gfx1250", "gfx1250-strict"):
         if not trans_k:
             raise NotImplementedError("NHD pa_decode requires gfx950")
@@ -949,8 +1014,24 @@ def compile_gfx1250_pa_decode(t):
     """
     if t.query_splits not in (1, 2, 4) or t.query_length % t.query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
-    if t.compute_dtype not in ("fp8", "bf16"):
+    if t.compute_dtype not in ("fp8", "bf16", "nvfp4w"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {t.compute_dtype}")
+    if t.nvfp4_wave and not (
+        t.head_dim == 128
+        and t.block_size == 128
+        and t.trans_v
+        and not t.per_token_kv
+        and t.sliding_window == 0
+        and t.query_splits == 1
+        and t.m_tiles == 1
+        and not (t.cluster_steps or t.cluster_runs)
+    ):
+        # A wave owns 32 tokens of a 128-token page and all 16 query rows.
+        raise ValueError(
+            "NVFP4 PA decode supports head_dim 128, page 128, one query tile "
+            "(query_length x GQA <= 16), no sliding window, query split or "
+            "step/run clusters"
+        )
     if t.bf16 and t.per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
     if t.merge_partitions and (t.direct_output or t.head_dim > MERGE_HEAD_DIM):
@@ -1294,7 +1375,9 @@ def compile_gfx1250_pa_decode(t):
                 ctx.step_bounds = step_bounds
                 if const_expr(t.cluster_steps or t.cluster_runs):
                     ctx.stage_pages = stage_pages
-            if const_expr(t.bf16_wave_query_tiles):
+            if const_expr(t.nvfp4_wave):
+                Gfx1250Nvfp4WavePipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
