@@ -35,11 +35,10 @@ from .kernels import (
 # Callers pack the fused weight for gemm="a6w6" in this row order.
 from .kernels.gemm_a6w6_4wave_host import host_weight_order  # noqa: F401
 from .kernels.gemm_hooks import GemmHooks
-from .kernels.qk_prep_epilogue import PrepSpec
+from .kernels.qk_prep_epilogue import HEAD_DIM, PrepSpec
 from .kernels.tensor_shim import _run_compiled
 from .pre_attention_monokernel_layout import role_layouts
 
-HEAD_DIM = 128
 # The host GEMMs by name; each host's own block sizes set the session's tile counts.
 HOSTS = {"int8": gemm_a8w8_int8_4wave, "a6w6": gemm_a6w6_4wave_host}
 GEMMS = tuple(HOSTS)
@@ -170,9 +169,6 @@ class PreAttentionMonokernel:
         valid_kv_len=None,
         softmax_scale=None,
         eps=1e-6,
-        trace=False,
-        defer=True,
-        v_tile_amax=True,
     ):
         from mori.cco import (
             GDA_CONNECTION_NONE,
@@ -223,9 +219,6 @@ class PreAttentionMonokernel:
             eps,
             workgroups,
             xcds,
-            trace,
-            defer,
-            v_tile_amax,
             gemm,
         )
         configs = [None] * world_size
@@ -321,22 +314,13 @@ class PreAttentionMonokernel:
             across_heads=self.prep.norm == "rms_across_heads",
             head_dim=HEAD_DIM,
             eps=eps,
-            trace=trace,
-            defer=defer,
-            v_tile_amax=v_tile_amax,
         )
         # Everything the hooks were built from that the GEMM's name does not cover.
-        options = (
-            ("t" if trace else "")
-            + ("" if defer else "n")
-            + ("" if v_tile_amax else "x")
-        )
         key = (
             f"pam{_source_key()}{self.profile.name.replace('-', '')}m{rows}"
             f"k{self.layouts[1].sequence}r{rank}w{world_size}c{workgroups}x{xcds}"
             + (f"e{eps:g}" if eps != 1e-6 else "")
             + (f"s{softmax_scale:g}" if softmax_scale is not None else "")
-            + options
         )
         host = {
             "xcd_swizzle": 8,
@@ -480,13 +464,6 @@ class PreAttentionMonokernel:
         across heads."""
         start = self._factors_at // 4 + role * self.rows
         return self.aux[start : start + self.rows]
-
-    def trace(self, role):
-        """The coordinator's timestamps of ``role`` in a traced build, int64 [16]."""
-        from .kernels.pre_attention_monokernel_hooks import TRACE
-
-        start = self.plan.ctl + TRACE + 128 * role
-        return self.bytes[start : start + 128].view(torch.int64)
 
     def close(self):
         torch.cuda.synchronize()

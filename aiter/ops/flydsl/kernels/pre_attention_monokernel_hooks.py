@@ -9,8 +9,8 @@ The fused Q/K/V roles GEMM runs these hooks:
   - after each role's tiles: the role's RMS factors (Q/K, norm across heads) and, for
     per-tensor scales, its amax per destination; the coordinator (last workgroup)
     exchanges amax with every peer;
-  - after each workgroup's first block of the next role (``defer``): the previous role's
-    quantize into the cached staging and its puts;
+  - after each workgroup's first block of the next role, when every workgroup has a tile
+    of every role: the previous role's quantize into the cached staging and its puts;
   - after every V tile: V's amax per destination (per-tensor V);
   - after V's tiles: V's quantize and puts, the drain, and the arrival flags.
 Each role's receive buffers are the A2A op's packed buffers for the profile, and each codec
@@ -29,17 +29,16 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 
 from .communication_ops_utils import spin_until_ge_i32_agent, spin_until_ge_i64
-from .mega_moe_tp.common import now
 from .pre_attention_monokernel_quant import THREADS, make_row_quantize
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 # Window control words, bytes from the control region, for up to 8 ranks: amax
 # [3][src 8][dst 8] FP32, amax generation [3][src 8], arrival generation [src 8], four
-# counters per role, scale [3][dst 8] FP32, the coordinator's per-wave amax [4][8], trace
-# [3][16], V's amax per destination from its tiles [8], per-channel exchange generation
-# [src 8] and counter, then per-workgroup amax [3][workgroups][8] from PEAKS and every
-# source's per-channel V maxima [src][world * channels] FP32 from Plan.pc_val.
-AMAX_VAL, AMAX_GEN, RECV_GEN, COUNTERS, SCALE, WAVE_AMAX, TRACE, V_AMAX = (
+# counters per role, scale [3][dst 8] FP32, the coordinator's per-wave amax [4][8], V's
+# amax per destination from its tiles [8], per-channel exchange generation [src 8] and
+# counter, then per-workgroup amax [3][workgroups][8] from PEAKS and every source's
+# per-channel V maxima [src][world * channels] FP32 from Plan.pc_val.
+AMAX_VAL, AMAX_GEN, RECV_GEN, COUNTERS, SCALE, WAVE_AMAX, V_AMAX = (
     0,
     1024,
     1280,
@@ -47,9 +46,8 @@ AMAX_VAL, AMAX_GEN, RECV_GEN, COUNTERS, SCALE, WAVE_AMAX, TRACE, V_AMAX = (
     1600,
     1792,
     2048,
-    2816,
 )
-PC_GEN, PC_COUNT, PEAKS = 2880, 2944, 4096
+PC_GEN, PC_COUNT, PEAKS = 2112, 2176, 4096
 MAX_WORLD = 8
 # Counters per role: workgroups' amax in, workgroups' rows quantized, XCDs written back,
 # scales ready.
@@ -120,9 +118,6 @@ def make_hooks(
     across_heads=True,
     head_dim=128,
     eps=1e-6,
-    trace=False,
-    defer=True,
-    v_tile_amax=True,
 ):
     """The role, first-block and tile hooks for ``layouts`` (``role_layouts``).
 
@@ -147,9 +142,9 @@ def make_hooks(
     row_chunks = ((rows + workgroups - 1) // workgroups + 63) // 64
     # The deferred quantize runs in the first-block hook of the next role, which needs a
     # tile of every role in every workgroup.
-    defer = defer and tiles_per_role >= workgroups
+    defer = tiles_per_role >= workgroups
     kinds = [layout.scale for layout in layouts]
-    v_tile_amax = v_tile_amax and kinds[2] == "tensor"
+    v_tile_amax = kinds[2] == "tensor"
     quantizers = [
         make_row_quantize(
             layout, rank, world, rows, heads_local, workgroups, across_heads
@@ -232,7 +227,6 @@ def make_hooks(
             fx.Int32(fx.block_idx.x),
             fx.Int32(generation),
             own + (ctl + COUNTERS + role * 16),
-            own + (ctl + TRACE + role * 128),
         )
 
     @flyc.jit
@@ -253,13 +247,9 @@ def make_hooks(
             bid,
             gen,
             counters,
-            stamps,
         ) = unpack(role, args)
         if tid == 0:
             spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
-            if const_expr(trace):
-                if bid == coord:
-                    fx.generic_store(gptr(stamps, fx.Int64), now())
         fx.barrier()
         fx.memory_fence(
             ordering=fx.AtomicOrdering.Acquire, syncscope=fx.rocdl.SyncScope.Agent
@@ -351,7 +341,6 @@ def make_hooks(
             bid,
             gen,
             counters,
-            stamps,
         ) = unpack(role, args)
         tile_amax = v_tile_amax and role == 2
         if bid == coord:
@@ -359,9 +348,6 @@ def make_hooks(
                 # The tiles' atomics land before each tile is counted.
                 if tid == 0:
                     spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
-                    if const_expr(trace):
-                        fx.generic_store(gptr(stamps, fx.Int64), now())
-                        fx.generic_store(gptr(stamps + 8, fx.Int64), now())
                 fx.barrier()
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
@@ -370,8 +356,6 @@ def make_hooks(
             else:
                 if tid == 0:
                     spin_until_ge_i32_agent(counters + AMAXED, gen * workgroups)
-                    if const_expr(trace):
-                        fx.generic_store(gptr(stamps + 8, fx.Int64), now())
                 fx.barrier()
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
@@ -470,8 +454,6 @@ def make_hooks(
             fx.barrier()
             if tid == 0:
                 fx.generic_store(gptr(counters + READY, fx.Int32), gen)
-                if const_expr(trace):
-                    fx.generic_store(gptr(stamps + 16, fx.Int64), now())
 
     @flyc.jit
     def channel_step(role, aux, args):
@@ -492,13 +474,9 @@ def make_hooks(
             bid,
             gen,
             counters,
-            stamps,
         ) = unpack(role, args)
         if tid == 0:
             spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
-            if const_expr(trace):
-                if bid == coord:
-                    fx.generic_store(gptr(stamps, fx.Int64), now())
         fx.barrier()
         fx.memory_fence(
             ordering=fx.AtomicOrdering.Acquire, syncscope=fx.rocdl.SyncScope.Agent
@@ -533,8 +511,6 @@ def make_hooks(
         if bid == coord:
             if tid == 0:
                 spin_until_ge_i32_agent(own + ctl + PC_COUNT, gen * workgroups)
-                if const_expr(trace):
-                    fx.generic_store(gptr(stamps + 8, fx.Int64), now())
             fx.barrier()
             if tid < world:
                 peer = tid
@@ -586,8 +562,6 @@ def make_hooks(
                     syncscope=fx.rocdl.SyncScope.Agent,
                 )
                 fx.generic_store(gptr(counters + READY, fx.Int32), gen)
-                if const_expr(trace):
-                    fx.generic_store(gptr(stamps + 16, fx.Int64), now())
 
     @flyc.jit
     def quantize_step(role, aux, args):
@@ -606,7 +580,6 @@ def make_hooks(
             bid,
             gen,
             counters,
-            stamps,
         ) = unpack(role, args)
         kind = kinds[role]
         if const_expr(kind != "block"):
@@ -634,9 +607,6 @@ def make_hooks(
         fx.barrier()
         if tid == 0:
             count(counters + DONE)
-            if const_expr(trace):
-                if bid == coord:
-                    fx.generic_store(gptr(stamps + 24, fx.Int64), now())
         # Workgroups go to the XCDs round robin, so the last xcds cover every L2.
         if bid >= workgroups - xcds:
             if tid == 0:
@@ -665,15 +635,12 @@ def make_hooks(
             bid,
             gen,
             counters,
-            stamps,
         ) = unpack(role, args)
         layout = layouts[role]
         sdma = cco.DevComm(dc).sdma()
         if bid == coord:
             if tid == 0:
                 spin_until_ge_i32_agent(counters + FLUSHED, gen * xcds)
-                if const_expr(trace):
-                    fx.generic_store(gptr(stamps + 32, fx.Int64), now())
             fx.barrier()
             if tid < world:
                 peer = tid
@@ -713,9 +680,6 @@ def make_hooks(
                         own + ctl + RECV_GEN + fx.Int64(peer) * 8, generation
                     )
                 fx.barrier()
-                if const_expr(trace):
-                    if tid == 0:
-                        fx.generic_store(gptr(stamps + 40, fx.Int64), now())
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
                     syncscope=fx.rocdl.SyncScope.OneAs,
@@ -760,7 +724,6 @@ def make_hooks(
                 _bid,
                 _gen,
                 _counters,
-                _stamps,
             ) = unpack(role, args)
             lane = tid % 64
             head = fx.Int32(col_base) // head_dim
