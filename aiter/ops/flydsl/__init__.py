@@ -212,6 +212,10 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
     ),
+    "make_minimax_m3_index_score_prefill_plan": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "make_score_prefill_plan",
+    ),
     "minimax_m3_index_score_prefill_nvfp4_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl_nvfp4",
@@ -237,6 +241,10 @@ _LAZY_IMPORTS = {
     "sparse_pa_nvfp4_prefill": (
         ".kernels.sparse_pa_nvfp4_prefill",
         "sparse_pa_nvfp4_prefill",
+    ),
+    "make_sparse_pa_nvfp4_prefill_plan": (
+        ".kernels.sparse_pa_nvfp4_prefill",
+        "make_sparse_pa_prefill_plan",
     ),
 }
 
@@ -288,6 +296,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "make_fp4_mqa_plan",
+    "make_minimax_m3_index_score_prefill_plan",
+    "make_sparse_pa_nvfp4_prefill_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
     "minimax_m3_index_score_flydsl_supported",
