@@ -36,7 +36,7 @@ from .tensor_shim import _run_compiled, buf_scalar_load
 BLOCK_M = 128
 BLOCK_N = 128
 STAGES_A = 2
-_COPY_VEC = 8  # 16B / bf16
+_COPY_VEC = 16 // torch.bfloat16.itemsize
 
 _INT32_MAX = 2**31 - 1
 # An HSA dispatch packet holds each axis's work-item count in a uint32.
@@ -636,7 +636,6 @@ def _check_launch(
     compact: bool,
     device_index: int,
 ) -> None:
-    """Raise ValueError for a launch past a HIP grid limit or a 32-bit offset."""
     if compact:
         names = (f"A.shape[0] // {block_m} + n_groups", "1", f"N / {block_n}")
     else:

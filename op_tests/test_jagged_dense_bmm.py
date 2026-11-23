@@ -38,7 +38,7 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 SEED = 1234
 INT32_MAX = 2**31 - 1
-_SIDE_GATE_CYCLES = 10**9  # GPU cycles. The gate must outlast the snapshot below.
+_SIDE_GATE_CYCLES = 10**9  # GPU cycles; must outlast the reader stream's copy of C.
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -119,7 +119,7 @@ def _launch(d, out, B, Mi, uniform, **kwargs):
     return out
 
 
-# tol_err_ratio=0: one missed group (1.56% of rows at B=64) would pass the 5% default.
+# One missed group is 1/B of the rows, which the 5% default error ratio passes.
 def _check(d, got, dtype, msg):
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
     return assertAllclose(
@@ -226,7 +226,7 @@ def _expect_rejected(launch, out, what, match):
 
 @benchmark()
 def test_jdbba_limit_invalid(limit, B, D, Kout, rows, max_seq_len, regime, dtype):
-    # The call must raise before launch, so the inputs need no values.
+    # The call raises before launch, so A, B, and BIAS can stay uninitialized.
     d = {
         "jagged": torch.empty(B * rows, D, dtype=dtype),
         "dense": torch.empty(B, D, Kout, dtype=dtype),
@@ -518,7 +518,6 @@ def test_jdbba_block_k_override(B, D, Kout, Mi, block_k, dtype):
     row = _live_tuned_row(B, D, Kout, Mi, 16, 4, 64)
     d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
     out = _nan_out(d["L"], d["N"], dtype)
-    # A cleared launcher cache makes the launch build the key it actually uses.
     with _tuned_csv(row + "\n"), mock.patch.dict(_LAUNCHERS, clear=True):
         cfg = jdbba_dispatch.resolve_config(
             n_groups=B,
@@ -589,7 +588,6 @@ def test_jdbba_output_overlap_invalid(B, D, Kout, Mi, overlaps, dtype):
     else:
         key = {"B": "dense", "BIAS": "bias", "SEQ_OFFSETS": "seq_offsets"}[overlaps]
         src = d[key]
-        # The input starts 4 bytes before the end of C.
         buf = torch.empty(c_bytes - 4 + src.nbytes, dtype=torch.uint8)
         out = buf[:c_bytes].view(dtype).view(d["L"], d["N"])
         shared = buf[c_bytes - 4 :].view(src.dtype).view(src.shape)
