@@ -14,7 +14,7 @@ from aiter.ops.triton.utils._triton import arch_info
 _ARCH = arch_info.get_arch()
 if _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.chunk_kda import prepare, walk
-elif _ARCH == "gfx1250":
+elif _ARCH in ("gfx1250", "gfx1250-strict"):
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda import (
         prepare,
         walk,
@@ -420,7 +420,7 @@ def chunk_kda(
         (o, final_state); final_state is None unless output_final_state is set without
         state_cache.
     """
-    if _ARCH not in ("gfx1250", "gfx950"):
+    if _ARCH not in ("gfx1250", "gfx1250-strict", "gfx950"):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
         assert out_gate is None, "the fused output norm needs the Gluon path"

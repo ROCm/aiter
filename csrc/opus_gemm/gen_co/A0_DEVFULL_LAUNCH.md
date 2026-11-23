@@ -16,7 +16,7 @@ Test directory: /home/blyu/opus-a0-devimage-20261027
 
 The device code objects are the already-built `amdgpu-pin-hybrid` A0 files, not
 new binaries compiled with this SDK. Their actual ELF processor is `0xeb` and
-the current host loader automatically selected `co/gfx1250-a0/` from ASIC
+the current host loader automatically selected `co/gfx1250-strict/` from ASIC
 Revision 0. No processor flag was rewritten.
 
 The test is native C++/HIP. It does not import PyTorch, call rocminfo, use GPU RNG,
