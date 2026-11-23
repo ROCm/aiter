@@ -28,6 +28,7 @@ try:
         eligible_payload_bytes,
         probe_peer_topology,
     )
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
     from aiter.ops.flydsl.quick_allreduce import (
         FlyQuickAllReduce,
@@ -38,6 +39,7 @@ try:
 except Exception:  # noqa: BLE001
     fly_policy = None
     _cuda_index = None
+    check_groups = None
     eligible_payload_bytes = None
     probe_peer_topology = None
     OneShotAllReduceRMSNorm = None
@@ -295,8 +297,21 @@ class FlyDSLQuickAllReduce:
                     exc_info=True,
                 )
                 ok = False
-            if all_ranks_agree(ok, group) and len(topo.groups) == 2:
-                groups = topo.groups
+            if all_ranks_agree(ok, group) and len(topo.groups) >= 2:
+                # The topology is identical on every rank, so every rank falls
+                # back together. A groups override that the kernel cannot
+                # build on (unequal sizes, not two groups) must not reach the
+                # engine build, where its error would disable mesh and ring.
+                try:
+                    groups = check_groups(topo.groups, world_size)
+                except ValueError:
+                    logger.warning(
+                        "%s: cannot build the hierarchical schedule on groups "
+                        "%s; running the flat schedules.",
+                        self._tag,
+                        topo.groups,
+                        exc_info=True,
+                    )
             policy = policy.with_topology(hierarchical=groups is not None)
         algorithms = [
             alg

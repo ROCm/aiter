@@ -1870,3 +1870,19 @@ def test_lamport_finegrained_inbox_holds_the_late_rearm_buffers():
         assert data_bytes(build, "finegrained", handshake="flag", **kw) == data_bytes(
             build, "uncached", handshake="flag", **kw
         )
+
+
+@pytest.mark.parametrize(
+    "text", ("0,1,2;3,4,5,6,7", "0,1,2,3,4,5,6,7", "0,1;2,3;4,5;6,7", "0;1,2,3,4,5,6,7")
+)
+def test_groups_override_the_hier_kernel_cannot_build_on_is_rejected(text):
+    """``parse_groups_env`` accepts any partition of the ranks; the backend runs
+    ``check_groups`` on the probed groups and falls back to the flat schedules
+    when it raises, instead of failing in the engine build."""
+    from aiter.ops.flydsl.comm_collectives_host_shared import parse_groups_env
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
+
+    groups = parse_groups_env(text, 8)
+    with pytest.raises(ValueError):
+        check_groups(groups, 8)
+    assert check_groups(parse_groups_env("0,1,2,3;4,5,6,7", 8), 8)

@@ -311,6 +311,22 @@ LEGACY_SHAPES_PER_WORLD_SIZE = {
 OUTLIER_DIVISOR = 8.0
 DIVISOR_MAX_LOSS_DB = 1.0
 
+# The fused two-shot routes a platform ships, ``(arch, link, tp)`` -> algorithms
+# with a fused window. Spelled out, not read from the policy, so a regression
+# that empties a window fails ``test_quick_allreduce_rmsnorm_shipped`` instead
+# of leaving its walk empty and the row skipped.
+FUSED_SHIPPED_ROUTES = {
+    ("gfx942", "xgmi", 2): ("mesh",),
+    ("gfx942", "xgmi", 4): ("mesh",),
+    ("gfx942", "xgmi", 8): ("mesh",),
+    ("gfx950", "xgmi", 2): ("ring",),
+    ("gfx950", "xgmi", 4): ("mesh",),
+    ("gfx950", "xgmi", 8): ("mesh",),
+    ("gfx950", "pcie", 2): ("ring",),
+    ("gfx950", "pcie", 4): ("mesh", "ring"),
+    ("gfx950", "pcie", 8): ("mesh",),
+}
+
 # (tp, algorithm, tokens, hidden, fill).
 EDGE_CASES = (
     (2, "mesh", 16, 1024, "pos_underflow"),
@@ -417,12 +433,15 @@ HIER_LOCAL_SHAPES = ((64, 7168), (1024, 7168), (8192, 7168))
 # pinned ``(local_rs, local_ag)``. The ``normal`` and ``run_ahead`` rows run
 # ``HIER_TEST_LADDER_CELL``'s ladder at its default codecs: 14 MiB on its
 # mesh/mesh ST=8 rung and 28 MiB on its ring/ring INT5 rung. Lamport also
-# runs back to back on a fine-grained inbox, its late re-arm's reason.
+# runs back to back on a fine-grained inbox, its late re-arm's reason. The
+# ``graph`` row is a ``normal`` one replayed in a CUDA graph, as production
+# serves it.
 FORCED_HIER_CASES = (
     (8, "halves", "exact", ("mesh", "mesh"), 8, 512, 1031, 7168, None),
     (8, "halves", "exact", ("ring", "ring"), 8, 512, 1031, 7168, None),
     (8, "halves", "normal", None, None, None, 1024, 7168, None),
     (8, "halves", "normal", None, None, None, 2048, 7168, None),
+    (8, "halves", "graph", None, None, None, 1024, 7168, None),
     (8, "halves", "run_ahead", None, None, None, *RUN_AHEAD_SHAPE, None),
     (8, "interleaved", "exact", ("mesh", "ring"), 1, 256, 333, 7168, None),
     (4, "halves", "exact", ("ring", "mesh"), 8, 512, 1031, 7168, None),
@@ -1098,9 +1117,14 @@ def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group)
     dragged now and then so that the others run ahead into the next call.
 
     Afterwards, every output is checked against its own fp32 reference, and
-    against the other ranks' outputs.
+    against the other ranks' outputs. The reference check is per tile as well
+    as over the payload: a tile consumed stale decodes the same on every rank,
+    and among the hundreds of tiles of a large payload it moves the payload's
+    SQNR by under a dB.
     """
     drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    cfg_used, _ = fly._pick_cfg(tokens * hidden * 2)
+    tile_bytes = _tile_bytes(cfg_used[1])
     outs = []
     for it in range(RUN_AHEAD_ITERS):
         if rank == 0 and it % 4 == 0:
@@ -1110,15 +1134,21 @@ def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group)
         fly.allreduce(inp, out)
         outs.append(out)
     torch.cuda.synchronize()
-    sqnr = float("inf")
+    sqnr = tile_sqnr = float("inf")
     lanes = 0
     for it, out in enumerate(outs):
         ref = sum(
             _run_ahead_part(it, r, tokens, hidden, device).float() for r in range(tp)
         )
         sqnr = min(sqnr, _sqnr_db(out.float(), ref))
+        tile_sqnr = min(tile_sqnr, _min_tile_sqnr_db(out.float(), ref, tile_bytes))
         lanes = max(lanes, _lanes_differing(out, group))
-    return {"calls": len(outs), "sqnr_db": sqnr, "lanes_differing": lanes}
+    return {
+        "calls": len(outs),
+        "sqnr_db": sqnr,
+        "min_tile_sqnr_db": tile_sqnr,
+        "lanes_differing": lanes,
+    }
 
 
 def _run_rank(
@@ -2273,7 +2303,8 @@ def test_quick_allreduce_hier_forced(
     *handshake*. *check* is ``exact`` (the fp16 wire on an exact-grid input,
     bit-identical to the fp32 reference, on the pinned local laps),
     ``normal`` (the default codecs, held to the SQNR floor, on the expected
-    super-tile) or ``run_ahead``.
+    super-tile), ``graph`` (``normal``, replayed in a CUDA graph) or
+    ``run_ahead``.
     """
     from aiter.ops.flydsl.comm_collectives_host_shared import parse_groups_env
 
@@ -2283,7 +2314,7 @@ def test_quick_allreduce_hier_forced(
         f"local={local} st={super_tile} block={block} inbox={inbox_memory}"
     )
     key = _forced_hier_key(tp, split, handshake, local, super_tile, block, inbox_memory)
-    rows = _result(key, (tokens, hidden, check, False))
+    rows = _result(key, _forced_hier_case(tokens, hidden, check))
     want = parse_groups_env(groups_env, tp)
     fails = [
         f"rank {rank}: built on groups {row['groups']}, handshake "
@@ -2306,7 +2337,7 @@ def test_quick_allreduce_hier_forced(
             if row["local"] != "/".join(local)
         ]
         _check(label, fails)
-    elif check == "normal":
+    elif check in ("normal", "graph"):
         _check(label, fails)
         _check_sqnr(
             label,
@@ -2330,6 +2361,12 @@ def test_quick_allreduce_hier_forced(
             max(r["n_mismatch"] for r in rows) if check == "exact" else None
         ),
     }
+
+
+def _forced_hier_case(tokens, hidden, check):
+    """The ``_run_rank`` case of a ``FORCED_HIER_CASES`` row: ``graph`` is the
+    ``normal`` fill, replayed in a CUDA graph."""
+    return (tokens, hidden, "normal" if check == "graph" else check, check == "graph")
 
 
 def _lamport_finegrained_key(tp, algorithm, super_tile, block, tuning):
@@ -2402,6 +2439,12 @@ def _run_ahead_fails(rows: list[dict], algorithm: str) -> list[str]:
         f"{row['calls']} calls"
         for rank, row in enumerate(rows)
         if row["sqnr_db"] < SQNR_MIN_DB
+    ]
+    fails += [
+        f"rank {rank}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB < "
+        f"{TILE_SQNR_MIN_DB} over {row['calls']} calls"
+        for rank, row in enumerate(rows)
+        if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB
     ]
     return fails
 
@@ -3402,7 +3445,16 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
     """
     walk = _shipped_cases(tp, algorithm)
     if not walk:
-        return {"gfx": ARCH, "skipped": True}
+        shipped = algorithm in FUSED_SHIPPED_ROUTES.get(
+            (ARCH, fly_policy.detect_link(), tp), ()
+        )
+        _check(
+            f"tp={tp} fused {algorithm} shipped walk",
+            [f"{ARCH} ships a fused {algorithm} route here, but its walk is empty"]
+            if shipped
+            else [],
+        )
+        return {"gfx": ARCH, "skipped": not shipped, "empty_walk": True}
     batch = _fused_batch(
         (tp, "shipped", algorithm),
         [w[:4] for w in walk],
@@ -4757,7 +4809,7 @@ def _verify(args, tps, algos, dts, link) -> None:
     for tp, split, hs, check, local, st, block, tokens, hidden, mem in hier_forced:
         _register(
             _forced_hier_key(tp, split, hs, local, st, block, mem),
-            (tokens, hidden, check, False),
+            _forced_hier_case(tokens, hidden, check),
         )
     lamport_fg = [c for c in LAMPORT_FINEGRAINED_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, check, st, block, tokens, hidden, tuning in lamport_fg:
