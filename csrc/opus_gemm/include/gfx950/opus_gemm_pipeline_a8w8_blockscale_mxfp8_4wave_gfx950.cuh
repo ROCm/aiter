@@ -5,7 +5,7 @@
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
-#include "opus_gemm_traits_mxfp8_4wave_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxfp8_4wave_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_mxfp8_detail {

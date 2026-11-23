@@ -2897,6 +2897,16 @@ GFX950_CO_KERNELS_JSON = os.path.join(
     "gen_co",
     "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json",
 )
+# MXFP8 NT / NN / TT / TN with plain (not shuffled) B. They share the CO kid space and
+# the a8w8_blockscale_bpreshuffle registry family with the preshuffled-B COs above.
+GFX950_PLAIN_CO_KERNELS_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a8w8_blockscale.json"
+)
+# Manifest -> image directory under gen_co/gfx950/.
+_GFX950_CO_IMAGE_DIRS = {
+    GFX950_CO_KERNELS_JSON: "a8w8_blockscale_bpreshuffle",
+    GFX950_PLAIN_CO_KERNELS_JSON: "a8w8_blockscale",
+}
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
 
 
@@ -3024,9 +3034,9 @@ def _bpreshuffle_instance(
 # CO metadata
 
 
-def _gfx950_co_image_path(path, entry):
-    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
-    return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
+def _gfx950_co_image_path(entry):
+    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(GFX950_CO_KERNELS_JSON)
+    return os.path.join(root, "gfx950", entry["image_dir"], entry["image"])
 
 
 _MXFP8_DIRECTION_PIPELINES = {
@@ -3048,7 +3058,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
     defaults = document.get("defaults", {})
     entries = {}
     for record in document["gfx950"]:
-        entry = {**defaults, **record}
+        entry = {**defaults, **record, "image_dir": _GFX950_CO_IMAGE_DIRS[path]}
         kid = entry["kid"]
         if kid in entries:
             raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
@@ -3105,7 +3115,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
     return {
         kid: entry
         for kid, entry in entries.items()
-        if not require_image or os.path.isfile(_gfx950_co_image_path(path, entry))
+        if not require_image or os.path.isfile(_gfx950_co_image_path(entry))
     }
 
 
@@ -3882,6 +3892,12 @@ def _bpreshuffle_jit_instances():
 gfx950_co_kernels_declared = _load_gfx950_co_kernels(
     GFX950_CO_KERNELS_JSON, require_image=False
 )
+for _kid, _entry in _load_gfx950_co_kernels(
+    GFX950_PLAIN_CO_KERNELS_JSON, require_image=False
+).items():
+    if _kid in gfx950_co_kernels_declared:
+        raise ValueError(f"gfx950 CO kid {_kid} is declared in both CO manifests")
+    gfx950_co_kernels_declared[_kid] = _entry
 
 
 for _kid, _instance in chain(
@@ -4098,9 +4114,7 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             kid: instance
             for kid, instance in records.items()
             if instance.bpreshuffle_co is None
-            or os.path.isfile(
-                _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
-            )
+            or os.path.isfile(_gfx950_co_image_path(instance.bpreshuffle_co))
         }
     return records
 
@@ -4477,9 +4491,7 @@ def get_kernel_instance(
         family == "a8w8_blockscale_bpreshuffle"
         and arch == "gfx950"
         and instance.bpreshuffle_co is not None
-        and not os.path.isfile(
-            _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
-        )
+        and not os.path.isfile(_gfx950_co_image_path(instance.bpreshuffle_co))
     ):
         return None
     return instance

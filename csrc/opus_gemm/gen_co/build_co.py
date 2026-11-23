@@ -31,9 +31,13 @@ identical without any sidecar::
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
 gfx950 uses short image/launcher names while retaining each verified ELF symbol.
-Its manifest is
-``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``. Its images and
-build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``.
+Its preshuffled-B manifest is
+``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``; its images and
+build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``. The
+plain-B MXFP8 NT / NN / TT / TN kernels are declared in
+``gen_co/co_kernels_gfx950_a8w8_blockscale.json`` and live in
+``gen_co/gfx950/a8w8_blockscale/``. Without --out-dir, a build goes to its
+kids' directory (kids of both manifests must be built separately).
 The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
@@ -857,9 +861,9 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
-def _default_co_output_dir(arch, offload_arch):
+def _default_co_output_dir(arch, offload_arch, image_dir=None):
     if arch == "gfx950":
-        return os.path.join(_HERE, arch, "a8w8_blockscale_bpreshuffle")
+        return os.path.join(_HERE, arch, image_dir)
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
@@ -947,10 +951,6 @@ def main():
         "gfx1250-strict",
     ):
         p.error("--offload-arch does not match --arch")
-    if not args.out_dir:
-        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
-    os.makedirs(args.out_dir, exist_ok=True)
-
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
@@ -978,6 +978,21 @@ def main():
     ]
     if not instances:
         raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
+    if not args.out_dir:
+        # gfx950: each CO manifest has its own image directory (and build_info.json).
+        image_dirs = (
+            {entry["image_dir"] for entry in instances}
+            if args.arch == "gfx950"
+            else {None}
+        )
+        if len(image_dirs) != 1:
+            p.error(
+                f"--kids span CO directories {sorted(image_dirs)}; build them separately or pass --out-dir"
+            )
+        args.out_dir = _default_co_output_dir(
+            args.arch, args.offload_arch, image_dirs.pop()
+        )
+    os.makedirs(args.out_dir, exist_ok=True)
     build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 

@@ -3323,10 +3323,11 @@ def gen_mxscale_bpreshuffle_instance(
             + " && ".join(conditions)
             + ', "CO tensor extent exceeds pipeline limits");'
         )
-        kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");'
+        image = f'{entry["image_dir"]}/{entry["image"]}'
+        kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{image}");'
         if entry.get("short_symbol"):
-            kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{entry['image']}");
-    static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{entry['image']}");
+            kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{image}");
+    static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{image}");
     AiterAsmKernelFast& kernel = k <= {entry['short_max_k']} ? short_k : normal;"""
         body = f"""{grid_setup}
     {kernel_select}
