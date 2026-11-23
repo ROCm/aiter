@@ -3660,8 +3660,14 @@ class Gfx1250Mxfp4Pipeline:
                             visible = visible & (token >= lower)
                         scores[m][c] = visible.select(scores[m][c], neg_inf)
                 tile_valid = ctx.planned_context - first
+                # Tokens before every row's window start count as past the
+                # context: their scales would raise S_b for later tokens.
+                tile_low = first_upper - t.sliding_window - first
                 for c in range_constexpr(kv.CHUNKS):
-                    row_valid = warp * self.TILE_TOKENS + 16 * c + lane16 < tile_valid
+                    v_token = warp * self.TILE_TOKENS + 16 * c + lane16
+                    row_valid = v_token < tile_valid
+                    if const_expr(t.sliding_window > 0):
+                        row_valid = row_valid & (v_token >= tile_low)
                     v_rows[c] = row_valid.select(v_rows[c], zero8)
                     v_scales[c] = row_valid.select(v_scales[c], fx.Int32(0))
             # Each lane holds token 16 c + lane16's scales. S_b follows the
@@ -3901,9 +3907,17 @@ class Gfx1250Mxfp4Pipeline:
                         scores[m][c] = visible.select(scores[m][c], neg_inf)
                 # V rows past the context: exact zeros with the smallest scale.
                 tile_valid = ctx.planned_context - first
+                # Tokens before every row's window start count as past the
+                # context: their scales would raise S_b for later tokens.
+                tile_low = first_upper - t.sliding_window - first
                 for p in range_constexpr(4):
-                    lo_valid = 64 * p + 16 * half + lane16 < tile_valid
-                    hi_valid = 64 * p + 32 + 16 * half + lane16 < tile_valid
+                    lo_token = 64 * p + 16 * half + lane16
+                    hi_token = lo_token + 32
+                    lo_valid = lo_token < tile_valid
+                    hi_valid = hi_token < tile_valid
+                    if const_expr(t.sliding_window > 0):
+                        lo_valid = lo_valid & (lo_token >= tile_low)
+                        hi_valid = hi_valid & (hi_token >= tile_low)
                     v_data[p] = fx.Vector.from_elements(
                         [
                             lo_valid.select(fx.Int32(v_data[p][i]), fx.Int32(0))
@@ -4277,8 +4291,14 @@ class Gfx1250Mxfp4Pipeline:
                             visible = visible & (token >= lower)
                         scores[i][c] = visible.select(scores[i][c], neg_inf)
                 tile_valid = ctx.planned_context - first
+                # Tokens before every row's window start count as past the
+                # context: their scales would raise S_b for later tokens.
+                tile_low = first_upper - t.sliding_window - first
                 for c in range_constexpr(kv.CHUNKS):
-                    row_valid = part * 64 + 16 * c + lane16 < tile_valid
+                    v_token = part * 64 + 16 * c + lane16
+                    row_valid = v_token < tile_valid
+                    if const_expr(t.sliding_window > 0):
+                        row_valid = row_valid & (v_token >= tile_low)
                     v_rows[c] = row_valid.select(v_rows[c], zero8)
                     v_scales[c] = row_valid.select(v_scales[c], fx.Int32(0))
             s_new, s_rescale = [], []

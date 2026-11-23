@@ -31,6 +31,7 @@ from .kernels.pa_decode_kernel import (
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
+    MXFP4_GFX1250_MAX_ROWS,
     MXFP4_GFX1250_STRICT_REFUSAL,
     compile_pa_decode_tile,
     gfx1250_tile_traits,
@@ -533,7 +534,12 @@ def _pa_decode_mxfp4(
     # B128 x 8k, 2-CTA clusters instead of the reducer: 29.9 -> 25.9 us; 2 KV
     # heads at B32 x 8k: 17.7 -> 16.5 us). With 4 tiles a CTA the splits'
     # shorter tiles win (B32 x 8k: 11.5 against 11.7 us).
-    if gfx1250 and splits > 1 and query_length > 1 and 40 < query_length * group:
+    if (
+        gfx1250
+        and splits > 1
+        and query_length > 1
+        and 40 < query_length * group <= MXFP4_GFX1250_MAX_ROWS
+    ):
         whole_ctas = -(-num_compute_units // num_kv_heads)
         whole_size = min(partitions, CLUSTER_PARTITIONS)
         while whole_size > 2 and num_seqs * whole_size > whole_ctas:
@@ -560,8 +566,13 @@ def _pa_decode_mxfp4(
     # One-M-tile CTAs whose clusters run in one round split their waves by
     # dims (``run_dims``) and merge on chip faster than the reducer (G16 B2 x
     # 8k: 5.3 -> 5.1 us), so single-token decode then takes the cluster too.
-    dims_cluster = rows <= 16 and (
-        num_seqs * num_kv_heads * splits * cluster_size <= num_compute_units
+    # Long runs a CTA lose the merge's gain to the per-tile exchange (B1 x
+    # 128k, an 8-CTA cluster of a max_partitions=8 plan: 48.6 against 64.3
+    # us), so dims take clusters of at most 4 tiles a CTA.
+    dims_cluster = (
+        rows <= 16
+        and num_seqs * num_kv_heads * splits * cluster_size <= num_compute_units
+        and seq_tiles <= 4 * cluster_size
     )
     cluster_merge = (
         cluster_size
@@ -601,7 +612,7 @@ def _pa_decode_mxfp4(
     # 27.0 -> 23.3 us). Where clusters merge, or with 40 rows, more and shorter
     # CTAs win (B3 x 8k: 7.0 against 9.1 us; G8 x MTP5 at B8 x 32k: 11.4
     # fused against 12.3 us).
-    wave_pairs = fuse_tasks == 2 and query_length * group > 40
+    wave_pairs = fuse_tasks == 2 and 40 < query_length * group <= MXFP4_GFX1250_MAX_ROWS
     if wave_pairs:
         fuse_tasks = 1
     # Clusters of at most 8 CTAs whose scratch holds a slot per wave merge
@@ -768,10 +779,9 @@ def _pa_decode_mxfp4(
             query_seq_len=query_length,
             query_group_size=group,
             head_size=head_dim,
-            # As on the FP8/BF16 path: a sequence has at most the tiles its
-            # length bound and window allow, so the reducer takes a shorter
-            # register rung (G16 B1 x 8k decode: 5.4 -> 5.3 us).
-            max_partitions=partitions,
+            # Not bounded by max_context_length: the plan splits the real length,
+            # so a context longer than the bound still has all its partials.
+            max_partitions=min(work_plan.max_partitions, capacity),
             stream=stream,
             reduce_info=work_plan.reduce_info,
         )

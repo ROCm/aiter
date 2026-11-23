@@ -1460,6 +1460,14 @@ def compile_gfx1250_pa_decode(t):
                 # the active branch reads them, and the compiler would sink
                 # their loads into it; readfirstlane keeps them here.
                 first_tile = part * run_tiles
+                run_end = first_tile + run_tiles
+                if const_expr(t.mxfp4):
+                    # MXFP4 attends a context longer than the bound in full:
+                    # the cluster's last CTA also runs the tiles past the runs.
+                    # Chosen before the length's wait, which only the min follows.
+                    run_end = (part == t.cluster_merge - 1).select(
+                        fx.Int32(2**30), run_end
+                    )
                 tbl = fx.recast_iter(fx.Int32, table)
                 row = seq * max_blocks
                 page = first_tile * (KV_COMPUTE_BLOCK // t.block_size)
@@ -1483,7 +1491,7 @@ def compile_gfx1250_pa_decode(t):
                 task_slot = first + part
                 task_seq = seq
                 task_begin = first_tile
-                task_end = fx.min(first_tile + run_tiles, tiles)
+                task_end = fx.min(run_end, tiles)
                 active = first_tile < tiles
                 if const_expr(pad_grid):
                     count = present.select(count, fx.Int32(0))
@@ -1499,6 +1507,12 @@ def compile_gfx1250_pa_decode(t):
                 # A sequence with more tasks than the cluster has CTAs splits its
                 # tiles over the cluster, in its first task slots.
                 first = fx.Int32(seq_tasks[0])
+                if const_expr(t.wave_partials):
+                    # A wave per slot: sequence s's waves take slots from
+                    # NWARP * s * cluster_merge, which the host bounds by the
+                    # scratch. The plan's first slot runs ahead of s *
+                    # cluster_merge once a cluster is smaller than its tasks.
+                    first = seq * t.cluster_merge
                 count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
                 if const_expr(pad_grid):
                     count = present.select(count, fx.Int32(0))

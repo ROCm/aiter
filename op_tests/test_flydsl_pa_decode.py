@@ -941,6 +941,69 @@ def _short_bound_pool(*, device):
     )
 
 
+def _tail_pool(lengths, query_length, tail_page, *, device):
+    """K = 0 (uniform softmax), V = 1 only on logical pages ``tail_page`` and up:
+    each row's output is the share of those tokens it sees, 0 if they are dropped.
+    """
+    width = -(-max(lengths) // 128)
+    pages = len(lengths) * width
+    table = torch.randperm(pages, dtype=torch.int32, device=device)
+    table = table.reshape(len(lengths), width)
+    key_pool = torch.zeros(
+        pages, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=device
+    )
+    value_pool = torch.zeros_like(key_pool)
+    key_pool[..., 128 * 64 :] = value_pool[..., 128 * 64 :] = 127
+    value_pool[table[:, tail_page:].reshape(-1).long(), :, : 128 * 64] = 0x22
+    query = torch.ones(
+        len(lengths) * query_length, 16, 128, dtype=torch.bfloat16, device=device
+    )
+    context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    return (
+        query,
+        (key_pool, _mxfp4_dequant(key_pool)),
+        (value_pool, _mxfp4_dequant(value_pool)),
+        table,
+        context,
+    )
+
+
+def _window_head_pool(lengths, query_length, window, *, device):
+    """K = 0, V = 1, but tokens before every row's window start carry a 2**20
+    V scale. Counted in the running scale S_b, they would push the visible
+    V'' below E4M3's range; each visible row's output is 1.
+    """
+    width = -(-max(lengths) // 128)
+    pages = len(lengths) * width
+    table = torch.randperm(pages, dtype=torch.int32, device=device)
+    table = table.reshape(len(lengths), width)
+    key_pool = torch.zeros(
+        pages, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=device
+    )
+    value_pool = torch.zeros_like(key_pool)
+    key_pool[..., 128 * 64 :] = 127
+    value_pool[..., : 128 * 64] = 0x22
+    scales = torch.full(
+        (len(lengths), width * 128), 127, dtype=torch.uint8, device=device
+    )
+    for seq, length in enumerate(lengths):
+        scales[seq, : max(0, length - query_length + 1 - window)] = 127 + 20
+    value_pool[table.reshape(-1).long(), 0, 128 * 64 :] = scales.reshape(
+        -1, 128
+    ).repeat_interleave(4, dim=1)
+    query = torch.ones(
+        len(lengths) * query_length, 16, 128, dtype=torch.bfloat16, device=device
+    )
+    context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    return (
+        query,
+        (key_pool, _mxfp4_dequant(key_pool)),
+        (value_pool, _mxfp4_dequant(value_pool)),
+        table,
+        context,
+    )
+
+
 _COMMON_CASES = [
     ("decode", {"block_size": 16, "max_partitions": 1, "quant": "fused"}),
     (
@@ -2026,6 +2089,105 @@ _MXFP4_GFX1250_CASES = [
             "cluster": 4,
             "splits": 1,
             "lengths": (8192, 8000, 7937, 8192) * 4,
+        },
+    ),
+    # More than 64 rows never runs whole: G16 x MTP8 keeps four 32-row splits
+    # where MTP4 would take one CTA (it raised "at most 64 query rows").
+    (
+        "mxfp4-mtp8-whole-capped",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 8,
+            "kv_heads": 4,
+            "splits": 4,
+            "lengths": (8192, 8000, 7937, 8192) * 4,
+        },
+    ),
+    # G16 x MTP6 (two 48-row splits) fuses its tasks; wave pairs take at most
+    # 64 rows (it raised "wave_pairs requires one split of 33-64 rows").
+    (
+        "mxfp4-mtp6-g16-fused",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 6,
+            "fused": True,
+            "pairs": False,
+            "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 32,
+        },
+    ),
+    # MTP clusters that shrink below the plan's tasks a sequence (a window,
+    # so no cluster runs) keep wave partials inside the scratch: 16 tasks a
+    # sequence in 8-CTA clusters wrote past it, or over the next KV head.
+    *[
+        (
+            f"mxfp4-mtp8-window4096-cluster-kv{kv_heads}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": 8,
+                "kv_heads": kv_heads,
+                "window": 4096,
+                "lengths": (4096,) * 10,
+            },
+        )
+        for kv_heads in (1, 2)
+    ],
+    # Cluster runs split a length bound below the context (16 one-tile runs
+    # of 4096 tokens): the cluster's last CTA also runs the tiles past the
+    # runs. Only tokens past 4096 carry V, so a dropped tail outputs 0.
+    *[
+        (
+            f"mxfp4-{mode}-runs-short-bound",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": query_length,
+                "max_context": 4096,
+                "pattern": "pool",
+                "pool": partial(_tail_pool, (8192, 6000, 4500), query_length, 32),
+                "cluster": 16,
+                "dims": query_length == 1,
+                "ref_mean_min": 0.1,
+            },
+        )
+        for mode, query_length in (("decode", 1), ("mtp4", 4))
+    ],
+    # Tokens of a masked tile before every row's window start are past the
+    # context for V: their 2**20 scales must not raise S_b, which would flush
+    # the visible V'' to 0. Wave dims (decode), the split CTAs (B1 MTP4) and
+    # wave pairs (256 MTP4 sequences) each mask their own V.
+    *[
+        (
+            f"mxfp4-window-head-scales-{name}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": query_length,
+                "window": window,
+                "pattern": "pool",
+                "pool": partial(_window_head_pool, lengths, query_length, window),
+                **pins,
+            },
+        )
+        for name, query_length, window, lengths, pins in (
+            ("decode-dims", 1, 4096, (8292,) * 3, {"dims": True}),
+            ("mtp4", 4, 300, (1027,), {}),
+            ("mtp4-pairs", 4, 300, (1027,) * 256, {"pairs": True}),
+        )
+    ],
+    # Decode clusters of more than 4 tiles a CTA keep per-wave partials rather
+    # than wave dims (an 8-partition plan over 16k: 8 tiles a CTA).
+    (
+        "mxfp4-decode-np8-long-cta",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "max_partitions": 8,
+            "cluster": 8,
+            "dims": False,
+            "lengths": (16384, 16000),
         },
     ),
     (
