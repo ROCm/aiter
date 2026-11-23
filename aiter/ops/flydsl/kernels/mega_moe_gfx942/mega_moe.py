@@ -2,25 +2,29 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X), shaped like
-MegaMoEV2.
+MegaMoEV2, with its three paths:
 
-Two kernel sets run it:
+- main (``forward`` / ``forward_prequant`` while large_M is off; ``main.py``, ``comm.py``):
+  five kernels per call. ``comm.py`` quantizes x, exchanges the route counts and plans
+  every route's destination row; ``main.py`` is one persistent kernel that writes each
+  route's row into its destination, runs gemm1 / gemm2 on 128-row blocks as the rows
+  arrive (W streamed into VGPRs) and adds every route into its source rank's output (BF16
+  atomics); ``comm.py`` then waits until all ranks' adds are done. Its tasks only wait for
+  work that is already running, so it needs no co-residency.
+- small_M (``forward_small_m``; ``small_m.py``): one kernel per call for decode-sized
+  batches. Every local expert owns fixed slots, so a route takes its row with one atomic
+  (no count exchange, no plan), and the combine sums each token's rows in slot order. It
+  spins on its peers inside the kernel, so it needs the whole GPU: nothing may run on
+  another stream at the same time. a8w8 has no small kernel: its small_M runs the main
+  path at the small-input capacity.
+- large_M (``forward`` / ``forward_prequant`` once enabled; ``large_m/``): the LDS mega
+  kernel, GEMM tiles of 256 rows with A and W staged through LDS (a8w4's MXFP4 decoded to
+  FP8 by the W loaders) that skip the MFMAs of a block's padding rows; faster than the
+  main path from about 1000 tokens per rank. No co-residency needed.
 
-- the main path: five kernels per call. ``comm.py`` quantizes x, exchanges the route
-  counts and plans every route's destination row; ``main.py`` is one persistent kernel
-  that writes each route's row into its destination, runs gemm1 / gemm2 on the rows as
-  they arrive and adds every route into its source rank's output (BF16 atomics);
-  ``comm.py`` then waits until all ranks' adds are done. Its tasks only wait for work
-  that is already running, so it needs no co-residency. W streams into VGPRs: faster
-  for decode batches.
-- the mega kernel of ``lds/``: GEMM tiles of 256 rows with A and W staged through
-  LDS, faster from about 1000 tokens per rank. It decodes a8w4's MXFP4 experts to FP8
-  in its W loaders.
-
-``forward`` / ``forward_prequant`` run the mega kernel and ``forward_small_m`` the main
-path at the small-input capacity, both on the same experts. a8w4 with
-``x_quant="per_token"`` runs every call on the main path and has no small-input path.
-There is no large-input path in this version (``large_m_available`` False).
+The main path is built only while large_M is off: unlike MegaMoEV2, an instance holds
+either the main path or large_M, and ``set_large_m_enabled`` cannot switch to the other
+one. ``x_quant="per_token"`` runs every call on the main path.
 
 Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
@@ -28,8 +32,8 @@ receives at most every route of every rank (8 x max_tok_per_rank x topk rows plu
 partial block per expert), so no route is dropped. The main path's buffers at
 max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
 (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory; 8192 is the
-largest (the receive buffer stays below 2 GiB). The mega kernel takes about the same;
-the small-input path at 128 tokens per rank 0.04 GiB.
+largest (the receive buffer stays below 2 GiB). large_M takes about the same, small_M at
+128 tokens per rank 0.18 GiB of the heap.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -45,18 +49,12 @@ from contextlib import nullcontext
 import torch
 
 from ..mega_moe import envs
-from . import host
 from . import weights as _weights
 
 _EP, _MODEL_DIM, _INTER_DIM, _EXPERTS, _TOPK, _NUM_CU = 8, 4096, 2048, 256, 6, 304
 # a8w4: mxfp4 experts (fd2 W); a8w8: fp8 experts with 128x128 block scales (W in the
 # (16, 16) preshuffle)
 _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
-# The main kernel splits a route id with shifts, so it needs a power-of-two top-k: other
-# top-k values are padded with no-route slots.
-_KERNEL_TOPK = 8
-# main kernel: producer workgroups; gemm2 trails gemm1 by this many block pairs
-_PRODUCERS, _LAG = 16, 2
 
 
 def eligible(
@@ -85,9 +83,9 @@ class MegaMoEGfx942:
     builds the same instances in the same order after MORI shmem is initialized.
 
     ``small_m_mtprs``, ``small_m_enabled`` and ``large_m_enabled`` are MegaMoEV2's
-    arguments. The small-input path (the main path for up to max(``small_m_mtprs``)
-    tokens per rank) is built when ``small_m_enabled`` (None: the ``AITER_MEGA_SMALL_M``
-    flag); there is no large-input path in this version."""
+    arguments (None: the ``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M`` flags).
+    small_M takes up to max(``small_m_mtprs``) tokens per rank. With large_M enabled,
+    ``forward`` runs it and the main path is not built."""
 
     def __init__(
         self,
@@ -150,35 +148,68 @@ class MegaMoEGfx942:
         self._no_route = torch.full((), -1, dtype=torch.int32, device=self.dev)
         self._weights = {}
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
-        self._lds, self._small_mtpr = None, 0
-        if x_quant != "per_1x128":
-            if quant != "a8w4":
-                raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
-            # the mega kernel quantizes x per 1x128 only
-            self._build_main(self.mtpr)
-            return
-        from .lds.host import LdsMegaMoE
-
-        self._lds = LdsMegaMoE(
-            rank=rank,
-            world_size=world_size,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            max_tok_per_rank=self.mtpr,
-            swiglu_limit=limit,
-            wq=_WQ[quant],
-            w1=w1,
-            w1_scale=w1_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-        )
+        if quant != "a8w4" and x_quant != "per_1x128":
+            raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
+        if large_m_enabled is None:
+            large_m_enabled = envs.AITER_MEGA_LARGE_M
         if small_m_enabled is None:
             small_m_enabled = envs.AITER_MEGA_SMALL_M
+        # large_M quantizes x per 1x128 only.
+        self._large = None
+        if large_m_enabled and x_quant == "per_1x128":
+            from .large_m.host import LargeMRuntime
+
+            self._large = LargeMRuntime(
+                rank=rank,
+                world_size=world_size,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                topk=topk,
+                max_tok_per_rank=self.mtpr,
+                swiglu_limit=limit,
+                wq=_WQ[quant],
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+            )
+        self._large_on = self._large is not None
+        self._main = None if self._large_on else self._main_runtime(self.mtpr)
+        self._small, self._small_mtpr = None, 0
         if small_m_enabled:
             self._small_mtpr = max(int(m) for m in small_m_mtprs)
-            self._build_main(self._small_mtpr)
+            if quant == "a8w4":
+                from .small_m import SmallMRuntime
+
+                self._small = SmallMRuntime(
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    topk=self.topk,
+                    tmax=self.world_size * self._small_mtpr,
+                    act=self._act,
+                    x_quant=x_quant,
+                )
+            else:
+                # The small kernel streams fd2 MXFP4 W only.
+                self._small = self._main_runtime(self._small_mtpr)
+
+    def _main_runtime(self, mtpr):
+        from .main import MainRuntime
+
+        return MainRuntime(
+            rank=self.rank,
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            topk=self.topk,
+            mtpr=mtpr,
+            wq=_WQ[self.quant],
+            act=self._act,
+            qx=self._qx,
+        )
 
     # ---- weights ---------------------------------------------------------------
 
@@ -260,8 +291,8 @@ class MegaMoEGfx942:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale):
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
-        if self._lds is not None:
-            self._lds.bind_weights(w1, w1_scale, w2, w2_scale)
+        if self._large is not None:
+            self._large.bind_weights(w1, w1_scale, w2, w2_scale)
 
     def bind_layer(self, layer_slot, w1, w1_scale, w2, w2_scale):
         self.bind_weights(w1, w1_scale, w2, w2_scale)
@@ -271,191 +302,6 @@ class MegaMoEGfx942:
 
     def preload_aot_bundles(self):
         """No AOT bundles yet: the kernels compile on the first call."""
-
-    # ---- main path ---------------------------------------------------------------
-
-    def _build_main(self, mtpr):
-        """The main path for up to ``mtpr`` tokens per rank."""
-        import mori.shmem as ms
-
-        from . import comm, main
-        from .protocol import (
-            ARRIVED,
-            BLOCK_M,
-            BUFFER_BYTES_MAX,
-            E_LOCAL,
-            NPES,
-            ROW_BITS,
-            SCHED_EXPECTED,
-        )
-
-        H, I, topk, dev = self.model_dim, self.inter_dim, _KERNEL_TOPK, self.dev
-        self._token_shift = max((mtpr - 1).bit_length(), 1)
-        self._tcap = tcap = 1 << self._token_shift
-        # Every route of every rank (the real top-k; the padding slots take no row),
-        # plus one partial block per local expert.
-        s_cap = -(-(NPES * tcap * self.topk + E_LOCAL * BLOCK_M) // BLOCK_M) * BLOCK_M
-        if s_cap >= 1 << ROW_BITS or s_cap * H >= BUFFER_BYTES_MAX:
-            raise ValueError(
-                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
-                "the 2 GiB the kernels address with i32 offsets"
-            )
-        self._s_cap, self._nblk = s_cap, s_cap // BLOCK_M
-        sym = host.symmetric
-        bufs = {
-            "recv_a": sym((s_cap, H), torch.uint8),
-            "recv_scale": sym((s_cap, H // 128), torch.float32),
-            "down_ids": sym((s_cap,), torch.int32),
-            "recv_w": sym((s_cap,), torch.float32),
-            "ws": sym((ARRIVED + self._nblk,), torch.int32),
-            "out": sym((tcap, H), torch.bfloat16),
-        }
-        torch.cuda.synchronize()
-        ms.shmem_barrier_all()
-        # every rank's address of each symmetric buffer
-        self._tables = {
-            name: host.peer_table(t, self.rank, self.world_size)
-            for name, t in bufs.items()
-        }
-        self._bufs = bufs
-        i32 = {"dtype": torch.int32, "device": dev}
-        self._route_idx = torch.empty(tcap * topk, **i32)
-        # forward's ids / weights padded to the kernels' top-k (see _routes)
-        self._ids_pad = torch.full((tcap, topk), -1, **i32)
-        self._wts_pad = torch.zeros((tcap, topk), dtype=torch.float32, device=dev)
-        self._send_route = torch.empty(tcap * topk, **i32)
-        self._send_info = torch.empty(tcap * topk, **i32)
-        self._num_valid = torch.zeros(1, **i32)
-        self._status = torch.zeros(8, **i32)
-        self._plan = torch.empty(comm.PLAN_INTS, **i32)
-        self._expert_ids = torch.zeros(self._nblk, **i32)
-        self._sched = torch.zeros(SCHED_EXPECTED + 2 * self._nblk, **i32)
-        # the plan kernel: one workgroup per producer wave, up to 1024 routes each
-        self._slices = _PRODUCERS * 8
-        if tcap * topk > self._slices * 1024:
-            raise ValueError(f"max_tok_per_rank={mtpr}: too many routes per call")
-        self._a2 = torch.empty((s_cap, I), dtype=torch.uint8, device=dev)
-        self._a2_scale = torch.empty((s_cap, I // 128), dtype=torch.float32, device=dev)
-        self._x8 = torch.empty((tcap, H), dtype=torch.uint8, device=dev)
-        self._xs = torch.empty((tcap, H // 128), dtype=torch.float32, device=dev)
-        self._grid = min(
-            torch.cuda.get_device_properties(dev).multi_processor_count,
-            main.max_tasks(self._nblk, H, I, _PRODUCERS),
-        )
-        key = {
-            "H": H,
-            "I": I,
-            "TOPK": topk,
-            "token_shift": self._token_shift,
-            "producers": _PRODUCERS,
-            "lag": _LAG,
-            "ACT": self._act,
-        }
-        if not self._qx:
-            key["QX"] = 0
-        if self.quant != "a8w4":
-            key["WQ"] = _WQ[self.quant]
-        d = dev.index
-        self._mega_k = host.launcher(main.ep_mega_kernel, d, **key)
-        # From BLOCK_M * E_LOCAL / topk tokens on this rank (uniform routing: an
-        # expert's rows span several blocks) the blocks of an expert re-read its W:
-        # cache gemm1's W, and gemm2's with cache modifier 1.
-        self._mega_big_k = host.launcher(main.ep_mega_kernel, d, **key, BCM1=0, BCM2=1)
-        self._big_tokens = BLOCK_M * E_LOCAL // topk
-        self._quant_k = host.launcher(comm.mega_quant_kernel, d, H=H, QX=self._qx)
-        self._prep_k = host.launcher(comm.mega_prep_kernel, d)
-        self._plan_k = host.launcher(comm.mega_plan_kernel, d)
-        self._finish_k = host.launcher(comm.mega_finish_kernel, d)
-
-    def _forward_main(self, x, wts, ids, x_scale=None):
-        T, H = x.shape
-        if T > self._tcap or H != self.model_dim:
-            raise ValueError(
-                f"x {tuple(x.shape)}: at most {self._tcap} rows of {self.model_dim}"
-            )
-        tab, bufs = self._tables, self._bufs
-        routes = T * _KERNEL_TOPK
-        quant = x_scale is None
-        if quant:
-            if x.dtype != torch.bfloat16:
-                raise TypeError(f"x is {x.dtype}, the main path quantizes bf16")
-            src, x8, xs = x.contiguous(), self._x8, self._xs
-        else:
-            src = None
-            x8, xs = x.contiguous().view(torch.uint8), x_scale.contiguous()
-        if T:
-            waves = T * (H // 512) if self._qx else T
-            host.launch(
-                self._quant_k, src, x8, xs, bufs["out"], T, int(quant), -(-waves // 4)
-            )
-        host.launch(
-            self._prep_k,
-            ids,
-            self._route_idx,
-            bufs["ws"],
-            tab["ws"],
-            self._num_valid,
-            self._status,
-            self._sched,
-            self._plan,
-            routes,
-            self.rank,
-            self._s_cap,
-        )
-        host.launch(
-            self._plan_k,
-            ids,
-            self._route_idx,
-            self._plan,
-            self._send_route,
-            self._send_info,
-            bufs["down_ids"],
-            self._expert_ids,
-            self._sched,
-            routes,
-            self.rank,
-            self._s_cap,
-            self._slices,
-        )
-        W = self._W
-        host.launch(
-            self._mega_big_k if T >= self._big_tokens else self._mega_k,
-            x8,
-            xs,
-            wts,
-            self._send_route,
-            self._send_info,
-            tab["recv_a"],
-            tab["recv_scale"],
-            tab["down_ids"],
-            tab["recv_w"],
-            tab["ws"],
-            tab["out"],
-            bufs["recv_a"],
-            bufs["recv_scale"],
-            bufs["down_ids"],
-            bufs["recv_w"],
-            bufs["ws"],
-            W["w1"],
-            W["w1_scale"],
-            W["w1_exp"],
-            W["w2"],
-            W["w2_scale"],
-            W["w2_exp"],
-            self._a2,
-            self._a2_scale,
-            self._expert_ids,
-            self._num_valid,
-            self._sched,
-            routes,
-            T,
-            self.rank,
-            self._nblk,
-            *self._situ,
-            self._grid,
-        )
-        host.launch(self._finish_k, bufs["ws"], tab["ws"], self._status, self.rank)
-        return bufs["out"][:T]
 
     # ---- small / large paths -----------------------------------------------------
 
@@ -467,17 +313,29 @@ class MegaMoEGfx942:
 
     @property
     def large_m_available(self):
-        """False: no large-input path in this version."""
-        return False
+        return self._large is not None
 
     def set_large_m_enabled(self, enabled):
-        """MegaMoEV2's switch to the large-input path; only False is valid here."""
-        if enabled:
-            raise RuntimeError("MegaMoEGfx942 has no large-input path in this version")
+        """MegaMoEV2's switch between large_M and the main path; every rank must make the
+        same choice. An instance holds only one of the two, so this only checks that the
+        path asked for is the one built."""
+        if enabled and self._large is None:
+            raise RuntimeError(
+                "the large-input path is not built (large_m_enabled or "
+                "AITER_MEGA_LARGE_M, x_quant='per_1x128')"
+            )
+        if not enabled and self._main is None:
+            raise RuntimeError(
+                "the main path is not built: this instance runs large_M "
+                "(large_m_enabled=False builds the main path instead)"
+            )
+        self._large_on = bool(enabled)
 
     # ---- calls -------------------------------------------------------------------
 
-    def _routes(self, x, topk_ids, wts, slots):
+    def _routes(self, x, topk_ids, wts, main=None):
+        """The routes as int32 ids (out-of-range ids -1) and f32 weights: padded to the
+        main kernel's top-k in ``main``'s buffers, else as they are."""
         # The kernels take raw pointers: every input must be on this layer's device.
         T = x.shape[0]
         for name, t in (("x", x), ("topk_ids", topk_ids), ("wts", wts)):
@@ -493,14 +351,14 @@ class MegaMoEGfx942:
         # Out-of-range ids are no routes, as in MegaMoEV2 (sglang marks padding rows with
         # id == experts); the kernels skip negative ids only.
         topk_ids = topk_ids.to(torch.int32)
-        if slots == self.topk:
+        if main is None:
             ids = torch.where(topk_ids < self.experts, topk_ids, self._no_route)
             return ids.contiguous(), wts.to(torch.float32).contiguous()
-        # Padded to the kernels' slots in place: the extra slots of these buffers stay
-        # -1 / 0 (no route) from the constructor on.
-        if T > self._tcap:
-            raise ValueError(f"{T} rows: at most {self._tcap} (max_tok_per_rank)")
-        ids, w = self._ids_pad[:T], self._wts_pad[:T]
+        # Padded to the main kernel's top-k in place: the extra slots of these buffers
+        # stay -1 / 0 (no route) from its constructor on.
+        if T > main.tcap:
+            raise ValueError(f"{T} rows: at most {main.tcap} (max_tok_per_rank)")
+        ids, w = main.ids_pad[:T], main.wts_pad[:T]
         torch.where(
             topk_ids < self.experts, topk_ids, self._no_route, out=ids[:, : self.topk]
         )
@@ -522,11 +380,11 @@ class MegaMoEGfx942:
         are always skipped, so ``mask_invalid_slots`` has no effect; the output is always
         sliced to T rows."""
         with _on(stream):
-            if self._lds is not None:
-                ids, w = self._routes(x_bf16, topk_ids, wts, self.topk)
-                return self._lds.forward(x_bf16, w, ids)
-            ids, w = self._routes(x_bf16, topk_ids, wts, _KERNEL_TOPK)
-            return self._forward_main(x_bf16, w, ids)
+            if self._large_on:
+                ids, w = self._routes(x_bf16, topk_ids, wts)
+                return self._large.forward(x_bf16, w, ids)
+            ids, w = self._routes(x_bf16, topk_ids, wts, self._main)
+            return self._main.forward(x_bf16, ids, w, self._W, self._situ)
 
     __call__ = forward
 
@@ -549,22 +407,21 @@ class MegaMoEGfx942:
                 f"{shape} on {self.dev}"
             )
         with _on(stream):
-            if self._lds is not None:
-                ids, w = self._routes(x_q, topk_ids, wts, self.topk)
-                return self._lds.forward_prequant(x_q, x_scale, w, ids)
-            ids, w = self._routes(x_q, topk_ids, wts, _KERNEL_TOPK)
-            return self._forward_main(x_q, w, ids, x_scale)
+            if self._large_on:
+                ids, w = self._routes(x_q, topk_ids, wts)
+                return self._large.forward_prequant(x_q, x_scale, w, ids)
+            ids, w = self._routes(x_q, topk_ids, wts, self._main)
+            return self._main.forward(x_q, ids, w, self._W, self._situ, x_scale)
 
     def forward_small_m(
         self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True
     ):
-        """MegaMoEV2's small-input call, on the main path. ``max_tokens``: the most rows
-        of this call on any EP rank, the same on every rank."""
-        if not self._small_mtpr:
+        """MegaMoEV2's small-input call: the small kernel (a8w4), the main path at the
+        small-input capacity (a8w8). ``max_tokens``: the most rows of this call on any
+        EP rank, the same on every rank."""
+        if self._small is None:
             raise RuntimeError(
                 "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
-                if self._lds is not None
-                else "MegaMoEGfx942 has no small-input path for x_quant='per_token'"
             )
         need = int(max_tokens)
         if need < int(x_bf16.shape[0]) or need > self._small_mtpr:
@@ -572,6 +429,8 @@ class MegaMoEGfx942:
                 f"max_tokens={need}: this rank has {int(x_bf16.shape[0])} rows, the "
                 f"small-input path takes at most {self._small_mtpr}"
             )
+        # The main kernel takes the routes padded to its top-k, the small one as they are.
+        pad = self._small if self.quant == "a8w8" else None
         with _on(stream):
-            ids, w = self._routes(x_bf16, topk_ids, wts, _KERNEL_TOPK)
-            return self._forward_main(x_bf16, w, ids)
+            ids, w = self._routes(x_bf16, topk_ids, wts, pad)
+            return self._small.forward(x_bf16, ids, w, self._W, self._situ)

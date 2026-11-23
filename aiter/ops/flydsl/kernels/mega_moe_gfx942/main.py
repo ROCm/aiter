@@ -34,6 +34,7 @@ co-residency.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -41,6 +42,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..act import gate_up_act, situ_params
+from . import comm, host
 from .atomic import _atomic_add_at, _atomic_load_at, _inv_l1, _xcc_id
 from .cvt import _channel_factor, _fp8x4_pack
 from .hw import (
@@ -73,6 +75,7 @@ from .mem import (
 from .protocol import (
     ARRIVED,
     BLOCK_M,
+    BUFFER_BYTES_MAX,
     E_LOCAL,
     NPES,
     QSTRIDE,
@@ -1207,3 +1210,198 @@ def ep_mega_kernel(
 def max_tasks(nblk, H, I, producers=16, NI=128, NO=256):
     """Upper bound of the tickets of all queues (each may add one empty pair partner)."""
     return producers + (I // NI + H // NO) * (nblk + 2 * QUEUES)
+
+
+# The kernel splits a route id with shifts, so it needs a power-of-two top-k: other
+# top-k values are padded with no-route slots.
+KERNEL_TOPK = 8
+# producer workgroups; gemm2 trails gemm1 by this many block pairs
+_PRODUCERS, _LAG = 16, 2
+
+
+class MainRuntime:
+    """The main path of one rank for up to ``mtpr`` tokens per rank: five kernels per
+    call (``comm.py``'s quant, prep and plan, the mega kernel, ``comm.py``'s finish).
+
+    ``wq``: "fp4" (a8w4's fd2 MXFP4 experts) or "fp8" (a8w8's FP8 128x128 block-scale
+    experts); ``qx``: 1 for x quantized per 1x128, 0 per token. Construction is
+    collective (MORI symmetric buffers)."""
+
+    def __init__(
+        self, *, rank, world_size, model_dim, inter_dim, topk, mtpr, wq, act, qx
+    ):
+        import mori.shmem as ms
+
+        self.rank, self.world_size, self.qx = int(rank), int(world_size), qx
+        self.dev = dev = torch.device("cuda", torch.cuda.current_device())
+        H, I, topk = int(model_dim), int(inter_dim), int(topk)
+        self.model_dim, self.topk = H, topk
+        self.token_shift = max((int(mtpr) - 1).bit_length(), 1)
+        self.tcap = tcap = 1 << self.token_shift
+        # Every route of every rank (the real top-k; the padding slots take no row),
+        # plus one partial block per local expert.
+        s_cap = -(-(NPES * tcap * topk + E_LOCAL * BLOCK_M) // BLOCK_M) * BLOCK_M
+        if s_cap >= 1 << ROW_BITS or s_cap * H >= BUFFER_BYTES_MAX:
+            raise ValueError(
+                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
+                "the 2 GiB the kernels address with i32 offsets"
+            )
+        self.s_cap, self.nblk = s_cap, s_cap // BLOCK_M
+        sym = host.symmetric
+        bufs = {
+            "recv_a": sym((s_cap, H), torch.uint8),
+            "recv_scale": sym((s_cap, H // 128), torch.float32),
+            "down_ids": sym((s_cap,), torch.int32),
+            "recv_w": sym((s_cap,), torch.float32),
+            "ws": sym((ARRIVED + self.nblk,), torch.int32),
+            "out": sym((tcap, H), torch.bfloat16),
+        }
+        torch.cuda.synchronize()
+        ms.shmem_barrier_all()
+        # every rank's address of each symmetric buffer
+        self.tables = {
+            name: host.peer_table(t, self.rank, self.world_size)
+            for name, t in bufs.items()
+        }
+        self.bufs = bufs
+        i32 = {"dtype": torch.int32, "device": dev}
+        kt = KERNEL_TOPK
+        self.route_idx = torch.empty(tcap * kt, **i32)
+        # the routes padded to the kernel's top-k (see MegaMoEGfx942._routes)
+        self.ids_pad = torch.full((tcap, kt), -1, **i32)
+        self.wts_pad = torch.zeros((tcap, kt), dtype=torch.float32, device=dev)
+        self.send_route = torch.empty(tcap * kt, **i32)
+        self.send_info = torch.empty(tcap * kt, **i32)
+        self.num_valid = torch.zeros(1, **i32)
+        self.status = torch.zeros(8, **i32)
+        self.plan = torch.empty(comm.PLAN_INTS, **i32)
+        self.expert_ids = torch.zeros(self.nblk, **i32)
+        self.sched = torch.zeros(SCHED_EXPECTED + 2 * self.nblk, **i32)
+        # the plan kernel: one workgroup per producer wave, up to 1024 routes each
+        self.slices = _PRODUCERS * 8
+        if tcap * kt > self.slices * 1024:
+            raise ValueError(f"max_tok_per_rank={mtpr}: too many routes per call")
+        self.a2 = torch.empty((s_cap, I), dtype=torch.uint8, device=dev)
+        self.a2_scale = torch.empty((s_cap, I // 128), dtype=torch.float32, device=dev)
+        self.x8 = torch.empty((tcap, H), dtype=torch.uint8, device=dev)
+        self.xs = torch.empty((tcap, H // 128), dtype=torch.float32, device=dev)
+        self.grid = min(
+            torch.cuda.get_device_properties(dev).multi_processor_count,
+            max_tasks(self.nblk, H, I, _PRODUCERS),
+        )
+        key = {
+            "H": H,
+            "I": I,
+            "TOPK": kt,
+            "token_shift": self.token_shift,
+            "producers": _PRODUCERS,
+            "lag": _LAG,
+            "ACT": act,
+        }
+        if not qx:
+            key["QX"] = 0
+        if wq != "fp4":
+            key["WQ"] = wq
+        d = dev.index
+        self.mega_k = host.launcher(ep_mega_kernel, d, **key)
+        # From BLOCK_M * E_LOCAL / topk tokens on this rank (uniform routing: an
+        # expert's rows span several blocks) the blocks of an expert re-read its W:
+        # cache gemm1's W, and gemm2's with cache modifier 1.
+        self.mega_big_k = host.launcher(ep_mega_kernel, d, **key, BCM1=0, BCM2=1)
+        self.big_tokens = BLOCK_M * E_LOCAL // kt
+        self.quant_k = host.launcher(comm.mega_quant_kernel, d, H=H, QX=qx)
+        self.prep_k = host.launcher(comm.mega_prep_kernel, d)
+        self.plan_k = host.launcher(comm.mega_plan_kernel, d)
+        self.finish_k = host.launcher(comm.mega_finish_kernel, d)
+
+    def forward(self, x, ids, wts, W, situ, x_scale=None):
+        """x bf16 [T, H] (or fp8 with ``x_scale``), ids int32 / wts f32 [T, 8] (the
+        padded routes); ``W`` the weights dict, ``situ`` the five activation scalars.
+        Returns bf16 [T, H], a view of the output buffer (valid until the next call)."""
+        T, H = x.shape
+        if T > self.tcap or H != self.model_dim:
+            raise ValueError(
+                f"x {tuple(x.shape)}: at most {self.tcap} rows of {self.model_dim}"
+            )
+        tab, bufs = self.tables, self.bufs
+        routes = T * KERNEL_TOPK
+        quant = x_scale is None
+        if quant:
+            if x.dtype != torch.bfloat16:
+                raise TypeError(f"x is {x.dtype}, the main path quantizes bf16")
+            src, x8, xs = x.contiguous(), self.x8, self.xs
+        else:
+            src = None
+            x8, xs = x.contiguous().view(torch.uint8), x_scale.contiguous()
+        if T:
+            waves = T * (H // 512) if self.qx else T
+            host.launch(
+                self.quant_k, src, x8, xs, bufs["out"], T, int(quant), -(-waves // 4)
+            )
+        host.launch(
+            self.prep_k,
+            ids,
+            self.route_idx,
+            bufs["ws"],
+            tab["ws"],
+            self.num_valid,
+            self.status,
+            self.sched,
+            self.plan,
+            routes,
+            self.rank,
+            self.s_cap,
+        )
+        host.launch(
+            self.plan_k,
+            ids,
+            self.route_idx,
+            self.plan,
+            self.send_route,
+            self.send_info,
+            bufs["down_ids"],
+            self.expert_ids,
+            self.sched,
+            routes,
+            self.rank,
+            self.s_cap,
+            self.slices,
+        )
+        host.launch(
+            self.mega_big_k if T >= self.big_tokens else self.mega_k,
+            x8,
+            xs,
+            wts,
+            self.send_route,
+            self.send_info,
+            tab["recv_a"],
+            tab["recv_scale"],
+            tab["down_ids"],
+            tab["recv_w"],
+            tab["ws"],
+            tab["out"],
+            bufs["recv_a"],
+            bufs["recv_scale"],
+            bufs["down_ids"],
+            bufs["recv_w"],
+            bufs["ws"],
+            W["w1"],
+            W["w1_scale"],
+            W["w1_exp"],
+            W["w2"],
+            W["w2_scale"],
+            W["w2_exp"],
+            self.a2,
+            self.a2_scale,
+            self.expert_ids,
+            self.num_valid,
+            self.sched,
+            routes,
+            T,
+            self.rank,
+            self.nblk,
+            *situ,
+            self.grid,
+        )
+        host.launch(self.finish_k, bufs["ws"], tab["ws"], self.status, self.rank)
+        return bufs["out"][:T]

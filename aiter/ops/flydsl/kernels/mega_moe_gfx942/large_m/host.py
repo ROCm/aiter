@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""LdsMegaMoE: the gfx942 EP8 MegaMoE on FP8 128x128 block-scale experts (wq "fp8") or a8w4's fd2 MXFP4
-experts (wq "fp4", decoded to FP8 on the way into LDS).
+"""LargeMRuntime: MegaMoEGfx942's large-input path (large_M), the LDS mega kernel, on FP8 128x128 block-scale
+experts (wq "fp8") or a8w4's fd2 MXFP4 experts (wq "fp4", decoded to FP8 on the way into LDS).
 
 Per call, on the current stream (x is first quantized to FP8 per 1x128 by aiter's per_1x128 quant):
   ep_prep    count routes per global expert, exchange the count rows, derive every route's sorted row
@@ -59,8 +59,8 @@ def _on(stream):
     return torch.cuda.stream(stream) if stream is not None else nullcontext()
 
 
-class LdsMegaMoE:
-    """One rank's EP8 MoE layer (32 local experts) on the mega kernel."""
+class LargeMRuntime:
+    """One rank's EP8 MoE layer (32 local experts) on the LDS mega kernel."""
 
     def __init__(
         self,
@@ -87,7 +87,7 @@ class LdsMegaMoE:
             topk=topk,
         ):
             raise ValueError(
-                f"LdsMegaMoE does not run world_size={world_size}, model_dim={model_dim}, "
+                f"LargeMRuntime does not run world_size={world_size}, model_dim={model_dim}, "
                 f"inter_dim={inter_dim}, experts={experts}, topk={topk} on this device"
             )
         if not swiglu_limit >= 0:

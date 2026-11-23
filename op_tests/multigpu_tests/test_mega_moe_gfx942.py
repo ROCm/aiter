@@ -4,16 +4,18 @@
 
 The layer is DeepSeek-V4-Flash's MoE: H 4096, I 2048, 256 experts (32 per rank),
 top-6, silu with swiglu_limit 10. Every output is checked against an fp32 reference
-with the clamp. Main and prequant run on the mega kernel, small on the main path.
+with the clamp. An instance holds either the main path or large_M, so the test builds
+one of each; small_M runs on the large_M one (the small kernel for a8w4, the main path
+at the small-input capacity for a8w8).
 ``--quant a8w8`` runs the layer on FP8 128x128 block-scale experts instead of MXFP4
 ones; some of their blocks have scale 0 over non-zero bytes (they must contribute
 nothing).
 
-- test_mega_moe_gfx942: every path the layer reports available (main, main on x
-  quantized beforehand by aiter's per_1x128 quant ("prequant", timed with that quant),
-  large, small) eagerly and as a CUDA graph replay. The ranks hold different token counts, one rank holds none, and
-  some rows are padding (every id == experts, as sglang marks them, or -1) or have
-  invalid slots.
+- test_mega_moe_gfx942: every path (main and large_M, each also on x quantized
+  beforehand by aiter's per_1x128 quant ("main pq", "large pq", timed with that quant),
+  and small_M) eagerly and as a CUDA graph replay. The ranks hold different token
+  counts, one rank holds none, and some rows are padding (every id == experts, as
+  sglang marks them, or -1) or have invalid slots.
 - test_mega_moe_gfx942_capacity: every rank brings max_tok_per_rank rows. With
   "all_to_one" routing every route of every rank goes to rank 0, which must receive
   all of them (8 x the uniform average; past 2^18 rows at max_tok_per_rank 8192).
@@ -276,22 +278,22 @@ def _prequant(x):
 def _run_paths(tokens, paths, inputs, stale, graph, ret):
     """Run each path on ``inputs`` (after one call on ``stale`` inputs, so a row the call
     does not write keeps a stale value) and check it; fills ``ret``."""
-    rank, mega = _STATE["rank"], _STATE["mega"]
+    rank, layers = _STATE["rank"], _STATE["layers"]
     x, wts, ids = inputs
     ref, routes = run_torch(x, wts, ids, tokens, rank, _STATE["ref_weights"])
     routed = ((ids >= 0) & (ids < E)).any(dim=-1)
     flops, nbytes = _perf(tokens, rank, routes)
     for path in paths:
+        # "main" / "main pq" on the main path's instance, the others on large_M's.
+        mega = layers[path.split()[0] if path != "small" else "large"]
 
-        def call(x, wts, ids, path=path):
+        def call(x, wts, ids, path=path, mega=mega):
             if path == "small":
                 return mega.forward_small_m(x, wts, ids, max_tokens=max(tokens))
-            if path == "prequant":
+            if path.endswith(" pq"):
                 return mega.forward_prequant(*_prequant(x), wts, ids)
             return mega.forward(x, wts, ids)
 
-        if path != "small":
-            mega.set_large_m_enabled(path == "large")
         cuda_graph = None
         if graph:
             static = [t.clone() for t in stale]
@@ -331,15 +333,13 @@ def _run_paths(tokens, paths, inputs, stale, graph, ret):
 def test_mega_moe_gfx942(tokens, graph):
     """``tokens``: rows per rank (the same tuple on every rank); ``graph``: replay a
     captured CUDA graph instead of eager calls."""
-    rank, mega = _STATE["rank"], _STATE["mega"]
+    rank, layers = _STATE["rank"], _STATE["layers"]
     seed = _STATE["case"] = _STATE.get("case", 0) + 2
     inputs = _make_inputs(tokens, rank, seed)
     stale = _make_inputs(tokens, rank, seed + 1, padding=False)
-    paths = ["main", "prequant"]
-    if mega.large_m_available:
-        paths.append("large")
-    # The small path takes decode batches only.
-    if max(tokens) <= mega.small_m_mtpr:
+    paths = ["main", "main pq", "large", "large pq"]
+    # small_M takes decode batches only.
+    if max(tokens) <= layers["large"].small_m_mtpr:
         paths.append("small")
     return _run_paths(tokens, paths, inputs, stale, graph, {"gfx": get_gfx_runtime()})
 
@@ -348,16 +348,16 @@ def test_mega_moe_gfx942(tokens, graph):
 def test_mega_moe_gfx942_capacity(mtpr, routing):
     """Every rank brings ``mtpr`` (the layer's max_tok_per_rank) rows; ``routing``:
     "uniform" or "all_to_one" (every route of every rank to rank 0)."""
-    rank, mega = _STATE["rank"], _STATE["mega"]
+    rank = _STATE["rank"]
     tokens = (mtpr,) * WORLD
     seed = _STATE["case"] = _STATE.get("case", 0) + 2
     inputs = _make_inputs(tokens, rank, seed, routing, padding=False)
     stale = _make_inputs(tokens, rank, seed + 1, padding=False)
-    paths = ["main", "large"] if mega.large_m_available else ["main"]
+    paths = ["main", "large"]
     return _run_paths(tokens, paths, inputs, stale, False, {"gfx": get_gfx_runtime()})
 
 
-def _layer(rank, weights, mtpr, small):
+def _layer(rank, weights, mtpr, small, large):
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
     w1, w1_scale, w2, w2_scale = weights
@@ -378,7 +378,7 @@ def _layer(rank, weights, mtpr, small):
         swiglu_limit=SWIGLU_LIMIT,
         small_m_mtprs=(SMALL_MTPR,),
         small_m_enabled=small,
-        large_m_enabled=True,
+        large_m_enabled=large,
     )
     mega.bind_weights(w1, w1_scale, w2, w2_scale)
     return mega
@@ -427,7 +427,10 @@ def _worker(rank, port, args):
             *weights, w1_gate_up_interleaved=False, quant=quant
         )
         _STATE.update(rank=rank, ref_weights=ref_weights)
-        _STATE["mega"] = _layer(rank, weights, MTPR, small=True)
+        _STATE["layers"] = {
+            "large": _layer(rank, weights, MTPR, small=True, large=True),
+            "main": _layer(rank, weights, MTPR, small=False, large=False),
+        }
         rows = [
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)
@@ -435,7 +438,10 @@ def _worker(rank, port, args):
         _summary(f"MegaMoEGfx942 {quant}, max_tok_per_rank {MTPR}", rows, rank)
         rows = []
         for mtpr in args.mtpr:
-            _STATE["mega"] = _layer(rank, weights, mtpr, small=False)
+            _STATE["layers"] = {
+                "large": _layer(rank, weights, mtpr, small=False, large=True),
+                "main": _layer(rank, weights, mtpr, small=False, large=False),
+            }
             rows += [
                 test_mega_moe_gfx942_capacity(mtpr, routing) for routing in args.routing
             ]

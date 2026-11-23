@@ -770,7 +770,7 @@ def mega_grid(op, producers):
 
 
 def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
-    """Run the mega kernel for an LdsMegaMoE `op` whose ep_prep and ep_plan ran for this call."""
+    """Run the mega kernel for a LargeMRuntime `op` whose ep_prep and ep_plan ran for this call."""
     launch = launcher(
         compile_ep_mega,
         x_fp8.device.index,
