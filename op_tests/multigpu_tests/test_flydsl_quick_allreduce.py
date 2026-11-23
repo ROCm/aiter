@@ -2781,6 +2781,7 @@ def _run_rank_fused(
             num_tiles = max(1, -(-nbytes // eng._tile_bytes(hidden)))
             cfg = eng._pick_cfg(hidden, nbytes, num_tiles)
             block = eng._by_cfg[cfg][1]["block"]
+            handshake = eng._by_cfg[cfg][1]["handshake"]
             row = {
                 "rank": rank,
                 "tokens": tokens,
@@ -2790,6 +2791,8 @@ def _run_rank_fused(
                 "variant": eng.variant(hidden, nbytes),
                 "block": block,
                 "low_latency": cfg[3],
+                "knobs": str(cfg[4]),
+                "handshake": handshake,
                 "out_sqnr_db": _sqnr_db(
                     out.to(torch.float32), out_ref.to(torch.float32)
                 ),
@@ -3179,12 +3182,97 @@ def _option_summary(rows: list[dict]) -> dict:
     }
 
 
+def _fused_ladder(algorithm: str, hidden: int, tp: int) -> tuple:
+    """The shipped fused ladder of *algorithm* at *hidden*."""
+    of = {
+        "mesh": fly_policy.fused_mesh_st_ladder,
+        "ring": fly_policy.fused_ring_st_ladder,
+    }[algorithm]
+    return of(world_size=tp, link=fly_policy.detect_link(), hidden=hidden)
+
+
+def _fused_rung_grid(
+    rung, ladder: tuple, *, world_size: int, cu_count: int, block: int
+) -> int:
+    """The persistent grid the fused engine builds *rung* with: the cap of the
+    first rung of the ladder with the same ``(super_tile, low_latency, knobs)``
+    (``FlyQuickAllReduceRMSNorm._ladder``), clamped to the resident workgroups
+    and then to ``WGS_PER_CU`` (``LOW_LATENCY_WGS_PER_CU``) per CU, as
+    ``_grid_for`` does."""
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm as Fused
+
+    key = (rung.super_tile, rung.low_latency, rung.knobs)
+    cap = next(
+        r.grid_cap for r in ladder if (r.super_tile, r.low_latency, r.knobs) == key
+    )
+    return min(
+        clamp_grid_cap(
+            cap,
+            arch=ARCH,
+            world_size=world_size,
+            super_tile=rung.super_tile,
+            cu_count=cu_count,
+            block=block,
+        ),
+        (Fused.LOW_LATENCY_WGS_PER_CU if rung.low_latency else Fused.WGS_PER_CU)
+        * cu_count,
+    )
+
+
+def _fused_threshold_cases(
+    walk: list, algorithm: str, tp: int
+) -> list[fab.FusedCase]:
+    """Cases at both sides of the super-tile fallback of every ST>1 rung.
+
+    A rung falls back to its ST=1 build below the tile count that fills the
+    grid and the walk's first and last payload of a rung may both sit on one 
+    side of it. Each probe is the last payload before and the first at the threshold.
+    """
+    link = fly_policy.detect_link()
+    batched = has_release_fence(_resolve_inbox_flags("auto", tp, link)[1])
+    cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    have = {(c.hidden, c.tokens) for c in walk}
+    # The policy window, as the walk takes it.
+    window = fly_policy.resolve_fused_policy(world_size=tp, link=link).window(
+        fly_policy.AllReduceAlgorithm(algorithm), quantized=True
+    )
+    lo, hi = window.inclusive_range()
+    out = []
+    for hidden in sorted({c.hidden for c in walk}):
+        ladder = _fused_ladder(algorithm, hidden, tp)
+        block, apr, _h_pad = _bare_fused_engine(algorithm, tp)._geom_for(hidden)
+        rows = 8 // apr
+        ends = [r.min_bytes - 1 for r in ladder[1:]] + [None]
+        for rung, end in zip(ladder, ends):
+            if rung.super_tile == 1:
+                continue
+            grid = _fused_rung_grid(
+                rung, ladder, world_size=tp, cu_count=cu_count, block=block
+            )
+            edge = rung.super_tile if batched else grid + 1
+            for tiles in (edge - 1, edge):
+                tokens = tiles * rows
+                nbytes = tokens * hidden * 2
+                if (
+                    tokens >= 1
+                    and nbytes >= rung.min_bytes
+                    and (end is None or nbytes <= end)
+                    and any(c.hidden == hidden and c.rung == rung for c in walk)
+                    and (hidden, tokens) not in have
+                    and lo <= nbytes <= hi
+                ):
+                    have.add((hidden, tokens))
+                    out.append(fab.FusedCase(hidden, tokens, rung))
+    return out
+
+
 def _shipped_cases(tp: int, algorithm: str) -> list[tuple]:
     """``(tokens, hidden, gemma_norm, inplace, case)`` of the shipped walk: the
     shapes of ``fab.fused_ladder_cases`` with the epilogue options alternated over
     them. Both are runtime flags rather than instances, so every width sees both
     without a sweep of their own."""
     walk = fab.fused_ladder_cases(algorithm, tp, fly_policy.detect_link())
+    walk = walk + _fused_threshold_cases(walk, algorithm, tp)
     return [
         (c.tokens, c.hidden, bool(i % 2), bool(i // 2 % 2), c)
         for i, c in enumerate(walk)
@@ -3208,9 +3296,11 @@ def _fused_expected_st(
     world_size: int,
     batched: bool,
     cu_count: int,
+    ladder: tuple,
 ) -> int:
     """Mirror of ``FlyQuickAllReduceRMSNorm._pick_cfg``: the super-tile the
-    fused engine runs *live_bytes* on at a width whose geometry gives *block*.
+    fused engine runs *live_bytes* on at a width whose geometry gives *block*,
+    on the grid ``_fused_rung_grid`` gives the rung of *ladder*.
     """
     want = rung.super_tile
     if want == 1:
@@ -3218,13 +3308,8 @@ def _fused_expected_st(
     num_tiles = _num_tiles(live_bytes, block)
     if batched:
         return want if num_tiles >= want else 1
-    grid = clamp_grid_cap(
-        rung.grid_cap,
-        arch=ARCH,
-        world_size=world_size,
-        super_tile=want,
-        cu_count=cu_count,
-        block=block,
+    grid = _fused_rung_grid(
+        rung, ladder, world_size=world_size, cu_count=cu_count, block=block
     )
     return want if num_tiles > grid else 1
 
@@ -3236,12 +3321,24 @@ def _fused_rung_fails(
     world_size: int,
     batched: bool,
     cu_count: int,
+    ladder: tuple,
 ) -> list[str]:
     """The run took the instance of the rung the shape is meant to reach: its
-    low-latency build, and the super-tile its tile count selects. An ST>1 rung
-    falls back to ST=1 below the tile count that fills the grid."""
+    low-latency build, its Lamport knobs and handshake, and the super-tile its
+    tile count selects. An ST>1 rung falls back to ST=1 below the tile count
+    that fills the grid, to the ST=1 build of the same knobs."""
     rung, fails = case.rung, []
     for r in rows:
+        if r["knobs"] != str(rung.knobs):
+            fails.append(
+                f"rank {r['rank']}: ran knobs [{r['knobs']}], the rung has "
+                f"[{rung.knobs}]"
+            )
+        if r["handshake"] != rung.handshake:
+            fails.append(
+                f"rank {r['rank']}: ran handshake {r['handshake']}, the rung has "
+                f"{rung.handshake}"
+            )
         if r["low_latency"] != rung.low_latency:
             fails.append(
                 f"rank {r['rank']}: low_latency={r['low_latency']}, the rung has "
@@ -3254,6 +3351,7 @@ def _fused_rung_fails(
             world_size=world_size,
             batched=batched,
             cu_count=cu_count,
+            ladder=ladder,
         )
         want_st = f"_st{expect}_"
         if want_st not in r["variant"]:
@@ -3299,7 +3397,12 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
                 + _fused_unfused_fails(rows)
                 + _fused_mxfp4_fails(rows)
                 + _fused_rung_fails(
-                    rows, c, world_size=tp, batched=batched, cu_count=cu_count
+                    rows,
+                    c,
+                    world_size=tp,
+                    batched=batched,
+                    cu_count=cu_count,
+                    ladder=_fused_ladder(algorithm, c.hidden, tp),
                 )
             )
         ]
@@ -4864,6 +4967,17 @@ def _verify_fused(tps, algos, extended: bool) -> None:
     )
 
 
+def _shipped_fused_knobs(tp: int) -> tuple[str, ...]:
+    """The knob sets the shipped fused mesh ladders run at *tp* on this host that
+    ``FUSED_KNOB_COVERAGE`` does not already hold, so a retuned ladder's
+    combination is held to the default build too."""
+    have = {str(MeshKnobs.parse(t)) for t in FUSED_KNOB_COVERAGE}
+    have.add(str(MeshKnobs()))
+    walk = fab.fused_ladder_cases("mesh", tp, fly_policy.detect_link())
+    out = {str(c.rung.knobs) for c in walk} - have
+    return tuple(sorted(out))
+
+
 def _knob_rank_fused(
     rank: int, tp: int, init_method: str, hiddens: tuple[int, ...], tunings: tuple
 ) -> list[dict]:
@@ -4980,7 +5094,10 @@ def test_quick_allreduce_rmsnorm_knobs(tp):
         _knob_rank_fused,
         tp,
         hiddens=FUSED_KNOB_HIDDENS,
-        tunings=tuple(MeshKnobs.parse(t) for t in FUSED_KNOB_COVERAGE),
+        tunings=tuple(
+            MeshKnobs.parse(t)
+            for t in (*FUSED_KNOB_COVERAGE, *_shipped_fused_knobs(tp))
+        ),
     )
     fails = []
     for rank, rank_rows in enumerate(ranks):

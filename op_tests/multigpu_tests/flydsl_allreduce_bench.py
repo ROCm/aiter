@@ -603,7 +603,8 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
 
 
 FUSED_DEFAULT_LADDER_HIDDENS = (2048, 4096, 5120, 7168, 8192)
-# The payload an unbounded dispatch window is cut at.
+# The payload an unbounded dispatch window is cut at, unless a ladder has a rung
+# starting at or above it.
 FUSED_WALK_TOP_BYTES = 64 << 20
 
 
@@ -633,8 +634,7 @@ def fused_ladder_cases(
     )
     if window is None:
         return []
-    lo, hi = window.inclusive_range()
-    hi = min(hi, top_bytes)
+    lo, window_hi = window.inclusive_range()
     kw = {"world_size": world_size, "link": link}
     ladder_of = {
         "oneshot": fp.fused_oneshot_ladder,
@@ -646,10 +646,13 @@ def fused_ladder_cases(
     for hidden in hiddens:
         row = hidden * 2
         ladder = ladder_of(**kw, hidden=hidden)
-        ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
+        # The cut never hides a rung: the top rung gets at least one row past its
+        # start.
+        hi_h = min(window_hi, max(top_bytes, ladder[-1].min_bytes + row))
+        ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi_h]
         for rung, end in zip(ladder, ends):
             first = -(-max(lo, rung.min_bytes, 1) // row) * row
-            last = min(hi, end) // row * row
+            last = min(hi_h, end) // row * row
             if first > last:
                 continue
             for nbytes in sorted({first, last}):
