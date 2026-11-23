@@ -25,7 +25,7 @@ from aiter import (
 from aiter import (
     fused_norm_rope_attn_rope_cast_bf16 as public_bf16,
 )
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime_for_device
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
     _fused_norm_rope_attn_rope_cast_bf16_fwd as fused_norm_rope_attn_rope_cast_fwd,
 )
@@ -2033,7 +2033,7 @@ def test_fused_norm_rope_attn_rope_cast(
         tensor = args[key]
         if tensor is not None:
             nbytes += tensor.numel() * tensor.element_size()
-    ret = {"gfx": get_gfx_runtime()}
+    ret = {"gfx": get_gfx_runtime_for_device()}
     for name, fn in candidates.items():
         out, us = run_perftest(fn, testGraph=True, num_rotate_args=1)
         actual = dequantize(*out[:2]).to(dtypes.fp32)
@@ -3153,7 +3153,10 @@ def run_contract_checks():
 
 
 def main():
-    if not torch.cuda.is_available() or get_gfx_runtime() not in SUPPORTED_GFX:
+    if (
+        not torch.cuda.is_available()
+        or get_gfx_runtime_for_device() not in SUPPORTED_GFX
+    ):
         aiter.logger.warning("fused_norm_rope_attn_rope_cast requires gfx950; skipping")
         return
     parser = argparse.ArgumentParser(

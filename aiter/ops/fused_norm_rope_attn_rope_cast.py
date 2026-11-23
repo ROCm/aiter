@@ -7,7 +7,7 @@ import math
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx_runtime, get_gfx_runtime_for_device
 
 # The ctypes ABI follows these signatures positionally. Keep argument order in
 # sync with csrc/kernels/mla/fused_norm_rope_attn_rope_cast/fused_norm_rope_attn_rope_cast.cu.
@@ -59,7 +59,7 @@ def is_fused_norm_rope_attn_rope_cast_supported(
     if arch is None:
         if torch.version.hip is None or not torch.cuda.is_available():
             return False
-        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+        arch = get_gfx_runtime_for_device(device)
     return arch == "gfx950"
 
 
