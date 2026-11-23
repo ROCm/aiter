@@ -628,7 +628,6 @@ def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
 #
 # "no schema can express it" -- a parameter whose type is AITER's own.
 _NOT_REGISTERED = {
-    "gemm_a8w8_blockscale_bpreshuffle": "out-buffer in the contract (`out`)",
     "gemm_a16w16": (
         "out-buffer in the contract (`out`); every caller reaches it through "
         "the torch_compile_guard of `gemm_a16w16` or `gemm_a16w16_out`, which "
@@ -643,11 +642,6 @@ _NOT_REGISTERED = {
         "out-buffer in the contract (`y`), and no schema can express it "
         "(`config` is a dict)"
     ),
-    "inverse_rope_group_quant": "out-buffer in the contract (`x_fp8`, `x_scale`)",
-    "mla_sparse_prefill": "out-buffer in the contract (`out`)",
-    "mla_sparse_prefill_v41": "out-buffer in the contract (`out`)",
-    "pa_decode_bf16": "out-buffer in the contract (`out`)",
-    "pa_fwd": "out-buffer in the contract (`out_`)",
     "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd": (
