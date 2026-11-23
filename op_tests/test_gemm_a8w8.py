@@ -1289,7 +1289,7 @@ def int8_4wave_prep_launcher(case, spec, num_cu=0, as_bool=False):
 
 @benchmark()
 def test_int8_4wave_prep(m, n, k, norm, rope, hadamard, bias, persistent):
-    from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import PrepSpec
+    from aiter.ops.flydsl.kernels.qk_prep_epilogue import PrepSpec
 
     spec = PrepSpec(norm, rope, bias, hadamard)
     case = make_int8_4wave_prep_case(m, n, k, bias, hadamard, seed=m + n + k)
@@ -1326,7 +1326,7 @@ def run_int8_4wave_prep_correctness():
     if get_gfx() != "gfx950":
         aiter.logger.info("INT8 4-wave prep: skipped, requires gfx950")
         return
-    from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import PrepSpec
+    from aiter.ops.flydsl.kernels.qk_prep_epilogue import PrepSpec
 
     rows = [
         test_int8_4wave_prep(257, 512, 512, norm, rope, hadamard, True, False)
