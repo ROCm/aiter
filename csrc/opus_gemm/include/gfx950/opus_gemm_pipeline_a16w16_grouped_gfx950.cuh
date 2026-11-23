@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 bf16 grouped GEMMs (the DeepGEMM interfaces) on the bf16 4-wave pipeline: its layouts, MFMA,
-// pinned registers and schedule (the helpers below and the tile body's main loop, the text of the dense
-// 4-wave pipeline of #7933), this file's own tile mapping, K range, buffer views and write-back:
-//   M-grouped NT / NN (opus_gemm_a16w16_grouped_kargs_gfx950), K-grouped TN with its plan kernel
-//   (opus_gemm_a16w16_k_grouped_kargs_gfx950). Traits: opus_gemm_traits_a16w16_grouped_gfx950.cuh.
+// gfx950 bf16 grouped GEMMs: M-grouped NT / NN and K-grouped TN on the bf16 4-wave pipeline.
 #pragma once
 
 #include "opus_gemm_traits_a16w16_grouped_gfx950.cuh"
@@ -41,15 +37,6 @@ __device__ inline int mn_r_xor(int lane_id, int wave, int e, int h) {
 }
 
 enum { OPERAND_A = 0, OPERAND_B = 1 };
-
-// Each operand takes one of two paths, picked by its own storage:
-//   _nt: K-contiguous   (A [M, K], B [N, K]): ds_read_b128
-//   _tn: M/N-contiguous (A [K, M], B [K, N]): ds_read_b64_tr_b16
-//          A      B
-//   NT   _nt    _nt
-//   NN   _nt    _tn
-//   TT   _tn    _nt
-//   TN   _tn    _tn
 
 // ============================================================================
 // K-contiguous operand (_nt): A [M, K], B [N, K]
@@ -209,7 +196,7 @@ __device__ inline auto make_layout_r_tn(int lane_id, int wave_id_m, int wave_id_
 }
 
 // ============================================================================
-// A / B layouts: each operand takes the _nt or _tn builder by its own storage (table above).
+// A / B layouts: each operand takes the _nt or _tn builder by its own storage.
 // ============================================================================
 // Create layout for loading A matrix from global memory.
 template<class T>
@@ -308,29 +295,25 @@ constexpr int c_reg() {
 // Grouped tile mapping
 // ============================================================================
 
-// The tile a block computes: C rows from `row` (valid below m_end), B of `group`, A / C slab `batch`
-// (masked). K-grouped: sums A / B rows [k_row0, k_row0 + k_rows), segment seg of nseg. row < 0: none.
+// The tile of a block (row < 0: none): C rows [row, m_end), B group, A / C batch, tile height; K-grouped:
+// A / B rows [k_row0, k_row0 + k_rows), segment seg of nseg.
 struct tile_t {
-    int row, m_end, group, batch;
+    int row, m_end, group, batch, height = 0;
     int k_row0 = 0, k_rows = 0, seg = 0, nseg = 1;
 };
 
-// K-grouped: slot = item * tiles_m + m tile; item = a plan table entry {group, first row, rows, seg | nseg << 16}.
+// K-grouped tile of slot = item * tiles_m + m tile, item = plan table entry {group, row0, rows, seg | nseg << 16}.
 template<class T, class K>
 __device__ inline tile_t k_grouped_tile(const K& kargs, int slot) {
     const int tiles_m = ceil_div(kargs.m, T::B_M);
     const int* const e = kargs.table + 4 * (slot / tiles_m);
     const int group = e[0], rows = e[2];
-    // an empty group only writes C_g = src_g (or 0), if write_empty
-    if (group < 0 || (rows == 0 && !kargs.write_empty)) return {-1, 0, 0, 0};
-    return {(slot % tiles_m) * T::B_M, kargs.m, group, 0, e[1], rows, e[3] & 0xffff, e[3] >> 16};
+    if (group < 0 || (rows == 0 && !kargs.write_empty)) return {-1, 0, 0, 0};   // empty: C_g = src_g (or 0)
+    return {(slot % tiles_m) * T::B_M, kargs.m, group, 0, T::B_M, e[1], rows, e[3] & 0xffff, e[3] >> 16};
 }
 
-// K-grouped plan kernel (one workgroup): from grouped_layout (the rows of each group), the first row of each group (prefix sum of the rows
-// rounded up to OPUS_A16W16_GROUP_ALIGN) and its split into seg_len-row segments. Table entries:
-//   [0, full_items)   full segments, group by group (unused slots: group -1)
-//   full_items + g    the remainder of group g
-// so segment s of a group always launches before s + 1. Also zeroes the turn counters.
+// K-grouped plan (one workgroup): table = full seg_len segments [0, full_items), then the remainder of each group
+// (full_items + g), so segment s launches before s + 1; zeroes the turn counters.
 __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan_kargs_gfx950& k) {
     constexpr int NT = OPUS_K_GROUPED_PLAN_THREADS;
     constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
@@ -385,9 +368,7 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
         k.turn[i] = 0;
 }
 
-// M-grouped plan kernel (one workgroup, contiguous): the rows and the first row of every group of
-// grouped_layout (groups padded to OPUS_A16W16_GROUP_ALIGN rows, any group order). A wave whose 64 rows
-// are all one group adds them at once.
+// M-grouped plan (one workgroup, contiguous): the rows and the first row of each group of grouped_layout.
 __device__ inline void m_grouped_plan_body(const opus_gemm_a16w16_m_grouped_plan_kargs_gfx950& k) {
     __shared__ int s_rows[OPUS_M_GROUPED_PLAN_MAX_GROUPS], s_first[OPUS_M_GROUPED_PLAN_MAX_GROUPS];
     const int tid = opus::thread_id_x(), lane_id = tid % 64;
@@ -420,18 +401,10 @@ __device__ inline void m_grouped_plan_body(const opus_gemm_a16w16_m_grouped_plan
     }
 }
 
-// M-grouped tile heights H0 > H1 > H2 (256 / 192 / 128): each group takes the cheapest mix holding its
-// rows, cost = measured run time per tile (% of a 256 tile, gfx950). E.g. 2176 rows -> 8 x 256 + 128,
-// 146 -> 192, 64 -> 128. These costs keep a group at <= ceil(rows / 256) tiles, the grid bound of
-// opus_gemm_a16w16_grouped_launch: re-check it when changing a cost.
+// Run time of a 256 / 192 / 128-row tile (gfx950, % of 256); keeps a group <= ceil(rows / 256) tiles (grid bound).
 constexpr int MIXED_COST[3] = {100, 91, 65};
 
-struct mixed_tile_t {
-    tile_t tile;
-    int height;
-};
-
-// counts[h]: the number of H[h]-row tiles of a group of `rows` rows.
+// counts[h]: the H[h]-row tiles of the cheapest tiling of `rows` rows.
 template<int H0, int H1, int H2>
 __device__ inline void mixed_counts(int rows, int (&counts)[3]) {
     int best = 0x7fffffff;
@@ -459,8 +432,7 @@ __device__ inline int wave_inclusive_sum(int v, int lane_id) {
     return v;
 }
 
-// Block -> (M tile, N tile): bands of MIXED_BAND M tiles, M fastest inside a band, so consecutive blocks
-// share a B tile (gfx950: +8% M-grouped, +3.5% K-grouped over N-fastest).
+// Block -> (M tile, N tile): bands of MIXED_BAND M tiles, M fastest, so blocks share a B tile (+8% / +3.5%).
 constexpr int MIXED_BAND = 4;
 
 __device__ inline void mixed_band_order(int wgid, int tiles, int tiles_n, int& tile, int& n) {
@@ -471,15 +443,11 @@ __device__ inline void mixed_band_order(int wgid, int tiles, int tiles_n, int& t
     n = i / size;
 }
 
-// M-grouped tile of block wgid: the tiles of all groups numbered densely in group order, then
-// mixed_band_order. Group g has ptr_rows[g] rows; contiguous: from row ptr_first[g] of A / C (its tiles
-// end at its padded end); masked (ptr_first nullptr): rows [0, ptr_rows[g]) of slab g.
-// One wave: lane l sums the tiles of groups [l c, l c + c), c = ceil(G / 64); a prefix sum over the lanes
-// finds the lane, then its c groups are checked in parallel.
+// M-grouped tile of block wgid: the tiles of all groups numbered in group order (masked: ptr_first nullptr).
 template<int H0, int H1, int H2, class K>
-__device__ inline mixed_tile_t m_grouped_tile(const K& kargs, int wgid, int tiles_n, int& n_tile) {
+__device__ inline tile_t m_grouped_tile(const K& kargs, int wgid, int tiles_n, int& n_tile) {
     constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
-    constexpr mixed_tile_t none = {{-1, 0, 0, 0}, 0};
+    constexpr tile_t none = {-1, 0, 0, 0};
     constexpr int H[3] = {H0, H1, H2};
     const int lane_id = opus::thread_id_x() % 64;
     const int groups = kargs.groups, c = ceil_div(groups, 64);
@@ -520,7 +488,7 @@ __device__ inline mixed_tile_t m_grouped_tile(const K& kargs, int wgid, int tile
             mixed_counts<H0, H1, H2>(grows, cnt);
             int ofs = 0;
             for (int h = 0; h < 3; ++h) {
-                if (local < cnt[h]) return {{row0 + ofs + local * H[h], m_end, group, masked ? group : 0}, H[h]};
+                if (local < cnt[h]) return {row0 + ofs + local * H[h], m_end, group, masked ? group : 0, H[h]};
                 local -= cnt[h];
                 ofs += cnt[h] * H[h];
             }
@@ -560,15 +528,13 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
     const int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     const int lane_id = thread_id_x() % T::WARP_SIZE;
 
-    // K-grouped: the segment's rows, rounded up to K tiles (rows past them read 0); at least the 2 K
-    // tiles the pipeline needs (an empty group computes C_g = 0 from 2 tiles of zeros).
+    // K-grouped: the segment's K tiles, at least 2 (rows past k_rows read 0).
     const int loops = [&] {
         if constexpr (T::K_GROUPED) return max(2, ceil_div(c_tile.k_rows, T::B_K));
         else return kargs.k / T::B_K;
     }();
 
-    // Buffer views of A / B / C: 64-bit tile bases (G B matrices / a long M can pass 2^31 elements),
-    // ranges ending at the tile.
+    // Buffer views of A / B / C: 64-bit tile bases, ranges ending at the tile.
     const int stride_out = kargs.stride_c;
     const int c_n_rem = kargs.n - col;
     const int rows_in = c_tile.m_end - row < T::B_M ? c_tile.m_end - row : T::B_M;
@@ -612,8 +578,7 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
     const unsigned int c_range =
         __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(c_m_rem * stride_out * sizeof(D_OUT)));
     auto g_c = make_gmem(ptr_out, c_range);
-    // K-grouped fp32 C: C_g = src_g + the segments' sums, added in segment order. Segment 0 reads the
-    // optional src (ptr_src), the later ones C itself (the sum so far); no src: range 0, reads return 0.
+    // K-grouped fp32 C = src + sum of segments: segment 0 reads src (none: 0), later ones C itself.
     constexpr bool RMW = T::K_GROUPED && T::C_F32;
     auto g_src = [&] {
         if constexpr (RMW) {
@@ -890,8 +855,7 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
     auto sc_offset = [&](int half_tile_m, int half_tile_n) {
         return half_tile_m * T::HALF_B_M * c_lds_stride + (FULL ? half_tile_n * T::HALF_B_N : 0);
     };
-    // K-grouped: an opaque lane id (empty asm on the mbcnt mask), so the thread id is recomputed here rather
-    // than kept live through the main loop (256 x 256 bf16 would spill it).
+    // K-grouped: thread id recomputed here (opaque mbcnt), not kept live through the main loop (spills).
     const int output_thread_id = [&] {
         if constexpr (T::K_GROUPED) {
             unsigned int lane_mask = ~0u;
@@ -902,13 +866,9 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
             return static_cast<int>(thread_id_x());
         }
     }();
-    // A tile whose last column chunk straddles column N (N % VEC_OUT != 0) cannot use the 16-byte stores
-    // there: the descriptor only bounds rows, so the vector would spill into the next row. Such tiles
-    // (the last tile column only) take a compact per-element path; all others the vector path.
-    // (K-grouped: N % 8 == 0, never ragged)
+    // Last tile column with N % VEC_OUT != 0: per-element stores (K-grouped: N % 8 == 0, never).
     const bool ragged = !T::K_GROUPED && c_n_rem < T::B_N && (c_n_rem % VEC_OUT) != 0;   // wave-uniform
-    // columns >= N: 2^31 bytes, far outside the descriptor, dropped by the hardware (a larger offset
-    // would wrap the 32-bit byte offset)
+    // columns >= N: offset 2^31 bytes, dropped by the buffer descriptor
     constexpr int OOB = static_cast<int>((1u << 31) / sizeof(D_OUT));
     constexpr int OUT_ITERS = T::HALF_B_M * T::HALF_B_N / (T::BLOCK_SIZE * VEC_OUT);
     using out_vec_t = opus::vector_t<D_OUT, VEC_OUT>;
@@ -963,11 +923,7 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
         __builtin_amdgcn_sched_barrier(0);
         copy_output(hm, hn, src);
     };
-    // RMW, a group split into segments: segment s adds into C after segment s - 1 has written it (turn ==
-    // s). Segment s - 1 cannot wait on s: its slot comes earlier, so it is dispatched first. Thread 0
-    // spins; its wave's acquire fence (after the spin) invalidates the CU's L1 and the L2 lines the other
-    // XCDs may have changed. The other waves pass their fence early, but read C only after the barrier
-    // below, i.e. after wave 0's invalidation.
+    // RMW: segment s waits for turn == s (segment s - 1 is dispatched earlier), then acquires C.
     [[maybe_unused]] int* const turn = [&] {
         if constexpr (RMW)
             return kargs.turn + (c_tile.group * ceil_div(kargs.m, T::B_M) + row / T::B_M) * num_tiles_n + col / T::B_N;
@@ -1004,8 +960,7 @@ __device__ __forceinline__ void gemm_a16w16_grouped_tile_body(const Kargs& kargs
 #endif // __HIP_DEVICE_COMPILE__
 }
 
-// K-grouped kernel: block block_id_x -> (work item, M tile, N tile), the item's tiles in bands of
-// MIXED_BAND M tiles (+3.5%), see k_grouped_tile.
+// K-grouped kernel: block -> (work item, M tile, N tile), the item's tiles in mixed_band_order.
 template<typename Traits, typename Kargs>
 __device__ __forceinline__ void gemm_a16w16_k_grouped_body(const Kargs& kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
@@ -1027,8 +982,7 @@ __device__ __forceinline__ void gemm_a16w16_k_grouped_body(const Kargs& kargs) {
 #endif // __HIP_DEVICE_COMPILE__
 }
 
-// M-grouped kernel: tiles T0 / T1 / T2 (B_M 256 / 192 / 128, same B_N and layout) chosen per group
-// (m_grouped_tile), one LDS buffer for all three bodies.
+// M-grouped kernel: tile bodies T0 / T1 / T2 (B_M 256 / 192 / 128) picked per group, one shared LDS buffer.
 template<typename T0, typename T1, typename T2, typename Kargs>
 __device__ __forceinline__ void gemm_a16w16_m_grouped_body(const Kargs& kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
@@ -1041,19 +995,19 @@ __device__ __forceinline__ void gemm_a16w16_m_grouped_body(const Kargs& kargs) {
     const int num_tiles_n = ceil_div(kargs.n, T0::B_N);
     const int wgid = opus::block_id_x();
     int n_tile;
-    const mixed_tile_t m = m_grouped_tile<T0::B_M, T1::B_M, T2::B_M>(kargs, wgid, num_tiles_n, n_tile);
-    if (m.tile.row < 0) return;
+    const tile_t tile = m_grouped_tile<T0::B_M, T1::B_M, T2::B_M>(kargs, wgid, num_tiles_n, n_tile);
+    if (tile.row < 0) return;
     __shared__ __attribute__((aligned(16))) char smem_ab[LDS_BYTES];
     const int col = n_tile * T0::B_N;
     // each body runs to the end: no pinned value crosses the branches
-    if (m.height == T0::B_M) gemm_a16w16_grouped_tile_body<T0>(kargs, m.tile, col, smem_ab);
-    else if (m.height == T1::B_M) gemm_a16w16_grouped_tile_body<T1>(kargs, m.tile, col, smem_ab);
-    else gemm_a16w16_grouped_tile_body<T2>(kargs, m.tile, col, smem_ab);
+    if (tile.height == T0::B_M) gemm_a16w16_grouped_tile_body<T0>(kargs, tile, col, smem_ab);
+    else if (tile.height == T1::B_M) gemm_a16w16_grouped_tile_body<T1>(kargs, tile, col, smem_ab);
+    else gemm_a16w16_grouped_tile_body<T2>(kargs, tile, col, smem_ab);
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }
 
-// Kernel arguments of a grouped traits (the kernels themselves are the extern "C" entries of the .co stubs).
+// Kernel arguments of a grouped traits.
 template<typename Traits>
 using opus_gemm_a16w16_grouped_kargs_t = std::conditional_t<Traits::K_GROUPED, opus_gemm_a16w16_k_grouped_kargs_gfx950,
                                                             opus_gemm_a16w16_grouped_kargs_gfx950>;

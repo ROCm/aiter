@@ -9,11 +9,8 @@
     k_grouped_bf16_gemm_tn_contiguous(a, b, d, grouped_layout, c=None)
         a [R, M], b [R, N], d [G, M, N]
 
-grouped_layout is int32 [M]: the group of each row of a / d, -1 for padding rows; every group starts
-at a multiple of 128 rows (get_mk_alignment_for_contiguous_layout()). masked_m is int32 [G]: the
-valid rows of each group. The K-grouped grouped_layout (as DeepGEMM's k_grouped) is int32 [G]: the
-rows (K) of each group of a / b; group g starts at the sum of the earlier sizes rounded up to 128.
-a and b are bf16; d is bf16 (the K-grouped d: fp32 or bf16) and written in place.
+M-grouped grouped_layout: int32 [M], group of each row (-1 padding, groups 128-aligned).
+K-grouped grouped_layout: int32 [G], rows of each group. d is written in place.
 """
 
 import functools
@@ -170,10 +167,7 @@ def _opus_gemm_a16w16_k_grouped_launch_raw(
 ) -> torch.Tensor: ...
 
 
-# A segment (one work item) is at most 1 / _SEG_SHARE of a CU's share of the rows x tiles: a group
-# too long for its tiles to fill the CUs is split so the CUs share it. Each extra segment costs a
-# read-modify-write of the fp32 d tile and a wait for the previous segment, so the split is coarse
-# and never below _SEG_MIN rows (gfx950 sweep of the GLM-5.3 / Kimi-K3 wgrad shapes).
+# Split a group into segments of <= 1 / _SEG_SHARE of a CU's share of the work, at least _SEG_MIN rows.
 _SEG_SHARE = 2
 _SEG_MIN = 8192
 
@@ -228,12 +222,8 @@ def k_grouped_bf16_gemm_tn_contiguous(
 ) -> None:
     """d[g] = (c[g] +) a[rows of g].T @ b[rows of g]; a [R, M], b [R, N], d [G, M, N].
 
-    grouped_layout int32 [G] (on the device, not read on the host; DeepGEMM's k_grouped grouped_layout,
-    the padded or the true K of each group): rows of group g are [off_g, off_g + grouped_layout[g]),
-    off_g = the earlier groups' sizes rounded up to 128 and summed; rows past grouped_layout[g] are
-    not read. d is fp32 or bf16. c (fp32 d only): the layout of d, or d itself to accumulate in place; an empty group
-    writes d[g] = c[g] (or 0, or nothing when c is d). Groups longer than seg_len rows (default:
-    picked from the shape and CU count) are split into segments added in order: deterministic.
+    grouped_layout: int32 [G], rows of each group. c (fp32 d): source, or d itself (in-place +=).
+    seg_len: split long groups (default from the shape); segments add in order (deterministic).
     """
     f32 = d.dtype == torch.float32
     if kid is None:
