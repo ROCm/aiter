@@ -460,7 +460,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         m_warp,
         n_warp,
     )
-    bounded_m = bool(M % tile_m)
     if fused:
         # One contiguous plane per split of an output tile, holding only the
         # peer rows -- the local stripe never leaves LDS.  Round M up for the
@@ -526,7 +525,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     # the JitFunction re-derives its specialization on the host every launch.
     runtime_args, constexpr_args = launch_args[:12], launch_args[12:]
     if compute_bound:
-        specialization = constexpr_args + (
+        # A launch of one workgroup is no cluster: it runs the plain kernel.
+        use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
+        specialization = (*constexpr_args[:7], use_cluster, *constexpr_args[8:]) + (
             scale_block,
             split_k,
             a_preshuffle,
@@ -534,7 +535,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             early_a,
             early_b,
             fused,
-            bounded_m,
             a_scale_preshuffled,
             compute_kernel_k_tiles_class(num_k_tiles),
             w_scale_32x32,
@@ -544,6 +544,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             _launch_gemm_a8w8_compute_bound,
             *runtime_args,
             _ptr_arg(y_scale_out) if fuse_quant else _ptr_arg(Out),
+            cluster_m,
             *specialization,
             batch,
             fuse_quant,
@@ -561,7 +562,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             a_scale_preshuffled,
             w_scale_32x32,
             fused,
-            bounded_m,
             rank0_splitk,
         )
         _run_compiled(
@@ -580,7 +580,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             False,  # fuse_quant_out
             _ptr_arg(Out),  # arg_out
             fused,
-            bounded_m,
             rank0_splitk,
             specialization_key=specialization,
         )
@@ -729,8 +728,9 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
 
 
 def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
+    """The tuned cluster_m if it tiles M, else the largest power of two that does."""
     for cm in range(max(1, int(cluster_m)), 0, -1):
-        if cluster_m_grid_ok(M, tile_m, cm):
+        if (cm == cluster_m or not cm & (cm - 1)) and cluster_m_grid_ok(M, tile_m, cm):
             return cm
     return None
 

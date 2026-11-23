@@ -490,7 +490,9 @@ CASES = [
     ("gfx1250", 8, 32, 512, public.dtypes.fp8, 0.0, "row_strided", True, "opus"),
     ("gfx950", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, "opus"),
     ("gfx942", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
-    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", False, None),
+    ("gfx1250-strict", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, None),
 ]
 
 
@@ -671,20 +673,25 @@ class TestV41Capability:
         assert caught.value is error
 
     @pytest.mark.parametrize("backend", [None, "asm", "opus"])
-    def test_provider_path_preserves_v2_contract(self, runtime, monkeypatch, backend):
+    def test_provider_path_preserves_v3_contract(self, runtime, monkeypatch, backend):
         def unexpected(*args, **kwargs):
             pytest.fail("provider path should not probe or execute a native backend")
 
         monkeypatch.setattr(public, "get_mla_sparse_prefill_v41_backend", unexpected)
         monkeypatch.setattr(public, "_asm_sparse_prefill_v41", unexpected)
         monkeypatch.setattr(public, "_opus_sparse_prefill_v41", unexpected)
+        # The public spelling still takes `out`; v3 is what a provider is offered,
+        # and it carries no output buffer. A call that names one does not reach
+        # here at all -- it bypasses routing -- so the only shape this path sees
+        # is the one below, with the `out` slot gone.
         args = (*arguments(), SCALE, None, None)
+        contract_args = (*args[:-2], args[-1])
 
         def provider(op, canonicalize, native, actual_args, kwargs):
-            assert op.name == "mla_sparse_prefill_v41" and op.version == 2
-            assert actual_args == args and kwargs == {}
+            assert op.name == "mla_sparse_prefill_v41" and op.version == 3
+            assert actual_args == contract_args and kwargs == {}
             bound, kw = canonicalize(*actual_args, **kwargs)
-            assert len(bound) == 14 and "backend" not in kw
+            assert len(bound) == 13 and "backend" not in kw
             return "provider"
 
         monkeypatch.setattr(public._plugin, "_dispatch", provider)

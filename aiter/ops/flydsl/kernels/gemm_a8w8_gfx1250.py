@@ -84,7 +84,6 @@ def launch_gemm_a8w8(
     fuse_quant_out: Constexpr[bool] = False,
     arg_out: fx.Pointer = _NULL_SCALE_PTR,
     fused_splitk: Constexpr[bool] = False,
-    bounded_m: Constexpr[bool] = True,
     rank0_splitk: Constexpr[bool] = False,
     c_lds_store: Constexpr[bool] = _C_LDS_STORE,
 ):
@@ -1132,7 +1131,6 @@ def launch_gemm_a8w8(
                 split_idx=split_idx,
                 mn_oob=mn_oob,
                 flat_tile=flat_tile,
-                bounded_m=bounded_m,
             )
         elif const_expr(not fuse_quant_out):
             c_off_rt = blk_m64 * ldc64 + blk_n64

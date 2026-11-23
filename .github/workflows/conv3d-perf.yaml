@@ -43,7 +43,7 @@ jobs:
   perf:
     needs: [dispatch_policy, ci_config]
     if: needs.dispatch_policy.outputs.allowed == 'true'
-    runs-on: linux-aiter-mi35x-1
+    runs-on: linux-aiter-do-mi350x-dpx-1
     timeout-minutes: 120
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}

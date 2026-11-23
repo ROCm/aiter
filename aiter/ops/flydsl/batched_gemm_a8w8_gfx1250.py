@@ -649,7 +649,6 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         k_tail,
         fused,  # fuse_quant_out
         False,  # fused_splitk
-        True,  # bounded_m (unused without fused_splitk)
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -689,7 +688,6 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         fused,  # fuse_quant_out
         _ptr_arg(Out),  # arg_out
         False,  # fused_splitk
-        True,  # bounded_m
         specialization_key=bmm_spec,
     )
     return Out
@@ -762,7 +760,6 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         preload_ks,
         False,  # a_preshuffle
         False,  # fused_splitk
-        True,  # bounded_m (unused without fused_splitk)
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -802,7 +799,6 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         False,  # fuse_quant_out
         _ptr_arg(Out),  # arg_out
         False,  # fused_splitk
-        True,  # bounded_m
         specialization_key=bmm_spec,
     )
     return Out
