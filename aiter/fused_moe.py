@@ -800,7 +800,7 @@ def _flydsl_moe_sorting(
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # buffer entirely -- the caller owns the [M, topk, model_dim] intermediate.
     # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
         moe_buf = (
