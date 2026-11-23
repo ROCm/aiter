@@ -386,8 +386,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
-    // gfx950 hd256: non-causal only
-    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0)
+    // gfx950 hd256: non-causal and bottom-right causal only
+    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0 && mt != 2)
     {
         return -1;
     }
@@ -747,7 +747,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         { // each workgroup walks its own share of the kv blocks
             gdx = nsplit;
         }
-        else if((mt == 1) || (mt == 2))
+        else if(((mt == 1) || (mt == 2)) && a.hdim_q != 256)
         { // mask kb
             gdx = (gdx + 1) / 2;
         }
