@@ -39,7 +39,12 @@ except ImportError:
     _HAS_FLYDSL = False
 
 try:
-    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        SELECTION_WIDTHS,
+        flydsl_qsa_sparse_prefill,
+        flydsl_qsa_sparse_prefill_available,
+        flydsl_qsa_sparse_prefill_supports_selection,
+    )
 
     _HAS_FLYDSL_PREFILL = True
 except ImportError:
@@ -211,6 +216,24 @@ def qsa_select_paged_tokens(
     return out
 
 
+def qsa_sparse_prefill_widths() -> tuple[int, ...]:
+    """Selection widths (4T + 3 int32 columns) ``qsa_sparse_prefill`` accepts, in
+    increasing order; empty where it cannot run (no FlyDSL, or the GPU is not
+    gfx942)."""
+    available = _HAS_FLYDSL_PREFILL and flydsl_qsa_sparse_prefill_available()
+    return SELECTION_WIDTHS if available else ()
+
+
+def qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
+    """Whether ``qsa_sparse_prefill`` takes an int32 [rows, width] selection: the
+    width is one of ``qsa_sparse_prefill_widths()`` and the selection spans fewer
+    than 2**31 bytes. Lets a caller pick its path before building the selection;
+    the remaining inputs are still checked by the call."""
+    return bool(
+        qsa_sparse_prefill_widths()
+    ) and flydsl_qsa_sparse_prefill_supports_selection(rows, width)
+
+
 def qsa_sparse_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -222,9 +245,17 @@ def qsa_sparse_prefill(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     kv_slots: torch.Tensor | None = None,
+    batch_invariant: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    compute: str = "fp8",
 ) -> torch.Tensor:
     """Sparse prefill/extend attention over packed K/V, or a token pool read through
-    kv_slots; FlyDSL on gfx942 only.
+    kv_slots; FlyDSL on gfx942 only. batch_invariant=True makes each request's result
+    independent of the other requests in the call. K/V may be FP8 (dtypes.fp8) with FP32
+    k_scale / v_scale per tensor ([1]) or per token and KV head ([N, HK]; [P, HK] with
+    kv_slots), computed with FP8 MFMAs (compute="fp8"; per-token V scales clamped to
+    [2**-60, 2**60]) or dequantized to BF16 (compute="bf16").
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
@@ -240,6 +271,10 @@ def qsa_sparse_prefill(
         softmax_scale=softmax_scale,
         out=out,
         kv_slots=kv_slots,
+        batch_invariant=batch_invariant,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compute=compute,
     )
 
 
@@ -254,5 +289,7 @@ __all__ = [
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
+    "qsa_sparse_prefill_supports_selection",
+    "qsa_sparse_prefill_widths",
     "qsa_store_quantized_rows",
 ]
