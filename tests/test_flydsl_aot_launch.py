@@ -159,7 +159,9 @@ def test_binding_keeps_the_loaded_kernel_until_the_cache_is_invalidated(monkeypa
 
     # A cache invalidated while a launch is under way (by another thread):
     # the kernel that launch read is not kept.
-    stale = lambda *a: ran.append(("stale", a))  # noqa: E731
+    def stale(*a):
+        ran.append(("stale", a))
+
     launch = cache.launch
 
     def racing_launch(key, make_exe, *args):
@@ -341,7 +343,7 @@ def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
     lib.write_bytes(b"BC one")
 
     class Artifact:
-        _link_libs = [str(lib)]
+        _link_libs = (str(lib),)
 
     class Compiled:
         _keepalive = Artifact()

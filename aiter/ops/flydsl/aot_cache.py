@@ -839,7 +839,7 @@ def _baked_args(exe, args) -> dict:
     if sig is None:
         try:
             sig = inspect.signature(getattr(exe, "func", exe), eval_str=True)
-        except Exception as e:  # noqa: BLE001  annotations that do not evaluate
+        except Exception as e:  # annotations that do not evaluate
             raise RuntimeError(f"cannot read the launcher's signature: {e}") from e
     baked = {}
     for index, param in enumerate(sig.parameters.values()):
