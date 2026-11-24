@@ -226,6 +226,10 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "minimax_m3_index_topk_prefill_flydsl": (
+        ".kernels.minimax_m3_index_topk_prefill",
+        "minimax_m3_index_topk_prefill_flydsl",
+    ),
     "sparse_pa_nvfp4_decode": (
         ".kernels.sparse_pa_nvfp4_decode",
         "sparse_pa_nvfp4_decode",
@@ -302,6 +306,7 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "minimax_m3_index_topk_prefill_flydsl",
     "pa_decode",
     "pa_decode_default_workgroup_budget",
     "pa_decode_nhd_max_query_length",
