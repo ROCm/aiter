@@ -3395,8 +3395,8 @@ def _use_1stage(tp: int, nbytes: int) -> bool:
     override = CudaCommunicator._ar_1stage_override
     if override is not None:
         return override
-    max_kb = CudaCommunicator._ar_1stage_max_kb
-    limit = max_kb if max_kb >= 0 else 128 * 7168 * 2 // tp
+    max_bytes = CudaCommunicator._ar_1stage_max_bytes
+    limit = max_bytes if max_bytes >= 0 else 128 * 7168 * 2 // tp
     return nbytes <= limit
 
 
