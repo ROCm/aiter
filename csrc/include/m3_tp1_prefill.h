@@ -47,4 +47,21 @@ void m3_tp1_moe_g2(const aiter_tensor_t& a2,                // [sorted, 1536] MX
                    int64_t m,
                    int64_t topk);
 
+// The same route rows from 8 waves per CU (per-XCD work queues); ctl: [>= 9] int32 queue state.
+// Route rows past its 32-bit store offsets (m * topk * 6144 * 2 > 0xFFFF0000) are refused.
+void m3_tp1_moe_g2_w8(const aiter_tensor_t& a2,
+                      const aiter_tensor_t& a2_scale,
+                      const aiter_tensor_t& w2_b,
+                      const aiter_tensor_t& w2_bs,
+                      const aiter_tensor_t& sorted_ids,
+                      const aiter_tensor_t& sorted_weights,
+                      const aiter_tensor_t& sorted_expert_ids,
+                      const aiter_tensor_t& num_valid_ids,
+                      aiter_tensor_t& cnt,
+                      aiter_tensor_t& tiles,
+                      aiter_tensor_t& ctl,
+                      aiter_tensor_t& out,
+                      int64_t m,
+                      int64_t topk);
+
 } // namespace aiter

@@ -1056,7 +1056,9 @@
             "f'{AITER_CSRC_DIR}/kernels/m3_tp1/moe_g2.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm -amdgpu-atomic-optimizer-strategy=None'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

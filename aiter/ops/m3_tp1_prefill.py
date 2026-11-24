@@ -16,6 +16,8 @@ w4 scales leave the pad rows unwritten; the GEMM drops those rows' outputs.
 ``moe_g2_p6``: the MXMOE a4w4 GEMM2 (H 6144, I 3072, sort block 128) into
 per-route bf16 rows, as aiter's v2 "reduce" GEMM2 with ``per_slot_out`` writes
 them, on ragged 256-row expert tiles; ``relayout_w2`` makes its W2 copy at load.
+``moe_g2_w8``: the same bytes from 8 waves per CU and per-XCD work queues, for up
+to ``MOE_G2_W8_MAX_ROUTES`` route rows (``moe_g2_w8_serves``).
 Launches run on the current stream. The entry points raise off gfx950;
 ``is_supported()`` tells callers in advance.
 """
@@ -27,6 +29,7 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 
 __all__ = [
+    "MOE_G2_W8_MAX_ROUTES",
     "NORM_FOLD_H",
     "NORM_FOLD_MX8",
     "NORM_INPUT_MX8",
@@ -35,6 +38,8 @@ __all__ = [
     "NORM_RED4_FOLD_H",
     "NORM_RED4_FOLD_MX8",
     "moe_g2_p6",
+    "moe_g2_w8",
+    "moe_g2_w8_serves",
     "mx8_quant",
     "norm_mx",
     "relayout_w2",
@@ -161,6 +166,60 @@ def moe_g2_p6(
     meta = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids)
     _m3_tp1_moe_g2(
         a2, a2_scale, w2_b, w2_bs, *meta, cnt, tiles, ntiles, out, int(m), int(topk)
+    )
+
+
+# moe_g2_w8 stores route rows through 32-bit buffer offsets (0xFFFF0000 marks padding)
+MOE_G2_W8_MAX_ROUTES = 0xFFFF0000 // (6144 * 2)
+
+
+@compile_ops("module_m3_tp1_moe_g2", fc_name="m3_tp1_moe_g2_w8", develop=True)
+def _m3_tp1_moe_g2_w8(
+    a2: Tensor,
+    a2_scale: Tensor,
+    w2_b: Tensor,
+    w2_bs: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    cnt: Tensor,
+    tiles: Tensor,
+    ctl: Tensor,
+    out: Tensor,
+    m: int,
+    topk: int,
+) -> None: ...
+
+
+def moe_g2_w8_serves(m: int, topk: int) -> bool:
+    """Whether ``moe_g2_w8`` takes ``m`` tokens at ``topk`` (87380 at top-4)."""
+    return m * topk <= MOE_G2_W8_MAX_ROUTES
+
+
+def moe_g2_w8(
+    a2: Tensor,
+    a2_scale: Tensor,
+    w2_b: Tensor,
+    w2_bs: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    m: int,
+    topk: int,
+) -> None:
+    """``moe_g2_p6``'s route rows, byte for byte, from 8 waves per CU (2 per SIMD)
+    taking tiles from per-XCD work queues; same arguments, and ``moe_g2_w8_serves``."""
+    _require_gfx950("moe_g2_w8")
+    blocks = sorted_ids.numel() // 128
+    cnt = torch.empty(blocks, dtype=torch.int32, device=out.device)
+    tiles = torch.empty((blocks, 4), dtype=torch.int32, device=out.device)
+    ctl = torch.empty(9, dtype=torch.int32, device=out.device)
+    meta = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids)
+    _m3_tp1_moe_g2_w8(
+        a2, a2_scale, w2_b, w2_bs, *meta, cnt, tiles, ctl, out, int(m), int(topk)
     )
 
 
