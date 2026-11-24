@@ -34,11 +34,11 @@
     "launch": {
         "v1_w_dot": {
             "BLK_LEQ_16": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3},
-            "any": {"num_warps": 2, "num_stages": 1, "waves_per_eu": 1}
+            "any": {"num_warps": 2, "num_stages": 1, "waves_per_eu": 1, "USE_TENSOR_DESC": true}
         },
         "v2_w_dot": {
             "BLK_LEQ_16": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 0},
-            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 2}
+            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 2, "USE_TENSOR_DESC": true}
         },
         "v1_wo_dot": {
             "BLK_LEQ_16": {"num_warps": 4},
