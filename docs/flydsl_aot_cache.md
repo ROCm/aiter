@@ -667,12 +667,15 @@ Validated compile-only on gfx942 (FlyDSL 0.5.3), without gfx1250 hardware:
 - `op_tests/test_flydsl_pa_decode.py` on gfx942, whose kernels share the
   edited files: 414 passed, 128 skipped.
 
-Hardware validation on 2026-11-24 used gfx1250 (256 CUs), FlyDSL 0.5.3 and
-Torch 2.11.0+rocm10.1.0a20260811-bkc.20260820:
+Historical hardware validation on 2026-11-24 used gfx1250 (256 CUs), FlyDSL
+0.5.3 and Torch 2.11.0+rocm10.1.0a20260811-bkc.20260820. The hardware matrix
+below included a separate PS64 kernel fix, now removed from this AOT-only
+change, and preceded the final disk-identity guards. It is not a full hardware
+pass for the current revision:
 
 - 36 representative cases across GEMM, FMHA, MLA, gather, PA decode and
   FP8/A4W4 GEMM ran in six fresh processes: build, hit, verify, JIT, hit, JIT.
-  After the PS64 fix below, first and steady outputs matched bitwise across
+  With the separate PS64 fix applied, first and steady outputs matched bitwise across
   modes, and the existing reference checks passed. Every hit and verify round
   built zero entries. This is sampled coverage, not every supported shape.
 - Full tuned GEMM replay produced 721 objects. Fresh-process hit and verify
@@ -689,13 +692,23 @@ Torch 2.11.0+rocm10.1.0a20260811-bkc.20260820:
   3.5–6 us extra cost. Compile/load wall time and steady GPU time must be
   reported separately.
 
-Validation exposed two pre-existing issues: dry-run storage metadata addresses
-could falsely overlap for large fake tensors, and the PS64 paired-page loop
-unconditionally consumed a pending PV on its first iteration. Disjoint virtual
-storage ranges fix replay; checking `pending_valid` on the even page fixes
-the unready LDS read that could produce NaNs in both AOT and JIT. The PS64
-op test now checks the first output before warmup, which previously hid this
-failure. These results include both fixes.
+The AOT replay fix assigns disjoint virtual storage ranges: storage metadata
+addresses could falsely overlap for large fake tensors. The `.o` identity
+checks protect disk loading; neither change modifies GPU kernel computation.
+
+Validation also exposed a pre-existing PS64 kernel issue in both AOT and JIT:
+the paired-page loop unconditionally consumes a pending PV on its first
+iteration, reading unready LDS data that can produce NaNs. Warmup can hide it.
+The kernel fix and its first-launch regression check are outside this AOT-only
+change and have been removed. This known PS64 issue remains unresolved here;
+the historical passing PS64 results above require that separate fix.
+
+With the final disk-identity guards, offline replay built 721 objects; fresh
+hit and verify runs rebuilt zero entries. Build/hit/verify whole-process times
+were 75.754/47.013/87.260 seconds. CPU regressions and real ELF mismatch
+rejection checks passed. The supplemental final GPU run could not start
+because the device was occupied; the subsequent rebase was checked with CPU
+regressions (39 passed, 4 skipped), but was not rerun on hardware.
 
 ## 6. Adopting it for another op
 

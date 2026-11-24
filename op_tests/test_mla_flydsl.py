@@ -1187,9 +1187,6 @@ def _test_ps64(
     def run_asm():
         _run_asm_ps64(case, num_splits, SOFTMAX_SCALE, asm_output)
 
-    # Warmup can hide reads of uninitialized LDS on the first pipeline page.
-    run_flydsl()
-    _check_output("ps64 first launch", reference, flydsl_output)
     _, flydsl_us = run_perftest(run_flydsl, num_iters=num_iters, num_warmup=num_warmup)
     _, asm_us = run_perftest(run_asm, num_iters=num_iters, num_warmup=num_warmup)
     return _row(
