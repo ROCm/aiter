@@ -203,6 +203,50 @@ _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG = tuple(
         ","
     )
 )
+# Opt-in: the one-shot reduce's (CHUNK, SPEC, num_warps) from the launch shape instead
+# of the fixed AITER_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG; bitwise the same output (neither
+# the merge steps nor the statistics reduction depend on them, warps 2 / 4 only). A pass
+# covers ~4x the expected live segments of a sequence (the token split's programs over
+# the batch's sequences and KV heads), so the longest contexts take one pass, as long as
+# the passes' LDS (CHUNK x head_size_v fp32 a program) of every program fits
+# _GFX12_SPLIT_REDUCE_ONESHOT_AUTO_LDS (all programs resident). Speculative boxes only
+# when the expected live segments fill them. gfx1250 (256 CUs x 320 KB LDS), Qwen3.5
+# 16 / 2 heads, d 256, ctx ~80k, us a call vs 16,8,2: 1-4 seqs x 4 rows (64-256
+# programs, 63-79 segments a sequence) 6.5-8.3 -> 3.1-3.9; 8-16 x 4 4.0-6.7 -> 4.0-4.5;
+# 32 x 1 3.8 -> 3.4; 120 x 4 13.5 -> 12.6; 120 x 1 6.5 -> 5.9.
+_GFX12_SPLIT_REDUCE_ONESHOT_AUTO = (
+    os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO", "0") == "1"
+)
+_GFX12_SPLIT_REDUCE_ONESHOT_AUTO_LDS = int(
+    os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO_LDS", str(64 << 20))
+)
+
+
+def gfx12_split_reduce_oneshot_config(
+    num_rows, num_query_heads, num_segments, num_seqs, num_kv_heads, head_size_v
+):
+    """(CHUNK, SPEC, num_warps) of reduce_segments_split_oneshot_gluon for a launch:
+    _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG, or the shape rule under
+    AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO=1 (launchers clamp them as before)."""
+    if not _GFX12_SPLIT_REDUCE_ONESHOT_AUTO:
+        return _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
+    sb = min(_GFX12_SPLIT_REDUCE_CONFIG[0], num_segments)
+    if _GFX12_TOKEN_SPLIT:
+        expect = _GFX12_TOKEN_SPLIT_PROGRAMS // max(1, num_kv_heads * num_seqs)
+        expect = max(1, min(expect, num_segments))
+    else:
+        expect = num_segments
+    fit = _GFX12_SPLIT_REDUCE_ONESHOT_AUTO_LDS // max(
+        1, num_rows * num_query_heads * head_size_v * 4
+    )
+    fit = 1 << (fit.bit_length() - 1) if fit >= 1 else 1
+    chunk = max(sb, min(triton.next_power_of_2(4 * expect), 128, fit))
+    if chunk <= sb:
+        spec = chunk
+    else:
+        spec = chunk // 2 if expect >= chunk // 2 else 0
+    warps = 4 if chunk >= 64 and head_size_v % 128 == 0 else 2
+    return chunk, spec, warps
 
 
 def gfx12_token_split_constants(v_cache_dtype=None):
@@ -2077,7 +2121,14 @@ def _reduce_segments_split_gfx1250(
     sb, num_buf, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
     sb = min(sb, NUM_SEGMENTS)
     if oneshot and _reduce_segments_split_oneshot_kernel_gfx1250 is not None:
-        chunk, spec, oneshot_warps = _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
+        chunk, spec, oneshot_warps = gfx12_split_reduce_oneshot_config(
+            num_rows,
+            params.num_query_heads,
+            NUM_SEGMENTS,
+            params.num_seqs,
+            params.num_kv_heads,
+            params.head_size_v,
+        )
         chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
         if params.head_size_v % (32 * oneshot_warps) == 0:
             _reduce_segments_split_oneshot_kernel_gfx1250[
