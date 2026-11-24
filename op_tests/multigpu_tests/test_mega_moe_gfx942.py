@@ -20,7 +20,9 @@ and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
   beforehand by aiter's per_1x128 quant ("main pq", "large pq", timed with that quant),
   and small_M) eagerly and as a CUDA graph replay. The ranks hold different token
   counts, one rank holds none, and some rows are padding (every id == experts, as
-  sglang marks them, or -1) or have invalid slots.
+  sglang marks them, or -1) or have invalid slots (-1, experts, +-2^32: the ids are
+  int64, torch.topk's dtype). One row's x holds a NaN: its output must not be finite,
+  except on large_M's ``forward``, whose x quant (aiter's per_1x128) drops a NaN.
 - test_mega_moe_gfx942_capacity: every rank brings max_tok_per_rank rows. With
   "all_to_one" routing every route of every rank goes to rank 0, which must receive
   all of them (8 x the uniform average; past 2^18 rows at max_tok_per_rank 8192).
@@ -196,10 +198,11 @@ def _make_weights_a8w4(rank):
     return kernel, ref
 
 
-def test_prepare_weights_flush():
-    """prepare_weights refuses MXFP4 weights that the kernels' FP8 decode would flush: a
-    32-K group 12 binades below its output channel's largest scale must hold only
-    zeros. A one-expert layer, H 512, I 256."""
+def test_prepare_weights_checks():
+    """prepare_weights refuses, before it launches anything on them, scales on another
+    device than W or of the wrong size; and MXFP4 weights that the kernels' FP8 decode
+    would flush: a 32-K group 12 binades below its output channel's largest scale must
+    hold only zeros. A one-expert layer, H 512, I 256."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
     quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -211,34 +214,41 @@ def test_prepare_weights_flush():
         )
         layer.append(quant(w, quant_dtype=dtypes.fp4x2))
 
-    def prepare():
+    def prepare(w1_scale=None):
         (w1, s1), (w2, s2) = layer
         return MegaMoEGfx942.prepare_weights(
             shuffle_weight_a16w4(w1, 16, False),
-            shuffle_scale_a16w4(s1, 1, False),
+            shuffle_scale_a16w4(s1, 1, False) if w1_scale is None else w1_scale,
             shuffle_weight_a16w4(w2, 16, False),
             shuffle_scale_a16w4(s2, 1, False),
         )
 
+    def refused(why, **kwargs):
+        try:
+            prepare(**kwargs)
+        except ValueError as err:
+            assert why in str(err), err
+        else:
+            raise AssertionError(f"prepare_weights took weights with {why}")
+
     w1, s1 = layer[0]
+    s1_shuffled = shuffle_scale_a16w4(s1, 1, False)
+    refused("one GPU", w1_scale=s1_shuffled.cpu())
+    refused("scale bytes", w1_scale=s1_shuffled.view(-1)[:-16])
     codes = s1.view(torch.uint8).view(512, 512 // 32)
     codes[0, 0], codes[0, 1] = 130, 130 - 12  # w1 row 0: group 1 is 12 binades down
-    try:
-        prepare()
-    except ValueError as err:
-        assert "binades" in str(err), err
-    else:
-        raise AssertionError("prepare_weights took weights its FP8 decode flushes")
+    refused("binades")
     w1.view(torch.uint8)[0, 0, 16:32] = 0  # row 0, K 32..63: group 1 all zero
     prepare()
 
 
 def _make_inputs(tokens, rank, seed, routing="uniform", padding=True):
-    """x bf16 [T, H], route weights f32 [T, k], ids int32 [T, k] of this rank's T rows
+    """x bf16 [T, H], route weights f32 [T, k], ids int64 [T, k] of this rank's T rows
     (k = TOPK). ``routing``: "uniform" (top-k of random scores), or "all_to_one" (k of
     rank 0's experts per row). ``padding``: the last row is sglang padding (every id ==
-    experts), the one before has no route (-1), and row 0 has an invalid slot of each
-    kind."""
+    experts), the one before has no route (-1), row 0 has invalid slots (-1, experts and
+    +-2^32, which become expert 0 if narrowed to int32 unchecked), and with 4 rows or
+    more row 1's x holds a NaN."""
     n = tokens[rank]
     gen = torch.Generator(device="cuda").manual_seed(seed * WORLD + rank)
     x = torch.randn((n, H), dtype=dtypes.bf16, device="cuda", generator=gen)
@@ -247,11 +257,12 @@ def _make_inputs(tokens, rank, seed, routing="uniform", padding=True):
     if routing == "all_to_one":
         order = torch.rand((n, E_LOCAL), device="cuda", generator=gen).argsort(dim=-1)
         ids = order[:, :TOPK]
-    ids = ids.to(torch.int32)
     if padding and n >= 3:
         ids[-1] = E
         ids[-2] = -1
-        ids[0, 1], ids[0, 4] = -1, E
+        ids[0, 1], ids[0, 2], ids[0, 3], ids[0, 4] = -1, 2**32, -(2**32), E
+    if padding and n >= 4:
+        x[1, 5] = float("nan")
     return x, values.softmax(dim=-1), ids
 
 
@@ -299,13 +310,17 @@ def _all_max(value):
     return float(t)
 
 
-def _check(name, out, ref, routed):
-    """-> (mismatch fraction, max |out - ref| / rms(reference row)), worst rank."""
+def _check(name, out, ref, routed, propagates_nan=True):
+    """-> (mismatch fraction, max |out - ref| / rms(reference row)), worst rank. A row
+    whose reference is not finite (its x holds a NaN) is not compared: with
+    ``propagates_nan`` it must come out not finite."""
     out = out.float()
-    rms = ref[routed].pow(2).mean(dim=-1, keepdim=True).sqrt()
+    nan_in = ~torch.isfinite(ref).all(dim=-1)
+    ok = routed & ~nan_in
+    rms = ref[ok].pow(2).mean(dim=-1, keepdim=True).sqrt()
     err = checkAllclose(
-        ref[routed] / rms,
-        out[routed] / rms,
+        ref[ok] / rms,
+        out[ok] / rms,
         rtol=0,
         atol=ATOL,
         msg=f"{name} routed rows: ",
@@ -318,7 +333,16 @@ def _check(name, out, ref, routed):
         atol=0,
         msg=f"{name} rows without a route: ",
     )
-    worst = ((out[routed] - ref[routed]) / rms).abs().max() if routed.any() else 0.0
+    if propagates_nan:
+        finite = torch.isfinite(out[nan_in]).all(dim=-1).float()
+        err += checkAllclose(
+            torch.zeros_like(finite),
+            finite,
+            rtol=0,
+            atol=0,
+            msg=f"{name} rows with a NaN input not finite: ",
+        )
+    worst = ((out[ok] - ref[ok]) / rms).abs().max() if ok.any() else 0.0
     return _all_max(err), _all_max(worst)
 
 
@@ -382,7 +406,8 @@ def _run_paths(tokens, paths, inputs, stale, graph, ret):
         torch.cuda.synchronize()
         _STATE["beat"] = time.monotonic()
         name = f"{path} {'graph' if graph else 'eager'} {tokens}"
-        err, worst = _check(name, out, ref, routed)
+        # large_M's forward quantizes x with aiter's per_1x128 quant, which drops a NaN.
+        err, worst = _check(name, out, ref, routed, propagates_nan=path != "large")
         us = _all_max(us)
         ret[f"{path} us"] = us
         ret[f"{path} TFLOPS"] = flops / us / 1e6
@@ -532,7 +557,7 @@ def _worker(rank, port, args):
 
         quant = _STATE["quant"] = args.quant
         if quant == "a8w4":
-            test_prepare_weights_flush()
+            test_prepare_weights_checks()
         weights, ref_weights = _make_weights(rank, quant)
         weights = MegaMoEGfx942.prepare_weights(
             *weights, w1_gate_up_interleaved=False, quant=quant

@@ -63,7 +63,7 @@ from .atomic import (
     _sys_store_at,
     _xcc_id,
 )
-from .cvt import _channel_factor, _fp8x4_pack
+from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
 from .hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, NUM_CU, _opaque_tx, _u
 from .kloop import _dispatch_rows, _make_core
 from .mem import (
@@ -378,11 +378,12 @@ def ep_mega_small_kernel(
                 for h in range_constexpr(2):
                     f = Vec(raw[c][h].bitcast(fx.BFloat16)).to(fx.Float32)
                     vals.extend(fx.Float32(f[i]) for i in range(8))
-                am = fx.Float32(0.0)
+                am = fx.Int32(0)
                 for v in vals:
-                    am = fx.maxnumf(am, fx.absf(v))
+                    am = fx.max(am, _abs_bits(v))
                 for s in (1, 2, 4):  # 8 lanes = one 128-col group
-                    am = fx.maxnumf(am, am.shuffle_xor(s, 64))
+                    am = fx.max(am, am.shuffle_xor(s, 64))
+                am = am.bitcast(fx.Float32)
                 sc = (am == fx.Float32(0.0)).select(
                     fx.Float32(1.0), am / fx.Float32(240.0)
                 )
@@ -411,17 +412,18 @@ def ep_mega_small_kernel(
             """QX 0: ``load_row``'s chunks -> per lane: CH x 16 fp8 (i32x4) and the row's f32
             scale (amax / 240 over the row, 1 for an all-zero row) in every lane."""
             vals = []
-            am = fx.Float32(0.0)
+            am = fx.Int32(0)
             for c in range_constexpr(CH):
                 vc = []
                 for h in range_constexpr(2):
                     f = Vec(raw[c][h].bitcast(fx.BFloat16)).to(fx.Float32)
                     vc.extend(fx.Float32(f[i]) for i in range(8))
                 for v in vc:
-                    am = fx.maxnumf(am, fx.absf(v))
+                    am = fx.max(am, _abs_bits(v))
                 vals.append(vc)
             for s in range_constexpr(6):
-                am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+                am = fx.max(am, am.shuffle_xor(1 << s, 64))
+            am = am.bitcast(fx.Float32)
             sc = (am == fx.Float32(0.0)).select(fx.Float32(1.0), am / fx.Float32(240.0))
             inv = fx.Float32(1.0) / sc
             qs = [
@@ -712,13 +714,13 @@ def ep_mega_small_kernel(
                     nb * fx.Int32(NI) + wave * fx.Int32(NIW) + lane_div_16 * fx.Int32(4)
                 )
                 for mi in range_constexpr(MR):
-                    am = fx.Float32(0.0)
+                    am = fx.Int32(0)
                     for c in range_constexpr(NC1):
                         for v in range_constexpr(4):
-                            am = fx.maxnumf(am, fx.absf(ys[mi, c][v]))
-                    am = fx.maxnumf(am, am.shuffle_xor(16, 64))
-                    am = fx.maxnumf(am, am.shuffle_xor(32, 64))
-                    lds_f32[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
+                            am = fx.max(am, _abs_bits(ys[mi, c][v]))
+                    am = fx.max(am, am.shuffle_xor(16, 64))
+                    am = fx.max(am, am.shuffle_xor(32, 64))
+                    lds[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
                 gpu.barrier()
                 out_rs = _rsrc(a["a2"], fx.Int64(arow + fx.Int32(BM)) * fx.Int64(I))
                 os_rs = _rsrc(
@@ -726,19 +728,20 @@ def ep_mega_small_kernel(
                 )
                 grp = wave // fx.Int32(WPG)
                 for mi in range_constexpr(MR):
-                    am = fx.Float32(0.0)
                     pv = Vec(
                         lds_vec_load(
                             lds_i32,
                             (rows[mi] * fx.Int32(NW) + grp * fx.Int32(WPG))
                             * fx.Int32(4),
-                            Vec.make_type(WPG, fx.Float32),
-                            fx.Float32,
+                            Vec.make_type(WPG, fx.Int32),
+                            fx.Int32,
                             align=4 * WPG,
                         )
                     )
-                    for j in range_constexpr(WPG):
-                        am = fx.maxnumf(am, fx.Float32(pv[j]))
+                    am = fx.Int32(pv[0])
+                    for j in range_constexpr(1, WPG):
+                        am = fx.max(am, fx.Int32(pv[j]))
+                    am = am.bitcast(fx.Float32)
                     s = (am == 0.0).select(
                         fx.Float32(1.0), am * fx.Float32(1.0 / 240.0)
                     )

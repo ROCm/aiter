@@ -11,13 +11,21 @@ from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
 
+def _abs_bits(x):
+    """|x| of an f32 as its i32 bits, for an amax that propagates NaN: the integer max of
+    these bits, bitcast back to f32, is the largest magnitude, and NaN once any input is
+    NaN (a NaN's bits exceed inf's), where a maxnumf amax drops the NaN. One v_and and
+    one integer max per element, against maximumf's v_max, v_cmp and v_cndmask."""
+    return fx.absf(fx.Float32(x)).bitcast(fx.Int32)
+
+
 def _fp8x4_pack(a, b, c, d):
     """Four f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, round to nearest even, and
     map a rounded-to-zero magnitude to +0 (FNUZ has no -0: 0x80 is NaN).
 
     min / max are minnumf / maxnumf (one v_min / v_max each), so NaN packs to 240 (0x7F).
-    NaN reaches the output through the scale instead: the caller's amax must propagate it
-    (fx.max, not maxnumf), then the dequantized values are NaN whatever the byte. The
+    NaN reaches the output through the scale instead: the caller's amax propagates it
+    (``_abs_bits``), then the dequantized values are NaN whatever the byte. The
     NaN-propagating minimumf / maximumf (NaN packs to 0, as aiter's
     ``moe_2stage_a16wmix`` ``_pack_activation``) give the same bits on finite inputs, but
     cost a gemm1 kernel 324 more of its 5919 instructions, and with a +-Inf input the

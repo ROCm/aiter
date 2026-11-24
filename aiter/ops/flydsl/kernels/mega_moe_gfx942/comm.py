@@ -29,7 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .atomic import _latomic_add, _sys_load_at, _sys_store_at
-from .cvt import _fp8x4_pack
+from .cvt import _abs_bits, _fp8x4_pack
 from .hw import _sleep, _u
 from .mem import (
     _ld,
@@ -139,11 +139,12 @@ def mega_quant_kernel(*, H, QX=1):
                     )
                 )
                 f = Vec(v.bitcast(fx.BFloat16)).to(fx.Float32)
-                am = fx.Float32(0.0)
+                am = fx.Int32(0)
                 for i in range_constexpr(8):
-                    am = fx.maxnumf(am, fx.absf(fx.Float32(f[i])))
+                    am = fx.max(am, _abs_bits(f[i]))
                 for s in range_constexpr(4):
-                    am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+                    am = fx.max(am, am.shuffle_xor(1 << s, 64))
+                am = am.bitcast(fx.Float32)
                 scale = (am == fx.Float32(0.0)).select(
                     fx.Float32(1.0), am / fx.Float32(240.0)
                 )
@@ -188,16 +189,17 @@ def mega_quant_kernel(*, H, QX=1):
             if quant != fx.Int32(0):
                 x_rs = _rsrc(x, fx.Int64(tokens) * fx.Int64(H * 2))
                 fs = []
-                am = fx.Float32(0.0)
+                am = fx.Int32(0)
                 for c in range_constexpr(CH):
                     v = Vec(_ld(x_rs, u16[c] * fx.Int32(4), 4))
                     f = Vec(v.bitcast(fx.BFloat16)).to(fx.Float32)
                     fc = [fx.Float32(f[i]) for i in range(8)]
                     for e in fc:
-                        am = fx.maxnumf(am, fx.absf(e))
+                        am = fx.max(am, _abs_bits(e))
                     fs.append(fc)
                 for s in range_constexpr(6):
-                    am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+                    am = fx.max(am, am.shuffle_xor(1 << s, 64))
+                am = am.bitcast(fx.Float32)
                 scale = (am == fx.Float32(0.0)).select(
                     fx.Float32(1.0), am / fx.Float32(240.0)
                 )

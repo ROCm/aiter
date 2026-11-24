@@ -46,6 +46,16 @@ still ``(w1, w1_scale, w2, w2_scale)``. ``quant="a8w8"`` takes fp8 experts with 
 128x128 block scales instead, in aiter's fp8 MoE preshuffle
 ``shuffle_weight(w, (16, 16))``, as they are (``prepare_weights(..., quant="a8w8")``
 checks them and zeroes the W of zero-scale blocks in place).
+
+Scale span: the main path and small_M keep each GEMM accumulator in units of the current
+128-K group's scale and rescale it by the ratio of consecutive scales (the registers hold
+one accumulator per output, not one per group). In those units it stays below 2^28, so
+along K a row's scales (x's per 1x128 scales, for a8w8 times W's block scales) must not
+fall more than about 2^99 below an earlier group's, or the accumulator overflows to inf.
+``prepare_weights`` refuses a8w8 block scales that span more than 2^60 along K.
+Activations after RMSNorm, and the gemm1 outputs (silu(gate) * up) that gemm2 rescales
+the same way, are far inside this; ``forward_prequant`` callers must keep ``x_scale``
+so. large_M scales each K block's partial products before adding them: no such bound.
 """
 
 from contextlib import nullcontext
@@ -365,8 +375,10 @@ class MegaMoEGfx942:
                 f"[T, {self.topk}], [T, {self.topk}]"
             )
         # Out-of-range ids are no routes, as in MegaMoEV2 (sglang marks padding rows with
-        # id == experts); the kernels skip negative ids only.
-        topk_ids = topk_ids.to(torch.int32)
+        # id == experts); the kernels skip negative ids only. Wider ids are clamped
+        # first: narrowing would turn +-2^32 into expert 0.
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.clamp(-1, self.experts).to(torch.int32)
         if main is None:
             ids = torch.where(topk_ids < self.experts, topk_ids, self._no_route)
             return ids.contiguous(), wts.to(torch.float32).contiguous()
@@ -391,10 +403,10 @@ class MegaMoEGfx942:
         slice_output=True,
         mask_invalid_slots=None,
     ):
-        """x bf16 [T, H], wts f32 [T, topk], topk_ids int32 [T, topk]. Returns bf16
-        [T, H], a view of an internal buffer that the next call overwrites. Invalid ids
-        are always skipped, so ``mask_invalid_slots`` has no effect; the output is always
-        sliced to T rows."""
+        """x bf16 [T, H], wts f32 [T, topk], topk_ids int32 (or int64) [T, topk]. Returns
+        bf16 [T, H], a view of an internal buffer that the next call overwrites. Invalid
+        ids are always skipped, so ``mask_invalid_slots`` has no effect; the output is
+        always sliced to T rows."""
         if x_bf16.shape[0] > self.mtpr:
             raise ValueError(
                 f"{x_bf16.shape[0]} rows: at most max_tok_per_rank={self.mtpr}"
@@ -413,7 +425,8 @@ class MegaMoEGfx942:
     ):
         """``forward`` on x already quantized as this instance's ``x_quant``: x_q
         float8_e4m3fnuz [T, H] and x_scale f32 [T, H / 128] ("per_1x128") or [T]
-        ("per_token")."""
+        ("per_token"). A row's per_1x128 scales must stay within the span the module
+        docstring gives (about 2^99 below an earlier group's at most)."""
         T, H = x_q.shape
         if T > self.mtpr:
             raise ValueError(f"{T} rows: at most max_tok_per_rank={self.mtpr}")

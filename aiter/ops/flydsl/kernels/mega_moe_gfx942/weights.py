@@ -162,8 +162,19 @@ def prepare_weights(w1, w1_scale, w2, w2_scale):
         raise ValueError(f"w1 {tuple(w1.shape)} and w2 {tuple(w2.shape)} do not match")
     out = []
     for w, s in ((w1, w1_scale), (w2, w2_scale)):
+        # channel_exponents reads the scales through a raw pointer on W's GPU.
+        if w.device.type != "cuda" or s.device != w.device:
+            raise ValueError(
+                f"W on {w.device}, its scales on {s.device}: expected one GPU"
+            )
         w_u8 = w.contiguous().view(torch.uint8)
         s_u8 = s.contiguous().view(torch.uint8).view(-1)
+        rows, k = w_u8.shape[0] * w_u8.shape[1], w_u8.shape[2] * 2
+        if rows % 32 or k % 256 or s_u8.numel() != rows * k // 32:
+            raise ValueError(
+                f"W {tuple(w.shape)} with {s_u8.numel()} scale bytes: expected N a "
+                "multiple of 32, K of 256, and one e8m0 byte per 32 K values"
+            )
         exp = channel_exponents(w_u8, s_u8)  # from the original scales
         s_u8 = _predelta(w_u8, s_u8, exp)
         tail = exp.contiguous().view(-1).view(torch.uint8)

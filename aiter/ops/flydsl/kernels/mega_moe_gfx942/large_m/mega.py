@@ -6,8 +6,9 @@
 ep_prep and ep_plan (comm.py) run first and build the plan.
 Workgroups take task tickets from per-XCD queues (persistent: one workgroup per CU taking tickets until the queues
 are empty). A workgroup takes a ticket only when it is running and its current task (if any) waits for nothing more,
-and a task only waits for lower tickets of its queue or for data that sources push without waiting, so the grid
-needs no co-residency. Each queue holds:
+a ticket scan takes any queue's untaken producer ticket before a compute ticket (so every producer runs), and a task
+only waits for lower tickets of its queue or for data that sources push without waiting, so the grid needs no
+co-residency. Each queue holds:
   [0, producers)  P2P-write this rank's routes in the order the destinations' queues need them (ep_prep), then add
                   each route to arrived[its sorted block] on its destination.
   then            units of NG GateUp tiles of block u and ND Down tiles of block u - lag: Down, and the combine
@@ -190,6 +191,10 @@ def compile_ep_mega(
             """(queue, ticket) of this workgroup's next task; ticket -1 when every queue is empty.
 
             prefetched: wave 0's ticket of the home queue taken during the previous task (possibly past its end).
+            Without one, untaken producer tickets of any queue come before compute tickets: a GateUp may wait for
+            every producer, so with fewer workgroups than the queues need (a grid on some XCDs only), producers left
+            in another queue would never run. Producer tasks prefetch nothing, so the workgroup that takes the last
+            producer scans again after it, and none is left.
             """
             if const_expr(after_task):
                 # The previous task's last LDS reads are done before the slots are overwritten.
@@ -208,17 +213,23 @@ def compile_ep_mega(
                     got = (early < queue_tasks(home)).select(early, fx.Int32(-1))
                 if got < 0:
                     open_mask = fx.Int32(0)
+                    prod_mask = fx.Int32(0)
                     for q in range_constexpr(queues):
                         seen = _uniform(
                             _atomic_load_at(sched + fx.Int64(q * 4), "agent-one-as")
                         )
+                        bit = fx.Int32(1 << q)
                         open_mask = open_mask | (
                             seen < queue_tasks(fx.Int32(q))
-                        ).select(fx.Int32(1 << q), fx.Int32(0))
+                        ).select(bit, fx.Int32(0))
+                        prod_mask = prod_mask | (seen < queue_producers).select(
+                            bit, fx.Int32(0)
+                        )
+                    mask = (prod_mask != 0).select(prod_mask, open_mask)
                     tries = fx.Int32(0)
                     while (got < 0) & (tries < queues):
                         cand = (home + tries) & (queues - 1)
-                        if ((open_mask >> cand) & 1) != 0:
+                        if ((mask >> cand) & 1) != 0:
                             taken = _uniform(lane0_add(sched + fx.Int64(cand * 4), 1))
                             got = (taken < queue_tasks(cand)).select(
                                 taken, fx.Int32(-1)

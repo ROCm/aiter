@@ -29,6 +29,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ..cvt import _abs_bits
 from ..hw import _sched_fence
 from ..hw import _u as _uniform
 from .util import (
@@ -598,10 +599,11 @@ def gateup_task_emitter(
                     gate = gate_values[element]
                     up = up_values[element]
                     if const_expr(swiglu_limit > 0):
-                        gate = fx.minnumf(gate, fx.Float32(swiglu_limit))
-                        up = fx.maxnumf(
-                            fx.minnumf(up, fx.Float32(swiglu_limit)),
-                            fx.Float32(-swiglu_limit),
+                        # Selects, not minnumf / maxnumf, which would turn a NaN into the limit.
+                        limit = fx.Float32(swiglu_limit)
+                        gate = (gate > limit).select(limit, gate)
+                        up = (up > limit).select(
+                            limit, (up < -limit).select(-limit, up)
                         )
                     exponent = fx.exp2(gate * -LOG2E, fastmath="afn")
                     with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
@@ -610,13 +612,12 @@ def gateup_task_emitter(
                 return result
 
             def row_max(row):
-                partial = Vec(
-                    lds_view(ROW_MAX_BASE + row * 4, col_waves).load()
-                ).bitcast(fx.Float32)
-                peak = partial[0]
+                """The row's amax from the column waves' partials (``_abs_bits`` maxima)."""
+                partial = Vec(lds_view(ROW_MAX_BASE + row * 4, col_waves).load())
+                peak = fx.Int32(partial[0])
                 for wave_col in range_constexpr(1, col_waves):
-                    peak = fx.maxnumf(peak, partial[wave_col])
-                return peak
+                    peak = fx.max(peak, fx.Int32(partial[wave_col]))
+                return peak.bitcast(fx.Float32)
 
             def fp8_epilogue(block, n_tile):
                 # Padding rows (zero A rows) are written too: FP8 zeros with scale 0.
@@ -632,21 +633,22 @@ def gateup_task_emitter(
                     for m_slice in range_constexpr(m_slices)
                 ]
                 for m_slice in range_constexpr(m_slices):
-                    peak = fx.Float32(0.0)
+                    peak = fx.Int32(0)
                     for gate_values in values[m_slice]:
                         for value in gate_values:
-                            peak = fx.maxnumf(peak, fx.absf(value))
+                            peak = fx.max(peak, _abs_bits(value))
                     # Lanes l, l ^ 16, l ^ 32, l ^ 48 hold this wave's other columns of row l % 16. shuffle_xor's
                     # ds_swizzle raises the task loop's scratch ops from 2 to 9, and an unmasked index (lane is
                     # opaque) keeps shuffle_idx's bounds check: each costs ~1% at 64 tokens per rank (wq fp4).
                     for shift in (16, 32):
-                        peak = fx.maxnumf(
-                            peak, fx.gpu.shuffle_idx(peak, (lane ^ shift) & 63, 64)
+                        peak = fx.max(
+                            peak,
+                            fx.Int32(fx.gpu.shuffle_idx(peak, (lane ^ shift) & 63, 64)),
                         )
                     if lane < 16:
                         lds_view(
                             ROW_MAX_BASE + (slice_rows[m_slice] + lane) * 4 + wave_n, 1
-                        ).store(Vec.from_elements([peak.bitcast(fx.Int32)], fx.Int32))
+                        ).store(Vec.from_elements([peak], fx.Int32))
                 rocdl.s_waitcnt(lgkmcnt=0)
                 barrier()
                 for m_slice in range_constexpr(m_slices):

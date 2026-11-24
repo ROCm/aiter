@@ -27,9 +27,10 @@ QX 0: one scale per row, applied in the epilogue); SiLU / SiTUv2; fp8 a2 + one f
 per (row, 128 cols), written through; done[b] += 1.
 gemm2(b, n): waits until done[b] = I / 128; 128 rows x 256 out cols; a2 rescaled per
 128-K group; times the route weight; BF16 atomics into out[token] of the source rank.
-A task only waits for producers (which never wait) or for lower tickets of its queue
-(held by running workgroups whose tasks wait for nothing more), so the grid needs no
-co-residency.
+A ticket scan takes any queue's untaken producer ticket before a compute ticket, so every
+producer runs. A task then only waits for producers (which never wait) or for lower
+tickets of its queue (held by running workgroups whose tasks wait for nothing more), so
+the grid needs no co-residency.
 """
 
 import flydsl.compiler as flyc
@@ -44,7 +45,7 @@ from flydsl.expr.typing import Vector as Vec
 from ..act import gate_up_act, situ_params
 from . import comm, host
 from .atomic import _atomic_add_at, _atomic_load_at, _inv_l1, _xcc_id
-from .cvt import _channel_factor, _fp8x4_pack
+from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
 from .hw import (
     CM_NT,
     CM_SC1,
@@ -305,27 +306,38 @@ def ep_mega_kernel(
         def take_ticket(after_task):
             """(queue, ticket) of this workgroup's next task; ticket -1 when all queues are
             empty. Plain loads find the queues that may still hold tasks first (an atomic
-            per leftover workgroup slows the tasks still running)."""
+            per leftover workgroup slows the tasks still running). Untaken producer
+            tickets of any queue come before the home queue's compute tickets: a compute
+            task may wait for every producer, so with fewer workgroups than the queues
+            need (a grid on some XCDs only), producers left in another queue would never
+            run. The workgroup that takes the last producer scans again after it, so none
+            is left."""
             if const_expr(after_task):
                 gpu.barrier()  # the previous task's LDS reads are done
             if wave0 == fx.Int32(0):
                 home = _xcc_id()
                 open_mask = fx.Int32(0)
+                prod_mask = fx.Int32(0)
                 for q in range_constexpr(QUEUES):
                     seen = _u(
                         _atomic_load_at(
                             sched0 + fx.Int64(q * QSTRIDE * 4), "agent-one-as"
                         )
                     )
+                    bit = fx.Int32(1 << q)
                     open_mask = open_mask | (seen < queue_tasks(fx.Int32(q))).select(
-                        fx.Int32(1 << q), fx.Int32(0)
+                        bit, fx.Int32(0)
                     )
+                    prod_mask = prod_mask | (seen < fx.Int32(QPROD)).select(
+                        bit, fx.Int32(0)
+                    )
+                mask = (prod_mask != fx.Int32(0)).select(prod_mask, open_mask)
                 got = fx.Int32(-1)
                 cand = home
                 tries = fx.Int32(0)
                 while (got < fx.Int32(0)) & (tries < fx.Int32(QUEUES)):
                     cand = (home + tries) & fx.Int32(QUEUES - 1)
-                    if ((open_mask >> cand) & fx.Int32(1)) != fx.Int32(0):
+                    if ((mask >> cand) & fx.Int32(1)) != fx.Int32(0):
                         taken = _u(
                             lane0_add(
                                 sched0 + fx.Int64(cand * fx.Int32(QSTRIDE * 4)), 1
@@ -758,13 +770,13 @@ def ep_mega_kernel(
                     nb * fx.Int32(NI) + wave * fx.Int32(NIW) + lane_div_16 * fx.Int32(4)
                 )
                 for mi in range_constexpr(MR):
-                    am = fx.Float32(0.0)
+                    am = fx.Int32(0)
                     for c in range_constexpr(NC1):
                         for v in range_constexpr(4):
-                            am = fx.maxnumf(am, fx.absf(ys[mi, c][v]))
-                    am = fx.maxnumf(am, am.shuffle_xor(16, 64))
-                    am = fx.maxnumf(am, am.shuffle_xor(32, 64))
-                    lds_f32[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
+                            am = fx.max(am, _abs_bits(ys[mi, c][v]))
+                    am = fx.max(am, am.shuffle_xor(16, 64))
+                    am = fx.max(am, am.shuffle_xor(32, 64))
+                    lds[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
                 gpu.barrier()
                 out_rs = _rsrc(a["a2"], fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I))
                 os_rs = _rsrc(
@@ -772,19 +784,20 @@ def ep_mega_kernel(
                 )
                 grp = wave // fx.Int32(WPG)
                 for mi in range_constexpr(MR):
-                    am = fx.Float32(0.0)
                     pv = Vec(
                         lds_vec_load(
                             lds_i32,
                             (rows[mi] * fx.Int32(NW) + grp * fx.Int32(WPG))
                             * fx.Int32(4),
-                            Vec.make_type(WPG, fx.Float32),
-                            fx.Float32,
+                            Vec.make_type(WPG, fx.Int32),
+                            fx.Int32,
                             align=4 * WPG,
                         )
                     )
-                    for j in range_constexpr(WPG):
-                        am = fx.maxnumf(am, fx.Float32(pv[j]))
+                    am = fx.Int32(pv[0])
+                    for j in range_constexpr(1, WPG):
+                        am = fx.max(am, fx.Int32(pv[j]))
+                    am = am.bitcast(fx.Float32)
                     s = (am == 0.0).select(
                         fx.Float32(1.0), am * fx.Float32(1.0 / 240.0)
                     )
