@@ -174,16 +174,29 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
-    # Short-K: panel=4 (c_relocate needs stages==1 and regresses on huge-N).
-    # Mid-K: panel=8. Long-K / nb3/nb4 keep legacy 8/4/1.
+    # Short-K: panel=4 (persistent: 1, for c_relocate). Mid-K: panel=8.
+    # Long-K / nb3 keep legacy 8/4. nb4 with one K-tile per slot takes panel=16:
+    # at panel=1 each stage is a 256-row x 4-byte A-scale TDM, and the A/B
+    # fragment reads of waves 0 and 2 stall on LDS (~1.9x slower at K=8192).
+    # Wider panels also cut the sectors wasted when the K/32-byte A-scale row
+    # pitch is not 32-byte aligned (K=4224: 132 bytes).
+    # The 32x4-preshuffled A-scale loads 8 x 128-byte rows and has no such cost.
     SA_PANEL_STAGES = (
         (
-            _SA_PANEL_CLASS0
-            if k_tiles_class == 0 and num_buffers == 2
+            1
+            if k_tiles_class == 0 and num_buffers == 2 and persistent_n_tiles > 1
             else (
-                _SA_PANEL_CLASS1
-                if k_tiles_class == 1 and num_buffers == 2
-                else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+                _SA_PANEL_CLASS0
+                if k_tiles_class == 0 and num_buffers == 2
+                else (
+                    _SA_PANEL_CLASS1
+                    if k_tiles_class == 1 and num_buffers == 2
+                    else (
+                        16
+                        if num_buffers == 4 and KPAIR == 1
+                        else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+                    )
+                )
             )
         )
         if mx32 and not a_scale_preshuffled
@@ -192,6 +205,8 @@ def launch_gemm_a8w8_256x256(
     SA_PANEL_WIDTH = SA_PANEL_STAGES * (SUPER_K // 32)
     SA_PANEL_PAD = 4 if SA_PANEL_STAGES > 1 else 0
     SA_PANEL_ROW = SA_PANEL_WIDTH + SA_PANEL_PAD
+    # A-scale panel slots; a panel is loaded (SA_RING - 1) panels ahead of use.
+    SA_RING = 2 if SA_PANEL_STAGES >= 16 else num_buffers
     LDS_PAD_A = 16
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
@@ -216,7 +231,7 @@ def launch_gemm_a8w8_256x256(
     PLANAR_B_BASE = 0
     PLANAR_A_BASE = PLANAR_B_BASE + num_buffers * STAGE_B
     PLANAR_SA_BASE = PLANAR_A_BASE + num_buffers * STAGE_A
-    PLANAR_SB_BASE = PLANAR_SA_BASE + num_buffers * STAGE_SA
+    PLANAR_SB_BASE = PLANAR_SA_BASE + SA_RING * STAGE_SA
     PLANAR_END = PLANAR_SB_BASE + num_buffers * STAGE_SB
 
     partial_elem = (
@@ -615,7 +630,7 @@ def launch_gemm_a8w8_256x256(
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):
             if const_expr(SA_PANEL_STAGES > 1):
-                slot = (wave == 2).select(sa_panel % num_buffers, fx.Int32(slot))
+                slot = (wave == 2).select(sa_panel % SA_RING, fx.Int32(slot))
                 tile_delta = (wave == 2).select(sa_panel * SA_PANEL_WIDTH, tile_delta)
             desc = tdm_ops.update_tensor_descriptor_2d_lds_addr(
                 tdm_desc,
@@ -669,8 +684,22 @@ def launch_gemm_a8w8_256x256(
                             fx.make_rmem_tensor(8, fx.Float32)
                         )
         # Pin Acc@512 so A/B ping-pong owns the low half (mxfp4 partition).
+        acc_zero = None
+        if const_expr(persistent_n_tiles > 1 and _HAS_SCHED_VGPR):
+            # A constant zero is loop-invariant, so its pinned copies get hoisted
+            # out of the tile loop and spilled; an opaque zero keeps them per tile.
+            zf = fx.Float32(
+                llvm_dialect.inline_asm(
+                    T.f32, [], "s_mov_b32 $0, 0", "=s", has_side_effects=True
+                )
+            )
+            acc_zero = Vec.from_elements([zf] * 8, fx.Float32)
         for cf_i, cf in enumerate(c_frags):
-            z = fx.constant_vector(0.0, T.vec(8, T.f32))
+            z = (
+                fx.constant_vector(0.0, T.vec(8, T.f32))
+                if const_expr(acc_zero is None)
+                else acc_zero
+            )
             if const_expr(_HAS_SCHED_VGPR):
                 z = _pin_acc_vec(z, cf_i)
             cf.store(z)
@@ -821,10 +850,6 @@ def launch_gemm_a8w8_256x256(
         # Mid-K: consecutive DS parking + 1×b128 producers (best on 25600×6144).
         DENSE_MIDK = const_expr(ASM_PIPE_ACTIVE and k_tiles_class == 1)
         BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE)
-        # Load-before-MMA on mid/long-K persistent only (short-K / non-ps regress).
-        LOAD_FIRST = const_expr(
-            ASM_PIPE_ACTIVE and k_tiles_class > 0 and persistent_n_tiles > 1
-        )
         # Scale pin helps huge-N mid-K; global pin regresses short-K (~2×).
         PIN_SCALE_ACTIVE = const_expr(
             _HAS_SCHED_VGPR and k_tiles_class == 1 and persistent_n_tiles > 1
@@ -892,7 +917,7 @@ def launch_gemm_a8w8_256x256(
             if const_expr(mx32):
                 if const_expr(SA_PANEL_STAGES > 1):
                     panel = sa_super // SA_PANEL_STAGES
-                    panel_slot = panel % num_buffers
+                    panel_slot = panel % SA_RING
                     panel_k = (sa_super % SA_PANEL_STAGES) * (SUPER_K // 32)
                     addr = (
                         _planar_base(
@@ -1016,7 +1041,7 @@ def launch_gemm_a8w8_256x256(
 
             def _prep():
                 if const_expr(SA_PANEL_STAGES > 1):
-                    sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
+                    sa_next_panel = sa_super // SA_PANEL_STAGES + SA_RING
                     sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
                         sa_next_panel
                         < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
@@ -1076,15 +1101,10 @@ def launch_gemm_a8w8_256x256(
                             if const_expr(BEAT_ACTIVE):
                                 _asm_beat()
 
-                    # Default: MMA then load (hide load behind next MMA).
-                    # LOAD_FIRST: issue ds_load before this slot's WMMA — can
-                    # remove WMMA→DS va_vdst(0) adjacency (A/B measured).
-                    if const_expr(LOAD_FIRST):
-                        _do_load()
-                        _do_mma()
-                    else:
-                        _do_mma()
-                        _do_load()
+                    # MMA then load: the load refills a pinned fragment slot that
+                    # this slot's WMMA may still read.
+                    _do_mma()
+                    _do_load()
                     if const_expr(pos == last and n_lead):
                         if const_expr(BEAT_ACTIVE):
                             _asm_sched_hint(max(0, n_lead - 1))
@@ -1580,8 +1600,12 @@ def launch_gemm_a8w8_256x256(
                 if defer == 0:
                     tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
             elif const_expr(SA_PANEL_STAGES > 1):
-                sa_seed = (fx.Int32(i * SA_PANEL_STAGES) < SUPERS).select(
-                    fx.Int32(1), fx.Int32(0)
+                sa_seed = (
+                    (fx.Int32(i * SA_PANEL_STAGES) < SUPERS).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    if const_expr(i < SA_RING)
+                    else fx.Int32(0)
                 )
                 tdm_ops.tensor_load_2d(
                     _prepare_tdm(i, seed_delta, fx.Int32(i), sa_seed)
