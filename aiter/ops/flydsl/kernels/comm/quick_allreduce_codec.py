@@ -348,6 +348,12 @@ def scale_slot_of(tid, block: int = BLOCK):
     return scale_slot, pair_in_slot
 
 
+def is_scale_leader(tid):
+    """Whether *tid* is the lowest thread of its scale group: the one that
+    stores, or re-arms, the group's scale byte word."""
+    return (tid % GROUP) == 0
+
+
 def hi_slot_of(tid, share):
     """(hi_leader, hi_slot) for the extra-bit plane.
 
@@ -610,8 +616,7 @@ def _codec_quant(codec, atom, lane, tid):
     words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
     if codec.hi2_i32_off is not None:
         words = (words[0], _compact_hi(words[1], lane, codec.hi_bits))
-    is_leader = (tid % GROUP) == 0
-    return words, _pack_e4m3_word(e, lane), is_leader
+    return words, _pack_e4m3_word(e, lane), is_scale_leader(tid)
 
 
 def _codec_dequant(codec, words, scale, tid, acc=None):
@@ -689,7 +694,7 @@ def lamport_fix(codec, words, tid):
     if codec.hi2_i32_off is not None and codec.hi_bits == 1:
         hi = words[1]
         hit = hi == sentinel
-        leader = (tid & fx.Int32(codec.hi_share - 1)) == fx.Int32(0)
+        leader, _ = hi_slot_of(tid, codec.hi_share)
         nib = hit.select(leader.select(nib | fx.Int32(0xF), nib), nib)
         rest = (hit.select(hi & fx.Int32(-2), hi),)
     nib = (nib == sentinel).select(nib ^ fx.Int32(1), nib)
@@ -708,7 +713,7 @@ def lamport_slots(codec, tid, scale_slot):
         slots.append(
             (
                 fx.Int32(codec.scale_i32_off) + scale_slot,
-                (tid % fx.Int32(GROUP)) == fx.Int32(0),
+                is_scale_leader(tid),
             )
         )
     return slots

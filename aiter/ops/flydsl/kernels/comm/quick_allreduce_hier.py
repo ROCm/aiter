@@ -101,7 +101,6 @@ from ...allreduce_policy import (
     HIER_SUPER_TILES,
 )
 from .quick_allreduce_codec import (
-    GROUP,
     SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
@@ -111,6 +110,7 @@ from .quick_allreduce_codec import (
     _i32,
     _scale_from_word,
     codecs_for_block,
+    is_scale_leader,
     lamport_fix,
     scale_slot_of,
     thread_lane,
@@ -146,6 +146,8 @@ from .transport import (
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    fanout_quad,
+    fanout_stripes,
     make_pack_storage,
 )
 
@@ -427,31 +429,36 @@ def make_quick_allreduce_hier_kernel(
                 base = (j == fx.Int32(i)).select(peers[push_ranks[i]], base)
             return base
 
-        # Slot offsets, by arithmetic rather than a layout: at G = 4 or 8 a
-        # unit mode would not survive coalescing (see the ring kernel).
-        def _local_slot(base, slot, payload, n, idx, sub, buf):
-            row = bid if buf is None else buf * fx.Int32(grid) + bid
-            return (
-                fx.Int32(base)
-                + (row * fx.Int32(n) + idx) * fx.Int32(slot)
-                + sub * fx.Int32(payload)
+        # Slot layouts: (buffer, block, member, sub-tile) -> i32 offset, as the
+        # mesh's ``wire_slot_layout``. The member is the source local index on
+        # a mesh lap, the hop on a ring lap, the group on the cross lap.
+        def _slot_layout(buffers, n, slot, payload):
+            return fx.make_layout(
+                (buffers, grid, n, super_tile),
+                (grid * n * slot, n * slot, slot, payload),
+            )
+
+        rs_layout = _slot_layout(local_buffers, rs_n, rs_slot, rs_payload)
+        ag_layout = _slot_layout(local_buffers, ag_n, ag_slot, ag_payload)
+        x_layout = _slot_layout(x_buffers, 2, x_slot, x_payload)
+
+        def _slot_off(base, layout, buf, member, sub):
+            """*buf* is the Lamport buffer; ``None`` on the flag handshake,
+            which has one local buffer."""
+            buf = fx.Int32(0 if buf is None else buf)
+            return fx.Int32(base) + fx.get_scalar(
+                fx.crd2idx((buf, bid, fx.Int32(member), sub), layout)
             )
 
         def _rs_slot(idx, sub, buf=None):
-            """Mesh: *idx* is the source local index. Ring: the hop. *buf* is
-            the Lamport buffer (None on the flag handshake, which has one)."""
-            return _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub, buf)
+            """Mesh: *idx* is the source local index. Ring: the hop."""
+            return _slot_off(rs_base, rs_layout, buf, idx, sub)
 
         def _ag_slot(idx, sub, buf=None):
-            return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub, buf)
+            return _slot_off(ag_base, ag_layout, buf, idx, sub)
 
         def _x_slot(parity, grp, sub):
-            return (
-                fx.Int32(x_base)
-                + ((parity * fx.Int32(grid) + bid) * fx.Int32(2) + fx.Int32(grp))
-                * fx.Int32(x_slot)
-                + sub * fx.Int32(x_payload)
-            )
+            return _slot_off(x_base, x_layout, parity, grp, sub)
 
         def _lds_write_packet(c, row, words, scale, is_leader):
             pack = packs[c.name]
@@ -487,20 +494,12 @@ def make_quick_allreduce_hier_kernel(
             a stripe, as in the mesh.
             """
             width_max = min(8, quads_per_block // n_push)
-            stripes = [
-                (b, min(width_max, c.n_sectors - b))
-                for b in range(0, c.n_sectors, width_max)
-            ]
+            stripes = fanout_stripes(c.n_sectors, width_max)
             for k in range_constexpr(rank_atoms):
                 for sector_base, width in stripes:
-                    n_quads = fx.Int32(n_push * width)
-                    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
-                    if const_expr(sector_fastest):
-                        j = safe % fx.Int32(n_push)
-                        sector_in_stripe = safe // fx.Int32(n_push)
-                    else:
-                        j = safe // fx.Int32(width)
-                        sector_in_stripe = safe % fx.Int32(width)
+                    n_quads, j, sector_in_stripe = fanout_quad(
+                        quad_id, n_push, width, sector_fastest
+                    )
                     sector = fx.Int32(sector_base) + sector_in_stripe
                     if quad_id < n_quads:
                         vec_idx = sector * fx.Int32(16) + lane_in_quad * fx.Int32(4)
@@ -521,7 +520,7 @@ def make_quick_allreduce_hier_kernel(
             for rnd in range_constexpr(-(-n_total // quads_per_block)):
                 s = quad_id + fx.Int32(rnd * quads_per_block)
                 if s < fx.Int32(n_total):
-                    flat = s * fx.Int32(16) + lane_in_quad * fx.Int32(4)
+                    flat = (tid + fx.Int32(rnd * block)) * fx.Int32(4)
                     v4 = fx.ptr_load(
                         smem_ptr + flat,
                         result_type=fx.Vector.make_type(4, fx.Int32),
@@ -732,7 +731,7 @@ def make_quick_allreduce_hier_kernel(
                 _ag_slot(fx.Int32(0), fx.Int32(0)) + fx.Int32(ag_release),
                 color,
             )
-            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            is_leader = is_scale_leader(tid)
             for _h in range_constexpr(G - 1):
                 h = _h + 2
                 chunk = (li - h + 1) % G
@@ -908,7 +907,7 @@ def make_quick_allreduce_hier_kernel(
         def _ag_ring_lamport(i, n_this, buf):
             """Hops ``2 .. G`` on the ring: as ``_ag_ring``, sub-tile by
             sub-tile. The forwarded bytes are already off the sentinel."""
-            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            is_leader = is_scale_leader(tid)
             for _h in range_constexpr(G - 1):
                 h = _h + 2
                 chunk = (li - h + 1) % G

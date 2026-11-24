@@ -39,7 +39,6 @@ from ...allreduce_policy import (
     SUPPORTED_WORLDS,
 )
 from .quick_allreduce_codec import (
-    GROUP,
     SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
@@ -47,6 +46,7 @@ from .quick_allreduce_codec import (
     _codec_quant,
     _scale_from_word,
     codecs_for_block,
+    is_scale_leader,
     lamport_fix,
     scale_slot_of,
     thread_lane,
@@ -581,7 +581,7 @@ def make_quick_allreduce_ring_kernel(
             writes an all-gather one.
             """
             chunk = _chunk_of(k)
-            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            is_leader = is_scale_leader(tid)
             if const_expr(k >= world_size):
                 # Ahead of the receive, so the HBM latency hides behind it.
                 _begin_chunk(tile, chunk, recv)

@@ -102,6 +102,8 @@ from .transport import (
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    fanout_quad,
+    fanout_stripes,
     make_pack_storage,
 )
 
@@ -318,10 +320,7 @@ def make_quick_allreduce_mesh_kernel(
     stripe_width = quads_per_block // n_push
     if knobs.stripe == "cap8":
         stripe_width = min(8, stripe_width)
-    stripes = [
-        (b, min(stripe_width, c.n_sectors - b))
-        for b in range(0, c.n_sectors, stripe_width)
-    ]
+    stripes = fanout_stripes(c.n_sectors, stripe_width)
     # ``fanout`` knob: either quad order is a bijection of the stripe's
     # (destination, sector) pairs onto quads (see ``_fanout_nt``), so forcing
     # one moves stores between lanes but not between addresses.
@@ -600,16 +599,9 @@ def make_quick_allreduce_mesh_kernel(
             """
             for k in range_constexpr(rank_atoms):
                 for sector_base, width in stripes:
-                    n_quads = fx.Int32(n_push * width)
-                    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
-                    if const_expr(sector_fastest):
-                        # sector fastest
-                        j = safe % fx.Int32(n_push)
-                        sector_in_stripe = safe // fx.Int32(n_push)
-                    else:
-                        # peer fastest
-                        j = safe // fx.Int32(width)
-                        sector_in_stripe = safe % fx.Int32(width)
+                    n_quads, j, sector_in_stripe = fanout_quad(
+                        quad_id, n_push, width, sector_fastest
+                    )
                     sector = fx.Int32(sector_base) + sector_in_stripe
                     if quad_id < n_quads:
                         vec_idx = fx.get_scalar(

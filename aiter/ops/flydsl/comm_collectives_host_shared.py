@@ -703,8 +703,8 @@ def clamp_grid_cap(
     * The Lamport build keeps a sub-tile's polled packets live across its
       reduce, so it takes the smallest measurement for the world size, and
       ``_LAMPORT_RESIDENT_WGS_PER_CU`` on INT5, INT6 and FP16.
-    * ``prefetch=1`` carries a tile's atoms across the poll, so it takes 
-      one workgroup off. The other knobs stay within the tables; ``lds_bufs=2`` 
+    * ``prefetch=1`` carries a tile's atoms across the poll, so it takes
+      one workgroup off. The other knobs stay within the tables; ``lds_bufs=2``
       is bounded by the host's LDS clamp.
     * A *block* wider than ``BLOCK`` scales the answer down by the wave slots
       it takes. That is a model, not a measurement; the fused host also

@@ -140,6 +140,28 @@ def _i32_to_bytes(i32_off):
     return fx.Int64(i32_off) * fx.Int64(I32_BYTES)
 
 
+def fanout_stripes(n_sectors, width):
+    """``[(first sector, width)]`` of the stripes of up to *width* sectors that
+    cover a rank-tile of *n_sectors* 64 B sectors."""
+    return [(b, min(width, n_sectors - b)) for b in range(0, n_sectors, width)]
+
+
+def fanout_quad(quad_id, n_push, width, sector_fastest):
+    """``(n_quads, dest, sector_in_stripe)`` of a quad in one fanout stripe.
+
+    One quad per (destination, sector) of a stripe, the quads past ``n_quads``
+    idle. Either order is a bijection of the pairs onto quads: *sector_fastest*
+    puts consecutive quads on consecutive destinations of one sector, else on
+    consecutive sectors of one destination. Idle quads get destination 0, so
+    the result is always safe to index with.
+    """
+    n_quads = fx.Int32(n_push * width)
+    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
+    if sector_fastest:
+        return n_quads, safe % fx.Int32(n_push), safe // fx.Int32(n_push)
+    return n_quads, safe // fx.Int32(width), safe % fx.Int32(width)
+
+
 def _to_sgpr_i64(addr):
     """Copy a wave-uniform i64 from vector to scalar registers."""
     return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
