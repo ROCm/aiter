@@ -98,7 +98,10 @@ def make_inputs(T, H, device="cuda", seed=0):
 # post: a regular seam; no_post: an Engram seam, whose post block runs separately;
 # identity_pre: pre_mix=None, as at the draft model's entry seam
 @pytest.mark.parametrize("mode", ["post", "no_post", "identity_pre"])
-@pytest.mark.parametrize("T", [1, 100, 384, 16384])
+# T=1 exercises the M_LEQ_16 bucket; T=17 and T=64 cover the M_LEQ_64 bucket
+# (the gfx1250 raised-split 80/64 schedule) at its lower edge and boundary;
+# 100/384/16384 cover the larger, gfx942-identical buckets.
+@pytest.mark.parametrize("T", [1, 17, 64, 100, 384, 16384])
 def test_mhc_fused_post_pre_delayed_rmsnorm(T, mode):
     residual, y, fn, hc_scale, hc_base, post, comb, pre, w = make_inputs(T, 5120)
     kw = {"norm_weight": w}

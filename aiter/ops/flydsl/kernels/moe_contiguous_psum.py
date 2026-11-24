@@ -17,6 +17,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
 
+from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -649,13 +650,20 @@ def build_moe_route_psum_fused_module():
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
         # The allocator's typed pointer keeps the counter in shared memory.
+        # A route to expert -1, or to an id at or past E, claims no slot and
+        # gets DROPPED_ROUTE_ROW, as in the split-kernel route. The store is in
+        # the else so a valid route is written once.
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            e = topk_p[route_i32]
-            ptr = lds_cnt + e
-            slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            rows_p[route_i32] = row
+            e = fx.Int32(topk_p[route_i32])
+            routed = (e >= fx.Int32(0)) & (e < experts)
+            if routed:
+                ptr = lds_cnt + e
+                slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
+                row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
+                rows_p[route_i32] = row
+            else:
+                rows_p[route_i32] = fx.Int32(DROPPED_ROUTE_ROW)
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.
@@ -692,12 +700,14 @@ def build_moe_route_psum_fused_module():
 
         # Phase D: in-place masked -> contiguous row remap.
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(rows_p[route_i32])
-            m = fx.Uint32(max_m)
-            expert = row // m
-            slot = row - expert * m
-            start = fx.Uint32(s_p[expert])
-            rows_p[route_i32] = start + slot
+            row_raw = rows_p[route_i32]
+            if fx.Int32(row_raw) >= 0:
+                row = fx.Uint32(row_raw)
+                m = fx.Uint32(max_m)
+                expert = row // m
+                slot = row - expert * m
+                start = fx.Uint32(s_p[expert])
+                rows_p[route_i32] = start + slot
 
     @flyc.jit
     def launch_route_psum_fused(
