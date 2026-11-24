@@ -9,6 +9,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     global_typed_ptr,
     lds_typed_ptr,
@@ -235,7 +236,7 @@ def _reduce_bf16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         slot = packed[mr] >> fx.Int32(24)
-        if token_id < i32_M:
+        if (token_id < i32_M) & (slot < fx.Int32(TOPK)):
             row_base_addr = (
                 (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
                 + n_block_idx * fx.Int32(BN)
@@ -467,6 +468,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, shared_t
     return total_work
 
 
+@aot_factory("moe_a16wmix_gemm2")
 @functools.cache
 def compile_gemm2_a16w4_port(
     BM=32,

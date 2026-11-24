@@ -14,22 +14,11 @@ from aiter.ops.triton.utils.shuffle import (
     gptq_to_gemm_a16w4,
     pack_gemm_a16w4_weight,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Archs with gemm_a16w4 configs.
 SUPPORTED_ARCHS = ("gfx942", "gfx1100")
 
-# (N, K) of the linear layers of Llama-3-8B (also Mistral-7B) and Qwen2.5-7B:
-# fused qkv, o, fused gate_up and down projections.
-MODEL_SHAPES = [
-    (6144, 4096),
-    (4096, 4096),
-    (28672, 4096),
-    (4096, 14336),
-    (4608, 3584),
-    (3584, 3584),
-    (37888, 3584),
-    (3584, 18944),
-]
 
 # Output tolerances (atol, rtol) for outputs with a standard deviation of about 1.
 TOLERANCES = {torch.float16: (2e-2, 1e-2), torch.bfloat16: (5e-2, 2e-2)}
@@ -111,17 +100,7 @@ def _check(out, ref, dtype):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
-def get_x_vals():
-    x_vals = [(1, 64, 128), (3, 72, 256), (17, 200, 384), (130, 520, 1024)]
-    x_vals += [
-        (M, N, K)
-        for N, K in MODEL_SHAPES
-        for M in (1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 8192)
-    ]
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=8, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_a16w4(M: int, N: int, K: int, dtype):
     _skip_if_unsupported_arch()

@@ -30,10 +30,12 @@ from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.plugin import route as _route
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
@@ -348,7 +350,19 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
-    target = GPUTarget("hip", gfx_version, warp_size)
+    # Compile for get_gfx_runtime() so gfx1250-strict never gets gfx1250-only instructions.
+    target_arch = gfx_version
+    try:
+        runtime_arch = get_gfx_runtime()
+    except (RuntimeError, KeyError):
+        runtime_arch = None
+    if (
+        runtime_arch
+        and runtime_arch != gfx_version
+        and base_gfx_arch(runtime_arch) == gfx_version
+    ):
+        target_arch = runtime_arch
+    target = GPUTarget("hip", target_arch, warp_size)
 
     # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
     # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
@@ -411,7 +425,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "num_ctas": 1,
         "enable_fp_fusion": True,
         "cluster_dims": [1, 1, 1],
-        "arch": gfx_version,
+        "arch": target_arch,
         "backend_name": "hip",
         "warp_size": warp_size,
         "name": (
@@ -642,6 +656,8 @@ def deepgemm_fp8_paged_mqa_logits_persistent_schedule(
     return out
 
 
+# The public entry is the routed op. It has no backend argument.
+@_route(op="fp8_paged_mqa_logits", version=1)
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache,
@@ -655,14 +671,20 @@ def deepgemm_fp8_paged_mqa_logits(
     ChunkK: int = 256,
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
-    VarCtxSchedule: torch.Tensor = None,
+    VarCtxSchedule: torch.Tensor | None = None,
     SplitKV: int | None = None,
-    PersistentSchedule: torch.Tensor = None,
+    PersistentSchedule: torch.Tensor | None = None,
 ):
     """Compute paged FP8 decode logits, optionally using a persistent CTA table.
 
+    Writes the logits into ``out_logits`` in place. Returns the cache key of
+    the compiled Triton kernel, which only AOT tools read. A kernel plugin
+    that serves the call has no such key and returns None.
+
     Build ``PersistentSchedule`` with the same query geometry, context lengths,
     ``max_model_len`` and ``ChunkK`` using the persistent schedule helper above.
+    With ``PersistentSchedule``, the kernels read the row lengths from it and
+    not from ``context_lens``.
     The caller initializes logits outside the context to ``-inf`` as on the
     SplitKV path. Persistent AOT binaries use a separate ``_persistent`` name.
     """
