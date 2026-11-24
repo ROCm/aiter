@@ -22,8 +22,8 @@ from aiter.ops.flydsl.kernels.comm.transport import (
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
     _canonicalize, _has_sentinel, SENTINEL_FILL_BYTE, INBOX_BUFFERS, ATOM_I32, ATOM_BYTES,
 )
-from aiter.ops.flydsl.allreduce_host_shared import _StEngine
-from aiter.ops.flydsl.one_shot_allreduce import _resolve_inbox_flags, resolve_link
+from aiter.ops.flydsl.comm_collectives_host_shared import _StEngine, resolve_inbox_flags
+from aiter.ops.flydsl.allreduce_policy import resolve_link
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64
 from aiter.ops.flydsl.kernels import communication_ops_utils as C
 
@@ -361,7 +361,7 @@ class FusedSliceAttnRes:
             nwaves = w if nwaves is None else nwaves
         self.nwg = int(nwg); self.nwaves = int(nwaves)
         link = resolve_link(link)
-        inbox_flags, resolved = _resolve_inbox_flags(inbox_memory, world_size, link)
+        inbox_flags, resolved = resolve_inbox_flags(inbox_memory, world_size, link)
         self.spec = build_fused_slice(world_size, nvb, self.nwg, self.nwaves, rank, hidden, num_tokens, resolved)
         self._eng = _StEngine(spec=self.spec, group=group, rank=self.rank,
                               world_size=self.world_size, inbox_flags=inbox_flags)

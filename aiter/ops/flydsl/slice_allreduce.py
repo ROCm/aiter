@@ -21,8 +21,8 @@ from aiter.ops.flydsl.kernels.comm.transport import (
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
     _canonicalize, _has_sentinel, SENTINEL_FILL_BYTE, INBOX_BUFFERS, ATOM_I32, ATOM_BYTES,
 )
-from aiter.ops.flydsl.allreduce_host_shared import _StEngine
-from aiter.ops.flydsl.one_shot_allreduce import _resolve_inbox_flags, resolve_link
+from aiter.ops.flydsl.comm_collectives_host_shared import _StEngine, resolve_inbox_flags
+from aiter.ops.flydsl.allreduce_policy import resolve_link
 
 WAVE = 64
 
@@ -164,7 +164,7 @@ class SliceAllReduce:
         self.rank = int(rank); self.world_size = int(world_size)
         self.device = device
         link = resolve_link(link)
-        inbox_flags, resolved = _resolve_inbox_flags(inbox_memory, world_size, link)
+        inbox_flags, resolved = resolve_inbox_flags(inbox_memory, world_size, link)
         self.spec = build_slice_allreduce(world_size, nwg, nwaves, rank, num_atoms, resolved)
         self._eng = _StEngine(spec=self.spec, group=group, rank=self.rank,
                               world_size=self.world_size, inbox_flags=inbox_flags)
