@@ -700,11 +700,29 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     max_num_tokens_padded = max_num_m_blocks * block_size
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    # The sort writes only the occupied prefix. A captured graph replays on the
+    # same addresses and does not clear them, so the tail would otherwise keep
+    # the previous replay's routes. Fill the sentinels the sort itself uses for
+    # padding: token id == M (out of range) and expert id == -1. Weight 0 drops
+    # a route that is read anyway. Eager keeps torch.empty.
+    if torch.cuda.is_current_stream_capturing():
+        sorted_ids = torch.full(
+            (max_num_tokens_padded,), M, dtype=dtypes.i32, device=device
+        )
+        sorted_weights = torch.zeros(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.full(
+            (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
+        )
+    else:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
@@ -742,8 +760,10 @@ def _moe_sorting_impl(
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
+        from aiter.utility.graph_alloc import capture_defined
+
         workspace = (
-            torch.empty(ws_size, dtype=torch.uint8, device=device)
+            capture_defined(ws_size, dtype=torch.uint8, device=device)
             if ws_size > 0
             else None
         )

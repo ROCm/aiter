@@ -13,7 +13,25 @@ capture sees deterministic allocations.
 
 import torch
 
+from aiter.utility.graph_alloc import persistent_alloc
+
+# Eager workspace, keyed by (device, stream). Two decode steps in flight must
+# not share it. A capture never uses this: its buffer has to come from that
+# graph's pool so a replay cannot clobber another graph's scratch.
 _workspace_cache = {}
+
+
+def _sorting_workspace(device, ws_size):
+    if torch.cuda.is_current_stream_capturing():
+        return torch.empty(ws_size, dtype=torch.int32, device=device)
+    stream = torch.cuda.current_stream(device).cuda_stream
+    key = (device, stream)
+    workspace = _workspace_cache.get(key)
+    if workspace is None or workspace.numel() < ws_size:
+        with persistent_alloc(device):
+            workspace = torch.empty(ws_size, dtype=torch.int32, device=device)
+        _workspace_cache[key] = workspace
+    return workspace
 
 
 def flydsl_moe_sorting_herd(
@@ -96,15 +114,11 @@ def flydsl_moe_sorting_fwd(
     topk = topk_ids.shape[1]
     device = topk_ids.device
 
-    # Pre-allocate workspace (cached per device for CUDA graph compatibility).
-    # A larger workspace can satisfy smaller requests, so we keep the largest seen.
+    # The multiphase sort clears this at the start of the call. It still has to
+    # be private to the stream (and, under capture, to the graph): a single
+    # device-global buffer is the scratch two overlapped decode replays share.
     ws_size = moe_sorting_get_workspace_size(M, num_experts, topk, unit_size)
-    workspace = None
-    if ws_size > 0:
-        workspace = _workspace_cache.get(device)
-        if workspace is None or workspace.numel() < ws_size:
-            workspace = torch.empty(ws_size, dtype=torch.int32, device=device)
-            _workspace_cache[device] = workspace
+    workspace = _sorting_workspace(device, ws_size) if ws_size > 0 else None
 
     moe_sorting_flydsl(
         topk_ids,

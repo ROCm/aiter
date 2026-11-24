@@ -1859,8 +1859,13 @@ def _flydsl_moe_stage1_impl(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
+    from aiter.utility.graph_alloc import capture_defined
+
+    # GEMM2 reads this shuffled scale in block tiles. The writer does not cover
+    # the padding, and a graph replay would otherwise leave the previous step's
+    # scales there.
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        capture_defined(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
