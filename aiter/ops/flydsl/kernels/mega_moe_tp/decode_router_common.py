@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Shared helpers: bf16x3 weight split of the decode-shape router GEMM.
+"""Shared helpers: bf16x3 weight split and the fp32 / int32 bit casts and Quark-even e8m0 / FP4 / FP8-amax arithmetic of the decode-shape router GEMM + input-quant launches.
 
 Ported from amd-kernels' ``moe/mxfp4_h6144_i768_e128_top4`` (``router_gemm.py``, ``router_topk.py``,
 ``common/loaders.py``, ``i3072/gemm1_prefill_h6144_i3072_persistent.py``, ``mxfp8/gemm1_prefill_h6144_i3072.py``),
@@ -8,7 +8,9 @@ Apache-2.0, "Copyright contributors to the amd-kernels project".
 """
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import range_constexpr
+from flydsl.expr.typing import T as _T
 
 PRELOAD_HINTS = {
     "llvm_options": {
@@ -39,3 +41,51 @@ def _split3(w):
                 a = a - (pk << 16).bitcast(fx.Float32)
                 b = b - (pk & -65536).bitcast(fx.Float32)
     return parts
+
+
+def _bits(f):
+    return fx.Float32(f).bitcast(fx.Int32)
+
+
+def _as_f32(i):
+    return fx.Int32(i).bitcast(fx.Float32)
+
+
+def _cvt_pk_fp4(old, a, b, scale_f32, sel):
+    """v_cvt_scalef32_pk_fp4_f32: two f32 / scale -> 2 e2m1 into byte ``sel``."""
+    return fx.Int32(
+        _llvm.call_intrinsic(
+            _T.i32,
+            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
+            [
+                fx.as_ir_value(old),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(scale_f32),
+                fx.as_ir_value(fx.Int32(sel)),
+            ],
+            [],
+            [],
+        )
+    )
+
+
+def _e8m0_even_e2m1(amax):
+    """Quark FP4 even scale of a nonnegative f32 amax, exponent byte >= 1: exponent(amax + half an e2m1 mantissa ulp,
+    0x200000) - 2, the subtraction folded into the bias (a signed shift for tiny inputs).
+    """
+    t = (_bits(amax) - fx.Int32(0xE00000)) >> 23
+    return (t > fx.Int32(1)).select(t, fx.Int32(1))
+
+
+def _fmax3_abs(a, b, c):
+    """Max of 3 absolute values by v_max3_f32 with |.| source modifiers (asm: the MLIR bridge lacks amdgcn.fmax3)."""
+    return fx.Float32(
+        _llvm.inline_asm(
+            _T.f32,
+            [fx.as_ir_value(fx.Float32(v)) for v in (a, b, c)],
+            "v_max3_f32 $0, |$1|, |$2|, |$3|",
+            "=v,v,v,v",
+            has_side_effects=False,
+        )
+    )

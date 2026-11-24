@@ -17,11 +17,14 @@ pytestmark = pytest.mark.skipif(
 H, E = 6144, 128
 
 
-@pytest.mark.parametrize("n", [1, 4, 8, 16, 17, 24, 32])
-def test_partials_sum_is_the_logits(n):
+@pytest.mark.parametrize(
+    "n", [1, 4, 8, 16, 17, 24, 32, 33, 48, 57, 58, 64, 65, 96, 128]
+)
+@pytest.mark.parametrize("lines", [True, False])
+def test_partials_sum_is_the_logits(n, lines):
     g = torch.Generator(device="cuda").manual_seed(n)
     w = (torch.randn(E, H, device="cuda", generator=g) * 0.05).float().contiguous()
     x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16, generator=g)
-    p = router_gemm_partials(x, w, router_line_layout(w))
+    p = router_gemm_partials(x, w, router_line_layout(w) if lines else None)
     ref = x.double() @ w.double().T
     torch.testing.assert_close(p.double().sum(1), ref, rtol=1e-4, atol=1e-4)
