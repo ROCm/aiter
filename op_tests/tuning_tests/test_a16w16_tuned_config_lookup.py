@@ -4,13 +4,16 @@
 ``get_GEMM_A16W16_tuned_config`` returns the tuned row or None, and
 ``get_GEMM_A16W16_config`` still builds its default on a miss.
 
-Requires torch (importing ``aiter`` pulls it in); it does not need a GPU.
+Requires torch (importing ``aiter`` pulls it in). Only the test of the real
+hipBLASLt binding needs a GPU; it is skipped without one.
 
 Run:
     python3 -m unittest op_tests.tuning_tests.test_a16w16_tuned_config_lookup -v
 """
 
 import csv
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -106,6 +109,22 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         )
         self.assertIsNone(tuned_config)
         self.assertEqual(config["libtype"], "torch")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU for hipBLASLt")
+    def test_real_lookup_of_unknown_solution_index_is_skipped(self):
+        """The real binding must raise, not exit, on an unknown index.
+
+        A subprocess runs it, so an exit fails this test and keeps the runner.
+        """
+        code = (
+            "import aiter.tuned_gemm as tuned\n"
+            "print(tuned._hipblaslt_solution_matches(2147483647, 'tuned_k'))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "False")
 
 
 class TestGfx1250StrictOpusRow(unittest.TestCase):
