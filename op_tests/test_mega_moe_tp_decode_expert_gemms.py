@@ -386,3 +386,27 @@ def test_decode_expert_gemms_matches_amd_kernels(n, asm):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.parametrize("n", [8, 24, 64, 128])
+def test_decode_expert_gemms_w13_split_layout_is_bitwise_equal(n):
+    """The routed w13 read in place in its preshuffled [E, 2, I/16, block] layout gives the same bits as the
+    gate / up interleaved copy."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(777 + n)
+    _, args = _build(n, dev, g)
+    xq, xs, q8, s8, packed, shared, ids, wt = args
+    w13, s13, w2, s2 = packed
+    split = (
+        w13.view(E, I // 16, 2, -1).transpose(1, 2).contiguous().view(-1),
+        s13,
+        w2,
+        s2,
+    )
+    out, sh = D.decode_expert_gemms(D.get_plan(n), *args)
+    out_s, sh_s = D.decode_expert_gemms(
+        D.get_plan(n, w13_split=True), xq, xs, q8, s8, split, shared, ids, wt
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), out_s.view(torch.int16))
+    assert torch.equal(sh.view(torch.int16), sh_s.view(torch.int16))

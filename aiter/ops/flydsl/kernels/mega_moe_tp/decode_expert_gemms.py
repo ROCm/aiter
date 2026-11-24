@@ -62,7 +62,13 @@ def tiles_for(n: int, asm: bool = True) -> dict:
 class DecodeExpertPlan:
     """Compiled launchers + grid sizes for ``n`` rows."""
 
-    def __init__(self, n: int, asm: bool = True, tiles: dict | None = None):
+    def __init__(
+        self,
+        n: int,
+        asm: bool = True,
+        tiles: dict | None = None,
+        w13_split: bool = False,
+    ):
         assert supported(n), n
         cfg = tiles_for(n, asm) if tiles is None else tiles
         kw, bm = small_config_for(n)
@@ -80,6 +86,7 @@ class DecodeExpertPlan:
             "sh_kw": sh_kw,
             "sh_pf": sh_pf,
             "pairs": id_pairs_for(n),
+            "w13_split": w13_split,
         }
         if "g1_prio" in cfg:
             g1_kw["prio"] = cfg["g1_prio"]
@@ -98,11 +105,15 @@ class DecodeExpertPlan:
 _plans: dict = {}
 
 
-def get_plan(n: int, asm: bool = True) -> DecodeExpertPlan:
-    key = (n, asm)
+def get_plan(n: int, asm: bool = True, w13_split: bool = False) -> DecodeExpertPlan:
+    """``w13_split``: the routed ``w13`` operand is in the preshuffled ``[E, 2, I/16, block]`` layout (gate
+    blocks, then up blocks, as ``shuffle_weight`` leaves it) instead of the gate / up interleaved
+    ``[E, I/16, 2, block]``; same outputs. The scales ``s13`` stay in the interleaved layout.
+    """
+    key = (n, asm, w13_split)
     p = _plans.get(key)
     if p is None:
-        p = _plans[key] = DecodeExpertPlan(n, asm)
+        p = _plans[key] = DecodeExpertPlan(n, asm, w13_split=w13_split)
     return p
 
 

@@ -365,8 +365,13 @@ def compile_shared_gemm2(*, tn=256, bm=16, pf=2):
 
 
 @functools.cache
-def compile_routed_gemm1_id_rows(*, kw=1, pf=3, bm=16, pairs=256, prio=None):
-    """``prio=(high, low)``: ``s_setprio high`` for the prologue (routing-id load, histogram, first
+def compile_routed_gemm1_id_rows(
+    *, kw=1, pf=3, bm=16, pairs=256, prio=None, w13_split=False
+):
+    """``w13_split``: the routed w13 values are read in the checkpoint-order preshuffle layout
+    ``[E, 2 (gate, up), I/16, 16-row block]`` instead of the gate / up interleaved ``[E, I/16, 2, block]``:
+    only the block address changes, the bytes read and every output bit are the same.
+    ``prio=(high, low)``: ``s_setprio high`` for the prologue (routing-id load, histogram, first
     weight loads), ``s_setprio low`` once the first weight loads are issued. No data or instruction
     order change: the outputs are the same bits."""
     assert kw in (1, 2, 4) and bm in (16, 32) and pairs in (64, 128, 256, 512)
@@ -417,7 +422,17 @@ def compile_routed_gemm1_id_rows(*, kw=1, pf=3, bm=16, pairs=256, prio=None):
             )
             wd = [
                 [
-                    (((col // 16 + ni) * 2 + gu) * 48 * 1024 + q16 * 256 + l16 * 16)
+                    (
+                        (
+                            gu * (I // 16) + col // 16 + ni
+                            if w13_split
+                            else (col // 16 + ni) * 2 + gu
+                        )
+                        * 48
+                        * 1024
+                        + q16 * 256
+                        + l16 * 16
+                    )
                     // 4
                     + kk * kt * 256
                     for gu in range_constexpr(2)
@@ -772,6 +787,7 @@ def compile_gemm1_shared_first(
     sh_pf=2,
     pairs=256,
     prio=None,
+    w13_split=False,
 ):
     """Routed GEMM1 launch whose first ``nsh`` workgroups run the shared expert's MXFP8 gate/up tiles.
 
@@ -795,10 +811,12 @@ def compile_gemm1_shared_first(
     tier = f"_id_rows_p{pairs}"
     if prio is not None:
         tier += f"_prio{prio[0]}{prio[1]}"
+    if w13_split:
+        tier += "_w13split"
     name = f"aiter_moe_gemm1_a4w4_swiglu_quant_h6144_i768_bm{bm}_tn{tn}_kw{kw}_pf{pf}{tier}_shared_a8w8{sh_name}_first"
     sh_tile = compile_shared_gemm1(kw=sh_kw, pf=sh_pf, bm=sh_bm)
     routed_tile = compile_routed_gemm1_id_rows(
-        kw=kw, pf=pf, bm=bm, pairs=pairs, prio=prio
+        kw=kw, pf=pf, bm=bm, pairs=pairs, prio=prio, w13_split=w13_split
     )
 
     @fx.struct
