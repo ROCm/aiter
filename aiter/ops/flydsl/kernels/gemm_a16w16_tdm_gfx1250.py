@@ -11,6 +11,7 @@ from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
 from .gemm_a16w16_gfx950_utils import BlockSwizzle
+from .gemm_a16w16_kernel_gfx1250 import CPOL_DEV
 
 WAVE_SIZE = 32
 LDS_PAD = 8
@@ -23,8 +24,6 @@ SUPPORTED_MMA = {GEMM_DTYPE_BF16: ((16, 16, 32),), GEMM_DTYPE_FP16: ((16, 16, 32
 GEMM_DTYPE_BITS = {GEMM_DTYPE_BF16: 16, GEMM_DTYPE_FP16: 16}
 FRAGMENT_LOAD_BITS = 128
 STORE_VEC_BITS = 128
-# gfx1250 buffer cache policy: device-scope cross-CTA workspace visibility.
-WORKSPACE_CACHE_DEVICE = 0x10
 
 
 def _validate_interleaved_tile(
@@ -909,9 +908,7 @@ def build_gemm_gfx1250(
                 max_size=False,
                 num_records_bytes=split_k * tile_elems * 4,
             )
-            ws_atom = fx.make_copy_atom(
-                rocdl.BufferCopy128b(WORKSPACE_CACHE_DEVICE), fx.Float32
-            )
+            ws_atom = fx.make_copy_atom(rocdl.BufferCopy128b(CPOL_DEV), fx.Float32)
             vec4_layout = fx.make_layout(4, 1)
 
             def store_partial(ai):
@@ -936,8 +933,12 @@ def build_gemm_gfx1250(
 
             for ai in range_constexpr(m_steps * n_steps):
                 store_partial(ai)
-            # Complete every wave's device-scope stores before the one-signal
-            # cluster barrier. Rank0 loads are issued only after the wait.
+            # Raw op: FlyDSL has no stable call for s_wait_storecnt, the wait
+            # that retires this wave's outstanding stores. The partials are
+            # stored with device scope (CPOL_DEV), so a retired store is
+            # visible to every CTA and no agent-scope fence is needed: each
+            # wave retires its own stores, then the one-signal cluster barrier
+            # lets rank 0 issue its loads (as in pa_decode/op_merge.py).
             rocdl.s_wait_storecnt(0)
             cluster_barrier()
             if k_rank == 0:

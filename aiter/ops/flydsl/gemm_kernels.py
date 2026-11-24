@@ -43,7 +43,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?(?:_i(?P<interleave>[01]))?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -52,14 +52,13 @@ _HGEMM_KERNEL_RE = re.compile(
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
 # bias or fp32 output, and runs on gfx950 only.
 SKINNY_POLICY = "sk"
-# One executable/tunable TDM policy. The legacy spellings below are accepted
-# ONLY by the persisted-name parser, then normalized to this policy.
-TDM_POLICIES = frozenset({"tdm"})
-_LEGACY_TDM_NAMES = {
-    "tdmi": (True, False),
-    "tdma": (False, True),
-    "tdmia": (True, True),
-}
+# gfx1250 cluster-TDM policies. The value is the wave schedule: "tdmi"
+# interleaves the fragment order on even/odd waves.
+TDM_POLICIES = {"tdm": False, "tdmi": True}
+# "tdma"/"tdmia" named the removed BF16 packed-atomic split-K reduction. A
+# persisted name that still carries one runs the same schedule on the FP32
+# workspace; these spellings are never emitted.
+_REMOVED_TDM_POLICIES = {"tdma": "tdm", "tdmia": "tdmi"}
 
 
 def _normalize_dtype_name(dtype: str | torch.dtype) -> str:
@@ -91,8 +90,8 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") in _LEGACY_TDM_NAMES:
-        raise ValueError("use policy='tdm' with interleave=True/False")
+    if config.get("policy") in _REMOVED_TDM_POLICIES:
+        raise ValueError("tdma/tdmia were removed; use policy 'tdm' or 'tdmi'")
     if config.get("policy") in (SKINNY_POLICY, "bs", *TDM_POLICIES):
         policy = config["policy"]
     else:
@@ -102,12 +101,10 @@ def flydsl_hgemm_kernel_name(
     _validate_k_stagger(k_stagger, gfx, policy)
     b_non_temporal = config.get("b_non_temporal", False)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
-    interleave = config.get("interleave", False)
-    if type(interleave) is not bool:
-        raise ValueError("interleave must be bool")
-    if interleave and policy != "tdm":
-        raise ValueError("interleave is a TDM schedule option")
-    schedule_suffix = f"_i{int(interleave)}" if policy == "tdm" else ""
+    if policy in TDM_POLICIES and (
+        config.get("interleave", TDM_POLICIES[policy]) is not TDM_POLICIES[policy]
+    ):
+        raise ValueError(f"config 'interleave' disagrees with policy {policy!r}")
     stagger_suffix = f"_stg{k_stagger}" if k_stagger else ""
     memory_suffix = "_bnt" if b_non_temporal else ""
     name = (
@@ -115,7 +112,7 @@ def flydsl_hgemm_kernel_name(
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
         f"x{config['stages']}_ks{config['split_k']}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
-        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}{schedule_suffix}_p{policy}_"
+        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
     if policy in ("bs", *TDM_POLICIES) and get_flydsl_hgemm_kernel_params(name) is None:
@@ -135,6 +132,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     if out_dtype not in (dtype, "fp32"):
         return None
     policy = match.group("policy")
+    policy = _REMOVED_TDM_POLICIES.get(policy, policy)
     k_stagger = int(match.group("k_stagger") or 0)
     b_non_temporal = match.group("b_non_temporal") is not None
     if (k_stagger or b_non_temporal) and (
@@ -173,18 +171,12 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "target_gfx": match.group("target_gfx"),
     }
 
-    schedule = match.group("interleave")
-    if schedule is not None and policy != "tdm":
-        return None
-    if policy in TDM_POLICIES or policy in _LEGACY_TDM_NAMES:
-        interleave, legacy_atomic = _LEGACY_TDM_NAMES.get(
-            policy, (schedule == "1", False)
-        )
+    if policy in TDM_POLICIES:
+        interleave = TDM_POLICIES[policy]
         if (
             params["target_gfx"] != "gfx1250"
             or params["out_dtype"] != params["dtype"]
             or params["k_waves"] != 1
-            or (legacy_atomic and (dtype != "bf16" or params["split_k"] == 1))
         ):
             return None
         from .kernels.gemm_a16w16_tdm_gfx1250 import (
@@ -215,7 +207,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
             )
         except ValueError:
             return None
-        params.update(policy="tdm", interleave=interleave)
+        params["interleave"] = interleave
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     return params
@@ -233,6 +225,21 @@ def _validate_b_non_temporal(value, gfx, policy):
         raise TypeError("b_non_temporal must be a bool")
     if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
         raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
+
+
+def flydsl_hgemm_policy_runs_on(policy: str, gfx: str) -> bool:
+    """Whether ``policy`` has a kernel for the runtime ``gfx``.
+
+    ``flydsl_hgemm`` raises on a False answer and the tuned-row lookup skips
+    the row. A gfx1250-strict runtime borrows the gfx1250 rows, so a TDM row
+    must fall back there instead of raising on every call.
+    """
+
+    if policy in TDM_POLICIES:
+        return gfx == "gfx1250"
+    if policy in (SKINNY_POLICY, "bs"):
+        return gfx == "gfx950"
+    return gfx in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def flydsl_hgemm(
@@ -254,7 +261,6 @@ def flydsl_hgemm(
     stream: torch.cuda.Stream | None = None,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
-    interleave: bool = False,
     bpreshuffle: bool = False,
 ) -> torch.Tensor:
     """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
@@ -271,9 +277,9 @@ def flydsl_hgemm(
     ``bpreshuffle`` reads AITER's BF16 ``shuffle_weight(..., (16, 16))``
     layout on gfx950 (ft/sk), without retaining an unshuffled copy. The
     full-tile path currently requires split_k=k_waves=1.
-    ``policy="tdm"`` selects FP32-workspace cluster TDM on gfx1250.
-    ``interleave`` is a schedule option, not another reduction policy.
-    Older persisted names are normalized by the name parser before dispatch.
+    ``policy="tdm"``/``"tdmi"`` select the gfx1250 TDM kernel with the plain
+    or the interleaved wave schedule. split_k=1 writes the output directly;
+    split_k>1 reduces FP32 partials in a cluster. Output keeps the input dtype.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -283,10 +289,6 @@ def flydsl_hgemm(
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
-    if type(interleave) is not bool:
-        raise ValueError("interleave must be bool")
-    if interleave and policy != "tdm":
-        raise ValueError("interleave is a TDM schedule option")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
     )
@@ -304,7 +306,7 @@ def flydsl_hgemm(
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if policy in TDM_POLICIES:
-        if gfx != "gfx1250":
+        if not flydsl_hgemm_policy_runs_on(policy, gfx):
             raise RuntimeError("TDM HGEMM policies require gfx1250")
         if k_waves != 1 or out_dtype not in (None, a.dtype):
             raise ValueError(
@@ -335,7 +337,7 @@ def flydsl_hgemm(
                 n_waves=n_waves,
                 group_m=group_m,
                 layout="nt",
-                interleave=interleave,
+                interleave=TDM_POLICIES[policy],
                 stream=launch_stream,
             )
     if policy == "bs":

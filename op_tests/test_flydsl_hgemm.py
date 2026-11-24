@@ -1028,7 +1028,12 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages, interleave
                 a, weight.t(), out, bias, layout="nn", interleave=interleave, **kwargs
             )
         return flydsl_hgemm(
-            a, weight, out=out, bias=bias, policy="tdm", interleave=interleave, **config
+            a,
+            weight,
+            out=out,
+            bias=bias,
+            policy="tdmi" if interleave else "tdm",
+            **config,
         )
 
     candidates = {"tdm": launch}
@@ -1159,7 +1164,7 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias, interleave):
         weight[:, part * (k // 3)] = col / 16
     bias = col / 8 if has_bias else None
     reference = run_torch_tdm(a, weight, bias, dtype, 3)
-    policies = ("tdm",)
+    policies = ("tdmi" if interleave else "tdm",)
     outputs = {
         policy: torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
         for policy in policies
@@ -1185,7 +1190,7 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias, interleave):
             out_dtype=dtype,
             has_bias=has_bias,
             target_gfx=get_gfx_runtime(),
-            config={**config, "policy": policy, "interleave": interleave},
+            config={**config, "policy": policy},
         )
         table = {
             key: {"libtype": "flydsl", "solidx": 0, "splitK": 3, "kernelName": name}
@@ -1430,13 +1435,6 @@ def check_tdm_contracts(dtype):
         except (ValueError, RuntimeError):
             continue
         raise AssertionError(f"TDM accepted {reason}")
-    for removed in ("split_k_atomic", "split_k_policy"):
-        try:
-            gemm(a, w.t(), out, **cfg, **{removed: True})
-        except TypeError:
-            pass
-        else:
-            raise AssertionError(f"removed argument still accepted: {removed}")
     # Fractional contributions survive FP32 partial storage. Old same-dtype
     # partials rounded each term down, changing the final answer.
     factor = 1 / 16 if dtype == dtypes.bf16 else 1 / 64

@@ -129,6 +129,45 @@ class TestGfx1250StrictOpusRow(unittest.TestCase):
         self.assertEqual(config["libtype"], "triton")
 
 
+class TestGfx1250StrictTdmRow(unittest.TestCase):
+    """A gfx1250-strict runtime borrows gfx1250 rows. TDM has no strict kernel,
+    so the lookup skips a TDM row there instead of letting it raise at launch."""
+
+    CU = 256
+    SHAPE = (128, 128, 768)
+    NAME = (
+        "flydsl_hgemm_abf16_wbf16_bf16_t128x128x128x2_ks3_w2x2x1_"
+        "bias0_ktail0_gm0_ptdm_gfx1250"
+    )
+
+    def _lookup(self, gfx):
+        key = ("gfx1250", self.CU, *self.SHAPE, False, BF16, BF16, False, False)
+        row = {"libtype": "flydsl", "solidx": 0, "splitK": 3, "kernelName": self.NAME}
+        for p in (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+        args = (*self.SHAPE, False, BF16, BF16, False, False, gfx, self.CU)
+        return (
+            tuned.get_GEMM_A16W16_tuned_config(*args),
+            tuned.get_GEMM_A16W16_config(*args),
+        )
+
+    def test_base_runtime_selects_the_tdm_row(self):
+        tuned_config, config = self._lookup("gfx1250")
+        self.assertEqual(tuned_config["kernelName"], self.NAME)
+        self.assertEqual(config["libtype"], "flydsl")
+
+    def test_strict_runtime_skips_the_tdm_row(self):
+        tuned_config, config = self._lookup("gfx1250-strict")
+        self.assertIsNone(tuned_config)
+        self.assertNotEqual(config["libtype"], "flydsl")
+
+
 class TestOpusRowOperandLayout(unittest.TestCase):
     """The OPUS launcher only reads K-contiguous A/B, so other layouts take the
     backend the GEMM would use without the OPUS row (Triton on gfx1250)."""
@@ -227,7 +266,7 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                         )
                         * 2
                     )
-                    if config["policy"] in ("ft", "ht"):
+                    if config.get("policy") not in ("tdm", "tdmi"):
                         lds = policy.gfx1250_lds_bytes(
                             config["block_m"],
                             config["block_n"],
@@ -290,35 +329,34 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                         for c in cs
                     }
 
-                original = [
-                    dict(c, policy="ht" if c["use_half_tile_interleaved"] else "ft")
-                    for c in policy._gfx1250_configs(m, 32, 5120)
-                ]
+                original = policy._gfx1250_configs(m, 32, 5120)
                 tdm = policy._gfx1250_tdm_configs(m, 32, 5120, torch.bfloat16)
                 self.assertEqual(names(configs), names(original) | names(tdm))
                 self.assertEqual(len(names(configs)), len(configs))
-                self.assertEqual({c["policy"] for c in configs}, {"tdm", "ft", "ht"})
-                self.assertTrue(
-                    any(
-                        c["policy"] == "ht"
-                        and c["block_m"] == c["block_n"] == 16
-                        and c["block_k"] == 256
-                        and c["stages"] == 5
-                        and c["split_k"] == 5
-                        for c in configs
+                self.assertFalse(any("policy" in c for c in original))
+                self.assertLessEqual({c["policy"] for c in tdm}, {"tdm", "tdmi"})
+                if m == 6:
+                    # One row of each backend that the DSV4.1 table has used
+                    # for this shape.
+                    prefix = "flydsl_hgemm_abf16_wbf16_bf16_"
+                    suffix = "_w1x1x1_bias0_ktail0_gm0_"
+                    self.assertIn(
+                        f"{prefix}t16x16x256x5_ks5{suffix}pht_gfx1250", names(configs)
                     )
-                )
+                    self.assertIn(
+                        f"{prefix}t16x16x128x6_ks8{suffix}ptdm_gfx1250", names(configs)
+                    )
 
 
 class TestTdmPolicyContract(unittest.TestCase):
-    def test_single_policy_names_and_legacy_normalization(self):
+    def test_tdm_names_round_trip_and_removed_names_map(self):
         from aiter.ops.flydsl.gemm_kernels import (
             TDM_POLICIES,
             flydsl_hgemm_kernel_name,
             get_flydsl_hgemm_kernel_params,
         )
 
-        self.assertEqual(set(TDM_POLICIES), {"tdm"})
+        self.assertEqual(TDM_POLICIES, {"tdm": False, "tdmi": True})
         config = {
             "block_m": 128,
             "block_n": 128,
@@ -329,53 +367,45 @@ class TestTdmPolicyContract(unittest.TestCase):
             "n_waves": 2,
             "k_waves": 1,
             "group_m": 0,
-            "policy": "tdm",
         }
         names = []
         for dtype in (torch.bfloat16, torch.float16):
-            for interleave in (False, True):
-                name = flydsl_hgemm_kernel_name(
+
+            def build(policy, dtype=dtype, **extra):
+                return flydsl_hgemm_kernel_name(
                     dtype=dtype,
                     out_dtype=dtype,
-                    config=dict(config, interleave=interleave),
+                    config=dict(config, policy=policy, **extra),
                     has_bias=True,
                     target_gfx="gfx1250",
                 )
+
+            for policy, interleave in TDM_POLICIES.items():
+                name = build(policy)
+                self.assertTrue(name.endswith(f"_gm0_p{policy}_gfx1250"), name)
                 names.append(name)
                 parsed = get_flydsl_hgemm_kernel_params(name)
-                self.assertEqual(parsed["policy"], "tdm")
+                self.assertEqual(parsed["policy"], policy)
                 self.assertEqual(parsed["interleave"], interleave)
-                self.assertNotIn("split_k_atomic", parsed)
                 for invalid in (
                     name.replace("gfx1250", "gfx950"),
                     name.replace("_w2x2x1_", "_w2x2x2_"),
                     name.replace("x128x2_ks", "x128x1_ks"),
+                    name.replace("_gm0_p", f"_gm0_i{int(interleave)}_p"),
                 ):
                     self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid))
-                for legacy in ("tdmi", "tdma", "tdmia"):
-                    with self.assertRaises(ValueError):
-                        flydsl_hgemm_kernel_name(
-                            dtype=dtype,
-                            out_dtype=dtype,
-                            config=dict(config, policy=legacy),
-                            has_bias=True,
-                            target_gfx="gfx1250",
-                        )
-                for legacy, schedule in (
-                    ("tdm", False),
-                    ("tdmi", True),
-                    ("tdma", False),
-                    ("tdmia", True),
-                ):
-                    old_name = name.replace(
-                        f"_i{int(interleave)}_ptdm_", f"_p{legacy}_"
-                    )
-                    parsed = get_flydsl_hgemm_kernel_params(old_name)
-                    if dtype == torch.float16 and legacy in ("tdma", "tdmia"):
-                        self.assertIsNone(parsed)
-                    else:
-                        self.assertEqual(parsed["policy"], "tdm")
-                        self.assertEqual(parsed["interleave"], schedule)
+                with self.assertRaises(ValueError):
+                    build(policy, interleave=not interleave)
+                # The removed atomic spellings are never emitted, but a row
+                # that still carries one runs the same schedule.
+                removed = policy + "a"
+                with self.assertRaises(ValueError):
+                    build(removed)
+                parsed = get_flydsl_hgemm_kernel_params(
+                    name.replace(f"_p{policy}_", f"_p{removed}_")
+                )
+                self.assertEqual(parsed["policy"], policy)
+                self.assertEqual(parsed["interleave"], interleave)
         self.assertEqual(len(names), len(set(names)))
 
     def test_examples_large_policy_and_single_cluster_reduction(self):
@@ -412,8 +442,12 @@ class TestTdmPolicyContract(unittest.TestCase):
                 self.assertEqual({c["group_m"] for c in large}, {0, 4})
                 small = policy._gfx1250_tdm_configs(32, 32, 256, dtype)
                 self.assertTrue(small)
-                self.assertTrue(all(c["policy"] == "tdm" for c in small))
-                self.assertTrue(all("split_k_atomic" not in c for c in small))
+                self.assertTrue(
+                    all(
+                        c["policy"] == ("tdmi" if c["interleave"] else "tdm")
+                        for c in small
+                    )
+                )
                 self.assertEqual(
                     len(small), len({tuple(sorted(c.items())) for c in small})
                 )
@@ -428,9 +462,9 @@ class TestTdmPolicyContract(unittest.TestCase):
             )
             odd = policy._gfx1250_tdm_configs(128, 139, 768, torch.bfloat16)
             self.assertTrue(odd)
-            self.assertTrue(all(c["policy"] == "tdm" for c in odd))
+            self.assertTrue(all(c["policy"] in ("tdm", "tdmi") for c in odd))
 
-    def test_single_policy_schedule_forwarded_by_tuner_and_production(self):
+    def test_tdm_policy_forwarded_by_tuner_and_production(self):
         import importlib.util
 
         import aiter.ops.flydsl.gemm_kernels as kernels
@@ -447,7 +481,7 @@ class TestTdmPolicyContract(unittest.TestCase):
         a = torch.empty((128, 768), dtype=torch.bfloat16)
         w = torch.empty((128, 768), dtype=a.dtype)
         out = torch.empty((128, 128), dtype=a.dtype)
-        for interleave in (False, True):
+        for policy in ("tdm", "tdmi"):
             cfg = {
                 "block_m": 128,
                 "block_n": 128,
@@ -458,8 +492,8 @@ class TestTdmPolicyContract(unittest.TestCase):
                 "n_waves": 2,
                 "k_waves": 1,
                 "group_m": 0,
-                "policy": "tdm",
-                "interleave": interleave,
+                "policy": policy,
+                "interleave": policy == "tdmi",
                 "use_half_tile_interleaved": False,
             }
             with mock.patch.object(tuner, "flydsl_hgemm", return_value=out) as launch:
@@ -467,8 +501,7 @@ class TestTdmPolicyContract(unittest.TestCase):
                     a, w, out, otype=a.dtype, config=cfg
                 )
                 self.assertIs(actual, out)
-                self.assertEqual(launch.call_args.kwargs["policy"], "tdm")
-                self.assertIs(launch.call_args.kwargs["interleave"], interleave)
+                self.assertEqual(launch.call_args.kwargs["policy"], policy)
             name = kernels.flydsl_hgemm_kernel_name(
                 dtype=a.dtype,
                 out_dtype=a.dtype,
@@ -481,8 +514,7 @@ class TestTdmPolicyContract(unittest.TestCase):
                     a, w, 0, otype=a.dtype, out=out, config={"kernelName": name}
                 )
                 self.assertIs(actual, out)
-                self.assertEqual(launch.call_args.kwargs["policy"], "tdm")
-                self.assertIs(launch.call_args.kwargs["interleave"], interleave)
+                self.assertEqual(launch.call_args.kwargs["policy"], policy)
 
 
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
@@ -627,14 +659,6 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     .replace("_wf16_", "_wfp16_")
                     .replace("_f16_", "_fp16_")
                 )
-                if params["policy"] == "tdm":
-                    import re
-
-                    canonical = re.sub(
-                        r"(?:_i[01])?_p(?:tdm|tdmi|tdma|tdmia)_gfx1250$",
-                        f"_i{int(params['interleave'])}_ptdm_gfx1250",
-                        canonical,
-                    )
                 self.assertEqual(rebuilt, canonical)
             count += 1
         self.assertGreater(count, 0, "No persisted HGEMM rows were checked")
@@ -724,6 +748,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
         import aiter.ops.flydsl.gemm_kernels as kernels
 
         seen = set()
+        seen_tdm = False
         a = torch.empty((2, 8), dtype=torch.bfloat16)
         b = torch.empty((8, 8), dtype=a.dtype)
         out = torch.empty((2, 8), dtype=a.dtype)
@@ -748,7 +773,25 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             if not params["target_gfx"].startswith("gfx1250"):
                 continue
             if params["policy"] in kernels.TDM_POLICIES:
-                continue  # TDM rows use the explicit wrapper tested below.
+                # gfx1250 routing of TDM rows is checked in the next test. A
+                # strict runtime has no TDM kernel: dispatch refuses the row.
+                self.assertFalse(
+                    kernels.flydsl_hgemm_policy_runs_on(
+                        params["policy"], "gfx1250-strict"
+                    )
+                )
+                with (
+                    self.subTest(gfx="gfx1250-strict", kernel=name),
+                    mock.patch.object(
+                        kernels, "get_gfx_runtime", return_value="gfx1250-strict"
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "require gfx1250"),
+                ):
+                    kernels.flydsl_hgemm(
+                        a, b, out=out, stream=stream, **{f: params[f] for f in fields}
+                    )
+                seen_tdm = True
+                continue
             seen.add(name)
             for gfx in ("gfx1250", "gfx1250-strict"):
                 with (
@@ -786,6 +829,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     self.assertNotIn("k_stagger", args)
                     self.assertNotIn("b_non_temporal", args)
         self.assertGreater(len(seen), 0)
+        self.assertTrue(seen_tdm)
 
     def test_gfx1250_tdm_csv_wrapper_routing(self):
         import importlib
@@ -810,7 +854,6 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             "k_waves",
             "group_m",
             "policy",
-            "interleave",
         )
         seen = set()
         for _, row in self._rows():
@@ -838,7 +881,6 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                 kw = launch.call_args.kwargs
                 self.assertEqual(kw["split_k"], params["split_k"])
                 self.assertEqual(kw["interleave"], params["interleave"])
-                self.assertNotIn("split_k_atomic", kw)
                 self.assertIs(kw["stream"], stream)
                 self.assertEqual(launch.call_args.args[1].shape, b.t().shape)
         self.assertGreater(len(seen), 0)
@@ -872,15 +914,14 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
             mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx1250"),
             mock.patch.object(tdm, "gemm_a16w16_tdm", return_value=self.out) as launch,
         ):
-            for interleave in (False, True):
+            for policy, interleave in (("tdm", False), ("tdmi", True)):
                 with self.subTest(interleave=interleave):
                     result = self.kernels.flydsl_hgemm(
                         self.a,
                         self.b,
                         out=self.out,
                         stream=self.stream,
-                        policy="tdm",
-                        interleave=interleave,
+                        policy=policy,
                         bpreshuffle=False,
                     )
                     self.assertIs(result, self.out)
@@ -909,7 +950,6 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
                         m_waves=1,
                         n_waves=1,
                         k_waves=1,
-                        interleave=False,
                         bpreshuffle=True,
                     )
                     self.assertIs(result, self.out)
@@ -928,7 +968,7 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
             mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx1250"),
             mock.patch.object(tdm, "gemm_a16w16_tdm") as launch,
         ):
-            for interleave in (False, True):
+            for policy, interleave in (("tdm", False), ("tdmi", True)):
                 with (
                     self.subTest(interleave=interleave),
                     self.assertRaisesRegex(ValueError, "BF16 preshuffle requires"),
@@ -938,27 +978,23 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
                         self.b,
                         out=self.out,
                         stream=self.stream,
-                        policy="tdm",
-                        interleave=interleave,
+                        policy=policy,
                         bpreshuffle=True,
                     )
             launch.assert_not_called()
 
-    def test_interleave_cannot_enter_gfx950_preshuffle_path(self):
+    def test_tdmi_cannot_enter_gfx950_preshuffle_path(self):
         with (
             mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(self.kernels, "gemm_a16w16") as launch,
         ):
-            with self.assertRaisesRegex(
-                ValueError, "interleave is a TDM schedule option"
-            ):
+            with self.assertRaisesRegex(ValueError, "BF16 preshuffle requires"):
                 self.kernels.flydsl_hgemm(
                     self.a,
                     self.b,
                     out=self.out,
                     stream=self.stream,
-                    policy="ft",
-                    interleave=True,
+                    policy="tdmi",
                     bpreshuffle=True,
                 )
             launch.assert_not_called()
