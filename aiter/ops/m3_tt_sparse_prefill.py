@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Token-tiled FP8 sparse prefill attention for MiniMax-M3 at TP1 (gfx950): a workgroup
-takes TT_TQ tokens of one request x the 16 query heads of one KV head."""
+"""Token-tiled FP8 sparse prefill attention for MiniMax-M3 at TP1 (gfx950): a tile is TT_TQ
+tokens of one request x the 16 query heads of one KV head, and one workgroup a CU walks
+its tiles."""
 
 from torch import Tensor
 
@@ -9,8 +10,8 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 
 MD_NAME = "module_m3_tt_sparse_prefill"
-TT_TQ = 12  # query tokens per workgroup: the longest tile of a tile map
-# a workgroup's bitmap of selected blocks holds 4096 blocks of 128 tokens
+TT_TQ = 12  # query tokens a tile: the longest tile of a tile map
+# a tile's bitmap of selected blocks holds 4096 blocks of 128 tokens
 TT_MAX_SEQ_LEN = 4096 * 128
 
 

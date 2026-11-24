@@ -43,6 +43,7 @@ CASES = {
     ),
     "ragged3": ([(24499, 77), (12000, 4023), (0, 4092)], "random"),
     "ctx512k": ([(TT_MAX_SEQ_LEN - 1024, 1024)], "random"),
+    "tiny": ([(5000, 7)], "random"),  # fewer tiles than workgroups
     "hkv8": ([(8192, 8192)], "correlated", 8),
 }
 
