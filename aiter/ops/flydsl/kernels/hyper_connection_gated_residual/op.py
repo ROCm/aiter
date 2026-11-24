@@ -29,6 +29,7 @@ from .common import (
     stream_scope,
 )
 from .k1 import (
+    _SKINNY_TWO_KERNEL,
     DECODE_MAX_M,
     _build_combine_rms,
     _k1_combine_norm_down,
@@ -166,11 +167,11 @@ def _k1_then_k2(
         block_input = residual.new_empty(0, hidden // hc_count)
         inj_next = residual.new_empty(0, hc_count) if need_inj else None
         return r2, block_input, inj_next
-    # The skinny path avoids row padding and requires the folded down weight.
-    # Limit it to DECODE_MAX_M because each lane holds one accumulator per row;
-    # shapes its builders cannot tile use the tiled path.
+    # The skinny path avoids row padding. Limit it to DECODE_MAX_M because each
+    # lane holds one accumulator per row; shapes its builders cannot tile use
+    # the tiled path. Only the two-kernel schedule takes an unfolded weight.
     if (
-        fold_w
+        (fold_w or _SKINNY_TWO_KERNEL)
         and tokens <= DECODE_MAX_M
         and skinny_decode_supported(hidden, w_down_merged.shape[0], hc_count, lowrank)
     ):
@@ -186,6 +187,7 @@ def _k1_then_k2(
             eps,
             need_inj,
             stream=stream,
+            fold_w=fold_w,
         )
     # GEMM stages use a padded row count while the combine prologue reads only
     # real tokens. K1-to-K2 buffers retain the padded shape until the final slice.
