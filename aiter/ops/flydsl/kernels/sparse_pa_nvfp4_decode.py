@@ -31,6 +31,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_fp8, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     DATA_B,
@@ -78,6 +79,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_copy_store,
     ptr_buf_tensor,
 )
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 # Cache-policy bit of buffer loads: non-temporal (streaming). The K data is read once, so it
 # streams; V stays cacheable (measured faster than streaming both).
@@ -176,6 +178,7 @@ def compile_decode(
     late_v: bool = False,
     select: bool = False,
     pins: bool = False,
+    quant: bool = False,
 ):
     """Build the decode kernel for ``splits`` workgroups per (row, kv head). ``late_v`` issues
     the next page's V loads after the QK of the page in hand instead of together with its K
@@ -187,11 +190,22 @@ def compile_decode(
     ``topk_idx`` (every split of a row stores the same bytes) and attend over them: the
     scorer -> selector -> attention chain loses its selector launch. ``pins`` also forces
     the ``init_blocks`` leading / ``local_blocks`` trailing blocks in, as
-    ``topk_per_row_small_k`` does."""
+    ``topk_per_row_small_k`` does.
+
+    ``quant`` emits the output as o_proj's MXFP8 GEMM input instead of bf16 (row-major e4m3 codes
+    ``[rows, Hq * 128]`` and one e8m0 scale per 32 values ``[rows, Hq * 4]``): each wave of the final
+    merge owns one 32-value group of a head, the group max is one cross-lane max, so the separate
+    activation-quantize launch of the o_proj disappears. Same bytes as quantizing the bf16 output
+    with ATOM's ``quantize_fp8`` (group 32, E8M0 ceil scale, E4M3). Technique source: amd-kernels'
+    MXFP8-output attention decode (``..._mxfp8_select16``); no code shared."""
     require(1 <= topk <= 64, f"topk must be in [1, 64], got {topk}")
     require(1 <= splits <= topk, f"splits must be in [1, topk = {topk}], got {splits}")
     SPLITS, TOPK, XCDS, LATE_V = splits, topk, xcds, late_v
-    SELECT, PINS = select, pins
+    SELECT, PINS, QUANT = select, pins, quant
+    require(
+        not quant or NW == 4,
+        "the fused MXFP8 output needs one wave per 32 of the 128 dims",
+    )
     K_CACHE = 0 if select else NT
     require(not select or topk == 16, "the in-kernel selection picks the top 16")
     # Split partials need sc1 unless all splits of a row run on one XCD.
@@ -201,6 +215,7 @@ def compile_decode(
         + (f"_x{XCDS}" if XCDS else "")
         + ("_lv" if late_v else "")
         + (("_selp" if pins else "_sel") if select else "")
+        + ("_q8" if quant else "")
     )
 
     @fx.struct
@@ -243,6 +258,8 @@ def compile_decode(
         i32_width: fx.Int32,  # their readable columns per row
         i32_init: fx.Int32,  # pins: leading / trailing blocks forced in
         i32_local: fx.Int32,
+        arg_qc: fx.Int64,  # quant: [rows, H * 128] e4m3 codes
+        arg_qs: fx.Int64,  # quant: [rows, H * 4] e8m0 scale bytes
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
@@ -579,7 +596,71 @@ def compile_decode(
         # the write.
         keep = (n < i32_group) & row_ok
 
+        if const_expr(QUANT):
+            head = kvh * i32_group + n
+            qcr = ptr_buf_tensor(
+                arg_qc,
+                fx.Int32,
+                unit_elems=2,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * D,
+            )
+            off = (row * i32_H + head) * (D // 4) + w * 8 + e_ * 2
+            qsr = ptr_buf_tensor(
+                arg_qs,
+                fx.Int8,
+                unit_elems=1,
+                num_records_bytes=i32_rows * i32_H * (D // 32),
+            )
+            soff = (row * i32_H + head) * (D // 32) + w
+
+        def store_quant(total, inv):
+            # bf16-rounded values: what the unfused path hands its quantizer
+            words = [
+                pk_bf16(total[2 * j] * inv, total[2 * j + 1] * inv)
+                for j in range_constexpr(4)
+            ]
+            vals = []
+            for j in range_constexpr(4):
+                vals.append(fx.Int32(words[j] << 16).bitcast(fx.Float32))
+                vals.append(fx.Int32(words[j] & fx.Int32(-65536)).bitcast(fx.Float32))
+            amax = fx.Float32(0.0)
+            for v in vals:
+                amax = maxf_nn(amax, fx.Int32(bits(v) & 0x7FFFFFFF).bitcast(fx.Float32))
+            amax = xlane4(amax, maxf_nn)
+            amax = maxf_nn(amax, fx.Float32(1e-10))
+            code = fx.Int32(
+                emit_mx_e8m0_scale(
+                    amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+                )
+            )
+            rcp = fx.Int32(fx.max(fx.Int32(254) - code, 0) << 23).bitcast(fx.Float32)
+            lim = fx.Float32(448.0)
+            q = []
+            for v in vals:
+                x = v * rcp
+                x = fx.arith.minnumf(x, lim, fastmath=fx.arith.FastMathFlags.nnan)
+                x = maxf_nn(x, fx.Float32(-448.0))
+                q.append(x)
+            w0 = emit_f32_to_fp8(q[0], q[1]) | (emit_f32_to_fp8(q[2], q[3]) << 16)
+            w1 = emit_f32_to_fp8(q[4], q[5]) | (emit_f32_to_fp8(q[6], q[7]) << 16)
+            buf_copy_store(
+                qcr,
+                keep.select(off, fx.Int32(OOB_DWORD)),
+                Vec.from_elements([w0, w1], fx.Int32),
+                unit_elems=2,
+            )
+            buf_copy_store(
+                qsr,
+                (keep & (e_ == 0)).select(soff, fx.Int32(OOB_DWORD)),
+                fx.Int8(code),
+                elem=fx.Int8,
+            )
+
         def store_out(total, inv):
+            if const_expr(QUANT):
+                store_quant(total, inv)
+                return
             val = Vec.from_elements(
                 [
                     pk_bf16(total[2 * j] * inv, total[2 * j + 1] * inv)
@@ -712,6 +793,8 @@ def compile_decode(
         i32_width: fx.Int32,
         i32_init: fx.Int32,
         i32_local: fx.Int32,
+        arg_qc: fx.Int64,
+        arg_qs: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
@@ -742,6 +825,8 @@ def compile_decode(
             i32_width,
             i32_init,
             i32_local,
+            arg_qc,
+            arg_qs,
         ).launch(
             grid=(i32_grid_x, 1 if XCDS else i32_hkv, 1 if XCDS else SPLITS),
             block=(64 * NW, 1, 1),
@@ -764,11 +849,12 @@ def _get_kernel(
     late_v: bool,
     select: bool,
     pins: bool,
+    quant: bool,
     device_index: int,
 ):
     # device_index only keys the cache: the launcher memoises its compiled handle, which
     # is bound to the device it was compiled on.
-    return compile_decode(splits, topk, xcds, late_v, select, pins)
+    return compile_decode(splits, topk, xcds, late_v, select, pins, quant)
 
 
 class DecodeWorkspace(NamedTuple):
@@ -863,7 +949,8 @@ def sparse_pa_nvfp4_decode(
     ) = None,  # bound of seq_lens when ``index_score`` is given
     init_blocks: int = 0,  # ``index_score``: leading blocks forced into the selection
     local_blocks: int = 0,  # ``index_score``: trailing blocks forced in (outrank the leading)
-) -> torch.Tensor:
+    quant_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | None:
     """Row i is query token i % query_len of request i // query_len and attends to
     the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
     be distinct (a selector emits every block once): the kernel attends once per slot,
@@ -878,6 +965,13 @@ def sparse_pa_nvfp4_decode(
     pays. ``index_max_seq_len`` bounds every ``seq_lens`` entry (``index_score`` must hold
     that many blocks per row) and ``topk`` must be 16. Rows of up to ``SELECT_BLOCKS`` live
     blocks (229K tokens) take the one-window selection, longer ones a windowed loop.
+
+    ``quant_out = (codes, scales)`` writes the output as o_proj's MXFP8 GEMM input instead of
+    bf16 (``out`` is then neither read nor written and may be None): ``codes`` fp8 e4m3 / uint8
+    ``[rows, Hq * 128]`` and ``scales`` uint8 / e8m0 ``[rows, Hq * 4]``, contiguous, one E8M0
+    scale per 32 values (ceil of amax / 448, E4M3, RNE, clamp to +-448), the bytes
+    ``quantize_fp8`` of ATOM gives for the bf16 output (finite outputs; NaN / inf are not byte-matched).
+    Returns None then.
 
     gfx950 only. Every operand must be on ``q``'s device and ``sm_scale`` must be finite
     and positive.
@@ -947,10 +1041,29 @@ def sparse_pa_nvfp4_decode(
             index_max_seq_len is None and not init_blocks and not local_blocks,
             "index_max_seq_len and the pins are for index_score",
         )
+    quant = quant_out is not None
+    if quant:
+        qc, qs = quant_out
+        require(
+            q.shape[2] == D
+            and qc.element_size() == 1
+            and qs.element_size() == 1
+            and qc.is_contiguous()
+            and qs.is_contiguous()
+            and qc.device == q.device
+            and qs.device == q.device
+            and qc.numel() >= q.shape[0] * q.shape[1] * D
+            and qs.numel() >= q.shape[0] * q.shape[1] * (D // 32)
+            and qc.data_ptr() % 8 == 0,
+            "quant_out needs contiguous one-byte codes [rows, Hq * 128] (8-byte aligned) and scales "
+            "[rows, Hq * 4] on q's device",
+        )
+        if out is None:
+            out = q  # placeholder: the fused-quant kernel never touches the bf16 output
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
-        return out
+        return None if quant else out
     num_heads = q.shape[1]
     group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(
@@ -1042,7 +1155,7 @@ def sparse_pa_nvfp4_decode(
         score, s_head, s_row, width = topk_idx.data_ptr(), 0, 0, 0
     with torch.cuda.device(q.device):
         _run_compiled(
-            _get_kernel(splits, topk, xcds, late_v, select, pins, dev),
+            _get_kernel(splits, topk, xcds, late_v, select, pins, quant, dev),
             q.data_ptr(),
             kv_cache.data_ptr(),
             topk_idx.data_ptr(),
@@ -1071,9 +1184,11 @@ def sparse_pa_nvfp4_decode(
             width,
             init_blocks,
             local_blocks,
+            qc.data_ptr() if quant else q.data_ptr(),
+            qs.data_ptr() if quant else q.data_ptr(),
             torch.cuda.current_stream(q.device),
         )
-    return out
+    return None if quant else out
 
 
 SELECT_MAX_ROWS = 256  # decode rows the in-kernel selection was measured to pay at
