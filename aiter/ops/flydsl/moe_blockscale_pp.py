@@ -163,7 +163,8 @@ def moe_bs_forward(
     """Block-FP8 MoE layer forward: ``sum_k w_k * W2[e_k] act(W13[e_k] x)``.
 
     x bf16 ``[T, D]``; topk_ids / topk_weights ``[T, topk]`` (ids outside
-    ``[0, E)`` contribute nothing); w13 fp8 ``[E, 2I, D]`` (gate rows, then up
+    ``[0, E)`` contribute nothing; a token's ids must be distinct, as from a
+    top-k router: ``moe_sorting`` keeps one route of a repeated expert); w13 fp8 ``[E, 2I, D]`` (gate rows, then up
     rows) and w2 fp8 ``[E, D, I]`` in ``shuffle_weight(w, (16, 16))`` layout;
     w13_scale / w2_scale their 128x128 block scales as e8m0 exponent bytes
     (``e8m0_from_pow2`` of power-of-two fp32 scales). act = ``silu(min(g, L)) *
@@ -185,10 +186,9 @@ def moe_bs_forward(
         out = torch.empty_like(x)
     if T == 0:
         return out
-    ids = topk_ids.to(torch.int32)
-    # Out-of-range experts become dropped routes (-1): the sort leaves them
-    # out and the reduction skips their never-written slot rows.
-    ids = torch.where((ids >= 0) & (ids < E), ids, -1)
+    # The sort drops ids outside [0, E) itself; the reduction skips only
+    # negative ones, so ids >= E become -1 (their slot rows are never written).
+    ids = torch.where(topk_ids < E, topk_ids.to(torch.int32), -1)
     sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sorting(
         ids, topk_weights.float(), E, D, x.dtype, BLOCK_M, accumulate=False
     )
@@ -230,5 +230,16 @@ def moe_bs_forward(
         topk=topk,
         waves_per_eu=waves_per_eu,
     )
-    _run_moe_reduction(slots, out, T, topk, D, topk_ids=ids, skip_dropped=True)
+    # Nontemporal loads pay once the slot rows outgrow the 256 MB MALL
+    # (T=16384: 239 -> 204 us); at 268 MB (T=4096, top-k 8) they cost 5 us.
+    _run_moe_reduction(
+        slots,
+        out,
+        T,
+        topk,
+        D,
+        topk_ids=ids,
+        skip_dropped=True,
+        streaming_loads=slots.numel() * slots.element_size() > (280 << 20),
+    )
     return out
