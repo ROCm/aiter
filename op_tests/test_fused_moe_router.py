@@ -259,6 +259,12 @@ def _call_fused(
 def _compare(ref, got, M, topk, unit_size):
     """Return {metric: error count or magnitude}; all zero means pass."""
     errs = {}
+    # NaN passes every `> W_TOL` check and vanishes inside max(), so count
+    # non-finite live weights before any maxima are taken.
+    nv_live = min(max(int(got["nv"][0]), 0), got["sw"].numel())
+    errs["nonfinite_err"] = int((~torch.isfinite(got["tw"])).sum()) + int(
+        (~torch.isfinite(got["sw"][:nv_live])).sum()
+    )
 
     # topk: per-token set of (expert -> weight). Selection order within a token
     # is free, the weight attached to each expert is not.
@@ -1142,6 +1148,40 @@ def test_fused_split_agree(M):
         if not torch.equal(outs[True][k], outs[False][k])
     }
     assert not diff, f"M={M}: fused and split differ in {diff}"
+
+
+# Logits this negative underflow every selected sigmoid to 0, so the renorm sum
+# is 0. Stock zeroes the weights instead of dividing by it.
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("M", [1, 104])
+def test_zero_renorm_sum_matches_stock(M, fused):
+    E, topk, unit_size = 320, 8, 16
+    g = torch.full((M, E), -100.0, dtype=dtypes.bf16)
+    b = _tie_free_bias(E)
+    h = torch.ones(M, COLS, dtype=dtypes.bf16)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
+    got = _alloc_poisoned(ref, M, topk, M)
+    try:
+        _pin_path(fused)
+        _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, None, None)
+        torch.cuda.synchronize()
+    finally:
+        _unpin_path()
+    _assert_ok(_compare(ref, got, M, topk, unit_size), f"M={M} fused={fused}")
+
+
+def test_checker_rejects_nonfinite_weights():
+    """NaN weights must fail the shared checker even where stock is zero."""
+    M, E, topk, unit_size = 4, 320, 8, 16
+    g, b, h = _inputs(M, E, dtypes.bf16, M)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, None)
+    for key in ("tw", "sw"):
+        got = {k: v.clone() for k, v in ref.items()}
+        got[key][0] = float("nan")
+        errs = _compare(ref, got, M, topk, unit_size)
+        assert errs["nonfinite_err"] > 0 and _failed(errs), key
+        with pytest.raises(AssertionError):
+            _assert_ok(errs, key)
 
 
 # The workspace is allocated by host code that runs only at capture time, so

@@ -305,7 +305,9 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
         s += aiter::mov_dpp_(s, opus::number<0x142>{}); // row_bcast15
         s += aiter::mov_dpp_(s, opus::number<0x143>{}); // row_bcast31
         s = readlane_f(s, 63);
-        w *= rsf / s;
+        // Sigmoid underflows to 0 for very negative logits; zero weights, as
+        // the stock grouped top-k does, instead of 0 * (rsf / 0) = NaN.
+        w *= s > 0.0f ? rsf / s : 0.0f;
     }
     else
     {
