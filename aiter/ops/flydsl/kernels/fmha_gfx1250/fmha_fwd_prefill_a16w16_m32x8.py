@@ -455,18 +455,25 @@ def _softmax(
         m_new_list.append(m_new)
         corr_list.append(corr)
 
-    # ---- Pass 2: p = exp2_fastmath(S - m_new), every row's subs before any exp. The subs pair
-    # into v_dual_sub_f32 against their row's shared m_new, and the exp run stays pure
-    # TRANS -- the coexecution hazard is TRANS followed by non-TRANS VALU, so an
-    # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
+    # ---- Pass 2: p = exp2_fastmath(S - m_new). The subs go out as PACKED math, 8 elements
+    # per kv-fragment against a splat of the row's m_new, so each pair is one
+    # v_pk_add_f32 with a neg modifier. Scalar subs only reach v_dual_sub_f32 if the
+    # scheduler leaves them adjacent, and it does not -- it interleaves them with the exp
+    # run, and VOPD is formed after scheduling on adjacency alone, so half of them never
+    # pair. Packed math cannot be unpaired. The exp run stays pure TRANS either way: the
+    # coexecution hazard is TRANS followed by non-TRANS VALU. ----
     # Raw subf, no ninf fast-math: masked s is -inf and must stay -inf.
-    diff_list = [
-        [
-            fx.Float32(arith.subf(_raw(sv), _raw(m_new_list[r])))
-            for sv in s_masked_list[r]
-        ]
-        for r in range(num_q_tiles)
-    ]
+    diff_list = []
+    for r in range(num_q_tiles):
+        m_splat = fx.Vector.filled(8, m_new_list[r], fx.Float32)
+        row = []
+        for kv_frag_idx in range(num_kv_frags):
+            svec = fx.Vector.from_elements(
+                s_masked_list[r][kv_frag_idx * 8 : (kv_frag_idx + 1) * 8], fx.Float32
+            )
+            dvec = fx.Vector(arith.subf(_raw(svec), _raw(m_splat)))
+            row += [fx.Float32(dvec[i]) for i in range(8)]
+        diff_list.append(row)
     p_flat_list = [[exp2_fastmath(d) for d in diff] for diff in diff_list]
     p_list = [
         [
