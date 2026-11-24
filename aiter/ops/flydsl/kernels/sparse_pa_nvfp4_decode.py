@@ -442,43 +442,21 @@ def compile_decode(
                 state += b_
             results = yield [fx.as_ir_value(x) for x in state]
 
-        def store_out(acc, inv):
-            outr = ptr_buf_tensor(
-                arg_out,
-                fx.Int32,
-                unit_elems=4,
-                unit_stride=1,
-                num_records_bytes=i32_rows * i32_H * (D * 2),
-            )
-            # Lane (n, g) holds dims [32 g, 32 g + 32) of head n in order.
-            o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + g * 16
-            for e in range_constexpr(4):
-                val = Vec.from_elements(
-                    [
-                        pk_bf16(acc[2 * j][e] * inv, acc[2 * j + 1][e] * inv)
-                        for j in range_constexpr(4)
-                    ],
-                    fx.Int32,
-                )
-                # Masked lanes store at an offset past the buffer end, which drops the write.
-                keep = (n < i32_group) & row_ok
-                buf_copy_store(
-                    outr,
-                    keep.select(o_row + e * 4, fx.Int32(OOB_DWORD)),
-                    val,
-                    unit_elems=4,
-                )
-
-        # Combine the waves' partials in wave 0.
+        # The waves' partials meet in LDS, then ALL four waves combine them: wave w merges the
+        # original lanes (n, g = w), and its lane L takes element e = L // 16 of every d-tile of
+        # that lane (16 w + L % 16). Merging in wave 0 alone left three waves idle behind a
+        # barrier for ~3 us, the longest serial stretch after the page loop. Every sum keeps
+        # the order of the single-wave merge, so the output is bit-identical to it.
+        ml = smem.ml.ptr
+        o_i32 = smem.o.ptr
         o_lds = fx.logical_divide(
             fx.make_view(
-                fx.recast_iter(fx.Int32, smem.o.ptr),
+                fx.recast_iter(fx.Int32, o_i32),
                 fx.make_layout(NW * NDT * 64 * 4, 1),
             ),
             fx.make_layout(4, 1),
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-        ml = smem.ml.ptr
         ml[(w * 2) * 64 + lane] = fx.Float32(results[2])
         ml[(w * 2 + 1) * 64 + lane] = fx.Float32(results[3])
         for dt in range_constexpr(NDT):
@@ -486,111 +464,149 @@ def compile_decode(
             r.store(Vec(results[4 + dt]).bitcast(fx.Int32))
             fx.copy(lds_atom, r, fx.slice(o_lds, (None, (w * NDT + dt) * 64 + lane)))
         fx.gpu.barrier()
-        if w == 0:
-            ms = [fx.Float32(ml[(ww * 2) * 64 + lane]) for ww in range_constexpr(NW)]
-            big = ms[0]
-            for ww in range_constexpr(1, NW):
-                big = maxf_nn(big, ms[ww])
-            big_raw = big
-            big = (big == neg_inf).select(fx.Float32(0.0), big)
-            wt = [fx.Float32(fx.math.exp2(ms[ww] - big)) for ww in range_constexpr(NW)]
-            l_tot = fx.Float32(0.0)
+        ol = w * 16 + n  # the original lane (n, g = w) this lane merges
+        e_ = g  # ... and the element of its d-tiles
+        ms = [fx.Float32(ml[(ww * 2) * 64 + ol]) for ww in range_constexpr(NW)]
+        big = ms[0]
+        for ww in range_constexpr(1, NW):
+            big = maxf_nn(big, ms[ww])
+        big_raw = big
+        big = (big == neg_inf).select(fx.Float32(0.0), big)
+        wt = [fx.Float32(fx.math.exp2(ms[ww] - big)) for ww in range_constexpr(NW)]
+        # The row sum over the four g lanes, in xlane4's order (g0 + g2) + (g1 + g3).
+        xs = []
+        for gg in range_constexpr(4):
+            xg = fx.Float32(0.0)
             for ww in range_constexpr(NW):
-                l_tot = l_tot + fx.Float32(ml[(ww * 2 + 1) * 64 + lane]) * wt[ww]
-            l_tot = xlane4(l_tot, lambda x, y: x + y)
-            acc = [zero4 for _ in range_constexpr(NDT)]
+                xg = xg + fx.Float32(ml[(ww * 2 + 1) * 64 + gg * 16 + n]) * wt[ww]
+            xs.append(xg)
+        l_tot = (xs[0] + xs[2]) + (xs[1] + xs[3])
+        acc = []
+        for dt in range_constexpr(NDT):
+            a_ = fx.Float32(0.0)
             for ww in range_constexpr(NW):
-                wv = Vec.filled(4, wt[ww], fx.Float32)
-                for dt in range_constexpr(NDT):
-                    r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                    fx.copy(
-                        lds_atom,
-                        fx.slice(o_lds, (None, (ww * NDT + dt) * 64 + lane)),
-                        r,
-                    )
-                    acc[dt] = acc[dt] + Vec(r.load()).bitcast(fx.Float32) * wv
-            if const_expr(SPLITS > 1):
-                # Padding workgroups (row_ok false) work on a spare unit, never a real one.
-                tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
-                pr = [
-                    ptr_buf_tensor(
-                        arg_part,
-                        fx.Int32,
-                        unit_elems=u,
-                        unit_stride=1,
-                        num_records_bytes=i64_part_bytes,
-                    )
-                    for u in (4, 2)
-                ]
-                row_f = (tid * SPLITS + zz) * 64 + lane
-                for dt in range_constexpr(NDT):
-                    buf_copy_store(
-                        pr[0],
-                        row_f * PART_F + dt * 4,
-                        acc[dt].bitcast(fx.Int32),
-                        unit_elems=4,
-                        cache_modifier=PART_SCOPE,
-                    )
+                a_ = (
+                    a_
+                    + as_f32(fx.Int32(o_i32[((ww * NDT + dt) * 64 + ol) * 4 + e_]))
+                    * wt[ww]
+                )
+            acc.append(a_)
+
+        outr = ptr_buf_tensor(
+            arg_out,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_rows * i32_H * (D * 2),
+        )
+        # Head n's dims [32 w, 32 w + 32) are four dwords groups; this lane owns group e.
+        o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + w * 16 + e_ * 4
+        # Masked heads and padding rows store at an offset past the buffer end, which drops
+        # the write.
+        keep = (n < i32_group) & row_ok
+
+        def store_out(total, inv):
+            val = Vec.from_elements(
+                [
+                    pk_bf16(total[2 * j] * inv, total[2 * j + 1] * inv)
+                    for j in range_constexpr(4)
+                ],
+                fx.Int32,
+            )
+            buf_copy_store(
+                outr,
+                keep.select(o_row, fx.Int32(OOB_DWORD)),
+                val,
+                unit_elems=4,
+            )
+
+        if const_expr(SPLITS > 1):
+            # Padding workgroups (row_ok false) work on a spare unit, never a real one.
+            tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
+            pr = [
+                ptr_buf_tensor(
+                    arg_part,
+                    fx.Int32,
+                    unit_elems=u,
+                    unit_stride=1,
+                    num_records_bytes=i64_part_bytes,
+                )
+                for u in (4, 2)
+            ]
+            # This split's partial of one (row, kv head): O as [e][lane][d-tile] fp32, then
+            # (max, sum) per lane.
+            blk0 = (tid * SPLITS + zz) * (64 * PART_F)
+            ml_off = blk0 + 4 * 64 * NDT + ol * 2
+            for h in range_constexpr(2):
+                buf_copy_store(
+                    pr[0],
+                    blk0 + (e_ * 64 + ol) * NDT + 4 * h,
+                    Vec.from_elements(
+                        [bits(acc[4 * h + i]) for i in range_constexpr(4)], fx.Int32
+                    ),
+                    unit_elems=4,
+                    cache_modifier=PART_SCOPE,
+                )
+            if e_ == 0:
                 buf_copy_store(
                     pr[1],
-                    row_f * PART_F + NDT * 4,
+                    ml_off,
                     Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
                     unit_elems=2,
                     cache_modifier=PART_SCOPE,
                 )
-                # The partial is stored before the ticket is taken.
-                fx.rocdl.s_waitcnt(vmcnt=0)
+            # Every wave's partial is stored before wave 0 takes the ticket.
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
+            if w == 0:
                 if lane == 0:
                     smem.ticket.ptr[0] = _atomic_add(arg_cnt + fx.Int64(tid) * 4, 1)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
-                if (
-                    fx.Int32(
-                        fx.rocdl.readfirstlane(T.i32, fx.Int32(smem.ticket.ptr[0]))
+            fx.gpu.barrier()
+            if (
+                fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(smem.ticket.ptr[0])))
+                == SPLITS - 1
+            ):
+                part_ml = [
+                    buf_copy_load(
+                        pr[1],
+                        (tid * SPLITS + sp) * (64 * PART_F) + 4 * 64 * NDT + ol * 2,
+                        unit_elems=2,
+                        cache_modifier=PART_SCOPE,
                     )
-                    == SPLITS - 1
-                ):
-                    rows_f = [
-                        (tid * SPLITS + sp) * 64 + lane
-                        for sp in range_constexpr(SPLITS)
-                    ]
-                    mls = [
-                        buf_copy_load(
-                            pr[1],
-                            rf * PART_F + NDT * 4,
-                            unit_elems=2,
+                    for sp in range_constexpr(SPLITS)
+                ]
+                bigs = [as_f32(x[0]) for x in part_ml]
+                top = bigs[0]
+                for sp in range_constexpr(1, SPLITS):
+                    top = maxf_nn(top, bigs[sp])
+                top = (top == neg_inf).select(fx.Float32(0.0), top)
+                ws = [fx.Float32(fx.math.exp2(b - top)) for b in bigs]
+                l_all = fx.Float32(0.0)
+                for sp in range_constexpr(SPLITS):
+                    l_all = l_all + as_f32(part_ml[sp][1]) * ws[sp]
+                inv_all = (l_all > fx.Float32(0.0)).select(
+                    v_scale / l_all, fx.Float32(0.0)
+                )
+                acc_all = [fx.Float32(0.0) for _ in range_constexpr(NDT)]
+                for sp in range_constexpr(SPLITS):
+                    for h in range_constexpr(2):
+                        part = buf_copy_load(
+                            pr[0],
+                            (tid * SPLITS + sp) * (64 * PART_F)
+                            + (e_ * 64 + ol) * NDT
+                            + 4 * h,
+                            unit_elems=4,
                             cache_modifier=PART_SCOPE,
-                        )
-                        for rf in rows_f
-                    ]
-                    bigs = [as_f32(x[0]) for x in mls]
-                    top = bigs[0]
-                    for sp in range_constexpr(1, SPLITS):
-                        top = maxf_nn(top, bigs[sp])
-                    top = (top == neg_inf).select(fx.Float32(0.0), top)
-                    ws = [fx.Float32(fx.math.exp2(b - top)) for b in bigs]
-                    l_all = fx.Float32(0.0)
-                    for sp in range_constexpr(SPLITS):
-                        l_all = l_all + as_f32(mls[sp][1]) * ws[sp]
-                    inv_all = (l_all > fx.Float32(0.0)).select(
-                        v_scale / l_all, fx.Float32(0.0)
-                    )
-                    acc_all = [zero4 for _ in range_constexpr(NDT)]
-                    for sp in range_constexpr(SPLITS):
-                        wv = Vec.filled(4, ws[sp], fx.Float32)
-                        for dt in range_constexpr(NDT):
-                            part = buf_copy_load(
-                                pr[0],
-                                rows_f[sp] * PART_F + dt * 4,
-                                unit_elems=4,
-                                cache_modifier=PART_SCOPE,
-                            ).bitcast(fx.Float32)
-                            acc_all[dt] = acc_all[dt] + part * wv
-                    store_out(acc_all, inv_all)
-                    if lane == 0:
-                        global_i32_ptr(arg_cnt + fx.Int64(tid) * 4)[0] = fx.Int32(0)
-            else:
-                inv = (l_tot > fx.Float32(0.0)).select(v_scale / l_tot, fx.Float32(0.0))
-                store_out(acc, inv)
+                        ).bitcast(fx.Float32)
+                        for i in range_constexpr(4):
+                            acc_all[4 * h + i] = acc_all[4 * h + i] + part[i] * ws[sp]
+                store_out(acc_all, inv_all)
+                if (w == 0) & (lane == 0):
+                    global_i32_ptr(arg_cnt + fx.Int64(tid) * 4)[0] = fx.Int32(0)
+        else:
+            inv = (l_tot > fx.Float32(0.0)).select(v_scale / l_tot, fx.Float32(0.0))
+            store_out(acc, inv)
 
     @flyc.jit
     def launch(
