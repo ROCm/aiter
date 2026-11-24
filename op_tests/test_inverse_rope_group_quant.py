@@ -47,7 +47,7 @@ torch.set_default_device("cuda")
 # converters are an opt-in fast path that falls back to the general chain
 # (kHwScaledFp8 / kNativeQuant). So this list is the set of verified targets
 # rather than a build constraint. gfx942 quantizes to E4M3_FNUZ rather than
-# E4M3 (kHwFp8E4m3 in the kernel); the reference tracks that through
+# E4M3 (aiter::kHwFp8MxDtype in the kernel); the reference tracks that through
 # dtypes.fp8, which is what _e8m0_round_up below takes its max_pos from.
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250", "gfx1201"]
 
