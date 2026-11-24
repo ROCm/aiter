@@ -505,6 +505,11 @@ def _build_compress_forward_kernel(
                     )
                     for i in range(VEC)
                 ]
+                # A consumed row has weight 0, but 0 * NaN is NaN, and its in_row
+                # can belong to another request in the batch. Zero the value too.
+                p2_kv = [
+                    arith.select(is_consumed, c_zero_f32, p2_kv[i]) for i in range(VEC)
+                ]
                 m_lane, kv_lane, w_lane = _softmax_step_padded(
                     m_lane, kv_lane, w_lane, p2_score, p2_kv
                 )

@@ -130,7 +130,6 @@ def build_flash_attn_paged_fp8_module(
     BATCH_INTERLEAVE_GROUP = traits.BATCH_INTERLEAVE_GROUP
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.NUM_HEADS_Q * traits.HEAD_DIM_V
-    _dualwave_swp_fp8_cache_tag = traits.cache_tag
 
     @fx.struct
     class SharedStorage:
@@ -514,8 +513,6 @@ def build_flash_attn_paged_fp8_module(
         lse_stride_h: fx.Int32,
         stream: fx.Stream,
     ):
-        # Make shape/mode traits visible to the JIT cache key.
-        _ = _dualwave_swp_fp8_cache_tag
         bs_idx = fx.Int64(batch_size)
         sl_idx = fx.Int64(seq_len)
         num_q_blocks = (sl_idx + BLOCK_M - 1) // BLOCK_M

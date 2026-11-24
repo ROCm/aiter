@@ -206,32 +206,6 @@ class PagedDualwaveSwpFp8Traits:
     SCHED_DS_READ_MASK: int = 0x100
 
     @property
-    def cache_tag(self):
-        return (
-            "paged_fp8_native",
-            self.NUM_HEADS_Q,
-            self.NUM_HEADS_KV,
-            self.HEAD_DIM,
-            self.HEAD_DIM_V,
-            self.WAVES_PER_EU,
-            self.DAZ,
-            self.DUALWAVE_SWP_LAZY_RESCALE,
-            self.DUALWAVE_SWP_RESCALE_THRESHOLD,
-            True,  # Packed varlen; retain the existing cache-tag prefix.
-            self.NUM_PREFETCH_K,
-            self.FP8_V_ROW_STRIDE,
-            self.BATCH_INTERLEAVE_GROUP,
-            self.PAIRED_PAGE_IDS,
-            self.PAGE_SIZE,
-            self.KV_CACHE_LAYOUT,
-            self.CACHE_BUFFERED,
-            self.CSR_PAGE_TABLE,
-            self.HAS_LAST_PAGE_LENS,
-            self.GUARD_OUTPUT_ROWS,
-            self.RETURN_LSE,
-        )
-
-    @property
     def LSE_BEFORE_O(self):
         # This ordering and late row reconstruction keep page-1 V192 spill-free.
         return self.RETURN_LSE and self.PAGE_SIZE == 1 and self.HEAD_DIM_V == 192
