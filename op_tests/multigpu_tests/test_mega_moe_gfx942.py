@@ -26,6 +26,10 @@ and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
 - test_mega_moe_gfx942_capacity: every rank brings max_tok_per_rank rows. With
   "all_to_one" routing every route of every rank goes to rank 0, which must receive
   all of them (8 x the uniform average; past 2^18 rows at max_tok_per_rank 8192).
+- test_nan_rows_in_two_stage_block: NaN rows in a block of 128 rows must not reach its
+  finite rows (large_M's stages of 64 rows).
+- test_small_m_below_one_m_tile: small_M with ``small_m_mtprs=(1,)``, fewer fixed slots
+  than one m-tile.
 
 The test spawns its 8 processes:
 
@@ -369,10 +373,13 @@ def _prequant(x):
     return aiter.get_torch_quant(aiter.QuantType.per_1x128)(x, quant_dtype=dtypes.fp8)
 
 
-def _run_paths(tokens, paths, inputs, stale, graph, ret):
+def _run_paths(tokens, paths, inputs, stale, graph, ret, layers=None):
     """Run each path on ``inputs`` (after one call on ``stale`` inputs, so a row the call
-    does not write keeps a stale value) and check it; fills ``ret``."""
-    rank, layers = _STATE["rank"], _STATE["layers"]
+    does not write keeps a stale value) and check it; fills ``ret``. ``layers``: the
+    instances by name ("main", "large"; small_M runs on "large"), the test's by default.
+    """
+    rank = _STATE["rank"]
+    layers = layers or _STATE["layers"]
     x, wts, ids = inputs
     ref, routes = run_torch(x, wts, ids, tokens, rank, _STATE["ref_weights"])
     routed = ((ids >= 0) & (ids < E)).any(dim=-1)
@@ -452,7 +459,7 @@ def test_mega_moe_gfx942_capacity(mtpr, routing):
     return _run_paths(tokens, paths, inputs, stale, False, {"gfx": get_gfx_runtime()})
 
 
-def _layer(rank, weights, mtpr, small, large):
+def _layer(rank, weights, mtpr, small, large, small_mtpr=SMALL_MTPR):
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
     w1, w1_scale, w2, w2_scale = weights
@@ -471,12 +478,44 @@ def _layer(rank, weights, mtpr, small, large):
         max_tok_per_rank=mtpr,
         act=ACT,
         swiglu_limit=SWIGLU_LIMIT,
-        small_m_mtprs=(SMALL_MTPR,),
+        small_m_mtprs=(small_mtpr,),
         small_m_enabled=small,
         large_m_enabled=large,
     )
     mega.bind_weights(w1, w1_scale, w2, w2_scale)
     return mega
+
+
+def test_nan_rows_in_two_stage_block():
+    """NaN rows must not reach the other rows of their block. Ranks 0 and 1 send 96 and
+    32 tokens to each of experts 0 .. k-1, and every row of rank 0 holds a NaN. Each of
+    these experts then receives 128 rows, two of large_M's four 64-row stages: with
+    unequal sources the rows are compacted, so rows 96 .. 127 are rank 0's and the odd
+    rows 1 .. 63 rank 1's, whatever order a rank's routes take. large_M's tail
+    retirement used to add the second stage's last partial (rows 96 .. 127), times a
+    scale of 0, to rows 32 .. 63 of the first."""
+    rank = _STATE["rank"]
+    tokens = (96, 32) + (0,) * (WORLD - 2)
+    seed = _STATE["case"] = _STATE.get("case", 0) + 2
+    x, wts, _ = _make_inputs(tokens, rank, seed, padding=False)
+    ids = torch.arange(TOPK, device="cuda").repeat(tokens[rank], 1)
+    if rank == 0:
+        x[:, 5] = float("nan")
+    stale = _make_inputs(tokens, rank, seed + 1, padding=False)
+    paths = ["main", "main pq", "large", "large pq", "small"]
+    _run_paths(tokens, paths, (x, wts, ids), stale, False, {})
+
+
+def test_small_m_below_one_m_tile(weights):
+    """small_m_mtprs=(1,): 8 rows of fixed slots per expert, less than one m-tile of
+    the small kernel (64 rows), round up to the m-tile. One token per rank."""
+    rank = _STATE["rank"]
+    mega = _layer(rank, weights, 1, small=True, large=False, small_mtpr=1)
+    tokens = (1,) * WORLD
+    seed = _STATE["case"] = _STATE.get("case", 0) + 2
+    inputs = _make_inputs(tokens, rank, seed)
+    stale = _make_inputs(tokens, rank, seed + 1, padding=False)
+    _run_paths(tokens, ["small"], inputs, stale, False, {}, layers={"large": mega})
 
 
 def test_input_checks():
@@ -568,6 +607,8 @@ def _worker(rank, port, args):
             "main": _layer(rank, weights, MTPR, small=False, large=False),
         }
         test_input_checks()
+        test_nan_rows_in_two_stage_block()
+        test_small_m_below_one_m_tile(weights)
         rows = [
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)

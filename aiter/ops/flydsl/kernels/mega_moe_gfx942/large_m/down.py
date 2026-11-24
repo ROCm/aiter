@@ -407,9 +407,10 @@ def down_task_emitter(
                             _sched_fence()
                     previous = (m_slice, n_pair)
 
-            def retire(pair, slot=1, scale=None):
+            def retire(pair, slot=1, scale=None, active=None):
                 """`pair` (partial slots 2 slot + {0, 1}, scale `slot` unless `scale`) into accum, in no MFMA
-                shadow."""
+                shadow; with `active`, only where it holds (the accumulators keep their values elsewhere).
+                """
                 last_m, last_n = pair
                 final_scale = (
                     Vec(partial_scale[None, slot].load())[0] if scale is None else scale
@@ -418,8 +419,10 @@ def down_task_emitter(
                     target = accum[None, acc_index(last_m, last_n[inner])]
                     values = Vec(partial[None, slot * 2 + inner].load())
                     for element in range_constexpr(4):
-                        target[element] = fx.fma(
-                            values[element], final_scale, target[element]
+                        kept = target[element]
+                        added = fx.fma(values[element], final_scale, kept)
+                        target[element] = (
+                            added if active is None else active.select(added, kept)
                         )
 
             def retire_tail():
@@ -427,14 +430,19 @@ def down_task_emitter(
                 then zero its slots, which the next pair retires as the skipped last pair.
                 """
                 if rows <= 3 * PACKET_ROWS:
-                    # Every candidate gets the FMAs, with scale 0 unless it is the tail: branches that
-                    # differ only in the target become a dynamic accum index (scratch) in LLVM.
+                    # Every candidate gets the FMAs: branches that differ only in the target become a dynamic accum
+                    # index (scratch) in LLVM. Stages 0 and 1 hold valid rows when they lie below the tail, so they
+                    # keep their values by a select: a scale of 0 would still add a NaN or inf partial (of the tail's
+                    # rows). Stage 2 is the tail or holds only padding rows, so a scale of 0 does there.
                     scale = Vec(partial_scale[None, 1].load())[0]
                     for stage in range_constexpr(3):
                         tail = (rows > stage * PACKET_ROWS) & (
                             rows <= (stage + 1) * PACKET_ROWS
                         )
-                        retire(stage_pairs(stage)[3], 1, tail.select(scale, 0.0))
+                        if const_expr(stage < 2):
+                            retire(stage_pairs(stage)[3], 1, scale, active=tail)
+                        else:
+                            retire(stage_pairs(stage)[3], 1, tail.select(scale, 0.0))
                     for inner in range_constexpr(2):
                         partial[None, 2 + inner].store(Vec.filled(4, 0.0, fx.Float32))
 

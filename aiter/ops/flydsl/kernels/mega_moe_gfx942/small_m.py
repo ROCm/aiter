@@ -1261,7 +1261,11 @@ class SmallMRuntime:
         from . import host
         from .protocol import SC_TILE, qx_of
 
-        self.rank, self.topk, self.tmax = int(rank), int(topk), int(tmax)
+        # An expert's fixed slots are whole m-tiles of BM rows: tmax rounds up to them
+        # (the caller's limit on the tokens of a call stays tmax).
+        bm = SMALL_KEY["BM"]
+        tmax = -(-int(tmax) // bm) * bm
+        self.rank, self.topk, self.tmax = int(rank), int(topk), tmax
         H, I = int(model_dim), int(inter_dim)
         e_local = int(experts) // int(world_size)
         dev = torch.device("cuda", torch.cuda.current_device())
