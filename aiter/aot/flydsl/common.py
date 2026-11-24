@@ -84,7 +84,7 @@ def run_only_env() -> Iterator[None]:
     """Force FlyDSL run-only mode: load AOT artifacts, never JIT-compile.
 
     Any kernel without a usable AOT cache raises RuntimeError at the call
-    site (with manager_key/cache_key/cache_dir details) instead of silently
+    site (naming the missing artifact and its cache dir) instead of silently
     masking missing precompiled coverage.
     """
     with override_env("FLYDSL_RUNTIME_RUN_ONLY", "1"):

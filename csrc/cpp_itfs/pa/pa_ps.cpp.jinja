@@ -9,6 +9,7 @@
                        void* max_logits_ptr_,                                         \
                        void* logits_ptr_,                                             \
                        void* sink_token_ptr_,                                         \
+                       void* query_start_loc_ptr_,                                    \
                        int stride_output_bs,                                          \
                        int stride_output_len,                                         \
                        int stride_output_kv_head,                                     \
@@ -51,6 +52,7 @@ FUNCTION_DEFINE
     auto* max_logits_ptr  = reinterpret_cast<const float*>(max_logits_ptr_);
     auto* logits_ptr      = reinterpret_cast<const {{logits_dtype}}*>(logits_ptr_);
     auto* sink_token_ptr  = reinterpret_cast<const {{sink_dtype}}*>(sink_token_ptr_);
+    auto* query_start_loc_ptr = reinterpret_cast<const int*>(query_start_loc_ptr_);
 
     dim3 grid(batch_size, num_kv_heads, query_seq_len * query_group_size);
     dim3 block(head_size);
@@ -61,6 +63,7 @@ FUNCTION_DEFINE
                                                               {{logits_dtype}},
                                                               {{sink_dtype}},
                                                               {{"true" if use_sinks else "false"}},
+                                                              {{"true" if is_varlen else "false"}},
                                                               head_size,
                                                               query_group_size_const,
                                                               context_partition_num_const>),
@@ -83,5 +86,6 @@ FUNCTION_DEFINE
         stride_logits_seq,
         stride_logits_head,
         stride_logits_part,
-        stride_logits_group);
+        stride_logits_group,
+        query_start_loc_ptr);
 }
