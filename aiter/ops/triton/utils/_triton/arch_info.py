@@ -18,12 +18,19 @@ try:
     _CACHED_ARCH = _probe_arch()
 except Exception:  # noqa: BLE001
     _CACHED_ARCH = None
+_PROBE_FAILED = False
 
 
 def get_arch():
-    global _CACHED_ARCH
-    if _CACHED_ARCH is None:
-        _CACHED_ARCH = _probe_arch()
+    global _CACHED_ARCH, _PROBE_FAILED
+    if _CACHED_ARCH is None and not _PROBE_FAILED:
+        try:
+            _CACHED_ARCH = _probe_arch()
+        except Exception:  # noqa: BLE001
+            # A GPU-less host (CPU CI, docs build) imports modules that only
+            # need arch-independent defaults. Do not turn that import into a
+            # driver error, and do not retry the probe for every caller.
+            _PROBE_FAILED = True
     return _CACHED_ARCH
 
 
