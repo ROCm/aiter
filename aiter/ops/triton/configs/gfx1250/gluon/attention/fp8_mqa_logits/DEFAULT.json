@@ -13,7 +13,11 @@
                 "WARPS_M": 2,
                 "waves_per_eu": 0,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 0
+                "waves_per_eu_exact": 0,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
             }
         },
         "KV_LEQ_2048": {
@@ -29,7 +33,11 @@
                 "WARPS_M": 2,
                 "waves_per_eu": 0,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 0
+                "waves_per_eu_exact": 0,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
             }
         },
         "KV_LEQ_4096": {
@@ -45,7 +53,11 @@
                 "WARPS_M": 1,
                 "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 2
+                "waves_per_eu_exact": 2,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
             }
         },
         "KV_LEQ_8192": {
@@ -61,7 +73,11 @@
                 "WARPS_M": 1,
                 "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 2
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
             }
         },
         "KV_LEQ_16384": {
@@ -77,7 +93,11 @@
                 "WARPS_M": 1,
                 "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 2
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
             }
         },
         "KV_LEQ_32768": {
@@ -93,7 +113,11 @@
                 "WARPS_M": 1,
                 "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 2
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
             }
         },
         "KV_LEQ_65536": {
@@ -107,9 +131,13 @@
                 "BLOCK_KV": 256,
                 "NUM_WARPS": 4,
                 "WARPS_M": 1,
-                "waves_per_eu": 0,
+                "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 0
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
             }
         },
         "any": {
@@ -125,7 +153,11 @@
                 "WARPS_M": 1,
                 "waves_per_eu": 3,
                 "MIN_ROWS": 2048,
-                "waves_per_eu_exact": 2
+                "waves_per_eu_exact": 2,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
             }
         }
     },

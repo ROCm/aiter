@@ -37,6 +37,7 @@ def relu_f32(x):
     return _relu_f32_dual_gfx1250(x)
 
 
+
 @gluon.jit
 def _load_kv_scales_block(
     base_ptr,
@@ -805,6 +806,10 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     USE_BUFFER_STORE: gl.constexpr,
     EXACT_ROWS: gl.constexpr = False,
     PACKED: gl.constexpr = False,
+    NUM_KV_BUFFERS: gl.constexpr = 2,
+    HEADSUM_WMMA: gl.constexpr = False,  # weighted head sum as a second (fp16) WMMA against block-diagonal weights
+    KV_PIPE: gl.constexpr = False,  # refill the slot read one tile ago before the wait (NUM_KV_BUFFERS >= 3)
+    KVS_PREFETCH: gl.constexpr = False,  # load the next tile's kv scales one iteration ahead
 ):
     block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
     row0 = gl.minimum(block_id * BLOCK_M, seq_len - BLOCK_M)
@@ -836,11 +841,14 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
             warp_bases: gl.constexpr = [WB_N[0], WB_M[0]]
         else:
             warp_bases: gl.constexpr = [WB_N[0], WB_M[0], WB_M[1]]
-    else:
+    elif WARPS_N == 4:
         if WARPS_M == 1:
             warp_bases: gl.constexpr = [WB_N[0], WB_N[1]]
         else:
             warp_bases: gl.constexpr = [WB_N[0], WB_N[1], WB_M[0]]
+    else:
+        gl.static_assert(WARPS_N == 8 and WARPS_M == 1, "WARPS_N 8 needs WARPS_M 1")
+        warp_bases: gl.constexpr = [WB_N[0], WB_N[1], WB_N[2]]
     if NUM_HEADS == 32:
         reg_bases: gl.constexpr = [[1, 0]]
     elif NUM_HEADS == 64:
@@ -894,6 +902,36 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
         cache=".cg",
     )
 
+    if HEADSUM_WMMA:
+        gl.static_assert(WARPS_M == 1, "HEADSUM_WMMA: the head sum runs over the rows of S, which must stay in one warp")
+        gl.static_assert(2 * BLOCK_M <= 16, "HEADSUM_WMMA: rows [0, BLOCK_M) hold w_hi, [BLOCK_M, 2 BLOCK_M) w_lo")
+        hs_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3, transposed=False, instr_shape=[16, 16, 32], warp_bases=warp_bases
+        )
+        dot_w_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=hs_layout, k_width=8)
+        dot_p_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=hs_layout, k_width=8)
+        wbd_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8], threads_per_warp=[2, 16], warps_per_cta=[NUM_WARPS, 1], order=[1, 0]
+        )
+        i_w = gl.arange(0, 16, layout=gl.SliceLayout(1, wbd_layout))[:, None]
+        j_w = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(0, wbd_layout))[None, :]
+        r_w = j_w // NUM_HEADS
+        w_full = gl.load(weights_ptr + (row0 + r_w) * stride_w_s + (j_w % NUM_HEADS) * stride_w_h + i_w * 0)
+        # fp16 range: S = q.k of e4m3 values is at most 128 * 448^2 = 2.6e7, so the Q.K WMMA runs scaled by 2^-9
+        # (max 50176 < 65504), and the weights are normalized by the power of two of their max; the output gets the
+        # exact power of two 2^(e + 9) back. The weights are split into fp16 hi + lo rows, so they stay ~fp32.
+        w_bits = gl.max(gl.max(gl.abs(w_full), 1), 0).to(gl.int32, bitcast=True)
+        w_exp = (w_bits >> 23) & 255
+        w_full = w_full * ((254 - w_exp) << 23).to(gl.float32, bitcast=True)
+        hs_out_scale = ((w_exp + 9) << 23).to(gl.float32, bitcast=True)
+        q_sc_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+            dot_a_layout, [BM_ROWS, HEAD_SIZE // 32], 32
+        )
+        q_sc = gl.full([BM_ROWS, HEAD_SIZE // 32], 118, gl.uint8, layout=q_sc_layout)
+        w_hi = w_full.to(gl.float16)
+        w_lo = (w_full - w_hi.to(gl.float32)).to(gl.float16)
+        w_bd = gl.where(i_w == r_w, w_hi, gl.where(i_w == r_w + BLOCK_M, w_lo, gl.zeros_like(w_hi)))
+        w_bd = gl.convert_layout(w_bd, dot_w_layout)
     union_start = seq_len_kv
     union_end = 0
     for r in gl.static_range(0, BLOCK_M):
@@ -913,7 +951,7 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
         HEAD_SIZE,
         NUM_WARPS,
         WARP_SIZE,
-        2,
+        NUM_KV_BUFFERS,
     )
     rows_st = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, store_layout))
     keys_st = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, store_layout))
@@ -935,24 +973,52 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     span = union_end - union_start
     num_full_tiles = span // BLOCK_KV
 
-    kv_loader.load_to_shared(0, buffer_id=0, USE_BUFFER_LOAD=USE_BUFFER_LOAD)
-    kv_loader.load_to_shared(BLOCK_KV, buffer_id=1, USE_BUFFER_LOAD=USE_BUFFER_LOAD)
+    gl.static_assert(not KV_PIPE or NUM_KV_BUFFERS >= 3, "KV_PIPE needs NUM_KV_BUFFERS >= 3")
+    # KV_PIPE: the loop issues tile i + NUM_KV_BUFFERS - 1, so the prologue issues one tile fewer
+    for b in gl.static_range(NUM_KV_BUFFERS - (1 if KV_PIPE else 0)):
+        kv_loader.load_to_shared(b * BLOCK_KV, buffer_id=b, USE_BUFFER_LOAD=USE_BUFFER_LOAD)
     buf_cur: gl.int32 = 0
     kv_off: gl.int32 = 0
+    if KVS_PREFETCH:
+        kvs_next = gl.load(kv_scales_ptr + keys_st, mask=keys_st < span, other=0.0)
     for i in tl.range(0, num_full_tiles + 1):
+        if KV_PIPE:  # refill the slot read one tile ago; the previous tile's store barrier covers the WAR
+            kv_loader.load_to_shared(
+                kv_off + (NUM_KV_BUFFERS - 1) * BLOCK_KV,
+                buffer_id=(buf_cur + NUM_KV_BUFFERS - 1) % NUM_KV_BUFFERS,
+                USE_BUFFER_LOAD=USE_BUFFER_LOAD,
+            )
         mfma_k = kv_loader.load_from_shared(
-            wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
+            wait_count=NUM_KV_BUFFERS - 1, target_layout=dot_b_layout, buffer_id=buf_cur
         )
-        kv_loader.load_to_shared(
-            kv_off + 2 * BLOCK_KV, buffer_id=buf_cur, USE_BUFFER_LOAD=USE_BUFFER_LOAD
-        )
+        if not KV_PIPE:
+            kv_loader.load_to_shared(
+                kv_off + NUM_KV_BUFFERS * BLOCK_KV, buffer_id=buf_cur, USE_BUFFER_LOAD=USE_BUFFER_LOAD
+            )
+        if KVS_PREFETCH:
+            kvs_cur = kvs_next
+            nxt = kv_off + BLOCK_KV + keys_st
+            kvs_next = gl.load(kv_scales_ptr + nxt, mask=nxt < span, other=0.0)
         acc = gl.zeros([BM_ROWS, BLOCK_KV], dtype=gl.float32, layout=mfma_layout)
-        sc = gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
-        sc = relu_f32(sc) * w
-        red = gl.sum(gl.reshape(sc, [BLOCK_M, NUM_HEADS, BLOCK_KV]), 1)
+        if HEADSUM_WMMA:
+            sc = gl.amd.gfx1250.wmma_scaled(mfma_q, q_sc, "e4m3", mfma_k, None, "e4m3", acc)
+            p = sc.to(gl.float16)
+            p = gl.maximum(p, gl.zeros_like(p))
+            p_dot = gl.convert_layout(p, dot_p_layout)
+            hs = gl.amd.gfx1250.wmma(w_bd, p_dot, gl.zeros([16, BLOCK_KV], dtype=gl.float32, layout=hs_layout))
+            # rows [0, BLOCK_M) hold the w_hi sums, [BLOCK_M, 2 BLOCK_M) the w_lo sums, the rest are 0
+            red = gl.sum(gl.reshape(hs, [16 // BLOCK_M, BLOCK_M, BLOCK_KV]), 0)
+            red = red * hs_out_scale
+        else:
+            sc = gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
+            sc = relu_f32(sc) * w
+            red = gl.sum(gl.reshape(sc, [BLOCK_M, NUM_HEADS, BLOCK_KV]), 1)
         red = gl.convert_layout(red, store_layout)
         keymask = keys_st < (span - kv_off)
-        kvs = gl.load(kv_scales_ptr + kv_off + keys_st, mask=keymask, other=0.0)
+        if KVS_PREFETCH:
+            kvs = kvs_cur
+        else:
+            kvs = gl.load(kv_scales_ptr + kv_off + keys_st, mask=keymask, other=0.0)
         red = red * kvs[None, :]
         if EXACT_ROWS:
             col = union_start + kv_off + keys_st
@@ -981,5 +1047,5 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
             )
         kv_off += BLOCK_KV
         logits_ptr += BLOCK_KV * stride_logits_k
-        buf_cur = 1 - buf_cur
+        buf_cur = (buf_cur + 1) % NUM_KV_BUFFERS
     kv_loader.wait(0)

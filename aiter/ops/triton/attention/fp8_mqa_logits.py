@@ -396,6 +396,10 @@ def fp8_mqa_logits(
                     USE_BUFFER_STORE=use_buffer_store,
                     EXACT_ROWS=clean_logits or packed,
                     PACKED=packed,
+                    NUM_KV_BUFFERS=rg["NUM_KV_BUFFERS"],
+                    HEADSUM_WMMA=bool(rg["HEADSUM_WMMA"]),
+                    KV_PIPE=bool(rg["KV_PIPE"]),
+                    KVS_PREFETCH=bool(rg["KVS_PREFETCH"]),
                     num_warps=rg["NUM_WARPS"],
                     waves_per_eu=(
                         rg["waves_per_eu_exact"]
