@@ -122,8 +122,33 @@ def _row_err(out, ref):
     """Largest per-row relative L2 error. A row the routing leaves empty must
     come out exactly zero (0/0 counts as 0, anything else over 0 as inf)."""
     out, ref = out.to(dtypes.fp32), ref.to(dtypes.fp32)
+    if not torch.isfinite(out).all() or not torch.isfinite(ref).all():
+        return float("inf")
     rel = (out - ref).norm(dim=-1) / ref.norm(dim=-1)
-    return rel.nan_to_num(nan=0.0).max().item()
+    zero_rows = (out == 0).all(dim=-1) & (ref == 0).all(dim=-1)
+    rel = torch.where(zero_rows, 0.0, rel)
+    return rel.nan_to_num(nan=float("inf"), posinf=float("inf")).max().item()
+
+
+def test_row_err():
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        ref = torch.tensor([[0.0, 0.0], [1.0, -1.0]], dtype=dtype, device="cpu")
+        assert _row_err(ref.clone(), ref) == 0.0
+        assert _row_err(ref * 0.5, ref) == 0.5
+        zeros = torch.zeros_like(ref)
+        assert _row_err(zeros, zeros) == 0.0
+        bad = ref.clone()
+        bad[0, 0] = 1.0
+        assert _row_err(bad, ref) == float("inf")
+        for value in (float("nan"), float("inf"), -float("inf")):
+            bad = ref.clone()
+            bad[1, 0] = value
+            assert _row_err(bad, ref) == float("inf")
+            assert _row_err(ref, bad) == float("inf")
+            assert _row_err(bad, bad) == float("inf")
+        bad = torch.full_like(ref, float("nan"))
+        assert _row_err(bad, ref) == float("inf")
+        assert _row_err(ref, bad) == float("inf")
 
 
 def _fresh():
@@ -618,6 +643,7 @@ def main():
     args = parser.parse_args()
 
     checks = [
+        test_row_err,
         test_plan_key_separates_what_resolution_reads,
         test_plan_cache_is_bounded,
         test_wrapped_get_2stage_cfgs_is_asked_every_call,
