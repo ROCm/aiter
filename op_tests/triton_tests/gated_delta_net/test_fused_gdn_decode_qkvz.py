@@ -35,6 +35,8 @@ FP8_MAX = 448.0
 #   128  -> _decode_group,       4 warps
 #   256  -> _decode_group,       8 warps
 _BATCHES = [1, 32, 64, 127, 128, 256]
+# The recurrent state pool may be fp32 or bf16; the update runs in fp32 either way.
+_STATE_DTYPES = [torch.float32, torch.bfloat16]
 
 
 def split_qkvz(projected_qkvz, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
@@ -172,7 +174,16 @@ def ref_gdn_decode(
     return normalized, quantized.view(-1, num_v_heads * head_v_dim), scales
 
 
-def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, seed=0):
+def make_inputs(
+    batch,
+    num_k_heads=4,
+    head_dim=128,
+    num_slots=None,
+    width=4,
+    seed=0,
+    ratio=2,
+    state_dtype=torch.float32,
+):
     """Build a self-consistent input set for the Qwen3-Next GDN decode contract.
 
     Every live row gets a *distinct* slot. Duplicate slots would let two rows
@@ -183,8 +194,7 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
     torch.manual_seed(seed)
     # Slot 0 is reserved, so N must exceed the batch to give everyone a slot.
     num_slots = num_slots if num_slots is not None else batch + 1
-    num_v_heads = 2 * num_k_heads
-    ratio = num_v_heads // num_k_heads
+    num_v_heads = ratio * num_k_heads
     group_width = 2 * head_dim + 2 * ratio * head_dim
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
 
@@ -205,7 +215,7 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
             head_dim,
             dtype=torch.float32,
             device=device,
-        ),
+        ).to(state_dtype),
         "ssm_state_indices": torch.arange(
             1, batch + 1, dtype=torch.int32, device=device
         ),
@@ -223,6 +233,26 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
         "head_k_dim": head_dim,
         "head_v_dim": head_dim,
     }
+
+
+def to_flat_layout(inp):
+    """Re-pack interleaved ``projected_qkvz`` / ``projected_ba`` (per key-head
+    group ``[q | k | v*ratio | z*ratio]``, ``[b*ratio | a*ratio]``) into the flat
+    Qwen3.5/3.8 layout ``[q_all | k_all | v_all | z_all]``, ``[b_all | a_all]``.
+    Returns a copy of ``inp`` with the two tensors replaced."""
+    kh, vh = inp["num_k_heads"], inp["num_v_heads"]
+    kd, vd = inp["head_k_dim"], inp["head_v_dim"]
+    ratio = vh // kh
+    qkvz = inp["projected_qkvz"].view(-1, kh, 2 * kd + 2 * ratio * vd)
+    q, k, v, z = torch.split(qkvz, [kd, kd, ratio * vd, ratio * vd], dim=-1)
+    flat_qkvz = torch.cat([t.reshape(t.shape[0], -1) for t in (q, k, v, z)], dim=-1)
+    ba = inp["projected_ba"].view(-1, kh, 2 * ratio)
+    b, a = torch.split(ba, [ratio, ratio], dim=-1)
+    flat_ba = torch.cat([b.reshape(b.shape[0], -1), a.reshape(a.shape[0], -1)], dim=-1)
+    out = dict(inp)
+    out["projected_qkvz"] = flat_qkvz.contiguous()
+    out["projected_ba"] = flat_ba.contiguous()
+    return out
 
 
 def _import_op():
@@ -325,11 +355,12 @@ def test_reference_bf16_and_fp8_are_consistent():
 
 
 @pytest.mark.parametrize("batch", _BATCHES)
-def test_fused_gdn_decode_correctness(batch):
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness(batch, state_dtype):
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch)
+    inp = make_inputs(batch, state_dtype=state_dtype)
     ref_inp = {
         k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
     }
@@ -369,6 +400,515 @@ def test_fused_gdn_decode_correctness(batch):
     torch.testing.assert_close(
         inp["conv_state"].float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
     )
+
+
+# Head topologies served by the ratio-generic kernel at every batch size:
+# (16, 3) is Qwen3.5/3.8-27B (48 value heads over 16 key heads, 10240 conv
+# channels); (8, 1) and (4, 4) bound the supported ratio range.
+_RATIO_BATCHES = [1, 16, 64, 128]
+_RATIO_TOPOLOGIES = [(16, 3), (8, 1), (4, 4)]
+
+
+@pytest.mark.parametrize("batch", _RATIO_BATCHES)
+@pytest.mark.parametrize("num_k_heads,ratio", _RATIO_TOPOLOGIES)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness_ratio(batch, num_k_heads, ratio, state_dtype):
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, ref_quant, ref_scales = ref_gdn_decode(**ref_inp, quant_dtype=FP8_DTYPE)
+
+    out, quant, scales = fused_gdn_decode_qkvz(
+        inp["projected_qkvz"],
+        inp["projected_ba"],
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+        scale=inp["scale"],
+        norm_eps=inp["norm_eps"],
+        quant_dtype=FP8_DTYPE,
+    )
+
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(scales, ref_scales, atol=ATOL, rtol=ATOL)
+    nv, hd = inp["num_v_heads"], inp["head_v_dim"]
+    torch.testing.assert_close(
+        quant.float().view(-1, nv, hd) * scales[:, :, None],
+        ref_quant.float().view(-1, nv, hd) * ref_scales[:, :, None],
+        atol=ATOL,
+        rtol=0.13,
+    )
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        inp["conv_state"].float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 64])
+@pytest.mark.parametrize("num_k_heads,ratio", [(16, 3), (4, 2), (8, 1), (4, 4)])
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness_flat_layout(
+    batch, num_k_heads, ratio, state_dtype
+):
+    """Flat ``[q_all | k_all | v_all | z_all]`` packing (Qwen3.5/3.8 checkpoints)
+    must match the reference run on the equivalent interleaved packing; ratio 2
+    takes the ratio-generic kernel here instead of the generated pair kernels."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    flat = to_flat_layout(inp)
+    out, quant, scales = fused_gdn_decode_qkvz(
+        flat["projected_qkvz"],
+        flat["projected_ba"],
+        flat["conv_state"],
+        flat["ssm_state"],
+        flat["ssm_state_indices"],
+        flat["conv_weight"],
+        flat["conv_bias"],
+        flat["A_log"],
+        flat["dt_bias"],
+        flat["norm_weight"],
+        scale=flat["scale"],
+        norm_eps=flat["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout="flat",
+    )
+    assert quant is None and scales is None
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        flat["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        flat["conv_state"].float(),
+        ref_inp["conv_state"].float(),
+        atol=ATOL,
+        rtol=ATOL,
+    )
+
+
+def _split_k_partials(projected_ba, num_ksplit):
+    """fp32 partials whose sum is exactly the bf16 projection."""
+    torch.manual_seed(1)
+    rest = torch.randn(
+        (num_ksplit - 1, *projected_ba.shape), device=projected_ba.device
+    )
+    return torch.cat([rest, (projected_ba.float() - rest.sum(0))[None]])
+
+
+@pytest.mark.parametrize("batch", [1, 4, 64])
+@pytest.mark.parametrize("num_k_heads,ratio", [(16, 3), (4, 2)])
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+@pytest.mark.parametrize("num_ksplit", [2, 8, 20])
+@pytest.mark.parametrize("qkvz_layout", ["interleaved", "flat"])
+def test_fused_gdn_decode_ba_partials(
+    batch, num_k_heads, ratio, state_dtype, num_ksplit, qkvz_layout
+):
+    """Split-K partials of ``projected_ba`` ([KS, T, 2*VH] fp32) give the result of
+    the bf16 projection they sum to."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    if qkvz_layout == "flat":
+        inp = to_flat_layout(inp)
+    out, _, _ = fused_gdn_decode_qkvz(
+        inp["projected_qkvz"],
+        _split_k_partials(inp["projected_ba"], num_ksplit),
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+        scale=inp["scale"],
+        norm_eps=inp["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 64])
+@pytest.mark.parametrize(
+    "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
+)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_row_strided_projections(
+    batch, num_k_heads, ratio, qkvz_layout, state_dtype
+):
+    """qkvz and ba as column views of one [T, qkvz + ba] buffer (one GEMM that
+    produces both) must match the reference; ratio 2 interleaved takes the
+    ratio-generic kernel here instead of the generated pair kernels."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    run = to_flat_layout(inp) if qkvz_layout == "flat" else inp
+    qkvz_dim = run["projected_qkvz"].shape[1]
+    fused = torch.cat([run["projected_qkvz"], run["projected_ba"]], dim=1)
+    qkvz, ba = fused.split([qkvz_dim, fused.shape[1] - qkvz_dim], dim=1)
+    assert not qkvz.is_contiguous() and not ba.is_contiguous()
+    out, _, _ = fused_gdn_decode_qkvz(
+        qkvz,
+        ba,
+        run["conv_state"],
+        run["ssm_state"],
+        run["ssm_state_indices"],
+        run["conv_weight"],
+        run["conv_bias"],
+        run["A_log"],
+        run["dt_bias"],
+        run["norm_weight"],
+        scale=run["scale"],
+        norm_eps=run["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        run["ssm_state"].float(), ref_inp["ssm_state"].float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        run["conv_state"].float(),
+        ref_inp["conv_state"].float(),
+        atol=ATOL,
+        rtol=ATOL,
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 64])
+@pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
+@pytest.mark.parametrize(
+    "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
+)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_slot_strided_state_pools(
+    batch, conv_layout, num_k_heads, ratio, qkvz_layout, state_dtype
+):
+    """Serving engines carve the conv and recurrent states of a block out of one
+    page, so the state tensors are strided along the slot dimension, and store
+    the conv window either channel-major ([N, channels, 3], vLLM "DS") or
+    width-major ([N, 3, channels] handed over as a transpose, vLLM "SD"). The
+    ratio-generic kernel must read and write them in place through those views."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    slots = inp["conv_state"].shape[0]
+    channels, width = inp["conv_state"].shape[1:]
+    vh, vd, kd = inp["ssm_state"].shape[1:]
+    conv_pool = torch.randn(
+        slots, channels * width + 4096, dtype=torch.bfloat16, device=device
+    )
+    ssm_pool = torch.randn(
+        slots, vh * vd * kd + 1024, dtype=torch.float32, device=device
+    ).to(state_dtype)
+    if conv_layout == "channel_major":
+        conv_view = conv_pool[:, : channels * width].unflatten(1, (channels, width))
+    else:
+        conv_view = (
+            conv_pool[:, : channels * width]
+            .unflatten(1, (width, channels))
+            .transpose(1, 2)
+        )
+    ssm_view = ssm_pool[:, : vh * vd * kd].unflatten(1, (vh, vd, kd))
+    assert not conv_view.is_contiguous() and not ssm_view.is_contiguous()
+    conv_view.copy_(inp["conv_state"])
+    ssm_view.copy_(inp["ssm_state"])
+    pool_tail_conv = conv_pool[:, channels * width :].clone()
+    pool_tail_ssm = ssm_pool[:, vh * vd * kd :].clone()
+
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    ops = to_flat_layout(inp) if qkvz_layout == "flat" else inp
+    # Ratio 2 interleaved reaches the ratio-generic kernel only with query_start_loc.
+    qsl = (
+        torch.arange(batch + 1, dtype=torch.int32, device=device)
+        if qkvz_layout == "interleaved"
+        else None
+    )
+    out, _, _ = fused_gdn_decode_qkvz(
+        ops["projected_qkvz"],
+        ops["projected_ba"],
+        conv_view,
+        ssm_view,
+        ops["ssm_state_indices"],
+        ops["conv_weight"],
+        ops["conv_bias"],
+        ops["A_log"],
+        ops["dt_bias"],
+        ops["norm_weight"],
+        scale=ops["scale"],
+        norm_eps=ops["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+        query_start_loc=qsl,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(ssm_view, ref_inp["ssm_state"], atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        conv_view.float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
+    )
+    # Nothing outside the state views was touched.
+    assert torch.equal(conv_pool[:, channels * width :], pool_tail_conv)
+    assert torch.equal(ssm_pool[:, vh * vd * kd :], pool_tail_ssm)
+
+
+@pytest.mark.parametrize("batch", [8, 64])
+@pytest.mark.parametrize(
+    "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
+)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_query_start_loc_padding(
+    batch, num_k_heads, ratio, qkvz_layout, state_dtype
+):
+    """CUDA-graph replay pads the batch: rows past the real requests have an
+    empty query segment but their slot index is the null block or a stale live
+    slot. With ``query_start_loc`` those rows must not touch any state."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    live = batch - 3
+    # Padded rows alias live slots (worst case) and the null slot 0.
+    idx = inp["ssm_state_indices"].clone()
+    idx[live] = idx[0]
+    idx[live + 1] = idx[1]
+    idx[live + 2] = 0
+    qsl = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+    qsl[1 : live + 1] = torch.arange(1, live + 1, dtype=torch.int32, device=device)
+    qsl[live + 1 :] = live
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    for k in ("projected_qkvz", "projected_ba", "ssm_state_indices"):
+        ref_inp[k] = ref_inp[k][:live]
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    ops = to_flat_layout(inp) if qkvz_layout == "flat" else inp
+    out, _, _ = fused_gdn_decode_qkvz(
+        ops["projected_qkvz"],
+        ops["projected_ba"],
+        ops["conv_state"],
+        ops["ssm_state"],
+        idx,
+        ops["conv_weight"],
+        ops["conv_bias"],
+        ops["A_log"],
+        ops["dt_bias"],
+        ops["norm_weight"],
+        scale=ops["scale"],
+        norm_eps=ops["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+        query_start_loc=qsl,
+    )
+    torch.testing.assert_close(
+        out[:live].float(), ref_norm.float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        ops["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        ops["conv_state"].float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
+    )
+
+
+def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
+    """``out`` and ``query_start_loc`` are kernel operands like the rest, so CPU
+    tensors with valid shapes and dtypes must not pass the support check."""
+    _import_op()
+    _requires_gfx950()
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz_supported,
+    )
+
+    batch = 4
+    ops = to_flat_layout(make_inputs(batch, num_k_heads=16, ratio=3))
+    args = [
+        ops[k]
+        for k in (
+            "projected_qkvz",
+            "projected_ba",
+            "conv_state",
+            "ssm_state",
+            "ssm_state_indices",
+            "conv_weight",
+            "conv_bias",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+        )
+    ]
+    vh, vd = ops["num_v_heads"], ops["head_v_dim"]
+    qsl = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16, device=device)
+
+    assert fused_gdn_decode_qkvz_supported(
+        *args, qkvz_layout="flat", query_start_loc=qsl, out=out
+    ) == (True, "")
+    for kwargs in ({"query_start_loc": qsl.cpu()}, {"out": out.cpu()}):
+        ok, reason = fused_gdn_decode_qkvz_supported(
+            *args, qkvz_layout="flat", **kwargs
+        )
+        assert not ok and "device" in reason, kwargs.keys()
+
+
+@pytest.mark.parametrize("num_ksplit", [0, 1])
+def test_fused_gdn_decode_supported_rejects_fewer_than_two_ba_partials(num_ksplit):
+    """A split-K GEMM with one split returns the reduced bf16 output, so fp32
+    partials with fewer than 2 splits are not valid input."""
+    _import_op()
+    _requires_gfx950()
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz_supported,
+    )
+
+    ops = to_flat_layout(make_inputs(4, num_k_heads=16, ratio=3))
+    ops["projected_ba"] = _split_k_partials(ops["projected_ba"], 2)[:num_ksplit]
+    args = [
+        ops[k]
+        for k in (
+            "projected_qkvz",
+            "projected_ba",
+            "conv_state",
+            "ssm_state",
+            "ssm_state_indices",
+            "conv_weight",
+            "conv_bias",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+        )
+    ]
+    ok, reason = fused_gdn_decode_qkvz_supported(*args, qkvz_layout="flat")
+    assert not ok and "at least 2 splits" in reason
+
+
+def test_fused_gdn_decode_preallocated_out():
+    """``out=`` writes the normalised output into the caller's buffer in place
+    (a slice of a larger activation buffer) and returns that same tensor."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    batch = 16
+    inp = make_inputs(batch, num_k_heads=16, ratio=3)
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    flat = to_flat_layout(inp)
+    buf = torch.full(
+        (batch + 8, inp["num_v_heads"], inp["head_v_dim"]),
+        7.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out = buf[:batch]
+    ret, _, _ = fused_gdn_decode_qkvz(
+        flat["projected_qkvz"],
+        flat["projected_ba"],
+        flat["conv_state"],
+        flat["ssm_state"],
+        flat["ssm_state_indices"],
+        flat["conv_weight"],
+        flat["conv_bias"],
+        flat["A_log"],
+        flat["dt_bias"],
+        flat["norm_weight"],
+        scale=flat["scale"],
+        norm_eps=flat["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout="flat",
+        out=out,
+    )
+    assert ret is out
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    assert torch.all(buf[batch:] == 7.0)
+
+
+def test_fused_gdn_decode_ratio3_bf16_only_and_pad_slot():
+    """Ratio 3: ``quant_dtype=None`` returns bf16 only, and PAD_SLOT_ID rows leave
+    both state pools untouched."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(8, num_k_heads=16, ratio=3)
+    inp["ssm_state_indices"][3] = -1  # PAD_SLOT_ID
+    pad_slot_ssm = inp["ssm_state"].clone()
+    pad_slot_conv = inp["conv_state"].clone()
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    out, quant, scales = fused_gdn_decode_qkvz(
+        inp["projected_qkvz"],
+        inp["projected_ba"],
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+        scale=inp["scale"],
+        norm_eps=inp["norm_eps"],
+        quant_dtype=None,
+    )
+    assert quant is None and scales is None
+    live = inp["ssm_state_indices"] != -1
+    torch.testing.assert_close(
+        out[live].float(), ref_norm[live].float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+    # The slot the padded row would have used (slot 4 = row 3 + 1) is bit-unchanged.
+    assert torch.equal(inp["ssm_state"][4], pad_slot_ssm[4])
+    assert torch.equal(inp["conv_state"][4], pad_slot_conv[4])
 
 
 def test_fused_gdn_decode_bf16_only():

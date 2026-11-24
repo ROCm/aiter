@@ -125,6 +125,35 @@ def all_reduce_(
     )
 
 
+def all_reduce_add_fake(
+    tensor: torch.Tensor, other: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
+    # The fallback all-reduces tensor + other: the shape and dtype of that sum.
+    return torch.empty(
+        torch.broadcast_shapes(tensor.shape, other.shape),
+        dtype=torch.result_type(tensor, other),
+        device=tensor.device,
+    )
+
+
+@torch_compile_guard(gen_fake=all_reduce_add_fake)
+def all_reduce_add_(
+    tensor: torch.Tensor,
+    other: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool,
+    ca_fp8_quant: bool,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_add_out_place(
+        tensor, other, ca_use_new, ca_fp8_quant, prefill_support
+    )
+
+
 def fused_allreduce_rmsnorm_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -794,6 +823,75 @@ class GroupCoordinator:
             input_, ca_use_new, ca_fp8_quant, prefill_support
         )
 
+    def all_reduce_add(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other), out of place: the sum over ranks of each
+        rank's input_ + other, with the add fused where the device communicator
+        can."""
+        if self.world_size == 1:
+            return input_ + other
+        return all_reduce_add_(
+            input_,
+            other,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
+            prefill_support=prefill_support,
+        )
+
+    def _all_reduce_add_out_place(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool,
+        ca_fp8_quant: bool,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        fused = getattr(self.device_communicator, "all_reduce_add", None)
+        if fused is None:
+            return self.device_communicator.all_reduce(input_ + other)
+        return fused(input_, other, ca_use_new, ca_fp8_quant, prefill_support)
+
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials over this group in one kernel.
+
+        o [B, H, D] and lse [B, H] are this rank's attention partials over its
+        KV shard. The result is [B, H / world_size, D] for this rank's heads,
+        merged by LSE (with return_lse, also the merged LSE). Returns None when
+        no custom kernel takes the inputs; the caller then merges its own way
+        (for example with an all-to-all).
+
+        Whether it returns None depends only on the inputs' shapes, dtypes and
+        strides and on this group, so every rank makes the same choice. Callers
+        rely on that: the kernel and their fallback are both collectives, and
+        ranks that chose differently would hang the group.
+
+        This is the gfx1250 merge (CustomAllreduce.custom_dcp_merge, over the LL
+        scratch). On gfx950, aiter.ops.flydsl.dcp_mailbox.dcp_lse_combine merges
+        a single-node group through a FlyDSL mailbox with a workspace of its own;
+        it is not reached from here.
+        """
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        merge = getattr(self.device_communicator, "dcp_lse_merge", None)
+        if merge is None:
+            return None
+        return merge(o, lse, owned_counts, return_lse)
+
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
@@ -827,9 +925,12 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if hadamard_rotate and quant_type != "mxfp4":
+            raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "per_token" and group_size == 128:
             # Both paths go through torch.library-registered ops so they lower
             # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
@@ -867,6 +968,7 @@ class GroupCoordinator:
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -964,6 +1066,8 @@ class GroupCoordinator:
         eps: float,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         return self.fused_allreduce_rmsnorm_quant(
             input_,
@@ -973,6 +1077,8 @@ class GroupCoordinator:
             prefill_support,
             quant_type="mxfp4",
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
@@ -1089,11 +1195,20 @@ class GroupCoordinator:
         ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
+        if not ca_comm._has_gather_scatter_kernel():
+            raise RuntimeError(
+                f"custom all-gather has no kernel for {self.world_size} ranks: "
+                "check should_custom_ag() first, or use all_gather(use_custom=True), "
+                "which falls back to NCCL"
+            )
         out = ca_comm.custom_all_gather(input_, dim)
         assert out is not None
         return out
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        """The custom all-gather, with no NCCL fallback: raises at group sizes
+        it has no kernel for (6 ranks off gfx1250). Callers check
+        `should_custom_ag()` first; `all_gather(use_custom=True)` falls back."""
         return outplace_all_gather(input_, group_name=self.unique_name)
 
     # didn't support dim in custom reduce_scatter
@@ -1178,9 +1293,17 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        can_use_custom = use_custom and (
-            dim == 0
-            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        # A group built without a device communicator (the world group) has none.
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if (use_custom and dc is not None) else None
+        can_use_custom = (
+            use_custom
+            # No custom all-gather kernel for this group size (6 ranks).
+            and (ca_comm is None or ca_comm._has_gather_scatter_kernel())
+            and (
+                dim == 0
+                or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+            )
         )
 
         if can_use_custom:
@@ -1594,6 +1717,13 @@ class GroupCoordinator:
         device_communicator; only the owner tears those down, since a second
         destroy raises and aborts teardown part-way.
         """
+        # Communicators first: their teardown may sync the ranks over cpu_group.
+        if self.device_communicator is not None:
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed below.
+            self.device_communicator = None
         if hasattr(self, "device_group"):
             if self._owns_device_group:
                 torch.distributed.destroy_process_group(self.device_group)
@@ -1602,12 +1732,6 @@ class GroupCoordinator:
             if self._owns_cpu_group:
                 torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            if self._owns_device_communicator:
-                self.device_communicator.destroy()
-            # Drop it either way: a kept reference would route collectives into
-            # process groups that are destroyed by now.
-            self.device_communicator = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster.close()
             self.mq_broadcaster = None
@@ -1895,6 +2019,7 @@ def initialize_model_parallel(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    device_communicators: bool = True,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1911,6 +2036,10 @@ def initialize_model_parallel(
               e.g. [0,1,2,3,4,5,6,7]
             - 2D List[List[int]]: multiple independent subgroups,
               e.g. [[0,1,2,3],[4,5,6,7]]
+        device_communicators: False builds the standard groups for their
+            ranks only, without a device communicator (RCCL and the all-reduce
+            buffers): for a process that needs the layout but never
+            communicates on the device, e.g. one that only loads weights.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1974,8 +2103,9 @@ def initialize_model_parallel(
 
     # When custom groups are provided, all communication goes through them
     # (standard ops assert via _assert_no_custom_group). Skip expensive
-    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
-    need_std_comm = custom_group_config is None
+    # CudaCommunicator allocation for standard TP/PP/DP/EP groups. So does a
+    # caller that asked for none.
+    need_std_comm = device_communicators and custom_group_config is None
 
     # When on, a group whose rank list matches an earlier one shares its
     # communicators instead of allocating duplicates.
@@ -2175,6 +2305,7 @@ def ensure_model_parallel_initialized(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    device_communicators: bool = True,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2190,6 +2321,7 @@ def ensure_model_parallel_initialized(
             data_parallel_size,
             prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
+            device_communicators=device_communicators,
         )
         return
 

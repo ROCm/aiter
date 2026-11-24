@@ -1,4 +1,3 @@
-import argparse
 import sys
 
 import torch
@@ -6,6 +5,9 @@ import triton
 
 from aiter.ops.triton.attention.hstu_attention import _AttentionFunction
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -290,11 +292,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark HSTU Attention",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="HSTU Attention")
     parser.add_argument(
         "--b",
         type=int,
@@ -367,14 +365,6 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "throughput", "bandwidth"],
-        default="throughput",
-        help="metric to plot",
-    )
-
-    parser.add_argument(
         "--mode",
         type=str,
         default="fwd",
@@ -393,7 +383,6 @@ def parse_args():
         default=False,
         help="Run user input info",
     )
-
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )

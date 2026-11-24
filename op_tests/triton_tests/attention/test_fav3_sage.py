@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 import torch
 
+import aiter
 from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -19,6 +21,7 @@ from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     rotation_smooth_qk,
+    sage_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import (
@@ -28,6 +31,159 @@ from aiter.test_mha_common import (
 
 ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
+
+
+@pytest.mark.parametrize(
+    "seqlen, tail_logit, causal, later_max, sparse, v_dtype",
+    [
+        pytest.param(4096, 0, False, False, False, torch.float8_e4m3fnuz, id="uniform"),
+        pytest.param(
+            4096, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-full"
+        ),
+        pytest.param(
+            4117, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-tail"
+        ),
+        pytest.param(
+            4117, -7, False, False, False, torch.float8_e4m3fnuz, id="tail-minus7"
+        ),
+        pytest.param(4117, -8, True, False, False, torch.float8_e4m3fnuz, id="causal"),
+        pytest.param(
+            4117, -8, False, True, False, torch.float8_e4m3fnuz, id="later-max"
+        ),
+        pytest.param(
+            4096, -8, False, False, True, torch.float8_e4m3fnuz, id="sparse-full"
+        ),
+        pytest.param(
+            4117, -8, False, True, True, torch.float8_e4m3fnuz, id="sparse-tail"
+        ),
+        pytest.param(4117, -8, False, False, False, torch.bfloat16, id="bf16-v"),
+        pytest.param(
+            4096,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-full",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-tail",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            True,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-causal",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-later-max",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            True,
+            torch.float8_e4m3fnuz,
+            id="spread-sparse-tail",
+        ),
+    ],
+)
+def test_sage_small_probabilities(
+    seqlen, tail_logit, causal, later_max, sparse, v_dtype
+):
+    """Constant V must remain constant when many small probabilities contribute."""
+    if v_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() != "gfx942":
+        pytest.skip("E4M3 FNUZ regression requires gfx942")
+
+    config = get_sage_fwd_configs()
+    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+    seqlen_q = seqlen if causal else block_m + 1
+    num_q_blocks = (seqlen_q + block_m - 1) // block_m
+    num_k_blocks = (seqlen + block_n - 1) // block_n
+    q = torch.zeros((1, seqlen_q, 1, 128), dtype=torch.int8, device="cuda")
+    k = torch.zeros((1, seqlen, 1, 128), dtype=torch.int8, device=q.device)
+    max_position = seqlen - 1 if later_max else 0
+    if tail_logit == "spread":
+        # Encode logits -7 - code/64 exactly using integer dot products.
+        q[..., :7] = torch.tensor([64, 32, 16, 8, 4, 2, 1], device=q.device)
+        codes = (
+            torch.linspace(0, 128, seqlen - 1, device=q.device, dtype=torch.float32)
+            .round()
+            .int()
+        )
+        shifts = torch.arange(5, -1, -1, device=q.device)
+        encoded_k = torch.cat(
+            (-7 - codes[:, None] // 64, -((codes[:, None] >> shifts) & 1)), dim=1
+        ).to(torch.int8)
+        tail_start = 0 if later_max else 1
+        k[:, tail_start : tail_start + seqlen - 1, 0, :7] = encoded_k
+        logit_scale = 1 / 64
+    else:
+        q[..., 0] = 1
+        k[..., 0] = tail_logit
+        k[:, max_position, :, 0] = 0
+        logit_scale = 1
+    head_dim_v = 64 if v_dtype == torch.bfloat16 else 128
+    v = torch.ones((1, seqlen, 1, head_dim_v), dtype=torch.float32, device=q.device).to(
+        v_dtype
+    )
+    # QK descaling includes the conversion from natural logits to exp2 units.
+    q_descale = torch.full(
+        (1, 1, num_q_blocks),
+        math.log2(math.e) * logit_scale,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    k_descale = torch.ones((1, 1, num_k_blocks), device=q.device, dtype=torch.float32)
+    v_descale = torch.ones((1, 1, head_dim_v), device=q.device, dtype=torch.float32)
+    sparse_args = {}
+    if sparse:
+        block_mask = torch.ones(
+            (1, num_q_blocks, num_k_blocks), dtype=torch.bool, device=q.device
+        )
+        indices, starts, counts = block_attn_mask_to_ragged_lut(block_mask, num_heads=1)
+        sparse_args = {
+            "kv_block_indices": indices,
+            "lut_start": starts,
+            "lut_count": counts,
+            "use_block_sparse": True,
+        }
+
+    out, lse = fav3_sage_func(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        causal=causal,
+        return_lse=True,
+        **sparse_args,
+    )
+    atol = 0.05 if v_dtype == torch.float8_e4m3fnuz and tail_logit != 0 else 0.01
+    torch.testing.assert_close(out, torch.ones_like(out), atol=atol, rtol=0)
+    logits = (k[0, :, 0].float() @ q[0, 0, 0].float()) * logit_scale
+    if causal:
+        expected_lse = torch.logcumsumexp(logits, dim=0)
+    else:
+        expected_lse = torch.logsumexp(logits, dim=0).expand(seqlen_q)
+    torch.testing.assert_close(lse[0, 0], expected_lse, atol=2e-5, rtol=2e-5)
 
 
 def test_block_attn_mask_to_ragged_lut_metadata_dtype():
@@ -47,6 +203,19 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     torch.testing.assert_close(
         lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
     )
+
+
+def test_tiebreak_keeps_its_own_reference_bound():
+    """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
+
+    Reusing a neighbouring distribution's bound here would report breakage on the property the
+    generator is built to create.
+    """
+    bound = fp8_max_diff_percentage("tiebreak")
+    others = [
+        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
+    ]
+    assert bound > max(others), f"tiebreak {bound} vs {others}"
 
 
 def compare_accuracy(current, reference):
@@ -112,7 +281,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -204,6 +375,24 @@ def check_attention_outputs(
             atol=atol or 1e-2,
             rtol=rtol or 1e-2,
         )
+
+
+def fp8_max_diff_percentage(input_distribution: str) -> float:
+    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
+    # property under test; this bound is only a backstop against gross breakage.
+    if input_distribution == "tiebreak":
+        return 25.0
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(
+        input_distribution
+    ).startswith("dump:"):
+        return 2.0
+    return 0.5
 
 
 def input_helper(
@@ -351,11 +540,18 @@ def _non_dense_qkv(kind, layout, batch, heads, seq, head_sz, dtype):
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 @pytest.mark.parametrize("smooth_k", [True, False])
 @pytest.mark.parametrize("q_smooth", [False, True])
-def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
+@pytest.mark.parametrize("v_dtype", [None, torch.float16])
+def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth, v_dtype):
     """Non-dense Q/K/V views must give the same result as contiguous copies."""
     q, k, v = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
     assert not all(t.is_contiguous() for t in (q, k, v))
-    kwargs = {"layout": layout, "smooth_k": smooth_k, "q_smooth": q_smooth}
+    kwargs = {
+        "layout": layout,
+        "smooth_k": smooth_k,
+        "q_smooth": q_smooth,
+        "v_dtype": v_dtype,
+        "config": _sage_config(v_dtype),
+    }
     out = fav3_sage_wrapper_func(q, k, v, **kwargs)
     ref = fav3_sage_wrapper_func(
         q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
@@ -365,6 +561,79 @@ def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
     torch.testing.assert_close(
         _tensor_from_result(out), _tensor_from_result(ref), atol=tol, rtol=tol
     )
+
+
+def _sage_config(v_dtype):
+    """Launch config for a V type that may not be the arch default.
+
+    The gfx942/gfx950 tables (BLOCK_N=128) are sized for an FP8 V; with a
+    16-bit V they need more LDS than gfx942 has, so use BLOCK_N=64 there.
+    """
+    if v_dtype in (torch.float16, torch.bfloat16):
+        return get_sage_fwd_configs(block_n=64)
+    return None
+
+
+@pytest.mark.parametrize("v_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("v_in_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_quant_16bit_v_passthrough(v_dtype, v_in_dtype, layout):
+    """A 16-bit v_dtype passes V through unscaled; Q and K are unchanged."""
+    q, k, _ = input_helper(2, 8, 4, 200, 333, 128, 128, torch.bfloat16, layout)
+    v = torch.randn_like(k, dtype=v_in_dtype) * 100
+    fp8 = aiter.dtypes.fp8
+    ref = sage_quant(q, k, v, fp8, torch.finfo(fp8).max, layout=layout)
+    out = sage_quant(q, k, v, v_dtype, None, layout=layout)
+    for name, a, b in zip(("q", "q_scale", "k", "k_scale"), out[:4], ref[:4]):
+        torch.testing.assert_close(a, b, atol=0, rtol=0, msg=name)
+    v_out, v_scale = out[4], out[5]
+    assert v_out.dtype == v_dtype
+    if v_in_dtype == v_dtype:
+        assert v_out is v
+    torch.testing.assert_close(v_out, v.to(v_dtype), atol=0, rtol=0)
+    assert v_scale.shape == ref[5].shape and v_scale.dtype == torch.float32
+    assert torch.all(v_scale == 1)
+
+
+@pytest.mark.parametrize("v_dtype", [torch.float16, torch.bfloat16, "fp8"])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(1, 1), (128, 128), (200, 333)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(2, 1), (8, 8)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_v_dtype(v_dtype, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, layout):
+    """Each V type is tested on every arch, not only on the arch that defaults to it."""
+    if v_dtype == "fp8":
+        if not arch_info.is_fp8_avail():
+            pytest.skip("FP8 V requires an arch with FP8")
+        v_dtype = aiter.dtypes.fp8
+    HEAD_SZ = 128
+    q, k, v = input_helper(
+        2,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        torch.bfloat16,
+        layout,
+    )
+    triton_out = fav3_sage_wrapper_func(
+        q, k, v, layout=layout, config=_sage_config(v_dtype), v_dtype=v_dtype
+    )
+    if layout == "bhsd":
+        q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    torch_out = attention_ref(q, k, v)[0]
+    if layout == "bhsd":
+        torch_out = torch_out.transpose(1, 2).contiguous()
+    check_attention_outputs(
+        triton_out, torch_out, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8
+    )
+
+
+def test_sage_v_dtype_rejects_other_types():
+    q, k, v = input_helper(1, 2, 2, 64, 64, 128, 128, torch.bfloat16, "bshd")
+    with pytest.raises(ValueError, match="v_dtype"):
+        fav3_sage_wrapper_func(q, k, v, v_dtype=torch.float32)
 
 
 @pytest.mark.parametrize("kind", ["seq_slice", "qkv_split"])

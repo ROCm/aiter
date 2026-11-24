@@ -21,15 +21,9 @@ from aiter.test_common import assertAllclose
 
 
 @pytest.fixture(autouse=True)
-def _na3d_default_device():
+def _require_cuda():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required for na3d_flash tests")
-    prev_device = torch.get_default_device()
-    try:
-        torch.set_default_device("cuda")
-        yield
-    finally:
-        torch.set_default_device(prev_device)
 
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
@@ -310,9 +304,9 @@ def test_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
         pytest.skip(f"na3d_flash unsupported on {get_gfx()}")
 
     scale = HD**-0.5
-    q = torch.randn(B, T, H, W, NH, HD, dtype=dtype) * scale
-    k = torch.randn(B, T, H, W, NH, HD, dtype=dtype)
-    v = torch.randn(B, T, H, W, NH, HD, dtype=dtype)
+    q = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda") * scale
+    k = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda")
+    v = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda")
 
     ref = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))
     out = na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW))
@@ -347,9 +341,9 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
         pytest.skip(f"na3d_flash unsupported on {get_gfx()}")
 
     scale = HD**-0.5
-    q = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16) * scale
-    k = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16)
-    v = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16)
+    q = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda") * scale
+    k = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda")
 
     ref = na3d_sdpa_ref(q, k, v, kernel_size=(KT, KH, KW))
     exact = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))  # w_offset=0 default

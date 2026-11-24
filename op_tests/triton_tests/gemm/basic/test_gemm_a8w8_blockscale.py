@@ -15,6 +15,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -42,39 +43,6 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None, impl=N
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
-
-
-def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    # GPT-OSS-120B attention projections
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
-    x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
-    # Small-K shapes that exercise the gluon wind-down's num_k_iter guards
-    # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
-    # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
-    x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
-    x_vals += [(v, 8192, 1024) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 4096, 8192) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 4096, 4096) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 4096, 2048) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 1536, 4096) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 32768, 1024) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 8192, 1536) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 7168, 4096) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 1536, 7168) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 7168, 768) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 2048, 7168) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 16384, 1536) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 65536, 1536) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 7168, 16384) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 6144, 7168) for v in (1, 32, 64, 128, 256, 1024)]
-    x_vals += [(v, 7168, 3072) for v in (1, 32, 64, 128, 256, 1024)]
-    # gfx942's tuned preshuffle config splits K=11008 into four 2816-wide
-    # partitions, so the last one runs 256 past K
-    x_vals += [(16, 4096, 11008)]
-    return x_vals
 
 
 def generate_gemm_a8w8_blockscale_inputs(
@@ -133,7 +101,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
 
@@ -145,7 +113,7 @@ def generate_gemm_a8w8_blockscale_inputs(
         for output in [True]
         for dtype in ["bf16"]
         for layout in ["TN"]
-        for shape in get_x_vals()
+        for shape in get_shapes(min_k=128)
     ],
 )
 @pytest.mark.parametrize("backend", ["gluon", "triton"])
@@ -158,15 +126,19 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     if backend == "gluon":
         if shuffle:
-            if DEVICE_ARCH not in ("gfx1250"):
+            if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
                 pytest.skip("Gluon + shuffle implementation requires gfx1250.")
-        elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
+        elif DEVICE_ARCH not in ("gfx950", "gfx1250", "gfx1250-strict"):
             pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
 
     if shuffle and (N % 16 > 0 or K % 32 > 0):
         pytest.skip(
             "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
         )
+    if backend == "triton" and shuffle and K % 128 > 0:
+        pytest.skip("Triton preshuffle needs K to be a multiple of 128")
+    if backend == "gluon" and K % 64 > 0:
+        pytest.skip("Gluon needs K to be a multiple of 64")
 
     if backend not in ("gluon",) and K < 512:
         pytest.skip("Small-K shapes exercise gluon-only paths.")

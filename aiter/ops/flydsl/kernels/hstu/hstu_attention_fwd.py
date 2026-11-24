@@ -289,7 +289,7 @@ def build_hstu_attention_fwd(
         inv_n: fx.Float32,
     ) -> None:
         compute_type = fx.Float32.ir_type
-        c_zero_dim_pack = Vec.filled(MFMA_DIM_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_dim_pack = fx.full(MFMA_DIM_LANE_K, 0.0, elem_dtype).ir_value()
 
         # QK uses gfx942's 16x16x16 or gfx950's native 16x16x32. P*V remains
         # 16-deep because P is reused directly from the four-value C fragment.
@@ -336,7 +336,7 @@ def build_hstu_attention_fwd(
         if has_contextual:
             max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
         if has_targets:
-            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+            max_id = (num_target > 0).select(max_id - num_target, max_id)
 
         # ---- Global tensor views: g-wide coordinate slices for coalesced vector loads ----
         # (row, head) is indexed through the tensor's own i64-strided layout first (row*row_stride can
@@ -500,7 +500,7 @@ def build_hstu_attention_fwd(
                 kv_tile_start = win_tile_start
 
         N_ACC = D_CHUNKS * Q_SUBTILES
-        c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+        c_zero_v4f32 = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         # ---- K register prefetch: coalesced global -> registers, then swizzled LDS store
         # (register dest is pipelineable across the backedge). Mirrors the V register path. ----
@@ -545,7 +545,7 @@ def build_hstu_attention_fwd(
                         fx.Int64(safe), head_idx, k_load_col // fx.Int32(VEC_K)
                     ).ir_value()
                     vecs.append(
-                        guard.select(raw, Vec.filled(VEC_K, 0.0, elem_dtype).ir_value())
+                        guard.select(raw, fx.full(VEC_K, 0.0, elem_dtype).ir_value())
                     )
             return vecs
 
@@ -602,7 +602,7 @@ def build_hstu_attention_fwd(
                         fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)
                     ).ir_value()
                     vecs.append(
-                        guard.select(raw, Vec.filled(VEC_V, 0.0, elem_dtype).ir_value())
+                        guard.select(raw, fx.full(VEC_V, 0.0, elem_dtype).ir_value())
                     )
             return vecs
 
@@ -667,7 +667,7 @@ def build_hstu_attention_fwd(
                         to_id(col_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
                 for qg in range_constexpr(Q_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    cur = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
                     # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident, no transposed-V scatter.
                     for ks in range_constexpr(K_STEPS_K):

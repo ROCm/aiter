@@ -2,9 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU source-level regressions for the FMoE token-bucket contract.
 
-GPU-only imports are intentionally outside this test boundary.  The helpers
-below compile the exact argparse, CSV and preprocessing methods from this tree;
-only gfx, CU count and CUDA device count are fixed review seams.
+GPU-only imports are intentionally outside this test boundary. The helpers
+compile the argparse, CSV and preprocessing methods from this tree and stub
+hardware identity and the unrelated power policy hook.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ import argparse
 import ast
 import contextlib
 import io
+import math
+import os
 import sys
 import tempfile
 import unittest
@@ -28,6 +30,8 @@ GROUPED_RUNTIME = ROOT / "aiter/ops/flydsl/grouped_moe_gfx1250.py"
 DP_SHARED = ROOT / "aiter/fused_moe_dp_shared_expert.py"
 BASE_TUNER = ROOT / "aiter/utility/base_tuner.py"
 FMOE_TUNER = ROOT / "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"
+MOE_LIMITS = ROOT / "aiter/ops/moe_limits.py"
+FLYDSL_MOE_COMMON = ROOT / "aiter/ops/flydsl/moe_common.py"
 KEYS = [
     "gfx",
     "cu_num",
@@ -134,6 +138,10 @@ def _normalizer(runtime_bucket):
 
 class _Dtypes:
     @staticmethod
+    def normalize_fp8_dtype(dtype):
+        return "torch.float8_e4m3fnuz"
+
+    @staticmethod
     def str2bool(value):
         value = str(value).lower()
         if value in {"1", "true", "yes"}:
@@ -156,64 +164,111 @@ def _tuner_classes(runtime_bucket):
         "get_out_file",
         "get_tuned_gemm_list",
         "get_retune_gemm_list",
+        "_normalize_tuned_csv",
+        "_normalize_tuned_identity",
+        "_resolve_fp8_name",
+        "_normalize_fp8_columns",
     )
-    base_body = [_assignment(base, "TunerCommon", "ARG_DEFAULTS")]
+    base_body = [
+        _assignment(base, "TunerCommon", name)
+        for name in ("ARG_DEFAULTS", "_QUANT_DTYPE_COLS", "input_metadata")
+    ]
     base_body += _methods(base, "TunerCommon", required=base_names)
     base_body += ast.parse(
         "def get_cu_num(self):\n    return 80\n"
         "def get_gfx(self):\n    return 'gfx942'\n"
+        "def _apply_select(self, args):\n    pass\n"
     ).body
     base_cls = ast.ClassDef(
-        name="ReviewBase",
+        name="TunerCommon",
         bases=[],
         keywords=[],
         decorator_list=[],
         type_params=[],
         body=base_body,
     )
-    # Optional selection lets this integration class run against unpatched main
-    # as a negative control instead of failing during loader construction.
-    fmoe_body = _methods(
-        fmoe,
+
+    def tuner_class(name, parent, attributes, methods=()):
+        return ast.ClassDef(
+            name=name,
+            bases=[ast.Name(id=parent, ctx=ast.Load())],
+            keywords=[],
+            decorator_list=[],
+            type_params=[],
+            body=[_assignment(fmoe, name, attr) for attr in attributes]
+            + _methods(fmoe, name, required=methods),
+        )
+
+    fmoe_cls = tuner_class(
         "FmoeTuner",
-        required=("_setup_specific_arguments", "parse_args", "pre_process"),
-        optional=("_normalize_tuning_tokens", "get_untuned_gemm_list"),
+        "TunerCommon",
+        (
+            "ARG_DEFAULTS",
+            "USES_TOKEN_BUCKET_CONTRACT",
+            "SUPPORTS_FAST_SCAN",
+            "swiglu_limit_tag",
+        ),
+        (
+            "_setup_specific_arguments",
+            "parse_args",
+            "pre_process",
+            "_already_tuned_mask",
+            "_normalize_tuning_tokens",
+            "get_untuned_gemm_list",
+        ),
     )
-    fmoe_cls = ast.ClassDef(
-        name="ReviewFmoe",
-        bases=[ast.Name(id="ReviewBase", ctx=ast.Load())],
-        keywords=[],
-        decorator_list=[],
-        type_params=[],
-        body=fmoe_body,
+    grouped_cls = tuner_class(
+        "GroupedFmoeTuner", "FmoeTuner", ("ARG_DEFAULTS", "USES_TOKEN_BUCKET_CONTRACT")
     )
-    grouped_cls = ast.ClassDef(
-        name="ReviewGrouped",
-        bases=[ast.Name(id="ReviewFmoe", ctx=ast.Load())],
-        keywords=[],
-        decorator_list=[],
-        type_params=[],
-        body=[ast.Pass()],
+    mxfp4_cls = tuner_class(
+        "Mxfp4FlydslTuner",
+        "FmoeTuner",
+        ("USES_TOKEN_BUCKET_CONTRACT", "SUPPORTS_FAST_SCAN", "input_metadata"),
+        (
+            "_setup_specific_arguments",
+            "parse_args",
+            "pre_process",
+            "_normalize_tuned_csv",
+            "_capture_configuration",
+            "_invocation_configuration",
+            "_require_distinct_input_output",
+        ),
     )
     namespace = {
         "Any": Any,
         "ClassVar": ClassVar,
         "argparse": argparse,
         "pd": pd,
-        "os": __import__("os"),
+        "math": math,
+        "os": os,
         "dtypes": _Dtypes(),
-        "torch": SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2)),
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(device_count=lambda: 2),
+            float8_e4m3fnuz="torch.float8_e4m3fnuz",
+            float8_e4m3fn="torch.float8_e4m3fn",
+        ),
         "get_padded_M": runtime_bucket,
         "get_gfx_runtime": lambda: "gfx942",
         "gfx_from_cu_num": lambda cu: "gfx942" if int(cu) == 80 else "gfx950",
-        "Mxfp4FlydslTuner": type("Mxfp4FlydslTuner", (), {}),
+        "AITER_ROOT_DIR": ROOT,
+        "AITER_CONFIG_FMOE": ROOT / "aiter/configs/tuned_fmoe.csv",
+        "AITER_CONFIG_GROUPED_FMOE": ROOT / "aiter/configs/tuned_grouped_fmoe.csv",
     }
+    helpers = (
+        _top_level(base, {"_read_csv", "_improvement_pct"})
+        + _top_level(fmoe, {"_mxfp4_search_mode", "_parse_fast_scan_iters"})
+        + _top_level(MOE_LIMITS.read_text(encoding="utf-8"), {"normalize_swiglu_limit"})
+        + _top_level(RUNTIME.read_text(encoding="utf-8"), {"swiglu_limit_tag"})
+        + _top_level(
+            FLYDSL_MOE_COMMON.read_text(encoding="utf-8"), {"resolve_swiglu_limit"}
+        )
+    )
     namespace = _compile(
-        _top_level(base, {"_read_csv"}) + [base_cls, fmoe_cls, grouped_cls],
+        helpers + [base_cls, fmoe_cls, grouped_cls, mxfp4_cls],
         FMOE_TUNER,
         namespace,
     )
-    return namespace["ReviewFmoe"], namespace["ReviewGrouped"]
+    return (namespace[cls.name] for cls in (fmoe_cls, grouped_cls, mxfp4_cls))
 
 
 @contextlib.contextmanager
@@ -263,7 +318,7 @@ class TestFmoeTunerTokenBuckets(unittest.TestCase):
         cls.grouped_bucket = staticmethod(
             _bucket(
                 GROUPED_RUNTIME,
-                {"_PADDED_M_TIERS", "_next_pow2", "_get_padded_m"},
+                {"_next_pow2", "_get_padded_m"},
                 "_get_padded_m",
             )
         )
@@ -289,6 +344,10 @@ class TestFmoeTunerTokenBuckets(unittest.TestCase):
         for raw, bucket in expected.items():
             with self.subTest(raw=raw):
                 self.assertEqual(self.runtime_bucket(raw), bucket)
+
+    def test_grouped_runtime_keeps_its_own_large_buckets(self):
+        for raw, bucket in {96: 128, 65536: 65536, 131071: 131072}.items():
+            with self.subTest(raw=raw):
                 self.assertEqual(self.grouped_bucket(raw), bucket)
 
     def test_normalizer_keeps_newest_canonical_row_and_distinct_keys(self):
@@ -315,7 +374,7 @@ class TestFmoeTunerTokenBucketIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         runtime = _bucket(RUNTIME, {"_PADDED_M_TIERS", "nextPow2", "get_padded_M"})
-        cls.tuner_class, cls.grouped_class = _tuner_classes(runtime)
+        cls.tuner_class, cls.grouped_class, cls.mxfp4_class = _tuner_classes(runtime)
 
     def _run(self, untuned, tuned, extra=(), tuner_class=None):
         tuner = (tuner_class or self.tuner_class)("review", KEYS, [], "CPU test")
@@ -386,25 +445,77 @@ class TestFmoeTunerTokenBucketIntegration(unittest.TestCase):
                 self.assertEqual(result.tunedf["gfx"].tolist(), ["gfx950"])
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
 
-    def test_grouped_inherits_real_preprocess_and_dp_command_has_flag(self):
-        grouped = _class(FMOE_TUNER.read_text(encoding="utf-8"), "GroupedFmoeTuner")
-        self.assertEqual(
-            [base.id for base in grouped.bases if isinstance(base, ast.Name)],
-            ["FmoeTuner"],
-        )
-        grouped_methods = {
-            node.name for node in grouped.body if isinstance(node, ast.FunctionDef)
-        }
-        self.assertNotIn("pre_process", grouped_methods)
-        self.assertNotIn("get_untuned_gemm_list", grouped_methods)
-        self.assertIs(self.grouped_class.pre_process, self.tuner_class.pre_process)
+    def test_grouped_preserves_raw_keys_when_filtering_tuned_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             untuned, tuned = Path(tmp) / "in.csv", Path(tmp) / "out.csv"
-            _write(untuned, [_row(96), _row(64)])
-            _write(tuned, [_row(128)])
-            result, _ = self._run(untuned, tuned, tuner_class=self.grouped_class)
+            _write(untuned, [_row(96), _row(65536), _row(64)])
+            _write(tuned, [_row(128), _row(32768)])
+            result, _ = self._run(
+                untuned, tuned, ["--grouped-gemm"], self.grouped_class
+            )
+            self.assertEqual(_tokens(result.untunedf), [96, 65536, 64])
+            result, _ = self._run(untuned, tuned)
             self.assertEqual(_tokens(result.untunedf), [64])
 
+    def test_specialized_tuners_keep_main_csv_dedup_order(self):
+        for tuner_class, flag in (
+            (self.grouped_class, "--grouped-gemm"),
+            (self.mxfp4_class, "--mxfp4-flydsl"),
+        ):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                untuned, tuned = Path(tmp) / "in.csv", Path(tmp) / "out.csv"
+                _write(untuned, [_row(token) for token in (65536, 64, 65536)])
+                _write(tuned, [])
+                result, args = self._run(untuned, tuned, [flag, "--last"], tuner_class)
+                self.assertFalse(hasattr(args, "token_bucket_contract"))
+                self.assertEqual(
+                    _tokens(result.get_untuned_gemm_list(untuned)), [65536, 64]
+                )
+                self.assertEqual(_tokens(result.untunedf), [64])
+
+    def test_runtime_preserves_fp8_normalization_with_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned, tuned = Path(tmp) / "in.csv", Path(tmp) / "out.csv"
+            _write(
+                untuned,
+                [_row(128), _row(64), _row(96, q_dtype_a="torch.float8_e4m3fn")],
+            )
+            _write(tuned, [])
+            result, _ = self._run(untuned, tuned, ["--last"])
+            self.assertEqual(_tokens(result.untunedf), [128])
+            self.assertEqual(
+                result.untunedf["q_dtype_a"].tolist(), ["torch.float8_e4m3fnuz"]
+            )
+
+    def test_swiglu_validation_and_runtime_bucketing_coexist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned, tuned = Path(tmp) / "in.csv", Path(tmp) / "out.csv"
+            _write(untuned, [_row(96)])
+            _write(tuned, [_row(128)])
+            result, _ = self._run(untuned, tuned, ["--swiglu_limit", "7"])
+            self.assertEqual(result.swiglu_limit_tag, "swiglu_limit=7")
+            self.assertEqual(_tokens(result.untunedf), [128])
+
+            for flags, error in (
+                (["--swiglu_limit", "-1"], "must be non-negative"),
+                (
+                    ["--swiglu_limit", "7", "--grouped-gemm"],
+                    "only supported by the default",
+                ),
+                (
+                    ["--swiglu_limit", "7", "--compare"],
+                    "does not support --run_config or --compare",
+                ),
+            ):
+                with (
+                    self.subTest(flags=flags),
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    with self.assertRaises(SystemExit):
+                        self._run(untuned, tuned, flags)
+                    self.assertIn(error, stderr.getvalue())
+
+    def test_dp_command_has_contract_flag(self):
         source = DP_SHARED.read_text(encoding="utf-8")
         outer = next(
             n

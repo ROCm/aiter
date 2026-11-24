@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -10,8 +11,10 @@ from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import (
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -19,16 +22,28 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
     generate_gemm_a8wfp4_inputs,
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+):
     _e5m2_type, e4m3_type = get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
-    x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
+
+    _p_gen = functools.partial(
+        generate_gemm_a8wfp4_inputs,
         M=M,
         N=N,
         K=K,
@@ -37,24 +52,29 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
         layout=layout,
         output=True,
     )
+    # (x, w, x_scales, w_scales, x_fp32, w_fp32, y)
+    _out_vals_keys = ["x", "w", "x_scales", "w_scales", "_", "_", "y"]
+
+    rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
+
+    kernel_fn = functools.partial(gemm_a8wfp4, dtype=out_dtype)
+
     # flops
     flops = 2.0 * M * N * K
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    # memory transfer. w is e2m1, packed two values per byte (K // 2 wide); the
+    # scale tensors keep their own numel (one scale per 32 K-elements, which
+    # doesn't reduce to a clean M/N/K product).
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K // 2) * rot_bufs[0][
+        "w"
+    ].element_size()
     mem_read += (
-        x_scales.numel() * x_scales.element_size()
-        + w_scales.numel() * w_scales.element_size()
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
     )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_a8wfp4(
-            x=x, w=w, y=y, x_scales=x_scales, w_scales=w_scales, dtype=out_dtype
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = bencher.bench(kernel_fn)
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -98,6 +118,10 @@ def run_benchmark(args, defaults):
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8wfp4(
         M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
@@ -114,7 +138,7 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(bencher, M, N, K, metric, args.layout)
 
     bench_gemm_a8wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -122,9 +146,13 @@ def run_model_benchmark(args):
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_af8wfp4(M, N, K, metric, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(bencher, M, N, K, metric, args.layout)
 
     bench_gemm_af8wfp4.run(save_path="." if args.o else None, print_data=True)
 

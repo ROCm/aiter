@@ -46,7 +46,8 @@ void topk_gating(aiter_tensor_t& topk_weights,
                  bool need_renorm,
                  float routed_scaling_factor,
                  const std::string& score_func,
-                 int num_shared_experts)
+                 int num_shared_experts,
+                 std::optional<aiter_tensor_t> num_valid_rows)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be float32");
@@ -96,6 +97,7 @@ void topk_gating(aiter_tensor_t& topk_weights,
     p.num_shared_experts    = num_shared_experts;
     p.topk                  = topk;
     p.num_tokens            = static_cast<int>(gating_output.size(0));
+    p.num_valid_rows        = num_valid_rows_ptr(num_valid_rows);
     p.routed_scaling_factor = routed_scaling_factor;
     p.need_renorm           = need_renorm;
     p.stream                = aiter::getCurrentHIPStream();
