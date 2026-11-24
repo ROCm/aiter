@@ -1,39 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE router GEMM + biased sigmoid top-k in one gfx1250 launch (FlyDSL).
+"""MoE router GEMM + biased sigmoid top-k in one gfx1250 launch (FlyDSL), as
+``tgemm.mm(x, w)`` + ``topk_gating(..., score_func="sigmoid")``; bitwise equal
+when ``split_k`` is that of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` runs:
 
-Replaces the decode pair ``tgemm.mm(x, w)`` (the FlyDSL gfx1250 A16W16 GEMM,
-split-K, bf16 logits) + ``topk_gating(..., score_func="sigmoid")`` and gives
-their bytes:
+* Logits: each 16x16 (expert, token) block is ``split_k`` WMMA chains over
+  consecutive K chunks from a zero accumulator (weight as operand A, activation
+  as B, the GEMM's fragment slots), summed in split order, rounded to bf16.
+* Top-k: as ``topk_gating_kernel_opt`` (SCORE_SIGMOID): lane L holds experts
+  L + 32i; score ``rcp(1 + exp2(-x*log2e))`` with denormals flushed (the
+  reference builds with -fgpu-flush-denormals-to-zero), selection value
+  ``score + bias`` (NaN -> -inf), the same 5-comparator network per lane,
+  ``topk`` wave-argmax rounds with ties to the lowest lane, the same renorm.
 
-* Logits. The FlyDSL GEMM (``gemm_a16w16_kernel_gfx1250``) computes every
-  16x16 (expert, token) block as ``split_k`` WMMA chains: chain ``s`` covers K
-  ``[s*K/split_k, (s+1)*K/split_k)`` in 32-wide steps from a zero
-  accumulator, router weight as WMMA operand A and activation as operand B;
-  the last split to arrive sums the chains in split order (p0 + p1 + ...) and
-  rounds to bf16. This kernel runs the same chains with the same operands in
-  the same fragment slots, and sums them in the same order.
-* Top-k. ``topk_gating_kernel_opt`` (SCORE_SIGMOID): one wave per token row,
-  lane L holds experts L, L+32, L+64, L+96; score ``rcp(1 + exp2(-x*log2e))``
-  (the reference is built with -fgpu-flush-denormals-to-zero, so a denormal
-  score is flushed here too), selection value ``score + bias`` (NaN -> -inf),
-  the same 5-comparator sorting network per lane, and ``topk`` rounds of a wave
-  argmax whose ties go to the lowest lane. Weights are the unbiased scores in
-  selection order, renormalized with the same sum order and floor.
-
-Each 16-row token tile is one workgroup cluster of ``split_k * n_groups``
-(<= 16) workgroups, one per (K split, expert group); a workgroup's waves each
-own ``CHAINS`` 16-expert slices, run as interleaved chains on one activation
-fragment. The chains' partials go to a cluster-private workspace; after the
-cluster barrier, wave ``w`` of cluster member ``c`` reduces and gates the
-tile's row ``c + C * w``. The hand-off is the cluster barrier (measured on
-MI455X: ~0.1 us over an empty launch, where a software grid barrier costs
-~2.5 us): no flags, no polling, no cross-tile dependency.
-
-``with_counts`` also leaves, per 8-row group, how many of its routes go to
-each expert (the A1 route/quant of the grouped MoE reads these instead of
-re-counting every id in every block), counted after a second cluster barrier.
+Each 16-row tile is one cluster of ``split_k * n_groups`` (<= 16) workgroups,
+one per (K split, expert group). Partials go to a cluster-private workspace;
+after the cluster barrier (~0.1 us on MI455X, a grid barrier ~2.5 us), wave
+``w`` of member ``c`` reduces and gates row ``c + C * w``. ``with_counts`` also
+writes each 8-row group's routes per expert (for the grouped MoE's A1 route),
+after a second cluster barrier.
 """
 
 import struct
@@ -68,9 +54,11 @@ def router_topk_geometry(split_k: int):
             f"split_k {split_k} exceeds the {MAX_CLUSTER}-workgroup cluster"
         )
     tile_n = EXPERTS // n_groups
-    if tile_n * n_groups != EXPERTS:
-        raise ValueError(f"split_k {split_k} gives no even expert split")
     return n_groups, tile_n, tile_n // TILE, split_k * n_groups
+
+
+def _rsrc(ptr):
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(ptr)))
 
 
 def _rmem_vec(v, n, dtype):
@@ -91,9 +79,8 @@ def build_moe_router_topk_module(
 ):
     """Launcher ``(x, w, bias, num_valid_rows, ws, topk_weights, topk_ids,
     group_counts, m, lda, has_nvr, stream)``; ``ws`` holds
-    ``ceil(m/16) * split_k * 16 * 128`` fp32. ``with_counts`` also writes
-    ``group_counts`` int32 ``[2 * ceil(m/16), 128]``: per 8-row group, its
-    routes per expert (ids outside [0, 128) and rows >= m count nowhere)."""
+    ``ceil(m/16) * split_k * 16 * 128`` fp32; ``group_counts`` int32
+    ``[2 * ceil(m/16), 128]`` (ids outside [0, 128), rows >= m count nowhere)."""
     if K % (split_k * WMMA_K):
         raise ValueError(f"K {K} is not a multiple of split_k * 32")
     if not 1 <= topk <= 4:
@@ -140,8 +127,7 @@ def build_moe_router_topk_module(
         ntile0 = (ng * waves + wave) * CHAINS
         tok = fx.Int32(((mt * TILE + lane16) < m).select(mt * TILE + lane16, m - 1))
 
-        x_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(x)))
-        w_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(w)))
+        x_rsrc, w_rsrc = _rsrc(x), _rsrc(w)
         # Dword offsets of this lane's fragment rows: K [kgrp*8, +8) and
         # [16 + kgrp*8, +8) of each 32-wide step.
         kbase = s * chunk + kgrp * 8
@@ -184,8 +170,7 @@ def build_moe_router_topk_module(
             rocdl.sched_barrier(0)
 
         # acc[i]: expert ntile*16 + kgrp*8 + i of token row mt*16 + lane16.
-        ws_i = fx.Int64(fx.ptrtoint(ws))
-        ws_rsrc = buffer_ops.create_buffer_resource_from_addr(ws_i)
+        ws_rsrc = _rsrc(ws)
         for ch in range_constexpr(CHAINS):
             ws_off = (
                 ((mt * split_k + s) * TILE + lane16) * EXPERTS
@@ -198,23 +183,12 @@ def build_moe_router_topk_module(
                     [accv[half * 4 + i] for i in range_constexpr(4)], fx.Float32
                 )
                 buffer_ops.buffer_store(part, ws_rsrc, ws_off + half * 4)
-        cnt_i = fx.Int64(fx.ptrtoint(group_counts))
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
 
-        bias_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(bias))
-        )
-        tw_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(topk_weights))
-        )
-        ti_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(topk_ids))
-        )
-        nvr_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(num_valid_rows))
-        )
+        bias_rsrc, nvr_rsrc = _rsrc(bias), _rsrc(num_valid_rows)
+        tw_rsrc, ti_rsrc = _rsrc(topk_weights), _rsrc(topk_ids)
         for rr in range_constexpr(row_iters):
             row_local = c + csize * (wave + waves * rr)
             row = mt * TILE + row_local
@@ -233,8 +207,6 @@ def build_moe_router_topk_module(
                     buffer_ops.buffer_store(out_id, ti_rsrc, row * topk + lane)
 
         if const_expr(with_counts):
-            # Per 8-row group: how many of its routes go to each expert, for
-            # the A1 route of the next launch (one 8-token block per group).
             fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
             cluster.cluster_barrier()
             fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
@@ -256,10 +228,9 @@ def build_moe_router_topk_module(
                         cnts[j] = cnts[j] + (e_r == lane * 4 + j).select(
                             fx.Int32(1), fx.Int32(0)
                         )
-                cnt_rsrc = buffer_ops.create_buffer_resource_from_addr(cnt_i)
                 buffer_ops.buffer_store(
                     fx.Vector.from_elements(cnts, fx.Int32),
-                    cnt_rsrc,
+                    _rsrc(group_counts),
                     (mt * 2 + c) * EXPERTS + lane * 4,
                 )
 

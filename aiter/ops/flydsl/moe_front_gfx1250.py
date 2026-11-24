@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 decode MoE front: router GEMM + biased sigmoid top-k in one launch.
-
-``flydsl_moe_router_topk`` returns what ``topk_gating(tgemm.mm(x, w), bias,
-score_func="sigmoid")`` returns, byte for byte, from one FlyDSL launch
-(``kernels/moe_router_topk_gfx1250.py``). It reproduces the router GEMM the
-tuned config launches, so it only takes the shapes whose config names the
-gfx1250 FlyDSL A16W16 kernel (``router_split_k`` says which).
+"""gfx1250 decode MoE front: ``flydsl_moe_router_topk`` runs ``topk_gating(
+tgemm.mm(x, w), bias, score_func="sigmoid")`` in one FlyDSL launch, where the
+tuned table says it is faster (``router_topk_config``).
 """
 
 from __future__ import annotations
 
+import csv
 import functools
 
 import torch
@@ -26,30 +23,61 @@ ROUTER_EXPERTS = 128
 _TILE = 16
 
 
-@functools.lru_cache(maxsize=4096)
-def router_split_k(m: int, n: int, k: int, dtype: str, otype: str) -> int | None:
-    """split_k of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` launches for this
-    shape, or None when the tuned config names anything else (whose logits
-    this kernel would not reproduce)."""
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+@functools.lru_cache(maxsize=1)
+def _tuned_rows() -> dict:
+    from aiter.jit.core import AITER_CONFIGS
 
-    gfx = get_gfx()
-    if not str(gfx).startswith("gfx1250") or n != ROUTER_EXPERTS:
+    with open(AITER_CONFIGS.AITER_CONFIG_MOE_ROUTER_TOPK_FILE, newline="") as f:
+        rows = list(csv.DictReader(f))
+    key = ("cu_num", "M", "N", "K", "topk")
+    cfg = ("split_k", "prefetch", "bitexact")
+    return {
+        (r["gfx"], *(int(r[c]) for c in key)): (
+            tuple(int(r[c]) for c in cfg) if r["fused"] == "1" else ()
+        )
+        for r in rows
+    }
+
+
+@functools.lru_cache(maxsize=4096)
+def router_topk_config(
+    m: int, n: int, k: int, topk: int, with_counts: bool = False
+) -> dict | None:
+    """``split_k`` / ``prefetch`` of ``flydsl_moe_router_topk`` for this call, or
+    None to keep ``tgemm.mm`` + ``topk_gating``: the tuned table
+    (``AITER_CONFIG_MOE_ROUTER_TOPK``, padded M) has no fused row, a bitexact
+    row's split_k is no longer the router GEMM's, or ``with_counts`` (rows are
+    tuned without ``group_counts``)."""
+    if with_counts:
+        return None
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+    from aiter.ops.gemm_op_common import find_padded_m_row
+
+    gfx, cu_num = get_gfx_runtime(), get_cu_num()
+    row, _ = find_padded_m_row(
+        _tuned_rows(), lambda pm: (gfx, cu_num, pm, n, k, topk), m, n, k
+    )
+    if not row or (row[2] and row[0] != router_gemm_split_k(m, n, k)):
+        return None
+    return {"split_k": row[0], "prefetch": row[1]}
+
+
+@functools.lru_cache(maxsize=4096)
+def router_gemm_split_k(m: int, n: int, k: int) -> int | None:
+    """split_k of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` launches for this
+    bf16 shape (the fused launch then gives its bytes), or None when the tuned
+    config names anything else."""
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    if gfx != "gfx1250" or n != ROUTER_EXPERTS:
         return None
     from aiter.tuned_gemm import get_GEMM_A16W16_config
 
+    bf16 = str(torch.bfloat16)
     try:
         config = get_GEMM_A16W16_config(
-            M=m,
-            N=n,
-            K=k,
-            bias=False,
-            dtype=dtype,
-            otype=otype,
-            scaleAB=False,
-            bpreshuffle=False,
-            gfx=gfx,
-            cu_num=get_cu_num(),
+            m, n, k, False, bf16, bf16, gfx=gfx, cu_num=get_cu_num()
         )
     except Exception:  # noqa: BLE001 - no config: not this kernel's GEMM
         return None
@@ -57,50 +85,26 @@ def router_split_k(m: int, n: int, k: int, dtype: str, otype: str) -> int | None
         return None
     from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
 
-    params = get_flydsl_hgemm_kernel_params(config["kernelName"])
-    if params is None or params.get("policy") not in ("ft", "ht"):
+    p = get_flydsl_hgemm_kernel_params(config["kernelName"]) or {}
+    if (
+        p.get("policy") not in ("ft", "ht")
+        or p.get("k_waves", 1) != 1
+        or p.get("has_bias")
+        or (p.get("dtype"), p.get("out_dtype")) != ("bf16", "bf16")
+        or not 1 <= p["split_k"] <= 16
+        or k % (p["split_k"] * 32)
+    ):
         return None
-    if params.get("k_waves", 1) != 1 or params.get("has_bias"):
-        return None
-    if params.get("dtype") != "bf16" or params.get("out_dtype") != "bf16":
-        return None
-    split_k = int(params["split_k"])
-    if split_k < 1 or split_k > 16 or k % (split_k * 32):
-        return None
-    from aiter.ops.flydsl.kernels.moe_router_topk_gfx1250 import router_topk_geometry
-
-    try:
-        router_topk_geometry(split_k)
-    except ValueError:
-        return None
-    return split_k
+    return p["split_k"]
 
 
 @functools.lru_cache(maxsize=256)
-def _router_launcher(
-    k,
-    split_k,
-    topk,
-    need_renorm,
-    scale,
-    has_bias,
-    prefetch,
-    with_counts,
-):
+def _router_launcher(*args):
     from aiter.ops.flydsl.kernels.moe_router_topk_gfx1250 import (
         build_moe_router_topk_module,
     )
 
-    return build_moe_router_topk_module(
-        K=k,
-        split_k=split_k,
-        topk=topk,
-        need_renorm=need_renorm,
-        routed_scaling_factor=scale,
-        has_bias=has_bias,
-        prefetch=prefetch,
-        with_counts=with_counts,
-    )
+    return build_moe_router_topk_module(*args)
 
 
 def router_group_counts_shape(m: int) -> tuple[int, int]:
@@ -125,11 +129,9 @@ def flydsl_moe_router_topk(
     prefetch: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(topk_weights fp32 [M, topk], topk_ids int32 [M, topk])`` of
-    ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``;
-    ``split_k`` must be ``router_split_k`` of the shape. ``group_counts``
-    (``router_group_counts_shape(M)`` int32) also receives each 8-row
-    group's routes per expert, which the grouped MoE's A1 route can take in
-    place of re-counting every id (``moe_route_group_counts``)."""
+    ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``.
+    ``group_counts`` (``router_group_counts_shape(M)`` int32) also receives
+    each 8-row group's routes per expert."""
     m, k = x.shape
     assert (
         w.shape == (ROUTER_EXPERTS, k) and w.is_contiguous()
@@ -189,4 +191,4 @@ def flydsl_moe_router_topk(
     return topk_weights, topk_ids
 
 
-__all__ = ["flydsl_moe_router_topk", "router_group_counts_shape", "router_split_k"]
+__all__ = ["flydsl_moe_router_topk", "router_group_counts_shape", "router_topk_config"]
