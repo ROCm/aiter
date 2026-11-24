@@ -558,7 +558,7 @@ launches through this cache:
 
 | Cache | Launcher | How |
 |---|---|---|
-| `gemm_a16w16_gfx950` | the default HGEMM, one module-level launcher for every config | `bind_aot`; the config items its constexpr param struct is made from are the `specialization_key` |
+| `gemm_a16w16_gfx950` | the default HGEMM, one module-level launcher for every config | `bind_aot`; the `specialization_key` is the config items its constexpr param struct is made from, and the device |
 | `gemm_a16w16_band_gfx950`, `gemm_a16w16_skinny_gfx950` | band and skinny HGEMM | `aot_factory` |
 | `gemm_a8w8_fp8_8wave`, `gemm_a8w8_int8_4wave` | per-token-per-channel a8w8 | `aot_factory` |
 | `mixed_moe_gemm1`, `mixed_moe_gemm2`, `mixed_fhmoe_gemm1`, `mixed_fhmoe_gemm2` | MX 2-stage MoE and FHMoE | `aot_factory` |
@@ -634,7 +634,9 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    or too few for the constexprs the entry was built with.
    A constexpr value the cache cannot compare (a lambda, a `Type[T]`) leaves
    the key on the JIT path, which keeps one compiled function per key and
-   does not check; under `verify` it raises, as every fallback does.
+   does not check; under `verify` it raises, as a failed export or load does.
+   (A factory argument or `specialization_key` the cache cannot key takes
+   the JIT path under `verify` too.)
 2. **The key covers the specialization.** The factory's arguments must
    determine its launcher, as `functools.cache` on it already requires. Pass
    anything else the compiled function depends on, e.g. a tensor dtype that
@@ -690,9 +692,11 @@ path's). Issue 4 is in the JIT path and remains.
 - Only the launchers in §5 are converted: the GEMMs and the 2-stage MoE of
   gfx942 and gfx950. Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
   the attention kernels, MegaMoE and the a8w4 `comm_fused_moe`, still trace
-  and compile on their first call in each process.
+  and compile on their first call in each process. (`moe_reduction` is not
+  specific to an arch, so a gfx1250 MoE that calls it launches it through the
+  cache; that is not validated.)
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
-  24136 rows) writes about 3790 entries, 1 GB, in about 15 minutes. Rows
+  24136 rows) writes about 5240 entries, 180 MB, in 15 to 20 minutes. Rows
   tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to
   that CU count's fingerprint directory, which a GPU with another count
   does not read.

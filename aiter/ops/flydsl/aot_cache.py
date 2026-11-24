@@ -1112,6 +1112,8 @@ class FlyDSLAotCache:
         self._builds = 0
         # Set by invalidate(): this process then runs every key through the JIT.
         self._jit_only = False
+        # Bumped by invalidate(), for those who keep a kernel from _mem.
+        self.epoch = 0
         # Reentrant: a factory may reset itself (invalidate) while it is built.
         self._lock = threading.RLock()
 
@@ -1141,6 +1143,7 @@ class FlyDSLAotCache:
         """
         with self._lock:
             self._jit_only = True
+            self.epoch += 1
             self._mem.clear()
             self._jit.clear()
 

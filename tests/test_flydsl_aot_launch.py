@@ -45,6 +45,7 @@ class _Launcher:
 
 class _Cache:
     name = "fake"
+    epoch = 0
 
 
 @pytest.mark.skipif(
@@ -122,6 +123,41 @@ def test_specialization_key_the_cache_cannot_key_runs_the_jit(monkeypatch):
     assert resolved == [("a",), (("a",), ("ok", 1))]
     assert binding.unkeyable == {Mode.A}
     assert binding((), ("ok", 1)) is True
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 binds nothing",
+)
+def test_binding_keeps_the_loaded_kernel_until_the_cache_is_invalidated(monkeypatch):
+    from aiter.ops.flydsl import aot_cache
+
+    ran, resolved = [], []
+
+    def resolve(self, key, make_exe, args):
+        resolved.append(key)
+        return lambda *a: ran.append((key, a))
+
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", resolve)
+    monkeypatch.setattr(aot_cache, "_load_module", object())
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    exe, cache = _Launcher(), aot_cache.FlyDSLAotCache("test_binding_kernels")
+    bind_aot(exe, cache, ("a",))
+    binding = getattr(exe, _ATTR)
+    for spec in (None, 7, None, 7):
+        assert binding((1,), spec) is True
+    # One lookup of the whole key per specialization key; later launches go
+    # straight to the loaded kernel.
+    assert resolved == [("a",), (("a",), 7)]
+    assert [key for key, _ in ran] == [("a",), (("a",), 7), ("a",), (("a",), 7)]
+
+    # A cache that was reset does not launch what it loaded before.
+    cache.invalidate()
+    made = []
+    binding.make_exe = lambda: made.append(1) or _Launcher()
+    monkeypatch.setattr(aot_cache._JitKernel, "__call__", lambda self, *a: None)
+    assert binding((1,), None) is True
+    assert made == [1] and len(ran) == 4
 
 
 @pytest.mark.skipif(
