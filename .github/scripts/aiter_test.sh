@@ -39,22 +39,8 @@ else
     fi
 fi
 
+# TEMPORARY: run every multi-GPU file once (drop before merge).
 skip_tests=(
-    "op_tests/multigpu_tests/bench_mega_moe_v2.py"
-    "op_tests/multigpu_tests/bench_attention_a2a.py"
-    "op_tests/multigpu_tests/test_mega_moe_tp.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
-    "op_tests/multigpu_tests/test_megamoe_internode.py"
-    "op_tests/multigpu_tests/test_wide_ep_moe.py"
-    "op_tests/multigpu_tests/test_dispatch_combine.py"
-    "op_tests/multigpu_tests/test_communication.py"
-    "op_tests/multigpu_tests/test_mori_all2all.py"
-    # runs as its own CI step before this suite ("Mori smoke test" in aiter-test.yaml)
-    "op_tests/multigpu_tests/test_mori_smoke.py"
-    "op_tests/multigpu_tests/test_fused_ar_rms.py"
-    "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
-    "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
-    "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
@@ -148,6 +134,45 @@ for file in "${sharded_files[@]}"; do
                         --layers 2 --acc_verify 1
                 '
                 _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 size + route suites on 8/4/2 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                env MORI_SHMEM_HEAP_SIZE=40G
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    run() { torchrun --standalone "$@"; }
+                    run --nproc_per_node=8 "$test_file" \
+                        --bs-list 1,64,512,1024,4096 --max-tok-per-rank 8192
+                    run --nproc_per_node=8 "$test_file" --suite routes
+                    run --nproc_per_node=8 "$test_file" --suite routes --network v41_flash
+                    HIP_VISIBLE_DEVICES=0,1,2,3 run --nproc_per_node=4 "$test_file" \
+                        --suite routes --network v41_flash
+                    HIP_VISIBLE_DEVICES=0,1 run --nproc_per_node=2 "$test_file" \
+                        --suite routes --network v41_flash
+                    for net in v4_pro v41_flash; do
+                        run --nproc_per_node=8 "$test_file" --network $net --max-tok-per-rank 16384 \
+                            --expect-large-m --bs-list 16384 --accuracy-max-bs 16384 --smoke-only \
+                            --large-m-state-slots 61 --layer-stress-cycles 9 --route-switch-rounds 8
+                    done
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/bench_mega_moe_v2.py)
+            {
+                echo "Running a short MegaMoEV2 vs Mori decode smoke on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 30m
+                env MORI_SHMEM_HEAP_SIZE=40G
+                torchrun --standalone --nproc_per_node=8 "$file"
+                --phase decode --tokens 128 --iters 3
             )
             ;;
         op_tests/multigpu_tests/test_comm_fused_moe.py)
