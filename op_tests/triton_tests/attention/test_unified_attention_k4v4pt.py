@@ -2946,3 +2946,69 @@ def test_unified_attn_k4v4pt_prefill_order(
     base = run(False)
     assert not base.isnan().any()
     assert torch.equal(run(True).view(torch.int16), base.view(torch.int16)), "the longest-first order changed the output"
+
+
+# AITER_UA3D_XCD_ROTATE on the A8K4V4PT 3D decode under the token split: batches of 8 / 16 / 24 sequences (a multiple
+# of the 8 XCDs, so without the rotation all segments of a sequence share one XCD), long and short contexts, MTP-3
+# verify rows and one-row drafter decode.
+_K4V4PT_XCD_CASES = [
+    [(4, k) for k in (80000, 9000, 140000, 2049, 56000, 130, 74000, 35000)],
+    [(4, 20000 + 7919 * i) for i in range(16)],
+    [(1, 3000 + 11113 * i) for i in range(24)],
+]
+
+
+@pytest.mark.parametrize("programs", [512, 896])
+@pytest.mark.parametrize("seq_lens", _K4V4PT_XCD_CASES)
+@torch.inference_mode()
+def test_unified_attn_k4v4pt_xcd_rotate(
+    programs: int, seq_lens: list[tuple[int, int]], monkeypatch
+) -> None:
+    """The 3D decode's XCD rotation (AITER_UA3D_XCD_ROTATE) is bitwise the default program order."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MAX_TILES", 128)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_PROGRAMS", programs)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt", ref=False
+    )
+
+    def run(rotate):
+        monkeypatch.setattr(module, "_GFX12_3D_XCD_ROTATE", rotate)
+        out = torch.full_like(inp["output"], float("nan"))
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=inp["value_cache"],
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=True,
+            backend="gluon",
+        )
+        return out
+
+    base = run(False)
+    assert not base.isnan().any()
+    assert torch.equal(run(True).view(torch.int16), base.view(torch.int16)), "the XCD rotation changed the output"
