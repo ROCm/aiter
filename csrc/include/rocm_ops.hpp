@@ -2668,6 +2668,18 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
+    m.def("qkv_a_rmsnorm_fp4",               \
+          &aiter::qkv_a_rmsnorm_fp4,         \
+          py::arg("q_out"),                  \
+          py::arg("q_scale"),                \
+          py::arg("kv_out"),                 \
+          py::arg("q_in"),                   \
+          py::arg("kv_in"),                  \
+          py::arg("q_weight"),               \
+          py::arg("kv_weight"),              \
+          py::arg("q_eps"),                  \
+          py::arg("kv_eps"),                 \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND                         \
     m.def("gated_rmsnorm_fp8_group_quant",                 \
@@ -2747,6 +2759,16 @@ namespace py = pybind11;
           py::arg("residual"),                    \
           py::arg("post_layer_mix"),              \
           py::arg("comb_res_mix"),                \
+          py::arg("store_nt") = -1);              \
+    m.def("mhc_post_reduce",                      \
+          &aiter::mhc_post_reduce,                \
+          "mhc_post_reduce",                      \
+          py::arg("out"),                         \
+          py::arg("x"),                           \
+          py::arg("residual"),                    \
+          py::arg("post_layer_mix"),              \
+          py::arg("comb_res_mix"),                \
+          py::arg("pre_mix")  = std::nullopt,     \
           py::arg("store_nt") = -1);              \
     m.def("mhc_fused_post_pre_gemm_sqrsum",       \
           &aiter::mhc_fused_post_pre_gemm_sqrsum, \
