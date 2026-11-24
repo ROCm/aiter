@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Settings and gfx942 BF16 D256 helpers shared by the QSA sparse attention kernels.
+"""Settings and gfx942 D256 helpers shared by the QSA sparse attention kernels.
 
 The first part holds the per-platform calibration and the private resource
 policy. The platform entry is picked by gfx model and CU count (nearest
-calibrated CU count of the same model) and read once per process;
-AITER_QSA_PLATFORM overrides fields of the picked entry, e.g.
-``AITER_QSA_PLATFORM="union_step=3.0,max_packed_kv_bytes=0"``.
+calibrated CU count of the same model) and read once per process; FP8 K/V
+replace its route terms (FP8_ROUTES); AITER_QSA_PLATFORM overrides fields of the
+picked entry, e.g. ``AITER_QSA_PLATFORM="union_step=3.0,max_packed_kv_bytes=0"``.
 
 The second part holds raw-buffer operations and pipeline barriers. The third
 part holds the QK and PV MFMA loops and the lazy softmax rescale, each defined
 once for the union and both direct kernels. The fourth part holds the
 BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave staggered D256
-pipeline that the union kernel runs. Everything below FlyDSL's stable API
+pipeline that the union kernel runs. The fifth part holds what both FP8 K/V
+kernels share: the FP8 MFMA, the lazy max of their softmax, the BF16 output
+rounding and the FP8 quantization of Q. Everything below FlyDSL's stable API
 (flydsl.expr, flydsl.expr.rocdl __all__, flydsl.compiler) is in the low-level
 section, each item with the reason it stays: empty inline asm register pins (no
 public asm entry or placement hint), the target-features attribute, ROCDL
@@ -85,6 +87,23 @@ def _keep_vgpr(words, chunk=4):
             [words[i] for i in range(start, start + chunk)], words.dtype
         )
         llvm.inline_asm(None, [part.ir_value()], "", "v", has_side_effects=True)
+
+
+def hold(*values):
+    """Empty asm uses: the FP32 values are computed at this point."""
+    # MachineSink ignores sched_barrier: results used only after a later branch would sink
+    # past it and run after the last MFMA.
+    for value in values:
+        llvm.inline_asm(
+            None, [fx.Float32(value).ir_value()], "", "v", has_side_effects=True
+        )
+
+
+def compiler_fence():
+    """Empty asm with a memory clobber: a compiler memory barrier, no instruction."""
+    # fx.memory_fence emits a real fence; this only keeps MachineSink from moving loads
+    # issued before it into a later block.
+    llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
 
 
 # ---- Kernel attributes ----
@@ -181,6 +200,43 @@ def lanes_below(mask):
     return fx.Int32(
         rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
     )
+
+
+def row_broadcast(value, lane):
+    """Lane ``lane`` of each 16-lane row (DPP row_newbcast); LLVM folds it into the VALU
+    instruction that uses it."""
+    # fx.gpu shuffles go through ds_bpermute or ds_swizzle and cannot fold into a VALU.
+    return fx.Float32(
+        rocdl.update_dpp(
+            fx.Float32.ir_type,
+            llvm.mlir_poison(fx.Float32.ir_type),
+            fx.Float32(value).ir_value(),
+            0x150 + lane,
+            0xF,
+            0xF,
+            True,
+        )
+    )
+
+
+def cvt_pk_fp8(a, b, word=None, high=False):
+    """FP32 a, b as two E4M3FNUZ bytes (round to nearest even) in the low (high) half of
+    word, its other half kept (v_cvt_pk_fp8_f32); no word starts a new one."""
+    # Float32.to(Float8E4M3FNUZ) converts one value per instruction.
+    old = llvm.mlir_poison(fx.Int32.ir_type) if word is None else fx.Int32(word)
+    return fx.Int32(rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, a, b, old, high))
+
+
+def log2(value):
+    """log2 by one bare v_log_f32."""
+    # fx.math.log2 adds denormal range reduction.
+    return fx.Float32(rocdl.log(fx.Float32.ir_type, fx.Float32(value).ir_value()))
+
+
+def rcp(value):
+    """1 / value by one bare v_rcp_f32."""
+    # Division lowers to a correctly rounded sequence of several instructions.
+    return fx.Float32(rocdl.rcp(fx.Float32.ir_type, fx.Float32(value).ir_value()))
 
 
 # ---- Volatile LDS reads and the lgkmcnt ledger ----
@@ -295,11 +351,42 @@ PLATFORMS = {
         pack_tokens_per_row=32,
     ),
 }
+# FP8 K/V (sparse_prefill_*_fp8, by K/V scale layout): route terms fitted on the FP8 kernels'
+# phase timings, synthetic and SGLang-captured selections (median error 3%); the per-tile
+# ratio is the sweep's best with the global route on. Past the packed-KV budget, FP8 direct
+# packs up to 320 tokens per query row (its raw K/V reads cost more than BF16's). Union and
+# minimum-row thresholds otherwise follow the BF16 entry.
+FP8_ROUTES = {
+    ("gfx942", 80): {
+        "tensor": {
+            "union_fixed": 5.7,
+            "union_step": 2.072,
+            "row_step": 1.275,
+            "direct_fixed": 11.9,
+            "pack_block": 0.00184,
+            "direct_cu_step": 0.24,
+            "union_ratio": 2.0,
+            "pack_tokens_per_row": 320,
+        },
+        "token": {
+            "union_fixed": 5.14,
+            "union_step": 2.483,
+            "row_step": 1.4,
+            "direct_fixed": 11.87,
+            "pack_block": 0.00213,
+            "direct_cu_step": 0.3,
+            "union_ratio": 2.0,
+            "pack_tokens_per_row": 320,
+        },
+    },
+}
 OVERRIDE = "AITER_QSA_PLATFORM"
 
 
 @functools.cache
-def platform() -> Platform:
+def _calibrated() -> tuple:
+    """The PLATFORMS key of this GPU (nearest calibrated CU count of its gfx model); warns
+    once per process for a CU count without its own entry."""
     gfx, cus = get_gfx_runtime(), get_cu_num()
     keys = [key for key in PLATFORMS if key[0] == gfx]
     if not keys:
@@ -314,7 +401,16 @@ def platform() -> Platform:
             cus,
             key[1],
         )
+    return key
+
+
+@functools.cache
+def platform(fp8=None) -> Platform:
+    """The calibration of this GPU: BF16 K/V, or FP8 K/V with "tensor" / "token" scales."""
+    key = _calibrated()
     entry = PLATFORMS[key]
+    if fp8 is not None:
+        entry = dataclasses.replace(entry, **FP8_ROUTES[key][fp8])
     text = os.environ.get(OVERRIDE, "").strip()
     if not text:
         return entry
@@ -425,25 +521,31 @@ def _buffer_at(address, size_bytes):
     return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
 
 
-def _buffer_words(buffer, offset, words=4):
+def _buffer_words(buffer, offset, words=4, cache=0):
     data = fx.make_rmem_tensor(4 * words, fx.Int8)
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words, cache), fx.Int8),
         fx.make_view(buffer + offset, fx.make_layout(4 * words, 1)),
         data,
     )
     return fx.Vector(data.load()).bitcast(fx.Int32)
 
 
-def _buffer_store_words(words, buffer, offset):
+def _buffer_store_words(words, buffer, offset, cache=0):
     words = fx.Vector(words)
     data = fx.make_rmem_tensor(4 * words.numel, fx.Int8)
     data.store(words.bitcast(fx.Int8))
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel, cache), fx.Int8),
         data,
         fx.make_view(buffer + offset, fx.make_layout(4 * words.numel, 1)),
     )
+
+
+# gfx942 buffer cache policy (aux bits: sc0 = 1, nt = 2, sc1 = 16): sc0 | sc1 is system scope,
+# so stores write through and loads read past the CU's L1 and this XCD's L2 (coherent between
+# CTAs of one launch on any XCD).
+SC_SYSTEM = 17
 
 
 def _write_address(address, words):
@@ -474,14 +576,24 @@ def _lds_store(address, value, dtype=fx.Int32):
 
 
 @flyc.jit
+def _lazy(ballot, values, update):
+    """values replaced by update(*values) when any lane's ballot bit is set: the rare branch
+    of a lazy online-softmax rescale, so update is only evaluated there."""
+    values = tuple(values)
+    if ballot != fx.Int64(0):
+        values = tuple(update(*values))
+    return values
+
+
 def _rescale(values, ballot, factor):
     """Lazy online-softmax rescale: multiply values (O accumulators, a row sum) by
     factor() when any lane's ballot bit is set; factor is only evaluated there."""
-    values = tuple(values)
-    if ballot != fx.Int64(0):
+
+    def update(*values):
         correction = factor()
-        values = tuple(value * correction for value in values)
-    return values
+        return tuple(value * correction for value in values)
+
+    return _lazy(ballot, values, update)
 
 
 def _read_q_g2r(resource, offset, lane):
@@ -761,3 +873,169 @@ def _pv(
     if sum_max is not None:
         return result, row_sum, candidate
     return result
+
+
+# ---- FP8 (E4M3FNUZ) K/V: MFMA, lazy max, output rounding and Q quantization ----
+
+FP8_MAX = 240.0  # largest finite E4M3FNUZ
+# Lazy max of the FP8 kernels: m moves only when some S'' exceeds LAZY (P' <= 2**7.5 fits
+# E4M3FNUZ), and then puts the row max at S'' = P_BIAS: P' of a key down to 2**-(11 + P_BIAS)
+# of the max stays nonzero (with P' <= 1, attention sinks over long flat tails lost the tail,
+# a quarter of the output).
+LAZY = 7.5
+P_BIAS = 4.0
+# A V scale enters as log2 and reciprocal; the clamp keeps both finite (NaN maps to the floor),
+# and its 2**120 spread keeps a row's P' / v_scale, its row sum terms, within FP32's range.
+SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
+# Q rows of amax below Q_MIN quantize as if their amax were Q_MIN (240 / amax overflows FP32
+# below about 2**-120; Q_MIN / 240 is a normal FP32 scale): fewer FP8 bits, but nonzero.
+Q_MIN = 2.0**-118
+# Q quantization: two rows per 16-lane group (16 dims per lane and row, every row load in
+# flight at once), so QROWS rows per 256-thread CTA.
+QR = 2
+QROWS = 16 * QR
+
+
+def _as_f32(bits):
+    return fx.Int32(bits).bitcast(fx.Float32)
+
+
+def _as_i32(value):
+    return fx.Float32(value).bitcast(fx.Int32)
+
+
+def _fma(a, b, c):
+    return fx.Float32(fx.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
+
+
+def _mfma_fp8(a, b, acc):
+    """One E4M3FNUZ MFMA on register words: a and b hold 8 FP8 values (two words) per lane,
+    acc 16 FP32 (32x32x16) or 4 (16x16x32)."""
+    acc = fx.Vector(acc)
+    m = 32 if acc.numel == 16 else 16
+    frag_a = fx.make_rmem_tensor(8, fx.Float8E4M3FNUZ)
+    frag_b = fx.make_rmem_tensor(8, fx.Float8E4M3FNUZ)
+    frag_c = fx.make_rmem_tensor(acc.numel, fx.Float32)
+    frag_a.store(fx.Vector.from_elements(list(a), fx.Int32).bitcast(fx.Float8E4M3FNUZ))
+    frag_b.store(fx.Vector.from_elements(list(b), fx.Int32).bitcast(fx.Float8E4M3FNUZ))
+    frag_c.store(acc)
+    mma = fx.make_mma_atom(rocdl.MFMA(m, m, 512 // m, fx.Float8E4M3FNUZ))
+    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    return fx.Vector(frag_c.load())
+
+
+def _fp8_word(values):
+    """Four FP32 -> one word of E4M3FNUZ (byte k = value k), round to nearest even."""
+    return cvt_pk_fp8(values[2], values[3], cvt_pk_fp8(values[0], values[1]), True)
+
+
+def _v_scale_terms(sv):
+    """(log2(v_scale), 1 / v_scale) of a clamped V scale."""
+    sv = fx.minnumf(
+        fx.maxnumf(fx.Float32(sv), fx.Float32(SCALE_MIN)), fx.Float32(SCALE_MAX)
+    )
+    return log2(sv), rcp(sv)
+
+
+def _lazy_max(o, row_sum, scores, m_run, ballot, tile_max):
+    """The FP8 kernels' lazy max (S'' = S * c - m in log2 units): when any lane's ballot bit
+    is set, m moves by max(tile_max() - P_BIAS, 0), and a fresh row (m = FLOOR, centered at
+    0) takes tile_max() - P_BIAS (FLOOR while it has no key: its S'' stay -inf); O (a list
+    of accumulator vectors) and the row sum l scale by 2**-delta and S'' shifts by -delta.
+    Returns (o, row_sum, scores, m_run)."""
+
+    def update(*values):
+        *o, row_sum, scores, m_run = values
+        tile = tile_max()
+        fresh = m_run == fx.Float32(_MAX_FLOOR)
+        delta = _maximum(
+            fx.Float32(tile) - P_BIAS,
+            fresh.select(fx.Float32(_MAX_FLOOR), fx.Float32(0.0)),
+        )
+        corr = fresh.select(fx.Float32(0.0), _exp(fx.Float32(0.0) - delta))
+        return (
+            *(fx.Vector(x) * corr for x in o),
+            fx.Float32(row_sum) * corr,
+            fx.Vector(scores) - delta,
+            fresh.select(fx.Float32(0.0), m_run) + delta,
+        )
+
+    *o, row_sum, scores, m_run = _lazy(ballot, (*o, row_sum, scores, m_run), update)
+    return o, row_sum, scores, m_run
+
+
+def _scaled_bf16(values, inv):
+    """Two BF16 words of four FP32 values times inv: FP32 multiplies, then round to nearest
+    even like _pack_bf16 and the high halves joined by v_perm."""
+
+    def rne(value):
+        bits = _as_i32(fx.Float32(value) * inv)
+        return bits + fx.Int32(0x7FFF) + ((bits >> 16) & fx.Int32(1))
+
+    words = []
+    for i in (0, 2):
+        lo, hi = rne(values[i]), rne(values[i + 1])
+        words.append(fx.Int32(perm_b32(hi, lo, 0x07060302)))
+    return words
+
+
+def _quantize_part(raw):
+    """16 BF16 dims of a row (16 lanes per row): FP8 words and the row scale
+    max(amax, Q_MIN) / 240 (0 for a zero row)."""
+    values = []
+    for vec in raw:
+        for j in range(4):
+            word = fx.Int32(vec[j])
+            values += [_as_f32(word << 16), _as_f32(word & fx.Int32(-65536))]
+    level = [fx.absf(v) for v in values]
+    while len(level) > 1:
+        level = [_maximum(level[i], level[i + 1]) for i in range(0, len(level), 2)]
+    amax = level[0]
+    for shift in (1, 2, 4, 8):
+        amax = _maximum(amax, fx.gpu.shuffle_xor(amax, shift, 64))
+    floor = _maximum(amax, fx.Float32(Q_MIN))
+    inverse = rcp(floor) * FP8_MAX
+    words = [
+        _fp8_word([values[4 * k + r] * inverse for r in range(4)]) for k in range(4)
+    ]
+    scale = (amax > fx.Float32(0.0)).select(floor * (1.0 / FP8_MAX), fx.Float32(0.0))
+    return words, scale
+
+
+@flyc.jit
+def quantize_rows(Q, Q8, QS, ROWS, cta):
+    """Rows cta * QROWS .. + QROWS - 1 of Q (rows of 256 BF16) for a 256-thread CTA: row
+    r * 16 + (thread >> 4) of the CTA's rows per step r; FP8 rows (E4M3FNUZ, RNE) and
+    their scales amax / 240 (Q_MIN / 240 for rows of amax below Q_MIN, 0 for a zero row).
+    Run by the FP8 pack kernel's CTAs past its blocks.
+    """
+    tid = fx.Int32(fx.thread_idx.x)
+    group, part = tid >> 4, tid & 15
+    extent = fx.Uint32(ROWS) * 512
+    gq = _buffer(Q, extent)
+    rows = [cta * QROWS + r * 16 + group for r in range(QR)]
+    raws = []
+    for row in rows:
+        offset = (row < ROWS).select(row * 512 + part * 32, fx.Int32(extent))
+        raws.append([_buffer_words(gq, offset + 16 * i, 4) for i in range(2)])
+    g8 = _buffer(Q8, fx.Uint32(ROWS) * 256)
+    scales = []
+    for row, raw in zip(rows, raws):
+        words, scale = _quantize_part(raw)
+        scales.append(scale)
+        _buffer_store_words(
+            fx.Vector.from_elements(words, fx.Int32),
+            g8,
+            (row < ROWS).select(row * 256 + part * 16, fx.Int32(ROWS * 256)),
+        )
+    # Lane `part` of a group stores the scale of its row step `part`.
+    scale = scales[QR - 1]
+    for r in fx.range_constexpr(QR - 1):
+        scale = (part == r).select(scales[r], scale)
+    row = cta * QROWS + part * 16 + group
+    gs = _buffer(QS, fx.Uint32(ROWS) * 4)
+    _buffer_store_words(
+        fx.Vector.from_elements([_as_i32(scale)], fx.Int32),
+        gs,
+        ((part < QR) & (row < ROWS)).select(row * 4, fx.Int32(ROWS * 4)),
+    )

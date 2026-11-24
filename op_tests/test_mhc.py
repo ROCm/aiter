@@ -691,7 +691,7 @@ def mhc_post_ref(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(x.dtype)
 
 
 @benchmark()
@@ -710,6 +710,12 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
         comb_res_mix,
     )
     hip_err = checkAllclose(out_ref, out_hip, msg="out")
+    # checkAllclose only reports; a wrong mhc_post (e.g. at a fallback tile:
+    # hidden 512 runs 256-column tiles, 1024 runs 512) must fail the test.
+    assert hip_err <= 0.05, (
+        f"mhc_post m={m} hidden={hidden_size} {dtype}: {hip_err:.2%} of "
+        "elements outside tolerance"
+    )
     ret = {}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
@@ -734,6 +740,178 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
     #     print(f"tilelang error: {tilelang_err}")
 
     return ret
+
+
+def mhc_post_reduce_ref(
+    streams: torch.Tensor, pre_mix: torch.Tensor | None
+) -> torch.Tensor:
+    """The streams `mhc_post` wrote, reduced in FP32 with h ascending from 0.
+
+    Eager torch runs every product and every sum as its own kernel, so none of
+    them is contracted into an FMA -- the rounding `mhc_post_reduce` promises.
+    """
+    y = streams.float()
+    acc = torch.zeros_like(y[:, 0])
+    for h in range(y.shape[1]):
+        acc = acc + (y[:, h] if pre_mix is None else pre_mix[:, h : h + 1] * y[:, h])
+    if pre_mix is None:
+        acc = acc * (1.0 / y.shape[1])
+    return acc.to(streams.dtype)
+
+
+@benchmark()
+def test_mhc_post_reduce(
+    m, hidden_size, hc_mult, reduce, dtype=dtypes.bf16, data_init="norm", seed=0
+):
+    """`mhc_post_reduce` against `mhc_post` + the FP32 reduction, to the bit.
+
+    ``reduce`` is "pre_mix" (the pre-mix weighted sum) or "mean".
+    """
+    gen = make_generator(seed)
+    x = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
+    pre_mix = (
+        fill((m, hc_mult), data_init, gen, dtype=dtypes.fp32)
+        if reduce == "pre_mix"
+        else None
+    )
+    streams, post_us = run_perftest(
+        mhc_post_hip, x, residual, post_layer_mix, comb_res_mix
+    )
+    out_ref = mhc_post_reduce_ref(streams, pre_mix)
+
+    def run_reduce():
+        out = torch.empty(m, hidden_size, dtype=dtype)
+        aiter.mhc_post_reduce(out, x, residual, post_layer_mix, comb_res_mix, pre_mix)
+        return out
+
+    out, reduce_us = run_perftest(run_reduce)
+    bit_exact = torch.equal(out.view(torch.int16), out_ref.view(torch.int16))
+    mismatches = int((out.view(torch.int16) != out_ref.view(torch.int16)).sum())
+    assert bit_exact, (
+        f"mhc_post_reduce({reduce}) m={m} hidden={hidden_size}: "
+        f"{mismatches} elements differ from mhc_post + the FP32 reduction"
+    )
+    return {
+        "reduce": reduce,
+        "bit_exact": bit_exact,
+        "mhc_post_us": post_us,
+        "reduce_us": reduce_us,
+    }
+
+
+def _launch_mhc_post(x, residual, post, comb):
+    aiter.mhc_post(torch.empty_like(residual), x, residual, post, comb)
+
+
+def _launch_mhc_post_reduce(x, residual, post, comb):
+    out = torch.empty(x.shape, dtype=x.dtype)
+    aiter.mhc_post_reduce(out, x, residual, post, comb)
+
+
+def test_mhc_post_reduce_operand_guards():
+    """`mhc_post_reduce` refuses an ``out`` that overlaps an input and operands
+    off ``residual``'s GPU, and on a second GPU launches on that GPU's stream
+    even while another device is current."""
+    m, hidden_size, hc_mult = 2, 1024, 4
+    x = torch.randn(m, hidden_size).bfloat16()
+    residual = torch.randn(m, hc_mult, hidden_size).bfloat16()
+    post = torch.rand(m, hc_mult, 1)
+    comb = torch.rand(m, hc_mult, hc_mult)
+    refusals = {
+        "out overlaps residual": lambda: aiter.mhc_post_reduce(
+            residual.view(-1)[: m * hidden_size].view(m, hidden_size),
+            x,
+            residual,
+            post,
+            comb,
+        ),
+        "out is x": lambda: aiter.mhc_post_reduce(x, x, residual, post, comb),
+        "post_layer_mix on the CPU": lambda: aiter.mhc_post_reduce(
+            torch.empty(m, hidden_size, dtype=x.dtype), x, residual, post.cpu(), comb
+        ),
+        "comb_res_mix on the CPU": lambda: aiter.mhc_post_reduce(
+            torch.empty(m, hidden_size, dtype=x.dtype), x, residual, post, comb.cpu()
+        ),
+        "fp32 with no rows": lambda: aiter.mhc_post_reduce(
+            torch.empty(0, hidden_size),
+            torch.empty(0, hidden_size),
+            torch.empty(0, hc_mult, hidden_size),
+            torch.empty(0, hc_mult, 1),
+            torch.empty(0, hc_mult, hc_mult),
+        ),
+    }
+    rows = []
+    for name, launch in refusals.items():
+        try:
+            launch()
+            torch.cuda.synchronize()
+            raised = False
+        except RuntimeError:
+            raised = True
+        assert raised, f"mhc_post_reduce accepted: {name}"
+        rows.append({"case": f"{name} raises", "ok": raised})
+    if torch.cuda.device_count() > 1:
+        expected = torch.empty(m, hidden_size, dtype=x.dtype)
+        aiter.mhc_post_reduce(expected, x, residual, post, comb)
+        dev = torch.device("cuda", 1)
+        args = [t.to(dev) for t in (x, residual, post, comb)]
+        out = torch.empty(m, hidden_size, dtype=x.dtype, device=dev)
+        side = torch.cuda.Stream(device=0)
+        with torch.cuda.device(0), torch.cuda.stream(side):
+            aiter.mhc_post_reduce(out, *args)
+        torch.cuda.synchronize(dev)
+        same = torch.equal(out.cpu(), expected.cpu())
+        assert same, "mhc_post_reduce on cuda:1 with cuda:0 current differs"
+        rows.append(
+            {"case": "cuda:1 inputs, cuda:0 current on a side stream", "ok": same}
+        )
+    return rows
+
+
+def test_mhc_post_support_queries():
+    """`mhc_post_supported` / `mhc_post_reduce_supported` against the launch:
+    over a sweep of hidden sizes and dtypes, a query is False exactly where
+    the op refuses the shape (raises), and True exactly where it runs."""
+    from aiter.ops.mhc import mhc_post_reduce_supported, mhc_post_supported
+
+    arch = get_gfx_runtime()
+    m, hc_mult = 4, 4
+    ops = (
+        ("mhc_post", mhc_post_supported, _launch_mhc_post),
+        ("mhc_post_reduce", mhc_post_reduce_supported, _launch_mhc_post_reduce),
+    )
+    hidden_sizes = sorted(set(range(256, 8193, 256)) | {320, 640, 2560})
+    rows, mismatches = [], []
+    for dtype in (dtypes.bf16, dtypes.fp16, dtypes.fp32):
+        for hidden_size in hidden_sizes:
+            x = torch.randn(m, hidden_size).to(dtype)
+            residual = torch.randn(m, hc_mult, hidden_size).to(dtype)
+            post = torch.rand(m, hc_mult, 1)
+            comb = torch.rand(m, hc_mult, hc_mult)
+            for name, query, launch in ops:
+                supported = query(hidden_size, hc_mult, dtype, arch)
+                try:
+                    launch(x, residual, post, comb)
+                    torch.cuda.synchronize()
+                    ran = True
+                except RuntimeError:
+                    ran = False
+                rows.append(
+                    {
+                        "op": name,
+                        "dtype": str(dtype),
+                        "hidden_size": hidden_size,
+                        "supported": supported,
+                        "ran": ran,
+                    }
+                )
+                if supported != ran:
+                    mismatches.append((name, str(dtype), hidden_size, supported, ran))
+    assert not mismatches, f"query and launch disagree on {arch}: {mismatches}"
+    return rows
 
 
 def mhc_post_pre_ref(
@@ -1745,7 +1923,7 @@ if not args.hc_head:
     df = []
     for dtype in args.dtype:
         for data_init in args.data_init:
-            for hidden_size in args.hidden_size:
+            for hidden_size in sorted(set(args.hidden_size) | {512, 1024}):
                 for m in args.m:
                     for hc_mult in [4]:
                         ret = test_mhc_post(
@@ -1758,6 +1936,29 @@ if not args.hc_head:
                         )
                         df.append(ret)
     print_json_table("mhc_post summary", df)
+
+    # The query sweep, then the reduce at the 1024- and 512-column tiles (1024 and
+    # 2560 take the 512 one; gfx942 takes it for every size) in both dtypes.
+    print_json_table("mhc_post support queries", test_mhc_post_support_queries())
+    print_json_table("mhc_post_reduce guards", test_mhc_post_reduce_operand_guards())
+
+    df = []
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        for data_init in args.data_init:
+            for hidden_size in sorted(set(args.hidden_size) | {1024, 2560}):
+                for m in args.m:
+                    for reduce in ("pre_mix", "mean"):
+                        ret = test_mhc_post_reduce(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=4,
+                            reduce=reduce,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        df.append(ret)
+    print_json_table("mhc_post_reduce summary", df)
 
     df = []
     for dtype in args.dtype:

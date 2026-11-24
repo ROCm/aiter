@@ -7,7 +7,7 @@ import math
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx_runtime, get_gfx_runtime_for_device
 
 # The ctypes ABI follows these signatures positionally. Keep argument order in
 # sync with csrc/kernels/mla/fused_norm_rope_attn_rope_cast/fused_norm_rope_attn_rope_cast.cu.
@@ -16,7 +16,51 @@ MD_NAME = "module_fused_norm_rope_attn_rope_cast"
 __all__ = [
     "fused_norm_rope_attn_rope_cast",
     "fused_norm_rope_attn_rope_cast_bf16",
+    "is_fused_norm_rope_attn_rope_cast_supported",
 ]
+
+
+def is_fused_norm_rope_attn_rope_cast_supported(
+    num_heads: int = 16,
+    head_dim: int = 512,
+    *,
+    q_dtype: torch.dtype = torch.bfloat16,
+    cos_dtype: torch.dtype = torch.bfloat16,
+    sin_dtype: torch.dtype = torch.bfloat16,
+    rope_dim: int = 64,
+    backend: str | None = None,
+    arch: str | None = None,
+    device: torch.device | int | None = None,
+) -> bool:
+    """Query the two-source MXFP8 entry's shape/dtype/architecture support.
+
+    This is the capability predicate used by
+    :func:`fused_norm_rope_attn_rope_cast`, not the BF16-KV entry. It does not
+    compile or launch a kernel, allocate tensors, or inspect tensor contents.
+    A true result still requires the documented MXFP8 KV/scale layouts, CSR,
+    strides, alignment, buffer ownership and finite-value contracts.
+
+    ``rope_dim`` counts rotary channels, twice the cos/sin table width.
+    Explicit ``arch`` supports offline queries without a GPU. Otherwise use
+    the selected Torch device (the current device by default), independent of
+    build-time GPU_ARCHS. No available ROCm device returns False; device-query
+    errors propagate rather than hiding a broken runtime.
+    """
+    if (
+        num_heads not in (16, 32, 64, 128)
+        or head_dim != 512
+        or q_dtype != torch.bfloat16
+        or cos_dtype != torch.bfloat16
+        or sin_dtype != torch.bfloat16
+        or rope_dim != 64
+        or backend not in (None, "opus")
+    ):
+        return False
+    if arch is None:
+        if torch.version.hip is None or not torch.cuda.is_available():
+            return False
+        arch = get_gfx_runtime_for_device(device)
+    return arch == "gfx950"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
@@ -277,11 +321,28 @@ def fused_norm_rope_attn_rope_cast(
         raise ValueError("backend must be None or 'opus'")
     if not isinstance(q, torch.Tensor) or q.ndim != 3 or q.device.type != "cuda":
         raise ValueError("q must be a GPU tensor [T,H,512]")
-    if q.dtype != torch.bfloat16:
-        raise ValueError("q must have dtype torch.bfloat16")
     t, h, d = q.shape
-    if h not in (16, 32, 64, 128) or d != 512:
-        raise ValueError("two-source FP8 attention requires H16/H32/H64/H128 and D512")
+    if (
+        not isinstance(cos, torch.Tensor)
+        or not isinstance(sin, torch.Tensor)
+        or cos.ndim != 2
+        or sin.shape != cos.shape
+    ):
+        raise ValueError("cos and sin must have matching [P,32] shapes")
+    if not is_fused_norm_rope_attn_rope_cast_supported(
+        h,
+        d,
+        q_dtype=q.dtype,
+        cos_dtype=cos.dtype,
+        sin_dtype=sin.dtype,
+        rope_dim=cos.shape[-1] * 2,
+        backend=backend,
+        device=q.device,
+    ):
+        raise ValueError(
+            "two-source FP8 attention requires gfx950, H16/H32/H64/H128, "
+            "D512, BF16 q/cos/sin dtype and 64 rotary channels"
+        )
     if type(num_splits) is not int or not 0 <= num_splits <= 32:
         raise ValueError("num_splits must be an integer in [0,32]")
     if num_splits == 0:
