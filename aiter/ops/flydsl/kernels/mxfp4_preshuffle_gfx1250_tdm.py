@@ -3358,7 +3358,7 @@ def launch_gemm_a8w4_tdm(
     )
     LOC_RUN = loc_group * max(b_placed, 1)
     if loc_sched:
-        assert b_placed and persistent_workers % (8 * cluster_n) == 0
+        assert b_placed and persistent_workers % (8 * cluster_m * cluster_n) == 0
         assert LOC_RUN % cluster_n == 0
     # The cache key follows only this body's globals, not the kernel's below.
     _ = launch_rotation
@@ -3443,7 +3443,9 @@ def launch_gemm_a8w4_tdm(
                     # m-units in turn, after their own columns.
                     nu = (cols > 0).select(cols, 1)
                     tasks = n_mu * cols + (n_run & 1) * ((n_mu + 1 - dom) >> 1)
-                stride = persistent_workers // cluster_n // 2
+                # M peers share one task; count physical clusters per domain.
+                # Omitting cluster_m skips tasks when the grid has M peers.
+                stride = persistent_workers // cluster_m // cluster_n // 2
 
                 def loc_coords(t):
                     t = fx.Int32(t)
