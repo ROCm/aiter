@@ -11,6 +11,8 @@ import triton
 # it requires validating and retuning the convolution configurations.
 BLOCK_K = 64
 
+_PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
+
 
 def _is_amd_wave32():
     """Return whether the active Triton target is an AMD wave32 device."""
@@ -27,12 +29,18 @@ def _out_hw(H, W, R, S, stride, padding, dilation):
     return P, Q
 
 
-def _validate_conv2d_devices(x, w_oihw, bias=None):
+def _validate_conv_devices(x, weight, bias=None, *, op: str):
     """Require input, weight, and optional bias on one CUDA/ROCm device."""
     if not x.is_cuda:
-        raise ValueError("conv2d input must be a CUDA/ROCm tensor")
-    if w_oihw.device != x.device or (bias is not None and bias.device != x.device):
-        raise ValueError("conv2d input, weight, and bias must be on the same device")
+        message = f"{op} input must be a CUDA/ROCm tensor"
+    elif weight.device != x.device or (bias is not None and bias.device != x.device):
+        message = f"{op} input, weight, and bias must be on the same device"
+    else:
+        return
+    raise ValueError(
+        f"{message}, got input={x.device}, weight={weight.device}, "
+        f"bias={bias.device if bias is not None else None}"
+    )
 
 
 def _conv_dims(x, w_oihw, stride, padding, dilation):
@@ -136,39 +144,42 @@ def _normalize_conv2d_params(stride, padding, dilation):
     )
 
 
-def _validate_conv2d_padding_mode(
-    padding_mode: str, height: int, width: int, padding: tuple[int, int]
+def _validate_padding_mode(
+    padding_mode: str, spatial: tuple[int, ...], padding: tuple[int, ...]
 ) -> None:
     """Validate the mode and spatial limits after non-negative normalization."""
-    modes = ("zeros", "reflect", "replicate", "circular")
-    if padding_mode not in modes:
-        raise ValueError(f"padding_mode must be one of {modes}, got {padding_mode!r}")
-    if height <= 0 or width <= 0:
+    if padding_mode not in _PADDING_MODES:
         raise ValueError(
-            f"input spatial dimensions must be positive, got {(height, width)}"
+            f"padding_mode must be one of {_PADDING_MODES}, got {padding_mode!r}"
         )
-
-    pad_height, pad_width = padding
-    if padding_mode == "reflect" and (pad_height >= height or pad_width >= width):
+    if any(size <= 0 for size in spatial):
+        raise ValueError(f"input spatial dimensions must be positive, got {spatial}")
+    if padding_mode == "reflect" and any(
+        amount >= size for amount, size in zip(padding, spatial, strict=True)
+    ):
         raise ValueError(
             "reflect padding must be less than each input spatial dimension, "
-            f"got padding={padding} for input {(height, width)}"
+            f"got padding={padding} for input {spatial}"
         )
-    if padding_mode == "circular" and (pad_height > height or pad_width > width):
+    if padding_mode == "circular" and any(
+        amount > size for amount, size in zip(padding, spatial, strict=True)
+    ):
         raise ValueError(
             "circular padding must not exceed each input spatial dimension, "
-            f"got padding={padding} for input {(height, width)}"
+            f"got padding={padding} for input {spatial}"
         )
 
 
-def _conv2d_padding_geometry(
-    height: int, width: int, padding: tuple[int, int], padding_mode: str
-) -> tuple[int, int, tuple[int, int]]:
+def _padding_geometry(
+    spatial: tuple[int, ...], padding: tuple[int, ...], padding_mode: str
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return effective dimensions and kernel padding for normalized, valid inputs."""
-    if padding_mode == "zeros" or padding == (0, 0):
-        return height, width, padding
-    pad_height, pad_width = padding
-    return height + 2 * pad_height, width + 2 * pad_width, (0, 0)
+    if padding_mode == "zeros" or not any(padding):
+        return tuple(spatial), padding
+    return (
+        tuple(size + 2 * amount for size, amount in zip(spatial, padding, strict=True)),
+        (0,) * len(padding),
+    )
 
 
 # ---------------------------------------------------------------------------
