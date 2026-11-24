@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import csv
 import os
 
 import torch
@@ -16,8 +17,12 @@ from aiter.fused_moe import (
     torch_moe_stage2,
 )
 from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.quant import per_1x32_f4_quant
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
+from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
@@ -31,6 +36,8 @@ from aiter.test_common import (
     run_perftest,
 )
 from aiter.utility import fp4_utils
+
+logger = aiter.logger
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -398,6 +405,94 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 summary_table = []
 
+DEFAULT_EP_CSV_PATHS = [
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "aiter", "configs", name)
+    for name in (
+        "tuned_grouped_fmoe.csv",
+        "model_configs/kimik3_gfx1250_tuned_grouped_fmoe.csv",
+    )
+]
+
+
+def run_ep_csv(args):
+    """Sweep the requested CSV or all default gfx1250 EP CSVs."""
+    if gpu_arch != "gfx1250":
+        raise RuntimeError(f"EP CSV requires gfx1250, got {gpu_arch}")
+    csv_paths = [args.csv_path] if args.csv_path is not None else DEFAULT_EP_CSV_PATHS
+    failures = []
+    for csv_path in csv_paths:
+        try:
+            _run_ep_csv_file(args, csv_path)
+        except (AssertionError, OSError, ValueError) as exc:
+            failures.append((csv_path, str(exc)))
+            logger.exception("[ep-csv] %s: FAILED", csv_path)
+    if failures:
+        raise AssertionError(f"EP CSV failures: {failures}")
+
+
+def _run_ep_csv_file(args, csv_path):
+    """Check every EP row using this file's runtime tuning configuration."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = csv_path
+    # The lookup cache is keyed by workload, so invalidate it when switching CSVs.
+    grouped._find_grouped_config.cache_clear()
+    print(f"[ep-csv] sweeping settings from {csv_path}", flush=True)
+    with open(csv_path, newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    ep_rows = [(index, row) for index, row in enumerate(rows) if row["topk"] == "-1"]
+    if not ep_rows:
+        raise ValueError(f"No EP rows (topk=-1) in {csv_path}")
+
+    failures = []
+    for index, row in ep_rows:
+        try:
+            local_experts = int(row["expert"])
+            # The 65-expert configs include one shared expert on each rank.
+            shared_experts = 1 if local_experts == 65 else 0
+            global_experts = (local_experts - shared_experts) * args.csv_ep
+            quant_label = {
+                "torch.float8_e4m3fn": "a8w4_mxfp4",
+                "torch.float4_e2m1fn_x2": "a4w4_mxfp4",
+            }[row["q_dtype_a"]]
+            activation = {
+                "ActivationType.Silu": ActivationType.Silu,
+                "ActivationType.Swiglu": ActivationType.Swiglu,
+                "ActivationType.Situv2": ActivationType.Situv2,
+            }[row["act_type"]]
+            print(
+                f"\n[ep-csv] row {index}: {quant_label} token={row['token']} "
+                f"model_dim={row['model_dim']} inter_dim={row['inter_dim']} "
+                f"local_experts={local_experts} ep={args.csv_ep} "
+                f"topk={args.csv_topk}",
+                flush=True,
+            )
+            test_fmoe_ep_mxfp4(
+                quant_label,
+                int(row["token"]),
+                int(row["model_dim"]),
+                int(row["inter_dim"]),
+                global_experts,
+                args.csv_topk,
+                shared_E=shared_experts,
+                ep=args.csv_ep,
+                ep_mode=args.ep_mode,
+                fake_ep_rank=args.fake_ep_rank,
+                const_init=args.const_init,
+                activation=activation,
+            )
+        except Exception as exc:  # Keep checking the remaining CSV rows.
+            failures.append((index, str(exc)))
+            logger.exception("[ep-csv] row %s: FAILED", index)
+
+    print(
+        f"[ep-csv] {csv_path}: "
+        f"{len(ep_rows) - len(failures)}/{len(ep_rows)} rows passed",
+        flush=True,
+    )
+    if failures:
+        raise AssertionError(f"EP CSV failures: {failures}")
+
 
 def test_fmoe_ep_mxfp4(
     quant_label,
@@ -411,9 +506,13 @@ def test_fmoe_ep_mxfp4(
     ep_mode="real",
     fake_ep_rank=0,
     const_init=None,
+    activation=ActivationType.Silu,
+    beta=None,
+    linear_beta=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
+    beta / linear_beta are the SiTUv2 gate / linear scales (default 4.0 / 25.0).
 
     ep_mode selects how tokens/routing reach fused_moe:
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
@@ -456,6 +555,10 @@ def test_fmoe_ep_mxfp4(
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
         return
+    beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+    linear_beta = (
+        DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+    )
     # ---------- ATOM shape model (MoriV2ModularKernel) ----------
     # Before MORI dispatch: each of `ep` ranks holds `graph_bs` tokens, each
     #   with `topk` *global* expert ids (spanning all E experts).
@@ -653,6 +756,17 @@ def test_fmoe_ep_mxfp4(
         ref_topk_ids = recv_topk_ids
         ref_topk_weights = recv_topk_weights
 
+    # Keep outside the timed fused_moe call and free of RNG draws, so timing
+    # and every later random tensor stay identical to a run without it.
+    local_rows = torch.bincount(
+        ref_topk_ids[expert_mask[ref_topk_ids.long()].bool()].long(),
+        minlength=expert_mask.numel(),
+    )[expert_mask.bool()]
+    print(
+        f"  [EP sim] local_routes={int(local_rows.sum())} "
+        f"active_experts={int((local_rows > 0).sum())}/{local_rows.numel()}"
+    )
+
     total_local = local_E + shared_E
     w1 = _randn_or_const(
         (total_local, inter_dim * 2, model_dim),
@@ -682,18 +796,36 @@ def test_fmoe_ep_mxfp4(
 
     w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
     w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
-    if _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
-        # Match both activation quantization points in the grouped A4W4 path.
-        # The generic BF16 reference above otherwise compares against A16W4
-        # and overstates the numerical error from the two MXFP4 round trips.
+    if quant_label == "a4w4_mxfp4" and (
+        _gfx == "gfx1250" or activation == ActivationType.Situv2
+    ):
+
+        def _quant_act(x):
+            return per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+    elif quant_label == "a8w4_mxfp4" and activation == ActivationType.Situv2:
+        # torch_moe has no SiTUv2, so the BF16 reference below cannot serve it.
+        def _quant_act(x):
+            return per_1x32_f8_scale_f8_quant(
+                x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+
+    else:
+        _quant_act = None
+    if _quant_act is not None:
+        # Match both activation quantization points (A4W4: MXFP4, A8W4: FP8).
+        # The generic BF16 reference below otherwise compares against A16W4
+        # and overstates the numerical error from the two activation round trips.
         local_topk_ids = torch.where(
             (ref_topk_ids >= local_expert_start) & (ref_topk_ids < local_expert_end),
             ref_topk_ids - local_expert_start,
-            -1,
+            torch.where(
+                (ref_topk_ids >= E) & (ref_topk_ids < E + shared_E),
+                ref_topk_ids - E + local_E,
+                -1,
+            ),
         )
-        a1_q, a1_scale = per_1x32_f4_quant(
-            ref_input, quant_dtype=dtypes.fp4x2, shuffle=False
-        )
+        a1_q, a1_scale = _quant_act(ref_input)
         a2 = torch_moe_stage1(
             a1_q,
             w1_qt,
@@ -701,19 +833,19 @@ def test_fmoe_ep_mxfp4(
             ref_topk_weights,
             local_topk_ids,
             dtype=dtype,
-            activation=ActivationType.Silu,
+            activation=activation,
             quant_type=QuantType.per_1x32,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
+            situ_beta=beta,
+            situ_linear_beta=linear_beta,
         )
         ref_rows, ref_topk = local_topk_ids.shape
-        a2_q, a2_scale = per_1x32_f4_quant(
-            a2.contiguous().view(ref_rows * ref_topk, inter_dim),
-            quant_dtype=dtypes.fp4x2,
-            shuffle=False,
+        a2_q, a2_scale = _quant_act(
+            a2.contiguous().view(ref_rows * ref_topk, inter_dim)
         )
         ref = torch_moe_stage2(
-            a2_q.view(ref_rows, ref_topk, inter_dim // 2),
+            a2_q.view(ref_rows, ref_topk, -1),
             w1_qt,
             w2_qt,
             ref_topk_weights,
@@ -732,6 +864,7 @@ def test_fmoe_ep_mxfp4(
             ref_topk_weights,
             ref_topk_ids,
             expert_mask=expert_mask,
+            activation=activation,
         )
 
     if _gfx == "gfx1250":
@@ -755,7 +888,7 @@ def test_fmoe_ep_mxfp4(
         )
         w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
         gate_mode = GateMode.INTERLEAVE.value
-        act = ActivationType.Silu
+        act = activation
         if quant_label == "a8w4_mxfp4":
             os.environ["AITER_FORCE_A8W4"] = "1"
         else:
@@ -770,12 +903,16 @@ def test_fmoe_ep_mxfp4(
         w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
         w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
         w2_s = shuffle_scale_a16w4(w2_scale, total_local, False)
-        act = ActivationType.Silu
+        act = activation
         gate_mode = GateMode.INTERLEAVE.value
         # Force the fp8 (a8w4) kernel regardless of token count. Below the
         # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
         # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        # SiTUv2 ignores the bound above and stays bf16 (a16w4, which rejects
+        # expert_mask) unless this opts it into fp8 activations.
+        os.environ["AITER_SITUV2_A8W4"] = "1"
+        os.environ.pop("AITER_SITUV2_A4W4", None)
     elif quant_label == "a4w4_mxfp4":
         # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
         # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
@@ -786,8 +923,10 @@ def test_fmoe_ep_mxfp4(
         w2_s = fp4_utils.e8m0_shuffle(w2_scale)
         w1_a.is_shuffled = True
         w2_a.is_shuffled = True
-        act = ActivationType.Silu
+        act = activation
         gate_mode = GateMode.SEPARATED.value
+        os.environ["AITER_SITUV2_A4W4"] = "1"
+        os.environ.pop("AITER_SITUV2_A8W4", None)
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
     # Optional per-kernel (gemm1/gemm2) timing, gated by AITER_EP_KERNEL_BENCH=1.
@@ -802,6 +941,11 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
+    activation_params = (
+        {"beta": beta, "linear_beta": linear_beta}
+        if activation == ActivationType.Situv2
+        else {}
+    )
     if _ep_kernel_bench and _gfx == "gfx1250":
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
@@ -821,6 +965,7 @@ def test_fmoe_ep_mxfp4(
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 num_local_tokens=num_local_tokens,
+                **activation_params,
             )
         finally:
             _grouped.kernel_bench_callable = None
@@ -856,6 +1001,7 @@ def test_fmoe_ep_mxfp4(
             num_local_tokens=num_local_tokens,
             num_warmup=3,
             num_iters=128,
+            **activation_params,
         )
 
     # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
@@ -886,6 +1032,18 @@ def test_fmoe_ep_mxfp4(
         assert (
             logits_diff < _logits_diff_tol
         ), f"{_msg}: logits_diff={logits_diff} exceeds {_logits_diff_tol}"
+    elif activation == ActivationType.Situv2:
+        # test_moe_2stage's SiTUv2 criterion: the two activation round trips
+        # push some elements past atol/rtol, so only fail when logits_diff does too.
+        err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg, printLog=False)
+        _logits_diff_tol = 0.01
+        _passed = err == 0 or logits_diff <= _logits_diff_tol
+        print(
+            f"[aiter] {_msg} checkAllclose_err={err:.6f} "
+            f"logits_diff={logits_diff:.6f} (tol {_logits_diff_tol}) "
+            f"{'PASSED' if _passed else 'FAILED'}"
+        )
+        assert _passed, f"{_msg}: checkAllclose_err={err}, logits_diff={logits_diff}"
     else:
         err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
 
@@ -893,6 +1051,7 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "ep_mode": ep_mode,
+            "activation": str(activation),
             "routing": routing,
             "global_token": token,
             "total_recv": total_recv,
@@ -944,7 +1103,8 @@ parser.add_argument(
           or -t g1u1_int8smoothquant
           or -t g1u1_fp8smoothquant
           or -t g1u1_a8w4_mxfp4          (EP, per_1x32 mxfp4 a8w4, gfx950)
-          or -t g1u1_a4w4_mxfp4          (EP, per_1x32 mxfp4 a4w4, gfx950)""",
+          or -t g1u1_a4w4_mxfp4          (EP, per_1x32 mxfp4 a4w4, gfx950)
+          or -t ep_csv                   (all grouped MoE EP CSV rows, gfx1250)""",
 )
 parser.add_argument(
     "-d",
@@ -954,6 +1114,28 @@ parser.add_argument(
     default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-a",
+    "--activation",
+    type=dtypes.str2ActivationType,
+    nargs="*",
+    default=[ActivationType.Silu],
+    help="""Activation for the mxfp4 EP tests.
+    e.g.: -a silu
+          or -a situv2""",
+)
+parser.add_argument(
+    "--beta",
+    type=float,
+    default=None,
+    help=f"SiTUv2 gate scale (default {DEFAULT_SITUV2_BETA}).",
+)
+parser.add_argument(
+    "--linear-beta",
+    type=float,
+    default=None,
+    help=f"SiTUv2 linear scale (default {DEFAULT_SITUV2_LINEAR_BETA}).",
 )
 parser.add_argument(
     "-m",
@@ -1049,9 +1231,35 @@ parser.add_argument(
 parser.add_argument(
     "--seed", type=int, default=0, help="Random input and routing seed."
 )
+parser.add_argument(
+    "--csv-path",
+    default=None,
+    help="Grouped MoE tuning CSV to sweep with -t ep_csv "
+    "(default: all gfx1250 EP CSVs).",
+)
+parser.add_argument(
+    "--csv-ep",
+    type=int,
+    default=4,
+    help="Number of ranks used to reconstruct global experts for EP CSV rows.",
+)
+parser.add_argument(
+    "--csv-topk",
+    type=int,
+    default=8,
+    help="Actual routing topk; the EP CSV uses -1 as a tuning wildcard.",
+)
 args = parser.parse_args()
 torch.manual_seed(args.seed)
 gpu_arch = get_gfx()
+
+if "ep_csv" in args.test:
+    if len(args.test) != 1:
+        parser.error("ep_csv must be selected alone")
+    if args.csv_ep < 1 or args.csv_topk < 1:
+        parser.error("--csv-ep and --csv-topk must be positive")
+    run_ep_csv(args)
+    raise SystemExit(0)
 
 for test in args.test:
     print(f"\nRunning test: {test}")
@@ -1172,23 +1380,27 @@ for test in args.test:
                             )
     elif test in ("g1u1_a8w4_mxfp4", "g1u1_a4w4_mxfp4"):
         label = "a8w4_mxfp4" if test == "g1u1_a8w4_mxfp4" else "a4w4_mxfp4"
-        for m in args.token:
-            for hdim in args.hidden_dim:
-                for idim in args.inter_dim:
-                    for ep in args.expert_parallelism:
-                        test_fmoe_ep_mxfp4(
-                            label,
-                            m,
-                            hdim,
-                            idim,
-                            args.expert,
-                            args.topk,
-                            shared_E=0,
-                            ep=ep,
-                            ep_mode=args.ep_mode,
-                            fake_ep_rank=args.fake_ep_rank,
-                            const_init=args.const_init,
-                        )
+        for activation in args.activation:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        for ep in args.expert_parallelism:
+                            test_fmoe_ep_mxfp4(
+                                label,
+                                m,
+                                hdim,
+                                idim,
+                                args.expert,
+                                args.topk,
+                                shared_E=0,
+                                ep=ep,
+                                ep_mode=args.ep_mode,
+                                fake_ep_rank=args.fake_ep_rank,
+                                const_init=args.const_init,
+                                activation=activation,
+                                beta=args.beta,
+                                linear_beta=args.linear_beta,
+                            )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
             for m in args.token:

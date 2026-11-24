@@ -216,6 +216,7 @@ def test_cat_and_cache_mla(
     if cache_dtype == torch.uint8 and DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         pytest.skip("FP4 KV cache is only supported in GFX950 and GFX1250")
 

@@ -969,9 +969,9 @@ def test_candidate_gather(num_heads, block):
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     ctx = st["ctx"][0]
     nb, K = (ctx + block - 1) // block, 128
-    ids = torch.rand(rows, nb, device="cuda").argsort(1)
+    ids = torch.rand(rows, nb, device="cuda", dtype=torch.float32).argsort(1)
     ids = ids[:, :K].to(torch.int32)
-    ids[torch.rand(rows, K, device="cuda") < 0.1] = -1
+    ids[torch.rand(rows, K, device="cuda", dtype=torch.float32) < 0.1] = -1
     ends = torch.randint(1, ctx + 1, (rows,), dtype=torch.int32, device="cuda")
     ends[0] = 0
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
@@ -991,7 +991,9 @@ def test_candidates_implicit(num_heads):
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     ctx = st["ctx"][0]
     ids = (
-        torch.rand(rows, ctx // block, device="cuda").argsort(1)[:, :K].to(torch.int32)
+        torch.rand(rows, ctx // block, device="cuda", dtype=torch.float32)
+        .argsort(1)[:, :K]
+        .to(torch.int32)
     )
     ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
@@ -1057,7 +1059,9 @@ def test_scale_mode_0(num_heads, next_n):
     for mode in (0, 1):
         torch.manual_seed(0)
         st[mode] = _make_case(2, next_n, num_heads, 128, ctx, 64, scale_mode=mode)
-    ids = torch.rand(2 * next_n, st[1]["mml"] // block, device="cuda")
+    ids = torch.rand(
+        2 * next_n, st[1]["mml"] // block, device="cuda", dtype=torch.float32
+    )
     ids = ids.argsort(1)[:, :64].to(torch.int32)
     ends = _row_ends(ctx, next_n, None)
     out = {}
@@ -1092,7 +1096,7 @@ def test_gather_far_pages(gib):
         torch.manual_seed(0)
         st = _make_case(1, rows, 32, 128, [2048], page_size, page_offset=page_offset)
         ids = (
-            torch.rand(rows, st["ctx"][0] // block, device="cuda")
+            torch.rand(rows, st["ctx"][0] // block, device="cuda", dtype=torch.float32)
             .argsort(1)[:, :K]
             .to(torch.int32)
         )
@@ -1152,12 +1156,16 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     _, rows, ctx_lens = shape
     hs, batch, total = 128, len(rows), sum(rows)
     st = _make_case(batch, 1, num_heads, hs, ctx_lens, page_size)
-    q4, q4s = quantize(torch.randn(total * num_heads, hs, device="cuda"))
+    q4, q4s = quantize(
+        torch.randn(total * num_heads, hs, device="cuda", dtype=torch.float32)
+    )
     q4 = q4.reshape(total, num_heads, hs // 2)
     q4s = q4s.reshape(total, num_heads, hs // SCALE_GROUP)
-    w = torch.randn(total, num_heads, device="cuda")
+    w = torch.randn(total, num_heads, device="cuda", dtype=torch.float32)
     cu = torch.tensor(
-        [0] + list(torch.tensor(rows).cumsum(0)), dtype=torch.int32, device="cuda"
+        [0] + list(torch.tensor(rows, device="cuda").cumsum(0)),
+        dtype=torch.int32,
+        device="cuda",
     )
     args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 

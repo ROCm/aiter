@@ -1,0 +1,37 @@
+{
+    "bm16_any": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4,
+        "persistent_iters": 1
+    },
+    "bm32_any": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "persistent_iters": 1
+    },
+    "bm64_any": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "persistent_iters": 1
+    },
+    "bm128_any": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "persistent_iters": 1
+    },
+    "bm256_any": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "persistent_iters": 1
+    }
+}

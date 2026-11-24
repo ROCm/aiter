@@ -33,7 +33,11 @@ def init_dist_env(
     data_parallel_rank: int = 0,
     decode_context_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
+    device_communicators: bool = True,
 ):
+    """``device_communicators=False``: only the groups and their ranks, for a
+    process that never communicates on the device (see
+    ``initialize_model_parallel``)."""
     pipeline_model_parallel_size = 1
     # world_size is TP x PP x PCP (PCP is an independent dimension that grows
     # world_size; see initialize_model_parallel in dist/parallel_state.py).
@@ -59,6 +63,7 @@ def init_dist_env(
         decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+        device_communicators=device_communicators,
     )
 
     # No per-rank signal/input-buffer registration here. An earlier version
