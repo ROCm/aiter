@@ -35,8 +35,6 @@ unfused chain, where the GEMM already fills the chip and the graft is a no-op.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
 
@@ -82,7 +80,7 @@ def k3_tail_epilogue_attn_res(
     acc: torch.Tensor,
     latent_inv_rms: torch.Tensor,
     shared: torch.Tensor,
-    residual_prefix: Optional[torch.Tensor],
+    residual_prefix: torch.Tensor | None,
     bank: torch.Tensor,
     nvb: int,
     qk_weight: torch.Tensor,
@@ -92,8 +90,8 @@ def k3_tail_epilogue_attn_res(
     *,
     scale: float = 1.0,
     write_snapshot: bool = True,
-    out: Optional[torch.Tensor] = None,
-    prefix_out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    prefix_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused latent-tail epilogue + AttnRes read on a raw up-proj accumulator.
 

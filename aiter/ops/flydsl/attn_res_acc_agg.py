@@ -25,12 +25,14 @@ test_attnres_tp2.py.
 
 This module is ADDITIVE: it imports but never mutates the one-shot AR dispatch.
 """
+
 import torch
 from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
     import triton
     import triton.language as tl
+
     _HAVE_TRITON = True
 except ImportError:  # pragma: no cover - triton always present on gfx950
     _HAVE_TRITON = False
@@ -68,11 +70,21 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _acc_agg_kernel(
-        prefix_ptr, addend_ptr, acc_ptr, ms_ptr, cw_ptr, ow_ptr,
-        out_ptr, pout_ptr,
-        H: tl.constexpr, SCORE_EPS: tl.constexpr, OUT_EPS: tl.constexpr,
-        HAS_OW: tl.constexpr, WRITE_PREFIX: tl.constexpr,
-        MS_STRIDE: tl.constexpr, BLK: tl.constexpr,
+        prefix_ptr,
+        addend_ptr,
+        acc_ptr,
+        ms_ptr,
+        cw_ptr,
+        ow_ptr,
+        out_ptr,
+        pout_ptr,
+        H: tl.constexpr,
+        SCORE_EPS: tl.constexpr,
+        OUT_EPS: tl.constexpr,
+        HAS_OW: tl.constexpr,
+        WRITE_PREFIX: tl.constexpr,
+        MS_STRIDE: tl.constexpr,
+        BLK: tl.constexpr,
     ):
         """One program per token. Mirrors OneShotAllReduceAttnRes acc-cache read +
         agg_reference. ``ms`` is read with a configurable row stride so the SAME
@@ -85,7 +97,9 @@ if _HAVE_TRITON:
         base = t * H
         prefix = tl.load(prefix_ptr + base + h, mask=hm, other=0.0).to(tl.float32)
         addend = tl.load(addend_ptr + base + h, mask=hm, other=0.0).to(tl.float32)
-        pv = (prefix + addend).to(tl.bfloat16).to(tl.float32)   # bf16-rounded prefix+addend
+        pv = (
+            (prefix + addend).to(tl.bfloat16).to(tl.float32)
+        )  # bf16-rounded prefix+addend
         if WRITE_PREFIX:
             tl.store(pout_ptr + base + h, pv.to(tl.bfloat16), mask=hm)
         cw = tl.load(cw_ptr + h, mask=hm, other=0.0).to(tl.float32)
@@ -105,7 +119,9 @@ if _HAVE_TRITON:
         acc = tl.load(acc_ptr + base + h, mask=hm, other=0.0).to(tl.float32)
         mix = a * pv + b * acc
         o = mix
-        if HAS_OW:  # out RMSNorm is bundled with ow (matches agg_reference: no ow -> no norm)
+        if (
+            HAS_OW
+        ):  # out RMSNorm is bundled with ow (matches agg_reference: no ow -> no norm)
             mss = tl.sum(mix * mix, axis=0)
             rnorm = tl.rsqrt(mss * (1.0 / H) + OUT_EPS)
             ow = tl.load(ow_ptr + h, mask=hm, other=0.0).to(tl.float32)
@@ -114,8 +130,14 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _bank_acc_online_kernel(
-        bank_ptr, cw_ptr, acc_ptr, ms_ptr,
-        H: tl.constexpr, NB: tl.constexpr, NVB: tl.constexpr, EPS: tl.constexpr,
+        bank_ptr,
+        cw_ptr,
+        acc_ptr,
+        ms_ptr,
+        H: tl.constexpr,
+        NB: tl.constexpr,
+        NVB: tl.constexpr,
+        EPS: tl.constexpr,
         BLK: tl.constexpr,
     ):
         """Single-read online-softmax producer (iter006). Emits (T,3) ms
@@ -149,10 +171,21 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _fused_producer_accagg_kernel(
-        bank_ptr, prefix_ptr, addend_ptr, cw_ptr, ow_ptr, out_ptr, pout_ptr,
-        H: tl.constexpr, NB: tl.constexpr, NVB: tl.constexpr,
-        SCORE_EPS: tl.constexpr, OUT_EPS: tl.constexpr,
-        HAS_OW: tl.constexpr, WRITE_PREFIX: tl.constexpr, BLK: tl.constexpr,
+        bank_ptr,
+        prefix_ptr,
+        addend_ptr,
+        cw_ptr,
+        ow_ptr,
+        out_ptr,
+        pout_ptr,
+        H: tl.constexpr,
+        NB: tl.constexpr,
+        NVB: tl.constexpr,
+        SCORE_EPS: tl.constexpr,
+        OUT_EPS: tl.constexpr,
+        HAS_OW: tl.constexpr,
+        WRITE_PREFIX: tl.constexpr,
+        BLK: tl.constexpr,
     ):
         """iter028: producer (_bank_acc_online_kernel) and consumer (_acc_agg_kernel)
         FUSED into one launch. Phase 1 online-softmax over nvb bank rows leaves
@@ -190,7 +223,9 @@ if _HAVE_TRITON:
         pv = (prefix + addend).to(tl.bfloat16).to(tl.float32)
         if WRITE_PREFIX:
             tl.store(pout_ptr + base + h, pv.to(tl.bfloat16), mask=hm)
-        p_sc = tl.sum(pv * cwv, axis=0) * tl.rsqrt(tl.sum(pv * pv, axis=0) * (1.0 / H) + SCORE_EPS)
+        p_sc = tl.sum(pv * cwv, axis=0) * tl.rsqrt(
+            tl.sum(pv * pv, axis=0) * (1.0 / H) + SCORE_EPS
+        )
         mm = tl.maximum(m, p_sc)
         resc = tl.exp(m - mm)
         p_w = tl.exp(p_sc - mm)
@@ -204,8 +239,21 @@ if _HAVE_TRITON:
         tl.store(out_ptr + base + h, o.to(out_ptr.dtype.element_ty), mask=hm)
 
 
-def fused_producer_accagg(prefix, addend, bank, cw, ow, nvb, score_eps, out_eps,
-                          *, out=None, prefix_out=None, write_prefix=True, nw=None):
+def fused_producer_accagg(
+    prefix,
+    addend,
+    bank,
+    cw,
+    ow,
+    nvb,
+    score_eps,
+    out_eps,
+    *,
+    out=None,
+    prefix_out=None,
+    write_prefix=True,
+    nw=None,
+):
     """Non-overlapped high-T branch: ONE kernel = producer_online + acc_agg (iter028).
     Reads the nvb bank rows + the prefix row, folds in registers -> out (+ prefix_out).
     1.27-1.32x vs precompute_bank_acc_online+acc_agg (saves the acc HBM round-trip and
@@ -234,9 +282,23 @@ def fused_producer_accagg(prefix, addend, bank, cw, ow, nvb, score_eps, out_eps,
     cwf = _as_fp32_cached(cw)
     owf = ow if ow is not None else prefix
     _fused_producer_accagg_kernel[(T,)](
-        bank, prefix, addend, cwf, owf, out, prefix_out,
-        H=Hh, NB=NB, NVB=int(nvb), SCORE_EPS=float(score_eps), OUT_EPS=float(out_eps),
-        HAS_OW=ow is not None, WRITE_PREFIX=write_prefix, BLK=BLK, num_warps=nw)
+        bank,
+        prefix,
+        addend,
+        cwf,
+        owf,
+        out,
+        prefix_out,
+        H=Hh,
+        NB=NB,
+        NVB=int(nvb),
+        SCORE_EPS=float(score_eps),
+        OUT_EPS=float(out_eps),
+        HAS_OW=ow is not None,
+        WRITE_PREFIX=write_prefix,
+        BLK=BLK,
+        num_warps=nw,
+    )
     return out, prefix_out
 
 
@@ -250,13 +312,36 @@ def precompute_bank_acc_online(bank, cw, nvb, score_eps, *, nw=4):
     acc = torch.empty((T, H_), dtype=torch.float32, device=bank.device)
     ms = torch.empty((T, 3), dtype=torch.float32, device=bank.device)
     cwf = _as_fp32_cached(cw)
-    _bank_acc_online_kernel[(T,)](bank, cwf, acc, ms, H=H_, NB=NB_, NVB=int(nvb),
-                                  EPS=float(score_eps), BLK=BLK, num_warps=nw)
+    _bank_acc_online_kernel[(T,)](
+        bank,
+        cwf,
+        acc,
+        ms,
+        H=H_,
+        NB=NB_,
+        NVB=int(nvb),
+        EPS=float(score_eps),
+        BLK=BLK,
+        num_warps=nw,
+    )
     return acc, ms
 
 
-def acc_agg(prefix, addend, acc, ms, cw, ow, score_eps, out_eps,
-            *, out=None, prefix_out=None, write_prefix=True, nw=8):
+def acc_agg(
+    prefix,
+    addend,
+    acc,
+    ms,
+    cw,
+    ow,
+    score_eps,
+    out_eps,
+    *,
+    out=None,
+    prefix_out=None,
+    write_prefix=True,
+    nw=8,
+):
     """acc-cache aggregation consumer (iter017, nw=8 tuned). Drop-in for the
     production ``attn_res_hip`` RAW agg: given the AR output ``addend``, the
     residual ``prefix``, and the producer's ``(acc, ms)``, folds ONLY the prefix
@@ -272,10 +357,23 @@ def acc_agg(prefix, addend, acc, ms, cw, ow, score_eps, out_eps,
     cwf = _as_fp32_cached(cw)
     owf = ow if ow is not None else prefix  # dummy ptr when HAS_OW False
     _acc_agg_kernel[(T,)](
-        prefix, addend, acc, ms, cwf, owf, out, prefix_out,
-        H=H, SCORE_EPS=float(score_eps), OUT_EPS=float(out_eps),
-        HAS_OW=ow is not None, WRITE_PREFIX=write_prefix,
-        MS_STRIDE=ms_stride, BLK=BLK, num_warps=nw)
+        prefix,
+        addend,
+        acc,
+        ms,
+        cwf,
+        owf,
+        out,
+        prefix_out,
+        H=H,
+        SCORE_EPS=float(score_eps),
+        OUT_EPS=float(out_eps),
+        HAS_OW=ow is not None,
+        WRITE_PREFIX=write_prefix,
+        MS_STRIDE=ms_stride,
+        BLK=BLK,
+        num_warps=nw,
+    )
     return out, prefix_out
 
 
@@ -373,11 +471,21 @@ def attn_res_allreduce_router(
     if T > t_fused and fuse_producer_agg and bank_acc is None:
         if all_reduce_fn is None:
             from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
             all_reduce_fn = tensor_model_parallel_all_reduce
         addend = all_reduce_fn(inp)
         return fused_producer_accagg(
-            prefix, addend, bank, cw, ow, nvb, score_eps, out_eps,
-            out=out, prefix_out=prefix_out, write_prefix=True,
+            prefix,
+            addend,
+            bank,
+            cw,
+            ow,
+            nvb,
+            score_eps,
+            out_eps,
+            out=out,
+            prefix_out=prefix_out,
+            write_prefix=True,
         )
 
     if bank_acc is None:
@@ -394,15 +502,35 @@ def attn_res_allreduce_router(
 
     if T <= t_fused:
         return ar.allreduce_attn_res(
-            inp, prefix, bank, nvb, cw, ow, score_eps, out_eps,
-            out=out, prefix_out=prefix_out, write_bank=write_bank, bank_acc=bank_acc,
+            inp,
+            prefix,
+            bank,
+            nvb,
+            cw,
+            ow,
+            score_eps,
+            out_eps,
+            out=out,
+            prefix_out=prefix_out,
+            write_bank=write_bank,
+            bank_acc=bank_acc,
         )
 
     if all_reduce_fn is None:
         from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
         all_reduce_fn = tensor_model_parallel_all_reduce
     addend = all_reduce_fn(inp)
     return acc_agg(
-        prefix, addend, acc, ms, cw, ow, score_eps, out_eps,
-        out=out, prefix_out=prefix_out, write_prefix=True,
+        prefix,
+        addend,
+        acc,
+        ms,
+        cw,
+        ow,
+        score_eps,
+        out_eps,
+        out=out,
+        prefix_out=prefix_out,
+        write_prefix=True,
     )

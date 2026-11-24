@@ -96,7 +96,9 @@ from .transport import (
 
 
 @flyc.jit
-def _xchg_join_dot_sq(dot_word, sq_word, dot_part, sq_part, dot_prev, sq_prev, n_writers, tid):
+def _xchg_join_dot_sq(
+    dot_word, sq_word, dot_part, sq_part, dot_prev, sq_prev, n_writers, tid
+):
     """Join point 1 of the split AttnRes epilogue: the signed prefix dot and the
     non-negative prefix sum of squares, each through its own HBM exchange word,
     in ONE device function. Doing the two joins as two *separate* ``@flyc.jit``
@@ -115,22 +117,30 @@ def _xchg_join_dot_sq(dot_word, sq_word, dot_part, sq_part, dot_prev, sq_prev, n
             syncscope=rocdl.SyncScope.AgentOneAs,
         )
     curd = fx.generic_load(
-        dot_word, dtype=fx.Int64,
-        memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        dot_word,
+        dtype=fx.Int64,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=rocdl.SyncScope.AgentOneAs,
     )
     while xchg_arrivals(curd - dot_prev) != fx.Int64(n_writers):
         curd = fx.generic_load(
-            dot_word, dtype=fx.Int64,
-            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+            dot_word,
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope=rocdl.SyncScope.AgentOneAs,
         )
     curs = fx.generic_load(
-        sq_word, dtype=fx.Int64,
-        memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        sq_word,
+        dtype=fx.Int64,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=rocdl.SyncScope.AgentOneAs,
     )
     while xchg_arrivals(curs - sq_prev) != fx.Int64(n_writers):
         curs = fx.generic_load(
-            sq_word, dtype=fx.Int64,
-            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+            sq_word,
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope=rocdl.SyncScope.AgentOneAs,
         )
     return (
         xchg_total_signed(curd - dot_prev, n_writers),
@@ -142,10 +152,17 @@ def _xchg_join_dot_sq(dot_word, sq_word, dot_part, sq_part, dot_prev, sq_prev, n
 
 @flyc.jit
 def _xchg_join_triple(
-    dot_word, sq_word, cross_word,
-    dot_part, sq_part, cross_part,
-    dot_prev, sq_prev, cross_prev,
-    n_writers, tid,
+    dot_word,
+    sq_word,
+    cross_word,
+    dot_part,
+    sq_part,
+    cross_part,
+    dot_prev,
+    sq_prev,
+    cross_prev,
+    n_writers,
+    tid,
 ):
     """Single-barrier join of the split AttnRes out-norm path (SILOTIGER-1277
     iter010): the prefix dot (signed), prefix sq, and cross=sum(pv*acc) (signed)
@@ -178,37 +195,51 @@ def _xchg_join_triple(
             syncscope=rocdl.SyncScope.AgentOneAs,
         )
     curd = fx.generic_load(
-        dot_word, dtype=fx.Int64,
-        memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        dot_word,
+        dtype=fx.Int64,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=rocdl.SyncScope.AgentOneAs,
     )
     while xchg_arrivals(curd - dot_prev) != fx.Int64(n_writers):
         curd = fx.generic_load(
-            dot_word, dtype=fx.Int64,
-            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+            dot_word,
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope=rocdl.SyncScope.AgentOneAs,
         )
     curs = fx.generic_load(
-        sq_word, dtype=fx.Int64,
-        memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        sq_word,
+        dtype=fx.Int64,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=rocdl.SyncScope.AgentOneAs,
     )
     while xchg_arrivals(curs - sq_prev) != fx.Int64(n_writers):
         curs = fx.generic_load(
-            sq_word, dtype=fx.Int64,
-            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+            sq_word,
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope=rocdl.SyncScope.AgentOneAs,
         )
     curc = fx.generic_load(
-        cross_word, dtype=fx.Int64,
-        memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        cross_word,
+        dtype=fx.Int64,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=rocdl.SyncScope.AgentOneAs,
     )
     while xchg_arrivals(curc - cross_prev) != fx.Int64(n_writers):
         curc = fx.generic_load(
-            cross_word, dtype=fx.Int64,
-            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+            cross_word,
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope=rocdl.SyncScope.AgentOneAs,
         )
     return (
         xchg_total_signed(curd - dot_prev, n_writers),
         xchg_total(curs - sq_prev),
         xchg_total_signed(curc - cross_prev, n_writers),
-        curd, curs, curc,
+        curd,
+        curs,
+        curc,
     )
 
 
@@ -265,6 +296,7 @@ def _make_kw_wave0_score(nvb: int, n_waves: int):
             fx.ptr_store(wgt, weight_ptr + fx.Int64(safe_w))
 
     return _kw_wave0_score
+
 
 #: Rows whose butterfly steps are emitted together by
 #: :func:`_wave_reduce_add_xpose`. Tail at T=1, atoms=2, nvb=8, against the
@@ -489,8 +521,8 @@ class OneShotAttnResEpilogue:
         # enables it at low T. An env override forces it on for gating. Off by
         # default -> every other build is byte-identical to the two-barrier path.
         env_merge = os.environ.get("AITER_FLY_AR_OUTNORM_MERGE") == "1"
-        self.outnorm_merge = bool(self.out_norm) and split > 1 and (
-            bool(outnorm_merge) or env_merge
+        self.outnorm_merge = (
+            bool(self.out_norm) and split > 1 and (bool(outnorm_merge) or env_merge)
         )
         # Row sums of the first reduction: dot(row, cw) and sum(row^2) for the
         # prefix row only. The nvb bank rows' scores are precomputed in the
@@ -544,9 +576,7 @@ class OneShotAttnResEpilogue:
             self.xchg_prev_off = (
                 self.n_streams * n_colors * self.n_groups * XCHG_LINE_BYTES
             )
-            self.xchg_bytes = (
-                self.xchg_prev_off + grid * n_colors * self.n_streams * 8
-            )
+            self.xchg_bytes = self.xchg_prev_off + grid * n_colors * self.n_streams * 8
             self.lds_bytes = 0
             self._shared = None
         else:
@@ -567,7 +597,9 @@ class OneShotAttnResEpilogue:
                 self.lds_bytes = n_colors * self.slots_per_color_kw * 4
                 self._shared = make_wave_partials(n_colors * self.slots_per_color_kw)
             else:
-                self.lds_bytes = n_colors * self.slots_per_color * 4 if multi_wave else 0
+                self.lds_bytes = (
+                    n_colors * self.slots_per_color * 4 if multi_wave else 0
+                )
                 self._shared = (
                     make_wave_partials(n_colors * self.slots_per_color)
                     if multi_wave
@@ -800,9 +832,9 @@ class _BoundOneShotAttnRes:
         """The active exchange word for row group ``self.group`` of this colour
         and *stream* (0 dot, 1 prefix sq, and -- iter010 out-norm single-barrier
         path -- 2 cross=sum(pv*acc), 3 accsq=sum(acc^2))."""
-        lane = (
-            fx.Int32(stream * self.epi.n_colors) + color
-        ) * fx.Int32(self.epi.n_groups) + self.group
+        lane = (fx.Int32(stream * self.epi.n_colors) + color) * fx.Int32(
+            self.epi.n_groups
+        ) + self.group
         return _global_ptr(
             self.xchg_ptr + fx.Int64(lane) * fx.Int64(XCHG_LINE_BYTES), T.i64, 8
         )
@@ -884,9 +916,7 @@ class _BoundOneShotAttnRes:
         producer-supplied full-row ``sum(acc^2)`` scalar (no join)."""
         cross = None
         for a in range_constexpr(len(pv)):
-            c = fx.Float32(
-                (pv[a] * acc[a]).reduce(ReductionOp.ADD, fastmath="reassoc")
-            )
+            c = fx.Float32((pv[a] * acc[a]).reduce(ReductionOp.ADD, fastmath="reassoc"))
             cross = c if cross is None else cross + c
         return cross
 
@@ -1005,13 +1035,22 @@ class _BoundOneShotAttnRes:
             s_wave = wave_reduce_add([s_pv])[0]
             c_wave = wave_reduce_add([cross_pv])[0]
             (
-                total_dot, total_sq, total_cross, done_d, done_s, done_c,
+                total_dot,
+                total_sq,
+                total_cross,
+                done_d,
+                done_s,
+                done_c,
             ) = _xchg_join_triple(
                 self._xchg_word(0, color),
                 self._xchg_word(1, color),
                 self._xchg_word(2, color),
-                d_wave, s_wave, c_wave,
-                state[0], state[3], state[6],
+                d_wave,
+                s_wave,
+                c_wave,
+                state[0],
+                state[3],
+                state[6],
                 epi.n_writers,
                 self.tid,
             )

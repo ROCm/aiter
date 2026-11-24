@@ -237,9 +237,7 @@ def make_quick_allreduce_mesh_kernel(
         epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
     elif fusion == "attn_res":
         if mxfp4 or low_latency:
-            raise ValueError(
-                "the AttnRes epilogue has no MXFP4 or low-latency build"
-            )
+            raise ValueError("the AttnRes epilogue has no MXFP4 or low-latency build")
         epilogue = MeshAttnResEpilogue(
             hidden=hidden,
             h_pad=h_pad,

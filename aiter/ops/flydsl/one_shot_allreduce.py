@@ -980,8 +980,11 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         # count saturates the wire or the bank is too shallow to characterise.
         if nvb < 4 or tokens > 16:
             return 1
-        legal = [s for s in SUPPORTED_SPLITS
-                 if s > 1 and hidden % s == 0 and hidden // s >= 512]
+        legal = [
+            s
+            for s in SUPPORTED_SPLITS
+            if s > 1 and hidden % s == 0 and hidden // s >= 512
+        ]
         return max(legal) if legal else 1
 
     @staticmethod
@@ -997,19 +1000,22 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         ladder; this just requires split>1 and the output norm)."""
         return bool(out_norm) and split > 1
 
-    def _attn_key(self, hidden: int, live_bytes: int, nvb: int, write_bank, out_norm,
-                  acc_cache=False):
+    def _attn_key(
+        self,
+        hidden: int,
+        live_bytes: int,
+        nvb: int,
+        write_bank,
+        out_norm,
+        acc_cache=False,
+    ):
         rung = select_rung(self._ladder(hidden), live_bytes)
         # SILOTIGER-1277 iter004: auto-select the decode split by live bytes when
         # the caller did not pin one. Only the acc_cache build may split (the
         # epilogue raises otherwise) and only under the AITER_FLY_AR_FUSED_SPLIT
         # opt-in; everything else stays unsplit, as before.
         outnorm_merge = False
-        if (
-            not self._split_pinned
-            and acc_cache
-            and fused_split_enabled()
-        ):
+        if not self._split_pinned and acc_cache and fused_split_enabled():
             tokens = int(live_bytes) // (int(hidden) * 2)
             # iter010(night2): pass the real ``hidden`` so the iter009 H-aware
             # branch actually drives the router/acc_agg path. Omitting it (the
@@ -1032,12 +1038,28 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
             # iter010: fold join point 2 into join point 1 at low T (same opt-in).
             outnorm_merge = self._attn_ladder_merge(tokens, split, bool(out_norm))
         base = self._cfg_key(hidden, rung)
-        return base + (int(nvb), bool(write_bank), bool(out_norm), bool(acc_cache),
-                       bool(outnorm_merge))
+        return base + (
+            int(nvb),
+            bool(write_bank),
+            bool(out_norm),
+            bool(acc_cache),
+            bool(outnorm_merge),
+        )
 
     def _build_attn(self, key) -> None:
-        (hidden, atoms, grid, fanout, h_pad, split, nvb, write_bank, out_norm,
-         acc_cache, outnorm_merge) = key
+        (
+            hidden,
+            atoms,
+            grid,
+            fanout,
+            h_pad,
+            split,
+            nvb,
+            write_bank,
+            out_norm,
+            acc_cache,
+            outnorm_merge,
+        ) = key
         spec = make_one_shot_allreduce_kernel(
             world_size=self.world_size,
             atoms=atoms,
@@ -1142,15 +1164,15 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         Compute once per (bank, cw); SGLang does it one layer ahead on the route
         sort's spare workgroups (overlapped, ~free)."""
         hidden = int(bank.shape[-1])
-        v = bank[:, :nvb, :].to(torch.float32)              # (T, nvb, H)
+        v = bank[:, :nvb, :].to(torch.float32)  # (T, nvb, H)
         cwf = cw.to(torch.float32).view(1, 1, hidden)
-        dot = (v * cwf).sum(dim=-1)                          # (T, nvb)
+        dot = (v * cwf).sum(dim=-1)  # (T, nvb)
         meansq = (v * v).sum(dim=-1) * (1.0 / hidden)
         scores = dot * torch.rsqrt(meansq + float(score_eps))  # (T, nvb)
-        m = scores.max(dim=-1, keepdim=True).values          # (T, 1) bank max
-        w = torch.exp(scores - m)                            # (T, nvb)
-        s = w.sum(dim=-1, keepdim=True)                      # (T, 1)
-        acc = torch.einsum("tr,trh->th", w, v)               # (T, H) fp32
+        m = scores.max(dim=-1, keepdim=True).values  # (T, 1) bank max
+        w = torch.exp(scores - m)  # (T, nvb)
+        s = w.sum(dim=-1, keepdim=True)  # (T, 1)
+        acc = torch.einsum("tr,trh->th", w, v)  # (T, H) fp32
         # SILOTIGER-1277 iter010: accsq = sum_h acc^2 per token, a full-row
         # scalar the producer is already positioned to form (acc is in hand and
         # AR-independent). The single-barrier out-norm epilogue reads it directly
@@ -1159,8 +1181,8 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         # on top of the prefix dot/sq, i.e. the SAME word count as the two-barrier
         # path but one fewer barrier -> a net win at every decode T (not just the
         # low-T tiles the 4-word variant was limited to).
-        accsq = (acc * acc).sum(dim=-1, keepdim=True)        # (T, 1) fp32
-        ms = torch.cat([m, s, accsq], dim=-1).contiguous()   # (T, 3)
+        accsq = (acc * acc).sum(dim=-1, keepdim=True)  # (T, 1) fp32
+        ms = torch.cat([m, s, accsq], dim=-1).contiguous()  # (T, 3)
         return acc.contiguous(), ms
 
     def _precompute_bank_scores(self, bank, cw, nvb, hidden, score_eps):
@@ -1176,7 +1198,6 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         kernel's reassoc tree, so this is validated bit-for-bit by the op_test
         gate (<= 1 ulp vs Triton), not assumed.
         """
-        tokens = int(bank.shape[0])
         v = bank[:, :nvb, :].to(torch.float32)  # (T, nvb, hidden)
         cwf = cw.to(torch.float32).view(1, 1, hidden)
         dot = (v * cwf).sum(dim=-1)  # (T, nvb)
@@ -1224,8 +1245,9 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
             inp, prefix_in, bank, nvb, cw, ow, out, prefix_out, write_bank
         )
         acc_cache = bank_acc is not None
-        key = self._attn_key(hidden, live_bytes, nvb, write_bank, ow is not None,
-                             acc_cache=acc_cache)
+        key = self._attn_key(
+            hidden, live_bytes, nvb, write_bank, ow is not None, acc_cache=acc_cache
+        )
         if key not in self._by_cfg:
             self._build_attn(key)
         eng, spec = self._by_cfg[key]

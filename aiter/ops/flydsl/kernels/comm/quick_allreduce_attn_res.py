@@ -90,7 +90,6 @@ from .transport import (
     atom_bf16_to_f32,
 )
 
-
 # ``_block_reduce_many`` and ``block_reduce_add`` each index a flat f32 array
 # from 0, so the two reductions of one row take disjoint windows of the one
 # allocation -- the same split the one-shot build uses, and for the same reason:
@@ -421,7 +420,7 @@ class _BoundMeshAttnRes:
     def prefetch(self, tile):
         """Not built: the hoist is the ``low_latency`` build's, which this
         prototype does not have."""
-        return None
+        return
 
     def finish_tile(self, tile, gathered, pre=None):
         for r in range_constexpr(self.epi.rows_per_tile):
@@ -463,9 +462,7 @@ class _BoundMeshAttnRes:
         if const_expr(self.epi.padded):
             buf = self._bank_buf(tile, r, j)
             return [
-                atom_bf16_to_f32(
-                    _buffer_load(buf, self.col_i32[a], ATOM_I32, fx.Int32)
-                )
+                atom_bf16_to_f32(_buffer_load(buf, self.col_i32[a], ATOM_I32, fx.Int32))
                 for a in range_constexpr(self.epi.atoms_per_row)
             ]
         return [
@@ -596,12 +593,10 @@ class _BoundMeshAttnRes:
                 local = s if local is None else local + s
             lds2 = None
             if const_expr(epi.n_waves > 1):
-                lds2 = _LdsWindow(
-                    self.lds, fx.Int32(epi.n_score_sums * epi.n_waves)
-                )
-            total = block_reduce_add(
-                [local], tid=self.tid, block=epi.block, lds=lds2
-            )[0]
+                lds2 = _LdsWindow(self.lds, fx.Int32(epi.n_score_sums * epi.n_waves))
+            total = block_reduce_add([local], tid=self.tid, block=epi.block, lds=lds2)[
+                0
+            ]
             scale = fx.Float32(1.0) / fmath.sqrt(total * inv_h + self.eps)
             out = scale_by_weight(mix, scale, self.ow_atoms)
         else:

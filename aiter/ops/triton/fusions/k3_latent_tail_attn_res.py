@@ -50,11 +50,8 @@ graft is a no-op.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
-import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.fusions.k3_latent_tail_attn_res import (
     _latent_tail_attn_res_kernel,
@@ -75,12 +72,12 @@ def supports_latent_tail_attn_res(
     latent: torch.Tensor,
     up_weight: torch.Tensor,
     shared: torch.Tensor,
-    prefix: Optional[torch.Tensor],
+    prefix: torch.Tensor | None,
     bank: torch.Tensor,
     nvb: int,
 ) -> bool:
     """Whether the fused path can serve these inputs (else keep the unfused chain)."""
-    M, L = latent.shape
+    M = latent.shape[0]
     H = up_weight.shape[0]
     return (
         0 < M <= MAX_TOKENS
@@ -94,7 +91,10 @@ def supports_latent_tail_attn_res(
         and bank.shape[0] == M
         and bank.shape[-1] == H
         and bank.shape[-2] >= nvb + 1  # snapshot append slot must exist
-        and (prefix is None or (prefix.dtype == torch.bfloat16 and prefix.stride(-1) == 1))
+        and (
+            prefix is None
+            or (prefix.dtype == torch.bfloat16 and prefix.stride(-1) == 1)
+        )
     )
 
 
@@ -104,7 +104,7 @@ def k3_latent_tail_attn_res(
     eps: float,
     up_weight: torch.Tensor,
     shared: torch.Tensor,
-    residual_prefix: Optional[torch.Tensor],
+    residual_prefix: torch.Tensor | None,
     bank: torch.Tensor,
     nvb: int,
     qk_weight: torch.Tensor,
@@ -114,7 +114,7 @@ def k3_latent_tail_attn_res(
     *,
     scale: float = 1.0,
     write_snapshot: bool = True,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
     block_n: int = 256,
     block_k: int = 64,
     num_warps: int = 4,

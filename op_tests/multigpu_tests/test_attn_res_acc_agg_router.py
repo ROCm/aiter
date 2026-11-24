@@ -17,10 +17,11 @@ fp32, the same math agg_reference uses):
 Run:  TP=8 python op_tests/multigpu_tests/test_attn_res_acc_agg_router.py
 Exit 0 iff FAIL=0. Gates gfx942/gfx950 only.
 """
-import os
-import sys
+
 import json
 import logging
+import os
+import sys
 from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
@@ -28,17 +29,20 @@ import torch.distributed as dist
 
 sys.path.insert(0, "/home/mvedenev/aiter")
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce, OneShotAllReduceAttnRes
 from aiter.ops.flydsl.attn_res_acc_agg import (
+    DEFAULT_T_FUSED,
     acc_agg,
     attn_res_allreduce_router,
-    DEFAULT_T_FUSED,
+)
+from aiter.ops.flydsl.one_shot_allreduce import (
+    OneShotAllReduce,
+    OneShotAllReduceAttnRes,
 )
 
 logger = logging.getLogger("attn_res_acc_agg_router")
 
 H = 7168
-NB = 9          # bank depth allocation; nvb<=NB active rows
+NB = 9  # bank depth allocation; nvb<=NB active rows
 SCORE_EPS = 1e-6
 OUT_EPS = 1e-6
 MAX_BYTES = 8 * 1024 * 1024
@@ -48,22 +52,25 @@ SUPPORTED_WORLDS = (2, 4, 8)
 
 
 def _ulp(a, b):
-    return ((a.float() - b.float()).abs()
-            / (b.float().abs().clamp_min(1e-3) * 2.0 ** -7)).max().item()
+    return (
+        ((a.float() - b.float()).abs() / (b.float().abs().clamp_min(1e-3) * 2.0**-7))
+        .max()
+        .item()
+    )
 
 
 def _agg_reference(prefix, addend, bank, nvb, cw, ow, out_norm):
     """torch fp32 aggregation reference (bank-max softmax, matches the kernel)."""
-    pv = (prefix.float() + addend.float()).to(torch.bfloat16).float()   # (T,H)
-    v = bank[:, :nvb, :].float()                                        # (T,nvb,H)
+    pv = (prefix.float() + addend.float()).to(torch.bfloat16).float()  # (T,H)
+    v = bank[:, :nvb, :].float()  # (T,nvb,H)
     cwf = cw.float().view(1, 1, H)
     dot = (v * cwf).sum(-1)
     meansq = (v * v).sum(-1) * (1.0 / H)
-    sr = dot * torch.rsqrt(meansq + SCORE_EPS)                          # (T,nvb)
+    sr = dot * torch.rsqrt(meansq + SCORE_EPS)  # (T,nvb)
     psum = (pv * cw.float()).sum(-1)
     pss = (pv * pv).sum(-1)
-    psc = psum * torch.rsqrt(pss * (1.0 / H) + SCORE_EPS)               # (T,)
-    mb = sr.max(-1).values                                             # bank max
+    psc = psum * torch.rsqrt(pss * (1.0 / H) + SCORE_EPS)  # (T,)
+    mb = sr.max(-1).values  # bank max
     m = torch.maximum(mb, psc)
     resc = torch.exp(mb - m)
     pw = torch.exp(psc - m)
@@ -85,10 +92,12 @@ def _run_rank(rank, tp, init_method, t_fused):
     torch.cuda.set_device(device)
     dist.init_process_group("gloo", init_method=init_method, world_size=tp, rank=rank)
     group = dist.group.WORLD
-    eng = OneShotAllReduceAttnRes(group=group, device=device, rank=rank,
-                                  world_size=tp, max_bytes=MAX_BYTES)
-    plain = OneShotAllReduce(group=group, device=device, rank=rank,
-                             world_size=tp, max_bytes=MAX_BYTES)
+    eng = OneShotAllReduceAttnRes(
+        group=group, device=device, rank=rank, world_size=tp, max_bytes=MAX_BYTES
+    )
+    plain = OneShotAllReduce(
+        group=group, device=device, rank=rank, world_size=tp, max_bytes=MAX_BYTES
+    )
 
     def all_reduce_fn(x):
         red = torch.empty_like(x)
@@ -117,9 +126,26 @@ def _run_rank(rank, tp, init_method, t_fused):
 
                     # --- Gate 1: acc_agg vs torch ref on the REAL one-shot AR output
                     addend = all_reduce_fn(inp)
-                    out_a, pout_a = acc_agg(prefix, addend, acc, ms, cw, owv,
-                                            SCORE_EPS, OUT_EPS, write_prefix=True)
-                    ref = _agg_reference(prefix, addend, bank, nvb, cw, ow if out_norm else None, out_norm)
+                    out_a, pout_a = acc_agg(
+                        prefix,
+                        addend,
+                        acc,
+                        ms,
+                        cw,
+                        owv,
+                        SCORE_EPS,
+                        OUT_EPS,
+                        write_prefix=True,
+                    )
+                    ref = _agg_reference(
+                        prefix,
+                        addend,
+                        bank,
+                        nvb,
+                        cw,
+                        ow if out_norm else None,
+                        out_norm,
+                    )
                     pref = (prefix.float() + addend.float()).to(torch.bfloat16)
                     u = _ulp(out_a, ref)
                     pe = torch.equal(pout_a, pref)
@@ -127,29 +153,69 @@ def _run_rank(rank, tp, init_method, t_fused):
 
                     # --- Gate 2: router dispatches to the right branch, bit-identically
                     out_r, pout_r = attn_res_allreduce_router(
-                        eng, inp.clone(), prefix, bank, nvb, cw, owv,
-                        SCORE_EPS, OUT_EPS, bank_acc=bank_acc, t_fused=t_fused,
+                        eng,
+                        inp.clone(),
+                        prefix,
+                        bank,
+                        nvb,
+                        cw,
+                        owv,
+                        SCORE_EPS,
+                        OUT_EPS,
+                        bank_acc=bank_acc,
+                        t_fused=t_fused,
                         all_reduce_fn=all_reduce_fn,
                     )
                     if t <= t_fused:
                         # router -> fused one-shot; cross-check vs a direct fused call
                         out_d, pout_d = eng.allreduce_attn_res(
-                            inp.clone(), prefix, bank, nvb, cw, owv,
-                            SCORE_EPS, OUT_EPS, bank_acc=bank_acc)
-                        route_match = torch.equal(out_r, out_d) and torch.equal(pout_r, pout_d)
+                            inp.clone(),
+                            prefix,
+                            bank,
+                            nvb,
+                            cw,
+                            owv,
+                            SCORE_EPS,
+                            OUT_EPS,
+                            bank_acc=bank_acc,
+                        )
+                        route_match = torch.equal(out_r, out_d) and torch.equal(
+                            pout_r, pout_d
+                        )
                         branch = "fused"
                     else:
                         # router -> cdr+acc_agg; must match a direct acc_agg on same AR
                         addend_r = all_reduce_fn(inp.clone())
-                        out_d, pout_d = acc_agg(prefix, addend_r, acc, ms, cw, owv,
-                                                SCORE_EPS, OUT_EPS, write_prefix=True)
-                        route_match = torch.equal(out_r, out_d) and torch.equal(pout_r, pout_d)
+                        out_d, pout_d = acc_agg(
+                            prefix,
+                            addend_r,
+                            acc,
+                            ms,
+                            cw,
+                            owv,
+                            SCORE_EPS,
+                            OUT_EPS,
+                            write_prefix=True,
+                        )
+                        route_match = torch.equal(out_r, out_d) and torch.equal(
+                            pout_r, pout_d
+                        )
                         branch = "cdr+acc_agg"
 
                     ok = bool(u <= 1.0 and pe and fin and route_match)
-                    rows.append(dict(t=t, nvb=nvb, out_norm=out_norm, branch=branch,
-                                     ulp=round(u, 3), prefix_exact=pe, finite=fin,
-                                     route_match=bool(route_match), ok=ok))
+                    rows.append(
+                        {
+                            "t": t,
+                            "nvb": nvb,
+                            "out_norm": out_norm,
+                            "branch": branch,
+                            "ulp": round(u, 3),
+                            "prefix_exact": pe,
+                            "finite": fin,
+                            "route_match": bool(route_match),
+                            "ok": ok,
+                        }
+                    )
     finally:
         eng.close()
         plain.close()
@@ -172,7 +238,9 @@ def main():
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     set_start_method("spawn", force=True)
     with Pool(processes=tp) as pool:
-        res = pool.starmap(_run_rank, [(r, tp, init_method, t_fused) for r in range(tp)])
+        res = pool.starmap(
+            _run_rank, [(r, tp, init_method, t_fused) for r in range(tp)]
+        )
 
     # reduce across ranks: worst ulp, AND of booleans, per (t,nvb,out_norm)
     agg = {}
@@ -196,14 +264,19 @@ def main():
         out.append(row)
         worst = max(worst, row["ulp"])
         fails += 0 if row["ok"] else 1
-        print(f"T={row['t']:>2} nvb={row['nvb']} out_norm={int(row['out_norm'])} "
-              f"[{row['branch']:>11}] ulp={row['ulp']:.3f} prefix_exact={row['prefix_exact']} "
-              f"route_match={row['route_match']} finite={row['finite']} "
-              f"{'OK' if row['ok'] else 'FAIL'}")
-    print(f"SUMMARY tp={tp} t_fused={t_fused} cases={len(out)} "
-          f"max_ulp_vs_ref={worst:.3f} FAIL={fails}")
+        print(
+            f"T={row['t']:>2} nvb={row['nvb']} out_norm={int(row['out_norm'])} "
+            f"[{row['branch']:>11}] ulp={row['ulp']:.3f} prefix_exact={row['prefix_exact']} "
+            f"route_match={row['route_match']} finite={row['finite']} "
+            f"{'OK' if row['ok'] else 'FAIL'}"
+        )
+    print(
+        f"SUMMARY tp={tp} t_fused={t_fused} cases={len(out)} "
+        f"max_ulp_vs_ref={worst:.3f} FAIL={fails}"
+    )
     if len(sys.argv) > 1:
-        json.dump(out, open(sys.argv[1], "w"), indent=1)
+        with open(sys.argv[1], "w") as f:
+            json.dump(out, f, indent=1)
     sys.exit(1 if fails else 0)
 
 

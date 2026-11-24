@@ -45,7 +45,7 @@ from aiter.ops.flydsl.kernels.comm.transport import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64
 
-ATOM_ELEMS = 8        # bf16 per thread: one 16 B vector of the row
+ATOM_ELEMS = 8  # bf16 per thread: one 16 B vector of the row
 ATOM_I32 = ATOM_ELEMS // 2
 WAVE = 64
 MAX_NVB = 8
@@ -65,8 +65,9 @@ def _lds_barrier():
     rocdl.s_barrier()
 
 
-def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
-                            write_bank: bool = False):
+def build_attn_res_read_dpp(
+    hidden: int, nvb: int, *, out_norm: bool = True, write_bank: bool = False
+):
     """Build the standalone FlyDSL AttnRes-read kernel for (hidden, nvb).
 
     One workgroup per token; block = hidden/ATOM_ELEMS threads, each owning one
@@ -75,10 +76,10 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
     nvb = int(nvb)
     assert hidden % ATOM_ELEMS == 0, "hidden must be a whole number of 16 B atoms"
     assert 1 <= nvb <= MAX_NVB
-    BLOCK = hidden // ATOM_ELEMS          # threads per workgroup (= kThreads)
+    BLOCK = hidden // ATOM_ELEMS  # threads per workgroup (= kThreads)
     assert BLOCK % WAVE == 0, "block must be whole waves"
     N_WAVES = BLOCK // WAVE
-    N_CAND = nvb + 1                      # bank rows + prefix
+    N_CAND = nvb + 1  # bank rows + prefix
     assert N_CAND <= WAVE, "candidates must fit one wave for the scoring lanes"
     INV_H = 1.0 / hidden
 
@@ -86,7 +87,7 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
     # weights + per-wave out-norm sumsq. This is O(n_waves * n_cand) floats, NOT
     # the whole bank -- the bank stays in registers.
     N_PART = N_WAVES * (2 * N_CAND)
-    N_W = N_CAND + 1   # +1 trash slot for inactive scoring lanes
+    N_W = N_CAND + 1  # +1 trash slot for inactive scoring lanes
     N_SQ = N_WAVES
 
     @fx.struct
@@ -97,15 +98,15 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
 
     @flyc.kernel
     def kern(
-        prefix_ptr: fx.Tensor,   # [T, H] bf16 -- prefix row, already prefix_in+addend
-        bank_ptr: fx.Tensor,     # [T, NB, H] bf16
-        cw_ptr: fx.Tensor,       # [H] fp32 score weight
-        ow_ptr: fx.Tensor,       # [H] fp32 out-norm weight (unread if not out_norm)
-        out_ptr: fx.Tensor,      # [T, H] bf16
+        prefix_ptr: fx.Tensor,  # [T, H] bf16 -- prefix row, already prefix_in+addend
+        bank_ptr: fx.Tensor,  # [T, NB, H] bf16
+        cw_ptr: fx.Tensor,  # [H] fp32 score weight
+        ow_ptr: fx.Tensor,  # [H] fp32 out-norm weight (unread if not out_norm)
+        out_ptr: fx.Tensor,  # [T, H] bf16
         score_eps: fx.Float32,
         out_eps: fx.Float32,
-        bank_stride_t: Int32,    # elements between tokens in bank (= NB*H)
-        bank_stride_b: Int32,    # elements between bank rows (= H)
+        bank_stride_t: Int32,  # elements between tokens in bank (= NB*H)
+        bank_stride_b: Int32,  # elements between bank rows (= H)
     ):
         tid = fx.thread_idx.x
         t = fx.block_idx.x
@@ -123,8 +124,8 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
         ow_buf = _buffer_ptr(_to_sgpr_i64(buf_base_i64(ow_ptr)), T.f32, 16)
         out_buf = _buffer_ptr(_to_sgpr_i64(buf_base_i64(out_ptr)), T.i32, 16)
 
-        col_i32 = tid * fx.Int32(ATOM_I32)      # i32 offset of this thread's atom
-        col_f32 = tid * fx.Int32(ATOM_ELEMS)    # f32 offset
+        col_i32 = tid * fx.Int32(ATOM_I32)  # i32 offset of this thread's atom
+        col_f32 = tid * fx.Int32(ATOM_ELEMS)  # f32 offset
 
         # cw (fp32) for this thread's 8 columns: two 16 B loads.
         cw_lo = _buffer_load(cw_buf, col_f32, 4, fx.Float32)
@@ -146,8 +147,9 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
         bank_fp32 = []
         for r in range_constexpr(nvb):
             row_i32 = bank_base + fx.Int32(r) * fx.Int32(bank_stride_b)
-            atom = _buffer_load(bank_buf, (row_i32 // fx.Int32(2)) + col_i32,
-                                ATOM_I32, fx.Int32)
+            atom = _buffer_load(
+                bank_buf, (row_i32 // fx.Int32(2)) + col_i32, ATOM_I32, fx.Int32
+            )
             f = atom_bf16_to_f32(atom)
             bank_fp32.append(f)
             dot = fx.Float32((f * cw).reduce(ReductionOp.ADD, fastmath="reassoc"))
@@ -256,8 +258,15 @@ def build_attn_res_read_dpp(hidden: int, nvb: int, *, out_norm: bool = True,
         stream: fx.Stream,
     ):
         kern(
-            prefix_ptr, bank_ptr, cw_ptr, ow_ptr, out_ptr,
-            score_eps, out_eps, bank_stride_t, bank_stride_b,
+            prefix_ptr,
+            bank_ptr,
+            cw_ptr,
+            ow_ptr,
+            out_ptr,
+            score_eps,
+            out_eps,
+            bank_stride_t,
+            bank_stride_b,
         ).launch(grid=(fx.Int64(num_tokens), 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     launch._block = BLOCK
@@ -289,13 +298,23 @@ def attn_res_read_dpp(prefix, bank, cw, ow, nvb, score_eps, out_eps, *, out=None
         launch = build_attn_res_read_dpp(H, int(nvb), out_norm=out_norm)
         _CACHE[key] = launch
     cwf = cw if cw.dtype == torch.float32 else cw.float()
-    owf = ow.float() if (ow is not None and ow.dtype != torch.float32) else (
-        ow if ow is not None else cwf)
+    owf = (
+        ow.float()
+        if (ow is not None and ow.dtype != torch.float32)
+        else (ow if ow is not None else cwf)
+    )
     stream = torch.cuda.current_stream().cuda_stream
     launch(
-        prefix, bank, cwf, owf, out,
-        float(score_eps), float(out_eps),
-        int(NB * H), int(H), int(T_),
+        prefix,
+        bank,
+        cwf,
+        owf,
+        out,
+        float(score_eps),
+        float(out_eps),
+        int(NB * H),
+        int(H),
+        int(T_),
         fx.Stream(stream),
     )
     return out

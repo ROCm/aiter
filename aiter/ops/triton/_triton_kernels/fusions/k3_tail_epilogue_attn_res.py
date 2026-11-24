@@ -16,9 +16,7 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_repr = make_kernel_repr(
-    "_tail_epilogue_attn_res_kernel", ["BD", "NVB", "L_CAND"]
-)
+_repr = make_kernel_repr("_tail_epilogue_attn_res_kernel", ["BD", "NVB", "L_CAND"])
 
 
 @triton.jit(repr=_repr)
@@ -59,15 +57,23 @@ def _tail_epilogue_attn_res_kernel(
     mask_h = offs_h < H
 
     inv_rms = tl.load(inv_rms_ptr + pid_m)
-    acc = tl.load(acc_ptr + pid_m * stride_am + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+    acc = tl.load(acc_ptr + pid_m * stride_am + offs_h, mask=mask_h, other=0.0).to(
+        tl.float32
+    )
     proj = (acc * inv_rms).to(tl.bfloat16).to(tl.float32)
-    proj += tl.load(shared_ptr + pid_m * stride_sm + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+    proj += tl.load(shared_ptr + pid_m * stride_sm + offs_h, mask=mask_h, other=0.0).to(
+        tl.float32
+    )
     if HAS_RES:
-        proj += tl.load(res_ptr + pid_m * stride_rm + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+        proj += tl.load(
+            res_ptr + pid_m * stride_rm + offs_h, mask=mask_h, other=0.0
+        ).to(tl.float32)
     prefix = proj.to(tl.bfloat16)
     tl.store(prefix_out_ptr + pid_m * stride_pm + offs_h, prefix, mask=mask_h)
     if WRITE_SNAPSHOT:
-        tl.store(bank_ptr + pid_m * stride_bm + NVB * stride_bl + offs_h, prefix, mask=mask_h)
+        tl.store(
+            bank_ptr + pid_m * stride_bm + NVB * stride_bl + offs_h, prefix, mask=mask_h
+        )
     prefix_v = prefix.to(tl.float32)
 
     qk = tl.load(qk_w_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
@@ -75,8 +81,11 @@ def _tail_epilogue_attn_res_kernel(
     denom = 0.0
     mix = tl.zeros([BD], dtype=tl.float32)
     for l in tl.range(0, NVB):
-        v = tl.load(bank_ptr + pid_m * stride_bm + l * stride_bl + offs_h,
-                    mask=mask_h, other=0.0).to(tl.float32)
+        v = tl.load(
+            bank_ptr + pid_m * stride_bm + l * stride_bl + offs_h,
+            mask=mask_h,
+            other=0.0,
+        ).to(tl.float32)
         rstd = 1.0 / tl.sqrt(tl.sum(v * v) / H + score_eps)
         logit = scale * rstd * tl.sum(v * qk)
         m_new = tl.maximum(m_run, logit)
@@ -97,4 +106,8 @@ def _tail_epilogue_attn_res_kernel(
     o_rstd = 1.0 / tl.sqrt(tl.sum(o * o) / H + out_eps)
     ow = tl.load(onorm_w_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
     y = (o * o_rstd) * ow
-    tl.store(out_ptr + pid_m * stride_om + offs_h, y.to(out_ptr.dtype.element_ty), mask=mask_h)
+    tl.store(
+        out_ptr + pid_m * stride_om + offs_h,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask_h,
+    )

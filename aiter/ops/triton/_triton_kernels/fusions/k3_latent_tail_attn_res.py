@@ -76,9 +76,9 @@ def _latent_tail_attn_res_kernel(
     for k0 in tl.range(0, L, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         mask_k = offs_k < L
-        x = tl.load(
-            latent_ptr + pid_m * stride_lm + offs_k, mask=mask_k, other=0.0
-        ).to(tl.float32)  # [BLOCK_K]
+        x = tl.load(latent_ptr + pid_m * stride_lm + offs_k, mask=mask_k, other=0.0).to(
+            tl.float32
+        )  # [BLOCK_K]
         nw = tl.load(norm_w_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
         sq += tl.sum(x * x)
         xb = (x * nw).to(tl.bfloat16)  # [BLOCK_K]
@@ -88,14 +88,16 @@ def _latent_tail_attn_res_kernel(
             mask=mask_h[:, None] & mask_k[None, :],
             other=0.0,
             cache_modifier=".cg",
-        ).to(tl.float32)  # [BD, BLOCK_K]
+        ).to(
+            tl.float32
+        )  # [BD, BLOCK_K]
         acc += tl.sum(w * xb[None, :].to(tl.float32), axis=1)
 
     inv_rms = 1.0 / tl.sqrt(sq / L + eps)
     proj = (acc * inv_rms).to(tl.bfloat16).to(tl.float32)
-    proj += tl.load(
-        shared_ptr + pid_m * stride_sm + offs_h, mask=mask_h, other=0.0
-    ).to(tl.float32)
+    proj += tl.load(shared_ptr + pid_m * stride_sm + offs_h, mask=mask_h, other=0.0).to(
+        tl.float32
+    )
     if HAS_RES:
         proj += tl.load(
             res_ptr + pid_m * stride_rm + offs_h, mask=mask_h, other=0.0
@@ -116,7 +118,9 @@ def _latent_tail_attn_res_kernel(
     mix = tl.zeros([BD], dtype=tl.float32)
     for l in tl.range(0, NVB):
         v = tl.load(
-            bank_ptr + pid_m * stride_bm + l * stride_bl + offs_h, mask=mask_h, other=0.0
+            bank_ptr + pid_m * stride_bm + l * stride_bl + offs_h,
+            mask=mask_h,
+            other=0.0,
         ).to(tl.float32)
         rstd = 1.0 / tl.sqrt(tl.sum(v * v) / H + score_eps)
         logit = scale * rstd * tl.sum(v * qk)
@@ -139,4 +143,8 @@ def _latent_tail_attn_res_kernel(
     o_rstd = 1.0 / tl.sqrt(tl.sum(o * o) / H + out_eps)
     ow = tl.load(onorm_w_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
     y = (o * o_rstd) * ow
-    tl.store(out_ptr + pid_m * stride_om + offs_h, y.to(out_ptr.dtype.element_ty), mask=mask_h)
+    tl.store(
+        out_ptr + pid_m * stride_om + offs_h,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask_h,
+    )

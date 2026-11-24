@@ -285,9 +285,7 @@ def _verify_case(eng, tokens, nvb, write_bank, out_norm, case_idx, rank, tp, dev
         acc_max_ulp=_max_ulp(ref_out, out_acc),
         acc_prefix_exact=bool(torch.equal(prefix_acc, ref_prefix)),
         acc_snapshot_exact=(
-            bool(torch.equal(bank_acc_got[:, nvb], prefix_acc))
-            if write_bank
-            else True
+            bool(torch.equal(bank_acc_got[:, nvb], prefix_acc)) if write_bank else True
         ),
         acc_bank_untouched=bool(
             torch.equal(bank_acc_got[:, untouched], bank[:, untouched])
@@ -574,9 +572,7 @@ def test_one_shot_allreduce_attn_res(tokens, nvb, write_bank, out_norm, tp):
                 f"rank {rank}: acc-cache bank[:, {nvb}] does not hold prefix_out"
             )
         if not row["acc_bank_untouched"]:
-            fails.append(
-                f"rank {rank}: acc-cache wrote a bank row other than {nvb}"
-            )
+            fails.append(f"rank {rank}: acc-cache wrote a bank row other than {nvb}")
         # SILOTIGER-1277 iter004 split-ladder path: auto-selected decode split on
         # the acc-cache read; same reference, same gates.
         if not row["split_finite"]:
@@ -593,13 +589,9 @@ def test_one_shot_allreduce_attn_res(tokens, nvb, write_bank, out_norm, tp):
                 "rank-order reference"
             )
         if not row["split_snapshot_exact"]:
-            fails.append(
-                f"rank {rank}: split bank[:, {nvb}] does not hold prefix_out"
-            )
+            fails.append(f"rank {rank}: split bank[:, {nvb}] does not hold prefix_out")
         if not row["split_bank_untouched"]:
-            fails.append(
-                f"rank {rank}: split wrote a bank row other than {nvb}"
-            )
+            fails.append(f"rank {rank}: split wrote a bank row other than {nvb}")
     identical = len({(r["out_sig"], r["prefix_sig"]) for r in rows}) == 1
     if not identical:
         fails.append("ranks do not agree bit for bit")
