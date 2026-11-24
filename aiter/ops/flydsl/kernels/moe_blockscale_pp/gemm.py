@@ -432,14 +432,16 @@ class LdsFragReader:
         bias = fx.Int32(fx.ptrtoint(region.ptr))
         if const_expr(preshuffled):
             off = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
-            # K half 1 is 64 columns = 4 x 16-byte groups further on.
-            offs = [off, off + 4 * 128]
+            rel = _opaque_vgpr(off + bias) - bias
+            # K half 1 is 64 columns = 4 x 16-byte groups further on: an
+            # immediate, not a second live VGPR.
+            self.rel = [rel, rel + 4 * 128]
         else:
             offs = []
             for step in range_constexpr(2):
                 r, c = swizzle_128(row, col + step * 64)
                 offs.append(r * 128 + c)
-        self.rel = [_opaque_vgpr(o + bias) - bias for o in offs]
+            self.rel = [_opaque_vgpr(o + bias) - bias for o in offs]
 
     def load(self, lds_src):
         frag = []
@@ -454,6 +456,32 @@ class LdsFragReader:
                 halves.append(v.load().bitcast(fx.Int32))
             frag.append(halves[0].shuffle(halves[1], list(range(8))))
         return frag
+
+
+class G2SRounds(G2SLoader):
+    """``G2SLoader`` whose rounds sit a constant ``round_bytes`` apart in the source.
+
+    Round r of the 8-wave copy reads rows ``r * 64`` further on, so its offset
+    is round 0's plus ``r * 64 * K``: that goes into the SGPR soffset, and the
+    loader holds one lane offset instead of one per round.
+    """
+
+    def __init__(
+        self, gl_src, base_offset, n_load_steps, lds_dtype, wave_id, round_bytes
+    ):
+        super().__init__(gl_src, [base_offset], n_load_steps, lds_dtype, wave_id)
+        self.round_bytes = round_bytes
+
+    def load(self, lds_dst, k_offset):
+        for step in range_constexpr(self.n_load_steps):
+            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[0])))
+            dst = self._lds_dst_at(lds_dst, step)
+            fx.copy(
+                self.g2lds_atom,
+                src,
+                dst,
+                soffset=fx.Int32(k_offset) + step * self.round_bytes,
+            )
 
 
 class MoeScaleLds:
@@ -743,7 +771,9 @@ def compile_moe_bs_gemm_8w(
                 a_sc_offs = [sc_tok * k128 + sc_col[s] for s in range_constexpr(2)]
                 a_k_stride = fx.Int32(1)
             else:
-                g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS, F8_IR_t, wave_id)
+                g2s = G2SRounds(
+                    a_div, gl_off_a[0], N_LDS_STEPS, F8_IR_t, wave_id, 64 * K
+                )
                 a_g2s = [g2s, g2s]
                 a_base = [(row0 + h * LDS_BLOCK_M) * K for h in range_constexpr(2)]
                 a_sc_offs = [
@@ -759,12 +789,13 @@ def compile_moe_bs_gemm_8w(
                 max_size=False,
                 num_records_bytes=N * K,
             )
-            b_g2s = G2SLoader(
+            b_g2s = G2SRounds(
                 fx.logical_divide(b_buf, fx.make_layout(1, 1)),
-                gl_off_b,
+                gl_off_b[0],
                 N_LDS_STEPS,
                 F8_IR_t,
                 wave_id,
+                64 * K,
             )
             B0_off = half_row0(nb, 0) * K
             B1_off = half_row0(nb, 1) * K
