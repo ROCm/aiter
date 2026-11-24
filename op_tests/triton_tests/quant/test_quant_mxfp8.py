@@ -1464,3 +1464,18 @@ def test_dynamic_mxfp8_quant_backend_validation():
     # fp32 input has no Gluon kernel on any arch.
     with pytest.raises(RuntimeError, match="Gluon backend requires"):
         dynamic_mxfp8_quant(x.float(), backend="gluon")
+
+
+def test_compress_rejects_fp4_cache():
+    _skip_without_fp8()
+    cfg = {
+        **_COMPRESSOR_BASE_CFG,
+        "compress_ratio": 128,
+        "overlap": False,
+        "state_width": 512,
+        "token_stride": _REC,
+    }
+    _, a = _compressor_inputs(8, cfg)
+    a.use_fp4_cache = True
+    with pytest.raises(NotImplementedError, match="use_fp4_cache"):
+        fused_deepseek_v4_compress_norm_rope_store(**vars(a))
