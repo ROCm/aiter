@@ -213,18 +213,22 @@ def _negate_slot(
     NEG_SHARED_LAYOUT: gl.constexpr,
     NEG_LAYOUT: gl.constexpr,
 ):
-    """Flip the sign bits of the FP8 slot of A, or of B, in LDS."""
-    if NEG_B:
-        slot = b_slot
-    else:
-        slot = a_slot
-    view = slot.reinterpret(
-        gl.int32, [slot.shape[0], slot.shape[1] // 4], NEG_SHARED_LAYOUT
-    )
-    for c in gl.static_range(view.shape[1] // NEG_WORDS):
-        part = view.slice(c * NEG_WORDS, NEG_WORDS, 1)
-        part.store(part.load(NEG_LAYOUT) ^ -2139062144)
-    gl.barrier()
+    """Flip the sign bits of the FP8 slot of A, or of B, in LDS.
+
+    NEG_WORDS == 0: the second half of K of A or of B is already negated in memory.
+    """
+    if NEG_WORDS > 0:
+        if NEG_B:
+            slot = b_slot
+        else:
+            slot = a_slot
+        view = slot.reinterpret(
+            gl.int32, [slot.shape[0], slot.shape[1] // 4], NEG_SHARED_LAYOUT
+        )
+        for c in gl.static_range(view.shape[1] // NEG_WORDS):
+            part = view.slice(c * NEG_WORDS, NEG_WORDS, 1)
+            part.store(part.load(NEG_LAYOUT) ^ -2139062144)
+        gl.barrier()
 
 
 @gluon.jit
@@ -558,6 +562,7 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     stride_b_scale,
     bias_ptr,
     stride_bias,
+    first_tiles,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -668,7 +673,9 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     # The FP8 WMMA truncates its products toward -inf. The second half of K runs with one operand
     # and the accumulator negated, so that half truncates toward +inf and the two biases cancel.
     num_main = gl.cdiv(K_local, BLOCK_K) - (NUM_BUFFERS - 1)
-    num_first = gl.maximum(gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, num_main), 0)
+    # first_tiles is the K stage where a weight with a pre-negated K tail changes sign.
+    half = gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, first_tiles)
+    num_first = gl.maximum(gl.minimum(half, num_main), 0)
     # Main loop. The cluster barrier stops a multicast load from filling a slot that a CTA still reads.
     for phase in gl.static_range(2):
         if phase == 1:
@@ -755,7 +762,8 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
             NUM_KSUB,
         )
         compute_idx += 1
-    accumulator = -accumulator
+    # The last sign change goes into the row scale: fewer instructions than a negated accumulator.
+    a_scale = -a_scale
 
     _scale_and_store(
         c_buffer,
@@ -804,6 +812,7 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
     stride_b_scale,
     bias_ptr,
     stride_bias,
+    first_tiles,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -917,7 +926,9 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
     slot = compute_idx % NUM_BUFFERS
     num_main = gl.cdiv(K_local, BLOCK_K) - NUM_BUFFERS
-    num_first = gl.maximum(gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, num_main), 0)
+    # first_tiles is the K stage where a weight with a pre-negated K tail changes sign.
+    half = gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, first_tiles)
+    num_first = gl.maximum(gl.minimum(half, num_main), 0)
     if num_first == 0:
         _negate_slot(
             a_buffer.index(slot),
@@ -1026,7 +1037,8 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
         )
         compute_idx += 1
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-    accumulator = -accumulator
+    # The last sign change goes into the row scale: fewer instructions than a negated accumulator.
+    a_scale = -a_scale
 
     if SLICED_K:
         # Add the K slice partials through LDS. The operand slots are dead here.

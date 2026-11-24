@@ -4,6 +4,7 @@
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _negate_k_tail_kernel
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -35,6 +36,40 @@ def _scale_stride(scale: torch.Tensor, size: int) -> int:
     return 1
 
 
+# A weight with a pre-negated K tail changes sign at a multiple of this value. BLOCK_K must divide it.
+_NEG_K_ALIGN = 512
+
+
+def gemm_a8w8_neg_k_start(K: int) -> int:
+    """Return the first K column of the negated tail of a pre-negated weight."""
+    return (K // 2) // _NEG_K_ALIGN * _NEG_K_ALIGN
+
+
+def gemm_a8w8_negate_w_k_tail(w: torch.Tensor) -> torch.Tensor:
+    """Return a copy of the FP8 weight (N, K) with the sign of its K tail flipped.
+
+    Do this one time for a static weight. Then call gemm_a8w8(..., backend="gluon",
+    w_k_tail_negated=True) on gfx1250: the kernel needs no pass over x for each call.
+    """
+    assert w.dtype == torch.float8_e4m3fn, "w must be FP8 E4M3"
+    out = w.clone()
+    out.view(torch.uint8)[:, gemm_a8w8_neg_k_start(w.shape[1]) :] ^= 0x80
+    return out
+
+
+def _negate_k_tail(x: torch.Tensor, k0: int) -> torch.Tensor:
+    """Return a copy of x with the sign of columns k0.. flipped (FP8 bytes XOR 0x80, as int32 words)."""
+    M, K = x.shape
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    n = M * K // 4
+    BLOCK = 4096
+    _negate_k_tail_kernel[(triton.cdiv(n, BLOCK),)](
+        x.view(torch.int32), y.view(torch.int32), n, K // 4, k0 // 4, BLOCK=BLOCK, num_warps=8
+    )
+    return y
+
+
 def _gemm_a8w8_ptpc_gfx1250(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -45,8 +80,12 @@ def _gemm_a8w8_ptpc_gfx1250(
     y: torch.Tensor | None,
     config: dict | None,
     skip_reduce: bool,
+    w_k_tail_negated: bool = False,
 ) -> torch.Tensor:
-    """Launch the gfx1250 Gluon PTPC kernel: x is (M, K) FP8 and w is (N, K) FP8."""
+    """Launch the gfx1250 Gluon PTPC kernel: x is (M, K) FP8 and w is (N, K) FP8.
+
+    w_k_tail_negated: w comes from gemm_a8w8_negate_w_k_tail.
+    """
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8 import (
         _KERNEL_MAP,
         _MIN_BUFFERS,
@@ -75,8 +114,10 @@ def _gemm_a8w8_ptpc_gfx1250(
     register_store = config["REGISTER_STORE"]
 
     # Split-K: each split does a whole number of BLOCK_K stages.
+    # A pre-negated weight has one sign change, so it runs without split-K.
     k_stages = triton.cdiv(K, BLOCK_K)
-    stages_per_split = triton.cdiv(k_stages, max(config["NUM_KSPLIT"], 1))
+    num_ksplit_cfg = 1 if w_k_tail_negated else max(config["NUM_KSPLIT"], 1)
+    stages_per_split = triton.cdiv(k_stages, num_ksplit_cfg)
     splitk_block_size = stages_per_split * BLOCK_K
     num_ksplit = triton.cdiv(K, splitk_block_size)
     if num_ksplit == 1:
@@ -84,6 +125,19 @@ def _gemm_a8w8_ptpc_gfx1250(
 
     # The pipeline cannot be deeper than the number of K stages of a split.
     num_buffers = min(config["NUM_BUFFERS"], stages_per_split)
+    # The kernel changes phase at half of the K stages, or at the sign change of the weight.
+    first_tiles = k_stages
+    if w_k_tail_negated:
+        k0 = gemm_a8w8_neg_k_start(K)
+        assert (
+            k0 % BLOCK_K == 0
+        ), f"BLOCK_K={BLOCK_K} must divide the sign change column {k0} of the weight"
+        first_tiles = k0 // BLOCK_K
+        # The phase change is in the main loop: keep the pipeline out of the first phase.
+        in_flight = k_stages - first_tiles
+        if kernel_type == "bandwidth_bound":
+            in_flight += 1
+        num_buffers = min(num_buffers, in_flight)
     if num_buffers < _MIN_BUFFERS[kernel_type]:
         _LOGGER.warning(
             "GEMM_A8W8 [gluon/gfx1250]: kernel_type='%s' needs NUM_BUFFERS>=%s "
@@ -116,6 +170,16 @@ def _gemm_a8w8_ptpc_gfx1250(
         register_store,
         config["CTAS_M"],
     )
+    # PRE_NEG: negate the second half of K of x in memory (one elementwise pass) instead of
+    # flipping an LDS slot per K stage in the kernel; the kernel then only negates the accumulator.
+    if w_k_tail_negated:
+        layouts = dict(layouts, NEG_WORDS=0)
+    elif config["PRE_NEG"] and num_ksplit == 1 and K % 4 == 0:
+        k_tiles = triton.cdiv(K, BLOCK_K)
+        in_flight = num_buffers - 1 if kernel_type == "bandwidth_bound" else num_buffers
+        num_first = max(min(k_tiles // 2, k_tiles - in_flight), 0)
+        x = _negate_k_tail(x, min(num_first * BLOCK_K, K))
+        layouts = dict(layouts, NEG_WORDS=0)  # create_ptpc_layouts is cached: do not mutate its dict
     _LOGGER.info(
         "GEMM_A8W8 [gluon/gfx1250]: x=%s w=%s kernel=%s",
         tuple(x.shape),
@@ -154,6 +218,7 @@ def _gemm_a8w8_ptpc_gfx1250(
         w_scale_stride,
         bias,
         _scale_stride(bias, N) if bias is not None else 0,
+        first_tiles,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -219,6 +284,7 @@ def gemm_a8w8(
     config: dict | None = None,
     skip_reduce: bool | None = False,
     backend: str = "triton",
+    w_k_tail_negated: bool = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -240,6 +306,9 @@ def gemm_a8w8(
         backend (str): "triton" (default) or "gluon". On gfx1250 the gluon backend
             runs the PTPC kernel. Its limits are: FP8 E4M3 inputs, and x and w
             contiguous along K. N can be any size.
+        w_k_tail_negated (bool): w comes from gemm_a8w8_negate_w_k_tail. Only for the
+            gluon backend on gfx1250. The kernel then needs no pass over x for the
+            FP8 WMMA truncation fix.
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -270,8 +339,18 @@ def gemm_a8w8(
         assert x.dtype == w.dtype, "Input types must be the same"
         if get_arch() in _GLUON_PTPC_ARCHS:
             return _gemm_a8w8_ptpc_gfx1250(
-                x, w, x_scale, w_scale, bias, dtype, y, config, skip_reduce
+                x,
+                w,
+                x_scale,
+                w_scale,
+                bias,
+                dtype,
+                y,
+                config,
+                skip_reduce,
+                w_k_tail_negated,
             )
+    assert not w_k_tail_negated, "w_k_tail_negated needs the gluon backend on gfx1250"
 
     w = w.T
 
