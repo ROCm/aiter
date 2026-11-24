@@ -902,7 +902,7 @@ class IPCBufferPool:
         self._free_fn = free_fn or ops.free_meta_buffer
 
         self._store = dist.distributed_c10d._get_default_store()
-        self._assert_pure_tcp_store(self._store)
+        self._assert_backend_free_store(self._store)
 
         ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(group))))
         self._store_key_prefix = f"aiter_ipc/p{IPCBufferPool._pool_seq}/g{ranks_tag}"
@@ -911,15 +911,15 @@ class IPCBufferPool:
         self._peer_bases: list[int] = []  # mapped by open_peer_buffers
 
     @staticmethod
-    def _assert_pure_tcp_store(store) -> None:
-        """Verify the store is a pure-TCP KV store, free from any collective
-        communication backend (RCCL / gloo / MPI)."""
+    def _assert_backend_free_store(store) -> None:
+        """Verify the store is a plain KV store (TCPStore or FileStore), free
+        from any collective communication backend (RCCL / gloo / MPI)."""
         s = store
         while isinstance(s, dist.PrefixStore):
             s = s.underlying_store
-        assert isinstance(s, dist.TCPStore), (
-            f"IPC metadata exchange requires a pure-TCP KV store "
-            f"(torch.distributed.TCPStore), got {type(s).__name__}. "
+        assert isinstance(s, (dist.TCPStore, dist.FileStore)), (
+            f"IPC metadata exchange requires a TCPStore or FileStore KV store "
+            f"(tcp:// or file:// init method), got {type(s).__name__}. "
             f"This ensures the exchange is backend-free — no RCCL, "
             f"gloo, or MPI collective is involved."
         )
@@ -1061,7 +1061,7 @@ class IPCBufferPool:
         return self._gather_ipc_meta((handle, data_ptr - base_ptr))
 
     def all_gather_object(self, obj) -> list:
-        """Gather a picklable *obj* from every rank via the TCP store.
+        """Gather a picklable *obj* from every rank via the default KV store.
 
         Each rank writes its serialised *obj* under a unique key, then reads
         every other rank's.  ``store.get()`` blocks until the key is
