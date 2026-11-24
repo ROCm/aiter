@@ -23,13 +23,13 @@ import sys
 
 import numpy as np
 import torch
+from test_flydsl_sparse_pa_nvfp4 import BLK, SM_SCALE, make_case
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
     decode_select_supported,
     sparse_pa_nvfp4_decode,
 )
-from test_flydsl_sparse_pa_nvfp4 import BLK, SM_SCALE, make_case
 
 TOPK = 16
 INIT_PIN, LOCAL_PIN = 1e30, 1e29
@@ -78,7 +78,9 @@ def make_scores(rows, width, live, kind, seed):
             ):
                 if j < n:
                     s[r, j] = val
-    elif kind == "rising":  # scores rise toward the row's end (more windows hold candidates)
+    elif (
+        kind == "rising"
+    ):  # scores rise toward the row's end (more windows hold candidates)
         s = s * 0.1 + torch.arange(width).float() / 64
     # past the live blocks the scorer writes nothing: leave garbage the kernel must ignore
     for r in range(rows):
@@ -86,7 +88,9 @@ def make_scores(rows, width, live, kind, seed):
     return s
 
 
-def run_case(name, seq_lens, ql, width, kind, init_blocks=0, local_blocks=0, splits=4, xcds=None):
+def run_case(
+    name, seq_lens, ql, width, kind, init_blocks=0, local_blocks=0, splits=4, xcds=None
+):
     c = make_case(seq_lens, [ql] * len(seq_lens), 1, 16, seed=len(name))
     rows = c["q"].shape[0]
     live = ((c["row_kv"] + BLK - 1) // BLK).cpu()
@@ -115,7 +119,16 @@ def run_case(name, seq_lens, ql, width, kind, init_blocks=0, local_blocks=0, spl
     if not ids_ok:
         bad = (topk.cpu()[0] != ref).any(1).nonzero().flatten()[:3].tolist()
         for r in bad:
-            print("   row", r, "live", int(live[r]), "got", topk.cpu()[0, r].tolist(), "ref", ref[r].tolist())
+            print(
+                "   row",
+                r,
+                "live",
+                int(live[r]),
+                "got",
+                topk.cpu()[0, r].tolist(),
+                "ref",
+                ref[r].tolist(),
+            )
     return ids_ok and out_ok
 
 
@@ -136,9 +149,19 @@ def main():
         for kind in ("random", "ties", "const", "special", "rising"):
             ok &= run_case(f"{name}/{kind}", lens, ql, width, kind)
     for init, local in ((1, 2), (0, 1), (3, 0)):
-        ok &= run_case(f"k7_175K/pins{init},{local}", [175000, 90001], 8, 2048, "ties", init, local)
+        ok &= run_case(
+            f"k7_175K/pins{init},{local}", [175000, 90001], 8, 2048, "ties", init, local
+        )
     for splits, xcds in ((1, None), (2, 8), (4, 8), (8, 8)):
-        ok &= run_case(f"k7_175K/s{splits}", [175000, 120000, 33000], 8, 2048, "random", splits=splits, xcds=xcds)
+        ok &= run_case(
+            f"k7_175K/s{splits}",
+            [175000, 120000, 33000],
+            8,
+            2048,
+            "random",
+            splits=splits,
+            xcds=xcds,
+        )
     assert decode_select_supported(8) and not decode_select_supported(512)
     print("ALL PASS" if ok else "FAILED")
     return 0 if ok else 1

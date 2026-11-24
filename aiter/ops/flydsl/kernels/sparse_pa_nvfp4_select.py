@@ -61,7 +61,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 TOPK = 16
 SELECT_STRIPS = 7  # strips of 64 blocks per wave, one window
 SELECT_BLOCKS = 4 * SELECT_STRIPS * 64  # blocks of one window (1792 = 229K tokens)
-CAND_DWORDS = 2 * (64 + 8 + 64)  # LDS: candidate (block, key) pairs: 64 + rank padding + 64 trash slots
+CAND_DWORDS = 2 * (
+    64 + 8 + 64
+)  # LDS: candidate (block, key) pairs: 64 + rank padding + 64 trash slots
 TMP_DWORDS = 260  # LDS: lane maxima of the four waves, per-wave counts, then the 16 ids
 SEL_DWORDS = 4 * TOPK  # LDS: the running top 16 of the window loop, (id, key) quads
 BOUND_BITS = 16  # key bits of the 16th lane maximum that bound the candidates
@@ -143,7 +145,8 @@ def _pinned_key(bits, col, init_blocks, local_start, pins):
 
 def first_window(tx, score_row, width):
     """The first window's raw score words, issued before the row's length is loaded (it
-    only masks them). ``score_row``: the row's i64 address; ``width``: readable columns."""
+    only masks them). ``score_row``: the row's i64 address; ``width``: readable columns.
+    """
     lane, wave = tx % 64, tx // 64
     span = (width < SELECT_BLOCKS).select(width, fx.Int32(SELECT_BLOCKS))
     srs = ptr_buf_tensor(
@@ -281,7 +284,9 @@ def _select_window(tx, nblk, init_blocks, local_blocks, pre, cand, tmp, pins):
 
 
 @ASTRewriter.transform
-def _select_loop(tx, score_row, width, nblk, init_blocks, local_blocks, pins, pre, cand, sel, tmp):
+def _select_loop(
+    tx, score_row, width, nblk, init_blocks, local_blocks, pins, pre, cand, sel, tmp
+):
     """Rows of more than SELECT_BLOCKS live blocks: windows of 4 waves x 7 strips x 64
     blocks, each narrowed as ``_select_window`` does and merged with the running top 16 in
     ``sel`` (a window's candidates must clear the running 16th key as well). Returns ``bad``;
@@ -411,19 +416,22 @@ def _select_loop(tx, score_row, width, nblk, init_blocks, local_blocks, pins, pr
             sync()
             if wave == 0:
                 r = (
-                    fx.Int32(tmp[lane]) + fx.Int32(tmp[64 + lane])
-                    + fx.Int32(tmp[128 + lane]) + fx.Int32(tmp[192 + lane])
+                    fx.Int32(tmp[lane])
+                    + fx.Int32(tmp[64 + lane])
+                    + fx.Int32(tmp[128 + lane])
+                    + fx.Int32(tmp[192 + lane])
                 )
                 if (lane < total) & (r < TOPK):
                     sel[4 * r] = mi
                     sel[4 * r + 1] = mk
             sync()
             nrun = (total < TOPK).select(total, fx.Int32(TOPK))
-            tprev = (nrun >= TOPK).select(fx.Int32(sel[4 * 15 + 1]), fx.Int32(INT_MIN + 1))
+            tprev = (nrun >= TOPK).select(
+                fx.Int32(sel[4 * 15 + 1]), fx.Int32(INT_MIN + 1)
+            )
         wbase = wbase + 4 * SELECT_STRIPS * 64
-    if bad == 0:
-        if tx < TOPK:
-            tmp[tx] = (tx < nrun).select(fx.Int32(sel[4 * tx]), fx.Int32(-1))
+    if (bad == 0) & (tx < TOPK):
+        tmp[tx] = (tx < nrun).select(fx.Int32(sel[4 * tx]), fx.Int32(-1))
     sync()
     return bad
 
@@ -447,12 +455,17 @@ def _select_exact(tx, score_row, width, nblk, init_blocks, local_blocks, pins, t
         c = tx + step * 256
         if c < live:
             mw = _comp(
-                _pinned_key(fx.Int32(buf_copy_load(srs, c)), c, init_blocks, local_start, pins), c
+                _pinned_key(
+                    fx.Int32(buf_copy_load(srs, c)), c, init_blocks, local_start, pins
+                ),
+                c,
             )
             rank = fx.Int32(0)
             for j in range(live):
                 jj = fx.Int32(j)
-                kj = _pinned_key(fx.Int32(buf_copy_load(srs, jj)), jj, init_blocks, local_start, pins)
+                kj = _pinned_key(
+                    fx.Int32(buf_copy_load(srs, jj)), jj, init_blocks, local_start, pins
+                )
                 rank = rank + _one(_comp(kj, jj) > mw)
             if rank < TOPK:
                 tmp[rank] = c
@@ -462,7 +475,18 @@ def _select_exact(tx, score_row, width, nblk, init_blocks, local_blocks, pins, t
 
 @ASTRewriter.transform
 def row_top16_prologue(
-    tx, score_row, width, pre, nblk, init_blocks, local_blocks, pins, cand, sel, tmp, out_row,
+    tx,
+    score_row,
+    width,
+    pre,
+    nblk,
+    init_blocks,
+    local_blocks,
+    pins,
+    cand,
+    sel,
+    tmp,
+    out_row,
 ):
     """The top-16 of one decode row, run by every thread of a 256-thread workgroup before
     its own work. The ids (-1 past the live count) are in ``tmp[0..15]`` behind this
@@ -481,7 +505,17 @@ def row_top16_prologue(
         bad = _select_window(tx, nblk, init_blocks, local_blocks, pre, cand, tmp, pins)
     else:
         bad = _select_loop(
-            tx, score_row, width, nblk, init_blocks, local_blocks, pins, pre, cand, sel, tmp
+            tx,
+            score_row,
+            width,
+            nblk,
+            init_blocks,
+            local_blocks,
+            pins,
+            pre,
+            cand,
+            sel,
+            tmp,
         )
     if bad != 0:
         _select_exact(tx, score_row, width, nblk, init_blocks, local_blocks, pins, tmp)

@@ -68,7 +68,6 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_select import (
     CAND_DWORDS,
     SEL_DWORDS,
-    SELECT_BLOCKS,
     TMP_DWORDS,
     first_window,
     row_top16_prologue,
@@ -278,12 +277,15 @@ def compile_decode(
             # The row's first window of scores goes out before its length is known.
             pre = first_window(
                 tx,
-                arg_score + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                arg_score
+                + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
                 i32_width,
             )
         req = row // i32_ql
         pos = fx.Int32(seq_p[req]) - i32_ql + row % i32_ql
-        live_blocks = ((pos >= 0).select(pos, fx.Int32(-1)) + BLK) // BLK  # before row_ok
+        live_blocks = (
+            (pos >= 0).select(pos, fx.Int32(-1)) + BLK
+        ) // BLK  # before row_ok
         pos = row_ok.select(pos, fx.Int32(-1))
         pos = (pos >= 0).select(pos, fx.Int32(-1))  # padding row: sees nothing
         pos = fx.Int32(fx.rocdl.readfirstlane(T.i32, pos))
@@ -318,7 +320,8 @@ def compile_decode(
             id_row = arg_topk + fx.Int64(kvh * i32_topk_hs + row * i32_topk_rs) * 4
             row_top16_prologue(
                 tx,
-                arg_score + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                arg_score
+                + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
                 i32_width,
                 pre,
                 live_blocks,
@@ -839,7 +842,9 @@ def sparse_pa_nvfp4_decode(
     late_v: bool | None = None,
     workspace: DecodeWorkspace | None = None,  # from sparse_pa_nvfp4_decode_alloc
     index_score: torch.Tensor | None = None,  # [Hkv, >= rows, width] fp32 block scores
-    index_max_seq_len: int | None = None,  # bound of seq_lens when ``index_score`` is given
+    index_max_seq_len: (
+        int | None
+    ) = None,  # bound of seq_lens when ``index_score`` is given
     init_blocks: int = 0,  # ``index_score``: leading blocks forced into the selection
     local_blocks: int = 0,  # ``index_score``: trailing blocks forced in (outrank the leading)
 ) -> torch.Tensor:
@@ -896,7 +901,10 @@ def sparse_pa_nvfp4_decode(
     topk = topk_idx.shape[-1]
     select = index_score is not None
     if select:
-        require(topk == 16, "the in-kernel selection picks 16 blocks: topk_idx [Hkv, rows, 16]")
+        require(
+            topk == 16,
+            "the in-kernel selection picks 16 blocks: topk_idx [Hkv, rows, 16]",
+        )
         require(
             index_max_seq_len is not None and index_max_seq_len > 0,
             "index_max_seq_len (the bound of seq_lens) is required with index_score",
@@ -913,7 +921,8 @@ def sparse_pa_nvfp4_decode(
         )
         require(
             index_score.shape[2] >= -(-index_max_seq_len // BLK)
-            and (hkv - 1) * index_score.stride(0) + rows * index_score.stride(1) < 2**31,
+            and (hkv - 1) * index_score.stride(0) + rows * index_score.stride(1)
+            < 2**31,
             "index_score must cover every live block and keep its offsets below 2**31",
         )
         require(init_blocks >= 0 and local_blocks >= 0, "pins must be >= 0")
