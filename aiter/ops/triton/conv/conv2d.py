@@ -418,6 +418,7 @@ def conv2d_general(
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
+    x = _ensure_layout(x, layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)

@@ -153,6 +153,27 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
         ), f"expected contiguous output, got strides={y.stride()}"
 
 
+@pytest.mark.parametrize(
+    "layout,width_step,memory_format",
+    [
+        pytest.param("nchw", 2, torch.contiguous_format, id="sliced-nchw"),
+        pytest.param("nhwc", 1, torch.channels_last, id="contiguous-nchw-to-nhwc"),
+    ],
+)
+def test_conv2d_general_input_layout(layout, width_step, memory_format):
+    x = torch.arange(96, device="cuda", dtype=torch.float16).reshape(1, 3, 4, 8)
+    x = x[..., ::width_step]
+    weight = torch.ones((2, 3, 2, 2), device="cuda", dtype=x.dtype)
+
+    actual = conv2d_module.conv2d_general(x, weight, layout=layout)
+    expected = F.conv2d(x.float(), weight.float()).to(x.dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected {layout} output, got strides={actual.stride()}"
+
+
 def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
     assert_weight_pack_cache_clear_is_scoped(
         monkeypatch,
