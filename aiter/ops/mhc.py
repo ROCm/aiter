@@ -459,9 +459,10 @@ def _mhc_fused_prefill_config_gfx950_256(m, hidden_size):
 # gfx950, 256 CUs, FP32 projection weights: up to this row count mhc_fused_post_pre
 # runs post + pre with regular stores in mhc_post. mhc_post on its own switches to
 # non-temporal stores above 8 * cu_num rows; mhc_pre reads that residual back at
-# once, and up to this row count it reads it faster after regular stores (measured
-# on MI350X for hidden sizes 4096, 5120 and 7168). The results are the same bits.
-MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 16384
+# once, and up to this row count it reads it faster after regular stores on both
+# MI350X and MI355X (at least 1.03x for hidden sizes 4096, 5120 and 7168). Above it
+# the two devices disagree and MI355X no longer gains. The results are the same bits.
+MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 8192
 
 
 def _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend) -> bool:
