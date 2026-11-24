@@ -615,13 +615,18 @@ collectives are off on every rank. The vote runs even when FlyDSL is off or
 declines on that rank, because a rank that skipped it would leave its peers
 waiting.
 
-### The mesh and the ring are persistent kernels
+### The mesh, the ring and hier are persistent kernels
 
 All workgroups of a persistent kernel must be on the GPU at the same time.
-If the grid is too large, the kernel deadlocks. `clamp_grid_cap` limits the
-grid with measured occupancy values. The host then uses the minimum grid of
-all ranks. A grid that is too small is always safe, because each block then
-does more tiles.
+If the grid is too large, the kernel deadlocks. The grid is fixed before the
+kernel is compiled, because it sizes the inbox, so the host first estimates
+it: `clamp_grid_cap` (`comm_collectives_host_shared.py`) limits the grid with
+occupancy values measured on the mesh, and the host then uses the minimum grid
+of all ranks. Before the first launch the host asks HIP whether the compiled
+kernel fits that grid. If it does not, the host compiles it again under a
+`waves_per_eu` floor for the grid, or raises if that does not fit either
+(`FlyQuickAllReduce._load_checked`). A grid that is too small is always safe,
+because each block then does more tiles.
 
 ### Change `acquire` and `recv` together
 

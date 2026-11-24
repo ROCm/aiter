@@ -1805,6 +1805,88 @@ def test_peer_topology_partner():
 
 
 @pytest.mark.parametrize(
+    "grid, block, cu_count, want",
+    [
+        # One workgroup per CU of 4 waves: one wave per SIMD.
+        (128, 256, 128, 1),
+        # A lone 8-wave workgroup still takes two waves on each SIMD.
+        (64, 512, 128, 2),
+        # The shipped PCIe TP8 hier rung: two b512 workgroups per CU.
+        (256, 512, 128, 4),
+        # Three 2-wave workgroups per CU spread over the 4 SIMDs.
+        (384, 128, 128, 2),
+        # One workgroup past a whole number per CU rounds up.
+        (129, 256, 128, 2),
+    ],
+)
+def test_resident_waves_per_eu(grid, block, cu_count, want):
+    assert H.resident_waves_per_eu(grid=grid, block=block, cu_count=cu_count) == want
+
+
+def test_check_resident_grid_raises_on_a_grid_that_cannot_be_resident():
+    """A persistent grid larger than the compiled kernel's occupancy would
+    hang; the check raises before the first launch instead."""
+    artifact = SimpleNamespace(max_blocks_per_cu=lambda: 2)
+    with mock.patch.object(H, "_launch_artifacts", return_value=[artifact]):
+        H.check_resident_grid(object(), grid=256, cu_count=128, owner="t")
+        with pytest.raises(RuntimeError, match="would hang"):
+            H.check_resident_grid(object(), grid=257, cu_count=128, owner="t")
+
+
+@pytest.mark.parametrize(
+    "plain_per_cu, hinted_per_cu, want",
+    [
+        # Fits as compiled: no hint, one compile, the code it had.
+        (2, 2, {}),
+        # Does not fit: compiled again under the grid's waves-per-EU floor.
+        (1, 2, {"waves_per_eu": 4}),
+        # Not even the floor fits: raise instead of hanging.
+        (1, 1, None),
+    ],
+)
+def test_quick_allreduce_loads_a_binary_whose_grid_is_resident(
+    plain_per_cu, hinted_per_cu, want
+):
+    """``FlyQuickAllReduce._load_checked`` keeps a binary that fits its
+    persistent grid, and recompiles one that does not under the
+    ``waves_per_eu`` floor of the grid (``resident_waves_per_eu``)."""
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    from aiter.ops.flydsl import quick_allreduce as QA
+
+    launch = SimpleNamespace(_mem_cache={})
+
+    def preload(launch, *args):
+        # One artifact per distinct set of compile hints, as FlyDSL keys it.
+        hints = CompilationContext.get_compile_hints()
+        per_cu = hinted_per_cu if hints.get("waves_per_eu") else plain_per_cu
+        key = tuple(sorted(hints.items()))
+        launch._mem_cache.setdefault(
+            key, SimpleNamespace(max_blocks_per_cu=lambda: per_cu)
+        )
+
+    # The shipped PCIe TP8 hier rung: 256 b512 workgroups on 128 CUs.
+    eng = SimpleNamespace(launch=launch, grid=256, block=512, compile_hints=None)
+    host = SimpleNamespace(_cu_count=128)
+    with mock.patch.object(QA, "preload_launcher", side_effect=preload) as loads:
+        if want is None:
+            with pytest.raises(RuntimeError, match="would hang"):
+                QA.FlyQuickAllReduce._load_checked(host, eng, ())
+            return
+        assert QA.FlyQuickAllReduce._load_checked(host, eng, ()) == want
+        assert eng.compile_hints == want
+        assert len(launch._mem_cache) == (1 if not want else 2)
+        # A second load, e.g. a first call inside a HIP graph capture after
+        # ``preload``, reuses the decision: no compile, no module load and no
+        # occupancy query, which capture forbids.
+        n = loads.call_count
+        for artifact in launch._mem_cache.values():
+            artifact.max_blocks_per_cu = mock.Mock(side_effect=AssertionError)
+        assert QA.FlyQuickAllReduce._load_checked(host, eng, ()) == want
+        assert loads.call_count == n
+
+
+@pytest.mark.parametrize(
     "text, want",
     [
         ("0,1,2,3;4,5,6,7", ((0, 1, 2, 3), (4, 5, 6, 7))),
@@ -1917,7 +1999,7 @@ def test_check_groups_order_is_canonical():
 def test_lamport_grid_clamp_follows_the_codec():
     """The Lamport mesh's VGPR count grows with the codec, so a wider one is
     resident fewer workgroups per CU."""
-    from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+    from aiter.ops.flydsl.comm_collectives_host_shared import clamp_grid_cap
 
     def cap(codec):
         return clamp_grid_cap(

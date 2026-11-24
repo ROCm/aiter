@@ -69,18 +69,23 @@ from .allreduce_policy import (
 )
 from .comm_collectives_host_shared import (
     _cuda_index,
+    _launch_artifacts,
     _StEngine,
     _validate_ipc_process_group,
     check_build_outside_capture,
     check_fused_aliasing,
     check_launch_outside_capture,
     check_payload,
+    check_resident_grid,
     check_world_size,
+    clamp_grid_cap,
+    grid_is_resident,
     kernel_symbol,
     payload_probes,
     preload_launcher,
     probe_peer_topology,
     require_arch,
+    resident_waves_per_eu,
     resolve_inbox_flags,
 )
 from .kernels.comm.quick_allreduce_fusions import (
@@ -97,7 +102,6 @@ from .kernels.comm.quick_allreduce_hier import (
 )
 from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_DIVISOR,
-    clamp_grid_cap,
     make_quick_allreduce_mesh_kernel,
     mesh_fanout_fits,
     mesh_lds_bytes,
@@ -548,7 +552,7 @@ class FlyQuickAllReduce:
         self.ag_codec = ag_codec
         self._algo = algo
         self._has_launched = False
-        cu_count = int(
+        cu_count = self._cu_count = int(
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
         lds_capacity = get_lds_capacity_bytes(arch)
@@ -821,7 +825,60 @@ class FlyQuickAllReduce:
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
         with torch.cuda.device(self._device_index):
-            _run_compiled(eng.launch, *args)
+            if getattr(eng.launch, "_cf", None) is not None:
+                _run_compiled(eng.launch, *args)
+                return
+            # First call: load without launching and make sure that the grid
+            # fits, then launch under the hints the binary is keyed on.
+            hints = self._load_checked(eng, args)
+            with CompilationContext.compile_hints(hints):
+                _run_compiled(eng.launch, *args)
+
+    def _load_checked(self, eng, args) -> dict:
+        """Compile and load *eng* for *args* without launching it, so that its
+        whole persistent grid is resident, and return the compile hints of
+        that binary.
+
+        ``clamp_grid_cap`` sizes the grid from tables measured on the mesh. A
+        binary that does not fit it would hang. It is compiled again under the
+        waves-per-EU floor of its grid (``resident_waves_per_eu``) instead,
+        which makes the compiler cap its registers. Raises if even the floor does
+        not fit. FlyDSL keys its JIT cache on the hints, so every compile of the
+        engine has to run under the hints returned here.
+        """
+        if eng.compile_hints is not None:
+            return eng.compile_hints
+        preload_launcher(eng.launch, *args)
+        plain = _launch_artifacts(eng.launch)
+        hints = {}
+        if not grid_is_resident(plain, grid=eng.grid, cu_count=self._cu_count):
+            hints = {
+                "waves_per_eu": resident_waves_per_eu(
+                    grid=eng.grid, block=eng.block, cu_count=self._cu_count
+                )
+            }
+            with CompilationContext.compile_hints(hints):
+                preload_launcher(eng.launch, *args)
+            seen = {id(a) for a in plain}
+            check_resident_grid(
+                eng.launch,
+                grid=eng.grid,
+                cu_count=self._cu_count,
+                owner="FlyQuickAllReduce",
+                artifacts=[
+                    a for a in _launch_artifacts(eng.launch) if id(a) not in seen
+                ],
+            )
+            logger.info(
+                "FlyQuickAllReduce: %s does not fit %d persistent workgroups on "
+                "%d CUs; compiled under waves_per_eu=%d instead",
+                kernel_symbol(eng.launch),
+                eng.grid,
+                self._cu_count,
+                hints["waves_per_eu"],
+            )
+        eng.compile_hints = hints
+        return hints
 
     def cfgs_for(self, lo: int, hi: int) -> list[tuple]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
@@ -849,7 +906,7 @@ class FlyQuickAllReduce:
             for key in keys:
                 eng = self._by_cfg[key]
                 args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
-                preload_launcher(eng.launch, *args)
+                self._load_checked(eng, args)
 
     def close(self):
         engines = getattr(self, "_by_cfg", None)
@@ -1587,7 +1644,26 @@ class FlyQuickAllReduceRMSNorm:
                 _run_compiled(eng.launch, *args)
                 return
             with self._compile_hints(spec):
+                self._load_checked(eng, args)
                 _run_compiled(eng.launch, *args)
+
+    def _load_checked(self, eng, args) -> None:
+        """Compile and load *eng* for *args* without launching it, and raise
+        if its grid cannot be resident (``check_resident_grid``).
+
+        The occupancy query loads a module, which HIP graph capture forbids,
+        so it runs once per engine, at ``preload`` or on the first call.
+        """
+        if eng.compile_hints is not None:
+            return
+        preload_launcher(eng.launch, *args)
+        check_resident_grid(
+            eng.launch,
+            grid=eng.grid,
+            cu_count=self._cu_count,
+            owner="FlyQuickAllReduceRMSNorm",
+        )
+        eng.compile_hints = CompilationContext.get_compile_hints()
 
     def _launch_args(
         self,
@@ -1842,7 +1918,7 @@ class FlyQuickAllReduceRMSNorm:
                     eng, spec, (0,) * 5, 0.0, None, live_bytes=0, num_tiles=0
                 )
                 with self._compile_hints(spec):
-                    preload_launcher(eng.launch, *args)
+                    self._load_checked(eng, args)
 
     def variant(self, hidden: int, nbytes: int, mxfp4: bool = False) -> str:
         """``<jit symbol>/g<grid>/x<grid_x>`` for this (hidden, payload)."""

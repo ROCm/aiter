@@ -13,15 +13,18 @@ import torch
 import torch.distributed as dist
 
 from .allreduce_policy import (
+    DEFAULT_MESH_KNOBS,
     INBOX_MEMORY_MODES,
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
+    MeshKnobs,
     default_inbox_memory,
     resolve_link,
 )
 from .ipc_heap import IpcHeap
+from .kernels.comm.transport import BLOCK, WAVE
 from .kernels.tensor_shim import _preload_compiled
 
 logger = logging.getLogger("aiter")
@@ -93,6 +96,7 @@ class _StEngine:
         self.rank_tile_bytes = spec["rank_tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.block = spec["block"]
+        self.compile_hints = None
         self._peer_bases = [None] * world_size
         self._buf_ptr = None
         self._meta_ptr = None
@@ -643,6 +647,132 @@ def launcher_loaded(launch) -> bool:
     next launch does no JIT and no module load. False if none is compiled."""
     artifacts = _launch_artifacts(launch)
     return bool(artifacts) and all(a._engine is not None for a in artifacts)
+
+
+# Persistent-grid residency
+# =========================
+#
+# Every quick all-reduce kernel is persistent: a workgroup spins on its peers'
+# packets, so all workgroups of a grid must be resident at once. The grid is
+# fixed before the kernel is compiled -- it sizes the IPC inbox and the ranks
+# agree on it -- so the host predicts residency from the tables below, then
+# checks the compiled kernel before its first launch (``check_resident_grid``,
+# ``FlyQuickAllReduce._load_checked``).
+
+# (world_size, super_tile) -> VGPR-limited workgroups per CU of the flag mesh
+# at ``BLOCK`` threads. Super-tile widens the live atom list, so residency
+# falls as it grows; world size narrows each rank's share of a tile, so it
+# rises with N.
+_RESIDENT_WGS_PER_CU = {
+    (2, 1): 3,
+    (2, 8): 4,
+    (4, 1): 4,
+    (4, 8): 5,
+    (8, 1): 4,
+    (8, 8): 6,
+}
+# The same for the Lamport mesh on the codecs wider than INT4.
+_LAMPORT_RESIDENT_WGS_PER_CU = {"int5": 3, "int6": 3, "fp16": 2}
+
+
+def clamp_grid_cap(
+    requested: int,
+    *,
+    arch: str,
+    world_size: int,
+    super_tile: int,
+    cu_count: int,
+    block: int = BLOCK,
+    handshake: str = "flag",
+    knobs: MeshKnobs = DEFAULT_MESH_KNOBS,
+    codec: str = "int4",
+) -> int:
+    """*requested* workgroups, clamped to the residency the tables predict.
+
+    An estimate, not a guarantee. The tables are measured on the mesh at
+    ``BLOCK`` threads, and the ring and the hierarchical kernel use them too.
+    The host checks the compiled kernel before its first launch: a grid that
+    does not fit is compiled again under a ``waves_per_eu`` floor, which may
+    cost registers, or raises (``FlyQuickAllReduce._load_checked``). An
+    estimate that is too low only launches fewer workgroups, each looping
+    over more tiles, so every rule below errs small:
+
+    * An unmeasured *super_tile* (the ring's 16 and 32) takes the smallest
+      measurement for the world size. An unknown *arch* or *world_size*
+      raises: there is nothing to be conservative with.
+    * The Lamport build keeps a sub-tile's polled packets live across its
+      reduce, so it takes the smallest measurement for the world size, and
+      ``_LAMPORT_RESIDENT_WGS_PER_CU`` on INT5, INT6 and FP16.
+    * ``prefetch=1`` carries a tile's atoms across the poll, so it takes 
+      one workgroup off. The other knobs stay within the tables; ``lds_bufs=2`` 
+      is bounded by the host's LDS clamp.
+    * A *block* wider than ``BLOCK`` scales the answer down by the wave slots
+      it takes. That is a model, not a measurement; the fused host also
+      bounds its launches at one workgroup per CU
+      (``FlyQuickAllReduceRMSNorm``).
+    """
+    if requested < 1 or cu_count < 1:
+        raise ValueError("grid_cap and cu_count must be positive")
+    if block < 1:
+        raise ValueError("block must be positive")
+    if arch not in SUPPORTED_ARCHS:
+        raise ValueError(f"clamp_grid_cap has no residency measurement for {arch!r}")
+    key = (int(world_size), int(super_tile))
+    resident = None if handshake == "lamport" else _RESIDENT_WGS_PER_CU.get(key)
+    if resident is None:
+        for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
+        if not for_world:
+            raise ValueError(
+                "clamp_grid_cap has no residency measurement for "
+                f"world_size={world_size}"
+            )
+        resident = min(for_world)
+    if handshake == "lamport":
+        resident = min(resident, _LAMPORT_RESIDENT_WGS_PER_CU.get(codec, resident))
+    if handshake == "lamport" and knobs.prefetch:
+        resident = max(1, resident - 1)
+    if block > BLOCK:
+        resident = max(1, (resident * BLOCK) // int(block))
+    return min(int(requested), resident * int(cu_count))
+
+
+def resident_waves_per_eu(*, grid: int, block: int, cu_count: int) -> int:
+    """Waves per SIMD that *grid* workgroups of *block* threads need on
+    *cu_count* CUs to be resident all at once.
+
+    The quick all-reduce kernels are persistent: every workgroup spins on its
+    peers' packets, so all of them must be resident together. Compiled under
+    this ``waves_per_eu`` floor, the compiler caps the registers to fit them.
+    """
+    wgs_per_cu = -(-int(grid) // int(cu_count))
+    return -(-(wgs_per_cu * -(-int(block) // WAVE)) // 4)
+
+
+def grid_is_resident(artifacts, *, grid: int, cu_count: int) -> bool:
+    """Whether *grid* workgroups of every loaded artifact fit on *cu_count*
+    CUs at once. HIP answers for the compiled kernel (registers and LDS)."""
+    return all(int(grid) <= a.max_blocks_per_cu() * int(cu_count) for a in artifacts)
+
+
+def check_resident_grid(
+    launch, *, grid: int, cu_count: int, owner: str, artifacts=None
+) -> None:
+    """Raise unless *grid* workgroups of the loaded *launch* (or of
+    *artifacts*, some of its artifacts) fit on *cu_count* CUs at once.
+
+    A persistent kernel with workgroups that cannot be resident waits on
+    them forever: this turns that hang into an error before the first
+    launch. *launch* must be loaded (``preload_launcher``).
+    """
+    for artifact in _launch_artifacts(launch) if artifacts is None else artifacts:
+        per_cu = artifact.max_blocks_per_cu()
+        if int(grid) > per_cu * int(cu_count):
+            raise RuntimeError(
+                f"{owner}: {kernel_symbol(launch)} launches {grid} persistent "
+                f"workgroups, but only {per_cu} per CU ({per_cu * cu_count} on "
+                f"{cu_count} CUs) fit at once, so the launch would hang; lower "
+                "the rung's grid_cap or block"
+            )
 
 
 def check_build_outside_capture(*, owner: str, hidden: int) -> None:

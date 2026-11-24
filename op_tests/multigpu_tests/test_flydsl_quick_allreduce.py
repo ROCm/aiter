@@ -196,10 +196,8 @@ from aiter.ops.flydsl.allreduce_policy import (
     mesh_st_ladder,
     ring_st_ladder,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
-    DEFAULT_DIVISOR,
-    clamp_grid_cap,
-)
+from aiter.ops.flydsl.comm_collectives_host_shared import clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import DEFAULT_DIVISOR
 from aiter.ops.flydsl.kernels.comm.transport import (
     ATOMS,
     has_release_fence,

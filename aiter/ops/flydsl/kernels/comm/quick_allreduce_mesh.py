@@ -44,7 +44,6 @@ from flydsl.expr.typing import T
 from ...allreduce_policy import (
     DEFAULT_MESH_KNOBS,
     MESH_CODECS,
-    SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
     MeshKnobs,
     mesh_super_tiles,
@@ -84,7 +83,6 @@ from .quick_allreduce_rmsnorm import MeshRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
     ATOMS,
-    BLOCK,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     LAMPORT_FILL_BYTE,
@@ -115,7 +113,6 @@ __all__ = [
     "DEFAULT_DIVISOR",
     "TILE_BYTES",
     "WORLD",
-    "clamp_grid_cap",
     "make_quick_allreduce_mesh_kernel",
     "mesh_lds_bytes",
 ]
@@ -144,19 +141,6 @@ LAMPORT_BUFFERS = 3
 # stays off the critical path.
 LAMPORT_BUFFERS_DEFERRED = 4
 
-# (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
-# mesh kernel. Super-tile widens the live atom list, so residency falls as it
-# grows; world size narrows each rank's share of a tile, so it rises with N.
-_RESIDENT_WGS_PER_CU = {
-    (2, 1): 3,
-    (2, 8): 4,
-    (4, 1): 4,
-    (4, 8): 5,
-    (8, 1): 4,
-    (8, 8): 6,
-}
-_LAMPORT_RESIDENT_WGS_PER_CU = {"int5": 3, "int6": 3, "fp16": 2}
-
 
 class _LazyPolled:
     """``polled`` of ``recv_order="per_source"``: ``{(src, k): (words, scale)}``
@@ -176,78 +160,6 @@ class _LazyPolled:
 
     def finish(self):
         self._finish()
-
-
-def clamp_grid_cap(
-    requested: int,
-    *,
-    arch: str,
-    world_size: int,
-    super_tile: int,
-    cu_count: int,
-    block: int = BLOCK,
-    handshake: str = "flag",
-    knobs: MeshKnobs = DEFAULT_MESH_KNOBS,
-    codec: str = "int4",
-) -> int:
-    """Clamp a requested persistent grid to what actually fits on the device.
-
-    A persistent kernel deadlocks if it launches more workgroups than can be
-    co-resident, so the cap has to respect VGPR-limited occupancy.
-
-    An unmeasured *super_tile* -- the ring runs ST=16 and ST=32, which this
-    table does not cover -- falls back to the smallest measurement for that
-    world size rather than raising. Under-launching a persistent kernel is
-    always safe (each block simply loops over more tiles); over-launching is
-    the failure mode, so the fallback has to err small. An unknown *arch* or
-    *world_size* still raises, because there is nothing to be conservative
-    with.
-
-    *block* wider than the measured 256 scales the answer down: the table is
-    VGPR- and wave-slot-limited workgroups per CU at four waves, and a 14-wave
-    workgroup takes 3.5x the slots. That scaling is a **model**, not a
-    measurement, and over-estimating residency here is a hang rather than a
-    slowdown -- so a fused build must not rely on it alone. The host bounds
-    those launches at one workgroup per CU as well; see
-    ``FlyQuickAllReduceRMSNorm``.
-
-    The table is measured on the flag handshake. The Lamport build keeps a
-    sub-tile's polled packets live across its reduce, ~120 VGPRs at every
-    super-tile on gfx950 TP8 (flag ST=8: 88), so a super-tile does not buy it
-    the residency the flag ST=8 row measures: it takes the smallest
-    measurement for the world size.
-
-    ``prefetch=1`` (Lamport tuning knob) carries a whole tile's atoms across the
-    poll: 145/139/133 VGPRs at TP8/4/2 against 121/116/109, which is 3 resident
-    workgroups per CU where the table says 4 (TP8, TP4), so it takes one off.
-    The other knobs stay within the table's VGPR counts (<= 128 at TP8/TP4);
-    ``lds_bufs=2`` is bounded through the host's LDS clamp instead.
-    """
-    if requested < 1 or cu_count < 1:
-        raise ValueError("grid_cap and cu_count must be positive")
-    if block < 1:
-        raise ValueError("block must be positive")
-    if arch not in SUPPORTED_ARCHS:
-        raise ValueError(
-            f"quick_allreduce_mesh has no residency measurement for {arch!r}"
-        )
-    key = (int(world_size), int(super_tile))
-    resident = None if handshake == "lamport" else _RESIDENT_WGS_PER_CU.get(key)
-    if resident is None:
-        for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
-        if not for_world:
-            raise ValueError(
-                "quick_allreduce_mesh has no residency measurement for "
-                f"world_size={world_size}"
-            )
-        resident = min(for_world)
-    if handshake == "lamport":
-        resident = min(resident, _LAMPORT_RESIDENT_WGS_PER_CU.get(codec, resident))
-    if handshake == "lamport" and knobs.prefetch:
-        resident = max(1, resident - 1)
-    if block > BLOCK:
-        resident = max(1, (resident * BLOCK) // int(block))
-    return min(int(requested), resident * int(cu_count))
 
 
 def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int]:
