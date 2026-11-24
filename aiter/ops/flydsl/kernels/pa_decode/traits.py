@@ -1523,6 +1523,9 @@ class Gfx1250Traits:
     quant_output: bool = False
     # With quant_output, False drops the BF16/FP16 store of the final output.
     store_output: bool = True
+    # With quant_output, MXFP8 (E8M0 scale per 32 elements, group-local, no
+    # LDS) instead of one FP32 descale per token.
+    quant_mx: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1858,7 +1861,9 @@ class Gfx1250Traits:
     @property
     def total_bytes(self):
         units = self.m_tiles * 16 // self.quant_unit
-        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
+        # MXFP8 groups are lane-local: no maxima in LDS.
+        per_token = self.quant_output and not self.quant_mx
+        return self.quant_offset + (units * self.NWARP * 4 if per_token else 0)
 
     @property
     def use_tdm(self):

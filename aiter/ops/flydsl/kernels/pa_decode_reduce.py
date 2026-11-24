@@ -11,6 +11,7 @@ import flydsl.expr as fx
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .dpp_utils import dpp_xor_f32
+from .pa_decode.op_mxfp8 import GROUP, MxFp8Groups, lane_masks
 from .tensor_shim import (
     _FX_ELEM,
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -58,6 +59,8 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    quant_mx: bool = False,
+    store_output: bool = True,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -90,6 +93,11 @@ def compile_pa_decode_ps_reduce(
     batch * (rows * KV heads)**2 <= 2**30.
     Sinks are per-head zero-value logits: include them in the shared maximum
     and add their denominator mass once.
+
+    ``quant_mx`` (gfx1250) also writes the MXFP8 output (``pa_decode.op_mxfp8``)
+    of the rows it reduces, from the values it stores, to the launch's
+    ``quantized`` and ``scales`` (output, FP8 output and scales contiguous).
+    ``store_output=False`` skips the BF16/FP16 store.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
@@ -125,6 +133,10 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
     if num_xcds < 0:
         raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
+    if quant_mx and architecture not in ("gfx1250", "gfx1250-strict"):
+        raise NotImplementedError(
+            f"The reducer's MXFP8 output requires gfx1250, not {architecture}"
+        )
 
     output_dtype = _FX_ELEM[output_dtype_str]
     logits_dtype = _FX_ELEM[logits_dtype_str]
@@ -196,6 +208,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if quant_mx:
+        kernel_name += "_mxfp8" if store_output else "_mxfp8only"
 
     @flyc.jit
     def _pa_decode_reduce_body(
@@ -203,7 +217,8 @@ def compile_pa_decode_ps_reduce(
         exp_sums_ptr: fx.Pointer,
         max_logits_ptr: fx.Pointer,
         logits_ptr: fx.Pointer,
-        sink_token_ptr: fx.Pointer,
+        # With quant_mx the FP8 output and its scales: see the launch.
+        sink_token_ptr,
         stride_output_bs: fx.Int32,
         stride_output_len: fx.Int32,
         stride_output_kv_head: fx.Int32,
@@ -219,7 +234,11 @@ def compile_pa_decode_ps_reduce(
         num_ctas: fx.Int32,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        # The sink pointer of a quant_mx kernel.
+        mx_sink_ptr=(),
     ):
+        if fx.const_expr(quant_mx):
+            mxfp8_ptrs, sink_token_ptr = sink_token_ptr, mx_sink_ptr
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
             # each XCD a contiguous run of (sequence, KV head, row) so rows
@@ -327,11 +346,18 @@ def compile_pa_decode_ps_reduce(
         def _store(acc, unit):
             # Output rows need only element alignment, so pairs store scalars.
             offset = output_base + unit * fx.Int32(elems)
-            if fx.const_expr(pairs):
-                output[offset] = acc[0].to(output_dtype)
-                output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
-            else:
-                output[offset] = acc.to(output_dtype)
+            if fx.const_expr(store_output):
+                if fx.const_expr(pairs):
+                    output[offset] = acc[0].to(output_dtype)
+                    output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
+                else:
+                    output[offset] = acc.to(output_dtype)
+            if fx.const_expr(quant_mx):
+                # A group is GROUP / elems adjacent lanes of one wave; callers
+                # store whole waves.
+                MxFp8Groups(*mxfp8_ptrs).store(
+                    [acc.to(output_dtype)], [offset], lane_masks(GROUP // elems), wave
+                )
 
         def _lane_stats(chunk):
             # Lane l owns partition l + wave * chunk; part_count <= NP.
@@ -732,7 +758,7 @@ def compile_pa_decode_ps_reduce(
             exp_sums_ptr: fx.Pointer,
             max_logits_ptr: fx.Pointer,
             logits_ptr: fx.Pointer,
-            sink_token_ptr: fx.Pointer,
+            sink_token_ptr,  # as in _pa_decode_reduce_body
             stride_output_bs: fx.Int32,
             stride_output_len: fx.Int32,
             stride_output_kv_head: fx.Int32,
@@ -748,6 +774,7 @@ def compile_pa_decode_ps_reduce(
             num_ctas: fx.Int32,
             rows_magic: fx.Int32,
             seq_magic: fx.Int32,
+            mx_sink_ptr=(),
         ):
             _pa_decode_reduce_body(
                 output_ptr,
@@ -770,6 +797,7 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                mx_sink_ptr,
             )
 
         def _reduce_args(*args):
@@ -797,10 +825,21 @@ def compile_pa_decode_ps_reduce(
         reduce_info: fx.Pointer,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        quantized: fx.Pointer,
+        scales: fx.Pointer,
         stream: fx.Stream,
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
+        mx_sink = ()
+        if fx.const_expr(quant_mx):
+            # The FP8 output and its scales take the sink pointer's kernel
+            # argument, so that every argument still preloads (a scale pointer
+            # past 120 bytes cost an s_load before the last store). A kernel
+            # with sinks takes its sink pointer last, past those bytes: that
+            # load overlaps the XCD remap, where seq_magic's would precede it.
+            mx_sink = (sink_token,) if use_sinks else ()
+            sink_token = (quantized, scales)
         pa_decode_reduce_kernel(
             *_reduce_args(
                 output,
@@ -823,7 +862,8 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
-            )
+            ),
+            *mx_sink,
         ).launch(
             grid=(
                 (num_ctas, 1, 1)
@@ -842,8 +882,9 @@ def compile_pa_decode_ps_reduce(
             "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
     if architecture in ("gfx1250", "gfx1250-strict"):
-        # All 108 argument bytes preload into user SGPRs, so the first load
-        # is reduce_info.
+        # All argument bytes preload into user SGPRs (108, or 116 with the
+        # MXFP8 output), so the first load is reduce_info; only the sink
+        # pointer of an MXFP8 kernel with sinks lies past them.
         launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

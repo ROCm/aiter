@@ -120,6 +120,21 @@ class Gfx1250Nvfp4WavePipeline:
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
+    def _tile(self, vh):
+        """The 16-dim output tile this wave stores for ``vh``: tiles 4 vh + w
+        (dims 64 vh + 16 w), or under the MXFP8 output 2 w + vh, so each wave
+        holds whole 32-dim groups (dims 32 w + 16 vh)."""
+        if const_expr(self.t.quant_mx):
+            return self.ctx.warp * 2 + vh
+        return vh * 4 + self.ctx.warp
+
+    def _dim(self, vh):
+        """First of the 8 dims lane (row, half) stores for ``vh``."""
+        ctx = self.ctx
+        if const_expr(self.t.quant_mx):
+            return ctx.warp * 32 + vh * 16 + ctx.half * 8
+        return vh * 64 + ctx.warp * 16 + ctx.half * 8
+
     def _slot(self, slot):
         return (slot * self.t.NWARP + self.ctx.warp) * NVFP4_SLOT_BYTES
 
@@ -489,7 +504,7 @@ class Gfx1250Nvfp4WavePipeline:
             denom = denom + weights[w] * wave_stats[w][1]
         merged = [row_max, denom]
         for vh in range_constexpr(2):
-            b = vh * 4 + ctx.warp
+            b = self._tile(vh)
             out = fx.Vector.filled(8, 0.0, fx.Float32)
             for w in range_constexpr(t.NWARP):
                 out = out + self.mem.load(
@@ -505,8 +520,8 @@ class Gfx1250Nvfp4WavePipeline:
     @flyc.jit
     def _store(self, final):
         """The CTA-shared BF16 pipeline's epilogue: wave w stores dims
-        64 vh + 16 w + 8 half + [0, 8) of row lane16, and with ``quant_output``
-        its FP8 output (``Gfx1250OutputQuant.store_cta``) from the same values."""
+        ``_dim(vh)`` + [0, 8) of row lane16, and with ``quant_output``
+        its FP8 output (``ctx.quant.store_cta``) from the same values."""
         ctx, t = self.ctx, self.t
         slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
 
@@ -524,7 +539,7 @@ class Gfx1250Nvfp4WavePipeline:
             inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
             if row < t.rows:
                 for vh in range_constexpr(2):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                    d = self._dim(vh)
                     value = (
                         final[2 + vh]
                         * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
@@ -553,9 +568,9 @@ class Gfx1250Nvfp4WavePipeline:
                             psum[partial_row] = denom
 
         def store_quantized():
-            # The FP8 epilogue of the CTA-shared pipelines: one query token,
-            # lane16 picks its row (GQA head), warp, half and vh its dims, so
-            # this CTA holds all of the token's values.
+            # The FP8 epilogue of the CTA-shared pipelines: lane16 picks one of
+            # this CTA's rows (query position and GQA head), warp, half and vh
+            # its dims, so the CTA holds every value of its rows.
             denom = final[1]
             inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
             norm = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(8)
@@ -564,7 +579,8 @@ class Gfx1250Nvfp4WavePipeline:
                 values.append((final[2 + vh] * norm).to(t.q_dtype))
                 offsets.append(
                     self.merge.output_offset(
-                        ctx.lane16, vh * 64 + ctx.warp * 16 + ctx.half * 8
+                        ctx.query_begin * t.query_group_size + ctx.lane16,
+                        self._dim(vh),
                     )
                 )
             # One 16-row tile; the four waves (parts) split its dims.
