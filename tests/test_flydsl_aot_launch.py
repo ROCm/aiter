@@ -536,6 +536,53 @@ def test_declared_sources_and_variables_select_the_entry(monkeypatch, tmp_path):
     assert disk_key() == first
 
 
+@pytest.mark.parametrize(
+    "module,factory,dependency",
+    [
+        ("mla_kernels", "_pagesize64_fp8_launcher", "kernels/tensor_shim.py"),
+        (
+            "kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8",
+            "_thd_launcher",
+            "../../jit/utils/lds_capacity.py",
+        ),
+        (
+            "mxfp8_bpreshuffle_gemm_gfx1250",
+            "gemm_a8w8_launcher",
+            "../../utility/mx_types.py",
+        ),
+    ],
+)
+def test_gfx1250_codegen_dependency_edit_selects_another_object(
+    monkeypatch, module, factory, dependency
+):
+    import importlib
+
+    from aiter.ops.flydsl import aot_cache
+
+    cache = getattr(importlib.import_module(f"aiter.ops.flydsl.{module}"), factory)
+    cache = cache.aot_cache
+    source = str((Path(aot_cache.__file__).parent / dependency).resolve())
+    original_digest = aot_cache._file_digest
+
+    # Model fresh processes reading the original source, an edited source,
+    # and the original again, without modifying the checkout or GPU code.
+    def key(edited):
+        monkeypatch.setattr(cache, "_digest", None)
+        monkeypatch.setattr(cache, "_hashes", None)
+        monkeypatch.setattr(
+            aot_cache,
+            "_file_digest",
+            lambda path: (
+                "edited source" if edited and path == source else original_digest(path)
+            ),
+        )
+        return cache._disk_key(("same configuration",), ())
+
+    original = key(False)
+    assert key(True) != original, f"{cache.name} does not hash {dependency}"
+    assert key(False) == original
+
+
 def test_directory_source_is_every_file_below_it(tmp_path):
     from aiter.ops.flydsl import aot_cache
 

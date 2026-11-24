@@ -209,12 +209,16 @@ def dry_run(
 
     from aiter.jit import core as jit_core
     from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
     from aiter.utility import graph_alloc
 
     _register_stream_stub()
     stream = _Stream(torch.device("cuda", 0))
     properties = SimpleNamespace(
-        name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
+        name=name or arch,
+        gcnArchName=arch,
+        multi_processor_count=cu_num,
+        warp_size=get_warp_size(arch),
     )
     real_data_ptr = torch.Tensor.data_ptr
     # The fake address range of each storage of this dry run, by storage

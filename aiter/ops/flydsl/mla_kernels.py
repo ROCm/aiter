@@ -131,6 +131,7 @@ _PAGESIZE1_AOT_SOURCES = [
     "kernels/kernels_common.py",
     "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
     "kernels/mla_gfx1250/mla_common.py",
+    "kernels/tensor_shim.py",
 ]
 
 
@@ -168,6 +169,8 @@ def _pagesize1_bf16_launcher():
         "kernels/act.py",
         "kernels/gemm_common_gfx1250.py",
         "kernels/kernels_common.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
     ],
 )
 @functools.cache

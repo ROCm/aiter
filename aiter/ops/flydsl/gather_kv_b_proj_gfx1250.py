@@ -25,6 +25,10 @@ _V_DIM = 128
         "kernels/gfx1250_cluster.py",
         "kernels/kernels_common.py",
         "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
+        "../../jit/utils/chip_info.py",
+        "../../jit/utils/lds_capacity.py",
     ],
 )
 @functools.cache

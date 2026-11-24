@@ -63,6 +63,10 @@ _AOT_SOURCES = [
     "kernels/kernels_common.py",
     "kernels/splitk_fused_epilogue_gfx1250.py",
     "kernels/tdm_ops_gfx1250.py",
+    "kernels/tensor_shim.py",
+    "kernels/buffer_ops.py",
+    "../../jit/utils/chip_info.py",
+    "../../jit/utils/lds_capacity.py",
 ]
 
 

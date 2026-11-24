@@ -3004,6 +3004,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
 # Launch wrappers + host entries
 # ============================================================================
 
+
 def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     """True when the launch bounds every WG to a single KV tile."""
     n_block = pick_n_block(qk_hdim, v_hdim, DTYPE_MAP[kv_dtype_str])
@@ -3017,6 +3018,9 @@ _AOT_SOURCES = [
     "kernels/fmha_gfx1250/fmha_utils.py",
     "kernels/kernels_common.py",
     "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+    "kernels/tensor_shim.py",
+    "../../jit/utils/chip_info.py",
+    "../../jit/utils/lds_capacity.py",
 ]
 
 

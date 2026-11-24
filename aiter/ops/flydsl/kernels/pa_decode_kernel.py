@@ -137,6 +137,9 @@ _GFX1250_PA_DECODE_AOT = FlyDSLAotCache(
         "kernels/layout_utils.py",
         "kernels/mxfp4_gemm_common.py",
         "kernels/utils.py",
+        "kernels/tensor_shim.py",
+        "../../jit/utils/chip_info.py",
+        "../../jit/utils/lds_capacity.py",
     ],
 )
 

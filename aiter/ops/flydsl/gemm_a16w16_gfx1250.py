@@ -76,6 +76,9 @@ _CFG_KEYS = (
     sources=[
         "kernels/gemm_a16w16_kernel_gfx1250.py",
         "kernels/communication_ops_utils.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
     ],
 )
 @functools.lru_cache(maxsize=1024)

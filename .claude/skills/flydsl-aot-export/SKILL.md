@@ -27,15 +27,16 @@ Converted wrappers to copy from:
 | Factory takes the constexprs, launcher takes runtime arguments only | `gemm_kernels.py` (`_preshuffle_launcher`), `gemm_a8w8_blockscale.py` (`_compile_gemm`), `kernels/fmha_gfx1250/fmha_fwd_prefill_a16w16_m32x8.py` |
 | Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`); `mxfp8_bpreshuffle_gemm_gfx1250.py`, `mla_kernels.py`, `gather_kv_b_proj_gfx1250.py` (a factory with no argument, the constexprs in `specialization_key`) |
 | Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
-| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`), `kernels/pa_decode_kernel.py` (`bind_aot`, keyed by its traits) |
+| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot`), `kernels/pa_decode_kernel.py` (`bind_aot`, keyed by its traits) |
 
 ## The one rule
 
 **Everything that changes the compiled code must be in the key.** The key is
 the factory's arguments plus `_run_compiled`'s `specialization_key`. Arch, CU
-count, FlyDSL itself, the kernel's source files and the environment variables
-those files read are tracked for you. Tensor dtype, rank and unit-stride axis
-are in the disk digest, but not in the in-memory key.
+count, FlyDSL itself and the fingerprinted environment are covered centrally.
+Declare all code-generating sources in `sources=` and additional inputs in
+`env=`; the cache no longer discovers them during tracing. Tensor dtype, rank
+and unit-stride axis are in the disk digest, but not in the in-memory key.
 
 So, for each launch, list what the trace depends on and tick each item off:
 
@@ -90,11 +91,11 @@ So, for each launch, list what the trace depends on and tick each item off:
 
    A launcher built where a factory cannot return it (a dict of launchers, a
    launcher shared by several argument sets): bind it where it is built, keyed
-   by the values that determine it, and give `make_exe` a fresh build:
+   by the values that determine it. Declared sources make rebuilding the
+   launcher just to discover its dependencies unnecessary:
 
    ```python
-   bind_aot(launch, _MY_AOT, dataclasses.astuple(traits),
-            make_exe=lambda: _build(traits)["launch"])
+   bind_aot(launch, _MY_AOT, dataclasses.astuple(traits))
    ```
 
 3. **Launch `factory.lazy(...)`, not `factory(...)`.** A hit then never calls
@@ -117,6 +118,14 @@ So, for each launch, list what the trace depends on and tick each item off:
    list in §7.
 
 ## Checks before calling it done
+
+Declared sources:
+
+- [ ] Include code-generating helpers outside `kernels/`, such as
+      `../../jit/utils/lds_capacity.py` and `../../utility/mx_types.py`.
+- [ ] When the trace calls `tensor_shim` IR helpers, explicitly declare
+      `kernels/tensor_shim.py` and its kernel dependencies. The import check
+      exempts that module because it also provides host launch plumbing.
 
 Key coverage:
 

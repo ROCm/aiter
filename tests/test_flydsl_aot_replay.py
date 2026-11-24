@@ -110,6 +110,38 @@ def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
         assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
 
 
+@pytest.mark.parametrize("partitions", [4, 64])
+def test_pa_decode_reducer_reaches_compile_only_launch(monkeypatch, partitions):
+    import importlib
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    launches = []
+    monkeypatch.setattr(pa, "_run_compiled", lambda *args: launches.append(args))
+    with dry_run("gfx1250", 256):
+        output = torch.empty((4, 1, 2, 4, 128), device="cuda", dtype=torch.bfloat16)
+        sums = torch.empty((2, 4 * partitions, 4), device="cuda", dtype=torch.float32)
+        logits = torch.empty(
+            (2, 4 * partitions, 4, 128), device="cuda", dtype=torch.bfloat16
+        )
+        pa.launch_pa_decode_ps_reduce(
+            output,
+            sums,
+            torch.empty_like(sums),
+            logits,
+            None,
+            *output.stride()[:4],
+            *sums.stride()[:2],
+            *logits.stride()[:3],
+            query_seq_len=1,
+            query_group_size=4,
+            head_size=128,
+            max_partitions=partitions,
+            stream=torch.cuda.current_stream(),
+            reduce_info=torch.empty((4, 2), device="cuda", dtype=torch.int32),
+        )
+    assert len(launches) == 1
+
+
 def test_dry_run_pointer_ranges_preserve_storage_aliases():
     """Large independent fake allocations must not trip real overlap guards."""
     with dry_run("gfx1250", 256):

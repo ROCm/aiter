@@ -208,6 +208,9 @@ def _fuses_quant_output(
         "kernels/pa_decode_reduce.py",
         "kernels/dpp_utils.py",
         "kernels/utils.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
     ],
 )
 @functools.lru_cache(maxsize=256)

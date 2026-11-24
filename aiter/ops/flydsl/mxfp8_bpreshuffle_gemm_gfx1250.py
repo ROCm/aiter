@@ -60,6 +60,10 @@ _GEMM_AOT_SOURCES = [
     "kernels/gfx1250_cluster.py",
     "kernels/kernels_common.py",
     "kernels/quant_utils.py",
+    "kernels/tensor_shim.py",
+    "kernels/buffer_ops.py",
+    "../../jit/utils/lds_capacity.py",
+    "../../utility/mx_types.py",
 ]
 _COMPUTE_BOUND_AOT_SOURCES = [
     "kernels/gemm_a8w8_256x256_gfx1250.py",
@@ -70,10 +74,16 @@ _COMPUTE_BOUND_AOT_SOURCES = [
     "kernels/quant_utils.py",
     "kernels/splitk_fused_epilogue_gfx1250.py",
     "kernels/tdm_ops_gfx1250.py",
+    "kernels/tensor_shim.py",
+    "kernels/buffer_ops.py",
+    "../../jit/utils/lds_capacity.py",
+    "../../utility/mx_types.py",
 ]
 _SPLITK_REDUCE_AOT_SOURCES = [
     "kernels/gemm_a8w8_splitk_reduce_gfx1250.py",
     "kernels/kernels_common.py",
+    "kernels/tensor_shim.py",
+    "kernels/buffer_ops.py",
 ]
 
 

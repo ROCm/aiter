@@ -237,8 +237,10 @@ one, both when an entry is built, so a hit pays nothing:
 
 - **A kernel file.** The declared files under `kernels/` are parsed, and
   every file under `kernels/` they import (anywhere in the file, including
-  inside a function) must be declared. Launch plumbing that generates no code
-  (`tensor_shim.py`, `aot_cache.py`, `aot_launch.py`) is exempt.
+  inside a function) must be declared. The checker exempts `tensor_shim.py`,
+  `aot_cache.py` and `aot_launch.py`. `tensor_shim.py` also contains IR
+  helpers such as buffer loads and stores: caches whose traces use them must
+  explicitly declare that file and its kernel dependencies.
 - **Bitcode.** The files the compiled kernel links must be declared.
 
 Either one raises `_UndeclaredSourceError`, in every mode; the launch does
@@ -246,7 +248,12 @@ not fall back to the JIT path. `tests/test_flydsl_aot_launch.py` runs the
 first check over every cache in the tree, so CI reports a forgotten file
 without building anything. The checks do not follow imports of a wrapper
 outside `kernels/` (a wrapper imports other families' wrappers), a dynamic
-import, or code outside the aiter package: declare those by hand.
+import, or helpers outside `kernels/`: declare those by hand. For example,
+gfx1250 FMHA allocates LDS using `jit/utils/lds_capacity.py`, and the MXFP8
+quantization epilogue uses constants from `utility/mx_types.py`; these files
+must participate in the digest even though the import checker does not require
+them. The gfx1250 caches declare these dependencies, with regressions checking
+that edits select new disk keys and restoring the source restores the key.
 
 Entries are stored per version of sources and variables,
 `<digest>-<variant hash>.{o,json}`. Switching a file or a variable back (e.g.
@@ -663,6 +670,41 @@ were 75.754/47.013/87.260 seconds. CPU regressions and real ELF mismatch
 rejection checks passed. The supplemental final GPU run could not start
 because the device was occupied; the subsequent rebase was checked with CPU
 regressions (39 passed, 4 skipped), but was not rerun on hardware.
+
+
+The schema-7 port was subsequently checked against
+`fix/flydsl-aot-key-guards-hgemm` (`e50ceed62`), after its merge into this
+branch (`19f29fba1`). The gfx1250 caches additionally declare code-generating
+`tensor_shim` helpers, LDS capacity definitions and MX type constants. AOT
+dry-run device properties now include the target wave size, which the PA
+reducer reads before compiling. Neither correction changes GPU computation.
+
+- CPU regressions: 59 passed, 4 skipped. Five new cases fail before these
+  corrections (three source-invalidation cases and two PA replay cases).
+- GEMM replay: 720 objects; fresh hit and verify built zero objects and
+  preserved all object/sidecar bytes and mtimes. Whole-process build/hit/verify
+  times were 55.7/47.4/65.9 s, including replay work. The same 17 unreached
+  non-FlyDSL rows and four refused interior sizes remain outside coverage.
+- Attention compile-only: 19 objects plus two standalone PA reducer objects;
+  hit, verify and mode 0 passed, with no hit/verify rebuilds. Actual ELF
+  object/pair/fingerprint substitutions were rejected before loading.
+- Hardware: 34 cases across GEMM, FMHA, MLA PS1, gather, PA and quantized GEMM
+  passed six process rounds (AOT, hit, verify, JIT, hit, JIT), with bitwise
+  equal first and steady outputs and zero hit/verify builds. PS1's initial
+  cold build ran before the separate six-round PS1 sequence.
+- PS64 split-1 again produced non-finite outputs in both AOT and JIT; its
+  split-4 hardware case was not reached. This pre-existing computation issue
+  remains outside the AOT-only changes. Offline compilation is not evidence
+  of PS64 numerical correctness.
+
+
+Interleaved native graph timings (101 iterations, two warmups; two AOT and two
+JIT runs) measured A4W4 general split-1 at 6.268/6.254 us, split-2 at
+5.854/5.811 us, and compute at 6.298/6.342 us. An initial FMHA FP8 THD graph
+gap of about 4% did not reproduce in an isolated repeat (6.546/6.543 us).
+The isolated THD eager host call still cost 90.991/86.891 us, about 4.1 us
+extra for AOT. Compile/replay time, first-call load time, host dispatch and
+steady GPU time remain separate metrics.
 
 ## 6. Adopting it for another op
 

@@ -14,6 +14,9 @@ from .aot_launch import aot_factory
     sources=[
         "kernels/gemm_a16w16_tdm_gfx1250.py",
         "kernels/gemm_a16w16_gfx950_utils.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
     ],
 )
 @functools.lru_cache(maxsize=128)
