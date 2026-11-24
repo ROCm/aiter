@@ -38,10 +38,9 @@ All four (x_dtype, w_dtype) combinations are selectable independently via
 (`x_block_scales`/`x_static_scale` and `w_block_scales`/`w_static_scale` are
 mutually exclusive pairs per operand).
 
-The gate GEMM (`gemm_a16w16`) uses a real tuned config, not the default:
-`get_gemm_config("GEMM-A16W16", M, N, K)` + `compute_splitk_params`, with
-BLOCK_SIZE_M/N/K clamped to <= 128 -- carried over unchanged from the original
-proton-based script.
+The gate GEMM (`gemm_a16w16`) selects its own config. A config built with
+Triton keys fails on gfx1250, where this op uses Gluon. The a4w4 and a8w4
+benches do the same.
 
 Everything except the two GEMMs -- weight/bias init, gating, routing, and
 picking the scale tensors -- is built once per weight-init draw, outside the
@@ -75,10 +74,6 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import moe_gemm_a8w8_blockscale
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
     get_parser,
@@ -288,16 +283,9 @@ def _generate_pool_inputs(
             (n_expts_tot, k_blocks_w2, n_blocks_w2), dtype=torch.float32, device=dev
         )
 
-    # -- gate GEMM with a real tuned config (not the default), + routing --
-    M, _K = xg.shape
-    K2, N = wg.shape
-    config, _ = get_gemm_config("GEMM-A16W16", M, N, K2)
-    compute_splitk_params(config, K2)
-    config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
-    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
-    config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
-
-    logits = gemm_a16w16(xg, wg.T, bg, config=config)
+    # gemm_a16w16 picks the config for the backend. A Triton-keyed config
+    # fails on gfx1250, where this op uses Gluon.
+    logits = gemm_a16w16(xg, wg.T, bg)
     rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
 
     # layer 2 reads layer 1's swiglu output; get it once here, outside the
