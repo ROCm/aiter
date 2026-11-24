@@ -1597,11 +1597,10 @@ def get_split_k_buffers(stream, device, split_k):
 def _dynamic_tensor_arg(tensor, leading_dim):
     tensor = tensor.detach()
     arg = flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
-    # FlyDSL's launch-argument fills (the JIT's, and those of an object loaded
-    # by flyc.load_module) read the address, shape and strides from this
-    # attribute when it is there, as for its TorchTensorJitArg. Without it
-    # each fill makes a DLPack view of the tensor again: about 6 us per tensor
-    # in a loaded object, 4 us in a JIT one (MI308X, FlyDSL 0.5.3).
+    # The launch-argument fills of an object loaded by flyc.load_module read
+    # the address, shape and strides from this attribute when it is there, as
+    # for FlyDSL's TorchTensorJitArg. Without it each fill makes a DLPack view
+    # of the tensor again, about 6 us per tensor (MI308X, FlyDSL 0.5.3).
     arg.torch_tensor = tensor
     return arg
 
