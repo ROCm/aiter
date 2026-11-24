@@ -23,6 +23,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.aot_launch import aot_factory
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 from .. import communication_ops_utils as comm_ops
 from ..flydsl_dispatch_combine_intranode_op import (
@@ -34,6 +35,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
 )
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import kStages, lds_typed_ptr
+from ..quant_utils import emit_mx_e8m0_scale
 from ..tensor_shim import (
     _preload_compiled,
     _run_compiled,
@@ -45,6 +47,7 @@ from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
 from .mega_moe_config import (
+    FUSED_QUANTS,
     FUSED_TOKEN_BUCKETS,
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
@@ -61,6 +64,7 @@ from .mega_moe_stage2 import (
     _stage2_lds_bytes,
     p2p_scatter_epilog,
 )
+from .quant import pack_mx_fp4_words
 from .weights import (
     check_bindable,
     check_forward_inputs,
@@ -128,11 +132,10 @@ def _quantize_row_mx(row_rsrc, lane, chunks, fz_scale_n_i32, fp4=False):
 
     Chunk c of lane l holds elements [c*1024 + l*16, +16) as one i32x4 of FP8 (i32x2 of FP4), so a 32-element
     scale group is a lane pair. Lane w < fz_scale_n_i32 returns packed scale word w (groups 4w..4w+3), matching the
-    [token, n/32] u8 scales. Bit-identical to quant.per_1x32_mx_quant.
+    [token, n/32] u8 scales. Matches quant.per_1x32_mx_quant for finite inputs.
     """
     assert fz_scale_n_i32 * 4 == chunks * 32, "1x32 scales must cover the row"
-    # 1/6 (fp4 e2m1 max) or 1/448 (fp8 e4m3 max).
-    inv_max_pos = fx.Int32(0x3E2AAAAB if fp4 else 0x3B124925).bitcast(fx.Float32)
+    mx_dtype = MxDtypeInt.FP4_E2M1 if fp4 else MxDtypeInt.FP8_E4M3
     raw = [
         load_at(row_rsrc, lane * fx.Int32(8) + fx.Int32(c * 512 + h * 4), fx.Int32, 4)
         for c in range(chunks)
@@ -150,23 +153,15 @@ def _quantize_row_mx(row_rsrc, lane, chunks, fz_scale_n_i32, fp4=False):
         for v in act:
             local_max = local_max.maximumf(v.maximumf(fx.Float32(0.0) - v))
         group_max = local_max.maximumf(local_max.shuffle_xor(fx.Int32(1), fx.Int32(64)))
-        working = (group_max * inv_max_pos).bitcast(fx.Int32)
-        mantissa = working & fx.Int32(0x7FFFFF)
-        biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-        e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
-        e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
-        words = []
+        e8m0 = fx.Int32(
+            emit_mx_e8m0_scale(
+                group_max, mode=MxScaleRoundModeInt.RoundUp, dtype=mx_dtype
+            )
+        )
         if const_expr(fp4):
-            dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-            for word in range_constexpr(2):
-                packed = fx.Int32(0)
-                for pair in range_constexpr(4):
-                    base = word * 8 + pair * 2
-                    packed = fx.rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32, packed, act[base], act[base + 1], dequant_scale, pair
-                    )
-                words.append(packed)
+            words = pack_mx_fp4_words(act, e8m0)
         else:
+            words = []
             quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
             scaled = [v * quant_scale for v in act]
             for word in range_constexpr(4):
@@ -404,10 +399,10 @@ def prefetch_direct_fixed_slot_route(
 # fmt: off
 @flyc.jit
 def emit_direct_fixed_slot_payload(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
+    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0, running_half=None, fz_fp4=False,
+    dedup=False, direct_done=0, running_half=None,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots.
@@ -425,8 +420,6 @@ def emit_direct_fixed_slot_payload(
     route = producer_slot * fx.Int32(num_waves) + warp
     route_stride = fx.Int32(dispatch_blocks * num_waves)
     route_limit = i32_cur_tok * fx.Int32(fz_k)
-    # A lane's payload words per 1024-value chunk (_quantize_row_mx).
-    lane_i32 = 2 if fz_fp4 else 4
 
     # A wave owns routes route + r * route_stride for r < route_rounds (dedup: tokens, see
     # prefetch_direct_fixed_slot_token); each round is a loop of at most one trip, and rounds past the prefetched
@@ -441,6 +434,8 @@ def emit_direct_fixed_slot_payload(
             # The token row goes once to each destination, into its token-row region; its place does not depend
             # on the expert offsets, so it is sent before the counter atomics and overlaps their round trip.
             token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+            # A lane's payload words per 1024-value chunk (FP8: 4, FP4: 2).
+            lane_i32 = len(rpf["row_values"][0])
             for j in range_constexpr(fz_k):
                 # Raw v_readlane (scalar result, a uniform branch), as _readlane_i64.
                 if fx.Int32(fx.rocdl.readlane(T.i32, rpf["send"], j)) != fx.Int32(0):
@@ -486,6 +481,7 @@ def emit_direct_fixed_slot_payload(
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk - source_token * fx.Int32(fz_k)
             row_values = rpf["row_values"]
+            lane_i32 = len(row_values[0])
             global_expert = rpf["global_expert"]
             valid_expert = (global_expert >= fx.Int32(0)) & (global_expert < fx.Int32(fz_total_experts))
             safe_expert = valid_expert.select(global_expert, fx.Int32(0))
@@ -1059,8 +1055,6 @@ def compile_mega_moe_stage1(
     NUM_ACC_N = n_per_wave // 16
     assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
 
-    TILE_K_BYTES = tile_k // 2
-    assert TILE_K_BYTES % 128 == 0
     assert tile_k == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
     assert a_dtype in ("fp8", "fp4")
     a_fp4 = a_dtype == "fp4"
@@ -1112,7 +1106,6 @@ def compile_mega_moe_stage1(
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
     fz_nbytes = model_dim // (2 if a_fp4 else 1)
-    fz_n_i32 = fz_nbytes // 4
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
     if fz_scale_n_i32 > 64:
@@ -1324,13 +1317,11 @@ def compile_mega_moe_stage1(
             emit_direct_fixed_slot_payload(
                 num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
                 fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
-                fz_n_i32=fz_n_i32,
                 fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
                 addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                 parity=payload_parity, expected=payload_expected, prefetched=prefetched, route_rounds=pre_rounds,
                 prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
-                fz_fp4=a_fp4,
             )
         if owner:
             emit_direct_fixed_slot_finalize(
@@ -1859,9 +1850,9 @@ _ROW_POISON = -1
 _TOKEN_REGION_END = (1 << 31) - (1 << 16)
 
 
-def _dispatch_dtype(quant: str) -> torch.dtype:
-    """Payload row dtype: the activation dtype of ``quant`` (GEMM1 output and GEMM2 stay FP8 for both)."""
-    return torch.float4_e2m1fn_x2 if quant == "a4w4" else torch.float8_e4m3fn
+def _dispatch_dtype(a_dtype: str) -> torch.dtype:
+    """Payload row dtype of the GEMM1 A dtype (the GEMM1 output and GEMM2 stay FP8 for both)."""
+    return torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn
 
 
 def _kernel_knobs(config: MegaMoEConfig) -> dict:
@@ -1901,7 +1892,7 @@ class SmallMRuntime:
         experts,
         topk,
         max_tok_per_rank,
-        quant="a8w4",
+        a_dtype="fp8",
     ):
         """group_major_capacity() of this runtime's dispatch, for a shared payload arena.
 
@@ -1914,7 +1905,7 @@ class SmallMRuntime:
             max_tok_per_rank=max_tok_per_rank,
             experts_per_rank=experts // world_size,
             topk=topk,
-            data_type=_dispatch_dtype(quant),
+            data_type=_dispatch_dtype(a_dtype),
             unit_size=cls.GM_UNIT_SIZE,
             scale_dim=model_dim // 32,
             compact=cls.GM_COMPACT,
@@ -1963,8 +1954,8 @@ class SmallMRuntime:
         """``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
         the routes of one MegaMoEV2 (see GroupMajorPayloadArena, stage1_output_buffers and
         FlyDSLDispatchCombineIntraNodeOp); None allocates."""
-        if quant not in ("a8w4", "a4w4"):
-            raise ValueError("SmallMRuntime supports quant='a8w4' or 'a4w4'")
+        if quant not in FUSED_QUANTS:
+            raise ValueError(f"SmallMRuntime supports quant in {FUSED_QUANTS}")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
@@ -2031,7 +2022,7 @@ class SmallMRuntime:
         self.comb_cfg = FlyDSLDispatchCombineConfig(rank=self.rank, world_size=self.world_size,
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
-            dispatch_dtype=_dispatch_dtype(quant), scale_dim=self._s1_scale_dim, scale_type_size=1,
+            dispatch_dtype=_dispatch_dtype(self._a_dtype), scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme="fixedslot", gm_compact=self.GM_COMPACT, max_total_recv_tokens=self.world_size)
         # fmt: on
@@ -2040,7 +2031,7 @@ class SmallMRuntime:
             payload_arena = GroupMajorPayloadArena([
                 self.payload_capacity(world_size=self.world_size, model_dim=self.model_dim,
                     inter_dim=self.inter_dim, experts=self.experts, topk=self.topk, max_tok_per_rank=self.mtpr,
-                    quant=quant)
+                    a_dtype=self._a_dtype)
             ])
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
             self.comb_cfg, gm_payload_arena=payload_arena, combine_input=combine_input

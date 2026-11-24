@@ -58,6 +58,7 @@ from .gemm2 import (
     issue_a_scale_lds_dt,
 )
 from .mega_moe_config import (
+    LARGE_M_QUANTS,
     MegaMoEConfig,
     fused_layout_supported,
     large_m_mtprs_for,
@@ -3111,8 +3112,8 @@ class LargeMRuntime:
         storage shared by the routes of one MegaMoEV2 (see GroupMajorPayloadArena,
         stage1_output_buffers and FlyDSLDispatchCombineIntraNodeOp; the quant buffers are
         the FP8 rows and E8M0 scales of max_tok_per_rank inputs); None allocates."""
-        if quant != "a8w4":
-            raise ValueError("LargeMRuntime currently supports quant='a8w4' only")
+        if quant not in LARGE_M_QUANTS:
+            raise ValueError(f"LargeMRuntime supports quant in {LARGE_M_QUANTS}")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):

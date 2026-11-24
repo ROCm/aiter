@@ -20,11 +20,9 @@ from dataclasses import astuple, fields
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
-    FUSED_QUANTS,
     FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
-    LARGE_M_QUANTS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -99,7 +97,6 @@ def test_fused_layout_gate():
     # A4W4 takes the small-input kernel on every layout; the large-input kernel stays A8W4.
     for layout in (V4_PRO, V41_FLASH_EP4, V41_FLASH_EP2, V41_FLASH_EP8):
         assert fused_layout_supported(**{**layout, "quant": "a4w4"})
-    assert set(FUSED_QUANTS) == {"a8w4", "a4w4"} and LARGE_M_QUANTS == ("a8w4",)
     for field, value in (
         ("arch", "gfx942"),
         ("world_size", 4),
@@ -773,18 +770,23 @@ def test_ep2_fused_configs_unchanged():
     assert digest == _EP2_FUSED_DIGEST, table
 
 
-# (world_size, experts_per_rank, model_dim, inter_dim) of the fused layouts.
 _ROUTED_LAYOUTS = {
-    "v4_pro_ep8": (8, 48, 7168, 3072),
-    "v41_flash_ep8": (8, 48, 5120, 2304),
-    "v41_flash_ep4": (4, 96, 5120, 2304),
-    "v41_flash_ep2": (2, 192, 5120, 2304),
+    "v4_pro_ep8": {
+        "world_size": 8,
+        "experts_per_rank": 48,
+        "model_dim": 7168,
+        "inter_dim": 3072,
+    },
+    "v41_flash_ep8": V41_FLASH_EP8_SHAPE,
+    "v41_flash_ep4": V41_FLASH_EP4_SHAPE,
+    "v41_flash_ep2": V41_FLASH_EP2_SHAPE,
 }
 
 
+@pytest.mark.parametrize("mtpr", (128, 8192))
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
-def test_routed_instance_routes(layout, quant):
+def test_routed_instance_routes(layout, quant, mtpr):
     """A routed instance (built offline, as the AOT replay does) serves up to 512 rows a rank through the
     small-input route for both quants; above that A8W4 takes the large-input route and A4W4 the staged one.
     The A4W4 small-input route sends FP4 payload rows and writes an FP8 GEMM1 output, which the shared GEMM1-output
@@ -793,10 +795,16 @@ def test_routed_instance_routes(layout, quant):
 
     from aiter.aot.flydsl import mega_moe as aot
     from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
+        group_major_capacity,
+    )
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import stage1_output_nbytes
 
-    world, epr, model_dim, inter_dim = _ROUTED_LAYOUTS[layout]
-    mtpr = 8192
+    shape = _ROUTED_LAYOUTS[layout]
+    world, epr = shape["world_size"], shape["experts_per_rank"]
+    model_dim, inter_dim = shape["model_dim"], shape["inter_dim"]
     job = {"experts_per_rank": epr, "model_dim": model_dim, "inter_dim": inter_dim}
     device = torch.device("cuda", 0)
     with dry_run(aot.ARCH, aot.NUM_CU, name=aot.DEVICE_NAME), aot._fake_shmem(device):
@@ -816,22 +824,59 @@ def test_routed_instance_routes(layout, quant):
             **aot._weights(job, device),
         )
     plan = moe._bundle_plan
-    assert plan.small_m_mtprs == DEFAULT_SMALL_M_MTPRS
-    assert plan.large_m == (quant == "a8w4") == (moe._large_m is not None)
+    small = small_m_mtprs_for(mtpr)
+    assert plan.small_m_mtprs == small
+    large = quant == "a8w4" and mtpr in large_m_mtprs_for(
+        world_size=world, model_dim=model_dim, inter_dim=inter_dim
+    )
+    assert plan.large_m == large == (moe._large_m is not None)
     row_bytes = model_dim // 2 if quant == "a4w4" else model_dim
     for runtime in moe._small_m_runtimes:
         assert runtime._s1_op.row_bytes == row_bytes
         assert runtime._s1_rx.shape[1] == row_bytes
         assert (
-            stage1_output_nbytes(runtime._s1_nvm, inter_dim)[0]
+            stage1_output_nbytes(runtime._s1_nvm, inter_dim, "fp8")[0]
             <= moe._s1_output_arena[0].numel()
         )
-    for max_tokens in (0, 1, 256, 257, 512, 513, 4096, mtpr):
+    # The shared payload arena holds exactly the largest of the routes that share it.
+    cfg = moe.comb_cfg
+    staged = group_major_capacity(
+        world_size=world,
+        hidden_dim=model_dim,
+        max_tok_per_rank=mtpr,
+        experts_per_rank=epr,
+        topk=6,
+        data_type=cfg.dispatch_dtype,
+        unit_size=cfg.gm_unit_size,
+        scale_dim=cfg.scale_dim,
+        scale_type_size=cfg.scale_type_size,
+        compact=cfg.gm_compact,
+        indexed_payload=cfg.gm_indexed_payload,
+    )
+    assert staged[2] == row_bytes
+    fused = {
+        "world_size": world,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": world * epr,
+        "topk": 6,
+    }
+    a_dtype = "fp4" if quant == "a4w4" else "fp8"
+    shared = [staged] + [
+        SmallMRuntime.payload_capacity(max_tok_per_rank=m, a_dtype=a_dtype, **fused)
+        for m in moe._small_m_shared
+    ]
+    if moe._large_m_shares_payload:
+        shared.append(LargeMRuntime.payload_capacity(max_tok_per_rank=mtpr, **fused))
+    assert moe._payload_arena.rx_bytes == max(rows * rb for _, rows, rb, _ in shared)
+    for max_tokens in (0, 1, 128, 129, 256, 257, 512, 513, 4096, mtpr):
+        if max_tokens > mtpr:
+            continue
         route, capacity = moe._route(min(max_tokens, 1), max_tokens)
-        if max_tokens <= 512:
+        if max_tokens <= small[-1]:
             assert route == ROUTE_SMALL_M, max_tokens
-            assert capacity == (256 if max_tokens <= 256 else 512)
-        elif quant == "a8w4":
+            assert capacity == min(m for m in small if m >= max_tokens)
+        elif large:
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
         else:
             assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens

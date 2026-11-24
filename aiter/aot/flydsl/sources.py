@@ -258,6 +258,7 @@ AOT_CACHES = {
         "sources": (
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
+            "kernels/quant_utils.py",
             "kernels/mega_moe/dispatch.py",
             "kernels/mega_moe/quant.py",
         ),
@@ -283,6 +284,7 @@ AOT_CACHES = {
             "kernels/flydsl_dispatch_combine_intranode_op.py",
             "kernels/layout_utils.py",
             "kernels/mxfp4_gemm_common.py",
+            "kernels/quant_utils.py",
             "kernels/mega_moe/dispatch.py",
             "kernels/mega_moe/gemm1.py",
             "kernels/mega_moe/gemm2.py",
@@ -291,6 +293,7 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_fused_gemm.py",
             "kernels/mega_moe/mega_moe_stage1.py",
             "kernels/mega_moe/mega_moe_stage2.py",
+            "kernels/mega_moe/quant.py",
             "kernels/mega_moe/weights.py",
         ),
         "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
@@ -304,6 +307,7 @@ AOT_CACHES = {
             "kernels/flydsl_dispatch_combine_intranode_op.py",
             "kernels/layout_utils.py",
             "kernels/mxfp4_gemm_common.py",
+            "kernels/quant_utils.py",
             "kernels/mega_moe/dispatch.py",
             "kernels/mega_moe/gemm1.py",
             "kernels/mega_moe/gemm2.py",
@@ -340,7 +344,9 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_stage2.py",
         ),
     },
-    "mega_moe_mx_quant": {},
+    "mega_moe_mx_quant": {
+        "sources": ("kernels/quant_utils.py",),
+    },
     "mega_moe_combine": {
         "sources": (
             "kernels/communication_ops_utils.py",

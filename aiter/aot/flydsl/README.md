@@ -101,11 +101,12 @@ variant of the profile's bundle plan.
   and the per-stage benchmarks launch it.
 - The instance builds every route of its plan. Where the layout supports the
   fused routes (`FUSED_LAYOUTS`: DeepSeek-V4-Pro EP8 and DeepSeek-V4.1-Flash
-  EP8 / EP4 / EP2, a8w4), `preload_aot_bundles()` also loads the small-input
-  kernel of every token bucket of each reachable small-input capacity (256 and
-  512), and, for an MTPR in `large_m_mtprs_for()` of the layout (1024..16384
-  for V4-Pro EP8 and V4.1-Flash EP8, 8192 and 16384 for V4.1-Flash EP4 and
-  EP2), the large-input persistent kernel. The default build covers the V4.1-Flash EP4,
+  EP8 / EP4 / EP2), `preload_aot_bundles()` also loads the small-input kernel
+  (a8w4 or a4w4) of every token bucket of each reachable small-input capacity
+  (256 and 512), and, for an a8w4 instance at an MTPR in `large_m_mtprs_for()`
+  of the layout (1024..16384 for V4-Pro EP8 and V4.1-Flash EP8, 8192 and 16384
+  for V4.1-Flash EP4 and EP2), the large-input persistent kernel; the
+  large-input route is a8w4 only. The default build covers the V4.1-Flash EP4,
   EP2 and EP8 profiles at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`:
   128, 8192, 16384; the large-input kernel at 8192 and 16384); one MTPR of the
   EP4 profile alone:
@@ -290,8 +291,9 @@ GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
 (`experts_per_rank=48/52/56`), Kimi-K3 (`experts_per_rank=112`) and
 DeepSeek-V4.1-Flash EP4 / EP2 / EP8 (`world_size=4/2/8`,
-`experts_per_rank=96/192/48`, a8w4, MTPR 128/8192/16384 unless `--mtpr` is
-given). The expert count is part of the
+`experts_per_rank=96/192/48`, MTPR 128/8192/16384 unless `--mtpr` is
+given), each for both quants (a8w4 and a4w4) unless `--quant` is given; a4w4
+doubles the V4.1-Flash jobs. The expert count is part of the
 compiled ABI, so one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments

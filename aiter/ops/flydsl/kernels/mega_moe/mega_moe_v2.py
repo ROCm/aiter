@@ -80,7 +80,6 @@ class MegaMoEV2:
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
-        self._quant = quant
         self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
         self._a_torch_dtype = (
             torch.float4_e2m1fn_x2
@@ -473,7 +472,7 @@ class MegaMoEV2:
                 if SmallMRuntime.ends_all_ranks(max_tok_per_rank=m, **fused)
             )
             for m in plan.small_m_mtprs:
-                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, quant=self._quant, **fused)
+                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, a_dtype=self._a_dtype, **fused)
                 route_outputs.append((capacity[0], "fp8"))
                 if m in self._small_m_shared:
                     capacities.append(capacity)

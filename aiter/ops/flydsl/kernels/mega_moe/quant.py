@@ -13,7 +13,9 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
 from aiter.ops.flydsl.aot_launch import aot_factory
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
+from ..quant_utils import emit_mx_e8m0_scale
 from ..tensor_shim import _run_compiled, buf_copy_atom, ptr_buf_tensor
 
 BLOCK = 64
@@ -22,6 +24,21 @@ GROUP = 32
 # fp32 bits of 1/max_pos for RoundUp ceil_pow2(amax/max_pos): fp4 max_pos=6, fp8 e4m3=448.
 _FP4_INV_MAX_POS_BITS = 0x3E2AAAAB
 _FP8_E4M3_INV_MAX_POS_BITS = 0x3B124925
+
+
+def pack_mx_fp4_words(act, e8m0):
+    """Pack f32 values (8 per i32 word) to FP4 E2M1 under the E8M0 scale ``e8m0``."""
+    dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+    words = []
+    for word in range_constexpr(len(act) // 8):
+        packed = fx.Int32(0)
+        for pair in range_constexpr(4):
+            idx = word * 8 + pair * 2
+            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32, packed, act[idx], act[idx + 1], dequant_scale, pair
+            )
+        words.append(packed)
+    return words
 
 
 def _load_i32x4(buffer, index):
@@ -48,13 +65,11 @@ def emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id):
         for elem in range_constexpr(8):
             act.append(values[elem])
 
-    working = (
-        local_max * fx.Int32(_FP8_E4M3_INV_MAX_POS_BITS).bitcast(fx.Float32)
-    ).bitcast(fx.Int32)
-    mantissa = working & fx.Int32(0x7FFFFF)
-    biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-    e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
-    e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
+    e8m0 = fx.Int32(
+        emit_mx_e8m0_scale(
+            local_max, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+        )
+    )
     scale_buf[group_id] = e8m0.to(fx.Uint8)
 
     quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
@@ -88,30 +103,14 @@ def emit_per_1x32_mx_fp4_group(in_buf, out_buf, scale_buf, group_id):
         for elem in range_constexpr(8):
             act.append(values[elem])
 
-    working = (local_max * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)).bitcast(
-        fx.Int32
+    e8m0 = fx.Int32(
+        emit_mx_e8m0_scale(
+            local_max, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP4_E2M1
+        )
     )
-    mantissa = working & fx.Int32(0x7FFFFF)
-    biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-    e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
-    e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
     scale_buf[group_id] = e8m0.to(fx.Uint8)
 
-    dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-    words = []
-    for word in range_constexpr(GROUP // 8):
-        packed = fx.Int32(0)
-        for pair in range_constexpr(4):
-            idx = word * 8 + pair * 2
-            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                packed,
-                act[idx],
-                act[idx + 1],
-                dequant_scale,
-                pair,
-            )
-        words.append(packed)
+    words = pack_mx_fp4_words(act, e8m0)
     _store_i32x4(out_buf, group_id, fx.Vector.from_elements(words, fx.Int32))
 
 
