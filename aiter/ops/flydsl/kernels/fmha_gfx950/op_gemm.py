@@ -4,15 +4,19 @@
 
 """The two GEMMs: QK^T and PV."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import probability_swap_pairs
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
+    _anchor_i32x8,
     _anchor_v_o,
 )
 
@@ -39,9 +43,10 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         )
 
     def _pack_fp8_i32x8(self, f32_vals):
+        """len(f32_vals) // 4 packed fp8 words (eight for a full P tile)."""
         c0 = llvm.mlir_poison(T.i32)
         words = []
-        for g in range_constexpr(8):
+        for g in range_constexpr(len(f32_vals) // 4):
             base = g * 4
             w = rocdl.cvt_pk_fp8_f32(
                 T.i32,
@@ -79,7 +84,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         return packs
 
     def _load_q_wide_global(self):
-        """Pull this lane's Q operands straight from global into VGPRs (head_dim > 128)."""
+        """Pull this lane's Q operands straight from global into VGPRs (head_dim > 128, or BN64)."""
         traits = self.traits
         d_base = self.lane_div_32 * 32
         packs = []
@@ -101,17 +106,51 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         q_all_wide = self._load_q_wide_lds() if q_wide is None else q_wide
         v_s_lo = self.c_zero_v16f32
         v_s_hi = self.c_zero_v16f32
-        for ws in range_constexpr(traits.HEAD_DIM // 64):
-            q_w = q_all_wide[ws]
-            v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_w, v_s_lo)
-            v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_w, v_s_hi)
         n_ds = const_expr(traits.HEAD_DIM // 64 * 4)
         n_mfma = const_expr(traits.HEAD_DIM // 64 * 2)
+        if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+            # Low strip's K steps first: its operands come in the first read group and the
+            # high strip's reads get two MFMAs to land instead of one.
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_all_wide[ws], v_s_lo)
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_all_wide[ws], v_s_hi)
+            if const_expr(traits.K_SHUFFLED and traits.CAUSAL):
+                # All K reads up front: no read waits behind an MFMA's issue. Non-causal shuffled
+                # spills with the extra live K operands.
+                rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds, 12)
+                rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, n_mfma, 12)
+                return (v_s_lo, v_s_hi)
+        else:
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                q_w = q_all_wide[ws]
+                v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_w, v_s_lo)
+                v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_w, v_s_hi)
         rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds // 2, 12)
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, 12)
         rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds // 2, 12)
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, n_mfma - 1, 12)
         return (v_s_lo, v_s_hi)
+
+    def qk_strip(self, k_strip, q_wide):
+        """S for one 32-key N-strip of load_k."""
+        v_s = self.c_zero_v16f32
+        for ws in range_constexpr(self.traits.HEAD_DIM // 64):
+            v_s = self._mfma_acc_fp8_wide(k_strip[ws], q_wide[ws], v_s)
+        return v_s
+
+    def qk_strip_if(self, k_loader, buf_id, q_wide, pred):
+        """qk_strip of the high strip under a uniform branch; the floor every tile max is clamped to otherwise."""
+        floor = fx.full(16, fx.Float32(self.c_neg_floor), fx.Float32).ir_value()
+
+        @flyc.jit
+        def _run():
+            v_s = floor
+            if pred:
+                v_s = self.qk_strip(k_loader.load_k_strip(buf_id, 1), q_wide)
+            return v_s
+
+        return _run()
 
     def cast_p_fp8_direct(self, v_p):
         lo_partial_list, hi_full = v_p
@@ -122,7 +161,54 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         for pks in range_constexpr(self.traits.PV_K_STEPS):
             p_base = pks * 8
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
-        return self._pack_fp8_i32x8(f32)
+        packed = self._pack_fp8_i32x8(f32)
+        if const_expr(self.k_rows_permuted()):
+            # K's permuted rows already put P in V's intact 16-token order (operand_layouts.k_row_permutation).
+            # The anchor keeps the fp8 packing from sinking past the V-read branch, which would keep P's fp32 live.
+            return _anchor_i32x8(packed)
+        if const_expr(self.traits.V_SHUFFLED):
+            # Match V's intact 16-token vectors after rounding P to fp8.
+            words = Vec(packed)
+            pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            reordered = []
+            pairs = probability_swap_pairs()
+            for i in range_constexpr(len(pairs)):
+                first, second = pairs[i]
+                # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
+                # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
+                # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at FlyDSL 0.5.0.
+                pair = rocdl.permlane32_swap(
+                    pair_ty,
+                    fx.as_ir_value(words[first]),
+                    fx.as_ir_value(words[second]),
+                    False,
+                    False,
+                )
+                reordered += [
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
+                ]
+            packed = Vec.from_elements(reordered, fx.Int32).ir_value()
+        return packed
+
+    def cast_p_fp8_half(self, v_p, half):
+        """Words [4 half, 4 half + 4) of cast_p_fp8_direct's packing, anchored; k_rows_permuted only.
+
+        Packing P in two anchored halves lets a caller place work (the V reads) between them, so half of
+        P's fp32 copy is dead before that work's results land.
+        """
+        lo_partial_list, hi_full = v_p
+        src = hi_full if half else lo_partial_list
+        f32 = []
+        for pks in range_constexpr(self.traits.PV_K_STEPS):
+            f32 += [src[pks * 8 + s] for s in range_constexpr(8)]
+        return Vec(_anchor_i32x8(self._pack_fp8_i32x8(f32)))
+
+    def join_p_fp8_halves(self, lo, hi):
+        return Vec.from_elements(
+            [lo[i] for i in range_constexpr(4)] + [hi[i] for i in range_constexpr(4)],
+            fx.Int32,
+        ).ir_value()
 
     def _pv_fp8_direct(self, p_fp8, v_v, v_o):
         v_o = _anchor_v_o(self.traits, v_o)

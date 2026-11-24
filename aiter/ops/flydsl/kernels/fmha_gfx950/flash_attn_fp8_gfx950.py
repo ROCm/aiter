@@ -6,10 +6,8 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.op_combine import (
@@ -34,6 +32,10 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+# conventional_bn64 wave priorities: K reads + QK above V reads + PV above softmax.
+BN64_QK_PRIO = 2
+BN64_PV_PRIO = 1
+
 
 def build_flash_attn_dualwave_swp_fp8_module(
     num_heads,
@@ -52,8 +54,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
     block_m=256,
     batch_interleave_group=1,
     return_lse=False,
+    paged=False,
+    kv_cache_layout="linear",
+    out_dtype="bf16",
+    body_variant="default",
+    gqa_pack_m=False,
+    batch_chunks=1,
+    interleaved=False,
+    o_staged=None,
+    o_store_nt=None,
 ):
-    """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K)."""
+    """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K).
+
+    conventional_bn64 only: ``batch_chunks`` (>= ceil((batch + 1) / 64)) sizes the on-device cu_seqlens_q scan, and
+    ``interleaved`` orders a uniform causal batch's q-blocks rank-major; both are compile-time. ``o_staged`` (None:
+    on wherever it applies) stages O through LDS for 1 KB contiguous stores; ``o_store_nt`` (None: follows
+    ``o_staged``) makes O stores non-temporal.
+    """
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -62,6 +79,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
     if head_dim_v is None:
         head_dim_v = head_dim
+    if paged and int(num_kv_splits) > 1:
+        raise NotImplementedError("paged split-K is not supported")
+    if out_dtype == "f16" and int(num_kv_splits) > 1:
+        # The split-K combine packs and decodes bf16 partials.
+        raise NotImplementedError("f16 output with split-K is not built yet")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -87,6 +109,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
         cross_seqlen=cross_seqlen,
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
+        paged=paged,
+        kv_cache_layout=kv_cache_layout,
+        out_dtype=out_dtype,
+        body_variant=body_variant,
+        gqa_pack_m=gqa_pack_m,
+        batch_chunks=batch_chunks,
+        interleaved=interleaved,
+        o_staged=o_staged,
+        o_store_nt=o_store_nt,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -96,6 +127,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     BATCH_INTERLEAVE_GROUP = traits.BATCH_INTERLEAVE_GROUP
     RETURN_LSE = traits.RETURN_LSE
+    # Scalar softmax FMAs and row-sum adds for conventional_bn64 (needs SLP off, see the llvm options below).
+    BN64_SCALAR_SOFTMAX = traits.BODY_VARIANT == "conventional_bn64"
+    # The bound test is the lazy threshold's test without the row max; eager rescale keeps the max-based fast loop.
+    BN64_MAX_FREE = BN64_SCALAR_SOFTMAX and traits.DUALWAVE_SWP_LAZY_RESCALE
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.DEFAULT_STRIDE_O_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
@@ -104,73 +139,84 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # fx.Array rejects a length of 0.
     _q_lds_elems = BLOCK_M * HEAD_DIM if traits.QLDS else 16
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-        vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
-        q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+    if traits.PAGED and traits.BODY_VARIANT != "conventional_bn64":
 
-    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_fp8_bn128_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,
-        Workspace: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        QDescale: fx.Tensor,
-        KDescale: fx.Tensor,
-        VDescale: fx.Tensor,
-        LSE: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        softmax_scale: fx.Float32,
-        lse_stride_h: fx.Int32,
-    ):
-        ctx = DualwaveFp8KernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            Workspace,
-            CuSeqQ,
-            CuSeqKv,
-            QDescale,
-            KDescale,
-            VDescale,
-            LSE,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            softmax_scale,
-            lse_stride_h,
-        )
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+            bt: fx.Array[fx.Int32, traits.PAGED_BT_LDS_SIZE, 16]
+
+    elif traits.BODY_VARIANT == "conventional_bn64":
+
+        # The staged O epilogue overlays each half of its tile on one ring buffer once the last tile is consumed.
+        # Two unions keep kv and vt distinct LDS objects, so the backend keeps their alias scopes: a K/V DMA into
+        # one ring buffer does not serialise ds_reads of the other. Each O half stays in bounds of its own object.
+        @fx.union
+        class KvOrOLo:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES // 2, 16]
+
+        @fx.union
+        class VtOrOHi:
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES // 2, 16]
+
+        @fx.struct
+        class SharedStorage:
+            ko: KvOrOLo
+            vo: VtOrOHi
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+
+    def _init_fwd_helpers(ctx):
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_lds(SharedStorage)
         ctx.init_thread_mapping()
-        if const_expr(traits.CAUSAL):
+        if const_expr(BN64_SCALAR_SOFTMAX):
+            # Descales first: they ride the sequence lookup's round trip instead of adding one before tile 0's DMAs.
+            ctx.issue_descale_loads()
+        elif const_expr(traits.CAUSAL):
+            # bn64's sequence lookup orders its q-blocks longest-first itself.
             ctx.init_causal_lpt_order()
         ctx.init_sequence_lengths()
         ctx.init_descriptors()
         ctx.init_atoms_and_lds_ptrs()
         ctx.init_dma_thread_offsets()
-        ctx.init_descale()
+        if const_expr(not BN64_SCALAR_SOFTMAX):
+            ctx.init_descale()
         ctx.init_tile_bounds()
-        ctx.init_workspace_io()
+        if const_expr(traits.BODY_VARIANT == "default"):
+            ctx.init_workspace_io()
 
-        q_loader = DualwaveFp8QLoader(ctx)
-        gemm_helper = DualwaveFp8GemmHelper(ctx)
-        softmax_helper = DualwaveFp8SoftmaxHelper(ctx)
-        kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
-        output_store = DualwaveFp8StoreHelper(ctx)
+        return (
+            DualwaveFp8QLoader(ctx),
+            DualwaveFp8GemmHelper(ctx),
+            DualwaveFp8SoftmaxHelper(ctx),
+            DualwaveFp8KvGmemToLdsLoader(ctx),
+            DualwaveFp8KvLdsToVgprLoader(ctx),
+            DualwaveFp8StoreHelper(ctx),
+        )
+
+    @flyc.jit
+    def _fwd_body(ctx):
+        (
+            q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
 
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
@@ -188,7 +234,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         def _phase_bar():
             _waitcnt_vm_n(DMA_PER_ITER)
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             rocdl.sched_barrier(0)
 
         def _softmax_part(v_s, l_row, m_new):
@@ -236,27 +282,38 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             q_row, q_wide = None, None
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % NPF_I)
+        pages = [None] * 4
+        if const_expr(traits.PAGED):
+            kv_gmem_to_lds.load_block_table_to_lds()
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            fx.gpu.barrier()
+            pages = kv_gmem_to_lds.end_page_ids(
+                kv_gmem_to_lds.begin_page_ids(
+                    [fx.Index(t0) + i for i in range_constexpr(4)]
+                )
+            )
+
+        kv_gmem_to_lds.load_k(t0 * BN, t0 % NPF_I, pages[0])
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             q_row, q_wide = _load_q_regs()
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % NPF_I)
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % NPF_I)
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % NPF_I)
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % NPF_I)
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % NPF_I)
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % NPF_I)
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % NPF_I)
+        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % NPF_I, pages[1])
+        kv_gmem_to_lds.load_v(t0 * BN, t0 % NPF_I, pages[0])
+        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % NPF_I, pages[1])
+        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % NPF_I, pages[2])
+        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % NPF_I, pages[3])
+        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % NPF_I, pages[2])
+        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % NPF_I, pages[3])
         if const_expr(traits.QLDS):
-            rocdl.s_waitcnt(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         else:
             _waitcnt_vm_n(DMA_PER_ITER)
         rocdl.sched_barrier(0)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
         rocdl.sched_barrier(0)
 
         if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
@@ -291,17 +348,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
             f_a_buf = _ring_wrap(a_buf + 4)
             f_b_buf = _ring_wrap(a_buf + 5)
 
+            future_pages = [None, None]
+            if const_expr(traits.PAGED):
+                future_pages = kv_gmem_to_lds.end_page_ids(
+                    kv_gmem_to_lds.begin_page_ids([j + 4, j + 5])
+                )
+
             v_k_a = kv_lds_to_regs.load_k(a_buf)
             v_k_b = kv_lds_to_regs.load_k(b_buf)
 
             v_s_a = gemm_helper.qk(v_k_a, q_wide)
             v_s_b = gemm_helper.qk(v_k_b, q_wide)
-            v_v_a = kv_lds_to_regs.load_v(a_buf)
+            v_v_a = kv_lds_to_regs.load_v(a_buf, j * BN if traits.V_SHUFFLED else None)
 
-            kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf)
-            kv_gmem_to_lds.load_k((j + 5) * BN, f_b_buf)
-            kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf)
-            kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf)
+            kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf, future_pages[0])
+            kv_gmem_to_lds.load_k((j + 5) * BN, f_b_buf, future_pages[1])
+            kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf, future_pages[0])
+            kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf, future_pages[1])
 
             _phase_bar()
             _pp_prio(0)
@@ -314,7 +377,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_p_a, l_row = _softmax_part(v_s_a, l_row, m_new)
             _phase_bar()
             _pp_prio(1)
-            v_v_b = kv_lds_to_regs.load_v(b_buf)
+            v_v_b = kv_lds_to_regs.load_v(
+                b_buf, (j + 1) * BN if traits.V_SHUFFLED else None
+            )
             v_o = _pv_part(v_p_a, v_v_a, v_o)
             _phase_bar()
             _pp_prio(0)
@@ -329,18 +394,419 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
-        inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+        # No stable approximate-reciprocal API at FlyDSL 0.5.0: 1.0 / x lowers to arith.divf (IEEE).
+        inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
         inv_l = inv_l * ctx.vd_fp8
         softmax_helper.scale_o(v_o, inv_l)
-        rocdl.s_barrier()
+        fx.gpu.barrier()
         if const_expr(not SPLITK):
             output_store.store_final_o(v_o, q_row, m_row, l_row)
         else:
             output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
             output_store.store_empty_split()
+
+    @flyc.jit
+    def _conventional_bn64_body(ctx):
+        (
+            _q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
+        BN = traits.BLOCK_N
+        D_CHUNKS = traits.D_CHUNKS
+        t0 = fx.Int64(ctx.split_t0)
+        t_end = fx.Int64(ctx.split_t_end)
+
+        # Tile 0's page came with the sequence lookup; each later page is one scalar load ahead of its DMA.
+        page = fx.Int64(ctx.page0)
+        # Tile 0's K/V DMAs ahead of Q's global loads: the first barrier's vmcnt(0) waits on the slowest of them.
+        kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
+        kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0), page)
+        next_page = ctx.page_id_smem(t0 + fx.Int64(1))
+        # Q comes straight from global (no LDS stage) so 3 WGs fit per CU.
+        ctx.init_q_row()
+        q_row = ctx.q_row
+        q_wide = gemm_helper.load_q_wide()
+        # The logit scale's readfirstlane after tile 0's DMAs and Q's loads issue, so no descale wait precedes them.
+        ctx.init_descale()
+        # Helpers copied the context before the descales existed.
+        for helper in (gemm_helper, softmax_helper, kv_lds_to_regs, output_store):
+            helper.c_logit_scale = ctx.c_logit_scale
+            helper.vd_fp8 = ctx.vd_fp8
+
+        # Carries nsm = bias - scale * m (not m) and l as this lane's half-row sum.
+        nsm = softmax_helper.nsm_init()
+        l_row = ctx.c_zero_f
+        v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+        # The next tile's page rides the loop carry as an SGPR.
+        init_args = [nsm, l_row] + v_o + [next_page]
+        loop_results = init_args
+
+        def _bn64_prio(v):
+            # sched_barrier keeps the priority switch at its phase boundary.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.sched_barrier(0)
+                _s_setprio(v)
+                rocdl.sched_barrier(0)
+
+        def _tile_top():
+            # Publish the prefetched tile and release the slot all waves last read.
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            # Keep the scheduler from moving LDS accesses across the barrier; FlyDSL 0.5.0 exports no stable equivalent.
+            rocdl.sched_barrier(0)
+            fx.gpu.barrier()
+            # Same fence after the barrier; no stable sched_barrier equivalent in FlyDSL 0.5.0.
+            rocdl.sched_barrier(0)
+            # The just-synchronised WG gets the SIMDs for its K reads and QK so its waves reach the next barrier together.
+            _bn64_prio(BN64_QK_PRIO)
+
+        def _tile_softmax_pv(j, loop_args, buf, v_s, masked, hi_vis=None):
+            nsm = loop_args[0]
+            l_row = loop_args[1]
+            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(masked):
+                if const_expr(traits.CAUSAL):
+                    v_s = softmax_helper.causal_mask_diag(v_s, fx.Int32(j), hi_vis)
+                else:
+                    v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
+            m_half = softmax_helper.half_row_max(v_s)
+            if const_expr(traits.DUALWAVE_SWP_LAZY_RESCALE):
+                v_o, nsm, l_row = softmax_helper.lazy_correct_o_nsm(
+                    v_o, nsm, l_row, m_half
+                )
+            else:
+                v_o, nsm, l_row = softmax_helper.rebase_nsm(v_o, nsm, l_row, m_half)
+            v_s = softmax_helper.sub_nsm(v_s, nsm, BN64_SCALAR_SOFTMAX)
+            # A skipped high strip's floor scores exp to exactly 0; branching its exps away costs ~12 VGPRs.
+            v_p = softmax_helper.exp2(v_s, 0)
+            v_p = softmax_helper.exp2(v_p, 16)
+            # Past its exps a wave feeds the matrix pipe (V reads, PV); waves still in softmax yield to it.
+            # Held to the next barrier.
+            _bn64_prio(BN64_PV_PRIO)
+            # Row sum before PV so P's fp32 copy dies before the V reads (3 waves/SIMD budget).
+            l_row = softmax_helper.half_row_sum(l_row, v_p, BN64_SCALAR_SOFTMAX)
+            v_p = gemm_helper.cast_p_fp8_direct(v_p)
+            if const_expr(not masked):
+                # Without the general loop's full-tile branch the V reads would hoist into the softmax and spill.
+                rocdl.sched_barrier(0)
+            # A fast tile is full, so its V needs no invalid-token masking.
+            v_v = kv_lds_to_regs.load_v(
+                buf,
+                j * BN if traits.V_SHUFFLED else None,
+                full=not masked,
+            )
+            if const_expr(not traits.V_SHUFFLED):
+                # Inline transpose reads are invisible to LLVM's wait insertion.
+                rocdl.s_waitcnt(lgkmcnt=0)
+            v_o = gemm_helper.pv(v_p, v_v, v_o)
+            return [nsm, l_row] + v_o
+
+        # Fast tiles [t0, t_main) are full, prefetch a real tile and need no mask. Causal: tile j ends at or below
+        # the block's first row's diagonal (64 j + 63 <= q_start + delta), so every row sees all its keys, and
+        # q_start + delta < seqlen_kv (active block) makes it full. Non-causal: every tile but the last is full.
+        # The general loop finishes the rest: the last tile, and causal diagonal tiles.
+        t_main = t_end - fx.Int64(1)
+        if const_expr(traits.CAUSAL):
+            diag_first = fx.Int32(ctx.q_start) + ctx.delta_i32 + fx.Int32(1)
+            diag_first = (diag_first > fx.Int32(0)).select(diag_first, fx.Int32(0))
+            t_full = fx.Int64(fx.arith.shrui(diag_first, fx.Int32(BN.bit_length() - 1)))
+            t_main = (t_main < t_full).select(t_main, t_full)
+        t_main = (t_main > t0).select(t_main, t0)
+
+        def _fast_softmax_pv(j, loop_args, buf, v_s, first):
+            """Max-free softmax (softmax_helper.merged_test_rebase): no row max unless a tile fails the bound test."""
+            nsm = loop_args[0]
+            l_row = loop_args[1]
+            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(first is not None):
+                nsm = softmax_helper.first_tile_offset(v_s, nsm, first)
+            p_lo, p_hi, l_tile, mb = softmax_helper.exp_and_bound(v_s, nsm)
+            _bn64_prio(BN64_PV_PRIO)
+
+            def _recompute_s():
+                # K is still in this tile's LDS buffer: no barrier since the first read.
+                return gemm_helper.qk(kv_lds_to_regs.load_k(buf), q_wide)
+
+            v_o, nsm, l_row, p_lo, p_hi, l_tile = softmax_helper.merged_test_rebase(
+                v_o, nsm, l_row, p_lo, p_hi, l_tile, mb, _recompute_s
+            )
+            # Anchored so the sum, and P's fp32 copy, die before the V reads.
+            l_row = softmax_helper.anchor_scalar_f32(fx.Float32(l_row) + l_tile)
+            p_lists = softmax_helper.v_s_vec_to_lists((p_lo, p_hi))
+            if const_expr(traits.V_SHUFFLED and traits.CAUSAL):
+                # V's LDS reads between P's two fp8 packing halves, so the second half's conversions cover their
+                # latency before PV's first wait. Packing all of P after the reads kept its fp32 copy live under V
+                # and spilled (168 VGPRs, 56 B scratch); the anchored first half frees 16 of those first. Drained
+                # first: a pending LDS read would make PV's partial waits lgkmcnt(0).
+                # Non-causal measured no gain (0.997).
+                rocdl.s_waitcnt(lgkmcnt=0)
+                p_lo8 = gemm_helper.cast_p_fp8_half(p_lists, 0)
+                # Raw rocdl op: no sched_barrier wrapper in FlyDSL 0.5.0 (only sched_mfma/vmem/dsrd/dswr).
+                rocdl.sched_barrier(0)
+                v_v = kv_lds_to_regs.load_v(buf, j * BN, full=True)
+                v_p = gemm_helper.join_p_fp8_halves(
+                    p_lo8, gemm_helper.cast_p_fp8_half(p_lists, 1)
+                )
+            else:
+                v_p = gemm_helper.cast_p_fp8_direct(p_lists)
+                # Raw rocdl op: no sched_barrier wrapper in FlyDSL 0.5.0.
+                rocdl.sched_barrier(0)
+                v_v = kv_lds_to_regs.load_v(
+                    buf, j * BN if traits.V_SHUFFLED else None, full=True
+                )
+            if const_expr(not traits.V_SHUFFLED):
+                # Inline transpose reads are invisible to LLVM's wait insertion.
+                rocdl.s_waitcnt(lgkmcnt=0)
+            v_o = gemm_helper.pv(v_p, v_v, v_o)
+            return [nsm, l_row] + v_o
+
+        def _fast_tile(j, loop_args, buf, next_buf, first=None):
+            _tile_top()
+            # pf <= t_main < t_end: a real tile, so no prefetch branch. pf < t_main is full; pf == t_main may be
+            # partial (or causal-masked) only in its K tail, which the general loop masks, so K skips the tail sentinel.
+            pf = j + fx.Int64(1)
+            page = fx.Int64(loop_args[2 + D_CHUNKS])
+            kv_gmem_to_lds.load_k(pf * BN, next_buf, page, real_tile=True, full=True)
+            kv_gmem_to_lds.load_v(pf * BN, next_buf, page, real_tile=True)
+            # As the general loop's prefetch branch: keep the DMA address math out of QK.
+            rocdl.sched_barrier(0)
+            v_k = kv_lds_to_regs.load_k(buf)
+            v_s = gemm_helper.qk(v_k, q_wide)
+            # Stands in for the mask branch: the max/exp would otherwise interleave into QK and spill Q.
+            rocdl.sched_barrier(0)
+            # The page two tiles ahead after QK, so K's LDS-read waits do not also wait on it; it lands in the
+            # softmax. j + 2 >= 2 needs no lower clamp.
+            pf_page = ctx.page_id_smem(j + fx.Int64(2), lower_clamp=False)
+            _bn64_prio(0)
+            if const_expr(BN64_MAX_FREE):
+                out = _fast_softmax_pv(j, loop_args, buf, v_s, first)
+            else:
+                out = _tile_softmax_pv(j, loop_args, buf, v_s, False)
+            return out + [pf_page]
+
+        # Unrolled by two over a unit-step pair counter: t0 is 0 (bn64 has no split-K), so pair halves read the
+        # fixed LDS buffers 0 and 1. An odd leftover tile runs the dynamic body once.
+        n_pairs = fx.Int64(fx.arith.shrui(fx.Int32(t_main), fx.Int32(1)))
+        pair_results = init_args
+        for p, loop_args in range(t0, n_pairs, fx.Int64(1), init=init_args):
+            j = fx.Int64(p) * fx.Int64(2)
+            args = _fast_tile(j, list(loop_args), 0, 1, j == t0)
+            args = _fast_tile(j + fx.Int64(1), args, 1, 0)
+            pair_results = yield args
+        init_args = list(pair_results)
+        fast_results = init_args
+        for j, loop_args in range(
+            n_pairs * fx.Int64(2), t_main, fx.Int64(1), init=init_args
+        ):
+            j = fx.Int64(j)
+            buf = fx.Int32(j) % fx.Int32(2)
+            fast_results = yield _fast_tile(
+                j, loop_args, buf, fx.Int32(1) - buf, j == t0
+            )
+
+        init_args = list(fast_results)
+        loop_results = init_args
+        for j, loop_args in range(t_main, t_end, fx.Int64(1), init=init_args):
+            j = fx.Int64(j)
+            buf = fx.Int32(j) % fx.Int32(2)
+            next_buf = fx.Int32(1) - buf
+            _tile_top()
+            pf = j + fx.Int64(1)
+            prefetch_page = fx.Int64(loop_args[2 + D_CHUNKS])
+            if pf < t_end:
+                prefetch_loader = kv_gmem_to_lds
+                prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
+                prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
+            if const_expr(traits.CAUSAL):
+                # A wave whose last row sees no key of the high 32-key strip skips its K reads, MFMAs and
+                # mask; the floor scores leave the max alone and P there is exactly 0.
+                wave_tokens = traits.ROWS_PER_WAVE
+                if const_expr(traits.GQA_PACK_M):
+                    wave_tokens = traits.ROWS_PER_WAVE // traits.GQA_GROUP_SIZE
+                hi_vis = ctx.q_start_pos_i32 + ctx.delta_i32 + fx.Int32(
+                    wave_tokens - 1
+                ) >= fx.Int32(j * BN) + fx.Int32(BN // 2)
+                v_s_lo = gemm_helper.qk_strip(
+                    kv_lds_to_regs.load_k_strip(buf, 0), q_wide
+                )
+                v_s = (
+                    v_s_lo,
+                    gemm_helper.qk_strip_if(kv_lds_to_regs, buf, q_wide, hi_vis),
+                )
+            else:
+                hi_vis = None
+                v_k = kv_lds_to_regs.load_k(buf)
+                v_s = gemm_helper.qk(v_k, q_wide)
+            pf_page = ctx.page_id_smem(j + fx.Int64(2), lower_clamp=False)
+            _bn64_prio(0)
+            loop_results = yield _tile_softmax_pv(
+                j, loop_args, buf, v_s, True, hi_vis
+            ) + [pf_page]
+        l_row = softmax_helper.finish_half_row_sum(loop_results[1])
+        v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+        _bn64_prio(0)
+        # No stable approximate-reciprocal API at FlyDSL 0.5.0: 1.0 / x lowers to arith.divf (IEEE).
+        inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
+        inv_l = fx.Float32(
+            (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+        )
+        softmax_helper.scale_o(v_o, inv_l * ctx.vd_fp8)
+        # Paged has no LSE, so the epilogue needs neither m nor l.
+        output_store.store_final_o(v_o, q_row)
+
+    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_fp8_bn128_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        Workspace: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        QDescale: fx.Tensor,
+        KDescale: fx.Tensor,
+        VDescale: fx.Tensor,
+        LSE: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        softmax_scale: fx.Float32,
+        lse_stride_h: fx.Int32,
+    ):
+        ctx = DualwaveFp8KernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            Workspace,
+            CuSeqQ,
+            CuSeqKv,
+            QDescale,
+            KDescale,
+            VDescale,
+            LSE,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            softmax_scale,
+            lse_stride_h,
+        )
+        _fwd_body(ctx)
+
+    if traits.PAGED:
+
+        @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+        def flash_attn_dualwave_swp_fp8_paged_kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+        ):
+            ctx = DualwaveFp8KernelContext(
+                traits,
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable=BlockTable,
+                block_table_stride=block_table_stride,
+            )
+            _fwd_body(ctx)
+
+    if BN64_SCALAR_SOFTMAX:
+
+        # One name per compile-time grid mapping, so dumps and AOT artifacts stay distinguishable.
+        @flyc.kernel(
+            name=(
+                "flash_attn_dualwave_swp_fp8_paged_bn64_kernel"
+                f"_bc{traits.BATCH_CHUNKS}_il{int(traits.INTERLEAVED)}"
+            ),
+            known_block_size=[BLOCK_SIZE, 1, 1],
+        )
+        def flash_attn_dualwave_swp_fp8_paged_bn64_kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+            batch_size: fx.Int32,
+        ):
+            ctx = DualwaveFp8KernelContext(
+                traits,
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable=BlockTable,
+                block_table_stride=block_table_stride,
+                batch_size=batch_size,
+            )
+            _conventional_bn64_body(ctx)
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
     # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
@@ -472,11 +938,177 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 stream=stream,
             )
 
+    if traits.PAGED:
+
+        @flyc.jit
+        def launch_flash_attn_dualwave_swp_paged(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            batch_size: fx.Int32,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
+        ):
+            bs_idx = fx.Index(batch_size)
+            sl_idx = fx.Index(seq_len)
+            num_q_blocks = (sl_idx + BLOCK_M - 1) // BLOCK_M
+            grid_heads = NUM_HEADS_Q
+            if const_expr(traits.GQA_PACK_M):
+                block_q = BLOCK_M // traits.GQA_GROUP_SIZE
+                num_q_blocks = (sl_idx + block_q - 1) // block_q
+                grid_heads = traits.NUM_HEADS_KV
+            if const_expr(SPLITK):
+                grid_z = bs_idx * NUM_KV_SPLITS
+            elif const_expr(BATCH_INTERLEAVE_GROUP > 1):
+                grid_z = bs_idx // BATCH_INTERLEAVE_GROUP
+            else:
+                grid_z = bs_idx
+
+            passthrough_entries = (
+                [
+                    ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                    ["no-nans-fp-math", "true"],
+                    ["unsafe-fp-math", "true"],
+                ]
+                if const_expr(daz)
+                else None
+            )
+            flash_attn_dualwave_swp_fp8_paged_kernel(
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable,
+                block_table_stride,
+                value_attrs={
+                    "rocdl.waves_per_eu": 1,
+                    "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
+                    "passthrough": passthrough_entries,
+                },
+            ).launch(
+                grid=(grid_heads * BATCH_INTERLEAVE_GROUP, num_q_blocks, grid_z),
+                block=(BLOCK_SIZE, 1, 1),
+                stream=stream,
+            )
+
+        launch_flash_attn_dualwave_swp = launch_flash_attn_dualwave_swp_paged
+
+    if BN64_SCALAR_SOFTMAX:
+
+        @flyc.jit
+        def launch_flash_attn_dualwave_swp_paged_bn64(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            batch_size: fx.Int32,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+            total_q: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
+        ):
+            passthrough_entries = (
+                [
+                    ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                    ["no-nans-fp-math", "true"],
+                    ["unsafe-fp-math", "true"],
+                ]
+                if const_expr(daz)
+                else None
+            )
+            # Compact 1D grid over (slot, KV head): total_q // block_q + batch slots cover every sequence's
+            # q-blocks (pipeline._init_compact_sequence). It depends only on total_q and the batch size, so a
+            # captured graph stays valid for any cu_seqlens_q with the same totals. Grid x avoids y's 65535 cap.
+            # No XCD remap: the K/V a q-block reuses is its sequence's page set, which on a prefill is far larger
+            # than L2 per XCD, so co-locating sibling q-blocks was not expected to cut HBM traffic; a remap would
+            # also break the longest-first dispatch order the slot order encodes. Not A/B measured.
+            block_q = BLOCK_M // traits.GQA_GROUP_SIZE
+            num_slots = fx.Index(total_q) // block_q + fx.Index(batch_size)
+            flash_attn_dualwave_swp_fp8_paged_bn64_kernel(
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable,
+                block_table_stride,
+                batch_size,
+                value_attrs={
+                    # BN64 fits 3 waves/SIMD (<=168 VGPR, 3 WGs of LDS per CU).
+                    "rocdl.waves_per_eu": 3,
+                    "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
+                    "passthrough": passthrough_entries,
+                },
+            ).launch(
+                grid=(traits.NUM_HEADS_KV * num_slots, 1, 1),
+                block=(BLOCK_SIZE, 1, 1),
+                stream=stream,
+            )
+
+        launch_flash_attn_dualwave_swp = launch_flash_attn_dualwave_swp_paged_bn64
+
     _dualwave_swp_llvm_options = {
         "enable-post-misched": False,
         "lsr-drop-solution": True,
         "disable-machine-sink": True,
     }
+    if BN64_SCALAR_SOFTMAX:
+        # Keeps SLP from re-packing the scalar softmax into v_pk ops, which wait for the matrix pipe. Per variant:
+        # the option is global LLVM state for the compile, and the default body's ISA must not change.
+        _dualwave_swp_llvm_options["slp-threshold"] = 100000
 
     _dualwave_swp_compile_hints = {
         "fast_fp_math": True,
@@ -504,6 +1136,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_descale=None,
         lse=None,
         lse_stride_h=0,
+        block_table=None,
+        block_table_stride=None,
+        total_q=None,
         stream=None,
     ):
         """Normalise the launch arguments shared by the run and compile paths."""
@@ -525,17 +1160,45 @@ def build_flash_attn_dualwave_swp_fp8_module(
             raise ValueError(
                 "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
             )
-        # O is bf16 and would be corrupted by the fp32 LSE stores. lse_stride_h
-        # sizes the LSE buffer descriptor, so leaving it at 0 gives num_records=0
-        # and the hardware silently drops every LSE store.
+        # O contains 16-bit output, not fp32 LSE. A nonzero lse_stride_h is required
+        # to bound the LSE descriptor.
         if RETURN_LSE and (lse is None or not lse_stride_h):
             raise ValueError(
                 "return_lse=True requires a fp32 lse tensor and a non-zero "
                 f"lse_stride_h, got lse={'None' if lse is None else 'tensor'}, "
                 f"lse_stride_h={lse_stride_h}"
             )
+        if traits.PAGED:
+            if block_table is None or cu_seqlens_q is None or cu_seqlens_kv is None:
+                raise ValueError(
+                    "paged requires block_table, cu_seqlens_q and per-sequence KV lengths"
+                )
+            if seq_len_kv > traits.PAGED_BT_LDS_SIZE * traits.BLOCK_N:
+                raise ValueError(
+                    "paged KV length exceeds the 2048-page LDS block-table limit"
+                )
+            if block_table_stride is None:
+                block_table_stride = block_table.stride(0)
+            # bn64's router declines a narrow table (_shapes_ok); the default body stages a row into LDS.
+            if not BN64_SCALAR_SOFTMAX and block_table_stride < -(
+                -seq_len_kv // traits.BLOCK_N
+            ):
+                raise ValueError(
+                    "block_table_stride is smaller than the maximum KV page count"
+                )
+            if BN64_SCALAR_SOFTMAX:
+                if total_q is None:
+                    raise ValueError(
+                        "conventional_bn64 requires total_q (query rows, q.shape[0])"
+                    )
+                if batch_size + 1 > traits.BATCH_CHUNKS * 64:
+                    raise ValueError(
+                        f"batch_size={batch_size} needs batch_chunks >= "
+                        f"{-(-(batch_size + 1) // 64)}, built with {traits.BATCH_CHUNKS}"
+                    )
+
         ws = workspace if SPLITK else O
-        return (
+        args = (
             Q,
             K,
             V,
@@ -556,18 +1219,22 @@ def build_flash_attn_dualwave_swp_fp8_module(
             lse_stride_h,
             fx.Stream(stream),
         )
+        if traits.PAGED:
+            paged_args = (block_table, block_table_stride)
+            if BN64_SCALAR_SOFTMAX:
+                paged_args += (total_q,)
+            args = args[:-1] + paged_args + (args[-1],)
+        return args
+
+    # Hints ride the launcher (public JitFunction attribute) instead of a
+    # CompilationContext scope around each call.
+    launch_flash_attn_dualwave_swp.compile_hints = dict(_dualwave_swp_compile_hints)
 
     def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return _run_compiled(
-                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
-            )
+        return _run_compiled(launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs))
 
     def _compile(*args, **kwargs):
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            return flyc.compile(
-                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
-            )
+        return flyc.compile(launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs))
 
     _launch.compile = _compile
 
