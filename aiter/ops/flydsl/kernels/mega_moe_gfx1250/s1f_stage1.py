@@ -616,9 +616,7 @@ def make_s1f_stage1(
     # npes>8 moves rows into bits [31:24]. Those stay signed-positive only
     # through 127, and a tile that wide is also more than one flag tile.
     if npes > 8 and int(tile_m) > 127:
-        raise ValueError(
-            f"npes={npes} packs a tile's rows in 8 bits, tile_m={tile_m}"
-        )
+        raise ValueError(f"npes={npes} packs a tile's rows in 8 bits, tile_m={tile_m}")
     if 4 * npes > FLAG_STRIDE:
         raise ValueError("a tile's flag slot holds one i32 per source")
     # One b128 covers 4 sources. npes>4 polls with one lane per source, and
@@ -1826,8 +1824,7 @@ def make_s1f_stage1(
                         dtype=fx.Int32,
                     )
                 chunks = [
-                    _b128(base + fx.Int32(4 * i))
-                    for i in range((int(npes) + 3) // 4)
+                    _b128(base + fx.Int32(4 * i)) for i in range((int(npes) + 3) // 4)
                 ]
                 elems = []
                 for ch in chunks:
