@@ -3661,7 +3661,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       
       const int32_t num_vecs = (size + vec_size_i - 1) / vec_size_i;
       const int32_t num_kv_vecs = (kv_lora_dim * num_kv_heads + vec_size_i - 1) / vec_size_i;
-      const uint32_t kv_lora_vec = 64;//kv_lora_dim / vec_size_o;
+      const uint32_t kv_lora_vec = kv_lora_dim / vec_size_o;
       
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
       // Reduced vector registers: only use two vectors total (reuse for both Q and K)
