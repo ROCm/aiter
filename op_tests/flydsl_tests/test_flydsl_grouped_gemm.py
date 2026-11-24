@@ -768,6 +768,29 @@ def test_shared_expert_byte_accounting(
     assert work["gemm2"] == (2359296, gemm2_bytes)
 
 
+@pytest.mark.parametrize("tokens", [1, 16])
+@pytest.mark.parametrize("balanced", [False, True])
+def test_shared_expert_routing(tokens, balanced, monkeypatch):
+    """The shared expert sees every token without diluting routed weights."""
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_EXPERT_BALANCE", balanced)
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 0)
+    hidden = torch.zeros((tokens, 256), dtype=torch.bfloat16)
+    ids, weights = _make_topk(hidden, experts=65, topk=9, shared_experts=1)
+    assert ids.shape == weights.shape == (tokens, 9)
+    assert torch.all(ids[:, -1] == 64)
+    assert torch.all(weights[:, -1] == 1)
+    routed = ids[:, :8]
+    assert torch.all((routed >= 0) & (routed < 64))
+    ordered = routed.sort(dim=1).values
+    assert torch.all(ordered[:, 1:] != ordered[:, :-1])
+    torch.testing.assert_close(weights[:, :8].sum(dim=1), torch.ones(tokens))
+    if balanced:
+        counts = torch.bincount(routed.flatten().long(), minlength=64)
+        assert int(counts.max() - counts.min()) <= 1
+        assert int(torch.count_nonzero(counts)) == min(tokens * 8, 64)
+    assert _active_expert_count(ids) == int(torch.unique(ids).numel())
+
+
 @pytest.mark.parametrize(
     "ids, expected",
     [([[0, 1], [1, 0]], 2), ([[7, 7], [-1, 2]], 2), ([[-1, -1]], 0)],
@@ -967,29 +990,6 @@ def run_moe(
         metrics["gemm1_us"] = g1
         metrics["gemm2_us"] = g2
     return metrics
-
-
-@pytest.mark.parametrize("tokens", [1, 16])
-@pytest.mark.parametrize("balanced", [False, True])
-def test_shared_expert_routing(tokens, balanced, monkeypatch):
-    """The shared expert sees every token without diluting routed weights."""
-    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_EXPERT_BALANCE", balanced)
-    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 0)
-    hidden = torch.zeros((tokens, 256), dtype=torch.bfloat16)
-    ids, weights = _make_topk(hidden, experts=65, topk=9, shared_experts=1)
-    assert ids.shape == weights.shape == (tokens, 9)
-    assert torch.all(ids[:, -1] == 64)
-    assert torch.all(weights[:, -1] == 1)
-    routed = ids[:, :8]
-    assert torch.all((routed >= 0) & (routed < 64))
-    ordered = routed.sort(dim=1).values
-    assert torch.all(ordered[:, 1:] != ordered[:, :-1])
-    torch.testing.assert_close(weights[:, :8].sum(dim=1), torch.ones(tokens))
-    if balanced:
-        counts = torch.bincount(routed.flatten().long(), minlength=64)
-        assert int(counts.max() - counts.min()) <= 1
-        assert int(torch.count_nonzero(counts)) == min(tokens * 8, 64)
-    assert _active_expert_count(ids) == int(torch.unique(ids).numel())
 
 
 # model_dim=512 (not the 256 default): the grouped kernel needs

@@ -260,12 +260,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_prefill = bool(
         persistent_workers
         and _supports_clustered_persistent(
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            num_buffers,
+            (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers),
             a_is_fp4,
             a_preshuffled,
             stage1_act,
@@ -364,32 +359,20 @@ def flydsl_grouped_gemm_a8w4_masked(
     # Paired gfx1250 profiling favors Tensor packing for clustered workers.
     # Only the base address reaches the kernel; extents use the explicit sizes.
     # Small views retain main's large-buffer ABI and pitched/offset support.
-    if persistent_prefill:
-        c_arg, sa_arg, sb_arg, qs_arg, ep_arg = (
-            _bounded_buffer_arg(tensor, dtype, True)
-            for tensor, dtype in (
-                (out, out_dtype),
-                (a_scales, fx.Int32),
-                (w_scales, fx.Int32),
-                (quant_scale_tensor, None),
-                (ep_row_map_tensor, fx.Int32),
-            )
+    c_arg, sa_arg, sb_arg, qs_arg, ep_arg = buffer_args = tuple(
+        _bounded_buffer_arg(tensor, dtype, persistent_prefill)
+        for tensor, dtype in (
+            (out, out_dtype),
+            (a_scales, fx.Int32),
+            (w_scales, fx.Int32),
+            (quant_scale_tensor, None),
+            (ep_row_map_tensor, fx.Int32),
         )
-        buffer_spec = tuple(
-            (
-                (value.dtype, tuple(value.shape))
-                if isinstance(value, torch.Tensor)
-                else None
-            )
-            for value in (c_arg, sa_arg, sb_arg, qs_arg, ep_arg)
-        )
-    else:
-        c_arg = ptr_arg(out, out_dtype)
-        sa_arg = ptr_arg(a_scales, fx.Int32)
-        sb_arg = ptr_arg(w_scales, fx.Int32)
-        qs_arg = ptr_arg(quant_scale_tensor)
-        ep_arg = ptr_arg(ep_row_map_tensor, fx.Int32)
-        buffer_spec = (None,) * 5
+    )
+    buffer_spec = tuple(
+        (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+        for value in buffer_args
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
         c_arg,

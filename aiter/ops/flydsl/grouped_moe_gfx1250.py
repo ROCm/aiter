@@ -1506,31 +1506,32 @@ def _grouped_a8w4_tdm_moe(
         **_ep_gemm2_kwargs,
     )
 
-    if kernel_bench_callable is not None:
-        if not _compact:
-            kernel_bench_callable.append(
-                (
-                    "quant_a1",
-                    functools.partial(
-                        flydsl_moe_fused_quant_preshuffle,
-                        hidden_states.reshape(1, token_num, _src_width),
-                        1,
-                        contiguous_m,
-                        wmma_rep=wmma_rep,
-                        quant_mode=_quant_mode,
-                        masked_m=None,
-                        topids_to_rows=topids_to_rows,
-                        source_topk=topk,
-                        num_valid_routes=_ep_nvr,
-                        prequantized_scale=src_a1_scale if _prequantized else None,
-                        out_payload=a1_payload,
-                        out_scale=a1_scale,
-                        row_to_token=_apre_row_to_token,
-                        row_major_scale=_row_major_a1,
-                        payload_preshuffled=a_preshuffled,
-                    ),
-                )
+    if kernel_bench_callable is not None and not _compact:
+        kernel_bench_callable.append(
+            (
+                "quant_a1",
+                functools.partial(
+                    flydsl_moe_fused_quant_preshuffle,
+                    hidden_states.reshape(1, token_num, _src_width),
+                    1,
+                    contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode,
+                    masked_m=None,
+                    topids_to_rows=topids_to_rows,
+                    source_topk=topk,
+                    num_valid_routes=_ep_nvr,
+                    prequantized_scale=src_a1_scale if _prequantized else None,
+                    out_payload=a1_payload,
+                    out_scale=a1_scale,
+                    row_to_token=_apre_row_to_token,
+                    row_major_scale=_row_major_a1,
+                    payload_preshuffled=a_preshuffled,
+                ),
             )
+        )
+
+    if kernel_bench_callable is not None:
         if not _fuse_quant:
             kernel_bench_callable.append(
                 (

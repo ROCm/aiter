@@ -5,6 +5,7 @@
 
 import ctypes
 import inspect
+from functools import partial
 
 import pytest
 import torch
@@ -29,6 +30,33 @@ _ADDRESS_ARGS = (
     "arg_bias",
     "arg_quant_scale",
     "arg_ep_row_map",
+)
+
+_launch_small_gemm = partial(
+    grouped.flydsl_grouped_gemm_a8w4_masked,
+    n_experts=1,
+    contiguous_m=64,
+    N=256,
+    K=256,
+    stream=0,
+)
+_launch_clustered_gemm = partial(
+    _launch_small_gemm,
+    n_experts=64,
+    contiguous_m=256,
+    N=7168,
+    K=2048,
+    tile_m=256,
+    tile_n=256,
+    tile_k=256,
+    m_warp=2,
+    n_warp=2,
+    num_buffers=4,
+    cluster_m=4,
+    cluster_n=4,
+    persistent_workers=256,
+    a_is_fp4=1,
+    a_preshuffled=1,
 )
 
 
@@ -153,21 +181,16 @@ def test_output_dimension_boundary_preserves_cached_abis(dispatch, a_preshuffled
 
     for elements in (2**31 - 1, 2**31) * 2:
         out = meta((elements,), torch.bfloat16)
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_small_gemm(
             out,
             meta((64, 256)),
             meta((1, 256, 128)),
             meta((256,)),
             meta((256,)),
             meta((1,), torch.int32),
-            n_experts=1,
-            contiguous_m=64,
-            N=256,
-            K=256,
             a_is_fp4=a_preshuffled,
             a_preshuffled=a_preshuffled,
             num_buffers=2,
-            stream=0,
             quant_scale=meta((1,)),
             ep_row_map=meta((64,), torch.int32),
         )
@@ -276,18 +299,15 @@ def test_default_optional_buffers_allow_odd_output_sizes(dispatch, dtype, elemen
     compiled, launches = dispatch
     for _ in range(2):
         out = torch.empty(elements, dtype=dtype)
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_small_gemm(
             out,
             torch.empty((elements, 256), dtype=torch.uint8),
             torch.empty((1, 1, 128), dtype=torch.uint8),
             torch.empty(256, dtype=torch.uint8),
             torch.empty(256, dtype=torch.uint8),
             torch.empty(1, dtype=torch.int32),
-            n_experts=1,
             contiguous_m=elements,
             N=1,
-            K=256,
-            stream=0,
             out_is_f16=int(dtype == torch.float16),
             stage1_quant_out=int(dtype == torch.uint8),
         )
@@ -306,21 +326,16 @@ def test_scale_byte_offset_changes_cached_abi(dispatch, a_preshuffled):
         storage = torch.empty(256 + offset, dtype=torch.uint8)
         scale_a = storage[offset:]
         out = torch.empty((64, 256), dtype=torch.bfloat16)
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_small_gemm(
             out,
             torch.empty((64, 256), dtype=torch.uint8),
             torch.empty((1, 256, 128), dtype=torch.uint8),
             scale_a,
             torch.empty(256, dtype=torch.uint8),
             torch.empty(1, dtype=torch.int32),
-            n_experts=1,
-            contiguous_m=64,
-            N=256,
-            K=256,
             a_is_fp4=a_preshuffled,
             a_preshuffled=a_preshuffled,
             num_buffers=2,
-            stream=0,
         )
         assert launches[-1]["arg_scale_a"] == scale_a.data_ptr()
         layout = launches[-1]["layout_buffers"].get("arg_scale_a")
@@ -340,18 +355,13 @@ def test_quant_output_layout_preserves_size_and_offset_abis(
                 out = torch.empty(elements, dtype=torch.uint8, device="meta")
                 storage = torch.empty(256 + offset, dtype=torch.uint8)
                 scale_a = storage[offset:]
-                grouped.flydsl_grouped_gemm_a8w4_masked(
+                _launch_small_gemm(
                     out,
                     torch.empty((64, 256), dtype=torch.uint8, device="meta"),
                     torch.empty((1, 256, 128), dtype=torch.uint8, device="meta"),
                     scale_a,
                     torch.empty(256, dtype=torch.uint8, device="meta"),
                     torch.empty(1, dtype=torch.int32, device="meta"),
-                    n_experts=1,
-                    contiguous_m=64,
-                    N=256,
-                    K=256,
-                    stream=0,
                     a_is_fp4=1,
                     stage1_act=1,
                     stage1_quant_out=1,
@@ -377,29 +387,14 @@ def test_persistent_buffers_keep_tensor_dimensions_bounded(dispatch, dtype):
 
     for elements in (2**31 - 1, 2**31) * 2:
         out = meta(elements, dtype)
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_clustered_gemm(
             out,
             meta(256 * 3584),
             meta(256 * 3584),
             meta(2**33),
             meta(2**33),
             meta(256, torch.int32),
-            n_experts=64,
-            contiguous_m=256,
-            N=7168,
             K=7168,
-            tile_m=256,
-            tile_n=256,
-            tile_k=256,
-            m_warp=2,
-            n_warp=2,
-            num_buffers=4,
-            cluster_m=4,
-            cluster_n=4,
-            persistent_workers=256,
-            a_is_fp4=1,
-            a_preshuffled=1,
-            stream=0,
             out_is_f16=int(dtype == torch.float16),
             stage1_act=int(dtype == torch.uint8),
             stage1_quant_out=int(dtype == torch.uint8),
@@ -430,29 +425,13 @@ def test_persistent_pitched_scale_offsets_select_compatible_cached_abis(dispatch
         storage = torch.empty(256 * 512 + offset, dtype=torch.uint8)
         scale = storage.as_strided((256, 225), (512, 1), offset)
         data = torch.empty(256 * 1024, dtype=torch.uint8, device="meta")
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_clustered_gemm(
             out,
             data,
             data,
             scale,
             data,
             torch.empty(256, dtype=torch.int32),
-            n_experts=64,
-            contiguous_m=256,
-            N=7168,
-            K=2048,
-            tile_m=256,
-            tile_n=256,
-            tile_k=256,
-            m_warp=2,
-            n_warp=2,
-            num_buffers=4,
-            cluster_m=4,
-            cluster_n=4,
-            persistent_workers=256,
-            a_is_fp4=1,
-            a_preshuffled=1,
-            stream=0,
         )
         assert launches[-1]["arg_scale_a"] == scale.data_ptr()
         layout = launches[-1]["layout_buffers"].get("arg_scale_a")
@@ -466,29 +445,14 @@ def test_persistent_empty_and_nonempty_buffers_keep_compatible_cached_abis(dispa
     for elements in (0, 256) * 2:
         out = torch.empty(elements, dtype=torch.bfloat16, device="meta")
         data = torch.empty(elements, dtype=torch.uint8, device="meta")
-        grouped.flydsl_grouped_gemm_a8w4_masked(
+        _launch_clustered_gemm(
             out,
             data,
             data,
             data,
             data,
             torch.empty(64, dtype=torch.int32),
-            n_experts=64,
             contiguous_m=elements,
-            N=7168,
-            K=2048,
-            tile_m=256,
-            tile_n=256,
-            tile_k=256,
-            m_warp=2,
-            n_warp=2,
-            num_buffers=4,
-            cluster_m=4,
-            cluster_n=4,
-            persistent_workers=256,
-            a_is_fp4=1,
-            a_preshuffled=1,
-            stream=0,
         )
         layout = launches[-1]["layout_buffers"]["arg_c"]
         assert int.from_bytes(layout, "little", signed=True) == int(elements != 0)
