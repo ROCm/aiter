@@ -292,7 +292,8 @@ class PullAllReduceRMSNorm:
         if not (self._capturing and torch.cuda.is_current_stream_capturing()):
             return False
         if len(self._inputs) >= MAX_ENTRIES:
-            return False  # the address table is full: the caller's next backend serves it
+            # the address table is full: the caller's next backend serves it
+            return False
         if inp.dim() != 2 or inp.shape[1] != HIDDEN or not 0 < inp.shape[0] <= MAX_ROWS:
             return False
         for t in (inp, residual_in, weight):
