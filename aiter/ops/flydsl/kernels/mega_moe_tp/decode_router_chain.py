@@ -11,8 +11,7 @@ import struct
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
+from .decode_router_common import on_supported_device, run_on_device
 from .decode_router_gemm import (
     MAX_ROWS,
     nblocks_config,
@@ -48,9 +47,9 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
     s = torch.empty((m, H // 32), dtype=torch.uint8, device=dev)
     q8 = torch.empty((m, H), dtype=torch.uint8, device=dev)
     s8 = torch.empty((m, H // 32), dtype=torch.uint8, device=dev)
-    stream = torch.cuda.current_stream(dev)
-    _run_compiled(
+    run_on_device(
         _get_router(*config, router_quant_placement(m), False, token_major),
+        dev,
         x.data_ptr(),
         router_weight.data_ptr(),
         partials.data_ptr(),
@@ -60,10 +59,10 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
         s.data_ptr(),
         q8.data_ptr(),
         s8.data_ptr(),
-        stream,
     )
-    _run_compiled(
+    run_on_device(
         _get_topk(E, TOPK, split, True) if token_major else _get_topk(E, TOPK, split),
+        dev,
         partials.data_ptr(),
         correction_bias.data_ptr(),
         weights.data_ptr(),
@@ -74,7 +73,6 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
         E if token_major else m * E,
         TOPK,
         struct.unpack("<i", struct.pack("<f", routed_scaling_factor))[0],
-        stream,
     )
     return (q, s), (q8, s8), weights, ids
 
@@ -83,23 +81,38 @@ def route_quant_small(
     x, router_weight, router_weight_lines, correction_bias, routed_scaling_factor=2.0
 ):
     """1-128 rows: router GEMM -> top-4 + MXFP4 / MXFP8 input quant ->
-    ((q4, s4), (q8, s8), topk weights, topk ids).
+    ((q4, s4), (q8, s8), topk weights, topk ids); None outside the covered inputs, so the caller falls back.
 
     Args:
-        x: bf16 [m, 6144], contiguous.
-        router_weight: fp32 [128, 6144]; router_weight_lines: ``router_line_layout(router_weight)``.
-        correction_bias: fp32 [128].
+        x: bf16 [m, 6144], contiguous, on a gfx950 device.
+        router_weight: fp32 [128, 6144]; router_weight_lines: ``router_line_layout(router_weight)`` or None.
+        correction_bias: fp32 [128]. All three on x's device.
     """
     n = x.shape[0]
-    if not (0 < n <= MAX_ROWS and x.is_contiguous() and x.shape[1] == H):
-        raise ValueError(f"route_quant_small: unsupported input {tuple(x.shape)}")
+    if not (
+        x.dim() == 2
+        and 0 < n <= MAX_ROWS
+        and x.shape[1] == H
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and router_weight.shape == (E, H)
+        and router_weight.dtype == torch.float32
+        and router_weight.is_contiguous()
+        and correction_bias.shape == (E,)
+        and correction_bias.dtype == torch.float32
+        and correction_bias.is_contiguous()
+        and on_supported_device(x, router_weight, correction_bias)
+    ):
+        return None
     if router_quant_placement(n):
         return _router_gemm_topk_quant(
             x, router_weight, correction_bias, routed_scaling_factor
         )
     parts = router_gemm_partials(x, router_weight, router_weight_lines)
-    if parts is None:
-        raise ValueError("route_quant_small: unsupported router weight")
+    if (
+        parts is None
+    ):  # e.g. a router_weight_lines that is not usable: not an error of the covered inputs
+        return None
     ids = torch.empty((n, TOPK), dtype=torch.int32, device=x.device)
     wt = torch.empty((n, TOPK), dtype=torch.float32, device=x.device)
     q4, q8 = splitk_biased_topk_mxfp4_mxfp8_quant(

@@ -21,7 +21,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .decode_router_common import (
     DPP_TREE,
@@ -34,10 +33,13 @@ from .decode_router_common import (
     _e8m0_even_e2m1,
     _fmax3_abs,
     _ir,
+    on_supported_device,
+    run_on_device,
 )
 from .decode_tile_primitives import _e8m0_fp8, _fp8
 
 H = 6144
+E, TOPK = 128, 4
 BLOCKS = H // 32  # 32-value blocks per row
 assert BLOCKS % 64 == 0 and NW == 1
 
@@ -348,14 +350,36 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
     x: torch.Tensor,  # bf16 [M, H] contiguous
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """Top-k and both input quants from one bf16 read, 1-256 rows ->
-    ((FP4 codes, e8m0 scales), (FP8 codes, e8m0 scales))."""
+    ((FP4 codes, e8m0 scales), (FP8 codes, e8m0 scales)). Raises ValueError for inputs outside that contract.
+    """
     m, split_k, num_experts = partials.shape
-    assert 0 < m <= 256
-    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape == (m, H)
-    assert partials.dtype == torch.float32 and partials.stride(2) == 1
-    assert correction_bias.dtype == torch.float32 and correction_bias.is_contiguous()
-    assert topk_weights.stride(1) == 1 and topk_ids.stride(1) == 1
-    assert topk_weights.stride(0) == topk_ids.stride(0)
+    topk = topk_ids.shape[1]
+    if not (
+        0 < m <= 256
+        and num_experts == E
+        and topk == TOPK
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.shape == (m, H)
+        and partials.dtype == torch.float32
+        and partials.stride(2) == 1
+        and correction_bias.dtype == torch.float32
+        and correction_bias.shape == (E,)
+        and correction_bias.is_contiguous()
+        and topk_weights.dtype == torch.float32
+        and topk_ids.dtype == torch.int32
+        and topk_weights.shape == (m, TOPK)
+        and topk_ids.shape == (m, TOPK)
+        and topk_weights.stride(1) == 1
+        and topk_ids.stride(1) == 1
+        and topk_weights.stride(0) == topk_ids.stride(0) >= TOPK
+        and on_supported_device(x, partials, correction_bias, topk_weights, topk_ids)
+    ):
+        raise ValueError(
+            "splitk_biased_topk_mxfp4_mxfp8_quant: unsupported inputs (1-256 rows of bf16 [m, 6144] x, fp32 "
+            f"[m, split_k, 128] partials, fp32 [128] bias, fp32 / int32 [m, 4] outputs on one gfx950 device): "
+            f"x {tuple(x.shape)} {x.dtype}, partials {tuple(partials.shape)} {partials.dtype}"
+        )
     q = torch.empty((m, H // 2), dtype=torch.uint8, device=x.device)
     s = torch.empty((m, H // 32), dtype=torch.uint8, device=x.device)
     q8 = torch.empty((m, H), dtype=torch.uint8, device=x.device)
@@ -373,8 +397,9 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
         if token_major
         else _get_kernel(num_experts, topk_ids.shape[1], split_k)
     )
-    _run_compiled(
+    run_on_device(
         launch,
+        x.device,
         partials.data_ptr(),
         correction_bias.data_ptr(),
         topk_weights.data_ptr(),
@@ -390,6 +415,5 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
         s.data_ptr(),
         q8.data_ptr(),
         s8.data_ptr(),
-        torch.cuda.current_stream(),
     )
     return (q, s), (q8, s8)
