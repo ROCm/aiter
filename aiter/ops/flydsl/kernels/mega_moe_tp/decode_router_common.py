@@ -7,12 +7,19 @@ Ported from amd-kernels' ``moe/mxfp4_h6144_i768_e128_top4`` (``router_gemm.py``,
 Apache-2.0, "Copyright contributors to the amd-kernels project".
 """
 
+import functools
+
 import flydsl.expr as fx
+import torch
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import T as _T
+
+from aiter.jit.utils.chip_info import get_gfx_runtime_for_device
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
 
 PRELOAD_HINTS = {
     "llvm_options": {
@@ -20,6 +27,40 @@ PRELOAD_HINTS = {
         "amdgpu-kernarg-preload-count": 16,
     }
 }
+
+
+# The kernels issue ``mfma_f32_16x16x32_bf16`` (gfx950 only, gfx942 has the 16x16x16 form) on 64-lane waves, and the
+# 128-row tier's LDS (69632 B) exceeds gfx942's 64 KiB.
+SUPPORTED_ARCH = "gfx950"
+# a byte extent the kernels address through a 32-bit buffer descriptor
+MAX_BUFFER_BYTES = 2**31 - 1
+
+
+@functools.cache
+def _arch_of(index: int) -> str:
+    return get_gfx_runtime_for_device(index)
+
+
+def on_supported_device(*tensors) -> bool:
+    """True when every tensor is CUDA storage on one device whose arch the kernels target. A launch on anything else
+    would hand a host or foreign-device address to the GPU, or issue an instruction the arch lacks.
+    """
+    dev = tensors[0].device
+    return (
+        dev.type == "cuda"
+        and all(t.device == dev for t in tensors)
+        and _arch_of(dev.index) == SUPPORTED_ARCH
+    )
+
+
+def run_on_device(exe, device: torch.device, *args):
+    """``_run_compiled`` on ``device`` with that device's stream: one launcher (and compiled handle) per GPU, since
+    a handle built on one GPU does not launch on another (see aiter/ops/flydsl/AGENTS.md, compiled-handle caches).
+    """
+    with torch.cuda.device(device):
+        _run_compiled(
+            _launcher_on(exe, device.index), *args, torch.cuda.current_stream(device)
+        )
 
 
 def _pk_bf16(a, b):

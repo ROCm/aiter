@@ -11,7 +11,7 @@ choice are the ones amd-kernels measured; the partials are bit-identical.
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from .decode_router_common import MAX_BUFFER_BYTES, on_supported_device, run_on_device
 
 H, E = 6144, 128
 MAX_ROWS = 128
@@ -59,10 +59,12 @@ def nblocks_config(num_rows: int):
 
 def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None):
     """FP32 partials [m, split_k, 128]: contiguous (token-major) to 64 rows, a permuted view of [split_k, m, 128]
-    above. None outside the covered shapes (1-128 rows, bf16 [m, 6144], fp32 [128, 6144] gate).
+    above. None outside the covered shapes (1-128 rows, bf16 [m, 6144] with non-overlapping rows, fp32 [128, 6144]
+    gate, all on one gfx950 device), so the caller falls back.
 
     Args:
-        router_weight_lines: the gate in ``router_line_layout``, used by the 1-32 row tiers when given.
+        router_weight_lines: ``router_line_layout(router_weight)``, read by the 1-32 row tiers when given (the
+            larger tiers read ``router_weight``). The two must hold the same gate: the kernels cannot check that.
     """
     m = hidden_states.shape[0]
     if (
@@ -73,63 +75,45 @@ def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None)
         or hidden_states.dtype != torch.bfloat16
         or hidden_states.stride(1) != 1
         or hidden_states.stride(0) % 2
+        # rows must not overlap (a broadcast row, stride 0, would get an empty buffer descriptor) and the span
+        # (the kernels' descriptor spans m * stride * 2 bytes) must fit its 32-bit extent
+        or hidden_states.stride(0) < H
+        or m * hidden_states.stride(0) * 2 > MAX_BUFFER_BYTES
         or router_weight.shape != (E, H)
         or router_weight.dtype != torch.float32
         or not router_weight.is_contiguous()
+        or not on_supported_device(hidden_states, router_weight)
     ):
         return None
-    split_k, _ = split_config(m)
+    split_k, block_k = split_config(m)
     token_major = m <= TOKEN_MAJOR_MAX
     partials = torch.empty(
         (split_k, m, E), dtype=torch.float32, device=hidden_states.device
     )
     result = partials.view(m, split_k, E) if token_major else partials.permute(1, 0, 2)
-    stream = torch.cuda.current_stream()
     lines_ok = (
         router_weight_lines is not None
         and router_weight_lines.dtype == torch.float32
         and router_weight_lines.is_contiguous()
         and router_weight_lines.numel() == E * H
+        and on_supported_device(hidden_states, router_weight_lines)
     )
+    x, p, sx = hidden_states.data_ptr(), partials.data_ptr(), hidden_states.stride(0)
     if lines_ok and m <= DIRECT_LINES_MAX:
         from .decode_router_gemm_direct import _get_kernel
 
-        _run_compiled(
-            _get_kernel(48, 64, (m + 15) // 16, 2, True, token_major),
-            hidden_states.data_ptr(),
-            router_weight_lines.data_ptr(),
-            partials.data_ptr(),
-            m,
-            hidden_states.stride(0),
-            stream,
-        )
+        exe = _get_kernel(split_k, block_k, (m + 15) // 16, 2, True, token_major)
+        args = (x, router_weight_lines.data_ptr(), p, m, sx)
     elif lines_ok and NBLOCKS_LINES_FROM <= m <= NBLOCKS_LINES_MAX:
         from .decode_router_gemm_lines import _get_kernel
 
-        _run_compiled(
-            _get_kernel(token_major),
-            hidden_states.data_ptr(),
-            router_weight_lines.data_ptr(),
-            partials.data_ptr(),
-            m,
-            hidden_states.stride(0),
-            stream,
-        )
+        exe = _get_kernel(token_major)
+        args = (x, router_weight_lines.data_ptr(), p, m, sx)
     else:
         from .decode_router_gemm_nblocks import _get_kernel
 
         x_direct = X_DIRECT_FROM <= m <= X_DIRECT_MAX
-        _run_compiled(
-            _get_kernel(*nblocks_config(m), 0, x_direct, token_major),
-            hidden_states.data_ptr(),
-            router_weight.data_ptr(),
-            partials.data_ptr(),
-            m,
-            hidden_states.stride(0),
-            0,
-            0,
-            0,
-            0,
-            stream,
-        )
+        exe = _get_kernel(*nblocks_config(m), 0, x_direct, token_major)
+        args = (x, router_weight.data_ptr(), p, m, sx, 0, 0, 0, 0)  # no quant outputs
+    run_on_device(exe, hidden_states.device, *args)
     return result
