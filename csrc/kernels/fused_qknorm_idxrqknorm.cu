@@ -24,6 +24,59 @@ constexpr int kHeadDim = 128;
 constexpr int kNumLanes = 32;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
 
+// ---- lane exchanges inside a 32-lane logical warp ----------------------------------------------
+// __shfl_xor lowers to ds_bpermute (an LDS-pipe round trip per exchange). On gfx950 the xor-1/2/4/8
+// partners are a DPP modifier of the consuming VALU op and xor-16 is v_permlane16_swap, so the
+// norm / amax butterflies and the RoPE partner exchange cost a few cycles each instead of ~100.
+// Technique of amd-kernels' norm_rope_nvfp4_insert; the lane map and the arithmetic are the
+// shuffle version's.
+template <int M>
+__device__ __forceinline__ float xorLane(float x)
+{
+#if defined(__gfx950__)
+    const int v = __builtin_bit_cast(int, x);
+    int r;
+    if constexpr(M == 1)
+        r = __builtin_amdgcn_update_dpp(v, v, 0xB1, 0xF, 0xF, false); // quad_perm [1,0,3,2]
+    else if constexpr(M == 2)
+        r = __builtin_amdgcn_update_dpp(v, v, 0x4E, 0xF, 0xF, false); // quad_perm [2,3,0,1]
+    else if constexpr(M == 4) // banks 1,3 take lane-4 (row_shr:4), banks 0,2 lane+4 (row_shl:4)
+        r = __builtin_amdgcn_update_dpp(
+            __builtin_amdgcn_update_dpp(v, v, 0x114, 0xF, 0xA, false), v, 0x104, 0xF, 0x5, false);
+    else if constexpr(M == 8)
+        r = __builtin_amdgcn_update_dpp(v, v, 0x128, 0xF, 0xF, false); // row_ror:8
+    else
+        return __shfl_xor(x, M, 32);
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor(x, M, 32);
+#endif
+}
+
+// Sum over the 32 lanes (all five xor steps). The xor-16 step is commutative, so the unordered
+// permlane16_swap pair is summed as is; the steps run in the order of warpReduceSum (16, 8, 4, 2,
+// 1), so the result is bit-identical to it.
+__device__ __forceinline__ float warpSum32(float x)
+{
+#if defined(__gfx950__)
+    {
+        // v_permlane16_swap of x with itself leaves (row 0/2 value, row 1/3 value) in the two
+        // registers of every lane. Inline asm: the compiler folds the two-result builtin to a
+        // single register.
+        unsigned a = __builtin_bit_cast(unsigned, x), b = a;
+        asm volatile("s_nop 1\n\tv_permlane16_swap_b32 %0, %1\n\ts_nop 1" : "+v"(a), "+v"(b));
+        x = __builtin_bit_cast(float, a) + __builtin_bit_cast(float, b);
+    }
+#else
+    x += __shfl_xor(x, 16, 32);
+#endif
+    x += xorLane<8>(x);
+    x += xorLane<4>(x);
+    x += xorLane<2>(x);
+    x += xorLane<1>(x);
+    return x;
+}
+
 __device__ __forceinline__ float warpReduceSum(float val)
 {
 #pragma unroll
@@ -234,7 +287,7 @@ __device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
     {
         sumsq += elems[i] * elems[i];
     }
-    sumsq = warpReduceSum(sumsq);
+    sumsq = warpSum32(sumsq);
     const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
@@ -258,7 +311,9 @@ __device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
             {
                 const float c       = static_cast<float>(ops.c[i]);
                 const float s       = static_cast<float>(ops.s[i]);
-                const float partner = __shfl(elems[i], partner_lane, 32);
+                // rotary_dim 64 (MiniMax-M3): partner_lane == lane ^ 8, a row_ror:8 DPP move
+                const float partner = rotary_dim == 64 ? xorLane<8>(elems[i])
+                                                       : __shfl(elems[i], partner_lane, 32);
                 elems[i] = first_half ? elems[i] * c - partner * s : elems[i] * c + partner * s;
             }
         }
@@ -456,6 +511,28 @@ __device__ __forceinline__ uint32_t nvE2m1Pack(const float (&y)[kElemsPerLane])
 #endif
 }
 
+// Correctly rounded 1/d without the denormal-mode switching and ~25-instruction expansion of
+// __fdiv_rn: v_rcp_f32 refined by two FMA Newton steps. Identical to __fdiv_rn(1, d) over every
+// positive normal fp32 (2^31 patterns, exhaustive on gfx950); outside [2^-100, 2^100] (and for 0 /
+// inf / nan) it falls back to __fdiv_rn.
+__device__ __forceinline__ float rcpRN(float d)
+{
+#if !defined(__gfx950__)
+    return __fdiv_rn(1.0f, d);
+#else
+    const float a = fabsf(d);
+    if(!(a >= 0x1p-100f && a <= 0x1p100f))
+    {
+        return __fdiv_rn(1.0f, d);
+    }
+    float r        = __builtin_amdgcn_rcpf(d);
+    const float e  = fmaf(-d, r, 1.0f);
+    r              = fmaf(r, e, r);
+    const float e2 = fmaf(-d, r, 1.0f);
+    return fmaf(r, e2, r);
+#endif
+}
+
 // One lane's kElemsPerLane elements (already scalar_t-rounded) -> its four codes as nibbles
 // (element 0 lowest) + the group's scale byte.
 __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
@@ -468,16 +545,14 @@ __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
     {
         amax = fmaxf(amax, fabsf(v[i]));
     }
-#pragma unroll
-    for(int mask = 1; mask < kNvLanesPerGroup; mask <<= 1)
-    {
-        amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
-    }
+    static_assert(kNvLanesPerGroup == 4, "the xor-1/2 exchanges below span one group");
+    amax = fmaxf(amax, xorLane<1>(amax));
+    amax = fmaxf(amax, xorLane<2>(amax));
     const float one_sixth = 0.1666666716337204f; // float32(1/6), as the torch reference
-    const float sf        = fminf(amax * one_sixth * __fdiv_rn(1.0f, gs), 448.0f);
+    const float sf        = fminf(amax * one_sixth * rcpRN(gs), 448.0f);
     const uint32_t sbyte  = nvE4m3Byte(sf);
     const float sv        = nvE4m3Value(sbyte);
-    const float quant     = sv != 0.0f ? __fdiv_rn(1.0f, sv * gs) : 0.0f;
+    const float quant     = sv != 0.0f ? rcpRN(sv * gs) : 0.0f;
     float y[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
@@ -551,7 +626,7 @@ __device__ __forceinline__ void storeNvfp4KRow(uint8_t* __restrict__ page,
     }
 }
 
-// V of token `pos` alone: its nibble of each element's word, atomic and/or (other tokens of the
+// V of token `pos` alone: its nibble of each element's word, atomic xor (other tokens of the
 // octet, in this or another warp, share the word).
 template <typename scalar_t>
 __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
@@ -562,20 +637,28 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
                                                  const scalar_t (&row)[kElemsPerLane],
                                                  int lane_id)
 {
+    uint32_t* words = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
+                                                  (pos / 8) * 512) +
+                      lane_id * kElemsPerLane;
+    const int shift = ((pos % 8) / 2) * 8 + (pos % 2) * 4;
+    const uint4 old = *reinterpret_cast<const uint4*>(words); // in flight during the quantization
     float v[kElemsPerLane];
     loadElems(row, v);
     uint32_t packed;
     const uint32_t sb = nvQuantLane(v, gs, packed);
-    uint32_t* words   = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
-                                                  (pos / 8) * 512) +
-                      lane_id * kElemsPerLane;
-    const int shift = ((pos % 8) / 2) * 8 + (pos % 2) * 4;
-#pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
-    {
-        atomicAnd(words + i, ~(0xFu << shift));
-        atomicOr(words + i, ((packed >> (4 * i)) & 0xFu) << shift);
-    }
+    // The nibble of token `pos` is written by this token only (a slot is written once per call), so
+    // one xor of (old ^ new) << shift per word lands it without disturbing the other tokens'
+    // nibbles of the octet (they flip disjoint bits, and xors commute): two 64-bit atomics per lane
+    // instead of 4 x (and + or). `old` is a plain load issued before the quantization; only its own
+    // nibble is used, and no other token changes that nibble.
+    const uint32_t d0 = ((((old.x >> shift) ^ (packed >> 0)) & 0xFu) << shift);
+    const uint32_t d1 = ((((old.y >> shift) ^ (packed >> 4)) & 0xFu) << shift);
+    const uint32_t d2 = ((((old.z >> shift) ^ (packed >> 8)) & 0xFu) << shift);
+    const uint32_t d3 = ((((old.w >> shift) ^ (packed >> 12)) & 0xFu) << shift);
+    using u64 = unsigned long long;
+    u64* w64  = reinterpret_cast<u64*>(words);
+    atomicXor(w64, static_cast<u64>(d0) | (static_cast<u64>(d1) << 32));
+    atomicXor(w64 + 1, static_cast<u64>(d2) | (static_cast<u64>(d3) << 32));
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[nkv * (kNvHeadSide + kNvHeadData) + head * kNvHeadScale +
