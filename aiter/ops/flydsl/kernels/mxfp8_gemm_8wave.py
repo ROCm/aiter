@@ -59,7 +59,9 @@ class ScalePreshuffledS2R:
         self.n_pairs = n_tiles // 2
         self.k1_stride = K // 256  # i32 groups of 64 per 32-row super-row
         self.lane = fx.thread_idx.x % 64
-        # Same byte count as the raw layout, just permuted.
+        # The layout covers the rows padded to 256 (what the launcher validates):
+        # a row in the last, partial 32-row group sits past rows * K / 32 bytes.
+        rows = ceildiv(rows, 256) * 256
         t_i8 = fx.rocdl.make_buffer_tensor(
             scale_arg,
             max_size=False,
