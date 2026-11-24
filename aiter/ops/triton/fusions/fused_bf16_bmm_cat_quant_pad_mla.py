@@ -165,7 +165,7 @@ def fused_bf16_bmm_cat_quant_pad_mla(
     config: dict | None = None,
 ) -> torch.Tensor:
     """
-    MLA decode query prep in one launch: the bf16 W_UK absorb BMM, concat with
+    MLA query prep in one launch: the bf16 W_UK absorb BMM, concat with
     the roped q_pe, static per-tensor FP8 quantization, and head padding by
     duplication. Equivalent to
 

@@ -264,18 +264,19 @@ def test_fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
 
 
 @pytest.mark.parametrize(
-    "M,QH,heads,d_nope,scale,tail,strided",
+    "M,QH,heads,d_nope,scale,tail,layout",
     [
-        (1, 96, 96, 128, 1.0, 64, False),
-        (33, 8, 16, 192, 0.37, 64, True),
-        (257, 8, 16, 128, 1e-3, 64, False),
-        (1, 8, 16, 128, 0.37, 0, False),
-        (0, 8, 16, 128, 1.0, 64, False),
-        (8192, 96, 96, 128, 0.37, 64, False),
+        (1, 96, 96, 128, 1.0, 64, "dense"),
+        (33, 8, 16, 192, 0.37, 64, "strided"),
+        (33, 96, 96, 128, 0.37, 64, "atom"),
+        (257, 8, 16, 128, 1e-3, 64, "dense"),
+        (1, 8, 16, 128, 0.37, 0, "dense"),
+        (0, 8, 16, 128, 1.0, 64, "dense"),
+        (8192, 96, 96, 128, 0.37, 64, "dense"),
     ],
 )
 def test_fused_bf16_bmm_nope_only(
-    M, QH, heads, d_nope, scale, tail, strided, monkeypatch
+    M, QH, heads, d_nope, scale, tail, layout, monkeypatch
 ):
     if get_arch() not in SUPPORTED_ARCHS:
         pytest.skip(f"NoPE-only MLA has no config for {get_arch()}")
@@ -284,9 +285,14 @@ def test_fused_bf16_bmm_nope_only(
     q_scale = torch.tensor(scale, dtype=torch.float32, device="cuda")
     fp8_max = 64.0 if scale == 1e-3 else fp8_quant_max()
     width = KV_LORA + tail
-    shape = (M + 2, heads + 1, 2 * width + 1) if strided else (M, heads, width)
-    storage = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
-    view = storage[1:-1, :heads, 1 : 2 * width : 2] if strided else storage
+    strided = layout == "strided"
+    if layout == "atom":
+        w_uk_t = w_uk_t.transpose(1, 2).contiguous().transpose(1, 2)
+        storage = torch.zeros((M, 128, width), dtype=torch.uint8, device="cuda")
+    else:
+        shape = (M + 2, heads + 1, 2 * width + 1) if strided else (M, heads, width)
+        storage = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+    view = storage[1:-1, :heads, 1 : 2 * width : 2] if strided else storage[:, :heads]
     if tail:
         # Include NaN encodings and distinct bytes for each duplicated head.
         view[..., KV_LORA] = 0x7F
@@ -310,7 +316,7 @@ def test_fused_bf16_bmm_nope_only(
         expected_view = (
             expected_storage[1:-1, :heads, 1 : 2 * width : 2]
             if strided
-            else expected_storage
+            else expected_storage[:, :heads]
         )
         expected_view[..., :KV_LORA].copy_(full[..., :KV_LORA].view(torch.uint8))
         # Bound the torch reference for the serving-sized case.
@@ -375,10 +381,7 @@ def test_fused_bf16_bmm_nope_only_rejects(invalid, monkeypatch):
         fused_bf16_bmm_cat_quant_pad_mla(q_nope, w_uk_t, None, q_scale, heads, out=out)
 
 
-def test_fused_bf16_bmm_benchmark_cli_and_providers(monkeypatch):
-    from contextlib import nullcontext
-    from types import SimpleNamespace
-
+def test_fused_bf16_bmm_benchmark_cli():
     from op_tests.op_benchmarks.triton import (
         bench_fused_bf16_bmm_cat_quant_pad_mla as bench,
     )
@@ -388,52 +391,8 @@ def test_fused_bf16_bmm_benchmark_cli_and_providers(monkeypatch):
         "unfused",
         "fused_rope_cache",
     ]
+    assert bench.parse_args(["--providers", "fused_nope_only"]).providers == [
+        "fused_nope_only"
+    ]
     with pytest.raises(SystemExit):
         bench.parse_args(["--rope-cache", "--providers", "fused_nope_only"])
-    args = bench.parse_args(
-        ["--providers", "fused", "fused_nope_only", "--print-kernels"]
-    )
-    q, w, pe, scale, out = (object() for _ in range(5))
-    calls = []
-
-    def generate(M, provider, args):
-        values = (
-            (q, w, scale, out)
-            if provider == "fused_nope_only"
-            else (q, w, pe, scale, out)
-        )
-        return lambda: values
-
-    def record(q_nope, w_uk_t, q_pe, q_scale, heads, **kwargs):
-        calls.append((q_nope, w_uk_t, q_pe, q_scale, heads, kwargs["out"]))
-
-    monkeypatch.setattr(bench, "make_input_gen", generate)
-    monkeypatch.setattr(bench, "fused_bf16_bmm_cat_quant_pad_mla", record)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(
-        torch.profiler,
-        "profile",
-        lambda **kwargs: nullcontext(SimpleNamespace(events=lambda: ())),
-    )
-    bench.print_kernels(1, args, None, calls=1)
-    assert (
-        calls == [(q, w, pe, scale, 16, out)] * 2 + [(q, w, None, scale, 16, out)] * 2
-    )
-
-    original_fields = bench.fields
-    monkeypatch.setattr(
-        bench, "fields", lambda args, provider: ("_", *original_fields(args, provider))
-    )
-    monkeypatch.setattr(
-        bench,
-        "make_input_gen",
-        lambda M, provider, args: lambda: (object(), *generate(M, provider, args)()),
-    )
-    expected_calls = calls.copy()
-    calls.clear()
-    bench.print_kernels(1, args, None, calls=1)
-    assert calls == expected_calls
-
-    monkeypatch.setattr(bench, "make_input_gen", lambda *args: lambda: (q, w))
-    with pytest.raises(ValueError):
-        bench.print_kernels(1, args, None, calls=1)

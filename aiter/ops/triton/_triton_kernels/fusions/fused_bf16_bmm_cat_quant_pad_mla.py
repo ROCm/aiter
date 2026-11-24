@@ -174,6 +174,8 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
     - out: (M, QH * DUP, N + D_PE), each head stored DUP times in a row, which is
       what repeat_interleave(DUP, dim=1) of the concatenated query produces.
 
+    With D_PE == 0, pe is None, no pe programs run and out[..., N:] is unchanged.
+
     With ROPE_AND_CACHE, pe is not roped yet. The kernel ropes q_pe and k_pe and
     writes fp8([kv_c[m] | k_pe[m]] / k_scale) to the cache slot of token m.
     Tokens with slot < 0 keep their q_pe unroped and do not write the cache.
