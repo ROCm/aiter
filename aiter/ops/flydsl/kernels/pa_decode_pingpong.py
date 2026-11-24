@@ -186,7 +186,9 @@ def compile_pa_decode_pingpong(
         buf: fx.Array[fx.Int32, total_bytes // 4, 16]
 
     class _LdsTraits:
-        pass
+        # This kernel owns its linear-cache DMA and LDS layout; PaDecodeLds is
+        # used only for allocation and typed addressing.
+        nhd_layout = False
 
     kernel_name = (
         f"pa_decode_pingpong_kvbf16_d{D}_v{DV}_bs{block_size}_gqa{GQA}_mtp{QLEN}"

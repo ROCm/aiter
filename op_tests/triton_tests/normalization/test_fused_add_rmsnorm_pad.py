@@ -48,7 +48,7 @@ def test_mul_add(
     backend: str | None,
 ):
 
-    if backend == "gluon" and get_arch() != "gfx1250":
+    if backend == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Gluon kernel is only supported on gfx1250")
 
     x, weight, res = generate_inputs(M, N, has_res, dtype)
