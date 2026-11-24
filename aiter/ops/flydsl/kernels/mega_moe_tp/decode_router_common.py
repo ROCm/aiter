@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Shared helpers: bf16x3 weight split and the fp32 / int32 bit casts and Quark-even e8m0 / FP4 / FP8-amax arithmetic of the decode-shape router GEMM + input-quant launches.
+"""Shared helpers: bf16x3 weight split, the DPP butterfly, the bit casts and the Quark-even e8m0 / FP4 / FP8-amax arithmetic of the decode-shape (1-128 row) MoE router chain.
 
 Ported from amd-kernels' ``moe/mxfp4_h6144_i768_e128_top4`` (``router_gemm.py``, ``router_topk.py``,
 ``common/loaders.py``, ``i3072/gemm1_prefill_h6144_i3072_persistent.py``, ``mxfp8/gemm1_prefill_h6144_i3072.py``),
@@ -9,7 +9,9 @@ Apache-2.0, "Copyright contributors to the amd-kernels project".
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl_ops
 from flydsl.expr import range_constexpr
+from flydsl.expr.typing import T
 from flydsl.expr.typing import T as _T
 
 PRELOAD_HINTS = {
@@ -41,6 +43,27 @@ def _split3(w):
                 a = a - (pk << 16).bitcast(fx.Float32)
                 b = b - (pk & -65536).bitcast(fx.Float32)
     return parts
+
+
+# one token (wave) per workgroup spreads the partial loads over more CUs: 172 rows 3.75 -> 3.33 us after the router
+NW = 1
+
+
+NEG_LOG2E = -1.44269504088896340736
+
+
+# AITER's wave_reduce on gfx9: quad_perm [1,0,3,2], quad_perm [2,3,0,1],
+# row_half_mirror, row_mirror, row_bcast:15, row_bcast:31
+DPP_TREE = (0xB1, 0x4E, 0x141, 0x140, 0x142, 0x143)
+
+
+def _ir(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def _dpp(v, ctrl):
+    """v_mov_b32_dpp, all rows / banks: an invalid source lane keeps its value (the lane-63 result never reads one)."""
+    return fx.Int32(_rocdl_ops.update_dpp(T.i32, _ir(v), _ir(v), ctrl, 0xF, 0xF, False))
 
 
 def _bits(f):
