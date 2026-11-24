@@ -8,13 +8,12 @@ from __future__ import annotations
 import math
 import operator
 import os
+import warnings
 from typing import NamedTuple
 
 import flydsl.expr as fx
-import mori.shmem as ms
 import torch
 from flydsl.expr.typing import Stream
-from mori.shmem import mori_shmem_create_tensor
 
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.ops.mha_v4_quant import (
@@ -23,7 +22,8 @@ from aiter.ops.mha_v4_quant import (
     mxfp6_v_tiles,
 )
 
-from .communication_ops_host_utils import build_p2p_table
+from .comm_collectives_host_shared import resolve_inbox_flags
+from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,
     make_attention_a2a_dequant_jit,
@@ -38,6 +38,16 @@ from .kernels.tensor_shim import _run_compiled
 _DEFAULT_BLOCK_NUM = 128
 _DEFAULT_WARP_NUM_PER_BLOCK = 8
 _MAX_RAW_BUFFER_BYTES = 0xFFFFFFFF
+# Assumed when the XCD count cannot be read. Safe for 1, 2, 4 or 8 XCDs:
+# a multiple of the true count only adds releases.
+_FALLBACK_N_XCD = 8
+
+
+def _resolve_n_xcd(device):
+    from aiter.jit.utils.chip_info import get_num_xcds
+
+    with torch.cuda.device(device):
+        return get_num_xcds(default=_FALLBACK_N_XCD)
 
 
 def _payload_size(
@@ -198,10 +208,24 @@ class AttentionA2AIntraNodeOp:
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
 
+    Inbox_memory selects the memory type of the buffers peers write into:
+    "uncached" allocates them in the MoRI symmetric heap, "finegrained" in HIP
+    IPC buffers exchanged over group. "uncached" is the default, so existing
+    callers are unchanged. "auto" is uncached on xGMI and fine-grained on PCIe
+    at TP4 and TP8. Only "uncached" needs MoRI initialized.
+
+    Returned outputs, and views of them, live in the op's peer-written buffers.
+    They stay valid after the op is closed or deleted, as long as they are
+    referenced, but a later call reusing their parity overwrites them. close()
+    is collective: every rank calls it after its last submit. A fine-grained op
+    that is not closed leaks its IPC buffers, because only the ranks together
+    can tell when no peer maps them.
+
     group is a required torch.distributed ProcessGroup containing exactly the
-    MoRI participants (size == world_size, group rank == rank). Construction
-    verifies that all ranks agree on the configuration and on the offsets of
-    every symmetric buffer, raising ValueError on every rank otherwise.
+    participants (size == world_size, group rank == rank; for "uncached", the
+    MoRI participants). Construction verifies that all ranks agree on the
+    configuration and, in the MoRI heap, on the offsets of every symmetric
+    buffer, raising ValueError on every rank otherwise.
     A role-0 submit on a different stream than the previous trio raises; use a
     new op or join the streams.
 
@@ -223,6 +247,7 @@ class AttentionA2AIntraNodeOp:
         softmax_scale=None,
         hadamard=None,
         valid_kv_len=None,
+        inbox_memory="uncached",
         group,
     ):
         self._next_role = 0
@@ -231,7 +256,7 @@ class AttentionA2AIntraNodeOp:
         if group is None:
             raise ValueError(
                 "group is required: a torch.distributed ProcessGroup containing "
-                "exactly the MoRI participants"
+                "exactly the participants"
             )
         self.quant = quant is not None
         if self.quant:
@@ -414,11 +439,8 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
-        if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
-            raise ValueError(
-                f"rank/world_size ({rank}/{world_size}) != MoRI "
-                f"PE/npes ({ms.shmem_mype()}/{ms.shmem_npes()})"
-            )
+        self.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
+        self.n_xcd = _resolve_n_xcd(self.device)
         # Must run before any symmetric allocation: mismatched configs
         # would otherwise hang in the shmem barrier instead of raising.
         if group.size() != world_size:
@@ -440,6 +462,8 @@ class AttentionA2AIntraNodeOp:
             q_multiplier,
             world_size,
             spin_timeout_iters,
+            self.inbox_memory,
+            self.n_xcd,
         )
         configs = [None] * world_size
         torch.distributed.all_gather_object(configs, config, group=group)
@@ -447,239 +471,256 @@ class AttentionA2AIntraNodeOp:
             raise ValueError(
                 f"ranks disagree on AttentionA2AIntraNodeOp config: {configs}"
             )
-        role_sequences = (seq_full, valid_kv_len, valid_kv_len)
-        role_numels = tuple(
-            sequence * heads_local * shape[3] for sequence in role_sequences
+        # After the agreement check: the MoRI heap checks rank against MoRI's
+        # PE, and a rank failing that alone would leave its peers in the gather.
+        heap = make_symmetric_heap(
+            memory=self.inbox_memory,
+            rank=rank,
+            world_size=world_size,
+            device=self.device,
+            group=group,
         )
-        kv_tiles = (valid_kv_len + 127) // 128
-        mxfp4_k_size = heads_local * kv_tiles * 8192
-        mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
-        fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
-        fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
-        fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
-        if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
-            from aiter.ops.mha_v4_quant import (
-                mxfp4_k_raw_buffer_size,
-                mxfp4_v_raw_buffer_size,
+        self._heap = heap
+        # A failure may happen on one rank alone and the peers would wait for it in publish.
+        # Every rank joins publish with its outcome instead, and all of them raise.
+        error = None
+        try:
+            role_sequences = (seq_full, valid_kv_len, valid_kv_len)
+            role_numels = tuple(
+                sequence * heads_local * shape[3] for sequence in role_sequences
             )
+            kv_tiles = (valid_kv_len + 127) // 128
+            mxfp4_k_size = heads_local * kv_tiles * 8192
+            mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
+            fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
+            fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
+            fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
+            if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
+                from aiter.ops.mha_v4_quant import (
+                    mxfp4_k_raw_buffer_size,
+                    mxfp4_v_raw_buffer_size,
+                )
 
-            mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
-            mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
-        if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
-            from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
+                mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
+                mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
+            if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
+                from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+                    fp6_k_raw_buffer_sizes,
+                )
 
-            fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
-                1, valid_kv_len, heads_local
-            )
-        payload_sizes = tuple(
-            _payload_size(
-                role,
-                codec,
-                self.return_packed,
-                self.quant,
-                role_numels[role],
-                mxfp4_k_size,
-                fp6_k_payload_size,
-                mxfp4_v_size,
-                fp6_v_payload_size,
-            )
-            for role, codec in enumerate(self.codecs)
-        )
-        scale_sizes = tuple(
-            _scale_size(
-                role,
-                codec,
-                per_tensor,
-                self.return_packed,
-                role_numels[role],
-                heads_local,
-                world_size,
-                block_num,
-                valid_kv_len,
-                fp6_k_scale_size,
-            )
-            for role, (codec, per_tensor) in enumerate(
-                zip(self.codecs, v4_amax_exchange)
-            )
-        )
-        scale_storage_sizes = scale_sizes
-        if self.return_packed:
-            # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
-            padding_sizes = tuple(
-                _scale_padding_size(
-                    role, codec, role_sequences[role], valid_kv_len, heads_local
+                fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
+                    1, valid_kv_len, heads_local
+                )
+            payload_sizes = tuple(
+                _payload_size(
+                    role,
+                    codec,
+                    self.return_packed,
+                    self.quant,
+                    role_numels[role],
+                    mxfp4_k_size,
+                    fp6_k_payload_size,
+                    mxfp4_v_size,
+                    fp6_v_payload_size,
                 )
                 for role, codec in enumerate(self.codecs)
             )
-            scale_storage_sizes = tuple(
-                size + padding for size, padding in zip(scale_sizes, padding_sizes)
-            )
-        for role, size in enumerate(payload_sizes):
-            _require_raw_buffer_extent(
-                f"{'qkv'[role]} output",
-                size * torch.empty((), dtype=payload_dtype).element_size(),
-            )
-        for role, (size, per_tensor) in enumerate(
-            zip(scale_storage_sizes, v4_amax_exchange)
-        ):
-            _require_raw_buffer_extent(
-                f"{'qkv'[role]} scale",
-                size * (4 if per_tensor else 1),
-            )
-        for role in range(3):
-            _require_raw_buffer_extent(f"{'qkv'[role]} input", numel * 2)
-        for name, extent in (
-            ("p2p output table", world_size * 8),
-            ("p2p scale table", world_size * 8),
-            ("xdb memory", world_size * 8),
-            ("reuse memory", world_size * 8),
-            ("reuse flags", 2 * 8),
-            ("xdb flag", 8),
-        ):
-            _require_raw_buffer_extent(name, extent)
-        if split_v_exchange:
-            _require_raw_buffer_extent("V partial amax", shape[2] * 1024)
-        self.v_pc_partial = None
-        if self.codecs[2] == "e4m3_pc":
-            partial_size = v_pc_partial_elems(shape[1], shape[2], shape[3])
-            _require_raw_buffer_extent("V per-channel partial amax", partial_size * 4)
-            self.v_pc_partial = torch.empty(
-                partial_size, dtype=torch.float32, device=self.device
-            )
-        self.v_partial_sets = (
-            tuple(
-                mori_shmem_create_tensor(
-                    (world_size // 2, 2, heads_local, 256), torch.float32
+            scale_sizes = tuple(
+                _scale_size(
+                    role,
+                    codec,
+                    per_tensor,
+                    self.return_packed,
+                    role_numels[role],
+                    heads_local,
+                    world_size,
+                    block_num,
+                    valid_kv_len,
+                    fp6_k_scale_size,
                 )
-                for _ in range(2)
-            )
-            if split_v_exchange
-            else ()
-        )
-        self.v_partial_ready_sets = (
-            tuple(
-                mori_shmem_create_tensor((world_size, heads_local), torch.int64)
-                for _ in range(2)
-            )
-            if split_v_exchange
-            else ()
-        )
-        for ready in self.v_partial_ready_sets:
-            ready.zero_()
-        self.outputs_sets = tuple(
-            tuple(
-                mori_shmem_create_tensor((size,), payload_dtype)
-                for size in payload_sizes
-            )
-            for _ in range(2)
-        )
-        # FP32 descales precede the replicated partial-max exchange slots.
-        self.scale_storage_sets = tuple(
-            tuple(
-                mori_shmem_create_tensor(
-                    (size,),
-                    torch.float32 if per_tensor else torch.uint8,
-                )
-                for size, per_tensor in zip(scale_storage_sizes, v4_amax_exchange)
-            )
-            for _ in range(2)
-        )
-        self.scales_sets = tuple(
-            tuple(
-                (
-                    scale[: heads_local * 128].view(1, heads_local, 128)
-                    if codec == "e4m3_pc"
-                    else scale[:1] if per_tensor else scale[:size]
-                )
-                for scale, per_tensor, size, codec in zip(
-                    scales, v4_amax_exchange, scale_sizes, self.codecs
+                for role, (codec, per_tensor) in enumerate(
+                    zip(self.codecs, v4_amax_exchange)
                 )
             )
-            for scales in self.scale_storage_sets
-        )
-        device = self.device
-        self.bf16_outputs_sets = ()
-        self._dequant_launch = None
-        if self.quant and not self.return_packed:
-            # Local consumers retain the same two-parity lifetime as received payloads.
-            self.bf16_outputs_sets = tuple(
+            scale_storage_sizes = scale_sizes
+            if self.return_packed:
+                # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
+                padding_sizes = tuple(
+                    _scale_padding_size(
+                        role, codec, role_sequences[role], valid_kv_len, heads_local
+                    )
+                    for role, codec in enumerate(self.codecs)
+                )
+                scale_storage_sizes = tuple(
+                    size + padding for size, padding in zip(scale_sizes, padding_sizes)
+                )
+            for role, size in enumerate(payload_sizes):
+                _require_raw_buffer_extent(
+                    f"{'qkv'[role]} output",
+                    size * torch.empty((), dtype=payload_dtype).element_size(),
+                )
+            for role, (size, per_tensor) in enumerate(
+                zip(scale_storage_sizes, v4_amax_exchange)
+            ):
+                _require_raw_buffer_extent(
+                    f"{'qkv'[role]} scale",
+                    size * (4 if per_tensor else 1),
+                )
+            for role in range(3):
+                _require_raw_buffer_extent(f"{'qkv'[role]} input", numel * 2)
+            for name, extent in (
+                ("p2p output table", world_size * 8),
+                ("p2p scale table", world_size * 8),
+                ("xdb memory", world_size * 8),
+                ("reuse memory", world_size * 8),
+                ("reuse flags", 2 * 8),
+                ("xdb flag", 8),
+            ):
+                _require_raw_buffer_extent(name, extent)
+            if split_v_exchange:
+                _require_raw_buffer_extent("V partial amax", shape[2] * 1024)
+            self.v_pc_partial = None
+            if self.codecs[2] == "e4m3_pc":
+                partial_size = v_pc_partial_elems(shape[1], shape[2], shape[3])
+                _require_raw_buffer_extent(
+                    "V per-channel partial amax", partial_size * 4
+                )
+                self.v_pc_partial = torch.empty(
+                    partial_size, dtype=torch.float32, device=self.device
+                )
+            self.v_partial_sets = (
                 tuple(
-                    torch.empty(numel, dtype=torch.bfloat16, device=device)
-                    for _ in range(3)
+                    heap.create_tensor(
+                        (world_size // 2, 2, heads_local, 256), torch.float32
+                    )
+                    for _ in range(2)
+                )
+                if split_v_exchange
+                else ()
+            )
+            self.v_partial_ready_sets = (
+                tuple(
+                    heap.create_tensor((world_size, heads_local), torch.int64)
+                    for _ in range(2)
+                )
+                if split_v_exchange
+                else ()
+            )
+            for ready in self.v_partial_ready_sets:
+                ready.zero_()
+            self.outputs_sets = tuple(
+                tuple(
+                    heap.create_tensor((size,), payload_dtype) for size in payload_sizes
                 )
                 for _ in range(2)
             )
-            self._dequant_launch = make_attention_a2a_dequant_jit(
-                numel=numel, codec=self.codecs, fp8_fnuz=self.fp8_fnuz
+            # FP32 descales precede the replicated partial-max exchange slots.
+            self.scale_storage_sets = tuple(
+                tuple(
+                    heap.create_tensor(
+                        (size,),
+                        torch.float32 if per_tensor else torch.uint8,
+                    )
+                    for size, per_tensor in zip(scale_storage_sizes, v4_amax_exchange)
+                )
+                for _ in range(2)
             )
-        self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
-        # Consumer-drain readiness is separate from producer-complete flags.
-        self.reuse_mem_sets = tuple(
-            mori_shmem_create_tensor((world_size,), torch.int64) for _ in range(2)
-        )
-        for ready_mem in self.reuse_mem_sets:
-            ready_mem.zero_()
-        self.reuse_flags = torch.ones(2, dtype=torch.int64, device=device)
-        for scales in self.scales_sets:
-            for role, (scale, codec) in enumerate(zip(scales, self.codecs)):
-                if self.return_packed and role == 1 and codec == "mxfp6":
-                    scale.zero_()
-        for storage, scales in zip(self.scale_storage_sets, self.scales_sets):
-            for backing, scale in zip(storage, scales):
-                backing[scale.numel() :].zero_()
-        for outputs in self.outputs_sets:
-            for output in outputs:
-                output.zero_()
-        self.xdb_mem.zero_()
-        self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
+            self.scales_sets = tuple(
+                tuple(
+                    (
+                        scale[: heads_local * 128].view(1, heads_local, 128)
+                        if codec == "e4m3_pc"
+                        else scale[:1] if per_tensor else scale[:size]
+                    )
+                    for scale, per_tensor, size, codec in zip(
+                        scales, v4_amax_exchange, scale_sizes, self.codecs
+                    )
+                )
+                for scales in self.scale_storage_sets
+            )
+            device = self.device
+            self.bf16_outputs_sets = ()
+            self._dequant_launch = None
+            if self.quant and not self.return_packed:
+                # Local consumers retain the same two-parity lifetime as received payloads.
+                self.bf16_outputs_sets = tuple(
+                    tuple(
+                        torch.empty(numel, dtype=torch.bfloat16, device=device)
+                        for _ in range(3)
+                    )
+                    for _ in range(2)
+                )
+                self._dequant_launch = make_attention_a2a_dequant_jit(
+                    numel=numel, codec=self.codecs, fp8_fnuz=self.fp8_fnuz
+                )
+            self.xdb_mem = heap.create_tensor((world_size,), torch.int64)
+            # Consumer-drain readiness is separate from producer-complete flags.
+            self.reuse_mem_sets = tuple(
+                heap.create_tensor((world_size,), torch.int64) for _ in range(2)
+            )
+            for ready_mem in self.reuse_mem_sets:
+                ready_mem.zero_()
+            self.reuse_flags = torch.ones(2, dtype=torch.int64, device=device)
+            for scales in self.scales_sets:
+                for role, (scale, codec) in enumerate(zip(scales, self.codecs)):
+                    if self.return_packed and role == 1 and codec == "mxfp6":
+                        scale.zero_()
+            for storage, scales in zip(self.scale_storage_sets, self.scales_sets):
+                for backing, scale in zip(storage, scales):
+                    backing[scale.numel() :].zero_()
+            for outputs in self.outputs_sets:
+                for output in outputs:
+                    output.zero_()
+            self.xdb_mem.zero_()
+            self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
 
-        # The MoRI barrier is host-only: peers must not publish into our flags
-        # before our zeroing has completed on the device. The zeroing is enqueued
-        # on the current stream, so syncing it avoids waiting on unrelated work.
-        torch.cuda.current_stream(self.device).synchronize()
-        ms.shmem_barrier_all()
+            # The heap barrier is host-only: peers must not publish into our flags
+            # before our zeroing has completed on the device. The zeroing is enqueued
+            # on the current stream, so syncing it avoids waiting on unrelated work.
+            torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        heap.publish(error)
         self.p2p_outputs_sets = tuple(
-            tuple(
-                build_p2p_table(output, rank, world_size, device) for output in outputs
-            )
+            tuple(heap.p2p_table(output) for output in outputs)
             for outputs in self.outputs_sets
         )
         self.p2p_scales_sets = tuple(
-            tuple(build_p2p_table(scale, rank, world_size, device) for scale in scales)
+            tuple(heap.p2p_table(scale) for scale in scales)
             for scales in self.scale_storage_sets
         )
         self.p2p_v_partial_sets = tuple(
-            build_p2p_table(partial, rank, world_size, device)
-            for partial in self.v_partial_sets
+            heap.p2p_table(partial) for partial in self.v_partial_sets
         )
         self.p2p_v_partial_ready_sets = tuple(
-            build_p2p_table(ready, rank, world_size, device)
-            for ready in self.v_partial_ready_sets
+            heap.p2p_table(ready) for ready in self.v_partial_ready_sets
         )
-        self.p2p_xdb_mem = build_p2p_table(self.xdb_mem, rank, world_size, device)
+        self.p2p_xdb_mem = heap.p2p_table(self.xdb_mem)
         self.p2p_reuse_mem_sets = tuple(
-            build_p2p_table(ready_mem, rank, world_size, device)
-            for ready_mem in self.reuse_mem_sets
+            heap.p2p_table(ready_mem) for ready_mem in self.reuse_mem_sets
         )
-        ms.shmem_barrier_all()
+        heap.barrier()
         # shmem_ptr_p2p translates by the offset from the local heap base, so
         # divergent allocation order would silently address the wrong buffer.
-        sym = [("output", t) for outs in self.outputs_sets for t in outs]
-        sym += [("scale", t) for sc in self.scale_storage_sets for t in sc]
-        sym += [("v_partial", t) for t in self.v_partial_sets]
-        sym += [("v_partial_ready", t) for t in self.v_partial_ready_sets]
-        sym += [("xdb", self.xdb_mem)]
-        sym += [("reuse", t) for t in self.reuse_mem_sets]
-        base = sym[0][1].data_ptr()
-        offsets = [(n, t.data_ptr() - base) for n, t in sym]
-        all_offsets = [None] * world_size
-        torch.distributed.all_gather_object(all_offsets, offsets, group=group)
-        for i, mine in enumerate(offsets):
-            if any(o[i] != all_offsets[0][i] for o in all_offsets):
-                raise ValueError(
-                    f"symmetric buffer {i} ({mine[0]}) offset differs across ranks: "
-                    f"{[o[i][1] for o in all_offsets]}"
-                )
+        # IPC buffers are separate allocations, opened by handle; every rank
+        # agreed on inbox_memory, so all of them take the same branch.
+        if self.inbox_memory == "uncached":
+            sym = [("output", t) for outs in self.outputs_sets for t in outs]
+            sym += [("scale", t) for sc in self.scale_storage_sets for t in sc]
+            sym += [("v_partial", t) for t in self.v_partial_sets]
+            sym += [("v_partial_ready", t) for t in self.v_partial_ready_sets]
+            sym += [("xdb", self.xdb_mem)]
+            sym += [("reuse", t) for t in self.reuse_mem_sets]
+            base = sym[0][1].data_ptr()
+            offsets = [(n, t.data_ptr() - base) for n, t in sym]
+            all_offsets = [None] * world_size
+            torch.distributed.all_gather_object(all_offsets, offsets, group=group)
+            for i, mine in enumerate(offsets):
+                if any(o[i] != all_offsets[0][i] for o in all_offsets):
+                    raise ValueError(
+                        f"symmetric buffer {i} ({mine[0]}) offset differs across "
+                        f"ranks: {[o[i][1] for o in all_offsets]}"
+                    )
         self._epoch = 0
         self._reuse_launch = make_attention_a2a_reuse_jit(
             rank=rank, npes=world_size, spin_timeout_iters=spin_timeout_iters
@@ -704,6 +745,10 @@ class AttentionA2AIntraNodeOp:
                 "q_multiplier": q_multiplier,
                 "fp8_fnuz": self.fp8_fnuz,
                 "spin_timeout_iters": spin_timeout_iters,
+                # A fine-grained inbox may hold payload lines dirty in the L2 of
+                # any XCD; every XCD's L2 is written back before the flag.
+                "flush_l2": self.inbox_memory == "finegrained",
+                "n_xcd": self.n_xcd,
             }
             for i in range(role_count)
         )
@@ -732,6 +777,8 @@ class AttentionA2AIntraNodeOp:
         - quantized BF16 (dequant): None for Q/K; the three BF16 outputs after V.
         - lossless BF16: None for Q/K; the three outputs after V.
         """
+        if self._heap is None:
+            raise RuntimeError("AttentionA2AIntraNodeOp is closed")
         if role not in (0, 1, 2) or role != self._next_role:
             raise ValueError("submit Q, K, V in order without interleaving trios")
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -819,6 +866,29 @@ class AttentionA2AIntraNodeOp:
             self._epoch += 1
             return self.outputs_sets[parity]
         return packed_result
+
+    def close(self):
+        """Collective: every rank calls it after its last submit. The op is
+        unusable after it.
+
+        A fine-grained op releases its IPC buffers: each is freed once every
+        peer has unmapped it and no returned output or view on it is left. The
+        MoRI heap keeps its buffers until MoRI is finalized.
+        """
+        heap = getattr(self, "_heap", None)
+        if heap is not None:
+            self._heap = None
+            heap.close()
+
+    def __del__(self):
+        heap = getattr(self, "_heap", None)
+        if heap is not None and heap.needs_close:
+            warnings.warn(
+                "AttentionA2AIntraNodeOp was not closed; its IPC buffers leak. "
+                "Call close() on every rank.",
+                ResourceWarning,
+                stacklevel=2,
+            )
 
     def _submit_role_launch(self, i, args):
         launch_args = (*(fx.Int64(arg) for arg in args[:-1]), args[-1])
