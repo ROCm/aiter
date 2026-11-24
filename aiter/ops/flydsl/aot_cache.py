@@ -983,7 +983,7 @@ def _export(exe, args, out_dir: Path, sym: str, link_libs: set | None = None) ->
     if cf is None:
         # A hook stopped the compile, such as an AOT replay that only
         # identifies kernels.
-        raise RuntimeError("flyc.compile returned no function to export")
+        raise _NoExport("flyc.compile returned no function to export")
     if link_libs is not None:
         # Private to FlyDSL (the CompiledArtifact a CompiledFunction keeps):
         # without it a linked library would go unrecorded, so the entry is
@@ -1091,6 +1091,10 @@ class _BakedArgumentError(RuntimeError):
     """One key launched with two values of a constexpr launch argument."""
 
 
+class _NoExport(RuntimeError):
+    """A hook stopped the compile, so there is nothing to export: not a failure."""
+
+
 class _StaleEntryError(RuntimeError):
     """``verify`` found a cached object that no longer matches its sources."""
 
@@ -1193,6 +1197,10 @@ class FlyDSLAotCache:
             return _JitKernel(make_exe(), key)
         try:
             return self._resolve(key, make_exe, args)
+        except _NoExport:
+            # e.g. an AOT replay that only identifies the kernels a call
+            # requests: the JIT path's compile-only launch is what it watches.
+            return _JitKernel(make_exe(), key)
         except (TypeError, ValueError, NotImplementedError, RuntimeError, OSError) as e:
             if _MODE == "verify" or isinstance(e, (_StaleEntryError, _UsageError)):
                 raise

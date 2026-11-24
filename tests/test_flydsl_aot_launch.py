@@ -371,6 +371,38 @@ def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
     assert rebuilt != stem and cache._find(out_dir, "digest", ()) == rebuilt
 
 
+def test_compile_hook_that_only_identifies_kernels_is_not_a_verify_failure(
+    monkeypatch,
+):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache, "_MODE", "verify")
+    monkeypatch.setattr(aot_cache, "_load_module", object())
+    cache = aot_cache.FlyDSLAotCache("test_no_export")
+    made = []
+
+    def make_exe():
+        made.append(1)
+        return _Launcher()
+
+    def no_export(self, key, make_exe, args):
+        raise aot_cache._NoExport("flyc.compile returned no function to export")
+
+    # An AOT replay that only identifies kernels stops flyc.compile: nothing
+    # to export, and the JIT path's compile-only launch is what it watches.
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", no_export)
+    assert isinstance(cache._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
+    assert made == [1]
+
+    def export_failed(self, key, make_exe, args):
+        raise RuntimeError("export failed")
+
+    # A real export failure still fails under verify.
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", export_failed)
+    with pytest.raises(RuntimeError, match="export failed"):
+        cache._kernel(("k",), make_exe, ())
+
+
 def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
     from flydsl.compiler import jit_function
 
