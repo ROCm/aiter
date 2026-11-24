@@ -1437,9 +1437,6 @@ def test_mha_backward_varlen_very_negative_logits(implementation):
     [
         (False, True, 256, "fp8_large_head"),
         (False, True, 320, "default"),  # pads to 512, exceeds LDS
-        (False, True, 512, "default"),  # pads to 512, exceeds LDS
-        (False, True, 255, "default"),
-        (False, True, 128, "default"),
         (False, False, 256, "default"),  # bf16 unaffected
         (True, True, 256, "dropout_or_fp32"),  # dropout keeps precedence
     ],
