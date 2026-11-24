@@ -104,7 +104,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -262,6 +262,66 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.parametrize("T, QH", [(36864, 128)])
+def test_fused_qk_rope_cat_and_cache_mla_int64_offsets(T: int, QH: int):
+    # q_out row offsets (T * QH * 576) and transposed q_nope head offsets
+    # ((QH - 1) * T * 512) both pass 2**31 - 1 in one launch.
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("gfx1250 runs the gluon kernel")
+    if torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3:
+        pytest.skip("Needs 32 GiB of device memory")
+    D_lora, D_pe, chunk = 512, 64, 4096
+    assert T * QH * (D_lora + D_pe) > 2**31 - 1
+    assert (QH - 1) * T * D_lora > 2**31 - 1
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    # SGLang passes q_nope as the transposed (QH, T, D_lora) output of a BMM.
+    q_nope = torch.randn((QH, T, D_lora), dtype=dtype, device="cuda").transpose(0, 1)
+    q_pe = torch.randn((T, QH, D_pe), dtype=dtype, device="cuda")
+    k_lora = torch.randn((T, 1, D_lora), dtype=dtype, device="cuda") / 20
+    k_pe = torch.randn((T, 1, D_pe), dtype=dtype, device="cuda") / 20
+    positions = torch.arange(T, dtype=torch.int64, device="cuda")
+    inv_freq = 1e4 ** (-torch.arange(0, D_pe, 2, device="cuda") / D_pe)
+    freqs = positions[:, None].float() * inv_freq[None, :]
+    cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    slot_mapping = torch.randperm(T, device="cuda")
+
+    def run(chunk_size):
+        q_out = torch.empty((T, QH, D_lora + D_pe), dtype=e4m3_dtype, device="cuda")
+        k_pe_out = torch.empty_like(k_pe)
+        kv_cache = torch.zeros((T, 1, D_lora + D_pe), dtype=e4m3_dtype, device="cuda")
+        for s in range(0, T, chunk_size):
+            e = min(s + chunk_size, T)
+            # A contiguous q_nope chunk keeps all reference offsets below 2**31.
+            q_nope_s = q_nope[s:e] if chunk_size == T else q_nope[s:e].contiguous()
+            fused_qk_rope_cat_and_cache_mla(
+                q_nope_s,
+                q_pe[s:e],
+                k_lora[s:e],
+                k_pe[s:e],
+                kv_cache,
+                slot_mapping[s:e],
+                positions[s:e],
+                cos,
+                sin,
+                k_scale,
+                False,
+                q_out=q_out[s:e],
+                k_pe_out=k_pe_out[s:e],
+            )
+        return q_out, k_pe_out, kv_cache
+
+    for name, out, ref in zip(("q_out", "k_pe_out", "kv_cache"), run(T), run(chunk)):
+        torch.testing.assert_close(
+            out.view(torch.uint8),
+            ref.view(torch.uint8),
+            atol=0,
+            rtol=0,
+            msg=lambda m, name=name: f"{name}: {m}",
+        )
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH", [12, 16])  # 12: Kimi-K3's 96 heads at TP8
 @pytest.mark.parametrize("D_pe", [64])
@@ -295,7 +355,7 @@ def test_fused_qk_cat_and_cache_mla(
 ):
     # The gluon kernel has no NoPE form. That also rules out the NVFP4 cache,
     # which is gfx1250-only.
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("fused_qk_cat_and_cache_mla has no gfx1250 kernel")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -450,7 +510,7 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
@@ -475,10 +535,14 @@ def test_fused_qk_rope_reshape_and_cache(
         k = k / 20
         v = v / 20
 
-    if cache_dtype == torch.uint8 and arch_info.get_arch() not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and arch_info.get_arch() not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         pytest.skip("FP4 cases only supported on gfx1250")
     elif cache_dtype == e4m3_dtype and arch_info.get_arch() not in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ):
         pytest.skip("FP8 cases only supported on gfx1250 and gfx950")
@@ -971,7 +1035,7 @@ def test_fused_qk_rope_cosine_cache_llama(
     torch_value_cache = value_cache.clone()
     # slot_t = slot_mapping // block_size
     # slot_b = slot_mapping % block_size
-    slot_t = torch.arange(slot_mapping.shape[0], device="cuda")
+    slot_t = torch.arange(slot_mapping.shape[0]).to(slot_mapping.device)
     slot_b = slot_mapping
     if cache_dtype == torch.uint8:
         torch_key_cache = torch_key_cache.view(cache_dtype_actual)
@@ -1222,7 +1286,7 @@ def _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=0):
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("QH, KH", [(8, 1), (16, 4)])
 def test_fused_qk_rope_reshape_and_cache_k4v8(scenario, block_size, D, QH, KH):
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     slot_mapping = _k4v8_slots(scenario, num_blocks, block_size)
@@ -1264,7 +1328,7 @@ def test_k4v8_cache_write_unified_attention(block_size, QH, KH):
     """Write an A8K4V8 cache with fused_qk_rope_reshape_and_cache and run
     unified_attention (FP8 Q, NVFP4 K, FP8 V, shuffled) on it, against
     ref_paged_attn on the dequantized K and the fp8 V with its descale."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 attention is only supported on GFX1250")
     from aiter.ops.triton.attention.unified_attention import unified_attention
     from op_tests.op_benchmarks.triton.bench_unified_attention import (
@@ -1382,7 +1446,7 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     """The write-only A8K4V8 op: bit-exact V and K up to NVFP4 rounding ties against the
     reference builders over the whole cache, and byte-identical to the cache write of
     fused_qk_rope_reshape_and_cache given that kernel's own roped K."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     QH = 4 * KH

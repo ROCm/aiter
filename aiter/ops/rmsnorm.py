@@ -473,7 +473,12 @@ def _rmsnorm_with_add_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="rmsnorm_with_add", version=1, fake=_rmsnorm_with_add_fake)
+@_route(
+    op="rmsnorm_with_add",
+    version=1,
+    fake=_rmsnorm_with_add_fake,
+    mutates_args=["out", "residual_out"],
+)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )
@@ -720,11 +725,14 @@ def qkv_a_rmsnorm_fp4(
     kv_eps: float,
     gemma_norm: bool = False,
 ) -> None:
-    """DeepSeek MLA q_a + kv_a RMSNorm in one launch.
+    """DeepSeek MLA q_a + kv_a RMSNorm in one launch on a wave32 GPU.
 
     q (``1024 < n <= 1536``, ``n % 128 == 0``) leaves as MXFP4 in ``q_out`` (m, n // 2)
     with its e8m0 scale in ``q_scale``, a contiguous ``(pad32(m), n // 32)`` byte tensor
     in the gfx1250 ASM GEMM A-scale layout (pad rows 0x7F). kv (``n <= 512``) leaves as
     bf16 in ``kv_out``; an empty ``kv_in`` skips it. Bit-exact with ``rmsnorm`` followed
     by ``per_1x32_mx_quant_hip(scale_layout_m32k4=True)`` for q and ``rmsnorm`` for kv.
+    Inputs and outputs are 2D tensors on the same GPU; weights are contiguous 1D
+    bf16 tensors of the matching width. Row pointers and bf16 weights must be
+    16-byte aligned, and row strides must fit int32. wave64 GPUs are rejected.
     """

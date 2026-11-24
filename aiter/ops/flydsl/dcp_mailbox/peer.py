@@ -7,7 +7,7 @@
 import torch
 import torch.distributed as dist
 
-from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+from aiter.ops.flydsl.ipc_heap import IpcHeap
 
 
 class _DeviceBytes:
@@ -34,24 +34,37 @@ class PeerBuffer:
         npes: int,
         device: torch.device,
     ):
-        self.local = UncachedIpcHeap.alloc_uncached(nbytes)
-        # a view, not an owner: close() frees the memory under it
-        self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
         self.device = device
         self.rank = rank
         self._opened: list[int] = []
+        self.local, handle, failure = 0, None, None
+        try:
+            self.local = IpcHeap.alloc_uncached(nbytes)
+            if npes > 1:
+                handle = IpcHeap.get_mem_handle_bytes(self.local)
+        except RuntimeError as err:  # every rank must still reach the agreement
+            failure = err
+        # Agree before the broadcast: a rank that raised here would leave its
+        # peers waiting in it until the process group times out.
+        if not _all_ok(failure is None, group if npes > 1 else None):
+            self.close()
+            raise RuntimeError(
+                "peer memory allocation failed on "
+                f"{'this' if failure else 'another'}"
+                " TP rank"
+            ) from failure
+        # a view, not an owner: close() frees the memory under it
+        self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
         addresses = [self.local]
         if npes > 1:
-            handles = UncachedIpcHeap.gather_object_list_via_broadcast(
-                group, UncachedIpcHeap.get_mem_handle_bytes(self.local)
-            )
+            handles = IpcHeap.gather_object_list_via_broadcast(group, handle)
             addresses, failure = [], None
             try:
                 for peer, handle in enumerate(handles):
                     if peer == rank:
                         addresses.append(self.local)
                     else:
-                        base = UncachedIpcHeap.open_mem_handle(handle)
+                        base = IpcHeap.open_mem_handle(handle)
                         self._opened.append(base)
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
@@ -72,7 +85,7 @@ class PeerBuffer:
         """Close the mappings of every peer buffer."""
         opened, self._opened = self._opened, []
         for base in opened:
-            UncachedIpcHeap.close_mem_handle(base)
+            IpcHeap.close_mem_handle(base)
 
     def close(self) -> None:
         """Close peer mappings and free the local buffer.
@@ -81,9 +94,9 @@ class PeerBuffer:
         a buffer freed while a peer still maps it cannot export a new handle.
         """
         self.close_peers()
+        self.bytes = None
         if self.local:
-            self.bytes = None
-            UncachedIpcHeap.free_device_mem(self.local)
+            IpcHeap.free_device_mem(self.local)
             self.local = 0
         self.addresses = None
 

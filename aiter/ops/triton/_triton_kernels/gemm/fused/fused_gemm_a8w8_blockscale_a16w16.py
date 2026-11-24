@@ -32,10 +32,6 @@ _fused_gemm_a8w8_blockscale_a16w16_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN_FP8": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_fp8"], args["BLOCK_SIZE_N"]),
-        "GRID_MN_BF16": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_repr)
@@ -86,8 +82,6 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     ADD_BIAS_FP8: tl.constexpr,
     ADD_BIAS_BF16: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN_FP8: tl.constexpr,
-    GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -120,8 +114,8 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     num_pid_n = num_pid_n_fp8 + num_pid_n_bf16
 
     if NUM_KSPLIT == 1:
-        GRID_MN: tl.constexpr = GRID_MN_FP8 + GRID_MN_BF16
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -171,7 +165,10 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(dtype=acc_dtype)
                 accumulator_fp8 += bias_fp8_vals[None, :]
 
-            for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+            # num_stages on the loop also pipelines the scale loads.
+            for k in tl.range(
+                pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=2
+            ):
                 if EVEN_K:
                     a = tl.load(a_fp8_ptrs)
                     b = tl.load(b_fp8_ptrs, cache_modifier=cache_modifier)
@@ -191,7 +188,10 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 a_scale = tl.load(a_scale_ptrs)
                 b_scale = tl.load(b_scale_ptrs)
 
-                accumulator_fp8 += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator_fp8 = tl.fma(
+                    tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator_fp8
+                )
 
                 a_fp8_ptrs += BLOCK_SIZE_K * stride_a_fp8_k
                 b_fp8_ptrs += BLOCK_SIZE_K * stride_b_fp8_k

@@ -26,6 +26,14 @@ runners:
     gpu_arch: MI350X
     gpu_count: 8
 
+  linux-aiter-do-mi350x-dpx-1:
+    gpu_arch: MI350X
+    gpu_count: 1
+
+  linux-aiter-do-mi350x-dpx-8:
+    gpu_arch: MI350X
+    gpu_count: 8
+
   linux-aiter-mi355-1:
     gpu_arch: MI355
     gpu_count: 1

@@ -130,16 +130,8 @@ def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
 
-_PADDED_M_TIERS = [32768, 131072]
-
-
 def _get_padded_m(m):
-    if m < _PADDED_M_TIERS[0]:
-        return _next_pow2(m)
-    for tier in reversed(_PADDED_M_TIERS):
-        if m >= tier:
-            return tier
-    return _PADDED_M_TIERS[0]
+    return min(_next_pow2(m), 131072)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -209,25 +201,47 @@ def _find_grouped_config(
             pass
         return value
 
+    max_token = 0
+
     def _matches(row, *, require_cu_num: bool):
+        nonlocal max_token
         for k, v in keys.items():
-            if k == "cu_num" and not require_cu_num:
+            if k == "token" or (k == "cu_num" and not require_cu_num):
                 continue
             cell = _cell(row, k)
+            # A plain EP row is also a safe fallback for fused EP. A row tuned
+            # with fused scatter remains specific to that path and wins below.
+            if k == "ep_fused" and cell == "0" and v == "1":
+                continue
             if cell and cell != v:
                 return False
-        return True
+        token = _cell(row, "token")
+        if token.isdigit():
+            max_token = max(max_token, int(token))
+        return not token or token == keys["token"]
 
-    matches = [row for row in rows if _matches(row, require_cu_num=True)]
-    if not matches:
-        matches = [row for row in rows if _matches(row, require_cu_num=False)]
-    # A row that names ep_fused explicitly was tuned for that path, so it wins
-    # over an otherwise equal row that serves both. Measuring the fused path
-    # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
-    # must use the multi-GPU benchmark.
-    ep_specific = [row for row in matches if _cell(row, "ep_fused")]
+    def _find_matches():
+        matches = [row for row in rows if _matches(row, require_cu_num=True)]
+        if not matches:
+            matches = [row for row in rows if _matches(row, require_cu_num=False)]
+        return matches
+
+    matches = _find_matches()
+    if not matches and 0 < max_token < token_num:
+        # Cap lookup at the largest compatible tuned token, not gaps.
+        keys["token"] = str(max_token)
+        matches = _find_matches()
+    # Prefer an exact path-specific row over a compatible fallback. Fused EP
+    # may reuse a plain row when no fused row exists; a blank row is generic.
+    ep_specific = [
+        row for row in matches if _cell(row, "ep_fused") == keys["ep_fused"]
+    ]
     if ep_specific:
         matches = ep_specific
+    elif ep_fused:
+        plain_fallback = [row for row in matches if _cell(row, "ep_fused") == "0"]
+        if plain_fallback:
+            matches = plain_fallback
     if not matches:
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -285,6 +299,71 @@ def _find_grouped_config(
         chosen.get("num_buffer_stage2"),
     )
     return chosen
+
+
+@functools.lru_cache(maxsize=1024)
+def _widest_grouped_tile(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_fused: bool = False,
+) -> int | None:
+    """Largest ``max(tile_m, tile_m2)`` tuned for this shape, any token bucket.
+
+    The compact arena is allocated once, but a step looks its tile up from its
+    own recv-token bucket. Those tiles are not monotonic, and the full-arena
+    bucket often has no row of its own; sizing the arena from that miss (the
+    tile_m=64 default) then clamps every larger tuned tile down to 64.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "gfx": str(get_gfx()),
+        "cu_num": str(get_cu_num()),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        "ep_fused": "1" if ep_fused else "0",
+    }
+
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
+    def _matches(row, *, require_cu_num: bool):
+        for k, v in keys.items():
+            if k == "cu_num" and not require_cu_num:
+                continue
+            cell = _cell(row, k)
+            if cell and cell != v:
+                return False
+        return True
+
+    rows = _load_grouped_config_rows()
+    matches = [row for row in rows if _matches(row, require_cu_num=True)]
+    if not matches:
+        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    widest = 0
+    for row in matches:
+        for column in ("tile_m", "tile_m2"):
+            try:
+                widest = max(widest, int(float(_cell(row, column) or 0)))
+            except ValueError:
+                continue
+    return widest or None
 
 
 def _use_grouped_gemm_enabled() -> bool:
@@ -720,7 +799,21 @@ def _grouped_a8w4_tdm_moe(
     if _compact:
         stage2_scatter = _compact_ctx
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
-    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    if (
+        _a_preshuffle_requested
+        and _compact
+        and not getattr(_compact_ctx, "compact_row_gather", False)
+    ):
+        raise ValueError(
+            "compact A-preshuffle requires separate dispatch and GEMM1; "
+            "set AITER_MEGA_S1F=0"
+        )
+    a_preshuffled = _a_preshuffle_requested
+    # Select GEMM2's input independently; GEMM1's quant epilogue writes it.
+    a2_preshuffled = a_preshuffled or (
+        data_format == "fp4"
+        and _as_bool(os.environ.get("AITER_FLYDSL_A2_PRESHUFFLE"), False)
+    )
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -872,7 +965,7 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
         and os.environ.get("AITER_TDM_APRE_ROUTE_FOLD", "1") in ("1", "true", "True")
     )
-    if a_preshuffled:
+    if a_preshuffled and not _compact:
         _apre_row_to_token = (
             torch.empty((int(contiguous_m),), dtype=torch.int32, device=device)
             if _apre_route_fold
@@ -1138,6 +1231,14 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
+    _row_gather = _compact and bool(getattr(_compact_ctx, "compact_row_gather", False))
+    if _row_gather and not _prequantized:
+        raise ValueError(
+            "[grouped-moe compact] dispatch shipped token-major rows for GEMM1 "
+            "to scatter, but only a prequantized A can be scattered; got "
+            f"{hidden_states.dtype} with a1_scale="
+            f"{None if src_a1_scale is None else src_a1_scale.dtype}"
+        )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -1177,7 +1278,9 @@ def _grouped_a8w4_tdm_moe(
         and int(token_num) >= _rm_min_tokens
         and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
-    _row_major_ascale = (_compact and _prequantized) or _row_major_a1
+    _row_major_ascale = (
+        (_compact and _prequantized) or _row_major_a1
+    ) and not a_preshuffled
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -1207,6 +1310,23 @@ def _grouped_a8w4_tdm_moe(
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
+        if _row_gather:
+            # The wire carries one deduplicated payload per token/peer. Scatter
+            # it once into final expert-row order so GEMM1 remains a contiguous
+            # TDM load instead of repeating indexed gathers for every K tile.
+            a1_payload, a1_scale = flydsl_moe_scatter_copy_compact(
+                a1_payload,
+                a1_scale,
+                stage2_scatter.compact_ep_rowmap,
+                wire_row_stride=int(stage2_scatter.compact_wire_row_stride),
+                topk=int(topk),
+                masked_m=stage2_scatter.compact_masked_m,
+                psum=stage2_scatter.compact_psum,
+                payload_preshuffled=a_preshuffled,
+                wmma_rep=wmma_rep,
+            )
+            _row_gather = False
+            _a1_wire_stride = 0
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
         (
@@ -1323,6 +1443,7 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            quant_out_preshuffled=int(a2_preshuffled),
             persistent_workers=persistent_workers,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
@@ -1392,7 +1513,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
-            payload_preshuffled=a_preshuffled,
+            payload_preshuffled=a2_preshuffled,
             **_a2_activation_kw,
         )
 
@@ -1417,7 +1538,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
-        a_preshuffled=int(a_preshuffled),
+        a_preshuffled=int(a2_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1473,7 +1594,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
-                        payload_preshuffled=a_preshuffled,
+                        payload_preshuffled=a2_preshuffled,
                         **_a2_activation_kw,
                     ),
                 )
@@ -1509,6 +1630,7 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        quant_out_preshuffled=int(a2_preshuffled),
                         persistent_workers=persistent_workers,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
@@ -1590,7 +1712,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
-                    a_preshuffled=int(a_preshuffled),
+                    a_preshuffled=int(a2_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -2471,6 +2593,237 @@ def flydsl_moe_scatter_copy_token(
         )
 
     return grouped_a1, a1_scale_raw
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy(row_bytes: int):
+    """Compile the compact-wire row scatter once per copied row width."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_module,
+    )
+
+    return build_moe_scatter_copy_compact_module(row_bytes)
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy_pair(payload_bytes: int, scale_bytes: int):
+    """Compile the paired payload + scale compact scatter once per shape."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_pair_module,
+    )
+
+    return build_moe_scatter_copy_compact_pair_module(payload_bytes, scale_bytes)
+
+
+def flydsl_moe_scatter_copy_compact(
+    a1_payload: torch.Tensor,
+    a1_scale: torch.Tensor | None,
+    ep_rowmap: torch.Tensor,
+    *,
+    wire_row_stride: int,
+    topk: int,
+    grouped_payload: torch.Tensor | None = None,
+    grouped_scale: torch.Tensor | None = None,
+    masked_m: torch.Tensor | None = None,
+    psum: torch.Tensor | None = None,
+    payload_preshuffled: bool = False,
+    wmma_rep: int = 1,
+):
+    """Materialize compact token-major wire rows in expert-contiguous order.
+
+    Compact dispatch keeps one payload per source token and peer. ``ep_rowmap``
+    names that source payload for each final expert row. Scatter it once before
+    GEMM1 so the grouped kernel can use its normal contiguous-A TDM loads.
+    For MXFP4, payload_preshuffled also writes M16/K32 payload slabs and
+    M16K4 scales for the requested GEMM1 wmma_rep, in the same copy pass.
+    Expert starts (psum - masked_m) must be M16-aligned, as guaranteed by
+    the compact dispatch plan. Device-resident route bounds are not read back.
+    """
+    if wire_row_stride <= 0:
+        raise ValueError(f"wire_row_stride must be positive, got {wire_row_stride}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    num_dst = int(ep_rowmap.shape[0]) - 1
+    if num_dst <= 0:
+        raise ValueError(f"ep_rowmap needs at least two rows, got {ep_rowmap.shape}")
+    device = a1_payload.device
+    payload_w = int(a1_payload.shape[-1])
+    if payload_preshuffled:
+        if wmma_rep <= 0 or num_dst % (wmma_rep * 16):
+            raise ValueError("A-preshuffle rows must align to positive wmma_rep * 16")
+        if (
+            payload_w <= 0
+            or payload_w % 64
+            or a1_scale is None
+            or int(a1_scale.shape[-1]) * 16 != payload_w
+            or wire_row_stride % 16
+        ):
+            raise ValueError("compact A-preshuffle requires K128 MXFP4 wire rows")
+        if (
+            masked_m is None
+            or psum is None
+            or masked_m.numel() == 0
+            or masked_m.ndim != 1
+            or masked_m.shape != psum.shape
+        ):
+            raise ValueError(
+                "compact A-preshuffle requires matching expert counts/psum"
+            )
+        for tensor in (a1_payload, a1_scale):
+            if (
+                tensor.dtype != torch.uint8
+                or tensor.device != device
+                or not tensor.is_cuda
+                or tensor.ndim not in (2, 3)
+                or (tensor.ndim == 3 and tensor.shape[0] != 1)
+                or tensor.stride(-1) != 1
+                or tensor.stride(-2) != wire_row_stride
+            ):
+                raise ValueError("A-preshuffle needs byte wire views on one GPU")
+        if a1_payload.data_ptr() % 16 or a1_scale.data_ptr() % 4:
+            raise ValueError("A-preshuffle wire payload/scale must align to 16/4 bytes")
+        if ep_rowmap.ndim != 2 or ep_rowmap.shape[1] != 2:
+            raise ValueError("A-preshuffle ep_rowmap must have shape (rows + 1, 2)")
+        for tensor in (ep_rowmap, masked_m, psum):
+            if (
+                tensor.dtype != torch.int32
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError("A-preshuffle needs contiguous int32 route metadata")
+        for tensor, width in (
+            (grouped_payload, payload_w),
+            (grouped_scale, int(a1_scale.shape[-1])),
+        ):
+            if tensor is not None and (
+                tensor.dtype != torch.uint8
+                or tensor.device != device
+                or not tensor.is_contiguous()
+                or tensor.numel() != num_dst * width
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError("A-preshuffle output must be aligned contiguous bytes")
+    if wire_row_stride % 16 == 0:
+        payload_unit = 16
+    elif wire_row_stride % 8 == 0:
+        payload_unit = 8
+    elif wire_row_stride % 4 == 0:
+        payload_unit = 4
+    else:
+        payload_unit = 1
+    if wire_row_stride % payload_unit:
+        raise ValueError("compact wire stride is not a whole copy unit")
+    if grouped_payload is None:
+        grouped_payload = torch.empty(
+            (1, num_dst, payload_w), dtype=torch.uint8, device=device
+        )
+    if (
+        a1_scale is not None
+        and payload_w % 16 == 0
+        and int(a1_scale.shape[-1]) % (4 if payload_preshuffled else 16) == 0
+        and wire_row_stride % 16 == 0
+    ):
+        scale_w = int(a1_scale.shape[-1])
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (
+                    (1, num_dst // wmma_rep, scale_w * wmma_rep)
+                    if payload_preshuffled
+                    else (1, num_dst, scale_w)
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+        if payload_preshuffled:
+            from aiter.ops.flydsl.moe_kernels import _get_compiled_apre_scatter
+
+            _run_compiled(
+                _get_compiled_apre_scatter(
+                    payload_w * 2,
+                    wmma_rep,
+                    src_scale_stride_bytes=wire_row_stride,
+                    src_payload_stride_bytes=wire_row_stride,
+                    compact_topk=topk,
+                    compact_experts=int(masked_m.numel()),
+                ),
+                ptr_arg(a1_payload, fx.Uint8),
+                ptr_arg(a1_scale, fx.Uint8),
+                ptr_arg(grouped_payload, fx.Uint8),
+                ptr_arg(grouped_scale, fx.Uint8),
+                ptr_arg(ep_rowmap, fx.Int32),
+                ptr_arg(masked_m, fx.Int32),
+                ptr_arg(psum, fx.Int32),
+                num_dst,
+                fx.Stream(torch.cuda.current_stream()),
+                specialization_key=(device.type, device.index),
+            )
+            return grouped_payload, grouped_scale
+        if (
+            masked_m is not None
+            and psum is not None
+            and int(masked_m.shape[0]) == int(psum.shape[0])
+            and int(masked_m.shape[0]) > 0
+        ):
+            n_experts = int(masked_m.shape[0])
+            # About 32 live rows per block when the row cap is spread across
+            # experts. The y grid is a host upper bound, so a captured graph
+            # stays static; a short expert just leaves its extra blocks idle.
+            n_split = max(
+                1, min(32, (num_dst + n_experts * 32 - 1) // (n_experts * 32))
+            )
+            _run_compiled(
+                _get_compiled_compact_scatter_copy_pair(payload_w, scale_w),
+                ptr_arg(a1_payload, fx.Uint8),
+                ptr_arg(a1_scale, fx.Uint8),
+                ptr_arg(grouped_payload, fx.Uint8),
+                ptr_arg(grouped_scale, fx.Uint8),
+                ptr_arg(ep_rowmap, fx.Int32),
+                ptr_arg(masked_m, fx.Int32),
+                ptr_arg(psum, fx.Int32),
+                wire_row_stride // 16,
+                topk,
+                n_experts,
+                n_split,
+                fx.Stream(torch.cuda.current_stream()),
+                specialization_key=(device.type, device.index),
+            )
+            return grouped_payload, grouped_scale
+    _run_compiled(
+        _get_compiled_compact_scatter_copy(payload_w),
+        ptr_arg(a1_payload, fx.Uint8),
+        ptr_arg(grouped_payload, fx.Uint8),
+        ptr_arg(ep_rowmap, fx.Int32),
+        wire_row_stride // payload_unit,
+        topk,
+        num_dst,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+
+    if a1_scale is not None:
+        scale_w = int(a1_scale.shape[-1])
+        if wire_row_stride % 16 == 0:
+            scale_unit = 16
+        elif wire_row_stride % 8 == 0:
+            scale_unit = 8
+        elif wire_row_stride % 4 == 0:
+            scale_unit = 4
+        else:
+            scale_unit = 1
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+            )
+        _run_compiled(
+            _get_compiled_compact_scatter_copy(scale_w),
+            ptr_arg(a1_scale, fx.Uint8),
+            ptr_arg(grouped_scale, fx.Uint8),
+            ptr_arg(ep_rowmap, fx.Int32),
+            wire_row_stride // scale_unit,
+            topk,
+            num_dst,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+    return grouped_payload, grouped_scale
 
 
 @functools.cache

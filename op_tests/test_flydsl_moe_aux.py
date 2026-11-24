@@ -30,10 +30,11 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (
     _build_g2l_lut,
     _grouped_a8w4_preshuffle_e8m0_scale,
+    flydsl_moe_scatter_copy_compact,
 )
 from aiter.ops.flydsl.herd_topk import herd_route_psum
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -60,6 +61,7 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_kernels import _get_compiled_apre_scatter
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -556,9 +558,7 @@ def test_route_g2l(numel, E_global, n_buckets, variant, w_dtype):
     # keeps the pre-ep_rowmap signature. Null tensor hoisted out of fn() so nothing
     # allocates under CUDA-graph capture.
     _ep_null = torch.empty(0, dtype=I32)
-    _ep_tail = (
-        (ptr_arg(_ep_null), 0, ptr_arg(_ep_null), 0) if variant == "lds" else ()
-    )
+    _ep_tail = (ptr_arg(_ep_null), 0, ptr_arg(_ep_null), 0) if variant == "lds" else ()
 
     def fn():
         launch(
@@ -652,6 +652,134 @@ def test_scatter_copy_token(num_dst, row_bytes):
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_scatter_copy_compact(model_dim, wmma_rep, preshuffled, compact=True):
+    """Check compact wire strides, duplicate routes, tails, and both layouts."""
+    counts = torch.tensor([0, 1, 15, 16, 17, 129], dtype=I32)
+    starts, psum, num_dst = run_torch_psum(counts, wmma_rep * 16)
+    payload_bytes, scale_bytes = model_dim // 2, model_dim // 32
+    wire_stride = (payload_bytes + scale_bytes + 127) // 128 * 128
+    num_src, topk = 47, 8
+    wire = torch.randint(0, 256, (num_src, wire_stride), dtype=torch.uint8)
+    src_payload = wire[:, :payload_bytes].unsqueeze(0)
+    src_scale = wire[:, payload_bytes : payload_bytes + scale_bytes]
+    src_scale.copy_(torch.randint(110, 140, src_scale.shape, dtype=torch.uint8))
+    # Valid-looking garbage in padding must be masked by expert counts.
+    rowmap = torch.zeros((num_dst + 1, 2), dtype=I32)
+    keep = torch.zeros(num_dst, dtype=torch.bool)
+    for start, count in zip(starts.tolist(), counts.tolist()):
+        # Repeated source tokens and distinct route slots must share the payload.
+        rows = torch.arange(count, dtype=I32)
+        keep[start : start + count] = True
+        rowmap[start : start + count, 0] = (
+            (rows * 13 + start) % num_src
+        ) * topk + rows % topk
+    # A skipped route inside a live tile exercises the LDS validity mask.
+    rowmap[int(starts[-1]) + 7, 0] = -1
+    source_rows = rowmap[:-1, 0] // topk
+    keep &= rowmap[:-1, 0] >= 0
+    if not compact:
+        assert preshuffled
+        src_payload = src_payload.contiguous()
+        src_scale = src_scale.contiguous()
+    raw_payload = torch.full((num_dst, payload_bytes), 0xEE, dtype=torch.uint8)
+    raw_scale = torch.full((num_dst, scale_bytes), 0xEE, dtype=torch.uint8)
+    raw_payload[keep] = src_payload[0, source_rows[keep].long()]
+    raw_scale[keep] = src_scale[source_rows[keep].long()]
+    if preshuffled:
+        ref_payload = (
+            raw_payload.reshape(num_dst // 16, 16, model_dim // 128, 4, 16)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+        )
+        ref_scale = (
+            raw_scale.reshape(
+                num_dst // (wmma_rep * 16), wmma_rep, 16, model_dim // 128, 4
+            )
+            .permute(0, 3, 1, 2, 4)
+            .contiguous()
+        )
+    else:
+        ref_payload, ref_scale = raw_payload, raw_scale
+    kwargs = {
+        "wire_row_stride": wire_stride,
+        "topk": topk,
+        "masked_m": counts,
+        "psum": psum,
+        "payload_preshuffled": preshuffled,
+        "wmma_rep": wmma_rep,
+    }
+    scale_shape = (
+        (1, num_dst // wmma_rep, scale_bytes * wmma_rep)
+        if preshuffled
+        else (1, num_dst, scale_bytes)
+    )
+    if compact:
+        dst_payload, dst_scale = flydsl_moe_scatter_copy_compact(
+            src_payload, src_scale, rowmap, **kwargs
+        )
+        assert dst_payload.shape == (1, num_dst, payload_bytes)
+        assert dst_scale.shape == scale_shape
+
+        def fn():
+            return flydsl_moe_scatter_copy_compact(
+                src_payload,
+                src_scale,
+                rowmap,
+                grouped_payload=dst_payload,
+                grouped_scale=dst_scale,
+                **kwargs,
+            )
+
+    else:
+        # Preserve coverage of the pre-existing contiguous-input launcher ABI.
+        launch = _get_compiled_apre_scatter(model_dim, wmma_rep)
+        mapping = torch.where(keep, source_rows, -1).contiguous()
+        dst_payload = torch.empty((1, num_dst, payload_bytes), dtype=torch.uint8)
+        dst_scale = torch.empty(scale_shape, dtype=torch.uint8)
+
+        def fn():
+            launch(
+                ptr_arg(src_payload),
+                ptr_arg(src_scale),
+                ptr_arg(dst_payload),
+                ptr_arg(dst_scale),
+                ptr_arg(mapping),
+                num_src,
+                num_dst,
+                1,
+                ptr_arg(mapping),
+                0,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+    nbytes = int(keep.sum()) * (payload_bytes + scale_bytes) * 2
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        dst_payload.fill_(0xEE)
+        dst_scale.fill_(0xEE)
+        _, us = run_perftest(run)
+        errors = []
+        for plane, ref, dst in (
+            ("payload", ref_payload, dst_payload),
+            ("scale", ref_scale, dst_scale),
+        ):
+            err = checkAllclose(
+                ref.reshape(-1).float(),
+                dst.reshape(-1).float(),
+                rtol=0,
+                atol=0,
+                msg=f"{name}: compact scatter {plane}",
+            )
+            assert err == 0, f"{name}: incorrect compact {plane} or padding"
+            errors.append(err)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(errors)
     return ret
 
 
@@ -1136,9 +1264,9 @@ def summarize(name, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "flydsl MoE aux kernels unsupported on %s; skipping", get_gfx()
+            "flydsl MoE aux kernels unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 
@@ -1205,6 +1333,28 @@ def main():
             for nd, rb in itertools.product([51, 1024], args.row_bytes)
         ],
     )
+    summarize(
+        "moe_scatter_copy_compact",
+        (
+            [
+                test_scatter_copy_compact(k, rep, apre)
+                for k, rep, apre in itertools.product(
+                    [128, 512, 7168], [1, 3, 8], [False, True]
+                )
+                if apre or k >= 512
+            ]
+            if get_gfx_runtime() == "gfx1250"
+            else []
+        ),
+    )
+    if get_gfx_runtime() == "gfx1250":
+        summarize(
+            "moe_apre_scatter contiguous inputs",
+            [
+                test_scatter_copy_compact(k, rep, True, compact=False)
+                for k, rep in itertools.product([128, 1152, 7168], [1, 8])
+            ],
+        )
     summarize(
         "moe_gather_reduce",
         [

@@ -988,6 +988,11 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+# Routed on the public entry point: it is the op's one spelling, it takes no
+# backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
+# contract is the whole signature, schedule metadata included: a provider with
+# its own schedule reads what it needs from it and ignores the rest.
+@_route(op="mla_decode_fwd", version=1)
 def mla_decode_fwd(
     q,
     kv_buffer,

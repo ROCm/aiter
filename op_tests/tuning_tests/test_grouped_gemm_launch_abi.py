@@ -5,6 +5,7 @@
 
 import ctypes
 import inspect
+import types
 
 import pytest
 import torch
@@ -15,6 +16,9 @@ from flydsl.compiler.jit_executor import CallState
 from flydsl.compiler.jit_function import _build_call_spec
 
 from aiter.ops.flydsl import grouped_gemm_mxfp4 as grouped
+from aiter.ops.flydsl import grouped_moe_gfx1250 as moe
+from aiter.ops.flydsl import moe_kernels
+from aiter.ops.flydsl.kernels import moe_apreshuffled_quant_scatter as apre_scatter
 from aiter.ops.flydsl.kernels import tensor_shim
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -224,3 +228,193 @@ def test_changing_arena_selects_a_new_specialization(dispatch):
         )
     assert len(compiled) == 2
     assert len(launches) == 3
+
+
+@pytest.mark.parametrize(
+    "overrides,env,expected_workers,expected_buffers",
+    [
+        ({}, {}, 256, 3),
+        ({"persistent_workers": 128}, {}, 128, 3),
+        ({"persistent_workers": 512, "num_buffers": 2}, {}, 512, 3),
+        (
+            {"persistent_workers": 128},
+            {"AITER_FLYDSL_PERSISTENT_WORKERS2": "64"},
+            64,
+            3,
+        ),
+        ({}, {"AITER_FLYDSL_PERSISTENT_WORKERS": "128"}, 128, 3),
+        ({}, {"AITER_FLYDSL_PERSISTENT_WORKERS2": "0"}, 256, 3),
+        ({"a_preshuffled": 0}, {}, 0, 4),
+        ({"tile_m": 128}, {}, 0, 4),
+        ({"next_stage_prefetch": 0}, {}, 0, 4),
+        ({}, {"AITER_TDM_NEXT_STAGE_PREFETCH": "0"}, 0, 4),
+        ({"tdm_as_in_prologue": 1}, {}, 0, 4),
+        ({}, {"AITER_GROUPED_GEMM_AS_PROLOGUE": "1"}, 0, 4),
+        ({"K": 512}, {}, 0, 2),
+        ({"stage2_scatter": None}, {}, 0, 4),
+    ],
+)
+def test_overlap_defaults_preserve_launch_configuration(
+    monkeypatch, overrides, env, expected_workers, expected_buffers
+):
+    """Inspect actual launch arguments without compiling or executing GPU code."""
+    for name in (
+        "AITER_FLYDSL_PERSISTENT_WORKERS",
+        "AITER_FLYDSL_PERSISTENT_WORKERS1",
+        "AITER_FLYDSL_PERSISTENT_WORKERS2",
+        "AITER_FLYDSL_MXFP4_CLUSTER_M",
+        "AITER_FLYDSL_MXFP4_CLUSTER_N",
+        "AITER_TDM_NEXT_STAGE_PREFETCH",
+        "AITER_GROUPED_GEMM_AS_PROLOGUE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    calls = []
+    signature = inspect.signature(launch_gemm_a8w4_tdm.func)
+
+    def capture_launch(exe, *args, specialization_key):
+        assert exe is launch_gemm_a8w4_tdm
+        assert specialization_key
+        calls.append(signature.bind(*args).arguments)
+
+    monkeypatch.setattr(grouped, "_run_compiled", capture_launch)
+    out = torch.empty((256, 1024), dtype=torch.bfloat16, device="meta")
+    data = torch.empty((256, 1024), dtype=torch.uint8, device="meta")
+    ids = torch.empty(64, dtype=torch.int32, device="meta")
+    config = {
+        "n_experts": 64,
+        "contiguous_m": 256,
+        "N": 1024,
+        "K": 2048,
+        "tile_m": 256,
+        "tile_n": 256,
+        "tile_k": 256,
+        "m_warp": 2,
+        "n_warp": 2,
+        "a_is_fp4": 1,
+        "a_preshuffled": 1,
+        "num_buffers": 4,
+        "next_stage_prefetch": 1,
+        "cluster_m": 1,
+        "cluster_n": 4,
+        "stream": 0,
+        "stage2_scatter": Stage2ScatterContext(123456, 0, 16384, 8192, 4, ids),
+    }
+    config.update(overrides)
+    grouped.flydsl_grouped_gemm_a8w4_masked(out, data, data, data, data, ids, **config)
+    assert len(calls) == 1
+    selected = calls[0]
+    assert selected["persistent_workers"] == expected_workers
+    assert selected["num_buffers"] == expected_buffers
+    for name in (
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "cluster_m",
+        "cluster_n",
+        "m_warp",
+        "n_warp",
+        "a_preshuffled",
+    ):
+        assert selected[name] == config[name]
+
+
+def test_compact_preshuffle_cache_separates_layout_and_scale_rep():
+    """Transport metadata and scale grouping must not reuse a stale kernel."""
+    factory = moe_kernels._get_compiled_apre_scatter
+    ordinary = factory(7168, 8)
+    compact = factory(7168, 8, 3840, 3840, 8, 64)
+    other_rep = factory(7168, 1, 3840, 3840, 8, 64)
+    other_topk = factory(7168, 8, 3840, 3840, 4, 64)
+    assert len({id(ordinary), id(compact), id(other_rep), id(other_topk)}) == 4
+    assert compact is factory(7168, 8, 3840, 3840, 8, 64)
+
+
+def test_compact_preshuffle_lds_bank_mapping():
+    """Audit the reused async scatter's payload and scale bank mappings."""
+    payload_stride = apre_scatter._PAYLOAD_LDS_ROW_DWORDS
+    scale_stride = apre_scatter._SCALE_LDS_ROW_DWORDS
+    scale_slice = apre_scatter._SCALE_LDS_SLICE_DWORDS
+    for first_lane in range(0, 512, 16):
+        write_banks, read_banks = [], []
+        for thread in range(first_lane, first_lane + 16):
+            for word in range(4):
+                write_banks.append(
+                    (thread // 32 * payload_stride + thread % 32 * 4 + word) % 64
+                )
+                read_banks.append(
+                    (thread % 16 * payload_stride + thread // 16 * 4 + word) % 64
+                )
+        assert len(set(write_banks)) == 64
+        assert len(set(read_banks)) == 64
+    for row in range(16):
+        write_banks = [
+            (column // 8 * scale_slice + row * scale_stride + column % 8) % 64
+            for column in range(32)
+        ]
+        assert len(set(write_banks)) == 32
+    for column in range(8):
+        read_banks = [(row * scale_stride + column) % 64 for row in range(16)]
+        assert len(set(read_banks)) == 16
+
+
+def test_compact_preshuffle_rejects_fused_stage1(monkeypatch):
+    """A fused producer cannot silently ignore the requested GEMM1 layout."""
+    monkeypatch.setattr(
+        moe,
+        "_flydsl_dispatch_context",
+        lambda: types.SimpleNamespace(compact_layout=True, compact_row_gather=False),
+    )
+    data = torch.empty((16, 64), device="meta")
+    ids = torch.empty((16, 8), dtype=torch.int32, device="meta")
+    with pytest.raises(ValueError, match="AITER_MEGA_S1F=0"):
+        moe._grouped_a8w4_tdm_moe(
+            data,
+            data,
+            data,
+            ids,
+            ids,
+            E=1,
+            model_dim=128,
+            inter_dim=128,
+            dtype=torch.bfloat16,
+            activation=None,
+            w1_scale=None,
+            w2_scale=None,
+            bias1=None,
+            bias2=None,
+            swiglu_limit=None,
+            doweight_stage1=False,
+            data_format="fp4",
+            a_preshuffle=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"wmma_rep": 0}, "positive wmma_rep"),
+        ({"wmma_rep": 3}, "positive wmma_rep"),
+        ({"wire_row_stride": 129}, "K128 MXFP4"),
+        ({"masked_m": None}, "matching expert counts/psum"),
+        ({}, "wire views on one GPU"),
+    ],
+)
+def test_compact_preshuffle_validates_before_launch(overrides, message):
+    data = torch.empty((16, 128), dtype=torch.uint8, device="cpu")
+    rowmap = torch.empty((129, 2), dtype=torch.int32, device="cpu")
+    counts = torch.empty(1, dtype=torch.int32, device="cpu")
+    kwargs = {
+        "wire_row_stride": 128,
+        "topk": 8,
+        "masked_m": counts,
+        "psum": counts,
+        "payload_preshuffled": True,
+        "wmma_rep": 8,
+    }
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        moe.flydsl_moe_scatter_copy_compact(
+            data[:, :64], data[:, 64:68], rowmap, **kwargs
+        )
