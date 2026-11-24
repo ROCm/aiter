@@ -1807,7 +1807,9 @@ def test_unified_attn_split_reduce_k4v8(
         [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2048), (1, 0)],
     ],
 )
-@pytest.mark.parametrize("config", [None, (64, 0, 2), (64, 64, 1), (32, 16, 4)])
+@pytest.mark.parametrize(
+    "config", [None, (64, 0, 2), (64, 64, 1), (32, 16, 4), "auto512", "auto2048"]
+)
 @torch.inference_mode()
 def test_unified_attn_split_reduce_oneshot_k4v8(
     seq_lens, config, gate: bool, select: bool, monkeypatch
@@ -1816,7 +1818,8 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     reduce_segments_split_gluon (the same statistics reduction, the same merge steps in
     the same order), on the 3D kernel's own partials under the gfx1250 token split, with
     and without the gate / row-selection epilogue, speculative or not, over one or
-    several LDS passes."""
+    several LDS passes; "auto<programs>": AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO's
+    (CHUNK, SPEC, warps) from the launch shape, with that token split size."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
@@ -1826,7 +1829,12 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
     monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MAX_TILES", 128)
     monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
-    if config is not None:
+    if isinstance(config, str):
+        monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_AUTO", True)
+        monkeypatch.setattr(
+            module, "_GFX12_TOKEN_SPLIT_PROGRAMS", int(config[len("auto") :])
+        )
+    elif config is not None:
         monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", config)
     torch.manual_seed(0)
     block_size, head_size, num_heads = 128, 256, (16, 2)
@@ -1912,6 +1920,31 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "shape, expected",
+    [
+        # (rows, query heads, segments, seqs, KV heads, head size v): Qwen3.5 decode,
+        # token split of 512 programs, split reduce SB 8
+        ((4, 16, 79, 1, 2, 256), (128, 64, 4)),  # 1 seq: ~79 live segments, one pass
+        ((128, 16, 79, 32, 2, 256), (32, 0, 2)),  # 32 seqs: 8 live, LDS caps CHUNK
+        ((480, 16, 128, 120, 2, 256), (8, 8, 2)),  # 120 seqs: CHUNK = SB
+    ],
+)
+def test_gfx12_split_reduce_oneshot_config(shape, expected, monkeypatch):
+    """AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO's (CHUNK, SPEC, warps) rule; off, the
+    fixed AITER_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG."""
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_CONFIG", (8, 2, 1))
+    monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", (16, 8, 2))
+    monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_AUTO", False)
+    assert module.gfx12_split_reduce_oneshot_config(*shape) == (16, 8, 2)
+    monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_AUTO", True)
+    monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_AUTO_LDS", 64 << 20)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_PROGRAMS", 512)
+    assert module.gfx12_split_reduce_oneshot_config(*shape) == expected
 
 
 def _fp4pt_v(inp):
