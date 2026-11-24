@@ -32,14 +32,18 @@ H, E = 6144, 128
 BLOCKS = H // 32  # 32-value groups per row
 
 
-def _dual_quant_group(i32_m, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk):
-    """One lane: 32-value group ``blk`` of x -> MXFP4 (even e8m0) and MXFP8 codes and scales,
-    ``router_topk_mxfp4_mxfp8_quant.py``'s arithmetic op for op."""
+def _dual_quant_group(i32_m, i32_sx, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk):
+    """One lane: 32-value group ``blk`` (row ``blk // BLOCKS``, group ``blk % BLOCKS``) of x (row stride
+    ``i32_sx`` elements) -> MXFP4 (even e8m0) and MXFP8 codes and scales, ``router_topk_mxfp4_mxfp8_quant.py``'s
+    arithmetic op for op. The outputs are packed [m, ...]."""
     xr = buffer_ops.create_buffer_resource_from_addr(
-        arg_x, num_records_bytes=fx.Int64(i32_m) * (H * 2)
+        arg_x, num_records_bytes=fx.Int64(i32_m) * fx.Int64(i32_sx * 2)
     )
+    row = blk // BLOCKS
+    group = blk - row * BLOCKS
+    x_dw = ((row * i32_sx) >> 1) + group * 16  # dword offset of the group
     xv = [
-        Vec(buffer_ops.buffer_load(xr, blk * 16 + j * 4, vec_width=4, dtype=fx.Int32))
+        Vec(buffer_ops.buffer_load(xr, x_dw + j * 4, vec_width=4, dtype=fx.Int32))
         for j in range_constexpr(4)
     ]
     qr = buffer_ops.create_buffer_resource_from_addr(
@@ -164,11 +168,15 @@ def compile_router_gemm_nblocks(
         if const_expr(quant == 1) and bid0 >= n_router:
             blk = (bid0 - n_router) * (64 * NT) + tx
             if blk < i32_m * BLOCKS:
-                _dual_quant_group(i32_m, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk)
+                _dual_quant_group(
+                    i32_m, i32_sx, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk
+                )
         if const_expr(quant == 2) and bid0 < n_q:
             blk = bid0 * (64 * NT) + tx
             if blk < i32_m * BLOCKS:
-                _dual_quant_group(i32_m, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk)
+                _dual_quant_group(
+                    i32_m, i32_sx, arg_x, arg_q, arg_s, arg_q8, arg_s8, blk
+                )
         bid = bid0 - n_q if const_expr(quant == 2) else bid0
         if (bid >= 0) & (bid < n_router):
             lane = tx % 64
