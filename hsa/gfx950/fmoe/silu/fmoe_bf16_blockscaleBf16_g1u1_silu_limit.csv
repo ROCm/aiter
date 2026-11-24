@@ -1,0 +1,3 @@
+knl_name,co_name,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n,flat,dim_align,dim_min
+_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128E,fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128.co,0,1,0,1,0,1,128,1,0,0
+_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256E,fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256.co,0,1,0,1,0,1,256,1,0,0
