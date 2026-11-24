@@ -329,7 +329,7 @@ def test_nvfp4_quant(
     dtype: torch.dtype,
 ):
     torch.cuda.empty_cache()
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
 
     torch.manual_seed(0)
@@ -626,7 +626,7 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
     arch = arch_info.get_arch()
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("The Gluon backend requires gfx950 or gfx1250")
     if arch == "gfx950" and dtype != torch.bfloat16:
         pytest.skip("The gfx950 Gluon kernel requires bf16 input")
@@ -645,6 +645,6 @@ def test_dynamic_mxfp4_quant_backend_validation():
     with pytest.raises(ValueError, match="Unknown backend"):
         dynamic_mxfp4_quant(x, backend="cuda")
     # gfx1250 runs Gluon for every dtype; elsewhere fp16 has no Gluon kernel.
-    if arch_info.get_arch() != "gfx1250":
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         with pytest.raises(RuntimeError, match="Gluon backend requires"):
             dynamic_mxfp4_quant(x.half(), backend="gluon")

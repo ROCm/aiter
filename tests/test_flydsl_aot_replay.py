@@ -196,6 +196,65 @@ def test_the_dry_run_answers_an_assignment_through_an_index(monkeypatch):
         assert table.shape == (8,)
 
 
+def test_the_dry_run_gives_each_storage_its_own_address_range():
+    """Host code compares pointers and the byte ranges they span, so fake
+    storages must be disjoint, aligned allocations, as on a GPU."""
+    with dry_run("gfx1250", 256):
+        tensors = [
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in (
+                ((1, 4096), torch.bfloat16),
+                ((128, 4096), torch.bfloat16),
+                ((1, 128), torch.bfloat16),
+                ((3,), torch.uint8),
+                ((8, 4096), torch.float32),
+            )
+        ]
+        spans = [
+            (t.data_ptr(), t.data_ptr() + t.untyped_storage().nbytes()) for t in tensors
+        ]
+    assert all(start % 4096 == 0 for start, _ in spans)
+    for (start_a, end_a), (start_b, end_b) in itertools.combinations(spans, 2):
+        assert end_a <= start_b or end_b <= start_a
+
+
+def test_a_view_keeps_its_storage_s_address_under_the_dry_run():
+    with dry_run("gfx1250", 256):
+        base = torch.empty((8, 128), dtype=torch.bfloat16, device="cuda")
+        assert base.data_ptr() == base.data_ptr()
+        assert base[2:].data_ptr() == base.data_ptr() + 2 * 128 * 2
+        assert base[:, 64:].data_ptr() == base.data_ptr() + 64 * 2
+        assert base.t().data_ptr() == base.data_ptr()
+        assert torch.empty(0, device="cuda").data_ptr() == 0
+
+
+@pytest.mark.parametrize(
+    ("m", "block_k", "stages"), [(1, 128, 5), (2, 256, 3), (4, 512, 2), (8, 512, 2)]
+)
+def test_a_split_k_tdm_gemm_replay_reaches_flydsl(m, block_k, stages):
+    """The gfx1250 TDM GEMM refuses an output that overlaps its inputs. The
+    fresh output of a replay must pass that check, as on a GPU (#8134: the
+    split-K bf16_tuned_gemm rows of Qwen3.5-397B, N=128 K=4096)."""
+    from aiter.ops.flydsl.gemm_a16w16_tdm import gemm_a16w16_tdm
+
+    with dry_run("gfx1250", 256):
+        a = torch.empty((m, 4096), dtype=torch.bfloat16, device="cuda")
+        b = torch.empty((128, 4096), dtype=torch.bfloat16, device="cuda")
+        with replay.identified_kernels() as kernels:
+            gemm_a16w16_tdm(
+                a,
+                b.t(),
+                block_m=16,
+                block_n=16,
+                block_k=block_k,
+                stages=stages,
+                m_waves=1,
+                n_waves=1,
+                split_k=8,
+            )
+    assert len(kernels) == 1
+
+
 def test_per_arch_replays_get_the_command_line(monkeypatch):
     argv = ["--shape", "12:12:192:128", "--check"]
     forwarded = []

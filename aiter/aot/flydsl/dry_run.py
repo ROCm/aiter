@@ -51,6 +51,12 @@ class _Device:
         return False
 
 
+# Fake device addresses of FakeTensor storages: page-aligned, a guard page
+# apart, from a base inside the 47-bit user address space.
+_FAKE_ADDRESS_BASE = 1 << 44
+_FAKE_PAGE = 1 << 12
+
+
 class GpuRuntimeReached(RuntimeError):
     """Host code under :func:`dry_run` reached the GPU runtime."""
 
@@ -211,23 +217,39 @@ def dry_run(
         name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
     )
     real_data_ptr = torch.Tensor.data_ptr
-    storage_addresses = {}
-    next_address = 256
+    # The fake address range of each storage of this dry run, by storage
+    # identity: (base, bytes reserved). Host code compares pointers and the
+    # byte ranges they span (the gfx1250 TDM GEMM refuses an output that
+    # overlaps its inputs), so each storage gets its own page-aligned range,
+    # a guard page before the next. The address of the storage object itself
+    # would put storages a few hundred bytes apart.
+    storage_ranges: dict[int, tuple[int, int]] = {}
+    next_base = _FAKE_ADDRESS_BASE
+
+    def storage_base(storage) -> int:
+        nonlocal next_base
+        nbytes = storage.nbytes()
+        base, reserved = storage_ranges.get(storage._cdata, (0, -1))
+        if reserved < nbytes:
+            # A new storage, or a larger one than the range of its identity
+            # holds: a dead storage's identity reused, or this one resized.
+            base = next_base
+            pages = -(-nbytes // _FAKE_PAGE)
+            next_base += (pages + 1) * _FAKE_PAGE
+            storage_ranges[storage._cdata] = (base, nbytes)
+        return base
 
     def data_ptr(tensor):
-        nonlocal next_address
         if not isinstance(tensor, FakeTensor):
             return real_data_ptr(tensor)
         if tensor.numel() == 0:
             return 0
-        storage = tensor.untyped_storage()
-        if storage._cdata not in storage_addresses:
-            # Host overlap checks need disjoint byte ranges, not the addresses
-            # of metadata objects. Keep the storage alive to prevent ID reuse.
-            storage_addresses[storage._cdata] = (storage, next_address)
-            next_address += (storage.nbytes() + 255) // 256 * 256
-        _, base = storage_addresses[storage._cdata]
-        return base + tensor.storage_offset() * tensor.element_size()
+        # Views keep their storage's address, so host code comparing pointers
+        # sees aliasing; the address is never dereferenced.
+        return (
+            storage_base(tensor.untyped_storage())
+            + tensor.storage_offset() * tensor.element_size()
+        )
 
     real_getitem = torch.Tensor.__getitem__
     real_setitem = torch.Tensor.__setitem__
