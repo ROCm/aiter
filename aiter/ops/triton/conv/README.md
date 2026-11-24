@@ -167,8 +167,9 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 ## Constraints
 
-- Only `groups=1` is implemented; callers must send depthwise or grouped
-  convolutions to another backend.
+- The Conv2D and Conv3D routers support dense convolution (`groups=1`).
+  For grouped or depthwise Conv2D, call `conv2d_general` with `groups=G`
+  and a weight of shape `(Cout, Cin // G, R, S)`.
 - Per-axis pad amounts may differ, for example `(0, 2)` for Conv2D or
   `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.

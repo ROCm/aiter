@@ -35,6 +35,7 @@ from aiter.ops.triton.conv._utils import (
     _prep_bias,
     _require_winograd_2d_eligible,
     _validate_conv_devices,
+    _validate_conv_groups,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     conv_config_uses_exact_routes,
@@ -193,7 +194,7 @@ def conv2d(
 
     Notes
     -----
-    - Only ``groups=1`` (depthwise/grouped raises ``AssertionError``).
+    - This router supports dense convolution. Use ``conv2d_general`` for groups > 1.
     - ``padding_mode`` supports zeros, reflect, replicate, and circular.
       Nonzero modes explicitly pad once before routing; convolution receives
       the padded input and effective padding ``(0, 0)``.
@@ -410,18 +411,28 @@ def conv2d_general(
     block_k=BLOCK_K,
     layout="nchw",
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
-    """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.).
+    """Compute forward Conv2d in NCHW or channels-last storage.
 
-    Supports the same padding modes as conv2d.
+    Each group reads Cin / groups input channels and produces Cout / groups
+    output channels. Weights have shape (Cout, Cin / groups, R, S).
+    Supports the same padding modes as conv2d. The result uses the requested layout.
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
-    x = _ensure_layout(x, layout)
-    N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
+    N, C, H, W_in = x.shape
+    K_out, Cw, R, S = w_oihw.shape
+    groups = _validate_conv_groups(groups, C, K_out, Cw, bias)
+    P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
+    # PyTorch returns zero output channels when the input has zero channels.
+    y = _alloc_output(N, K_out if C else 0, P, Q, x, layout)
+    if y.numel() == 0:
+        return y
 
-    y = _alloc_output(N, K_out, P, Q, x, layout)
+    x = _ensure_layout(x, layout)
     bias = _prep_bias(bias)
     w_k, K_pad = get_or_make_weight_pack(w_oihw, block_k)
     _launch_general(
@@ -445,6 +456,7 @@ def conv2d_general(
         block_k,
         activation,
         layout=layout,
+        groups=groups,
     )
     return y
 

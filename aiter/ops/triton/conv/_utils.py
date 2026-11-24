@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import operator
 from collections.abc import Sequence
 
 import torch
@@ -50,6 +51,34 @@ def _conv_dims(x, w_oihw, stride, padding, dilation):
     assert Cw == C
     P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
     return N, C, H, W_in, K_out, R, S, P, Q
+
+
+def _validate_conv_groups(groups, in_channels, out_channels, weight_channels, bias):
+    """Check grouped weight and bias dimensions and return the integer group count."""
+    try:
+        count = operator.index(groups)
+    except TypeError:
+        raise ValueError(f"groups must be a positive integer, got {groups!r}") from None
+    if isinstance(groups, bool) or count <= 0:
+        raise ValueError(f"groups must be a positive integer, got {groups!r}")
+    if in_channels % count:
+        raise ValueError(
+            f"input channels {in_channels} must be divisible by groups={count}"
+        )
+    if out_channels < count or out_channels % count:
+        raise ValueError(
+            f"output channels {out_channels} must be a positive multiple of groups={count}"
+        )
+    if weight_channels != in_channels // count:
+        raise ValueError(
+            f"weight has {weight_channels} input channels per group, "
+            f"expected {in_channels // count} for groups={count}"
+        )
+    if bias is not None and bias.shape != (out_channels,):
+        raise ValueError(
+            f"bias must have shape ({out_channels},), got {tuple(bias.shape)}"
+        )
+    return count
 
 
 def _alloc_output(N, K_out, P, Q, x, layout):

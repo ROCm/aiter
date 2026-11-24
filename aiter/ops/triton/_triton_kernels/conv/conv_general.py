@@ -7,6 +7,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.common.activation import (
     _apply_activation_from_str,
 )
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
@@ -22,6 +23,7 @@ _conv2d_general_kernel_repr = make_kernel_repr(
         "BLOCK_N",
         "BLOCK_K",
         "GROUP_SIZE_M",
+        "GROUPS",
         "HAS_BIAS",
         "ACTIVATION",
         "LAYOUT",
@@ -54,8 +56,9 @@ def _conv2d_general_kernel(
     M_total,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,  # blocks the flattened C*R*S GEMM-K axis (see loop below), not channels
+    BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    GROUPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
     LAYOUT: tl.constexpr,
@@ -87,24 +90,21 @@ def _conv2d_general_kernel(
         stride_y_p: tl.constexpr = Q * K_out
         stride_y_q: tl.constexpr = K_out
 
-    pid = tl.program_id(axis=0)
-
+    C_per_group: tl.constexpr = C // GROUPS
+    K_out_per_group: tl.constexpr = K_out // GROUPS
+    pid = tl.program_id(0)
+    conv_group = pid % GROUPS
     num_pid_m = tl.cdiv(M_total, BLOCK_M)
-    num_pid_n = tl.cdiv(K_out, BLOCK_N)
-
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    num_pid_n = tl.cdiv(K_out_per_group, BLOCK_N)
+    pid_m, pid_n = pid_grid(pid // GROUPS, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    local_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = conv_group * K_out_per_group + local_n
     offs_k = tl.arange(0, BLOCK_K)
 
     m_mask = offs_m < M_total
-    kout_mask = offs_n < K_out
+    kout_mask = local_n < K_out_per_group
 
     # Decode offs_m -> (n_idx, p_idx, q_idx)
     n_idx = offs_m[:, None] // (P * Q)
@@ -121,24 +121,27 @@ def _conv2d_general_kernel(
     stride_x_dw = dil_w * stride_x_w
 
     # Input base: X[N, C, H, W_in] (NCHW) or X[N, H, W_in, C] (NHWC)
-    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
-    # Weight base: W[K_out, K_pad] contiguous (K_pad = padded C*R*S)
+    x_base = (
+        X
+        + n_idx * stride_x_n
+        + conv_group * C_per_group * stride_x_c
+        + base_ih * stride_x_h
+        + base_iw * stride_x_w
+    )
+    # The packed weight row contains one group's input channels and filter taps.
     w_base = W + offs_n[None, :] * stride_w_kout
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     rs_stride = R * S
 
-    # Reduction is over the flattened im2col GEMM-K axis (C*R*S = K_pad), not
-    # channels alone: one BLOCK_K step can straddle channel/filter-tap
-    # boundaries, so each kred is decoded below into (c, r, s). Here the GEMM-K
-    # axis is genuinely C*R*S, whereas in 1x1/3x3 the same BLOCK_K names a
-    # reduction that spans only channels (R=S=1, or the 3x3 taps looped
-    # separately in static_range).
+    # Decode the group's flattened reduction index into (input channel, row, column).
     for k0 in range(0, K_pad, BLOCK_K):
         kred = k0 + offs_k
 
         w_ptrs = w_base + kred[:, None] * stride_w_kred
-        w_tile = tl.load(w_ptrs, mask=kout_mask[None, :], other=0.0)
+        w_tile = tl.load(
+            w_ptrs, mask=(kred[:, None] < K_pad) & kout_mask[None, :], other=0.0
+        )
 
         c = kred // rs_stride
         rs = kred % rs_stride
@@ -150,7 +153,12 @@ def _conv2d_general_kernel(
 
         X_ptrs = x_base + c * stride_x_c + r * stride_x_dh + s * stride_x_dw
         x_mask = (
-            n_valid & (ih >= 0) & (iw >= 0) & (ih < H) & (iw < W_in) & (c[None, :] < C)
+            n_valid
+            & (ih >= 0)
+            & (iw >= 0)
+            & (ih < H)
+            & (iw < W_in)
+            & (c[None, :] < C_per_group)
         )
         x_tile = tl.load(X_ptrs, mask=x_mask, other=0.0)
 
@@ -158,7 +166,7 @@ def _conv2d_general_kernel(
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     acc = _apply_activation_from_str(acc, ACTIVATION)
