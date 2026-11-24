@@ -24,6 +24,7 @@ from chip_info import (
 )
 from gemm_a8w8_blockscale_instance import (
     KernelInstance,
+    SliceKInstance,
     candidate_kernels_by_name,
     candidate_kernels_dict,
     default_kernels_dict,
@@ -59,10 +60,31 @@ class gemm_a8w8_blockscale_codegen:
             )
         return default_kernels_dict
 
-    def gen_ck_instance(self, k: KernelInstance):
-        """
-        Generate kernel instance code for ck gemm a8w8 blockscale
-        """
+    def gen_slicek_impl(self, k: SliceKInstance) -> str:
+        return f"""// SPDX-License-Identifier: MIT
+// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a8w8_blockscale_common.cuh"
+#include "gemm_a8w8_blockscale_slicek.cuh"
+
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch
+    )
+{{
+    return gemm_a8w8_blockscale_slicek_impl<DDataType, EDataType,
+        {k.MRep}, {k.NRep}, {k.NWaves}, {k.Unroll}, {k.KSplit}>(
+        XQ, WQ, x_scale, w_scale, Y, KBatch);
+}}
+"""
+
+    def gen_legacy_impl(self, k: KernelInstance) -> str:
         instance_params = f"""                    {k.BLOCK_SIZE},
                     {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
                     {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
@@ -86,7 +108,7 @@ class gemm_a8w8_blockscale_codegen:
             else 2
         )
 
-        LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+        return f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_blockscale_common.cuh"
@@ -159,6 +181,15 @@ torch::Tensor
 }}
 """
 
+    def gen_ck_instance(self, k: KernelInstance | SliceKInstance):
+        """
+        Generate kernel instance code for ck gemm a8w8 blockscale
+        """
+        LEGACY_INSTANCE_IMPL = (
+            self.gen_slicek_impl(k)
+            if isinstance(k, SliceKInstance)
+            else self.gen_legacy_impl(k)
+        )
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
             LEGACY_INSTANCE_IMPL
         )

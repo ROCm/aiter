@@ -1,6 +1,20 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices,Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices,Inc. All rights reserved.
+import os
+import sys
 from dataclasses import dataclass
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
+from chip_info import get_gfx
 
 
 @dataclass
@@ -69,6 +83,52 @@ class KernelInstance:
         )
 
 
+@dataclass
+class SliceKInstance:
+    """gfx950 small-M kernel (gemm_a8w8_blockscale_slicek.cuh): one
+    (16 * MRep) x (16 * NRep) output tile per workgroup, K split over its
+    NWaves waves and reduced in LDS in wave order. KSplit = 2 adds a second
+    workgroup per tile; each rounds its half and adds it atomically into a
+    zeroed output, which is order-independent. Both are deterministic, so
+    these kernels take no splitK."""
+
+    MRep: int
+    NRep: int
+    NWaves: int
+    Unroll: int
+    KSplit: int
+
+    supports_splitk = False
+
+    @property
+    def BLOCK_SIZE(self) -> int:
+        return 64 * self.NWaves
+
+    @property
+    def MPerBLOCK(self) -> int:
+        return 16 * self.MRep
+
+    @property
+    def NPerBLOCK(self) -> int:
+        return 16 * self.NRep
+
+    @property
+    def KPerBLOCK(self) -> int:
+        return 128
+
+    @property
+    def name(self) -> str:
+        return "_".join(
+            [
+                "a8w8_blockscale_slicek",
+                f"{self.MPerBLOCK}x{self.NPerBLOCK}x128",
+                f"{self.NWaves}w",
+                f"u{self.Unroll}",
+                f"ks{self.KSplit}",
+            ]
+        )
+
+
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
@@ -112,8 +172,31 @@ default_kernels_dict = {
 # fmt: on
 
 
+# fmt: off
+# gfx950-only slice-K kernels, appended so existing CK kernel IDs stay stable.
+# Only the variants the tuned CSVs use are listed, to keep the tune build small.
+slicek_kernels_list = [
+    #             | MRep | NRep | NWaves | Unroll | KSplit |
+    SliceKInstance(   1,     1,      8,       2,       1  ),
+    SliceKInstance(   1,     1,     16,       2,       1  ),
+    SliceKInstance(   1,     1,     16,       4,       1  ),
+    SliceKInstance(   1,     1,     16,       4,       2  ),
+    SliceKInstance(   1,     2,      8,       2,       1  ),
+    SliceKInstance(   1,     2,     16,       2,       1  ),
+    SliceKInstance(   1,     4,     16,       2,       1  ),
+    SliceKInstance(   2,     2,     16,       2,       1  ),
+]
+# fmt: on
+
+if get_gfx() == "gfx950":
+    _next_id = max(candidate_kernels_dict) + 1
+    for _i, _k in enumerate(slicek_kernels_list):
+        candidate_kernels_dict[_next_id + _i] = _k
+
 # Name-keyed reverse lookup so codegen can filter the tuned CSV by kernelName,
 # matching what the C++ runtime dispatcher uses.  This guards against a
 # (kernelId, kernelName) desync in the CSV silently producing a .so that
 # TORCH_CHECK(false, ...) at runtime for the offending shape.
-candidate_kernels_by_name = {v.name: v for v in candidate_kernels_dict.values()}
+candidate_kernels_by_name = {
+    v.name: v for v in list(candidate_kernels_dict.values()) + slicek_kernels_list
+}

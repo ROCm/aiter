@@ -290,11 +290,14 @@ def run_flydsl(
     )
 
 
-def test_splitk_deterministic(m, n, k, splitK, backend, kernel_name, repeats=20):
+def test_splitk_deterministic(
+    m, n, k, splitK, backend, kernel_name, repeats=20, ref_kernel_name=None
+):
     """A tuned split-K kernel gives the same bits on every call.
 
     With more than two K batches the partials are reduced in K order instead of
     added atomically into the output, whose result depends on arrival order.
+    `ref_kernel_name` (default: `kernel_name`) is the splitK=0 reference.
     """
     scale_n = (n + block_shape[0] - 1) // block_shape[0]
     scale_k = (k + block_shape[1] - 1) // block_shape[1]
@@ -304,20 +307,18 @@ def test_splitk_deterministic(m, n, k, splitK, backend, kernel_name, repeats=20)
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
 
-    def run(split):
+    def run(split, name=kernel_name):
         out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
         if backend == "cktile":
             return gemm_a8w8_blockscale_cktile(
-                x, weight, x_scale, w_scale, out, False, split, kernel_name
+                x, weight, x_scale, w_scale, out, False, split, name
             )
-        return gemm_a8w8_blockscale_ck(
-            x, weight, x_scale, w_scale, out, split, kernel_name
-        )
+        return gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, out, split, name)
 
     first = run(splitK)
     mismatches = sum(not torch.equal(run(splitK), first) for _ in range(repeats))
     err = checkAllclose(
-        run(0),
+        run(0, ref_kernel_name or kernel_name),
         first,
         msg=f"{backend} splitK={splitK} vs splitK=0",
         rtol=1e-2,
@@ -664,6 +665,14 @@ if get_gfx() == "gfx950":
         (64, 2048, 3072, 3, "cktile", _tile8w),
     ]:
         test_splitk_deterministic(m, n, k, splitK, backend, kernel_name)
+    # Slice-K kernels of tuned rows (KSplit 1 and 2) against a CK splitK=0 kernel.
+    for m, n, k, kernel_name in [
+        (1, 2048, 3072, "a8w8_blockscale_slicek_16x16x128_16w_u2_ks1"),
+        (80, 128, 7168, "a8w8_blockscale_slicek_16x16x128_16w_u4_ks2"),
+    ]:
+        test_splitk_deterministic(
+            m, n, k, 0, "ck", kernel_name, repeats=100, ref_kernel_name=_ck16x64
+        )
 
 # Save results from benchmarks
 if args.output:
