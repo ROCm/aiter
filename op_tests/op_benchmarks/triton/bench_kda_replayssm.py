@@ -22,11 +22,21 @@ def main():
     parser.add_argument(
         "--timer", choices=["both", "do_bench", "graph_event"], default="both"
     )
+    parser.add_argument(
+        "--ckpt_dtype", choices=["fp32", "fp16", "bf16"], default="fp32"
+    )
     args = parser.parse_args()
     live = args.requests if args.live is None else args.live
     if not 0 < live <= args.requests or any(n < 1 for n in args.pool):
         parser.error("live must be within requests and pools must be positive")
-    inputs, _ = make_inputs(args.requests, "spec_verify", pad_rows=0)
+    ckpt_dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[args.ckpt_dtype]
+    inputs, _ = make_inputs(
+        args.requests, "spec_verify", pad_rows=0, ckpt_dtype=ckpt_dtype
+    )
     for key in ("q", "k", "v", "a", "b"):
         inputs[key] = inputs[key][:, : live * 5]
     inputs["slot_idx"][live:] = -1
@@ -62,10 +72,11 @@ def main():
         if args.timer in ("both", "do_bench"):
             us = do_bench(run, warmup=25, rep=100, return_mode="median") * 1000
             logger.warning(
-                "requests=%s live=%s pool=%s timer=do_bench latency_us=%.3f",
+                "requests=%s live=%s pool=%s ckpt=%s timer=do_bench latency_us=%.3f",
                 args.requests,
                 live,
                 size,
+                args.ckpt_dtype,
                 us,
             )
         if args.timer in ("both", "graph_event"):
@@ -86,10 +97,11 @@ def main():
                 end.synchronize()
                 samples.append(start.elapsed_time(end) * 1000 / 64)
             logger.warning(
-                "requests=%s live=%s pool=%s timer=graph_event latency_us=%.3f",
+                "requests=%s live=%s pool=%s ckpt=%s timer=graph_event latency_us=%.3f",
                 args.requests,
                 live,
                 size,
+                args.ckpt_dtype,
                 statistics.median(samples),
             )
 
