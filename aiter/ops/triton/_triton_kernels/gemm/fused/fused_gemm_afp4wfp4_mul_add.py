@@ -81,6 +81,7 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -107,7 +108,7 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -228,7 +229,7 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -302,6 +303,7 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -327,7 +329,7 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -509,7 +511,7 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
@@ -562,7 +564,7 @@ def _fused_gemm_afp4wfp4_mul_add_reduce_kernel(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )

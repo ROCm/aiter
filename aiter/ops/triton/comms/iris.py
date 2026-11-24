@@ -75,7 +75,8 @@ def calculate_heap_size(
         elem_bytes = 1
     else:
         # Fallback for uncommon types (e.g., float8, complex types, future dtypes)
-        elem_bytes = torch.empty(0, dtype=dtype).element_size()
+        # Only the element size is used, so a CPU tensor is enough.
+        elem_bytes = torch.empty(0, dtype=dtype, device="cpu").element_size()
 
     M_shard = M // world_size
 

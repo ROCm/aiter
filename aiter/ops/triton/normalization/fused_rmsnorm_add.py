@@ -57,7 +57,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
         res1_stride_m = res1.stride(0)
         out_res1_stride_m = out_res1.stride(0)
 
-    if get_arch() == "gfx1250":
+    if get_arch() in ("gfx1250", "gfx1250-strict"):
 
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
