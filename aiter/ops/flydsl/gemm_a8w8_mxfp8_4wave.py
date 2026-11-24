@@ -171,7 +171,10 @@ def _w_scale_shuffled(w_scale: Tensor) -> Tensor:
         w_scale.data_ptr(),
         tuple(w_scale.shape),
         tuple(w_scale.stride()),
-        w_scale._version,
+        # inference tensors (created under torch.inference_mode(), e.g. weights loaded there)
+        # have no version counter; they cannot be updated in place outside inference mode
+        # either, so the pointer + the held tensor identify the content
+        -1 if w_scale.is_inference() else w_scale._version,
     )
     hit = _W_SCALE_CACHE.get(key)
     if hit is not None:

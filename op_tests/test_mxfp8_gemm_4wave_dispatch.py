@@ -134,5 +134,28 @@ def test_w_scale_cache_follows_in_place_update():
     assert torch.equal(b, ref) and not torch.equal(a, b)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_w_scale_cache_accepts_inference_tensor():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("gfx950 only")
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+
+    m, n, k = 512, 512, 1024
+    xq, xs, wsh, ws = _operands(m, n, k)
+    with torch.inference_mode():
+        ws_inf = ws.clone()  # an inference tensor: no version counter
+    assert ws_inf.is_inference()
+    name = make_mxfp8_4wave_kernel_name(True)
+    a = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    b = torch.empty_like(a)
+    run_gemm_a8w8_mxfp8_gfx950(xq, wsh, xs, ws_inf, a, name)
+    run_gemm_a8w8_mxfp8_gfx950(xq, wsh, xs, ws_inf, b, name)  # cache hit
+    ref = torch.empty_like(a)
+    run_gemm_a8w8_mxfp8_gfx950(xq, wsh, xs, ws, ref, name)
+    assert torch.equal(a, ref) and torch.equal(b, ref)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q", "-x"]))
