@@ -802,6 +802,24 @@ def _make_inputs(
             key[table[seq, peak // page_size].long(), :, peak % page_size] = (
                 90.0 / dim**0.5
             )
+    elif pattern == "causal":
+        # Like peaked-spread, but each sequence's leading token lies past the
+        # causal bound of older MTP rows: token length-1-j, with j cycling from
+        # query_length-2 down to 0 by sequence (q4: the newest-but-two, -one and
+        # newest token), which row 0, rows 0-1 or rows 0-2 must not see. A
+        # future token that leaks into an older row becomes that row's output.
+        query.fill_(1.0)
+        key.zero_()
+        for seq, length in enumerate(lengths):
+            if length == 0:
+                continue
+            ahead = (
+                query_length - 2 - seq % (query_length - 1) if query_length > 1 else 0
+            )
+            peak = max(length - 1 - ahead, 0)
+            key[table[seq, peak // page_size].long(), :, peak % page_size] = (
+                90.0 / dim**0.5
+            )
     elif pattern == "varied":
         # Uniform draws quantize to nearly one per-token scale, so a shifted
         # scale still matches the oracle. Token magnitudes spanning about a
@@ -2273,6 +2291,13 @@ _GATE_GAP_PADDED = [
     ("fp8-per-token", 8, 16, 1, (90001, 77777), 16384),
     ("fp8-per-tensor", 16, 16, 1, (16411, 50000, 1, 130999), 8192),
 ]
+# MTP rows whose last 256-token tile holds 1-2 tokens: a token older rows must not
+# see then sits in the second-to-last tile, which a multi-tile task does not peel,
+# so a score mask skipped on non-peeled tiles leaks it. pa_benchmark lengths are
+# multiples of 256 and never reach that tile. With the "causal" pattern, sequence 0
+# (1025) and 3 (770) put the newest-but-two token there and sequence 1 (513) the
+# newest-but-one; sequence 2 keeps the newest token in the last tile.
+_GATE_GAP_CAUSAL_LENGTHS = (1025, 513, 2049, 770)
 _GATE_GAP_CASES = [
     *[
         (
@@ -2319,6 +2344,40 @@ _GATE_GAP_CASES = [
             ),
         )
         for kv, group, page, ql, lengths, width in _GATE_GAP_PADDED
+    ],
+    *[
+        (
+            f"gate-gap-{kv}-causal-g{group}-p{page}",
+            dict(
+                _GATE_GAP_KV[kv],
+                group_size=group,
+                block_size=page,
+                query_length=4,
+                lengths=_GATE_GAP_CAUSAL_LENGTHS,
+                pattern="causal",
+            ),
+        )
+        for kv in _GATE_GAP_KV
+        for group in (16, 8)
+        for page in (16, 128)
+    ],
+    # The production plan (no partition cap) splits long rows into multi-tile tasks.
+    # On gfx942 only these cases catch the FP8 form of a skipped score mask; the
+    # capped cases above catch the BF16 form.
+    *[
+        (
+            f"gate-gap-{kv}-causal-default-plan",
+            dict(
+                _GATE_GAP_KV[kv],
+                group_size=16,
+                block_size=16,
+                query_length=4,
+                lengths=(32769, 4097, 16385, 8194),
+                max_partitions=None,
+                pattern="causal",
+            ),
+        )
+        for kv in _GATE_GAP_KV
     ],
 ]
 
