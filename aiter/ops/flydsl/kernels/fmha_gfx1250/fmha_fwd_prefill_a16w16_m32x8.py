@@ -432,6 +432,9 @@ def _softmax(
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax_fastmath(local_max_list[r], peer(local_max_list[r]))
         m_full = fmax_fastmath(m_prev, row_max)
+        # Before the select, so m_prev's last use is the select that overwrites its own
+        # carried register -- computing it after forces a copy of m_prev past that update.
+        delta = fsub_fastmath(m_prev, m_full)
 
         # Deferred oaccu rescale: keep m STALE while the running max barely moves, so the
         # caller SKIPS the wide `o_acc *= corr`. The ballot promotes the test to
@@ -447,6 +450,8 @@ def _softmax(
             # as the compare's only other consumer, so the fold sinks to the s_cbranch
             # instead of sitting between the max tree and the exp chain.
             m_new = need.select(m_full, m_prev)
+            # Stale row keeps m, so its corr is exp2(0) = 1.
+            delta = need.select(delta, fx.Float32(0.0))
             rescale_masks.append(fx.Int32(rocdl.ballot(fx.Int32.ir_type, need)))
         else:
             m_new = m_full
@@ -454,7 +459,7 @@ def _softmax(
         # log2-domain, so exp2 takes the difference directly. m is seeded to BIG_NEG
         # (finite), so a fully masked row keeps m_new = BIG_NEG -> corr = 1 and
         # p = exp2_fastmath(-inf) = 0, with no (-inf)-(-inf) anywhere and no clamp needed.
-        corr = exp2_fastmath(fsub_fastmath(m_prev, m_new))
+        corr = exp2_fastmath(delta)
         m_new_list.append(m_new)
         corr_list.append(corr)
 
