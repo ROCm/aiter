@@ -469,6 +469,7 @@ class _Stage1Fusion:
         block_runs,
         tdm_b_th=0,
         tdm_as_in_prologue=0,
+        quant_out_preshuffled=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
@@ -481,6 +482,7 @@ class _Stage1Fusion:
             block_runs,
             tdm_b_th,
             tdm_as_in_prologue,
+            quant_out_preshuffled,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -514,6 +516,7 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                quant_out_preshuffled=quant_out_preshuffled,
             )
             self.launches[key] = launch
         return launch
@@ -536,6 +539,7 @@ class _Stage1Fusion:
         quant_wmma_rep,
         tdm_b_th=0,
         tdm_as_in_prologue=0,
+        quant_out_preshuffled=0,
     ):
         from .compact_plan import compact_run_buffer_dwords
 
@@ -568,6 +572,7 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
+                quant_out_preshuffled=quant_out_preshuffled,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -603,6 +608,7 @@ class _Stage1Fusion:
         stage1_quant_out=0,
         quant_scale=None,
         quant_wmma_rep=1,
+        quant_out_preshuffled=0,
         cluster_m=-1,
         cluster_n=-1,
         waves_per_tensor_tdm=-1,
@@ -658,6 +664,8 @@ class _Stage1Fusion:
                 "A tile mismatch means _compact_gemm_tiles no longer resolves "
                 "the tiles fused_moe does"
             )
+        if quant_out_preshuffled and (N % 256 or contiguous_m % 16):
+            raise ValueError("S1F preshuffled output requires N % 256 == M % 16 == 0")
         tokens = int(step["token_count"])
         producers, block_runs = self._variant(tokens)
         group_m = _S1F_GROUP_M
@@ -688,19 +696,16 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
-        # Include the GEMM1 TDM options in the warmed launch variants.
+        # Warm all step variants, keyed by TDM and output layout options.
         g1_opts = {
             "tdm_b_th": int(tdm_b_th),
             "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
         }
-        # Warm every step bound before capture, as main requires.
-        keys = {(t, int(stage1_act), q, *g1_opts.values()) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values()))
-        if not keys <= self.precompiled and (
-            not torch.cuda.is_current_stream_capturing()
-        ):
-            for t, act, q, b_th, asprol in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q, b_th, asprol))
+        keys = {(t, int(stage1_act), q, *g1_opts.values(), int(quant_out_preshuffled)) for t, q in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values(), int(quant_out_preshuffled)))
+        if not keys <= self.precompiled and not torch.cuda.is_current_stream_capturing():
+            for t, act, q, b_th, asprol, apre in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, b_th, asprol, apre))
                 self._precompile(
                     launch_args,
                     tile_m=t,
@@ -709,6 +714,7 @@ class _Stage1Fusion:
                     quant_wmma_rep=q,
                     tdm_b_th=b_th,
                     tdm_as_in_prologue=asprol,
+                    quant_out_preshuffled=apre,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -718,6 +724,7 @@ class _Stage1Fusion:
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
             **g1_opts,
+            quant_out_preshuffled=int(quant_out_preshuffled),
         )
         self._run(
             launch,

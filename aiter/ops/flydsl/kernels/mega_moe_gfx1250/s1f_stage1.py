@@ -536,6 +536,7 @@ def make_s1f_stage1(
     ctas_per_cu=2,
     tdm_b_th=0,
     tdm_as_in_prologue=0,
+    quant_out_preshuffled=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -764,6 +765,7 @@ def make_s1f_stage1(
             persistent_workers=G,
             rolled_drain=0,
             a_preshuffled=0,
+            quant_out_preshuffled=quant_out_preshuffled,
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,
