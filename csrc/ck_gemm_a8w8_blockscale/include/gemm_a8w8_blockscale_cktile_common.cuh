@@ -25,6 +25,8 @@
 #include "ck_tile/ops/gemm.hpp"
 #include "ck_tile/ops/gemm_quant.hpp"
 
+#include "gemm_a8w8_blockscale_splitk_reduce.cuh"
+
 using TILE_FP32 = float;
 using TILE_FP16 = ck_tile::half_t;
 using TILE_BF16 = ck_tile::bf16_t;
@@ -112,14 +114,28 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             BlockPerCu,
                                             AQRowMajor>;
 
+// K batch blockIdx.z writes its partial to its own [M, N] slice of C, so every
+// element has a single writer.
+template <typename Kernel>
+struct SplitKPartialsKernel : Kernel
+{
+    CK_TILE_DEVICE void operator()(typename Kernel::KernelArgs kargs) const
+    {
+        kargs.c_ptr = static_cast<typename Kernel::CDataType*>(kargs.c_ptr) +
+                      static_cast<ck_tile::long_index_t>(blockIdx.z) * kargs.M * kargs.N;
+        Kernel::operator()(kargs);
+    }
+};
+
 template <typename QDataType,
           typename OutDataType,
           typename GemmConfig,
           bool PadN,
           bool PadK,
           bool PreshuffleB,
+          bool SplitKPartials,
           bool UseDoubleSmemBuffer = PreshuffleB>
-void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
+void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args, ck_tile::index_t grid_k_batch)
 {
 
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::ABQuantGrouped;
@@ -224,12 +240,14 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              false,
                                              1>>;
 
-        using Kernel =
+        using BaseKernel =
             ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
+        using Kernel =
+            std::conditional_t<SplitKPartials, SplitKPartialsKernel<BaseKernel>, BaseKernel>;
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
-        const dim3 grids  = Kernel::GridSize(args.M, args.N, args.k_batch);
+        const dim3 grids  = Kernel::GridSize(args.M, args.N, grid_k_batch);
         const dim3 blocks = Kernel::BlockSize();
 
         if(!Kernel::IsSupportedArgument(kargs))
@@ -246,27 +264,55 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 }
 
-template <typename QDataType, typename OutDataType, typename GemmConfig, bool PreshuffleB>
-void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
+template <typename QDataType,
+          typename OutDataType,
+          typename GemmConfig,
+          bool PreshuffleB,
+          bool SplitKPartials = false>
+void TileGemmCompute(ck_tile::QuantGemmHostArgs& args, ck_tile::index_t grid_k_batch)
 {
     const bool pad_n = (args.N % BQuantGroupSize::kN != 0);
     const bool pad_k = (args.K % AQuantGroupSize::kK != 0);
 
     if(pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true, PreshuffleB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            true,
+                            true,
+                            PreshuffleB,
+                            SplitKPartials>(args, grid_k_batch);
     }
     else if(pad_n && !pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false, PreshuffleB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            true,
+                            false,
+                            PreshuffleB,
+                            SplitKPartials>(args, grid_k_batch);
     }
     else if(!pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true, PreshuffleB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            false,
+                            true,
+                            PreshuffleB,
+                            SplitKPartials>(args, grid_k_batch);
     }
     else
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false, PreshuffleB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            false,
+                            false,
+                            PreshuffleB,
+                            SplitKPartials>(args, grid_k_batch);
     }
 }
 
@@ -393,6 +439,38 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_AQ = stride_AQ;
     args.stride_BQ = stride_BQ;
 
+    // More than two K batches on gfx950: each batch writes an FP32 partial to its
+    // own workspace slice and the partials are reduced in batch order, so the
+    // output does not depend on atomic arrival order.
+    if(aiter_blockscale::use_splitk_partials(k_batch))
+    {
+        // Equal K ranges on plain B: run each batch as its own K=K/k_batch GEMM
+        // (k_batch=1 in the kernel, so the epilogue stores instead of adding).
+        // The batch index still comes from blockIdx.z. Otherwise the batches add
+        // into a zeroed slice, one writer per element.
+        const bool store_partials = !PreshuffleB && K % (k_batch * GemmInstance::K_Tile_v) == 0;
+        auto ws = aiter_blockscale::splitk_workspace(Y, k_batch, M, N, /*zeroed=*/!store_partials);
+        args.c_ptr    = ws.data_ptr();
+        args.stride_C = N;
+        if(store_partials)
+        {
+            // QK_A/QK_B stay the full group counts: the kernel uses them as the
+            // scale extents and the BQ stride, offset by blockIdx.z * K groups.
+            args.K       = K / k_batch;
+            args.k_batch = 1;
+        }
+        if(PreshuffleB)
+        {
+            TileGemmCompute<QDataType, TILE_FP32, GemmInstance, true, true>(args, k_batch);
+        }
+        else
+        {
+            TileGemmCompute<QDataType, TILE_FP32, GemmInstance, false, true>(args, k_batch);
+        }
+        aiter_blockscale::splitk_reduce(ws, Y, k_batch, M, N);
+        return Y;
+    }
+
     // Split-K uses atomic_add into C; zero the output buffer first.
     // Use zero_() so all rows are cleared regardless of the leading-dimension
     // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
@@ -404,11 +482,11 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     // do tile GEMM
     if(PreshuffleB)
     {
-        TileGemmCompute<QDataType, OutDataType, GemmInstance, true>(args);
+        TileGemmCompute<QDataType, OutDataType, GemmInstance, true>(args, k_batch);
     }
     else
     {
-        TileGemmCompute<QDataType, OutDataType, GemmInstance, false>(args);
+        TileGemmCompute<QDataType, OutDataType, GemmInstance, false>(args, k_batch);
     }
 
     return Y;

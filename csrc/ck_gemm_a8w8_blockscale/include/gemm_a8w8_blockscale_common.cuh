@@ -33,6 +33,8 @@
 
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 
+#include "gemm_a8w8_blockscale_splitk_reduce.cuh"
+
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
@@ -156,7 +158,236 @@ using DeviceLegacyGemmHelperF8BlockScale =
           BlkGemmPipelineVer, A0DataType>;
 // clang-format on
 
-template <typename DDataType, typename EDataType, typename GemmInstance>
+// The fused split-K kernels store their FP32 partials through CK's float global
+// buffer stores, the only float global stores in the modules that include this
+// header. On gfx950, where the fused kernel is compiled, make them device-scope
+// stores (sc1: write-through, coherent across XCDs), so that the workgroup that
+// reduces a tile can read the partials of the others without a release fence
+// (buffer_wbl2, which writes back the whole L2).
+#if defined(__gfx950__)
+namespace ck {
+constexpr auto kSplitKStoreCoherence =
+    AmdBufferCoherenceEnum::DEVICE_NT0 != AmdBufferCoherenceEnum::DefaultCoherence
+        ? AmdBufferCoherenceEnum::DEVICE_NT0
+        : AmdBufferCoherenceEnum::GLC;
+#define AITER_SPLITK_COHERENT_FLOAT_STORE(N)                                              \
+    template <>                                                                           \
+    __device__ void amd_buffer_store<float, N, AmdBufferCoherenceEnum::DefaultCoherence>( \
+        const typename vector_type_maker<float, N>::type::type src_thread_data,           \
+        float* p_dst_wave,                                                                \
+        const index_t dst_thread_element_offset,                                          \
+        const bool dst_thread_element_valid,                                              \
+        const index_t dst_element_space_size)                                             \
+    {                                                                                     \
+        amd_buffer_store<float, N, kSplitKStoreCoherence>(src_thread_data,                \
+                                                          p_dst_wave,                     \
+                                                          dst_thread_element_offset,      \
+                                                          dst_thread_element_valid,       \
+                                                          dst_element_space_size);        \
+    }
+AITER_SPLITK_COHERENT_FLOAT_STORE(1)
+AITER_SPLITK_COHERENT_FLOAT_STORE(2)
+AITER_SPLITK_COHERENT_FLOAT_STORE(4)
+AITER_SPLITK_COHERENT_FLOAT_STORE(8)
+#undef AITER_SPLITK_COHERENT_FLOAT_STORE
+} // namespace ck
+#endif
+
+// Kernel arguments of the fused deterministic split-K GEMM: the FP32-output
+// instance's arguments (C = the [KBatch, M, N] workspace) plus the real output
+// and the per-tile arrival counters.
+template <typename Argument>
+struct SplitKFusedArgument : Argument
+{
+    explicit SplitKFusedArgument(const Argument& arg) : Argument(arg) {}
+
+    uint16_t* p_out;
+    int64_t ld_out;
+    uint32_t* p_counters;
+};
+
+// kernel_gemm_xdl_cshuffle_v3 with C stored (not added) to the workspace slice
+// of K batch blockIdx.z; the last K batch of a tile to finish also reduces it
+// (see gemm_a8w8_blockscale_splitk_reduce.cuh).
+template <typename Gridwise,
+          ck::index_t MPerBlock,
+          ck::index_t NPerBlock,
+          bool IsBF16,
+          bool HasMainKBlockLoop,
+          ck::index_t MinimumOccupancy,
+          ck::TailNumber TailNum = ck::TailNumber::Full>
+__global__ void __launch_bounds__(Gridwise::MaxBlockSize, MinimumOccupancy)
+    kernel_gemm_blockscale_splitk_fused(SplitKFusedArgument<typename Gridwise::Argument> karg)
+{
+#if defined(__gfx950__)
+    constexpr auto Set = ck::InMemoryDataOperationEnum::Set;
+    if constexpr(Gridwise::template IsValidCompilationParameter<Set>())
+    {
+        __shared__ char p_shared[Gridwise::GetSharedMemoryNumberOfByte(ck::get_device_arch())];
+
+        const auto block_2_ctile_map = typename Gridwise::Block2CTileMap{karg.M, karg.N, 4};
+        const auto tile              = block_2_ctile_map.CalculateBottomIndex(
+            ck::make_multi_index(static_cast<ck::index_t>(blockIdx.x)));
+        const int m0 = __builtin_amdgcn_readfirstlane(tile[ck::Number<0>{}] * MPerBlock);
+        const int n0 = __builtin_amdgcn_readfirstlane(tile[ck::Number<1>{}] * NPerBlock);
+        if(m0 < 0 || n0 < 0 || m0 >= karg.M || n0 >= karg.N)
+            return;
+
+        const float* ws          = karg.p_c_grid;
+        auto splitk_batch_offset = typename Gridwise::SplitKBatchOffset(karg);
+        Gridwise::template Run<HasMainKBlockLoop, Set, TailNum>(
+            karg.p_a_grid + splitk_batch_offset.a_k_split_offset,
+            karg.p_b_grid + splitk_batch_offset.b_k_split_offset,
+            karg.p_ds_grid,
+            karg.p_c_grid + static_cast<ck::long_index_t>(blockIdx.z) * karg.M * karg.N,
+            karg.p_a_scale_grid + splitk_batch_offset.scale_a_k_split_offset,
+            karg.p_b_scale_grid + splitk_batch_offset.scale_b_k_split_offset,
+            p_shared,
+            karg,
+            karg.a_element_op,
+            karg.b_element_op,
+            karg.c_element_op);
+
+        aiter_blockscale::splitk_tile_fixup<MPerBlock, NPerBlock, Gridwise::MaxBlockSize, IsBF16>(
+            ws,
+            karg.p_out,
+            karg.ld_out,
+            karg.p_counters + blockIdx.x * aiter_blockscale::kSplitKCounterStride,
+            karg.M,
+            karg.N,
+            m0,
+            n0,
+            karg.KBatch);
+    }
+#else
+    ck::ignore = karg;
+#endif
+}
+
+// Launches the fused split-K kernel for PartialsInstance (FP32 output),
+// following the kernel selection of DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3.
+// Returns false, launching nothing, when that selection has no kernel.
+template <typename PartialsInstance,
+          bool IsBF16,
+          ck::BlockGemmPipelineVersion PipelineVer,
+          ck::index_t MinOccupancy,
+          ck::index_t KPerBlock,
+          ck::index_t MPerBlock,
+          ck::index_t NPerBlock>
+bool launch_splitk_fused(const typename PartialsInstance::Argument& arg,
+                         torch::Tensor& Y,
+                         uint32_t* counters,
+                         hipStream_t stream)
+{
+    using Gridwise = typename PartialsInstance::GridwiseGemm64;
+    using ck::TailNumber;
+
+    const auto [gdx, gdy, gdz] = Gridwise::CalculateGridSize(arg.M, arg.N, arg.KBatch);
+    SplitKFusedArgument<typename Gridwise::Argument> karg(arg);
+    karg.p_out      = reinterpret_cast<uint16_t*>(Y.data_ptr());
+    karg.ld_out     = Y.stride(0);
+    karg.p_counters = counters;
+
+    const ck::index_t k_grain = arg.KBatch * KPerBlock;
+    const ck::index_t K_split = (arg.K + k_grain - 1) / k_grain * KPerBlock;
+
+    const auto launch = [&](auto kernel) {
+        kernel<<<dim3(gdx, gdy, gdz), dim3(Gridwise::MaxBlockSize), 0, stream>>>(karg);
+        return true;
+    };
+    constexpr ck::index_t MO = MinOccupancy;
+    if(Gridwise::CalculateHasMainKBlockLoop(K_split))
+    {
+        if constexpr(PipelineVer == ck::BlockGemmPipelineVersion::v1 ||
+                     PipelineVer == ck::BlockGemmPipelineVersion::v3)
+        {
+            return launch(kernel_gemm_blockscale_splitk_fused<Gridwise,
+                                                              MPerBlock,
+                                                              NPerBlock,
+                                                              IsBF16,
+                                                              true,
+                                                              MO>);
+        }
+    }
+    else if constexpr(PipelineVer == ck::BlockGemmPipelineVersion::v1)
+    {
+        const auto tail = Gridwise::CalculateKBlockLoopTailNum(K_split);
+        if(tail == TailNumber::Full)
+        {
+            return launch(kernel_gemm_blockscale_splitk_fused<Gridwise,
+                                                              MPerBlock,
+                                                              NPerBlock,
+                                                              IsBF16,
+                                                              false,
+                                                              MO>);
+        }
+        if(tail == TailNumber::Odd)
+        {
+            return launch(kernel_gemm_blockscale_splitk_fused<Gridwise,
+                                                              MPerBlock,
+                                                              NPerBlock,
+                                                              IsBF16,
+                                                              false,
+                                                              MO,
+                                                              TailNumber::Odd>);
+        }
+    }
+    return false;
+}
+
+template <typename DeviceInstance, typename DDataType, typename EOutType>
+auto make_blockscale_argument(torch::Tensor& XQ,
+                              torch::Tensor& WQ,
+                              torch::Tensor& x_scale,
+                              torch::Tensor& w_scale,
+                              EOutType* p_e,
+                              int KBatch)
+{
+    constexpr ck::index_t NumDTensor = DsDataType::Size();
+
+    const int M = XQ.size(0);
+    const int N = WQ.size(0);
+    const int K = XQ.size(1);
+
+    auto device_gemm = DeviceInstance{};
+    auto argument    = device_gemm.MakeArgument(XQ.data_ptr(),
+                                                WQ.data_ptr(),
+                                                std::array<const void*, NumDTensor>{},
+                                                p_e,
+                                                M,
+                                                N,
+                                                K,
+                                                XQ.stride(-2),
+                                                WQ.stride(-2),
+                                                std::array<ck::index_t, NumDTensor>{},
+                                                N,
+                                                reinterpret_cast<DDataType*>(x_scale.data_ptr()),
+                                                reinterpret_cast<DDataType*>(w_scale.data_ptr()),
+                                                AElementOp{},
+                                                BElementOp{},
+                                                CDEElementOp{});
+    if(KBatch > 1)
+    {
+        device_gemm.SetKBatch(&argument, KBatch);
+    }
+    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
+    return std::make_pair(device_gemm, argument);
+}
+
+// On gfx950 with KBatch 4, 8 or 16, each batch stores an FP32 partial and the
+// last batch to finish a tile adds the partials in batch order
+// (bitwise-reproducible output). Otherwise, and when the fused path has no
+// kernel for this shape (wave32, or pipelines other than v1/v3), GemmInstance
+// runs as before, which for KBatch > 1 adds the partials atomically into Y.
+template <typename DDataType,
+          typename EDataType,
+          typename GemmInstance,
+          typename PartialsInstance                = void,
+          ck::BlockGemmPipelineVersion PipelineVer = ck::BlockGemmPipelineVersion::v1,
+          ck::index_t MinOccupancy                 = 1,
+          ck::index_t KPerBlock                    = 0,
+          ck::index_t MPerBlock                    = 0,
+          ck::index_t NPerBlock                    = 0>
 __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                                         torch::Tensor& WQ,
                                                         torch::Tensor& x_scale,
@@ -164,50 +395,42 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                                         torch::Tensor& Y,
                                                         int KBatch = 1)
 {
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
-
-    int StrideA = XQ.stride(-2);
-    int StrideB = WQ.stride(-2);
-    int StrideE = N;
-
-    auto a_element_op   = AElementOp{};
-    auto b_element_op   = BElementOp{};
-    auto cde_element_op = CDEElementOp{};
-
-    constexpr ck::index_t NumDTensor = DsDataType::Size();
-
-    // do legacy GEMM
-    auto device_gemm = GemmInstance{};
-    auto invoker     = device_gemm.MakeInvoker();
-    auto argument    = device_gemm.MakeArgument(XQ.data_ptr(),
-                                             WQ.data_ptr(),
-                                             std::array<const void*, NumDTensor>{},
-                                             reinterpret_cast<EDataType*>(Y.data_ptr()),
-                                             M,
-                                             N,
-                                             K,
-                                             StrideA,
-                                             StrideB,
-                                             std::array<ck::index_t, NumDTensor>{},
-                                             StrideE,
-                                             reinterpret_cast<DDataType*>(x_scale.data_ptr()),
-                                             reinterpret_cast<DDataType*>(w_scale.data_ptr()),
-                                             a_element_op,
-                                             b_element_op,
-                                             cde_element_op);
-
     TORCH_CHECK(KBatch >= 1, "KBatch must be >= 1, got ", KBatch);
 
-    if(KBatch > 1)
+    const int M = XQ.size(0);
+    const int N = WQ.size(0);
+    auto stream = at::hip::getCurrentHIPStream();
+
+    if constexpr(!std::is_void_v<PartialsInstance>)
     {
-        device_gemm.SetKBatch(&argument, KBatch);
+        const int64_t ws_elems = static_cast<int64_t>(KBatch) * M * N;
+        if(aiter_blockscale::use_splitk_fused(KBatch) && ck::get_warp_size() == 64 &&
+           ws_elems * sizeof(float) <= INT32_MAX)
+        {
+            TORCH_CHECK(Y.stride(-1) == 1, "split-K: Y inner dim must be contiguous");
+            using Gridwise        = typename PartialsInstance::GridwiseGemm64;
+            const int64_t tiles   = std::get<0>(Gridwise::CalculateGridSize(M, N, KBatch));
+            const auto counters   = aiter_blockscale::splitk_counters(Y, tiles, stream);
+            auto ws               = aiter_blockscale::splitk_workspace(Y, KBatch, M, N);
+            auto [gemm, argument] = make_blockscale_argument<PartialsInstance, DDataType>(
+                XQ, WQ, x_scale, w_scale, ws.data_ptr<float>(), KBatch);
+            if(launch_splitk_fused<PartialsInstance,
+                                   std::is_same_v<EDataType, BF16>,
+                                   PipelineVer,
+                                   MinOccupancy,
+                                   KPerBlock,
+                                   MPerBlock,
+                                   NPerBlock>(argument, Y, counters.ptr, stream))
+            {
+                return Y;
+            }
+        }
     }
 
-    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
-
-    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
+    auto [device_gemm, argument] = make_blockscale_argument<GemmInstance, DDataType>(
+        XQ, WQ, x_scale, w_scale, reinterpret_cast<EDataType*>(Y.data_ptr()), KBatch);
+    auto invoker = device_gemm.MakeInvoker();
+    invoker.Run(argument, StreamConfig{stream});
     return Y;
 }
 
