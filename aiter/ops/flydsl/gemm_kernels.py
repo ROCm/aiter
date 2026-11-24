@@ -452,6 +452,8 @@ def _get_compile_fn():
         "kernels/mfma_preshuffle_pipeline.py",
         "kernels/splitk_epilogue.py",
         "kernels/kernels_common.py",
+        "kernels/tensor_shim.py",
+        "kernels/buffer_ops.py",
         "kernels/communication_ops_utils.py",
         "kernels/gemm_a16w16_gfx950_utils.py",
     ],

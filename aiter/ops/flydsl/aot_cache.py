@@ -389,8 +389,8 @@ def _source_files(sources) -> list:
     return sorted(files)
 
 
-# Launch plumbing every kernel file imports; it generates no code.
-_NOT_KERNEL_CODE = ("__init__.py", "aot_cache.py", "aot_launch.py", "tensor_shim.py")
+# The cache's own modules: they generate no kernel code.
+_NOT_KERNEL_CODE = ("__init__.py", "aot_cache.py", "aot_launch.py")
 
 
 @functools.cache

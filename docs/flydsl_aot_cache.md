@@ -237,8 +237,9 @@ one, both when an entry is built, so a hit pays nothing:
 
 - **A kernel file.** The declared files under `kernels/` are parsed, and
   every file under `kernels/` they import (anywhere in the file, including
-  inside a function) must be declared. Launch plumbing that generates no code
-  (`tensor_shim.py`, `aot_cache.py`, `aot_launch.py`) is exempt.
+  inside a function) must be declared, `tensor_shim.py` included (its
+  `ptr_buf_tensor` and friends emit code). The cache's own modules
+  (`aot_cache.py`, `aot_launch.py`) are exempt.
 - **Bitcode.** The files the compiled kernel links must be declared.
 
 Either one raises `_UndeclaredSourceError`, in every mode; the launch does

@@ -138,6 +138,7 @@ _AOT_SOURCES = [
     "kernels/gemm",
     "kernels/buffer_ops.py",
     "kernels/kernels_common.py",
+    "kernels/tensor_shim.py",
     "kernels/mfma_preshuffle_pipeline.py",
     "kernels/communication_ops_utils.py",
 ]

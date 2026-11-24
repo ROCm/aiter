@@ -308,6 +308,7 @@ def _constexprs(
         "kernels/bmm_a8w8_mxscale_gfx950.py",
         "kernels/buffer_ops.py",
         "kernels/kernels_common.py",
+        "kernels/tensor_shim.py",
         "kernels/mfma_preshuffle_pipeline.py",
         "../../utility/mx_types.py",
         "kernels/quant_utils.py",

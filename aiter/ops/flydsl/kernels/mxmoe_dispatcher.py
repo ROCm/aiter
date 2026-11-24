@@ -731,6 +731,7 @@ _G2_AOT_CACHE = FlyDSLAotCache(
         "kernels/act.py",
         "kernels/layout_utils.py",
         "kernels/kernels_common.py",
+        "kernels/tensor_shim.py",
     ],
 )
 

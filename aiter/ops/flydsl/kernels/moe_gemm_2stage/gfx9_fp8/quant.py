@@ -24,6 +24,7 @@ _AOT_SOURCES = [
     "kernels/moe_gemm_2stage/gfx9_fp8",
     "kernels/buffer_ops.py",
     "kernels/kernels_common.py",
+    "kernels/tensor_shim.py",
 ]
 
 _ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax", sources=_AOT_SOURCES)
