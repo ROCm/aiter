@@ -34,6 +34,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.act import clamp_gate_up, sigmoid_f32
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
     S2RLoader,
@@ -46,6 +47,8 @@ from aiter.ops.flydsl.kernels.mxfp8_gemm_8wave import (
     MxMfma,
     barrier_if_zero,
 )
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtypeInt
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -79,8 +82,48 @@ def _load_i32_lane(div, idx):
     return fx.Int32(reg.load()[0])
 
 
+def _lane_col8():
+    """Column (in elements) of the 8 a lane holds after the pair swap, within a 32-column pair."""
+    q = fx.thread_idx.x % 64 // 16
+    return (q % 2 == 1).select(16 + 4 * (q - 1), 4 * q)
+
+
+def _swap_pair(x, y):
+    """``permlane16_swap`` of two i32 words: (lower-row word, upper-row word) in every lane.
+
+    No fx-level cross-lane swap exists; this is one v_permlane16_swap_b32.
+    """
+    i32 = fx.Int32.ir_type
+    pair = rocdl.permlane16_swap(
+        _llvm.StructType.get_literal([i32, i32]),
+        fx.Int32(x).ir_value(),
+        fx.Int32(y).ir_value(),
+        False,
+        False,
+    )
+    return [fx.Int32(_llvm.extractvalue(i32, pair, [h])) for h in (0, 1)]
+
+
+def _i32_view(t, n_bytes, n_words, align):
+    """Buffer tensor over ``t`` (``n_bytes`` checked), indexed in i32 words."""
+    g = fx.rocdl.make_buffer_tensor(t, max_size=False, num_records_bytes=n_bytes)
+    ptr = fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type,
+        address_space=rocdl.TargetAddressSpace.BufferDesc,
+        alignment=align,
+    )
+    return fx.logical_divide(
+        fx.Tensor(
+            fx.make_view(
+                fx.recast_iter(ptr, fx.get_iter(g)), fx.make_layout(n_words, 1)
+            )
+        ),
+        fx.make_layout(1, 1),
+    )
+
+
 class StoreBf16Rows:
-    """bf16 stores of the swapped-operand accumulators, 16 bytes per lane.
+    """bf16 stores of the swapped-operand accumulators, 16 bytes per lane (probe output).
 
     With the weights as the MFMA's A operand, lane ``l`` of a 16x16 tile holds
     output row ``l % 16`` at columns ``4 * (l // 16) + [0, 4)``. One
@@ -92,58 +135,231 @@ class StoreBf16Rows:
 
     def __init__(self, C, c_rows, ldc):
         self.ldc = ldc
-        lane = fx.thread_idx.x % 64
-        self.lane_row = lane % 16
-        q = lane // 16
-        self.lane_col = (q % 2 == 1).select(16 + 4 * (q - 1), 4 * q)
-        gC = fx.rocdl.make_buffer_tensor(
-            C, max_size=False, num_records_bytes=c_rows * ldc * 2
-        )
-        i32_ptr = fx.PointerType.get(
-            elem_ty=fx.Int32.ir_type,
-            address_space=rocdl.TargetAddressSpace.BufferDesc,
-            alignment=16,
-        )
-        self.c_div = fx.logical_divide(
-            fx.Tensor(
-                fx.make_view(
-                    fx.recast_iter(i32_ptr, fx.get_iter(gC)),
-                    fx.make_layout(c_rows * (ldc // 2), 1),
-                )
-            ),
-            fx.make_layout(1, 1),
-        )
+        self.lane_row = fx.thread_idx.x % 16
+        self.lane_col = _lane_col8()
+        self.c_div = _i32_view(C, c_rows * ldc * 2, c_rows * (ldc // 2), 16)
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
 
     def store(self, c_frag, base_row, base_col):
         """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
-        i32 = fx.Int32.ir_type
         for i in range_constexpr(N_TILES_A):
             x = Vec(c_frag[i]).to(fx.BFloat16).bitcast(fx.Int32)
             y = Vec(c_frag[N_TILES_A + i]).to(fx.BFloat16).bitcast(fx.Int32)
-            words = []
-            for w in range_constexpr(2):
-                # No fx-level cross-lane swap; this is one v_permlane16_swap_b32.
-                pair = rocdl.permlane16_swap(
-                    _llvm.StructType.get_literal([i32, i32]),
-                    x[w].ir_value(),
-                    y[w].ir_value(),
-                    False,
-                    False,
-                )
-                words.append(
-                    [fx.Int32(_llvm.extractvalue(i32, pair, [h])) for h in (0, 1)]
-                )
+            lo = _swap_pair(x[0], y[0])
+            hi = _swap_pair(x[1], y[1])
             fx.memref_store_vec(
-                Vec.from_elements(
-                    [words[0][0], words[1][0], words[0][1], words[1][1]], fx.Int32
-                ),
-                self.reg,
+                Vec.from_elements([lo[0], hi[0], lo[1], hi[1]], fx.Int32), self.reg
             )
             row = base_row + i * 16 + self.lane_row
             idx = (row * self.ldc + base_col + self.lane_col) // 2  # in i32 words
             fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
+
+
+class StoreSlotBf16:
+    """Stage-2 epilogue: routing-weighted bf16 rows scattered to ``[T * topk, D]``.
+
+    Sorted row r goes to row ``token * topk + slot`` (both from
+    ``sorted_ids[r]``) after an fp32 multiply by ``sorted_weights[r]``, so a
+    plain top-k sum finishes the layer. Padding rows name token T, which lands
+    past the descriptor: their stores are dropped without a branch.
+    """
+
+    def __init__(self, C, n_tokens, topk, D, ids_div, w_div):
+        self.D = D
+        self.topk = topk
+        self.ids_div = ids_div
+        self.w_div = w_div
+        self.lane_row = fx.thread_idx.x % 16
+        self.lane_col = _lane_col8()
+        n_rows = n_tokens * topk
+        self.c_div = _i32_view(C, n_rows * D * 2, n_rows * (D // 2), 16)
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        self.reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+
+    def rows(self, base_row):
+        """(output row, routing weight) of this lane's row in each of the N_TILES_A row tiles."""
+        out = []
+        for i in range_constexpr(N_TILES_A):
+            r = base_row + i * 16 + self.lane_row
+            sid = _load_i32_lane(self.ids_div, r)
+            w = _load_i32_lane(self.w_div, r).bitcast(fx.Float32)
+            out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
+        return out
+
+    def store(self, c_frag, rows, base_col):
+        """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
+        for i in range_constexpr(N_TILES_A):
+            out_row, w = rows[i]
+            x = (Vec(c_frag[i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
+            y = (Vec(c_frag[N_TILES_A + i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
+            lo = _swap_pair(x[0], y[0])
+            hi = _swap_pair(x[1], y[1])
+            fx.memref_store_vec(
+                Vec.from_elements([lo[0], hi[0], lo[1], hi[1]], fx.Int32), self.reg
+            )
+            idx = (out_row * self.D + base_col + self.lane_col) // 2
+            fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
+
+
+class SwigluFp8Epilogue:
+    """Stage-1 epilogue: SwiGLU, 1x128 power-of-two requant, fp8 + E8M0 stores.
+
+    Tile (m, nb) holds gate (c?0) and up (c?1) of intermediate features
+    ``nb * 128 + [0, 128)``, one 1x128 scale block of the stage-2 input. A lane
+    holds features ``wave_n * 32 + j * 16 + 4q + [0, 4)`` of one row, the
+    gate and up of each in the same register slot. Per row: the lane max, then
+    the max over the four q lanes (two lane swaps), then over the group's four
+    wave_n waves through LDS (``amax`` holds [wave_m][wave_n][128 rows]); the
+    one barrier this takes pairs between the two groups like any other.
+    ``limit`` > 0 clamps as ``silu(min(g, L)) * clamp(u, -L, L)``; the host
+    passes float max for "no clamp".
+    """
+
+    def __init__(self, C, C_scale, m_pad, inter, limit, amax_lds, wave_m, wave_n):
+        self.inter = inter
+        self.m_pad = m_pad
+        self.neg_limit = -limit
+        self.wave_m = wave_m
+        self.wave_n = wave_n
+        lane = fx.thread_idx.x % 64
+        self.lane_row = lane % 16
+        self.q = lane // 16
+        self.lane_col = _lane_col8()
+        self.c_div = _i32_view(C, m_pad * inter, m_pad * (inter // 4), 8)
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
+        self.reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
+        n_sc = m_pad * (inter // 128)
+        self.sc_div = fx.logical_divide(
+            fx.rocdl.make_buffer_tensor(
+                C_scale, max_size=False, num_records_bytes=n_sc
+            ),
+            fx.make_layout(1, 1),
+        )
+        self.sc_atom = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8)
+        self.sc_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
+        self.sc_oob = fx.Int32(n_sc)
+        self.amax = amax_lds
+
+    def _amax_at(self, wn, r):
+        return fx.make_view(
+            fx.add_offset(
+                self.amax.ptr, fx.make_int_tuple((self.wave_m * 4 + wn) * 128 + r)
+            ),
+            fx.make_layout(1, 1),
+        )
+
+    def _rmax(self, v):
+        for half in (32, 16):
+            if const_expr(half == 32):
+                i32 = fx.Int32.ir_type
+                pair = rocdl.permlane32_swap(
+                    _llvm.StructType.get_literal([i32, i32]),
+                    v.bitcast(fx.Int32).ir_value(),
+                    v.bitcast(fx.Int32).ir_value(),
+                    False,
+                    False,
+                )
+                o = [fx.Int32(_llvm.extractvalue(i32, pair, [h])) for h in (0, 1)]
+            else:
+                o = _swap_pair(v.bitcast(fx.Int32), v.bitcast(fx.Int32))
+            v = o[0].bitcast(fx.Float32).maximumf(o[1].bitcast(fx.Float32))
+        return v
+
+    def store(self, gate_up, row0, nb):
+        """``gate_up[h] = (gate accs, up accs)`` of row half h; acc ``j * N_TILES_A + i``."""
+        acts = {}
+        for h in range_constexpr(2):
+            g_frag, u_frag = gate_up[h]
+            for i in range_constexpr(N_TILES_A):
+                m = fx.Float32(0.0)
+                for j in range_constexpr(2):
+                    g4 = Vec(g_frag[j * N_TILES_A + i])
+                    u4 = Vec(u_frag[j * N_TILES_A + i])
+                    vals = []
+                    for v in range_constexpr(4):
+                        g, u = clamp_gate_up(g4[v], u4[v], self.neg_limit)
+                        a = g * sigmoid_f32(g) * u
+                        vals.append(a)
+                        m = m.maximumf(fx.math.absf(a))
+                    acts[(h, i, j)] = vals
+                m = self._rmax(m)
+                # The four q lanes of a row hold the same maximum; all store it.
+                r = h * 64 + i * 16 + self.lane_row
+                fx.memref_store_vec(
+                    fx.full(1, m, fx.Float32), self._amax_at(self.wave_n, r)
+                )
+        # Every wave of the group has written its maxima.
+        fx.rocdl.s_waitcnt(lgkmcnt=0)
+        rocdl.s_barrier()
+        for h in range_constexpr(2):
+            for i in range_constexpr(N_TILES_A):
+                r = h * 64 + i * 16 + self.lane_row
+                m = Vec(self._amax_at(0, r).load())[0]
+                for wn in range_constexpr(1, 4):
+                    m = m.maximumf(Vec(self._amax_at(wn, r).load())[0])
+                # ceil_pow2(max(amax, 1e-10) / 448), HK's and the reference's rule.
+                e = fx.Int32(
+                    emit_mx_e8m0_scale(
+                        m.maximumf(fx.Float32(1e-10)).ir_value(),
+                        mode=MX_DEFAULT_ROUND_MODE,
+                        dtype=MxDtypeInt.FP8_E4M3,
+                    )
+                )
+                inv = ((254 - e) << 23).bitcast(fx.Float32)
+                words = []
+                for j in range_constexpr(2):
+                    vals = acts[(h, i, j)]
+                    q8 = []
+                    for p in range_constexpr(2):
+                        # The scaled value can exceed 448 by one ulp of the division.
+                        lo = (
+                            (vals[2 * p] * inv)
+                            .maximumf(fx.Float32(-448.0))
+                            .minimumf(fx.Float32(448.0))
+                        )
+                        hi = (
+                            (vals[2 * p + 1] * inv)
+                            .maximumf(fx.Float32(-448.0))
+                            .minimumf(fx.Float32(448.0))
+                        )
+                        q8.append((lo, hi))
+                    w = fx.Int32(
+                        rocdl.cvt_pk_fp8_f32(
+                            fx.Int32.ir_type,
+                            q8[0][0].ir_value(),
+                            q8[0][1].ir_value(),
+                            fx.Int32(0).ir_value(),
+                            False,
+                        )
+                    )
+                    w = fx.Int32(
+                        rocdl.cvt_pk_fp8_f32(
+                            fx.Int32.ir_type,
+                            q8[1][0].ir_value(),
+                            q8[1][1].ir_value(),
+                            w.ir_value(),
+                            True,
+                        )
+                    )
+                    words.append(w)
+                pair = _swap_pair(words[0], words[1])
+                fx.memref_store_vec(Vec.from_elements(pair, fx.Int32), self.reg)
+                row = row0 + h * LDS_BLOCK_M + self.wave_m * A_GRP_ROWS + i * 16
+                row = row + self.lane_row
+                col = nb * 128 + self.wave_n * B_GRP_ROWS + self.lane_col
+                fx.copy(
+                    self.atom,
+                    self.reg,
+                    fx.slice(self.c_div, (None, (row * self.inter + col) // 4)),
+                )
+                # One writer per row: q == 0 lanes of the wave_n == 0 wave.
+                writer = (self.q == 0) & (self.wave_n == 0)
+                sc_idx = writer.select(nb * self.m_pad + row, self.sc_oob)
+                fx.memref_store_vec(fx.full(1, e.to(fx.Int8), fx.Int8), self.sc_reg)
+                fx.copy(
+                    self.sc_atom, self.sc_reg, fx.slice(self.sc_div, (None, sc_idx))
+                )
 
 
 class MoeScaleLds:
@@ -239,6 +455,8 @@ def compile_moe_bs_gemm_8w(
     N: int,
     gather: bool,
     gate_up_inter: int = 0,
+    epilogue: str = "bf16",
+    topk: int = 0,
     waves_per_eu: int = 2,
 ):
     """Build the persistent grouped GEMM launcher.
@@ -246,9 +464,19 @@ def compile_moe_bs_gemm_8w(
     ``N``: weight rows per expert (2 * I for stage 1, the model dim for stage 2).
     ``gate_up_inter`` = I > 0 pairs gate row block ``n`` with up row block
     ``I / 128 + n`` in one tile (stage 1); 0 takes 256 consecutive rows.
-    Output (probe P1): the bf16 GEMM result per sorted row, ``[M_pad, N]``,
-    columns in weight-row order.
+    ``epilogue``:
+
+    * ``"bf16"`` (probe): the GEMM per sorted row, ``C`` bf16 ``[M_pad, N]``,
+      columns in weight-row order.
+    * ``"swiglu_fp8"`` (stage 1, needs ``gate_up_inter``): ``C`` fp8
+      ``[M_pad, I]`` = requantized SwiGLU, ``C_scale`` its E8M0 1x128 scales
+      column-major ``[I // 128, M_pad]`` (stage 2's A operand as is).
+    * ``"slot_bf16"`` (stage 2): ``C`` bf16 ``[T * topk, N]``, the routing
+      weighted expert output of route (token, slot) in row ``token * topk + slot``.
     """
+    assert epilogue in ("bf16", "swiglu_fp8", "slot_bf16"), epilogue
+    assert epilogue != "swiglu_fp8" or gate_up_inter
+    assert epilogue != "slot_bf16" or topk > 0
     assert K % 512 == 0, "a 128x128 B scale needs K a multiple of 512 here"
     K_ITERS = K // BLOCK_K
     assert K_ITERS % 2 == 0
@@ -272,12 +500,14 @@ def compile_moe_bs_gemm_8w(
 
     _kname = (
         f"flydsl_moe_bs_8w_{'gather' if gather else 'sorted'}_n{N}_k{K}"
-        f"{'_gu' if gate_up_inter else ''}_w{waves_per_eu}"
+        f"{'_gu' if gate_up_inter else ''}_{epilogue}{topk or ''}_w{waves_per_eu}"
     )
 
     @fx.struct
     class SharedStorage:
         S_lds: fx.Array[fx.Float8E4M3FN, 2 * MoeScaleLds.BYTES, 16]
+        if epilogue == "swiglu_fp8":
+            R_lds: fx.Array[fx.Float32, 2 * 4 * 128, 16]
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -297,7 +527,10 @@ def compile_moe_bs_gemm_8w(
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        C_scale: fx.Tensor,
+        sorted_weights: fx.Tensor,
         m_pad: fx.Int32,
+        limit: fx.Float32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -358,7 +591,19 @@ def compile_moe_bs_gemm_8w(
         mfma = MxMfma(N_TILES_B, N_TILES_A, paired_tiles=False)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreBf16Rows(C, m_pad, N)
+        if const_expr(epilogue == "bf16"):
+            store_c = StoreBf16Rows(C, m_pad, N)
+        elif const_expr(epilogue == "swiglu_fp8"):
+            store_c = SwigluFp8Epilogue(
+                C, C_scale, m_pad, gate_up_inter, limit, lds.R_lds, wave_m, wave_n
+            )
+        else:
+            w_div = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(sorted_weights, max_size=False),
+                fx.make_layout(1, 1),
+            )
+            n_tokens = _load_i32(nv_div, 1)
+            store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div)
 
         def run_tile(tile):
             m_blk = tile // NB
@@ -523,6 +768,12 @@ def compile_moe_bs_gemm_8w(
             sb0 = scale_read(k, "b0")
             b0_frag = b_s2r.load(b_cur0, preshuffled=True)
             a0_frag = a_s2r.load(a_cur0)
+            if const_expr(epilogue == "slot_bf16"):
+                # The epilogue's routes, drained by the wait below.
+                base_row = row0 + wave_m * A_GRP_ROWS
+                slot_rows = [
+                    store_c.rows(base_row + h * LDS_BLOCK_M) for h in range_constexpr(2)
+                ]
             wait_barrier(0)
 
             c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
@@ -581,10 +832,18 @@ def compile_moe_bs_gemm_8w(
             base_row = row0 + wave_m * A_GRP_ROWS
             col0 = half_row0(nb, 0) + wave_n * B_GRP_ROWS
             col1 = half_row0(nb, 1) + wave_n * B_GRP_ROWS
-            store_c.store(c00, base_row, col0)
-            store_c.store(c01, base_row, col1)
-            store_c.store(c10, base_row + LDS_BLOCK_M, col0)
-            store_c.store(c11, base_row + LDS_BLOCK_M, col1)
+            if const_expr(epilogue == "bf16"):
+                store_c.store(c00, base_row, col0)
+                store_c.store(c01, base_row, col1)
+                store_c.store(c10, base_row + LDS_BLOCK_M, col0)
+                store_c.store(c11, base_row + LDS_BLOCK_M, col1)
+            elif const_expr(epilogue == "swiglu_fp8"):
+                store_c.store([(c00, c01), (c10, c11)], row0, nb)
+            else:
+                store_c.store(c00, slot_rows[0], col0)
+                store_c.store(c01, slot_rows[0], col1)
+                store_c.store(c10, slot_rows[1], col0)
+                store_c.store(c11, slot_rows[1], col1)
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -604,7 +863,10 @@ def compile_moe_bs_gemm_8w(
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        C_scale: fx.Tensor,
+        sorted_weights: fx.Tensor,
         m_pad: fx.Int32,
+        limit: fx.Float32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
@@ -617,7 +879,10 @@ def compile_moe_bs_gemm_8w(
             sorted_ids,
             sorted_expert_ids,
             num_valid_ids,
+            C_scale,
+            sorted_weights,
             m_pad,
+            limit,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": "512,512",
