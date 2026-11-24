@@ -60,6 +60,13 @@ _CLUSTERS_POW2 = tuple(
 )
 _GENERIC_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c != (1, 1))
 _COMPUTE_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c not in _COMPUTE_CLUSTERS)
+# Clusters of 3 M-tiles (a cluster_m that is not a power of two), so the
+# M-tiles of a decode GEMM share each weight read; only the opt-in K3 candidates
+# at the end of kernels_list use them.
+_COMPUTE_CLUSTERS_NPOT = ((3, 1), (3, 4))
+_COMPUTE_CLUSTERS_ALL = (
+    _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA + _COMPUTE_CLUSTERS_NPOT
+)
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _MAX_CLUSTER = 16  # workgroups of a gfx1250 cluster
 _PERSISTENT_N_TILES = (2, 4, 8)
@@ -307,6 +314,36 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
             no_loop_cbar=True,
         )
     )
+    # K3 TP1 decode rows whose cluster_m (3 or 5) is the M-tile count of their
+    # bucket, so every M-tile of an output column shares each weight read.
+    # (tile_m, tile_n, tile_k, num_buffers, split_k, cluster_m, cluster_n,
+    #  m_warp, n_warp, compute, fused_splitk, quad_early)
+    for tm, tn, tk, nb, sk, cm, cn, mw, nw, compute, fsk, qe in (
+        (128, 128, 128, 4, 1, 3, 4, 2, 2, True, False, False),
+        (128, 256, 128, 3, 1, 3, 1, 2, 2, True, False, False),
+        (128, 256, 128, 3, 2, 3, 1, 2, 2, True, True, False),
+        (128, 256, 128, 4, 1, 3, 1, 2, 2, True, False, False),
+        (32, 128, 128, 2, 1, 5, 1, 2, 2, False, False, False),
+        (64, 128, 256, 3, 1, 3, 1, 2, 2, False, False, False),
+        (64, 128, 256, 3, 1, 5, 2, 2, 2, False, False, False),
+        (64, 128, 512, 3, 1, 3, 1, 1, 4, False, False, True),
+    ):
+        extra.append(
+            WmmaKernelInstance(
+                tm,
+                tn,
+                tk,
+                nb,
+                sk,
+                cm,
+                cn,
+                mw,
+                nw,
+                name_prefix=COMPUTE_NAME_PREFIX if compute else NAME_PREFIX,
+                fused_splitk=fsk,
+                quad_early=qe,
+            )
+        )
     return dict(enumerate([*base, *extra]))
 
 
@@ -355,7 +392,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if (
             ki.cluster_m,
             ki.cluster_n,
-        ) not in _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA:
+        ) not in _COMPUTE_CLUSTERS_ALL:
             return False
         # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
         # must not launch when M < tile_m (cluster barrier hang on decode M).
