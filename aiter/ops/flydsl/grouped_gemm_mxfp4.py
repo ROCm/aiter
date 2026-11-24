@@ -317,11 +317,12 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
-    # Keep smaller receive buckets on their existing specialization.
+    # Use this step's source-token count, not the padded receive capacity, so
+    # a small step in a prefill-sized arena keeps its existing specialization.
     fixed_n_ep = (
-        contiguous_m >= 417792
+        enable_ep_scatter
+        and stage2_scatter.source_token_count >= 4096
         and SUPPORT_EXPLICIT_VGPR_PARTITION
-        and enable_ep_scatter
         and not stage2_scatter.combine_quant_bits
         and stage2_scatter.world_size == 4
         and stage2_scatter.slot_stride_bytes == 10240
@@ -338,7 +339,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         and cluster_m == cluster_n == k_waves == 1
         and tdm_spec[2] == 1
     )
-    # The accepted Flash receive bucket favors a bounded live-route grid.
+    # Flash prefill steps use a bounded live-route grid from T4096 per rank.
     # Explicit worker overrides keep their requested dispatch.
     if (
         fixed_n_ep

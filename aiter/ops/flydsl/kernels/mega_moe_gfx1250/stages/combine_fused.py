@@ -87,12 +87,12 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
 
 
 def _bf16_prefill_threads(config, token_count, quant_bits, shared_add):
-    """Use the measured four-wave reduce for the dense Flash prefill step."""
+    """Use the four-wave reduce for dense Flash prefill from T4096 per rank."""
     if (
         quant_bits == 0
         and shared_add is None
-        and token_count == 16384
-        and config.max_tokens_per_rank == 16384
+        and token_count >= 4096
+        and config.max_tokens_per_rank >= 4096
         and config.stage1_fused
         and (config.hidden_dim, config.geometry.inter_dim,
              config.experts_per_rank, config.topk, config.world_size)
@@ -211,6 +211,7 @@ class _FusedScatterCombine:
             max_tokens_per_rank=config.max_tokens_per_rank,
             world_size=config.world_size,
             source_token_map=batch.routing.source_token_map,
+            source_token_count=batch.routing.token_count,
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
         )

@@ -524,7 +524,7 @@ class MegaMoEConfig:
         """
         if (
             quant_bits == 0
-            and self.max_tokens_per_rank == 16384
+            and self.max_tokens_per_rank >= 4096
             and self.recipe.combine == CombineKind.FUSED_SCATTER
         ):
             from .s1f_ctl import s1f_prefill_config

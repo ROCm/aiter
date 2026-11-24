@@ -582,7 +582,7 @@ class _Stage1Fusion:
             if (
                 a_preshuffled
                 and num_buffers == 3
-                and int(recv_bound) >= 65536
+                and int(recv_bound) >= 16384
                 and config.combine_slot_stride_for(0) == 10240
             )
             else 1
