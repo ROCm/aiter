@@ -460,9 +460,12 @@ def _check_timeout(rank, device, tp, failures):
         * torch.randn((e, hidden), generator=gen, dtype=torch.float32, device=device),
         0.01 * torch.randn((e,), generator=gen, dtype=torch.float32, device=device),
     )
+    # The comm size of the first shape: the launches use kernels that each rank has
+    # already compiled.
     comm = AllReduceRmsnormMoeRoute(
-        tp.cpu_group, 64, hidden, e, k, router_fp32=fp32, timeout_s=0.05
+        tp.cpu_group, MAX_TOKENS, hidden, e, k, router_fp32=fp32
     )
+    limit = comm.timeout_us
     try:
         for tokens in (2, 64):  # one-shot, then two-shot
             x, r, ref = _inputs(
@@ -470,6 +473,7 @@ def _check_timeout(rank, device, tp, failures):
             )
             torch.cuda.synchronize()
             dist.barrier(group=tp.cpu_group)
+            comm.timeout_us = 50_000  # 50 ms for the launch that the last rank skips
             if rank != comm.world - 1:
                 _call(x, r, weights, shape, comm)
             torch.cuda.synchronize()
@@ -477,6 +481,9 @@ def _check_timeout(rank, device, tp, failures):
             record = comm.error()
             if record[0] != 1 or record[3] not in (1, 2, 3, 4, 5):
                 failures.append(f"rank {rank}: error record {record} after a time-out")
+            # The launch after reset has the default limit: a rank that starts late
+            # must not stop the others.
+            comm.timeout_us = limit
             comm.reset()
             out = _call(x, r, weights, shape, comm, out={"moe_buf": torch.ones_like(x)})
             torch.cuda.synchronize()
@@ -691,13 +698,18 @@ def _worker(rank, world_size, init_method):
     aiter.init_dist_env(world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
     failures = []
+    # 8 ranks run only the first shape and the time-out check, which launches its kernel.
+    # Each other kernel variant compiles on all 8 ranks, which takes most of the CI time.
+    # 2 and 4 ranks run all checks.
+    full = world_size < 8
     try:
-        for shape in SHAPES:
+        for shape in SHAPES if full else SHAPES[:1]:
             _check_shape(rank, device, tp, shape, failures)
-        _check_scales(rank, device, tp, failures)
         _check_timeout(rank, device, tp, failures)
-        _check_routing_edges(rank, device, tp, failures)
-        _check_max_tokens(rank, device, tp, failures)
+        if full:
+            _check_scales(rank, device, tp, failures)
+            _check_routing_edges(rank, device, tp, failures)
+            _check_max_tokens(rank, device, tp, failures)
         return failures
     finally:
         aiter.destroy_dist_env()
