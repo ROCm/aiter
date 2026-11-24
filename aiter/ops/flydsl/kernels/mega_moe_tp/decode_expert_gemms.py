@@ -16,7 +16,14 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .decode_expert_tiles import compile_gemm1_shared_first, compile_gemm2_shared_first
+from .decode_expert_tiles import (
+    E,
+    H,
+    I,
+    compile_gemm1_shared_first,
+    compile_gemm2_shared_first,
+)
+from .decode_id_routing import TOPK
 from .decode_tile_primitives import (
     id_pairs_for,
     max_sorted_rows,
@@ -25,8 +32,6 @@ from .decode_tile_primitives import (
     shared_g2_columns_for,
     small_config_for,
 )
-
-H, I, E, TOPK = 6144, 768, 128, 4
 
 ROWS = (8, 128)
 # rows where the retuned GEMM2 prefetch / GEMM1 prologue priority win
@@ -101,6 +106,50 @@ def get_plan(n: int, asm: bool = True) -> DecodeExpertPlan:
     return p
 
 
+def _bytes(t, nbytes, name, dev):
+    """Metadata-only check of one raw-buffer operand (no sync, graph-safe) and its flat uint8
+    view. The tiles bind their buffer resources from ``plan.n``, not from the tensors, so a
+    short, strided or foreign-device operand would read out of bounds or mis-address."""
+    assert t.device == dev, f"{name} is on {t.device}, expected {dev}"
+    assert t.is_contiguous(), f"{name} must be contiguous"
+    assert t.element_size() == 1, f"{name} must be a one-byte dtype, got {t.dtype}"
+    assert t.numel() == nbytes, f"{name} has {t.numel()} bytes, expected {nbytes}"
+    return t.view(torch.uint8).view(-1)
+
+
+def _check_operands(n, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
+    dev = xq.device
+    assert dev.type == "cuda", dev
+    w13, s13, w2, s2 = w
+    sw13, ss13, sw2, ss2 = shared
+    ops = (
+        _bytes(xq, n * (H // 2), "xq", dev),
+        _bytes(xs, n * (H // 32), "xs", dev),
+        _bytes(w13, E * I * H, "w13", dev),
+        _bytes(s13, E * I * (H // 16), "s13", dev),
+        _bytes(w2, E * H * I // 2, "w2", dev),
+        _bytes(s2, E * H * (I // 32), "s2", dev),
+        _bytes(q8, n * H, "q8", dev),
+        _bytes(s8, n * (H // 32), "s8", dev),
+        _bytes(sw13, 2 * I * H, "shared w13", dev),
+        _bytes(ss13, I * (H // 16), "shared s13", dev),
+        _bytes(sw2, H * I, "shared w2", dev),
+        _bytes(ss2, H * (I // 32), "shared s2", dev),
+    )
+    for t, dt, name in (
+        (topk_ids, torch.int32, "topk_ids"),
+        (topk_w, torch.float32, "topk_w"),
+    ):
+        assert (
+            t.device == dev and t.is_contiguous()
+        ), f"{name} must be contiguous on {dev}"
+        assert t.dtype == dt and t.shape == (
+            n,
+            TOPK,
+        ), f"{name}: {t.dtype} {tuple(t.shape)}"
+    return ops
+
+
 def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
     """Routed + shared expert GEMM1 and GEMM2 for ``plan.n`` rows.
 
@@ -116,9 +165,12 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
         shared-expert output, for the caller's slot + shared reduction.
     """
     n, dev = plan.n, xq.device
-    w13, s13, w2, s2 = w
-    sw13, ss13, sw2, ss2 = shared
+    xq, xs, w13, s13, w2, s2, q8, s8, sw13, ss13, sw2, ss2 = _check_operands(
+        n, xq, xs, q8, s8, w, shared, topk_ids, topk_w
+    )
     rows = plan.rows
+    # the compiled handle is bound to the device it was first launched on: key it per device
+    key = ("dev", dev.index)
     # GEMM1 reads topk_ids and publishes the block -> expert map (+ block count) and the rows
     eids = torch.empty(rows // 16 + 1, device=dev, dtype=torch.int32)
     nv = torch.empty(rows, device=dev, dtype=torch.int32)
@@ -132,32 +184,33 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
     ids = topk_ids.view(-1)
     _run_compiled(
         plan.k1,
-        xq.view(-1),
-        xs.view(torch.uint8).view(-1),
-        w13.view(-1),
-        s13.view(-1),
+        xq,
+        xs,
+        w13,
+        s13,
         q.view(-1),
         s.view(-1),
         ids,
         eids,
         nv,
-        q8.view(-1),
-        s8.view(-1),
-        sw13.view(-1),
-        ss13.view(-1),
+        q8,
+        s8,
+        sw13,
+        ss13,
         hq.view(-1),
         hs.view(-1),
         n,
         rows,
         plan.nsh1,
         stream,
+        specialization_key=key,
     )
     _run_compiled(
         plan.k2,
         q.view(-1),
         s.view(-1),
-        w2.view(-1),
-        s2.view(-1),
+        w2,
+        s2,
         out.view(-1),
         nv,
         topk_w.view(-1),
@@ -165,12 +218,13 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
         nv,
         hq.view(-1),
         hs.view(-1),
-        sw2.view(-1),
-        ss2.view(-1),
+        sw2,
+        ss2,
         sh_out.view(-1),
         n,
         rows,
         plan.nsh2,
         stream,
+        specialization_key=key,
     )
     return out, sh_out
