@@ -3010,7 +3010,17 @@ def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     return int(max_seqlen_k) <= n_block
 
 
-@aot_factory("fmha_fwd_prefill_a8w8_m32x8_thd")
+# The kernel files the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "kernels/buffer_ops.py",
+    "kernels/fmha_gfx1250/fmha_buffer_managers.py",
+    "kernels/fmha_gfx1250/fmha_utils.py",
+    "kernels/kernels_common.py",
+    "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+]
+
+
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_thd", sources=_AOT_SOURCES)
 @functools.cache
 def _thd_launcher(
     mask_left: bool,
@@ -3125,7 +3135,7 @@ def _thd_launcher(
     return _launch
 
 
-@aot_factory("fmha_fwd_prefill_a8w8_m32x8_paged")
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_paged", sources=_AOT_SOURCES)
 @functools.cache
 def _paged_launcher(
     mask_left: bool,
@@ -3247,7 +3257,7 @@ def _paged_launcher(
     return _launch
 
 
-@aot_factory("fmha_fwd_prefill_a8w8_m32x8_bshd")
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_bshd", sources=_AOT_SOURCES)
 @functools.cache
 def _bshd_launcher(
     mask_left: bool,

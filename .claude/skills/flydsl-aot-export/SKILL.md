@@ -27,7 +27,7 @@ Converted wrappers to copy from:
 | Factory takes the constexprs, launcher takes runtime arguments only | `gemm_kernels.py` (`_preshuffle_launcher`), `gemm_a8w8_blockscale.py` (`_compile_gemm`), `kernels/fmha_gfx1250/fmha_fwd_prefill_a16w16_m32x8.py` |
 | Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`); `mxfp8_bpreshuffle_gemm_gfx1250.py`, `mla_kernels.py`, `gather_kv_b_proj_gfx1250.py` (a factory with no argument, the constexprs in `specialization_key`) |
 | Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
-| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py`, `kernels/pa_decode_kernel.py` (`bind_aot` with `make_exe`) |
+| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`), `kernels/pa_decode_kernel.py` (`bind_aot`, keyed by its traits) |
 
 ## The one rule
 
@@ -60,7 +60,12 @@ So, for each launch, list what the trace depends on and tick each item off:
    Constexprs go to the factory:
 
    ```python
-   @aot_factory("my_kernel")            # the cache name; above functools.cache
+   @aot_factory(                        # above functools.cache
+       "my_kernel",                     # the cache name
+       # Every file the kernel's code comes from, besides this one; relative
+       # to aiter/ops/flydsl. A directory stands for its .py files.
+       sources=["kernels/my_kernel.py", "kernels/kernels_common.py"],
+   )
    @functools.cache
    def _my_launcher(N, K, tile_m, out_dtype):
        from .kernels.my_kernel import compile_my_kernel   # import inside
@@ -73,7 +78,7 @@ So, for each launch, list what the trace depends on and tick each item off:
    no argument, and the constexprs in `specialization_key`:
 
    ```python
-   @aot_factory("my_kernel")
+   @aot_factory("my_kernel", sources=["kernels/my_kernel.py"])
    @functools.cache
    def _my_launcher():
        from .kernels.my_kernel import launch_my_kernel
@@ -169,9 +174,10 @@ for it` marks a fallback and is a failure of the conversion.
 4. **Mode 0.** Run with `AITER_FLYDSL_AOT_CACHE=0`: the JIT path must still
    work, since it is the fallback.
 5. **Sidecar.** Open a `<digest>-<variant>.json` of the new cache: `baked`
-   lists the constexpr argument indexes and values, `sources` the kernel's
-   files. A kernel file missing from `sources` means the trace did not run
-   it; see §4.2 of the doc for the holes and `extra_sources`.
+   lists the constexpr argument indexes and values, `sources` the files the
+   cache declares. Compare them with what the kernel is built from: a file
+   that is not declared invalidates nothing (§4.2 of the doc). Declare
+   variables the kernel code reads in `env=`.
    `fingerprint` must match the target/toolchain directory, `key` must match
    the filename's digest, and `object_sha256` must match the `.o` bytes.
    Disk resolution rejects mismatched pairs and old sidecars
@@ -226,8 +232,10 @@ or `tensor_shim.py`, and after a FlyDSL pin bump.
 | `one launcher bound to keys ... and ...` | Two factories or keys return one launcher object | One factory per launcher; for shared launchers use `bind_aot` at the build |
 | `cannot bind a dict` / `tuple` | The factory returns several launchers | `bind_aot` each launcher where it is built |
 | `... launching through the JIT path` at bind time | A key element the cache cannot store | Convert it to a plain value at the call site |
-| `changed after this process started; not caching` | A recorded source was edited while the process ran | Rerun in a new process |
-| A second run builds again | The key or a recorded env variable differs between runs, or the sources differ (first build of a process records import side effects) | Diff the two sidecars |
+| `changed after this process imported it` | A declared source was edited while the process ran | Rerun in a new process |
+| `does not declare [...], which its sources import` | A declared kernel file imports a kernel file missing from `sources=` | Add it to `sources=` |
+| `links [...], which it does not declare` | The kernel links bitcode missing from `sources=` | Add its path to `sources=` |
+| A second run builds again | The key, a declared source or a declared variable differs between runs | Diff the two sidecars |
 | `verify` mismatch | The trace reads something the key does not hold | Find it (a global, a config, a device property) and put it in the key |
 | The preload/tuner precompile does not speed up the first launch | It compiles the raw launcher | Step 5 above |
 

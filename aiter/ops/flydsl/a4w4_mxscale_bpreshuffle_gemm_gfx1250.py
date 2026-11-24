@@ -54,7 +54,21 @@ _fx = None
 # arguments, so a factory takes none and every launch passes them in
 # specialization_key. A factory imports its kernel module, so a launch served
 # from the AOT cache (``factory.lazy()``) never does.
-@aot_factory("gemm_a4w4_gfx1250")
+# The kernel files both launchers are built from, besides this file and
+# their own kernel module.
+_AOT_SOURCES = [
+    "kernels/act.py",
+    "kernels/gemm_common_gfx1250.py",
+    "kernels/gfx1250_cluster.py",
+    "kernels/kernels_common.py",
+    "kernels/splitk_fused_epilogue_gfx1250.py",
+    "kernels/tdm_ops_gfx1250.py",
+]
+
+
+@aot_factory(
+    "gemm_a4w4_gfx1250", sources=["kernels/gemm_a4w4_gfx1250.py", *_AOT_SOURCES]
+)
 @functools.cache
 def _general_launcher():
     from .kernels.gemm_a4w4_gfx1250 import launch_gemm_a4w4
@@ -62,7 +76,10 @@ def _general_launcher():
     return launch_gemm_a4w4
 
 
-@aot_factory("gemm_a4w4_256x256_gfx1250")
+@aot_factory(
+    "gemm_a4w4_256x256_gfx1250",
+    sources=["kernels/gemm_a4w4_256x256_gfx1250.py", *_AOT_SOURCES],
+)
 @functools.cache
 def _compute_launcher():
     from .kernels.gemm_a4w4_256x256_gfx1250 import launch_gemm_a4w4_256x256

@@ -202,7 +202,14 @@ def _fuses_quant_output(
     )
 
 
-@aot_factory("pa_decode_ps_reduce_gfx1250")
+@aot_factory(
+    "pa_decode_ps_reduce_gfx1250",
+    sources=[
+        "kernels/pa_decode_reduce.py",
+        "kernels/dpp_utils.py",
+        "kernels/utils.py",
+    ],
+)
 @functools.lru_cache(maxsize=256)
 def _gfx1250_ps_reduce_launcher(**options):
     """The gfx1250 reducer's launcher, launched through the AOT cache."""

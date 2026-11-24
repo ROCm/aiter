@@ -71,7 +71,13 @@ _CFG_KEYS = (
 )
 
 
-@aot_factory("gemm_a16w16_gfx1250")
+@aot_factory(
+    "gemm_a16w16_gfx1250",
+    sources=[
+        "kernels/gemm_a16w16_kernel_gfx1250.py",
+        "kernels/communication_ops_utils.py",
+    ],
+)
 @functools.lru_cache(maxsize=1024)
 def _cached_launcher(*cfg):
     # Imported here: a launch the AOT cache serves does not build the kernel.

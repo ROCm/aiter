@@ -52,7 +52,32 @@ def _fused_splitk_ok(tile_m, cluster_m, cluster_n, split_k, compute_bound) -> bo
 # a factory takes none and every launch passes them in specialization_key. A
 # factory imports its kernel module, so a launch served from the AOT cache
 # (``factory.lazy()``) never does.
-@aot_factory("gemm_a8w8_gfx1250")
+# The kernel files each launcher is built from, besides this file.
+_GEMM_AOT_SOURCES = [
+    "kernels/gemm_a8w8_gfx1250.py",
+    "kernels/act.py",
+    "kernels/gemm_common_gfx1250.py",
+    "kernels/gfx1250_cluster.py",
+    "kernels/kernels_common.py",
+    "kernels/quant_utils.py",
+]
+_COMPUTE_BOUND_AOT_SOURCES = [
+    "kernels/gemm_a8w8_256x256_gfx1250.py",
+    "kernels/act.py",
+    "kernels/gemm_common_gfx1250.py",
+    "kernels/gfx1250_cluster.py",
+    "kernels/kernels_common.py",
+    "kernels/quant_utils.py",
+    "kernels/splitk_fused_epilogue_gfx1250.py",
+    "kernels/tdm_ops_gfx1250.py",
+]
+_SPLITK_REDUCE_AOT_SOURCES = [
+    "kernels/gemm_a8w8_splitk_reduce_gfx1250.py",
+    "kernels/kernels_common.py",
+]
+
+
+@aot_factory("gemm_a8w8_gfx1250", sources=_GEMM_AOT_SOURCES)
 @functools.cache
 def gemm_a8w8_launcher():
     from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
@@ -60,7 +85,7 @@ def gemm_a8w8_launcher():
     return launch_gemm_a8w8
 
 
-@aot_factory("gemm_a8w8_256x256_gfx1250")
+@aot_factory("gemm_a8w8_256x256_gfx1250", sources=_COMPUTE_BOUND_AOT_SOURCES)
 @functools.cache
 def _gemm_a8w8_compute_bound_launcher():
     from .kernels.gemm_a8w8_256x256_gfx1250 import launch_gemm_a8w8_256x256
@@ -68,7 +93,7 @@ def _gemm_a8w8_compute_bound_launcher():
     return launch_gemm_a8w8_256x256
 
 
-@aot_factory("gemm_a8w8_splitk_reduce_gfx1250")
+@aot_factory("gemm_a8w8_splitk_reduce_gfx1250", sources=_SPLITK_REDUCE_AOT_SOURCES)
 @functools.cache
 def splitk_reduce_launcher(split_k: int, out_dtype_str: str, partial_dtype_str: str):
     from .kernels.gemm_a8w8_splitk_reduce_gfx1250 import (

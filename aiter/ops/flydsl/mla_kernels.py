@@ -126,7 +126,18 @@ def _validate_pagesize1_inputs(
 # The gfx1250 launchers take their Constexprs as launch arguments, so each
 # launch passes them in specialization_key. The factories take no argument and
 # import the kernel module only when the AOT cache has to build an entry.
-@aot_factory("mla_pagesize1_fp8_fp8")
+_PAGESIZE1_AOT_SOURCES = [
+    "kernels/buffer_ops.py",
+    "kernels/kernels_common.py",
+    "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+    "kernels/mla_gfx1250/mla_common.py",
+]
+
+
+@aot_factory(
+    "mla_pagesize1_fp8_fp8",
+    sources=["kernels/mla_gfx1250/mla_pagesize1_fp8_fp8.py", *_PAGESIZE1_AOT_SOURCES],
+)
 @functools.cache
 def _pagesize1_fp8_launcher():
     from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
@@ -136,7 +147,10 @@ def _pagesize1_fp8_launcher():
     return launch_mla_pagesize1_fp8_fp8
 
 
-@aot_factory("mla_pagesize1_bf16_bf16")
+@aot_factory(
+    "mla_pagesize1_bf16_bf16",
+    sources=["kernels/mla_gfx1250/mla_pagesize1_bf16_bf16.py", *_PAGESIZE1_AOT_SOURCES],
+)
 @functools.cache
 def _pagesize1_bf16_launcher():
     from .kernels.mla_gfx1250.mla_pagesize1_bf16_bf16 import (
@@ -146,7 +160,16 @@ def _pagesize1_bf16_launcher():
     return launch_mla_pagesize1_bf16_bf16
 
 
-@aot_factory("mla_pagesize64_fp8_fp8")
+@aot_factory(
+    "mla_pagesize64_fp8_fp8",
+    sources=[
+        "kernels/mla_gfx1250/mla_pagesize64_fp8_fp8.py",
+        "kernels/mla_gfx1250/mla_common.py",
+        "kernels/act.py",
+        "kernels/gemm_common_gfx1250.py",
+        "kernels/kernels_common.py",
+    ],
+)
 @functools.cache
 def _pagesize64_fp8_launcher():
     from .kernels.mla_gfx1250.mla_pagesize64_fp8_fp8 import (
@@ -156,7 +179,10 @@ def _pagesize64_fp8_launcher():
     return launch_mla_pagesize64_fp8_fp8
 
 
-@aot_factory("mla_decode_reduce")
+@aot_factory(
+    "mla_decode_reduce",
+    sources=["kernels/mla_reduce.py", "kernels/kernels_common.py"],
+)
 @functools.cache
 def _decode_reduce_launcher(H: int, Dv: int, out_dtype: str):
     from .kernels.mla_reduce import compile_mla_decode_reduce

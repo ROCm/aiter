@@ -131,7 +131,14 @@ def skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves):
     return None
 
 
-@aot_factory("gemm_a16w16_skinny_gfx950")
+@aot_factory(
+    "gemm_a16w16_skinny_gfx950",
+    sources=[
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
+        "kernels/tensor_shim.py",
+    ],
+)
 @functools.lru_cache(maxsize=256)
 def compile_gemm_a16w16_skinny_gfx950(
     n: int,

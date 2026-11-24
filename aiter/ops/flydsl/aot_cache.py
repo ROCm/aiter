@@ -36,13 +36,21 @@ way.
 
 Invalidation has two levels. The directory is named by a fingerprint of the
 toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
-``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each entry also records the
-Python source files that ran while it was built (the factory and the trace)
-and the aiter modules that code imports values from, with their hashes; the
-environment variables the build-feeding code of those files names or that
-aiter code read during the build; and ``get_gfx()`` when the build used it.
-A hit whose sources or inputs changed is rebuilt. Editing one kernel, or setting a variable one
-kernel reads, therefore invalidates only the entries that depend on it.
+``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each cache also declares the
+source files its launchers are built from and the other environment
+variables their code reads (the file creating the cache is always one of its
+sources)::
+
+    FlyDSLAotCache("preshuffle_gemm_a8",
+                   sources=["kernels/preshuffle_gemm.py", ...],
+                   env=["MY_TUNING_SWITCH"])
+
+Their contents and values are hashed into every entry's name, so an edit to a
+declared file, or another value of a declared variable, makes new entries for
+that cache only, and going back finds the earlier ones. Nothing is detected:
+a file or a variable that is not declared does not invalidate anything.
+``tests/test_flydsl_aot_launch.py`` checks that the sources of every cache
+include the files under ``aiter/ops/flydsl`` those import.
 
 ``AITER_FLYDSL_AOT_CACHE`` selects the mode:
 
@@ -59,10 +67,8 @@ prebuild writes ship with the package, like its JIT modules.
 
 from __future__ import annotations
 
-import _collections_abc
 import ast
 import contextlib
-import dis
 import fcntl
 import functools
 import hashlib
@@ -92,7 +98,7 @@ from aiter import logger
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
-_SCHEMA = 6
+_SCHEMA = 7
 _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
@@ -140,21 +146,6 @@ def _flydsl_cache_env() -> tuple:
 
 
 _ENV_EXTRA = tuple(sorted({*_ENV_EXTRA, *_flydsl_cache_env()}))
-# Variables that describe the build rather than the code it makes. The AOT dry
-# run sets them (CU_NUM and GPU_ARCHS to the target, hashed in the fingerprint
-# as _cu_num and _target_arch); recording them per entry would keep the
-# runtime, which leaves them unset, from hitting what the dry run built.
-# AITER_AOT_* are set by setup.py and the replay; AITER_CONFIG_* point the
-# replay at the CSV it replays, and the config it selects is in the key.
-_ENV_SETUP = {"AITER_GPU_ARCHS", "COMPILE_ONLY", "CU_NUM", "GPU_ARCHS"}
-_ENV_SETUP_PREFIXES = ("AITER_AOT_", "AITER_CONFIG_")
-# A string literal read as a variable name: os.environ.get("X"), os.getenv("X"),
-# os.environ["X"], "X" in os.environ.
-_ENV_NAME_RE = re.compile(
-    r"""(?:environ\.get|getenv|environ\.setdefault)\(\s*["']([A-Za-z_]\w*)["']"""
-    r"""|environ\[\s*["']([A-Za-z_]\w*)["']\s*\]"""
-    r"""|["']([A-Za-z_]\w*)["']\s+(?:not\s+)?in\s+os\.environ"""
-)
 
 
 def aot_cache_mode() -> str:
@@ -292,7 +283,7 @@ def fingerprint() -> str:
     device bitcode, torch HIP, Python, the target arch and CU count, and the ``AITER_FLYDSL_*`` /
     ``FLYDSL_*`` environment variables. Changing any of them selects a new
     cache directory. Kernel sources and the other variables they read are
-    tracked per entry instead (``_record_sources``). Only the FlyDSL hash is
+    declared per cache instead (``FlyDSLAotCache``). Only the FlyDSL hash is
     cached: an AOT build switches arch and environment within one process.
     """
     env_items = sorted(
@@ -316,20 +307,6 @@ def fingerprint() -> str:
 
 
 @functools.cache
-def _untracked_roots() -> tuple:
-    """Source trees whose files are not recorded as entry dependencies.
-
-    FlyDSL is covered by the fingerprint; torch, the standard library and
-    third-party packages change only with an environment change.
-    """
-    import sysconfig
-
-    roots = [Path(flydsl.__file__).parent, Path(torch.__file__).parent]
-    roots += [Path(sysconfig.get_paths()[k]) for k in ("stdlib", "platstdlib")]
-    return tuple(str(r.resolve()) + os.sep for r in roots)
-
-
-@functools.cache
 def _tracked_root() -> str:
     import aiter
 
@@ -337,42 +314,28 @@ def _tracked_root() -> str:
 
 
 def _portable(path: str) -> str:
-    """``path`` as a sidecar stores it: relative to the aiter package if inside
-    it, so entries built in a source tree still match once the package is
-    installed elsewhere (a prebuilt wheel); absolute otherwise."""
-    return path.removeprefix(_tracked_root())
+    """``path`` as an entry names it: relative to the aiter package if inside
+    it, else its file name, so entries built in a source tree still match once
+    the package is installed elsewhere (a prebuilt wheel)."""
+    root = _tracked_root()
+    return path.removeprefix(root) if path.startswith(root) else os.path.basename(path)
 
 
-def _is_tracked(path: str) -> bool:
-    if not path.endswith(".py") or path == os.path.realpath(__file__):
-        return False
-    if path.startswith(_tracked_root()):
-        # aiter/aot holds build tooling; the replay's hooks run during the trace.
-        return not path.startswith(_tracked_root() + "aot" + os.sep)
-    if path.startswith(_untracked_roots()):
-        return False
-    return "site-packages" not in path and "dist-packages" not in path
+# When this module was imported: before any FlyDSL kernel module of this
+# process (their wrappers import it). A forked worker inherits it.
+_IMPORTED_NS = time.time_ns()
 
 
-@functools.cache
-def _process_start_ns() -> int:
-    """When this process started, to a clock tick: ``/proc/self/stat`` gives it
-    in ticks since boot."""
-    with open("/proc/self/stat") as f:
-        ticks = int(f.read().rpartition(")")[2].split()[19])
-    since_boot = ticks * 10**9 // os.sysconf("SC_CLK_TCK")
-    return time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME) + since_boot
-
-
-def _changed_since_start(files) -> list:
-    """Sources modified after this process started. The process may run the code
-    it imported before the change, so an entry built now could hold the old code
-    under the new file's hash."""
-    start = _process_start_ns()
+def _changed_since_import(files) -> list:
+    """Sources modified after this process imported aiter's FlyDSL code. The
+    process runs what it imported, so what it would trace may no longer be what
+    such a file says."""
     changed = []
     for f in files:
+        if not f.endswith(".py"):
+            continue  # read by the compile (bitcode), not imported
         with contextlib.suppress(OSError):
-            if os.stat(f).st_mtime_ns > start:
+            if os.stat(f).st_mtime_ns > _IMPORTED_NS:
                 changed.append(f)
     return changed
 
@@ -386,283 +349,6 @@ def _file_digest(path: str) -> str | None:
         return None
 
 
-def _first_line(node) -> int:
-    """The line a function's code object starts at: its first decorator."""
-    return min([node.lineno] + [d.lineno for d in node.decorator_list])
-
-
-def _cached(node) -> bool:
-    """Whether a function is memoized, so a later call need not enter it."""
-    for d in node.decorator_list:
-        d = d.func if isinstance(d, ast.Call) else d
-        name = d.attr if isinstance(d, ast.Attribute) else getattr(d, "id", "")
-        if name in ("cache", "lru_cache"):
-            return True
-    return False
-
-
-def _build_spans(body, called, at_import=True) -> list:
-    """Line spans of ``body`` that can feed a build: statements run at import,
-    functions called in it, and memoized functions, which may have run before."""
-    spans = []
-    for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _first_line(node) in called or _cached(node):
-                spans.append((_first_line(node), node.end_lineno))
-            else:
-                spans += _build_spans(node.body, called, False)
-        elif isinstance(node, ast.ClassDef):
-            spans += _build_spans(node.body, called, at_import)
-        elif at_import:
-            spans.append((node.lineno, node.end_lineno))
-    return spans
-
-
-@functools.cache
-def _parse(path: str):
-    """``(lines, tree)`` of a source file, once per build; None if unreadable."""
-    try:
-        text = Path(path).read_text(errors="replace")
-        return text.splitlines(), ast.parse(text)
-    except (OSError, SyntaxError, ValueError):
-        return None
-
-
-def _build_text(path: str, called: frozenset) -> str:
-    """The code of ``path`` that can feed a build (``_build_spans``)."""
-    parsed = _parse(path)
-    if parsed is None:
-        return ""
-    lines, tree = parsed
-    return "\n".join(
-        "\n".join(lines[a - 1 : b]) for a, b in _build_spans(tree.body, called)
-    )
-
-
-def _env_names(path: str, called: frozenset) -> frozenset:
-    """Environment variables ``path`` reads by a literal name in the code that
-    can feed a build. Host-only functions the build never called, such as an
-    allocator or IPC setup, are skipped."""
-    return frozenset(
-        n
-        for m in _ENV_NAME_RE.finditer(_build_text(path, called))
-        for n in m.groups()
-        if n
-    )
-
-
-def _module_file(name: str) -> str | None:
-    """The source of aiter module ``name``, e.g. ``aiter.ops.flydsl.x``."""
-    parts = name.split(".")
-    if parts[0] != "aiter" or not all(parts):
-        return None
-    base = os.path.join(_tracked_root(), *parts[1:])
-    for f in (base + ".py", os.path.join(base, "__init__.py")):
-        if os.path.isfile(f):
-            return f
-    return None
-
-
-def _import_base(path: str, node: ast.ImportFrom) -> str:
-    """The absolute module ``node`` imports from, in file ``path``."""
-    if node.level == 0:
-        return node.module or ""
-    rel = _portable(path)
-    if os.path.isabs(rel):
-        return ""
-    package = ["aiter"] + rel.split(os.sep)[:-1]
-    package = package[: len(package) - node.level + 1]
-    return ".".join(package + ([node.module] if node.module else []))
-
-
-def _bound_names(node) -> set:
-    """The module-level names statement ``node`` binds or mutates
-    (``X[k] = ...``, ``X.a = ...``), not counting the statements nested in it."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return {node.name}
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        return {(a.asname or a.name).split(".")[0] for a in node.names}
-    names = set()
-    for c in _header(node):
-        for n in ast.walk(c):
-            if not isinstance(getattr(n, "ctx", None), ast.Store):
-                continue
-            while isinstance(n, (ast.Subscript, ast.Attribute)):
-                n = n.value
-            if isinstance(n, ast.Name):
-                names.add(n.id)
-    return names
-
-
-def _header(node) -> list:
-    """The expressions of statement ``node``, without its nested statements:
-    the condition of an ``if``, the iterable of a ``for``, an assignment."""
-    return [
-        c
-        for c in ast.iter_child_nodes(node)
-        if not isinstance(c, (ast.stmt, ast.ExceptHandler))
-    ]
-
-
-def _module_statements(body, outer=()):
-    """Statements run at import, inside ``if``/``try``/``with`` blocks too,
-    each with the compound statements around it."""
-    for node in body:
-        yield node, outer
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        for c in ast.iter_child_nodes(node):
-            if isinstance(c, ast.ExceptHandler):
-                yield from _module_statements(c.body, outer + (node,))
-            elif isinstance(c, ast.stmt):
-                yield from _module_statements([c], outer + (node,))
-
-
-@functools.cache
-def _bindings(path: str) -> dict:
-    """Module-level name -> ``(statement, enclosing statements)`` of ``path``
-    that bind it. ``"*"`` holds the star imports."""
-    parsed = _parse(path)
-    out = {}
-    if parsed is not None:
-        for node, outer in _module_statements(parsed[1].body):
-            for name in _bound_names(node):
-                out.setdefault(name, []).append((node, outer))
-    return out
-
-
-def _star_files(path: str) -> list:
-    """The aiter modules ``path`` star-imports."""
-    return [
-        f
-        for node, _ in _bindings(path).get("*", ())
-        if (f := _module_file(_import_base(path, node))) is not None
-    ]
-
-
-def _defines(path: str, name: str, seen: frozenset = frozenset()) -> bool:
-    """Whether ``path`` binds ``name``, itself or through its star imports."""
-    if path in seen:
-        return False
-    if name in _bindings(path):
-        return True
-    return any(_defines(f, name, seen | {path}) for f in _star_files(path))
-
-
-def _binds_logger(node) -> bool:
-    """Whether ``node`` is ``x = logging.getLogger(...)``: a logger does not
-    change a kernel, and ``from aiter import logger`` would otherwise tie
-    every entry to ``aiter/__init__.py``."""
-    v = getattr(node, "value", None)
-    f = v.func if isinstance(v, ast.Call) else None
-    return (
-        isinstance(f, (ast.Attribute, ast.Name))
-        and (getattr(f, "attr", None) or getattr(f, "id", None)) == "getLogger"
-    )
-
-
-def _value_sources(path: str, name: str, seen: set, run: bool = False) -> set:
-    """The files module-level ``name`` of ``path`` takes its value from.
-
-    A function the build calls is recorded by the profile hook, so it adds
-    nothing unless memoized (a cached call does not enter it) or ``run``: it
-    was called at import to compute a value. Any other value adds ``path`` and,
-    through the names its statement and the conditions around it read, what
-    it was computed from.
-    """
-    if (path, name, run) in seen:
-        return set()
-    seen.add((path, name, run))
-    nodes = _bindings(path).get(name)
-    if not nodes:
-        # A star re-export, or bound in a way this does not follow.
-        out = {path}
-        for f in _star_files(path):
-            if _defines(f, name):
-                out |= _value_sources(f, name, seen, run)
-        return out
-    out = set()
-    for node, outer in nodes:
-        if isinstance(node, ast.ImportFrom):
-            base = _import_base(path, node)
-            for a in node.names:
-                if (a.asname or a.name) == name:
-                    out |= _imported(base, a.name, seen, run)
-            continue
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if (a.asname or a.name).split(".")[0] == name:
-                    out.add(_module_file(a.name))
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if not (run or _cached(node)):
-                continue
-            reads = [node]
-        elif isinstance(node, ast.ClassDef):
-            reads = [node]
-        elif _binds_logger(node):
-            continue
-        else:
-            reads = _header(node)
-        out.add(path)
-        bound = _bindings(path)
-        for expr in reads + [h for o in outer for h in _header(o)]:
-            for n in ast.walk(expr):
-                if isinstance(n, ast.Name) and n.id in bound and n.id != name:
-                    out |= _value_sources(path, n.id, seen, True)
-    out.discard(None)
-    return out
-
-
-def _imported(module: str, name: str, seen: set, run: bool = False) -> set:
-    """The files ``from module import name`` takes a value from."""
-    sub = _module_file(f"{module}.{name}")
-    if sub is not None:
-        return {sub}
-    f = _module_file(module)
-    if f is None:
-        return set()
-    if name == "*":
-        return {f}
-    return _value_sources(f, name, seen, run)
-
-
-def _import_sources(files, called: dict) -> set:
-    """Aiter modules whose module-level values the code of ``files`` imports.
-
-    Reading an imported constant calls nothing, so the profile hook does not
-    see the module that defines it. Static, and on the generous side: an extra
-    file costs a rebuild when it is edited, a missing one a stale kernel.
-    """
-    out = set()
-    seen = set()
-    for path in files:
-        parsed = _parse(path)
-        if parsed is None:
-            continue
-        spans = _build_spans(parsed[1].body, frozenset(called.get(path, ())))
-        for node in ast.walk(parsed[1]):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            if not any(a <= node.lineno <= b for a, b in spans):
-                continue
-            if isinstance(node, ast.Import):
-                out.update(_module_file(a.name) for a in node.names)
-                continue
-            base = _import_base(path, node)
-            for a in node.names:
-                out |= _imported(base, a.name, seen)
-    out.discard(None)
-    out = {os.path.realpath(f) for f in out}
-    return {f for f in out if _is_tracked(f)} - set(files)
-
-
-def _clear_get_gfx():
-    from aiter.jit.utils.chip_info import get_gfx
-
-    get_gfx.cache_clear()
-
-
 def _get_gfx():
     from aiter.jit.utils.chip_info import get_gfx
 
@@ -672,163 +358,83 @@ def _get_gfx():
         return None
 
 
-# Values aiter derives from the environment, kept with the variables an entry
-# depends on. get_gfx() honours GPU_ARCHS (its last arch when it names
-# several), while the fingerprint's arch is the device's or FlyDSL's target:
-# an image setting GPU_ARCHS="gfx942;gfx950" answers gfx950 on a gfx942.
+# Inputs a cache may declare besides environment variables. get_gfx() honours
+# GPU_ARCHS (its last arch when it names several), while the fingerprint's arch
+# is the device's or FlyDSL's target: an image setting GPU_ARCHS="gfx942;gfx950"
+# answers gfx950 on a gfx942. A kernel that picks code by get_gfx() declares it.
 _DERIVED = {"get_gfx()": _get_gfx}
 
 
-def _calls_get_gfx(path: str) -> bool:
-    """Whether code of ``path`` that may have run before a build calls
-    get_gfx(): module-level statements and memoized functions."""
-    parsed = _parse(path)
-    if parsed is None:
-        return False
-    spans = _build_spans(parsed[1].body, frozenset())
-    for node in ast.walk(parsed[1]):
-        if isinstance(node, ast.Call):
-            f = node.func
-            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
-            if name == "get_gfx" and any(a <= node.lineno <= b for a, b in spans):
-                return True
-    return False
-
-
-def _uses_get_gfx(files, calls) -> bool:
-    """Whether the build called get_gfx(), directly or through a value
-    computed before it. Its memo is cleared before each build, so a call
-    during the build enters it and the profile hook sees it."""
-    from aiter.jit.utils import chip_info
-
-    code = inspect.unwrap(chip_info.get_gfx).__code__
-    if (code.co_filename, code.co_firstlineno) in calls:
-        return True
-    return any(_calls_get_gfx(f) for f in files)
-
-
 def _input(name: str):
-    """The current value of an entry's input: a variable or a ``_DERIVED`` one."""
+    """The current value of a declared input: a variable or a ``_DERIVED`` one."""
     return _DERIVED[name]() if name in _DERIVED else os.environ.get(name)
 
 
-# os.getenv, os.environ.get and `in` reach _Environ.__getitem__ through these.
-# Taken from the code objects: on Python 3.11+ both modules are frozen, and
-# their co_filename is "<frozen os>" rather than os.__file__.
-_ENV_PLUMBING = frozenset(
-    {os.getenv.__code__.co_filename, _collections_abc.Mapping.get.__code__.co_filename}
-)
-# The plumbing that reads one variable by name. copy(), items(), dict(os.environ)
-# and the like read every variable; they are not a dependency on each, and
-# recording them would write the whole environment, secrets included, into
-# the entry.
-_ENV_BY_NAME = frozenset({"get", "getenv", "__contains__", "setdefault"})
+def _source_files(sources) -> list:
+    """The files a cache declares: each path as given if absolute, else under
+    ``aiter/ops/flydsl``; a directory stands for every ``.py`` below it."""
+    base = os.path.dirname(os.path.realpath(__file__))
+    files = set()
+    for src in sources:
+        path = os.path.realpath(os.path.join(base, os.fspath(src)))
+        if os.path.isdir(path):
+            found = [str(f) for f in Path(path).rglob("*.py")]
+            if not found:
+                raise _UsageError(f"[FlyDSL AOT] no .py file under source {src!r}")
+            files.update(os.path.realpath(f) for f in found)
+        elif os.path.isfile(path):
+            files.add(path)
+        else:
+            raise _UsageError(f"[FlyDSL AOT] source {src!r} ({path}) does not exist")
+    return sorted(files)
 
 
-def _subscript(frame) -> bool:
-    """Whether ``frame`` is at ``os.environ[...]``, not a C-level bulk read."""
-    for ins in dis.get_instructions(frame.f_code):
-        if ins.offset == frame.f_lasti:
-            return ins.opname == "BINARY_SUBSCR" or (
-                ins.opname == "BINARY_OP" and ins.argrepr == "[]"
-            )
-    return False
+# Launch plumbing every kernel file imports; it generates no code.
+_NOT_KERNEL_CODE = ("__init__.py", "aot_cache.py", "aot_launch.py", "tensor_shim.py")
 
 
-@contextlib.contextmanager
-def _record_sources(out: set, env: set, calls: set):
-    """Collect the files of every Python function called in this block, the
-    ``(file, first line)`` of each, and the environment variables aiter code
-    reads in it.
-
-    Run around the factory and the trace, it names the sources the generated
-    code can depend on: the kernel, its helpers and any aiter code they call.
-    A variable read under a computed name is caught here; one read at import or
-    inside a cached function is caught only if kernel code names it
-    (``_entry_env``). Reads of the whole environment are not recorded.
-    """
-    seen = set()
-    reads = set()
-    getitem = os._Environ.__getitem__.__code__
-
-    def prof(frame, event, _arg):
-        if event != "call":
-            return
-        seen.add(frame.f_code.co_filename)
-        calls.add((frame.f_code.co_filename, frame.f_code.co_firstlineno))
-        if frame.f_code is getitem:
-            caller = frame.f_back
-            by_name = True
-            while caller is not None and caller.f_code.co_filename in _ENV_PLUMBING:
-                by_name &= caller.f_code.co_name in _ENV_BY_NAME
-                caller = caller.f_back
-            if caller is frame.f_back:
-                by_name = caller is not None and _subscript(caller)
-            if caller is not None and by_name:
-                reads.add((caller.f_code.co_filename, frame.f_locals.get("key")))
-
-    old = sys.getprofile()
-    sys.setprofile(prof)
-    try:
-        yield
-    finally:
-        sys.setprofile(old)
-        out.update(os.path.realpath(f) for f in seen if _is_tracked(f))
-        env.update(
-            k
-            for f, k in reads
-            if isinstance(k, str) and _is_tracked(os.path.realpath(f))
-        )
+@functools.cache
+def _kernel_imports(path: str) -> frozenset:
+    """The files under ``aiter/ops/flydsl/kernels`` that ``path`` imports,
+    anywhere in it (read from its text; nothing is imported)."""
+    root = Path(_tracked_root())
+    kernels = Path(__file__).resolve().parent / "kernels"
+    module = ".".join(("aiter", *Path(path).relative_to(root).with_suffix("").parts))
+    found = set()
+    for node in ast.walk(ast.parse(Path(path).read_bytes())):
+        names = ()
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = module.rsplit(".", node.level)[0] if node.level else ""
+            target = ".".join(part for part in (base, node.module) if part)
+            names = [target, *(f"{target}.{alias.name}" for alias in node.names)]
+        for name in names:
+            if not name.startswith("aiter."):
+                continue
+            file = root.joinpath(*name.split(".")[1:]).with_suffix(".py")
+            if (
+                kernels in file.parents
+                and file.name not in _NOT_KERNEL_CODE
+                and file.is_file()
+            ):
+                found.add(str(file))
+    return frozenset(found)
 
 
-def _entry_env(files, read, calls, called) -> dict:
-    """The variables an entry built from ``files`` depends on, with their values.
-
-    Names are taken from the text of kernel code only (``aiter/ops/flydsl``),
-    and there only from code that can feed the build (``_env_names``).
-    Shared modules such as ``aiter/jit/core.py`` name many variables that do
-    not affect a kernel, so for them only the reads seen during the build count.
-    ``get_gfx()`` is added as an input when the build used it (``_uses_get_gfx``).
-    """
-    kernel_root = _tracked_root() + "ops" + os.sep + "flydsl" + os.sep
-    names = set(read).union(
-        *(
-            _env_names(f, frozenset(called.get(f, ())))
-            for f in files
-            if f.startswith(kernel_root)
-        )
-    )
-    env = {
-        k: os.environ.get(k)
-        for k in sorted(names)
-        if not _env_in_fingerprint(k)
-        and k not in _ENV_SETUP
-        and not k.startswith(_ENV_SETUP_PREFIXES)
-    }
-    if _uses_get_gfx(files, calls):
-        env["get_gfx()"] = _get_gfx()
-    return env
+def _undeclared_imports(files) -> list:
+    """Kernel files that the declared kernel files import and that are not
+    declared themselves: sources someone forgot."""
+    kernels = str(Path(__file__).resolve().parent / "kernels") + os.sep
+    declared = set(files)
+    missing = set()
+    for f in files:
+        if f.startswith(kernels) and f.endswith(".py"):
+            missing |= _kernel_imports(f) - declared
+    return sorted(missing)
 
 
-def _called_lines(calls) -> dict:
-    """Real path -> first lines of the functions ``calls`` holds in it."""
-    by_file = {}
-    for f, line in calls:
-        by_file.setdefault(f, set()).add(line)
-    called = {}
-    for f, lines in by_file.items():
-        called.setdefault(os.path.realpath(f), set()).update(lines)
-    return called
-
-
-def _baked_args(exe, args) -> dict:
-    """The launch arguments a build compiles into the object: ``Constexpr[T]``
-    and ``Type[T]`` parameters of the launcher, by position, each as the
-    ``repr`` of its normalized value.
-
-    A loaded object ignores these arguments, so an entry serves only calls
-    that pass the values it was built with (``_entry_current``).
-    """
+def _launcher_signature(exe):
     if isinstance(exe, functools.partial):
         # A @flyc.jit method reached through its instance: the JitFunction is
         # the bound one, and its signature leaves ``self`` out, as ``args`` do.
@@ -841,19 +447,40 @@ def _baked_args(exe, args) -> dict:
             sig = inspect.signature(getattr(exe, "func", exe), eval_str=True)
         except Exception as e:  # annotations that do not evaluate
             raise RuntimeError(f"cannot read the launcher's signature: {e}") from e
-    baked = {}
-    for index, param in enumerate(sig.parameters.values()):
+    return sig
+
+
+def _constexpr_params(exe) -> list:
+    """``(position, parameter)`` of the launcher's ``Constexpr[T]`` and
+    ``Type[T]`` parameters: what a compile bakes into the object."""
+    out = []
+    for index, param in enumerate(_launcher_signature(exe).parameters.values()):
         ann = param.annotation
         if ann is inspect.Parameter.empty:
             continue
-        if not (
-            Constexpr.is_constexpr_annotation(ann) or is_type_param_annotation(ann)
-        ):
-            continue
+        if Constexpr.is_constexpr_annotation(ann) or is_type_param_annotation(ann):
+            out.append((index, param))
+    return out
+
+
+def _constexpr_count(exe) -> int:
+    return len(_constexpr_params(exe))
+
+
+def _baked_args(exe, args) -> dict:
+    """The launch arguments a build compiles into the object: ``Constexpr[T]``
+    and ``Type[T]`` parameters of the launcher, by position, each as the
+    ``repr`` of its normalized value.
+
+    A loaded object ignores these arguments, so an entry serves only calls
+    that pass the values it was built with (``_entry_current``).
+    """
+    baked = {}
+    for index, param in _constexpr_params(exe):
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             raise RuntimeError(f"baked launch argument *{param.name} has no position")
         if param.kind is param.KEYWORD_ONLY or index >= len(args):
-            # Left to its default, which the launcher's source (recorded) fixes.
+            # Left to its default, which the launcher's source (in the digest) fixes.
             continue
         try:
             baked[str(index)] = repr(_normalize_key(args[index]))
@@ -879,17 +506,6 @@ def _baked_current(baked: dict, args) -> bool:
         except _UsageError:
             return False
     return True
-
-
-def _entry_current(meta: dict, args) -> bool:
-    root = _tracked_root()
-    sources = meta["sources"].items()
-    # os.path.join keeps an absolute path as it is.
-    return (
-        _baked_current(meta["baked"], args)
-        and all(_file_digest(os.path.join(root, p)) == d for p, d in sources)
-        and all(_input(k) == v for k, v in meta["env"].items())
-    )
 
 
 @contextlib.contextmanager
@@ -986,8 +602,8 @@ def _export(exe, args, out_dir: Path, sym: str, link_libs: set | None = None) ->
         raise _NoExport("flyc.compile returned no function to export")
     if link_libs is not None:
         # Private to FlyDSL (the CompiledArtifact a CompiledFunction keeps):
-        # without it a linked library would go unrecorded, so the entry is
-        # not written.
+        # without it a linked library could not be checked against the
+        # declared sources, so the entry is not written.
         try:
             libs = cf._keepalive._link_libs
         except AttributeError as e:
@@ -1091,6 +707,11 @@ class _BakedArgumentError(RuntimeError):
     """One key launched with two values of a constexpr launch argument."""
 
 
+class _UndeclaredSourceError(RuntimeError):
+    """A cache's kernels are built from a file it does not declare; never
+    falls back."""
+
+
 class _NoExport(RuntimeError):
     """A hook stopped the compile, so there is nothing to export: not a failure."""
 
@@ -1099,16 +720,53 @@ class _StaleEntryError(RuntimeError):
     """``verify`` found a cached object that no longer matches its sources."""
 
 
+# Cache name -> the file that created its cache, and the caches by name. Two
+# caches of one name would share a directory and load each other's entries.
+_NAMES = {}
+_CACHES = {}
+
+
+def _creation_file() -> str:
+    """The file creating a cache, outside this module and ``aot_launch``: the
+    same file again (a module reloaded) is the same cache."""
+    here = (__file__, os.path.join(os.path.dirname(__file__), "aot_launch.py"))
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename in here:
+        frame = frame.f_back
+    return frame.f_code.co_filename if frame else "?"
+
+
 class FlyDSLAotCache:
     """Persistent ``export_to_c`` cache for one launcher family."""
 
-    def __init__(self, name: str, extra_sources=()):
+    def __init__(self, name: str, sources=(), env=()):
+        """``sources``: the files the launchers of this cache are built from,
+        besides the one creating it: each relative to ``aiter/ops/flydsl`` or
+        absolute; a directory stands for every ``.py`` below it. ``env``: the environment variables their
+        code reads, other than ``AITER_FLYDSL_*`` / ``FLYDSL_*``, and
+        ``"get_gfx()"`` if it picks code by ``chip_info.get_gfx()``. An edit
+        to a source, or another value of an input, makes new entries."""
         if not re.fullmatch(r"[A-Za-z0-9_]+", name):
             raise ValueError(f"cache name must be a C identifier fragment: {name!r}")
+        if isinstance(sources, (str, os.PathLike)):
+            sources = (sources,)
+        site = _creation_file()
+        first = _NAMES.setdefault(name, site)
+        if first != site:
+            raise ValueError(
+                f"FlyDSL AOT cache name {name!r} is already used in {first}; "
+                f"a cache name must be unique"
+            )
+        _CACHES[name] = self
         self.name = name
-        # Files a kernel depends on without calling into them while tracing,
-        # e.g. a module whose constants it imports. Hashed into every entry.
-        self._extra = tuple(os.path.realpath(p) for p in extra_sources)
+        if os.path.isfile(site):  # not an interactive session
+            sources = (site, *sources)
+        self._files = _source_files(sources)
+        self._env = tuple(sorted({env} if isinstance(env, str) else set(env)))
+        # [(source, sha256)] and its hash, once the files were read (_sources).
+        self._hashes = None
+        self._digest = None
+        self._imports_checked = False
         self._mem = {}
         # Compile-only launchers, by key.
         self._jit = {}
@@ -1124,8 +782,35 @@ class FlyDSLAotCache:
     def directory(self) -> Path:
         return cache_root() / fingerprint() / self.name
 
+    def _sources(self) -> str:
+        """Hash of the declared sources, read once per process: this process
+        runs the code it imported, so what it traces is those files as they
+        were, whatever is edited later."""
+        if self._digest is None:
+            changed = _changed_since_import(self._files)
+            if changed:
+                # Imported before the edit: what this process would trace is
+                # no longer what the file says.
+                raise RuntimeError(
+                    f"{changed[0]} changed after this process imported it; "
+                    f"not using the AOT cache for it"
+                )
+            self._hashes = sorted((_portable(f), _file_digest(f)) for f in self._files)
+            blob = json.dumps(self._hashes, sort_keys=True).encode()
+            self._digest = hashlib.sha256(blob).hexdigest()
+        return self._digest
+
+    def _inputs(self) -> dict:
+        return {name: _input(name) for name in self._env}
+
     def _disk_key(self, key, args) -> str:
-        ident = (self.name, _normalize_key(key), _arg_signature(args))
+        ident = (
+            self.name,
+            _normalize_key(key),
+            _arg_signature(args),
+            self._sources(),
+            tuple(self._inputs().items()),
+        )
         # FlyDSL merges the caller's CompilationContext.compile_hints(...)
         # into the compile; the launcher's own hints come from its sources.
         hints = CompilationContext.get_compile_hints()
@@ -1167,7 +852,12 @@ class FlyDSLAotCache:
                 with self._lock:
                     kernel = self._mem.get(key)
                     if kernel is None:
-                        kernel = self._mem[key] = self._kernel(key, make_exe, args)
+                        kernel = self._kernel(key, make_exe, args)
+                        if kernel is None:
+                            # COMPILE_ONLY was set meanwhile (another thread
+                            # preloading): the entry is built, nothing launches.
+                            return
+                        self._mem[key] = kernel
         kernel(*args)
 
     def _prebuild(self, key, make_exe, args) -> None:
@@ -1180,8 +870,7 @@ class FlyDSLAotCache:
         fallback. The export's compile does both for a new entry.
         """
         with self._lock:
-            # The export first: a trace FlyDSL already cached in this process
-            # would hide the sources the entry records.
+            # The export first: its compile is also the compile-only launch.
             if _MODE != "0" and _load_module is not None and not self._jit_only:
                 builds = self._builds
                 self._kernel(key, make_exe, args)
@@ -1202,7 +891,9 @@ class FlyDSLAotCache:
             # requests: the JIT path's compile-only launch is what it watches.
             return _JitKernel(make_exe(), key)
         except (TypeError, ValueError, NotImplementedError, RuntimeError, OSError) as e:
-            if _MODE == "verify" or isinstance(e, (_StaleEntryError, _UsageError)):
+            if _MODE == "verify" or isinstance(
+                e, (_StaleEntryError, _UsageError, _UndeclaredSourceError)
+            ):
                 raise
             logger.warning(
                 f"[FlyDSL AOT] {self.name}: no exported entry for {key!r} ({e}); "
@@ -1213,7 +904,7 @@ class FlyDSLAotCache:
     def _resolve(self, key, make_exe, args):
         """Load the entry for ``key`` from disk, building it first on a miss.
 
-        A hit reads only the object, its sidecar and the recorded sources; it
+        A hit reads only the object, its sidecar and the declared sources; it
         never calls ``make_exe``, whose factory runs FlyDSL's AST rewrite.
         """
         digest = self._disk_key(key, args)
@@ -1238,19 +929,22 @@ class FlyDSLAotCache:
                 found.with_suffix(".o").unlink(missing_ok=True)
                 found = self._build(make_exe, args, out_dir, sym, digest)
             kernel = _load_module(found.with_suffix(".o"))
-        baked = json.loads(found.with_suffix(".json").read_text())["baked"]
-        if baked:
+        meta = json.loads(found.with_suffix(".json").read_text())
+        baked = meta["baked"]
+        # Also for a launcher whose constexprs were all left to their defaults:
+        # a later launch that passes one must not run this object.
+        if baked or meta.get("constexpr"):
             return _BakedKernel(kernel, self.name, key, args, sorted(map(int, baked)))
         return kernel
 
     @staticmethod
     def _find(out_dir: Path, digest: str, args):
-        """The stem of the variant of ``digest`` built from the current sources
-        and environment, with the constexpr values ``args`` pass.
+        """The stem of the entry of ``digest`` that bakes the constexpr values
+        ``args`` pass.
 
-        An entry is stored per version of those, ``<digest>-<variant hash>``,
-        so switching a kernel file or a variable back and forth (e.g. between
-        branches) reuses the earlier build instead of overwriting it.
+        The digest holds the declared sources and inputs, so switching a
+        kernel file or a variable back and forth (e.g. between branches)
+        finds the earlier build again instead of overwriting it.
         """
         for sidecar in sorted(out_dir.glob(f"{digest}-*.json")):
             stem = sidecar.with_suffix("")
@@ -1259,7 +953,7 @@ class FlyDSLAotCache:
                 current = (
                     meta["fingerprint"] == out_dir.parent.name
                     and meta["key"] == digest
-                    and _entry_current(meta, args)
+                    and _baked_current(meta["baked"], args)
                 )
                 # A valid foreign object can load successfully. Check its
                 # contents against this key's sidecar before handing it to
@@ -1269,8 +963,8 @@ class FlyDSLAotCache:
                         hashlib.sha256(stem.with_suffix(".o").read_bytes()).hexdigest()
                         == meta["object_sha256"]
                     )
-            except (OSError, ValueError, KeyError):
-                continue
+            except (OSError, ValueError, KeyError, AttributeError, TypeError):
+                continue  # unreadable, or not a sidecar this version wrote
             if current and stem.with_suffix(".o").exists():
                 return stem
         return None
@@ -1280,40 +974,20 @@ class FlyDSLAotCache:
         _remove_stale_tmp(out_dir)
         tmp = Path(tempfile.mkdtemp(dir=out_dir, prefix=".tmp-"))
         try:
-            files = set(self._extra)
-            read = set()
-            calls = set()
+            self._check_declared()
             libs = set()
-            _clear_get_gfx()
-            with _record_sources(files, read, calls):
-                exe = make_exe()
-                tmp_obj = _export(exe, args, tmp, sym, libs)
-            # Parsed now, not from the per-process cache: the build read the
-            # files as they are on disk at this point.
-            _parse.cache_clear()
-            _bindings.cache_clear()
-            called = _called_lines(calls)
-            files |= _import_sources(files, called)
-            changed = _changed_since_start(files)
-            if changed:
-                raise RuntimeError(
-                    f"{changed[0]} changed after this process started; not caching "
-                    f"a build that may hold its earlier code"
-                )
-            # Hashed now, not from the per-process cache: the build read the
-            # files as they are on disk at this point.
-            _file_digest.cache_clear()
-            # A linked bitcode file is an input like a source: its code is in
-            # the object. It is not Python, so nothing above reads it, and the
-            # compile read it just now, whenever it was written.
-            sources = {_portable(f): _file_digest(f) for f in sorted(files | libs)}
+            exe = make_exe()
+            tmp_obj = _export(exe, args, tmp, sym, libs)
+            self._check_declared(libs)
             meta = {
                 "fingerprint": out_dir.parent.name,
                 "key": digest,
                 "object_sha256": hashlib.sha256(tmp_obj.read_bytes()).hexdigest(),
-                "sources": sources,
-                "env": _entry_env(files, read, calls, called),
+                # In the digest already; kept here to say what an entry is.
+                "sources": dict(self._hashes),
+                "env": self._inputs(),
                 "baked": _baked_args(exe, args),
+                "constexpr": _constexpr_count(exe),
             }
             variant = hashlib.sha256(json.dumps(meta).encode()).hexdigest()[:12]
             stem = out_dir / f"{digest}-{variant}"
@@ -1324,11 +998,30 @@ class FlyDSLAotCache:
             os.replace(tmp_obj, stem.with_suffix(".o"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-            _parse.cache_clear()
-            _bindings.cache_clear()
         self._builds += 1
         logger.info(f"[FlyDSL AOT] built {stem}.o")
         return stem
+
+    def _check_declared(self, libs=()) -> None:
+        """Raise if this cache is built from something it does not declare: a
+        kernel file its declared kernel files import, or bitcode its kernel
+        links. Run when an entry is built, so a hit pays nothing; the AOT
+        replays and CI build every cache."""
+        if not self._imports_checked:
+            missing = _undeclared_imports(self._files)
+            if missing:
+                raise _UndeclaredSourceError(
+                    f"[FlyDSL AOT] cache {self.name!r} does not declare "
+                    f"{[_portable(f) for f in missing]}, which its sources import: "
+                    f"add them to its sources="
+                )
+            self._imports_checked = True
+        missing = sorted(set(libs) - set(self._files))
+        if missing:
+            raise _UndeclaredSourceError(
+                f"[FlyDSL AOT] cache {self.name!r} links {missing}, which it "
+                f"does not declare: add the bitcode to its sources="
+            )
 
     def _verify(self, exe, args, sym, obj) -> None:
         with tempfile.TemporaryDirectory() as tmp:

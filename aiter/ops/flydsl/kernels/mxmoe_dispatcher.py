@@ -721,7 +721,18 @@ def compile_gemm2_a4w4_port(
 
 # ---- launcher cache + dispatch (compile once per config, fast-dispatch after) ----
 G2_CACHE = {}
-_G2_AOT_CACHE = FlyDSLAotCache("mxmoe_gemm2")
+_G2_AOT_CACHE = FlyDSLAotCache(
+    "mxmoe_gemm2",
+    sources=[
+        "kernels/mxmoe_gemm_v2.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/buffer_ops.py",
+        "kernels/dpp_utils.py",
+        "kernels/act.py",
+        "kernels/layout_utils.py",
+        "kernels/kernels_common.py",
+    ],
+)
 
 
 def get_g2(

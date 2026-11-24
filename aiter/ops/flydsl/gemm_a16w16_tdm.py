@@ -9,7 +9,13 @@ import torch
 from .aot_launch import aot_factory
 
 
-@aot_factory("gemm_a16w16_tdm_gfx1250")
+@aot_factory(
+    "gemm_a16w16_tdm_gfx1250",
+    sources=[
+        "kernels/gemm_a16w16_tdm_gfx1250.py",
+        "kernels/gemm_a16w16_gfx950_utils.py",
+    ],
+)
 @functools.lru_cache(maxsize=128)
 def _tdm_launcher(device: torch.device, *config):
     """``build_gemm_gfx1250(*config)`` for ``device``. The device keeps one

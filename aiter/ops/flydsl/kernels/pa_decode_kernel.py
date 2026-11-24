@@ -125,7 +125,20 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
-_GFX1250_PA_DECODE_AOT = FlyDSLAotCache("pa_decode_tile_gfx1250")
+_GFX1250_PA_DECODE_AOT = FlyDSLAotCache(
+    "pa_decode_tile_gfx1250",
+    sources=[
+        "kernels/pa_decode",
+        "kernels/pa_decode_plan.py",
+        "kernels/act.py",
+        "kernels/buffer_ops.py",
+        "kernels/dpp_utils.py",
+        "kernels/kernels_common.py",
+        "kernels/layout_utils.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/utils.py",
+    ],
+)
 
 
 def _dtype_tag(dtype):
@@ -1005,14 +1018,7 @@ def compile_gfx1250_pa_decode(t):
     if compiled is None:
         compiled = _build_gfx1250_pa_decode(t)
         # The traits are the launcher's constexprs, so they key its AOT entry.
-        # An entry is traced from a fresh build, so that the sources the
-        # kernel definition runs are recorded with it.
-        bind_aot(
-            compiled["launch"],
-            _GFX1250_PA_DECODE_AOT,
-            dataclasses.astuple(t),
-            make_exe=lambda: _build_gfx1250_pa_decode(t)["launch"],
-        )
+        bind_aot(compiled["launch"], _GFX1250_PA_DECODE_AOT, dataclasses.astuple(t))
         compiled = _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
     return compiled
 

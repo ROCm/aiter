@@ -16,7 +16,17 @@ _NOPE = 128
 _V_DIM = 128
 
 
-@aot_factory("gather_kv_b_proj_8wave_gfx1250")
+@aot_factory(
+    "gather_kv_b_proj_8wave_gfx1250",
+    sources=[
+        "kernels/gather_kv_b_proj_gfx1250.py",
+        "kernels/act.py",
+        "kernels/gemm_common_gfx1250.py",
+        "kernels/gfx1250_cluster.py",
+        "kernels/kernels_common.py",
+        "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+    ],
+)
 @functools.cache
 def _projection_launcher():
     """The kernel launcher. Its Constexprs are launch arguments, passed in
