@@ -19,14 +19,16 @@ only at 128/256-row prefill tiles; this module supplies the small-M (8-128 row) 
 routing primitive they are missing, generalized over the pair/row count only (no
 MiniMax-M3.1-specific constant besides the E128/top4/16-row-block shape the call site fixes).
 """
+
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as _rocdl_ops
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 E, TOPK, MAX_PAIRS = 128, 4, 256
 HIST = 256  # 128 experts, 64 per-lane dummy slots; 64 lanes x 16 B zeroed in one store
@@ -74,19 +76,31 @@ def wave_expert(ids, m, block, lane, hb, pairs=MAX_PAIRS):
         pairs: the pair slots scanned, a compile-time multiple of 64, >= M * 4.
     """
     n_pairs = m * TOPK
-    ir_ = buffer_ops.create_buffer_resource(ids, max_size=False, num_records_bytes=n_pairs * 4)
+    ir_ = buffer_ops.create_buffer_resource(
+        ids, max_size=False, num_records_bytes=n_pairs * 4
+    )
     vals = []
     for c in range_constexpr(pairs // 64):
         q = lane + c * 64
         v = fx.Int32(buffer_ops.buffer_load(ir_, q, vec_width=1, dtype=fx.Int32))
         vals.append((q < n_pairs).select(v, fx.Int32(-1)))
-    llvm.StoreOp(_raw(Vec.from_elements([fx.Int32(0)] * 4, fx.Int32)), _ptr(hb + lane * 16), alignment=16)
+    llvm.StoreOp(
+        _raw(Vec.from_elements([fx.Int32(0)] * 4, fx.Int32)),
+        _ptr(hb + lane * 16),
+        alignment=16,
+    )
     llvm.StoreOp(_raw(fx.Int32(m)), _ptr(hb + HIST * 4 + lane * 4), alignment=4)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     for c in range_constexpr(len(vals)):
         slot = (vals[c] >= 0).select(vals[c], E + lane)
-        llvm.AtomicRMWOp(llvm.AtomicBinOp.add, _ptr(hb + slot * 4), _raw(fx.Int32(1)),
-                         llvm.AtomicOrdering.monotonic, syncscope="workgroup", alignment=4)
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.add,
+            _ptr(hb + slot * 4),
+            _raw(fx.Int32(1)),
+            llvm.AtomicOrdering.monotonic,
+            syncscope="workgroup",
+            alignment=4,
+        )
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     cc = Vec(llvm.load(T.vec(2, T.i32), _ptr(hb + lane * 8), alignment=8))
     c0, c1 = fx.Int32(cc[0]), fx.Int32(cc[1])
@@ -116,11 +130,19 @@ def wave_block_rows(vals, expert, first, lane, hb):
         bal = rocdl.ballot(T.i64, _raw(match))
         lo = arith.trunci(T.i32, bal)
         hi = arith.trunci(T.i32, arith.shrui(bal, arith.constant(32, type=T.i64)))
-        below = fx.Int32(rocdl.mbcnt_hi(T.i32, hi, rocdl.mbcnt_lo(T.i32, lo, _raw(fx.Int32(0)))))
+        below = fx.Int32(
+            rocdl.mbcnt_hi(T.i32, hi, rocdl.mbcnt_lo(T.i32, lo, _raw(fx.Int32(0))))
+        )
         r = run + below - first
         slot = (match & (r >= 0) & (r < 16)).select(r, 16 + lane)
-        llvm.StoreOp(_raw((q >> 2) | ((q & 3) << 24)), _ptr(hb + HIST * 4 + slot * 4), alignment=4)
+        llvm.StoreOp(
+            _raw((q >> 2) | ((q & 3) << 24)),
+            _ptr(hb + HIST * 4 + slot * 4),
+            alignment=4,
+        )
         tot = run + below + match.select(fx.Int32(1), fx.Int32(0))
         run = fx.Int32(fx.rocdl.readlane(T.i32, tot, fx.Int32(63)))
     fx.rocdl.s_waitcnt(lgkmcnt=0)
-    return fx.Int32(llvm.load(T.i32, _ptr(hb + HIST * 4 + (lane % 16) * 4), alignment=4))
+    return fx.Int32(
+        llvm.load(T.i32, _ptr(hb + HIST * 4 + (lane % 16) * 4), alignment=4)
+    )
