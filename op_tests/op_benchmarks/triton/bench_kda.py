@@ -165,7 +165,7 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
-def make_gating_case(B, T, H, provider, device):
+def make_gating_case(B, T, H, provider, device, state_dtype=torch.float32):
     """Arguments of ``kda_gating_decode`` in Kimi-K3's layouts.
 
     beta is a view of the fused in_proj row ``[q | k | v | g | beta | f_a]``.
@@ -206,7 +206,7 @@ def make_gating_case(B, T, H, provider, device):
         "k": k,
         "v": v,
         "o": torch.empty((tokens, H, D), **act),
-        "initial_state": torch.randn((slots, H, D, D), **fp32),
+        "initial_state": torch.randn((slots, H, D, D), **fp32).to(state_dtype),
         "cu_seqlens": torch.arange(0, tokens + 1, T, dtype=torch.int32, device=device),
         "ssm_state_indices": write,
         "ssm_state_indices_in": read,
@@ -329,7 +329,11 @@ def gluon_lines(args):
 
 def benchmark(args):
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
+    state_dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[args.state_dtype]
     D = args.head_dim
 
     line_vals = []
@@ -373,7 +377,9 @@ def benchmark(args):
                 return float("nan"), float("nan"), float("nan")
 
             def make():
-                return make_gating_case(B, T, H, provider, args.device)
+                return make_gating_case(
+                    B, T, H, provider, args.device, state_dtype=state_dtype
+                )
 
             if provider.startswith("recurrent_"):
                 run = run_recurrent_case
@@ -520,7 +526,9 @@ def parse_args():
     parser.add_argument("--num_heads", type=int, nargs="+", default=K3_NUM_HEADS)
     parser.add_argument("--head_dim", type=int, default=K3_HEAD_DIM)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
-    parser.add_argument("--state_dtype", default="fp32", choices=["fp32", "bf16"])
+    parser.add_argument(
+        "--state_dtype", default="fp32", choices=["fp32", "fp16", "bf16"]
+    )
     parser.add_argument(
         "--gluon_configs",
         type=str,

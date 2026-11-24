@@ -12,6 +12,10 @@ The read slot is ``read[seq, accepted - 1]`` in spec verify, else
 ``read[seq]``. A negative read slot, an empty sequence or an accepted count
 below 1 leaves the output and all slots unchanged. A negative write slot still
 writes the output.
+
+The state pool is FP32, FP16 or BF16. The program loads its tile to FP32,
+keeps it in FP32 across all tokens, and rounds each stored state to the pool
+dtype, as ATOM's Triton kernel does.
 """
 
 from triton.experimental import gluon
@@ -131,7 +135,7 @@ def _one_token(
             state_ptr + (slot_in.to(gl.int64) * stride_slot + tile),
             off_s,
             cache=LOAD_CACHE,
-        )
+        ).to(gl.float32)
     q, k, a, v, b = _token_inputs(
         q_ptr + tok * stride_q_tok + i_h * K,
         k_ptr + tok * stride_k_tok + i_h * K,
@@ -150,7 +154,7 @@ def _one_token(
             state_ptr + (slot_in.to(gl.int64) * stride_slot + tile),
             off_s,
             cache=LOAD_CACHE,
-        )
+        ).to(gl.float32)
     if GATE_DIST > 0:
         # Keep the state load above the gate math.
         gl.amd.hint.sched_barrier()
@@ -160,7 +164,7 @@ def _one_token(
         gl.amd.hint.sched_barrier()
     if slot_out >= 0:
         gl.amd.gfx1250.buffer_store(
-            S,
+            S.to(state_ptr.dtype.element_ty),
             state_ptr + (slot_out.to(gl.int64) * stride_slot + tile),
             off_s,
             cache=STORE_CACHE,
@@ -218,7 +222,7 @@ def _multi_token(
     tile = (i_hv * V + i_v * BV) * K
     S = gl.amd.gfx1250.buffer_load(
         state_ptr + (slot_in.to(gl.int64) * stride_slot + tile), off_s, cache=LOAD_CACHE
-    )
+    ).to(gl.float32)
     tok = bos.to(gl.int64)
     q_p = q_ptr + tok * stride_q_tok + i_h * K
     k_p = k_ptr + tok * stride_k_tok + i_h * K
@@ -251,7 +255,7 @@ def _multi_token(
         )
         if slot_out >= 0:
             gl.amd.gfx1250.buffer_store(
-                S,
+                S.to(state_ptr.dtype.element_ty),
                 state_ptr + (slot_out.to(gl.int64) * stride_slot + tile),
                 off_s,
                 cache=STORE_CACHE,
@@ -312,7 +316,7 @@ def _multi_token_pre(
     tile = (i_hv * V + i_v * BV) * K
     S = gl.amd.gfx1250.buffer_load(
         state_ptr + (slot_in.to(gl.int64) * stride_slot + tile), off_s, cache=LOAD_CACHE
-    )
+    ).to(gl.float32)
     PL: gl.constexpr = gl.BlockedLayout(
         [1, 4], [32 // (K // 4), K // 4], [NUM_WARPS, 1], [1, 0]
     )
@@ -377,7 +381,7 @@ def _multi_token_pre(
             )
             if slot_out >= 0:
                 gl.amd.gfx1250.buffer_store(
-                    S,
+                    S.to(state_ptr.dtype.element_ty),
                     state_ptr + (slot_out.to(gl.int64) * stride_slot + tile),
                     off_s,
                     cache=STORE_CACHE,
@@ -618,13 +622,20 @@ def kda_gating_kernel(
                     )
 
 
-def get_kda_gating_config(num_seq_heads: int, multi_token: bool) -> dict:
+def get_kda_gating_config(
+    num_seq_heads: int, multi_token: bool, state_bytes: int = 4
+) -> dict:
     """Return the ``kda_gating_kernel`` config for ``num_seq_heads`` programs.
 
     ``num_seq_heads`` is the number of sequences times the number of value
     heads. A spec-verify or other 2D slot table uses the ``multi_token`` table.
+    A 2-byte (FP16 or BF16) state pool moves half the bytes of an FP32 one, so
+    it has its own ``*_16bit_state`` tables; ``state_bytes`` is the element
+    size of the pool.
     """
     cfg_dir = resolve_config_dir("attention", "KDA_GATING", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    table = tuned["multi_token" if multi_token else "one_token"]
-    return select_leq_config(table, num_seq_heads, prefix="SEQ_HEADS_LEQ_")
+    name = "multi_token" if multi_token else "one_token"
+    if state_bytes == 2:
+        name += "_16bit_state"
+    return select_leq_config(tuned[name], num_seq_heads, prefix="SEQ_HEADS_LEQ_")
