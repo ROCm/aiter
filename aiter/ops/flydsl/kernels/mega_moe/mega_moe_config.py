@@ -57,11 +57,16 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# Kimi-K2.6: 384 experts (48 per rank at EP8), top-8, R1's 7168x2048 shape, SiLU without a SwiGLU clamp.
+KIMI_K26_EXPERTS_PER_RANK = 48
+K26_MODEL_DIM, K26_INTER_DIM = 7168, 2048
+K26_FUSED_LAYOUT = (8, K26_MODEL_DIM, K26_INTER_DIM, 8 * KIMI_K26_EXPERTS_PER_RANK, 8)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
+# serve: EP8 DeepSeek-V4-Pro, EP4 / EP2 / EP8 DeepSeek-V4.1-Flash and EP8 Kimi-K2.6.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
+        K26_FUSED_LAYOUT,
         *(
             (world, model_dim, inter_dim, world * epr, 6)
             for world, epr, model_dim, inter_dim in (
@@ -103,6 +108,10 @@ V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
 # EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
 # (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
 V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
+# SwiGLU clamp each FUSED_LAYOUTS layout is served with (10.0 unless listed).
+_FUSED_SWIGLU_LIMITS = {K26_FUSED_LAYOUT: 0.0}
+# EP8 Kimi-K2.6 takes its large-input tune at the capacity it was measured at.
+K26_LARGE_M_MTPRS = (8192,)
 # (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
 _V41_FLASH_LARGE_M_MTPRS = {
     (world, model_dim, inter_dim): mtprs
@@ -478,7 +487,8 @@ def fused_layout_supported(
         arch.split(":", 1)[0] == "gfx950"
         and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
-        and swiglu_limit == 10.0
+        and swiglu_limit
+        == _FUSED_SWIGLU_LIMITS.get((world_size, model_dim, inter_dim, experts, topk), 10.0)
         and act == "silu"
         and not fanout_masks
     )
@@ -491,8 +501,11 @@ def large_m_mtprs_for(
 
     EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
-    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
+    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes); EP8
+    Kimi-K2.6 K26_LARGE_M_MTPRS.
     """
+    if (world_size, model_dim, inter_dim) == K26_FUSED_LAYOUT[:3]:
+        return K26_LARGE_M_MTPRS
     return _V41_FLASH_LARGE_M_MTPRS.get(
         (world_size, model_dim, inter_dim), LARGE_M_MTPRS
     )
@@ -1092,6 +1105,11 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     return config
 
 
+def _tune_kimi_k26(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8): the base config."""
+    return config
+
+
 def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
     on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
@@ -1185,6 +1203,13 @@ _NETWORKS = (
     ),
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
+    ),
+    NetworkProfile(
+        "kimi_k26",
+        KIMI_K26_EXPERTS_PER_RANK,
+        K26_MODEL_DIM,
+        K26_INTER_DIM,
+        _tune_kimi_k26,
     ),
     NetworkProfile(
         "v41_flash_ep2",

@@ -467,20 +467,20 @@ def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
     return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
 
 
-def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False):
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_topk, stream_w=False):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
     _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does)."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
     cached_w = hot_expert if stream_w else hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))
     nv_flag = nv_flag | cached_w.select(fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0))
-    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_fp8_rows_min_rows(fz_topk)))).select(
         fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
     )
 
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, fz_topk, addr_disp, parity, expected, plan_nv,
     plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
@@ -551,7 +551,7 @@ def emit_direct_fixed_slot_finalize(
         if const_expr(not plan_wt):
             comm_ops.fence_system_release()
         if lane == fx.Int32(0):
-            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_topk, stream_w)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -1173,7 +1173,7 @@ def compile_mega_moe_stage1(
         if owner:
             emit_direct_fixed_slot_finalize(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-                fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
+                fz_tile_m=fz_tile_m, fz_topk=fz_k, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
                 stream_w=stream_w,
@@ -1311,7 +1311,7 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(metadata_base + num_expert_tiles, plan_ptr(incl_base, slot))
                 fx.ptr_store(safe_count, plan_ptr(count_base, slot))
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_k, stream_w)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
@@ -1555,9 +1555,15 @@ _COMBINE_REDUCERS = 256
 # cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
 # cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
 _CACHED_W_MIN_ROWS = 2560
+
+
 # Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
-# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
-_FP8_ROWS_MIN_ROWS = 3584
+# path) to the combine instead of BF16: 512 rows above uniform routing at 512 tokens (3584 at top-6, 4608 at
+# top-8), so uniform calls always combine BF16 rows.
+def _fp8_rows_min_rows(topk: int) -> int:
+    return 512 * (int(topk) + 1)
+
+
 # Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
 # (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256

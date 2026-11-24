@@ -24,7 +24,7 @@ and large-input kernels where the layout and MTPR support them), and
 ``preload_aot_bundles()`` loads the kernels of all of them.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, DeepSeek-V4.1-Flash EP4, EP2 and EP8)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, DeepSeek-V4.1-Flash EP4, EP2 and EP8, Kimi-K2.6)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
@@ -94,6 +94,13 @@ V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
 # DeepSeek-V4.1-Flash EP8 deployment profile (epr48, the EP4 shape and MTPRs).
 V41_FLASH_EP8_WORLD_SIZE = 8
 V41_FLASH_EP8_EXPERTS_PER_RANKS = (48,)
+# Kimi-K2.6 deployment profile (EP8 / epr48, topk8, d7168 / i2048, SiLU without a
+# SwiGLU clamp), a8w4 only.
+K26_EXPERTS_PER_RANKS = (48,)
+K26_TOPK = 8
+K26_MODEL_DIM = 7168
+K26_INTER_DIM = 2048
+K26_QUANTS = ("a8w4",)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -160,8 +167,8 @@ def production_jobs(
     swiglu_limit=SWIGLU_LIMIT,
     v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
-    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
-    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3,
+    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only) and Kimi-K2.6.
 
     Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
@@ -196,6 +203,16 @@ def production_jobs(
             inter_dim=V41_FLASH_INTER_DIM,
             swiglu_limit=swiglu_limit,
         )
+    jobs += default_jobs(
+        mtprs,
+        K26_EXPERTS_PER_RANKS,
+        quants=tuple(q for q in quants if q in K26_QUANTS),
+        world_size=world_size,
+        topk=K26_TOPK,
+        model_dim=K26_MODEL_DIM,
+        inter_dim=K26_INTER_DIM,
+        swiglu_limit=0.0,
+    )
     return jobs
 
 
