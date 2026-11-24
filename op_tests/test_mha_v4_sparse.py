@@ -3698,15 +3698,9 @@ def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed
     return tuple(x.unsqueeze(0).to(torch.bfloat16).contiguous() for x in (q, k, v))
 
 
-# gfx950 only: this pins the FP8-V rebuild that unfolded the pooled pass's P, which gfx942's FP8-V
-# objects have not been checked against.
 @parametrize(
     ("recipe", "block_tile"),
-    [
-        param(*p.values, skip=p.skip or get_gfx() != "gfx950", id=p.id)
-        for p in _sol_attn_geometry_params()
-        if p.values[0].v_format == native_fp8_format()
-    ],
+    [p for p in _sol_attn_geometry_params() if p.values[0].v_format == native_fp8_format()],
 )
 def test_mha_v4_sol_fp8_p_keeps_pooled_mass_far_below_the_exact_max(recipe, block_tile):
     """FP8-V rows quantize P to e4m3 against the exact pass's max. A pooled block's P carries the
