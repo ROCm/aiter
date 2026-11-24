@@ -524,6 +524,17 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     return kernel
 
 
+def _varctx_num_ctas(
+    batch_size: int, next_n: int, cu_count: int, waves_per_eu: int
+) -> int:
+    if min(batch_size, next_n, cu_count, waves_per_eu) <= 0:
+        raise ValueError(
+            "VarCtx batch, query count, CU count and waves must be positive"
+        )
+    # Each query needs a workgroup, even if the batch needs more than one wave.
+    return max(cu_count * waves_per_eu, batch_size * next_n)
+
+
 def deepgemm_fp8_paged_mqa_logits_schedule(
     batch_size,
     next_n,
@@ -533,9 +544,14 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
 ):
+    """Return a GPU scalar with the safe chunk count per VarCtx workgroup.
+
+    Use the same query counts, context lengths, chunk size, model length,
+    CU count and waves for the VarCtx logits launch.
+    """
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
-    assert batch_size < TotalCuCount * WavePerEU // next_n
+    num_ctas = _varctx_num_ctas(batch_size, next_n, TotalCuCount, WavePerEU)
 
     max_chunks = math.ceil(max_model_len / ChunkK)
     schedule_waves_per_eu = 4
@@ -555,7 +571,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         batch_size,
         context_lens,
         safe_chunks_per_cta,
-        TotalCuCount * WavePerEU // next_n,
+        num_ctas // next_n,
         ChunkK,
         align_power_of_2_batch,
         TryCount,
@@ -687,6 +703,8 @@ def deepgemm_fp8_paged_mqa_logits(
     not from ``context_lens``.
     The caller initializes logits outside the context to ``-inf`` as on the
     SplitKV path. Persistent AOT binaries use a separate ``_persistent`` name.
+    Build ``VarCtxSchedule`` with matching inputs using
+    :func:`deepgemm_fp8_paged_mqa_logits_schedule`.
     """
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
@@ -797,7 +815,7 @@ def deepgemm_fp8_paged_mqa_logits(
     if Persistent:
         grid = (PersistentSchedule.shape[0], 1, 1)
     elif VarCtxOpt:
-        grid = (TotalCuCount * WavePerEU, 1, 1)
+        grid = (_varctx_num_ctas(batch_size, next_n, TotalCuCount, WavePerEU), 1, 1)
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
 
