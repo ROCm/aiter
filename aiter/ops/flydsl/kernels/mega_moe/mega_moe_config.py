@@ -324,10 +324,15 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input GEMM1 (tile_n 256): up to this many units of an XCD slice's partial last round run as two
+    # tile_n / 2 halves each, as many as that round leaves CTAs idle, so the round's tail is spread over more
+    # CTAs (0: off).
+    g1_split_tail: int = 0
     # Small-input GEMM1 (interleaved local plan): a unit of an expert with more than one m-tile runs a pair of its
     # m-tiles as one tile of twice the rows, which reads each W1 slab once for both (GEMM2 keeps its m-tile units).
     # The pair reads W1 through the cache: with streamed W1 (b_nt) only a rank whose plan picks the cached-weight
-    # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ.
+    # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ. Not with
+    # g1_split_tail.
     pair_tiles: bool = False
 
 
@@ -513,6 +518,29 @@ def large_m_mtprs_for(
     """
     return _V41_FLASH_LARGE_M_MTPRS.get(
         (world_size, model_dim, inter_dim), LARGE_M_MTPRS
+    )
+
+
+def large_m_buckets(mtpr: int) -> tuple[int, ...]:
+    """Token buckets whose configs a large-input runtime of capacity ``mtpr`` launches: those of the EP-wide
+    max_tokens it serves (LARGE_M_MIN_TOKENS up to mtpr; the capacity's own for a call without max_tokens).
+    """
+    first = nearest_token_bucket(LARGE_M_MIN_TOKENS, FUSED_TOKEN_BUCKETS)
+    return tuple(b for b in FUSED_TOKEN_BUCKETS if first <= b <= mtpr)
+
+
+def large_m_runtime_knobs(config: "MegaMoEConfig") -> tuple:
+    """The knobs of a large-input config that size its runtime's buffers or set what the routes of an instance
+    share (payload rows, pair order, scale staging, combine rows and end-of-launch barrier): every bucket of a
+    layout's large-input tune keeps them."""
+    k1, k2 = config.fused_stage1, config.fused_stage2
+    return (
+        config.p2p_quant,
+        k1.dedup_rows,
+        k1.bucket_pairs,
+        k2.comb_tok_wait,
+        k2.row_align,
+        k2.scale_stage,
     )
 
 
@@ -1745,10 +1773,15 @@ def _tune_a4w4_small(
 
 
 def _tune_a4w4_large(
-    config: MegaMoEConfig, layout: tuple[int, int, int, int]
+    config: MegaMoEConfig, layout: tuple[int, int, int, int], bucket: int
 ) -> MegaMoEConfig:
-    """A4W4 large-input kernel of a fused layout: the layout's A8W4 tune unless measured otherwise. One config
-    serves every row count of a capacity (the kernel is built per capacity)."""
+    """A4W4 large-input kernel of a fused layout: the layout's A8W4 tune unless measured otherwise.
+
+    ``bucket`` is the token bucket of the call's EP-wide max_tokens (the same on every rank; the instance
+    capacity for a call without it), so a tune may change the launch geometry per bucket. The knobs that size
+    the runtime's buffers or set what its routes share (large_m_runtime_knobs) stay the same for every bucket
+    of a layout.
+    """
     return config
 
 
@@ -1772,7 +1805,7 @@ def _fused_config(
             config = _tune_v41_flash_ep2_large(config)
         elif layout == V41_FLASH_EP8_LAYOUT:
             config = _tune_v41_flash_ep8_large(config)
-        return _tune_a4w4_large(config, layout) if quant == "a4w4" else config
+        return _tune_a4w4_large(config, layout, bucket) if quant == "a4w4" else config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
         stage2=_small_m_stage2(bucket),
@@ -1800,7 +1833,8 @@ def select_fused_config(
     """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
     config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) and
     FUSED_QUANTS quant for ``tokens`` rows on a rank; an idle rank takes the 1-token
-    config."""
+    config. The large-input route passes the call's EP-wide max_tokens (or the
+    capacity), so every rank of a launch selects the same config."""
     if quant not in FUSED_QUANTS:
         raise ValueError(f"quant={quant!r} must be one of {FUSED_QUANTS}")
     if mtpr <= 0 or mtpr & (mtpr - 1):

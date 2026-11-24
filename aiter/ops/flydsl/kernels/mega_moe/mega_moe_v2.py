@@ -1152,34 +1152,36 @@ class MegaMoEV2:
         route = self._route(int(x_bf16.shape[0]), max_tokens)
         return self._forward_route(
             route, x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
-            mask_invalid_slots=mask_invalid_slots,
+            mask_invalid_slots=mask_invalid_slots, max_tokens=max_tokens,
         )
 
     def _forward_route(
-        self, route, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, route, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
+        max_tokens=None,
     ):
         """forward() on a given (route, capacity); tests pin a route through this,
-        identically on every rank."""
+        identically on every rank. ``max_tokens`` selects the large-input route's
+        launch config (None: its capacity's)."""
         # Every launch of the call -- quantization, prepare, Stage1, Stage2 and
         # combine -- runs on the caller's stream, resolved once here.
         if stream is None:
             return self._launch_route(
                 route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots,
-                torch.cuda.current_stream(),
+                torch.cuda.current_stream(), max_tokens,
             )
         launch_stream = torch_stream(stream)
         with torch.cuda.stream(launch_stream):
             return self._launch_route(
-                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, launch_stream
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, launch_stream, max_tokens
             )
 
-    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, stream):
+    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, stream, max_tokens=None):
         """``stream``: the current torch stream. The fused routes take stream None
         (the current stream) and check their inputs themselves."""
         route, capacity = route
         if route == ROUTE_LARGE_M:
             return self._large_m.forward(
-                x_bf16, wts, topk_ids, slice_output=slice_output
+                x_bf16, wts, topk_ids, slice_output=slice_output, max_tokens=max_tokens
             )
         if route == ROUTE_SMALL_M:
             runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(capacity)]
@@ -1255,6 +1257,7 @@ class MegaMoEV2:
                 topk_ids,
                 stream=stream,
                 slice_output=slice_output,
+                max_tokens=max_tokens,
             )
         launch_stream = torch_stream(stream)
         if stream is None:

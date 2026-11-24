@@ -62,7 +62,9 @@ from .mega_moe_config import (
     MegaMoEConfig,
     fused_layout_supported,
     fused_quant,
+    large_m_buckets,
     large_m_mtprs_for,
+    large_m_runtime_knobs,
     select_fused_config,
 )
 from .mega_moe_fused_gemm import (
@@ -3189,6 +3191,14 @@ class LargeMRuntime:
         # Packed FP4 rows hold two values a byte; the quant kernel writes them as uint8.
         self._a_row_bytes = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
         self._quant_dtype = torch.uint8 if self._a_dtype == "fp4" else torch.float8_e4m3fn
+        # A call launches the config of its EP-wide max_tokens (the capacity's without it); the buffers below are
+        # sized by the capacity's, so every bucket keeps its runtime-level knobs.
+        runtime_knobs = large_m_runtime_knobs(self._select_config(self.mtpr))
+        self._bucket_configs = tuple(
+            dict.fromkeys(self._select_config(b) for b in large_m_buckets(self.mtpr))
+        )
+        if any(large_m_runtime_knobs(c) != runtime_knobs for c in self._bucket_configs):
+            raise ValueError("the large-input configs of a capacity must agree on large_m_runtime_knobs")
         self.state_slots = int(state_slots)
         if self.state_slots <= 0:
             raise ValueError("state_slots must be positive")
@@ -3578,12 +3588,16 @@ class LargeMRuntime:
             )
         return per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype)
 
-    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
+    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output, max_tokens):
         if not 0 <= run_tokens <= self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} outside [0, {self.mtpr}]")
-        # Launch geometry, tile_m and producer counts are part of the
-        # cross-rank wire protocol, so every rank selects the MTPR config.
-        config = self._select_config(self.mtpr)
+        if max_tokens is None:
+            max_tokens = self.mtpr
+        elif not run_tokens <= max_tokens <= self.mtpr:
+            raise ValueError(f"max_tokens={max_tokens} must be in [{run_tokens}, {self.mtpr}]")
+        # Launch geometry, tile_m and producer counts are part of the cross-rank wire protocol, so every rank
+        # selects the config of the call's EP-wide max_tokens (the MTPR config without it).
+        config = self._select_config(int(max_tokens))
         self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
@@ -3605,13 +3619,15 @@ class LargeMRuntime:
         # Rank-local FP8 row scales of the GEMM2 m-blocks (FusedStage2Knobs.scale_stage), rewritten by every
         # launch before it reads them: one buffer serves every state slot.
         self._fused_scale_stage = None
-        config = self._select_config(self.mtpr)
-        if config.fused_stage2.scale_stage:
-            spec = dict(large_m_kernel_specs(
-                config, model_dim=self.model_dim, inter_dim=self.inter_dim, topk=self.topk, rank=self.rank,
-                npes=self.world_size, mtpr=self.mtpr, experts_per_rank=self.epr, num_valid_max=nvm,
-            )[0])
-            nbytes = spec["max_g2_m_blocks"] * (self.model_dim // spec["BN"]) * spec["BM"] * 16
+        if self._select_config(self.mtpr).fused_stage2.scale_stage:
+            specs = [
+                dict(large_m_kernel_specs(
+                    config, model_dim=self.model_dim, inter_dim=self.inter_dim, topk=self.topk, rank=self.rank,
+                    npes=self.world_size, mtpr=self.mtpr, experts_per_rank=self.epr, num_valid_max=nvm,
+                )[0])
+                for config in self._bucket_configs
+            ]
+            nbytes = max(spec["max_g2_m_blocks"] * (self.model_dim // spec["BN"]) * spec["BM"] * 16 for spec in specs)
             if nbytes >= _BUFFER_OFFSET_ABI_BYTES:
                 raise ValueError("the GEMM2 scale staging buffer exceeds the 32-bit buffer-resource ABI")
             self._fused_scale_stage = torch.empty(nbytes, dtype=torch.uint8, device=self.dev)
@@ -3687,11 +3703,12 @@ class LargeMRuntime:
         )
         wts = torch.empty((rows, self.topk), dtype=torch.float32, device=self.dev)
         topk_ids = torch.empty((rows, self.topk), dtype=torch.int32, device=self.dev)
-        self._run_fused_stage1(
-            x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True
-        )
+        for config in self._bucket_configs:
+            self._run_fused_stage1(x_q, wts, scales, topk_ids, stream, config, preload=True)
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, max_tokens=None):
+        """``max_tokens``: the call's row count on its largest EP rank, identical on every rank; it selects the
+        launch config (None: the capacity's)."""
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
         )
@@ -3702,13 +3719,13 @@ class LargeMRuntime:
         if run_tokens:
             with torch.cuda.stream(torch_stream(stream)):
                 per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype, out=(x_q, scales))
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output, max_tokens)
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, max_tokens=None):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output, max_tokens)
 
     __call__ = forward
 
