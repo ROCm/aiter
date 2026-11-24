@@ -222,19 +222,32 @@ class StoreSlotBf16:
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
         return out
 
-    def store(self, c_frag, rows, base_col):
-        """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
+    def pack(self, c_frag, rows):
+        """The 16-byte row pieces of ``c_frag`` (``[j * N_TILES_A + i]``), weighted: 4 words per row tile."""
+        words = []
         for i in range_constexpr(N_TILES_A):
-            out_row, w = rows[i]
+            w = rows[i][1]
             x = (Vec(c_frag[i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
             y = (Vec(c_frag[N_TILES_A + i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
             lo = _swap_pair(x[0], y[0])
             hi = _swap_pair(x[1], y[1])
+            words += [lo[0], hi[0], lo[1], hi[1]]
+        return words
+
+    def store_words(self, words, rows, base_col, valid=None):
+        """Store ``pack``'s words; ``valid`` False sends them past the descriptor (still issued)."""
+        for i in range_constexpr(N_TILES_A):
             fx.memref_store_vec(
-                Vec.from_elements([lo[0], hi[0], lo[1], hi[1]], fx.Int32), self.reg
+                Vec.from_elements(words[4 * i : 4 * i + 4], fx.Int32), self.reg
             )
-            idx = (out_row * self.D + base_col + self.lane_col) // 2
+            idx = (rows[i][0] * self.D + base_col + self.lane_col) // 2
+            if const_expr(valid is not None):
+                idx = valid.select(idx, fx.Int32(1 << 30))
             fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
+
+    def store(self, c_frag, rows, base_col):
+        """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
+        self.store_words(self.pack(c_frag, rows), rows, base_col)
 
 
 class SwigluFp8Epilogue:
@@ -739,7 +752,44 @@ def compile_moe_bs_gemm_8w(
             n_tokens = _load_i32(nv_div, 1)
             store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div, lds.T_lds)
 
-        def run_tile(tile, parity):
+        # Stage 2 defers a tile's 16 output stores (128 KB a CU) into the next
+        # tile's first K-step, after that step's first load: issued in the
+        # epilogue, all 8 waves' stores drained together while no MFMA ran,
+        # the lagging group stalled up to ~5k cy behind the leading group's,
+        # and the leading group then waited for it at the next prologue's
+        # barrier (ATT, T=8192: last MFMA -> next first MFMA was ~43% of a
+        # wave's time). Carried as 64 packed bf16 words + 8 output rows a wave.
+        deferred = epilogue == "slot_bf16"
+        # 4 accumulator groups x N_TILES_A stores x 4 words, then the output
+        # row of each (row half, row tile): read from the route LDS at step 0
+        # instead, those reads got an s_waitcnt vmcnt(0) behind the step's
+        # first LDS-DMA (no alias proof), ~1.4k cy a tile (ATT).
+        N_WORDS = 4 * 4 * N_TILES_A
+        N_PENDING = N_WORDS + 2 * N_TILES_A
+        STORES = 4 * N_TILES_A
+
+        def slot_cols(nb):
+            return (
+                half_row0(nb, 0) + wave_n * B_GRP_ROWS,
+                half_row0(nb, 1) + wave_n * B_GRP_ROWS,
+            )
+
+        def deferred_store(prev_tile, pending):
+            """The previous tile's stores: ``pending`` = its packed words, then its output rows."""
+            valid = prev_tile >= 0
+            pcol0, pcol1 = slot_cols(fx.Int32(prev_tile) % NB)
+            words = pending[:N_WORDS]
+            rows = [
+                [(pending[N_WORDS + h * N_TILES_A + i], None) for i in range(N_TILES_A)]
+                for h in range(2)
+            ]
+            n = 4 * N_TILES_A
+            for g, (h, col) in enumerate(
+                ((0, pcol0), (0, pcol1), (1, pcol0), (1, pcol1))
+            ):
+                store_c.store_words(words[g * n : (g + 1) * n], rows[h], col, valid)
+
+        def run_tile(tile, parity, prev=None):
             m_blk = tile // NB
             nb = tile % NB
             expert = _load_i32(eids_div, m_blk)
@@ -877,6 +927,8 @@ def compile_moe_bs_gemm_8w(
                 b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
                 a_load(1, a_next1, k + 1)
+                if const_expr(deferred and k == 0):
+                    deferred_store(prev[0], prev[1])
                 rocdl.s_barrier()
                 scale_chunk_dma(k)
 
@@ -892,12 +944,15 @@ def compile_moe_bs_gemm_8w(
                 sa1 = scale_read(k, "a1")
                 a1_frag = a_s2r.load(a_cur1)
                 a_load(0, a_cur0, k + 2)
-                wait_barrier(4 * N_LDS_STEPS)
+                # Step 0: the previous tile's stores came after A1's load; let
+                # them stay in flight (they are newer than everything these
+                # two waits require).
+                wait_barrier(4 * N_LDS_STEPS + (STORES if deferred and k == 0 else 0))
 
                 c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
                 b_g2s.load(b_cur1, B1_off + (k + 2) * B_K_STEP)
-                wait_barrier(3 * N_LDS_STEPS)
+                wait_barrier(3 * N_LDS_STEPS + (STORES if deferred and k == 0 else 0))
 
                 c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
 
@@ -966,6 +1021,7 @@ def compile_moe_bs_gemm_8w(
             # Pairs the lagging group's last barrier above (see the dense kernel).
             barrier_if_zero(leading)
 
+            pending = None
             base_row = row0 + wave_m * A_GRP_ROWS
             col0 = half_row0(nb, 0) + wave_n * B_GRP_ROWS
             col1 = half_row0(nb, 1) + wave_n * B_GRP_ROWS
@@ -981,10 +1037,14 @@ def compile_moe_bs_gemm_8w(
                     store_c.rows(wave_m * A_GRP_ROWS + h * LDS_BLOCK_M, parity)
                     for h in range_constexpr(2)
                 ]
-                store_c.store(c00, slot_rows[0], col0)
-                store_c.store(c01, slot_rows[0], col1)
-                store_c.store(c10, slot_rows[1], col0)
-                store_c.store(c11, slot_rows[1], col1)
+                pending = (
+                    store_c.pack(c00, slot_rows[0])
+                    + store_c.pack(c01, slot_rows[0])
+                    + store_c.pack(c10, slot_rows[1])
+                    + store_c.pack(c11, slot_rows[1])
+                    + [row for h in range(2) for row, _ in slot_rows[h]]
+                )
+            return pending
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -1002,6 +1062,16 @@ def compile_moe_bs_gemm_8w(
             for tile in range(start, n_tiles, grid):
                 run_tile(fx.Int32(tile), trip & 1)
                 trip = trip + 1
+        elif const_expr(deferred):
+            init = [fx.Int32(0), fx.Int32(-1)] + [fx.Int32(0)] * N_PENDING
+            for tile, state in range(start, n_tiles, grid, init=init):
+                words = run_tile(
+                    fx.Int32(tile), state[0] & 1, (state[1], list(state[2:]))
+                )
+                final = yield [state[0] + 1, fx.Int32(tile)] + words
+            # The last tile's stores (a workgroup without a tile sends them
+            # out of bounds).
+            deferred_store(final[1], list(final[2:]))
         else:
             for tile, state in range(start, n_tiles, grid, init=[fx.Int32(0)]):
                 run_tile(fx.Int32(tile), state[0] & 1)
