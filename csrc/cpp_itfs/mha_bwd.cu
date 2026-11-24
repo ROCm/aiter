@@ -747,7 +747,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         { // each workgroup walks its own share of the kv blocks
             gdx = nsplit;
         }
-        else if(((mt == 1) || (mt == 2)) && a.hdim_q != 256)
+        else if(((mt == 1) || (mt == 2)) && !(arch_id == "gfx950" && a.hdim_q == 256))
         { // mask kb
             gdx = (gdx + 1) / 2;
         }
