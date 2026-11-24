@@ -15,6 +15,9 @@ import triton
 from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+    get_gdn_decode_config,
+)
 
 
 def _flydsl_gdr_enabled() -> bool:
@@ -273,11 +276,30 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     V = head_v_dim
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    st_elem_bytes = (
+        initial_state.element_size()
+        if initial_state is not None
+        else qkv.element_size()
+    )
+    state_kb = (T * HV * K * V * st_elem_bytes) // 1024
+    cfg = get_gdn_decode_config(
+        "FUSED_REARRANGE_SIGMOID_GDR",
+        "verify" if T > N else "decode",
+        state_kb,
+        state_elem_bytes=st_elem_bytes,
+    )
+
+    BK = triton.next_power_of_2(K)
+    if cfg is not None:
+        cfg_bv, num_warps, num_stages, waves_per_eu = cfg
+        BV = min(triton.next_power_of_2(V), cfg_bv)
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
+        num_warps = 4
+        num_stages = 3
+        waves_per_eu = None
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 4
 
     if inplace_final_state and ssm_state_indices is None:
         raise ValueError(
@@ -311,6 +333,13 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     stride_qkv_l, stride_qkv_hd = qkv.stride()
+
+    launch_kwargs = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+    if waves_per_eu is not None:
+        launch_kwargs["waves_per_eu"] = waves_per_eu
 
     grid = (NK, NV, N * HV)
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel[grid](
@@ -346,8 +375,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **launch_kwargs,
     )
     o = o.squeeze(0)
     return o, final_state

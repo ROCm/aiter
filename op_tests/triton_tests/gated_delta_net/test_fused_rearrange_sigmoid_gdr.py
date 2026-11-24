@@ -269,3 +269,96 @@ def test_fused_rearrange_sigmoid_gdr_kda():
 
     torch.testing.assert_close(o_tr.float(), o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=1e-2, atol=1e-2)
+
+
+def test_fused_rearrange_sigmoid_gdr_gfx1151_config_lookup(monkeypatch):
+    from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+        get_gdn_decode_config,
+    )
+    from aiter.ops.triton.utils._triton import arch_info
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1151")
+    for elem_bytes in (2, 4):
+        for mode_key in ("decode", "verify"):
+            mall_cfg = get_gdn_decode_config(
+                "FUSED_REARRANGE_SIGMOID_GDR",
+                mode_key,
+                16384,
+                state_elem_bytes=elem_bytes,
+            )
+            dram_cfg = get_gdn_decode_config(
+                "FUSED_REARRANGE_SIGMOID_GDR",
+                mode_key,
+                65536,
+                state_elem_bytes=elem_bytes,
+            )
+            assert mall_cfg is not None and dram_cfg is not None
+            assert mall_cfg[0] >= dram_cfg[0]
+            assert dram_cfg[3] == 2
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx942")
+    assert (
+        get_gdn_decode_config(
+            "FUSED_REARRANGE_SIGMOID_GDR", "decode", 65536, state_elem_bytes=2
+        )
+        is None
+    )
+
+
+@cuda_ok
+def test_fused_rearrange_sigmoid_gdr_dram_bucket_matches_fallback(monkeypatch):
+    from aiter.ops.triton.gated_delta_net import (
+        fused_rearrange_sigmoid_gdr as gdr_mod,
+    )
+
+    device = "cuda"
+    N, H, HV, K, V, dtype = 64, 16, 32, 128, 128, torch.bfloat16
+    torch.manual_seed(0)
+    qkv = torch.randn(N, 2 * H * K + HV * V, device=device, dtype=dtype) * 0.1
+    A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    a = torch.randn(N, HV, device=device, dtype=dtype) * 0.1
+    b_gate = torch.randn(N, HV, device=device, dtype=dtype) * 0.1
+    dt_bias = torch.randn(HV, device=device, dtype=dtype) * 0.1
+    h0 = torch.randn(N, HV, V, K, device=device, dtype=dtype) * 0.1
+    cu_seqlens = torch.arange(N + 1, device=device, dtype=torch.int32)
+    idx = torch.arange(N, device=device, dtype=torch.int32)
+
+    h_tuned = h0.clone()
+    o_tuned, _ = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log,
+        a,
+        b_gate,
+        dt_bias,
+        qkv,
+        H * K,
+        HV * V,
+        K,
+        V,
+        initial_state=h_tuned,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    monkeypatch.setattr(gdr_mod, "get_gdn_decode_config", lambda *args, **kwargs: None)
+    h_ref = h0.clone()
+    o_ref, _ = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log,
+        a,
+        b_gate,
+        dt_bias,
+        qkv,
+        H * K,
+        HV * V,
+        K,
+        V,
+        initial_state=h_ref,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    torch.testing.assert_close(o_tuned.float(), o_ref.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(h_tuned.float(), h_ref.float(), rtol=1e-2, atol=1e-2)

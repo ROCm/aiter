@@ -17,6 +17,13 @@ import torch
 import triton
 from packaging import version
 
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    USE_LRU_CACHE,
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.tuned_config_utils import autotune_enabled
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,51 @@ GATED_DELTA_RULE_TRITON_AUTOTUNE = autotune_enabled("GATED_DELTA_RULE")
 # kernels can use exp2 instead of exp. Python/wrapper-only: pass into kernels
 # as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
 RCP_LN2: float = math.log2(math.e)
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def _lookup_gdn_decode_config(
+    arch: str,
+    config_name: str,
+    mode_key: str,
+    state_kb: int,
+    dtype_key: str | None = None,
+) -> tuple[int, int, int, int | None] | None:
+    cfg_dir = resolve_config_dir("attention", config_name, backend="triton")
+    published = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    if not published:
+        return None
+    table = (
+        published.get(dtype_key, {}).get(mode_key)
+        if dtype_key is not None
+        else published.get(mode_key)
+    )
+    if not table:
+        return None
+    cfg = select_leq_config(table, state_kb, prefix="STATE_KB_LEQ_")
+    return (
+        cfg["BV"],
+        cfg["num_warps"],
+        cfg["num_stages"],
+        cfg.get("waves_per_eu"),
+    )
+
+
+def get_gdn_decode_config(
+    config_name: str,
+    mode_key: str,
+    state_kb: int,
+    state_elem_bytes: int | None = None,
+) -> tuple[int, int, int, int | None] | None:
+    """Return ``(BV, num_warps, num_stages, waves_per_eu)`` for a GDN decode op, or ``None``."""
+    dtype_key = (
+        None
+        if state_elem_bytes is None
+        else ("f16" if state_elem_bytes <= 2 else "fp32")
+    )
+    return _lookup_gdn_decode_config(
+        arch_info.get_arch(), config_name, mode_key, state_kb, dtype_key
+    )
 
 
 @lru_cache(maxsize=1)

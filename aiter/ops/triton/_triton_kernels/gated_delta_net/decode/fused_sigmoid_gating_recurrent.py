@@ -4,9 +4,13 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     autotune_cache_kwargs,
+    get_gdn_decode_config,
     input_guard,
 )
-from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_configs,
+    autotune_enabled,
+)
 
 
 def is_cuda():
@@ -228,32 +232,74 @@ def fused_sigmoid_gating_delta_rule_update(
 
     o = q.new_empty(NK, *v.shape)
 
-    def grid(META):
-        return (NK, triton.cdiv(V, META["BV"]), N * HV)
+    kernel_kwargs = {
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "softplus_beta": softplus_beta,
+        "softplus_threshold": softplus_threshold,
+        "q": q,
+        "k": k,
+        "v": v,
+        "b": b,
+        "o": o,
+        "h0_source": initial_state_source,
+        "h0_indices": initial_state_indices,
+        "cu_seqlens": cu_seqlens,
+        "scale": scale,
+        "T": T,
+        "B": B,
+        "H": H,
+        "HV": HV,
+        "K": K,
+        "V": V,
+        "BK": BK,
+        "USE_QK_L2NORM_IN_KERNEL": use_qk_l2norm_in_kernel,
+    }
 
-    fused_sigmoid_gating_delta_rule_update_kernel[grid](
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        o=o,
-        h0_source=initial_state_source,
-        h0_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-        T=T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-    )
+    cfg = None
+    if not autotune_enabled("GATED_DELTA_RULE"):
+        state_elem_bytes = (
+            initial_state_source.element_size()
+            if initial_state_source is not None
+            else v.element_size()
+        )
+        mode_key = (
+            "recurrent"
+            if ((T > N) if cu_seqlens is not None else (T > 1))
+            else "decode"
+        )
+        state_kb = (N * HV * K * V * state_elem_bytes) // 1024
+        cfg = get_gdn_decode_config(
+            "FUSED_SIGMOID_GATING_DELTA_RULE",
+            mode_key,
+            state_kb,
+            state_elem_bytes=state_elem_bytes,
+        )
+
+    if cfg is not None:
+        cfg_bv, num_warps, num_stages, waves_per_eu = cfg
+        BV = min(triton.next_power_of_2(V), cfg_bv)
+        launch_kwargs = {
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+        if waves_per_eu is not None:
+            launch_kwargs["waves_per_eu"] = waves_per_eu
+        grid = (NK, triton.cdiv(V, BV), N * HV)
+        # Bypass the autotune and heuristic wrappers when a published arch config exists.
+        fused_sigmoid_gating_delta_rule_update_kernel.fn.fn[grid](
+            **kernel_kwargs,
+            BV=BV,
+            USE_INITIAL_STATE=initial_state_source is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            **launch_kwargs,
+        )
+    else:
+
+        def grid(META):
+            return (NK, triton.cdiv(V, META["BV"]), N * HV)
+
+        fused_sigmoid_gating_delta_rule_update_kernel[grid](**kernel_kwargs)
     o = o.squeeze(0)
     return o

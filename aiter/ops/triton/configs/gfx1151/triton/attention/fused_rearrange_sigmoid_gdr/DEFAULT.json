@@ -1,0 +1,114 @@
+{
+    "f16": {
+        "decode": {
+            "STATE_KB_LEQ_512": {
+                "BV": 4,
+                "num_warps": 2,
+                "num_stages": 1
+            },
+            "STATE_KB_LEQ_1024": {
+                "BV": 32,
+                "num_warps": 4,
+                "num_stages": 1
+            },
+            "STATE_KB_LEQ_16384": {
+                "BV": 64,
+                "num_warps": 4,
+                "num_stages": 1,
+                "waves_per_eu": 2
+            },
+            "STATE_KB_LEQ_32768": {
+                "BV": 64,
+                "num_warps": 2,
+                "num_stages": 1,
+                "waves_per_eu": 2
+            },
+            "any": {
+                "BV": 8,
+                "num_warps": 2,
+                "num_stages": 2,
+                "waves_per_eu": 2
+            }
+        },
+        "verify": {
+            "STATE_KB_LEQ_1024": {
+                "BV": 4,
+                "num_warps": 1,
+                "num_stages": 2
+            },
+            "STATE_KB_LEQ_8192": {
+                "BV": 32,
+                "num_warps": 4,
+                "num_stages": 1
+            },
+            "STATE_KB_LEQ_16384": {
+                "BV": 64,
+                "num_warps": 4,
+                "num_stages": 1,
+                "waves_per_eu": 2
+            },
+            "STATE_KB_LEQ_32768": {
+                "BV": 64,
+                "num_warps": 2,
+                "num_stages": 1,
+                "waves_per_eu": 2
+            },
+            "any": {
+                "BV": 8,
+                "num_warps": 2,
+                "num_stages": 2,
+                "waves_per_eu": 2
+            }
+        }
+    },
+    "fp32": {
+        "decode": {
+            "STATE_KB_LEQ_2048": {
+                "BV": 4,
+                "num_warps": 1,
+                "num_stages": 2
+            },
+            "STATE_KB_LEQ_16384": {
+                "BV": 8,
+                "num_warps": 2,
+                "num_stages": 1
+            },
+            "STATE_KB_LEQ_32768": {
+                "BV": 64,
+                "num_warps": 2,
+                "num_stages": 1,
+                "waves_per_eu": 2
+            },
+            "any": {
+                "BV": 4,
+                "num_warps": 2,
+                "num_stages": 2,
+                "waves_per_eu": 2
+            }
+        },
+        "verify": {
+            "STATE_KB_LEQ_2048": {
+                "BV": 4,
+                "num_warps": 1,
+                "num_stages": 2
+            },
+            "STATE_KB_LEQ_16384": {
+                "BV": 8,
+                "num_warps": 2,
+                "num_stages": 1
+            },
+            "STATE_KB_LEQ_32768": {
+                "BV": 16,
+                "num_warps": 2,
+                "num_stages": 2,
+                "waves_per_eu": 2
+            },
+            "any": {
+                "BV": 4,
+                "num_warps": 2,
+                "num_stages": 2,
+                "waves_per_eu": 2
+            }
+        }
+    }
+}

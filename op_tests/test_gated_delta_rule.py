@@ -556,6 +556,168 @@ def test_fused_sigmoid_gating_delta_rule_update(
     assert_close("o", ref, tri, tol)
 
 
+def test_gdn_decode_gfx1151_config_lookup(monkeypatch):
+    from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+        get_gdn_decode_config,
+    )
+    from aiter.ops.triton.utils._triton import arch_info
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1151")
+    for elem_bytes in (2, 4):
+        for mode_key in ("decode", "recurrent"):
+            mall_cfg = get_gdn_decode_config(
+                "FUSED_SIGMOID_GATING_DELTA_RULE",
+                mode_key,
+                16384,
+                state_elem_bytes=elem_bytes,
+            )
+            dram_cfg = get_gdn_decode_config(
+                "FUSED_SIGMOID_GATING_DELTA_RULE",
+                mode_key,
+                65536,
+                state_elem_bytes=elem_bytes,
+            )
+            assert mall_cfg is not None and dram_cfg is not None
+            assert mall_cfg[0] > dram_cfg[0]
+            assert dram_cfg[3] == 2
+
+    for mode_key in ("decode", "recurrent"):
+        mall_cfg = get_gdn_decode_config(
+            "FUSED_RECURRENT_GATED_DELTA_RULE", mode_key, 16384
+        )
+        dram_cfg = get_gdn_decode_config(
+            "FUSED_RECURRENT_GATED_DELTA_RULE", mode_key, 65536
+        )
+        assert mall_cfg is not None and dram_cfg is not None
+        assert mall_cfg[0] > dram_cfg[0]
+        assert dram_cfg[3] == 2
+
+    small_decode_cfg = get_gdn_decode_config(
+        "FUSED_RECURRENT_GATED_DELTA_RULE", "decode", 8192
+    )
+    large_mall_decode_cfg = get_gdn_decode_config(
+        "FUSED_RECURRENT_GATED_DELTA_RULE", "decode", 16384
+    )
+    assert small_decode_cfg == (32, 4, 1, 2)
+    assert large_mall_decode_cfg == (32, 2, 1, 2)
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx942")
+    assert (
+        get_gdn_decode_config(
+            "FUSED_SIGMOID_GATING_DELTA_RULE", "decode", 65536, state_elem_bytes=2
+        )
+        is None
+    )
+    assert (
+        get_gdn_decode_config("FUSED_RECURRENT_GATED_DELTA_RULE", "decode", 65536)
+        is None
+    )
+
+
+def test_fused_sigmoid_gating_and_recurrent_dram_bucket_matches_fallback(monkeypatch):
+    from aiter.ops.triton._triton_kernels.gated_delta_net.decode import (
+        fused_sigmoid_gating_recurrent as sig_mod,
+    )
+    from aiter.ops.triton.gated_delta_net import gated_delta_rule as rec_mod
+
+    torch.manual_seed(0)
+    B, H, HV, K, V, dtype = 64, 16, 32, 128, 128, torch.bfloat16
+    q = torch.randn(B, 1, H, K, device=device, dtype=dtype) * 0.1
+    k = torch.randn(B, 1, H, K, device=device, dtype=dtype) * 0.1
+    v = torch.randn(B, 1, HV, V, device=device, dtype=dtype) * 0.1
+    b = torch.randn(B, 1, HV, device=device, dtype=dtype) * 0.1
+    a = torch.randn(B, 1, HV, device=device, dtype=dtype) * 0.1
+    A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    h0 = torch.randn(B, HV, K, V, device=device, dtype=dtype) * 0.1
+    idx = torch.arange(B, device=device, dtype=torch.int32)
+
+    h_tuned = h0.clone()
+    o_tuned = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=h_tuned,
+        initial_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    monkeypatch.setattr(sig_mod, "get_gdn_decode_config", lambda *args, **kwargs: None)
+    h_ref = h0.clone()
+    o_ref = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=h_ref,
+        initial_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert_close("sigmoid_o", o_ref, o_tuned, 0.005)
+    assert_close("sigmoid_h", h_ref, h_tuned, 0.005)
+
+    # Recurrent GDN DRAM bucket (h0 + ht = 64 MB) + gv != None edge case
+    g = F.logsigmoid(torch.randn(B // 2, 1, HV, device=device, dtype=torch.float32))
+    beta = torch.sigmoid(torch.randn(B // 2, 1, HV, device=device, dtype=torch.float32))
+    h0_rec = torch.randn(B // 2, HV, K, V, device=device, dtype=torch.float32) * 0.1
+    o_rec_tuned, ht_rec_tuned = fused_recurrent_gated_delta_rule(
+        q[: B // 2],
+        k[: B // 2],
+        v[: B // 2],
+        g=g,
+        beta=beta,
+        initial_state=h0_rec,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    gv = F.logsigmoid(torch.randn(2, 4, 8, 64, device=device, dtype=torch.float32))
+    o_gv_tuned, ht_gv_tuned = fused_recurrent_gated_delta_rule(
+        q[:2, :1, :4, :64].expand(2, 4, 4, 64).contiguous(),
+        k[:2, :1, :4, :64].expand(2, 4, 4, 64).contiguous(),
+        v[:2, :1, :8, :64].expand(2, 4, 8, 64).contiguous(),
+        gv=gv,
+        beta=beta[:2, :1, :8].expand(2, 4, 8).contiguous(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    monkeypatch.setattr(rec_mod, "get_gdn_decode_config", lambda *args, **kwargs: None)
+    o_rec_ref, ht_rec_ref = fused_recurrent_gated_delta_rule(
+        q[: B // 2],
+        k[: B // 2],
+        v[: B // 2],
+        g=g,
+        beta=beta,
+        initial_state=h0_rec,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    o_gv_ref, ht_gv_ref = fused_recurrent_gated_delta_rule(
+        q[:2, :1, :4, :64].expand(2, 4, 4, 64).contiguous(),
+        k[:2, :1, :4, :64].expand(2, 4, 4, 64).contiguous(),
+        v[:2, :1, :8, :64].expand(2, 4, 8, 64).contiguous(),
+        gv=gv,
+        beta=beta[:2, :1, :8].expand(2, 4, 8).contiguous(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert_close("rec_o", o_rec_ref, o_rec_tuned, 0.005)
+    assert_close("rec_ht", ht_rec_ref, ht_rec_tuned, 0.005)
+    assert_close("rec_gv_o", o_gv_ref, o_gv_tuned, 0.005)
+    assert_close("rec_gv_ht", ht_gv_ref, ht_gv_tuned, 0.005)
+
+
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype"),
     [

@@ -1,0 +1,36 @@
+{
+    "decode": {
+        "STATE_KB_LEQ_8192": {
+            "BV": 32,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "STATE_KB_LEQ_32768": {
+            "BV": 32,
+            "num_warps": 2,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "any": {
+            "BV": 16,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 2
+        }
+    },
+    "recurrent": {
+        "STATE_KB_LEQ_32768": {
+            "BV": 32,
+            "num_warps": 2,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "any": {
+            "BV": 16,
+            "num_warps": 2,
+            "num_stages": 2,
+            "waves_per_eu": 2
+        }
+    }
+}
