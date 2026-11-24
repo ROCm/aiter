@@ -88,19 +88,32 @@ def child(cases):
     )
     from aiter.ops.flydsl.aot_cache import _JitKernel
 
-    # The cache calls the launcher factory only to trace: count those calls.
+    # Every trace, exported or JIT, goes through flyc.compile: count those.
     traces = 0
+    compile = flyc.compile
+
+    @functools.wraps(compile)
+    def counting_compile(*args, **kwargs):
+        nonlocal traces
+        traces += 1
+        return compile(*args, **kwargs)
+
+    flyc.compile = counting_compile
+
+    # A hit never calls the launcher factory: count those calls. The factory
+    # also reads a variable, as a kernel reads a tuning switch.
+    factories = 0
     compile_fn = gemm_kernels._get_compile_fn
 
     @functools.wraps(compile_fn)
-    def counting_compile_fn():
-        nonlocal traces
-        traces += 1
+    def reading_compile_fn():
+        nonlocal factories
+        factories += 1
         os.environ.get(TEST_ENV)
         dict(os.environ)  # a bulk read must not be recorded
         return compile_fn()
 
-    gemm_kernels._get_compile_fn = counting_compile_fn
+    gemm_kernels._get_compile_fn = reading_compile_fn
 
     for (m, n, k), qname in cases:
         tm, tn, tk, sk = CASES[(m, n, k)]
@@ -123,13 +136,14 @@ def child(cases):
         digest = hashlib.sha256(out.view(torch.int16).cpu().numpy().tobytes())
         rec = {"first_ms": first_ms, "err": err, "out": digest.hexdigest()}
         print("RESULT " + json.dumps([[m, n, k], qname, rec]), flush=True)
-    cache = gemm_kernels._PRESHUFFLE_AOT_CACHE
+    cache = gemm_kernels._preshuffle_launcher.aot_cache
     kernels = list(cache._mem.values())
     state = {
         "entries": len(kernels),
         "jit": sum(isinstance(k, _JitKernel) for k in kernels),
         "builds": cache._builds,
         "traces": traces,
+        "factories": factories,
     }
     print("STATE " + json.dumps(state), flush=True)
 
@@ -175,7 +189,8 @@ def check_paths(cache_dir, cases):
     n = len(cases)
 
     RESULTS["jit"], state = run_mode("0", cache_dir, cases)
-    assert state["jit"] == state["entries"], f"mode 0 did not run the JIT: {state}"
+    assert state["entries"] == 0, f"mode 0 launched through the cache: {state}"
+    assert state["traces"] == n, f"mode 0 did not trace every case: {state}"
     assert not cache_files(cache_dir), "mode 0 wrote the AOT cache"
 
     RESULTS["aot miss"], state = run_mode("1", cache_dir, cases)
@@ -193,7 +208,7 @@ def check_paths(cache_dir, cases):
         assert env == {TEST_ENV: None}, f"{p}.json records {sorted(env)}"
 
     RESULTS["aot hit"], state = run_mode("1", cache_dir, cases)
-    expected = {"entries": entries, "jit": 0, "builds": 0, "traces": 0}
+    expected = {"entries": entries, "jit": 0, "builds": 0, "traces": 0, "factories": 0}
     assert state == expected, f"aot hit traced or rebuilt: {state}"
     assert cache_files(cache_dir) == built, "aot hit rewrote the AOT cache"
 
@@ -201,7 +216,7 @@ def check_paths(cache_dir, cases):
     assert state["jit"] == 0 and state["builds"] == 0, f"aot verify: {state}"
     assert cache_files(cache_dir) == built, "aot verify rewrote the AOT cache"
 
-    rebuilt = {**expected, "builds": entries, "traces": entries}
+    rebuilt = {**expected, "builds": entries, "traces": entries, "factories": entries}
     _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
     assert state == rebuilt, f"a variable the build read did not rebuild: {state}"
 

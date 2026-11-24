@@ -30,7 +30,7 @@ import torch
 
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 
 # gemm_a8w8_mxfp8_bpreshuffle's gfx950 scales per w_scale block (row-major 1x32
 # x_scale; 1x32 or 32x32 w_scale), defined next to its tune pipelines;
@@ -60,12 +60,6 @@ def _reduce_exe():
     # flyc.jit(.func) starts with empty compile_hints, so the hint on
     # launch_splitk_reduce itself never reaches this reduction.
     return set_slp_vectorize_once_used(flyc.jit(launch_splitk_reduce.func), False)
-
-
-# One cache per launcher: the plain and the fused GEMM ABIs and the reduction.
-_GEMM_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_gemm")
-_GEMM_FUSED_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_gemm_fused")
-_REDUCE_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_splitk_reduce")
 
 
 @functools.cache
@@ -135,6 +129,21 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
     return launch
 
 
+# One AOT cache per launcher: the plain and the fused GEMM ABIs and the
+# reduction. Each launcher's constexprs are its key.
+@aot_factory("mxscale_preshuffle_gemm")
+@functools.cache
+def _gemm_launcher(constexprs: tuple):
+    return _bound_gemm_exe(False, constexprs)
+
+
+@aot_factory("mxscale_preshuffle_gemm_fused")
+@functools.cache
+def _gemm_fused_launcher(constexprs: tuple):
+    return _bound_gemm_exe(True, constexprs)
+
+
+@aot_factory("mxscale_preshuffle_splitk_reduce")
 @functools.cache
 def _bound_reduce_exe(split_k: int, out_dtype: str, strided: bool):
     """``_reduce_exe()`` with its Constexprs bound; see ``_bound_gemm_exe``."""
@@ -246,7 +255,7 @@ def flydsl_mxscale_preshuffle_gemm(
         SCALE_BLOCKS_B,
         SCALE_LAYOUTS,
     )
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
     if a_dtype not in ("fp4", "fp6", "fp8"):
@@ -416,9 +425,8 @@ def flydsl_mxscale_preshuffle_gemm(
 
     if split_k == 1:
         constexprs = (*spec, False, *pf_tail)
-        _GEMM_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(False, constexprs),
+        _run_compiled(
+            _gemm_launcher.lazy(constexprs),
             out_ptr,
             a_ptr,
             b_ptr,
@@ -427,6 +435,7 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st_arg,
+            specialization_key=A.device,
         )
         return Out
 
@@ -457,9 +466,8 @@ def flydsl_mxscale_preshuffle_gemm(
             l2_reduce = -(-num_tiles // 8) * split_k <= _GFX950_CUS_PER_XCD
         fused_tail = (depth, bool(b_nt), True) if fused_f32 and l2_reduce else pf_tail
         constexprs = (*spec, fused_f32, *fused_tail)
-        _GEMM_FUSED_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(True, constexprs),
+        _run_compiled(
+            _gemm_fused_launcher.lazy(constexprs),
             ptr_arg(workspace),
             a_ptr,
             b_ptr,
@@ -470,6 +478,7 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st_arg,
+            specialization_key=A.device,
         )
         return Out
 
@@ -479,9 +488,8 @@ def flydsl_mxscale_preshuffle_gemm(
         tmp.record_stream(st)
     tmp_ptr = ptr_arg(tmp)
     constexprs = (*spec, False, *pf_tail)
-    _GEMM_AOT_CACHE.launch(
-        (constexprs, A.device),
-        lambda: _bound_gemm_exe(False, constexprs),
+    _run_compiled(
+        _gemm_launcher.lazy(constexprs),
         tmp_ptr,
         a_ptr,
         b_ptr,
@@ -490,10 +498,10 @@ def flydsl_mxscale_preshuffle_gemm(
         M,
         N,
         st_arg,
+        specialization_key=A.device,
     )
-    _REDUCE_AOT_CACHE.launch(
-        (split_k, out_dtype, False, A.device),
-        lambda: _bound_reduce_exe(split_k, out_dtype, False),
+    _run_compiled(
+        _bound_reduce_exe.lazy(split_k, out_dtype, False),
         tmp_ptr,
         out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
@@ -501,6 +509,7 @@ def flydsl_mxscale_preshuffle_gemm(
         N // 2,  # row_dw
         N // 2,  # ldc_dw (contiguous Out)
         st_arg,
+        specialization_key=A.device,
     )
     return Out
 

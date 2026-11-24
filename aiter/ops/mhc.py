@@ -917,6 +917,110 @@ def mhc_post(
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
 
 
+@compile_ops("module_mhc", fc_name="mhc_post_reduce", develop=True)
+def _mhc_post_reduce(
+    out: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor | None = None,
+    store_nt: int = -1,
+) -> None: ...
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def mhc_post_reduce(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor | None = None,
+    store_nt: int = -1,
+) -> None:
+    """`mhc_post` with its ``hc_mult`` output streams reduced in the epilogue.
+
+    Writes ``out`` (m, hidden_size), contiguous, in place; the
+    (m, hc_mult, hidden_size) result of `mhc_post` is never stored. Each stream
+    is computed and rounded to the input dtype exactly as `mhc_post` writes it,
+    then the streams are summed in FP32 with ``h`` ascending:
+
+    - ``pre_mix`` (m, hc_mult) FP32: ``sum_h pre_mix[:, h] * stream_h``, each
+      product and each sum rounded on its own (no FMA);
+    - ``pre_mix=None``: ``(sum_h stream_h) / hc_mult``, the mean.
+
+    The result is bit-identical to `mhc_post` followed by that reduction in
+    FP32 and a cast back to the input dtype. ``residual`` is the plain
+    (m, hc_mult, hidden_size) layout: this op has no ``res_preshuffle``.
+    Coverage is `mhc_post_reduce_supported`; anything else raises, as do
+    operands on different devices and an ``out`` that overlaps an input.
+    """
+    # The launch takes the current stream: make it residual's device's.
+    with torch.cuda.device(residual.device):
+        _mhc_post_reduce(
+            out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt
+        )
+
+
+def _mhc_post_tile(hidden_size: int, arch: str, with_256: bool) -> int:
+    """The residual tile `mhc_post` takes for ``hidden_size``, 0 for none.
+
+    The widest of 1024 / 512 / 256 columns that divides ``hidden_size`` and fits
+    at least twice -- a dispatch rule kept from the launch's old check (the
+    kernels also run one tile per work-group), which leaves every shape that ran
+    before on its old tile; gfx942 has no 1024-column tile, and the reduce
+    epilogue no 256-column body (``with_256=False``).
+
+    MUST stay in lockstep with ``mhc_post_tile`` in csrc/kernels/mhc_kernels.cu,
+    which every `mhc_post` / `mhc_post_reduce` launch dispatches on;
+    ``op_tests/test_mhc.py`` sweeps hidden sizes and checks the two agree.
+    """
+    for tile in (1024, 512, 256):
+        if (tile == 1024 and arch == "gfx942") or (tile == 256 and not with_256):
+            continue
+        if hidden_size % tile == 0 and hidden_size >= 2 * tile:
+            return tile
+    return 0
+
+
+def mhc_post_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post` runs: ``hc_mult`` 4, BF16 or FP16, and a
+    ``hidden_size`` with a residual tile on ``arch`` (default: the live GPU).
+    Elsewhere it raises; callers check this first and keep their own path."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=True) != 0
+    )
+
+
+def mhc_post_reduce_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post_reduce` runs: as :func:`mhc_post_supported`,
+    without the 256-column tile. So hidden sizes a multiple of 256 but not of
+    512 are refused, and so is 512 itself (its 512-column tile does not fit
+    twice); 1024 runs on 512-column tiles."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=False) != 0
+    )
+
+
 def get_mhc_pre_splitk_large_m(
     m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
