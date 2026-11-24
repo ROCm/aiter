@@ -70,7 +70,7 @@ env:
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/aiter-di-ci/atomesh-logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/aiter-di-ci/atomesh-ci
-  ATOMESH_NODE_POOL_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  ATOMESH_NODE_POOL_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   ISL_LIST_DEFAULT: "1024"
   OSL_DEFAULT: "1024"
   CONC_LIST_DEFAULT: "16"
