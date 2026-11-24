@@ -234,6 +234,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             histogram,
             scan,
             metadata,
+            clear_histogram_after=False,
         ):
             first_bin = tid * two
             count0 = histogram[first_bin]
@@ -245,6 +246,11 @@ def build_topk_per_row_decode_one_workgroup_module(
             if lane == wave_size - 1:
                 scan[wave] = wave_inclusive
             gpu.barrier()
+            if const_expr(clear_histogram_after):
+                # Every thread has read its counts, and the barrier at the end
+                # of this function publishes the clear to the next pass.
+                histogram[tid] = zero
+                histogram[tid + _BLOCK_THREADS] = zero
 
             if wave == 0:
                 active = lane < num_waves
@@ -368,11 +374,8 @@ def build_topk_per_row_decode_one_workgroup_module(
             scan,
             metadata,
         ):
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
-
+            # The running counters were zeroed with the rest of metadata before
+            # the first pass and nothing else writes them.
             num_steps = (row_vectors + block_threads - one) // block_threads
             for step in range(zero, num_steps, one):
                 vector_idx = step * block_threads + tid
@@ -440,7 +443,10 @@ def build_topk_per_row_decode_one_workgroup_module(
             row_indices,
             row_values,
         ):
-            clear_histogram(histogram)
+            if const_expr(compact):
+                # Elsewhere choose_threshold cleared it; the compact build reads
+                # the first-level count after that call.
+                clear_histogram(histogram)
             reread_row(
                 lambda col, values: histogram_pass2(col, values, first_threshold)
             )
@@ -453,10 +459,10 @@ def build_topk_per_row_decode_one_workgroup_module(
                 histogram,
                 scan,
                 metadata,
+                clear_histogram_after=True,
             )
             second_threshold = metadata[_SECOND_THRESHOLD]
 
-            clear_histogram(histogram)
             reread_row(
                 lambda col, values: histogram_pass3(
                     col,
@@ -697,6 +703,7 @@ def build_topk_per_row_decode_one_workgroup_module(
                 histogram,
                 scan,
                 metadata,
+                clear_histogram_after=not compact,
             )
             first_threshold = metadata[_FIRST_THRESHOLD]
             first_above = metadata[_FIRST_ABOVE]
@@ -749,8 +756,6 @@ def build_topk_per_row_decode_one_workgroup_module(
         if row_len > top_k:
             if tid < 8:
                 metadata[tid] = zero
-            gpu.barrier()
-
             clear_histogram(histogram)
             reread_row(histogram_pass1)
             gpu.barrier()
