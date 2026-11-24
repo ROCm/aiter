@@ -14,6 +14,7 @@ from aiter.ops import attention
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
     _MLA_BACKENDS,
+    MLA_DECODE_KERNEL_HEAD_COUNTS,
     MlaAsmStatus,
     MlaBackend,
     _mla_decode_head_plan,
@@ -252,6 +253,8 @@ def test_decode_num_heads(monkeypatch):
             cp_round_robin=True,
         )
         assert h >= n and s.supported is not False, (n, q, h, s.reasons)
+        # It pads only onto a kernel head count, the list callers import.
+        assert h == n or h in MLA_DECODE_KERNEL_HEAD_COUNTS, (n, q, h)
 
 
 def test_ps1_asm_cprr_kernel(monkeypatch):

@@ -2706,8 +2706,9 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
 )
 
 # Q head counts the MLA decode kernels are built for; a query can be padded up
-# to one of them.
-_MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
+# to one of them. get_mla_decode_num_heads only ever answers one of these (or
+# the count it was asked for); callers that pick a padded width read it here.
+MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
 
 def get_mla_decode_num_heads(
@@ -2734,7 +2735,7 @@ def get_mla_decode_num_heads(
     for a DCP decode.
     """
     for heads in sorted(
-        {num_heads, *(n for n in _MLA_DECODE_KERNEL_HEAD_COUNTS if n > num_heads)}
+        {num_heads, *(n for n in MLA_DECODE_KERNEL_HEAD_COUNTS if n > num_heads)}
     ):
         s = get_mla_decode_shape_support(
             heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs
