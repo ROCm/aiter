@@ -1834,6 +1834,29 @@ def _tune_v41_flash_ep4_a4w4_large(config: MegaMoEConfig, bucket: int) -> MegaMo
     return config
 
 
+def _tune_v41_flash_ep2_a4w4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 EP2 DeepSeek-V4.1-Flash small-input kernel: the A8W4 tune (_tune_v41_flash_ep2_small) with the changes
+    measured for A4W4 on gfx950 (routes suite, MTPR 512). Launch protocol knobs unchanged.
+    """
+    if bucket == 1:
+        # Cached W1 (b_nt 0): 41.4 -> 39.6 us.
+        return replace(config, stage1=replace(config.stage1, b_nt=0))
+    if bucket == 64:
+        # Wider GEMM1 n-tiles, as at 128 tokens (each streams a longer W1 slab): 516 -> 480 us.
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    return config
+
+
+def _tune_v41_flash_ep2_a4w4_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """A4W4 EP2 DeepSeek-V4.1-Flash large-input kernel: the A8W4 tune (_tune_v41_flash_ep2_large) with the changes
+    measured for A4W4 on gfx950 (routes suite, MTPR 16384, max_tokens 513..16384), one config for every bucket.
+    """
+    # The presend covers twice the local experts (16): 6.45 -> 6.19 ms at 16384 tokens, neutral below.
+    return replace(
+        config, fused_stage1=replace(config.fused_stage1, presend_experts=16)
+    )
+
+
 def _tune_a4w4_small(
     config: MegaMoEConfig, layout: tuple[int, int, int, int], bucket: int
 ) -> MegaMoEConfig:
@@ -1845,6 +1868,8 @@ def _tune_a4w4_small(
     """
     if layout == V41_FLASH_EP4_LAYOUT:
         return _tune_v41_flash_ep4_a4w4_small(config, bucket)
+    if layout == V41_FLASH_EP2_LAYOUT:
+        return _tune_v41_flash_ep2_a4w4_small(config, bucket)
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
@@ -1889,6 +1914,8 @@ def _tune_a4w4_large(
     """
     if layout == V41_FLASH_EP4_LAYOUT:
         return _tune_v41_flash_ep4_a4w4_large(config, bucket)
+    if layout == V41_FLASH_EP2_LAYOUT:
+        return _tune_v41_flash_ep2_a4w4_large(config)
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_large(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
