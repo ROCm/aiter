@@ -232,23 +232,40 @@ def test_rmsnorm2d_row_bound(dtype, m, n):
 
 
 def test_rmsnorm_hip_refuses_partial_words():
-    """The HIP entry points refuse a row that is not a whole number of 4-byte words."""
-    for n, quant in ((1003, False), (1002, True)):
+    """Each of the four HIP entry points refuses a row that is not a whole number of
+    4-byte words (an odd N, and N % 4 != 0 with the 8-bit output of the two quant
+    entries) and writes nothing."""
+    for name, n in (
+        ("rmsnorm", 1003),
+        ("add_rmsnorm", 1003),
+        ("rmsnorm_quant", 1002),
+        ("rmsnorm_quant", 1003),
+        ("add_rmsnorm_quant", 1002),
+        ("add_rmsnorm_quant", 1003),
+    ):
+        quant = name.endswith("_quant")
         x = torch.randn((2, n), dtype=dtypes.bf16, device="cuda")
         w = torch.ones(n, dtype=dtypes.bf16, device="cuda")
+        out_buf, out = _guarded(2, n, dtypes.fp8 if quant else dtypes.bf16, 0x5A)
+        args, written = [out, x], [("out", out_buf, 0x5A)]
+        if name.startswith("add_"):
+            res_buf, res_out = _guarded(2, n, dtypes.bf16, 12345.0)
+            args += [torch.randn_like(x), res_out]
+            written.append(("residual_out", res_buf, 12345.0))
+        if quant:
+            scale = torch.full((2, 1), 12345.0, dtype=dtypes.fp32, device="cuda")
+            args.append(scale)
+            written.append(("scale", scale, 12345.0))
         try:
-            if quant:
-                out = torch.empty((2, n), dtype=dtypes.fp8, device="cuda")
-                scale = torch.empty((2, 1), dtype=dtypes.fp32, device="cuda")
-                rmsnorm_ops.rmsnorm_quant(out, x, scale, w, 1e-5)
-            else:
-                rmsnorm_ops.rmsnorm(torch.empty_like(x), x, w, 1e-5)
+            getattr(rmsnorm_ops, name)(*args, w, 1e-5)
         except RuntimeError as exc:
             assert "whole 4-byte words" in str(exc), exc
         else:
-            raise AssertionError(
-                f"[row bound] HIP entry accepted n = {n}, quant={quant}"
-            )
+            raise AssertionError(f"[row bound] {name} accepted n = {n}")
+        torch.cuda.synchronize()
+        for what, buf, guard in written:
+            g = torch.full((1,), guard, dtype=buf.dtype, device="cuda")
+            assert bool((buf == g).all()), f"[row bound] {name}, n = {n}: wrote {what}"
 
 
 def test_rmsnorm2d_fuseAdd_deterministic(dtype, m, n, runs=5):

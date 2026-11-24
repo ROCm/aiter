@@ -463,6 +463,10 @@ __global__ void add_rmsnorm_quant_kernel(
     // written past the row. That is the start of the next row, or memory past the tensor.
     // Refuse those widths. aiter/ops/rmsnorm.py keeps them off this kernel wherever another
     // backend exists. fp4x2 rows are bounded to the packed row above and are left as they are.
+    // This check is the word bound that gfx942 and gfx950 need. gfx1250 needs more: there the
+    // bounds check drops a whole 16-byte vector, so a row with n % 8 != 0 loses its last
+    // n % 8 elements. That rule lives in _use_hip_common (aiter/ops/rmsnorm.py) and is not
+    // checked here.
     static inline void check_row_words(const char* func, const aiter_tensor_t& input,
                                        const aiter_tensor_t& out, int n)
     {
