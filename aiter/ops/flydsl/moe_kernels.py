@@ -3553,6 +3553,9 @@ def _get_compiled_apre_scatter(
     feat_dim: int,
     wmma_rep: int,
     src_scale_stride_bytes: int = 0,
+    src_payload_stride_bytes: int = 0,
+    compact_topk: int = 0,
+    compact_experts: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
         build_moe_apre_scatter_module,
@@ -3562,6 +3565,9 @@ def _get_compiled_apre_scatter(
         feat_dim,
         wmma_rep,
         src_scale_stride_bytes,
+        src_payload_stride_bytes,
+        compact_topk,
+        compact_experts,
     )
 
 

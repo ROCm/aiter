@@ -56,6 +56,43 @@ assert PROLOGUE_GATHERS > 0 and PROLOGUE_GATHERS % GATHERS_PER_INDEX_VECTOR == 0
 assert 0 <= MAINLOOP_GATHERS <= 2 * GATHERS_PER_INDEX_VECTOR
 
 
+def can_overlap_scatter(
+    *,
+    enable_ep_scatter,
+    ep_world_size,
+    ep_quant_bits,
+    a_is_fp4,
+    a_preshuffled,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    next_stage_prefetch,
+    tdm_as_in_prologue,
+    k_waves,
+    k_tiles,
+):
+    """Check layout eligibility before choosing workers and LDS buffers.
+
+    The host launcher and kernel builder share this gate so the host only
+    defaults scheduling parameters when the kernel can use the overlap ABI.
+    """
+    return bool(
+        enable_ep_scatter
+        and ep_world_size > 1
+        and not ep_quant_bits
+        and a_is_fp4
+        and a_preshuffled
+        and tile_m == tile_n == tile_k == 256
+        and m_warp == n_warp == 2
+        and next_stage_prefetch
+        and not tdm_as_in_prologue
+        and k_waves == 1
+        and k_tiles >= 3
+    )
+
+
 def make_scatter_store(
     lsa0,
     lsa1,
