@@ -1124,6 +1124,8 @@ def _mla_gluon_paged(
     batch, qlen, nhead, kv_lora_rank = q_nope.shape
     if qlen == 1:
         q_nope, q_pe = q_nope[:, 0], q_pe[:, 0]
+    if sm_scale is None:
+        sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
     o = torch.empty(q_nope.shape, dtype=torch.bfloat16, device="cuda")
     o, lse = mla_gluon(
         q_nope=q_nope,
@@ -1132,7 +1134,7 @@ def _mla_gluon_paged(
         o=o,
         page_table=page_table,
         seq_info=seq_info,
-        sm_scale=sm_scale or 1.0 / (kv_c.shape[-1] ** 0.5),
+        sm_scale=sm_scale,
         k_pe=None,
         kv_pe_offset=kv_lora_rank,
         use_2d_view=use_2d_view,
