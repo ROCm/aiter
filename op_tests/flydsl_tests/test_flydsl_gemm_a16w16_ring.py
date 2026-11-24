@@ -93,6 +93,25 @@ def test_ring_graph_replay():
     assert torch.equal(out, eager)
 
 
+def test_ring_rejects_weights_past_32bit_offsets():
+    """N=K=65536 passes the LDS/ring checks but its 8 GiB weight overflows the 32-bit DMA offset."""
+    from aiter.ops.flydsl.kernels.gemm_a16w16_ring_gfx950 import fits
+
+    assert fits(50016, 6144, 1, 1, 4)
+    assert not fits(65536, 65536, 1, 1, 4)
+
+
+@_SKIP
+def test_ring_rejects_cpu_and_foreign_device_tensors():
+    x, w = _inputs(8, *_SHAPES[0])
+    with pytest.raises(ValueError):
+        gemm_a16w16_ring(x.cpu(), w)
+    with pytest.raises(ValueError):
+        gemm_a16w16_ring(x, w.cpu())
+    with pytest.raises(ValueError):
+        gemm_a16w16_ring(x, w, out=torch.empty(8, _SHAPES[0][0], dtype=dtypes.bf16))
+
+
 def test_ring_shuffle_roundtrip():
     w = torch.randn(512 * 16, 128, dtype=dtypes.bf16)
     assert torch.equal(unshuffle_weight_ring(shuffle_weight_ring(w)), w)
@@ -144,7 +163,11 @@ def main():
         for (n, k), m in itertools.product(shapes, args.rows)
         if ring_supported(m, n, k)
     ]
+    if not rows:
+        aiter.logger.info("no requested shape is supported by the ring GEMM")
+        return
     df = pd.DataFrame(rows)
+    assert (df["ring err"] == 0).all(), "ring GEMM mismatched the fp32 reference"
     aiter.logger.info("gemm_a16w16_ring summary:\n%s", df.to_markdown(index=False))
 
 

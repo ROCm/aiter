@@ -62,8 +62,19 @@ def _barrier():
     llvm.inline_asm(None, [], "s_barrier", "~{memory}", has_side_effects=True)
 
 
+# Weight DMA offsets are 32-bit; 0x70000000 is the out-of-range sentinel of a fragment past the tile's rows, so the
+# whole weight (N * K * 2 bytes) must end below it.
+W_MAX_BYTES = 0x70000000
+
+
 def supported_shape(n: int, k: int) -> bool:
-    return n % 16 == 0 and (n // 16) >= TILES and k % 64 == 0 and k >= 64 * 4
+    return (
+        n % 16 == 0
+        and (n // 16) >= TILES
+        and k % 64 == 0
+        and k >= 64 * 4
+        and n * k * 2 < W_MAX_BYTES
+    )
 
 
 def fits(n: int, k: int, mt: int, mh: int, r: int) -> bool:
@@ -83,8 +94,13 @@ def fits(n: int, k: int, mt: int, mh: int, r: int) -> bool:
 
 
 @functools.cache
-def compile_ring(n: int, k: int, mt: int, mh: int, r: int, shuffled: bool = True):
-    """Launcher for N, K and ``mt`` 16-row fragments per wave, ``mh`` M halves, ring depth ``r``."""
+def compile_ring(
+    n: int, k: int, mt: int, mh: int, r: int, shuffled: bool = True, device: int = 0
+):
+    """Launcher for N, K and ``mt`` 16-row fragments per wave, ``mh`` M halves, ring depth ``r``.
+
+    ``device`` only keys the cache: a compiled handle is bound to the device it was built on.
+    """
     assert fits(n, k, mt, mh, r), (n, k, mt, mh, r)
     G16 = n // 16
     NRB = G16 // TILES

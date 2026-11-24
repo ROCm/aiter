@@ -80,6 +80,8 @@ def gemm_a16w16_ring(
     """
     m, k = x.shape
     n = w.shape[0]
+    if x.device.type != "cuda" or w.device != x.device:
+        raise ValueError("ring GEMM takes CUDA x and w on the same device")
     if not ring_supported(m, n, k, x.device):
         raise ValueError(f"ring GEMM does not take M={m} N={n} K={k} on this device")
     if (
@@ -97,23 +99,28 @@ def gemm_a16w16_ring(
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     elif (
-        out.shape != (m, n)
+        out.device != x.device
+        or out.shape != (m, n)
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
         or out.data_ptr() % 16
     ):
-        raise ValueError("out must be a contiguous 16-byte-aligned BF16 [M, N]")
+        raise ValueError(
+            "out must be a contiguous 16-byte-aligned BF16 [M, N] on the device of x"
+        )
     mt, mh, r = ring_tiling(m)
-    exe = compile_ring(n, k, mt, mh, r, shuffled)
-    _run_compiled(
-        exe,
-        x.data_ptr(),
-        w.data_ptr(),
-        out.data_ptr(),
-        m,
-        1,
-        torch.cuda.current_stream(),
-    )
+    # The compiled handle is device bound: key it (and launch) per device.
+    with torch.cuda.device(x.device):
+        exe = compile_ring(n, k, mt, mh, r, shuffled, torch.cuda.current_device())
+        _run_compiled(
+            exe,
+            x.data_ptr(),
+            w.data_ptr(),
+            out.data_ptr(),
+            m,
+            1,
+            torch.cuda.current_stream(x.device),
+        )
     return out
 
 
