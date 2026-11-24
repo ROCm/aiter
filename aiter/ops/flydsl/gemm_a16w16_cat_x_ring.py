@@ -48,6 +48,9 @@ def cat_x_ring_supported(m: int, n: int, seg_k: int, device=None, ks: int = 10) 
         and ks % NSEG == 0
         and stages % ks == 0
         and stages // ks >= 4
+        # byte offsets into the weight and the fp32 partials are i32 inside the kernel
+        and n * NSEG * seg_k * 2 < 2**31
+        and ks * m * n * 4 < 2**31
     )
 
 
@@ -73,6 +76,8 @@ def gemm_a16w16_cat_x_ring(
             f"cat-x ring GEMM does not take M={m} N={n} seg_k={seg_k} ks={ks} on this device"
         )
     stride = xs[0].stride(0)
+    if w.device.type != "cuda" or any(x.device != w.device for x in xs):
+        raise ValueError("taps and weight must be on one CUDA device")
     for x in xs:
         if (
             x.dtype != torch.bfloat16
@@ -91,47 +96,59 @@ def gemm_a16w16_cat_x_ring(
         )
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=w.device)
-    elif out.shape != (m, n) or out.dtype != torch.bfloat16 or out.stride(1) != 1:
+    elif (
+        out.device != w.device
+        or out.shape != (m, n)
+        or out.dtype != torch.bfloat16
+        or out.stride(1) != 1
+    ):
         raise ValueError("out must be a bf16 [M, N] with unit column stride")
     if workspace is None:
         workspace = torch.empty(ks, m, n, dtype=torch.float32, device=w.device)
     elif (
-        workspace.shape != (ks, m, n)
+        workspace.device != w.device
+        or workspace.shape != (ks, m, n)
         or workspace.dtype != torch.float32
         or not workspace.is_contiguous()
     ):
         raise ValueError("workspace must be a contiguous fp32 [ks, M, N]")
-    exe = compile_cat_ring(
-        n, seg_k, (m + 15) // 16, ks, _ring_depth(NSEG * seg_k // 64 // ks)
-    )
-    _run_compiled(
-        exe,
-        *[x.data_ptr() for x in xs],
-        w.data_ptr(),
-        workspace.data_ptr(),
-        m,
-        stride * 2,
-        torch.cuda.current_stream(),
-    )
-    _gemm_splitk_reduce_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 32))](
-        workspace,
-        out,
-        None,
-        m,
-        n,
-        workspace.stride(0),
-        workspace.stride(1),
-        workspace.stride(2),
-        out.stride(0),
-        out.stride(1),
-        32,
-        32,
-        ks,
-        triton.next_power_of_2(ks),
-        ADD_BIAS=False,
-        activation=None,
-        use_activation=False,
-    )
+    with torch.cuda.device(w.device):
+        exe = compile_cat_ring(
+            n,
+            seg_k,
+            (m + 15) // 16,
+            ks,
+            _ring_depth(NSEG * seg_k // 64 // ks),
+            w.device.index,
+        )
+        _run_compiled(
+            exe,
+            *[x.data_ptr() for x in xs],
+            w.data_ptr(),
+            workspace.data_ptr(),
+            m,
+            stride * 2,
+            torch.cuda.current_stream(),
+        )
+        _gemm_splitk_reduce_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 32))](
+            workspace,
+            out,
+            None,
+            m,
+            n,
+            workspace.stride(0),
+            workspace.stride(1),
+            workspace.stride(2),
+            out.stride(0),
+            out.stride(1),
+            32,
+            32,
+            ks,
+            triton.next_power_of_2(ks),
+            ADD_BIAS=False,
+            activation=None,
+            use_activation=False,
+        )
     return out
 
 

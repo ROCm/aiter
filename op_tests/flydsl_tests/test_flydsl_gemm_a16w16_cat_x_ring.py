@@ -98,6 +98,8 @@ def test_cat_x_ring_rejects_unsupported():
     with pytest.raises(ValueError):
         gemm_a16w16_cat_x_ring(xs[:4], ws)
     assert not cat_x_ring_supported(129, N, SEG_K)
+    # i32 byte offsets: a weight of 2 GiB or more is refused, not wrapped
+    assert not cat_x_ring_supported(8, 2**20, SEG_K)
 
 
 @benchmark()

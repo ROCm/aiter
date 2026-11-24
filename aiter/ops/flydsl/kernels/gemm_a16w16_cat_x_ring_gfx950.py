@@ -32,7 +32,10 @@ NSEG = 5
 
 
 @functools.cache
-def compile_cat_ring(n: int, seg_k: int, mt: int, ks: int, r: int, nr: int = 4):
+def compile_cat_ring(
+    n: int, seg_k: int, mt: int, ks: int, r: int, device: int = 0, nr: int = 4
+):
+    """``device`` only keys the cache: a compiled handle must not be shared across GPUs."""
     K = NSEG * seg_k
     NB_TOTAL = K // 64
     assert ks % NSEG == 0 and NB_TOTAL % ks == 0 and 1 <= mt <= 8
