@@ -1,60 +1,62 @@
-"""Microbenchmark for the fp8 MHA forward kernel in mha.py.
+"""Microbenchmark for the MXFP8 MHA forward kernel in mha_mxfp8.py (gfx1250 only).
 
-Timing uses ``triton.testing.do_bench_cudagraph``: the launch is captured into a
-graph and replayed, so the numbers exclude per-call host overhead (the Triton
-launcher, the argument marshalling in ``mha_fwd``) and measure the kernel
-itself. Everything the timed callable touches is preallocated for the same
-reason -- nothing but the launch happens inside the graph.
+Timing uses ``RotatingBufferBench``: the launches are captured into a CUDA graph
+that rotates over a pool of input sets, so the numbers exclude per-call host
+overhead and do not time cache-resident inputs. The output buffer is
+preallocated in each pool entry, so the graph holds only the launches.
 
 Usage:
-    python bench_mha_fp8.py                          # default seqlen sweep
-    python bench_mha_fp8.py --seqlen_q 4096 --batch 2
-    python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
-    python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
-    python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
-    python bench_mha_fp8.py --rep 100
+    python bench_mha_mxfp8.py                          # default shape
+    python bench_mha_mxfp8.py --seqlen_q 4096 --batch 2
+    python bench_mha_mxfp8.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
+    python bench_mha_mxfp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
+    python bench_mha_mxfp8.py --q_heads 32 --k_heads 8  # grouped query attention
 """
 
 import argparse
+import functools
 
 import torch
-import triton
 
 from aiter.ops.triton.attention.mha_mxfp8 import mha_fwd
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_mha_mxfp8 import init_qkv
 
-FP8_DTYPE = torch.float8_e4m3fn
-FP8_MAX = 448.0
-
-
-def init_qkv(shape, quant_dim, device="cuda"):
-    x = torch.randn(shape, device=device, dtype=torch.float32)
-    x_quant, x_scale = downcast_to_mxfp(
-        x.to(torch.bfloat16), torch.float8_e4m3fn, axis=quant_dim
-    )
-    if quant_dim != -1:
-        x_quant = x_quant.contiguous()
-        x_scale = x_scale.contiguous()
-    return x_quant, x_scale
+_POOL_KEYS = ["q", "k", "v", "q_scale", "k_scale", "v_scale", "o"]
 
 
-def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
+def _generate_inputs(b, hq, hk, sq, sk, d):
+    """Quantized Q/K/V from the unit test, and a preallocated bf16 output."""
     q_shape = (b, hq, sq, d)
     kv_shape = (b, hk, sk, d)
-    q, q_scale = init_qkv(q_shape, -1, device)
-    k, k_scale = init_qkv(kv_shape, -1, device)
-    v, v_scale = init_qkv(kv_shape, -2, device)
-    o = torch.empty(q_shape, device=device, dtype=torch.bfloat16)
+    # init_qkv also returns the dequantized input; the kernel does not read it.
+    _, q, q_scale = init_qkv(q_shape, -1)
+    _, k, k_scale = init_qkv(kv_shape, -1)
+    _, v, v_scale = init_qkv(kv_shape, -2)
+    o = torch.empty(q_shape, device="cuda", dtype=torch.bfloat16)
+    return q, k, v, q_scale, k_scale, v_scale, o
 
-    def run():
+
+def bench_case(bencher, b, hq, hk, sq, sk, d, causal):
+    bencher.build_pool(
+        [functools.partial(_generate_inputs, b, hq, hk, sq, sk, d)], [_POOL_KEYS]
+    )
+
+    def run(q, k, v, q_scale, k_scale, v_scale, o):
         mha_fwd(q, k, v, q_scale, k_scale, v_scale, o=o, causal=causal)
 
-    ms = triton.testing.do_bench_cudagraph(run, rep=rep)
+    ms = bencher.bench(run)
 
     # Two SQ x SK x D matmuls per (batch, query head): Q @ K^T and P @ V.
     # With the bottom-right causal mask, query i sees i + (SK - SQ) + 1 keys,
     # so only SQ * SK - SQ * (SQ - 1) / 2 (query, key) pairs are computed.
-    # num_pairs = sq * sk - sq * (sq - 1) / 2 if causal else sq * sk
     if causal and sk > sq:
         num_pairs = sq * sk - sq * (sq - 1) / 2
     elif causal:
@@ -72,16 +74,16 @@ def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    parser = get_parser(kernel_name="MXFP8 MHA forward")
+    parser.description = __doc__
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--q_heads", type=int, default=32, help="number of query heads")
     parser.add_argument(
         "--k_heads",
         type=int,
         default=None,
-        help="number of K/V heads for GQA; defaults to --q-_heads (plain MHA)",
+        help="number of K/V heads for GQA; defaults to --q_heads (plain MHA)",
     )
     parser.add_argument(
         "--seqlen_q", type=int, default=8192, help="query sequence length"
@@ -94,30 +96,31 @@ def main():
     )
     parser.add_argument("--head_dim", type=int, default=128)
     parser.add_argument("--causal", action="store_true", default=False)
-    parser.add_argument(
-        "--rep", type=int, default=500, help="do_bench_cudagraph replay budget, in ms"
-    )
     args = parser.parse_args()
 
-    assert torch.cuda.is_available(), "bench_mha.py needs a GPU"
+    assert torch.cuda.is_available(), "bench_mha_mxfp8.py needs a GPU"
     torch.manual_seed(0)
-    device = torch.device("cuda")
 
     k_heads = args.q_heads if args.k_heads is None else args.k_heads
     assert (
         args.q_heads % k_heads == 0
-    ), f"--q_heads ({args.q_heads}) must be a multiple of --k-heads ({k_heads})"
+    ), f"--q_heads ({args.q_heads}) must be a multiple of --k_heads ({k_heads})"
 
     seqlen_k = args.seqlen_q if args.seqlen_k is None else args.seqlen_k
     assert (
         not args.causal or seqlen_k >= args.seqlen_q
     ), f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
 
-    print("MHA fwd fp8")
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
+    print("MHA fwd mxfp8")
     print(
         f"{'B':>4} {'HQ':>4} {'HK':>4} {'SQ':>7} {'SK':>7} {'D':>5} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}"
     )
     r = bench_case(
+        bencher,
         args.batch,
         args.q_heads,
         k_heads,
@@ -125,8 +128,6 @@ def main():
         seqlen_k,
         args.head_dim,
         args.causal,
-        args.rep,
-        device,
     )
     print(
         f"{args.batch:>4} {args.q_heads:>4} {k_heads:>4} {args.seqlen_q:>7} {seqlen_k:>7} {args.head_dim:>5} "
