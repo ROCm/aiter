@@ -606,7 +606,6 @@ def _mxfp4_inline_sort_unsupported(
     if bias2 is not None and not metadata.stage2_has_bias:
         return "stage2 kernel does not support bias2"
     for name, value in (
-        ("expert_mask", expert_mask),
         ("a1_scale", a1_scale),
         ("a2_scale", a2_scale),
         ("stage2_scatter", stage2_scatter),
@@ -637,7 +636,8 @@ def _mxfp4_inline_sort_unsupported(
         return "cross-device tensors"
 
     p2 = parse_flydsl_v2_gemm2_kernel(metadata.stage2.keywords["kernelName2"])
-    if not _mxfp4_aux_instance_supported(
+    # EP sorts with the masked Opus kernel instead of this generated one.
+    if expert_mask is None and not _mxfp4_aux_instance_supported(
         experts,
         topk_ids.shape[1],
         hidden,
@@ -1244,6 +1244,9 @@ def fused_moe(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1270,7 +1273,13 @@ def fused_moe(
     cache identities, so deployments changing this setting must rebuild their
     FlyDSL AOT cache.
 
+    ``w1_global_scale`` / ``w2_global_scale`` with fp4x2 weights select the
+    gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
+    ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
+    the ``shuffle_scale_nvfp4_moe`` layout.
     """
+    if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
+        raise ValueError("herd_topk does not support NVFP4 global scales")
     has_shared_expert = (
         any(
             tensor is not None
@@ -1300,6 +1309,8 @@ def fused_moe(
             unsupported.append("quant_dtype_a")
         if quant_dtype_a2 is not None:
             unsupported.append("quant_dtype_a2")
+        if w1_global_scale is not None or w2_global_scale is not None:
+            unsupported.append("w1_global_scale / w2_global_scale")
         # The MXFP8 path does not consume caller-prequantized activations and
         # requires an explicit preshuffle marker. Preserve the existing DSV4
         # MXFP4 path, which accepts activation scales and trusts its layout.
@@ -1408,6 +1419,8 @@ def fused_moe(
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
         deterministic=deterministic,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -1454,6 +1467,8 @@ def fused_moe_fake(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1619,8 +1634,12 @@ def _can_use_bf16_g1u1_small_m_direct(
     )
 
 
+# Version 2: v1 ended at `deterministic`; v2 adds `w1_global_scale` and
+# `w2_global_scale`, which turn fp4x2 weights from MXFP4 into NVFP4. A v1
+# provider built for 40 arguments cannot bind 42, and a forwarder that binds
+# them would serve an NVFP4 call as MXFP4, so v1 is not superseded.
 @torch_compile_guard(gen_fake=fused_moe_fake)
-@_route(op="fused_moe", version=1)
+@_route(op="fused_moe", version=2)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1664,6 +1683,8 @@ def fused_moe_(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Route each token to its top-k experts, run both expert projections and
     combine them, weighted by ``topk_weight``.
@@ -1711,6 +1732,11 @@ def fused_moe_(
     * ``herd_topk`` (gfx1250) says ``topk_ids`` and ``topk_weight`` hold K+1
       HERD candidates per token, scaled by ``herd_routed_scaling_factor``;
       with ``herd_topk=0`` that factor is unused.
+    * ``w1_global_scale`` / ``w2_global_scale`` set (fp32 ``[E, 2]`` gate/up
+      and ``[E]``, each ``1 / weight_global_scale``) make fp4x2 weights NVFP4:
+      E4M3 per-16 block scales in ``w1_scale`` / ``w2_scale``, multiplied by
+      the per-expert global scale. Both None is MXFP4 as before. A provider
+      without NVFP4 must decline calls that set them.
 
     A caller may hand the next call on its thread a precomputed sort with
     ``register_presorted_moe``. The registration is consumed below this route,
@@ -1764,6 +1790,8 @@ def fused_moe_(
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
         deterministic=deterministic,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -1802,6 +1830,8 @@ def _fused_moe_impl(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1908,6 +1938,14 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if (w1_global_scale is not None or w2_global_scale is not None) and (
+        q_dtype_w != dtypes.fp4x2 or gate_mode != GateMode.SEPARATED
+    ):
+        raise ValueError(
+            "w1_global_scale / w2_global_scale (NVFP4 MoE) need fp4x2 weights and"
+            f" gate_mode={GateMode.SEPARATED.value!r}, got {q_dtype_w} and"
+            f" {gate_mode.value!r}"
+        )
     q_dtype_a = resolve_activation_dtype(
         quant_type,
         q_dtype_w,
@@ -2157,6 +2195,7 @@ def _fused_moe_impl(
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             _has_input_activation_scales=a1_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            has_global_scale=w1_global_scale is not None or w2_global_scale is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -2318,6 +2357,8 @@ def _fused_moe_impl(
                 gate_mode=gate_mode,
                 q_dtype_a=q_dtype_a,
                 q_dtype_w=q_dtype_w,
+                w1_global_scale=w1_global_scale,
+                w2_global_scale=w2_global_scale,
             )
         )
         return _return_output(full_output, output)
@@ -2413,23 +2454,17 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     elif metadata.output_aux:
-        # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
-        # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
-        # route tokens to the wrong experts, so fail loudly there.
-        if expert_mask is not None and (
-            getattr(metadata.stage2, "func", metadata.stage2)
-            is not _flydsl_v2_stage2_wrapper
-        ):
-            raise NotImplementedError(
-                "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
-                "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
-            )
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
+        _is_opus = _is_mxmoe_opus_metadata(metadata)
+        _g2 = None if _is_opus else parse_g2_kname_any(_kn2)
+        if expert_mask is not None and (_is_opus or not _g2["v2"]):
+            raise NotImplementedError(
+                f"MXMOE GEMM2 {_kn2!r} does not support expert-parallel; "
+                "use a flydsl_moe2_layout_ GEMM2."
+            )
         _atomic = (
-            not stage2_uses_route_reduce(metadata.stage2)
-            if _is_mxmoe_opus_metadata(metadata)
-            else parse_g2_kname_any(_kn2)["atomic"]
+            not stage2_uses_route_reduce(metadata.stage2) if _is_opus else _g2["atomic"]
         )
         # The presort layout has to match both the selected kernels' tile size
         # and the block size the stages are given, which a caller's
@@ -4098,6 +4133,8 @@ def _mxfp4_a4w4_stage2_fw(
     kernelName2="",
     reverse_sorted=None,
     use_valid_token_count=False,
+    expert_mask=None,
+    topk_ids=None,
     **_kwargs,
 ):
 
@@ -4147,6 +4184,8 @@ def _mxfp4_a4w4_stage2_fw(
             topk_weights=topk_weights,
             bias2=bias2,
             block_m=block_m,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
             reverse_sorted=reverse_sorted,
             use_valid_token_count=use_valid_token_count,
         )
@@ -5160,8 +5199,15 @@ def get_2stage_cfgs(
     has_num_local_tokens=False,
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
+    has_global_scale=False,
 ):
     gate_mode = GateMode(gate_mode)
+    if q_dtype_w == dtypes.fp4x2 and has_global_scale:
+        from aiter.ops.moe_nvfp4 import _fused_moe_nvfp4
+
+        if has_stage2_scatter:
+            raise ValueError("NVFP4 fused_moe: stage2_scatter is not supported")
+        return MOEMetadata(None, None, 32, 0, full_impl=_fused_moe_nvfp4)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
     if q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
@@ -5500,11 +5546,6 @@ def get_2stage_cfgs(
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
-        elif _is_inline_sort_cfg(kn1, kn2) and is_ep:
-            cfg = None
-            logger.warning(
-                "[fused_moe] discarding tuned inline-sort config with expert_mask"
-            )
         elif _is_inline_sort_cfg(kn1, kn2):
             inline_metadata = _make_mxfp4_metadata(
                 kn1,
@@ -5636,7 +5677,25 @@ def get_2stage_cfgs(
                 f"sort block_m={cfg.get('block_m', BLOCK_SIZE_M)} and GEMM2 {kn2!r} "
                 f"must both match GEMM1 BM={parsed_g1['BM']}"
             )
-        elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
+        # BM16 makes the masked Opus aux sort use dispatch_policy=1, which hangs
+        # at >= 819 experts (#8014).
+        elif is_ep and parsed_g1["BM"] == 16:
+            reject_reason = "BM16 MXMOE is not supported under EP yet"
+        # MXMOE under EP is validated only for SiTUv2 with an atomic or reduce
+        # layout GEMM2.
+        elif is_ep and activation != ActivationType.Situv2:
+            reject_reason = (
+                f"MXMOE under EP is only validated for SiTUv2, got {activation}"
+            )
+        # Under EP `expert` is the local count, and the masked Opus sort plus the
+        # prequant GEMM1 replace every NE-keyed aux kernel.
+        elif is_ep and parse_flydsl_v2_gemm2_kernel(kn2) is None:
+            reject_reason = f"EP requires a flydsl_moe2_layout_ GEMM2, got {kn2!r}"
+        elif is_ep and parse_flydsl_v2_gemm2_kernel(kn2)["epilog"] == "scatter":
+            reject_reason = "the scatter GEMM2 epilog is not validated under EP"
+        elif not is_ep and not aiter.is_mxfp4_moe_shape_supported(
+            expert, model_dim, inter_dim, topk
+        ):
             reject_reason = (
                 "generated MXFP4 auxiliary kernels do not cover "
                 f"(expert={expert}, model_dim={model_dim}, "
@@ -5646,8 +5705,6 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
             )
-        elif is_ep:
-            reject_reason = "the MXMOE output_aux sort drops expert_mask"
         if reject_reason is not None:
             cfg = None
             logger.warning(
@@ -5758,14 +5815,16 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
-    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
-    # the default heuristics take the 1-stage kernel, which cannot apply
-    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
-    # its default config for this token count. Tuned FlyDSL rows still win.
+    # Calls CK's runtime-limit stage-1 can clamp stay on it: the whole-graph
+    # default clamps the BF16 activations it reads and reports stage1=None.
+    # Same condition as the NotImplementedError gate below (FP8 is already
+    # required here), which defines what that stage-1 accepts.
+    ck_can_clamp_silu = inter_dim % 128 == 0 and q_dtype_a == dtypes.fp8
     if (
         full_impl is None
         and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
         and clamped_silu
+        and not ck_can_clamp_silu
         and q_type == QuantType.per_Token
         and q_dtype_w == dtypes.fp8
         and use_g1u1
@@ -6412,7 +6471,7 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    # The fallback's layout GEMM2 writes bf16 only, and its output_aux sort drops expert_mask.
+    # The fallback's layout GEMM2 writes bf16 only, and it is not validated under EP.
     _mxmoe_fallback_ok = (
         dtype == dtypes.bf16
         and not is_ep
@@ -7031,6 +7090,7 @@ def fused_moe_2stages(
         in (
             _flydsl_stage2_wrapper,
             _flydsl_v2_stage2_wrapper,
+            _mxfp4_a4w4_stage2_fw,
         )
         and expert_mask is not None
     ):

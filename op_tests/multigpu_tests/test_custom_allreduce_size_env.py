@@ -251,6 +251,7 @@ def _stub(gfx1250=True, ws=4, min_size=0, lamport_max_bytes=0, **env):
     )
     ca._cag_max_size = s.ag
     ca._crs_max_size = s.rs
+    ca._crs_first_dim_max_size = s.rs_first_dim
     ca._car_min_size = min_size
     return ca
 
