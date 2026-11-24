@@ -859,11 +859,6 @@ def _mha_varlen_fwd_kernel(
     V_SL: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[HEAD_DIM_V, 32]], [BLOCK_N, HEAD_DIM_V], [1, 0]
     )
-    O_SL: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[HEAD_DIM_V, 128 // o_ptr.type.element_ty.primitive_bitwidth]],
-        [BLOCK_M, HEAD_DIM_V],
-        [1, 0],
-    )
 
     h = gl.program_id(0) % num_heads
     qblk = gl.program_id(0) // num_heads
@@ -1077,134 +1072,170 @@ def _mha_varlen_fwd_kernel(
         gl.barrier()
         k0 = local_load_k(k_smem, 1, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
         kp0 = local_load_k(k_pe_smem, 1, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True)
-        for c in range(tb, te - 1):
-            cb = (c - tb) % 2
-            kc1 = (c + 1 - tb) % NUM_K_BUFFERS
-            kc2 = (c + 2 - tb) % NUM_K_BUFFERS
-            kc3 = (c + 3 - tb) % NUM_K_BUFFERS
-            gl.barrier()
-            with gl.amd.warp_pipeline_stage("stage0"):
-                if EARLY_K:
-                    k1 = local_load_k(k_smem, kc1, 1, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp1 = local_load_k(
-                        k_pe_smem, kc1, 1, BLOCK_N, PE_DIM, KPEL, SLOT=True
+        # Tiles before b need no mask: an unmasked loop, then a masked tail loop.
+        s = gl.minimum(gl.maximum(b - 1, tb), te - 1)
+        for MASK in gl.static_range(2):
+            for c in range(s if MASK else tb, te - 1 if MASK else s):
+                cb = (c - tb) % 2
+                kc1 = (c + 1 - tb) % NUM_K_BUFFERS
+                kc2 = (c + 2 - tb) % NUM_K_BUFFERS
+                kc3 = (c + 3 - tb) % NUM_K_BUFFERS
+                gl.barrier()
+                with gl.amd.warp_pipeline_stage("stage0"):
+                    if EARLY_K:
+                        k1 = local_load_k(
+                            k_smem, kc1, 1, BLOCK_N, HEAD_DIM, KL, SLOT=True
+                        )
+                        kp1 = local_load_k(
+                            k_pe_smem, kc1, 1, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                        )
+                    qk0 = gl.convert_layout(gl.amd.gfx1250.wmma(q, k0, qk_zeros), LPE)
+                    qk0 = gl.convert_layout(gl.amd.gfx1250.wmma(q_pe, kp0, qk0), L)
+                    if not EARLY_K:
+                        k1 = local_load_k(
+                            k_smem, kc1, 1, BLOCK_N, HEAD_DIM, KL, SLOT=True
+                        )
+                        kp1 = local_load_k(
+                            k_pe_smem, kc1, 1, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                        )
+                    p1 = gl.exp2(qk1_shifted)
+                    if PV_SPLIT_K:
+                        if not ROWSUM_MMA:
+                            s1 = gl.sum(p1, 1)
+                        p1 = gl.convert_layout(p1.to(v_ptr.type.element_ty), PL2)
+                    alpha = gl.exp2(m_i - m_use)
+                    m_i = m_ij
+                    acc0 = acc0 * alpha[:, None]
+                    acc1 = acc1 * alpha[:, None]
+                    tdm_load_v(
+                        v_desc,
+                        v_smem,
+                        c + 1,
+                        BLOCK_N,
+                        HEAD_DIM_V,
+                        1,
+                        1 - cb,
+                        c + 1 < te,
                     )
-                qk0 = gl.convert_layout(gl.amd.gfx1250.wmma(q, k0, qk_zeros), LPE)
-                qk0 = gl.convert_layout(gl.amd.gfx1250.wmma(q_pe, kp0, qk0), L)
-                if not EARLY_K:
-                    k1 = local_load_k(k_smem, kc1, 1, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp1 = local_load_k(
-                        k_pe_smem, kc1, 1, BLOCK_N, PE_DIM, KPEL, SLOT=True
-                    )
-                p1 = gl.exp2(qk1_shifted)
-                if PV_SPLIT_K:
-                    if not ROWSUM_MMA:
-                        s1 = gl.sum(p1, 1)
-                    p1 = gl.convert_layout(p1.to(v_ptr.type.element_ty), PL2)
-                alpha = gl.exp2(m_i - m_use)
-                m_i = m_ij
-                acc0 = acc0 * alpha[:, None]
-                acc1 = acc1 * alpha[:, None]
-                tdm_load_v(
-                    v_desc, v_smem, c + 1, BLOCK_N, HEAD_DIM_V, 1, 1 - cb, c + 1 < te
-                )
-            gl.amd.gfx1250.tdm.async_wait(3)
-            with gl.amd.warp_pipeline_stage("stage1"):
-                qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q, k1, qk_zeros), LPE)
-                qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q_pe, kp1, qk1), L)
-                if PV_SPLIT_K:
-                    vb = v_smem.index(cb)
-                    v00 = vb.slice(0, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
-                    v10 = vb.slice(HN, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
-                    if ROWSUM_MMA:
-                        l_acc = (
-                            l_acc
-                            * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[:, None]
+                gl.amd.gfx1250.tdm.async_wait(3)
+                with gl.amd.warp_pipeline_stage("stage1"):
+                    qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q, k1, qk_zeros), LPE)
+                    qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q_pe, kp1, qk1), L)
+                    if PV_SPLIT_K:
+                        vb = v_smem.index(cb)
+                        v00 = (
+                            vb.slice(0, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
+                        )
+                        v10 = (
+                            vb.slice(HN, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
+                        )
+                        if ROWSUM_MMA:
+                            l_acc = (
+                                l_acc
+                                * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[
+                                    :, None
+                                ]
+                            )
+                        else:
+                            l_i = gl.fma(l_i, alpha, s0 + s1)
+                    else:
+                        v0 = local_load_v(
+                            v_smem, cb, 0, BLOCK_N, HEAD_DIM_V, VL, SLOT=True
+                        )
+                        p = concat_subtile(p0, p1)
+                        l_i = gl.fma(l_i, alpha, gl.sum(p, 1))
+                        p_quant = gl.convert_layout(p.to(v_ptr.type.element_ty), PL)
+                if NUM_K_BUFFERS < 3:
+                    gl.barrier()
+                with gl.amd.warp_pipeline_stage("stage2"):
+                    if PV_SPLIT_K:
+                        a0 = gl.convert_layout(acc0, LPE)
+                        a0 = gl.amd.gfx1250.wmma(p0, v00, a0)
+                        acc0 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, v10, a0), L)
+                        if ROWSUM_MMA:
+                            l_acc = gl.amd.gfx1250.wmma(p0, ones_v, l_acc)
+                            l_acc = gl.amd.gfx1250.wmma(p1, ones_v, l_acc)
+                        v01 = (
+                            vb.slice(0, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2)
+                        )
+                        v11 = (
+                            vb.slice(HN, HN, dim=0)
+                            .slice(HV, HV, dim=1)
+                            .load(layout=VL2)
                         )
                     else:
-                        l_i = gl.fma(l_i, alpha, s0 + s1)
-                else:
-                    v0 = local_load_v(v_smem, cb, 0, BLOCK_N, HEAD_DIM_V, VL, SLOT=True)
-                    p = concat_subtile(p0, p1)
-                    l_i = gl.fma(l_i, alpha, gl.sum(p, 1))
-                    p_quant = gl.convert_layout(p.to(v_ptr.type.element_ty), PL)
-            if NUM_K_BUFFERS < 3:
-                gl.barrier()
-            with gl.amd.warp_pipeline_stage("stage2"):
-                if PV_SPLIT_K:
-                    a0 = gl.convert_layout(acc0, LPE)
-                    a0 = gl.amd.gfx1250.wmma(p0, v00, a0)
-                    acc0 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, v10, a0), L)
-                    if ROWSUM_MMA:
-                        l_acc = gl.amd.gfx1250.wmma(p0, ones_v, l_acc)
-                        l_acc = gl.amd.gfx1250.wmma(p1, ones_v, l_acc)
-                    v01 = vb.slice(0, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2)
-                    v11 = vb.slice(HN, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2)
-                else:
-                    acc0 = gl.amd.gfx1250.wmma(p_quant, v0, acc0)
-                    v1 = local_load_v(v_smem, cb, 1, BLOCK_N, HEAD_DIM_V, VL, SLOT=True)
-                tdm_load_k(k_desc, k_smem, c + 3, BLOCK_N, HEAD_DIM, 1, kc3, c + 3 < te)
-                tdm_load_k(
-                    k_pe_desc, k_pe_smem, c + 3, BLOCK_N, PE_DIM, 1, kc3, c + 3 < te
-                )
-                if c + 1 >= b:
-                    qk0 = apply_mask_varlen(
-                        qk0,
-                        0,
-                        tile_m,
-                        c + 1,
-                        BLOCK_M,
-                        BLOCK_N,
-                        seqlen_k,
-                        True,
-                        causal_off,
-                        L,
-                        CAUSAL,
-                        False,
+                        acc0 = gl.amd.gfx1250.wmma(p_quant, v0, acc0)
+                        v1 = local_load_v(
+                            v_smem, cb, 1, BLOCK_N, HEAD_DIM_V, VL, SLOT=True
+                        )
+                    tdm_load_k(
+                        k_desc, k_smem, c + 3, BLOCK_N, HEAD_DIM, 1, kc3, c + 3 < te
                     )
-                    qk1 = apply_mask_varlen(
-                        qk1,
-                        1,
-                        tile_m,
-                        c + 1,
-                        BLOCK_M,
-                        BLOCK_N,
-                        seqlen_k,
-                        True,
-                        causal_off,
-                        L,
-                        CAUSAL,
-                        False,
+                    tdm_load_k(
+                        k_pe_desc, k_pe_smem, c + 3, BLOCK_N, PE_DIM, 1, kc3, c + 3 < te
                     )
-                qk = concat_subtile(qk0, qk1)
-                m_row = gl.reduce(qk, 1, fast_maximum) * qk_scale
-            gl.amd.gfx1250.tdm.async_wait(3)
-            with gl.amd.warp_pipeline_stage("stage3"):
-                if EARLY_K:
-                    k0 = local_load_k(k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp0 = local_load_k(
-                        k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
-                    )
-                if PV_SPLIT_K:
-                    a1 = gl.convert_layout(acc1, LPE)
-                    a1 = gl.amd.gfx1250.wmma(p0, v01, a1)
-                    acc1 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, v11, a1), L)
-                else:
-                    acc1 = gl.amd.gfx1250.wmma(p_quant, v1, acc1)
-                if not EARLY_K:
-                    k0 = local_load_k(k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp0 = local_load_k(
-                        k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
-                    )
-                m_ij = fast_maximum(m_i, m_row)
-                m_use = gl.where(m_ij == float("-inf"), 0.0, m_ij)
-                qk0_shifted = qk0 * qk_scale - m_use[:, None]
-                qk1_shifted = qk1 * qk_scale - m_use[:, None]
-                p0 = gl.exp2(qk0_shifted)
-                if PV_SPLIT_K:
-                    if not ROWSUM_MMA:
-                        s0 = gl.sum(p0, 1)
-                    p0 = gl.convert_layout(p0.to(v_ptr.type.element_ty), PL2)
+                    if MASK:
+                        qk0 = apply_mask_varlen(
+                            qk0,
+                            0,
+                            tile_m,
+                            c + 1,
+                            BLOCK_M,
+                            BLOCK_N,
+                            seqlen_k,
+                            True,
+                            causal_off,
+                            L,
+                            CAUSAL,
+                            False,
+                        )
+                        qk1 = apply_mask_varlen(
+                            qk1,
+                            1,
+                            tile_m,
+                            c + 1,
+                            BLOCK_M,
+                            BLOCK_N,
+                            seqlen_k,
+                            True,
+                            causal_off,
+                            L,
+                            CAUSAL,
+                            False,
+                        )
+                    qk = concat_subtile(qk0, qk1)
+                    m_row = gl.reduce(qk, 1, fast_maximum) * qk_scale
+                gl.amd.gfx1250.tdm.async_wait(3)
+                with gl.amd.warp_pipeline_stage("stage3"):
+                    if EARLY_K:
+                        k0 = local_load_k(
+                            k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True
+                        )
+                        kp0 = local_load_k(
+                            k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                        )
+                    if PV_SPLIT_K:
+                        a1 = gl.convert_layout(acc1, LPE)
+                        a1 = gl.amd.gfx1250.wmma(p0, v01, a1)
+                        acc1 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, v11, a1), L)
+                    else:
+                        acc1 = gl.amd.gfx1250.wmma(p_quant, v1, acc1)
+                    if not EARLY_K:
+                        k0 = local_load_k(
+                            k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True
+                        )
+                        kp0 = local_load_k(
+                            k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                        )
+                    m_ij = fast_maximum(m_i, m_row)
+                    m_use = gl.where(m_ij == float("-inf"), 0.0, m_ij)
+                    qk0_shifted = qk0 * qk_scale - m_use[:, None]
+                    qk1_shifted = qk1 * qk_scale - m_use[:, None]
+                    p0 = gl.exp2(qk0_shifted)
+                    if PV_SPLIT_K:
+                        if not ROWSUM_MMA:
+                            s0 = gl.sum(p0, 1)
+                        p0 = gl.convert_layout(p0.to(v_ptr.type.element_ty), PL2)
         p1 = gl.exp2(qk1_shifted)
         alpha = gl.exp2(m_i - m_use)
         m_i = m_ij
@@ -1262,23 +1293,17 @@ def _mha_varlen_fwd_kernel(
     # Rows without a visible key: o = 0, lse = -inf.
     l_safe = gl.where(l_i == 0.0, 1.0, l_i)
     out = acc * (o_scale / l_safe)[:, None]
-    o_smem = gl.allocate_shared_memory(
-        o_ptr.type.element_ty, [BLOCK_M, HEAD_DIM_V], O_SL
-    )
-    o_smem.store(out.to(o_ptr.type.element_ty))
-    gl.barrier()
-    o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=o_ptr
+    # Store from registers: TDM store has hardware issues on gfx1250 (see #7202).
+    o_base = (
+        o_ptr
         + (q_start + m0).to(gl.int64) * stride_o_t
         + h * stride_o_h
-        + split * stride_o_s,
-        shape=(seqlen_q - m0, HEAD_DIM_V),
-        strides=(stride_o_t, 1),
-        block_shape=(BLOCK_M, HEAD_DIM_V),
-        layout=O_SL,
+        + split * stride_o_s
     )
-    gl.amd.gfx1250.tdm.async_store(o_desc, [0, 0], o_smem)
-    gl.amd.gfx1250.tdm.async_wait(0)
+    offs_o = offs_m[:, None] * stride_o_t + offs_d[None, :]
+    gl.amd.gfx1250.buffer_store(
+        out.to(o_ptr.type.element_ty), o_base, offs_o, mask=row_ok[:, None]
+    )
     if RETURN_LSE:
         lse = gl.where(l_i == 0.0, float("-inf"), m_i * LN2 + gl.log(l_safe))
         gl.store(lse_rows + split * stride_lse_s, lse, mask=row_ok)

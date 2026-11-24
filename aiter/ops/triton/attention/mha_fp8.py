@@ -11,8 +11,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fp8 import (
     _mha_varlen_fwd_fp8,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import (
-    _mha_varlen_fwd_kernel,
     _mha_fwd_subtiled,
+    _mha_varlen_fwd_kernel,
 )
 from aiter.ops.triton.attention.utils import lse_merge
 from aiter.ops.triton.utils._triton.arch_info import get_arch

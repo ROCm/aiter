@@ -296,141 +296,131 @@ def _skip_unless_gfx1250():
         pytest.skip("Only supported on gfx1250")
 
 
-@pytest.mark.parametrize(
-    "causal, q_lens, k_lens, hq, hk, dv",
-    [
-        (True, [1024], [1024], 24, 24, 128),
-        (True, [1000, 37, 2048, 1, 513], [1000, 37, 2048, 1, 513], 24, 24, 128),
-        (True, [300, 1000], [900, 1000], 8, 8, 128),  # seqlen_k > seqlen_q
-        (True, [300], [100], 4, 4, 128),  # seqlen_k < seqlen_q: rows without keys
-        (False, [256], [256], 24, 24, 128),  # short keys
-        (False, [700], [5000], 24, 4, 128),  # GQA
-        (False, [777, 64], [5000, 130], 16, 16, 128),
-        (False, [512], [65536], 24, 24, 128),  # split-KV
-        (True, [600, 100], [600, 100], 8, 8, 64),
-        (False, [300], [5000], 8, 2, 64),
-    ],
-)
-@pytest.mark.parametrize("return_lse", [True, False])
-def test_mha_varlen_fp8_shared_pe(causal, q_lens, k_lens, hq, hk, dv, return_lse):
-    """return_lse=False is the default path. It uses other kernel options."""
-    _skip_unless_gfx1250()
-    q, k, v, k_pe = generate_varlen_pe_fp8_inputs(q_lens, k_lens, hq, hk, dv)
-    res = mha_varlen_fwd(
-        q, k, v, _cu(q_lens), _cu(k_lens), max(q_lens), max(k_lens),
-        None, None, None,
-        softmax_scale=QK_SCALE, causal=causal, return_lse=return_lse, k_pe=k_pe,
-    )  # fmt: skip
-    o, lse = res if return_lse else (res, None)
-    check_varlen_pe(o, lse, *varlen_pe_ref(q, k, v, k_pe, q_lens, k_lens, causal))
-
-
-@pytest.mark.parametrize("pad", [0, 50])
-def test_mha_varlen_fp8_split_kv_pad(pad):
-    _skip_unless_gfx1250()
-    q, k, v, cu_q, cu_k, q_scale, k_scale, v_scale, out, lse = (
-        generate_mha_varlen_fp8_inputs([200, 312], [40000, 30000], 16, pad)
+def _seq_ids(lens):
+    return torch.repeat_interleave(
+        torch.arange(len(lens), device="cuda"), torch.tensor(lens, device="cuda")
     )
-    mha_varlen_fwd(
-        q, k, v, cu_q, cu_k, 312, 40000, q_scale, k_scale, v_scale,
-        return_lse=True, out=out, lse=lse,
-    )  # fmt: skip
-    qf, kf, vf = q.float() * q_scale, k.float() * k_scale, v.float() * v_scale
-    ref = varlen_pe_ref(
-        qf[:512], kf[..., :QK_NOPE_D], vf, kf[..., QK_NOPE_D:], [200, 312], [40000, 30000],
-        False, sm_scale=q.shape[-1] ** -0.5,
-    )  # fmt: skip
-    check_varlen_pe(out[:512], lse[:, :512], *ref)
-    assert (out[512:] == 7.0).all() and (lse[:, 512:] == 7.0).all()
 
 
-@pytest.mark.parametrize("return_lse", [True, False])
-@pytest.mark.parametrize("zero", ["softmax_scale", "q_descale"])
-@pytest.mark.parametrize("causal", [True, False])
-def test_mha_varlen_fp8_shared_pe_zero_scale(causal, zero, return_lse):
-    """A zero softmax or q scale gives equal weights to the visible keys, without NaN or Inf."""
-    _skip_unless_gfx1250()
-    q_lens, k_lens, h = [300, 100], [500, 100], 8
-    q, k, v, k_pe = generate_varlen_pe_fp8_inputs(q_lens, k_lens, h, h, seed=4)
-    ones = lambda: torch.ones((len(q_lens), h), dtype=torch.float32, device="cuda")
-    q_scale, k_scale, v_scale = ones(), ones(), ones()
-    sm_scale = 0.0 if zero == "softmax_scale" else QK_SCALE
-    if zero == "q_descale":
-        q_scale[0] = 0.0
-    res = mha_varlen_fwd(
-        q, k, v, _cu(q_lens), _cu(k_lens), max(q_lens), max(k_lens),
-        q_scale, k_scale, v_scale,
-        softmax_scale=sm_scale, causal=causal, return_lse=return_lse, k_pe=k_pe,
-    )  # fmt: skip
-    o, lse = res if return_lse else (res, None)
-    seq_q = torch.repeat_interleave(
-        torch.arange(len(q_lens), device="cuda"), torch.tensor(q_lens, device="cuda")
-    )
-    q_ref = q.float() * q_scale[seq_q][..., None]
-    ref = varlen_pe_ref(q_ref, k, v, k_pe, q_lens, k_lens, causal, sm_scale=sm_scale)
-    assert torch.isfinite(o.float()).all()
-    check_varlen_pe(o, lse, *ref)
+def generate_varlen_pe_scaled_inputs(q_lens, k_lens, hq, hk, dv, scales, seed=0):
+    """fp8 inputs and dequant scales for one ``scales`` mode, and their fp32 values for the reference.
 
+    none: no scales. per_seq: per-sequence amax scales (k_pe shares the k scale).
+    zero_softmax: unit scales, softmax scale 0. zero_q: q_descale 0 for the first sequence.
+    """
+    n = len(q_lens)
+    if scales != "per_seq":
+        q, k, v, k_pe = generate_varlen_pe_fp8_inputs(q_lens, k_lens, hq, hk, dv, seed)
+        if scales == "none":
+            return q, k, v, k_pe, (None, None, None), QK_SCALE, (q, k, v, k_pe)
+        ones = [
+            torch.ones((n, h), dtype=torch.float32, device="cuda") for h in (hq, hk, hk)
+        ]
+        if scales == "zero_q":
+            ones[0][0] = 0.0
+        sm_scale = 0.0 if scales == "zero_softmax" else QK_SCALE
+        q_ref = q.float() * ones[0][_seq_ids(q_lens)][..., None]
+        return q, k, v, k_pe, tuple(ones), sm_scale, (q_ref, k, v, k_pe)
 
-@pytest.mark.parametrize("causal", [True, False])
-def test_mha_varlen_fp8_shared_pe_scales(causal):
-    """Per-sequence dequant scales; k_pe is shared by the heads, so the k scale is per sequence."""
-    _skip_unless_gfx1250()
-    q_lens, k_lens, hq, hk = [700, 300], [900, 300], 24, 4
     tq, tk, f8 = sum(q_lens), sum(k_lens), torch.float8_e4m3fn
-    seq_q = torch.repeat_interleave(
-        torch.arange(len(q_lens), device="cuda"), torch.tensor(q_lens, device="cuda")
-    )
-    seq_k = torch.repeat_interleave(
-        torch.arange(len(k_lens), device="cuda"), torch.tensor(k_lens, device="cuda")
-    )
+    seq_q, seq_k = _seq_ids(q_lens), _seq_ids(k_lens)
     g = torch.Generator(device="cuda")
-    g.manual_seed(3)
+    g.manual_seed(seed)
 
     def rnd(*shape):
         return 0.5 * torch.randn(shape, dtype=torch.float32, device="cuda", generator=g)
 
-    def amax_per_seq(x, seq, n):
+    def amax_per_seq(x, seq):
         """amax over the tokens (and the last dim) of each sequence: [n, x.shape[1]]."""
         out = torch.zeros((n, x.shape[1]), dtype=torch.float32, device="cuda")
         return out.index_reduce_(0, seq, x.abs().amax(-1), "amax")
 
     q_f, kv_f, kpe_f = (
         rnd(tq, hq, QK_NOPE_D + ROPE_D),
-        rnd(tk, hk, 256),
+        rnd(tk, hk, QK_NOPE_D + dv),
         rnd(tk, 1, ROPE_D),
     )
-    q_scale = amax_per_seq(q_f, seq_q, len(q_lens)) / 448.0
+    q_scale = amax_per_seq(q_f, seq_q) / 448.0
     k_amax = torch.maximum(
-        amax_per_seq(kv_f[..., :QK_NOPE_D], seq_k, len(k_lens)).amax(1, keepdim=True),
-        amax_per_seq(kpe_f, seq_k, len(k_lens)),
+        amax_per_seq(kv_f[..., :QK_NOPE_D], seq_k).amax(1, keepdim=True),
+        amax_per_seq(kpe_f, seq_k),
     )
     k_scale = (k_amax / 448.0).expand(-1, hk).contiguous()
-    v_scale = amax_per_seq(kv_f[..., QK_NOPE_D:], seq_k, len(k_lens)) / 448.0
+    v_scale = amax_per_seq(kv_f[..., QK_NOPE_D:], seq_k) / 448.0
     q = (q_f / q_scale[seq_q][..., None]).to(f8)
-    kv = torch.empty((tk, hk, 256), dtype=f8, device="cuda")
+    kv = torch.empty((tk, hk, QK_NOPE_D + dv), dtype=f8, device="cuda")
     kv[..., :QK_NOPE_D] = (kv_f[..., :QK_NOPE_D] / k_scale[seq_k][..., None]).to(f8)
     kv[..., QK_NOPE_D:] = (kv_f[..., QK_NOPE_D:] / v_scale[seq_k][..., None]).to(f8)
-    k, v = kv.split([QK_NOPE_D, 128], dim=-1)
+    k, v = kv.split([QK_NOPE_D, dv], dim=-1)
     pe_buf = torch.empty((tk, 512 + ROPE_D), dtype=f8, device="cuda")
     pe_buf[:, 512:] = (kpe_f[:, 0] / k_scale[seq_k][:, :1]).to(f8)
     k_pe = pe_buf[:, 512:].unsqueeze(1)
-    o, lse = mha_varlen_fwd(
-        q, k, v, _cu(q_lens), _cu(k_lens), max(q_lens), max(k_lens),
-        q_scale, k_scale, v_scale,
-        softmax_scale=QK_SCALE, causal=causal, return_lse=True, k_pe=k_pe,
-    )  # fmt: skip
     ks = k_scale[seq_k][..., None]
-    ref = varlen_pe_ref(
+    ref = (
         q.float() * q_scale[seq_q][..., None],
         k.float() * ks,
         v.float() * v_scale[seq_k][..., None],
         k_pe.float().expand(-1, hk, -1) * ks,
-        q_lens,
-        k_lens,
-        causal,
     )
-    check_varlen_pe(o, lse, *ref)
+    return q, k, v, k_pe, (q_scale, k_scale, v_scale), QK_SCALE, ref
+
+
+@pytest.mark.parametrize(
+    "causal, q_lens, k_lens, hq, hk, dv, scales",
+    [
+        (True, [1024], [1024], 24, 24, 128, "none"),
+        (True, [1000, 37, 2048, 1, 513], [1000, 37, 2048, 1, 513], 24, 24, 128, "none"),
+        (True, [300, 1000], [900, 1000], 8, 8, 128, "none"),  # seqlen_k > seqlen_q
+        # seqlen_k < seqlen_q: rows without keys
+        (True, [300], [100], 4, 4, 128, "none"),
+        (False, [256], [256], 24, 24, 128, "none"),  # short keys
+        (False, [700], [5000], 24, 4, 128, "none"),  # GQA
+        (False, [777, 64], [5000, 130], 16, 16, 128, "none"),
+        (False, [512], [65536], 24, 24, 128, "none"),  # split-KV
+        # split-KV, two sequences
+        (False, [200, 312], [40000, 30000], 16, 16, 128, "per_seq"),
+        (True, [600, 100], [600, 100], 8, 8, 64, "none"),
+        (False, [300], [5000], 8, 2, 64, "none"),
+        (True, [700, 300], [900, 300], 24, 4, 128, "per_seq"),
+        (False, [700, 300], [900, 300], 24, 4, 128, "per_seq"),
+        (True, [300, 100], [500, 100], 8, 8, 128, "zero_softmax"),
+        (False, [300, 100], [500, 100], 8, 8, 128, "zero_softmax"),
+        (True, [300, 100], [500, 100], 8, 8, 128, "zero_q"),
+        (False, [300, 100], [500, 100], 8, 8, 128, "zero_q"),
+    ],
+)
+@pytest.mark.parametrize("return_lse", [True, False])
+def test_mha_varlen_fp8_shared_pe(
+    causal, q_lens, k_lens, hq, hk, dv, scales, return_lse
+):
+    """k_pe shared by the heads, as vLLM passes it. return_lse=False is the default path, with other
+    kernel options. A zero softmax or q scale gives equal weights to the visible keys. Rows after
+    cu_seqlens_q[-1] must not be written."""
+    _skip_unless_gfx1250()
+    q, k, v, k_pe, (q_scale, k_scale, v_scale), sm_scale, ref_in = (
+        generate_varlen_pe_scaled_inputs(q_lens, k_lens, hq, hk, dv, scales)
+    )
+    tq, pad = sum(q_lens), 50
+    q = torch.cat([q, q[:pad]])
+    out = torch.full((tq + pad, hq, dv), 7.0, dtype=torch.bfloat16, device="cuda")
+    lse = (
+        torch.full((hq, tq + pad), 7.0, dtype=torch.float32, device="cuda")
+        if return_lse
+        else None
+    )
+    res = mha_varlen_fwd(
+        q, k, v, _cu(q_lens), _cu(k_lens), max(q_lens), max(k_lens),
+        q_scale, k_scale, v_scale,
+        softmax_scale=sm_scale, causal=causal, return_lse=return_lse, out=out, lse=lse,
+        k_pe=k_pe,
+    )  # fmt: skip
+    o = res[0] if return_lse else res
+    ref = varlen_pe_ref(*ref_in, q_lens, k_lens, causal, sm_scale=sm_scale)
+    assert torch.isfinite(o[:tq].float()).all()
+    check_varlen_pe(o[:tq], None if lse is None else lse[:, :tq], *ref)
+    assert (out[tq:] == 7.0).all(), "rows outside cu_seqlens_q were written"
+    if lse is not None:
+        assert (lse[:, tq:] == 7.0).all(), "LSE outside cu_seqlens_q was written"
 
 
 @pytest.mark.parametrize("context_first", [True, False])
