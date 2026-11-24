@@ -13,6 +13,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -25,20 +26,14 @@ _CONFIG_NAME = "FUSED_BF16_BMM_NVFP4_QUANT_MLA"
 # R1 MLA: the NoPE head dim P and the KV LoRA rank L.
 D_NOPE = 128
 KV_LORA = 512
-_CU_COUNT: dict = {}
 
 
 def _get_config() -> dict:
-    cfg_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
+    # Both supported archs read the gfx1250 tree; there is no gfx1250-strict one.
+    cfg_dir = resolve_config_dir(
+        "fusions", _CONFIG_NAME, backend="gluon", arch="gfx1250"
+    )
     return dict(load_config_json(f"{cfg_dir}/DEFAULT.json")["any"])
-
-
-def _cu_count(device: torch.device) -> int:
-    if device not in _CU_COUNT:
-        _CU_COUNT[device] = torch.cuda.get_device_properties(
-            device
-        ).multi_processor_count
-    return _CU_COUNT[device]
 
 
 def fused_bf16_bmm_nvfp4_quant_mla(
@@ -54,7 +49,12 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     (``batched_gemm_bf16``) followed by the NoPE part of
     ``aiter.ops.mla_nvfp4.mla_nvfp4_quantize_q``: per row, a block of 16
     values gets the E4M3 scale of amax / 6 at the gain 6.72, and E2M1 codes
-    over that scale. A block that holds an Inf gets other bytes.
+    over that scale. That holds while every value over its block's divisor
+    stays below 2**25, that is for every absorbed value below about 2.2e9 in
+    magnitude (only a scale saturated at 448 lets the quotient pass 6). Past
+    that the codes saturate to 6.0, where the scalar producer's nearest-code
+    search, comparing FP32 distances that round alike, keeps 4.0. A block
+    that holds an Inf gets other bytes.
 
     Args:
         q_nope (torch.Tensor): ``(B, H, 128)`` BF16. The last dim must have
@@ -91,6 +91,7 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     )
     assert q_nope.data_ptr() % 16 == 0, "q_nope rows must be 16-byte aligned"
     assert w_uk.is_contiguous(), "w_uk must be contiguous"
+    assert w_uk.data_ptr() % 16 == 0, "w_uk must be 16-byte aligned"
     if q_nope_fp4 is None:
         q_nope_fp4 = torch.empty(
             (batch, heads, KV_LORA // 2), dtype=torch.uint8, device=q_nope.device
@@ -105,13 +106,19 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     )
     assert q_aux.shape == (batch, heads, 128) and q_aux.dtype == torch.uint8
     assert q_nope_fp4.is_contiguous() and q_aux.is_contiguous()
+    # The TDM stores need 16-byte bases; a contiguous view can start anywhere.
+    assert (
+        q_nope_fp4.data_ptr() % 16 == 0 and q_aux.data_ptr() % 16 == 0
+    ), "q_nope_fp4 and q_aux must be 16-byte aligned"
     if batch == 0:
         return q_nope_fp4, q_aux
 
     config = _get_config()
     block_m, num_warps = config["BLOCK_M"], config["num_warps"]
     block_n = KV_LORA // 2
-    splits = max(1, _cu_count(q_nope.device) // heads)
+    with torch.cuda.device(q_nope.device):
+        cus = get_num_sms()
+    splits = max(1, cus // heads)
     tiles = triton.cdiv(triton.cdiv(batch, block_m), splits)
     warp_bases = tuple(tuple(base) for base in config["WARP_BASES"])
     wmma, op_a, op_b = create_wmma_layouts(num_warps, warp_bases)

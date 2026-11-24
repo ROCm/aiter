@@ -92,7 +92,9 @@ def reference(q_nope, w_uk):
     return quantize_reference(out)
 
 
-@pytest.mark.parametrize("batch", [1, 37, 64, 65, 300, 1536, 2047, 2048, 2049, 2200, 2240, 2300])
+@pytest.mark.parametrize(
+    "batch", [1, 37, 64, 65, 300, 1536, 2047, 2048, 2049, 2200, 2240, 2300]
+)
 @pytest.mark.parametrize("q_width", [D_NOPE, 192])
 def test_fused_bf16_bmm_nvfp4_quant_mla(batch, q_width):
     q_nope, w_uk, q_nope_fp4, q_aux = generate_inputs(
@@ -138,6 +140,38 @@ def test_rejects_bad_inputs():
         fused_bf16_bmm_nvfp4_quant_mla(q_nope.float(), w_uk, codes, aux)
     with pytest.raises(AssertionError):
         fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes[:, :, :128], aux)
+    # Contiguous, but off a 16-byte boundary.
+    raw = torch.empty(aux.numel() + 1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(AssertionError):
+        fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, raw[1:].view(aux.shape))
+
+
+def test_codes_saturate_past_the_scale_range():
+    """Absorbed values of +-2**39 overflow the block scale: it saturates at 448
+    (E4M3 0x7E) and every code at +-6.0 (7 and 15)."""
+    q_nope = torch.full(
+        (1, HEADS, D_NOPE), 65536.0, dtype=torch.bfloat16, device="cuda"
+    )
+    w_uk = torch.full(
+        (HEADS, KV_LORA, D_NOPE), 65536.0, dtype=torch.bfloat16, device="cuda"
+    )
+    w_uk[:, 1::2] = -65536.0
+    codes, aux = fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk)
+    assert (aux[..., 64:96] == 0x7E).all()
+    assert (codes == (7 | (15 << 4))).all()
+    assert torch.equal(codes, reference(q_nope, w_uk)[0])
+
+
+def test_runs_under_the_strict_arch_alias(monkeypatch):
+    import aiter.ops.triton.fusions.fused_bf16_bmm_nvfp4_quant_mla as op
+    from aiter.ops.triton.utils._triton import arch_info
+
+    q_nope, w_uk, codes, aux = generate_inputs(37)
+    want = reference(q_nope, w_uk)[0]
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250-strict")
+    monkeypatch.setattr(op, "get_arch", lambda: "gfx1250-strict")
+    fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux)
+    assert torch.equal(codes, want)
 
 
 @pytest.mark.parametrize("batch", [37, 2049, 2300])

@@ -53,7 +53,11 @@ def bench_fn(bencher, batch, heads, metric):
 
 
 def run_benchmark(args):
-    batches = [args.M] if args.M else [1, 32, 64, 128, 256, 512, 1024, 1536, 2048, 2200, 2240, 2300]
+    batches = (
+        [args.M]
+        if args.M
+        else [1, 32, 64, 128, 256, 512, 1024, 1536, 2048, 2200, 2240, 2300]
+    )
     benchmark = triton.testing.Benchmark(
         x_names=["batch"],
         x_vals=batches,
