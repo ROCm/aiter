@@ -258,7 +258,7 @@ def gdn_fused_prefill_fwd(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    exe = compile_gdn_fused_prefill(
+    exe = compile_gdn_fused_prefill.lazy(
         H=H,
         Hg=Hg,
         BV=_pick_bv(N, H, q.device),

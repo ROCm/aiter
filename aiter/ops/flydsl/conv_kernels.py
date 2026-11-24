@@ -14,9 +14,11 @@ import os
 import weakref
 
 import torch
+from flydsl.compiler.kernel_function import CompilationContext
 
 from .kernels.conv.conv3d_gfx950_utils import (
     BF16_BYTES,
+    CONV_COMPILE_HINTS,
     DEFAULT_TILE,
     LDG_VEC,
     MAX_DYN_DIVIDEND,
@@ -36,6 +38,7 @@ from .kernels.conv.conv3d_transpose import (
     TR_VEC,
     compile_transpose_ncdhw_ndhwc,
 )
+from .kernels.tensor_shim import _run_compiled
 
 # ---------------------------------------------------------------------------
 # Which cards this op runs on
@@ -610,17 +613,13 @@ def _pick_wgm(npq, k, groups, tile, device):
 
 
 def _dispatch(exe, *args, stream=None):
-    """Run a builder's launcher, pre-compiling on first use.
+    """Run a builder's launcher through ``_run_compiled`` (the AOT cache).
 
     ``extra_args`` are the trailing scalars a variable-resolution conv3d takes
-    on top of its tensors; empty for every other kernel. ``exe.compile``
-    appends them itself, so they are only spelled out on the steady-state call.
+    on top of its tensors (the transpose's ``s``); empty for every other kernel.
     """
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        exe._cf = exe.compile(*args, stream=stream)
-        return
-    cf(*args, *getattr(exe, "extra_args", ()), _as_stream(stream))
+    with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+        _run_compiled(exe.launcher, *args, *exe.extra_args, _as_stream(stream))
 
 
 def _ncdhw_to_ndhwc(x, stream):
