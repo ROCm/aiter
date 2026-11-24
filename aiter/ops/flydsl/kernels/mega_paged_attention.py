@@ -12,8 +12,9 @@ kernel):
 
 1. attention: tasks of S 256-token tiles of a row's paged KV, each run by
    ``pa_decode``'s own tile pipeline and written as a partial (row max, row
-   sum, normalized output). S = ceil(tiles / grid), up to
-   ``max_tiles_per_task``, so a launch has about one task a CTA;
+   sum, normalized output). S (up to ``max_tiles_per_task``) minimizes the
+   rounds of tasks over the grid times a task's cost; a CTA claims tasks
+   past its first;
 2. merge + per-token FP8: the CTA that lands a row's last partial merges the
    row's partials as ``pa_decode``'s reducer does, rounds the row to bf16 (the
    unfused PA output) and publishes it as FP8 with one scale, as
@@ -47,6 +48,9 @@ chain up to 6 us a launch.
 * ``ROW_COUNT`` line ``row``: partials landed a row; the merging CTA zeroes it.
 * ``ROWS_DONE`` line ``parity``: rows published this launch. A launch uses the parity
   of its epoch and zeroes the other one for the next launch.
+* ``TASK_CLAIM`` line ``parity``: attention tasks past each CTA's first,
+  claimed this launch (when there are more tasks than CTAs), the same way: a
+  CU whose CTAs run alone takes more of them.
 * ``TILE_CLAIM`` line ``parity``: o_proj tiles claimed this launch, the same way. CTAs
   claim tiles as they finish attention, so the last ones to finish (on the
   critical path) are the ones left without a tile, and a claimed tile's W
@@ -97,15 +101,20 @@ from .pa_decode.traits import (
 from .tensor_shim import buf_base_i64, ptr_buf_tensor
 from .utils import rcp_f32
 
-# Rows the task planner scans with one wave.
-MAX_ROWS = WAVE
+# The most rows a launch takes; the task planner gives a wave lane
+# MAX_ROWS / WAVE of them.
+MAX_ROWS = 2 * WAVE
+# o_proj runs a tile in passes of up to PASS_ROWS rows: the W slice stays in
+# VGPRs across them, the accumulators and the LDS partial tile are a pass's.
+PASS_ROWS = WAVE
 # ``sync`` layout, in int32 words: a 128 B cache line a counter (a CTA's epoch
 # is read and written once a launch, so those share lines).
 SYNC_LINE = 32
 ROW_COUNT = 0
 ROWS_DONE = MAX_ROWS * SYNC_LINE
 TILE_CLAIM = ROWS_DONE + 2 * SYNC_LINE
-EPOCH = TILE_CLAIM + 2 * SYNC_LINE
+TASK_CLAIM = TILE_CLAIM + 2 * SYNC_LINE
+EPOCH = TASK_CLAIM + 2 * SYNC_LINE
 # ``trace`` int64 stamps a CTA: start, phases 1-2 done, rows ready, phase 3
 # done, phase 4 done; then the ticks its PA tasks took, the ticks landing
 # their partials took (merges included) and its task count, all accumulated.
@@ -423,6 +432,9 @@ def compile_mega_paged_attention(
     # waves split K, so no operand is loaded twice, and their partial sums
     # meet in LDS in wave order.
     m_sub = max_rows // 16
+    pass_subs = min(m_sub, PASS_ROWS // 16)
+    # (first M subtile, M subtiles) of each pass.
+    passes = [(m0, min(pass_subs, m_sub - m0)) for m0 in range(0, m_sub, pass_subs)]
     if hidden % block_n or block_n % 16:
         raise ValueError(
             f"block_n {block_n} must be a multiple of 16 dividing {hidden}"
@@ -437,10 +449,13 @@ def compile_mega_paged_attention(
     if prefetch is None:
         # x, W and the accumulators of a wave, in VGPRs: every x step in flight
         # while that still fits next to the PA tile's budget.
-        all_x = 4 * (m_sub * k_steps + n_sub * k_steps + m_sub * n_sub)
+        all_x = 4 * (pass_subs * k_steps + n_sub * k_steps + pass_subs * n_sub)
         prefetch = k_steps if all_x <= 240 else min(4, k_steps)
-    tile_atoms = max_rows * block_n // ATOM_COLS
-    push_iters = -(-tile_atoms // threads)
+        if len(passes) > 1:
+            # A later pass's x loads would spill the W slice it shares.
+            prefetch = min(2, k_steps)
+    # A full pass's atoms; a thread's share of them.
+    push_iters = -(-(16 * pass_subs * block_n // ATOM_COLS) // threads)
     if hidden % (ATOM_COLS * threads):
         raise NotImplementedError(
             f"hidden {hidden} must split into {ATOM_COLS}-column atoms over {threads} threads"
@@ -462,9 +477,12 @@ def compile_mega_paged_attention(
     # two quarter-waves of a half-wave (rows 4 apart, 16 banks apart) never
     # share a bank, and every row stays 16 B aligned.
     gemm_stride = block_n + (4 - block_n) % 8
-    gemm_region = max_rows * gemm_stride * 4
+    gemm_region = 16 * pass_subs * gemm_stride * 4
     if waves != 4:
         raise NotImplementedError("the o_proj reduction pairs four waves")
+    # The planner's rows: a wave lane holds ``lane_rows`` consecutive ones.
+    lane_rows = -(-max_rows // WAVE)
+    plan_rows = lane_rows * WAVE
 
     @fx.struct
     class MegaStorage:
@@ -472,8 +490,11 @@ def compile_mega_paged_attention(
         # phase 3 reuses it for the two o_proj partial tiles.
         buf: fx.Array[fx.Int32, max(traits.total_bytes, 2 * gemm_region) // 4, 16]
         # Inclusive prefix of tasks a row, then each row's context length.
-        prefix: fx.Array[fx.Int32, MAX_ROWS, 16]
-        context: fx.Array[fx.Int32, MAX_ROWS, 16]
+        prefix: fx.Array[fx.Int32, plan_rows, 16]
+        context: fx.Array[fx.Int32, plan_rows, 16]
+        # W's scales of the o_proj tile in hand, loaded with W (in VGPRs they
+        # would live through every pass).
+        w_scale: fx.Array[fx.Float32, block_n, 16]
         # A wave's partial reduction; a CTA-wide broadcast word.
         red: fx.Array[fx.Float32, 16, 16]
         word: fx.Array[fx.Int32, 4, 16]
@@ -488,37 +509,57 @@ def compile_mega_paged_attention(
     def _lds_i32(base, index):
         return fx.Int32(fx.ptr_load(_lds(base, index)))
 
-    def _load_length(context_ptr, num_rows, tid):
-        """Row ``tid % WAVE``'s context length (0 past ``num_rows``), issued
-        first so its latency overlaps the epoch's."""
-        lane = tid % WAVE
+    def _load_lengths(context_ptr, num_rows, tid):
+        """The context lengths (0 past ``num_rows``) of lane ``tid % WAVE``'s
+        planner rows, issued first so their latency overlaps the epoch's."""
         last = num_rows - 1
-        row = (lane < last).select(lane, last)
-        length = fx.Int32(fx.ptr_load(_i32_ptr(context_ptr, row)))
-        return (lane < num_rows).select(length, fx.Int32(0))
+        lengths = []
+        for i in range_constexpr(lane_rows):
+            row = (tid % WAVE) * lane_rows + i
+            safe = (row < last).select(row, last)
+            length = fx.Int32(fx.ptr_load(_i32_ptr(context_ptr, safe)))
+            lengths.append((row < num_rows).select(length, fx.Int32(0)))
+        return lengths
 
     @flyc.jit
-    def _plan_tasks(length, num_rows, nblk, prefix_base, context_base, word_base, tid):
+    def _plan_tasks(lengths, num_rows, nblk, prefix_base, context_base, word_base, tid):
         """Wave 0: each row's task count, its inclusive prefix and its length."""
         if tid < WAVE:
             lane = tid
-            tiles = (length + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
-            total = tiles
-            for off in range_constexpr(5, -1, -1):
-                total = total + total.shuffle_xor(fx.Int32(1 << off), WAVE)
-            # Tiles a task: about one task a CTA.
-            span = (total + (nblk - 1)) // nblk
-            span = (span < 1).select(fx.Int32(1), span)
-            span = (span > max_tiles_per_task).select(
-                fx.Int32(max_tiles_per_task), span
-            )
-            prefix = (tiles + (span - 1)) // span
+            tiles = [(n + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK for n in lengths]
+            # Tiles a task: the span whose rounds of tasks over the grid cost
+            # least, a task costing its tiles plus half a tile (its query load,
+            # partial and merge count); ties go to the longer span.
+            span = fx.Int32(1)
+            best = fx.Int32(0)
+            for cand in range_constexpr(1, max_tiles_per_task + 1):
+                count = (tiles[0] + (cand - 1)) // cand
+                for t in tiles[1:]:
+                    count = count + (t + (cand - 1)) // cand
+                for off in range_constexpr(5, -1, -1):
+                    count = count + count.shuffle_xor(fx.Int32(1 << off), WAVE)
+                cost = (count + (nblk - 1)) // nblk * (2 * cand + 1)
+                if const_expr(cand == 1):
+                    best = cost
+                else:
+                    take = cost <= best
+                    span = take.select(fx.Int32(cand), span)
+                    best = take.select(cost, best)
+            tasks = [(t + (span - 1)) // span for t in tiles]
+            mine = tasks[0]
+            for t in tasks[1:]:
+                mine = mine + t
+            prefix = mine
             for off in range_constexpr(6):
                 step = 1 << off
                 other = fx.gpu.shuffle_idx(prefix, (lane - step) & (WAVE - 1), WAVE)
                 prefix = prefix + (lane >= step).select(other, fx.Int32(0))
-            fx.ptr_store(prefix, _lds(prefix_base, lane))
-            fx.ptr_store(length, _lds(context_base, lane))
+            # The lane's rows in order, from the tasks of the lanes before it.
+            prefix = prefix - mine
+            for i in range_constexpr(lane_rows):
+                prefix = prefix + tasks[i]
+                fx.ptr_store(prefix, _lds(prefix_base, lane * lane_rows + i))
+                fx.ptr_store(lengths[i], _lds(context_base, lane * lane_rows + i))
             if lane == 0:
                 fx.ptr_store(span, _lds(word_base, 2))
 
@@ -533,7 +574,7 @@ def compile_mega_paged_attention(
     def _find_row(prefix_base, task):
         """The row whose task range holds ``task``: prefix entries <= task."""
         row = fx.Int32(0)
-        for bit in range_constexpr(5, -1, -1):
+        for bit in range_constexpr(plan_rows.bit_length() - 2, -1, -1):
             probe = row + (1 << bit)
             row = (_lds_i32(prefix_base, probe - 1) <= task).select(probe, row)
         return row
@@ -873,8 +914,9 @@ def compile_mega_paged_attention(
         rocdl.sched_barrier(0)
         return ws
 
-    def _gemm_tile(ws, x_rsrc, lane, warp, tile):
-        """This wave's K slice of an o_proj tile: f32x4 per (M, N) subtile."""
+    def _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count):
+        """This wave's K slice of M subtiles ``[m0, m0 + m_count)`` of an o_proj
+        tile: f32x4 per (M, N) subtile."""
         # One 1 KB chunk of x a load: lane (n1, g) reads row n1, K [16g, 16g + 16).
         lane_off = lane * 16
         base = _uniform(warp * (k_steps * X_CHUNK))
@@ -886,13 +928,15 @@ def compile_mega_paged_attention(
                     lane_off,
                     4,
                     _BYPASS,
-                    soffset=base + (m * (row_k // 64) + _k_step(tile, s)) * X_CHUNK,
+                    soffset=base
+                    + ((m0 + m) * (row_k // 64) + _k_step(tile, s)) * X_CHUNK,
                 )
-                for m in range_constexpr(m_sub)
+                for m in range_constexpr(m_count)
             ]
 
         acc = [
-            [fx.full(4, 0.0, fx.Float32) for _j in range(n_sub)] for _m in range(m_sub)
+            [fx.full(4, 0.0, fx.Float32) for _j in range(n_sub)]
+            for _m in range(m_count)
         ]
         # x issues in consumption order: in-order vmcnt waits keep ``prefetch``
         # steps in flight.
@@ -902,7 +946,7 @@ def compile_mega_paged_attention(
                 pending.append(issue_x(s + prefetch))
                 rocdl.sched_barrier(0)
             xs = pending[s]
-            for m in range_constexpr(m_sub):
+            for m in range_constexpr(m_count):
                 a = xs[m].bitcast(fx.Int64)
                 for j in range_constexpr(n_sub):
                     b = ws[s][j].bitcast(fx.Int64)
@@ -928,9 +972,19 @@ def compile_mega_paged_attention(
         gpu.barrier()
         return _lds_i32(word_base, 1)
 
+    @flyc.jit
+    def _next_task(sync_ptr, claim, word_base, tid, total, nblk):
+        """The next attention task: one claimed past the first round, if any."""
+        task = total
+        if total > nblk:
+            task = nblk + _claim_tile(sync_ptr, claim, word_base, tid)
+        else:
+            gpu.barrier()
+        return task
+
     def _stage_partial(acc, lane, region, accumulate):
         """Store (or add into) one of the two LDS partial tiles."""
-        for m in range_constexpr(m_sub):
+        for m in range_constexpr(len(acc) // n_sub):
             for j in range_constexpr(n_sub):
                 for i in range_constexpr(4):
                     row = 16 * m + 4 * (lane // 16) + i
@@ -993,37 +1047,67 @@ def compile_mega_paged_attention(
         row = atom // (block_n // ATOM_COLS)
         return atom, row, atom - row * (block_n // ATOM_COLS)
 
-    def _col_scales(tile, tid, w_scale_ptr):
-        """W's per-column scales of this thread's atoms (loaded with W)."""
-        w_scale = fx.recast_iter(fx.Float32, w_scale_ptr)
-        scales = []
-        for c in range_constexpr(push_iters):
-            _atom, _row, col = _push_atom(c, tid)
-            scales.append(
-                fx.Vector(
-                    fx.ptr_load(
-                        fx.add_offset(w_scale, tile * block_n + col * ATOM_COLS),
-                        result_type=fx.Vector.make_type(ATOM_COLS, fx.Float32),
-                    )
-                )
+    def _load_col_scales(tile, tid, w_scale_ptr):
+        """Four of W's per-column scales of ``tile`` a thread (the first
+        ``block_n / 4`` threads' are the tile's), issued ahead of W so that
+        staging them waits for them alone."""
+        quad = tid % (block_n // 4)
+        return fx.Vector(
+            fx.ptr_load(
+                fx.add_offset(
+                    fx.recast_iter(fx.Float32, w_scale_ptr), tile * block_n + 4 * quad
+                ),
+                result_type=fx.Vector.make_type(4, fx.Float32),
             )
-        return scales
+        )
 
-    def _row_scales(tid, x_scale_ptr):
-        """x's per-row scales of this thread's atoms (loaded with x)."""
+    @flyc.jit
+    def _stage_col_scales(scales, tid, w_scale_base):
+        """The tile's W scales into LDS; the push reads them after the wait
+        for rows' barrier."""
+        if tid < block_n // 4:
+            fx.ptr_store(scales, _lds(w_scale_base, 4 * tid, fx.Float32))
+
+    def _col_scales(col, w_scale_base):
+        """W's scales of column atom ``col`` of the tile in hand."""
+        return fx.Vector(
+            fx.ptr_load(
+                _lds(w_scale_base, col * ATOM_COLS, fx.Float32),
+                result_type=fx.Vector.make_type(ATOM_COLS, fx.Float32),
+            )
+        )
+
+    def _row_scales(tid, x_scale_ptr, row0):
+        """x's per-row scales of this thread's atoms of the pass at ``row0``
+        (loaded with x)."""
         x_scale_rsrc = _rsrc(x_scale_ptr)
         scales = []
         for c in range_constexpr(push_iters):
             _atom, row, _col = _push_atom(c, tid)
+            row = row + row0
             row = (row < max_rows).select(row, fx.Int32(max_rows - 1))
             scales.append(_as_f32(_bload(x_scale_rsrc, row * 4, 1, _BYPASS)))
         return scales
 
     @flyc.jit
-    def _push_tile(tile, num_rows, tid, gemm_base, x_scales, w_scales, peers, buf):
-        """Scale the tile to bf16 and push its live rows into every rank's inbox."""
-        for c in range_constexpr(push_iters):
-            atom, row, col = _push_atom(c, tid)
+    def _push_tile(
+        tile,
+        num_rows,
+        tid,
+        gemm_base,
+        x_scales,
+        w_scale_base,
+        peers,
+        buf,
+        row0,
+        m_count,
+    ):
+        """Scale the pass's tile at ``row0`` to bf16 and push its live rows into
+        every rank's inbox."""
+        tile_atoms = 16 * m_count * block_n // ATOM_COLS
+        for c in range_constexpr(-(-tile_atoms // threads)):
+            atom, local, col = _push_atom(c, tid)
+            row = local + row0
             if (atom < tile_atoms) & (row < num_rows):
                 pair = [
                     fx.Vector(
@@ -1031,7 +1115,7 @@ def compile_mega_paged_attention(
                             _lds(
                                 gemm_base,
                                 r * (gemm_region // 4)
-                                + row * gemm_stride
+                                + local * gemm_stride
                                 + col * ATOM_COLS,
                                 fx.Float32,
                             ),
@@ -1042,7 +1126,11 @@ def compile_mega_paged_attention(
                 ]
                 acc = pair[0] + pair[1]
                 n = tile * block_n + col * ATOM_COLS
-                y = acc * fx.full(ATOM_COLS, x_scales[c], fx.Float32) * w_scales[c]
+                y = (
+                    acc
+                    * fx.full(ATOM_COLS, x_scales[c], fx.Float32)
+                    * _col_scales(col, w_scale_base)
+                )
                 payload = _canonicalize(atom_f32_to_bf16(y))
                 if const_expr(two_shot):
                     owner = tile // tiles_per_rank
@@ -1200,6 +1288,53 @@ def compile_mega_paged_attention(
                 for addr in addrs:
                     _store_v4i32_peer(addr, sentinel, _ST_NT)
 
+    @flyc.jit
+    def _tile_pass(
+        tile,
+        m0,
+        m_count,
+        ws,
+        w_scale_base,
+        x_rsrc,
+        x_scale_ptr,
+        num_rows,
+        gemm_base,
+        peers,
+        buf,
+        lane,
+        warp,
+        tid,
+        trace_ptr,
+        bid,
+    ):
+        """One pass of an o_proj tile: rows ``[16 m0, 16 (m0 + m_count))``."""
+        row0 = 16 * m0
+        t_g = _now()
+        x_scales = _row_scales(tid, x_scale_ptr, row0)
+        acc = _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count)
+        if const_expr(trace):
+            rocdl.s_waitcnt(vmcnt=0)
+        t_r = _now()
+        _reduce_waves(acc, warp, lane, gemm_base)
+        t_p = _now()
+        _push_tile(
+            tile,
+            num_rows,
+            tid,
+            gemm_base,
+            x_scales,
+            w_scale_base,
+            peers,
+            buf,
+            row0,
+            m_count,
+        )
+        t_c = _now()
+        # The gemm (loads waited for), the wave reduction and the push.
+        _accumulate(trace_ptr, bid, 9, t_r - t_g, tid)
+        _accumulate(trace_ptr, bid, 10, t_p - t_r, tid)
+        _accumulate(trace_ptr, bid, 11, t_c - t_p, tid)
+
     kernel_name = (
         f"mega_paged_attention_d{head_dim}_g{group}_b{block_size}"
         f"_r{max_rows}_t{max_tiles_per_task}_n{hidden}_bn{block_n}"
@@ -1247,23 +1382,25 @@ def compile_mega_paged_attention(
         prefix_base = fx.recast_iter(fx.Uint8, mega.prefix.ptr)
         context_base = fx.recast_iter(fx.Uint8, mega.context.ptr)
         red_base = fx.recast_iter(fx.Uint8, mega.red.ptr)
+        w_scale_base = fx.recast_iter(fx.Uint8, mega.w_scale.ptr)
         word_base = fx.recast_iter(fx.Uint8, mega.word.ptr)
         gemm_base = pa_base
 
         _stamp(trace_ptr, bid, 0, tid)
-        length = _load_length(context_ptr, num_rows, tid)
+        lengths = _load_lengths(context_ptr, num_rows, tid)
         epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, EPOCH + bid)))
         parity = epoch & 1
         rows_done = ROWS_DONE + parity * SYNC_LINE
 
-        _plan_tasks(length, num_rows, nblk, prefix_base, context_base, word_base, tid)
+        _plan_tasks(lengths, num_rows, nblk, prefix_base, context_base, word_base, tid)
         if (bid == 0) & (tid == 0):
             # Nothing reads the other parity this launch; the next one counts on it.
             other = (parity ^ 1) * SYNC_LINE
             fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, ROWS_DONE + other))
             fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, TILE_CLAIM + other))
+            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, TASK_CLAIM + other))
         gpu.barrier()
-        total = _lds_i32(prefix_base, MAX_ROWS - 1)
+        total = _lds_i32(prefix_base, plan_rows - 1)
         span = _lds_i32(word_base, 2)
         _stamp(trace_ptr, bid, 14, tid)
         _publish_empty_rows(
@@ -1278,9 +1415,10 @@ def compile_mega_paged_attention(
             tid,
         )
 
-        # Phases 1-2: attention tasks strided over the persistent grid; the CTA
-        # landing a row's last partial merges and publishes the row.
-        for task in range(bid, total, nblk):
+        # Phases 1-2: attention tasks, the first a CTA, the rest claimed; the
+        # CTA landing a row's last partial merges and publishes the row.
+        task = bid
+        while task < total:
             row = _find_row(prefix_base, task)
             first, count = _row_tasks(prefix_base, row)
             length = _lds_i32(context_base, row)
@@ -1335,8 +1473,11 @@ def compile_mega_paged_attention(
             _stamp_value(trace_ptr, bid, 6, t_done - t_land, tid)
             _stamp_value(trace_ptr, bid, 15, t_task, tid)
             _accumulate(trace_ptr, bid, 7, fx.Int64(1), tid)
-            # The next task restages Q and K/V over the same LDS.
-            gpu.barrier()
+            # The next task restages Q and K/V over the same LDS (the claim's
+            # barrier orders that).
+            task = _next_task(
+                sync_ptr, TASK_CLAIM + parity * SYNC_LINE, word_base, tid, total, nblk
+            )
 
         _stamp(trace_ptr, bid, 1, tid)
         # Phase 3: o_proj tiles once every row is published.
@@ -1352,21 +1493,54 @@ def compile_mega_paged_attention(
         tile = _claim_tile(sync_ptr, claim, word_base, tid)
         while tile < n_tiles:
             t_w = _now()
+            col_scales = _load_col_scales(tile, tid, w_scale_ptr)
             ws = _load_w_slice(tile, w_rsrc, lane, warp)
-            w_scales = _col_scales(tile, tid, w_scale_ptr)
+            _stage_col_scales(col_scales, tid, w_scale_base)
             _wait_rows(sync_ptr, rows_done, num_rows, tid)
             _stamp(trace_ptr, bid, 2, tid)
             t_g = _now()
-            x_scales = _row_scales(tid, x_scale_ptr)
-            acc = _gemm_tile(ws, x_rsrc, lane, warp, tile)
-            if const_expr(trace):
-                rocdl.s_waitcnt(vmcnt=0)
-            t_r = _now()
-            _reduce_waves(acc, warp, lane, gemm_base)
-            t_p = _now()
-            _push_tile(
-                tile, num_rows, tid, gemm_base, x_scales, w_scales, peers, parity
-            )
+            for p in range_constexpr(len(passes)):
+                m0, m_count = passes[p]
+                if const_expr(p == 0):
+                    _tile_pass(
+                        tile,
+                        m0,
+                        m_count,
+                        ws,
+                        w_scale_base,
+                        x_rsrc,
+                        x_scale_ptr,
+                        num_rows,
+                        gemm_base,
+                        peers,
+                        parity,
+                        lane,
+                        warp,
+                        tid,
+                        trace_ptr,
+                        bid,
+                    )
+                else:
+                    # A pass of padding rows only is skipped.
+                    if 16 * m0 < num_rows:
+                        _tile_pass(
+                            tile,
+                            m0,
+                            m_count,
+                            ws,
+                            w_scale_base,
+                            x_rsrc,
+                            x_scale_ptr,
+                            num_rows,
+                            gemm_base,
+                            peers,
+                            parity,
+                            lane,
+                            warp,
+                            tid,
+                            trace_ptr,
+                            bid,
+                        )
             t_c = _now()
             if const_expr(grid < n_tiles):
                 tile = _claim_tile(sync_ptr, claim, word_base, tid)
@@ -1375,9 +1549,6 @@ def compile_mega_paged_attention(
                 tile = fx.Int32(n_tiles)
             t_e = _now()
             _accumulate(trace_ptr, bid, 8, t_g - t_w, tid)
-            _accumulate(trace_ptr, bid, 9, t_r - t_g, tid)
-            _accumulate(trace_ptr, bid, 10, t_p - t_r, tid)
-            _accumulate(trace_ptr, bid, 11, t_c - t_p, tid)
             _accumulate(trace_ptr, bid, 12, t_e - t_c, tid)
             _accumulate(trace_ptr, bid, 13, fx.Int64(1), tid)
 
