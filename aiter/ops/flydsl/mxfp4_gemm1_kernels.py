@@ -34,6 +34,7 @@ def _get_compiled_mxfp4_gemm1_port(
     num_waves=4,
     k_wave=1,
     ep32=False,
+    occ2=False,
 ):
     if ep32:
         from .kernels.mxfp4_gemm1_ep32 import compile_gemm1_ep32 as compile_gemm1
@@ -62,6 +63,7 @@ def _get_compiled_mxfp4_gemm1_port(
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
+        **({"occ2": True} if occ2 else {}),
     )
 
 
@@ -84,7 +86,30 @@ def _assert_supported(
     num_waves=4,
     native_scale_layout=False,
     k_wave=1,
+    occ2=False,
 ):
+    if occ2:
+        if not (
+            a_dtype == "fp8"
+            and BM == 128
+            and BN == 256
+            and BK == 256
+            and num_waves == 4
+            and k_wave == 1
+            and not inline_quant
+        ):
+            raise NotImplementedError(
+                "flydsl mxfp4 GEMM1 occ2 requires BM128/BN256/BK256 FP8 activation, "
+                "four waves, k_wave 1 and no inline quantization"
+            )
+        from .kernels.mxfp4_gemm1 import OCC2_LDS_LIMIT, occ2_lds_bytes
+
+        if D_HIDDEN % BK == 0 and occ2_lds_bytes(D_HIDDEN, BK) > OCC2_LDS_LIMIT:
+            raise NotImplementedError(
+                "flydsl mxfp4 GEMM1 occ2 needs its LDS within "
+                f"{OCC2_LDS_LIMIT} B to keep two workgroups per CU, got "
+                f"{occ2_lds_bytes(D_HIDDEN, BK)} B for D_HIDDEN={D_HIDDEN}"
+            )
     if a_dtype not in MXFP4_G1_VARIANTS:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires a_dtype in {tuple(MXFP4_G1_VARIANTS)}, "
@@ -237,6 +262,7 @@ def flydsl_mxfp4_gemm1(
     num_waves=4,
     k_wave=1,
     ep32=False,
+    occ2=False,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order.
 
@@ -264,7 +290,10 @@ def flydsl_mxfp4_gemm1(
             num_waves=num_waves,
             native_scale_layout=native_scale_layout,
             k_wave=k_wave,
+            occ2=occ2,
         )
+    elif occ2:
+        raise NotImplementedError("flydsl mxfp4 GEMM1 occ2 has no EP32 kernel")
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     if hidden_row_stride_bytes is None:
@@ -293,6 +322,7 @@ def flydsl_mxfp4_gemm1(
         num_waves,
         k_wave,
         ep32,
+        occ2,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

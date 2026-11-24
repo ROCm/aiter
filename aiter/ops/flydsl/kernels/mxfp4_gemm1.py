@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -23,6 +24,7 @@ from .mxfp4_gemm_common import (
     _inline_dpp_quad_amax,
     _inline_e8m0,
     _layout_idx,
+    _lds_ptr3,
     _lds_swizzle_mask,
     _pkmax_u16,
     _scalar_store,
@@ -97,6 +99,7 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    occ2=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -286,6 +289,28 @@ def _gemm1_body(
     s_aq_i32x1_tiles = fx.logical_divide(s_aq_i32_flat, mem_1x1)
     i32x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
 
+    a_scopes = None
+    if const_expr(occ2):
+        from .mxfp4_gemm2_ep32 import lds_slot_scopes
+
+        # One alias scope per A slot: a read of the current slot does not wait for
+        # the next tile's DMA into the other slot.
+        a_scopes = lds_slot_scopes(kAStages, "g1_occ2")
+        aq_rsrc = _buffer_rsrc(arg_aq, aq_num_records)
+        lds_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+
+    def a_slot_probe(slot):
+        # Fence this wave's DMA into `slot` before the barrier that shares it; the
+        # slot scope keeps DMAs into the other slot and the B loads out of the wait.
+        llvm.load(
+            T.i32,
+            _lds_ptr3(lds_base_i32, fx.Int32(slot * (BM * KH_TILE))),
+            alignment=4,
+            volatile_=True,
+            alias_scopes=a_scopes[slot][0],
+            noalias_scopes=a_scopes[slot][1],
+        )
+
     def issue_a_load_lds(slot, kt):
         # A wave-wide BufferCopyLDS128b writes 1024 contiguous bytes. That is
         # eight FP4 rows or four FP8 rows. Larger FP8 tiles use two four-row
@@ -323,6 +348,23 @@ def _gemm1_body(
                         + fx.Int32(slot * (BM * KH_TILE))
                         + dst_row_base * fx.Int32(KH_TILE)
                     )
+                    if const_expr(occ2):
+                        # Raw DMA: fx.copy(BufferCopyLDS128b) cannot carry alias
+                        # scopes, and without them the waitcnt pass drains every
+                        # load (vmcnt(0)) before any LDS read that follows a DMA
+                        # (ATT, EP8 M4096: 7 x ~1.7k cycles per wave).
+                        rocdl.raw_ptr_buffer_load_lds(
+                            aq_rsrc,
+                            _lds_ptr3(lds_base_i32, off),
+                            fx.Int32(16),
+                            voffset + fx.Int32(kt * KH_TILE),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            alias_scopes=a_scopes[slot][0],
+                            noalias_scopes=a_scopes[slot][1],
+                        )
+                        continue
                     fx.copy(
                         aq_dma_atom,
                         fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
@@ -461,11 +503,13 @@ def _gemm1_body(
         fx.copy(i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r)
         return r
 
-    def issue_a_ds_read(slot, khalf=None):
+    def issue_a_ds_read(slot, khalf=None, chunks=None):
         mask = _lds_swizzle_mask(lane_mod_16)
         a = [[None, None] for _ in range(kMChunks)]
         halves = range_constexpr(2) if khalf is None else (khalf,)
-        if const_expr(kMChunks == 1):
+        if const_expr(chunks is not None):
+            order = [(i, k) for k in halves for i in chunks]
+        elif const_expr(kMChunks == 1):
             order = [(0, k) for k in halves]
         elif const_expr(not k_split):
             order = [(i, k) for k in halves for i in range_constexpr(kMChunks)]
@@ -489,12 +533,30 @@ def _gemm1_body(
                     + fx.Int32(slot * (BM * KH_TILE))
                     + lds_row * fx.Int32(KH_TILE)
                 )
-                lo = fx.Vector(
-                    fx.memref_load_vec(_lds_i32x4_frag((boff + lo_col) // fx.Int32(16)))
-                )
-                hi = fx.Vector(
-                    fx.memref_load_vec(_lds_i32x4_frag((boff + hi_col) // fx.Int32(16)))
-                )
+                if const_expr(occ2):
+                    lo, hi = [
+                        fx.Vector(
+                            llvm.load(
+                                T.vec(4, T.i32),
+                                _lds_ptr3(lds_base_i32, boff + col),
+                                alignment=16,
+                                alias_scopes=a_scopes[slot][0],
+                                noalias_scopes=a_scopes[slot][1],
+                            )
+                        )
+                        for col in (lo_col, hi_col)
+                    ]
+                else:
+                    lo = fx.Vector(
+                        fx.memref_load_vec(
+                            _lds_i32x4_frag((boff + lo_col) // fx.Int32(16))
+                        )
+                    )
+                    hi = fx.Vector(
+                        fx.memref_load_vec(
+                            _lds_i32x4_frag((boff + hi_col) // fx.Int32(16))
+                        )
+                    )
                 t = fx.make_rmem_tensor(mem_8x1, fx.Int32)
                 t.store(lo.shuffle(hi, list(range(8))))
                 a[i][k] = t
@@ -994,10 +1056,84 @@ def _gemm1_body(
             if const_expr(wt < K_TILES_PER_WAVE):
                 issue_b_scale_load(b_scale_v[slot_b], global_k_tile(wt))
 
+    def run_k_slice_occ2(global_k_tile):
+        # Two-workgroups-per-CU BM128 FP8 pipeline. A is read from LDS one K half and
+        # four 16-row chunks at a time, and B is single-buffered per K half, so the
+        # wave stays within 256 VGPRs (two waves per SIMD) and the two-slot A ring
+        # within 80 KiB of LDS. Each accumulator still adds K half 0 before half 1.
+        OCC2_SUBS = 2
+        bh = [[None] * N_REPS for _ in range(2)]
+        bs = [[None, None] for _ in range(2)]
+        issue_a_scale_load()
+        issue_a_load_lds(0, global_k_tile(0))
+        rocdl.sched_barrier(0)
+        issue_b_scale_load(bs[0], global_k_tile(0))
+        for h in range_constexpr(2):
+            for j in range_constexpr(N_REPS):
+                issue_b_load_half(bh[h], global_k_tile(0), j, h)
+
+        for KT in range_constexpr(K_TILES_PER_WAVE):
+            read_slot = KT % kAStages
+            has_next = KT + 1 < K_TILES_PER_WAVE
+            bs_cur = bs[KT % 2]
+            a_slot_probe(read_slot)
+            gpu.barrier()
+            asc_cur = issue_a_scale_ds_read(global_k_tile(KT))
+            if const_expr(has_next):
+                # Every wave is past this step's barrier, so the slot read one step
+                # ago is free. The scale read stays above the DMA: it carries no
+                # slot scope and would wait for it.
+                rocdl.sched_barrier(0)
+                issue_a_load_lds((KT + 1) % kAStages, global_k_tile(KT + 1))
+                issue_b_scale_load(bs[(KT + 1) % 2], global_k_tile(KT + 1))
+            for h in range_constexpr(2):
+                for g in range_constexpr(0, kSubBlocks, OCC2_SUBS):
+                    subs = list(range(g, min(g + OCC2_SUBS, kSubBlocks)))
+                    last_group = g + OCC2_SUBS >= kSubBlocks
+                    rocdl.sched_barrier(0)
+                    a_g = issue_a_ds_read(
+                        read_slot,
+                        khalf=h,
+                        chunks=[sub * 2 + i for sub in subs for i in range(2)],
+                    )
+                    for J in range_constexpr(N_REPS):
+                        if const_expr(interleave):
+                            mni, in_b = J // 2, J % 2
+                        else:
+                            mni, in_b = J % 2, J // 2
+                        sb = bs_cur[mni]
+                        rocdl.sched_barrier(0)
+                        for sub in subs:
+                            _mma(
+                                accm[sub * 2][J],
+                                2 * h,
+                                2 * h + in_b,
+                                a_g[sub * 2][h],
+                                bh[h][J],
+                                asc_cur[sub],
+                                sb,
+                            )
+                            _mma(
+                                accm[sub * 2 + 1][J],
+                                2 * h + 1,
+                                2 * h + in_b,
+                                a_g[sub * 2 + 1][h],
+                                bh[h][J],
+                                asc_cur[sub],
+                                sb,
+                            )
+                        if const_expr(last_group and has_next):
+                            rocdl.sched_barrier(0)
+                            issue_b_load_half(bh[h], global_k_tile(KT + 1), J, h)
+                    rocdl.sched_barrier(0)
+
     def run_k_slice(k_tile_base_const):
         def global_k_tile(local_tile):
             return k_tile_base_const + local_tile
 
+        if const_expr(occ2):
+            run_k_slice_occ2(global_k_tile)
+            return
         if const_expr(k_split):
             run_k_slice_ksplit(global_k_tile)
             return
@@ -1545,6 +1681,15 @@ def _bm_constants(
 
 LDS_2WG_LIMIT = 65 * 1024
 
+# Two workgroups share a gfx950 CU's 160 KiB of LDS up to 80 KiB each (measured:
+# both stay resident at 81920 B, one at 90112 B).
+OCC2_LDS_LIMIT = 80 * 1024
+
+
+def occ2_lds_bytes(D_HIDDEN, BK=256):
+    """LDS of the two-workgroup BM128 FP8 GEMM1 (BN256, K pipeline depth 1)."""
+    return _bm_constants(128, 256, BK, D_HIDDEN // BK, 1, 2, 1)[3]
+
 MIN_N_BLOCKS_FOR_SHALLOW_K = 4
 
 
@@ -1590,6 +1735,7 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    occ2=False,
 ):
     """Compile GEMM1 with expert-sorted output."""
     try:
@@ -1611,6 +1757,7 @@ def compile_gemm1_a4w4_port(
             num_waves=num_waves,
             native_scale_layout=native_scale_layout,
             k_wave=k_wave,
+            occ2=occ2,
         )
     except NotImplementedError as exc:
         raise AssertionError(str(exc)) from exc
@@ -1641,8 +1788,10 @@ def compile_gemm1_a4w4_port(
             kmchunks_for(BM) % epi_splits == 0
         ), f"epi_splits={epi_splits} does not divide BM={BM} evenly"
 
-    k_stages = default_k_stages(
-        BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
+    k_stages = (
+        1
+        if occ2
+        else default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits)
     )
     assert (
         1 <= k_stages <= K_TILES_TOTAL // k_wave
@@ -1687,6 +1836,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if occ2:
+        name_suffix += "_occ2"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1787,6 +1938,7 @@ def compile_gemm1_a4w4_port(
                 k_wave=k_wave,
                 epi_splits=epi_splits,
                 k_stages=k_stages,
+                occ2=occ2,
             )
 
     @flyc.jit
@@ -1828,7 +1980,7 @@ def compile_gemm1_a4w4_port(
             stream=stream,
         )
 
-    if k_stages == 1:
+    if k_stages == 1 and not occ2:
         launch_gemm1.compile_hints = {
             "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
         }
