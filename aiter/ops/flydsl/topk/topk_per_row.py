@@ -34,6 +34,7 @@ from ..kernels.topk.topk_per_row_decode import (
     launch_topk_per_row_decode,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
+    ROW_CACHE_MAX_WIDTH,
     build_topk_per_row_decode_one_workgroup_module,
     one_workgroup_rows_are_exact,
 )
@@ -747,6 +748,9 @@ def _decode_with_backend(
             and k == _PAIR_SCATTER_K
             and width >= _PAIR_SCATTER_MIN_WIDTH
         )
+        # A pair-scatter row that fits two float4s per thread stays in
+        # registers across the radix passes instead of being reread.
+        cache_row = pair_scatter and width <= ROW_CACHE_MAX_WIDTH
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k,
             wave_size=wave_size,
@@ -756,6 +760,7 @@ def _decode_with_backend(
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
             finite_only=finite_only,
             pair_scatter=pair_scatter,
+            cache_row=cache_row,
         )
         run_topk_launcher(
             launcher,

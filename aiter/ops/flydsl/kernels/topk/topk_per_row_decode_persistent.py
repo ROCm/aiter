@@ -50,6 +50,10 @@ _NEG_INF_BUCKET = 3
 _NEG_INF_KEY = 0x007FFFFF
 
 
+# Widest row a cache_row build holds: _SCATTER_PAIR float4s per thread.
+ROW_CACHE_MAX_WIDTH = _BLOCK_THREADS * _SCATTER_PAIR * _VEC
+
+
 def one_workgroup_rows_are_exact(width: int) -> bool:
     """Whether full rows of `width` are a whole number of this kernel's vectors."""
     return width % _VEC == 0
@@ -66,8 +70,14 @@ def build_topk_per_row_decode_one_workgroup_module(
     compact: bool = False,
     finite_only: bool = False,
     pair_scatter: bool = False,
+    cache_row: bool = False,
 ):
-    """packed_rows: row r is read from element row_starts[r] of a flat input
+    """cache_row: keep the row's two float4s per thread in registers from the
+    first load, so the three histogram passes and the scatter do not reread
+    global memory. A pair_scatter build for rows of at most
+    `ROW_CACHE_MAX_WIDTH`; a wider row would be silently truncated.
+
+    packed_rows: row r is read from element row_starts[r] of a flat input
     (indices still relative to that start); otherwise from the input's row r
     and row_starts is not read.
 
@@ -88,6 +98,8 @@ def build_topk_per_row_decode_one_workgroup_module(
     packing pays one LDS read."""
     if exact_rows and not full_rows:
         raise ValueError("exact_rows is a full-rows build; pass full_rows=True")
+    if cache_row and (compact or not pair_scatter):
+        raise ValueError("cache_row is a pair_scatter, non-compact build")
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
@@ -106,6 +118,8 @@ def build_topk_per_row_decode_one_workgroup_module(
         name_params["exact"] = 1
     if pair_scatter:
         name_params["pair"] = _SCATTER_PAIR
+    if cache_row:
+        name_params["cache"] = 1
     if finite_only:
         name_params["finite"] = 1
 
@@ -180,6 +194,18 @@ def build_topk_per_row_decode_one_workgroup_module(
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_vectors = (row_len + vec_width - one) // vec_width
+
+        if const_expr(cache_row):
+            # Thread t owns vectors [2t, 2t+2), the pair scatter's split; the
+            # histogram passes are order-free. Issued here, the loads overlap
+            # the setup barriers below.
+            row_cache = []
+            for vec_offset in range_constexpr(_SCATTER_PAIR):
+                cache_vector = tid * fx.Int32(_SCATTER_PAIR) + vec_offset
+                safe_cache_vector = (cache_vector < row_vectors).select(
+                    cache_vector, zero
+                )
+                row_cache.append(_load_f32x4(input_resource, safe_cache_vector))
 
         def in_row(col):
             """Whether `col` lies in the row; a Python True when it must."""
@@ -284,9 +310,15 @@ def build_topk_per_row_decode_one_workgroup_module(
             gpu.barrier()
 
         def reread_row(chunk):
-            for vector_idx in range(tid, row_vectors, block_threads):
-                col_base = vector_idx * vec_width
-                chunk(col_base, _load_f32x4(input_resource, vector_idx))
+            if const_expr(cache_row):
+                for vec_offset in range_constexpr(_SCATTER_PAIR):
+                    cache_vector = tid * fx.Int32(_SCATTER_PAIR) + vec_offset
+                    if cache_vector < row_vectors:
+                        chunk(cache_vector * vec_width, row_cache[vec_offset])
+            else:
+                for vector_idx in range(tid, row_vectors, block_threads):
+                    col_base = vector_idx * vec_width
+                    chunk(col_base, _load_f32x4(input_resource, vector_idx))
 
         def histogram_pass1(col_base, values):
             for lane_idx in range_constexpr(_VEC):
@@ -397,7 +429,12 @@ def build_topk_per_row_decode_one_workgroup_module(
                         active_vector = vector_idx < row_vectors
                         safe_vector_idx = active_vector.select(vector_idx, zero)
                         col_base = safe_vector_idx * vec_width
-                        rvals = _load_f32x4(input_resource, safe_vector_idx)
+                        if const_expr(cache_row):
+                            # One scan step covers the whole row (see
+                            # ROW_CACHE_MAX_WIDTH), so step is always 0.
+                            rvals = row_cache[vec_offset]
+                        else:
+                            rvals = _load_f32x4(input_resource, safe_vector_idx)
                         for lane_idx in range_constexpr(_VEC):
                             col = col_base + lane_idx
                             above, equal = classify(
