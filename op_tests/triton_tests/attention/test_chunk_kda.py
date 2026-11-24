@@ -21,7 +21,7 @@ from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref, kda_gate_ref, l2n
 
 ARCH = get_arch()
 pytestmark = pytest.mark.skipif(
-    ARCH not in ("gfx1250", "gfx950"),
+    ARCH not in ("gfx1250", "gfx1250-strict", "gfx950"),
     reason=f"chunk KDA gluon needs gfx1250 or gfx950, got {ARCH}",
 )
 STATE_DTYPES = [
@@ -455,7 +455,7 @@ def test_chunk_kda_strided_state_indices(nd_tok):
 def test_chunk_kda_paged_many_seqs(seqlens):
     """Enough prefills at H = 24 to overfill the GPU at BV 64."""
     N = len(seqlens)
-    if ARCH == "gfx1250":
+    if ARCH in ("gfx1250", "gfx1250-strict"):
         assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
     inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=2, seed=6)
     raw, cache = make_page_cache(K3_SLOTS)
