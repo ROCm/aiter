@@ -10,29 +10,32 @@ consumes. Everything runs on device from the current block table: block
 IDs are only meaningful within one step (eviction and reuse recycle
 them), so groups are rebuilt every step and never cached.
 
-Algorithm
----------
+Pipeline per fill (all device kernels / collectives, static shapes):
+
 1. Stable radix order: rows sorted lexicographically over the first
-   ``LEAD_KEY_COLUMNS`` block-table columns (three stable int64 argsorts,
-   two physical block ids per key). Deep sibling trees collide on all six
+   ``LEAD_KEY_COLUMNS`` block-table columns (stable int64 argsorts, two
+   physical block ids per key). Deep sibling trees collide on all six
    lead columns and stay a single run; the LCP pass below then measures
    real sharing. Rows sharing fewer than the sorted depth can in
    principle interleave deep families and split a group into two -- a
    grouping-quality issue, never a correctness one.
-2. A Triton kernel (``_cascade_lcp_kernel``) compares every adjacent pair
-   in sorted order and emits its longest shared full-block prefix (LCP),
-   clamped by both contexts' whole blocks (the in-progress tail block is
-   private by construction).
-3. Torch collectives turn pair LCPs into groups (runs of pairs meeting
-   ``min_shared_blocks``), per-group shared block counts (min pair LCP),
-   items of at most ``members_per_item`` members, and the B/singles
-   metadata. Spillover (item table or B batch full) degrades, never
-   fails: those members run as singles.
+2. ``_cascade_lcp_kernel`` compares every adjacent pair in sorted order
+   and emits its longest shared full-block prefix (LCP), clamped by both
+   contexts' whole blocks (the in-progress tail block is private by
+   construction).
+3. ``_cascade_plan_items_kernel`` -- one CTA, one tile of up to
+   ``TILE_LIMIT`` rows -- turns pair LCPs into the full cascade
+   metadata with segmented scans: runs of joined pairs, per-run shared
+   block counts (min pair LCP), run-local member indices, items of at
+   most ``members_per_item`` members, B/single ranks, and every scatter
+   and count. Overflow of the item table or B batch degrades members to
+   singles, never to failure.
+4. ``_cascade_tables_kernel`` builds the shifted tail block tables.
 
 All buffers are allocated once per batch bucket by
 :func:`plan_pa_decode_cascade_groups`; :func:`fill_pa_decode_cascade_plan`
-is a fixed sequence of kernel launches and collectives with static
-shapes -- no host synchronization -- suitable for CUDA-graph capture.
+is a fixed sequence of launches with static shapes -- no host
+synchronization -- suitable for CUDA-graph capture.
 """
 
 from dataclasses import dataclass
@@ -43,6 +46,7 @@ import triton.language as tl
 
 LEAD_KEY_COLUMNS = 6
 LCP_CHUNK = 128
+TILE_LIMIT = 4096
 
 
 @triton.jit
@@ -85,16 +89,22 @@ def _cascade_lcp_kernel(
 
 
 @triton.jit
-def _cascade_emit_kernel(
-    order_ptr,  # [n] int64 sorted rows
-    lens_ptr,  # [n] int32 context lengths
-    mrank_ptr,  # [n] int64 member rank
-    srank_ptr,  # [n] int64 single rank
-    item_id_ptr,  # [n] int64 item index
-    slot_ptr,  # [n] int64 slot within item (member-major order)
-    sblk_ptr,  # [n] int32 shared blocks of the row's group
-    ok_ptr,  # [n] int32 1 = goes to an item, 0 = single
-    items_ptr,  # [max_items, 2 + MEMBERS] int32
+def _scan_chain_min(seg_a, val_a, seg_b, val_b):
+    # Segmented-min combine: newer segments reset the accumulator.
+    return seg_b, tl.where(seg_a == seg_b, tl.minimum(val_a, val_b), val_b)
+
+
+@triton.jit
+def _scan_max(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _cascade_plan_items_kernel(
+    lcp_ptr,  # [n - 1] int32 pair LCPs between sorted rows
+    order_ptr,  # [n] int64 sorted row order
+    len_ptr,  # [n] int32 context lengths
+    items_ptr,  # [max_items, 2 + M] int32, pre-zeroed
     b_map_ptr,
     b_item_ptr,
     b_slot_ptr,
@@ -102,34 +112,92 @@ def _cascade_emit_kernel(
     sblk_b_ptr,
     singles_rows_ptr,
     singles_lens_ptr,
+    counts_ptr,  # [3]: items with live members, B rows, single rows
     n_rows,
+    min_shared,
+    MAX_ITEMS,
     MAX_B,
     M: tl.constexpr,
     PAGE: tl.constexpr,
+    TILE: tl.constexpr,
 ):
-    p = tl.program_id(0)
-    if p >= n_rows:
-        return
-    row = tl.load(order_ptr + p).to(tl.int32)
-    if tl.load(ok_ptr + p):
-        mrank = tl.load(mrank_ptr + p)
-        item = tl.load(item_id_ptr + p).to(tl.int32)
-        slot = tl.load(slot_ptr + p).to(tl.int32)
-        sblk = tl.load(sblk_ptr + p)
-        length = tl.load(lens_ptr + row)
-        tl.store(b_map_ptr + mrank, row)
-        tl.store(b_item_ptr + mrank, item)
-        tl.store(b_slot_ptr + mrank, slot)
-        tl.store(tail_lens_ptr + mrank, length - sblk * PAGE)
-        tl.store(sblk_b_ptr + mrank, sblk)
-        base = items_ptr + item * (2 + M)
-        tl.store(base + 0, sblk)  # all members write the same value
-        tl.atomic_add(base + 1, 1)
-        tl.store(base + 2 + slot, row)  # unique target
-    else:
-        srank = tl.load(srank_ptr + p)
-        tl.store(singles_rows_ptr + srank, row)
-        tl.store(singles_lens_ptr + srank, tl.load(lens_ptr + row))
+    BIG: tl.constexpr = 1 << 30
+    row_idx = tl.arange(0, TILE)
+    inb = row_idx < n_rows
+
+    # --- joins: join_next[p] means sorted rows p and p + 1 are siblings,
+    #     join_prev[p] means p - 1 and p are.
+    lcp_next = tl.load(lcp_ptr + row_idx, mask=inb & (row_idx <= n_rows - 2), other=0)
+    lcp_prev = tl.load(lcp_ptr + row_idx - 1, mask=inb & (row_idx >= 1), other=0)
+    join_next = row_idx <= n_rows - 2
+    join_next = join_next & (lcp_next >= min_shared)
+    join_prev = inb & (row_idx >= 1) & (lcp_prev >= min_shared)
+    member = (join_next | join_prev).to(tl.int32)
+
+    # --- run structure via segmented scans (all register-resident).
+    # first[p]: sorted index of the first row of p's run (reset-flagged max).
+    reset = inb & (~join_prev)
+    reset_i = reset.to(tl.int32)
+    first = tl.associative_scan(tl.where(reset, row_idx, -1).to(tl.int32), 0, _scan_max)
+    local = row_idx - first  # within-run position
+    # seg: monotone run id, constant within a run (inclusive cumsum
+    # counts the run's own start boundary, so every row of the run ties).
+    seg = tl.cumsum(reset_i, 0)
+    # chainv on ROW indices: pair (p, p+1) lcp where the chain is alive.
+    chainv = tl.where(join_next, lcp_next, BIG).to(tl.int32)
+    _seg_fwd, segmin_fwd = tl.associative_scan((seg, chainv), 0, _scan_chain_min)
+    # The run's sblk is the min over its whole pair chain: the forward
+    # scan covers the chain from its start through each row, a mirrored
+    # scan over flipped indices covers each row through the chain's end,
+    # and pair chains partition (with idempotent overlap) around the row.
+    _seg_rev, segmin_rev = tl.associative_scan(
+        (tl.flip(seg, 0), tl.flip(chainv, 0)), 0, _scan_chain_min
+    )
+    sblk = tl.minimum(segmin_fwd, tl.flip(segmin_rev, 0))
+
+    # --- items: one start per run and per M members inside it. Every row
+    # belongs to the latest item start at or before it.
+    item_start = (member != 0) & ((local % M) == 0)
+    item_id = tl.cumsum(item_start.to(tl.int32), 0) - 1
+    ok1 = (member != 0) & (item_id < MAX_ITEMS)
+    rank_ok1 = tl.cumsum(ok1.to(tl.int32), 0) - ok1.to(tl.int32)
+    ok = ok1 & (rank_ok1 < MAX_B)
+    single = inb & (~ok)
+
+    order = tl.load(order_ptr + row_idx, mask=inb, other=0)
+    rows = order.to(tl.int32)
+    lengths = tl.load(len_ptr + rows, mask=ok, other=0)
+    slot = (local % M).to(tl.int32)
+
+    # --- emit: items table, B metadata, singles metadata.
+    item_flat = item_id.to(tl.int64) * (2 + M)
+    tl.store(
+        items_ptr + item_flat,
+        sblk,
+        mask=ok,
+    )  # every member of an item writes the same value
+    tl.atomic_add(items_ptr + item_flat + 1, 1, mask=ok)
+    tl.store(items_ptr + item_flat + 2 + slot, rows, mask=ok)  # unique
+
+    mrank = rank_ok1.to(tl.int64)
+    tl.store(b_map_ptr + mrank, rows, mask=ok)
+    tl.store(b_item_ptr + mrank, item_id.to(tl.int32), mask=ok)
+    tl.store(b_slot_ptr + mrank, slot, mask=ok)
+    tl.store(tail_lens_ptr + mrank, lengths - sblk * PAGE, mask=ok)
+    tl.store(sblk_b_ptr + mrank, sblk, mask=ok)
+
+    srank = tl.cumsum(single.to(tl.int32), 0) - single.to(tl.int32)
+    s_len = tl.load(len_ptr + rows, mask=single, other=0)
+    tl.store(singles_rows_ptr + srank, rows, mask=single)
+    tl.store(singles_lens_ptr + srank, s_len, mask=single)
+
+    # --- counts.
+    n_items = tl.max(tl.where(ok, item_id + 1, 0), 0)
+    n_members = tl.sum(ok.to(tl.int32), 0)
+    n_singles = tl.sum(single.to(tl.int32), 0)
+    tl.store(counts_ptr + 0, n_items)
+    tl.store(counts_ptr + 1, n_members)
+    tl.store(counts_ptr + 2, n_singles)
 
 
 @triton.jit
@@ -173,6 +241,10 @@ def _cascade_tables_kernel(
         tl.store(dst, vals, mask=cols < width)
 
 
+def _pow2(n: int) -> int:
+    return 1 << max(n - 1, 1).bit_length()
+
+
 @dataclass(frozen=True)
 class CascadeGroupPlanner:
     """Scratch for one batch bucket of grouping work.
@@ -192,6 +264,10 @@ class CascadeGroupPlanner:
 def plan_pa_decode_cascade_groups(
     device, *, max_rows: int, table_width: int, max_b_rows: int
 ) -> CascadeGroupPlanner:
+    if max_rows > TILE_LIMIT:
+        raise ValueError(
+            f"cascade planner supports at most {TILE_LIMIT} rows, got {max_rows}"
+        )
     dev = torch.device(device)
     return CascadeGroupPlanner(
         max_rows=max_rows,
@@ -228,8 +304,7 @@ def fill_pa_decode_cascade_plan(
         raise ValueError("batch exceeds the planner's allocation")
     if n > ws.max_singles:
         raise ValueError("workspace singles batch must fit the whole batch")
-    dev = block_tables.device
-    page = ws.block_size
+    ws_page = ws.block_size
     M = ws.members_per_item
     order = pl.order[:n]
     order.copy_(pl.arange_n[:n])
@@ -254,62 +329,21 @@ def fill_pa_decode_cascade_plan(
             pl.lcp,
             n,
             width,
-            PAGE=page,
+            PAGE=ws_page,
             CHUNK=LCP_CHUNK,
             num_warps=1,
         )
-    pair = pl.lcp[: n - 1] if n > 1 else pl.lcp[:0]
 
-    # --- 3. groups, items and row assignments (static collectives) ---
-    join = pair >= min_shared_blocks  # bool [n-1]
-    arange = pl.arange_n[:n]
-    gid = torch.zeros(n, dtype=torch.int64, device=dev)
-    if n > 1:
-        gid[1:] = torch.cumsum((~join).to(torch.int64), 0)
-    gcount = torch.zeros(n, dtype=torch.int64, device=dev).scatter_add_(
-        0, gid, torch.ones(n, dtype=torch.int64, device=dev)
-    )
-    member = gcount[gid] >= 2
-    gmin = torch.full((n,), 1 << 30, dtype=torch.int32, device=dev)
-    if n > 1:
-        gmin.scatter_reduce_(
-            0,
-            gid[: n - 1],
-            torch.where(join, pair, torch.full_like(pair, 1 << 30)),
-            reduce="amin",
-            include_self=True,
-        )
-    gstart = torch.full((n,), n, dtype=torch.int64, device=dev)
-    gstart.scatter_reduce_(0, gid, arange, reduce="amin", include_self=True)
-    local = arange - gstart[gid]
-    sblk_at = gmin[gid]  # int32 [n], meaningful where member
-    g_items = torch.div(gcount + (M - 1), M, rounding_mode="floor")
-    item_base = torch.zeros(n, dtype=torch.int64, device=dev)
-    if n > 1:
-        item_base[1:] = torch.cumsum(g_items, 0)[: n - 1]
-    item_id = item_base[gid] + torch.div(local, M, rounding_mode="floor")
-    slot = local % M
-    mrank = torch.cumsum(member.to(torch.int64), 0) - 1
-    member_ok = member & (item_id < ws.max_items) & (mrank < ws.max_b_rows)
-    single = ~member_ok
-    srank = torch.cumsum(single.to(torch.int64), 0) - 1
-    order.to(torch.int32)
-
-    # --- 4-6. item table, B metadata and singles metadata (one kernel) ---
+    # --- 3. items, B/singles metadata and counts (one fused kernel) ---
     ws.items.zero_()
     for t in (ws.b_map, ws.b_item, ws.b_slot, ws.tail_lens, pl.sblk_b):
         t.fill_(0)
     ws.singles_rows.fill_(0)
     ws.singles_lens.fill_(0)
-    _cascade_emit_kernel[(n,)](
+    _cascade_plan_items_kernel[(1,)](
+        pl.lcp,
         order,
         context_lengths,
-        mrank,
-        srank,
-        item_id,
-        slot,
-        sblk_at,
-        member_ok.to(torch.int32),
         ws.items,
         ws.b_map,
         ws.b_item,
@@ -318,19 +352,18 @@ def fill_pa_decode_cascade_plan(
         pl.sblk_b,
         ws.singles_rows,
         ws.singles_lens,
+        ws.counts,
         n,
+        min_shared_blocks,
+        ws.max_items,
         ws.max_b_rows,
         M=M,
-        PAGE=page,
-        num_warps=1,
+        PAGE=ws_page,
+        TILE=_pow2(pl.max_rows),
+        num_warps=8,
     )
 
-    # --- 7. counts ---
-    ws.counts[0] = (ws.items[:, 1] > 0).sum().to(torch.int32)
-    ws.counts[1] = member_ok.sum().to(torch.int32)
-    ws.counts[2] = single.sum().to(torch.int32)
-
-    # --- 8. tail / singles block tables (one kernel) ---
+    # --- 4. tail / singles block tables (one kernel) ---
     cols_chunks = -(-width // LCP_CHUNK)
     _cascade_tables_kernel[(2, max(ws.max_b_rows, ws.max_singles), cols_chunks)](
         block_tables,
