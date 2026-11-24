@@ -47,6 +47,8 @@ def _cascade_shared_kernel(
     #   (sblk, count, member_row[0], ..., member_row[MEMBERS-1])
     # with count <= 0 marking a padded (no-op) item.
     items_ptr,
+    # Member -> gathered-Q row: b_of_item_slot [max_items, MEMBERS] int32.
+    bslot_ptr,
     # A partials: am/al [max_items, A_SEGMENTS, MEMBERS, num_q_heads] fp32,
     # aacc [max_items, A_SEGMENTS, MEMBERS, num_q_heads, head_dim] fp32.
     am_ptr,
@@ -72,6 +74,11 @@ def _cascade_shared_kernel(
     K_HEAD_STRIDE: tl.constexpr,
     V_BLK_STRIDE: tl.constexpr,
     V_HEAD_STRIDE: tl.constexpr,
+    PLAIN_LAYOUT: tl.constexpr,
+    K_TOK_STRIDE: tl.constexpr,
+    K_DIM_STRIDE: tl.constexpr,
+    V_TOK_STRIDE: tl.constexpr,
+    V_DIM_STRIDE: tl.constexpr,
 ):
     item = tl.program_id(0)
     seg = tl.program_id(1)
@@ -88,15 +95,17 @@ def _cascade_shared_kernel(
     member = tl.arange(0, BLOCK_MG) // GQA
     g = tl.arange(0, BLOCK_MG) % GQA
     member_ok = member < count
-    member_row = tl.load(meta0 + 2 + member, mask=member_ok, other=0).to(tl.int64)
+    # q_ptr is the workspace's members-by-B-row gather, so the kernel only
+    # needs each member's B index; it works for pure-decode and mixed steps.
+    member_b = tl.load(
+        bslot_ptr + item * MEMBERS + member, mask=member_ok, other=0
+    ).to(tl.int64)
     head = kvh * GQA + g
     d = tl.arange(0, HEAD_DIM)
 
-    # i64 row offsets: row strides times row indices can exceed 2**31
-    # elements on large caches/batches.
     q = tl.load(
         q_ptr
-        + member_row[:, None] * Q_ROW_STRIDE
+        + member_b[:, None] * Q_ROW_STRIDE
         + head[:, None] * Q_HEAD_STRIDE
         + d[None, :],
         mask=member_ok[:, None],
@@ -122,14 +131,25 @@ def _cascade_shared_kernel(
     base_ptr = bt_ptr + bt_row * bt_row_stride
     for j in range(first_blk, last_blk):
         bid = tl.load(base_ptr + j).to(tl.int64)
-        k = tl.load(
-            k_ptr
-            + bid * K_BLK_STRIDE
-            + kvh * K_HEAD_STRIDE
-            + tt[:, None] * 8
-            + (d[None, :] // 8) * (PAGE * 8)
-            + (d[None, :] % 8)
-        )
+        if PLAIN_LAYOUT:
+            # Plain vLLM paged layout, logical [blocks, kv_heads, page, dim].
+            k = tl.load(
+                k_ptr
+                + bid * K_BLK_STRIDE
+                + kvh * K_HEAD_STRIDE
+                + tt[:, None] * K_TOK_STRIDE
+                + d[None, :] * K_DIM_STRIDE
+            )
+        else:
+            # Vectorized 5D: [blocks, kv_heads, dim // 8, page, 8].
+            k = tl.load(
+                k_ptr
+                + bid * K_BLK_STRIDE
+                + kvh * K_HEAD_STRIDE
+                + tt[:, None] * 8
+                + (d[None, :] // 8) * (PAGE * 8)
+                + (d[None, :] % 8)
+            )
 
         s = tl.dot(q, tl.trans(k))  # fp32, log2 units
         m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -138,14 +158,23 @@ def _cascade_shared_kernel(
         alpha = tl.where(m_i == float("-inf"), 1.0, alpha)
         p = tl.exp2(s - m_new[:, None])
 
-        v = tl.load(
-            v_ptr
-            + bid * V_BLK_STRIDE
-            + kvh * V_HEAD_STRIDE
-            + (tt[:, None] // 8) * (HEAD_DIM * 8)
-            + d[None, :] * 8
-            + (tt[:, None] % 8)
-        )
+        if PLAIN_LAYOUT:
+            v = tl.load(
+                v_ptr
+                + bid * V_BLK_STRIDE
+                + kvh * V_HEAD_STRIDE
+                + tt[:, None] * V_TOK_STRIDE
+                + d[None, :] * V_DIM_STRIDE
+            )
+        else:
+            v = tl.load(
+                v_ptr
+                + bid * V_BLK_STRIDE
+                + kvh * V_HEAD_STRIDE
+                + (tt[:, None] // 8) * (HEAD_DIM * 8)
+                + d[None, :] * 8
+                + (tt[:, None] % 8)
+            )
 
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         l_i = l_i * alpha + tl.sum(p, 1)
@@ -176,24 +205,27 @@ def _cascade_fold_kernel(
     al_ptr,
     aacc_ptr,
     # Member bookkeeping (device, int32):
-    #   b_map[i]   original batch row of B-pass row i
+    #   b_tok[i]   output/Q row of B-pass row i
     #   b_item[i]  item index of B-pass row i
     #   b_slot[i]  member slot of B-pass row i within its item
     #   n_ptr[0]   number of live B-pass rows (padded rows exit early)
-    b_map_ptr,
+    b_tok_ptr,
     b_item_ptr,
     b_slot_ptr,
     n_ptr,
-    # B-pass staging written by FlyDSL pa_decode's tile kernel:
+    # B-pass staging. STAGING_FLYDSL=1: FlyDSL pa_decode's tile kernel,
     #   pmax [num_kv_heads, capacity, rows] fp32, natural-log partition max
     #   psum [num_kv_heads, capacity, rows] fp32, partition sum-exp
     #   pout [num_kv_heads, capacity, rows, head_dim] out dtype,
     #        per-partition NORMALIZED output (acc / l)
+    # STAGING_FLYDSL=0: AITER Triton v2 decode tile kernel, same tensors
+    # shaped [n_b, num_kv_heads, max_parts, group(, head_dim)].
     pmax_ptr,
     psum_ptr,
     pout_ptr,
-    # B-pass plan's [n_b, 2] int32: (first packed task, task count) per row.
-    reduce_info_ptr,
+    # FlyDSL mode: B plan's [n_b, 2] int32 (first packed task, task count).
+    # v2 mode: tail lens [n_b] int32 (the fold derives the partition count).
+    reduce_info_or_lens_ptr,
     # Optional attention sinks [num_q_heads], unscaled natural-log logits.
     sinks_ptr,
     # Strides (elements); pout's group stride is HEAD_DIM.
@@ -205,15 +237,19 @@ def _cascade_fold_kernel(
     aa_item_stride,
     aa_seg_stride,
     aa_mem_stride,
-    ps_head_stride,
-    ps_part_stride,
-    po_head_stride,
-    po_part_stride,
+    ps_seq_stride: tl.constexpr,
+    ps_head_stride: tl.constexpr,
+    ps_part_stride: tl.constexpr,
+    po_seq_stride: tl.constexpr,
+    po_head_stride: tl.constexpr,
+    po_part_stride: tl.constexpr,
     GQA: tl.constexpr,  # query heads per KV head
     HEAD_DIM: tl.constexpr,
     A_SEGMENTS: tl.constexpr,
+    STAGING_FLYDSL: tl.constexpr,
+    PARTITION_SZ: tl.constexpr,  # v2 mode's tokens per partition
     HAS_SINKS: tl.constexpr,
-    KERNEL_MAX_PARTITIONS: tl.constexpr,  # B-pass plan's max_partitions
+    KERNEL_MAX_PARTITIONS: tl.constexpr,
 ):
     b = tl.program_id(0)
     head = tl.program_id(1)
@@ -243,19 +279,33 @@ def _cascade_fold_kernel(
         )
         big_m = tl.maximum(big_m, m_s)
 
-    first = tl.load(reduce_info_ptr + b * 2)
-    count = tl.load(reduce_info_ptr + b * 2 + 1)
-    for p in range(KERNEL_MAX_PARTITIONS):
-        if p < count:
-            m_p = tl.load(
-                pmax_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
-            )
-            big_m = tl.maximum(big_m, m_p)
+    if STAGING_FLYDSL:
+        first = tl.load(reduce_info_or_lens_ptr + b * 2)
+        count = tl.load(reduce_info_or_lens_ptr + b * 2 + 1)
+    else:
+        tail = tl.load(reduce_info_or_lens_ptr + b)
+        count = (tail + PARTITION_SZ - 1) // PARTITION_SZ
+        first = 0
+    b64 = b.to(tl.int64)
+    if STAGING_FLYDSL:
+        for p in range(KERNEL_MAX_PARTITIONS):
+            if p < count:
+                m_p = tl.load(
+                    pmax_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
+                )
+                big_m = tl.maximum(big_m, m_p)
+    else:
+        for p in range(KERNEL_MAX_PARTITIONS):
+            if p < count:
+                m_p = tl.load(
+                    pmax_ptr + b64 * ps_seq_stride + kvh64 * ps_head_stride + p * ps_part_stride + g
+                )
+                big_m = tl.maximum(big_m, m_p)
 
     # An entirely empty row (no shared, no tail, -inf or absent sink) has no
     # finite mass: store zeros rather than NaNs.
     if big_m == float("-inf"):
-        row = tl.load(b_map_ptr + b).to(tl.int64)
+        row = tl.load(b_tok_ptr + b).to(tl.int64)
         tl.store(
             out_ptr + row * out_row_stride + head * out_head_stride + d,
             tl.zeros([HEAD_DIM], tl.float32).to(out_ptr.dtype.element_ty),
@@ -298,24 +348,40 @@ def _cascade_fold_kernel(
 
     for p in range(KERNEL_MAX_PARTITIONS):
         if p < count:
-            m_p = tl.load(
-                pmax_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
-            )
-            l_p = tl.load(
-                psum_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
-            )
-            po = tl.load(
-                pout_ptr
-                + kvh64 * po_head_stride
-                + (first + p) * po_part_stride
-                + g * HEAD_DIM
-                + d
-            ).to(tl.float32)
+            if STAGING_FLYDSL:
+                m_p = tl.load(
+                    pmax_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
+                )
+                l_p = tl.load(
+                    psum_ptr + kvh64 * ps_head_stride + (first + p) * ps_part_stride + g
+                )
+                po = tl.load(
+                    pout_ptr
+                    + kvh64 * po_head_stride
+                    + (first + p) * po_part_stride
+                    + g * HEAD_DIM
+                    + d
+                ).to(tl.float32)
+            else:
+                m_p = tl.load(
+                    pmax_ptr + b64 * ps_seq_stride + kvh64 * ps_head_stride + p * ps_part_stride + g
+                )
+                l_p = tl.load(
+                    psum_ptr + b64 * ps_seq_stride + kvh64 * ps_head_stride + p * ps_part_stride + g
+                )
+                po = tl.load(
+                    pout_ptr
+                    + b64 * po_seq_stride
+                    + kvh64 * po_head_stride
+                    + p * po_part_stride
+                    + g * HEAD_DIM
+                    + d
+                ).to(tl.float32)
             w_p = l_p * tl.exp(m_p - big_m)
             num += po * w_p
             den += w_p
 
-    row = tl.load(b_map_ptr + b).to(tl.int64)
+    row = tl.load(b_tok_ptr + b).to(tl.int64)
     tl.store(
         out_ptr + row * out_row_stride + head * out_head_stride + d,
         (num / den).to(out_ptr.dtype.element_ty),

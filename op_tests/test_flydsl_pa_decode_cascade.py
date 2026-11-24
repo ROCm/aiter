@@ -99,9 +99,11 @@ def _fill_workspace(ws, items, singles_rows, lengths, table, device):
             assert tail >= 0, "shared prefix cannot exceed the context"
             b_idx = len(b_rows)
             b_rows.append((b_idx, it, slot, row, tail))
+            ws.b_of_item_slot[it, slot] = b_idx
     assert len(b_rows) <= ws.max_b_rows
     for b_idx, it, slot, row, tail in b_rows:
         ws.b_map[b_idx] = row
+        ws.tok_of_b[b_idx] = row
         ws.b_item[b_idx] = it
         ws.b_slot[b_idx] = slot
         ws.tail_lens[b_idx] = tail
@@ -111,11 +113,14 @@ def _fill_workspace(ws, items, singles_rows, lengths, table, device):
         ws.tail_tables[b_idx, : kept.numel()] = kept
     for s_idx, row in enumerate(singles_rows[: ws.max_singles]):
         ws.singles_rows[s_idx] = row
+        ws.tok_of_s[s_idx] = row
         ws.singles_lens[s_idx] = lengths[row]
         span = -(-int(lengths[row]) // PAGE)
         ws.singles_tables[s_idx, :span] = table[row, :span]
     ws.b_map[len(b_rows) :].zero_()
+    ws.tok_of_b[len(b_rows) :].zero_()
     ws.tail_lens[len(b_rows) :].zero_()
+    ws.b_of_item_slot[len(items) :].zero_()
     ws.singles_rows[len(singles_rows) :].zero_()
     ws.singles_lens[len(singles_rows) :].zero_()
     ws.counts[0] = len(items)
@@ -443,3 +448,153 @@ def test_cuda_graph_replay_changed_groups(device):
     bad[[3, 4]] = bad[[3, 4]] * 0  # members share the looser cascade bound
     members = ok[[3, 4]].amax()
     assert bad.amax() < 3e-3 and members < 6e-3
+
+
+def _run_plain4d_case(device, *, group, dim, kv_heads=2, items=(), lengths=()):
+    """Same as _run_case but through kv_layout="plain4d" (Triton v2 tails)."""
+    from aiter.ops.flydsl.pa_decode_cascade import (
+        pa_decode_cascade,
+        plan_pa_decode_cascade,
+    )
+
+    torch.manual_seed(0)
+    heads = kv_heads * group
+    batch = len(lengths)
+    table_width = max(-(-v // PAGE) for v in lengths) + 2
+    num_pages = table_width * batch + 8
+    key, value, _, _ = _make_caches(num_pages, kv_heads, dim, torch.bfloat16, device)
+    table = torch.zeros(batch, table_width, dtype=torch.int32)
+    cursor = 0
+    for row, total in enumerate(lengths):
+        n = -(-total // PAGE)
+        table[row, :n] = torch.arange(cursor, cursor + n)
+        cursor += n
+    for members, sblk in items:
+        base = int(table[members[0], 0])
+        for row in members[1:]:
+            table[row, :sblk] = torch.arange(base, base + sblk)
+    table = table.to(device)
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    query = torch.randn(batch, heads, dim, device=device).to(torch.bfloat16) * 0.25
+    singles = sorted(set(range(batch)) - {r for rows, _ in items for r in rows})
+    ws = plan_pa_decode_cascade(
+        device,
+        num_q_heads=heads,
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        members_per_item=4,
+        max_items=max(len(items), 1),
+        max_singles=max(len(singles), 1),
+        table_width=table_width,
+        kv_layout="plain4d",
+    )
+    n_items, _ = _fill_workspace(ws, items, singles, lengths_t, table, device)
+    output = torch.full_like(query, float("nan"))
+    pa_decode_cascade(
+        output, query, key, value, lengths_t, table, dim**-0.5, workspace=ws
+    )
+    ref = _reference(query, key, value, table, lengths_t)
+    return output, ref, n_items, singles
+
+
+def test_plain4d_parity(device):
+    """Plain vLLM-layout caches: shared pass + v2 tails match fp32 references."""
+    out, ref, n_items, singles = _run_plain4d_case(
+        device,
+        group=4,
+        dim=128,
+        lengths=[80, 96, 77, 64, 33],
+        items=[([0, 1, 2], 3)],
+    )
+    _check(out, ref, n_items, singles)
+
+
+def test_plain4d_sinks_and_boundary(device):
+    out, ref, n_items, singles = _run_plain4d_case(
+        device,
+        group=6,
+        dim=256,
+        lengths=[48, 48, 48, 96],
+        items=[([0, 1, 2], 3)],
+    )
+    _check(out, ref, n_items, singles)
+
+
+def test_mixed_step_token_rows(device):
+    """Decode rows living at shifted token positions (a mixed step's maps).
+
+    Five requests sit behind four chunk-token rows, as in a mixed
+    prefill/decode step. The cascade op must fill exactly the decode
+    token positions and leave the chunk rows untouched.
+    """
+    from aiter.ops.flydsl.pa_decode_cascade import (
+        pa_decode_cascade,
+        plan_pa_decode_cascade,
+    )
+
+    torch.manual_seed(0)
+    group, dim, kv_heads = 4, 128, 2
+    heads = kv_heads * group
+    lengths = [80, 96, 77, 64, 72]
+    batch = len(lengths)
+    chunk_rows = 4
+    num_tok = batch + chunk_rows
+    table_width = max(-(-v // PAGE) for v in lengths) + 2
+    num_pages = table_width * batch + 8
+    key, value, key_cache, value_cache = _make_caches(
+        num_pages, kv_heads, dim, torch.bfloat16, device
+    )
+    table = torch.zeros(batch, table_width, dtype=torch.int32)
+    cursor = 0
+    for row, total in enumerate(lengths):
+        n = -(-total // PAGE)
+        table[row, :n] = torch.arange(cursor, cursor + n)
+        cursor += n
+    table[1, :3] = table[0, :3]
+    table[2, :3] = table[0, :3]
+    table = table.to(device)
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    query = torch.randn(num_tok, heads, dim, device=device).to(torch.bfloat16) * 0.25
+    q_map = torch.arange(chunk_rows, num_tok, dtype=torch.int32, device=device)
+    items = [([0, 1, 2], 3)]
+    singles = sorted(set(range(batch)) - {0, 1, 2})
+
+    ws = plan_pa_decode_cascade(
+        device,
+        num_q_heads=heads,
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        max_items=2,
+        max_singles=batch,
+        table_width=table_width,
+    )
+    # Planner path with the token map (request rows -> token rows).
+    from aiter.ops.flydsl.pa_decode_cascade_plan import (
+        fill_pa_decode_cascade_plan,
+        plan_pa_decode_cascade_groups,
+    )
+
+    pl = plan_pa_decode_cascade_groups(
+        device, max_rows=batch, table_width=table_width, max_b_rows=ws.max_b_rows
+    )
+    fill_pa_decode_cascade_plan(ws, pl, table, lengths_t, q_map_of_req=q_map)
+    assert int(ws.counts[0]) == 1, "planner did not form the group"
+    assert int(ws.counts[1]) == 3 and int(ws.counts[2]) == 2, (
+        ws.counts.tolist(),
+        ws.items.tolist(),
+    )
+
+    output = torch.full_like(query, float("nan"))
+    pa_decode_cascade(
+        output, query, key_cache, value_cache, lengths_t, table, dim**-0.5, workspace=ws
+    )
+    # Chunk token rows were not touched.
+    assert torch.isnan(output[:chunk_rows]).all()
+    dec_out = output[chunk_rows:]
+    # Reference over the full decode rows (token rows map 1:1 to requests).
+    dec_q = query[chunk_rows:]
+    ref = _reference(dec_q, key, value, table, lengths_t)
+    diff = (dec_out.float() - ref.float()).abs()
+    assert not torch.isnan(dec_out).any()
+    bound = 1.5 * 8e-3 + 1.5 * 2e-2 * ref.float().abs()
+    assert (diff - bound).clamp(min=0).amax() == 0, diff.amax()

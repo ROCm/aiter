@@ -104,13 +104,17 @@ def _cascade_plan_items_kernel(
     lcp_ptr,  # [n - 1] int32 pair LCPs between sorted rows
     order_ptr,  # [n] int64 sorted row order
     len_ptr,  # [n] int32 context lengths
+    qmap_ptr,  # [n] int32 request row -> token row, or an inert pointer
     items_ptr,  # [max_items, 2 + M] int32, pre-zeroed
+    bslot_ptr,  # [max_items, MEMBERS] int32 member's B-pass row
     b_map_ptr,
+    b_tok_ptr,
     b_item_ptr,
     b_slot_ptr,
     tail_lens_ptr,
     sblk_b_ptr,
     singles_rows_ptr,
+    singles_tok_ptr,
     singles_lens_ptr,
     counts_ptr,  # [3]: items with live members, B rows, single rows
     n_rows,
@@ -119,6 +123,7 @@ def _cascade_plan_items_kernel(
     MAX_B,
     M: tl.constexpr,
     PAGE: tl.constexpr,
+    HAS_QMAP: tl.constexpr,
     TILE: tl.constexpr,
 ):
     BIG: tl.constexpr = 1 << 30
@@ -180,7 +185,13 @@ def _cascade_plan_items_kernel(
     tl.store(items_ptr + item_flat + 2 + slot, rows, mask=ok)  # unique
 
     mrank = rank_ok1.to(tl.int64)
+    if HAS_QMAP:
+        tok = tl.load(qmap_ptr + rows, mask=ok | single, other=0)
+    else:
+        tok = rows
+    tl.store(bslot_ptr + item_id * M + slot, mrank.to(tl.int32), mask=ok)
     tl.store(b_map_ptr + mrank, rows, mask=ok)
+    tl.store(b_tok_ptr + mrank, tok, mask=ok)
     tl.store(b_item_ptr + mrank, item_id.to(tl.int32), mask=ok)
     tl.store(b_slot_ptr + mrank, slot, mask=ok)
     tl.store(tail_lens_ptr + mrank, lengths - sblk * PAGE, mask=ok)
@@ -189,6 +200,7 @@ def _cascade_plan_items_kernel(
     srank = tl.cumsum(single.to(tl.int32), 0) - single.to(tl.int32)
     s_len = tl.load(len_ptr + rows, mask=single, other=0)
     tl.store(singles_rows_ptr + srank, rows, mask=single)
+    tl.store(singles_tok_ptr + srank, tok, mask=single)
     tl.store(singles_lens_ptr + srank, s_len, mask=single)
 
     # --- counts.
@@ -287,6 +299,7 @@ def fill_pa_decode_cascade_plan(
     context_lengths: torch.Tensor,
     *,
     min_shared_blocks: int = 1,
+    q_map_of_req: torch.Tensor | None = None,
 ) -> None:
     """Group ``block_tables`` rows into the workspace's cascade metadata.
 
@@ -336,21 +349,35 @@ def fill_pa_decode_cascade_plan(
 
     # --- 3. items, B/singles metadata and counts (one fused kernel) ---
     ws.items.zero_()
-    for t in (ws.b_map, ws.b_item, ws.b_slot, ws.tail_lens, pl.sblk_b):
+    for t in (
+        ws.b_map,
+        ws.tok_of_b,
+        ws.b_item,
+        ws.b_slot,
+        ws.tail_lens,
+        pl.sblk_b,
+        ws.b_of_item_slot,
+    ):
         t.fill_(0)
+    ws.tok_of_s.fill_(0)
     ws.singles_rows.fill_(0)
     ws.singles_lens.fill_(0)
+    qmap = q_map_of_req if q_map_of_req is not None else context_lengths
     _cascade_plan_items_kernel[(1,)](
         pl.lcp,
         order,
         context_lengths,
+        qmap,
         ws.items,
+        ws.b_of_item_slot,
         ws.b_map,
+        ws.tok_of_b,
         ws.b_item,
         ws.b_slot,
         ws.tail_lens,
         pl.sblk_b,
         ws.singles_rows,
+        ws.tok_of_s,
         ws.singles_lens,
         ws.counts,
         n,
@@ -359,6 +386,7 @@ def fill_pa_decode_cascade_plan(
         ws.max_b_rows,
         M=M,
         PAGE=ws_page,
+        HAS_QMAP=q_map_of_req is not None,
         TILE=_pow2(pl.max_rows),
         num_warps=8,
     )
