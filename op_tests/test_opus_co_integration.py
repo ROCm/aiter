@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Integration coverage for gfx1250 pre-built OPUS A16W16 kernels."""
+"""Integration coverage for OPUS COs and gfx950 MXFP8 bpreshuffle kernels."""
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ from aiter.ops.opus import (
     opus_bmm,
     opus_gemm,
 )
-from aiter.ops.opus._arch import GFX1250, SUPPORTED_OPUS_ARCHES
+from aiter.ops.opus._arch import GFX950, GFX1250, SUPPORTED_OPUS_ARCHES
 from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from csrc.opus_gemm.opus_gemm_common import (
     CO_KERNELS_JSON,
@@ -31,6 +32,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX1250_SPLITK_FUSE_KIDS,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     _load_co_kernels,
+    a8w8_mxscale_bpreshuffle_supports_shape,
+    bpreshuffle_workspace_bytes,
     co_image_path,
     get_kernel_instance,
     gfx1250_4wave_co_kernels_list,
@@ -105,6 +108,262 @@ def _gfx1250_device() -> torch.device:
     if arch != GFX1250:
         pytest.skip(f"requires gfx1250 hardware, got {arch!r}")
     return torch.device("cuda", torch.cuda.current_device())
+
+
+@pytest.fixture(scope="module")
+def _gfx950_device() -> torch.device:
+    import aiter
+    from aiter.jit.core import get_user_jit_dir
+
+    arch = _runtime_arch()
+    if arch != GFX950:
+        pytest.skip(f"requires gfx950 hardware, got {arch!r}")
+    device = torch.device("cuda", torch.cuda.current_device())
+    # Request the CO and JIT kernels exercised below for fresh caches.
+    # Build in a subprocess because
+    # importing the tuner binds its registry to the current device architecture.
+    # Match the parent package and JIT directory when CI installs a wheel.
+    aiter_package_root = str(Path(aiter.__file__).resolve().parents[1])
+    opus_dir = str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
+    build = """
+import sys
+sys.path.insert(0, sys.argv[3])
+sys.path.insert(0, sys.argv[1])
+from opus_gemm_tune import _ensure_kids_compiled
+_ensure_kids_compiled((0, 20, 3547, 7504, 7987, 7991, 7997, 8279), family="a8w8_blockscale_bpreshuffle",
+                      gfx="gfx950", cu_num=int(sys.argv[2]))
+"""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            build,
+            opus_dir,
+            str(torch.cuda.get_device_properties(device).multi_processor_count),
+            aiter_package_root,
+        ],
+        check=True,
+        env={**os.environ, "AITER_JIT_DIR": get_user_jit_dir()},
+    )
+    return device
+
+
+def _gfx950_mxscale_co_inputs(M, N, K, device):
+    X = torch.ones((M, K), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
+    # Keep the rejection reproducer safe even with the old STATIC_N=1536 CO.
+    storage_n = max(N, 1536)
+    W_storage = torch.ones((storage_n, K), device=device, dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    W = W_storage[:N]
+    x_scale = torch.full((K // 128, M), 127, device=device, dtype=torch.uint8).T.view(
+        torch.float8_e8m0fnu
+    )
+    w_scale_storage = torch.full(
+        (storage_n // 128, K // 128), 127, device=device, dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
+    w_scale = w_scale_storage[: N // 128]
+    backing = torch.full(
+        (M * storage_n + 4096,), -7.0, device=device, dtype=torch.bfloat16
+    )
+    Y = backing[: M * N].view(M, N)
+    return X, W, x_scale, w_scale, Y, backing
+
+
+@pytest.mark.parametrize("entry", ("opus_gemm", "raw"))
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (256, 1024, 128),  # Original out-of-bounds write reproducer.
+        (256, 1536, 7168),  # Aligned but unlisted M.
+        (10240, 1024, 7168),  # Aligned but unlisted N.
+        (10240, 1536, 128),  # Aligned but unlisted K.
+    ),
+)
+def test_gfx950_mxscale_co_rejects_unlisted_shape(shape, entry, _gfx950_device):
+    from aiter.ops.opus.gemm_op_a8w8 import (
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw,
+    )
+
+    X, W, x_scale, w_scale, Y, backing = _gfx950_mxscale_co_inputs(
+        *shape, _gfx950_device
+    )
+    # kid 20 declares only (10240, 1536, 7168). The C++ host check must
+    # reject before launch even when the Python adapter is bypassed.
+    with pytest.raises(RuntimeError, match="shape is not declared for this CO"):
+        if entry == "raw":
+            _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+                X.unsqueeze(0), W.unsqueeze(0), x_scale, w_scale, Y.unsqueeze(0), 20
+            )
+        else:
+            opus_gemm(
+                X,
+                W,
+                Y,
+                family="a8w8_blockscale_bpreshuffle",
+                kid=20,
+                layout="bpreshuffle",
+                x_scale=x_scale,
+                w_scale=w_scale,
+            )
+    torch.cuda.synchronize(_gfx950_device)
+    assert (backing == -7.0).all().item(), "rejected CO modified output or canary"
+
+
+@pytest.mark.parametrize(
+    ("kid", "shape"),
+    (
+        (0, (256, 1024, 128)),  # CO without a shape whitelist stays usable.
+        (20, (10240, 1536, 7168)),
+    ),
+)
+def test_gfx950_mxscale_co_accepts_supported_shape(kid, shape, _gfx950_device):
+    M, N, K = shape
+    X, W, x_scale, w_scale, Y, backing = _gfx950_mxscale_co_inputs(
+        M, N, K, _gfx950_device
+    )
+    actual = opus_gemm(
+        X,
+        W,
+        Y,
+        family="a8w8_blockscale_bpreshuffle",
+        kid=kid,
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
+    )
+    torch.cuda.synchronize(_gfx950_device)
+    assert actual is Y
+    # FP8 inputs are one and E8M0 scales are one, so every dot product is K.
+    assert (Y == K).all().item(), f"incorrect output for kid={kid}, shape={shape}"
+    assert (backing[M * N :] == -7.0).all().item(), "CO modified output canary"
+
+
+@pytest.fixture
+def _mxscale_csv(tmp_path, monkeypatch):
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.ops import gemm_op_a8w8 as op
+
+    path = tmp_path / "mxscale.csv"
+    monkeypatch.setenv(
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE", str(path)
+    )
+
+    def clear():
+        AITER_CONFIGS.get_config_file.cache_clear()
+        op._load_mxscale_bpreshuffle_tuned.cache_clear()
+        op._mxscale_bpreshuffle_tuned_nk.cache_clear()
+        op.get_mxscale_bpreshuffle_config.cache_clear()
+        op._MXSCALE_UNTUNED_REPORTED.clear()
+
+    def write(shape, kid, cu_num):
+        instance = get_kernel_instance(
+            GFX950, "a8w8_blockscale_bpreshuffle", kid, cu_num=cu_num
+        )
+        row = {
+            "gfx": GFX950,
+            "cu_num": cu_num,
+            "M": shape[0],
+            "N": shape[1],
+            "K": shape[2],
+            "w_scale_block": "128x128",
+            "libtype": "opus",
+            "kernelId": kid,
+            "splitK": 1,
+            "us": 1.0,
+            "kernelName": instance.name,
+            "tflops": 1.0,
+            "bw": 1.0,
+            "errRatio": 0.001,
+        }
+        with path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, row.keys())
+            writer.writeheader()
+            writer.writerow(row)
+        clear()
+
+    clear()
+    yield write
+    clear()
+
+
+@pytest.mark.parametrize(
+    ("case", "shape", "kid", "expected_backend"),
+    (
+        ("jit", (1344, 768, 7168), 3547, "opus"),
+        ("co", (10240, 1536, 7168), 20, "opus"),
+        ("padded_m", (10239, 1536, 7168), 20, "bmm"),
+        ("fp16", (256, 1024, 256), 0, "mxpsh"),
+        ("unlisted_shape", (256, 1024, 128), 20, "bmm"),
+    ),
+)
+def test_gfx950_mxscale_production_csv_dispatch(
+    case, shape, kid, expected_backend, _gfx950_device, _mxscale_csv, monkeypatch
+):
+    from aiter import dtypes
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops import opus
+    from aiter.ops.flydsl import batched_gemm_a8w8, mxscale_preshuffle_kernels
+    from aiter.test_common import checkAllclose
+    from csrc.gemm_a8w8_mxfp8_bpreshuffle.gemm_a8w8_mxfp8_bpreshuffle_tune import (
+        generate_data,
+        run_torch,
+    )
+
+    m, n, k = shape
+    csv_shape = (10240, n, k) if case == "padded_m" else shape
+    cu_num = torch.cuda.get_device_properties(_gfx950_device).multi_processor_count
+    _mxscale_csv(csv_shape, kid, cu_num)
+    # Exercise the real CSV loader and padded-M lookup, without replacing it.
+    config = op.get_mxscale_bpreshuffle_config(m, n, k, "128x128")
+    assert config["kernelId"] == kid
+
+    calls = []
+    original_opus = opus.opus_gemm
+    original_bmm = batched_gemm_a8w8.run_bmm_a8w8_mxfp8
+    original_mxpsh = mxscale_preshuffle_kernels.run_gemm_a8w8_mxfp8_gfx950
+
+    def capture_opus(*args, **kwargs):
+        calls.append(("opus", kwargs["kid"]))
+        return original_opus(*args, **kwargs)
+
+    def capture_bmm(*args, **kwargs):
+        calls.append(("bmm", kwargs.get("kernel_name")))
+        return original_bmm(*args, **kwargs)
+
+    def capture_mxpsh(*args, **kwargs):
+        calls.append(("mxpsh", args[5]))
+        return original_mxpsh(*args, **kwargs)
+
+    monkeypatch.setattr(opus, "opus_gemm", capture_opus)
+    monkeypatch.setattr(batched_gemm_a8w8, "run_bmm_a8w8_mxfp8", capture_bmm)
+    monkeypatch.setattr(
+        mxscale_preshuffle_kernels, "run_gemm_a8w8_mxfp8_gfx950", capture_mxpsh
+    )
+    data = generate_data(
+        m, n, k, seed=0, w_scale_block="128x128", device=_gfx950_device
+    )
+    dtype = dtypes.fp16 if case == "fp16" else dtypes.bf16
+    backing = torch.full((m * n + 4096,), -7.0, dtype=dtype, device=_gfx950_device)
+    output = backing[: m * n].view(m, n)
+    actual = op.gemm_a8w8_blockscale_bpreshuffle(
+        data["x"],
+        data["weight_shuffle"],
+        data["x_scale"],
+        data["w_scale"],
+        dtype=dtype,
+        out=output,
+    )
+    torch.cuda.synchronize(_gfx950_device)
+    assert actual.data_ptr() == output.data_ptr()
+    assert actual.dtype == dtype
+    assert calls == [(expected_backend, kid if expected_backend == "opus" else None)]
+    reference = run_torch(data["x_deq"], data["w_deq"]).to(dtype)
+    error = checkAllclose(reference, actual, printLog=False, catastrophic_check=True)
+    assert error <= 0.05, (case, shape, error)
+    assert (
+        (backing[m * n :] == -7.0).all().item()
+    ), "production dispatch modified canary"
 
 
 def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
@@ -481,7 +740,7 @@ def test_gfx1250_co_loader_handles_missing_assets(tmp_path, capsys):
 
     document = json.loads(Path(CO_KERNELS_JSON).read_text())
     document[GFX1250] = document[GFX1250][:1]
-    manifest = tmp_path / "co_kernels.json"
+    manifest = tmp_path / "co_kernels_gfx1250.json"
     manifest.write_text(json.dumps(document))
 
     assert _load_co_kernels(manifest) == {}
@@ -497,7 +756,7 @@ def test_gfx1250_co_loader_rejects_duplicate_identity(tmp_path, duplicate):
     if duplicate == "name":
         second["kid"] += 1
     document[GFX1250] = [first, second]
-    manifest = tmp_path / "co_kernels.json"
+    manifest = tmp_path / "co_kernels_gfx1250.json"
     manifest.write_text(json.dumps(document))
 
     expected = "duplicate co kid" if duplicate == "kid" else "same symbol"
@@ -527,7 +786,137 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
 
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]
-    assert not kid_rejects_shape(instance, 65, 129, 4097)
+    assert not kid_rejects_shape(instance, 65, 129, 4097, 256)
+
+
+@pytest.mark.parametrize(
+    "n,supported", [(262016, True), (262144, False), (262272, False)]
+)
+def test_gfx950_bpreshuffle_workspace_bound(n, supported):
+    instance = get_kernel_instance(
+        "gfx950", "a8w8_blockscale_bpreshuffle", 7991, cu_num=256
+    )
+    assert bpreshuffle_workspace_bytes(instance, 1024, n, 512) == 16 * 1024 * n
+    assert a8w8_mxscale_bpreshuffle_supports_shape(instance, 1024, n, 512) is supported
+
+
+@pytest.mark.parametrize(
+    "kid,m,k",
+    [
+        (7997, 16, 768),
+        (7997, 16, 896),
+        (7997, 16, 1024),
+        (7997, 32, 1024),
+        (7997, 33, 1024),
+        (8279, 32, 1024),
+        (8279, 32, 1152),
+        (8279, 32, 1536),
+        (8279, 32, 1664),
+        (8279, 33, 1536),
+        (7987, 16, 2048),
+        (7987, 16, 2176),
+        (7991, 16, 6144),
+        (7991, 33, 6144),
+    ],
+)
+def test_gfx950_staged_b_capacity_matches_torch(kid, m, k, _gfx950_device):
+    from aiter.ops.shuffle import shuffle_weight
+
+    device = _gfx950_device
+    generator = torch.Generator(device=device).manual_seed(kid + m + k)
+    x = (torch.randint(0, 2, (m, k), device=device, generator=generator) * 2 - 1).to(
+        torch.float32
+    ) * 0.125
+    w = (torch.randint(0, 2, (128, k), device=device, generator=generator) * 2 - 1).to(
+        torch.float32
+    ) * 0.25
+    a_exp = torch.randint(-1, 2, (m, k // 128), device=device, generator=generator)
+    b_exp = torch.randint(-1, 2, (1, k // 128), device=device, generator=generator)
+    a_scale = torch.exp2(a_exp.float()).repeat_interleave(128, 1)
+    b_scale = (
+        torch.exp2(b_exp.float()).repeat_interleave(128, 0).repeat_interleave(128, 1)
+    )
+    reference = ((x * a_scale) @ (w * b_scale).T).to(torch.bfloat16)
+    y = torch.full((m, 128), float("nan"), device=device, dtype=torch.bfloat16)
+    actual = opus_gemm(
+        x.to(torch.float8_e4m3fn),
+        shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+        y,
+        family="a8w8_blockscale_bpreshuffle",
+        layout="bpreshuffle",
+        kid=kid,
+        x_scale=(a_exp.T.contiguous() + 127).to(torch.uint8).T,
+        w_scale=(b_exp + 127).to(torch.uint8),
+    )
+    assert actual is y
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kid,m,n,k",
+    [
+        (7997, 16, 128, 1024),
+        (8279, 32, 16384, 1536),
+        (7991, 16, 128, 6144),
+        (7504, 1024, 1536, 7168),
+    ],
+)
+def test_gfx950_mxscale_tuned_dispatch(kid, m, n, k, _gfx950_device, monkeypatch):
+    from aiter import dtypes
+    from aiter.ops import gemm_op_a8w8 as gemm
+    from aiter.ops.opus import gemm_op_a8w8 as opus_a8w8
+    from aiter.ops.shuffle import shuffle_weight
+
+    calls = []
+    raw = opus_a8w8._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw
+
+    def capture(*args):
+        calls.append(args[5])
+        return raw(*args)
+
+    monkeypatch.setattr(
+        gemm,
+        "get_mxscale_bpreshuffle_config",
+        lambda *args: {"libtype": "opus", "kernelId": kid},
+    )
+    monkeypatch.setattr(
+        opus_a8w8, "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw", capture
+    )
+    device = _gfx950_device
+    x = torch.full((m, k), 0.125, device=device).to(torch.float8_e4m3fn)
+    w = torch.full((n, k), 0.25, device=device).to(torch.float8_e4m3fn)
+    x_scale = torch.full((k // 128, m), 127, device=device, dtype=torch.uint8).T
+    w_scale = torch.full((n // 128, k // 128), 127, device=device, dtype=torch.uint8)
+    y = torch.full((m, n), float("nan"), device=device, dtype=torch.bfloat16)
+    actual = gemm.gemm_a8w8_blockscale_bpreshuffle(
+        x,
+        shuffle_weight(w, layout=(16, 16)),
+        x_scale.view(dtypes.fp8_e8m0),
+        w_scale.view(dtypes.fp8_e8m0),
+        out=y,
+    )
+    assert actual is y
+    assert calls == [kid]
+    torch.testing.assert_close(actual, torch.full_like(y, k / 32), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("n", [262144, 262272])
+def test_gfx950_splitk_host_rejects_descriptor_overflow(n, _gfx950_device):
+    from aiter.ops.opus.gemm_op_a8w8 import (
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw,
+    )
+
+    device = _gfx950_device
+    x = torch.empty((1, 1024, 512), device=device, dtype=torch.float8_e4m3fn)
+    w = torch.empty((1, n, 512), device=device, dtype=torch.float8_e4m3fn)
+    y = torch.empty((1, 1024, n), device=device, dtype=torch.bfloat16)
+    x_scale = torch.empty((1024, 4), device=device, dtype=torch.uint8)
+    w_scale = torch.empty((n // 128, 4), device=device, dtype=torch.uint8)
+    workspace = torch.empty(4, device=device, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="split-K workspace exceeds reducer limits"):
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+            x, w, x_scale, w_scale, y, 7991, workspace
+        )
 
 
 if __name__ == "__main__":

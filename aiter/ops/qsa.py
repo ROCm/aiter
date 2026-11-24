@@ -14,8 +14,13 @@ import torch
 
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
+    FP4_GROUP,
+    FP8_DTYPE,
+    FP8_MAX,
+    qsa_cache_row_layout,
     qsa_expand_block_indices,
     qsa_sparse_paged_gqa,
+    qsa_store_quantized_rows,
 )
 from aiter.ops.triton.attention.qsa import (
     qsa_paged_mqa_logits as _triton_qsa_paged_mqa_logits,
@@ -34,7 +39,12 @@ except ImportError:
     _HAS_FLYDSL = False
 
 try:
-    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        SELECTION_WIDTHS,
+        flydsl_qsa_sparse_prefill,
+        flydsl_qsa_sparse_prefill_available,
+        flydsl_qsa_sparse_prefill_supports_selection,
+    )
 
     _HAS_FLYDSL_PREFILL = True
 except ImportError:
@@ -55,16 +65,22 @@ def qsa_paged_mqa_logits(
     max_columns: int | None = None,
     row_starts: torch.Tensor | None = None,
     allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score compressed key groups.
 
     Dispatches to the FlyDSL MFMA scorer for large prefill batches when
     ``allow_flydsl`` is set and FlyDSL is available, otherwise falls through
     to the triton wrapper.
+
+    FP8 / MXFP4 keys (with ``compressed_k_scale``) and ``stacked_decode`` are
+    triton only.
     """
     if (
         allow_flydsl
         and _HAS_FLYDSL
+        and compressed_k_scale is None
         and q.shape[0] > 256
         and q.stride(2) == 1
         and compressed_k_cache.stride(3) == 1
@@ -105,6 +121,8 @@ def qsa_paged_mqa_logits(
         score_divisor,
         max_columns,
         row_starts,
+        compressed_k_scale=compressed_k_scale,
+        stacked_decode=stacked_decode,
     )
 
 
@@ -121,6 +139,8 @@ def qsa_select_paged_tokens(
     logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
 ) -> torch.Tensor:
     """Score, select and expand in one call."""
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
@@ -165,6 +185,8 @@ def qsa_select_paged_tokens(
             max_columns=columns,
             row_starts=row_starts,
             allow_flydsl=allow_flydsl,
+            compressed_k_scale=compressed_k_scale,
+            stacked_decode=stacked_decode,
         )
         selected_groups = torch.empty(
             (row_end - row_start, block_topk), dtype=torch.int32, device=q.device
@@ -194,6 +216,24 @@ def qsa_select_paged_tokens(
     return out
 
 
+def qsa_sparse_prefill_widths() -> tuple[int, ...]:
+    """Selection widths (4T + 3 int32 columns) ``qsa_sparse_prefill`` accepts, in
+    increasing order; empty where it cannot run (no FlyDSL, or the GPU is not
+    gfx942)."""
+    available = _HAS_FLYDSL_PREFILL and flydsl_qsa_sparse_prefill_available()
+    return SELECTION_WIDTHS if available else ()
+
+
+def qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
+    """Whether ``qsa_sparse_prefill`` takes an int32 [rows, width] selection: the
+    width is one of ``qsa_sparse_prefill_widths()`` and the selection spans fewer
+    than 2**31 bytes. Lets a caller pick its path before building the selection;
+    the remaining inputs are still checked by the call."""
+    return bool(
+        qsa_sparse_prefill_widths()
+    ) and flydsl_qsa_sparse_prefill_supports_selection(rows, width)
+
+
 def qsa_sparse_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -205,9 +245,17 @@ def qsa_sparse_prefill(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     kv_slots: torch.Tensor | None = None,
+    batch_invariant: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    compute: str = "fp8",
 ) -> torch.Tensor:
     """Sparse prefill/extend attention over packed K/V, or a token pool read through
-    kv_slots; FlyDSL on gfx942 only.
+    kv_slots; FlyDSL on gfx942 only. batch_invariant=True makes each request's result
+    independent of the other requests in the call. K/V may be FP8 (dtypes.fp8) with FP32
+    k_scale / v_scale per tensor ([1]) or per token and KV head ([N, HK]; [P, HK] with
+    kv_slots), computed with FP8 MFMAs (compute="fp8"; per-token V scales clamped to
+    [2**-60, 2**60]) or dequantized to BF16 (compute="bf16").
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
@@ -223,14 +271,25 @@ def qsa_sparse_prefill(
         softmax_scale=softmax_scale,
         out=out,
         kv_slots=kv_slots,
+        batch_invariant=batch_invariant,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compute=compute,
     )
 
 
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
+    "FP4_GROUP",
+    "FP8_DTYPE",
+    "FP8_MAX",
+    "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
+    "qsa_sparse_prefill_supports_selection",
+    "qsa_sparse_prefill_widths",
+    "qsa_store_quantized_rows",
 ]
