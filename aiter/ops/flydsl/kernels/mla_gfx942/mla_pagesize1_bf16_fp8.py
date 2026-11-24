@@ -61,9 +61,9 @@ def _round_to_bf16_finite(value):
 
 def _mfma(a, b, acc):
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    operand_a = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-    operand_b = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-    accumulator = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+    operand_a = fx.make_rmem_tensor(4, fx.BFloat16)
+    operand_b = fx.make_rmem_tensor(4, fx.BFloat16)
+    accumulator = fx.make_rmem_tensor(4, fx.Float32)
     operand_a.store(a)
     operand_b.store(b)
     accumulator.store(acc)
@@ -125,9 +125,7 @@ def _wave_uniform(value):
 
 
 def _mfma_fragment(v, start):
-    return fx.Vector.from_elements(
-        [v[start + i] for i in range_constexpr(4)], dtype=fx.BFloat16
-    )
+    return v.shuffle(v, [start, start + 1, start + 2, start + 3])
 
 
 @cache
@@ -671,13 +669,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                                 store_lane_group,
                                 None,
                             )
-                            value = fx.Vector.from_elements(
-                                [
-                                    _round_to_bf16_finite(acc[i] * factor)
-                                    for i in range_constexpr(4)
-                                ],
-                                dtype=fx.BFloat16,
-                            )
+                            value = _round_to_bf16_finite(acc * factor)
                             final_output[(out_row, output_columns)].store(value)
                         # Trace-time flag around a device test: they must not be merged.
                         if write_final_lse:  # noqa: SIM102
