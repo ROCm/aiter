@@ -753,12 +753,17 @@ def compile_moe_bs_gemm_8w(
             store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div, lds.T_lds)
 
         # Stage 2 defers a tile's 16 output stores (128 KB a CU) into the next
-        # tile's first K-step, after that step's first load: issued in the
-        # epilogue, all 8 waves' stores drained together while no MFMA ran,
-        # the lagging group stalled up to ~5k cy behind the leading group's,
-        # and the leading group then waited for it at the next prologue's
-        # barrier (ATT, T=8192: last MFMA -> next first MFMA was ~43% of a
-        # wave's time). Carried as 64 packed bf16 words + 8 output rows a wave.
+        # tile's first K-step: issued in the epilogue, all 8 waves' stores
+        # drained together while no MFMA ran, the lagging group stalled up to
+        # ~5k cy behind the leading group's, and the leading group then waited
+        # for it at the next prologue's barrier (ATT, T=8192: last MFMA -> next
+        # first MFMA was ~43% of a wave's time). Carried as 64 packed bf16
+        # words + 8 output rows a wave. vmcnt is in order, so a store is
+        # drained by the first wait for a load issued after it: row half 0's
+        # stores follow step 0's A1 load (drained at step 1's middle wait),
+        # half 1's follow its A0 load (drained at step 1's end wait). All 16
+        # after A1 (ed13799dc), or half 1 after step 0's B1 load (7 spills),
+        # measured ~2% slower than this split at T=4096 / 16384 (vs HK, ABAB).
         deferred = epilogue == "slot_bf16"
         # 4 accumulator groups x N_TILES_A stores x 4 words, then the output
         # row of each (row half, row tile): read from the route LDS at step 0
@@ -774,8 +779,10 @@ def compile_moe_bs_gemm_8w(
                 half_row0(nb, 1) + wave_n * B_GRP_ROWS,
             )
 
-        def deferred_store(prev_tile, pending):
-            """The previous tile's stores: ``pending`` = its packed words, then its output rows."""
+        HALF_STORES = STORES // 2
+
+        def deferred_store(prev_tile, pending, halves=(0, 1)):
+            """The previous tile's stores of row ``halves``: ``pending`` = its packed words, then its output rows."""
             valid = prev_tile >= 0
             pcol0, pcol1 = slot_cols(fx.Int32(prev_tile) % NB)
             words = pending[:N_WORDS]
@@ -787,7 +794,8 @@ def compile_moe_bs_gemm_8w(
             for g, (h, col) in enumerate(
                 ((0, pcol0), (0, pcol1), (1, pcol0), (1, pcol1))
             ):
-                store_c.store_words(words[g * n : (g + 1) * n], rows[h], col, valid)
+                if const_expr(h in halves):
+                    store_c.store_words(words[g * n : (g + 1) * n], rows[h], col, valid)
 
         def run_tile(tile, parity, prev=None):
             m_blk = tile // NB
@@ -928,7 +936,7 @@ def compile_moe_bs_gemm_8w(
                 a0_frag = a_s2r.load(a_cur0)
                 a_load(1, a_next1, k + 1)
                 if const_expr(deferred and k == 0):
-                    deferred_store(prev[0], prev[1])
+                    deferred_store(prev[0], prev[1], (0,))
                 rocdl.s_barrier()
                 scale_chunk_dma(k)
 
@@ -944,10 +952,16 @@ def compile_moe_bs_gemm_8w(
                 sa1 = scale_read(k, "a1")
                 a1_frag = a_s2r.load(a_cur1)
                 a_load(0, a_cur0, k + 2)
-                # Step 0: the previous tile's stores came after A1's load; let
-                # them stay in flight (they are newer than everything these
-                # two waits require).
-                wait_barrier(4 * N_LDS_STEPS + (STORES if deferred and k == 0 else 0))
+                if const_expr(deferred and k == 0):
+                    deferred_store(prev[0], prev[1], (1,))
+                # The deferred stores stay in flight through step 0's two
+                # waits; step 1's middle wait needs the loads issued between
+                # the halves, so only half 1 still does.
+                wait_barrier(
+                    4 * N_LDS_STEPS
+                    + (STORES if deferred and k == 0 else 0)
+                    + (HALF_STORES if deferred and k == 1 else 0)
+                )
 
                 c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
