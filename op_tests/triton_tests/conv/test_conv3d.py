@@ -13,7 +13,7 @@ collapse to the same 4 distinct shapes. A few small extra shapes exercise
 stride/pad/dilation and non-3x3x3 kernels through the same general path.
 
 Tolerances reuse the shared dynamic model with K_red = C*T*R*S. The same
-module also covers configuration lookup.
+module also covers configuration lookup and benchmark graph and pool behavior.
 """
 
 import pytest
@@ -51,12 +51,13 @@ from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key_3d,
     format_shape_key_3d,
 )
-
-from ._helpers import (
+from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
     CONV3D_WEIGHT_PACK_CACHE_NAMES,
     _winograd_tolerances,
     apply_activation,
+    assert_conv_benchmark_graph_packing_and_outputs,
+    assert_prepacked_pool_sizes_only_rotating_packed_inputs,
     assert_weight_pack_cache_clear_is_scoped,
     dynamic_conv_tolerances,
 )
@@ -1394,6 +1395,38 @@ def test_winograd_launchers_use_complete_3d_key_and_axes(
     assert all(
         count == 1 for count in launch_counts
     ), f"expected one launch per Winograd stage, got {launch_counts}"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Convolution benchmarks require a GPU"
+)
+def test_prepacked_pool_sizes_only_rotating_packed_inputs(monkeypatch):
+    assert_prepacked_pool_sizes_only_rotating_packed_inputs(monkeypatch, dimensions=3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Convolution benchmarks require a GPU"
+)
+@pytest.mark.parametrize(
+    "method,layout,kernel_size,channels",
+    [
+        ("1x1x1", "ncdhw", 1, 8),
+        ("cblocked", "ncdhw", 3, 64),
+        ("winograd_cblocked", "ncdhw", 3, 64),
+    ],
+)
+def test_conv_benchmark_graph_packing_and_outputs(
+    monkeypatch, tmp_path, method, layout, kernel_size, channels
+):
+    assert_conv_benchmark_graph_packing_and_outputs(
+        monkeypatch,
+        tmp_path,
+        dimensions=3,
+        method=method,
+        layout=layout,
+        kernel_size=kernel_size,
+        channels=channels,
+    )
 
 
 if __name__ == "__main__":

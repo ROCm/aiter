@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Benchmark the Triton Conv3D implementations against PyTorch."""
+"""Benchmark Triton Conv3D with fixed weights and rotating activations.
+
+Graph timings exclude weight preparation and CPU dispatch.
+Channel-blocked routes report input packing excluded and included.
+Bandwidth is effective input, weight, bias, and output bytes per second.
+"""
 
 import argparse
 import csv
+import functools
 import json
 import os
 import statistics
@@ -11,9 +17,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
-import triton
 
+from aiter import logger
 from aiter.ops.triton.conv._prepack import (
     clear_conv3d_weight_pack_caches,
     prepack_ncdhw_to_cblocked,
@@ -30,14 +35,18 @@ from aiter.ops.triton.conv.conv3d import (
     conv3d_winograd_hw_f4x3_cblocked,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import BASE_DIR
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.conv._helpers import (
-    _winograd_tolerances,
-    apply_activation,
-    dynamic_conv_tolerances,
+    generate_conv_input,
+    generate_conv_weights,
 )
 
 METHODS = (
@@ -210,50 +219,6 @@ def _run_triton(method, x, w, bias, case: Conv3DCase, layout: str, activation: s
     raise ValueError(f"unknown method: {method}")
 
 
-def _torch_reference(x, w, bias, case: Conv3DCase, activation: str):
-    result = F.conv3d(
-        x,
-        w,
-        bias,
-        stride=case.stride,
-        padding=case.padding,
-        dilation=case.dilation,
-    )
-    return apply_activation(result, activation)
-
-
-def _make_inputs(case: Conv3DCase, dtype: torch.dtype, layout: str, use_bias: bool):
-    N, C, D, H, W, K, T, R, S = case.dims
-    x = torch.randn((N, C, D, H, W), device="cuda", dtype=dtype)
-    if layout == "ndhwc":
-        x = x.contiguous(memory_format=torch.channels_last_3d)
-    w = torch.randn((K, C, T, R, S), device="cuda", dtype=dtype)
-    bias = torch.randn((K,), device="cuda", dtype=dtype) if use_bias else None
-    return x, w, bias
-
-
-def _assert_correct(
-    output,
-    reference,
-    case: Conv3DCase,
-    dtype: torch.dtype,
-    kernel_name: str,
-):
-    _, C, _, _, _, _, T, R, S = case.dims
-    reduction = C * T * R * S
-    if "winograd" in kernel_name.lower() or "wino" in kernel_name.lower():
-        rtol, atol = _winograd_tolerances(dtype, reduction)
-    else:
-        rtol, atol = dynamic_conv_tolerances(dtype, reduction)
-    torch.testing.assert_close(
-        output.float(),
-        reference.float(),
-        rtol=rtol,
-        atol=atol,
-        msg=lambda msg: f"Conv3D benchmark mismatch for {case.name}\n\n{msg}",
-    )
-
-
 def _flops(case: Conv3DCase) -> float:
     N, C, D, H, W, K, T, R, S = case.dims
     OD, OH, OW = _out_dhw(D, H, W, T, R, S, case.stride, case.padding, case.dilation)
@@ -337,23 +302,14 @@ def _metric_labels(metric: str) -> tuple[str, str]:
     return "ms", "latency [ms]"
 
 
-def _is_better(metric: str, triton_value: float, torch_value: float) -> bool:
-    if metric == "time":
-        return triton_value < torch_value
-    return triton_value > torch_value
-
-
 def _print_layer_table(layers, has_any_repack, metric):
     short_unit, _ = _metric_labels(metric)
-    print("\n" + "=" * 80)
-    print("LAYER-BY-LAYER BENCHMARK")
-    print("=" * 80)
+    logger.info("\nLAYER-BY-LAYER BENCHMARK")
 
     headers = ["#", "Layer", "Type", "Shape", "Triton Kernel"]
-    headers.append(f"Tri Kernel {short_unit}")
+    headers.append(f"Packing excluded {short_unit}")
     if has_any_repack:
-        headers.append(f"Tri Kernel+Repack {short_unit}")
-    headers.extend([f"Torch {short_unit}", "Winner"])
+        headers.append(f"Packing included {short_unit}")
 
     rows = []
     for index, layer in enumerate(layers):
@@ -368,22 +324,14 @@ def _print_layer_table(layers, has_any_repack, metric):
         if has_any_repack:
             e2e_value = layer["values"].get("triton_e2e")
             row.append(f"{e2e_value:.2f}" if e2e_value is not None else "—")
-        torch_value = layer["values"]["torch"]
-        row.append(f"{torch_value:.2f}")
-        row.append(
-            "Triton"
-            if _is_better(metric, layer["values"]["triton_kernel"], torch_value)
-            else "Torch"
-        )
         rows.append(row)
-    print(_box_table(headers, rows))
+    logger.info("\n%s", _box_table(headers, rows))
 
 
 def _aggregate_value(layers, provider, metric):
     timing_key = {
         "triton_kernel": "ms_tri",
         "triton_e2e": "ms_tri_e2e",
-        "torch": "ms_torch",
     }[provider]
     total_ms = 0.0
     total_work = 0.0
@@ -405,98 +353,30 @@ def _aggregate_value(layers, provider, metric):
 
 def _print_overall_perf_table(layers, has_any_repack, metric):
     _, long_unit = _metric_labels(metric)
-    print("\n" + "=" * 80)
-    print("OVERALL PERFORMANCE")
-    print("=" * 80)
-
-    tri_values = [layer["values"]["triton_kernel"] for layer in layers]
-    torch_values = [layer["values"]["torch"] for layer in layers]
-    e2e_values = [
-        layer["values"].get("triton_e2e", layer["values"]["triton_kernel"])
-        for layer in layers
-    ]
-    count = len(layers)
-    tri_wins = sum(
-        _is_better(metric, tri, torch) for tri, torch in zip(tri_values, torch_values)
-    )
-    e2e_wins = sum(
-        _is_better(metric, e2e, torch) for e2e, torch in zip(e2e_values, torch_values)
-    )
-
-    rows = [
-        [
-            f"Mean {long_unit} (kernel)",
-            f"{statistics.mean(tri_values):.2f}",
-            f"{statistics.mean(torch_values):.2f}",
-        ]
-    ]
+    logger.info("\nOVERALL PERFORMANCE")
+    modes = [("Packing excluded", "triton_kernel")]
     if has_any_repack:
-        rows.append(
-            [
-                f"Mean {long_unit} (kernel+repack)",
-                f"{statistics.mean(e2e_values):.2f}",
-                f"{statistics.mean(torch_values):.2f}",
-            ]
-        )
-    rows.append(
-        [
-            f"Median {long_unit} (kernel)",
-            f"{statistics.median(tri_values):.2f}",
-            f"{statistics.median(torch_values):.2f}",
-        ]
-    )
-    if has_any_repack:
-        rows.append(
-            [
-                f"Median {long_unit} (kernel+repack)",
-                f"{statistics.median(e2e_values):.2f}",
-                f"{statistics.median(torch_values):.2f}",
-            ]
-        )
+        modes.append(("Packing included", "triton_e2e"))
+    headers = ["Input packing", f"Mean {long_unit}", f"Median {long_unit}"]
     if metric != "time":
-        rows.append(
-            [
-                f"Aggregate {long_unit} (kernel)",
-                f"{_aggregate_value(layers, 'triton_kernel', metric):.2f}",
-                f"{_aggregate_value(layers, 'torch', metric):.2f}",
-            ]
-        )
-        if has_any_repack:
-            rows.append(
-                [
-                    f"Aggregate {long_unit} (kernel+repack)",
-                    f"{_aggregate_value(layers, 'triton_e2e', metric):.2f}",
-                    f"{_aggregate_value(layers, 'torch', metric):.2f}",
-                ]
-            )
-    rows.append(
-        [
-            "Total kernel time (ms)",
-            f"{sum(layer['ms_tri'] for layer in layers):.2f}",
-            f"{sum(layer['ms_torch'] for layer in layers):.2f}",
+        headers.append(f"Aggregate {long_unit}")
+    headers.append("Total ms")
+    rows = []
+    for label, provider in modes:
+        values = [
+            layer["values"].get(provider, layer["values"]["triton_kernel"])
+            for layer in layers
         ]
-    )
-    if has_any_repack:
-        rows.append(
-            [
-                "Total kernel+repack time (ms)",
-                f"{_aggregate_value(layers, 'triton_e2e', 'time'):.2f}",
-                f"{sum(layer['ms_torch'] for layer in layers):.2f}",
-            ]
-        )
-    rows.append(
-        ["Layer wins (kernel)", f"{tri_wins}/{count}", f"{count - tri_wins}/{count}"]
-    )
-    if has_any_repack:
-        rows.append(
-            [
-                "Layer wins (kernel+repack)",
-                f"{e2e_wins}/{count}",
-                f"{count - e2e_wins}/{count}",
-            ]
-        )
-    rows.append(["Correctness", f"{count}/{count} passed", "—"])
-    print(_box_table(("Metric", "Triton", "PyTorch (MIOpen)"), rows))
+        row = [
+            label,
+            f"{statistics.mean(values):.2f}",
+            f"{statistics.median(values):.2f}",
+        ]
+        if metric != "time":
+            row.append(f"{_aggregate_value(layers, provider, metric):.2f}")
+        row.append(f"{_aggregate_value(layers, provider, 'time'):.4f}")
+        rows.append(row)
+    logger.info("\n%s", _box_table(headers, rows))
 
 
 def _print_weighted_totals(cases, timings, include_e2e):
@@ -509,29 +389,21 @@ def _print_weighted_totals(cases, timings, include_e2e):
             getattr(case, field) * timings[(index, "triton_kernel")]
             for index, case in enumerate(cases)
         )
-        torch_ms = sum(
-            getattr(case, field) * timings[(index, "torch")]
-            for index, case in enumerate(cases)
-        )
+        row = [workload, calls, f"{kernel_ms / 1e3:.4f}"]
         if include_e2e:
             e2e_ms = sum(
                 getattr(case, field)
                 * timings.get((index, "triton_e2e"), timings[(index, "triton_kernel")])
                 for index, case in enumerate(cases)
             )
-        else:
-            e2e_ms = kernel_ms
-        rows.append((workload, calls, kernel_ms / 1e3, e2e_ms / 1e3, torch_ms / 1e3))
-    if not rows:
-        return
-
-    print("\nCall-count-weighted model totals:")
-    print("workload calls triton_kernel_s triton_e2e_s torch_s speedup")
-    for workload, calls, kernel_s, e2e_s, torch_s in rows:
-        speedup = torch_s / e2e_s if e2e_s else float("nan")
-        print(
-            f"{workload} {calls} {kernel_s:.4f} {e2e_s:.4f} "
-            f"{torch_s:.4f} {speedup:.2f}x"
+            row.append(f"{e2e_ms / 1e3:.4f}")
+        rows.append(row)
+    if rows:
+        headers = ["Workload", "Calls", "Packing excluded (s)"]
+        if include_e2e:
+            headers.append("Packing included (s)")
+        logger.info(
+            "\nCall-count-weighted convolution totals:\n%s", _box_table(headers, rows)
         )
 
 
@@ -547,13 +419,14 @@ def run_benchmark(args) -> None:
     providers = ["triton_kernel"]
     if include_e2e:
         providers.append("triton_e2e")
-    providers.append("torch")
 
     unit = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}[args.metric]
     timings: dict[tuple[int, str], float] = {}
     values: dict[tuple[int, str], float] = {}
     moved_bytes: dict[tuple[int, str], int] = {}
-    validated: set[int] = set()
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     result_rows = []
 
     def benchmark_case(case_id, provider):
@@ -565,62 +438,89 @@ def run_benchmark(args) -> None:
 
         torch.manual_seed(case_id)
         use_bias = case.bias and not args.no_bias
-        x, w, bias = _make_inputs(case, dtype, args.layout, use_bias)
+        batch, channels, depth, height, width, outputs, taps, rows, columns = case.dims
+        input_generator = functools.partial(
+            generate_conv_input,
+            (batch, channels, depth, height, width),
+            dtype,
+            args.layout,
+        )
+        weight_generator = functools.partial(
+            generate_conv_weights,
+            (outputs, channels, taps, rows, columns),
+            dtype,
+            use_bias,
+        )
+        prepacked = provider == "triton_kernel" and needs_pack
+        cblocked_fn = (
+            conv3d_winograd_hw_f4x3_cblocked
+            if "winograd" in kernel_name.lower()
+            else conv3d_ncdhw_cblocked
+        )
 
-        def run_triton():
+        def invoke(input_tensor, weight, bias, x_blocked=None):
+            if prepacked:
+                return cblocked_fn(
+                    input_tensor,
+                    weight,
+                    bias,
+                    case.stride,
+                    case.padding,
+                    case.dilation,
+                    activation=args.activation,
+                    x_blocked=x_blocked,
+                )
             return _run_triton(
-                args.method, x, w, bias, case, args.layout, args.activation
+                args.method,
+                input_tensor,
+                weight,
+                bias,
+                case,
+                args.layout,
+                args.activation,
             )
 
-        def run_torch():
-            return _torch_reference(x, w, bias, case, args.activation)
+        fixed_generators = [weight_generator]
+        fixed_keys = [("weight", "bias")]
+        rotating_generator = input_generator
+        rotating_keys = ("input_tensor",)
+        if prepacked:
+            fixed_generators.append(input_generator)
+            fixed_keys.append(("input_tensor",))
+
+            def rotating_generator():
+                (input_tensor,) = input_generator()
+                packed_input, _ = prepack_ncdhw_to_cblocked(input_tensor, BLOCK_K)
+                return (packed_input,)
+
+            rotating_keys = ("x_blocked",)
 
         try:
-            if case_id not in validated:
-                output = run_triton()
-                reference = run_torch()
-                torch.cuda.synchronize()
-                _assert_correct(output, reference, case, dtype, kernel_name)
-                validated.add(case_id)
-                del output, reference
-                torch.cuda.empty_cache()
-
-            if provider == "torch":
-                function = run_torch
-            elif provider == "triton_e2e" or not needs_pack:
-                function = run_triton
-            else:
-                x_blocked, _ = prepack_ncdhw_to_cblocked(x, BLOCK_K)
-                cblocked_fn = (
-                    conv3d_winograd_hw_f4x3_cblocked
-                    if "winograd" in kernel_name.lower()
-                    else conv3d_ncdhw_cblocked
-                )
-
-                def function():
-                    return cblocked_fn(
-                        x,
-                        w,
-                        bias,
-                        case.stride,
-                        case.padding,
-                        case.dilation,
-                        activation=args.activation,
-                        x_blocked=x_blocked,
-                    )
-
-            milliseconds = triton.testing.do_bench(function, warmup=15, rep=50)
+            bencher.build_pool(
+                [rotating_generator],
+                [rotating_keys],
+                inp_gen_fixed_fns=fixed_generators,
+                inp_fixed_keys=fixed_keys,
+            )
+            milliseconds = bencher.bench(invoke)
             timings[(case_id, provider)] = milliseconds
             moved = _effective_bytes(case, dtype, use_bias)
             moved_bytes[(case_id, provider)] = moved
             return _metric_value(args.metric, milliseconds, _flops(case), moved)
         finally:
+            bencher.rot_bufs = None
             clear_conv3d_weight_pack_caches()
             torch.cuda.empty_cache()
 
-    print(
-        f"# source={source} shapes={len(cases)} dtype={args.dtype} "
-        f"layout={args.layout} method={args.method} metric={args.metric}"
+    logger.info(
+        "source=%s shapes=%s dtype=%s layout=%s method=%s metric=%s weight_policy=fixed; "
+        "GPU graph timings exclude weight preparation",
+        source,
+        len(cases),
+        args.dtype,
+        args.layout,
+        args.method,
+        args.metric,
     )
     for case_id, case in enumerate(cases):
         for provider in providers:
@@ -631,6 +531,12 @@ def run_benchmark(args) -> None:
             row = {
                 "case": case_id,
                 "provider": provider,
+                "input_packing": (
+                    "included"
+                    if provider == "triton_e2e"
+                    else "excluded" if packs_input[case_id] else "not_needed"
+                ),
+                "weight_policy": "fixed",
                 "value": value,
                 "unit": unit,
                 "kernel": kernel_names[case_id],
@@ -660,7 +566,6 @@ def run_benchmark(args) -> None:
                 "bytes": layer_bytes,
                 "ms_tri": timings[(case_id, "triton_kernel")],
                 "ms_tri_e2e": timings.get((case_id, "triton_e2e")),
-                "ms_torch": timings[(case_id, "torch")],
                 "flops": _flops(case),
             }
         )
@@ -680,7 +585,7 @@ def run_benchmark(args) -> None:
             writer = csv.DictWriter(file, fieldnames=result_rows[0])
             writer.writeheader()
             writer.writerows(result_rows)
-        print(f"Saved {output_path}")
+        logger.info("Saved %s", output_path)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
