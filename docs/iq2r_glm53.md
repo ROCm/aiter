@@ -962,6 +962,29 @@ copy of the shared expert per GPU at TP4 (not measured in the budget).
 
 ## Quality against MXFP4
 
+**1,024 entries with LDLQ, full Terminal-Bench 2.0.** All 89 tasks, one
+attempt per task per arm, both arms at the same time on one host with 8
+MI350X (IQ2R on 4 GPUs, MXFP4 A4W4 on the other 4, TP4 each), the same aiter
+and ATOM code, FP8 KV cache, `--max-num-seqs 16`, standard kernels. Harbor
+0.25.0 with its terminus-2 agent (temperature 0.95, the benchmark's task time
+limits), 8 tasks at a time per arm, thinking capped at 16,384 tokens plus
+4,096 answer tokens by a proxy:
+
+| | IQ2R, 1,024 entries + LDLQ | MXFP4 A4W4 |
+|---|---|---|
+| Solved | 60 / 89 (67.4%) | 62 / 89 (69.7%) |
+| Solved by both / only this arm | 56 / 4 | 56 / 6 |
+| Infrastructure errors | 0 | 0 |
+
+- On par with MXFP4: the two arms disagree on 10 tasks, 4 to 6, which is
+  within run-to-run noise (exact McNemar test p = 0.75). One attempt per task
+  moves an 89-task score by a few tasks between runs.
+- Only IQ2R: build-cython-ext, polyglot-rust-c, pytorch-model-cli,
+  schemelike-metacircular-eval. Only MXFP4: build-pov-ray, largest-eigenval,
+  mteb-leaderboard, path-tracing, regex-chess, train-fasttext.
+- These are not leaderboard settings (one attempt, capped thinking); they
+  compare the two arms under identical conditions.
+
 **1,024 entries with LDLQ (decision corpus above), paired tasks.**
 Native kernels, TP4, FP8 KV cache, max-num-seqs 16; base and MXFP4 side by side,
 then the LDLQ arm, on one day:
@@ -984,9 +1007,8 @@ then the LDLQ arm, on one day:
   thinking (median output 15K vs 23K tokens, as MXFP4) and lifts the 15 SWE
   tasks from 10 to 15 of 30.
 - These are small, hard-case subsets: 15-task SWE runs move by a few tasks, the
-  Terminal-Bench tasks by about +-4 of 15. The full benchmarks (SWE-bench Lite,
-  Terminal-Bench 2.0) were not run on this recipe; the 512-entry recipe below
-  trailed MXFP4 on SWE-bench Lite.
+  Terminal-Bench tasks by about +-4 of 15. Full SWE-bench Lite was not run on
+  this recipe; the 512-entry recipe below trailed MXFP4 on it.
 - The MXFP4 arm here is A4W4; the 512-entry comparison below used A8W4
   (9, 11, 12 on the same 15 tasks).
 - No degenerate output in any arm (no `</think>` collapses, no runaway
@@ -1048,7 +1070,7 @@ What the numbers say:
 
 ## Not measured
 
-- The full SWE-bench Lite and Terminal-Bench 2.0, and GSM8K, on the 1,024-entry LDLQ recipe.
+- The full SWE-bench Lite and GSM8K on the 1,024-entry LDLQ recipe; Terminal-Bench 2.0 with several attempts per task.
 - Serving of the 1,024-entry checkpoint on MI355X (the serving tables are MI350X); its per-GPU memory budget.
 - Longer inputs and outputs than 1024/1024; MTP.
 - Variation across GPUs and nodes; token counts between tuned rows; M > 4096; power.
