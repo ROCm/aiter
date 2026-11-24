@@ -2888,14 +2888,18 @@ def test_triton_unified_attn_one_q_block(
 @pytest.mark.parametrize(
     "num_seqs, kv_len, num_splits",
     [
-        # 64 * 2 one-block programs leave a 256-CU launch half empty, but the padded
-        # count (num_tokens // 4 + num_seqs per KV head) says the launch is full.
-        # Counting the one-block grid is what makes this launch split.
+        # The split lookup starts from BLOCK_Q=1 (16 queries per KV head, BLOCK_M 16),
+        # so the padded count is 256 tokens // 1 + 64 seqs = 320 per KV head, 640
+        # programs for 2 KV heads: more than the 256 CUs, so the launch stays unsplit.
+        # The one-block grid is 64 * 2 = 128 programs, half the CUs. Counting it is
+        # what makes this launch split.
         (64, 8192, 4),
-        # the padded count already splits, so it is kept. Counting the one-block
-        # grid here as well would give 32 segments instead of 8.
+        # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
+        # so it is kept. Counting the one-block grid (16 programs) as well would give
+        # 32 segments instead of 8.
         (8, 8192, 8),
-        # 256 * 2 one-block programs fill the CUs: nothing to split
+        # padded: 1024 // 1 + 256 = 1280 per KV head, 2560 programs. One-block: 512.
+        # Both fill the CUs: nothing to split.
         (256, 1024, 1),
     ],
 )
