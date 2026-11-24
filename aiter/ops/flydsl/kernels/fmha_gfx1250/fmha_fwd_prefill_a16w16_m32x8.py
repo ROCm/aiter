@@ -40,6 +40,7 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
@@ -359,10 +360,12 @@ def _softmax(
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
 
     def peer(v):  # cross-lane reduce partner: lane l <-> l^16 (the other kv half)
+        # ``old`` is tied to vdst and only feeds lanes whose partner is inactive, which
+        # cannot happen here. Passing v instead would copy v into vdst, as v is still live.
         return fx.Float32(
             rocdl.permlanex16(
                 f32,
-                _raw(v),
+                llvm_dialect.mlir_poison(f32),
                 _raw(v),
                 sel_lo,
                 sel_hi,
