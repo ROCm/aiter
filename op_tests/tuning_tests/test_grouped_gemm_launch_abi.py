@@ -237,6 +237,13 @@ def test_changing_arena_selects_a_new_specialization(dispatch):
         ({}, {}, 256, 3),
         ({"persistent_workers": 128}, {}, 128, 3),
         ({"persistent_workers": 512, "num_buffers": 2}, {}, 512, 3),
+        ({}, {"AITER_FLYDSL_EP_SCATTER_OVERLAP": "0"}, 0, 4),
+        (
+            {"persistent_workers": 512, "num_buffers": 3},
+            {"AITER_FLYDSL_EP_SCATTER_OVERLAP": "0"},
+            512,
+            3,
+        ),
         (
             {"persistent_workers": 128},
             {"AITER_FLYDSL_PERSISTENT_WORKERS2": "64"},
@@ -267,6 +274,7 @@ def test_overlap_defaults_preserve_launch_configuration(
         "AITER_FLYDSL_MXFP4_CLUSTER_N",
         "AITER_TDM_NEXT_STAGE_PREFETCH",
         "AITER_GROUPED_GEMM_AS_PROLOGUE",
+        "AITER_FLYDSL_EP_SCATTER_OVERLAP",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
@@ -308,6 +316,9 @@ def test_overlap_defaults_preserve_launch_configuration(
     selected = calls[0]
     assert selected["persistent_workers"] == expected_workers
     assert selected["num_buffers"] == expected_buffers
+    assert selected["ep_scatter_overlap"] == int(
+        env.get("AITER_FLYDSL_EP_SCATTER_OVERLAP", "1")
+    )
     for name in (
         "tile_m",
         "tile_n",
@@ -319,6 +330,44 @@ def test_overlap_defaults_preserve_launch_configuration(
         "a_preshuffled",
     ):
         assert selected[name] == config[name]
+
+
+def test_scatter_overlap_override_separates_cached_launches(dispatch, monkeypatch):
+    """The overlap ABI must not reuse an ordinary-scatter compiled handle."""
+    compiled, launches = dispatch
+    data = torch.empty((256, 1024), dtype=torch.uint8, device="meta")
+    ids = torch.empty(64, dtype=torch.int32, device="meta")
+    scatter = Stage2ScatterContext(123456, 0, 16384, 8192, 4, ids)
+    for overlap in ("0", "1", "0"):
+        monkeypatch.setenv("AITER_FLYDSL_EP_SCATTER_OVERLAP", overlap)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            data,
+            data,
+            data,
+            data,
+            data,
+            ids,
+            n_experts=64,
+            contiguous_m=256,
+            N=1024,
+            K=2048,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            num_buffers=3,
+            next_stage_prefetch=1,
+            cluster_m=1,
+            cluster_n=4,
+            persistent_workers=512,
+            stream=0,
+            stage2_scatter=scatter,
+        )
+    assert len(compiled) == 2
+    assert len(launches) == 3
 
 
 @pytest.mark.parametrize(

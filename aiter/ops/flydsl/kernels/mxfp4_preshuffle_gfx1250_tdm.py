@@ -234,6 +234,7 @@ def build_gemm_a8w4_tdm_task(
     b_placed=0,
     loc_sched=0,
     loc_group=1,
+    ep_scatter_overlap=1,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -470,7 +471,8 @@ def build_gemm_a8w4_tdm_task(
     num_waves = m_warp * n_warp
     block = num_waves * k_waves * WAVE
     overlap_scatter = bool(
-        persistent_workers > 0
+        ep_scatter_overlap
+        and persistent_workers > 0
         and num_buffers == 3
         and ep_scatter_common.can_overlap_scatter(
             enable_ep_scatter=enable_ep_scatter,
@@ -3279,6 +3281,7 @@ def launch_gemm_a8w4_tdm(
     loc_sched: Constexpr[int] = 0,
     arg_loc_phase: fx.Pointer = None,
     loc_group: Constexpr[int] = 1,
+    ep_scatter_overlap: Constexpr[int] = 1,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3355,6 +3358,7 @@ def launch_gemm_a8w4_tdm(
         b_placed=b_placed,
         loc_sched=loc_sched,
         loc_group=loc_group,
+        ep_scatter_overlap=ep_scatter_overlap,
     )
     LOC_RUN = loc_group * max(b_placed, 1)
     if loc_sched:
