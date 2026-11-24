@@ -69,8 +69,8 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     Returns:
         tuple: ``(q_nope_fp4, q_aux)``.
 
-    gfx1250 only. One workgroup per (head, split) keeps the head's W_UK in
-    LDS; there are about as many workgroups as CUs. Graph-safe.
+    gfx1250 only. One workgroup per (head, split) reuses W_UK operands in
+    registers; there are about as many workgroups as CUs. Graph-safe.
     """
     _LOGGER.info(
         "FUSED_BF16_BMM_NVFP4_QUANT_MLA: q_nope=%s w_uk=%s",
@@ -113,7 +113,8 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     block_n = KV_LORA // 2
     splits = max(1, _cu_count(q_nope.device) // heads)
     tiles = triton.cdiv(triton.cdiv(batch, block_m), splits)
-    wmma, op_a, op_b = create_wmma_layouts(num_warps)
+    warp_bases = tuple(tuple(base) for base in config["WARP_BASES"])
+    wmma, op_a, op_b = create_wmma_layouts(num_warps, warp_bases)
     sh_a, sh_b = create_shared_layouts(block_m, block_n, D_NOPE, "TN", 16)
     grid = (heads, triton.cdiv(triton.cdiv(batch, block_m), tiles))
     _fused_bf16_bmm_nvfp4_quant_mla_kernel[grid](
@@ -139,6 +140,7 @@ def fused_bf16_bmm_nvfp4_quant_mla(
         SHARED_LAYOUT_A=sh_a,
         SHARED_LAYOUT_B=sh_b,
         WMMA_LAYOUT=wmma,
+        WARP_BASES=warp_bases,
         OPERAND_LAYOUT_A=op_a,
         OPERAND_LAYOUT_B=op_b,
         num_warps=num_warps,

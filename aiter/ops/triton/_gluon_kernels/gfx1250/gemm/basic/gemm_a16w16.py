@@ -78,14 +78,15 @@ def create_shared_layouts(
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
 
 
-def create_wmma_layouts(num_warps):
-    warp_bases = []
-    for i in range(int(math.log2(num_warps))):
-        if i == 0:
-            warp_bases.append((0, 1))
-        else:
-            warp_bases.append((1 << (i - 1), 0))
-    warp_bases = tuple(warp_bases)
+def create_wmma_layouts(num_warps, warp_bases=None):
+    if warp_bases is None:
+        warp_bases = []
+        for i in range(int(math.log2(num_warps))):
+            if i == 0:
+                warp_bases.append((0, 1))
+            else:
+                warp_bases.append((1 << (i - 1), 0))
+    warp_bases = tuple(tuple(base) for base in warp_bases)
 
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]

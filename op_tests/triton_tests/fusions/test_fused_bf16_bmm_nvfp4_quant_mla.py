@@ -68,16 +68,10 @@ def _e2m1_codes(x):
     return code | (torch.signbit(x).to(torch.int64) << 3)
 
 
-def reference(q_nope, w_uk):
-    """BF16 BMM per head, then 16-value blocks: scale E4M3(amax / 6 * gain),
-    codes E2M1(x / (scale / gain))."""
-    batch, heads, _ = q_nope.shape
-    out = torch.empty((batch, heads, KV_LORA), dtype=torch.bfloat16, device="cuda")
-    batched_gemm_bf16(q_nope.transpose(0, 1), w_uk, YQ=out.transpose(0, 1))
+def quantize_reference(out):
+    batch, heads, _ = out.shape
     x = out.float().view(batch, heads, KV_LORA // 16, 16)
     amax = x.abs().amax(dim=-1)
-    # Tensor divisors: a division by a Python scalar is a multiply by its
-    # reciprocal on the GPU, which is not correctly rounded.
     gain = torch.full_like(amax, Q_GAIN)
     ideal = torch.where(
         amax == 0, torch.ones_like(amax), amax / torch.full_like(amax, 6.0)
@@ -89,7 +83,16 @@ def reference(q_nope, w_uk):
     return packed, s8.view(torch.uint8)
 
 
-@pytest.mark.parametrize("batch", [1, 37, 64, 65, 300, 1536])
+def reference(q_nope, w_uk):
+    """BF16 BMM per head, then 16-value blocks: scale E4M3(amax / 6 * gain),
+    codes E2M1(x / (scale / gain))."""
+    batch, heads, _ = q_nope.shape
+    out = torch.empty((batch, heads, KV_LORA), dtype=torch.bfloat16, device="cuda")
+    batched_gemm_bf16(q_nope.transpose(0, 1), w_uk, YQ=out.transpose(0, 1))
+    return quantize_reference(out)
+
+
+@pytest.mark.parametrize("batch", [1, 37, 64, 65, 300, 1536, 2047, 2048, 2049, 2200, 2240, 2300])
 @pytest.mark.parametrize("q_width", [D_NOPE, 192])
 def test_fused_bf16_bmm_nvfp4_quant_mla(batch, q_width):
     q_nope, w_uk, q_nope_fp4, q_aux = generate_inputs(
@@ -135,3 +138,23 @@ def test_rejects_bad_inputs():
         fused_bf16_bmm_nvfp4_quant_mla(q_nope.float(), w_uk, codes, aux)
     with pytest.raises(AssertionError):
         fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes[:, :, :128], aux)
+
+
+@pytest.mark.parametrize("batch", [37, 2049, 2300])
+@pytest.mark.parametrize("heads", [1, 8, 128])
+def test_exact_bmm_against_torch(batch, heads):
+    # Dyadic inputs make the FP32 dot sums exact across reduction orders.
+    gen = torch.Generator(device="cuda").manual_seed(batch + heads)
+    q = torch.randint(-4, 5, (batch, heads, 192), device="cuda", generator=gen)
+    q = q.to(torch.bfloat16) * (1 / 8)
+    w = torch.randint(-4, 5, (heads, 512, 128), device="cuda", generator=gen)
+    w = w.to(torch.bfloat16) * (1 / 64)
+    want = torch.bmm(q[..., :128].transpose(0, 1).float(), w.transpose(1, 2).float())
+    want = want.transpose(0, 1).to(torch.bfloat16)
+    codes = torch.full((batch, heads, 256), 0xA5, device="cuda", dtype=torch.uint8)
+    aux = torch.full((batch, heads, 128), 0xA5, device="cuda", dtype=torch.uint8)
+    fused_bf16_bmm_nvfp4_quant_mla(q[..., :128], w, codes, aux)
+    want_codes, want_scales = quantize_reference(want)
+    assert torch.equal(codes, want_codes)
+    assert torch.equal(aux[..., 64:96], want_scales)
+    assert (aux[..., :64] == 0xA5).all() and (aux[..., 96:] == 0xA5).all()

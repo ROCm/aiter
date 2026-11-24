@@ -32,7 +32,8 @@ KEYS = ["q_nope", "w_uk", "q_nope_fp4", "q_aux"]
 
 
 def bench_fn(bencher, batch, heads, metric):
-    gen = functools.partial(generate_inputs, batch, heads)
+    # q_b_proj stores NoPE and RoPE together in [B, H, 192].
+    gen = functools.partial(generate_inputs, batch, heads, q_width=192)
     rot_bufs = bencher.build_pool([gen], [KEYS])
     ms = bencher.bench(fused_bf16_bmm_nvfp4_quant_mla)
     flops = 2.0 * batch * heads * KV_LORA * D_NOPE
@@ -52,7 +53,7 @@ def bench_fn(bencher, batch, heads, metric):
 
 
 def run_benchmark(args):
-    batches = [args.M] if args.M else [1, 32, 64, 128, 256, 512, 1024, 1536]
+    batches = [args.M] if args.M else [1, 32, 64, 128, 256, 512, 1024, 1536, 2048, 2200, 2240, 2300]
     benchmark = triton.testing.Benchmark(
         x_names=["batch"],
         x_vals=batches,

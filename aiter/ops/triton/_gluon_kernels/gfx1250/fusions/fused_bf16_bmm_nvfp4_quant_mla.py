@@ -3,9 +3,9 @@
 
 """Gluon (gfx1250) BF16 BMM with the R1 NVFP4 MLA Q quantization in the epilogue.
 
-One persistent workgroup per (head, split) keeps the head's weight in LDS and
-walks row tiles. Each tile goes through two WMMA halves, is quantized in
-registers and leaves by TDM stores.
+One persistent workgroup per (head, split) loads the head's weight into
+registers and walks row tiles. Each tile goes through two WMMA halves, is
+quantized in registers and leaves by TDM stores.
 """
 
 from triton.experimental import gluon
@@ -72,7 +72,7 @@ def _quantize_regs(
 
 _fused_bf16_bmm_nvfp4_quant_mla_repr = make_kernel_repr(
     "_fused_bf16_bmm_nvfp4_quant_mla_kernel",
-    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "num_warps"],
+    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "WARP_BASES", "num_warps"],
 )
 
 
@@ -100,6 +100,7 @@ def _fused_bf16_bmm_nvfp4_quant_mla_kernel(
     SHARED_LAYOUT_A: gl.constexpr,
     SHARED_LAYOUT_B: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
+    WARP_BASES: gl.constexpr,
     OPERAND_LAYOUT_A: gl.constexpr,
     OPERAND_LAYOUT_B: gl.constexpr,
     num_warps: gl.constexpr,
@@ -164,6 +165,10 @@ def _fused_bf16_bmm_nvfp4_quant_mla_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
     gl.barrier()
     zero = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    # Reuse the weight operands across row tiles. Quantize each half before
+    # the next WMMA to shorten the accumulator lifetime.
+    w0 = b0.permute([1, 0]).load(OPERAND_LAYOUT_B)
+    w1 = b1.permute([1, 0]).load(OPERAND_LAYOUT_B)
     for t in range(n_tiles):
         if t + 1 < n_tiles:
             # Every warp read this buffer (tile t - 1) before the last barrier.
@@ -171,14 +176,10 @@ def _fused_bf16_bmm_nvfp4_quant_mla_kernel(
                 a_desc, [m0 + (t + 1) * BLOCK_M, 0], a_buf.index((t + 1) % 2)
             )
         cur_a = a_buf.index(t % 2).load(OPERAND_LAYOUT_A)
-        acc0 = gl.amd.gfx1250.wmma(
-            cur_a, b0.permute([1, 0]).load(OPERAND_LAYOUT_B), zero
-        )
-        acc1 = gl.amd.gfx1250.wmma(
-            cur_a, b1.permute([1, 0]).load(OPERAND_LAYOUT_B), zero
-        )
+        acc0 = gl.amd.gfx1250.wmma(cur_a, w0, zero)
         c_blocks = c_buf.index(t % 2).reshape([BLOCK_M, NS, 8])
         _quantize_regs(acc0, c_blocks, s_buf.index(t % 2), 0, BLOCK_M, BLOCK_N)
+        acc1 = gl.amd.gfx1250.wmma(cur_a, w1, zero)
         _quantize_regs(
             acc1, c_blocks, s_buf.index(t % 2), BLOCK_N // 16, BLOCK_M, BLOCK_N
         )
