@@ -209,7 +209,14 @@ def get_tune_space():
     return [config.to_string() for config in configs]
 
 
-@aot_factory("moe_gfx942_gemm")
+@aot_factory(
+    "moe_gfx942_gemm",
+    sources=[
+        "kernels/moe_gemm_2stage/gfx9_fp8",
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
+    ],
+)
 @cache
 def _get_compiled_kernel(
     N,

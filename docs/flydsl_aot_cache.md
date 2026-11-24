@@ -59,10 +59,12 @@ an entry and how to invalidate it when a kernel source changes:
 
 - hashing a whole kernel directory into the cache directory is safe but
   invalidates every kernel on any edit;
-- a per-caller list of source files is finer, but a helper missing from the
-  list is a silent stale hit;
-- recording the files the trace actually runs (§4.2) is per kernel and needs
-  no list.
+- recording the files a trace runs needs no list, but what a trace runs
+  depends on what the process ran before (a memoized factory, a module
+  already imported), so the recorded set is not reliable;
+- a list of source files declared per cache (§4.2), as FlashInfer's
+  `gen_jit_spec(name, sources)` has, is per kernel family and explicit. A
+  file missing from the list is checked for instead of detected at run time.
 
 ### 2.4 Comparison
 
@@ -70,7 +72,7 @@ an entry and how to invalidate it when a kernel source changes:
 |---|---|---|---|
 | startup warm-up | no (moves it to startup) | no | FlyDSL's own IR key |
 | aiter AOT `dry_run` | no | no | FlyDSL's own IR key |
-| this design | **yes** | no | toolchain/env dir + **per-entry recorded sources** + key |
+| this design | **yes** | no | toolchain/env dir + **sources declared per cache** + key |
 | a cache of FlyDSL handles keyed by private state | yes | **yes** (rejected) | fragile |
 
 ## 3. FlyDSL building blocks
@@ -118,16 +120,19 @@ op wrapper ──► _run_compiled(launcher, *launcher_args)
                  │
                  ├─ memory hit (key) ───────────────────────► CompiledFunction(*args)
                  │
-                 └─ digest = sha256(name, key, cache_signature of each runtime arg)
+                 └─ digest = sha256(name, key, cache_signature of each runtime arg,
+                    │                contents of the declared sources,
+                    │                values of the declared variables)
                     dir    = $AITER_FLYDSL_AOT_CACHE_DIR/<fingerprint>/<name>/
                     │
-                    ├─ some <digest>-<srchash>.json whose recorded sources all
-                    │  still hash the same, and its .o exists
+                    ├─ some <digest>-<variant>.json that bakes the constexpr
+                    │  values of this call, and its .o exists
                     │    ──► flyc.load_module(.o)   ~2-3 ms, no trace, make_exe not called
                     └─ miss (flock <digest>.lock, re-check)
-                         with sys.setprofile recording every aiter .py that runs:
-                           exe = make_exe()
-                           flyc.compile(exe, *CPU placeholders, compile_only=True)
+                         check the declared sources for a forgotten kernel file
+                         exe = make_exe()
+                         flyc.compile(exe, *CPU placeholders, compile_only=True)
+                         check that linked bitcode is declared
                          export_to_c into a temp dir
                          os.replace(.json), then os.replace(.o) last
                          ──► flyc.load_module(.o)
@@ -194,101 +199,54 @@ source:
   build, which sets it, and the runtime, which reads the device, would use
   different directories.
 
-**Level 2: per-entry sources.** aiter sources are not hashed as a directory.
-During a miss, `make_exe()` and the trace run under `sys.setprofile`, which
-records the `co_filename` of every Python function called. Every recorded
-`.py` inside the aiter package (except `aot_cache.py` itself) is stored with
-its sha256 in the entry's sidecar `.json`, together with any
-`extra_sources`. Files inside the aiter package are stored relative to it, so
-entries prebuilt in a source tree (`PREBUILD_KERNELS=1 setup.py bdist_wheel`)
-still match once the wheel is installed into `site-packages`. A lookup accepts an entry only if all of those files still
-hash the same. The per-process digest cache makes this one `sha256` per file
-per process.
+**Level 2: the sources a cache declares.** aiter sources are not hashed as a
+directory, and nothing is detected at run time. Each cache lists the files
+its launchers are built from, as FlashInfer's `gen_jit_spec(name, sources)`
+does:
 
-The profile hook sees calls, not reads of a module-level value: a kernel that
-does `from .common import TILE_M` and reads `TILE_M` never calls into
-`common.py`. So after the build, the imports in the code of each recorded file
-that can feed it (the same spans as the variable scan below) are resolved
-statically, and the module a non-function value comes from is recorded too.
-The resolution follows re-exports, star imports and namespace packages, and
-the names a value is computed from: its statement and the conditions around
-it (`BIG = TILE * 2` or `if FLAG: BIG = 2` records where `TILE` or `FLAG` comes
-from). A function called at import to compute a value is followed the same
-way. `import x` records `x`. A function the kernel imports adds nothing, since
-the build records it when it calls it, unless it is memoized; then its body is
-followed too. A logger (`x = logging.getLogger(...)`) adds nothing, or
-`from aiter import logger` would tie every entry to `aiter/__init__.py`. This
-over-records rather than under-records: an imported constant the kernel does
-not use costs a rebuild when its file changes. It is static, so a value built
-by code it cannot read (`globals()[name] = ...`, `importlib`) is not followed;
-an unresolved name records the module it was looked up in.
+```python
+@aot_factory(
+    "gemm_a8w8_blockscale",
+    sources=[
+        "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
+        "kernels/gemm_a8w8_blockscale_8wave.py",
+        "kernels/buffer_ops.py",
+        "kernels/kernels_common.py",
+    ],
+)
+```
 
-A bitcode file the kernel links with `link_extern(..., bitcode_path=...)`
-(MORI's CCO device library, say) is stored with its sha256 among the sources,
-under its absolute path: a rebuilt library rebuilds the entries that link it.
+- A path is relative to `aiter/ops/flydsl`, or absolute. A directory stands
+  for every `.py` below it.
+- The file that creates the cache is always one of its sources.
+- `env=[...]` names the environment variables the kernel code reads, other
+  than `AITER_FLYDSL_*` / `FLYDSL_*` (level 1). `"get_gfx()"` stands for
+  `chip_info.get_gfx()`, for code that picks instructions by it.
+- Bitcode a kernel links with `link_extern(..., bitcode_path=...)` is a
+  source too, by its absolute path.
 
-The sidecar stores, under `baked`, the values of the launcher's `Constexpr`
-launch arguments the entry was built with (§6); a lookup requires the call to
-pass the same ones.
+The sha256 of each file and the value of each variable go into the digest
+that names an entry. So an edit to a declared file, or another value of a
+declared variable, makes new entries for that cache only, when each is next
+used; every other cache still hits. A file inside the aiter package is named
+relative to it and one outside by its file name, so entries built in a source
+tree still match once the package is installed elsewhere (a prebuilt wheel).
 
-The sidecar also stores the environment variables the entry depends on, with
-their values (`null` if unset), and a lookup requires the same values. They
-are found two ways, so no list has to be kept:
+A file that is not declared invalidates nothing. Two checks find a forgotten
+one, both when an entry is built, so a hit pays nothing:
 
-- names read by a literal in a recorded kernel file, one under
-  `aiter/ops/flydsl/` (`os.environ.get("X")`, `os.getenv("X")`,
-  `os.environ["X"]`, `"X" in os.environ`). This covers a module-level read at
-  import and a read inside an `lru_cache`d function, which run before or
-  outside the build. Only code that can feed the build is scanned: module and
-  class-body statements, functions the build called and memoized functions.
-  A host-only function the build never called, such as allocator or IPC
-  setup reading `PYTORCH_HIP_ALLOC_CONF`, is skipped, so its variable does not
-  make prebuilt entries miss. Shared modules are not scanned: `aiter/jit/core.py` alone
-  names about 45 variables (`AITER_CONFIG_*`, `AITER_JIT_DIR`, …) and
-  `aiter/__init__.py` names `AITER_LOG_LEVEL`, none of which changes a kernel;
-- names aiter code reads during the build, seen by the same profile hook
-  (`os._Environ.__getitem__` called from a tracked file). This covers a name
-  computed at runtime, e.g. `os.environ.get(name)`. Only reads of one name
-  count (`[]`, `get`, `getenv`, `in`, `setdefault`). `os.environ.copy()`,
-  `dict(os.environ)`, `items()` and the like read every variable; recording
-  them would write the whole environment, secrets included, into a sidecar
-  that ships with the package, and the entry would hit only on that machine.
+- **A kernel file.** The declared files under `kernels/` are parsed, and
+  every file under `kernels/` they import (anywhere in the file, including
+  inside a function) must be declared. Launch plumbing that generates no code
+  (`tensor_shim.py`, `aot_cache.py`, `aot_launch.py`) is exempt.
+- **Bitcode.** The files the compiled kernel links must be declared.
 
-Variables the fingerprint owns (`AITER_FLYDSL_*`, `FLYDSL_*`, the extras) are
-left to it. So are those that describe the build rather than the code:
-`CU_NUM`, `GPU_ARCHS`, `AITER_GPU_ARCHS`, `COMPILE_ONLY`, `AITER_AOT_*`
-(`setup.py` sets `AITER_AOT_IMPORT`, the replay `AITER_AOT_REPLAY` and
-`AITER_AOT_FEATURE_GUARD`) and `AITER_CONFIG_*`, which the replay points at
-the CSVs it replays. The build sets them and the runtime does not; the
-fingerprint already hashes the arch and CU count, and the key holds the
-config a CSV selects. Only the variables an entry's own
-files name are compared, so a switch for another kernel (`AITER_FLY_AR`, an
-MoE tuning variable) does not invalidate GEMM entries.
-
-`GPU_ARCHS` is left to the fingerprint, but `chip_info.get_gfx()` returns its
-last arch, while the fingerprint hashes the device's. An image setting
-`GPU_ARCHS="gfx942;gfx950"` answers `gfx950` on a gfx942, so a kernel choosing
-code by `get_gfx()` would build a gfx950 variant into the gfx942 directory.
-An entry whose build calls `get_gfx()` therefore stores its value under the
-key `"get_gfx()"`, and a lookup compares it like a variable. Its memo is
-cleared before each build, so the profile hook sees the call; a value computed
-from it before the build, at module level or in a memoized function of a
-recorded file, is found by scanning that code. Hashing it into the
-fingerprint instead would make every entry miss in such an image, including
-those of kernels that never call it. The replay sets `GPU_ARCHS` to the arch
-it builds for, so its entries store that arch and a process on that device
-hits them. None of the converted
-launchers calls `get_gfx()` today.
-
-For the preshuffle GEMM the recorded set is `gemm_kernels.py`, the kernel
-modules it builds from (`kernels/preshuffle_gemm.py`, `splitk_epilogue.py`,
-`gemm_a16w16_gfx950_utils.py`, `kernels_common.py`, …), `jit/utils/chip_info.py`,
-and in the first build of a process the modules it imports (`ops/triton/…`,
-an import side effect, harmless). So:
-
-- editing `kernels/act.py`, or any MoE kernel, still hits every GEMM entry;
-- editing `kernels/preshuffle_gemm.py` rebuilds only the GEMM entries, and
-  only when each is next used.
+Either one raises `_UndeclaredSourceError`, in every mode; the launch does
+not fall back to the JIT path. `tests/test_flydsl_aot_launch.py` runs the
+first check over every cache in the tree, so CI reports a forgotten file
+without building anything. The checks do not follow imports of a wrapper
+outside `kernels/` (a wrapper imports other families' wrappers), a dynamic
+import, or code outside the aiter package: declare those by hand.
 
 Entries are stored per version of sources and variables,
 `<digest>-<variant hash>.{o,json}`. Switching a file or a variable back (e.g.
@@ -297,38 +255,34 @@ instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
-A process runs the code it imported, so a source edited after it started
-(`git checkout` during a test run) no longer matches what it would trace. A
-build that records such a file is not written: that key takes the JIT path
-in this process, with a warning, and the next process builds the entry from
-the new code.
+A process runs the code it imported, so a declared `.py` edited after the
+process imported aiter's FlyDSL code (`git checkout` during a test run) no
+longer matches what it would trace. That cache then takes the JIT path in
+this process, with a warning, and the next process builds or loads the
+entries of the new code.
 
-Recording costs about 80 ms on a miss (≈110 ms → ≈190 ms), once per entry
-per machine. A hit pays nothing for it.
+A cache name is unique: creating a cache of one name from two files raises,
+since the two would share a directory.
 
 Known holes, and how they are handled:
 
 | hole | example | mitigation |
 |---|---|---|
-| A module-level value reached without an import in build code | `getattr(consts, name)`, `globals()[name] = ...`, or an import inside a function the build did not call | Imports in build code are followed statically (above). Pass the file in `extra_sources`, or run `verify` mode |
-| Code outside the aiter package affects the kernel | a helper in another installed package | Pass it in `extra_sources`, or run `verify` mode |
+| A source the checks do not see | a helper the wrapper (outside `kernels/`) imports, `importlib.import_module(name)`, a helper in another installed package | Declare it in `sources`. `verify` mode detects a stale entry |
+| A variable the kernel code reads that is not declared | `os.environ.get("MY_SWITCH")` in a kernel file | Declare it in `env`, or pass its value in `key`. `verify` mode detects it |
 | The trace reads state that is neither env nor source | a global set at runtime, a config file, a device property other than arch and CU count | Put it in `key`. `verify` mode detects it |
-| A variable read under a computed name, outside the build | `os.environ.get(name)` at import | Read it in the wrapper and pass it in `key`, or run `verify` mode |
-| A variable read outside the build in a shared module | a module-level `os.getenv("X")` in `aiter/jit/` | Name it in kernel code under `aiter/ops/flydsl/`, or pass it in `key`. Today's shared reads are arch, CU count and config paths, all covered |
-| A variable read only by copying the environment | `env = dict(os.environ)` then `env["X"]` | Read it by name |
 | An incomplete hand-written `key` | a value the factory closes over but does not take as an argument | The disk digest still covers the argument types. `verify` mode re-exports and compares |
-| A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Recorded per entry and compared on lookup (§6); two values under one key raise |
+| A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Stored per entry and compared on lookup (§6); two values under one key raise |
 | Compile hints set by the caller | `with CompilationContext.compile_hints(...)` around the launch | Hashed into the disk digest. In memory a key keeps the function of its first launch in the process, as on the JIT path, so one key must launch under one set of hints |
 | A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A load failure rebuilds the entry once |
 
-Recording the files the trace actually ran gets per-kernel granularity
-without a list to maintain (§2.3). The remaining hole (constants read
-without a call) is the reason `verify` mode exists.
+Declared sources give per-family granularity with an explicit list; the
+checks above and `verify` mode cover what a list can miss.
 
 Modes, set with `AITER_FLYDSL_AOT_CACHE`:
 
-- `1` (default): on. It is safe on by default because per-entry source tracking makes edits during kernel development
-  rebuild only what they touch.
+- `1` (default): on. Edits during kernel development rebuild only the caches that declare
+  the edited file.
 - `0`: off. The op uses the existing `_run_compiled` path.
 - `verify`: like `1`, but on every disk hit it re-traces, re-exports, and
   byte-compares the `.o`. A mismatch raises and names the stale entry.
@@ -387,8 +341,7 @@ requests from that launch, and bisects M between two rows when their ends
 request different kernels. Without it, a key whose `.o` is already on disk
 (from an earlier run, or another M in the same run) traces nothing; the
 bisection then stops early and skips kernels. On the mxfp8 CSV below this
-lost 7 of 49 kernels. The export runs first because FlyDSL's in-process
-trace cache would otherwise hide the sources the entry records. When the
+lost 7 of 49 kernels. The export runs first. When the
 export just built the entry, its own compile already showed the replay the
 request and filled FlyDSL's cache (the same artifact), so the JIT launch is
 skipped. Otherwise it runs and also fills FlyDSL's own cache for mode `0`
@@ -407,8 +360,6 @@ requests, which the replay needs. With `FLYDSL_RUNTIME_ENABLE_CACHE=0` or an
 IR dump, FlyDSL skips its cache and lock, and processes compile the same
 kernel in parallel; exports stay single. `flock` assumes a local file system.
 
-Files under `aiter/aot/` are not recorded as sources: the replay's hooks run
-inside the trace, and editing the replay must not invalidate every entry.
 Measured on the bmm rows: editing another kernel's file rebuilds nothing,
 editing `kernels/bmm_a8w8_mxscale_gfx950.py` rebuilds exactly its 8 entries,
 and reverting the edit reuses the earlier ones.
@@ -468,8 +419,7 @@ the process.
 
 - The JIT column is measured with FlyDSL's own disk cache already warm, so
   it is the trace alone.
-- The miss pays the trace, the export and about 80 ms for source recording,
-  once per entry per machine. A hit costs about 2-3 ms.
+- The miss pays the trace and the export, once per entry per machine. A hit costs about 2-3 ms.
 - Kernel time is unchanged. Host time of the whole wrapper is 36.4 µs on a
   hit against 37.7 µs through JIT (m=1, n=1024, k=512, 2000 calls).
 
@@ -608,7 +558,7 @@ gives the same results on both paths for row- and column-major tensors.
 Opt in at the launcher factory, not at the call site:
 
 ```python
-@aot_factory("my_kernel")            # the cache name
+@aot_factory("my_kernel", sources=["kernels/my_kernel.py", ...])
 @functools.cache
 def my_launcher(N, K, tile_m, ...):  # its arguments are the key
     return compile_my_kernel(N, K, tile_m, ...)
@@ -617,32 +567,26 @@ _run_compiled(my_launcher.lazy(N, K, tile_m, ...), *args, stream)
 ```
 
 A launcher built inside a wrapper (no factory returning it) binds where it is
-built: `bind_aot(launch, FlyDSLAotCache("my_kernel"), (TOPK, N))`.
+built: `bind_aot(launch, FlyDSLAotCache("my_kernel", sources=[...]), (TOPK, N))`.
 
 A factory argument the cache cannot key (e.g. a numpy scalar) leaves that
 launcher on the JIT path, and so does such a `specialization_key` (an Enum),
 for that key. `factory.cache_clear()` drops the launchers the cache loaded and
 keeps the factory on the JIT path for the rest of the process: the caller
 wants a new trace, possibly of state the cache does not track (a patched
-module global), which an entry on disk would not reflect. A module that imports `aot_launch` records it as a
-source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
+module global), which an entry on disk would not reflect.
 
 0. **Launch `factory.lazy(...)` on hot paths.** It does not call the factory,
    so a hit pays neither the compiler import nor the `@flyc.kernel`
    definitions (a few hundred ms of AST rewriting per kernel module in a fresh
    process). `_run_compiled(factory(...), ...)` works too, and is what an
    unchanged call site does; it calls the factory once per process and key.
-   The factory then runs before the build that records sources (§4.2): the
-   kernel's own files are recorded as its trace runs them, but a helper file
-   that only the factory calls is not, unless its values are imported.
-   `factory.lazy(...)` runs the factory inside the build, and
-   `bind_aot(..., make_exe=...)` does so for a launcher bound by hand.
 1. **Launch arguments are runtime only.** Every launcher parameter that
    varies per call is a tensor, an `fx` numeric (`Int32`, …) or an
    `fx.Stream` (a torch stream as the last argument is converted). Constexprs
    go to the factory and so into the key. A launcher that keeps a
    `Constexpr[T]` launch argument must pass it in `specialization_key`, as on
-   the JIT path. The object ignores such an argument, so each entry records
+   the JIT path. The object ignores such an argument, so each entry stores
    the values it was built with in its sidecar (`baked`) and serves only calls
    that pass them: another process with another value builds its own variant.
    Within a process, one key launched with two values raises, where the JIT
@@ -659,12 +603,14 @@ source (§4.2), so editing `aot_launch.py` rebuilds those entries once.
    determine its launcher, as `functools.cache` on it already requires. Pass
    anything else the compiled function depends on, e.g. a tensor dtype that
    can vary for one launcher, as `_run_compiled`'s `specialization_key`, as
-   on the JIT path. Arch, CU count and the variables the kernel's files read
-   are tracked already. Tensor rank and unit-stride axis are covered by the
+   on the JIT path. Arch and CU count are in the fingerprint; declare any other
+   variable the kernel's files read in `env`. Tensor rank and unit-stride axis are covered by the
    disk digest.
-3. **Pass extra sources.** If the kernel uses code outside the aiter
-   package, pass those paths as `aot_factory(..., extra_sources=)`. Constants
-   imported from an aiter module are recorded already.
+3. **Declare the sources.** List in `sources=` every file the launcher's
+   code is generated from: the kernel module, the helpers it imports, a
+   tuning table the wrapper reads its tiles from, linked bitcode (§4.2). The
+   first build, and `tests/test_flydsl_aot_launch.py`, raise for a kernel
+   file or bitcode that is missing.
 4. **Keep the wrapper branch-free.** `_run_compiled` handles mode `0`, the
    fallback and compile-only.
 5. **Test it.** CI runs every op test under `AITER_FLYDSL_AOT_CACHE=verify`

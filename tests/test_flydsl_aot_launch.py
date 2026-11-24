@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import flydsl.compiler as flyc
@@ -220,9 +221,9 @@ def test_constexpr_launch_arguments_select_the_entry():
     from aiter.ops.flydsl.aot_cache import (
         _arg_signature,
         _baked_args,
+        _baked_current,
         _BakedArgumentError,
         _BakedKernel,
-        _entry_current,
     )
 
     def launch(
@@ -246,16 +247,12 @@ def test_constexpr_launch_arguments_select_the_entry():
 
     # An entry serves only the constexpr values it was built with; a runtime
     # argument may differ.
-    meta = {"sources": {}, "env": {}, "baked": baked}
-    assert _entry_current(meta, (1, 8, 64, "b", (3, 4)))
-    assert not _entry_current(meta, (0, 4, 32, "b", (3, 4)))
-    assert not _entry_current(meta, (0, 4, 64, "c", (3, 4)))
-    assert not _entry_current(meta, (0, 4, 64, "b", (3, 5)))
-    assert not _entry_current(meta, (0, 4, 64))
-    # An entry written before values were recorded is not one to trust.
-    with pytest.raises(KeyError):
-        _entry_current({"sources": {}, "env": {}}, args)
-
+    meta = {"libs": {}, "baked": baked}
+    assert _baked_current(meta["baked"], (1, 8, 64, "b", (3, 4)))
+    assert not _baked_current(meta["baked"], (0, 4, 32, "b", (3, 4)))
+    assert not _baked_current(meta["baked"], (0, 4, 64, "c", (3, 4)))
+    assert not _baked_current(meta["baked"], (0, 4, 64, "b", (3, 5)))
+    assert not _baked_current(meta["baked"], (0, 4, 64))
     # A constexpr left to its default is fixed by the launcher's source.
     assert _baked_args(exe, (0, 4, 64)) == {"2": "64"}
     # A value no later process can compare is not exported.
@@ -335,7 +332,7 @@ def test_compile_hints_of_the_caller_select_the_entry():
     assert hinted != plain == cache._disk_key(("k",), (1,))
 
 
-def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
+def test_linked_bitcode_must_be_declared(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
     # Written after this process started, as a library extracted on first use.
@@ -352,23 +349,33 @@ def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
             Path(out_dir, f"{sym}.o").write_bytes(b"object")
 
     monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: Compiled())
-    cache = aot_cache.FlyDSLAotCache("test_link_libs")
 
     def make_exe():
         return lambda: None
 
     out_dir = tmp_path / "cache"
-    stem = cache._build(make_exe, (), out_dir, "sym", "digest")
-    meta = json.loads(stem.with_suffix(".json").read_text())
-    assert str(lib) in meta["sources"]
-    assert cache._find(out_dir, "digest", ()) == stem
+    cache = aot_cache.FlyDSLAotCache("test_link_libs_undeclared")
+    with pytest.raises(aot_cache._UndeclaredSourceError, match=r"device\.bc"):
+        cache._build(make_exe, (), out_dir, "sym", "digest")
+    assert not list(out_dir.glob("*.o")), "an entry was written"
+    # Never a silent fall back to the JIT path, in any mode.
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "root"))
+    with pytest.raises(aot_cache._UndeclaredSourceError):
+        cache._kernel(("k",), make_exe, ())
 
-    # A rebuilt library (e.g. another MORI) no longer matches the entry.
+    def disk_key():
+        aot_cache._file_digest.cache_clear()
+        cache = aot_cache.FlyDSLAotCache("test_link_libs", sources=[lib])
+        return cache, cache._disk_key(("k",), ())
+
+    cache, first = disk_key()
+    stem = cache._build(make_exe, (), out_dir, "sym", first)
+    assert cache._find(out_dir, first, ()) == stem
+    # A rebuilt library (e.g. another MORI) is another entry.
     lib.write_bytes(b"BC two")
-    aot_cache._file_digest.cache_clear()
-    assert cache._find(out_dir, "digest", ()) is None
-    rebuilt = cache._build(make_exe, (), out_dir, "sym", "digest")
-    assert rebuilt != stem and cache._find(out_dir, "digest", ()) == rebuilt
+    assert disk_key()[1] != first
 
 
 def test_compile_hook_that_only_identifies_kernels_is_not_a_verify_failure(
@@ -401,6 +408,198 @@ def test_compile_hook_that_only_identifies_kernels_is_not_a_verify_failure(
     monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", export_failed)
     with pytest.raises(RuntimeError, match="export failed"):
         cache._kernel(("k",), make_exe, ())
+
+
+class _FakeCompiled:
+    class _keepalive:
+        _link_libs = ()
+
+    def export_to_c(self, out_dir, sym):
+        Path(out_dir, f"{sym}.o").write_bytes(b"object")
+
+
+def _old_file(path, text):
+    """A source written before this process started, as an installed file."""
+    path.write_text(text)
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    return path
+
+
+def test_declared_sources_and_variables_select_the_entry(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    kernel = _old_file(tmp_path / "kernel.py", "TILE = 4\n")
+    other = _old_file(tmp_path / "other.py", "X = 1\n")
+    monkeypatch.delenv("AOT_TEST_SWITCH", raising=False)
+
+    def disk_key():
+        # A new process: the files are read again.
+        aot_cache._file_digest.cache_clear()
+        cache = aot_cache.FlyDSLAotCache(
+            "test_declared", sources=[kernel], env=["AOT_TEST_SWITCH"]
+        )
+        assert str(kernel) in cache._files and __file__ in cache._files
+        return cache._disk_key(("k",), ())
+
+    first = disk_key()
+    assert disk_key() == first
+    # Not declared: nothing is detected.
+    _old_file(other, "X = 2\n")
+    monkeypatch.setenv("AOT_TEST_UNDECLARED", "1")
+    assert disk_key() == first
+    _old_file(kernel, "TILE = 8\n")
+    edited = disk_key()
+    assert edited != first
+    monkeypatch.setenv("AOT_TEST_SWITCH", "1")
+    assert disk_key() not in (first, edited)
+    # Going back finds the earlier entries.
+    monkeypatch.delenv("AOT_TEST_SWITCH")
+    _old_file(kernel, "TILE = 4\n")
+    assert disk_key() == first
+
+
+def test_directory_source_is_every_file_below_it(tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    a = _old_file(tmp_path / "pkg" / "a.py", "")
+    b = _old_file(tmp_path / "pkg" / "sub" / "b.py", "")
+    cache = aot_cache.FlyDSLAotCache("test_dir_source", sources=[tmp_path / "pkg"])
+    assert {str(a), str(b)} <= set(cache._files)
+    # Relative paths are under aiter/ops/flydsl.
+    cache = aot_cache.FlyDSLAotCache("test_rel_source", sources="kernels/act.py")
+    assert any(f.endswith("aiter/ops/flydsl/kernels/act.py") for f in cache._files)
+    with pytest.raises(aot_cache._UsageError, match="does not exist"):
+        aot_cache.FlyDSLAotCache("test_missing_source", sources=["kernels/nope.py"])
+
+
+def test_source_edited_after_this_process_imported_it_is_not_cached(
+    monkeypatch, tmp_path
+):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    # Written now: after this process imported aiter's FlyDSL code, so what it
+    # would trace is not what the file says.
+    src = tmp_path / "edited.py"
+    src.write_text("X = 2\n")
+    cache = aot_cache.FlyDSLAotCache("test_edited", sources=[src])
+    with pytest.raises(RuntimeError, match="changed after"):
+        cache._disk_key(("k",), ())
+
+
+def test_cache_names_are_unique_per_file(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+    from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+
+    FlyDSLAotCache("test_unique_name")
+    FlyDSLAotCache("test_unique_name")  # this file again, as a reloaded module
+    other = _old_file(tmp_path / "other_module.py", "")
+    monkeypatch.setattr(aot_cache, "_creation_file", lambda: str(other))
+    with pytest.raises(ValueError, match="already used"):
+        FlyDSLAotCache("test_unique_name")
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
+    reason="mode 0 binds nothing",
+)
+def test_every_cache_declares_the_kernel_files_its_sources_import():
+    """Sources are declared by hand. A forgotten one is found here, and by the
+    cache when it builds an entry: a declared file under ``kernels/`` imports
+    a file under ``kernels/`` that is not declared."""
+    import importlib
+    import re
+
+    from aiter.ops.flydsl import aot_cache
+
+    base = Path(aot_cache.__file__).resolve().parent
+    creates = re.compile(r"^(@aot_factory\(|.*\bFlyDSLAotCache\()", re.MULTILINE)
+    for file in sorted(base.rglob("*.py")):
+        if file.name in aot_cache._NOT_KERNEL_CODE:
+            continue
+        if not creates.search(file.read_text()):
+            continue
+        name = ".".join(("aiter", "ops", "flydsl", *file.relative_to(base).parts))
+        importlib.import_module(name.removesuffix(".py"))
+    real = {
+        name: cache
+        for name, cache in aot_cache._CACHES.items()
+        if not name.startswith("test_")
+    }
+    assert len(real) >= 20, sorted(real)
+    missing = {
+        name: [os.path.relpath(f, base) for f in undeclared]
+        for name, cache in real.items()
+        if (undeclared := aot_cache._undeclared_imports(cache._files))
+    }
+    assert not missing, "\n".join(
+        f"cache {name!r} must also declare sources={files}"
+        for name, files in sorted(missing.items())
+    )
+
+
+def test_cache_that_forgets_a_kernel_file_does_not_build(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    # preshuffle_gemm.py imports mfma_preshuffle_pipeline.py, among others.
+    cache = aot_cache.FlyDSLAotCache(
+        "test_forgotten_source", sources=["kernels/preshuffle_gemm.py"]
+    )
+    with pytest.raises(
+        aot_cache._UndeclaredSourceError, match="mfma_preshuffle_pipeline"
+    ):
+        cache._build(lambda: (lambda: None), (), tmp_path / "c", "s", "d")
+    assert not list((tmp_path / "c").glob("*.o")), "an entry was written"
+
+
+def test_launcher_with_a_defaulted_constexpr_is_guarded(monkeypatch, tmp_path):
+    import inspect
+
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl import aot_cache
+
+    def launch(n: fx.Int32, flag: fx.Constexpr[bool] = False):
+        pass
+
+    exe = _Launcher()
+    exe._sig = inspect.signature(launch)
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    ran = []
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: ran.append)
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    cache = aot_cache.FlyDSLAotCache("test_default_constexpr")
+    # The first launch leaves the constexpr to its default: nothing is baked.
+    kernel = cache._resolve(("k",), lambda: exe, (4,))
+    kernel(4)
+    kernel(8)
+    # A later launch of the key that passes it must not run that object.
+    with pytest.raises(aot_cache._BakedArgumentError):
+        kernel(4, True)
+    assert ran == [4, 8]
+
+
+def test_compile_only_set_during_a_first_launch_launches_nothing(monkeypatch):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    cache = aot_cache.FlyDSLAotCache("test_compile_only_race")
+    # _resolve returns None when COMPILE_ONLY appeared after launch() looked.
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_kernel", lambda *a: None)
+    cache.launch(("k",), lambda: _Launcher())
+    assert ("k",) not in cache._mem
+
+
+def test_sidecar_of_another_shape_is_skipped(tmp_path):
+    from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+
+    for i, text in enumerate(('{"sources": {}}', "[]", "{}", '{"baked": 3}')):
+        (tmp_path / f"d-{i}.json").write_text(text)
+        (tmp_path / f"d-{i}.o").write_bytes(b"object")
+    assert FlyDSLAotCache._find(tmp_path, "d", ()) is None
 
 
 def test_fingerprint_covers_what_flydsl_keys_its_cache_on():

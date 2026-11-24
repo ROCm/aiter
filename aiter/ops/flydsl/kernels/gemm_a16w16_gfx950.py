@@ -1479,7 +1479,19 @@ set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 # items its constexpr param is made from, and its device as the
 # specialization key. The device keeps the JIT path's handles apart (a handle
 # launches only on the device it was compiled on); entries on disk are shared.
-bind_aot(gemm_a16w16_gfx950, FlyDSLAotCache("gemm_a16w16_gfx950"), ())
+bind_aot(
+    gemm_a16w16_gfx950,
+    FlyDSLAotCache(
+        "gemm_a16w16_gfx950",
+        sources=[
+            "kernels/gemm_a16w16_gfx950_utils.py",
+            "kernels/kernels_common.py",
+            "kernels/tensor_shim.py",
+            "kernels/buffer_ops.py",
+        ],
+    ),
+    (),
+)
 _PARAM_ITEMS = {}
 
 

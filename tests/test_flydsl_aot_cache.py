@@ -101,7 +101,9 @@ def child(cases):
     flyc.compile = counting_compile
 
     # A hit never calls the launcher factory: count those calls. The factory
-    # also reads a variable, as a kernel reads a tuning switch.
+    # also reads a variable, as a kernel reads a tuning switch, which the
+    # cache declares.
+    gemm_kernels._preshuffle_launcher.aot_cache._env = (TEST_ENV,)
     factories = 0
     compile_fn = gemm_kernels._get_compile_fn
 
@@ -110,7 +112,6 @@ def child(cases):
         nonlocal factories
         factories += 1
         os.environ.get(TEST_ENV)
-        dict(os.environ)  # a bulk read must not be recorded
         return compile_fn()
 
     gemm_kernels._get_compile_fn = reading_compile_fn
@@ -218,7 +219,7 @@ def check_paths(cache_dir, cases):
 
     rebuilt = {**expected, "builds": entries, "traces": entries, "factories": entries}
     _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
-    assert state == rebuilt, f"a variable the build read did not rebuild: {state}"
+    assert state == rebuilt, f"a declared variable did not rebuild: {state}"
 
 
 def test_aot_cache():

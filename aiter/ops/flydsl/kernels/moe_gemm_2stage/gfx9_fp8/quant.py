@@ -19,8 +19,15 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from . import common as fxh
 from .common import _ptr
 
-_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax")
-_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor")
+# What the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "kernels/moe_gemm_2stage/gfx9_fp8",
+    "kernels/buffer_ops.py",
+    "kernels/kernels_common.py",
+]
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax", sources=_AOT_SOURCES)
+_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor", sources=_AOT_SOURCES)
 
 
 @functools.cache

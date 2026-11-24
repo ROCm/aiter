@@ -27,7 +27,21 @@ __all__ = [
 ]
 
 
-@aot_factory("mixed_moe_gemm1")
+# What the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "kernels/mixed_moe_gemm_2stage_common.py",
+    "kernels/act.py",
+    "kernels/buffer_ops.py",
+    "kernels/kernels_common.py",
+    "kernels/layout_utils.py",
+    "kernels/mfma_epilogues.py",
+    "kernels/mfma_preshuffle_pipeline.py",
+    "kernels/tensor_shim.py",
+    "moe_common.py",
+]
+
+
+@aot_factory("mixed_moe_gemm1", sources=_AOT_SOURCES)
 @functools.cache
 def compile_mixed_moe_gemm1(
     *,
@@ -89,7 +103,7 @@ def compile_mixed_moe_gemm1(
     )
 
 
-@aot_factory("mixed_moe_gemm2")
+@aot_factory("mixed_moe_gemm2", sources=_AOT_SOURCES)
 @functools.cache
 def compile_mixed_moe_gemm2(
     *,
