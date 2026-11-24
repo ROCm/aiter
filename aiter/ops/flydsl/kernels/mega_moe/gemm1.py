@@ -467,7 +467,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     fold_rows > 0 also returns a runner for an m-tile followed by a tail tile of its expert with at most
     fold_rows real rows: one sort_block_m + fold_rows row tile (the rows are contiguous) storing both.
     """
-    assert row_map is None or lookahead > 0 or (async_a_copy and a_k_step_bytes == 256)
+    assert row_map is None or lookahead > 0 or async_a_copy
     sched = TileScheduler(
         expert_rsrc=expert_rsrc,
         inter_dim=inter_dim,
@@ -597,16 +597,16 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
 
     if const_expr(not short_rows):
         return expert_of_flat, do_scheduled_tile
-    assert lookahead == 0 and not indirect_input and sort_block_m % short_rows == 0 and a_dtype == "fp8"
+    assert lookahead == 0 and not indirect_input and sort_block_m % short_rows == 0
     s_repeat = short_rows // 16
     # fmt: off
-    a_gather_s = ATileLoader(row_bytes=model_dim, sort_block_m=short_rows, k_step_bytes=a_k_step_bytes,
+    a_gather_s = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=short_rows, k_step_bytes=a_k_step_bytes,
         total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy,
-        async_lds=a_async_lds)
+        async_lds=a_async_lds, a_dtype=a_dtype)
     a_scale_s = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=s_repeat, model_dim=model_dim, sort_block_m=short_rows,
         total_threads=total_threads, packed=ascale_packed)
     # fmt: on
-    mfma_s = MfmaScaleGU(m_repeat=s_repeat, num_acc_n=num_acc_n)
+    mfma_s = MfmaScaleGU(m_repeat=s_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
     epi_s = make_epilogue(s_repeat, short_rows)
 
     def do_short_tile(flat):
@@ -626,13 +626,13 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     # A and its scales are staged in whole 32-row groups (rows past the tail are its padding).
     f_rows = sort_block_m + short_rows
     # fmt: off
-    a_gather_f = ATileLoader(row_bytes=model_dim, sort_block_m=f_rows, k_step_bytes=a_k_step_bytes,
+    a_gather_f = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=f_rows, k_step_bytes=a_k_step_bytes,
         total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy,
-        async_lds=a_async_lds)
+        async_lds=a_async_lds, a_dtype=a_dtype)
     a_scale_f = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=f_rows // 16, model_dim=model_dim, sort_block_m=f_rows,
         total_threads=total_threads, packed=ascale_packed)
     # fmt: on
-    mfma_f = MfmaScaleGU(m_repeat=f_repeat, num_acc_n=num_acc_n)
+    mfma_f = MfmaScaleGU(m_repeat=f_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
     epi_t = epi_s if fold_rows == short_rows else make_epilogue(fold_rows // 16, fold_rows)
     epi_f = _FoldEpilogue(epi, epi_t, m_repeat * num_acc_n, sort_block_m)
 

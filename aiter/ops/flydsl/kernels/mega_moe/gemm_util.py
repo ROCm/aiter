@@ -116,8 +116,8 @@ class ATileLoader:
         if const_expr(self._async_copy):
             assert total_threads % 64 == 0
             total_chunks = sort_block_m * (k_step_bytes // 16)
+            # Whole waves per copy round; the last round may leave waves idle (an FP4 fold tile of 160 rows).
             assert total_chunks % 64 == 0
-            assert total_chunks < total_threads or total_chunks % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
             # async_lds: the A copies are async LDS DMA, which the compiler does not make an LDS read wait for, so
             # the K-step's A reads do not drain this step's copy into the other buffer (a read of either buffer
@@ -244,14 +244,18 @@ class ATileLoader:
     def load_row_map(self, tile_row_base_i32, srcmap_rsrc, row_stride_i32=None):
         """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``).
 
-        ``row_stride_i32``: tile row r sits in slot ``tile_row_base + r * row_stride`` (default 1).
+        ``row_stride_i32``: tile row r sits in slot ``tile_row_base + r * row_stride`` (default 1). With a partial
+        copy round, the rows of its idle threads past the tile read its last row.
         """
         chunks_per_row = self._k_step_bytes // 16
+        total_chunks = self._sort_block_m * chunks_per_row
         out = []
-        for c in range_constexpr(
-            0, self._sort_block_m * chunks_per_row, self._total_threads
-        ):
+        for c in range_constexpr(0, total_chunks, self._total_threads):
             row = (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
+            if const_expr(total_chunks % self._total_threads):
+                row = (row < fx.Int32(self._sort_block_m)).select(
+                    row, fx.Int32(self._sort_block_m - 1)
+                )
             if const_expr(self._half_rows):
                 row = _paired_slot(row, row_stride_i32, self._half_rows)
             elif const_expr(row_stride_i32 is not None):
@@ -301,15 +305,16 @@ class ATileLoader:
         )
         chunks_per_row = self._k_step_bytes // 16
         total_chunks = self._sort_block_m * chunks_per_row
-        copy_waves = min(total_chunks, self._total_threads) // 64
         for round_base in range_constexpr(
             0,
             total_chunks,
             self._total_threads,
         ):
+            # A partial round (fewer chunks left than threads) runs on its leading waves only.
+            remaining = total_chunks - round_base
             copy_active = (
-                self._wave < fx.Int32(copy_waves)
-                if const_expr(total_chunks < self._total_threads)
+                self._wave < fx.Int32(remaining // 64)
+                if const_expr(remaining < self._total_threads)
                 else fx.Boolean(True)
             )
 
