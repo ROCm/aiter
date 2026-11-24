@@ -378,6 +378,8 @@ def compile_moe_gemm2(
         p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
+        # The cache holds IR of one trace, and a launcher can be traced again.
+        flyobj.clear_all()
         e_idx = fx.gpu.block_idx.y
 
         flyobj.bid = e_idx
