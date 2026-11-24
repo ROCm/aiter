@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from aiter import test_common
+from aiter import smi_monitor, test_common
 from aiter.test_common import device_memory_profiling, input_copies, perftest
 from aiter.utility import measure
 
@@ -301,12 +301,13 @@ class TestLlcFallback(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+@unittest.skipUnless(smi_monitor._AMDSMI_AVAILABLE, "needs amdsmi")
 class TestLlcOnDevice(unittest.TestCase):
     def test_amdsmi_answers_on_this_device(self):
         measure.llc_bytes.cache_clear()
         device = torch.cuda.current_device()
-        llc = measure.llc_bytes(device)
-        self.assertEqual(llc, measure._amdsmi_llc(device))
+        with self.assertNoLogs(measure.logger, "WARNING"):
+            llc = measure.llc_bytes(device)
         self.assertGreaterEqual(
             llc, torch.cuda.get_device_properties(device).L2_cache_size
         )
