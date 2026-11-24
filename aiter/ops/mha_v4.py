@@ -563,17 +563,28 @@ def _mha_v4_kv_tile_for_q_tile_from_manifest(
     return kv_tiles.pop() if kv_tiles else 0
 
 
-def mha_v4_block_tiles_in_any_precision(mode: int) -> tuple[tuple[int, int], ...]:
+def mha_v4_block_tiles_in_any_precision(
+    mode: int, head_dim: Optional[int] = None  # noqa: UP045
+) -> tuple[tuple[int, int], ...]:
     """Every (q_tile, kv_tile) this GPU has a `mode` row for, without collapsing precisions.
 
     mha_v4_block_tiles() answers one KV tile per Q tile, which is what a caller shaping a mask
     needs and is why it refuses where the rows disagree. This is for describing the hardware --
     error messages and "is this tile buildable at all" checks -- which want the whole set and must
     not raise on their way to reporting something else. It is no use for choosing a geometry: a
-    tile listed here may exist in a precision the caller is not running.
+    tile listed here may exist in a precision the caller is not running. `head_dim` keeps the rows
+    of that head dim only; None keeps every head dim's.
     """
     rows = _mha_v4_block_rows_from_manifest()[mode]
-    return tuple(sorted({(row[_ROW_TS_QO], row[_ROW_TS_KV]) for row in rows}))
+    return tuple(
+        sorted(
+            {
+                (row[_ROW_TS_QO], row[_ROW_TS_KV])
+                for row in rows
+                if head_dim is None or row[_ROW_HEAD_DIM] == head_dim
+            }
+        )
+    )
 
 
 @functools.cache
@@ -1417,7 +1428,9 @@ def _fmha_v4_fwd_sol(
 
 
 def _check_mxfp8_hd256_records(records: Tensor, name: str) -> None:
-    head_stride = mxfp8_hd256_k_tiles(records.shape[1]) * MHA_V4_MXFP8_HD256_K_TILE_BYTES
+    head_stride = (
+        mxfp8_hd256_k_tiles(records.shape[1]) * MHA_V4_MXFP8_HD256_K_TILE_BYTES
+    )
     expected = (
         records.shape[2] * head_stride,
         MHA_V4_MXFP8_HD256_K_ROW_BYTES,
@@ -1725,7 +1738,7 @@ def _check_block_tile(
         f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
         f"q={q_format.name} k={k_format.name} v={v_format.name} at head dim {head_dim}; "
         f"those operands have {mha_v4_block_tiles(operands, mode, head_dim)} and the GPU has "
-        f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
+        f"{mha_v4_block_tiles_in_any_precision(mode, head_dim)} in some precision"
     )
 
 
@@ -3116,18 +3129,21 @@ def _mha_v4_sol_mx(
     already; a packed K pools from its unshifted source, so sol_prepare takes it as k_shift. The
     returned LSE still holds the shift, for the caller to restore.
     """
+    head_dim = q.shape[-1]
     if softmax_scale is None:
-        softmax_scale = 128**-0.5
+        softmax_scale = head_dim**-0.5
     multiplier = mha_v4_q_multiplier(softmax_scale)
     if qk_format == AttentionFormat.MXFP4:
-        q_quantized, q_descale = quantize_mxfp4_q(q, multiplier)
-        k_raw, k_descale = quantize_mxfp4_k(k, k_mean)
+        quant_q, quant_k, _ = mha_v4_mx_producers(qk_format, head_dim)
+        q_quantized, q_descale = quant_q(q, multiplier)
+        k_raw, k_descale = quant_k(k, k_mean)
         k_quantized = mxfp4_k_view(k_raw, k_descale)
         q_routing, k_source, k_packed_format = q, k, "mxfp4"
     elif qk_format == AttentionFormat.MXFP6:
-        q_quantized, q_descale = quantize_mxfp6_q(q, multiplier)
-        k_raw, k_descale_raw = quantize_mxfp6_k(k, k_mean)
-        k_quantized, k_descale = mxfp6_k_view(
+        quant_q, quant_k, _ = mha_v4_mx_producers(qk_format, head_dim)
+        q_quantized, q_descale = quant_q(q, multiplier)
+        k_raw, k_descale_raw = quant_k(k, k_mean)
+        k_quantized, k_descale = _MXFP6_K_VIEWS[head_dim](
             k_raw, k_descale_raw, k.shape[0], k.shape[1], k.shape[2]
         )
         q_routing, k_source, k_packed_format = q, k, "mxfp6"
@@ -3137,14 +3153,14 @@ def _mha_v4_sol_mx(
         q_routing, k_source, k_packed_format = q_quantized, None, None
     v_pack = AttentionPack.V_FOR_FP6_P
     if v_format == AttentionFormat.MXFP4:
-        v_raw, v_descale = quantize_v_mxfp4_fp6_p(v)
+        v_raw, v_descale = mha_v4_mx_producers(v_format, head_dim)[2](v)
         v_quantized = mxfp4_v_view(v_raw, v_descale, k.shape[1])
         v_packed_format = "mxfp4_fp6_p"
     elif _is_fp8_format(v_format):
         v_quantized, v_descale = quantize_v_fp8(v)
         v_packed_format, v_pack = None, AttentionPack.DEFAULT
     else:
-        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+        v_quantized, v_descale = mha_v4_mx_producers(v_format, head_dim)[2](v)
         v_packed_format = "mxfp6_fp6_p"
     tile_m, tile_n = block_tile
     plan = sol_prepare(
