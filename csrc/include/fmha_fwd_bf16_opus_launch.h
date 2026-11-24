@@ -34,6 +34,9 @@ struct fmha_fwd_bf16_opus_args
     void* o_ptr       = nullptr;
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
+    // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
+    // Symmetric D=64/128 kernels only, and not with a sliding window.
+    const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
     // The *_pad arrays give the physical row offsets (equal to the non-pad arrays when
@@ -143,6 +146,7 @@ inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args
     kargs.ptr_lse      = a.lse_ptr;
     kargs.stride_lse_b = a.stride_lse_b;
     kargs.stride_lse_h = a.stride_lse_h;
+    kargs.ptr_sink     = a.sink_ptr;
 
     // Group / varlen. A null seqstart_q selects batch mode, where these stay null and the
     // GROUP_MODE branches compile out entirely.
@@ -174,8 +178,8 @@ inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
     return !(a.batch == 0 || a.seqlen_q == 0 || a.nhead == 0);
 }
 
-// D_QK = D_V = 128 (symmetric). Covers batch mode, group / varlen and the sliding
-// window; which one is selected follows from the arguments, see below.
+// D_QK = D_V in {64, 128} (symmetric). Covers batch mode, group / varlen and (D=128
+// only) the sliding window; which one is selected follows from the arguments, see below.
 inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     bool ok = false;
@@ -219,6 +223,25 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
             gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
+
+    // D=64 shares the tile shape (Q=32, KV=64, 8 waves); only D_TILE_SIZE differs, and
+    // every derived count in opus_gqa_traits follows from it. It has no LOCAL instance;
+    // fmha_fwd_bf16_opus_launch refuses a window before we get here.
+    if(a.hdim_q == 64)
+    {
+        if(is_group)
+        {
+            if(a.causal)
+                launch(opus_gqa_traits<32, 64, 64, 8, true, true>{});
+            else
+                launch(opus_gqa_traits<32, 64, 64, 8, false, true>{});
+        }
+        else if(a.causal)
+            launch(opus_gqa_traits<32, 64, 64, 8, true, false>{});
+        else
+            launch(opus_gqa_traits<32, 64, 64, 8, false, false>{});
+        return true;
+    }
 
     // causal x group x local. LOCAL implies CAUSAL, so there is no non-causal window.
     if(is_group)
@@ -365,9 +388,9 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 
 // Launches the opus forward kernel that matches the argument head dims on `stream`.
 // Returns false when the input is outside what the kernels cover: a GPU other than
-// gfx950, a data type other than bf16, a (hdim_q, hdim_v) other than (128,128) or
-// (192,128), or a kv extent past the 32-bit async-load offset limit. Both head-dim
-// kernels take batch and group / varlen; only the 128/128 one takes a sliding window.
+// gfx950, a data type other than bf16, a (hdim_q, hdim_v) outside {(64,64), (128,128),
+// (192,128)}, or a kv extent past the 32-bit async-load offset limit. Every head-dim
+// kernel takes batch and group / varlen; only the 128/128 one takes a sliding window.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     static const std::string arch_id = get_gpu_arch();
@@ -391,8 +414,20 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         AITER_LOG_WARNING("opus fwd: hdim 192/128 has no sliding-window kernel");
         return false;
     }
+    // Likewise D=64: the sliding-window kernel is D=128 only.
+    if(a.hdim_q == 64 && a.window_size_left >= 0)
+    {
+        AITER_LOG_WARNING("opus fwd: hdim 64 has no sliding-window kernel");
+        return false;
+    }
+    // Only gqa_d128_kernel reads the sink; refuse it where it would be ignored.
+    if(a.sink_ptr != nullptr && (a.window_size_left >= 0 || a.hdim_q != a.hdim_v))
+    {
+        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim and no window");
+        return false;
+    }
 
-    if(a.hdim_q == 128 && a.hdim_v == 128)
+    if(a.hdim_q == a.hdim_v && (a.hdim_q == 64 || a.hdim_q == 128))
     {
         return fmha_fwd_bf16_opus_detail::launch_d128(a, stream);
     }

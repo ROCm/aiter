@@ -12,10 +12,15 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
 from .common import _ptr
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax")
+_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor")
 
 
 @functools.cache
@@ -78,6 +83,8 @@ def flydsl_absmax():
         absmax(A, Amax, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _ABSMAX_AOT_CACHE, ())
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
         stream = torch.cuda.current_stream()
@@ -191,6 +198,8 @@ def flydsl_quant_per_tensor(torch_dtype):
         quantize_per_tensor(A, Amax, B, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _QUANT_AOT_CACHE, (torch_dtype,))
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
         stream = torch.cuda.current_stream()

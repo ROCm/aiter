@@ -23,6 +23,13 @@ void rotate_activation_mxfp8_quant(aiter_tensor_t& out,
                                    double multiplier,
                                    const aiter_tensor_t& mean);
 
+// As above on the [b, s, 2h, 128] half-head view of hd256 K, but the data goes straight into the
+// hd256 MXFP8 code object's 64-token K records, E8M0 tail included; `scale` stays token-major.
+void rotate_activation_mxfp8_quant_k_hd256(aiter_tensor_t& out,
+                                           aiter_tensor_t& scale,
+                                           const aiter_tensor_t& input,
+                                           const aiter_tensor_t& mean);
+
 void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,
                                    const aiter_tensor_t& input,
@@ -63,6 +70,16 @@ void quantize_v_mxfp4(aiter_tensor_t& out,
                       aiter_tensor_t& scale,
                       const aiter_tensor_t& input,
                       int64_t head_split = 1);
+
+// Gated per-(batch, head, channel) mean of BSHD K over every max(1, S / sample_rows)-th row, into
+// fp32 `out` (batch, heads, dim): the mean where its squared norm exceeds min_common^2 times the
+// mean squared row norm, zeros elsewhere. `partial` (batch * heads, chunks, dim + 1) fp32 is the
+// workspace; its chunk count sets the parallelism.
+void k_smooth_mean(aiter_tensor_t& out,
+                   aiter_tensor_t& partial,
+                   const aiter_tensor_t& input,
+                   int64_t sample_rows,
+                   double min_common);
 
 } // namespace torch_itfs
 } // namespace aiter

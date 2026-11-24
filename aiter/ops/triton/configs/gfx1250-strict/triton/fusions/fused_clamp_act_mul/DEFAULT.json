@@ -1,0 +1,6 @@
+{
+    "any": {
+        "num_warps": 8,
+        "waves_per_eu": 0
+    }
+}

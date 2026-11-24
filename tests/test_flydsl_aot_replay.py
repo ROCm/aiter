@@ -6,6 +6,7 @@ These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
 
 import csv
+import itertools
 import os
 import pathlib
 import subprocess
@@ -176,6 +177,65 @@ def test_the_dry_run_answers_an_assignment_through_an_index(monkeypatch):
         table[3] = 1 << 40
         assert scale.shape == (4, 16)
         assert table.shape == (8,)
+
+
+def test_the_dry_run_gives_each_storage_its_own_address_range():
+    """Host code compares pointers and the byte ranges they span, so fake
+    storages must be disjoint, aligned allocations, as on a GPU."""
+    with dry_run("gfx1250", 256):
+        tensors = [
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in (
+                ((1, 4096), torch.bfloat16),
+                ((128, 4096), torch.bfloat16),
+                ((1, 128), torch.bfloat16),
+                ((3,), torch.uint8),
+                ((8, 4096), torch.float32),
+            )
+        ]
+        spans = [
+            (t.data_ptr(), t.data_ptr() + t.untyped_storage().nbytes()) for t in tensors
+        ]
+    assert all(start % 4096 == 0 for start, _ in spans)
+    for (start_a, end_a), (start_b, end_b) in itertools.combinations(spans, 2):
+        assert end_a <= start_b or end_b <= start_a
+
+
+def test_a_view_keeps_its_storage_s_address_under_the_dry_run():
+    with dry_run("gfx1250", 256):
+        base = torch.empty((8, 128), dtype=torch.bfloat16, device="cuda")
+        assert base.data_ptr() == base.data_ptr()
+        assert base[2:].data_ptr() == base.data_ptr() + 2 * 128 * 2
+        assert base[:, 64:].data_ptr() == base.data_ptr() + 64 * 2
+        assert base.t().data_ptr() == base.data_ptr()
+        assert torch.empty(0, device="cuda").data_ptr() == 0
+
+
+@pytest.mark.parametrize(
+    ("m", "block_k", "stages"), [(1, 128, 5), (2, 256, 3), (4, 512, 2), (8, 512, 2)]
+)
+def test_a_split_k_tdm_gemm_replay_reaches_flydsl(m, block_k, stages):
+    """The gfx1250 TDM GEMM refuses an output that overlaps its inputs. The
+    fresh output of a replay must pass that check, as on a GPU (#8134: the
+    split-K bf16_tuned_gemm rows of Qwen3.5-397B, N=128 K=4096)."""
+    from aiter.ops.flydsl.gemm_a16w16_tdm import gemm_a16w16_tdm
+
+    with dry_run("gfx1250", 256):
+        a = torch.empty((m, 4096), dtype=torch.bfloat16, device="cuda")
+        b = torch.empty((128, 4096), dtype=torch.bfloat16, device="cuda")
+        with replay.identified_kernels() as kernels:
+            gemm_a16w16_tdm(
+                a,
+                b.t(),
+                block_m=16,
+                block_n=16,
+                block_k=block_k,
+                stages=stages,
+                m_waves=1,
+                n_waves=1,
+                split_k=8,
+            )
+    assert len(kernels) == 1
 
 
 def test_per_arch_replays_get_the_command_line(monkeypatch):
@@ -410,3 +470,51 @@ def test_gemm_scan_covers_the_heuristics_where_a_sparse_table_has_no_row(
         {**job, "tuned": ((1, 16, 1), (8192, 256, 1), (32768, 256, 1))}, 8193
     )
     assert not all(any(b * 256 < m <= (b + 1) * 256 for m in dense) for b in blocks)
+
+
+def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
+    tmp_path, monkeypatch
+):
+    from aiter.aot.flydsl import gemm
+    from aiter.ops import gemm_op_a8w8
+    from aiter.ops.flydsl import gemm_a8w8_bpreshuffle_4wave as four_wave
+
+    source = _REPO_ROOT / "aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = [
+            row
+            for row in reader
+            if row["q_dtype_w"] == "torch.int8" and row["libtype"] == "flydsl"
+        ]
+        fieldnames = reader.fieldnames
+    assert len(rows) == 3
+    path = tmp_path / "a8w8_bpreshuffle_tuned_gemm.csv"
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    jobs = gemm.parse_csv(str(path))
+    assert {(j["m"], j["n"], j["k"], j["kernel_name"]) for j in jobs} == {
+        (int(r["M"]), int(r["N"]), int(r["K"]), r["kernelName"]) for r in rows
+    }
+
+    launched = []
+    run_4wave = four_wave.run_gemm_a8w8_bpreshuffle_4wave
+
+    def record(*args, **kwargs):
+        launched.append(args[5])
+        return run_4wave(*args, **kwargs)
+
+    monkeypatch.setattr(four_wave, "run_gemm_a8w8_bpreshuffle_4wave", record)
+    monkeypatch.setenv("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", str(path))
+    gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
+    try:
+        with dry_run("gfx950", 256, python_ops=True):
+            for job in jobs:
+                with replay.identified_kernels() as kernels:
+                    gemm.replay(job)
+                assert kernels, job
+    finally:
+        gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
+    assert launched == [job["kernel_name"] for job in jobs]
