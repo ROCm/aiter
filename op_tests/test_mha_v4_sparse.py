@@ -3700,7 +3700,11 @@ def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed
 
 @parametrize(
     ("recipe", "block_tile"),
-    [p for p in _sol_attn_geometry_params() if p.values[0].v_format == native_fp8_format()],
+    [
+        p
+        for p in _sol_attn_geometry_params()
+        if p.values[0].v_format == native_fp8_format()
+    ],
 )
 def test_mha_v4_sol_fp8_p_keeps_pooled_mass_far_below_the_exact_max(recipe, block_tile):
     """FP8-V rows quantize P to e4m3 against the exact pass's max. A pooled block's P carries the
