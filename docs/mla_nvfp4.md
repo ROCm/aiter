@@ -168,12 +168,15 @@ fall back to FP8 kernels without an explicit conversion.
 The shipped `mla_a4w4_qh128_1tg_32mx4_128nx1_r1_np.co` has an
 80-byte, ten-pointer ABI, fixed LDS of 262144 bytes and a 16KiB aligned
 instruction entry. Dynamic LDS is zero.
-It contains 73500 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
+It contains 64768 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
 SPI prefetch 255. Its public symbol is `mla_a4w4_qh128_1tg_32mx4_128nx1_r1_np`.
 Both HIP producer kernels also request 16KiB instruction alignment.
 The kernel object/descriptor itself is a different address from the entry.
-The first N128 tile skips the shared score-mask call when all 128 tokens are
-valid; partial first tiles retain masking before the softmax maximum reduction.
+The decoder keeps output completion inline, compacts helper paths and uses
+bounded instruction prefetch. Its entry schedule overlaps query completion
+and scale-loading work. Full first N128 tiles retain the mask fast path; partial
+first tiles are masked before the softmax maximum reduction. These changes
+preserve the T1 numerical contract and public ABI.
 
 The precompiled ASM CO is in the shared `hsa/gfx1250/mla/` directory.
 AITER loads the shipped CO and compiles the C++ wrapper and HIP producer
@@ -230,25 +233,35 @@ per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
 and unified dispatch, repeatability, guards, producer byte layouts, active-tail
 requantization, BF16-to-decode, dense-to-CSR, stream/graph and fullgraph compile.
 The optional test allocates approximately 12GiB to put both KV streams above
-4GiB offsets. Current validation and the full-tile mask comparison are reported
-separately from earlier FP8 comparisons and full-model accuracy results.
+4GiB offsets. Current public integration validation and matched FP8 decode
+measurements are reported below; full-model results retain their historical
+revision and validation scope.
 
-### Public integration validation (2026-11-23)
+### Public integration validation (2026-11-24)
 
 On gfx1250 B0 hardware, **44 selected GPU tests passed, with no skips** using a
-fresh v7 JIT build with the previously built v6 cache still present. Coverage
-includes the standard BF16-input FP32 attention reference, supplemental quantized-algorithm checks, constant V, guards, producer
-layouts, graph/fullgraph paths, KV offsets beyond 4 GiB and FP8 QH128 regression.
-Existing test tolerances are unchanged. The actual loaded N128-named decoder's
-73,500 instruction bytes match the validated full-tile mask version; decoder
-and both HIP producer entries are 16 KiB aligned. The v7 wrapper loads the new
-CO even with a v6 cache present and the old CO absent.
+fresh v7 JIT build and the refreshed public CO:
 
-The same decoder instructions also passed 17 GPU contract groups and standard
-FP32 attention checks on 646 requests spanning tails and 5K/8K contexts. Those
-outputs matched the preceding decoder bitwise, as did both paired timing
-workloads below. These operator checks do not replace a full-model evaluation
-of this revision.
+```bash
+AITER_NVFP4_TEST_LARGE=1 python3 -m pytest op_tests/test_mla_nvfp4.py op_tests/test_mla_decode_pagesize64.py -k 'Nvfp4 or nvfp4 or TestMlaQh128'
+```
+
+Coverage includes standard FP32 attention on original BF16 inputs, the existing
+strict quantized-algorithm oracle, constant V, guards, producer layouts,
+graph/fullgraph execution, KV offsets beyond 4 GiB and FP8 QH128 regression.
+The tests and their accuracy limits are unchanged. All 64,768 loaded decoder
+instruction bytes match the refreshed CO, and the decoder and both HIP producer
+entries are 16 KiB aligned. The public N128 filename, symbol, ten-pointer ABI and
+v7 loader interface remain compatible; this refresh requires no module rename.
+
+The two current FP8 benchmark runs below cover 43,008 requests whose complete
+NVFP4 outputs match the validated T1 baseline bitwise. Graph/eager equality,
+finite values, output guards and the untouched reserved LSE buffer passed.
+The first, middle and last request in each row were additionally compared with
+standard FP32 attention on the original BF16 inputs: 45 requests per format,
+90 checks in total. Maximum NRMS was 0.179018 for NVFP4 and 0.047535 for FP8;
+no checked elements exceeded their existing tolerance budgets. These operator
+checks do not replace a full-model evaluation of this revision.
 
 ### Full-model accuracy history
 
@@ -267,83 +280,71 @@ not had a new full-model evaluation; its bitwise operator checks above are not
 a claim of a new MLPerf score, repeated-run accuracy stability or model-throughput
 improvement.
 
-### Full-tile mask timing (2026-11-22)
+### Decode timing (2026-11-24)
 
-The current instruction image was compared directly with the preceding NVFP4
-CO at `cff86078c5406990d0da57487a58e7d3b8051beb` on a single gfx1250 B0 GPU.
-Both use T1, QH128, page size 64, identical BF16 inputs and randomized independent
-page mappings in a pool of 400,000 physical pages. Each row retains 180 paired
-Graph32 samples across three blocks, both initialization orders and 30 AB/BA
-rounds per order. Means are microseconds per decode dispatch; input preparation,
-quantization and reference checks are excluded. Outputs matched bitwise.
+The following measurements use the instruction image shipped in the current
+CO on a single gfx1250 B0 GPU, with threshold 1, QH128 and page size 64.
+Both formats share original BF16 Q/KV, request lengths and random physical page
+mapping, using their respective native packed layouts. NVFP4 produces output
+only; the existing FP8 API also produces LSE.
 
-| Batch | Fixed KV | Previous NVFP4 (us) | Full-tile mask (us) | Time reduction | Faster rounds |
-|---:|---:|---:|---:|---:|---:|
-| 1536 | 5120 | 404.093 | 403.187 | 0.224% | 104/180 |
-| 512 | 2500 | 76.078 | 75.620 | 0.601% | 160/180 |
+Each row has two blocks with opposite initialization orders. Each block uses
+8 eager warmups, 32 dispatches per graph, 5 initial graph replays, and 30 AB/BA
+rounds with a same-format warm graph before each timed sample. All 60 samples
+per format are retained; the tables show arithmetic means in microseconds per
+decode dispatch. Preparation, quantization, cache writes and correctness checks
+are outside timing. The two blocks belong to one run, rather than independent
+repeated runs. GPU occupancy sampling observed no concurrent task during timing.
 
-These are small workload-specific improvements from one paired experiment.
-The renamed public CO preserves the measured instruction image and kernel
-descriptor; renaming did not introduce another performance measurement.
+Physical page pool: **199,945 pages**.
 
-### Decode timing (2026-11-22)
-
-The following FP8 comparison is historical: it measured the preceding NVFP4 CO
-at `cff86078c5406990d0da57487a58e7d3b8051beb`, before the full-tile mask fast path.
-It has not been rerun for the current CO.
-
-Single-GPU measurements on gfx1250 B0 used those preceding decoder instructions,
-threshold 1, QH128 and page size 64. Both formats shared original BF16 Q/KV,
-request lengths and randomized physical page mappings, with their respective
-native shuffled layouts. NVFP4 produced output only; the existing FP8 API also
-produced LSE.
-
-Each row contains two measurement blocks with opposite initialization orders.
-Each block uses 8 eager warmups, 32 dispatches per graph, 5 initial graph replays,
-and 30 alternating NVFP4/FP8 and FP8/NVFP4 rounds. A same-format warm graph
-precedes every sample. The table retains all 60 samples per format and reports
-the arithmetic mean in microseconds per dispatch. Input preparation, quantization,
-cache writes and reference checks are outside the timed region.
-
-The first nine rows use a pool of **199,945 physical pages**. The target mean is
-not necessarily the actual mean after clipping:
-
-| Batch | Target mean KV | Length distribution | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 faster rounds |
+| Batch | Target mean KV | Distribution | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 faster rounds |
 |---:|---:|---|---:|---:|---:|---:|
-| 1536 | 2500 | Uniform | 240.100 | 247.501 | 1.0308x | 59/60 |
-| 1536 | 2500 | Lognormal | 285.748 | 280.372 | 0.9812x | 1/60 |
-| 1536 | 2500 | Few long | 242.439 | 254.359 | 1.0492x | 60/60 |
-| 1536 | 4000 | Uniform | 353.809 | 386.797 | 1.0932x | 59/60 |
-| 1536 | 4000 | Lognormal | 427.594 | 428.989 | 1.0033x | 38/60 |
-| 1536 | 4000 | Few long | 306.189 | 324.113 | 1.0585x | 60/60 |
-| 1024 | 4000 | Uniform | 240.659 | 251.416 | 1.0447x | 60/60 |
-| 1024 | 4000 | Lognormal | 293.424 | 287.514 | 0.9799x | 2/60 |
-| 1024 | 4000 | Few long | 222.339 | 232.322 | 1.0449x | 60/60 |
+| 1536 | 2500 | Uniform | 250.680 | 262.032 | 1.0453x | 58/60 |
+| 1536 | 2500 | Lognormal | 302.718 | 314.822 | 1.0400x | 60/60 |
+| 1536 | 2500 | Few long | 269.034 | 284.654 | 1.0581x | 60/60 |
+| 1536 | 4000 | Uniform | 370.483 | 406.853 | 1.0982x | 59/60 |
+| 1536 | 4000 | Lognormal | 435.527 | 479.816 | 1.1017x | 60/60 |
+| 1536 | 4000 | Few long | 308.745 | 336.980 | 1.0914x | 60/60 |
+| 1024 | 4000 | Uniform | 252.862 | 264.841 | 1.0474x | 60/60 |
+| 1024 | 4000 | Lognormal | 319.833 | 329.296 | 1.0296x | 60/60 |
+| 1024 | 4000 | Few long | 233.473 | 247.047 | 1.0581x | 60/60 |
 
-Uniform means every request has exactly the target length. Lognormal lengths
-use NumPy `default_rng(0)`, log-space sigma 0.8, rescaling to the target mean,
-clipping to [200, 20000], and integer conversion; the three shapes are generated
-in the order shown. Their actual means are 2498.698, 3970.786 and 3955.996.
-For the few-long cases, `floor(batch/32)` requests receive the remaining target
-token budget after the others receive half the target mean; lengths are clipped
-to [200, 30000]. Their actual means are 2148.438, 2875 and 2875. Different
-distributions therefore do not have identical total token counts; compare the
-two formats within each row.
+Physical page pool: **322,560 pages**.
 
-Seven of these nine row means favor NVFP4. The 1.0033x result is close to parity,
-and FP8 remains faster in two lognormal cases. Performance is workload-dependent.
-The two blocks are from the same run, rather than independent repeated runs.
+| Batch | Target mean KV | Distribution | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 faster rounds |
+|---:|---:|---|---:|---:|---:|---:|
+| 5120 | 2500 | Uniform | 792.386 | 938.756 | 1.1847x | 60/60 |
+| 5120 | 2500 | Lognormal | 860.328 | 980.381 | 1.1395x | 60/60 |
+| 5120 | 2500 | Few long | 698.368 | 819.397 | 1.1733x | 60/60 |
+| 5120 | 4000 | Uniform | 1175.578 | 1438.787 | 1.2239x | 60/60 |
+| 5120 | 4000 | Lognormal | 1258.903 | 1487.265 | 1.1814x | 60/60 |
+| 5120 | 4000 | Few long | 882.745 | 1066.741 | 1.2084x | 60/60 |
 
-The larger uniform workloads use **600,000 physical pages**, accommodating
-409,600 and 491,520 independent KV pages respectively:
+The batch-5120 uniform KV=4000 case requires exactly 322,560 pages and fills
+its physical pool. The original 199,945-page pool cannot hold this workload.
+Other cases use fewer pages than their pool capacity. Pool size differs between
+the tables, so cross-table timing changes cannot be attributed solely to batch.
 
-| Batch | Fixed KV | NVFP4 mean (us) | FP8 mean (us) | FP8 / NVFP4 | NVFP4 time reduction | NVFP4 faster rounds |
-|---:|---:|---:|---:|---:|---:|---:|
-| 5120 | 5120 | 1390.817 | 1692.650 | 1.2170x | 17.83% | 60/60 |
-| 5120 | 6144 | 1643.160 | 2007.923 | 1.2220x | 18.17% | 60/60 |
+Uniform gives every request the target length. Lognormal uses NumPy
+`default_rng(0)`, log-space sigma 0.8, rescaling to the target mean, clipping to
+[200, 20000], then integer conversion. Each table starts its own generator;
+shapes are generated in the order shown. Actual lognormal means are 2498.698,
+3970.786 and 3955.996 in the first table, and 2498.390 and 3957.895 in the second.
+For few-long cases, `floor(batch/32)` requests receive the remaining target
+token budget after other requests receive half the target mean; lengths are
+clipped to [200, 30000]. Their actual means are 2148.438 for target 2500 and
+2875 for target 4000. Different distributions therefore have different token
+totals; compare the formats within each row.
 
-Both initialization-order blocks favor NVFP4 for both large workloads. Pool size
-changes between the two tables, so absolute timing differences cannot be
-attributed solely to batch size. These are decode-kernel comparisons with FP8,
-not a direct paired comparison with the preceding NVFP4 binary, and they do not
-establish end-to-end model-throughput gains.
+All 15 row means favor NVFP4, with FP8/NVFP4 ratios of 1.0296x to 1.2239x.
+For batch 5120, NVFP4 reduces decode time by 12.25% to 18.29% and wins all
+60 paired rounds in every row. Both initialization-order blocks favor NVFP4
+for every row. Performance remains workload-dependent.
+
+The public-symbol CO preserves the complete measured `.text` and kernel
+descriptor byte for byte; repackaging was not timed separately. Its SHA256 is
+`21881918157398e443aa3041953a9969f56d676e4eb2e7cfc4071388aa5f5063`.
+These compare current NVFP4 with FP8, rather than directly measuring the
+incremental gain over the preceding NVFP4 CO. They do not establish an
+end-to-end model-throughput improvement.
