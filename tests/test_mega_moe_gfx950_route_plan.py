@@ -20,9 +20,11 @@ from dataclasses import astuple, fields
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
+    FUSED_QUANTS,
     FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
+    LARGE_M_QUANTS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -94,7 +96,10 @@ def test_fused_layout_gate():
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "inter_dim": 3072})
     assert not fused_layout_supported(**{**V41_FLASH_EP8, "inter_dim": 3072})
     assert not fused_layout_supported(**{**V41_FLASH_EP8, "model_dim": 7168})
-    assert not fused_layout_supported(**{**V41_FLASH_EP8, "quant": "a4w4"})
+    # A4W4 takes the small-input kernel on every layout; the large-input kernel stays A8W4.
+    for layout in (V4_PRO, V41_FLASH_EP4, V41_FLASH_EP2, V41_FLASH_EP8):
+        assert fused_layout_supported(**{**layout, "quant": "a4w4"})
+    assert set(FUSED_QUANTS) == {"a8w4", "a4w4"} and LARGE_M_QUANTS == ("a8w4",)
     for field, value in (
         ("arch", "gfx942"),
         ("world_size", 4),
@@ -102,7 +107,7 @@ def test_fused_layout_gate():
         ("inter_dim", 2048),
         ("experts", 416),
         ("topk", 8),
-        ("quant", "a4w4"),
+        ("quant", "a8w8"),
         ("swiglu_limit", 0.0),
     ):
         assert not fused_layout_supported(**{**V4_PRO, field: value}), field
@@ -766,3 +771,67 @@ def test_ep2_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _EP2_FUSED_DIGEST, table
+
+
+# (world_size, experts_per_rank, model_dim, inter_dim) of the fused layouts.
+_ROUTED_LAYOUTS = {
+    "v4_pro_ep8": (8, 48, 7168, 3072),
+    "v41_flash_ep8": (8, 48, 5120, 2304),
+    "v41_flash_ep4": (4, 96, 5120, 2304),
+    "v41_flash_ep2": (2, 192, 5120, 2304),
+}
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+@pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
+def test_routed_instance_routes(layout, quant):
+    """A routed instance (built offline, as the AOT replay does) serves up to 512 rows a rank through the
+    small-input route for both quants; above that A8W4 takes the large-input route and A4W4 the staged one.
+    The A4W4 small-input route sends FP4 payload rows and writes an FP8 GEMM1 output, which the shared GEMM1-output
+    arena must hold."""
+    import torch
+
+    from aiter.aot.flydsl import mega_moe as aot
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import stage1_output_nbytes
+
+    world, epr, model_dim, inter_dim = _ROUTED_LAYOUTS[layout]
+    mtpr = 8192
+    job = {"experts_per_rank": epr, "model_dim": model_dim, "inter_dim": inter_dim}
+    device = torch.device("cuda", 0)
+    with dry_run(aot.ARCH, aot.NUM_CU, name=aot.DEVICE_NAME), aot._fake_shmem(device):
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+        moe = MegaMoEV2(
+            rank=0,
+            world_size=world,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=world * epr,
+            topk=6,
+            quant=quant,
+            max_tok_per_rank=mtpr,
+            swiglu_limit=10.0,
+            routed=True,
+            **aot._weights(job, device),
+        )
+    plan = moe._bundle_plan
+    assert plan.small_m_mtprs == DEFAULT_SMALL_M_MTPRS
+    assert plan.large_m == (quant == "a8w4") == (moe._large_m is not None)
+    row_bytes = model_dim // 2 if quant == "a4w4" else model_dim
+    for runtime in moe._small_m_runtimes:
+        assert runtime._s1_op.row_bytes == row_bytes
+        assert runtime._s1_rx.shape[1] == row_bytes
+        assert (
+            stage1_output_nbytes(runtime._s1_nvm, inter_dim)[0]
+            <= moe._s1_output_arena[0].numel()
+        )
+    for max_tokens in (0, 1, 256, 257, 512, 513, 4096, mtpr):
+        route, capacity = moe._route(min(max_tokens, 1), max_tokens)
+        if max_tokens <= 512:
+            assert route == ROUTE_SMALL_M, max_tokens
+            assert capacity == (256 if max_tokens <= 256 else 512)
+        elif quant == "a8w4":
+            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
+        else:
+            assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens

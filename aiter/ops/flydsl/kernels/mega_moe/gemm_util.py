@@ -144,7 +144,7 @@ class ATileLoader:
         below ``row_map["rows"]`` are the padding.
         """
         if const_expr(row_map is not None):
-            assert not self._indexed_input and not self._is_fp4
+            assert not self._indexed_input
             input_iter = fx.get_iter(self._x_tensor)
             input_view = fx.Tensor(
                 fx.make_view(

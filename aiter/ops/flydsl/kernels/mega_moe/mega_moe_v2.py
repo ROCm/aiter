@@ -24,6 +24,7 @@ from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
+    LARGE_M_QUANTS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -79,6 +80,7 @@ class MegaMoEV2:
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
+        self._quant = quant
         self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
         self._a_torch_dtype = (
             torch.float4_e2m1fn_x2
@@ -137,6 +139,7 @@ class MegaMoEV2:
             ),
             large_m=(
                 fused
+                and quant in LARGE_M_QUANTS
                 and large_m_enabled
                 and self.mtpr
                 in large_m_mtprs_for(
@@ -414,7 +417,9 @@ class MegaMoEV2:
         payload: a rank that left it early may already dispatch its next call,
         of any route, into its peers. The small-input runtimes also keep their
         own combine input, whose rows their combine leaves poisoned
-        (bf16_head_tokens). The GEMM1 output is rank-local, so it stays shared.
+        (bf16_head_tokens). The GEMM1 output is rank-local, so it stays shared,
+        sized for each route's output dtype (the small-input route writes FP8
+        for A4W4 too).
         """
         self._payload_arena = None
         self._s1_output_arena = None
@@ -447,13 +452,13 @@ class MegaMoEV2:
             "experts": self.experts,
             "topk": self.topk,
         }
-        # Capacities of the routes sharing the payload arena, and of every route.
-        route_capacities = list(capacities)
+        # capacities: the routes sharing the payload arena; route_outputs: (GEMM1 output rows, dtype) of every route.
+        route_outputs = [(capacities[0][0], self._a_dtype)]
         if plan.large_m:
             from .mega_moe_large_m import LargeMRuntime
 
             capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
-            route_capacities.append(capacity)
+            route_outputs.append((capacity[0], self._a_dtype))
             self._large_m_shares_payload = LargeMRuntime.ends_all_ranks(
                 max_tok_per_rank=self.mtpr, **fused
             )
@@ -468,13 +473,16 @@ class MegaMoEV2:
                 if SmallMRuntime.ends_all_ranks(max_tok_per_rank=m, **fused)
             )
             for m in plan.small_m_mtprs:
-                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
-                route_capacities.append(capacity)
+                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, quant=self._quant, **fused)
+                route_outputs.append((capacity[0], "fp8"))
                 if m in self._small_m_shared:
                     capacities.append(capacity)
         self._payload_arena = GroupMajorPayloadArena(capacities)
-        out_bytes, osd_bytes = stage1_output_nbytes(
-            max(nvm for nvm, _, _, _ in route_capacities), self.inter_dim, self._a_dtype
+        out_bytes, osd_bytes = (
+            max(sizes)
+            for sizes in zip(
+                *(stage1_output_nbytes(nvm, self.inter_dim, dt) for nvm, dt in route_outputs)
+            )
         )
         self._s1_output_arena = (
             torch.zeros(out_bytes, dtype=torch.uint8, device=self.dev),

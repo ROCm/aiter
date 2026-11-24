@@ -72,6 +72,9 @@ FUSED_LAYOUTS = frozenset(
         ),
     }
 )
+# Quant modes of the fused routes: the small-input kernel takes both, the large-input kernel A8W4 only.
+FUSED_QUANTS = ("a8w4", "a4w4")
+LARGE_M_QUANTS = ("a8w4",)
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -475,15 +478,15 @@ def fused_layout_supported(
     act: str = "silu",
     fanout_masks: tuple[int, ...] = (),
 ) -> bool:
-    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a8w4 on gfx950.
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a FUSED_QUANTS quant on gfx950.
 
     The small-input kernel serves every such layout; the large-input kernel the
-    capacities large_m_mtprs_for() gives it.
+    LARGE_M_QUANTS layouts at the capacities large_m_mtprs_for() gives it.
     """
     return (
         arch.split(":", 1)[0] == "gfx950"
         and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
-        and quant == "a8w4"
+        and quant in FUSED_QUANTS
         and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks

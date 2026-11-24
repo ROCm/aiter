@@ -145,22 +145,26 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
         jobs = mega_moe.production_jobs()
         ep4 = [job for job in jobs if job["world_size"] == 4]
         # V4-Pro (3 MTPRs x 3 EPLB profiles x 2 quants x 8 ranks), Kimi-K3
-        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 / EP8 (3 MTPRs x 4 / 2 / 8 ranks, a8w4 only).
-        self.assertEqual(len(jobs), 144 + 48 + 12 + 6 + 24)
+        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 / EP8 (3 MTPRs x 2 quants x 4 / 2 / 8 ranks).
+        self.assertEqual(len(jobs), 144 + 48 + 2 * (12 + 6 + 24))
         self.assertEqual(
-            {(job["mtpr"], job["rank"]) for job in ep4},
-            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(4)},
+            {(job["quant"], job["mtpr"], job["rank"]) for job in ep4},
+            {
+                (quant, mtpr, rank)
+                for quant in ("a8w4", "a4w4")
+                for mtpr in (128, 8192, 16384)
+                for rank in range(4)
+            },
         )
         for job in ep4:
             self.assertEqual(
                 (
-                    job["quant"],
                     job["experts_per_rank"],
                     job["model_dim"],
                     job["inter_dim"],
                     job["topk"],
                 ),
-                ("a8w4", 96, 5120, 2304, 6),
+                (96, 5120, 2304, 6),
             )
         self.assertEqual(len({job["kernel_name"] for job in jobs}), len(jobs))
         # The prefill instances (8192, 16384) build the large-input kernel too.
@@ -172,13 +176,16 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
         self.assertEqual(
             {job["mtpr"] for job in ep4 if job["mtpr"] in large}, {8192, 16384}
         )
-        # Without a8w4 there is no EP4 job: its fused routes are a8w4.
-        self.assertFalse(
-            [
-                job
-                for job in mega_moe.production_jobs(quants=("a4w4",))
-                if job["world_size"] == 4
-            ]
+        # A4W4 ships its staged and small-input routes (no large-input route).
+        self.assertEqual(
+            len(
+                [
+                    job
+                    for job in mega_moe.production_jobs(quants=("a4w4",))
+                    if job["world_size"] == 4
+                ]
+            ),
+            12,
         )
 
     def test_v41_flash_ep2_profile(self):
@@ -189,30 +196,37 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
 
         ep2 = [job for job in mega_moe.production_jobs() if job["world_size"] == 2]
         self.assertEqual(
-            {(job["mtpr"], job["rank"]) for job in ep2},
-            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(2)},
+            {(job["quant"], job["mtpr"], job["rank"]) for job in ep2},
+            {
+                (quant, mtpr, rank)
+                for quant in ("a8w4", "a4w4")
+                for mtpr in (128, 8192, 16384)
+                for rank in range(2)
+            },
         )
         for job in ep2:
             self.assertEqual(
                 (
-                    job["quant"],
                     job["experts_per_rank"],
                     job["model_dim"],
                     job["inter_dim"],
                     job["topk"],
                 ),
-                ("a8w4", 192, 5120, 2304, 6),
+                (192, 5120, 2304, 6),
             )
         large = large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304)
         self.assertEqual(
             {job["mtpr"] for job in ep2 if job["mtpr"] in large}, {8192, 16384}
         )
-        self.assertFalse(
-            [
-                job
-                for job in mega_moe.production_jobs(quants=("a4w4",))
-                if job["world_size"] == 2
-            ]
+        self.assertEqual(
+            len(
+                [
+                    job
+                    for job in mega_moe.production_jobs(quants=("a4w4",))
+                    if job["world_size"] == 2
+                ]
+            ),
+            6,
         )
 
     def test_v41_flash_ep8_profile(self):
@@ -223,24 +237,16 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             job for job in jobs if job["model_dim"] == 5120 and job["world_size"] == 8
         ]
         self.assertEqual(
-            {(job["mtpr"], job["rank"]) for job in ep8},
-            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(8)},
+            {(job["quant"], job["mtpr"], job["rank"]) for job in ep8},
+            {
+                (quant, mtpr, rank)
+                for quant in ("a8w4", "a4w4")
+                for mtpr in (128, 8192, 16384)
+                for rank in range(8)
+            },
         )
         for job in ep8:
             self.assertEqual(
-                (
-                    job["quant"],
-                    job["experts_per_rank"],
-                    job["inter_dim"],
-                    job["topk"],
-                ),
-                ("a8w4", 48, 2304, 6),
+                (job["experts_per_rank"], job["inter_dim"], job["topk"]),
+                (48, 2304, 6),
             )
-        # Without a8w4 there is no V4.1-Flash EP8 job either.
-        self.assertFalse(
-            [
-                job
-                for job in mega_moe.production_jobs(quants=("a4w4",))
-                if job["model_dim"] == 5120
-            ]
-        )

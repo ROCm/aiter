@@ -78,16 +78,15 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
-# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
-# the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
-# (128: staged + small-input 256) and prefill (8192 and 16384: staged +
-# small-input + large-input; the EP4 large-input route exists only there).
+# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304). Its MTPRs
+# are those of ATOM's instances: decode (128: staged + small-input 256) and
+# prefill (8192 and 16384: staged + small-input + large-input; the EP4
+# large-input route exists only there, for a8w4).
 V41_FLASH_WORLD_SIZE = 4
 V41_FLASH_EXPERTS_PER_RANKS = (96,)
 V41_FLASH_MODEL_DIM = 5120
 V41_FLASH_INTER_DIM = 2304
 V41_FLASH_MTPRS = (128, 8192, 16384)
-V41_FLASH_QUANTS = ("a8w4",)
 # DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
 V41_FLASH_EP2_WORLD_SIZE = 2
 V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
@@ -161,7 +160,7 @@ def production_jobs(
     v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
     """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
-    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
+    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``).
 
     Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
@@ -190,7 +189,7 @@ def production_jobs(
         jobs += default_jobs(
             v41_flash_mtprs,
             flash_experts_per_ranks,
-            quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
+            quants=quants,
             world_size=flash_world_size,
             model_dim=V41_FLASH_MODEL_DIM,
             inter_dim=V41_FLASH_INTER_DIM,
