@@ -64,4 +64,31 @@ void m3_tp1_moe_g2_w8(const aiter_tensor_t& a2,
                       int64_t m,
                       int64_t topk);
 
+// moe_g2_w8 on a tile list and work-queue state m3_tp1_moe_sort wrote (no tile prepass).
+void m3_tp1_moe_g2_w8_tiles(const aiter_tensor_t& a2,
+                            const aiter_tensor_t& a2_scale,
+                            const aiter_tensor_t& w2_b,
+                            const aiter_tensor_t& w2_bs,
+                            const aiter_tensor_t& sorted_ids,
+                            const aiter_tensor_t& sorted_weights,
+                            const aiter_tensor_t& tiles,
+                            aiter_tensor_t& ctl,
+                            aiter_tensor_t& out,
+                            int64_t m,
+                            int64_t topk);
+
+// One-launch MoE sort (128 experts, top-4, 128-row blocks): moe_sorting's arrays for the MXMOE
+// pipeline, and moe_g2_w8's tiles and work-queue state (ctl). At most 32768 tokens.
+void m3_tp1_moe_sort(const aiter_tensor_t& topk_ids,
+                     const aiter_tensor_t& topk_weights,
+                     std::optional<aiter_tensor_t> num_local_tokens,
+                     aiter_tensor_t& sorted_ids,
+                     aiter_tensor_t& sorted_weights,
+                     aiter_tensor_t& sorted_expert_ids,
+                     aiter_tensor_t& num_valid_ids,
+                     aiter_tensor_t& m_indices,
+                     aiter_tensor_t& reverse_sorted,
+                     aiter_tensor_t& tiles,
+                     aiter_tensor_t& ctl);
+
 } // namespace aiter

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A caller's precomputed BM=16 MoE sort, handed to the next fused_moe call.
+"""A caller's precomputed MoE sort (BM=16, or the MXMOE pipeline's BM=128), handed
+to the next fused_moe call.
 
 fused_moe, fhmoe and the comm-fused runtime all consume it, so it lives here
 rather than in fused_moe.py, which the other two can only import lazily.
@@ -29,13 +30,14 @@ def bytes_overlap(a, b):
     )
 
 
-# Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
-# SGLang's radix-4 router), registered on the calling thread immediately before
+# Optional sort metadata from a caller's fused route+sort kernel (e.g. SGLang's
+# radix-4 router at BM=16), registered on the calling thread immediately before
 # fused_moe. CUDA-graph replay does not re-enter Python, so a captured fused_moe
 # keeps whichever sort launches it was captured with.
 _PRESORTED_MOE = threading.local()
-# The only block size a presort is accepted for; other tile sizes re-sort.
+# The block sizes a presort is accepted for; other tile sizes re-sort.
 PRESORTED_MOE_BLOCK_M = 16
+PRESORTED_MOE_BLOCK_MS = (PRESORTED_MOE_BLOCK_M, 128)
 # Reasons a registration was ignored, so each one is logged only once.
 _PRESORTED_MOE_IGNORED = set()
 _PRESORTED_MOE_SORT_KEYS = (
@@ -53,14 +55,16 @@ _PRESORTED_MOE_SORT_KEYS = (
 # Running it eagerly (a graph break) keeps it ordered before its consumer.
 @torch.compiler.disable
 def register_presorted_moe(aux: dict | None) -> None:
-    """Hand the next fused_moe call on this thread a precomputed BM=16 sort.
+    """Hand the next fused_moe call on this thread a precomputed sort.
 
     ``aux`` holds the sort outputs (sorted_token_ids, sorted_weights,
     sorted_expert_ids, num_valid_ids, m_indices, reverse_sorted) and the keys
     they were computed for (topk_ids_ptr, topk_weights_ptr, M, block_m,
-    num_experts, topk). The sort outputs must use aiter's BM=16 sort layout:
-    contiguous tensors on topk_ids' device, fp32 sorted_weights and int32
-    everything else, sorted_expert_ids with one entry per 16 sorted rows,
+    num_experts, topk, and num_local_tokens_ptr when the sort covers only the
+    first num_local_tokens rows). The sort outputs must use aiter's sort layout
+    for block_m (16, or 128 for the MXMOE pipeline): contiguous tensors on
+    topk_ids' device, fp32 sorted_weights and int32 everything else,
+    sorted_expert_ids with one entry per block_m sorted rows,
     sorted_weights and m_indices at least as long as sorted_token_ids,
     reverse_sorted with M * topk entries and num_valid_ids with 2. A
     registration that does not match the call or breaks this layout is ignored
@@ -79,8 +83,9 @@ def register_presorted_moe(aux: dict | None) -> None:
     it matches or is used, so a stale registration never applies to a later
     call. A caller that registers and then does not call fused_moe must clear it
     with ``register_presorted_moe(None)``. It is only used when the call runs
-    with block_m == 16 and without expert_mask or num_local_tokens; other calls
-    run fused_moe's own sort.
+    with the presort's block_m, without expert_mask, and with num_local_tokens
+    exactly when the presort names that tensor; other calls run fused_moe's own
+    sort.
 
     Under torch.compile this call runs eagerly, so it stays ordered before the
     fused_moe that consumes it; a ``fullgraph=True`` compile rejects it instead.
@@ -122,22 +127,26 @@ def match_presorted_moe(
 
     ``block_m`` is the selected kernels' tile size; ``stage_block_m`` is the
     block size fused_moe hands its sort and stages (a caller's block_size_M),
-    which defaults to ``block_m``. Both must be 16.
+    which defaults to ``block_m``. Both must equal the presort's, 16 or 128.
     """
     if not aux:
         return None
-    if int(block_m) != PRESORTED_MOE_BLOCK_M:
+    if int(block_m) not in PRESORTED_MOE_BLOCK_MS:
         presorted_moe_ignored(f"block_m={block_m}")
         return None
     # The stages index sorted_expert_ids by stage_block_m rows, so a caller's
-    # block_size_M that overrides the kernels' tile would misread a BM=16 sort.
+    # block_size_M that overrides the kernels' tile would misread the presort.
     if stage_block_m is not None and int(stage_block_m) != int(block_m):
         presorted_moe_ignored(f"block_size_M={stage_block_m} != kernel block_m")
         return None
-    # The presort has no expert mask applied and covers every row of topk_ids;
-    # moe_sorting honors both, so a masked or row-limited call must re-sort.
-    if expert_mask is not None or num_local_tokens is not None:
-        presorted_moe_ignored("expert_mask or num_local_tokens is set")
+    # The presort has no expert mask applied, and covers the rows of the
+    # num_local_tokens it names, or every row; a call that differs re-sorts.
+    if expert_mask is not None:
+        presorted_moe_ignored("expert_mask is set")
+        return None
+    local = None if num_local_tokens is None else num_local_tokens.data_ptr()
+    if aux.get("num_local_tokens_ptr") != local:
+        presorted_moe_ignored("num_local_tokens differs from the presort's")
         return None
     for key, expected in (
         ("topk_ids_ptr", topk_ids.data_ptr()),
@@ -154,8 +163,8 @@ def match_presorted_moe(
         if int(aux[key]) != int(expected):
             presorted_moe_ignored(f"{key} does not match the call")
             return None
-    if not _presorted_layout_ok(aux, topk_ids, topk, num_experts):
-        presorted_moe_ignored("sort tensors break the BM=16 sort layout")
+    if not _presorted_layout_ok(aux, topk_ids, topk, num_experts, int(block_m)):
+        presorted_moe_ignored(f"sort tensors break the BM={block_m} sort layout")
         return None
     # The stages zero or write output while still reading the sort tensors.
     if output is not None and any(
@@ -166,7 +175,7 @@ def match_presorted_moe(
     return aux
 
 
-def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
+def _presorted_layout_ok(aux, topk_ids, topk, num_experts, block_m):
     """Whether the six sort tensors match the layout the aux-sort kernels read.
 
     The stages size their intermediates from sorted_token_ids.numel() (max_sorted)
@@ -202,14 +211,12 @@ def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
         ):
             return False
     max_sorted = ids.numel()
-    # Worst case for a BM=16 sort, as aiter's own sort allocates: every route
+    # Worst case for a block_m sort, as aiter's own sort allocates: every route
     # plus BM - 1 padding rows per active expert. Smaller cannot hold all routings.
-    capacity = aux_sort_capacity(
-        topk_ids.shape[0], topk, num_experts, PRESORTED_MOE_BLOCK_M
-    )
+    capacity = aux_sort_capacity(topk_ids.shape[0], topk, num_experts, block_m)
     return (
         max_sorted >= capacity
-        and experts.numel() * PRESORTED_MOE_BLOCK_M == max_sorted
+        and experts.numel() * block_m == max_sorted
         and weights.numel() >= max_sorted
         and m_indices.numel() >= max_sorted
         and reverse.numel() == topk_ids.shape[0] * topk

@@ -779,24 +779,20 @@ void check_bytes(const aiter_tensor_t& t, size_t numel, const char* name)
                 " elements");
 }
 
-void run_g2(const aiter_tensor_t& a2,
-            const aiter_tensor_t& a2_scale,
-            const aiter_tensor_t& w2_b,
-            const aiter_tensor_t& w2_bs,
-            const aiter_tensor_t& sorted_ids,
-            const aiter_tensor_t& sorted_weights,
-            const aiter_tensor_t& sorted_expert_ids,
-            const aiter_tensor_t& num_valid_ids,
-            aiter_tensor_t& cnt,
-            aiter_tensor_t& tiles,
-            aiter_tensor_t& ntiles,
-            aiter_tensor_t& out,
-            int64_t m,
-            int64_t topk,
-            bool w8)
+// The operands the GEMM2 kernels read; returns the sort blocks.
+int64_t check_g2(const aiter_tensor_t& a2,
+                 const aiter_tensor_t& a2_scale,
+                 const aiter_tensor_t& w2_b,
+                 const aiter_tensor_t& w2_bs,
+                 const aiter_tensor_t& sorted_ids,
+                 const aiter_tensor_t& sorted_weights,
+                 const aiter_tensor_t& tiles,
+                 const aiter_tensor_t& ntiles,
+                 const aiter_tensor_t& out,
+                 int64_t m,
+                 int64_t topk,
+                 bool w8)
 {
-    aiter_detail::AiterThrowGuard throw_guard;
-
     const size_t sorted      = sorted_ids.numel();
     const int64_t max_blocks = static_cast<int64_t>(sorted) / kSortBlock;
     AITER_CHECK(max_blocks <= kMaxSortBlocks,
@@ -827,15 +823,64 @@ void run_g2(const aiter_tensor_t& a2,
         sorted_weights.dtype() == AITER_DTYPE_fp32 && sorted_weights.is_contiguous() &&
             sorted_weights.numel() >= sorted,
         "m3_tp1_moe_g2: sorted_weights must be a contiguous fp32 tensor of sorted_ids' size");
-    check_i32(sorted_expert_ids, max_blocks, "sorted_expert_ids");
-    check_i32(num_valid_ids, 1, "num_valid_ids");
-    check_i32(cnt, max_blocks, "cnt");
     check_i32(tiles, max_blocks * 4, "tiles");
     check_i32(ntiles, w8 ? 9 : 1, w8 ? "ctl" : "ntiles");
     AITER_CHECK(!w8 || m * topk * NH * 2 <= static_cast<int64_t>(W8_OOB),
                 "m3_tp1_moe_g2_w8: ",
                 m * topk,
                 " route rows exceed its 32-bit store offsets");
+    return max_blocks;
+}
+
+void launch_w8(const aiter_tensor_t& a2,
+               const aiter_tensor_t& a2_scale,
+               const aiter_tensor_t& w2_b,
+               const aiter_tensor_t& w2_bs,
+               const aiter_tensor_t& sorted_ids,
+               const aiter_tensor_t& sorted_weights,
+               const aiter_tensor_t& tiles,
+               aiter_tensor_t& ctl,
+               aiter_tensor_t& out,
+               int64_t m,
+               int64_t topk,
+               hipStream_t stream)
+{
+    moe_g2_gemm_w8<<<dim3(get_num_cu_func()), dim3(512), 0, stream>>>(
+        static_cast<const uint8_t*>(a2.data_ptr()),
+        static_cast<const uint8_t*>(a2_scale.data_ptr()),
+        static_cast<const uint8_t*>(w2_b.data_ptr()),
+        static_cast<const uint8_t*>(w2_bs.data_ptr()),
+        static_cast<const int4*>(tiles.data_ptr()),
+        static_cast<int*>(ctl.data_ptr()),
+        static_cast<const int*>(sorted_ids.data_ptr()),
+        static_cast<const float*>(sorted_weights.data_ptr()),
+        static_cast<uint16_t*>(out.data_ptr()),
+        static_cast<int>(m),
+        static_cast<int>(topk));
+}
+
+void run_g2(const aiter_tensor_t& a2,
+            const aiter_tensor_t& a2_scale,
+            const aiter_tensor_t& w2_b,
+            const aiter_tensor_t& w2_bs,
+            const aiter_tensor_t& sorted_ids,
+            const aiter_tensor_t& sorted_weights,
+            const aiter_tensor_t& sorted_expert_ids,
+            const aiter_tensor_t& num_valid_ids,
+            aiter_tensor_t& cnt,
+            aiter_tensor_t& tiles,
+            aiter_tensor_t& ntiles,
+            aiter_tensor_t& out,
+            int64_t m,
+            int64_t topk,
+            bool w8)
+{
+    aiter_detail::AiterThrowGuard throw_guard;
+    const int64_t max_blocks = check_g2(
+        a2, a2_scale, w2_b, w2_bs, sorted_ids, sorted_weights, tiles, ntiles, out, m, topk, w8);
+    check_i32(sorted_expert_ids, max_blocks, "sorted_expert_ids");
+    check_i32(num_valid_ids, 1, "num_valid_ids");
+    check_i32(cnt, max_blocks, "cnt");
     if(max_blocks == 0 || m == 0)
         return;
 
@@ -855,35 +900,32 @@ void run_g2(const aiter_tensor_t& a2,
         static_cast<int*>(ntiles.data_ptr()),
         w8 ? 8 : 0);
     if(w8)
-    {
-        moe_g2_gemm_w8<<<dim3(get_num_cu_func()), dim3(512), 0, stream>>>(
+        launch_w8(a2,
+                  a2_scale,
+                  w2_b,
+                  w2_bs,
+                  sorted_ids,
+                  sorted_weights,
+                  tiles,
+                  ntiles,
+                  out,
+                  m,
+                  topk,
+                  stream);
+    else
+        // one persistent WG per CU of an MI355X
+        moe_g2_gemm<<<dim3(256), dim3(256), 0, stream>>>(
             static_cast<const uint8_t*>(a2.data_ptr()),
             static_cast<const uint8_t*>(a2_scale.data_ptr()),
             static_cast<const uint8_t*>(w2_b.data_ptr()),
             static_cast<const uint8_t*>(w2_bs.data_ptr()),
             static_cast<const int4*>(tiles.data_ptr()),
-            static_cast<int*>(ntiles.data_ptr()),
+            static_cast<const int*>(ntiles.data_ptr()),
             static_cast<const int*>(sorted_ids.data_ptr()),
             static_cast<const float*>(sorted_weights.data_ptr()),
             static_cast<uint16_t*>(out.data_ptr()),
             static_cast<int>(m),
             static_cast<int>(topk));
-        HIP_CALL(hipGetLastError());
-        return;
-    }
-    // one persistent WG per CU of an MI355X
-    moe_g2_gemm<<<dim3(256), dim3(256), 0, stream>>>(
-        static_cast<const uint8_t*>(a2.data_ptr()),
-        static_cast<const uint8_t*>(a2_scale.data_ptr()),
-        static_cast<const uint8_t*>(w2_b.data_ptr()),
-        static_cast<const uint8_t*>(w2_bs.data_ptr()),
-        static_cast<const int4*>(tiles.data_ptr()),
-        static_cast<const int*>(ntiles.data_ptr()),
-        static_cast<const int*>(sorted_ids.data_ptr()),
-        static_cast<const float*>(sorted_weights.data_ptr()),
-        static_cast<uint16_t*>(out.data_ptr()),
-        static_cast<int>(m),
-        static_cast<int>(topk));
     HIP_CALL(hipGetLastError());
 }
 
@@ -951,6 +993,39 @@ void m3_tp1_moe_g2_w8(const aiter_tensor_t& a2,
            m,
            topk,
            true);
+}
+
+void m3_tp1_moe_g2_w8_tiles(const aiter_tensor_t& a2,
+                            const aiter_tensor_t& a2_scale,
+                            const aiter_tensor_t& w2_b,
+                            const aiter_tensor_t& w2_bs,
+                            const aiter_tensor_t& sorted_ids,
+                            const aiter_tensor_t& sorted_weights,
+                            const aiter_tensor_t& tiles,
+                            aiter_tensor_t& ctl,
+                            aiter_tensor_t& out,
+                            int64_t m,
+                            int64_t topk)
+{
+    aiter_detail::AiterThrowGuard throw_guard;
+    const int64_t max_blocks = check_g2(
+        a2, a2_scale, w2_b, w2_bs, sorted_ids, sorted_weights, tiles, ctl, out, m, topk, true);
+    if(max_blocks == 0 || m == 0)
+        return;
+    const HipDeviceGuard guard(out.device_id);
+    launch_w8(a2,
+              a2_scale,
+              w2_b,
+              w2_bs,
+              sorted_ids,
+              sorted_weights,
+              tiles,
+              ctl,
+              out,
+              m,
+              topk,
+              getCurrentHIPStream());
+    HIP_CALL(hipGetLastError());
 }
 
 } // namespace aiter

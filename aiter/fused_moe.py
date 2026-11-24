@@ -2324,7 +2324,7 @@ def _fused_moe_impl(
     ):
         raise RuntimeError("_stage2_override requires a two-stage MoE config")
     if presorted_aux and not metadata.output_aux:
-        presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
+        presorted_moe_ignored("the selected MoE pipeline takes no aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(

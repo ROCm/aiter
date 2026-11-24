@@ -18,6 +18,10 @@ per-route bf16 rows, as aiter's v2 "reduce" GEMM2 with ``per_slot_out`` writes
 them, on ragged 256-row expert tiles; ``relayout_w2`` makes its W2 copy at load.
 ``moe_g2_w8``: the same bytes from 8 waves per CU and per-XCD work queues, for up
 to ``MOE_G2_W8_MAX_ROUTES`` route rows (``moe_g2_w8_serves``).
+``moe_sort``: the MoE sort of the MXMOE pipeline (128 experts, top-4, 128-row
+blocks) and ``moe_g2_w8``'s tile list in one launch, as a presort for
+``aiter.fused_moe.register_presorted_moe``; ``moe_g2_w8_tiles`` runs the GEMM2
+on that tile list.
 Launches run on the current stream. The entry points raise off gfx950;
 ``is_supported()`` tells callers in advance.
 """
@@ -30,6 +34,7 @@ from ..jit.utils.chip_info import get_gfx_runtime
 
 __all__ = [
     "MOE_G2_W8_MAX_ROUTES",
+    "MOE_SORT_MAX_TOKENS",
     "NORM_FOLD_H",
     "NORM_FOLD_MX8",
     "NORM_INPUT_MX8",
@@ -40,6 +45,8 @@ __all__ = [
     "moe_g2_p6",
     "moe_g2_w8",
     "moe_g2_w8_serves",
+    "moe_g2_w8_tiles",
+    "moe_sort",
     "mx8_quant",
     "norm_mx",
     "relayout_w2",
@@ -221,6 +228,111 @@ def moe_g2_w8(
     _m3_tp1_moe_g2_w8(
         a2, a2_scale, w2_b, w2_bs, *meta, cnt, tiles, ctl, out, int(m), int(topk)
     )
+
+
+@compile_ops("module_m3_tp1_moe_g2", fc_name="m3_tp1_moe_g2_w8_tiles", develop=True)
+def _m3_tp1_moe_g2_w8_tiles(
+    a2: Tensor,
+    a2_scale: Tensor,
+    w2_b: Tensor,
+    w2_bs: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    tiles: Tensor,
+    ctl: Tensor,
+    out: Tensor,
+    m: int,
+    topk: int,
+) -> None: ...
+
+
+def moe_g2_w8_tiles(
+    a2: Tensor,
+    a2_scale: Tensor,
+    w2_b: Tensor,
+    w2_bs: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    tiles: Tensor,
+    ctl: Tensor,
+    out: Tensor,
+    m: int,
+    topk: int,
+) -> None:
+    """``moe_g2_w8`` on the tile list and work-queue state ``moe_sort`` wrote
+    (``g2_tiles`` / ``g2_ctl``) for this sort: no tile prepass. Once per sort."""
+    _require_gfx950("moe_g2_w8_tiles")
+    meta = (sorted_ids, sorted_weights, tiles, ctl)
+    _m3_tp1_moe_g2_w8_tiles(a2, a2_scale, w2_b, w2_bs, *meta, out, int(m), int(topk))
+
+
+MOE_SORT_MAX_TOKENS = 32768  # one WG per expert holds 64 tokens per thread
+
+
+@compile_ops("module_m3_tp1_moe_g2", fc_name="m3_tp1_moe_sort", develop=True)
+def _m3_tp1_moe_sort(
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    num_local_tokens: Tensor | None,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    m_indices: Tensor,
+    reverse_sorted: Tensor,
+    tiles: Tensor,
+    ctl: Tensor,
+) -> None: ...
+
+
+def moe_sort(
+    topk_ids: Tensor, topk_weights: Tensor, num_local_tokens: Tensor | None = None
+) -> dict:
+    """Sort a top-4 routing over 128 experts into 128-row blocks in one launch: the
+    arrays aiter's moe_sorting writes for the MXMOE pipeline (same bytes where it
+    writes them; a token that names an expert twice routes there once), as a dict
+    ``register_presorted_moe`` takes, plus ``g2_tiles`` / ``g2_ctl`` for
+    ``moe_g2_w8_tiles``. ``topk_ids`` int32 / ``topk_weights`` fp32 ``[M, 4]``, M at
+    most ``MOE_SORT_MAX_TOKENS``; ``num_local_tokens``: an int32 tensor of one count."""
+    _require_gfx950("moe_sort")
+    m = topk_ids.shape[0]
+    dev = topk_ids.device
+    rows = (m * 4 + 128 * 128 - 4 + 127) // 128 * 128
+    i32 = torch.int32
+    aux = {
+        "sorted_token_ids": torch.empty(rows, dtype=i32, device=dev),
+        "sorted_weights": torch.empty(rows, dtype=torch.float32, device=dev),
+        "sorted_expert_ids": torch.empty(rows // 128, dtype=i32, device=dev),
+        "num_valid_ids": torch.empty(2, dtype=i32, device=dev),
+        "m_indices": torch.empty(rows, dtype=i32, device=dev),
+        "reverse_sorted": torch.empty(m * 4, dtype=i32, device=dev),
+        "g2_tiles": torch.empty((rows // 128, 4), dtype=i32, device=dev),
+        "g2_ctl": torch.empty(9, dtype=i32, device=dev),
+    }
+    _m3_tp1_moe_sort(
+        topk_ids,
+        topk_weights,
+        num_local_tokens,
+        aux["sorted_token_ids"],
+        aux["sorted_weights"],
+        aux["sorted_expert_ids"],
+        aux["num_valid_ids"],
+        aux["m_indices"],
+        aux["reverse_sorted"],
+        aux["g2_tiles"],
+        aux["g2_ctl"],
+    )
+    aux.update(
+        topk_ids_ptr=topk_ids.data_ptr(),
+        topk_weights_ptr=topk_weights.data_ptr(),
+        M=m,
+        block_m=128,
+        num_experts=128,
+        topk=4,
+    )
+    if num_local_tokens is not None:
+        aux["num_local_tokens_ptr"] = num_local_tokens.data_ptr()
+    return aux
 
 
 def relayout_w2(w2_q: Tensor, w2_s: Tensor) -> tuple[Tensor, Tensor]:

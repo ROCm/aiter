@@ -1053,7 +1053,8 @@
     "module_m3_tp1_moe_g2": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/m3_tp1_moe_g2_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/moe_g2.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/moe_g2.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/moe_sort.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
