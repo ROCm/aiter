@@ -265,17 +265,18 @@ def test_flydsl_two_kv_heads(qlen, route_spy):
     _check(out, _reference(q, k, v, used, table, qlen))
 
 
-def test_flydsl_decode_batches_above_512(route_spy):
+@pytest.mark.parametrize("qlen", [1, 8])
+def test_flydsl_decode_batches_above_512(qlen, route_spy):
     lengths = tuple(
         int(x)
         for x in torch.randint(
             1, 700, (600,), generator=torch.Generator().manual_seed(1)
         )
     )
-    q, k, v, out, cu, used, table = _inputs(lengths, 64, qlen=1)
-    _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
+    q, k, v, out, cu, used, table = _inputs(lengths, 64, qlen=qlen)
+    _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl")
     assert route_spy == ["flydsl"]
-    _check(out, _reference(q, k, v, used, table, 1))
+    _check(out, _reference(q, k, v, used, table, qlen))
 
 
 def test_shrinking_batch_reuses_workspace(route_spy):
@@ -830,6 +831,52 @@ def test_cold_capture_raises_for_explicit_flydsl():
         _call(q, k, v, out, cu, used, table, max_k=300, backend="flydsl")
 
 
+def test_cold_auto_capture_falls_back_to_warmed_triton(route_spy):
+    release_flydsl_resources()
+    q, k, v, out, cu, used, table = _inputs((4097, 300), 64)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        # Warm only the fallback: FlyDSL must decline allocation in capture.
+        _call(q, k, v, out, cu, used, table, max_k=4097, backend="triton")
+        out.fill_(float("nan"))
+    stream.synchronize()
+    route_spy.clear()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(q, k, v, out, cu, used, table, max_k=4097)
+    assert route_spy == ["uniform", "triton"]
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(out, _reference(q, k, v, used, table))
+
+
+def test_workspace_growth_pins_earlier_graph_buffers():
+    release_flydsl_resources()
+    small = _inputs((4097, 300, 129), 64, qlen=1)
+    large = _inputs((4097, 300, 129, 64) * 16, 64, qlen=1)
+    stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(stream):
+        _call(*small, qlen=1, max_k=4097, backend="flydsl")
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(*small, qlen=1, max_k=4097, backend="flydsl")
+    with torch.cuda.stream(stream):
+        _call(*large, qlen=1, max_k=4097, backend="flydsl")
+    stream.synchronize()
+
+    (state,) = [
+        state for key, state in flydsl_ua._WORKSPACES.items() if key[2] == "uniform_1"
+    ]
+    assert len(state["pinned"]) == 1
+    small[3].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(small[3], _reference(small[0], small[1], small[2], small[5], small[6], 1))
+
+
 @pytest.mark.parametrize("page", [64, 128])
 def test_ragged_graph_replay_follows_new_offsets(page):
     query_lengths, lengths = (40, 1, 300, 7), (16384, 4097, 300, 2048)
@@ -864,7 +911,9 @@ def test_ragged_graph_replay_follows_new_offsets(page):
         _check(out, _reference(q, k, v, used, table, cu_seqlens_q=offsets))
 
 
-def test_varlen_optimized_graph_replay_follows_new_lengths():
+def test_varlen_optimized_graph_replay_follows_new_lengths(route_spy):
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the optimized varlen kernel runs on 256-CU parts")
     qlen = 8192
     # The block table holds 2 * qlen tokens.
     q, k, v, out, cu, used, table = _inputs((2 * qlen,), 128, qlen=qlen)
@@ -882,6 +931,7 @@ def test_varlen_optimized_graph_replay_follows_new_lengths():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         call()
+    assert route_spy == ["optimized", "optimized"]
     for context in (2 * qlen, qlen, qlen + 4000):
         used.fill_(context)
         q.normal_()

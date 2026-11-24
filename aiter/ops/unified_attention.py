@@ -48,6 +48,9 @@ def unified_attention(
     ``seqused_k`` contains KV lengths, and ``block_table`` maps logical pages.
     ``max_seqlen_q``/``max_seqlen_k`` bound lengths; ``softmax_scale`` scales
     QK logits, and ``q_descale``/``k_descale``/``v_descale`` dequantize FP8.
+    A FlyDSL CUDA graph may replay only while the tensor-held lengths remain
+    within the host bounds captured in that graph. In particular, exceeding
+    the captured ``max_seqlen_k`` can silently omit reducer partitions.
 
     ``causal`` selects bottom-right masking; ``window_size`` selects the
     attention window. Optional scales, biases, softcap, sinks, and
@@ -68,6 +71,9 @@ def unified_attention(
     FlyDSL BF16 contract: the configurations validated in
     ``aiter.ops.flydsl.unified_attention_bf16`` (gfx950, BF16 linear KV, the
     MiMo V2.6 geometry); ``backend="flydsl"`` names the declined property.
+    Before graph capture, warm up uncaptured on the capture stream with the
+    same route-selecting host arguments; a larger workspace does not imply that
+    every kernel specialization is compiled.
     When q holds ``num_seqs * max_seqlen_q`` tokens with ``max_seqlen_q <= 8``,
     they require ``cu_seqlens_q == arange(num_seqs + 1) * max_seqlen_q``, which
     is not checked on the GPU. ``AITER_UNIFIED_ATTN_FLYDSL=0`` disables

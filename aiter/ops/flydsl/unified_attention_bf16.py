@@ -25,11 +25,14 @@ CU count. Performance was measured on MI355X only; MI350X is the same chip
 at a lower power cap and clock, and ``AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED=0``
 or ``AITER_UNIFIED_ATTN_FLYDSL=0`` opts out if it regresses there.
 
-Graph capture: the first call of a geometry on a stream must run uncaptured to
-allocate its workspace. Each call, captured or not, records a GPU plan refresh
-from ``seqused_k``, so lengths may change between replays up to the captured
-``max_seqlen_k``. Calls and replays sharing a workspace must not overlap.
-Workspaces and compiled kernels persist until ``release_flydsl_resources``.
+Graph capture: first run an uncaptured call on the capture stream with the same
+route-selecting host arguments as the call to capture. A larger workspace alone
+is not enough: changes to ``max_seqlen_k``, batch/query geometry or direct-output
+eligibility can select another kernel specialization. Each call, captured or
+not, records a GPU plan refresh from ``seqused_k``, so tensor lengths may change
+between replays up to the captured ``max_seqlen_k``. Calls and replays sharing a
+workspace must not overlap. Workspaces and compiled kernels persist until
+``release_flydsl_resources``.
 
 The optimized varlen specialization is additionally limited to the global page-128,
 HKV=1, direct-output plan with ``max_seqlen_k >= 4096``. Set
