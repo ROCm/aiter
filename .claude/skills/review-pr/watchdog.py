@@ -18,6 +18,7 @@ Reads STUCK_MINUTES, PR, GH_TOKEN, AITER_BOT_TOKEN, OWNER_OVERRIDE, and the GITH
 Actions sets for every step.
 """
 
+import datetime
 import json
 import math
 import os
@@ -31,8 +32,15 @@ POLL_SECONDS = 120
 PAGE = 100
 
 
+def _minutes_between(start, end):
+    """Minutes from one workflow timestamp to the one after it, for timing a completed job."""
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return ((datetime.datetime.strptime(end, fmt)
+             - datetime.datetime.strptime(start, fmt)).total_seconds() / 60.0)
+
+
 class GitHub:
-    """The three calls this needs, with no dependency to install on the hosted runner.
+    """The calls this needs, with no dependency to install on the hosted runner.
 
     Transport sits behind _get/_post on purpose: the test substitutes those two and everything
     above them -- paging, URLs, which token posts the comment -- is the shipping code.
@@ -70,22 +78,58 @@ class GitHub:
     def jobs(self, repo, run_id):
         return self._get("/repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, PAGE))["jobs"]
 
-    def in_progress_runs(self, repo):
-        """Every in_progress run of this workflow, not just the first page.
+    def _runs(self, repo, *statuses):
+        """Every run of this workflow in the given statuses, not just the first page.
 
-        A batch of reviews queues up as a long list of in_progress runs and the API returns the
-        newest first -- so the one actually holding the runner is last, and a single page would
-        miss exactly it.
+        A batch of reviews queues up as a long list and the API returns the newest first -- so
+        the one actually holding the runner is last, and a single page would miss exactly it.
         """
-        out, page = [], 1
-        while True:
-            batch = self._get(
-                "/repos/%s/actions/workflows/%s/runs?status=in_progress&per_page=%d&page=%d"
-                % (repo, WORKFLOW, PAGE, page))["workflow_runs"]
-            out += batch
-            if len(batch) < PAGE:
-                return out
-            page += 1
+        out = []
+        for status in statuses:
+            page = 1
+            while True:
+                batch = self._get(
+                    "/repos/%s/actions/workflows/%s/runs?status=%s&per_page=%d&page=%d"
+                    % (repo, WORKFLOW, status, PAGE, page))["workflow_runs"]
+                out += batch
+                if len(batch) < PAGE:
+                    break
+                page += 1
+        return out
+
+    def in_progress_runs(self, repo):
+        """Every in_progress run of this workflow. box_busy asks only this: a queued run holds
+        no runner, so it cannot be the box working on anything."""
+        return self._runs(repo, "in_progress")
+
+    def live_runs(self, repo):
+        """Every run holding a real request: in progress, or queued at the hosted runner.
+
+        A queued run of this workflow passed the gate job's `if` -- a comment without the
+        trigger phrase skips inside seconds and never waits for a runner -- so every queued run
+        is a review request. Ten fired together left eight of them here, invisible to a survey
+        that read only in_progress runs, and every gate that did run told its requester 'queued
+        behind 1' with six requests ahead of them.
+        """
+        return self._runs(repo, "in_progress", "queued")
+
+    def recent_review_minutes(self, repo, want):
+        """How long the last few completed reviews took, newest first.
+
+        Refused requests conclude successfully too, with no review job to time, so they are
+        skipped rather than priced: a run whose review never started says nothing about the
+        box's pace.
+        """
+        out = []
+        runs = self._get("/repos/%s/actions/workflows/%s/runs?status=success&per_page=%d"
+                         % (repo, WORKFLOW, PAGE))["workflow_runs"]
+        for run in runs:
+            review = next((j for j in self.jobs(repo, run["id"]) if j["name"] == "review"), None)
+            if review is not None and review.get("started_at") and review.get("completed_at"):
+                out.append(_minutes_between(review["started_at"], review["completed_at"]))
+                if len(out) >= want:
+                    break
+        return out
 
     def comment(self, repo, pr, body):
         # Post as aiter-bot, like every other message this workflow sends.

@@ -1,0 +1,94 @@
+{
+    "mean_1": {
+        "BLOCK_LEQ_64": {
+            "ROWS": 16,
+            "HEADS_PER_PROGRAM": 2,
+            "num_warps": 1
+        },
+        "any": {
+            "ROWS": 8,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        }
+    },
+    "mean_2": {
+        "any": {
+            "ROWS": 8,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        }
+    },
+    "mean_4": {
+        "any": {
+            "ROWS": 8,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        }
+    },
+    "aux_1": {
+        "BLOCK_LEQ_32": {
+            "ROWS": 64,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 1
+        },
+        "BLOCK_LEQ_64": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 1
+        },
+        "BLOCK_LEQ_128": {
+            "ROWS": 16,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 1
+        },
+        "any": {
+            "ROWS": 8,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        }
+    },
+    "aux_2": {
+        "BLOCK_LEQ_64": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 1
+        },
+        "BLOCK_LEQ_128": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 2
+        },
+        "BLOCK_LEQ_256": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        },
+        "any": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 8
+        }
+    },
+    "aux_4": {
+        "BLOCK_LEQ_32": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 1
+        },
+        "BLOCK_LEQ_64": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 2
+        },
+        "BLOCK_LEQ_128": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 4
+        },
+        "any": {
+            "ROWS": 32,
+            "HEADS_PER_PROGRAM": 1,
+            "num_warps": 8
+        }
+    }
+}
