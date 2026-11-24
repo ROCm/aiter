@@ -168,8 +168,9 @@ def compile_pa_sparse_prefill_nvfp4(
     rounded s * c (the maxima are unchanged; P differs by that rounding) and a
     pairwise row sum. ``quant_mx``: write o_proj's MXFP8 input instead of the
     BF16 rows (``op_mxfp8``: E4M3 values of the BF16 output and one E8M0 scale per
-    32, bit for bit ``quantize_fp8`` of it; one KV head), rows past ``rows`` up
-    to ``quant_rows`` (a padded token bucket) as FP8 zeros with unit scales.
+    32, bit for bit ``quantize_fp8`` of it), tokens past ``rows`` up to
+    ``quant_rows`` (a padded token bucket; flattened row ``token * kv_heads +
+    kv_head``) as FP8 zeros with unit scales.
 
     Returns ``{"launch", "kernel"}``; ``launch(query, key, value, ks, vs, table,
     context, output, rows, kv_heads, table_stride, scale_page_stride, sq_row,
@@ -829,7 +830,7 @@ def compile_pa_sparse_prefill_nvfp4(
                     mx_store(values, offsets)
             elif const_expr(quant_mx):
                 if row < quant_rows:
-                    pad_row(row)
+                    pad_row(row * kv_heads + kvh)
 
     @flyc.jit
     def launch(

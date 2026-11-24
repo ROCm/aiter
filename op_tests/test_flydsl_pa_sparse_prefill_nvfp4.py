@@ -416,15 +416,19 @@ def mxfp8_reference(x):
     return q.view(torch.uint8).reshape(x.shape[0], -1), code.to(torch.uint8)
 
 
+@pytest.mark.parametrize("kv_heads", [1, 4])
 @pytest.mark.parametrize("variant", ["4+sr+fe", "3+sr+fe", "v2:2", "v2:4"])
-def test_pa_sparse_prefill_nvfp4_mxfp8(variant, device):
+def test_pa_sparse_prefill_nvfp4_mxfp8(variant, kv_heads, device):
     """The MXFP8 output is the group-32 quant of the kernel's own BF16 rows, bit
-    for bit; padded bucket rows are FP8 zeros with unit scales."""
-    c = make_case([(3000, 203)], device, "shared")
+    for bit; padded bucket rows are FP8 zeros with unit scales. With ``kv_heads``
+    KV heads the flattened rows are (token, KV head) pairs and the padding is
+    whole tokens (two here)."""
+    c = make_case([(3000, 203 if kv_heads == 1 else 204)], device, "shared")
     tile_rows, kw = parse_variant(variant)
+    kw["kv_heads"] = kv_heads
     sp = importlib.import_module("aiter.ops.flydsl.pa_sparse_prefill")
     kp, ks, vp, vs = c["caches"][0]
-    rows, pad = c["q"].shape[0], 5
+    rows, pad = c["q"].shape[0], 5 if kv_heads == 1 else 2 * kv_heads
     out = torch.empty_like(c["q"])
     sp.pa_sparse_prefill_nvfp4(out, c["q"], kp, vp, ks, vs, c["table"], c["ctx"], SCALE,
                                tile_rows=tile_rows, **kw)

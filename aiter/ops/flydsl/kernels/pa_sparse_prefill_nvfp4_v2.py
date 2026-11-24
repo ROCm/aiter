@@ -1220,7 +1220,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     mx_store(values, offsets)
             elif const_expr(quant_mx):
                 if row < quant_rows:
-                    pad_row(row)
+                    pad_row(row * kv_heads + kvh)
 
     @flyc.jit
     def launch(
