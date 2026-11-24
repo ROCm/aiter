@@ -1152,8 +1152,15 @@ def build_gemm_a8w4_tdm_task(
             elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
         )
         if const_expr(overlap_scatter):
-            waves = [(w,) for w in ep_scatter_common.LOAD_WAVES] * 2
-            TDM_PER = len(waves) // len(ep_scatter_common.LOAD_WAVES)
+            if const_expr(b_placed):
+                # IOD B tiles are split across two owner waves. Keep all input
+                # TDM traffic on overlap-scatter's load waves while store waves
+                # 2/3 remain dedicated to the scatter pipeline.
+                waves = [ep_scatter_common.LOAD_WAVES] * 4
+                TDM_PER = 4
+            else:
+                waves = [(w,) for w in ep_scatter_common.LOAD_WAVES] * 2
+                TDM_PER = len(waves) // len(ep_scatter_common.LOAD_WAVES)
         elif const_expr(tdm_as_in_prologue):
             assert num_waves == 4, "As-prologue requires a four-wave workgroup"
             # Match the WST rotating-stage assignment. The one-shot A-scale load
