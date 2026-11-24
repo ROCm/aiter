@@ -33,24 +33,62 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+    // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
+    // valueless extra key in the softmax denominator (see store_result). nullptr => none.
+    // Read by gqa_d128_kernel only; the sliding-window kernel is never given one.
+    const void* __restrict__ ptr_sink;
+
+    // ── group mode (varlen / packed sequences) ──
+    // Prefix sums (length B+1). *_seqstart_* are real lengths (masking, KV-tile count,
+    // empty-tail short circuit); *_seqstart_*_pad are physical row offsets. A null
+    // ptr_seqstart_q selects batch mode. Only read when the traits' GROUP_MODE is set.
+    const int* ptr_seqstart_q;
+    const int* ptr_seqstart_k;
+    const int* ptr_seqstart_q_pad;
+    const int* ptr_seqstart_k_pad;
+
+    // Sliding window, only meaningful when the traits' LOCAL is set: a query at
+    // KV-coordinate j attends to [j - window_size_left, j]. Negative means unbounded
+    // (plain causal). right > 0 is not implemented.
+    int window_size_left;
+
+    // ── group mode: flattened Q-block axis ──
+    // When > 0, the extent of the Q-block axis: the groups' blocks laid end to end, and
+    // each block inverts seqstart_q to work out which group it belongs to. The value is
+    // therefore fixed by that mapping, not free: see
+    // fmha_fwd_bf16_opus_args::total_q_blocks.
+    //
+    // 0 means "not supplied" and keeps the rectangular grid, where every group is given as
+    // many Q-blocks as the longest group needs and the surplus returns immediately.
+    int total_q_blocks;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
-// MFMA config). This integration is D=128 only: MFMA 32x32x16 bf16, K/V loaded in
-// one shot (no D slicing).
+// MFMA config). MFMA 32x32x16 bf16, K/V loaded in one shot (no D slicing), which holds
+// for D=64 and D=128 alike — every quantity below is derived from D_TILE_SIZE and stays
+// integral at both. The static_asserts near the end of the struct enforce that rather
+// than relying on this list being kept in sync.
 template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
-        bool CAUSAL_ = false>
+        bool CAUSAL_ = false,
+        bool GROUP_MODE_ = false,
+        bool LOCAL_ = false>
 struct opus_gqa_traits {
-    static_assert(D_TILE_SIZE_ == 128, "fmha_fwd_hd128_bf16_opus supports D_TILE_SIZE 128 only");
+    static_assert(D_TILE_SIZE_ == 64 || D_TILE_SIZE_ == 128,
+                  "opus_gqa_traits supports D_TILE_SIZE 64 or 128");
 
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr bool CAUSAL = CAUSAL_;
+    // Group (varlen) mode: locate sequences via seqstart, not a uniform batch stride.
+    static constexpr bool GROUP_MODE = GROUP_MODE_;
+    // Sliding window: bound the KV range on the left too, via kargs.window_size_left.
+    static constexpr bool LOCAL = LOCAL_;
+    static_assert(!LOCAL_ || CAUSAL_, "LOCAL needs CAUSAL for the right-hand bound");
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -64,13 +102,13 @@ struct opus_gqa_traits {
     static constexpr int T_N = 1;         // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile (D=128): bf16 32x32x16
+    // MFMA instruction shape: bf16 32x32x16.
     static constexpr int W_M = 32;
     static constexpr int W_N = 32;
     static constexpr int W_K = 16;
 
-    // D=128 covers the full head dim in one MMA (no D slicing).
-    static constexpr int SLICE_D = D_TILE_SIZE;  // == 128
+    // Each kernel instance covers the full head dim without an outer D-slicing loop.
+    static constexpr int SLICE_D = D_TILE_SIZE;
     static constexpr int NUM_D_SLICES = 1;
     static_assert(D_TILE_SIZE % SLICE_D == 0);
 
@@ -105,7 +143,9 @@ struct opus_gqa_traits {
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
 
-    // K/V smem padding (D=128): K uses 16B padding, V uses 64B padding.
+    // K/V smem padding (K 16B, V 64B), unchanged from D=128. These are not independent
+    // tuning knobs: the store/read layouts use the same constants and must change with
+    // the allocations or their addressing will diverge.
     static constexpr int smem_k_padding = smem_padding_16B;
     static constexpr int smem_v_padding = smem_padding_64B;
 
@@ -129,6 +169,18 @@ struct opus_gqa_traits {
     static constexpr int KEEP_VMCNT = k_buffer_load_insts + v_buffer_load_insts;
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
+
+    // D-generality guards: every derived count above must divide exactly, or the tiling
+    // silently drops work. Checked here so a new D_TILE_SIZE fails at compile time.
+    static_assert(D_TILE_SIZE % D_128B_SIZE == 0, "D_TILE_SIZE must be a multiple of 128B");
+    static_assert(SLICE_D % W_K == 0, "SLICE_D must be divisible by the MFMA K");
+    static_assert(SLICE_D % W_N == 0, "SLICE_D must be divisible by the MFMA N");
+    static_assert((KV_TILE_SIZE * D_TILE_SIZE) % (BLOCK_SIZE * VEC_KV) == 0,
+                  "K/V tile must divide evenly into whole-block vector loads");
+    static_assert((GEMM0_E_N * GEMM0_E_K * W_N * W_K) % (WARP_SIZE * VEC_KV) == 0,
+                  "K ds_read count must be integral");
+    static_assert((GEMM1_E_N * GEMM1_E_K * W_N * W_K) % (WARP_SIZE * VEC_TR_V) == 0,
+                  "V ds_read count must be integral");
 
     static constexpr size_t smem_size_bytes() {
         // Q-in-LDS layout (K double-buffered + Q/V aliased shared region).
