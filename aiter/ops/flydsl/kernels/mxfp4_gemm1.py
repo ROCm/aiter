@@ -97,6 +97,7 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    bf16_act_quant=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -1332,10 +1333,11 @@ def _gemm1_body(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=swiglu_limit,
+                swiglu_alpha_first=bf16_act_quant,
             )
-            if const_expr(out_dtype == "fp8"):
+            if const_expr(out_dtype == "fp8" or bf16_act_quant):
                 # Match the existing two-stage path: activation is materialized
-                # as BF16 before the inter-stage MXFP8 quantization.
+                # as BF16 before the inter-stage MX quantization.
                 result = [value.to(fx.BFloat16).to(fx.Float32) for value in result]
 
             local_max = _fabs_f32(result[0])
@@ -1590,6 +1592,7 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    bf16_act_quant=False,
 ):
     """Compile GEMM1 with expert-sorted output."""
     try:
@@ -1687,6 +1690,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if bf16_act_quant:
+        name_suffix += "_bf16q"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1787,6 +1792,7 @@ def compile_gemm1_a4w4_port(
                 k_wave=k_wave,
                 epi_splits=epi_splits,
                 k_stages=k_stages,
+                bf16_act_quant=bf16_act_quant,
             )
 
     @flyc.jit
