@@ -6,12 +6,12 @@
     "-std=c++20",
     "-DOPUS_ENABLE_RUNTIME_QUERY=0"
   ],
-  "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-  "hip_clang_path": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
+  "device_clang": "clang version 24.0.0git (https://github.com/yuyzhang512/llvm-project.git 49c41889681640665400cb01c9fbb4c0a024cde4)",
+  "hip_clang_path": "/root/llvm-project/build/bin",
   "hipcc": "/opt/rocm/bin/hipcc",
   "kernels": [
     {
-      "co_sha256": "b791f0e0f7632cc81312a8b48c110d1d16dec3a5327c25a59142795479ad1cdf",
+      "co_sha256": "f459eeef16515a0d495737d93e357539b3945331c4c5f5af0280000947b97da1",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -39,7 +39,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "1498e71e64f218c0da3decbeac084bf46268f9ced0bd0dc77172844ac7025bfb",
+      "co_sha256": "340ff9f7b59f1c011388c8741b19be91907f0ab28cbf85ec8094fae4c3e50b98",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -67,7 +67,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "04454991d8dcbbde842766ca2994da53fc3a7ee4a4b1f4942cd0c9896e4e8002",
+      "co_sha256": "d69fba8b45483338e054afb4f7657408c33a6a68ef782d022250852491a17b40",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -95,7 +95,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "fc16dc905ed60b80b545e688317b4742fa68e07289889f811e47b8e2583c0d0a",
+      "co_sha256": "b14cf29c306468dac800744a552f5911b5991152d2810ee22aec0622953cec3a",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -123,7 +123,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "29fafa3117e4e79c242ec361f5146329e6fb294681b13fdfd107d128b174144f",
+      "co_sha256": "482a621d56a700e87e604736ce3d97f63585cc0ece5222a362199141675750e8",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -151,7 +151,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "eb9e7230d303928a221bca4086fb051d695e246a86a3c8275f8553585a51ebd1",
+      "co_sha256": "64b4866fa49a6e308c6ee03892ee1308feed657f29f123b8ff0a11ac4043bb58",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -179,7 +179,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f4ff57027b7851846efa08a1200ff3f57373c71405e29c0f988e54002bb43a0f",
+      "co_sha256": "30049ac6aaae7706d8e0773bd3525ceb88dc9f548e3d49e7bf089396075f408d",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -207,7 +207,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "5a7c3511849a05b9f0b94ec9262befa982fab65dd02dbc9174efb5027a6f667b",
+      "co_sha256": "75f41b5b3536b8ea7c71126835c40785bc2e5960dda628bcc84c32c3b47e58d5",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -235,7 +235,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2fee59a75a62516115d6ff60183b56fd523112ca499ee40876103ccf0f72d890",
+      "co_sha256": "0411d519ea5985ac570c70c9d80a13f6c62a933b19508425342989ff2074e8d9",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -263,7 +263,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f64729d35cb342c976691922cfcd58107ffa0f6bbe5bd646526539c1042ef4d9",
+      "co_sha256": "5c21b5cd338f77b798e5e32fe4b5d3a3535744d793250c0d99ffba33a4c92305",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -291,7 +291,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "ba05d607a72c6928a91c7635a11cfd7d70eefcf9c94788b9c9c98ff84ce04043",
+      "co_sha256": "bf00b91c3d046f9c7196af8caf9e70487adaaa0a254028bc74af5d8db0ce8df7",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"
@@ -319,7 +319,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "1a4b813f8133f95e334e7ecc4a97188afd856126d8523be03afb465d8b0c6af7",
+      "co_sha256": "119ec0635171ed996c612d21882f10f6bf543ee913072c84a7f32ee06cdb37eb",
       "device_flags": [
         "-Werror=ignored-attributes",
         "-Wno-deprecated-attributes"

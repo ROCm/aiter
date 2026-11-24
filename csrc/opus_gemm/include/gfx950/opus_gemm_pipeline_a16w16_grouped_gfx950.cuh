@@ -378,6 +378,7 @@ __device__ inline void m_grouped_plan_body(const opus_gemm_a16w16_m_grouped_plan
         s_rows[g] = 0;
         s_first[g] = k.m;
     }
+    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     opus::sync_threads();
     for (int base = tid - lane_id; base < k.m; base += OPUS_M_GROUPED_PLAN_THREADS) {
         const int r = base + lane_id;
@@ -394,6 +395,7 @@ __device__ inline void m_grouped_plan_body(const opus_gemm_a16w16_m_grouped_plan
             lower(&s_first[g], r);
         }
     }
+    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     opus::sync_threads();
     for (int g = tid; g < k.groups; g += OPUS_M_GROUPED_PLAN_THREADS) {
         k.rows[g] = s_rows[g];
