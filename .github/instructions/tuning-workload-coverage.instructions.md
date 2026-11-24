@@ -1,17 +1,11 @@
 ---
-applyTo: "**/*.csv,**/*.json,**/*.yaml,**/*.yml,**/*.toml"
+applyTo: "**/*tuned*.csv"
 ---
 
-# Tuning workload coverage
+# Tuned/untuned rows move together
 
-For paired tuning CSVs, check both directions on newly changed workloads:
-1. Newly added workload-specific tuned entries must have their full workload key
-   in the applicable untuned input (or ask for it when it is known to be
-   required but missing).
-2. Newly added untuned workloads must have a matching tuned entry in an
-   associated tuned file, and tuned workloads must not be removed while still
-   present in the untuned input (unless retained in another associated tuned
-   file, including runtime-merged model CSVs, or moved).
-
-Do not flag unchanged legacy entries, generic defaults, unknown pairings, or
-ambiguous/unsupported tuning types and formats.
+When a PR adds tuned rows for some workloads, the paired untuned CSV should get
+the same input rows; when it removes rows on one side, it should remove them on
+the other. Comment only on rows the PR itself adds or removes. A row may
+legitimately live in another tuned file the runtime merges, or in a shared
+untuned input, so check before asking. Do not flag untouched legacy rows.

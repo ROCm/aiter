@@ -1,4 +1,23 @@
-"""Best-effort bidirectional check for paired tuned/untuned tuning CSVs."""
+"""Best-effort helper: do a PR's tuned and untuned CSV row changes move together?
+
+For every tuned/untuned CSV pair touched by the PR (paired by file name only), it
+compares the rows the PR *adds or removes* and reports four kinds of mismatch:
+
+  TUNED_NOT_IN_UNTUNED        added tuned workload, no matching untuned row
+  UNTUNED_NOT_IN_TUNED        added untuned workload, no matching tuned row
+  TUNED_REMOVED_UNTUNED_KEPT  tuned workload removed, untuned row left behind
+  UNTUNED_REMOVED_TUNED_KEPT  untuned workload removed, tuned row left behind
+
+Informational lines: CHECKED (pair compared, nothing to report), UNPAIRED (tuned
+rows changed but no untuned CSV matches the name), NOT_CHECKED (format or pairing
+the helper does not handle). `SKIPPED:` means a Git or parse failure.
+
+This is deliberately not exhaustive. It does not model runtime-merged tuned files,
+shared untuned inputs, or tuner-specific key layouts; legacy drift that the PR does
+not touch is never reported. When a key appears in another CSV changed by the same
+PR, the finding says so (often a move). The reviewer decides from the diff and these
+hints; a finding here is a question to check, not a verdict.
+"""
 
 import argparse
 import csv
@@ -10,49 +29,21 @@ import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 
-TUNED = re.compile(r"(^|[_-])tuned(?=[_-]|(?:\.csv)?$)", re.IGNORECASE)
-UNTUNED = re.compile(r"(^|[_-])untuned(?=[_-]|(?:\.csv)?$)", re.IGNORECASE)
-ARCH_TOKEN = re.compile(r"^gfx\d+[a-z0-9-]*$", re.IGNORECASE)
-
-# From aiter/utility/dtypes.py defaultDtypes + normalize_fp8_dtype.
-ARCH_FP8_E4M3 = {
-    "gfx942": "torch.float8_e4m3fnuz",
-    "gfx950": "torch.float8_e4m3fn",
-    "gfx1100": "torch.float8_e4m3fn",
-    "gfx1101": "torch.float8_e4m3fn",
-    "gfx1102": "torch.float8_e4m3fn",
-    "gfx1150": "torch.float8_e4m3fn",
-    "gfx1151": "torch.float8_e4m3fn",
-    "gfx1200": "torch.float8_e4m3fn",
-    "gfx1201": "torch.float8_e4m3fn",
-    "gfx1250": "torch.float8_e4m3fn",
-    "gfx1250-strict": "torch.float8_e4m3fn",
-}
-E4M3_FLAVORS = frozenset({"torch.float8_e4m3fn", "torch.float8_e4m3fnuz"})
-FP8_QUANT_COLS = frozenset({"q_dtype_a", "q_dtype_w"})
-UNSUPPORTED_FAMILIES = ("chunk_gdn_h_opt", "paged_mqa_logits")
-OUTPUT_PLACEHOLDER_COLS = frozenset(
-    {
-        "kernelid",
-        "kernelname",
-        "kernelname1",
-        "kernelname2",
-        "solidx",
-        "us",
-        "us1",
-        "us2",
-        "tflops",
-        "bw",
-        "err_ratio",
-        "errratio",
-        "err1",
-        "err2",
-        "splitk",
-        "libtype",
-        "ksplit",
-        "block_m",
-    }
+TUNED = re.compile(r"(^|[_-])tuned(?=[_-]|$)", re.IGNORECASE)
+UNTUNED = re.compile(r"(^|[_-])untuned(?=[_-]|$)", re.IGNORECASE)
+ARCH_TOKEN = re.compile(r"^gfx\d+[a-z0-9]*$", re.IGNORECASE)
+HW_COLS = ("gfx", "cu_num")
+# Tuner outputs; never part of a workload key even if an untuned file carries them.
+OUTPUT_COLS = frozenset(
+    c.lower()
+    for c in (
+        "kernelId kernelName kernelName1 kernelName2 solidx us us1 us2 tflops bw "
+        "err_ratio errRatio err1 err2 splitK libtype ksplit block_m run_1stage"
+    ).split()
 )
+# Tuned rows serialise these keys differently from the untuned input.
+UNSUPPORTED = ("chunk_gdn_h_opt", "paged_mqa_logits")
+SAMPLE = 10
 
 
 def git(repo, *args):
@@ -61,721 +52,355 @@ def git(repo, *args):
     ).stdout
 
 
-def paths_at(repo, revision):
-    data = git(repo, "ls-tree", "-r", "--name-only", "-z", revision)
-    return {p.decode("utf-8", "surrogateescape") for p in data.split(b"\0") if p}
+def tracked_csvs(repo, rev):
+    data = git(repo, "ls-tree", "-r", "--name-only", "-z", rev)
+    names = (p.decode("utf-8", "surrogateescape") for p in data.split(b"\0") if p)
+    return {n for n in names if n.lower().endswith(".csv")}
 
 
-def changes(repo, base, head):
+def changed_csvs(repo, base, head):
+    """(base_path_or_None, head_path_or_None) for every changed CSV; renames split."""
     data = git(
-        repo,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--name-status",
-        "-z",
-        "--find-renames",
-        base,
-        head,
-        "--",
+        repo, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z",
+        "--find-renames", base, head, "--",
     )
     fields = iter(data.decode("utf-8", "surrogateescape").split("\0")[:-1])
     for status in fields:
-        old = next(fields)
+        a = next(fields)
+        b = next(fields) if status[0] in "RC" else a
+        if not (a.lower().endswith(".csv") or b.lower().endswith(".csv")):
+            continue
         if status[0] in "RC":
-            yield status[0], old, next(fields)
+            # A rename is a removal at the old path plus an addition at the new one;
+            # the cross-file hints below make the move visible to the reviewer.
+            if status[0] == "R":
+                yield a, None
+            yield None, b
+        elif status[0] == "A":
+            yield None, a
+        elif status[0] == "D":
+            yield a, None
         else:
-            yield status[0], old if status[0] != "A" else None, old
+            yield a, a
 
 
-def _stem_tokens(stem, marker_re):
-    cleaned = marker_re.sub(lambda m: m.group(1), stem)
-    return [tok for tok in re.split(r"[_-]+", cleaned.lower()) if tok]
+def kind(path):
+    name = PurePosixPath(path).stem
+    if UNTUNED.search(name):
+        return "untuned"
+    if TUNED.search(name):
+        return "tuned"
+    return None
 
 
-def resolve_source(path, tracked):
-    """Return ('matched', src), ('ambiguous', None), or ('missing', expected_sibling)."""
+def tokens(path, marker):
     p = PurePosixPath(path)
-    sibling = str(p.with_name(TUNED.sub(r"\1untuned", p.name, count=1)))
-    if sibling in tracked:
-        return "matched", sibling
-    if p.parent != PurePosixPath("aiter/configs/model_configs"):
-        return "missing", sibling
+    stem = marker.sub(lambda m: m.group(1), p.stem)
+    return str(p.parent), sorted(t for t in re.split(r"[_-]+", stem.lower()) if t)
 
-    model_untuned = [
-        name
-        for name in tracked
-        if PurePosixPath(name).parent == PurePosixPath("aiter/configs/model_configs")
-        and PurePosixPath(name).suffix.lower() == ".csv"
-        and UNTUNED.search(PurePosixPath(name).name)
+
+def untuned_for(tuned, tracked):
+    """Untuned CSVs in the same directory whose name matches the tuned name.
+
+    Exact token match first (any order: `x_bf16_tuned` ~ `x_untuned_bf16`), then the
+    tuned name without an arch token against an arch-neutral untuned name.
+    """
+    folder, want = tokens(tuned, TUNED)
+    cands = [(u, tokens(u, UNTUNED)) for u in tracked if kind(u) == "untuned"]
+    cands = [(u, t) for u, (d, t) in cands if d == folder]
+    exact = [u for u, t in cands if t == want]
+    if exact:
+        return exact
+    no_arch = [t for t in want if not ARCH_TOKEN.match(t)]
+    if no_arch == want:
+        return []
+    return [
+        u for u, t in cands if t == no_arch and not any(ARCH_TOKEN.match(x) for x in t)
     ]
-    tuned_tokens = _stem_tokens(p.stem, TUNED)
-    exact_matches = [
-        name
-        for name in model_untuned
-        if sorted(_stem_tokens(PurePosixPath(name).stem, UNTUNED))
-        == sorted(tuned_tokens)
-    ]
-    if len(exact_matches) == 1:
-        return "matched", exact_matches[0]
-    if len(exact_matches) > 1:
-        return "ambiguous", None
-
-    tuned_no_arch = [t for t in tuned_tokens if not ARCH_TOKEN.match(t)]
-    arch_neutral_matches = [
-        name
-        for name in model_untuned
-        if not any(
-            ARCH_TOKEN.match(t) for t in _stem_tokens(PurePosixPath(name).stem, UNTUNED)
-        )
-        and sorted(_stem_tokens(PurePosixPath(name).stem, UNTUNED))
-        == sorted(tuned_no_arch)
-    ]
-    if len(arch_neutral_matches) == 1:
-        return "matched", arch_neutral_matches[0]
-    if len(arch_neutral_matches) > 1:
-        return "ambiguous", None
-
-    # If an arch-mismatched or alternate-named model untuned file plausibly matches
-    # (e.g. qwen3_5_397b_untuned_gemm.csv for qwen3_5_397b_bf16_tuned_gemm.csv),
-    # treat as ambiguous rather than falsely reporting missing untuned input.
-    tuned_no_arch_set = set(tuned_no_arch)
-    for name in model_untuned:
-        u_no_arch = [
-            t
-            for t in _stem_tokens(PurePosixPath(name).stem, UNTUNED)
-            if not ARCH_TOKEN.match(t)
-        ]
-        if sorted(u_no_arch) == sorted(tuned_no_arch) or (
-            len(u_no_arch) >= 2 and set(u_no_arch).issubset(tuned_no_arch_set)
-        ):
-            return "ambiguous", None
-    return "missing", sibling
 
 
-def source_for(path, tracked):
-    kind, val = resolve_source(path, tracked)
-    return val if kind == "matched" else None
-
-
-def tuned_for(untuned_path, tracked):
-    """Exact inverse of source_for: tuned CSVs whose resolved source is untuned_path."""
+def tuned_for(untuned, tracked):
     return sorted(
-        name
-        for name in tracked
-        if _is_paired_tuned_csv(name) and source_for(name, tracked) == untuned_path
+        t for t in tracked if kind(t) == "tuned" and untuned_for(t, tracked) == [untuned]
     )
 
 
-def runtime_tuned_for(untuned_path, tracked):
-    paired = set(tuned_for(untuned_path, tracked))
-    associated = set(paired)
-    config_dir = PurePosixPath("aiter/configs")
-    model_dir = config_dir / "model_configs"
-    source = PurePosixPath(untuned_path)
-    if source.parent == config_dir:
-        canonical = UNTUNED.sub(r"\1tuned", source.stem, count=1)
-        families = {canonical}
-    elif source.parent == model_dir:
-        model_names = [
-            PurePosixPath(name).stem
-            for name in associated
-            if PurePosixPath(name).parent == model_dir
-        ]
-        families = {
-            PurePosixPath(name).stem
-            for name in tracked
-            if PurePosixPath(name).parent == config_dir
-            and _is_paired_tuned_csv(name)
-            and any(PurePosixPath(name).stem in model for model in model_names)
-        }
-    else:
-        return sorted(associated), paired
-
-    for name in tracked:
-        p = PurePosixPath(name)
-        if not _is_paired_tuned_csv(name):
-            continue
-        if p.parent == config_dir and p.stem in families:
-            associated.add(name)
-        elif p.parent == model_dir and any(family in p.stem for family in families):
-            associated.add(name)
-    return sorted(associated), paired
-
-
-def read_csv(repo, revision, path):
-    text = git(repo, "show", f"{revision}:{path}").decode("utf-8-sig")
-    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
-    header = next(reader, None)
-    if not header:
-        raise ValueError(f"{path}: empty CSV header")
-    header = [name.strip() for name in header]
-    if not all(header) or len(header) != len(set(header)):
+def read_csv(repo, rev, path):
+    """Header and [(line, row)]; callers only ask for paths tracked at rev."""
+    raw = git(repo, "show", f"{rev}:{path}")
+    reader = csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline=""), strict=True)
+    header = [h.strip() for h in next(reader, [])]
+    if not header or not all(header) or len(header) != len(set(header)):
         raise ValueError(f"{path}: empty or duplicate column names")
     rows = []
-    while True:
-        line = reader.line_num + 1
-        row = next(reader, None)
-        if row is None:
-            break
-        if not row:
+    for row in reader:
+        if not row or not any(v.strip() for v in row):
             continue
         if len(row) != len(header):
             raise ValueError(
-                f"{path}:{line}: row has {len(row)} fields, expected {len(header)}"
+                f"{path}:{reader.line_num}: {len(row)} fields, expected {len(header)}"
             )
-        rows.append((line, dict(zip(header, (value.strip() for value in row)))))
+        rows.append((reader.line_num, dict(zip(header, (v.strip() for v in row)))))
     return header, rows
 
 
-def value_key(value, column=None, fp8_target=None):
-    lower = value.lower()
-    if lower in {"true", "false"}:
-        return lower
+def norm(value, column):
+    """Undo the spellings the tuners are known to rewrite; nothing more."""
+    low = value.lower()
+    if low in ("true", "false"):
+        return low
     if column == "q_type" and value == "QuantType.per_128x128":
         return "QuantType.per_1x128"
-    if fp8_target is not None and column in FP8_QUANT_COLS and value in E4M3_FLAVORS:
-        return fp8_target
-    # CSV readers infer numeric columns; preserve equality between 1 and 1.0.
+    if value in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz"):
+        return "torch.float8_e4m3"  # arch-native flavour; best-effort, not per-arch
     try:
         number = Decimal(value)
     except InvalidOperation:
         return value
-    return number if number.is_finite() else value
+    return number.normalize() if number.is_finite() else value
 
 
-def workload(row, columns, fp8_target=None):
-    return tuple(
-        value_key(row[column], column=column, fp8_target=fp8_target)
-        for column in columns
-    )
+def key(row, cols):
+    if any(row.get(c, "") == "" for c in cols):
+        return None
+    return tuple(norm(row[c], c) for c in cols)
 
 
-def _is_paired_tuned_csv(path):
-    name = PurePosixPath(path).name.lower()
-    return (
-        name.endswith(".csv")
-        and bool(TUNED.search(name))
-        and not any(family in name for family in UNSUPPORTED_FAMILIES)
-    )
+def show(row, cols):
+    return json.dumps({c: row[c] for c in cols}, ensure_ascii=True)
 
 
-def _is_paired_untuned_csv(path):
-    name = PurePosixPath(path).name.lower()
-    return (
-        name.endswith(".csv")
-        and bool(UNTUNED.search(name))
-        and not any(family in name for family in UNSUPPORTED_FAMILIES)
-    )
+class Scan:
+    def __init__(self, repo, base, head):
+        self.repo, self.base, self.head = repo, base, head
+        self.base_csvs = tracked_csvs(repo, base)
+        self.head_csvs = tracked_csvs(repo, head)
+        self.changed = list(changed_csvs(repo, base, head))
+        self.cache = {}
+        self.out = []
+        self.failed = False
 
+    def rows(self, rev, path):
+        tracked = self.base_csvs if rev == self.base else self.head_csvs
+        if path is None or path not in tracked:
+            return None, []
+        if (rev, path) not in self.cache:
+            self.cache[(rev, path)] = read_csv(self.repo, rev, path)
+        return self.cache[(rev, path)]
 
-def _uses_e4m3(rows, cols):
-    return any(row.get(col) in E4M3_FLAVORS for _, row in rows for col in cols)
-
-
-def _has_placeholder_or_output(columns, rows):
-    return any(col.lower() in OUTPUT_PLACEHOLDER_COLS for col in columns) or any(
-        row[col] == "" for _, row in rows for col in columns
-    )
-
-
-def _add_partial_keys(partial, columns, sibling_columns, rows, fp8_cols):
-    shared = tuple(column for column in columns if column in sibling_columns)
-    for _, row in rows:
-        gfx = row.get("gfx") if fp8_cols and "gfx" in sibling_columns else None
-        key = workload(row, shared, fp8_target="torch.float8_e4m3fn")
-        partial.setdefault((shared, gfx), set()).add(key)
-
-
-def _possibly_covered(row, partial, gfx=None):
-    return any(
-        (gfx is None or sibling_gfx is None or gfx == sibling_gfx)
-        and workload(row, columns, fp8_target="torch.float8_e4m3fn") in keys
-        for (columns, sibling_gfx), keys in partial.items()
-    )
-
-
-def _other_tuned_head_keys(
-    repo, head, source, exclude_path, columns, fp8_cols, head_tracked
-):
-    keys = set()
-    partial = {}
-    siblings, paired = runtime_tuned_for(source, head_tracked)
-    for sibling_tuned in siblings:
-        if sibling_tuned == exclude_path:
-            continue
-        s_cols, s_rows = read_csv(repo, head, sibling_tuned)
-        if set(columns) - set(s_cols) or (fp8_cols and "gfx" not in s_cols):
-            if sibling_tuned in paired:
-                return None
-            _add_partial_keys(partial, columns, s_cols, s_rows, fp8_cols)
-            continue
-        for _, row in s_rows:
-            k = workload(row, columns)
-            keys.add((row.get("gfx", ""), k) if fp8_cols else k)
-    return keys, partial
-
-
-def check_no_untuned(repo, base, head, old_path, path, old_source, expected_source):
-    key_cols, inputs = read_csv(repo, base, old_source)
-    tuned_cols, tuned = read_csv(repo, head, path)
-    old_cols, old_rows = read_csv(repo, base, old_path)
-    if (
-        _has_placeholder_or_output(key_cols, inputs)
-        or set(key_cols) - set(tuned_cols)
-        or set(key_cols) - set(old_cols)
-    ):
-        return []
-    fp8_cols = FP8_QUANT_COLS.intersection(key_cols)
-    if fp8_cols and ("gfx" not in tuned_cols or "gfx" not in old_cols):
-        return []
-
-    def key(row):
-        value = workload(row, key_cols)
-        return (row.get("gfx", ""), value) if fp8_cols else value
-
-    old_keys = {key(row) for _, row in old_rows}
-    new_rows = [
-        (line, row) for line, row in tuned if key(row) not in old_keys
-    ]
-    if not new_rows:
-        return []
-    lines = [
-        f"NO_UNTUNED_INPUT {path}: {len(new_rows)} new workload rows have no untuned input (expected {expected_source})"
-    ]
-    for line, row in new_rows[:10]:
-        sample = {c: row[c] for c in key_cols}
-        lines.append(f"  {path}:{line}: {json.dumps(sample, ensure_ascii=True)}")
-    return lines
-
-
-def check_deleted_tuned(repo, base, head, old_path, source, head_tracked):
-    if source not in head_tracked:
-        return []
-    columns, inputs = read_csv(repo, head, source)
-    if _has_placeholder_or_output(columns, inputs):
-        return []
-    old_cols, old_rows = read_csv(repo, base, old_path)
-    if set(columns) - set(old_cols):
-        return []
-    fp8_cols = FP8_QUANT_COLS.intersection(columns)
-    if fp8_cols and "gfx" not in old_cols and _uses_e4m3(old_rows, fp8_cols):
-        return []
-    other = _other_tuned_head_keys(
-        repo, head, source, None, columns, fp8_cols, head_tracked
-    )
-    if other is None:
-        return []
-    other_keys, partial = other
-    input_keys_by_arch = {None: {workload(row, columns) for _, row in inputs}}
-    for target in set(ARCH_FP8_E4M3.values()):
-        input_keys_by_arch[target] = {
-            workload(row, columns, fp8_target=target) for _, row in inputs
-        }
-    removed = {}
-    for line, row in old_rows:
-        key = workload(row, columns)
-        gfx = row.get("gfx", "")
-        full_k = (gfx, key) if fp8_cols else key
-        if full_k in other_keys or _possibly_covered(row, partial, gfx if fp8_cols else None):
-            continue
-        fp8_target = ARCH_FP8_E4M3.get(gfx)
-        if key in input_keys_by_arch[fp8_target]:
-            removed.setdefault(full_k, (line, row))
-    if not removed:
-        return []
-    lines = [
-        f"REMOVED_TUNED {old_path}: {len(removed)} removed keys still present in {source}"
-    ]
-    for line, row in removed.values():
-        key = {column: row[column] for column in columns}
-        lines.append(f"  {old_path}:{line}: {json.dumps(key, ensure_ascii=True)}")
-    return lines
-
-
-def check_csv(
-    repo, base, head, old_path, path, source, head_tracked, moved_old_pairs=()
-):
-    columns, inputs = read_csv(repo, head, source)
-    tuned_columns, tuned = read_csv(repo, head, path)
-    if set(columns) - set(tuned_columns):
-        return []
-    if _has_placeholder_or_output(columns, inputs):
-        return []
-
-    fp8_cols = FP8_QUANT_COLS.intersection(columns)
-    has_gfx = "gfx" in tuned_columns
-    # Gfx-less FP8 tables (e.g. cu_num-keyed files) are ambiguous across e4m3fn/e4m3fnuz; skip.
-    if (
-        fp8_cols
-        and not has_gfx
-        and (_uses_e4m3(inputs, fp8_cols) or _uses_e4m3(tuned, fp8_cols))
-    ):
-        return []
-
-    def _old_key(row):
-        key = workload(row, columns)
-        return (row.get("gfx", ""), key) if fp8_cols else key
-
-    old_keys = set()
-    old_rows = []
-    if old_path is not None:
-        old_columns, old_rows = read_csv(repo, base, old_path)
-        if set(columns) - set(old_columns):
-            return []
-        if fp8_cols and "gfx" not in old_columns:
-            return []
-        old_keys.update(_old_key(row) for _, row in old_rows)
-
-    for sibling_old, sibling_new, sibling_status in moved_old_pairs:
-        sib_old_cols, sib_old_rows = read_csv(repo, base, sibling_old)
-        if set(columns) - set(sib_old_cols):
-            continue
-        if fp8_cols and "gfx" not in sib_old_cols:
-            return []
-        sib_old_keys = {_old_key(row) for _, row in sib_old_rows}
-        if sibling_status == "D":
-            old_keys.update(sib_old_keys)
-        else:
-            sib_new_cols, sib_new_rows = read_csv(repo, head, sibling_new)
-            if set(columns) - set(sib_new_cols):
+    def elsewhere(self, k, cols, want, exclude):
+        """Other CSVs of kind `want` changed by this PR whose head has key k."""
+        hits = []
+        for _, path in self.changed:
+            if path is None or path in exclude or kind(path) != want:
                 continue
-            if fp8_cols and "gfx" not in sib_new_cols:
-                return []
-            sib_head_keys = {_old_key(row) for _, row in sib_new_rows}
-            old_keys.update(sib_old_keys - sib_head_keys)
+            header, rows = self.rows(self.head, path)
+            if header and set(cols) <= set(header):
+                if any(key(r, cols) == k for _, r in rows):
+                    hits.append(path)
+        return f"  [also at head in {', '.join(sorted(set(hits)))}]" if hits else ""
 
-    input_keys_by_arch = {
-        None: {workload(row, columns) for _, row in inputs},
-    }
-    for target in set(ARCH_FP8_E4M3.values()):
-        input_keys_by_arch[target] = {
-            workload(row, columns, fp8_target=target) for _, row in inputs
-        }
+    def report(self, tag, title, items, cols, want, exclude):
+        if not items:
+            return 0
+        self.out.append(f"{tag} {title}")
+        for i, (path, line, row, k) in enumerate(items):
+            if i == SAMPLE:
+                self.out.append(f"  ... {len(items) - SAMPLE} more")
+                break
+            hint = self.elsewhere(k, cols, want, exclude)
+            self.out.append(f"  {path}:{line}: {show(row, cols)}{hint}")
+        return len(items)
 
-    new = {}
-    head_full_keys = set()
-    for line, row in tuned:
-        key = workload(row, columns)
-        old_k = (row.get("gfx", ""), key) if fp8_cols else key
-        head_full_keys.add(old_k)
-        if old_k not in old_keys:
-            gfx = row.get("gfx", "")
-            new.setdefault((gfx, key), (line, row))
+    def check_group(self, untuned):
+        """Compare one untuned CSV with every tuned CSV name-paired to it."""
+        # Name-pair at each revision. A deleted input keeps the tuned files nothing else
+        # claims; a tuned file whose name now pairs with a different input leaves this
+        # group entirely. Rows are then compared as the union over the group's files, so
+        # renames and moves between files of one pair are not row changes.
+        def members(csvs):
+            if untuned in csvs:
+                return set(tuned_for(untuned, csvs))
+            return {t for t in tuned_for(untuned, csvs | {untuned}) if not untuned_for(t, csvs)}
 
-    missing = []
-    for (gfx, key), (line, row) in new.items():
-        fp8_target = ARCH_FP8_E4M3.get(gfx)
-        if key not in input_keys_by_arch[fp8_target]:
-            missing.append((line, row))
+        def claimed_elsewhere(t, csvs):
+            other = untuned_for(t, csvs)
+            return len(other) == 1 and other[0] != untuned
 
-    lines = []
-    if missing:
-        lines.append(
-            f"MISSING {path}: {len(missing)} of {len(new)} new keys absent from {source}"
-        )
-        for line, row in missing:
-            key = {column: row[column] for column in columns}
-            lines.append(f"  {path}:{line}: {json.dumps(key, ensure_ascii=True)}")
-
-    # Check tuned workloads removed from this file while remaining in the untuned input.
-    if old_path is not None:
-        other = _other_tuned_head_keys(
-            repo, head, source, path, columns, fp8_cols, head_tracked
-        )
-        if other is not None:
-            other_keys, partial = other
-            removed = {}
-            for line, row in old_rows:
-                key = workload(row, columns)
-                gfx = row.get("gfx", "")
-                full_k = (gfx, key) if fp8_cols else key
-                if (
-                    full_k in head_full_keys
-                    or full_k in other_keys
-                    or _possibly_covered(row, partial, gfx if fp8_cols else None)
-                ):
-                    continue
-                fp8_target = ARCH_FP8_E4M3.get(gfx)
-                if key in input_keys_by_arch[fp8_target]:
-                    removed.setdefault(full_k, (line, row))
-            if removed:
-                lines.append(
-                    f"REMOVED_TUNED {path}: {len(removed)} removed keys still present in {source}"
-                )
-                for line, row in removed.values():
-                    key = {column: row[column] for column in columns}
-                    lines.append(
-                        f"  {old_path}:{line}: {json.dumps(key, ensure_ascii=True)}"
-                    )
-
-    if not lines:
-        return [
-            f"COVERED {path}: {len(new)} new workload keys checked against {source}"
+        group = members(self.base_csvs) | members(self.head_csvs)
+        head_files = [
+            t for t in group
+            if t in self.head_csvs and not claimed_elsewhere(t, self.head_csvs)
         ]
-    return lines
+        tuned = sorted(t for t in group if t in head_files or t not in self.head_csvs)
+        if not tuned:
+            return  # input with no name-paired tuned file (e.g. shared input): skip
+        u_hdr_b, u_base = self.rows(self.base, untuned)
+        u_hdr_h, u_head = self.rows(self.head, untuned)
+        u_hdr = u_hdr_h or u_hdr_b
+        base_t = [(t, *self.rows(self.base, t)) for t in tuned if t in self.base_csvs]
+        head_t = [(t, *self.rows(self.head, t)) for t in tuned if t in head_files]
+        headers = [h for _, h, _ in base_t + head_t]
+        pair = f"{', '.join(tuned)} <-> {untuned}"
+        # Key: untuned input columns the tuned files also carry and the input always
+        # fills. Anything else is ignored (and named), not a reason to skip the pair.
+        inputs = [c for c in u_hdr if c.lower() not in OUTPUT_COLS]
+        cols = [
+            c for c in inputs
+            if all(c in h for h in headers)
+            and all(r.get(c, "") != "" for _, r in u_base + u_head)
+        ]
+        ignored = [c for c in inputs if c not in cols]
+        if not cols:
+            self.out.append(f"NOT_CHECKED {pair}: no input column shared with tuned rows")
+            return
+        pair += f" [key: {', '.join(cols)}" + (
+            f"; ignored: {', '.join(ignored)}]" if ignored else "]")
+        # Per-GPU rows are distinct tuned workloads when every tuned header has them.
+        ident = cols + [c for c in HW_COLS if c not in cols and all(c in h for h in headers)]
 
+        def keys(files, columns):
+            return {key(r, columns) for _, _, rows in files for _, r in rows} - {None}
 
-def _has_ambiguous_tuned_candidate(untuned_path, tracked):
-    p = PurePosixPath(untuned_path)
-    if p.parent != PurePosixPath("aiter/configs/model_configs"):
-        return False
-    u_no_arch = {t for t in _stem_tokens(p.stem, UNTUNED) if not ARCH_TOKEN.match(t)}
-    if len(u_no_arch) < 2:
-        return False
-    for name in tracked:
-        np = PurePosixPath(name)
-        if np.parent != PurePosixPath(
-            "aiter/configs/model_configs"
-        ) or not _is_paired_tuned_csv(name):
-            continue
-        if resolve_source(name, tracked)[0] != "ambiguous":
-            continue
-        t_no_arch = {t for t in _stem_tokens(np.stem, TUNED) if not ARCH_TOKEN.match(t)}
-        if u_no_arch.issubset(t_no_arch):
+        tk_base, tk_head = keys(base_t, cols), keys(head_t, cols)
+        base_ids = keys(base_t, ident)
+        uk_base = {key(r, cols) for _, r in u_base} - {None}
+        uk_head = {key(r, cols) for _, r in u_head} - {None}
+
+        def first(files, keep):
+            found = {}
+            for t, _, rows in files:
+                for line, r in rows:
+                    k = key(r, cols)
+                    if k is not None and k not in found and keep(r, k):
+                        found[k] = (t, line, r, k)
+            return list(found.values())
+
+        added_tuned = first(
+            head_t, lambda r, k: key(r, ident) not in base_ids and k not in uk_head)
+        removed_tuned = first(
+            base_t, lambda r, k: k not in tk_head and k in uk_head)
+
+        added_untuned = [
+            (untuned, line, r, k)
+            for line, r in u_head
+            if (k := key(r, cols)) is not None and k not in uk_base and k not in tk_head
+        ]
+        removed_untuned = [
+            (untuned, line, r, k)
+            for line, r in u_base
+            if (k := key(r, cols)) is not None and k not in uk_head and k in tk_head
+        ]
+
+        own = set(tuned) | {untuned}
+        n = self.report(
+            "TUNED_NOT_IN_UNTUNED", f"{pair}: {len(added_tuned)} added tuned workloads "
+            f"have no row in {untuned}", added_tuned, cols, "untuned", own)
+        n += self.report(
+            "UNTUNED_NOT_IN_TUNED", f"{pair}: {len(added_untuned)} added untuned "
+            "workloads have no tuned row", added_untuned, cols, "tuned", own)
+        n += self.report(
+            "TUNED_REMOVED_UNTUNED_KEPT", f"{pair}: {len(removed_tuned)} removed tuned "
+            f"workloads are still in {untuned}", removed_tuned, cols, "tuned", own)
+        n += self.report(
+            "UNTUNED_REMOVED_TUNED_KEPT", f"{pair}: {len(removed_untuned)} removed "
+            "untuned workloads still have tuned rows", removed_untuned, cols, "untuned", own)
+        if not n:
+            counts = (len(tk_head - tk_base), len(tk_base - tk_head),
+                     len(uk_head - uk_base), len(uk_base - uk_head))
+            self.out.append(
+                f"CHECKED {pair}: "
+                "tuned +{}/-{}, untuned +{}/-{} workloads, all matched".format(*counts)
+            )
+
+    def tuned_rows_changed(self, base_path, head_path):
+        hdr_h, rows_h = self.rows(self.head, head_path)
+        hdr_b, rows_b = self.rows(self.base, base_path)
+        hdr = hdr_h or hdr_b
+        cols = [c for c in hdr if c.lower() not in OUTPUT_COLS]
+        if hdr_h and hdr_b and cols != [c for c in hdr_b if c.lower() not in OUTPUT_COLS]:
             return True
-    return False
+        return {key(r, cols) for _, r in rows_h} != {key(r, cols) for _, r in rows_b}
 
+    def run(self):
+        groups, seen_unpaired = set(), set()
+        for base_path, head_path in self.changed:
+            for path, tracked in ((base_path, self.base_csvs), (head_path, self.head_csvs)):
+                if path is None:
+                    continue
+                k = kind(path)
+                if k is None:
+                    continue
+                if any(f in path.lower() for f in UNSUPPORTED):
+                    if path not in seen_unpaired:
+                        seen_unpaired.add(path)
+                        self.out.append(f"NOT_CHECKED {path}: key layout differs from its input")
+                    continue
+                if k == "untuned":
+                    groups.add(path)
+                    continue
+                cands = untuned_for(path, tracked)
+                if len(cands) > 1 and tracked is self.head_csvs:
+                    # Ambiguous only at head: keep the pairing the base had, if any.
+                    before = untuned_for(path, self.base_csvs) if path in self.base_csvs else []
+                    if len(before) == 1:
+                        cands = before
+                if len(cands) == 1:
+                    groups.add(cands[0])
+                elif path not in seen_unpaired:
+                    seen_unpaired.add(path)
+                    if cands:
+                        self.out.append(
+                            f"NOT_CHECKED {path}: several untuned CSVs match the name "
+                            f"({', '.join(sorted(cands))})")
+                    else:
+                        try:
+                            changed_rows = self.tuned_rows_changed(base_path, head_path)
+                        except (csv.Error, UnicodeDecodeError, ValueError) as exc:
+                            self.fail(path, exc)
+                            continue
+                        if changed_rows:
+                            self.out.append(
+                                f"UNPAIRED {path}: workload rows changed but no untuned "
+                                "CSV matches the name; not checked (flag only if this "
+                                "family normally has an untuned input)")
+        for untuned in sorted(groups):
+            try:
+                self.check_group(untuned)
+            except (csv.Error, UnicodeDecodeError, ValueError) as exc:
+                self.fail(untuned, exc)
+        if not self.out:
+            self.out.append("No paired tuning CSVs changed.")
 
-def check_untuned_additions(repo, base, head, old_path, path, head_tracked):
-    columns, inputs = read_csv(repo, head, path)
-    if _has_placeholder_or_output(columns, inputs):
-        return []
-
-    old_keys = set()
-    if old_path is not None:
-        old_cols, old_rows = read_csv(repo, base, old_path)
-        if set(columns) - set(old_cols):
-            return []
-        old_keys = {workload(row, columns) for _, row in old_rows}
-
-    new_inputs = [
-        (line, row) for line, row in inputs if workload(row, columns) not in old_keys
-    ]
-    if not new_inputs:
-        return []
-
-    associated_tuned, paired = runtime_tuned_for(path, head_tracked)
-    if not associated_tuned:
-        if _has_ambiguous_tuned_candidate(path, head_tracked):
-            return []
-        p = PurePosixPath(path)
-        expected = str(p.with_name(UNTUNED.sub(r"\1tuned", p.name, count=1)))
-        lines = [
-            f"UNTUNED_MISSING {path}: {len(new_inputs)} of {len(new_inputs)} new untuned keys have no tuned CSV (expected {expected})"
-        ]
-        for line, row in new_inputs[:10]:
-            key = {column: row[column] for column in columns}
-            lines.append(f"  {path}:{line}: {json.dumps(key, ensure_ascii=True)}")
-        return lines
-
-    fp8_cols = FP8_QUANT_COLS.intersection(columns)
-    usable_tuned = []
-    tuned_arch_sets = []
-    partial = {}
-    for t_path in associated_tuned:
-        t_cols, t_rows = read_csv(repo, head, t_path)
-        if set(columns) - set(t_cols) or (
-            fp8_cols
-            and "gfx" not in t_cols
-            and (_uses_e4m3(inputs, fp8_cols) or _uses_e4m3(t_rows, fp8_cols))
-        ):
-            if t_path in paired:
-                return []
-            _add_partial_keys(partial, columns, t_cols, t_rows, fp8_cols)
-            continue
-        usable_tuned.append(t_path)
-        by_arch = {}
-        for _, t_row in t_rows:
-            fp8_target = ARCH_FP8_E4M3.get(t_row.get("gfx", ""))
-            by_arch.setdefault(fp8_target, set()).add(workload(t_row, columns))
-        tuned_arch_sets.append(by_arch)
-
-    if not usable_tuned:
-        return []
-
-    missing_u = []
-    for line, row in new_inputs:
-        covered = any(
-            workload(row, columns, fp8_target=fp8_target) in t_keys
-            for by_arch in tuned_arch_sets
-            for fp8_target, t_keys in by_arch.items()
-        ) or _possibly_covered(row, partial)
-        if not covered:
-            missing_u.append((line, row))
-
-    if not missing_u:
-        return []
-    lines = [
-        f"UNTUNED_MISSING {path}: {len(missing_u)} of {len(new_inputs)} new untuned keys absent from {', '.join(usable_tuned)}"
-    ]
-    for line, row in missing_u:
-        key = {column: row[column] for column in columns}
-        lines.append(f"  {path}:{line}: {json.dumps(key, ensure_ascii=True)}")
-    return lines
+    def fail(self, path, exc):
+        self.failed = True
+        self.out.append(
+            f"SKIPPED: tuning coverage could not parse {path} ({exc}); review it manually")
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("repo", help="repository containing the PR commits")
     parser.add_argument("base", help="target branch tip")
     parser.add_argument("head", help="PR head")
     args = parser.parse_args()
-
-    out_lines = []
-    had_error = False
     try:
         merge_base = git(args.repo, "merge-base", args.base, args.head).decode().strip()
-        base_tracked = paths_at(args.repo, merge_base)
-        head_tracked = paths_at(args.repo, args.head)
-        changed = list(changes(args.repo, merge_base, args.head))
-
-        rename_map = {old_p: new_p for status, old_p, new_p in changed if status == "R"}
-        base_tuned_by_source = {}
-        for status, old_p, new_p in changed:
-            if old_p is None or not _is_paired_tuned_csv(old_p):
-                continue
-            old_src = source_for(old_p, base_tracked)
-            if old_src is not None:
-                canon_src = rename_map.get(old_src, old_src)
-                base_tuned_by_source.setdefault(canon_src, []).append(
-                    (old_p, new_p, status)
-                )
-
-        checked = False
-        for status, old_path, path in changed:
-            if status == "D":
-                if _is_paired_tuned_csv(old_path):
-                    old_src = source_for(old_path, base_tracked)
-                    if old_src is not None:
-                        canon_src = rename_map.get(old_src, old_src)
-                        try:
-                            lines = check_deleted_tuned(
-                                args.repo,
-                                merge_base,
-                                args.head,
-                                old_path,
-                                canon_src,
-                                head_tracked,
-                            )
-                        except (csv.Error, UnicodeDecodeError, ValueError) as exc:
-                            had_error = True
-                            out_lines.append(
-                                f"SKIPPED: tuning coverage could not parse {old_path} ({exc}); "
-                                "review these files manually"
-                            )
-                            continue
-                        if lines:
-                            checked = True
-                            out_lines.extend(lines)
-                continue
-
-            if _is_paired_tuned_csv(path):
-                kind, val = resolve_source(path, head_tracked)
-                if kind == "ambiguous":
-                    continue
-                if kind == "missing":
-                    old_src = (
-                        source_for(old_path, base_tracked)
-                        if old_path is not None and _is_paired_tuned_csv(old_path)
-                        else None
-                    )
-                    if old_src is None or rename_map.get(old_src, old_src) in head_tracked:
-                        continue
-                    try:
-                        lines = check_no_untuned(
-                            args.repo, merge_base, args.head, old_path, path, old_src, val
-                        )
-                    except (csv.Error, UnicodeDecodeError, ValueError) as exc:
-                        had_error = True
-                        out_lines.append(
-                            f"SKIPPED: tuning coverage could not parse {path} ({exc}); "
-                            "review these files manually"
-                        )
-                        continue
-                    if lines:
-                        checked = True
-                        out_lines.extend(lines)
-                    continue
-
-                source = val
-                effective_old_path = None
-                if old_path is not None and _is_paired_tuned_csv(old_path):
-                    old_src = source_for(old_path, base_tracked)
-                    if (old_src is None and old_path == path) or (
-                        old_src is not None
-                        and (old_src == source or rename_map.get(old_src) == source)
-                    ):
-                        effective_old_path = old_path
-
-                moved_old_pairs = [
-                    pair
-                    for pair in base_tuned_by_source.get(source, ())
-                    if pair[0] != effective_old_path
-                ]
-
-                try:
-                    lines = check_csv(
-                        args.repo,
-                        merge_base,
-                        args.head,
-                        effective_old_path,
-                        path,
-                        source,
-                        head_tracked,
-                        moved_old_pairs=moved_old_pairs,
-                    )
-                except (csv.Error, UnicodeDecodeError, ValueError) as exc:
-                    had_error = True
-                    out_lines.append(
-                        f"SKIPPED: tuning coverage could not parse {path} ({exc}); "
-                        "review these files manually"
-                    )
-                    continue
-                if lines:
-                    checked = True
-                    out_lines.extend(lines)
-            elif _is_paired_untuned_csv(path):
-                try:
-                    lines = check_untuned_additions(
-                        args.repo, merge_base, args.head, old_path, path, head_tracked
-                    )
-                except (csv.Error, UnicodeDecodeError, ValueError) as exc:
-                    had_error = True
-                    out_lines.append(
-                        f"SKIPPED: tuning coverage could not parse {path} ({exc}); "
-                        "review these files manually"
-                    )
-                    continue
-                if lines:
-                    checked = True
-                    out_lines.extend(lines)
-
-        if not checked and not had_error:
-            out_lines.append("No paired tuning CSVs to check.")
+        scan = Scan(args.repo, merge_base, args.head)
+        scan.run()
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode("utf-8", "replace").strip()
-        if not detail:
-            cmd = " ".join(str(a) for a in exc.cmd)
-            detail = (
-                f"{cmd} exited with status {exc.returncode} "
-                "(no common ancestor or missing object)"
-            )
-        print(
-            f"SKIPPED: tuning coverage could not read the PR commits: {detail}; "
-            "review these files manually"
+        detail = exc.stderr.decode("utf-8", "replace").strip() or (
+            f"git exited with status {exc.returncode} (no common ancestor or missing object)"
         )
+        print(f"SKIPPED: tuning coverage could not read the PR commits: {detail}; "
+              "review these files manually")
         return 1
     except OSError as exc:
-        print(
-            f"SKIPPED: tuning coverage could not access repository: {exc}; "
-            "review these files manually"
-        )
+        print(f"SKIPPED: tuning coverage could not access repository: {exc}; "
+              "review these files manually")
         return 1
-
-    for line in out_lines:
-        print(line)
-    return 1 if had_error else 0
+    print("\n".join(scan.out))
+    return 1 if scan.failed else 0
 
 
 if __name__ == "__main__":

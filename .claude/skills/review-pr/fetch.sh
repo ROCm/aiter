@@ -928,7 +928,7 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
-# Compare the PR's new workload keys with the matching head-side untuned input.
+# Compare the PR's tuned/untuned row changes for name-paired CSVs (best-effort hints).
 # The checker reads Git blobs, not PR code or the reviewer's working tree.
 if ! python3 "$SKILLS_ROOT/review-pr/tuning_coverage.py" \
     "$PROJECT_ROOT" "$BASE_SHA" "$HEAD_SHA" > "$WORK/tuning_coverage.txt"; then

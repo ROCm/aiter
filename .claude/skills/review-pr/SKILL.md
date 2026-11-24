@@ -40,7 +40,7 @@ so what follows is the map, not the manual.**
 | `siblings.txt` | a variant of a changed function still carrying a changed line | A1's sibling is in the same file, not another file |
 | `flydsl_bounds.txt` | FlyDSL buffer/descriptor bounds not tied to the tensor's real extent | B2 is `tl.load` without a mask and FlyDSL has no `tl`, so this class had no rule at all |
 | `aot_pairing.txt` | new ops-side contracts `aiter/aot/flydsl/` was not taught | #4397 wired stage2 into AOT and missed stage1; it drifted for 32 commits |
-| `tuning_coverage.txt` | new tuned workloads missing untuned inputs, new untuned workloads missing tuned entries, and removed tuned workloads still in untuned | existing gaps are not newly introduced; unknown pairings and unsupported types are skipped |
+| `tuning_coverage.txt` | rows this PR adds or removes on one side of a name-paired tuned/untuned CSV but not the other | a hint, not a verdict: a row moved to another tuned file or a shared input is not modelled, and untouched legacy drift is never listed |
 | `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |
 | `twins.txt` | which existing file each new file was copied from | the defect is the *asymmetry* between them, not the copy |
 | `test_quality.txt` | assertion count, tolerances, shapes of added tests | zero assertions may mean a helper asserts — read before firing |
@@ -57,19 +57,15 @@ A `SKIPPED:` artifact means that axis or file was **not checked** —
 say so rather than reading silence as clean. A forensic that ran and found nothing says so
 in words.
 
-**Tuning workload coverage:** On supported tuning CSVs, require bidirectional coverage
-for newly changed workloads (or a documented exception):
-1. Newly added workload-specific tuned entries must exist in the authoritative untuned
-   input; if an applicable input is known to be required but missing, ask for it.
-2. Newly added untuned entries must have a matching tuned entry in an associated tuned
-   file, and tuned entries must not be removed while they remain in the untuned input
-   (unless retained in another associated tuned file or moved).
-Check `tuning_coverage.txt` even when no tuning family was derived. The scanner reports
-an absent input only when a previously paired input was removed; otherwise an unknown
-pairing is skipped. Account for runtime-merged model CSVs before reporting a missing or
-removed tuned entry. Do not flag unchanged legacy entries, generic defaults, or
-ambiguous/unsupported formats. Only `SKIPPED:` operational failures mean the scanner
-could not run.
+**Tuning workload coverage (A5):** when a PR adds tuned rows for some shapes it should
+add the same rows to the paired untuned CSV, and when it removes rows on one side it should
+remove them on the other. `tuning_coverage.txt` is a best-effort helper for that judgement:
+it pairs tuned/untuned CSVs by file name, compares only the rows this PR adds or removes,
+and lists the four mismatch kinds (`TUNED_NOT_IN_UNTUNED`, `UNTUNED_NOT_IN_TUNED`,
+`TUNED_REMOVED_UNTUNED_KEPT`, `UNTUNED_REMOVED_TUNED_KEPT`). It does not know about
+runtime-merged tuned files or shared inputs, so read `pr.diff` before firing: a hint such
+as `[also at head in ...]` usually means a move, and `UNPAIRED`/`NOT_CHECKED` lines are
+for you to judge, not findings. Never flag legacy rows the PR did not touch.
 
 **Read `$WORK/rules_expanded.txt` — it is the full text of exactly the rules in
 `$WORK/rules.txt`, and it is the rule list for this review.** They are derived from paths, added/deleted
