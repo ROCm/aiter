@@ -99,8 +99,8 @@ def compile_pa_decode_pingpong(
     runs a sequence's adjacent tasks as one range.
     """
     assert block_size % TILE == 0 and block_size & (block_size - 1) == 0
-    # Windows' overlapping KV is reused across CTAs, so it stays cacheable.
-    dma_aux = 0 if window else 2
+    # Windows and varlen query blocks reuse KV across CTAs, so keep it cacheable.
+    dma_aux = 0 if window or varlen else 2
     # Direct window output is written once: stream it past the reused KV.
     OAUX = 2 if window else 0
     M, R, CH = pingpong_layout(query_length)
