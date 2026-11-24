@@ -126,18 +126,71 @@ def _fma(a, b, c):
 def _lane_sums(s_part, base, n_values, n_waves, lane):
     """The block totals of ``n_values`` wave partials laid out ``[value][wave]``.
 
-    Lane ``i`` adds up value ``i`` and V_READLANE_B32 hands every total to SGPRs,
-    so a wave issues ``n_waves`` LDS reads instead of ``n_values * n_waves``.
+    Lane ``i`` adds up value ``i`` of each 32-value chunk and V_READLANE_B32 hands
+    the totals to SGPRs, so a wave issues ``n_waves`` LDS reads per chunk instead of
+    ``n_waves`` per value.
     """
-    mine = (lane < n_values).select(lane, fx.Int32(0))
-    total = fx.memref_load(s_part, base + mine * n_waves)
-    for w in range_constexpr(1, n_waves):
-        total = total + fx.memref_load(s_part, base + mine * n_waves + w)
-    bits = total.bitcast(fx.Int32)
+    sums = []
+    for start in range_constexpr(0, n_values, WARP_SIZE):
+        count = min(WARP_SIZE, n_values - start)
+        mine = start + (lane < count).select(lane, fx.Int32(0))
+        total = fx.memref_load(s_part, base + mine * n_waves)
+        for w in range_constexpr(1, n_waves):
+            total = total + fx.memref_load(s_part, base + mine * n_waves + w)
+        bits = total.bitcast(fx.Int32)
+        sums += [
+            fx.Int32(fx.rocdl.readlane(T.i32, bits, fx.Int32(i))).bitcast(fx.Float32)
+            for i in range_constexpr(count)
+        ]
+    return sums
+
+
+def _swap16(x, y):
+    """V_PERMLANE16_SWAP_B32: lanes 16..31 of ``x`` trade places with lanes 0..15 of ``y``."""
+    pair = fx.rocdl.permlane16_swap(
+        llvm.StructType.get_literal([T.i32, T.i32]),
+        x.bitcast(fx.Int32).ir_value(),
+        y.bitcast(fx.Int32).ir_value(),
+        False,
+        False,
+    )
     return [
-        fx.Int32(fx.rocdl.readlane(T.i32, bits, fx.Int32(i))).bitcast(fx.Float32)
-        for i in range_constexpr(n_values)
+        fx.Int32(llvm.extractvalue(T.i32, pair, [j])).bitcast(fx.Float32)
+        for j in range(2)
     ]
+
+
+def _wave_scatter_sums(values, lane):
+    """Wave totals of ``2^k`` per-lane values, scattered so lane ``l`` holds value ``l >> (5 - k)``.
+
+    Each halving step pairs value ``j`` with ``j + s/2`` between lanes ``d`` apart,
+    and each lane keeps one of the two plus its partner's copy: a swap and an add
+    per pair at ``d = 16``, two selects, a shuffle and an add below; xor steps then
+    finish the lane groups. ``2^k - 1`` pairs, where reducing every value whole
+    costs five shuffle-adds each.
+    """
+    vals = list(values)
+    d = WARP_SIZE // 2
+    while len(vals) > 1:
+        half = len(vals) // 2
+        nxt = []
+        if d == WARP_SIZE // 2:
+            for j in range(half):
+                lo, hi = _swap16(vals[j], vals[j + half])
+                nxt.append(lo + hi)
+        else:
+            upper = (lane & d) != 0
+            for j in range(half):
+                send = upper.select(vals[j], vals[j + half])
+                keep = upper.select(vals[j + half], vals[j])
+                nxt.append(keep + send.shuffle_xor(fx.Int32(d), fx.Int32(WARP_SIZE)))
+        vals = nxt
+        d //= 2
+    total = vals[0]
+    while d >= 1:
+        total = total + total.shuffle_xor(fx.Int32(d), fx.Int32(WARP_SIZE))
+        d //= 2
+    return total
 
 
 def _uniform(value):
@@ -356,16 +409,30 @@ def build_attn_res_fwd(
         # Partials alternate between two LDS buffers, so back-to-back reductions
         # on different buffers need no barrier between them.
         def block_sum(values, buf):
-            totals = [_wave_sum(value) for value in values]
             if const_expr(n_waves == 1):
-                return [_uniform(total) for total in totals]
+                return [_uniform(_wave_sum(value)) for value in values]
             base = buf * red * n_waves
+            if const_expr(len(values) > 2):
+                # The first 2^k values come out scattered over lane groups, one
+                # store per group; the rest are reduced whole.
+                k = min(len(values), WARP_SIZE).bit_length() - 1
+                group = WARP_SIZE >> k
+                scattered = _wave_scatter_sums(values[: 1 << k], lane)
+                rest = [_wave_sum(value) for value in values[1 << k :]]
+                if lane % group == 0:
+                    index = base + (lane // group) * n_waves + wave
+                    fx.memref_store(scattered, s_part, index)
+                if lane == 0:
+                    for i in range_constexpr(len(rest)):
+                        index = base + ((1 << k) + i) * n_waves + wave
+                        fx.memref_store(rest[i], s_part, index)
+                fx.gpu.barrier()
+                return _lane_sums(s_part, base, len(values), n_waves, lane)
+            totals = [_wave_sum(value) for value in values]
             if lane == 0:
                 for i in range_constexpr(len(totals)):
                     fx.memref_store(totals[i], s_part, base + i * n_waves + wave)
             fx.gpu.barrier()
-            if const_expr(len(totals) > 2):
-                return _lane_sums(s_part, base, len(totals), n_waves, lane)
             sums = []
             for i in range_constexpr(len(totals)):
                 total = fx.memref_load(s_part, base + i * n_waves)
@@ -620,16 +687,30 @@ def build_attn_res_bwd(
         # Partials alternate between two LDS buffers, so back-to-back reductions
         # on different buffers need no barrier between them.
         def block_sum(values, buf):
-            totals = [_wave_sum(value) for value in values]
             if const_expr(n_waves == 1):
-                return [_uniform(total) for total in totals]
+                return [_uniform(_wave_sum(value)) for value in values]
             base = buf * red * n_waves
+            if const_expr(len(values) > 2):
+                # The first 2^k values come out scattered over lane groups, one
+                # store per group; the rest are reduced whole.
+                k = min(len(values), WARP_SIZE).bit_length() - 1
+                group = WARP_SIZE >> k
+                scattered = _wave_scatter_sums(values[: 1 << k], lane)
+                rest = [_wave_sum(value) for value in values[1 << k :]]
+                if lane % group == 0:
+                    index = base + (lane // group) * n_waves + wave
+                    fx.memref_store(scattered, s_part, index)
+                if lane == 0:
+                    for i in range_constexpr(len(rest)):
+                        index = base + ((1 << k) + i) * n_waves + wave
+                        fx.memref_store(rest[i], s_part, index)
+                fx.gpu.barrier()
+                return _lane_sums(s_part, base, len(values), n_waves, lane)
+            totals = [_wave_sum(value) for value in values]
             if lane == 0:
                 for i in range_constexpr(len(totals)):
                     fx.memref_store(totals[i], s_part, base + i * n_waves + wave)
             fx.gpu.barrier()
-            if const_expr(len(totals) > 2):
-                return _lane_sums(s_part, base, len(totals), n_waves, lane)
             sums = []
             for i in range_constexpr(len(totals)):
                 total = fx.memref_load(s_part, base + i * n_waves)
@@ -857,9 +938,9 @@ def build_attn_res_bwd(
     return launch_bwd
 
 
-_WGRAD_VECS = 8  # four-column fp32 vectors per workgroup
+_WGRAD_VECS = 8  # four-column fp32 vectors per workgroup: 128 bytes of a row
 _WGRAD_LANES = 32  # threads that split the partial rows of one vector
-_WGRAD_UNROLL = 8  # partial rows each lane has in flight
+_WGRAD_UNROLL = 16  # partial rows each lane has in flight
 
 
 def build_attn_res_weight_grads(
@@ -867,12 +948,18 @@ def build_attn_res_weight_grads(
 ):
     """``dquery``, ``drms`` and ``dwo`` from the backward's per-workgroup partial rows.
 
-    A workgroup owns 32 columns: each of 32 lanes walks every 32nd partial row with
-    16-byte loads, eight rows in flight, and LDS then sums the lanes in a fixed
-    order, so the result does not depend on scheduling. ``dquery = dqw * w`` and
-    ``drms = dqw * q``; with no bank the scores get no gradient and both are zero.
+    A workgroup owns 32 columns, a 128-byte line of each partial row: each of 32
+    lanes walks every 32nd row with 16-byte loads, sixteen rows in flight. The four
+    lanes of a wave that share columns combine with two xor shuffles, and the eight
+    wave partials add up in LDS in a fixed order, so the result does not depend on
+    scheduling. ``dquery = dqw * w`` and ``drms = dqw * q``; with no bank the scores
+    get no gradient and both are zero.
     """
     threads = _WGRAD_VECS * _WGRAD_LANES
+    n_waves = threads // WARP_SIZE
+    lane_xors = [
+        _WGRAD_VECS << s for s in range((WARP_SIZE // _WGRAD_VECS).bit_length() - 1)
+    ]
     blocks = -(-hidden_size // (_WGRAD_VECS * _F32_VEC))
     q_bf16, w_bf16, wo_bf16 = weight_bf16
     has_dqw = num_bank > 0
@@ -884,7 +971,7 @@ def build_attn_res_weight_grads(
 
     @fx.struct
     class SharedStorage:
-        lanes: fx.Array[fx.Float32, n_sums * threads * _F32_VEC, 16]
+        waves: fx.Array[fx.Float32, n_sums * n_waves * _WGRAD_VECS * _F32_VEC, 16]
 
     @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
     def wgrad_kernel(
@@ -901,9 +988,12 @@ def build_attn_res_weight_grads(
         vec = tid % _WGRAD_VECS
         lane = tid // _WGRAD_VECS
         col_vec = fx.Int32(fx.block_idx.x) * _WGRAD_VECS + vec
+        wave = tid // WARP_SIZE
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        s_lanes = fx.logical_divide(
-            lds.lanes.view(fx.make_layout(n_sums * threads * _F32_VEC, 1)),
+        s_waves = fx.logical_divide(
+            lds.waves.view(
+                fx.make_layout(n_sums * n_waves * _WGRAD_VECS * _F32_VEC, 1)
+            ),
             fx.make_layout(_F32_VEC, 1),
         )
         f32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
@@ -934,8 +1024,18 @@ def build_attn_res_weight_grads(
                 fx.memref_store_vec(value, reg)
                 fx.copy(f32_atom, reg, vec_slot(row))
 
-        def lane_slot(i, index):
-            return fx.slice(s_lanes, (None, i * threads + index))
+        def wave_slot(i, w):
+            return fx.slice(s_waves, (None, (i * n_waves + w) * _WGRAD_VECS + vec))
+
+        def wave_sum(value):
+            # The lanes of a wave that share ``vec`` sit _WGRAD_VECS threads apart.
+            lanes = []
+            for e in range_constexpr(_F32_VEC):
+                x = value[e]
+                for d in lane_xors:
+                    x = x + x.shuffle_xor(fx.Int32(d), fx.Int32(WARP_SIZE))
+                lanes.append(x)
+            return fx.Vector.from_elements(lanes, fx.Float32)
 
         parts = [
             fx.rocdl.make_buffer_tensor(part_dqw),
@@ -962,21 +1062,28 @@ def build_attn_res_weight_grads(
                     for ok, value in zip(valid, loaded):
                         acc[i] = acc[i] + ok.select(value, zero)
             results = yield acc
-        for i in range_constexpr(n_sums):
-            reg = fx.make_rmem_tensor(_F32_VEC, fx.Float32)
-            fx.memref_store_vec(results[i], reg)
-            fx.copy(lds_atom, reg, lane_slot(i, tid))
+        partials = [
+            wave_sum(results[i]) if sums_on[i] else zero
+            for i in range_constexpr(n_sums)
+        ]
+        if tid % WARP_SIZE < _WGRAD_VECS:
+            for i in range_constexpr(n_sums):
+                if const_expr(sums_on[i]):
+                    reg = fx.make_rmem_tensor(_F32_VEC, fx.Float32)
+                    fx.memref_store_vec(partials[i], reg)
+                    fx.copy(lds_atom, reg, wave_slot(i, wave))
         fx.gpu.barrier()
 
-        if lane == 0:
+        if tid < _WGRAD_VECS:
             totals = []
             for i in range_constexpr(n_sums):
-                total = None
-                for src_lane in range_constexpr(_WGRAD_LANES):
-                    reg = fx.make_rmem_tensor(_F32_VEC, fx.Float32)
-                    fx.copy(lds_atom, lane_slot(i, src_lane * _WGRAD_VECS + vec), reg)
-                    value = fx.memref_load_vec(reg)
-                    total = value if total is None else total + value
+                total = zero
+                if const_expr(sums_on[i]):
+                    for w in range_constexpr(n_waves):
+                        reg = fx.make_rmem_tensor(_F32_VEC, fx.Float32)
+                        fx.copy(lds_atom, wave_slot(i, w), reg)
+                        value = fx.memref_load_vec(reg)
+                        total = value if w == 0 else total + value
                 totals.append(total)
             dqw = totals[0] if has_dqw else zero
             q_vals = load_vec(fx.rocdl.make_buffer_tensor(query), q_bf16)

@@ -169,8 +169,9 @@ def main():
         "--num_bank",
         type=int,
         nargs="*",
-        default=[1, 2, 4, 8, 0],
-        help="banked candidates; the prefix makes L = K + 1 (Kimi-K3: K = 1..8)",
+        default=[1, 2, 4, 8, 16, 0],
+        help="banked candidates; the prefix makes L = K + 1 (Kimi-K3: K = 1..8; "
+        "16 covers reductions of more than 32 values)",
     )
     parser.add_argument(
         "--output_norm",
