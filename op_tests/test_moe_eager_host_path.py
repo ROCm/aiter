@@ -4,8 +4,8 @@
 
 In plain eager mode fused_moe calls the fused_moe_ body (its kernel plugin
 route) without the torch.ops dispatch, _fused_moe_impl reuses the plan resolved for an earlier call with the
-same signature, and its own sort writes into reused buffers. The sweep runs
-each case both ways, "eager" and "op" (all three off: _plain_eager false, as
+same signature, while each sort allocates outputs owned by its caller. The sweep runs
+each case both ways, "eager" and "op" (both shortcuts off: _plain_eager false, as
 under a tracer), checks them bit for bit against each other and against the
 torch reference, and times them. The checks before it cover the plan
 bookkeeping and the cases that keep the original behavior: torch.compile,
@@ -21,6 +21,7 @@ import argparse
 import contextlib
 import dataclasses
 import itertools
+import threading
 import time
 from unittest import mock
 
@@ -156,8 +157,8 @@ def _fresh():
 
 
 def _original_path():
-    """All three shortcuts off, as when fused_moe is not plain eager."""
-    return mock.patch.object(fm, "_plain_eager", lambda t: False)
+    """Dispatch and plan shortcuts off, as when fused_moe is not plain eager."""
+    return mock.patch.object(fm, "_plain_eager", lambda *t: False)
 
 
 @contextlib.contextmanager
@@ -214,7 +215,7 @@ def test_fused_moe_host_path(quant_type, tokens, ep, pad):
     miss = run().clone()
     assert len(fm._MOE_PLANS) == 1
     with _resolutions() as resolved:
-        # another shape in between: another plan, other views of the sort buffers
+        # another shape in between: a different shape resolves another plan
         _call(quant_type, *_routes(37, ep, seed=1))
         hit = run().clone()
     assert len(resolved) == 1  # the 37-token call resolved; the repeat did not
@@ -446,6 +447,7 @@ def test_nvfp4_calls_take_no_plan():
 
 def test_plain_eager_only_for_real_eager_tensors():
     from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.overrides import TorchFunctionMode
     from torch.utils._python_dispatch import TorchDispatchMode
 
     x = torch.zeros(2, device=DEV)
@@ -460,6 +462,28 @@ def test_plain_eager_only_for_real_eager_tensors():
 
     with Passthrough():
         assert not fm._plain_eager(x)
+
+    class FunctionMode(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    with FunctionMode():
+        assert not fm._plain_eager(x)
+        assert fm._op_or_eager_body(fm.fused_moe_, x) is fm.fused_moe_
+
+    class WeightSubclass(torch.Tensor):
+        __torch_function__ = torch._C._disabled_torch_function_impl
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            raise AssertionError("the subclass must retain the custom-op dispatch")
+
+    weight = torch.Tensor._make_subclass(WeightSubclass, x)
+    for tensors in ((weight, x), (x, weight)):
+        assert not fm._plain_eager(x, *tensors)
+        assert fm._op_or_eager_body(fm.fused_moe_, x, *tensors) is fm.fused_moe_
+    assert fm._plain_eager(x, torch.nn.Parameter(x), None)
+
     with FakeTensorMode() as mode:
         fake = mode.from_tensor(x)
         assert not fm._plain_eager(fake)
@@ -497,31 +521,16 @@ def test_cuda_graph_capture_and_replay():
     qt = QuantType.per_Token
     x, w, ids, mask = _routes(300, True, seed=11)
     xs, ws, idss = x.clone(), w.clone(), ids.clone()
-    ref = _call(qt, x, w, ids, mask).clone()  # eager first: plan and sort buffers exist
+    ref = _call(qt, x, w, ids, mask).clone()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _call(qt, xs, ws, idss, mask)
     torch.cuda.current_stream().wait_stream(stream)
-    sorts = []
-    original_sort = fm.moe_sorting
-
-    def recording_sort(*args, **kwargs):
-        ret = original_sort(*args, **kwargs)
-        sorts.append((kwargs.get("_scratch"), ret[0]))
-        return ret
-
     graph = torch.cuda.CUDAGraph()
-    with mock.patch.object(fm, "moe_sorting", recording_sort), torch.cuda.graph(graph):
+    with torch.cuda.graph(graph):
         out = _call(qt, xs, ws, idss, mask)
-    # the sort asked for reused buffers, and capture allocated its own instead
-    # (on its own stream too: no scratch buffer holds what the graph recorded)
-    ((asked, sorted_ids),) = sorts
-    assert asked
-    for buf, _ in fm._SORT_SCRATCH.values():
-        lo = buf.data_ptr()
-        assert not lo <= sorted_ids.data_ptr() < lo + buf.numel()
-    # eager calls between replays (other routes, other sizes) write those buffers
+    # Eager sorts between replays must not overwrite the graph's sort outputs.
     xo, wo, ido, _ = _routes(300, True, seed=12)
     for _ in range(3):
         graph.replay()
@@ -532,7 +541,7 @@ def test_cuda_graph_capture_and_replay():
     assert torch.equal(out, ref)
 
 
-def test_two_streams_do_not_share_sort_buffers():
+def test_two_streams_do_not_interfere():
     _fresh()
     qt = QuantType.per_Token
     inputs = [_routes(300, True, seed=s) for s in (21, 22)]
@@ -546,44 +555,138 @@ def test_two_streams_do_not_share_sort_buffers():
             with torch.cuda.stream(s):
                 outs[k].append(_call(qt, *inputs[k]))
     torch.cuda.synchronize()
-    keys = {(dev, raw) for dev, raw in fm._SORT_SCRATCH}
-    assert {(torch.cuda.current_device(), s.cuda_stream) for s in streams} <= keys
     for k in range(2):
         for o in outs[k]:
             assert torch.equal(o, refs[k])
 
 
-def test_bench_hook_gets_its_own_sort_buffers():
+def test_bench_hook_inputs_survive_other_calls():
     _fresh()
     qt = QuantType.per_Token
-    x, w, ids, mask = _routes(300, False, seed=31)
-    _call(qt, x, w, ids, mask)
-    scratch = [entry[0] for entry in fm._SORT_SCRATCH.values()]
+    inputs = _routes(300, False, seed=31)
+    _call(qt, *inputs)
     fm.kernel_bench_callable = []
     try:
-        _call(qt, x, w, ids, mask)
+        _call(qt, *inputs)
         sorted_ids = fm.kernel_bench_callable[0][1].args[4]
+        ref = sorted_ids.clone()
     finally:
         fm.kernel_bench_callable = None
-    for buf in scratch:
-        lo = buf.data_ptr()
-        assert not lo <= sorted_ids.data_ptr() < lo + buf.numel()
+    _call(qt, *_routes(300, False, seed=32))
+    assert torch.equal(sorted_ids, ref)
 
 
-def test_moe_sorting_scratch_matches():
-    for M, ep in itertools.product((1, 7, 300, 4096), (False, True)):
-        _, w, ids, mask = _routes(M, ep, seed=M)
-        n_global = 2 * E if ep else E
-        args = (ids, w, n_global, D, dtypes.bf16, 32, mask)
-        ref = fm.moe_sorting(*args)
-        got = fm.moe_sorting(*args, _scratch=True)
-        torch.cuda.synchronize()
-        valid = int(ref[3][0])
-        assert torch.equal(got[3], ref[3])
-        assert torch.equal(got[0][:valid], ref[0][:valid])
-        assert torch.equal(got[1][:valid], ref[1][:valid])
-        assert torch.equal(got[2][: valid // 32], ref[2][: valid // 32])
-        assert torch.equal(got[4], ref[4])  # moe_buf: zeroed output rows
+def test_prepared_stage2_survives_other_calls():
+    qt = QuantType.No
+    w1, w2, _, _ = _weights(qt)[0]
+
+    def prepare(inputs):
+        x, w, ids, mask = inputs
+        return fm.fused_moe_prepare_stage2(
+            x,
+            w1,
+            w2,
+            w,
+            ids,
+            expert_mask=mask,
+            activation=ActivationType.Silu,
+            quant_type=qt,
+        )
+
+    for tokens in (32, 300):
+        inputs = [_routes(tokens, False, seed=s) for s in (41, 42)]
+        with _original_path():
+            refs = [_call(qt, *i).clone() for i in inputs]
+        expected = [run_torch(qt, *i) for i in inputs]
+        for ref, want in zip(refs, expected):
+            assert _row_err(ref, want) < 0.01
+        for prepare_second in (False, True):
+            _fresh()
+            try:
+                first = prepare(inputs[0])
+            except RuntimeError as exc:
+                if get_gfx_runtime() != "gfx942" and (
+                    "requires a two-stage MoE config" in str(exc)
+                    or "selected MoE pipeline has no separate stage2" in str(exc)
+                ):
+                    aiter.logger.warning(
+                        "prepare-stage2 lifetime: no separate stage2 on %s at M=%d",
+                        get_gfx_runtime(),
+                        tokens,
+                    )
+                    break
+                raise
+            if prepare_second:
+                second = prepare(inputs[1])
+                other = fm.fused_moe_run_stage2(second)
+            else:
+                other = _call(qt, *inputs[1])
+            assert torch.equal(other, refs[1])
+            # Prepared inputs may be run again; out= gives each run its own sum.
+            for _ in range(2):
+                got = fm.fused_moe_run_stage2(first, out=torch.empty_like(refs[0]))
+                assert torch.equal(got, refs[0])
+                assert _row_err(got, expected[0]) < 0.01
+
+
+def test_same_stream_threads_do_not_interfere():
+    def run_case(qt, tokens, ep):
+        device = torch.cuda.current_device()
+        _fresh()
+        inputs = [_routes(tokens, ep, seed=s) for s in (51, 52)]
+        with _original_path():
+            refs = [_call(qt, *i).clone() for i in inputs]
+        expected = [run_torch(qt, *i) for i in inputs]
+        # Finish JIT and input setup before either host thread enters the gate.
+        for i in inputs:
+            _call(qt, *i)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        sorted_first, release_first = threading.Event(), threading.Event()
+        results, errors = [], []
+        original_sort = fm.moe_sorting
+
+        def gated_sort(*args, **kwargs):
+            ret = original_sort(*args, **kwargs)
+            if threading.current_thread() is worker:
+                sorted_first.set()
+                assert release_first.wait(30), "second call did not release first sort"
+            return ret
+
+        def first_call():
+            try:
+                with torch.cuda.device(device), torch.cuda.stream(stream):
+                    results.append(_call(qt, *inputs[0]))
+            except (AssertionError, RuntimeError, ValueError, TypeError) as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=first_call, daemon=True)
+        with mock.patch.object(fm, "moe_sorting", gated_sort):
+            worker.start()
+            try:
+                assert sorted_first.wait(30), f"first call did not reach sort: {errors}"
+                # sort(A) has returned but A's stages have not started. Both
+                # sorts and both stage launches use this same stream.
+                with torch.cuda.device(device), torch.cuda.stream(stream):
+                    other = _call(qt, *inputs[1])
+            finally:
+                release_first.set()
+                worker.join(30)
+        assert not worker.is_alive(), "first call did not finish"
+        if errors:
+            raise errors[0]
+        stream.synchronize()
+        tol = 0.01 if qt == QuantType.No else 0.1
+        for got, ref, want in zip((results[0], other), refs, expected):
+            assert torch.equal(got, ref)
+            assert _row_err(got, want) < tol
+
+    for case in (
+        (QuantType.No, 32, False),
+        (QuantType.No, 300, False),
+        (QuantType.per_Token, 300, True),
+    ):
+        run_case(*case)
 
 
 def test_workspace_size_is_the_ops():
@@ -653,9 +756,10 @@ def main():
         test_plain_eager_only_for_real_eager_tensors,
         test_torch_compile_keeps_the_custom_op,
         test_cuda_graph_capture_and_replay,
-        test_two_streams_do_not_share_sort_buffers,
-        test_bench_hook_gets_its_own_sort_buffers,
-        test_moe_sorting_scratch_matches,
+        test_two_streams_do_not_interfere,
+        test_bench_hook_inputs_survive_other_calls,
+        test_prepared_stage2_survives_other_calls,
+        test_same_stream_threads_do_not_interfere,
         test_workspace_size_is_the_ops,
     ]
     for check in checks:

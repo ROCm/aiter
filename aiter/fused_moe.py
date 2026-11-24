@@ -11,6 +11,7 @@ from enum import IntEnum
 from typing import NamedTuple
 
 import torch
+from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 import aiter
 
@@ -658,55 +659,6 @@ def _moe_sorting_opus_workspace_size(tokens, num_experts, topk, policy, device_i
     )
 
 
-# Per (device, stream): one grow-only byte buffer and the sort-output views cut
-# from it, by size. See _moe_sort_scratch.
-_SORT_SCRATCH: dict = {}
-_SORT_SCRATCH_VIEWS_MAX = 64
-
-
-def _moe_sort_scratch(device, num_sorted, num_blocks, ws_size):
-    """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    workspace)` for a sort whose outputs fused_moe consumes before it returns.
-
-    The next call on the same stream is ordered after that (threads sharing a
-    stream must not interleave inside fused_moe), so it can take the same
-    memory: the sort writes every element the stages read, and the Opus API
-    clears its workspace itself. Kept per stream, so calls on two streams
-    never share it. The caller allocates instead while a CUDA graph captures,
-    so no graph records these addresses.
-    """
-    key = (device.index, torch._C._cuda_getCurrentRawStream(device.index))
-    sizes = (num_sorted, num_blocks, ws_size)
-    entry = _SORT_SCRATCH.get(key)
-    if entry is not None:
-        views = entry[1].get(sizes)
-        if views is not None:
-            return views
-    # Each piece starts 512-byte aligned, as its own allocation would.
-    nbytes = (4 * num_sorted, 4 * num_sorted, 4 * num_blocks, 8, ws_size)
-    offsets = []
-    total = 0
-    for n in nbytes:
-        offsets.append(total)
-        total += (n + 511) // 512 * 512
-    if entry is None or entry[0].numel() < total:
-        entry = (torch.empty(total, dtype=torch.uint8, device=device), {})
-        _SORT_SCRATCH[key] = entry
-    buf, views_by_size = entry
-    if len(views_by_size) >= _SORT_SCRATCH_VIEWS_MAX:
-        views_by_size.clear()
-    pieces = [buf[o : o + n] for o, n in zip(offsets, nbytes)]
-    views = (
-        pieces[0].view(dtypes.i32),
-        pieces[1].view(dtypes.fp32),
-        pieces[2].view(dtypes.i32),
-        pieces[3].view(dtypes.i32),
-        pieces[4] if ws_size > 0 else None,
-    )
-    views_by_size[sizes] = views
-    return views
-
-
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -722,8 +674,6 @@ def _moe_sorting_impl(
     accumulate=True,
     output_aux=False,
     output=None,
-    *,
-    scratch=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -761,34 +711,12 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     max_num_tokens_padded = max_num_m_blocks * block_size
-    # The aux and local-id outputs are not scratch; they also switch the Opus
-    # dispatch below, so only a sort without them sizes its workspace here.
-    scratch = (
-        scratch
-        and not output_aux
-        and not return_local_topk_ids
-        and not torch.cuda.is_current_stream_capturing()
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    if scratch:
-        ws_size = (
-            _moe_sorting_opus_workspace_size(
-                M, num_experts, topk, dispatch_policy, topk_ids.get_device()
-            )
-            if use_opus
-            else 0
-        )
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, workspace = (
-            _moe_sort_scratch(device, max_num_tokens_padded, max_num_m_blocks, ws_size)
-        )
-    else:
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.empty(
-            max_num_tokens_padded, dtype=dtypes.fp32, device=device
-        )
-        sorted_expert_ids = torch.empty(
-            max_num_m_blocks, dtype=dtypes.i32, device=device
-        )
-        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
     #  - else (FlyDSL stage2 reduce mode without mask, or the non-atomic
@@ -822,15 +750,14 @@ def _moe_sorting_impl(
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
-        if not scratch:
-            ws_size = _moe_sorting_opus_workspace_size(
-                M, num_experts, topk, dispatch_policy, topk_ids.get_device()
-            )
-            workspace = (
-                torch.empty(ws_size, dtype=torch.uint8, device=device)
-                if ws_size > 0
-                else None
-            )
+        ws_size = _moe_sorting_opus_workspace_size(
+            M, num_experts, topk, dispatch_policy, topk_ids.get_device()
+        )
+        workspace = (
+            torch.empty(ws_size, dtype=torch.uint8, device=device)
+            if ws_size > 0
+            else None
+        )
         aiter.moe_sorting_opus_fwd(
             topk_ids,
             topk_weights,
@@ -964,11 +891,7 @@ def moe_sorting(
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
-    *,
-    _scratch=False,
 ):
-    """``_scratch``: the caller consumes the sort outputs before it returns, so
-    they may be reused memory (see ``_moe_sort_scratch``)."""
     asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
@@ -1017,7 +940,6 @@ def moe_sorting(
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
-            scratch=_scratch,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -1284,24 +1206,22 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
-def _plain_eager(x):
-    """Whether this call runs eagerly on real tensors: not traced by
-    torch.compile, under no TorchDispatchMode (FakeTensorMode, make_fx, ...),
-    and ``x`` is not a tensor subclass. Only then may host-side shortcuts
-    (skipping an op dispatch, reusing cached plans or buffers) stand in for
-    the op as written."""
+def _plain_eager(x, *tensors):
+    """Whether host shortcuts preserve dispatch for these tensor arguments."""
     return (
         not torch.compiler.is_compiling()
         and type(x) is torch.Tensor
-        and not torch._C._len_torch_dispatch_stack()
+        and all(
+            t is None or type(t) in (torch.Tensor, torch.nn.Parameter) for t in tensors
+        )
+        and not torch.overrides.has_torch_function((x, *tensors))
+        and not is_in_torch_dispatch_mode()
     )
 
 
-def _op_or_eager_body(op, x):
-    """``op``'s Python body when it can be called directly, else ``op``: the
-    ``torch.ops`` dispatch is kept wherever a tracer or mode handles the op as
-    one opaque call."""
-    return getattr(op, "_eager_body", op) if _plain_eager(x) else op
+def _op_or_eager_body(op, x, *tensors):
+    """Keep the custom op where a tracer, mode or tensor subclass handles it."""
+    return getattr(op, "_eager_body", op) if _plain_eager(x, *tensors) else op
 
 
 @drop_presort_after
@@ -1479,7 +1399,26 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return _op_or_eager_body(fused_moe_, hidden_states)(
+    return _op_or_eager_body(
+        fused_moe_,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        num_local_tokens,
+        bias1,
+        bias2,
+        scatter_source_map,
+        output,
+        w1_global_scale,
+        w2_global_scale,
+    )(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -2004,7 +1943,24 @@ def _fused_moe_impl(
         and _config_shape is None
         and w1_global_scale is None
         and w2_global_scale is None
-        and _plain_eager(hidden_states)
+        and _plain_eager(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            num_local_tokens,
+            bias1,
+            bias2,
+            output,
+            w1_global_scale,
+            w2_global_scale,
+        )
     ):
         plan_key = (
             topk_ids.shape,
@@ -2735,28 +2691,24 @@ def _fused_moe_run(
     _stage2_override=None,
 ):
     """Sort the routes and run the stages of a fused_moe call resolved to `plan`."""
-    (
-        _,
-        _,
-        metadata,
-        activation,
-        quant_type,
-        gate_mode,
-        swiglu_limit,
-        silu_limit,
-        M,
-        topk,
-        model_dim,
-        global_E,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        isG1U1,
-        block_size_M,
-        asm_mode,
-        stage1_func,
-        need_local_topk_ids,
-    ) = plan
+    metadata = plan.metadata
+    activation = plan.activation
+    quant_type = plan.quant_type
+    gate_mode = plan.gate_mode
+    swiglu_limit = plan.swiglu_limit
+    silu_limit = plan.silu_limit
+    M = plan.M
+    topk = plan.topk
+    model_dim = plan.model_dim
+    global_E = plan.global_E
+    dtype = plan.dtype
+    q_dtype_a = plan.q_dtype_a
+    q_dtype_w = plan.q_dtype_w
+    isG1U1 = plan.isG1U1
+    block_size_M = plan.block_size_M
+    asm_mode = plan.asm_mode
+    stage1_func = plan.stage1_func
+    need_local_topk_ids = plan.need_local_topk_ids
     sort_m_indices = None
     sort_reverse_sorted = None
     runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
@@ -2959,8 +2911,6 @@ def _fused_moe_run(
             and asm_mode is not AsmMoeMode.POST_REDUCE,
             flat=asm_mode,
             output=sort_output,
-            # The stages below consume the sort; a bench hook keeps it longer.
-            _scratch=kernel_bench_callable is None and _plain_eager(topk_ids),
         )
         if need_local_topk_ids:
             (
