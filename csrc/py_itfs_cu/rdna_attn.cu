@@ -169,6 +169,15 @@ void check_device(const aiter_tensor_t& q,
                q.device_id, ", got one on device ", t->device_id);
 }
 
+// Lengths and offsets the kernels read as consecutive ints.
+void check_lengths(const aiter_tensor_t& t, const char* name) {
+  AITER_CHECK(t.dtype() == AITER_DTYPE_i32 && t.numel() >= 1 &&
+                 t.is_contiguous(),
+             name, " must be a contiguous int32 tensor, got ",
+             AiterDtype_to_str(t.dtype()), " ", sizes(t), " strides ",
+             strides(t));
+}
+
 bool same_sizes(const aiter_tensor_t& a, const aiter_tensor_t& b) {
   if (a.dim() != b.dim()) return false;
   for (int i = 0; i < a.dim(); ++i)
@@ -205,6 +214,9 @@ void check_prefill_scratch(const PrefillConfig& c, const aiter_tensor_t& q,
                            const aiter_tensor_t& partial_o,
                            const aiter_tensor_t& partial_ml,
                            const aiter_tensor_t& counters) {
+  AITER_CHECK(partial_o.is_contiguous() && partial_ml.is_contiguous() &&
+                 counters.is_contiguous(),
+             "scratch must be contiguous (make_prefill_scratch)");
   if (c.max_segments <= 1) return;
   const int64_t d = static_cast<int>(c.head_dim);
   const int64_t target =
@@ -303,8 +315,7 @@ void rdna_decode_attn(aiter_tensor_t& q,
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
                  block_table.stride(-1) == 1,
              "block table must be int32 rows, contiguous within a row");
-  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
-             "seq_lens must be an int32 tensor holding the sequence length");
+  check_lengths(seq_lens, "seq_lens");
   // nseq sequences; sequence s reads row s of the block table and scratch.
   AITER_CHECK(q.dim() == 3 && q.size(0) % maxm == 0 && q.size(0) > 0, "q has ",
              q.dim() == 3 ? q.size(0) : -1,
@@ -355,6 +366,14 @@ void rdna_decode_attn(aiter_tensor_t& q,
       acc.dtype() == AITER_DTYPE_fp32 && m.dtype() == AITER_DTYPE_fp32 &&
           l.dtype() == AITER_DTYPE_fp32 && cnt.dtype() == AITER_DTYPE_i32,
       "scratch must be float32 partials and int32 counters");
+  // The kernel addresses the scratch as packed buffers, a batch's by one
+  // stride for both m and l.
+  AITER_CHECK(acc.is_contiguous() && m.is_contiguous() && l.is_contiguous() &&
+                 cnt.is_contiguous(),
+             "scratch must be contiguous (make_scratch)");
+  AITER_CHECK(!batched || m.stride(0) == l.stride(0),
+             "m and l must hold the same rows per sequence, got strides ",
+             m.stride(0), " and ", l.stride(0));
   const int64_t seqs = batched ? acc.size(0) : 1;
   AITER_CHECK((int64_t)acc.numel() / seqs >= rows * d &&
                  (int64_t)m.numel() / seqs >= rows &&
@@ -432,17 +451,16 @@ void rdna_prefill_attn(aiter_tensor_t& q,
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
                  block_table.stride(-1) == 1,
              "block table must be an int32 row, contiguous");
-  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
-             "seq_lens must be an int32 tensor holding the sequence length");
+  check_lengths(seq_lens, "seq_lens");
   AITER_CHECK(plan.has_value() == query_start_loc.has_value(),
              "a batch takes both a plan and query_start_loc");
   if (plan) {
     AITER_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
                    plan->size(1) == 4 && plan->is_contiguous(),
                "plan must be plan_prefill's contiguous int32 [entries, 4]");
-    AITER_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
-                   query_start_loc->numel() >= 2,
-               "query_start_loc must be int32, one entry per sequence and one");
+    check_lengths(*query_start_loc, "query_start_loc");
+    AITER_CHECK(query_start_loc->numel() >= 2,
+               "query_start_loc needs one entry per sequence and one");
     const int64_t nseq = query_start_loc->numel() - 1;
     AITER_CHECK(block_table.dim() == 2 && block_table.size(0) >= nseq &&
                    (int64_t)seq_lens.numel() >= nseq,
@@ -557,19 +575,18 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
   AITER_CHECK(q.dtype() == dtype && k.dtype() == dtype && v.dtype() == dtype &&
                  out.dtype() == dtype,
              "kernel built for ", AiterDtype_to_str(dtype));
-  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
-             "seq_lens must be int32, a length per sequence");
+  check_lengths(seq_lens, "seq_lens");
   AITER_CHECK(plan.has_value() == query_start_loc.has_value(),
              "a batch takes both a plan and query_start_loc");
   if (plan) {
     AITER_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
                    plan->size(1) == 4 && plan->is_contiguous(),
                "plan must be plan_prefill's contiguous int32 [entries, 4]");
-    AITER_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
-                   query_start_loc->numel() >= 2 &&
+    check_lengths(*query_start_loc, "query_start_loc");
+    AITER_CHECK(query_start_loc->numel() >= 2 &&
                    seq_lens.numel() >= query_start_loc->numel() - 1,
-               "query_start_loc must be int32, one entry per sequence and "
-               "one, with a length per sequence");
+               "query_start_loc needs one entry per sequence and one, with a "
+               "length per sequence");
     AITER_CHECK(head_group >= 0 &&
                    (head_group == 0 || c.num_kv_heads % head_group == 0),
                "head_group must divide the kv heads");

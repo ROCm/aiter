@@ -312,6 +312,14 @@ def main() -> None:
             else [1, 4]
         )
     if args.non_causal:
+        # Encoder attention runs the tables' builds through encoder_forward.
+        knobs = dict.fromkeys(utils.KNOBS + utils.PREFILL_KNOBS)
+        forced = [k for k in knobs if getattr(args, k) is not None]
+        if forced or args.ablate or args.jit:
+            p.error(
+                "--non-causal times the tables' builds: no forced knobs, "
+                "--ablate or --jit"
+            )
         shapes, _ = load(args)
         non_causal(args, shapes)
         return

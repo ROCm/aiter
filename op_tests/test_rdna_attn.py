@@ -1080,15 +1080,31 @@ def check_prefill_batch_mm_prefix(shape):
         _assert_prefill_close(out[rows], ref, dtype, f"sequence {i} (M={m}, S={s})")
 
 
-def check_encoder_without_segments():
-    """No segments: an empty output and no launch."""
+def check_encoder_segments():
+    """No tokens: an empty output and no launch. Segments that do not add up
+    to the tokens are refused: they would address past Q, K and V or leave
+    rows unwritten. An empty segment among the others changes nothing."""
     rows = [v for v in _prefill_rows() if not v.causal]
     if not rows:
         return
     v = rows[0]
+    scale = v.head_size**-0.5
     q, k, val, _ = _non_causal_inputs(v, [])
-    out = hip.encoder_forward(q, k, val, [], v.head_size**-0.5)
+    out = hip.encoder_forward(q, k, val, [], scale)
     assert out.shape == q.shape and out.dtype == q.dtype
+    q, k, val, _ = _non_causal_inputs(v, [128])
+    for bad in ([64, 128], [64], [], [192, -64]):
+        try:
+            hip.encoder_forward(q, k, val, bad, scale)
+        except ValueError as e:
+            assert "must partition" in str(e), e
+        else:
+            raise AssertionError(f"segments {bad} of 128 tokens were not refused")
+    out = hip.encoder_forward(q, k, val, [64, 0, 64], scale)
+    torch.cuda.synchronize()
+    for rows_ in (slice(0, 64), slice(64, 128)):
+        ref = full_attention(q[rows_], k[rows_], val[rows_])
+        _assert_prefill_close(out[rows_], ref, v.dtype, "empty segment between two")
 
 
 def check_refusals():
@@ -1153,6 +1169,54 @@ def check_refusals():
             ),
         )
 
+    # The kernels read lengths and scratch as packed buffers: a strided view
+    # would be read as its neighbours.
+    acc, m_, l_, cnt = hip.make_scratch(v, dev)
+    out = torch.empty_like(q)
+    strided_m = torch.empty(2 * m_.numel(), device=dev)[::2]
+    _refused(
+        "scratch must be contiguous",
+        lambda: module.decode_attn(
+            q, kv, block_table, out, acc, strided_m, l_, cnt, seq_lens, scale
+        ),
+    )
+    bv, bmodule = _built(batch=1)
+    _, bq, bkv, btable = _batch_inputs(bv, [64, 48])
+    bacc, bm, bl, bcnt = hip.make_scratch(bv, dev, max_seqs=2)
+    # Two lengths, every other int: read in a row they would be 64 and 0.
+    strided_lens = torch.tensor([64, 0, 48, 0], device=dev, dtype=torch.int32)[::2]
+    _refused(
+        "seq_lens must be a contiguous int32",
+        lambda: bmodule.decode_attn(
+            bq,
+            bkv,
+            btable,
+            torch.empty_like(bq),
+            bacc,
+            bm,
+            bl,
+            bcnt,
+            strided_lens,
+            bv.head_size**-0.5,
+        ),
+    )
+    wide_l = torch.empty(2, 2 * bl.shape[1], device=dev)
+    _refused(
+        "m and l must hold the same rows",
+        lambda: bmodule.decode_attn(
+            bq,
+            bkv,
+            btable,
+            torch.empty_like(bq),
+            bacc,
+            bm,
+            wide_l,
+            bcnt,
+            torch.tensor([64, 48], device=dev, dtype=torch.int32),
+            bv.head_size**-0.5,
+        ),
+    )
+
     # Only one sequence's (ranges, 2) on the device reaches the prefill
     # kernel: the batch's (sequences, ranges, 2) would unmask other sequences'
     # keys.
@@ -1176,6 +1240,51 @@ def check_refusals():
                 bad,
             ),
         )
+
+    # A plan's query starts are read as consecutive ints too.
+    lens = [(64, 64), (32, 32)]
+    bq2, bkv2, btable2, starts, lens_cpu = _prefill_batch(pv, lens)
+    launch = _launch_prefill_batch(
+        pv, bq2, bkv2, btable2, starts, lens_cpu, torch.empty_like(bq2)
+    )
+    launch()
+    torch.cuda.synchronize()
+    build, head_group = hip.prefill_batch_variant_for(
+        pv.num_q_heads,
+        pv.num_kv_heads,
+        pv.head_size,
+        pv.page_size,
+        1,
+        pv.window,
+        pv.dtype,
+        starts.numpy(),
+        lens_cpu.numpy(),
+    )
+    plan, head_group = hip.plan_prefill(
+        starts.numpy(),
+        lens_cpu.numpy(),
+        build,
+        pv.window,
+        hip.prefill_target_workgroups(dev),
+        head_group,
+    )
+    strided_starts = torch.stack([starts, starts], 1).to(dev)[:, 0]
+    _refused(
+        "query_start_loc must be a contiguous int32",
+        lambda: hip.load_prefill(build).prefill_attn(
+            bq2,
+            bkv2,
+            btable2,
+            torch.empty_like(bq2),
+            *hip.make_prefill_scratch([build], dev),
+            lens_cpu.to(dev),
+            64,
+            pv.head_size**-0.5,
+            plan=torch.from_numpy(plan).to(dev),
+            query_start_loc=strided_starts,
+            head_group=head_group,
+        ),
+    )
 
     # Non-causal builds run only through encoder_attn, causal ones only
     # through prefill_attn.
@@ -1261,7 +1370,7 @@ def run_checks():
         (32, 4, 512, 0, torch.bfloat16),
     ):
         check_prefill_batch_mm_prefix(shape)
-    check_encoder_without_segments()
+    check_encoder_segments()
     check_refusals()
     aiter.logger.info("rdna_attn behaviour checks passed")
 

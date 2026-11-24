@@ -937,7 +937,8 @@ def make_prefill_scratch(
 
 # The page size the non-causal builds are listed under; they read no pages.
 ENCODER_PAGE_SIZE = 16
-# Per (shape, device): prefill scratch, sized for every non-causal build.
+# Per (shape, device, stream): prefill scratch, sized for every non-causal
+# build.
 _ENCODER_SCRATCH: dict = {}
 
 
@@ -1025,16 +1026,25 @@ def encoder_forward(
         q: (tokens, Hq, D), the segments one after the other.
         k: (tokens, Hkv, D).
         v: (tokens, Hkv, D).
-        seg_lens: Each segment's tokens, on the host.
+        seg_lens: Each segment's tokens, on the host; they add up to the
+            tokens of q. A segment may be empty.
         scale: Softmax scale.
 
     Returns:
         (tokens, Hq, D). `encoder_unsupported` must have returned None.
 
+    Raises:
+        ValueError: seg_lens does not partition the tokens of q.
+
     """
+    if any(n < 0 for n in seg_lens) or sum(seg_lens) != q.shape[0]:
+        raise ValueError(
+            f"seg_lens must partition the {q.shape[0]} tokens of q, got "
+            f"{len(seg_lens)} segments of {sum(seg_lens)} tokens"
+        )
     dev, dtype = q.device, q.dtype
     out = torch.empty(q.shape, dtype=dtype, device=dev)
-    if not seg_lens:
+    if not q.shape[0]:
         return out
     hq, d, hkv = q.shape[1], q.shape[2], k.shape[1]
     lay = _encoder_layout(tuple(seg_lens), hq, hkv, d, dtype, dev)
@@ -1042,12 +1052,15 @@ def encoder_forward(
     prefill = load_prefill(lay.variant)
     assert prefill is not None
     shape = (hq, hkv, d, ENCODER_PAGE_SIZE, 0, dtype)
-    scratch = _ENCODER_SCRATCH.get((shape, dev))
+    # A launch's partials and counters are its own until it ends: launches of
+    # one stream run in order, those of different streams may overlap.
+    key = (shape, dev, torch.cuda.current_stream(dev).cuda_stream)
+    scratch = _ENCODER_SCRATCH.get(key)
     if scratch is None or scratch[1].numel() < 2 * lay.variant.scratch_rows(dev):
         scratch = make_prefill_scratch(
             [*prefill_variants(*shape, causal=False), lay.variant], dev
         )
-        _ENCODER_SCRATCH[(shape, dev)] = scratch
+        _ENCODER_SCRATCH[key] = scratch
     if lay.plan is None or lay.plan.shape[0]:
         prefill.encoder_attn(
             q,
