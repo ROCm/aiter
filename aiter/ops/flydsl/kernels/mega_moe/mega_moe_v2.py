@@ -448,13 +448,14 @@ class MegaMoEV2:
             "inter_dim": self.inter_dim,
             "experts": self.experts,
             "topk": self.topk,
+            "a_dtype": self._a_dtype,
         }
         # capacities: the routes sharing the payload arena; route_outputs: (GEMM1 output rows, dtype) of every route.
         route_outputs = [(capacities[0][0], self._a_dtype)]
         if plan.large_m:
             from .mega_moe_large_m import LargeMRuntime
 
-            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, a_dtype=self._a_dtype, **fused)
+            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
             route_outputs.append((capacity[0], "fp8"))
             self._large_m_shares_payload = LargeMRuntime.ends_all_ranks(
                 max_tok_per_rank=self.mtpr, **fused
@@ -470,7 +471,7 @@ class MegaMoEV2:
                 if SmallMRuntime.ends_all_ranks(max_tok_per_rank=m, **fused)
             )
             for m in plan.small_m_mtprs:
-                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, a_dtype=self._a_dtype, **fused)
+                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
                 route_outputs.append((capacity[0], "fp8"))
                 if m in self._small_m_shared:
                     capacities.append(capacity)

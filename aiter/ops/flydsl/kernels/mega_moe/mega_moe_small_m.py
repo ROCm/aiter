@@ -52,6 +52,7 @@ from .mega_moe_config import (
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
     fused_layout_supported,
+    fused_quant,
     nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
@@ -1916,6 +1917,7 @@ class SmallMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         )
         if config.fused_stage1.dedup_rows:
             rows += world_size * max_tok_per_rank
@@ -1923,7 +1925,15 @@ class SmallMRuntime:
 
     @classmethod
     def ends_all_ranks(
-        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether every launch ends only once every peer's grid finished (its combine waits for every peer's flag).
 
@@ -1939,6 +1949,7 @@ class SmallMRuntime:
                 experts_per_rank=experts // world_size,
                 model_dim=model_dim,
                 inter_dim=inter_dim,
+                quant=fused_quant(a_dtype),
             ).fused_stage1.tok_done
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= max_tok_per_rank
@@ -1990,7 +2001,7 @@ class SmallMRuntime:
         self._configs = {
             bucket: select_fused_config(
                 bucket, self.mtpr, world_size=self.world_size, experts_per_rank=self.epr,
-                model_dim=self.model_dim, inter_dim=self.inter_dim,
+                model_dim=self.model_dim, inter_dim=self.inter_dim, quant=quant,
             )
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= self.mtpr

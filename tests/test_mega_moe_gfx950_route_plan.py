@@ -252,6 +252,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout, quant):
             experts_per_rank=epr,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=quant,
         )
         num_valid_max, payload_rows, payload_row_bytes, _ = (
             LargeMRuntime.payload_capacity(
@@ -969,3 +970,13 @@ def test_large_m_a4w4_runs_the_a8w4_config(layout, mtpr):
         rows.append(sbm + k1.short_tail_rows)
     for tile_rows in rows:
         assert tile_rows * (128 // 16) % 64 == 0, tile_rows
+
+
+def test_fused_config_quant():
+    with pytest.raises(ValueError, match="quant"):
+        select_fused_config(1, 512, quant="a16w4")
+    # Every fused route and layout serves A4W4 with a config of its own selection.
+    for shape in ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE, V41_FLASH_EP8_SHAPE):
+        for mtpr in (512, 16384):
+            config = select_fused_config(1, mtpr, quant="a4w4", **shape)
+            assert config.p2p_quant == select_fused_config(1, mtpr, **shape).p2p_quant

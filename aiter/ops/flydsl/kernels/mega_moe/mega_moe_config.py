@@ -72,8 +72,8 @@ FUSED_LAYOUTS = frozenset(
         ),
     }
 )
-# Quant modes of the fused routes (small- and large-input kernels alike). Both run the A8W4 tunes: the A4W4
-# kernels are not tuned of their own.
+# Quant modes of the fused routes (small- and large-input kernels alike). A4W4 starts from a layout's A8W4 tune and
+# takes its own changes on top (_tune_a4w4_small / _tune_a4w4_large).
 FUSED_QUANTS = ("a8w4", "a4w4")
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
@@ -128,6 +128,15 @@ SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
 ACTIVATION_FP4 = "fp4"
 ACTIVATION_FP8 = "fp8"
 SUPPORTED_ACTIVATION_DTYPES = (ACTIVATION_FP4, ACTIVATION_FP8)
+
+
+def fused_quant(a_dtype: str) -> str:
+    """The FUSED_QUANTS quant of a fused route's activation dtype (packed FP4 rows: A4W4, FP8 rows: A8W4)."""
+    if a_dtype not in SUPPORTED_ACTIVATION_DTYPES:
+        raise ValueError(
+            f"a_dtype={a_dtype!r} must be one of {SUPPORTED_ACTIVATION_DTYPES}"
+        )
+    return "a4w4" if a_dtype == ACTIVATION_FP4 else "a8w4"
 
 
 def fixed_stage1_epoch_slot(grid_mult: int, num_dispatch_cu: int, num_cu: int) -> int:
@@ -1723,6 +1732,26 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     )
 
 
+def _tune_a4w4_small(
+    config: MegaMoEConfig, layout: tuple[int, int, int, int], bucket: int
+) -> MegaMoEConfig:
+    """A4W4 small-input kernel of a fused layout (world_size, experts_per_rank, model_dim, inter_dim): the layout's
+    A8W4 tune unless measured otherwise.
+
+    The ranks of a launch may pick different buckets, so a change here keeps the launch protocol knobs (dedup_rows,
+    plan_local, direct_done, tok_counters, bf16_head_tokens) the same for every bucket of a layout.
+    """
+    return config
+
+
+def _tune_a4w4_large(
+    config: MegaMoEConfig, layout: tuple[int, int, int, int]
+) -> MegaMoEConfig:
+    """A4W4 large-input kernel of a fused layout: the layout's A8W4 tune unless measured otherwise. One config
+    serves every row count of a capacity (the kernel is built per capacity)."""
+    return config
+
+
 @cache
 def _fused_config(
     bucket: int,
@@ -1731,30 +1760,31 @@ def _fused_config(
     experts_per_rank: int,
     model_dim: int,
     inter_dim: int,
+    quant: str,
 ) -> MegaMoEConfig:
     layout = (world_size, experts_per_rank, model_dim, inter_dim)
     expert_waves = (experts_per_rank + 63) // 64
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
         if layout == V41_FLASH_EP4_LAYOUT:
-            return _tune_v41_flash_ep4_large(config)
-        if layout == V41_FLASH_EP2_LAYOUT:
-            return _tune_v41_flash_ep2_large(config)
-        if layout == V41_FLASH_EP8_LAYOUT:
-            return _tune_v41_flash_ep8_large(config)
-        return config
+            config = _tune_v41_flash_ep4_large(config)
+        elif layout == V41_FLASH_EP2_LAYOUT:
+            config = _tune_v41_flash_ep2_large(config)
+        elif layout == V41_FLASH_EP8_LAYOUT:
+            config = _tune_v41_flash_ep8_large(config)
+        return _tune_a4w4_large(config, layout) if quant == "a4w4" else config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
         stage2=_small_m_stage2(bucket),
         p2p_quant="none",
     )
     if layout == V41_FLASH_EP4_LAYOUT:
-        return _tune_v41_flash_ep4_small(config, bucket)
-    if layout == V41_FLASH_EP2_LAYOUT:
-        return _tune_v41_flash_ep2_small(config, bucket)
-    if layout == V41_FLASH_EP8_LAYOUT:
-        return _tune_v41_flash_ep8_small(config, bucket)
-    return config
+        config = _tune_v41_flash_ep4_small(config, bucket)
+    elif layout == V41_FLASH_EP2_LAYOUT:
+        config = _tune_v41_flash_ep2_small(config, bucket)
+    elif layout == V41_FLASH_EP8_LAYOUT:
+        config = _tune_v41_flash_ep8_small(config, bucket)
+    return _tune_a4w4_small(config, layout, bucket) if quant == "a4w4" else config
 
 
 def select_fused_config(
@@ -1765,11 +1795,14 @@ def select_fused_config(
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = V4_MODEL_DIM,
     inter_dim: int = V4_INTER_DIM,
+    quant: str = "a8w4",
 ) -> MegaMoEConfig:
     """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
-    config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) for
-    ``tokens`` rows on a rank; an idle rank takes the 1-token config. A4W4 takes
-    the A8W4 config (untuned for A4W4)."""
+    config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) and
+    FUSED_QUANTS quant for ``tokens`` rows on a rank; an idle rank takes the 1-token
+    config."""
+    if quant not in FUSED_QUANTS:
+        raise ValueError(f"quant={quant!r} must be one of {FUSED_QUANTS}")
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     large_mtprs = large_m_mtprs_for(
@@ -1790,4 +1823,5 @@ def select_fused_config(
         experts_per_rank,
         model_dim,
         inter_dim,
+        quant,
     )

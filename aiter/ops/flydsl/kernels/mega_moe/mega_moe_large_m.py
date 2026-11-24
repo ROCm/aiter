@@ -61,6 +61,7 @@ from .mega_moe_config import (
     FUSED_QUANTS,
     MegaMoEConfig,
     fused_layout_supported,
+    fused_quant,
     large_m_mtprs_for,
     select_fused_config,
 )
@@ -3062,7 +3063,14 @@ class LargeMRuntime:
 
     @classmethod
     def indexed_payload(
-        cls, *, world_size, model_dim, inter_dim, experts, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether the dispatch stores one payload row per (source rank, token): dedup_rows sends a token's row to a
         destination once, at row rank * mtpr + token, so the route-major rows are never written.
@@ -3075,6 +3083,7 @@ class LargeMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         ).fused_stage1.dedup_rows
 
     @classmethod
@@ -3107,12 +3116,21 @@ class LargeMRuntime:
                 inter_dim=inter_dim,
                 experts=experts,
                 max_tok_per_rank=max_tok_per_rank,
+                a_dtype=a_dtype,
             ),
         )
 
     @classmethod
     def ends_all_ranks(
-        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether every launch ends only once every rank finished its GEMM2 (the combine's generation barrier).
 
@@ -3128,6 +3146,7 @@ class LargeMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         ).fused_stage2.comb_tok_wait
 
     # fmt: off
@@ -3187,7 +3206,7 @@ class LargeMRuntime:
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT,
             gm_indexed_payload=self.indexed_payload(world_size=self.world_size, model_dim=self.model_dim,
-                inter_dim=self.inter_dim, experts=self.experts, max_tok_per_rank=self.mtpr),
+                inter_dim=self.inter_dim, experts=self.experts, max_tok_per_rank=self.mtpr, a_dtype=self._a_dtype),
             max_total_recv_tokens=self.world_size)
         # fmt: on
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
@@ -3438,7 +3457,7 @@ class LargeMRuntime:
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         config = select_fused_config(
             tokens, self.mtpr, world_size=self.world_size, experts_per_rank=self.epr,
-            model_dim=self.model_dim, inter_dim=self.inter_dim,
+            model_dim=self.model_dim, inter_dim=self.inter_dim, quant=fused_quant(self._a_dtype),
         )
         self._active_config = config
         return config
