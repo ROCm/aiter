@@ -2760,6 +2760,16 @@ namespace py = pybind11;
           py::arg("post_layer_mix"),              \
           py::arg("comb_res_mix"),                \
           py::arg("store_nt") = -1);              \
+    m.def("mhc_post_reduce",                      \
+          &aiter::mhc_post_reduce,                \
+          "mhc_post_reduce",                      \
+          py::arg("out"),                         \
+          py::arg("x"),                           \
+          py::arg("residual"),                    \
+          py::arg("post_layer_mix"),              \
+          py::arg("comb_res_mix"),                \
+          py::arg("pre_mix")  = std::nullopt,     \
+          py::arg("store_nt") = -1);              \
     m.def("mhc_fused_post_pre_gemm_sqrsum",       \
           &aiter::mhc_fused_post_pre_gemm_sqrsum, \
           "mhc_fused_post_pre_gemm_sqrsum",       \
@@ -3016,20 +3026,3 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
-
-#define FP8_MQA_LOGITS_PYBIND             \
-    m.def("fp8_mqa_logits",               \
-          &aiter::fp8_mqa_logits,         \
-          py::arg("out"),                 \
-          py::arg("q_fp8"),               \
-          py::arg("k_fp8"),               \
-          py::arg("kv_scale"),            \
-          py::arg("weights"),             \
-          py::arg("cu_seqlen_ks"),        \
-          py::arg("cu_seqlen_ke"),        \
-          py::arg("BlockM")       = 0,    \
-          py::arg("SplitN")       = 0,    \
-          py::arg("num_warps")    = 0,    \
-          py::arg("TotalCuCount") = 256,  \
-          py::arg("clean_logits") = true, \
-          py::arg("reverse_rows") = -1);

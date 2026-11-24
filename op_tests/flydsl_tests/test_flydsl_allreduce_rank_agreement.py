@@ -155,7 +155,6 @@ def _build(owner: str, group, rank: int):
         ca.world_size = WORLD
         ca.device = torch.device("cpu")
         ca._fly_rms = None
-        ca._is_gfx1250 = False  # This CPU stand-in has no gfx1250 DCP inbox.
         ca._init_fly_rms()
         return ca._fly_rms is not None
 
