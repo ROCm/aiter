@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
-# Adapted from amd-kernels gemm/bf16_n50016_k6144 (MIT), revision fd233ef: the lm_head vocabulary-shard GEMM
-# kernel.py's compile_bf16_gemm_n50016_k6144, generalized in N and K, with the M-halves (mh) and ring-depth (r)
-# parameters kept free as amd-kernels' own host.py dispatches them.
+#
+# Adapted from the amd-kernels project's gemm/bf16_n50016_k6144 kernel (revision fd233ef; SPDX-License-Identifier:
+# Apache-2.0, SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project): its
+# compile_bf16_gemm_n50016_k6144, generalized in N and K, with the M-halves (mh) and ring-depth (r) parameters kept
+# free as amd-kernels' own host.py dispatches them.
 
 """BF16 small-M ring GEMM for gfx950: ``out[M, N] = x[M, K] @ w[N, K]^T``, 1 <= M <= 128.
 
