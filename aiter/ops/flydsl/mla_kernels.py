@@ -67,8 +67,11 @@ def flydsl_mla_pagesize1_bf16_fp8(
     from .kernels.mla_gfx942.mla_pagesize1_bf16_fp8 import (
         launch_mla_pagesize1_bf16_fp8,
     )
+
     arch = get_gfx_runtime()
-    _require_runtime((arch == "gfx942") or (arch == "gfx950") , "expected gfx942 or gfx950")
+    _require_runtime(
+        (arch == "gfx942") or (arch == "gfx950"), "expected gfx942 or gfx950"
+    )
     _require(q.dim() == 3, "q: expected [total_q, num_heads, 576]")
     num_heads = q.size(1)
     _require(1 <= num_heads <= 16, "q: expected 1--16 query heads")
@@ -143,7 +146,6 @@ def flydsl_mla_pagesize1_bf16_fp8(
         ptr_arg(kv_scale, fx.Float32),
         float(softmax_scale),
         q.size(0),
-        kv_buffer.size(0),
         kv_page_indices.numel(),
         split_data.size(0),
         work_info.size(0),
