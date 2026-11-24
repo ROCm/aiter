@@ -143,7 +143,11 @@ def test_ids_outside_expert_range_are_ignored(m):
     ids = _ids("uniform", m, seed=1000 + m)
     g = torch.Generator().manual_seed(m)
     bad = torch.rand(ids.shape, generator=g) < 0.2
-    junk = torch.tensor([-1, E, E + 8, 256, 336, 1 << 20], dtype=torch.int32)
+    # ids 256 + r alias the wave's row table slot r (the padding value of a short block), 336+
+    # lands past the wave's scratch slice
+    junk = torch.tensor(
+        [-1, E, E + 8, 336, 1 << 20] + [256 + r for r in range(16)], dtype=torch.int32
+    )
     ids[bad] = junk[torch.randint(0, junk.numel(), (int(bad.sum()),), generator=g)]
     _check(ids.cuda())
 
