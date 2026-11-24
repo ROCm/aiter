@@ -25,6 +25,7 @@ from aiter.ops.mha_v4 import (
     _K_SMOOTH_MIN_COMMON,
     _K_SMOOTH_SAMPLE_ROWS,
     MHA_V4_BLOCK_SPARSE_MODES,
+    MHA_V4_SOL_MODE,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
@@ -1237,16 +1238,19 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             for row in rows
             if int(row[header.index("mode")]) not in MHA_V4_BLOCK_SPARSE_MODES
         ]
+    # Skipped explicitly: the gfx942 Sol-Attn objects read the block LUT with global loads, and
+    # their recipes carry only per-tensor scales, so they have no scale gather to bound. Drop
+    # this exclusion if gfx942 gains MX or per-row scales.
+    if arch == "gfx942":
+        rows = [
+            row for row in rows if int(row[header.index("mode")]) != MHA_V4_SOL_MODE
+        ]
     co_names = sorted({row[header.index("co_name")] for row in rows})
     assert co_names, f"no dispatchable fmha_v4 rows for {arch}"
 
     # global_load_lds_dword is the bulk K-tile stage into LDS, not a scale fetch; it is bounded
     # by the FP4 K/V slack the producers still reserve.
     gather = re.compile(r"\bglobal_load_(?:dword|ubyte)\b")
-    # A load issued under a lane predicate reads only the lanes that pass it: the Sol-Attn LUT
-    # stage masks exec to the row's entry count. Only full-exec loads can overshoot.
-    narrow_exec = re.compile(r"\bs_mov_b64 exec, vcc\b|\bs_and_saveexec_b64\b")
-    restore_exec = re.compile(r"\bs_mov_b64 exec, -1\b|\bs_or_b64 exec, exec\b")
     offenders = {}
     for name in co_names:
         # gfx942 names its objects with an MI300/ prefix; gfx950 does not.
@@ -1260,14 +1264,7 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             text=True,
             check=True,
         ).stdout
-        hits, masked = 0, False
-        for line in listing.splitlines():
-            if narrow_exec.search(line):
-                masked = True
-            elif restore_exec.search(line):
-                masked = False
-            elif gather.search(line) and not masked:
-                hits += 1
+        hits = len(gather.findall(listing))
         if hits:
             offenders[name] = hits
     assert not offenders, (
