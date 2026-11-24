@@ -2607,7 +2607,8 @@ def _fused_moe_impl(
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
-        if silu_limit and normalize_swiglu_limit(swiglu_limit) is not None:
+        # Only the *_silu_limit_* asm kernels clamp; get_2stage_cfgs passes them the limit.
+        if silu_limit and not metadata.stage1.keywords.get("swiglu_limit"):
             raise NotImplementedError(
                 f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r}; "
                 "the selected kernel has no clamp."
@@ -3066,6 +3067,14 @@ def fused_moe_run_stage2(
     return out
 
 
+def _fp32_swiglu_limit(swiglu_limit):
+    # Kernels take a float32 limit, 0.0 = no clamp. Keep a positive limit from
+    # narrowing to 0 (no clamp) or inf, like the CK launcher does.
+    if not swiglu_limit:
+        return 0.0
+    return min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+
+
 def fused_moe_1stage(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -3095,6 +3104,7 @@ def fused_moe_1stage(
     doweight_stage1: bool | None = None,
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     expert_mask: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ):
     asm_mode = AsmMoeMode(flat)
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
@@ -3187,6 +3197,7 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
+                swiglu_limit=_fp32_swiglu_limit(swiglu_limit),
             )
         elif isG1U1 and asm_mode is AsmMoeMode.POST_REDUCE:
             # The by-name launcher lookup does not check the sorted tile size.
@@ -5442,6 +5453,7 @@ def get_2stage_cfgs(
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
+    limit_asm_1stage = False
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
@@ -5458,7 +5470,15 @@ def get_2stage_cfgs(
             cfg_2stages_by_limit_tag[(limit_tune_file, limit_tag)] = limit_cfgs
         limit_cfg = _lookup_cfg(limit_cfgs)
         if limit_cfg is not None:
-            if (
+            # A per_1x128 1-stage row may name an asm kernel that applies the limit
+            # (*_silu_limit_*); fmoe_fp8_blockscale_g1u1 rejects any other name.
+            limit_asm_1stage = bool(
+                limit_cfg.get("run_1stage", False)
+                and q_type == QuantType.per_1x128
+                and int(limit_cfg.get("ksplit", 0) or 0) <= 1
+                and "_silu_limit_" in str(limit_cfg.get("kernelName1", ""))
+            )
+            if not limit_asm_1stage and (
                 limit_cfg.get("run_1stage", False)
                 or int(limit_cfg.get("ksplit", 0) or 0) > 1
                 or "_silu_" not in str(limit_cfg.get("kernelName1", ""))
@@ -5466,7 +5486,7 @@ def get_2stage_cfgs(
             ):
                 raise ValueError(
                     "Incompatible runtime SiLU limit tuning row; retune with "
-                    "non-split CK SiLU instances"
+                    "non-split CK SiLU instances or *_silu_limit_* asm 1-stage kernels"
                 )
             cfg = limit_cfg
         else:
@@ -5736,9 +5756,10 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
-    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
-    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue,
+    # for gfx942 per-token FP8 the FlyDSL backend, and the *_silu_limit_* asm
+    # 1-stage kernels a limit-tagged row names, so it must reject other ASM 1-stage
+    # and FlyDSL whole-graph rows before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
@@ -5751,7 +5772,12 @@ def get_2stage_cfgs(
         and cfg is not None
         and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
     )
-    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
+    if (
+        clamp_silu_limit
+        and cfg is not None
+        and not flydsl_gfx942_row
+        and not limit_asm_1stage
+    ):
         cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
         if (
             cfg.get("run_1stage", False)
@@ -6077,9 +6103,10 @@ def get_2stage_cfgs(
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     if clamp_silu_limit:
-        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
+        # Deliberately override tuned, heuristic and AITER_KSPLIT selections, except
+        # a limit-tagged row naming an asm 1-stage kernel that applies the limit.
         ksplit = 0
-        run_1stage = False
+        run_1stage = run_1stage and limit_asm_1stage
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
         gfx=gfx,
@@ -6186,6 +6213,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
                 flat=cfg_flat,
+                swiglu_limit=swiglu_limit if clamp_silu_limit else None,
             ),
             None,
             block_m,
@@ -7373,14 +7401,9 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            # silu_and_mul takes a float32 limit. Keep a positive limit from
-            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
-            limit = (
-                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
-                if swiglu_limit
-                else 0.0
+            aiter.silu_and_mul(
+                out, tmp_out.view(dtypes.fp32), _fp32_swiglu_limit(swiglu_limit)
             )
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
