@@ -1,0 +1,258 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""IOD phase probe for ``iod_locality`` (gfx1250, SPX + NPS1).
+
+home(addr) = a14 ^ a17 ^ a20 ^ phase[addr >> 21]; workgroup b of a grid whose
+workgroups all run is on domain ((b + 3) % 8) >= 4. One launch of 8 probers,
+one per workgroup class, all running: prober b walks every page and times one
+cold load in each of 16 granules of a 256 KiB aligned window, whose home bits
+a14 ^ a17 alternate, so the faster parity names domain(b) ^ phase(page) without
+an absolute latency threshold. Eight concurrent single loads do not contend.
+
+A launch whose other workgroups exit at once does not keep that mapping (two of
+the eight classes land on the other domain), so every prober has to run.
+
+Where workgroup 0 starts is dispatcher state, not a constant: a launch sees
+domain(b) = ((b + c) & 7) >= 4 for a rotation c that follows the hardware pipe
+it lands on (HW_ID2 PIPE_ID 1, 2, 3 -> c = 3, 2, 1; pipe 0 -> 0 or 4). A process
+that launches from many streams (ATOM, MORI) gets pipe 0 at load time, so the
+probe saw c = 0 there on every rank. The classes still split cleanly into a
+rotation, so each pass reads its rotation from the relative pattern of the
+eight classes and is kept only if every prober's ``launch_rotation`` names the
+same one (mod 4; c and c + 4 differ by a global flip the phase absorbs, and
+the GEMMs read c the same way); the others are relaunched on another stream.
+Each class must agree with the domain formula on (nearly) every page of the
+kept passes; if one does not, or too few passes are kept, the probe reports it
+instead of returning a phase.
+
+Lines the kernels before the probe left dirty in the memory-side cache (the
+shuffle that wrote the weight, the scatter that placed the previous one) blur
+the two parities until they are written back; a small tensor, a scale, then
+fails on most pages. Writing more does not drain them, reading does, so the
+probe first streams ``EVICT_BYTES`` of reads.
+"""
+
+import numpy as np
+import torch
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import T
+
+from .tensor_shim import _run_compiled, buf_copy_store, ptr_arg, ptr_buf_tensor
+
+PROBERS = 8
+NGRAN = 16
+#: A class agreeing with the domain formula on fewer pages than this fails the probe.
+MIN_CLASS_AGREE = 0.9
+#: Launches in all, warm-up included: each reads its own cold 128 B line of a granule.
+MAX_LAUNCHES = 128 // PROBERS
+_PAR = np.array([(g ^ (g >> 3)) & 1 for g in range(NGRAN)])
+_ROT = np.array(
+    [[((b + c) & 7) >= 4 for b in range(PROBERS)] for c in range(8)], dtype=np.int64
+)
+#: hwreg(HW_REG_HW_ID2, offset 0, size 6): QUEUE_ID [3:0], PIPE_ID [5:4].
+_HW_ID2_QUEUE_PIPE = 24 | (0 << 6) | ((6 - 1) << 11)
+#: Reads streamed before probing; 256 MiB was the least that drained a
+#: freshly written tensor on gfx1250.
+EVICT_BYTES = 512 << 20
+
+
+def launch_rotation():
+    """Rotation c of the running launch: workgroup b is on IOD domain ((b + c) & 7) >= 4.
+
+    The dispatch of a launch starts on the XCC its hardware queue slot selects:
+    c = 4 - PIPE_ID - 4 QUEUE_ID mod 8, up to one constant common to all slots,
+    which the probe's phase absorbs. Read from HW_ID2, it is the same for every
+    workgroup of a launch.
+    """
+    # Raw: neither fx nor the ROCDL dialect of the pinned FlyDSL has s_getreg.
+    imm = fx.Int32(_HW_ID2_QUEUE_PIPE).ir_value()
+    v = fx.Int32(_llvm.call_intrinsic(T.i32, "llvm.amdgcn.s.getreg", [imm], [], []))
+    return (fx.Int32(4) - (v >> 4) - (v << 2)) & 7
+
+
+def _timed_load(addr):
+    """Realtime ticks around one global load at ``addr`` (i64), waited in place."""
+    # Raw: the pinned FlyDSL has no realtime-counter read, and only one asm block
+    # keeps the load and both waits between the two reads.
+    res = ir.Type.parse("!llvm.struct<(i64, i64, i32)>")
+    r = _llvm.inline_asm(
+        res,
+        [addr.ir_value()],
+        "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n"
+        "s_wait_kmcnt 0\n"
+        "global_load_b32 $2, $3, off\n"
+        "s_wait_loadcnt 0\n"
+        "s_sendmsg_rtn_b64 $1, sendmsg(MSG_RTN_GET_REALTIME)\n"
+        "s_wait_kmcnt 0",
+        "=&s,=&s,=&v,v",
+        has_side_effects=True,
+    )
+    t0 = fx.Int64(_llvm.extractvalue(T.i64, r, [0]))
+    t1 = fx.Int64(_llvm.extractvalue(T.i64, r, [1]))
+    return (t1 - t0).to(fx.Int32)
+
+
+@flyc.jit
+def _launch_probe(
+    base: fx.Int64,
+    lat: fx.Pointer,
+    npg: fx.Int32,
+    line: fx.Int32,
+    win0: fx.Int32,
+    win1: fx.Int32,
+    stream: fx.Stream,
+):
+    # The cache key follows only this body's globals, not the kernel's below.
+    _ = launch_rotation
+
+    # ``base`` is an address, not a tensor: the windows may read allocation bytes
+    # outside the probed tensor.
+    @flyc.kernel(name="iod_loc_probe", known_block_size=[32, 1, 1])
+    def kernel(
+        base: fx.Int64,
+        lat: fx.Pointer,
+        npg: fx.Int32,
+        line: fx.Int32,
+        win0: fx.Int32,
+        win1: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        if tid == 0:
+            out = ptr_buf_tensor(lat, fx.Int32)
+            # A 128 B line per (pass, prober): cold, and never shared.
+            slot = (line * PROBERS + bid) & 127
+            lo = fx.Int64(slot) * 128
+            for p in range(fx.Int32(0), npg, fx.Int32(1)):
+                win = (p == 0).select(win0, (p == npg - 1).select(win1, fx.Int32(0)))
+                page = base + (fx.Int64(p) << 21) + fx.Int64(win) + lo
+                for g in range_constexpr(NGRAN):
+                    t = _timed_load(page + g * 16384)
+                    buf_copy_store(out, (bid * npg + p) * NGRAN + g, t)
+            buf_copy_store(out, PROBERS * NGRAN * npg + bid, launch_rotation())
+
+    kernel(base, lat, npg, line, win0, win1).launch(
+        grid=(PROBERS, 1, 1), block=(32, 1, 1), stream=stream
+    )
+
+
+def _rotation(odd_fast: np.ndarray):
+    """Rotation c in 0..3 of one launch (c and c + 4 read the same), or None.
+
+    Class b's odd-fast pages are domain(b) ^ phase; relative to class 0 the
+    phase cancels and leaves domain(b) ^ domain(0), which names the rotation.
+    """
+    rel = (odd_fast != odd_fast[:1]).mean(1)
+    if np.minimum(rel, 1 - rel).max() > 1 - MIN_CLASS_AGREE:
+        return None
+    rel = (rel > 0.5).astype(np.int64)
+    for c in range(4):
+        if np.array_equal(_ROT[c] ^ _ROT[c][0], rel):
+            return c
+    return None
+
+
+PAGE = 2 << 20
+WIN = NGRAN * 16384
+
+
+def probe_windows(start: int, nbytes: int, lo: int, hi: int):
+    """(first page, pages, window offset in the first page, in the last) for
+    the pages bytes [start, start + nbytes) touch, each window WIN aligned
+    within [lo, hi) (the bytes the probe may read); None if a page has none."""
+    base = start - start % PAGE
+    npg = -(-(start + nbytes - base) // PAGE)
+    wins = []
+    for p in (0, npg - 1):
+        pg = base + p * PAGE
+        a = max(pg, lo)
+        a = pg + -(-(a - pg) // WIN) * WIN
+        if a + WIN > min(pg + PAGE, hi):
+            return None
+        wins.append(a - pg)
+    return base, npg, wins[0], wins[1]
+
+
+def _drain_dirty_lines(dev):
+    try:
+        junk = torch.empty(EVICT_BYTES // 4, dtype=torch.int32, device=dev)
+    except torch.OutOfMemoryError:
+        return
+    junk.sum(dtype=torch.int64)
+
+
+def probe_phase(buf: torch.Tensor, npass: int = 4, span=None):
+    """Phase of every 2 MiB page ``buf`` touches.
+
+    The probe reads one WIN window per page within ``span`` (lo, hi), the
+    readable bytes around ``buf`` (default its own), which ``probe_windows``
+    must find. Returns (phase u8[npg], weak pages, per-class agreement,
+    rotation of every launch); phase is None when a workgroup class does not
+    follow the domain formula or fewer than ``npass`` launches after the
+    warm-up run at the rotation ``launch_rotation`` reads from their hardware
+    queue.
+    """
+    nbytes = buf.numel() * buf.element_size()
+    lo, hi = span or (buf.data_ptr(), buf.data_ptr() + nbytes)
+    wins = probe_windows(buf.data_ptr(), nbytes, lo, hi)
+    assert wins is not None and nbytes > 0
+    base, npg, win0, win1 = wins
+    assert npass + 1 <= MAX_LAUNCHES
+    dev = buf.device
+    lat = torch.zeros(PROBERS * npg * NGRAN + PROBERS, dtype=torch.int32, device=dev)
+    current = torch.cuda.current_stream(dev)
+    _drain_dirty_lines(dev)
+    stream = current
+    est = []
+    rotations = []
+    # Launch 0 is a discarded warm-up: the first loads after an idle GPU read
+    # slow on either domain.
+    for line in range(MAX_LAUNCHES):
+        stream.wait_stream(current)
+        _run_compiled(
+            _launch_probe,
+            base,
+            ptr_arg(lat),
+            npg,
+            line,
+            win0,
+            win1,
+            fx.Stream(stream),
+        )
+        current.wait_stream(stream)
+        h = lat.cpu().numpy()
+        t = h[: PROBERS * npg * NGRAN].reshape(PROBERS, npg, NGRAN)
+        odd_fast = np.median(t[:, :, _PAR == 1], 2) < np.median(t[:, :, _PAR == 0], 2)
+        c = int(h[-PROBERS])
+        rot = _rotation(odd_fast)
+        rotations.append(rot)
+        if rot != c & 3 or (h[-PROBERS:] != c).any():
+            # Another stream is the only handle on which pipe the next launch takes.
+            stream = torch.cuda.Stream(dev)
+            continue
+        if line == 0:
+            continue
+        # Odd granules are homed on 1 ^ phase: fast iff that is the prober's domain.
+        est.append(_ROT[c][:, None] ^ odd_fast.astype(np.int64))
+        if len(est) == npass:
+            break
+    if len(est) < npass:
+        return None, npg, np.full(PROBERS, len(est) / npass), rotations
+    est = np.stack(est)
+    votes = est.sum((0, 1))
+    n = npass * PROBERS
+    phase = (2 * votes > n).astype(np.uint8)
+    weak = int((np.abs(2 * votes - n) * 2 < n).sum())
+    agree = (est == phase[None, None, :]).mean((0, 2))
+    if agree.min() < MIN_CLASS_AGREE:
+        return None, weak, agree, rotations
+    # A window's a20 flips its granules' homes, which the votes read as phase.
+    phase[0] ^= (win0 >> 20) & 1
+    phase[-1] ^= (win1 >> 20) & 1 if npg > 1 else 0
+    return phase, weak, agree, rotations

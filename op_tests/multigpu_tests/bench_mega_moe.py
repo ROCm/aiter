@@ -97,7 +97,7 @@ from aiter import (
 from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight_iod, shuffle_weight
 from aiter.utility import fp4_utils
 
 try:
@@ -129,6 +129,7 @@ _DEFAULT_SCALE_INIT = "constant"
 # and where rank 0 of the profiling pass left its kernel tables.
 _PASS_ENV = "_BENCH_MEGA_MOE_PASS"
 _PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
+_PROF_FLUSH_S = float(os.environ.get("BENCH_MEGA_MOE_PROF_FLUSH_S", "1.0"))
 
 
 def _import_mori_comm():
@@ -283,6 +284,8 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         gate_up=True,
     )
     w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
+    moe_shuffle_weight_iod(w1_a, w1_ss, n_experts, gate_up=True)
+    moe_shuffle_weight_iod(w2_a, w2_ss, n_experts)
     if spec["key"] == "a4w4_mxfp4":
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)
@@ -866,6 +869,9 @@ class DeviceMoEPipeline:
             for _ in range(prof_replays):
                 self.graph.replay()
             torch.cuda.synchronize()
+            # Kineto's roctracer backend segfaults in processActivities when
+            # the trace stops while its buffer thread still delivers records.
+            time.sleep(_PROF_FLUSH_S)
         self.comm.barrier()
         self._prof = prof
         return sum(_event_device_us(e) for e in prof.key_averages())

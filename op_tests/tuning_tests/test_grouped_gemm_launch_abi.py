@@ -33,6 +33,7 @@ _ADDRESS_ARGS = (
     "arg_bias",
     "arg_quant_scale",
     "arg_ep_row_map",
+    "arg_loc_phase",
 )
 
 

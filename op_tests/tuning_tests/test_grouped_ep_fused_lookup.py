@@ -234,6 +234,10 @@ class GroupedNonEpTokenFallbackTest(unittest.TestCase):
                 self.assertIs(self.lookup(32768, topk=topk), plain)
                 self.assertIs(self.lookup(32768, topk=topk, ep_fused=True), fused)
 
+    def test_plain_row_is_fused_fallback(self):
+        plain = self.add_row(8192, topk="-1", ep_fused="0")
+        self.assertIs(self.lookup(8192, topk=-1, ep_fused=True), plain)
+
     def test_ep_fallback_keeps_topk_and_model_separate(self):
         ep = self.add_row(16384, topk="-1")
         self.add_row(16384, model_dim="7168")

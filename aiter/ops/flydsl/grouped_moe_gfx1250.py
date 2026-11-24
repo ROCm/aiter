@@ -209,6 +209,10 @@ def _find_grouped_config(
             if k == "token" or (k == "cu_num" and not require_cu_num):
                 continue
             cell = _cell(row, k)
+            # A plain EP row is also a safe fallback for fused EP. A row tuned
+            # with fused scatter remains specific to that path and wins below.
+            if k == "ep_fused" and cell == "0" and v == "1":
+                continue
             if cell and cell != v:
                 return False
         token = _cell(row, "token")
@@ -227,13 +231,17 @@ def _find_grouped_config(
         # Cap lookup at the largest compatible tuned token, not gaps.
         keys["token"] = str(max_token)
         matches = _find_matches()
-    # A row that names ep_fused explicitly was tuned for that path, so it wins
-    # over an otherwise equal row that serves both. Measuring the fused path
-    # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
-    # must use the multi-GPU benchmark.
-    ep_specific = [row for row in matches if _cell(row, "ep_fused")]
+    # Prefer an exact path-specific row over a compatible fallback. Fused EP
+    # may reuse a plain row when no fused row exists; a blank row is generic.
+    ep_specific = [
+        row for row in matches if _cell(row, "ep_fused") == keys["ep_fused"]
+    ]
     if ep_specific:
         matches = ep_specific
+    elif ep_fused:
+        plain_fallback = [row for row in matches if _cell(row, "ep_fused") == "0"]
+        if plain_fallback:
+            matches = plain_fallback
     if not matches:
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -2095,6 +2103,25 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A weight placed by moe_shuffle_weight_iod is readable only by its
+        # layout tiling and the one with tile_n halved, four waves, two waves
+        # per TDM tensor; each GEMM keeps the tuned tile_n when it is one of
+        # them, and the tuned four-wave grid and cluster for the tuned tile,
+        # else 1 x 4 waves and no cluster.
+        from .iod_locality import pin_tile
+
+        for _w, _sfx in ((w1, ""), (w2, "2")):
+            _tile = pin_tile(_w, _tdm_kw.get(f"tile_n{_sfx}"))
+            if _tile is None:
+                continue
+            _grid = (_tdm_kw.get(f"m_warp{_sfx}"), _tdm_kw.get(f"n_warp{_sfx}"))
+            _tuned = (_tdm_kw.get(f"tile_n{_sfx}"), _tdm_kw.get(f"tile_k{_sfx}"))
+            if _tile != _tuned or None in _grid or _grid[0] * _grid[1] != 4:
+                _grid = (1, 4)
+                _tdm_kw[f"cluster_m{_sfx}"] = _tdm_kw[f"cluster_n{_sfx}"] = 1
+            _tdm_kw[f"tile_n{_sfx}"], _tdm_kw[f"tile_k{_sfx}"] = _tile
+            _tdm_kw[f"m_warp{_sfx}"], _tdm_kw[f"n_warp{_sfx}"] = _grid
+            _tdm_kw[f"waves_per_tensor_tdm{_sfx}"] = 2
         # A tile from the CSV row or an AITER_TDM_* override must fit as given;
         # only the built-in default may be narrowed (see _grouped_a8w4_tdm_moe).
         _tdm_kw["tiles_configured"] = any(
