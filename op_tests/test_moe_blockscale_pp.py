@@ -125,11 +125,12 @@ def test_moe_blockscale(tokens, topk, swiglu_limit, routing):
         x, ids, tw, w13s, e13, w2s, e2, out=out, swiglu_limit=swiglu_limit
     )
     if swiglu_limit == 0 and routing == "random":
-        # fused_moe's per_1x128 path has no SwiGLU limit argument and is the
-        # current AITER baseline only for the plain routing.
+        # What fused_moe's per_1x128 dispatch runs for this shape: the
+        # flydsl_bspp backend from the T=4096 bucket up (tuned rows), CK / asm
+        # below. Timed for the plain routing only.
         w13s.is_shuffled = w2s.is_shuffled = True
         out_aiter = torch.empty_like(x)
-        candidates["aiter_per_1x128"] = lambda: fused_moe(
+        candidates["fused_moe"] = lambda: fused_moe(
             x,
             w13s,
             w2s,
@@ -203,6 +204,86 @@ def test_moe_blockscale_graph(tokens, topk):
     return {"gfx": get_gfx_runtime(), "flydsl_pp err": max(errs)}
 
 
+@benchmark()
+def test_moe_blockscale_dispatch(tokens, topk, swiglu_limit):
+    """fused_moe reaches the FlyDSL backend through an ``impl__flydsl_bspp__default`` row.
+
+    The tuned table is injected (one row for this shape), and the registered
+    entry is wrapped to count its calls; the result must match the reference.
+    """
+    import os
+    import tempfile
+
+    import aiter.fused_moe as fm
+    import aiter.ops.flydsl.moe_blockscale_pp as bspp
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    E = ROUTED_EXPERTS + int(topk == 9)
+    w13, s13, w2, s2 = weights(E, 1024, 4096)
+    w13s, w2s = shuffle_weight(w13, (16, 16)), shuffle_weight(w2, (16, 16))
+    w13s.is_shuffled = w2s.is_shuffled = True
+    x, ids, tw = make_routing(tokens, E, topk, seed=7)
+    header = (
+        "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,"
+        "q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,"
+        "us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw,_tag"
+    )
+    row = (
+        f"gfx950,{get_cu_num()},{fm.get_padded_M(tokens)},4096,1024,{E},{topk},"
+        "ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,"
+        "QuantType.per_1x128,1,0,256,0,1.0,impl__flydsl_bspp__default,0.0%,0.0,,0.0%,"
+        "1.0,0,0,0,0,0,"
+    )
+    calls = []
+    real = bspp.run_moe_bs_pp_impl
+
+    def counting(request, config):
+        calls.append(config)
+        return real(request, config)
+
+    with tempfile.NamedTemporaryFile("w", suffix="_tuned_fmoe.csv", delete=False) as f:
+        f.write(header + "\n" + row + "\n")
+    saved_env = os.environ.get("AITER_CONFIG_FMOE")
+    try:
+        os.environ["AITER_CONFIG_FMOE"] = f.name
+        bspp.run_moe_bs_pp_impl = counting
+        type(AITER_CONFIGS).get_config_file.cache_clear()
+        fm.cfg_2stages = None
+        fm.get_2stage_cfgs.cache_clear()
+        out = fm.fused_moe(
+            x,
+            w13s,
+            w2s,
+            tw,
+            ids,
+            activation=aiter.ActivationType.Silu,
+            quant_type=aiter.QuantType.per_1x128,
+            w1_scale=s13,
+            w2_scale=s2,
+            dtype=dtypes.bf16,
+            swiglu_limit=swiglu_limit or None,
+        )
+    finally:
+        bspp.run_moe_bs_pp_impl = real
+        if saved_env is None:
+            os.environ.pop("AITER_CONFIG_FMOE", None)
+        else:
+            os.environ["AITER_CONFIG_FMOE"] = saved_env
+        type(AITER_CONFIGS).get_config_file.cache_clear()
+        fm.cfg_2stages = None
+        fm.get_2stage_cfgs.cache_clear()
+        os.unlink(f.name)
+    assert calls == ["default"], f"fused_moe did not dispatch to flydsl_bspp: {calls}"
+    rows = torch.linspace(0, tokens - 1, min(tokens, 256)).long()
+    ref = run_torch(
+        x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], swiglu_limit
+    )
+    err = rel_l2(out[rows], ref)
+    assert err < TOL, f"fused_moe -> flydsl_bspp: rel L2 {err:.4f}"
+    return {"gfx": get_gfx_runtime(), "dispatched": calls[0], "err": err}
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -233,6 +314,16 @@ def main():
         df.append(test_moe_blockscale(tokens, topk, limit, routing))
     aiter.logger.info(
         "moe_blockscale summary (markdown):\n%s",
+        pd.DataFrame(df).to_markdown(index=False),
+    )
+    df = [
+        test_moe_blockscale_dispatch(t, k, limit)
+        for k in args.topk
+        for t in (4096,)
+        for limit in (0.0, 1.0)
+    ]
+    aiter.logger.info(
+        "moe_blockscale fused_moe dispatch (markdown):\n%s",
         pd.DataFrame(df).to_markdown(index=False),
     )
     df = [test_moe_blockscale_graph(t, k) for k in args.topk for t in (128, 4096)]

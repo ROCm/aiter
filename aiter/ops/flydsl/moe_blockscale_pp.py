@@ -12,6 +12,7 @@ exponent bytes, which is lossless for power-of-two fp32 scales
 from __future__ import annotations
 
 import functools
+import weakref
 
 import torch
 from torch import Tensor
@@ -243,3 +244,96 @@ def moe_bs_forward(
         streaming_loads=slots.numel() * slots.element_size() > (280 << 20),
     )
     return out
+
+
+# id(scale) -> (weak reference to it, its _version, e8m0 bytes). Keyed by id:
+# a WeakKeyDictionary compares keys with ==, which tensors do elementwise.
+_E8M0_CACHE: dict[int, tuple[weakref.ref, int, Tensor]] = {}
+
+
+def _e8m0_cached(scale: Tensor) -> Tensor:
+    """E8M0 bytes of power-of-two fp32 block scales, converted once per tensor version.
+
+    Outside graph capture the first conversion checks that every scale is a
+    power of two; a warm-up call before capture fills the cache.
+    """
+    if scale.dtype == torch.uint8:
+        return scale
+    hit = _E8M0_CACHE.get(id(scale))
+    if hit is not None and hit[0]() is scale and hit[1] == scale._version:
+        return hit[2]
+    if torch.cuda.is_current_stream_capturing():
+        bits = scale.float().contiguous().view(torch.int32)
+        e8m0 = ((bits >> 23) & 0xFF).to(torch.uint8)
+    else:
+        e8m0 = e8m0_from_pow2(scale)
+    key = id(scale)
+    _E8M0_CACHE[key] = (
+        weakref.ref(scale, lambda _, key=key: _E8M0_CACHE.pop(key, None)),
+        scale._version,
+        e8m0,
+    )
+    return e8m0
+
+
+def run_moe_bs_pp_impl(request, config_string: str) -> Tensor:
+    """``fused_moe`` whole-forward backend for ``impl__flydsl_bspp__default`` tuned rows.
+
+    gfx950 per_1x128 block-FP8 MoE with power-of-two scales: fp8 w1
+    ``[E, 2I, D]`` (gate rows, then up rows) and w2 ``[E, D, I]`` in
+    ``shuffle_weight(w, (16, 16))`` layout marked ``is_shuffled``, fp32
+    ``[E, N / 128, K / 128]`` block scales, bf16 activations, SiLU with an
+    optional ``swiglu_limit``. Anything else raises NotImplementedError.
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if config_string != "default":
+        raise NotImplementedError(f"flydsl_bspp: unknown config {config_string!r}")
+    gate_mode = getattr(request.gate_mode, "value", request.gate_mode)
+    w1, w2 = request.w1, request.w2
+    unsupported = None
+    if get_gfx_runtime() != "gfx950":
+        unsupported = f"arch {get_gfx_runtime()}"
+    elif QuantType(request.quant_type) != QuantType.per_1x128:
+        unsupported = f"quant type {request.quant_type}"
+    elif ActivationType(request.activation) != ActivationType.Silu:
+        unsupported = f"activation {request.activation}"
+    elif w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        unsupported = "weights other than fp8 e4m3"
+    elif not (getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
+        unsupported = "weights not marked is_shuffled"
+    elif w1.shape[1] != 2 * w2.shape[2] or w1.shape[2] != w2.shape[1]:
+        unsupported = f"weight shapes {tuple(w1.shape)} / {tuple(w2.shape)}"
+    elif request.expert_mask is not None:
+        unsupported = "expert parallelism (expert_mask)"
+    elif request.bias1 is not None or request.bias2 is not None:
+        unsupported = "per-expert bias"
+    elif request.doweight_stage1:
+        unsupported = "doweight_stage1=True"
+    elif request.a1_scale is not None or request.a2_scale is not None:
+        unsupported = "prequantized activations"
+    elif request.hidden_pad or request.intermediate_pad:
+        unsupported = "hidden/intermediate padding"
+    elif gate_mode not in (None, "separated"):
+        unsupported = f"gate mode {gate_mode!r}"
+    elif request.hidden_states.dtype != torch.bfloat16 or request.dtype not in (
+        None,
+        torch.bfloat16,
+    ):
+        unsupported = "activations / output other than bf16"
+    elif request.ksplit:
+        unsupported = "split-K"
+    if unsupported is not None:
+        raise NotImplementedError(f"flydsl_bspp whole-forward backend: {unsupported}")
+    limit = request.swiglu_limit
+    return moe_bs_forward(
+        request.hidden_states,
+        request.topk_ids,
+        request.topk_weight,
+        w1,
+        _e8m0_cached(request.w1_scale),
+        w2,
+        _e8m0_cached(request.w2_scale),
+        swiglu_limit=float(limit) if limit else 0.0,
+    )
