@@ -160,6 +160,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     innermost 32 FP4 values packed into 16 bytes.
     Eligible EP scatter overlap uses three buffers and defaults zero workers
     to 256; positive worker counts keep the usual cluster-aligned rounding.
+    AITER_FLYDSL_EP_SCATTER_OVERLAP=0 disables overlap for tuning comparisons.
     """
     if quant_out_preshuffled is None:
         quant_out_preshuffled = a_preshuffled
@@ -260,7 +261,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         "AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue
     )
     enable_ep_scatter = stage2_scatter is not None
-    if ep_scatter_common.can_overlap_scatter(
+    ep_scatter_overlap = _select_bool_env("AITER_FLYDSL_EP_SCATTER_OVERLAP", 1)
+    if ep_scatter_overlap and ep_scatter_common.can_overlap_scatter(
         enable_ep_scatter=enable_ep_scatter,
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_quant_bits=stage2_scatter.combine_quant_bits if enable_ep_scatter else 0,
@@ -417,6 +419,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         ptr_arg(out if loc_phase is None else loc_phase, fx.Int32),
         loc_group or 1,
         int(quant_out_preshuffled),
+        ep_scatter_overlap,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -426,6 +429,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             layout_spec,
             loc_group,
             int(quant_out_preshuffled),
+            ep_scatter_overlap,
         ),
     )
     return out
