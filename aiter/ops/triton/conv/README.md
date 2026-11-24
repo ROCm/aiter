@@ -65,6 +65,25 @@ y = conv2d(
 )
 ```
 
+### Grouped and depthwise Conv2D
+
+`conv2d`, `conv2d_nchw`, and `conv2d_nhwc` accept the keyword `groups` (default 1).
+It must be a positive integer that divides both channel counts.
+Weights have shape `(Cout, Cin // groups, R, S)`.
+In this example each group reads two input channels and produces three output channels.
+
+```python
+import torch
+from aiter.ops.triton.conv.conv2d import conv2d
+
+x = torch.randn(1, 8, 16, 16, device="cuda", dtype=torch.float16)
+w = torch.randn(12, 2, 3, 3, device=x.device, dtype=x.dtype)
+y = conv2d(x, w, padding=1, groups=4)
+```
+
+For depthwise convolution, set `groups=Cin`. Each input channel then uses
+`Cout // Cin` filters, each with one input channel.
+
 ### Padding modes
 
 All routed and specialized Conv2D and Conv3D APIs accept `padding_mode="zeros"` as a
@@ -141,7 +160,8 @@ packs and filter transforms are version-aware LRU cached.
 
 ### Conv2D routing
 
-A shape-driven router picks one of six kernel families:
+Calls with `groups > 1` use the general kernel for every filter size.
+For dense convolution (`groups=1`), the router selects a kernel by shape.
 
 | Family | When it runs |
 |---|---|
@@ -167,9 +187,7 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 ## Constraints
 
-- The Conv2D and Conv3D routers support dense convolution (`groups=1`).
-  For grouped or depthwise Conv2D, call `conv2d_general` with `groups=G`
-  and a weight of shape `(Cout, Cin // G, R, S)`.
+- The Conv3D router supports dense convolution (`groups=1`).
 - Per-axis pad amounts may differ, for example `(0, 2)` for Conv2D or
   `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.

@@ -204,6 +204,43 @@ def test_conv2d_general_group_isolation(cin, cout, groups, layout, dtype):
     ), f"expected {layout} output, got strides={actual.stride()}"
 
 
+@pytest.mark.parametrize(
+    "layout,dtype,groups,kernel_size,dilation",
+    [
+        pytest.param("nchw", torch.float16, 2, 1, 1, id="grouped-1x1"),
+        pytest.param("nhwc", torch.bfloat16, 4, 3, 2, id="depthwise-3x3"),
+    ],
+)
+def test_conv2d_routes_grouped_filters(layout, dtype, groups, kernel_size, dilation):
+    torch.manual_seed(0)
+    x = torch.randint(-3, 4, (2, 4, 7, 9), device="cuda", dtype=dtype)
+    weight = torch.randint(
+        -3, 4, (8, 4 // groups, kernel_size, kernel_size), device="cuda", dtype=dtype
+    )
+    bias = torch.arange(8, device="cuda", dtype=dtype)
+
+    actual = conv2d_module.conv2d(
+        x, weight, bias, 2, 1, dilation, "relu", layout, "reflect", groups=groups
+    )
+    padded = F.pad(x.float(), (1, 1, 1, 1), mode="reflect")
+    expected = F.conv2d(
+        padded, weight.float(), bias.float(), stride=2, dilation=dilation, groups=groups
+    ).relu()
+
+    torch.testing.assert_close(actual, expected.to(dtype), rtol=0, atol=0)
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected {layout} output, got strides={actual.stride()}"
+
+
+def test_conv2d_rejects_boolean_groups_on_dense_route():
+    x = torch.empty(1, 4, 3, 3, device="cuda", dtype=torch.float16)
+    weight = torch.empty(8, 4, 1, 1, device="cuda", dtype=x.dtype)
+    with pytest.raises(ValueError, match="groups must be a positive integer"):
+        conv2d_module.conv2d(x, weight, groups=True)
+
+
 def test_conv2d_general_grouped_zero_input_channels():
     x = torch.empty(1, 0, 5, 7, device="cuda", dtype=torch.float16)
     weight = torch.empty(8, 0, 3, 3, device="cuda", dtype=x.dtype)

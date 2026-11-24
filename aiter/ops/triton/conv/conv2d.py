@@ -143,7 +143,11 @@ def _resolve_route(
     K_out,
     layout,
     padding=(0, 0),
+    *,
+    groups=1,
 ):
+    if groups > 1:
+        return Route.GENERAL
     if _is_1x1_conv(R, S, dilation):
         return Route.ONE_X_ONE
     if _is_3x3_conv(R, S):
@@ -179,6 +183,8 @@ def conv2d(
     activation="none",
     layout="nchw",
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
     ``torch.nn.functional.conv2d`` (no backward).
@@ -194,7 +200,9 @@ def conv2d(
 
     Notes
     -----
-    - This router supports dense convolution. Use ``conv2d_general`` for groups > 1.
+    - ``groups`` must be a positive integer that divides both channel counts.
+      Weights have shape ``(Cout, Cin // groups, R, S)``. Set ``groups=Cin``
+      for depthwise convolution.
     - ``padding_mode`` supports zeros, reflect, replicate, and circular.
       Nonzero modes explicitly pad once before routing; convolution receives
       the padded input and effective padding ``(0, 0)``.
@@ -210,7 +218,7 @@ def conv2d(
 
     _LOGGER.get_logger().info(
         "CONV2D: x=%s w=%s stride=%s padding=%s padding_mode=%s dilation=%s "
-        "layout=%s dtype=%s bias=%s act=%s",
+        "layout=%s dtype=%s bias=%s act=%s groups=%s",
         tuple(x.shape),
         tuple(w_oihw.shape),
         stride,
@@ -221,6 +229,7 @@ def conv2d(
         x.dtype,
         "yes" if bias is not None else "no",
         activation,
+        groups,
     )
 
     if layout == "nhwc":
@@ -233,6 +242,7 @@ def conv2d(
             dilation,
             activation,
             padding_mode=padding_mode,
+            groups=groups,
         )
     else:
         return conv2d_nchw(
@@ -244,6 +254,7 @@ def conv2d(
             dilation,
             activation,
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 
@@ -519,12 +530,14 @@ def _route_and_run(
     layout,
     *,
     padding_mode="zeros",
+    groups=1,
 ):
     """Resolve and execute one route, including required input preparation."""
     x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
-    x = _ensure_layout(x, layout)
     N, C, H, W_in = x.shape
-    K_out, _, R, S = w_oihw.shape
+    K_out, Cw, R, S = w_oihw.shape
+    groups = _validate_conv_groups(groups, C, K_out, Cw, bias)
+    x = _ensure_layout(x, layout)
     route = _resolve_route(
         R,
         S,
@@ -537,6 +550,7 @@ def _route_and_run(
         K_out,
         layout,
         padding=padding,
+        groups=groups,
     )
 
     if route == Route.ONE_X_ONE:
@@ -607,6 +621,7 @@ def _route_and_run(
         activation,
         block_k,
         layout=layout,
+        groups=groups,
     )
 
 
@@ -620,11 +635,14 @@ def conv2d_nchw(
     activation="none",
     block_k=BLOCK_K,
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Route NCHW conv2d with zeros, reflect, replicate, or circular padding.
 
     Nonzero modes pre-pad once before routing and activation packing.
     Preparation and convolution run on the input tensor's device.
+    Grouped weights have shape (Cout, Cin // groups, R, S).
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
@@ -640,6 +658,7 @@ def conv2d_nchw(
             block_k,
             layout="nchw",
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 
@@ -653,6 +672,8 @@ def conv2d_nhwc(
     activation="none",
     block_k=BLOCK_K,
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Conv2d with NHWC (channels-last) input and output.
 
@@ -662,6 +683,7 @@ def conv2d_nhwc(
     Supports zeros, reflect, replicate, and circular padding; nonzero modes
     pre-pad once before routing and activation packing. Preparation and
     convolution run on the input tensor's device.
+    Grouped weights have shape (Cout, Cin // groups, R, S).
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
@@ -677,6 +699,7 @@ def conv2d_nhwc(
             block_k,
             layout="nhwc",
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 
