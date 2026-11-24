@@ -71,6 +71,20 @@ def st_sys_wt(base, off, v):
     buffer_store(v, rsrc, fx.Int32(off), cache_modifier=CPOL_SYS, offset_is_bytes=True)
 
 
+def sys_rsrc(base):
+    """The buffer descriptor of a run of st_sys_wt_r stores at the wave-uniform base. Made
+    once for the run: st_sys_wt remakes it per store, and rewriting its SGPRs (or exec: a
+    lane mask, or a store's data VGPRs) between two stores waits for every store in flight
+    (s_wait_xcnt): over xGMI ~0.1 us each with a few in flight, ~1 us each with ~200 (the
+    sh8 AG row: 127 us)."""
+    return create_buffer_resource_from_addr(uni64(base).ir_value())
+
+
+def st_sys_wt_r(rsrc, off, v):
+    """st_sys_wt with the descriptor of sys_rsrc."""
+    buffer_store(v, rsrc, fx.Int32(off), cache_modifier=CPOL_SYS, offset_is_bytes=True)
+
+
 def uni64(v):
     v = fx.Int64(v)
     lo = uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
@@ -125,6 +139,45 @@ def ld_agent(addr):
     return fx.Int32(
         fx.generic_load(gptr(addr), memory_order=MONO, syncscope=AGENT, volatile=True)
     )
+
+
+# Kernel code prefetch (ROCm/aiter#7827, #7921): a launch preloads only the first ~32 KiB
+# of a kernel; the rest is fetched line by line when reached, and another large kernel
+# can evict it between launches. s_prefetch_inst is a no-op unless MODE.SCALAR_PREFETCH_EN
+# is set, which a wave only starts with when it is the first of its program on the WGP.
+KERNEL_PREFETCH_MAX_BYTES = 56 * 1024  # one s_prefetch_inst: <= 32 lines of 128 B; 64 KB I$
+_HWREG_MODE_SCALAR_PREFETCH_EN = 1 | (24 << 6)  # hwreg(HW_REG_MODE, 24, 1)
+
+
+def prefetch_kernel_code(num_waves, func_index=0):
+    """Prefetch this kernel's code (its first 56 KiB) into the instruction cache, each wave
+    every num_waves-th 4 KiB. Raw ops: FlyDSL has no s_setreg / s_prefetch_inst / code-size
+    wrapper (the function's end is only known to the assembler, as .Lfunc_end<index>)."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    def asm(res, text):
+        return _llvm.InlineAsmOp(res=res, operands_=[], asm_string=text, constraints="=s",
+                                 has_side_effects=True, is_align_stack=False).res
+
+    _llvm.call_intrinsic(None, "llvm.amdgcn.s.setreg",
+                         [fx.Int32(_HWREG_MODE_SCALAR_PREFETCH_EN).ir_value(),
+                          fx.Int32(1).ir_value()], [], [])
+    label = f".Lkprefetch{func_index}"
+    start = fx.Int64(asm(T.i64, f"{label}:\ns_getpc_b64 $0")) - 4
+    size = fx.Int32(asm(T.i32, f"s_mov_b32 $0, .Lfunc_end{func_index}-{label}"))
+    cap = fx.Int32(KERNEL_PREFETCH_MAX_BYTES)
+    span = (size < cap).select(size, cap)
+    last_line = ((span - 1) >> 7) << 7
+    wave = fx.Int32(rocdl.wave_id())
+    chunks = KERNEL_PREFETCH_MAX_BYTES >> 12
+    for i in range_constexpr(-(-chunks // num_waves)):
+        off = (fx.Int32(i * num_waves) + wave) << 12
+        off = (off < last_line).select(off, last_line)  # past the end: the last line again
+        lines = (span - off + 127) >> 7
+        lines = (lines < 32).select(lines, fx.Int32(32)) - 1
+        ptr = _llvm.IntToPtrOp(_llvm.PointerType.get(address_space=1),
+                               (start + fx.Int64(off)).ir_value()).result
+        _llvm.call_intrinsic(None, "llvm.amdgcn.s.prefetch.inst.p1", [ptr, lines.ir_value()], [], [])
 
 
 def ld_sys64(addr):
@@ -379,6 +432,36 @@ def bf16x8_f32(v4):
         out.append((w << i32(16)).bitcast(fx.Float32))
         out.append((w & i32(-65536)).bitcast(fx.Float32))
     return out
+
+
+def quant_fp8_block32(v4s):
+    """One 32-element MX block, held as four 16 B bf16 loads -> (32 B of MXFP8 (e4m3) as two
+    4 x i32, the e8m0 byte as i32). Scale RoundUp, as the MXFP8 activation quant of the
+    grouped path (quant_utils.emit_amax_e8m0_native_scale + v_cvt_scalef32_pk8_fp8_f32)."""
+    from ..quant_utils import _D
+
+    vals = []
+    for v in v4s:
+        vals += bf16x8_f32(v)
+    level = [abs(fx.Float32(v)) for v in vals]
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level), 3):
+            acc = level[i]
+            for v in level[i + 1 : i + 3]:
+                acc = fx.maxnumf(acc, v)
+            nxt.append(acc)
+        level = nxt
+    amax = fx.minnumf(level[0], fx.Float32(3.4028234663852886e38))
+    e8 = fx.Int32(emit_mx_e8m0_scale(amax, dtype=_D.FP8_E4M3))
+    scale = (e8 << i32(23)).bitcast(fx.Float32)
+    words = []
+    for g in range_constexpr(4):
+        v8 = fx.Vector.from_elements(vals[8 * g : 8 * g + 8], fx.Float32)
+        w2 = fx.Vector(rocdl.cvt_scalef32_pk8_fp8_f32(T.vec(2, T.i32), v8.ir_value(), scale.ir_value()))
+        words += [fx.Int32(w2[0]), fx.Int32(w2[1])]
+    return (fx.Vector.from_elements(words[:4], fx.Int32),
+            fx.Vector.from_elements(words[4:], fx.Int32)), e8
 
 
 def quant_fp4_block32(v4s):

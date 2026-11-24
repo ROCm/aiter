@@ -232,6 +232,8 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    w_is_fp8=0,
+    single_item=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -262,7 +264,10 @@ def build_gemm_a8w4_tdm_task(
       tile's expert and its valid rows (``min(tile_m, expert end - blk_m)``).
       Replaces the psum reads (has_work, expert lookup, mn_oob), i.e. three
       dependent rounds of global loads per tile; the caller only names
-      populated tiles.
+      populated tiles. A third entry is a row offset added to the tile's
+      first row for the output store only (i32): the fused shared expert reads
+      per-token operands, row = token, and writes its stage-2 rows where the
+      contiguous layout holds that expert.
     - ``item_hooks`` (S1F): a one-element list holding a dict of callables the
       body calls on every wave: ``drain_start`` after the steady k-loop,
       before the drain fences; ``epi_start`` after the drain's last fence,
@@ -283,6 +288,14 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
+    - ``w_is_fp8``: the weights (B) are MXFP8 instead of MXFP4 (the fused
+      shared expert): a k128 of one 16-row group is 2048 B in the
+      ``shuffle_weight_gfx1250`` layout, and the WMMA is the 16x16x128
+      f8f6f4 form with an FP8 weight operand. A-side formats, the B-scale
+      layout and the epilogues do not change.
+    - ``single_item`` (inlinable body): the workgroup runs this body once and
+      exits, so the closing barrier that hands the LDS arena to the next work
+      item is dropped.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -311,11 +324,22 @@ def build_gemm_a8w4_tdm_task(
         if INTERLEAVED_LDS_LOAD is None
         else INTERLEAVED_LDS_LOAD
     )
+    assert w_is_fp8 in (0, 1), "w_is_fp8 must be 0 or 1"
+    # The N32 FP4-only WMMA needs both operands in FP4.
+    f4_wmma = bool(a_is_fp4 and not w_is_fp8)
+    assert not (
+        w_is_fp8 and (interleaved_lds_load_on or planar_lds_on)
+    ), "MXFP8 weights use the plain staged LDS layout"
     WMMA_M = 16
-    WMMA_N = 32 if a_is_fp4 else 16
+    WMMA_N = 32 if f4_wmma else 16
     WMMA_K = 128
     WAVE = 32
-    PACK_TK = tile_k // 2
+    # Weight bytes per row per k-tile, and per k128 of one 16-row group.
+    B_ROW_B = tile_k if w_is_fp8 else tile_k // 2
+    B_K128_B = 2048 if w_is_fp8 else 1024
+    # Dwords one lane holds of a weight operand.
+    B_NDW = 16 if (f4_wmma or w_is_fp8) else 8
+    W_ELEM = fx.Float8E4M3FN if w_is_fp8 else fx.Float4E2M1FN
     KWS = tile_k // WMMA_K
     # K may end on half a k128 (K % 128 == 64, e.g. 576 = 4 x 128 + 64): the
     # weights stay unpadded and only the scales are laid out per whole k128.
@@ -370,22 +394,22 @@ def build_gemm_a8w4_tdm_task(
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
-    hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
+    hyper_params = HYPER_PARAMS["a4w4" if f4_wmma else "a8w4"][
         "prefill" if is_prefill else "default"
     ]
     sched_mma_group = hyper_params["mma_group"]
     sched_first_group = hyper_params.get("mma_first_group", sched_mma_group)
     sched_ds_first = hyper_params["ds_first_group"]
-    sched_ds_group = hyper_params["ds_group"] if a_is_fp4 and KWS > 1 else 0
+    sched_ds_group = hyper_params["ds_group"] if f4_wmma and KWS > 1 else 0
     tdm_early_timeout = hyper_params["tdm_early_timeout"]
     ksl0_prefix_mma = hyper_params["ksl0_prefix_mma"]
     ksl0_fence_mma = hyper_params["ksl0_fence_mma"]
     ksl1_prefence_mma = hyper_params["ksl1_prefence_mma"]
     wmma_in_barrier = hyper_params["wmma_in_barrier"]
     # Resolve applicability here; k_step validates the actual WMMA ranges.
-    ksl0_prefix_mma = ksl0_prefix_mma if a_is_fp4 and KWS > 1 else 0
-    ksl1_prefence_mma = ksl1_prefence_mma if a_is_fp4 and KWS == 2 else 0
-    wmma_in_barrier = wmma_in_barrier if a_is_fp4 and KWS == 2 else 0
+    ksl0_prefix_mma = ksl0_prefix_mma if f4_wmma and KWS > 1 else 0
+    ksl1_prefence_mma = ksl1_prefence_mma if f4_wmma and KWS == 2 else 0
+    wmma_in_barrier = wmma_in_barrier if f4_wmma and KWS == 2 else 0
     if not is_prefill:
         # The shared defaults also serve small tiles with fewer accumulators.
         prefix_capacity = ((wmma_m_rep + 1) // 2) * wmma_n_rep
@@ -397,7 +421,7 @@ def build_gemm_a8w4_tdm_task(
     # Group two N fragments and four M fragments into a 64x64 output block.
     wmma_2x4 = bool(
         hyper_params["wmma_2x4"]
-        and a_is_fp4
+        and f4_wmma
         and tile_m == tile_n == tile_k == 256
         and m_warp == n_warp == 2
     )
@@ -445,7 +469,7 @@ def build_gemm_a8w4_tdm_task(
 
     LDS_PAD_A = 0 if a_preshuffled else 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
-    B_LDS_ROW = PACK_TK * 16
+    B_LDS_ROW = B_ROW_B * 16
     STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
     STAGE_B = ceildiv((tile_n // 16) * B_LDS_ROW, 16) * 16
 
@@ -525,8 +549,8 @@ def build_gemm_a8w4_tdm_task(
     # accumulators (one f32 dword4 per lane per chunk) for the final reduction.
     K_PARTIAL_B = (
         ((tile_m // m_warp) // 16)
-        * ((tile_n // n_warp) // (32 if a_is_fp4 else 16))
-        * ((32 if a_is_fp4 else 16) // 2)
+        * ((tile_n // n_warp) // WMMA_N)
+        * (WMMA_N // 2)
         * 4
         * num_waves
         * WAVE
@@ -558,7 +582,7 @@ def build_gemm_a8w4_tdm_task(
             output_n_rep % WN_PER_MX_BLOCK == 0
         ), "stage1 quant requires complete four-WMMA N groups"
 
-    _afp = "fp4" if a_is_fp4 else "fp8"
+    _afp = ("fp4" if a_is_fp4 else "fp8") + ("_w8" if w_is_fp8 else "")
     _a_layout = "_apre" if a_preshuffled else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
@@ -591,7 +615,7 @@ def build_gemm_a8w4_tdm_task(
     _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
     _prefence = f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
     _prefence += f"_ksl0tail_{ksl0_fence_mma}"
-    if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
+    if f4_wmma and KWS > 1 and ksl0_prefix_mma:
         _prefence += f"_ksl0prefix{ksl0_prefix_mma}"
     _prefence += "_ab2"
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
@@ -641,7 +665,7 @@ def build_gemm_a8w4_tdm_task(
         schedule_rows: task_index_type,
     ):
         A_KROW = K // A_PACK
-        Kp16 = (K // 2) * 16
+        Kp16 = (K if w_is_fp8 else K // 2) * 16
         # Scale dwords per 32-row B super-row: one per k128, padded K included.
         K4 = K128 * 32
 
@@ -760,6 +784,12 @@ def build_gemm_a8w4_tdm_task(
         SA_GROW = a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K128
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
+        # A ternary: @flyc.jit does not let branch-local names escape.
+        c_outer_off = (
+            blk_m64 + fx.Int64(tile_meta[0][2])
+            if tile_meta is not None and len(tile_meta[0]) > 2
+            else c_outer_off
+        )
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
         # Per-expert A-data OOB: bound to the owning expert's valid-row
@@ -1092,13 +1122,13 @@ def build_gemm_a8w4_tdm_task(
             b_off0,
             Kp16,
             None,
-            PACK_TK * 16,
+            B_LDS_ROW,
             tile_n // 16,
             on_i32=False,
             lds_off=B_LDS_OFF,
             lds_stage=B_LDS_STAGE,
             lds_row=B_LDS_ROW,
-            k_adv=PACK_TK * 16,
+            k_adv=B_LDS_ROW,
             wv=waves[1],
             wg_mask=b_mcast_mask,
             cache_modifier=tdm_b_th,
@@ -1355,13 +1385,24 @@ def build_gemm_a8w4_tdm_task(
             )
 
         def load_b_half(base, half, ksl):
-            off = half * B_LDS_ROW + ksl * 1024
+            off = half * B_LDS_ROW + ksl * B_K128_B
+            if const_expr(w_is_fp8):
+                # Four K32 slabs of 16 FP8 values per lane.
+                v = [
+                    Vec(lds_load_b128(base, fx.Int32(off + 512 * j)))
+                    for j in range_constexpr(4)
+                ]
+                return (
+                    v[0]
+                    .shuffle(v[1], list(range(8)))
+                    .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
+                )
             return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
                 Vec(lds_load_b128(base, fx.Int32(off + 512))), list(range(8))
             )
 
         def load_b(base, wn, ksl):
-            if const_expr(a_is_fp4):
+            if const_expr(f4_wmma):
                 return load_b_half(base, wn * 2, ksl).shuffle(
                     load_b_half(base, wn * 2 + 1, ksl), list(range(16))
                 )
@@ -1389,7 +1430,7 @@ def build_gemm_a8w4_tdm_task(
 
         wmma_atoms = (
             []
-            if a_is_fp4
+            if f4_wmma
             else [
                 [
                     fx.make_mma_atom(
@@ -1397,7 +1438,7 @@ def build_gemm_a8w4_tdm_task(
                             WMMA_M,
                             WMMA_N,
                             WMMA_K,
-                            fx.Float4E2M1FN,
+                            W_ELEM,
                             ACT_ELEM,
                             fx.Float32,
                             opsel_a=sb_sel,
@@ -1489,9 +1530,9 @@ def build_gemm_a8w4_tdm_task(
                 i, wn = mma_order[mma_index]
                 wm = wm_list[i]
                 idx = wm * wmma_n_rep + wn
-                scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                scale_a = sb_k[wn if f4_wmma else wn // 2]
                 scale_b = sa_k[wm // 2]
-                if const_expr(a_is_fp4):
+                if const_expr(f4_wmma):
                     wt_value = wt[wn].load()
                     act_value = act[i].load()
                     mma_result = rocdl.wmma_scale_f32_32x16x128_f4(
@@ -1521,7 +1562,7 @@ def build_gemm_a8w4_tdm_task(
 
         DS_A = 2 if a_is_fp4 else 4
         # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
-        DS_B = 4 if a_is_fp4 else 2
+        DS_B = 4 if (f4_wmma or w_is_fp8) else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
         # Packed scale b32 reads merge pairwise into native ds_load_2addr.
@@ -1550,13 +1591,13 @@ def build_gemm_a8w4_tdm_task(
                 for _ in range_constexpr(wmma_m_rep)
             ]
             b = [
-                fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                fx.make_rmem_tensor(B_NDW, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
             sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
             sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(USE_EXPLICIT_VGPR_PARTITION):
-                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
+                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * B_NDW
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
@@ -1564,7 +1605,7 @@ def build_gemm_a8w4_tdm_task(
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
                     b[wn] = place_vgpr(b[wn], reg)
-                    reg += WMMA_VECTOR_DWORDS
+                    reg += B_NDW
                 assert reg <= 256 + (slot_idx + 1) * 128
                 # Scales remain free in v0-v255.
             return RmemSlot(
@@ -1598,7 +1639,7 @@ def build_gemm_a8w4_tdm_task(
                 ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            if const_expr(a_is_fp4 and interleaved_lds_load):
+            if const_expr(f4_wmma and interleaved_lds_load):
                 # Alternate equal 32-byte A/B chunks. DS_GROUP controls only
                 # scheduling hints; it must not select the load order.
                 a_parts, b_parts = [], []
@@ -2835,7 +2876,7 @@ def build_gemm_a8w4_tdm_task(
                 # Same region as drain_start / epi_start (inside has_work).
                 item_hooks[0]["epi_end"]()
 
-        if const_expr(persistent_workers > 0):
+        if const_expr(persistent_workers > 0 and not single_item):
             if const_expr(raw_drain or defer_c_wait):
                 # LDS hand-off only (S1F: the next item's slot). The output
                 # store no longer reads what the next prologue writes: either

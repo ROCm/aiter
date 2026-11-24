@@ -22,7 +22,9 @@ LINE = 32
 CT_EPOCH = 0
 CT_ERR = 1
 E_MAX = 1024
-LL_TOKENS = 256  # ag_rs: ag_ll / rs_ll up to this many tokens (engine)
+# ag_rs: ag_ll / rs_ll up to this many tokens; AR: rs_ll (push) up to LL_TOKENS / tp tokens
+# (engine; the yred region is sized for it: 2 * LL_TOKENS * (~H + 4 H) bytes). MEGA_LL_TOKENS
+LL_TOKENS = int(__import__("os").environ.get("MEGA_LL_TOKENS", "512"))
 CT_CNT = 8 * LINE  # [par][E] routes per expert
 CT_FILL = CT_CNT + 2 * E_MAX  # [par][E] routes placed per expert
 # Grid sync points (all CTAs arrive once per launch; a set per epoch parity, the
@@ -57,6 +59,8 @@ FLAG_INTS = 8 * LINE
 
 ERR_AG, ERR_RS, ERR_BAR = 1, 2, 4  # grid barrier j (1..4) sets ERR_BAR << (j - 1)
 ERR_DF = 64  # a per-m-tile wait (dataflow) timed out
+# sh8: the shared expert's waits (G1: its rows placed; G2: its m-tile's G1 tiles; RS: its G2 tiles)
+ERR_SH1, ERR_SH2, ERR_SH3 = 8192, 16384, 32768
 # an LL poll (ag_ll / rs_ll) timed out, by site: AG gate, hist ids, placement ids,
 # placement rows, RS weights, Y partials
 ERR_LL_GATE, ERR_LL_HIST, ERR_LL_IDS, ERR_LL_ROWS, ERR_LL_TW, ERR_LL_Y = 128, 256, 512, 1024, 2048, 4096
@@ -81,8 +85,20 @@ def pl_off(cm: int) -> int:
     return q_off(cm) + 2 * LINE
 
 
-def tcnt_ints(cm: int) -> int:
+def def_off(cm: int) -> int:
+    """ovl: [epoch parity] deferred RS unit counts (a line each), then the deferred
+    unit list (2 cm ints: every RS unit fits)"""
     return pl_off(cm) + 2 * E_MAX
+
+
+def pd_off(cm: int) -> int:
+    """[epoch parity] CTAs done placing (df0: RS reads rpos only after every CTA's
+    placement; a line each), after the deferred counts; the deferred list follows"""
+    return def_off(cm) + 2 * LINE
+
+
+def tcnt_ints(cm: int) -> int:
+    return pd_off(cm) + 2 * LINE + 2 * cm
 
 
 @dataclass(frozen=True)
@@ -102,7 +118,8 @@ class GemmCfg:
     ds_first_n: int = -1
     c_sep: int = 0  # output staging in its own LDS region; store not waited per task
     b_th: int = 0  # TDM temporal hint of the B (weight) loads (gemm_tile tdm_b_th)
-    # ug (upstream task builder) only: LDS SoA load interleave, TDM waves per tensor
+    # LDS SoA load interleave (ug: upstream task builder only); waves a tensor's TDM loads
+    # are split over (num_waves_per_tensor_tdm)
     soa: int = 0
     tdm_w: int = 2
 
@@ -163,6 +180,12 @@ class LaunchCfg:
     # ag_rs (with ag_ll): RS partials pushed as LL items too; Y polls them (no RS
     # writeback, drain, signal or wait)
     rs_ll: bool = False
+    # big M: one dynamic queue of G1 / G2 tiles in row-fraction order (an expert's j-th
+    # m-tile before any (j+1)-th) and the RS units of the tokens they complete, so a CU
+    # runs RS (memory) beside GEMM (WMMA); an RS unit whose G2 tiles are not done yet is
+    # deferred to after the queue (no wait inside it). ovl_ru: units a wave takes per item
+    ovl: bool = False
+    ovl_ru: int = 2
     # G1 / G2 tiles from upstream's build_gemm_a8w4_tdm_task (mxfp4_preshuffle_gfx1250_tdm:
     # PR #7726's main loop: strict VGPR placement for 256^3 tiles, 2 WMMA : 3 DS groups,
     # WMMAs around the stage fences, one LDS base per stage) as explicit tiles: this
@@ -170,14 +193,43 @@ class LaunchCfg:
     # waits (a_ready: after the B prologue); needs Ip == I and g1 / g2 tile_m == align_m
     ug: bool = False
     y2_unroll: int = 2  # AR two-step: Y2 (remote pull) units a wave loads at once (2: -1~5%)
+    # routing count (not ag_ll): routes' ids a thread loads at once (1: one load a loop turn,
+    # a latency chain of ~0.45 us a route; Kimi AR 256: 32 routes a thread)
+    hu: int = 8
+    # ag_rs (ag_ll): while the AG is in flight (HBM idle) waves 1.. of every CTA read W1 into
+    # the cache by real loads, wpf load instructions a wave (32 lanes x 64 B lines; a
+    # global_prefetch hint did nothing: 11-14 v6, ROCm/aiter#7345), so G1's first tiles find
+    # it there. wpf_e=0: the W1 of this rank's own routes' experts (certain; small T);
+    # wpf_e=1: of experts 0.. (the first tasks of the static order; when most experts have rows)
+    wpf: int = 0
+    wpf_e: bool = False
+    # MiniMax-M3.1: the last expert (id E - 1, every token's last route) is the shared expert
+    # and runs A8W8: MXFP8 weights (their own tensors) x MXFP8 activations. Its routes keep
+    # their place in the routing (count, slot, rpos, RS); placement quantizes their x rows to
+    # MXFP8 into per-slot buffers (row = slot in the expert), and its tiles are upstream's
+    # body (build_gemm_a8w4_tdm_task: a_is_fp4=0, w_is_fp8=1) on the s1 / s2 shapes, after
+    # the routed tasks of the static order
+    sh8: bool = False
+    # (s1 at 16 / 32 tokens, AR, us: 32x256x128 b2 55.9 / 64.6; b4 49.4 / 59.4; 32x128x128 b6
+    # 46.3 / 58.1; 32x128x256 b3 46.0 / 57.7; 16x256 1x4 b4 48.3 / 61.6; all-fp4: 44.7 / 57.3)
+    s1: GemmCfg = GemmCfg(tile_m=32, tile_n=128, tile_k=256, m_warp=2, n_warp=2, num_buffers=3, b_th=6)
+    s2: GemmCfg = GemmCfg(tile_m=32, tile_n=256, tile_k=128, m_warp=2, n_warp=2, num_buffers=2, b_th=6)
+    # sh8, dynamic queue: the shared tiles' order. 0: n-tile major (an n-tile of every m-tile, then
+    # the next: the A rows are re-read from memory once an n-tile); 1: m-tile major (an m-tile's
+    # n-tiles together: its A rows and the shared weights stay cached)
+    sh_ord: int = 0
+    # sh8, ag_rs from the arena (not LL): the shared stage-1 A is the arena's MXFP8 rows themselves
+    # (a shared route's slot = its token's arena row; every token routes to the shared expert):
+    # placement copies no MXFP8 rows
+    sh_dir: bool = False
 
     @property
     def align_m(self) -> int:
         return max(self.g1.tile_m, self.g2.tile_m)
 
 
-def ll_bytes(H: int, topk: int, tp: int, m: int) -> int:
+def ll_bytes(H: int, topk: int, tp: int, m: int, sh8: bool = False) -> int:
     """yred bytes the LL items of one epoch parity take (ag_ll: AG rows of the tp * m
-    tokens; rs_ll: their RS partials)"""
-    rll = (H + H // 16 + 16 * topk + 127) // 128 * 128
+    tokens; rs_ll: their RS partials). sh8: a row also carries its MXFP8 chunks + scales"""
+    rll = (H + H // 16 + 16 * topk + (2 * H + H // 16 if sh8 else 0) + 127) // 128 * 128
     return tp * m * (rll + 4 * H)

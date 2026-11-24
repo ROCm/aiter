@@ -59,16 +59,22 @@ from .config import (
     LaunchCfg,
     q_off,
     pl_off,
+    def_off,
+    pd_off,
     E_MAX,
     tile_counts_stride,
 )
 from .device import _EXP_NOFENCE
 from .dense_tile import make_dense_task
+from .config import ERR_SH1, ERR_SH2, ERR_SH3
 from .config import DEADLINE, ERR_LL_GATE, ERR_LL_HIST, ERR_LL_IDS, ERR_LL_ROWS, ERR_LL_TW, ERR_LL_Y
-from .device import AGENT, SPIN_SLEEP, gptr, ld_sys64, now
+from .device import AGENT, SPIN_SLEEP, before, gptr, ld_sys64, now, prefetch_kernel_code
 from flydsl.expr import rocdl
 from .device import (
     st_sys_wt,
+    st_sys_wt_r,
+    sys_rsrc,
+    quant_fp8_block32,
     acq_agent,
     acq_sys,
     add_agent,
@@ -266,6 +272,11 @@ def compile_mega_moe_tp_1250(
     MTS = tile_counts_stride(CM_C)  # ints per counter set
     QOFF = q_off(CM_C)  # the task queue counters in tcnt
     PLOFF = pl_off(CM_C)  # per-expert placed counts (df0)
+    DEFOFF = def_off(CM_C)  # ovl: deferred RS unit counts and list
+    PDOFF = pd_off(CM_C)  # df0: CTAs done placing
+    # df0 (no barrier 2): RS reads a route's rpos only once every CTA has placed (a late
+    # CTA's routes would otherwise be read stale, from the last launch: wrong rows)
+    PD = cfg.df0 and not cfg.self_place
 
     def rup(x):
         return (x + i32(AM - 1)) // i32(AM) * i32(AM)
@@ -313,13 +324,51 @@ def compile_mega_moe_tp_1250(
     assert not QP or (cfg.ar and not cfg.local_hist and not QO and not cfg.self_place)
     LL = cfg.ag_ll
     assert not LL or not (cfg.ar or AGS or QO or SP or QP), "ag_ll: the ag_rs AG only"
+    # the shared expert (id E - 1) as A8W8: its tiles are upstream's body on the s1 / s2
+    # shapes; its rows live in per-slot MXFP8 buffers (row = slot in the expert)
+    SH8 = cfg.sh8
+    s1, s2 = cfg.s1, cfg.s2
+    STM = s1.tile_m
+    SHCAP = (mmax * tp + 127) // 128 * 128 + 128  # rows of the shared buffers (engine)
+    AGU = tp if (SH8 and LL) else 1  # AG push units of a row (sh8 + LL: one a rank)
+    # sh_dir: the shared rows stay in the arena (stage 1 reads them there): slot = arena row
+    SHD = cfg.sh_dir
+    assert not SHD or (SH8 and not cfg.ar and not LL and cfg.dyn and mmax % STM == 0), (
+        "sh_dir: sh8 ag_rs from the arena (dynamic queue; a rank's arena rows start an m-tile)")
+    SNT1 = 2 * I // s1.tile_n
+    SNT2 = H // s2.tile_n
+    assert not SH8 or (
+        Ip == I and E >= 2 and s1.tile_m == s2.tile_m and STM % AM == 0
+        and 2 * I % s1.tile_n == 0 and H % s2.tile_n == 0 and not cfg.ovl and not cfg.ug
+        and not cfg.dense and cfg.expert_hint and DF1 and not QO and not SP
+    ), "sh8: unsupported configuration"
+    # sh8 placements: per route (AR + local_hist, ag_ll: RPW 1, static order, df0), per token
+    # (AR q_place: the dynamic queue, barrier 2)
+    assert not SH8 or (
+        ((cfg.ar or LL) and LH and not cfg.dyn and DF0 and RPW == 1 and not QP)
+        or (cfg.ar and QP and cfg.dyn and not DF0 and not LH)
+        or (not cfg.ar and not LL and not AGS and cfg.dyn and not DF0 and not LH)
+    ), "sh8: AR / ag_rs LL static order (local_hist, df0), or the dynamic queue (AR q_place, ag_rs)"
     # LL row of global token t in the yred region: the FP4 chunks (a wave's 16 B chunks c
     # (block b = c // WAVE, NLB(b) lanes) at b * WAVE * 32: (w0, ep, w1, ep) at lane * 16,
     # (w2, ep, w3, ep) NLB(b) * 16 B after (a wave's store: contiguous bytes)), the e8m0
     # words (4 blocks a word), ids, weights
     LLS = 2 * XB + 2 * XS
-    LLU = 4  # routes a thread's hist polls at once
+    LLU = int(os.environ.get("MEGA_LLU", "4"))  # routes a thread's hist polls at once
+    HU = max(1, cfg.hu)  # not LL: routes' ids a thread's hist loads at once
+    # W1 into the cache while the AG is in flight: the waves 1.. of every CTA, WPF loads each
+    # (a load: 32 lanes x one 64 B line); a slot (an own route, or expert s) is W1B bytes
+    WPF = cfg.wpf if LL else 0
+    W1B = Ip * H  # an expert's W1 bytes ([2 Ip, H / 2] fp4x2)
+    assert not WPF or (W1B % (WAVE * 64) == 0 and WPF <= 48)
+    UPE = W1B // (WAVE * 64)  # wave loads an expert's W1 takes
     RSL = cfg.rs_ll
+    IPF = os.environ.get("MEGA_INST_PREFETCH", "1") == "1"  # kernel code prefetch at entry
+    OVL = cfg.ovl
+    RU = cfg.ovl_ru
+    assert not OVL or (cfg.dyn and cfg.df1 and cfg.df2 and not cfg.df0 and not cfg.rs_ll
+                       and not cfg.ag_ll and not cfg.self_place and not cfg.dense
+                       and g1.tile_m == g2.tile_m and cfg.b_first), "ovl: big-M dynamic queue"
     UG = cfg.ug
     assert not UG or (Ip == I and g1.tile_m == g2.tile_m == cfg.align_m and not cfg.dense
                       and not cfg.self_place and not cfg.g2_q8), "ug"
@@ -330,7 +379,12 @@ def compile_mega_moe_tp_1250(
     def NLB(b):
         return min(WAVE, NBLK - b * WAVE)
     LLW = LLS + 8 * TOPK
-    RLL = (LLW + 8 * TOPK + 127) // 128 * 128
+    # sh8: then the row's MXFP8 chunks (a lane's 32 B block: 8 items in 4 stores of 16 B, store
+    # h at h * NLB * 16 + lane * 16 of the wave's block of WAVE * 64 B: contiguous stores) and
+    # their e8m0 words (as the FP4 ones)
+    LL8 = LLW + 8 * TOPK
+    LL8S = LL8 + 2 * H
+    RLL = ((LL8S + 2 * XS if SH8 else LLW + 8 * TOPK) + 127) // 128 * 128
     assert RPW <= WAVE and RPW % CH == 0
     name = (
         f"mega_moe_tp1250_h{H}_i{I}_e{E}_k{TOPK}_tp{tp}_mm{mmax}_{act}_{cfg.path}"
@@ -339,6 +393,12 @@ def compile_mega_moe_tp_1250(
     )
     if g1.b_th or g2.b_th:
         name += f"_th{g1.b_th}x{g2.b_th}"
+    if g1.soa or g2.soa:
+        name += f"_soa{g1.soa}{g2.soa}"
+    if (g1.tdm_w, g2.tdm_w) != (2, 2) and not cfg.ug:
+        name += f"_tw{g1.tdm_w}{g2.tdm_w}"
+    if NW != 4:
+        name += f"_nw{NW}"
     if Ip < I:
         name += f"_ip{Ip}"
     if cfg.dense:
@@ -352,9 +412,25 @@ def compile_mega_moe_tp_1250(
     if cfg.rs_wt:
         name += "_wt"
     if LL:
-        name += "_ll"
+        name += "_ll" + (f"u{LLU}" if LLU != 4 else "")
+    if HU != 1 and not LL:
+        name += f"_hu{HU}"
+    if WPF:
+        name += f"_wpf{WPF}" + ("e" if cfg.wpf_e else "")
+    if SH8:
+        name += "_sh8" + "_".join(
+            f"m{g.tile_m}n{g.tile_n}k{g.tile_k}w{g.m_warp}x{g.n_warp}b{g.num_buffers}t{g.b_th}"
+            for g in (s1, s2))
+        if cfg.sh_ord:
+            name += f"o{cfg.sh_ord}"
+        if SHD:
+            name += "d"
     if RSL:
         name += "_rsll"
+    if IPF:
+        name += "_ipf"
+    if OVL:
+        name += f"_ovl{RU}"
     if UG:
         name += f"_ug{g1.soa}{g2.soa}w{g1.tdm_w}{g2.tdm_w}"
     TS = os.environ.get("MEGA_TS", "0") == "1"  # debug phase stamps
@@ -401,7 +477,9 @@ def compile_mega_moe_tp_1250(
             ds_first_n=None if g.ds_first_n < 0 else g.ds_first_n,
             c_sep=g.c_sep,
             tdm_b_th=g.b_th,
+            num_waves_per_tensor_tdm=g.tdm_w,
             expert_given=int(cfg.expert_hint),
+            lds_soa_load_interleave=g.soa,
         )
 
     @flyc.jit
@@ -448,6 +526,18 @@ def compile_mega_moe_tp_1250(
         swiglu_limit: fx.Float32,
         situ_beta: fx.Float32,
         situ_linear_beta: fx.Float32,
+        sw1: fx.Pointer,
+        sw1s: fx.Pointer,
+        sw2: fx.Pointer,
+        sw2s: fx.Pointer,
+        sa1: fx.Pointer,
+        sa1s: fx.Pointer,
+        sa2: fx.Pointer,
+        sa2s: fx.Pointer,
+        sa1_addr: fx.Int64,
+        sa1s_addr: fx.Int64,
+        off_xq8: fx.Int64,
+        off_xs8: fx.Int64,
         stream: fx.Stream,
     ):
         ug_lds, ug_meta1, ug_ready1, ug_meta2, ug_ready2 = [None], [None], [None], [None], [None]
@@ -510,6 +600,33 @@ def compile_mega_moe_tp_1250(
             ug_t1 = ug_build(g1, H, True, ug_meta1, ug_ready1)
             ug_t2 = ug_build(g2, I, False, ug_meta2, ug_ready2)
 
+        sh_lds, sh_meta1, sh_ready1, sh_meta2, sh_ready2 = [None], [None], [None], [None], [None]
+        sh_t1 = sh_t2 = None
+        if SH8:
+            def sh_build(g, K, stage1, meta, ready):
+                t_, b_, _, _, lay_ = build_gemm_a8w4_tdm_task(
+                    K=K, tile_m=g.tile_m, tile_n=g.tile_n, tile_k=g.tile_k, m_warp=g.m_warp,
+                    n_warp=g.n_warp, out_is_f16=0,
+                    num_buffers=min(g.num_buffers, ceildiv(K, g.tile_k)), a_is_fp4=0,
+                    n_experts=1, stage1_act=stage1_act if stage1 else 0, has_bias=0,
+                    stage1_quant_out=int(stage1),
+                    quant_wmma_rep=(s2.tile_m // s2.m_warp // 16) if stage1 else 1,
+                    cluster_n=1, cluster_m=1, next_stage_prefetch=0,
+                    num_waves_per_tensor_tdm=g.tdm_w, tdm_as_in_prologue=0, tdm_b_th=g.b_th,
+                    enable_ep_scatter=0, ep_arena_handle=0, ep_combine_input_offset=0,
+                    ep_slot_stride_bytes=0, ep_destination_stride=0, ep_world_size=0,
+                    ep_quant_bits=0, row_major_ascale=int(stage1), a_row_stride_bytes=0,
+                    a_scale_row_stride_bytes=0, lds_soa_load_interleave=0,
+                    persistent_workers=NCTA, rolled_drain=0, a_preshuffled=0, m_align=0,
+                    explicit_tile=1, lds_base=sh_lds, a_ready=ready, tile_meta=meta,
+                    w_is_fp8=1,
+                )
+                assert b_ == BLK and lay_["arena"] <= LDS_BYTES, (
+                    f"sh8 tile: {b_} threads, {lay_['arena']} B LDS > {LDS_BYTES}")
+                return t_
+            sh_t1 = sh_build(s1, H, True, sh_meta1, sh_ready1)
+            sh_t2 = sh_build(s2, I, False, sh_meta2, sh_ready2)
+
         @flyc.kernel(name=name, known_block_size=[BLK, 1, 1])
         def kernel(
             w1: fx.Pointer,
@@ -554,7 +671,21 @@ def compile_mega_moe_tp_1250(
             swiglu_limit: fx.Float32,
             situ_beta: fx.Float32,
             situ_linear_beta: fx.Float32,
+            sw1: fx.Pointer,
+            sw1s: fx.Pointer,
+            sw2: fx.Pointer,
+            sw2s: fx.Pointer,
+            sa1: fx.Pointer,
+            sa1s: fx.Pointer,
+            sa2: fx.Pointer,
+            sa2s: fx.Pointer,
+            sa1_addr: fx.Int64,
+            sa1s_addr: fx.Int64,
+            off_xq8: fx.Int64,
+            off_xs8: fx.Int64,
         ):
+            if fx.const_expr(IPF):  # this kernel's code into the I$ (ROCm/aiter#7827)
+                prefetch_kernel_code(NW)
             tid = fx.Int32(gpu.thread_id("x"))
             bid = fx.Int32(gpu.block_id("x"))
             wave = uni(tid // WAVE)
@@ -562,6 +693,7 @@ def compile_mega_moe_tp_1250(
             lptr = fx.SharedAllocator().allocate(LDS_BYTES + 16 + (E * 4 if EHINT else 0), alignment=1024)._ptr
             lds_slot["ptr"] = lptr
             ug_lds[0] = lptr  # (ug: upstream's tile body runs in this kernel's LDS)
+            sh_lds[0] = lptr  # (sh8: the shared expert's bodies too)
             L = uni(fx.Int32(fx.ptrtoint(lptr)))
             peers = [p0, p1, p2, p3, p4, p5, p6, p7]
 
@@ -617,6 +749,10 @@ def compile_mega_moe_tp_1250(
             if bid == i32(1 % NCTA):
                 if tid == i32(0):
                     st_agent(tcnt + i64(QOFF * 4) + i64(i32(1) - par) * (LINE * 4), 0)
+                    if fx.const_expr(OVL):
+                        st_agent(tcnt + i64(DEFOFF * 4) + i64(i32(1) - par) * (LINE * 4), 0)
+                    if fx.const_expr(PD):
+                        st_agent(tcnt + i64(PDOFF * 4) + i64(i32(1) - par) * (LINE * 4), 0)
                 for k in range(tid, 3 * SYNC_NG, BLK):
                     st_agent(
                         tcnt + (4 * MTS) * 4 + i64((i32(1) - par) * i32(3 * SYNC_NG) + k) * 4, 0
@@ -653,6 +789,8 @@ def compile_mega_moe_tp_1250(
                 return i64(cu) * CW + j * 256 + i64(lane) * 8
             nw_ag = fx.min(ceildiv(m, i32(NW)), i32(NCTA))
             nw_rs = fx.min(ceildiv(m * i32((1 if AR else tp) * NCH), i32(NW)), i32(NCTA))
+            if fx.const_expr(OVL):  # every CTA may run RS units (queue items)
+                nw_rs = i32(NCTA)
             if bid == i32(0):
                 if tid < i32(4):  # FL_AG / FL_RS / FL_ID / FL_Y of the other parity
                     st_sys(
@@ -710,8 +848,9 @@ def compile_mega_moe_tp_1250(
 
             def ids_at(t, k):
                 """route k of token t's expert id (AR: the local input)"""
-                if fx.const_expr(AR):
-                    return ld_i32(ids_in + i64(t * i32(TOPK) + k) * 4)
+                if fx.const_expr(AR):  # (an id out of range: a dropped route)
+                    e_ = ld_i32(ids_in + i64(t * i32(TOPK) + k) * 4)
+                    return ((e_ < i32(0)) | (e_ >= i32(E))).select(i32(-1), e_)
                 if fx.const_expr(LL):  # (a timed-out poll's word: clamped, no wild address)
                     e_ = ll_wait([llrow(t) + LLS + i64(k) * 8], ERR_LL_IDS)[0]
                     return ((e_ < i32(0)) | (e_ >= i32(E))).select(i32(-1), e_)
@@ -747,14 +886,23 @@ def compile_mega_moe_tp_1250(
                 # contiguous bytes of FP4 (and 32 of scales) on the xGMI
                 # AR (not LH): every token quantized once into the own arena (no push);
                 # barrier 1 orders it before the placement copy
-                for i in range(gw, m if not ((AR and LH) or QP) or QO else 0, GW):
+                # (sh8 + LL: a wave pushes one row to ONE rank: ~50 write-through stores. A wave
+                # with ~150 remote stores of its own takes ~85 us, the acks come back one at a time)
+                for ag_u in range(gw, (m * AGU) if not ((AR and LH) or QP) or QO else 0, GW):
+                    i = ag_u // i32(AGU)
+                    ag_p = ag_u - i * i32(AGU)
                     src = x_in + i64(i) * (H * 2) + i64(lane) * 64
                     q, scs = [], []
+                    ag_q8, ag_s8 = [], []
                     for b in range_constexpr(NB_PER_LANE):
                         v4s = [ld_v4(src + bofs(b) + j * 16) for j in range_constexpr(4)]
                         qb, e8 = quant_fp4_block32(v4s)
                         q.append(qb)
                         scs.append(e8)
+                        if fx.const_expr(SH8 and not AR):  # (the shared expert's A8 rows)
+                            ag_q8b, ag_e8b = quant_fp8_block32(v4s)
+                            ag_q8.append(ag_q8b)
+                            ag_s8.append(ag_e8b)
                     dr = i64(i) if AR else i64(rank * i32(mmax) + i)
                     idv = i32(-1)
                     twv = fx.Float32(0.0)
@@ -771,11 +919,72 @@ def compile_mega_moe_tp_1250(
                                 sv = sv | ((fx.Int32(gpu.shuffle_down(fx.Int32(scs[b]), k_, WAVE))
                                             & i32(0xFF)) << i32(8 * k_))
                             swd.append(sv)
+                        ag_w8 = []
+                        for b in range_constexpr(NB_PER_LANE if SH8 else 0):
+                            sv = fx.Int32(ag_s8[b]) & i32(0xFF)
+                            for k_ in range_constexpr(1, 4):
+                                sv = sv | ((fx.Int32(gpu.shuffle_down(fx.Int32(ag_s8[b]), k_, WAVE))
+                                            & i32(0xFF)) << i32(8 * k_))
+                            ag_w8.append(sv)
+                        if fx.const_expr(SH8):
+                            # sh8: ~50 item stores a rank. Every item is built before the first
+                            # store, one descriptor a rank, no lane mask (a lane off its 4-block
+                            # group's first one repeats the group's e8m0 word, a lane past TOPK
+                            # the items of lane TOPK - 1): a store issued while others are in
+                            # flight must not wait for them (see sys_rsrc; 127 -> ~6 us a row)
+                            lq_ = lane & i32(3)
+                            lk_ = fx.min(lane, i32(TOPK - 1))
+                            twi_ = twv.bitcast(fx.Int32)
+
+                            def ll_lead(w_):
+                                x_ = w_
+                                for k_ in range_constexpr(1, 4):
+                                    x_ = (lq_ == i32(k_)).select(fx.Int32(gpu.shuffle_up(w_, k_, WAVE)), x_)
+                                return x_
+
+                            ll_all = [
+                                (i32(LLS) + lk_ * i32(8), fx.Vector.from_elements(
+                                    [(lane < i32(TOPK)).select(idv, rdlane(idv, TOPK - 1)), ep], fx.Int32)),
+                                (i32(LLW) + lk_ * i32(8), fx.Vector.from_elements(
+                                    [(lane < i32(TOPK)).select(twi_, rdlane(twi_, TOPK - 1)), ep], fx.Int32)),
+                            ]
+                            ll_part = []
+                            for b in range_constexpr(NB_PER_LANE):
+                                w_ = fx.Vector(q[b])
+                                c16 = lane * i32(16) + i32(b * WAVE * 32)
+                                it_ = [
+                                    (c16, fx.Vector.from_elements([w_[0], ep, w_[1], ep], fx.Int32)),
+                                    (c16 + i32(NLB(b) * 16),
+                                     fx.Vector.from_elements([w_[2], ep, w_[3], ep], fx.Int32)),
+                                    (i32(2 * XB + b * WAVE * 2) + (lane - lq_) * i32(2),
+                                     fx.Vector.from_elements([ll_lead(swd[b]), ep], fx.Int32)),
+                                ]
+                                # (store h of a lane's 4: 16 B at h * NLB * 16 + lane * 16, so a
+                                # wave's store is contiguous bytes: one burst, not 32 pieces)
+                                o8 = lane * i32(16) + i32(LL8 + b * WAVE * 64)
+                                for h_ in range_constexpr(4):
+                                    w8_ = fx.Vector(ag_q8[b][h_ // 2])
+                                    it_.append((o8 + i32(h_ * NLB(b) * 16), fx.Vector.from_elements(
+                                        [w8_[2 * (h_ % 2)], ep, w8_[2 * (h_ % 2) + 1], ep], fx.Int32)))
+                                it_.append((i32(LL8S + b * WAVE * 2) + (lane - lq_) * i32(2),
+                                            fx.Vector.from_elements([ll_lead(ag_w8[b]), ep], fx.Int32)))
+                                if fx.const_expr(bok(b) is None):
+                                    ll_all += it_
+                                else:
+                                    ll_part.append((b, it_))
+                            ll_rs = sys_rsrc(peer(ag_p) + llp + i64(rank * m + i) * RLL)
                     for p in range_constexpr(1 if AR else tp):
                         base = mine if AR else peers[p]
                         dq = base + off_xq + dr * XB + i64(lane) * 16
                         ds = base + off_xs + dr * XS + i64(lane)
-                        if fx.const_expr(LL):
+                        if fx.const_expr(LL and SH8 and p == 0):  # (to rank ag_p only)
+                            for lo_, lv_ in ll_all:
+                                st_sys_wt_r(ll_rs, lo_, lv_)
+                            for lb_, li_ in ll_part:  # (a partial last block: its lanes only)
+                                if bok(lb_):
+                                    for lo_, lv_ in li_:
+                                        st_sys_wt_r(ll_rs, lo_, lv_)
+                        if fx.const_expr(LL and not SH8):
                             lrow = base + llp + i64(rank * m + i) * RLL
                             for b in range_constexpr(NB_PER_LANE):
                                 w_ = fx.Vector(q[b])
@@ -818,6 +1027,20 @@ def compile_mega_moe_tp_1250(
                                     st_sys_wt(base + off_ids + dr * (TOPK * 4), lane * i32(4), idv)
                                     st_sys_wt(base + off_tw + dr * (TOPK * 4), lane * i32(4),
                                               twv.bitcast(fx.Int32))
+                            for b in range_constexpr(NB_PER_LANE if SH8 else 0):  # the MXFP8 row
+                                def ag_wt8(b=b):
+                                    st_sys_wt(base + off_xq8 + dr * H, lane * i32(32) + i32(b * WAVE * 32),
+                                              ag_q8[b][0])
+                                    st_sys_wt(base + off_xq8 + dr * H,
+                                              lane * i32(32) + i32(b * WAVE * 32 + 16), ag_q8[b][1])
+                                    st_sys_wt(base + off_xs8 + dr * XS, lane + i32(b * WAVE),
+                                              fx.Int8(ag_s8[b]))
+
+                                if fx.const_expr(bok(b) is None):
+                                    ag_wt8()
+                                else:
+                                    if bok(b):
+                                        ag_wt8()
                         if fx.const_expr(not (WT and not AR) and not LL):
                             for b in range_constexpr(NB_PER_LANE):
                                 if fx.const_expr(bok(b) is None):
@@ -827,6 +1050,18 @@ def compile_mega_moe_tp_1250(
                                     if bok(b):
                                         st_v4(dq + b * WAVE * 16, q[b])
                                         st_i8(ds + b * WAVE, scs[b])
+                            for b in range_constexpr(NB_PER_LANE if (SH8 and not AR) else 0):  # the MXFP8 row
+                                def ag_st8p(b=b):
+                                    d8 = base + off_xq8 + dr * H + i64(lane) * 32 + b * WAVE * 32
+                                    st_v4(d8, ag_q8[b][0])
+                                    st_v4(d8 + 16, ag_q8[b][1])
+                                    st_i8(base + off_xs8 + dr * XS + i64(lane) + b * WAVE, ag_s8[b])
+
+                                if fx.const_expr(bok(b) is None):
+                                    ag_st8p()
+                                else:
+                                    if bok(b):
+                                        ag_st8p()
                             if fx.const_expr(not AGS and not AR):
                                 if lane < i32(TOPK):
                                     st_i32(base + off_ids + (dr * TOPK + i64(lane)) * 4, idv)
@@ -856,6 +1091,40 @@ def compile_mega_moe_tp_1250(
                     ts(16)
                     ts(17)
                 ts(1)
+                if fx.const_expr(WPF):
+                    # W1 into the cache while the AG is in flight (HBM idle): real loads, a 64 B
+                    # line a lane, folded into a word (so they are not dropped); the waves
+                    # 1.. (wave 0 polls the gate). Unit u = j * NPW + pw: slot u // UPE (own
+                    # route / expert), its wave-load u % UPE
+                    if wave > i32(0):
+                        pf_w1 = fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, w1)))
+                        pf_pw = bid * i32(NW - 1) + wave - i32(1)
+                        pf_n = m * i32(TOPK)  # own routes
+                        pf_sl, pf_ch, pf_e = [], [], []
+                        for j in range_constexpr(WPF):
+                            pf_u = pf_pw + i32(j * NCTA * (NW - 1))
+                            pf_s = pf_u // i32(UPE)
+                            pf_sl.append(pf_s)
+                            pf_ch.append(pf_u - pf_s * i32(UPE))
+                            if fx.const_expr(cfg.wpf_e):
+                                pf_e.append(pf_s)
+                            else:
+                                pf_e.append(ld_i32(ids_in + i64(fx.min(pf_s, pf_n - i32(1))) * 4))
+                        # every load issued before any is waited for (no branch between them:
+                        # a slot past the routes / a dropped route reads expert 0's line)
+                        pf_a = []
+                        for j in range_constexpr(WPF):
+                            pf_ok = (pf_e[j] >= i32(0)) & (pf_e[j] < i32(E))
+                            if fx.const_expr(not cfg.wpf_e):
+                                pf_ok = pf_ok & (pf_sl[j] < pf_n)
+                            pf_a.append(pf_w1 + i64(pf_ok.select(pf_e[j], i32(0))) * W1B
+                                        + i64(pf_ch[j] * i32(WAVE) + lane) * 64)
+                        pf_v = [ld_i32(pf_a[j]) for j in range_constexpr(WPF)]
+                        pf_acc = i32(0)
+                        for j in range_constexpr(WPF):
+                            pf_acc = pf_acc ^ pf_v[j]
+                        if pf_acc == ep + i32(0x5A5A5A5A):  # (never: keeps the loads)
+                            fx.atomic_or(gptr(err), fx.Int32(0), syncscope=AGENT)
                 # ---------------- R1: wait every rank; routes per expert ----------------
                 if fx.const_expr(LL):  # a CTA's readers start once every rank's last ids landed
                     if tid == i32(0):
@@ -887,16 +1156,22 @@ def compile_mega_moe_tp_1250(
                     for u in range_constexpr(LLU):
                         if (r0 + i32(u * hst) < nr) & (ev_[u] >= i32(0)) & (ev_[u] < i32(E)):
                             lds_add(L + L_HIST + ev_[u] * 4, 1)
-                for r in range(
-                    (i32(0) if LH else bid * i32(BLK)) + tid, 0 if LL else nr, hst
+                # (not LL) a thread's HU routes' ids loaded at once
+                for r0 in range(
+                    (i32(0) if LH else bid * i32(BLK)) + tid, 0 if LL else nr, hst * HU
                 ):
-                    t = r // i32(TOPK)
-                    eid = ids_at(t, r - t * i32(TOPK))
-                    if eid >= i32(0):
-                        lds_add(L + L_HIST + eid * 4, 1)
-                    if fx.const_expr(SP):  # a dropped route has no row
-                        if (eid < i32(0)) & (bid == i32(0)):
-                            st_i32(rpos + i64(r) * 4, i32(-1))
+                    hr_ = [fx.min(r0 + i32(u * hst), nr - i32(1)) for u in range_constexpr(HU)]
+                    he_ = []
+                    for u in range_constexpr(HU):
+                        ht_ = hr_[u] // i32(TOPK)
+                        he_.append(ids_at(ht_, hr_[u] - ht_ * i32(TOPK)))
+                    for u in range_constexpr(HU):
+                        hin_ = r0 + i32(u * hst) < nr
+                        if hin_ & (he_[u] >= i32(0)) & (he_[u] < i32(E)):
+                            lds_add(L + L_HIST + he_[u] * 4, 1)
+                        if fx.const_expr(SP):  # a dropped route has no row
+                            if hin_ & (he_[u] < i32(0)) & (bid == i32(0)):
+                                st_i32(rpos + i64(r0 + i32(u * hst)) * 4, i32(-1))
                 gpu.barrier()
                 if fx.const_expr(not LH):
                     for e in range(tid, E, BLK):
@@ -992,19 +1267,46 @@ def compile_mega_moe_tp_1250(
                             )
                         st_i32(rpos + i64(tq * i32(TOPK) + lane) * 4, pos)
                     qq_ = [quant_fp4_block32(xq_[b]) for b in range_constexpr(NB_PER_LANE)]
+                    if fx.const_expr(SH8):  # (the shared slot's row: the token as MXFP8)
+                        qp_q8 = [quant_fp8_block32(xq_[b]) for b in range_constexpr(NB_PER_LANE)]
+                        qp_st = lds_ld(L + L_HIST + (E - 1) * 4)
                     for k in range_constexpr(TOPK):
                         pk = rdlane(pos, k)
                         drow = i64((pk >= i32(0)).select(pk, spare))
                         dq = a1_addr + drow * XB + i64(lane) * 16
                         dsc = a1s_addr + drow * XS + i64(lane)
-                        for b in range_constexpr(NB_PER_LANE):
-                            if fx.const_expr(bok(b) is None):
-                                st_v4(dq + b * WAVE * 16, qq_[b][0])
-                                st_i8(dsc + b * WAVE, qq_[b][1])
-                            else:
-                                if bok(b):
+
+                        def qp_fp4(dq=dq, dsc=dsc):
+                            for b in range_constexpr(NB_PER_LANE):
+                                if fx.const_expr(bok(b) is None):
                                     st_v4(dq + b * WAVE * 16, qq_[b][0])
                                     st_i8(dsc + b * WAVE, qq_[b][1])
+                                else:
+                                    if bok(b):
+                                        st_v4(dq + b * WAVE * 16, qq_[b][0])
+                                        st_i8(dsc + b * WAVE, qq_[b][1])
+
+                        if fx.const_expr(SH8):
+                            qp_sr = pk - qp_st
+                            qp_sr = i64(((qp_sr >= i32(0)) & (qp_sr < i32(SHCAP - 1))).select(
+                                qp_sr, i32(SHCAP - 1)))
+                            qp_dq = sa1_addr + qp_sr * H + i64(lane) * 32
+                            qp_ds = sa1s_addr + qp_sr * XS + i64(lane)
+                            if rdlane(eidl, k) == i32(E - 1):
+                                for b in range_constexpr(NB_PER_LANE):
+                                    if fx.const_expr(bok(b) is None):
+                                        st_v4(qp_dq + b * WAVE * 32, qp_q8[b][0][0])
+                                        st_v4(qp_dq + b * WAVE * 32 + 16, qp_q8[b][0][1])
+                                        st_i8(qp_ds + b * WAVE, qp_q8[b][1])
+                                    else:
+                                        if bok(b):
+                                            st_v4(qp_dq + b * WAVE * 32, qp_q8[b][0][0])
+                                            st_v4(qp_dq + b * WAVE * 32 + 16, qp_q8[b][0][1])
+                                            st_i8(qp_ds + b * WAVE, qp_q8[b][1])
+                            else:
+                                qp_fp4()
+                        else:
+                            qp_fp4()
                     if fx.const_expr(DF0):  # this token's rows are in a1: count them
                         rel_wg()
                         if pos >= i32(0):
@@ -1028,9 +1330,17 @@ def compile_mega_moe_tp_1250(
                         eid = ids_at(t, r - t * i32(TOPK))
                         eidl = eid
                         if eid >= i32(0):
-                            pos = lds_ld(L + L_HIST + eid * 4) + add_agent(
-                                fillb + i64(eid) * 4, 1
-                            )
+                            if fx.const_expr(SHD):  # (a shared route: its token's arena row)
+                                if eid == i32(E - 1):
+                                    pos = lds_ld(L + L_HIST + (E - 1) * 4) + ar
+                                else:
+                                    pos = lds_ld(L + L_HIST + eid * 4) + add_agent(
+                                        fillb + i64(eid) * 4, 1
+                                    )
+                            else:
+                                pos = lds_ld(L + L_HIST + eid * 4) + add_agent(
+                                    fillb + i64(eid) * 4, 1
+                                )
                         st_i32(rpos + i64(r) * 4, pos)
                     for j0 in range_constexpr(0, RPW, CH):
                         pss = [rdlane(pos, j0 + jj) for jj in range_constexpr(CH)]
@@ -1041,71 +1351,337 @@ def compile_mega_moe_tp_1250(
                                 srcx = x_in + ars[jj] * (H * 2) + i64(lane) * 64
                                 dq = a1_addr + drow * XB + i64(lane) * 16
                                 dsc = a1s_addr + drow * XS + i64(lane)
-                                for b in range_constexpr(NB_PER_LANE):
-                                    if fx.const_expr(XEARLY):
-                                        v4s = xv[b]
-                                    else:
-                                        v4s = [ld_v4(srcx + bofs(b) + j * 16)
-                                               for j in range_constexpr(4)]
-                                    qb, e8 = quant_fp4_block32(v4s)
-                                    if fx.const_expr(bok(b) is None):
-                                        st_v4(dq + b * WAVE * 16, qb)
-                                        st_i8(dsc + b * WAVE, e8)
-                                    else:
-                                        if bok(b):
+                                # sh8: a route of the shared expert (wave-uniform: one route
+                                # a wave) is quantized to MXFP8 into the shared buffers, row =
+                                # its slot in the expert (a slot out of range: the spare row)
+                                def pl_fp4():
+                                    for b in range_constexpr(NB_PER_LANE):
+                                        if fx.const_expr(XEARLY):
+                                            v4s = xv[b]
+                                        else:
+                                            v4s = [ld_v4(srcx + bofs(b) + j * 16)
+                                                   for j in range_constexpr(4)]
+                                        qb, e8 = quant_fp4_block32(v4s)
+                                        if fx.const_expr(bok(b) is None):
                                             st_v4(dq + b * WAVE * 16, qb)
                                             st_i8(dsc + b * WAVE, e8)
-                        vs, ss = [], []
-                        for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
-                            # access cc of a lane: 16 B at cc * 512 + lane * 16 (a wave's
-                            # access is 512 contiguous bytes)
-                            if fx.const_expr(LL):
-                                lr = llrow(rdlane(tg, j0 + jj))
-                                its = []
-                                for cc in range_constexpr(CCN):
-                                    c16 = i64(lane) * 16 + (cc * WAVE * 32 if cok(cc) is None
-                                                            else cok(cc).select(i64(cc * WAVE * 32), i64(0)))
-                                    for h_ in range_constexpr(4):
-                                        its.append(lr + c16 + (h_ // 2) * (NLB(cc) * 16) + (h_ % 2) * 8)
-                                for c4 in range_constexpr(XSC):
-                                    its.append(lr + 2 * XB + i64(fx.min(lane + i32(c4 * WAVE), i32(XS // 4 - 1))) * 8)
-                                ws = ll_wait(its, ERR_LL_ROWS)
-                                vs.append([fx.Vector.from_elements(ws[4 * cc : 4 * cc + 4], fx.Int32)
-                                           for cc in range_constexpr(CCN)])
-                                ss.append([ws[4 * CCN + c4] for c4 in range_constexpr(XSC)])
-                            else:
-                                s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
-                                vs.append([ld_v4(s0 + (cc * 512 if cok(cc) is None else cok(cc).select(i64(cc * 512), i64(0))))
-                                           for cc in range_constexpr(CCN)])
-                                # the e8m0 row (XS bytes): 4 B a lane, WAVE * 4 B per access
-                                ss.append([ld_i32(mine + off_xs + ars[jj] * XS
-                                                  + i64(fx.min(lane * i32(4) + i32(c4 * WAVE * 4), i32(XS - 4))))
-                                           for c4 in range_constexpr(XSC)])
-                        for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
-                            drow = i64(((pss[jj] >= i32(0)) & (pss[jj] < spare)).select(pss[jj], spare))
-                            d0 = a1_addr + drow * XB + i64(lane) * 16
-                            for cc in range_constexpr(CCN):
-                                if fx.const_expr(cok(cc) is None):
-                                    st_v4(d0 + cc * 512, vs[jj][cc])
+                                        else:
+                                            if bok(b):
+                                                st_v4(dq + b * WAVE * 16, qb)
+                                                st_i8(dsc + b * WAVE, e8)
+
+                                if fx.const_expr(SH8):
+                                    pl_sh = rdlane(eidl, j0 + jj) == i32(E - 1)
+                                    pl_sr = pss[jj] - lds_ld(L + L_HIST + (E - 1) * 4)
+                                    pl_sr = i64(((pl_sr >= i32(0)) & (pl_sr < i32(SHCAP - 1))).select(
+                                        pl_sr, i32(SHCAP - 1)))
+                                    pl_dq = sa1_addr + pl_sr * H + i64(lane) * 32
+                                    pl_ds = sa1s_addr + pl_sr * XS + i64(lane)
+                                    if pl_sh:
+                                        for b in range_constexpr(NB_PER_LANE):
+                                            if fx.const_expr(XEARLY):
+                                                v4s = xv[b]
+                                            else:
+                                                v4s = [ld_v4(srcx + bofs(b) + j * 16)
+                                                       for j in range_constexpr(4)]
+                                            q8w, e8 = quant_fp8_block32(v4s)
+                                            if fx.const_expr(bok(b) is None):
+                                                st_v4(pl_dq + b * WAVE * 32, q8w[0])
+                                                st_v4(pl_dq + b * WAVE * 32 + 16, q8w[1])
+                                                st_i8(pl_ds + b * WAVE, e8)
+                                            else:
+                                                if bok(b):
+                                                    st_v4(pl_dq + b * WAVE * 32, q8w[0])
+                                                    st_v4(pl_dq + b * WAVE * 32 + 16, q8w[1])
+                                                    st_i8(pl_ds + b * WAVE, e8)
+                                    else:
+                                        pl_fp4()
                                 else:
-                                    if cok(cc):
+                                    pl_fp4()
+                        def pl_copy():
+                            vs, ss = [], []
+                            for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
+                                # access cc of a lane: 16 B at cc * 512 + lane * 16 (a wave's
+                                # access is 512 contiguous bytes)
+                                if fx.const_expr(LL):
+                                    lr = llrow(rdlane(tg, j0 + jj))
+                                    its = []
+                                    for cc in range_constexpr(CCN):
+                                        c16 = i64(lane) * 16 + (cc * WAVE * 32 if cok(cc) is None
+                                                                else cok(cc).select(i64(cc * WAVE * 32), i64(0)))
+                                        for h_ in range_constexpr(4):
+                                            its.append(lr + c16 + (h_ // 2) * (NLB(cc) * 16) + (h_ % 2) * 8)
+                                    for c4 in range_constexpr(XSC):
+                                        its.append(lr + 2 * XB + i64(fx.min(lane + i32(c4 * WAVE), i32(XS // 4 - 1))) * 8)
+                                    ws = ll_wait(its, ERR_LL_ROWS)
+                                    vs.append([fx.Vector.from_elements(ws[4 * cc : 4 * cc + 4], fx.Int32)
+                                               for cc in range_constexpr(CCN)])
+                                    ss.append([ws[4 * CCN + c4] for c4 in range_constexpr(XSC)])
+                                else:
+                                    s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
+                                    vs.append([ld_v4(s0 + (cc * 512 if cok(cc) is None else cok(cc).select(i64(cc * 512), i64(0))))
+                                               for cc in range_constexpr(CCN)])
+                                    # the e8m0 row (XS bytes): 4 B a lane, WAVE * 4 B per access
+                                    ss.append([ld_i32(mine + off_xs + ars[jj] * XS
+                                                      + i64(fx.min(lane * i32(4) + i32(c4 * WAVE * 4), i32(XS - 4))))
+                                               for c4 in range_constexpr(XSC)])
+                            for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
+                                drow = i64(((pss[jj] >= i32(0)) & (pss[jj] < spare)).select(pss[jj], spare))
+                                d0 = a1_addr + drow * XB + i64(lane) * 16
+                                for cc in range_constexpr(CCN):
+                                    if fx.const_expr(cok(cc) is None):
                                         st_v4(d0 + cc * 512, vs[jj][cc])
-                            for c4 in range_constexpr(XSC):
-                                if fx.const_expr((c4 + 1) * WAVE * 4 <= XS):
-                                    st_i32(a1s_addr + drow * XS + i64(lane) * 4 + c4 * WAVE * 4,
-                                           ss[jj][c4])
-                                else:  # the row's tail (H % 4096)
-                                    if lane * i32(4) + i32(c4 * WAVE * 4) < i32(XS):
+                                    else:
+                                        if cok(cc):
+                                            st_v4(d0 + cc * 512, vs[jj][cc])
+                                for c4 in range_constexpr(XSC):
+                                    if fx.const_expr((c4 + 1) * WAVE * 4 <= XS):
                                         st_i32(a1s_addr + drow * XS + i64(lane) * 4 + c4 * WAVE * 4,
                                                ss[jj][c4])
+                                    else:  # the row's tail (H % 4096)
+                                        if lane * i32(4) + i32(c4 * WAVE * 4) < i32(XS):
+                                            st_i32(a1s_addr + drow * XS + i64(lane) * 4 + c4 * WAVE * 4,
+                                                   ss[jj][c4])
+
+                        if fx.const_expr(SH8 and not LL and not AR):
+                            # rows one at a time: a shared route's row is the arena's MXFP8 row
+                            # (and scales) into the shared buffers, the others' FP4 as pl_copy
+                            pa_st = lds_ld(L + L_HIST + (E - 1) * 4)
+                            for jj in range_constexpr(CH):
+                                pa_sr = pss[jj] - pa_st
+                                pa_sr = i64(((pa_sr >= i32(0)) & (pa_sr < i32(SHCAP - 1))).select(
+                                    pa_sr, i32(SHCAP - 1)))
+                                pa_dr = i64(((pss[jj] >= i32(0)) & (pss[jj] < spare)).select(pss[jj], spare))
+                                def pa_fp8(jj=jj, pa_sr=pa_sr):
+                                    pa_s8 = mine + off_xq8 + ars[jj] * H + i64(lane) * 32
+                                    pa_v = []
+                                    for b in range_constexpr(NB_PER_LANE):
+                                        pa_o = (b * WAVE * 32 if bok(b) is None
+                                                else bok(b).select(i64(b * WAVE * 32), i64(0)))
+                                        pa_v.append((ld_v4(pa_s8 + pa_o), ld_v4(pa_s8 + pa_o + 16)))
+                                    pa_sc = [ld_i32(mine + off_xs8 + ars[jj] * XS
+                                                    + i64(fx.min(lane * i32(4) + i32(c4 * WAVE * 4), i32(XS - 4))))
+                                             for c4 in range_constexpr(XSC)]
+                                    pa_dq = sa1_addr + pa_sr * H + i64(lane) * 32
+                                    for b in range_constexpr(NB_PER_LANE):
+                                        def pa_st8(b=b):
+                                            st_v4(pa_dq + b * WAVE * 32, pa_v[b][0])
+                                            st_v4(pa_dq + b * WAVE * 32 + 16, pa_v[b][1])
+
+                                        if fx.const_expr(bok(b) is None):
+                                            pa_st8()
+                                        else:
+                                            if bok(b):
+                                                pa_st8()
+                                    for c4 in range_constexpr(XSC):
+                                        if fx.const_expr((c4 + 1) * WAVE * 4 <= XS):
+                                            st_i32(sa1s_addr + pa_sr * XS + i64(lane) * 4 + c4 * WAVE * 4, pa_sc[c4])
+                                        else:
+                                            if lane * i32(4) + i32(c4 * WAVE * 4) < i32(XS):
+                                                st_i32(sa1s_addr + pa_sr * XS + i64(lane) * 4 + c4 * WAVE * 4,
+                                                       pa_sc[c4])
+
+                                def pa_fp4(jj=jj, pa_dr=pa_dr):
+                                    pa_s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
+                                    pa_f = [ld_v4(pa_s0 + (cc * 512 if cok(cc) is None else cok(cc).select(i64(cc * 512), i64(0))))
+                                            for cc in range_constexpr(CCN)]
+                                    pa_fs = [ld_i32(mine + off_xs + ars[jj] * XS
+                                                    + i64(fx.min(lane * i32(4) + i32(c4 * WAVE * 4), i32(XS - 4))))
+                                             for c4 in range_constexpr(XSC)]
+                                    pa_d0 = a1_addr + pa_dr * XB + i64(lane) * 16
+                                    for cc in range_constexpr(CCN):
+                                        if fx.const_expr(cok(cc) is None):
+                                            st_v4(pa_d0 + cc * 512, pa_f[cc])
+                                        else:
+                                            if cok(cc):
+                                                st_v4(pa_d0 + cc * 512, pa_f[cc])
+                                    for c4 in range_constexpr(XSC):
+                                        if fx.const_expr((c4 + 1) * WAVE * 4 <= XS):
+                                            st_i32(a1s_addr + pa_dr * XS + i64(lane) * 4 + c4 * WAVE * 4, pa_fs[c4])
+                                        else:
+                                            if lane * i32(4) + i32(c4 * WAVE * 4) < i32(XS):
+                                                st_i32(a1s_addr + pa_dr * XS + i64(lane) * 4 + c4 * WAVE * 4,
+                                                       pa_fs[c4])
+
+                                if fx.const_expr(SHD):  # (a shared row stays in the arena)
+                                    if rdlane(eidl, j0 + jj) != i32(E - 1):
+                                        pa_fp4()
+                                else:
+                                    if rdlane(eidl, j0 + jj) == i32(E - 1):
+                                        pa_fp8()
+                                    else:
+                                        pa_fp4()
+                        elif fx.const_expr(SH8 and LL):
+                            # the shared route (wave-uniform: one route a wave): its token's
+                            # MXFP8 items -> the shared buffers, row = its slot in the expert
+                            pc_sh = rdlane(eidl, j0) == i32(E - 1)
+                            pc_sr = pss[0] - lds_ld(L + L_HIST + (E - 1) * 4)
+                            pc_sr = i64(((pc_sr >= i32(0)) & (pc_sr < i32(SHCAP - 1))).select(
+                                pc_sr, i32(SHCAP - 1)))
+                            if pc_sh:
+                                pc_lr = llrow(rdlane(tg, j0))
+                                pc_it = []
+                                for b in range_constexpr(NB_PER_LANE):
+                                    pc_o = pc_lr + LL8 + i64(lane) * 16 + (
+                                        b * WAVE * 64 if bok(b) is None
+                                        else bok(b).select(i64(b * WAVE * 64), i64(0)))
+                                    for k_ in range_constexpr(8):  # word k: store k // 2's item k % 2
+                                        pc_it.append(pc_o + (k_ // 2) * (NLB(b) * 16) + (k_ % 2) * 8)
+                                for c4 in range_constexpr(XSC):
+                                    pc_it.append(pc_lr + LL8S + i64(fx.min(lane + i32(c4 * WAVE), i32(XS // 4 - 1))) * 8)
+                                pc_ws = ll_wait(pc_it, ERR_LL_ROWS)
+                                pc_dq = sa1_addr + pc_sr * H + i64(lane) * 32
+                                for b in range_constexpr(NB_PER_LANE):
+                                    def pc_st(b=b):
+                                        st_v4(pc_dq + b * WAVE * 32,
+                                              fx.Vector.from_elements(pc_ws[8 * b : 8 * b + 4], fx.Int32))
+                                        st_v4(pc_dq + b * WAVE * 32 + 16,
+                                              fx.Vector.from_elements(pc_ws[8 * b + 4 : 8 * b + 8], fx.Int32))
+
+                                    if fx.const_expr(bok(b) is None):
+                                        pc_st()
+                                    else:
+                                        if bok(b):
+                                            pc_st()
+                                for c4 in range_constexpr(XSC):
+                                    if fx.const_expr((c4 + 1) * WAVE * 4 <= XS):
+                                        st_i32(sa1s_addr + pc_sr * XS + i64(lane) * 4 + c4 * WAVE * 4,
+                                               pc_ws[8 * NB_PER_LANE + c4])
+                                    else:  # the row's tail (H % 4096)
+                                        if lane * i32(4) + i32(c4 * WAVE * 4) < i32(XS):
+                                            st_i32(sa1s_addr + pc_sr * XS + i64(lane) * 4 + c4 * WAVE * 4,
+                                                   pc_ws[8 * NB_PER_LANE + c4])
+                            else:
+                                pl_copy()
+                        else:
+                            pl_copy()
                     if fx.const_expr(DF0):  # this batch's rows are in a1: count them
                         rel_wg()
                         if pos >= i32(0):
                             add_agent(placed + i64(eidl) * 4, 1)
                 ts(14)
+                if fx.const_expr(PD):  # this CTA's routes placed (rpos stores retired)
+                    rel_wg()
+                    gpu.barrier()
+                    if tid == i32(0):
+                        rel_agent()
+                        add_agent(tcnt + i64(PDOFF * 4) + i64(par) * (LINE * 4), 1)
                 if fx.const_expr(not DF0 and not SP):
                     barrier(2)
                 ts(4)
+            def rs_unit(u):
+                """RS unit u (token u // NCH, column chunk u % NCH)"""
+                t = u // i32(NCH)
+                cu = u - t * i32(NCH)
+                o = i32(0) if AR else t // m
+                i = t if AR else t - o * m
+                ar = o * i32(mmax) + i
+                psl = i32(-1)
+                wl = fx.Float32(0.0)
+                if lane < i32(TOPK):
+                    psl = ld_i32(rpos + i64(t * i32(TOPK) + lane) * 4)
+                    if fx.const_expr(AR):
+                        wl = ld_f32(tw_in + i64(t * i32(TOPK) + lane) * 4)
+                    else:
+                        if fx.const_expr(LL):
+                            wl = ll_wait([llrow(t) + LLW + i64(lane) * 8], ERR_LL_TW)[0].bitcast(fx.Float32)
+                        else:
+                            wl = ld_f32(mine + off_tw + (i64(ar) * TOPK + i64(lane)) * 4)
+                # a dropped route: row 0 read, weight 0 (no branch); a slot past the
+                # routed rows (never written: a stale rpos) clamped
+                psl = fx.min(psl, cm - i32(1))
+                if fx.const_expr(DF2):  # every G2 tile of this token's routes' m-tiles
+                    if (lane < i32(TOPK)) & (psl >= i32(0)):
+                        rs_ci = psl // i32(g2.tile_m)
+                        rs_ct = i32(NT2)
+                        if fx.const_expr(SH8):  # (a shared row: its STM-row tile's count)
+                            rs_sh = psl >= sh_st
+                            rs_ci = rs_sh.select(
+                                sh_st // i32(g2.tile_m)
+                                + ((psl - sh_st) // i32(STM)) * i32(STM // g2.tile_m), rs_ci)
+                            rs_ct = rs_sh.select(i32(SNT2), rs_ct)
+                        spin_agent(cnt2 + i64(rs_ci) * 4, rs_ct, err,
+                                   (rs_sh.select(i32(ERR_SH3), i32(ERR_DF)) if SH8 else ERR_DF))
+                    acq_agent()
+                wl = (psl >= i32(0)).select(wl, fx.Float32(0.0))
+                psl = fx.max(psl, i32(0))
+                fs = []
+                for k in range_constexpr(TOPK):
+                    srow_k = rdlane(psl, k)
+                    if fx.const_expr(EXP == "rs_contig"):  # experiment: contiguous rows
+                        srow_k = t * i32(TOPK) + i32(k)
+                    src = gout_addr + i64(srow_k) * (H * 2)
+                    if fx.const_expr(G2Q8):  # 8 fp8 + their block's e8m0 per access
+                        fs.append([
+                            (ld_v2(src + eoff(cu, j)), ld_u8(src + H + eoff(cu, j) // 32))
+                            for j in range_constexpr(NJ)
+                        ])
+                    else:
+                        fs.append([ld_v4(src + eoff(cu, j) * 2) for j in range_constexpr(NJ)])
+                acc = [fx.Float32(0.0)] * (NJ * 8)
+                for k in range_constexpr(TOPK):
+                    w = rdlane(wl.bitcast(fx.Int32), k).bitcast(fx.Float32)
+                    for j in range_constexpr(NJ):
+                        if fx.const_expr(G2Q8):
+                            f = fp8x8_f32(fs[k][j][0], fs[k][j][1])
+                        else:
+                            f = bf16x8_f32(fs[k][j])
+                        for q in range_constexpr(8):
+                            acc[j * 8 + q] = acc[j * 8 + q] + w * f[q]
+                dst_rank = peer(o)
+                if fx.const_expr(EXP == "rs_local"):  # experiment: RS rows to own arena
+                    dst_rank = mine
+                drow = dst_rank + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
+                if fx.const_expr(PULL):  # own arena, slot [owner][row]: owners read it
+                    drow = mine + off_recv + i64(o * i32(mmax) + i) * (H * 2)
+                if fx.const_expr(AR):  # own arena, slot t: every rank reads it
+                    drow = mine + off_recv + i64(t) * (H * 2)
+                if fx.const_expr(Q8):
+                    # 16 int8 per lane at element offsets (a wave's store: 512
+                    # contiguous bytes); block e8m0s after the H data bytes, by the
+                    # block's first (even) lane
+                    for hh in range_constexpr(NHH):
+                        words, e8 = q8_block(acc[16 * hh : 16 * hh + 16])
+                        el = eoff(cu, 2 * hh)
+                        if fx.const_expr(WT):
+                            st_sys_wt(drow, el, fx.Vector.from_elements(words, fx.Int32))
+                            if (lane & i32(1)) == i32(0):
+                                st_sys_wt(drow, H + el // 32, fx.Int8(e8))
+                        else:
+                            st_v4(drow + el, fx.Vector.from_elements(words, fx.Int32))
+                            if (lane & i32(1)) == i32(0):
+                                st_i8(drow + H + el // 32, e8)
+                else:
+                    out = []
+                    for q in range_constexpr(NJ * 4):
+                        lo = acc[2 * q].to(fx.BFloat16)
+                        hi = acc[2 * q + 1].to(fx.BFloat16)
+                        out.append(
+                            fx.Vector.from_elements([lo, hi], fx.BFloat16).bitcast(fx.Int32)[0]
+                        )
+                    # RSL: access j's 16 B as LL items (w0, ep, w1, ep) at j * 1024 +
+                    # lane * 16, (w2, ep, w3, ep) 512 B after, of chunk cu's 4 CW bytes
+                    # (AR: to every rank, slot [rank][t]: each rank's Y polls locally)
+                    for p_ in range_constexpr(tp if AR else 1):
+                        rsl_row = dst_rank + llrs + i64(rank * m + i) * (4 * H)
+                        if fx.const_expr(AR):
+                            rsl_row = peers[p_] + llrs + i64(rank * m + t) * (4 * H)
+                        for j in range_constexpr(NJ if RSL else 0):
+                            c_ = cu * i32(CW * 4) + i32(j * 1024) + lane * i32(16)
+                            st_sys_wt(rsl_row, c_, fx.Vector.from_elements(
+                                [out[4 * j], ep, out[4 * j + 1], ep], fx.Int32))
+                            st_sys_wt(rsl_row, c_ + i32(512), fx.Vector.from_elements(
+                                [out[4 * j + 2], ep, out[4 * j + 3], ep], fx.Int32))
+                    for j in range_constexpr(0 if RSL else NJ):
+                        if fx.const_expr(WT):
+                            st_sys_wt(drow, eoff(cu, j) * 2,
+                                      fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32))
+                        else:
+                            st_v4(
+                                drow + eoff(cu, j) * 2,
+                                fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32),
+                            )
+
             # ---------------- G1 / G2: the grouped GEMM tiles ----------------------
             def self_place(tk_):
                 """SP: G1 task tk_'s A rows. Its expert's routes in token order (rank of a
@@ -1227,13 +1803,183 @@ def compile_mega_moe_tp_1250(
                     hi = right.select(hi, mid)
                 return lo
             rows = ld_i32(psum_addr + (E - 1) * 4)
+            # sh8: the shared expert's rows [sh_st, sh_st + sh_cnt) are not routed m-tiles;
+            # its tiles: sh_mt m-tiles of STM rows x SNT1 (G1) / SNT2 (G2) n-tiles
+            sh_st = i32(0)
+            sh_cnt = i32(0)
+            sh_mt = i32(1)
+            if fx.const_expr(SH8):
+                sh_st = rup(ld_i32(psum_addr + (E - 2) * 4))
+                sh_cnt = fx.max(fx.min(rows - sh_st, i32(SHCAP - STM)), i32(0))
+                sh_mt = fx.max(ceildiv(sh_cnt, i32(STM)), i32(1))
+                if fx.const_expr(SHD):
+                    # the shared rows are the arena rows (rank o: [o * mmax, o * mmax + m)):
+                    # sh_mtr m-tiles a rank; they must fit gout (every token routes to the
+                    # shared expert, else an error and no shared tiles)
+                    sh_mtr = ceildiv(m, i32(STM))
+                    sh_fit = (sh_st + i32((tp - 1) * mmax) + m <= cm) & (m > i32(0))
+                    sh_cnt = sh_fit.select(i32(1), i32(0))
+                    sh_mt = fx.max(sh_mtr * i32(tp), i32(1))
+                    if (tid == i32(0)) & (m > i32(0)) & (sh_cnt == i32(0)):
+                        fx.atomic_or(gptr(err), fx.Int32(ERR_SH1), syncscope=AGENT)
+                rows = sh_st
+            n1s = (sh_cnt > i32(0)).select(sh_mt * i32(SNT1), i32(0)) if SH8 else i32(0)
+            n2s = (sh_cnt > i32(0)).select(sh_mt * i32(SNT2), i32(0)) if SH8 else i32(0)
             n_mt = ceildiv(rows, i32(g1.tile_m))
             n1 = n_mt * i32(NT1)
-            if fx.const_expr(DYN):
+
+            def sh_task(ut, meta, ready, c_, a_, b_, sa_, sb_, qs_, n_, j_, nt_, off_, w_addr, w_tgt,
+                        w_bit):
+                """sh8: tile (m-tile j_, n-tile nt_) of the shared expert as an explicit tile
+                of upstream's body: its valid rows (tile_meta; stage 2: the output rows are
+                the expert's place in the routed layout, off_), and the dataflow wait the A
+                owners run after the B prologue (a_ready)"""
+                vr_ = fx.max(fx.min(sh_cnt - j_ * i32(STM), i32(STM)), i32(0))
+                if fx.const_expr(SHD):  # (j_: an arena m-tile; its rank's rows end at m)
+                    jl_ = j_ - (j_ // i32(mmax // STM)) * i32(mmax // STM)
+                    vr_ = fx.max(fx.min(m - jl_ * i32(STM), i32(STM)), i32(0))
+                meta[0] = (i32(0), vr_) if off_ is None else (i32(0), vr_, off_)
+
+                def ready_fn():
+                    if fx.const_expr(w_addr is not None):
+                        spin_agent(w_addr, w_tgt, err, w_bit)
+                        acq_agent()
+
+                ready[0] = ready_fn
+                ut(c_, a_, b_, sa_, sb_, psum, a_, qs_, a_, i32(SHCAP), n_, swiglu_limit,
+                   situ_beta, situ_linear_beta, j_, nt_)
+            if fx.const_expr(DYN and OVL):
+                # segments j = 0 .. JM-1: [G1 tiles (j-th m-tile of every expert, n-tiles)]
+                # [their G2 tiles] [RSI RS items: NW waves x RU units of the tokens these
+                # rows mostly complete]. An item only waits on earlier items (claimed by
+                # running CTAs); an RS unit whose G2 tiles are not done is deferred
+                TMO = g1.tile_m
+                NT2O = H // g2.tile_n
+
+                def e_end(e):
+                    """expert e's end row: the resident LDS psum copy (expert_hint), else
+                    the global psum (without the hint LEXP sits in the GEMM arena, which the
+                    tiles overwrite)"""
+                    e = fx.min(fx.max(e, i32(0)), i32(E - 1))
+                    if fx.const_expr(EHINT):
+                        return lds_ld(L + LEXP + e * 4)
+                    return ld_i32(psum_addr + i64(e) * 4)
+
+                def e_rows(e):
+                    """expert e's first row and its m-tile count"""
+                    st_ = (e > i32(0)).select(rup(e_end(e - i32(1))), i32(0))
+                    return st_, ceildiv(e_end(e) - st_, i32(TMO))
+
+                def tk_of(mt, nt, n_nt):
+                    """the task id gemm_tile maps to (m-tile mt, n-tile nt): mtile_of's inverse"""
+                    grp = mt // i32(16)
+                    first = grp * i32(16)
+                    gt = fx.min(n_mt - first, i32(16))
+                    return grp * i32(n_nt * 16) + nt * gt + (mt - first)
+
+                # JM: the most m-tiles an expert has (thread max, wave xor-max, waves via LDS)
+                jm = i32(0)
+                for e in range(tid, E, BLK):
+                    _, ce_ = e_rows(e)
+                    jm = fx.max(jm, ce_)
+                for k_ in range_constexpr(5):
+                    jm = fx.max(jm, fx.Int32(gpu.shuffle_xor(jm, 1 << k_, WAVE)))
+                gpu.barrier()
+                if lane == i32(0):
+                    lds_st(L + L_SCAN0 + wave * 4, jm)
+                gpu.barrier()
+                JM = lds_ld(L + L_SCAN0)
+                for w_ in range_constexpr(1, NW):
+                    JM = fx.max(JM, lds_ld(L + L_SCAN0 + w_ * 4))
+                JM = uni(JM)
+                gpu.barrier()
+                S1 = i32(E * NT1)
+                S2 = i32(E * NT2O)
+                n_rsu = Tt * i32(NCH)
+                n_rsi = ceildiv(n_rsu, i32(NW * RU))
+                RSI = ceildiv(n_rsi, fx.max(JM, i32(1)))
+                SEG = S1 + S2 + RSI
+                # segment jj: G1 of fraction jj, G2 of fraction jj - 1, RS of fraction jj - 2
+                # (a G2 tile is claimed a segment after its m-tile's G1 tiles: not spinning)
+                ntot = (JM + i32(2)) * SEG
+                defc = tcnt + i64(DEFOFF * 4) + i64(par) * (LINE * 4)
+                defl = tcnt + i64(DEFOFF * 4 + 4 * LINE * 4)
+                qc = tcnt + i64(QOFF * 4) + i64(par) * (LINE * 4)
+                if tid == i32(0):
+                    lds_st(L + Q_LDS, add_agent(qc, 1))
+                gpu.barrier()
+                tq = uni(lds_ld(L + Q_LDS))
+                gpu.barrier()
+                while tq < ntot:
+                    nxt = i32(0)
+                    if tid == i32(0):  # the next claim, in flight during this item
+                        nxt = add_agent(qc, 1)
+                    jj = tq // SEG
+                    ll_ = tq - jj * SEG
+                    if ll_ < S1 + S2:
+                        is1 = ll_ < S1
+                        l2_ = is1.select(ll_, ll_ - S1)
+                        nnt = is1.select(i32(NT1), i32(NT2O))
+                        eo = l2_ // nnt
+                        nto = l2_ - eo * nnt
+                        st_e, c_e = e_rows(eo)
+                        jf = is1.select(jj, jj - i32(1))  # the fraction this tile belongs to
+                        mto = st_e // i32(TMO) + jf
+                        if (jf >= i32(0)) & (jf < c_e) & (mto < n_mt) & (eo < i32(E)):  # (in range by construction)
+                            if is1:
+                                T1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
+                                   swiglu_limit, situ_beta, situ_linear_beta,
+                                   tk_of(mto, nto, NT1), rows, eo, None, None, err)
+                                if fx.const_expr(g1.c_sep or UG):
+                                    tdm_ops.tensor_wait(0)
+                                rel_wg()
+                                gpu.barrier()
+                                if tid == i32(0):
+                                    rel_agent()
+                                    add_agent(cnt1 + i64(mto) * 4, 1)
+                            else:
+                                T2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                                   swiglu_limit, situ_beta, situ_linear_beta,
+                                   tk_of(mto, nto, NT2O), rows, eo, cnt1 + i64(mto) * 4,
+                                   i32(NT1), err)
+                                tdm_ops.tensor_wait(0)
+                                rel_wg()
+                                gpu.barrier()
+                                if tid == i32(0):
+                                    rel_agent()
+                                    add_agent(cnt2 + i64(mto) * 4, 1)
+                    else:
+                        ri = (jj - i32(2)) * RSI + (ll_ - S1 - S2)
+                        for r_ in range_constexpr(RU):
+                            uu = (ri * i32(NW) + wave) * i32(RU) + i32(r_)
+                            if (ri >= i32(0)) & (ri < n_rsi) & (uu >= i32(0)) & (uu < n_rsu):
+                                # ready: every route's G2 m-tile done (a non-blocking look)
+                                tq_ = uu // i32(NCH)
+                                nok = i32(0)
+                                if lane < i32(TOPK):
+                                    ps_ = fx.min(ld_i32(rpos + i64(tq_ * i32(TOPK) + lane) * 4), cm - i32(1))
+                                    if ps_ >= i32(0):
+                                        c2_ = ld_agent(cnt2 + i64(ps_ // i32(g2.tile_m)) * 4)
+                                        nok = before(c2_, i32(NT2O)).select(i32(1), i32(0))
+                                for k_ in range_constexpr(5):
+                                    nok = nok | fx.Int32(gpu.shuffle_xor(nok, 1 << k_, WAVE))
+                                if nok == i32(0):
+                                    acq_agent()
+                                    rs_unit(uu)
+                                else:
+                                    if lane == i32(0):
+                                        di_ = add_agent(defc, 1)
+                                        st_i32(defl + i64(di_) * 4, uu)
+                    if tid == i32(0):
+                        lds_st(L + Q_LDS, nxt)
+                    gpu.barrier()
+                    tq = uni(lds_ld(L + Q_LDS))
+                    gpu.barrier()
+            if fx.const_expr(DYN and not OVL):
                 # one queue: tasks [0, n1) G1, [n1, n1 + n2) G2. A G2 task is claimed
                 # only once every G1 task is (claimed by a running CTA): no deadlock
                 n2q = n_mt * i32(H // g2.tile_n)
-                ntot = n1 + n2q
+                ntot = n1 + n1s + n2q + n2s
                 qc = tcnt + i64(QOFF * 4) + i64(par) * (LINE * 4)
                 if tid == i32(0):
                     lds_st(L + Q_LDS, add_agent(qc, 1))
@@ -1268,28 +2014,76 @@ def compile_mega_moe_tp_1250(
                             rel_agent()
                             add_agent(cnt1 + i64(mtile_of(tq, n_mt, NT1)) * 4, 1)
                     else:
-                        t2 = tq - n1
-                        cnt_t2 = cnt1 + i64(mtile_of(t2, n_mt, H // g2.tile_n)) * 4
-                        if fx.const_expr(BF):  # the tile waits for the m-tile after B
-                            T2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                                  swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
-                                  ehint(t2, NT2), cnt_t2, i32(NT1), err)
-                        else:
-                            if tid == i32(0):  # every G1 tile of this m-tile done
-                                spin_agent(cnt_t2, NT1, err, ERR_DF)
-                                acq_agent()
-                            gpu.barrier()
-                            acq_wg()
-                            T2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                                  swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
-                                  ehint(t2, NT2), None, None, err)
-                        if fx.const_expr(DF2):  # this m-tile's G2 tile done
+                        def dyn_g2(t2):
+                            cnt_t2 = cnt1 + i64(mtile_of(t2, n_mt, H // g2.tile_n)) * 4
+                            if fx.const_expr(BF):  # the tile waits for the m-tile after B
+                                T2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                                      swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
+                                      ehint(t2, NT2), cnt_t2, i32(NT1), err)
+                            else:
+                                if tid == i32(0):  # every G1 tile of this m-tile done
+                                    spin_agent(cnt_t2, NT1, err, ERR_DF)
+                                    acq_agent()
+                                gpu.barrier()
+                                acq_wg()
+                                T2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                                      swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
+                                      ehint(t2, NT2), None, None, err)
+                            if fx.const_expr(DF2):  # this m-tile's G2 tile done
+                                tdm_ops.tensor_wait(0)
+                                rel_wg()
+                                gpu.barrier()
+                                if tid == i32(0):
+                                    rel_agent()
+                                    add_agent(cnt2 + i64(mtile_of(t2, n_mt, NT2)) * 4, 1)
+
+                        def sh_mn(sk, snt):
+                            """shared task sk's (m-tile, n-tile): cfg.sh_ord"""
+                            if fx.const_expr(cfg.sh_ord == 1):
+                                sc_, sn_ = sk // i32(snt), sk % i32(snt)
+                            else:
+                                sc_, sn_ = sk % sh_mt, sk // sh_mt
+                            if fx.const_expr(SHD):  # (the sc_-th valid m-tile: its arena m-tile)
+                                so_ = sc_ // sh_mtr
+                                sc_ = so_ * i32(mmax // STM) + (sc_ - so_ * sh_mtr)
+                            return sc_, sn_
+
+                        def dyn_sh1(sk):
+                            sj, snt = sh_mn(sk, SNT1)
+                            sh_task(sh_t1, sh_meta1, sh_ready1, sa2, sa1, sw1, sa1s, sw1s, sa2s,
+                                    i32(2 * I), sj, snt, None, None, None, ERR_SH1)
                             tdm_ops.tensor_wait(0)
                             rel_wg()
                             gpu.barrier()
                             if tid == i32(0):
                                 rel_agent()
-                                add_agent(cnt2 + i64(mtile_of(t2, n_mt, NT2)) * 4, 1)
+                                add_agent(cnt1 + i64(sh_st // i32(TM1) + sj * i32(STM // TM1)) * 4, 1)
+
+                        def dyn_sh2(sk):
+                            sj, snt = sh_mn(sk, SNT2)
+                            sh_task(sh_t2, sh_meta2, sh_ready2, gout, sa2, sw2, sa2s, sw2s, sa2s,
+                                    i32(H), sj, snt, sh_st,
+                                    cnt1 + i64(sh_st // i32(TM1) + sj * i32(STM // TM1)) * 4,
+                                    i32(SNT1), ERR_SH2)
+                            if fx.const_expr(DF2):
+                                tdm_ops.tensor_wait(0)
+                                rel_wg()
+                                gpu.barrier()
+                                if tid == i32(0):
+                                    rel_agent()
+                                    add_agent(cnt2 + i64(sh_st // i32(g2.tile_m)
+                                                         + sj * i32(STM // g2.tile_m)) * 4, 1)
+
+                        if fx.const_expr(SH8):
+                            if tq < n1 + n1s:
+                                dyn_sh1(tq - n1)
+                            else:
+                                if tq < n1 + n1s + n2q:
+                                    dyn_g2(tq - n1 - n1s)
+                                else:
+                                    dyn_sh2(tq - n1 - n1s - n2q)
+                        else:
+                            dyn_g2(tq - n1)
                     if tid == i32(0):
                         lds_st(L + Q_LDS, nxt)
                     gpu.barrier()
@@ -1331,6 +2125,19 @@ def compile_mega_moe_tp_1250(
                     if tid == i32(0):
                         rel_agent()
                         add_agent(cnt1 + i64(mtile_of(tk, n_mt, NT1)) * 4, 1)
+            if fx.const_expr(SH8 and not DYN):
+                for sk in range((vbid + i32(NCTA) - n1 % i32(NCTA)) % i32(NCTA), n1s, NCTA):
+                    sj = sk % sh_mt
+                    sh_task(sh_t1, sh_meta1, sh_ready1, sa2, sa1, sw1, sa1s, sw1s, sa2s,
+                            i32(2 * I), sj, sk // sh_mt, None,
+                            placed + i64(E - 1) * 4, sh_cnt, ERR_SH1)
+                    # this shared m-tile's G1 tile done (its TDM output store landed)
+                    tdm_ops.tensor_wait(0)
+                    rel_wg()
+                    gpu.barrier()
+                    if tid == i32(0):
+                        rel_agent()
+                        add_agent(cnt1 + i64(sh_st // i32(TM1) + sj * i32(STM // TM1)) * 4, 1)
             ts(5)
             if fx.const_expr(not DF1 and not DYN):
                 if fx.const_expr(UG):  # the G1 tiles' TDM output stores
@@ -1361,9 +2168,24 @@ def compile_mega_moe_tp_1250(
                     if tid == i32(0):
                         rel_agent()
                         add_agent(cnt2 + i64(mtile_of(tk, n_mt, NT2)) * 4, 1)
+            if fx.const_expr(SH8 and not DYN):  # the shared expert's G2 tiles: rows land at sh_st + slot of gout
+                for sk in range((vbid + i32(NCTA) - n2 % i32(NCTA)) % i32(NCTA), n2s, NCTA):
+                    sj = sk % sh_mt
+                    sh_task(sh_t2, sh_meta2, sh_ready2, gout, sa2, sw2, sa2s, sw2s, sa2s,
+                            i32(H), sj, sk // sh_mt, sh_st,
+                            cnt1 + i64(sh_st // i32(TM1) + sj * i32(STM // TM1)) * 4, i32(SNT1),
+                            ERR_SH2)
+                    if fx.const_expr(DF2):
+                        tdm_ops.tensor_wait(0)
+                        rel_wg()
+                        gpu.barrier()
+                        if tid == i32(0):
+                            rel_agent()
+                            add_agent(cnt2 + i64(sh_st // i32(g2.tile_m)
+                                                 + sj * i32(STM // g2.tile_m)) * 4, 1)
             ts(7)
             tdm_ops.tensor_wait(0)  # the last task's output store (c_sep)
-            if fx.const_expr(not DF2):
+            if fx.const_expr(not DF2 or OVL):  # (ovl: every queue item done before the deferred RS units)
                 barrier(4)
             ts(8)
             if fx.const_expr(not GEMMONLY):  # experiment: GEMM phases only
@@ -1372,114 +2194,24 @@ def compile_mega_moe_tp_1250(
                 # route k's slot and weight, then all TOPK rows' loads are in flight at
                 # once; access j of a lane is 16 B at cu * CW * 2 + j * 512 + lane * 16, so
                 # a wave's store is 512 contiguous bytes (one xGMI burst, not 32 pieces)
-                for u in range(gw, Tt * i32(NCH), GW):
-                    t = u // i32(NCH)
-                    cu = u - t * i32(NCH)
-                    o = i32(0) if AR else t // m
-                    i = t if AR else t - o * m
-                    ar = o * i32(mmax) + i
-                    psl = i32(-1)
-                    wl = fx.Float32(0.0)
-                    if lane < i32(TOPK):
-                        psl = ld_i32(rpos + i64(t * i32(TOPK) + lane) * 4)
-                        if fx.const_expr(AR):
-                            wl = ld_f32(tw_in + i64(t * i32(TOPK) + lane) * 4)
-                        else:
-                            if fx.const_expr(LL):
-                                wl = ll_wait([llrow(t) + LLW + i64(lane) * 8], ERR_LL_TW)[0].bitcast(fx.Float32)
-                            else:
-                                wl = ld_f32(mine + off_tw + (i64(ar) * TOPK + i64(lane)) * 4)
-                    # a dropped route: row 0 read, weight 0 (no branch); a slot past the
-                    # routed rows (never written: a stale rpos) clamped
-                    psl = fx.min(psl, cm - i32(1))
-                    if fx.const_expr(DF2):  # every G2 tile of this token's routes' m-tiles
-                        if (lane < i32(TOPK)) & (psl >= i32(0)):
-                            spin_agent(cnt2 + i64(psl // i32(g2.tile_m)) * 4, NT2, err, ERR_DF)
+                if fx.const_expr(PD):  # every CTA's placement done: the rpos RS reads are current
+                    if tid == i32(0):
+                        spin_agent(tcnt + i64(PDOFF * 4) + i64(par) * (LINE * 4), NCTA, err, ERR_DF)
                         acq_agent()
-                    wl = (psl >= i32(0)).select(wl, fx.Float32(0.0))
-                    psl = fx.max(psl, i32(0))
-                    fs = []
-                    for k in range_constexpr(TOPK):
-                        srow_k = rdlane(psl, k)
-                        if fx.const_expr(EXP == "rs_contig"):  # experiment: contiguous rows
-                            srow_k = t * i32(TOPK) + i32(k)
-                        src = gout_addr + i64(srow_k) * (H * 2)
-                        if fx.const_expr(G2Q8):  # 8 fp8 + their block's e8m0 per access
-                            fs.append([
-                                (ld_v2(src + eoff(cu, j)), ld_u8(src + H + eoff(cu, j) // 32))
-                                for j in range_constexpr(NJ)
-                            ])
-                        else:
-                            fs.append([ld_v4(src + eoff(cu, j) * 2) for j in range_constexpr(NJ)])
-                    acc = [fx.Float32(0.0)] * (NJ * 8)
-                    for k in range_constexpr(TOPK):
-                        w = rdlane(wl.bitcast(fx.Int32), k).bitcast(fx.Float32)
-                        for j in range_constexpr(NJ):
-                            if fx.const_expr(G2Q8):
-                                f = fp8x8_f32(fs[k][j][0], fs[k][j][1])
-                            else:
-                                f = bf16x8_f32(fs[k][j])
-                            for q in range_constexpr(8):
-                                acc[j * 8 + q] = acc[j * 8 + q] + w * f[q]
-                    dst_rank = peer(o)
-                    if fx.const_expr(EXP == "rs_local"):  # experiment: RS rows to own arena
-                        dst_rank = mine
-                    drow = dst_rank + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
-                    if fx.const_expr(PULL):  # own arena, slot [owner][row]: owners read it
-                        drow = mine + off_recv + i64(o * i32(mmax) + i) * (H * 2)
-                    if fx.const_expr(AR):  # own arena, slot t: every rank reads it
-                        drow = mine + off_recv + i64(t) * (H * 2)
-                    if fx.const_expr(Q8):
-                        # 16 int8 per lane at element offsets (a wave's store: 512
-                        # contiguous bytes); block e8m0s after the H data bytes, by the
-                        # block's first (even) lane
-                        for hh in range_constexpr(NHH):
-                            words, e8 = q8_block(acc[16 * hh : 16 * hh + 16])
-                            el = eoff(cu, 2 * hh)
-                            if fx.const_expr(WT):
-                                st_sys_wt(drow, el, fx.Vector.from_elements(words, fx.Int32))
-                                if (lane & i32(1)) == i32(0):
-                                    st_sys_wt(drow, H + el // 32, fx.Int8(e8))
-                            else:
-                                st_v4(drow + el, fx.Vector.from_elements(words, fx.Int32))
-                                if (lane & i32(1)) == i32(0):
-                                    st_i8(drow + H + el // 32, e8)
-                    else:
-                        out = []
-                        for q in range_constexpr(NJ * 4):
-                            lo = acc[2 * q].to(fx.BFloat16)
-                            hi = acc[2 * q + 1].to(fx.BFloat16)
-                            out.append(
-                                fx.Vector.from_elements([lo, hi], fx.BFloat16).bitcast(fx.Int32)[0]
-                            )
-                        # RSL: access j's 16 B as LL items (w0, ep, w1, ep) at j * 1024 +
-                        # lane * 16, (w2, ep, w3, ep) 512 B after, of chunk cu's 4 CW bytes
-                        # (AR: to every rank, slot [rank][t]: each rank's Y polls locally)
-                        for p_ in range_constexpr(tp if AR else 1):
-                            rsl_row = dst_rank + llrs + i64(rank * m + i) * (4 * H)
-                            if fx.const_expr(AR):
-                                rsl_row = peers[p_] + llrs + i64(rank * m + t) * (4 * H)
-                            for j in range_constexpr(NJ if RSL else 0):
-                                c_ = cu * i32(CW * 4) + i32(j * 1024) + lane * i32(16)
-                                st_sys_wt(rsl_row, c_, fx.Vector.from_elements(
-                                    [out[4 * j], ep, out[4 * j + 1], ep], fx.Int32))
-                                st_sys_wt(rsl_row, c_ + i32(512), fx.Vector.from_elements(
-                                    [out[4 * j + 2], ep, out[4 * j + 3], ep], fx.Int32))
-                        for j in range_constexpr(0 if RSL else NJ):
-                            if fx.const_expr(WT):
-                                st_sys_wt(drow, eoff(cu, j) * 2,
-                                          fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32))
-                            else:
-                                st_v4(
-                                    drow + eoff(cu, j) * 2,
-                                    fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32),
-                                )
+                    gpu.barrier()
+                    acq_wg()
+                for u in range(gw, 0 if OVL else Tt * i32(NCH), GW):
+                    rs_unit(u)
+                if fx.const_expr(OVL):  # the units the queue deferred (every G2 tile done)
+                    n_def = ld_agent(tcnt + i64(DEFOFF * 4) + i64(par) * (LINE * 4))
+                    for di in range(gw, n_def, GW):
+                        rs_unit(ld_i32(tcnt + i64(DEFOFF * 4 + 4 * LINE * 4) + i64(di) * 4))
                 ts(18)
                 if fx.const_expr(not RSL):  # (RSL: no drain, no signal; Y polls)
                     rel_wg()
                     gpu.barrier()
                 if tid == i32(0):
-                    if (bid * i32(NW) < Tt * i32(NCH)) & (i32(int(RSL)) == i32(0)):  # pushed rows
+                    if ((bid * i32(NW) < Tt * i32(NCH)) | (i32(int(OVL)) == i32(1))) & (i32(int(RSL)) == i32(0)):  # pushed rows
                         if fx.const_expr(not WT):  # (WT: written through, waited above)
                             rel_sys()
                         # the group's last writer signals every rank
@@ -1842,6 +2574,7 @@ def compile_mega_moe_tp_1250(
             p3, p4, p5, p6, p7, off_xq, off_xs, off_ids, off_tw, off_recv, off_flag,
             off_yred,
             rank, m, cm, swiglu_limit, situ_beta, situ_linear_beta,
+            sw1, sw1s, sw2, sw2s, sa1, sa1s, sa2, sa2s, sa1_addr, sa1s_addr, off_xq8, off_xs8,
         ).launch(grid=(NCTA, 1, 1), block=(BLK, 1, 1), stream=stream)
 
     # the grouped GEMM's own launch hints (mxfp4_preshuffle_gfx1250_tdm)
@@ -1850,6 +2583,13 @@ def compile_mega_moe_tp_1250(
         "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
         "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     }
-    if cfg.waves_per_eu:  # cap VGPRs so that many waves (CTAs per CU) fit a SIMD
-        launch.compile_hints["waves_per_eu"] = cfg.waves_per_eu
+    # cap VGPRs so that every CTA of the grid is resident (cta_per_cu * NW waves a CU, 4 SIMDs):
+    # a kernel over the budget leaves CTAs out and every grid wait times out (sh8 + ag_ll at 3
+    # CTAs per CU: 420 VGPRs > 341). Always with sh8 (upstream's bodies are VGPR-heavy);
+    # MEGA_WPE=1: every kernel (the hint changes the code a little even under the budget)
+    wpe = cfg.waves_per_eu
+    if not wpe and (SH8 or os.environ.get("MEGA_WPE", "0") == "1"):
+        wpe = max(1, (cfg.cta_per_cu * NW + 3) // 4)
+    if wpe > 1:
+        launch.compile_hints["waves_per_eu"] = wpe
     return launch, NCTA

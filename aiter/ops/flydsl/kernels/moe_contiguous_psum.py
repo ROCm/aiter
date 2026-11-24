@@ -25,6 +25,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
+# Routes one thread of the fused route+psum kernel owns: the kernel covers
+# FUSED_ROUTE_SWEEPS * MAX_EXPERTS_PER_BLOCK routes.
+FUSED_ROUTE_SWEEPS = 8
 
 # The row remap is grid-strided across this many blocks. Each block re-derives the
 # tiny per-expert prefix sum in LDS (barrier-free across blocks), so no cross-block
@@ -599,7 +602,8 @@ def build_moe_contiguous_psum_remap_ep_module():
 def build_moe_route_psum_fused_module():
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
 
-    For small token counts every route fits in one workgroup, so the three
+    For small token counts every route fits in one workgroup (at most
+    ``FUSED_ROUTE_SWEEPS * MAX_EXPERTS_PER_BLOCK`` routes), so the three
     pre-GEMM launches (route-maps, contiguous-psum, remap) collapse into one
     kernel. The per-expert atomic counter lives in LDS (workgroup-scope
     atomics, no global round-trip), and the tile-aligned prefix sum + in-place
@@ -607,6 +611,10 @@ def build_moe_route_psum_fused_module():
 
     Outputs match ``topids_to_rows`` (contiguous layout) + ``masked_m`` counts
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
+
+    ``identity_expert`` (-1: none) names an expert whose routes take the row of
+    their token (``route // topk``) instead of a claimed slot, so that expert's
+    rows are in token order. Its routed tokens must be the first tokens.
     """
 
     @flyc.kernel(
@@ -623,6 +631,8 @@ def build_moe_route_psum_fused_module():
         experts: Int32,
         max_m: Int32,
         tile_m: Int32,
+        identity_expert: Int32,
+        topk: Int32,
     ):
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui rather than their signed forms.
@@ -643,27 +653,40 @@ def build_moe_route_psum_fused_module():
 
         in_expert = tid < fx.Uint32(experts)
 
+        # Every route this thread owns, loaded up front: the loads overlap the
+        # counter clear, and the remap below needs no global load at all (the
+        # ids and slots stay in registers, the starts in LDS).
+        numel_i32 = fx.Uint32(numel)
+        routes, ids, live = [], [], []
+        for sweep in range_constexpr(FUSED_ROUTE_SWEEPS):
+            route_i32 = tid + sweep * MAX_EXPERTS_PER_BLOCK
+            in_range = route_i32 < numel_i32
+            routes.append(route_i32)
+            live.append(in_range)
+            ids.append(fx.Int32(topk_p[in_range.select(route_i32, fx.Uint32(0))]))
+
         # Phase A: zero the LDS per-expert atomic counter.
         if in_expert:
             lds_cnt[tid] = fx.Int32(0)
         gpu.barrier()
 
-        # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
+        # Phase B: route + workgroup-scope LDS atomic -> slot in the expert.
         # The allocator's typed pointer keeps the counter in shared memory.
         # A route to expert -1, or to an id at or past E, claims no slot and
-        # gets DROPPED_ROUTE_ROW, as in the split-kernel route. The store is in
-        # the else so a valid route is written once.
-        numel_i32 = fx.Uint32(numel)
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            e = fx.Int32(topk_p[route_i32])
-            routed = (e >= fx.Int32(0)) & (e < experts)
+        # gets DROPPED_ROUTE_ROW, as in the split-kernel route.
+        slots = []
+        for sweep in range_constexpr(FUSED_ROUTE_SWEEPS):
+            e = ids[sweep]
+            routed = live[sweep] & (e >= fx.Int32(0)) & (e < experts)
+            slot = fx.Int32(-1)
             if routed:
-                ptr = lds_cnt + e
-                slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
-                row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-                rows_p[route_i32] = row
-            else:
-                rows_p[route_i32] = fx.Int32(DROPPED_ROUTE_ROW)
+                slot = fx.atomic_add(lds_cnt + e, fx.Int32(1), syncscope="workgroup")
+            # The identity expert (a shared expert every token routes to) keeps
+            # its rows in token order: row = token, whatever order the counter
+            # was claimed in. Its count is still the counter's.
+            token = fx.Int32(routes[sweep] // fx.Uint32(topk))
+            slot = (routed & (e == identity_expert)).select(token, slot)
+            slots.append(slot)
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.
@@ -696,18 +719,19 @@ def build_moe_route_psum_fused_module():
             m_tid = lds_cnt[tid]
             s_p[tid] = start
             p_p[tid] = start + m_tid
-        gpu.barrier()
 
-        # Phase D: in-place masked -> contiguous row remap.
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            row_raw = rows_p[route_i32]
-            if fx.Int32(row_raw) >= 0:
-                row = fx.Uint32(row_raw)
-                m = fx.Uint32(max_m)
-                expert = row // m
-                slot = row - expert * m
-                start = fx.Uint32(s_p[expert])
-                rows_p[route_i32] = start + slot
+        # Phase D: contiguous row = the expert's start (the scan, still in
+        # LDS) + the slot claimed in phase B.
+        for sweep in range_constexpr(FUSED_ROUTE_SWEEPS):
+            kept = slots[sweep] >= fx.Int32(0)
+            e = fx.Uint32(kept.select(ids[sweep], fx.Int32(0)))
+            has_prev = e != 0
+            start = has_prev.select(
+                fx.Int32(src[has_prev.select(e - 1, fx.Uint32(0))]), fx.Int32(0)
+            )
+            row = kept.select(start + slots[sweep], fx.Int32(DROPPED_ROUTE_ROW))
+            if live[sweep]:
+                rows_p[routes[sweep]] = row
 
     @flyc.jit
     def launch_route_psum_fused(
@@ -720,6 +744,8 @@ def build_moe_route_psum_fused_module():
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
+        identity_expert: fx.Int32,
+        topk: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_fused_kernel(
@@ -732,6 +758,8 @@ def build_moe_route_psum_fused_module():
             experts,
             max_m,
             tile_m,
+            identity_expert,
+            topk,
         ).launch(
             grid=(1, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

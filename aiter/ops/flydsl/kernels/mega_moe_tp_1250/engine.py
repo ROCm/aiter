@@ -69,17 +69,47 @@ def _apply(cfg: LaunchCfg, ov: str) -> LaunchCfg:
     return cfg
 
 
-def default_launch_cfg(tokens: int, model_dim: int = 4096, shape=None, mode: str = "") -> LaunchCfg:
+def default_launch_cfg(tokens: int, model_dim: int = 4096, shape=None, mode: str = "",
+                       sh8: bool = False) -> LaunchCfg:
     """The launch config of a batch of (global) tokens: its dispatch path and tiles,
     then the tuned row of shape = (experts, inter per rank, tp) at these tokens if
     tuned_mega_moe_tp.csv has one (then the row of this mode: ar / ag_rs), then
     MEGA_CFG="field=value,..." (experiments)."""
     cfg = _default_launch_cfg(tokens, model_dim)
     if shape is not None:
-        cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens, ""), ""))
-        if mode:
-            cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens, mode), ""))
+        # rows of mode "" and this mode; with the A8W8 shared expert (sh8) then the rows
+        # of mode sh8 / <mode>_sh8
+        modes = [""] + ([mode] if mode else [])
+        if sh8:
+            modes += ["sh8"] + ([mode + "_sh8"] if mode else [])
+        key = _tuned_key(tokens, model_dim, shape, modes)
+        for mo in modes:
+            cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, key, mo), ""))
     return _apply(cfg, os.environ.get("MEGA_CFG", ""))
+
+
+def _regime(tokens: int, model_dim: int):
+    d = _default_launch_cfg(tokens, model_dim)
+    return d.path, d.g1.tile_m, tokens <= LL_TOKENS
+
+
+def _tuned_key(tokens: int, model_dim: int, shape, mode: str) -> int:
+    """The tuned row serving these tokens: their own, else (as guard rows) the next
+    tuned token count above of the same default regime (dispatch path, G1 tile_m, LL
+    or not), so tokens between tuned points keep the tuned tiles instead of falling
+    back to the heuristic defaults. MEGA_TUNED_KEY=<tokens> forces a row (-1: none)."""
+    env = os.environ.get("MEGA_TUNED_KEY", "")
+    if env:
+        return int(env)
+    modes = (mode,) if isinstance(mode, str) else tuple(mode)
+    keys = sorted({k[4] for k in _tuned_rows() if k[:4] == (model_dim, *shape) and k[5] in ("",) + modes})
+    if tokens in keys or os.environ.get("MEGA_TUNED_BUCKET", "1") != "1":
+        return tokens
+    reg = _regime(tokens, model_dim)
+    for k in keys:
+        if k > tokens:
+            return k if _regime(k, model_dim) == reg else tokens
+    return tokens
 
 
 def _default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
@@ -155,6 +185,10 @@ class MegaMoeTP1250Engine:
         group=None,
         device: torch.device | None = None,
         cfg_fn=default_launch_cfg,
+        shared_w1: torch.Tensor | None = None,
+        shared_w1_scale: torch.Tensor | None = None,
+        shared_w2: torch.Tensor | None = None,
+        shared_w2_scale: torch.Tensor | None = None,
     ):
         if not 1 <= world_size <= MAX_TP:
             raise ValueError(f"tp {world_size} not in [1, {MAX_TP}]")
@@ -179,19 +213,41 @@ class MegaMoeTP1250Engine:
         self.n_cu = int(props.multi_processor_count)
         self.cfg_fn = cfg_fn
         self.set_weights(w1, w1_scale, w2, w2_scale)
+        # sh8 (MiniMax-M3.1): the last expert (id experts - 1) is the shared expert, A8W8:
+        # its MXFP8 weights in the grouped path's fused-shared layouts (moe_shuffle_weight /
+        # moe_shuffle_scale of one expert: w1 [1, 2 I, H] GUGU, w2 [1, H, I]); w1 / w2 then
+        # hold the experts - 1 routed experts
+        self.sh8 = shared_w1 is not None
+        self.sw = tuple(t.contiguous() for t in (shared_w1, shared_w1_scale, shared_w2,
+                                                 shared_w2_scale)) if self.sh8 else None
 
         tot, H, K = self.mmax * self.tp, model_dim, topk
-        arena = SymmetricArena(group=group, device=self.device)
+        # the arena base and yred (LL items, Y rows: what peers write and this rank polls) on
+        # multiples of MEGA_ARENA_ALIGN bytes (0: off). A small arena (< 10 MB: inside a
+        # caching-allocator block, yred at any 256 B offset) cost AR 2~3 us at 8..32 tokens
+        # (DSv4.1 AR 8: 30.4 vs 27.6 us with tp * max_local_tokens = 32 vs >= 2048); the base
+        # alone does nothing, ag_rs is unchanged (MEGA_ARENA_ALIGN_R: the aligned regions)
+        al = int(os.environ.get("MEGA_ARENA_ALIGN", str(2 << 20)))
+        arena = SymmetricArena(group=group, device=self.device, align=al)
+        alr = os.environ.get("MEGA_ARENA_ALIGN_R", "yred").split(",")
         self._xq = arena.reserve("xq", (tot, H // 2), torch.uint8)
         self._xs = arena.reserve("xs", (tot, H // 32), torch.uint8)
         self._ids = arena.reserve("ids", (tot, K), torch.int32)
         self._tw = arena.reserve("tw", (tot, K), torch.float32)
-        self._recv = arena.reserve("recv", (self.tp, self.mmax, H), torch.bfloat16)
+        # sh8 (ag_rs, not LL): the AG rows as MXFP8 too (the shared expert's activations)
+        if self.sh8:
+            # (whole shared m-tiles + a spare tile: sh_dir reads stage 1's A here)
+            shcap = (tot + 127) // 128 * 128 + 128
+            self._xq8 = arena.reserve("xq8", (shcap, H), torch.uint8)
+            self._xs8 = arena.reserve("xs8", (shcap, H // 32), torch.uint8)
+        self._recv = arena.reserve("recv", (self.tp, self.mmax, H), torch.bfloat16,
+                                   align=al if "recv" in alr else 0)
         # AR two-step Y: every rank's reduced rows, read by the others; ag_rs (<= LL_TOKENS
         # tokens): the LL items of ag_ll / rs_ll, both epoch parities
-        ll = 2 * ll_bytes(H, K, self.tp, LL_TOKENS // self.tp) // 2
-        self._yred = arena.reserve("yred", (max(self.tp * self.mmax * H, ll),), torch.bfloat16)
-        self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
+        ll = 2 * ll_bytes(H, K, self.tp, LL_TOKENS // self.tp, sh8=self.sh8) // 2
+        self._yred = arena.reserve("yred", (max(self.tp * self.mmax * H, ll),), torch.bfloat16,
+                                   align=al if "yred" in alr else 0)
+        self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32, align=al if "flag" in alr else 0)
         arena.commit()
         self.arena = arena
         self._group = group
@@ -207,6 +263,14 @@ class MegaMoeTP1250Engine:
             (self.cm * (inter_dim // 32) + 4096,), dtype=torch.uint8, device=dev
         )
         self.gout = torch.empty((self.cm, H), dtype=torch.bfloat16, device=dev)
+        # sh8: the shared expert's MXFP8 rows (row = its slot in the expert): stage-1 input
+        # (placement) and scales (row-major e8m0), stage-1 output and its scales (kernel SHCAP)
+        if self.sh8:
+            shcap = (tot + 127) // 128 * 128 + 128
+            self.sa1 = torch.zeros((shcap, H), dtype=torch.uint8, device=dev)
+            self.sa1s = torch.zeros((shcap, H // 32), dtype=torch.uint8, device=dev)
+            self.sa2 = torch.zeros((shcap, inter_dim), dtype=torch.uint8, device=dev)
+            self.sa2s = torch.zeros((shcap * (inter_dim // 32) + 4096,), dtype=torch.uint8, device=dev)
         self.psum = torch.zeros(1024, dtype=torch.int32, device=dev)
         self.rpos = torch.empty(tot * K, dtype=torch.int32, device=dev)
         # per-m-tile completion counts: [epoch parity][G1, G2][m-tile]
@@ -245,7 +309,8 @@ class MegaMoeTP1250Engine:
             out = self.y[:m]
         if m == 0:
             return out
-        cfg = cfg or self.cfg_fn(m * self.tp, self.H, (self.E, self.Ip, self.tp), mode="ag_rs")
+        cfg = cfg or self.cfg_fn(m * self.tp, self.H, (self.E, self.Ip, self.tp), mode="ag_rs",
+                                 **({"sh8": True} if self.sh8 else {}))
         if not cfg.ar:
             # ag_rs: write the AG rows and RS partials the peers read through at system
             # scope instead of a writeback before the signal (MEGA_RS_WT=1: on; measured
@@ -264,6 +329,37 @@ class MegaMoeTP1250Engine:
         if cfg.rs_ll and (m * self.tp > LL_TOKENS or cfg.ar_two
                           or (not cfg.ar and not cfg.ag_ll)):
             cfg = dataclasses.replace(cfg, rs_ll=False)
+        if self.sh8 and not cfg.sh8:
+            # (the shared bodies take ~340~420 VGPRs: at most 2 waves a SIMD, i.e. 2 CTAs of
+            # 4 waves a CU, keep a margin)
+            cfg = dataclasses.replace(cfg, sh8=True, cta_per_cu=min(
+                cfg.cta_per_cu, 8 // (cfg.g1.m_warp * cfg.g1.n_warp)))
+            if cfg.align_m > cfg.s1.tile_m:
+                # the shared tiles' rows are whole routed alignments (the completion counts
+                # index routed-size m-tiles): 4 waves along M, 128 columns (2 x 2 waves of 256
+                # columns need 512 VGPRs at 128 rows: the whole budget of 2 CTAs a CU); k128
+                # stages (LDS); no streaming hint: its weights are re-read by every m-tile
+                sg = dict(tile_m=cfg.align_m, m_warp=4, n_warp=1, tile_n=128, tile_k=128,
+                          num_buffers=2, b_th=0)
+                cfg = dataclasses.replace(cfg, s1=dataclasses.replace(cfg.s1, **sg),
+                                          s2=dataclasses.replace(cfg.s2, **sg))
+                if cfg.align_m >= 128:
+                    # 2 x 2 waves of 256 columns halve the A re-reads (-7~10% at 16384 / 32768
+                    # tokens; exactly the 512 VGPRs of 2 CTAs a CU, under the waves_per_eu
+                    # hint); m-tile major order (the m-tile's A rows stay cached: -1~2%)
+                    sg = dict(m_warp=2, n_warp=2, tile_n=256)
+                    cfg = dataclasses.replace(cfg, s1=dataclasses.replace(cfg.s1, **sg),
+                                              s2=dataclasses.replace(cfg.s2, **sg), sh_ord=1)
+            if cfg.path == "mid" and (cfg.ar or cfg.ag_ll):
+                # sh8 runs the static order with per-CTA routing counts (the small path's
+                # dataflow): the mid path up to the LL token limit (512 tokens)
+                cfg = dataclasses.replace(cfg, dyn=False, local_hist=True, df0=True, df1=True,
+                                          place_rpw=1, q_place=False)
+        if (self.sh8 and not cfg.ar and not cfg.ag_ll and not cfg.sh_dir and cfg.dyn
+                and self.mmax % 128 == 0 and os.environ.get("MEGA_SH_DIR", "1") == "1"):
+            # ag_rs from the arena: stage 1 of the shared expert reads the arena's MXFP8 rows
+            # (-3~4% at 16384 / 32768 tokens: placement copies no MXFP8 rows)
+            cfg = dataclasses.replace(cfg, sh_dir=True)
         x = x.contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
@@ -309,6 +405,14 @@ class MegaMoeTP1250Engine:
             self.swiglu_limit,
             self.situ[0],
             self.situ[1],
+            *((p(self.sw[0]), p(self.sw[1]), p(self.sw[2]), p(self.sw[3]),
+               p(self._xq8.local if cfg.sh_dir else self.sa1),
+               p(self._xs8.local if cfg.sh_dir else self.sa1s),
+               p(self.sa2), p(self.sa2s), self.sa1.data_ptr(), self.sa1s.data_ptr(),
+               self._xq8.offset, self._xs8.offset)
+              if self.sh8 else
+              (p(w1), p(w1s), p(w2), p(w2s), p(self.a1), p(self.a1s), p(self.a2), p(self.a2s),
+               self.a1.data_ptr(), self.a1s.data_ptr(), 0, 0)),
             torch.cuda.current_stream(),
         )
         if cfg not in self._ready:
@@ -351,7 +455,8 @@ class MegaMoeTP1250Engine:
                 self.y_ar = torch.empty((self.mmax * self.tp, self.H), dtype=torch.bfloat16,
                                         device=self.device)
             out = self.y_ar[:T]
-        cfg = cfg or self.cfg_fn(T, self.H, (self.E, self.Ip, self.tp), mode="ar")
+        cfg = cfg or self.cfg_fn(T, self.H, (self.E, self.Ip, self.tp), mode="ar",
+                                 **({"sh8": True} if self.sh8 else {}))
         # rs_wt (MEGA_RS_WT=0: off): the rows peers read written through at system scope
         # instead of a system-scope cache writeback before their signal (-10~55 us)
         cfg = dataclasses.replace(cfg, ar=True, rs_pull=False, ag_split=False,

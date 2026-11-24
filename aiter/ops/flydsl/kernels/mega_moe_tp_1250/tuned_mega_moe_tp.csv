@@ -11,13 +11,17 @@ model_dim,experts,inter,tp,tokens,mode,cfg,us,note
 5120,384,576,4,256,,g1.num_buffers=4;cta_per_cu=2;df0=1,145.8,1110 r11 deeper G1 (default 148.1); +df0 r92 (LL era: -1~4us)
 6144,129,768,4,8,,cta_per_cu=1;g2.tile_n=1024;g1.tile_k=512;g1.num_buffers=4,33.8,1114 r79 deep G1 pipeline (ar 40.7 / ag_rs 43.5 -> 37.1)
 6144,129,768,4,32,,cta_per_cu=2;g1.num_buffers=4,59.3,1114 r79 (ar 61.4 / ag_rs 66.6 -> 64.2)
-3584,896,768,4,8,,cta_per_cu=2;g1.num_buffers=4,60.7,1114 r79 (ar 64.5 / ag_rs 64.1 -> 62.3)
-3584,896,768,4,16,,cta_per_cu=2;g1.num_buffers=4,84.8,1114 r79 (ar 89.2 / ag_rs 90.5 -> 87.5)
+3584,896,768,4,8,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,,1115 r116 G1 K-512 stages nb2 + G2 nb4 (ag_rs 62.1->60.4 / ar 57.6->56.4)
+3584,896,768,4,16,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,,1115 r116 G1 K-512 stages nb2 + G2 nb4 (ag_rs 87.7->85.7 / ar 81.4->80.6)
 6144,129,768,4,64,,cta_per_cu=2;g1.tile_n=512;g1.tile_k=128;g1.num_buffers=2,72.9,1114 r82 G1 512 wide (ar 74.7 / ag_rs 80.3 -> 78.4)
 6144,129,768,4,128,,g1.tile_n=512;g1.tile_k=128;g1.num_buffers=2;df0=1,86.5,1114 r82 (ar 89.0 / ag_rs 94.9 -> 92.4); +df0 r92 (LL era: -1~4us)
 6144,129,768,4,256,,g1.tile_n=512;g1.tile_k=128;g1.num_buffers=2;df0=1,100.1,1114 r82 (ar 101.1 / ag_rs 99.0 -> 98.1); +df0 r92 (LL era: -1~4us)
 3584,896,768,4,256,ar,local_hist=0,276.7,1114 r82 AR only: grid route count + q_place (286.8; ag_rs 274.1 -> 277.7)
-3584,896,768,4,32,,cta_per_cu=2;g1.num_buffers=4,,1114 r96 robustness: at 3 CTAs/CU (~300 VGPRs) Kimi stalled 20 s in ~40% of runs (not all CTAs resident); 2 CTAs/CU none in 10 runs
-3584,896,768,4,64,,cta_per_cu=2;g1.num_buffers=4,,1114 r96 robustness: at 3 CTAs/CU (~300 VGPRs) Kimi stalled 20 s in ~40% of runs (not all CTAs resident); 2 CTAs/CU none in 10 runs
-3584,896,768,4,128,,cta_per_cu=2;g1.num_buffers=4,,1114 r96 robustness: at 3 CTAs/CU (~300 VGPRs) Kimi stalled 20 s in ~40% of runs (not all CTAs resident); 2 CTAs/CU none in 10 runs
-3584,896,768,4,256,,cta_per_cu=2;g1.num_buffers=4,,1114 r96 robustness: at 3 CTAs/CU (~300 VGPRs) Kimi stalled 20 s in ~40% of runs (not all CTAs resident); 2 CTAs/CU none in 10 runs
+3584,896,768,4,32,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,129.6,1115 r115 deeper G1 K stages + G2 nb4 (cta2 nb4: 132.5)
+3584,896,768,4,64,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,,1115 r116 G1 K-512 stages nb2 + G2 nb4 (ag_rs 199.6->196.0 / ar 192.7->190.9)
+3584,896,768,4,128,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,,1115 r116 G1 K-512 stages nb2 + G2 nb4 (ag_rs 257.2->251.1 / ar 260.1->255.0)
+3584,896,768,4,256,,cta_per_cu=2;g1.tile_k=512;g1.num_buffers=2;g2.num_buffers=4,,1115 r116 G1 K-512 stages nb2 + G2 nb4 (ag_rs 278.9->273.0 / ar 278.6->275.5)
+6144,129,768,4,16384,,g1.soa=1;g2.soa=1,,1117 r125 LDS SoA load interleave (ar 786.3->777.9 / ag_rs 762.4->753.8)
+6144,129,768,4,32768,,g1.soa=1;g2.soa=1,,1117 r125 LDS SoA load interleave (ar 1475.0->1456.0 / ag_rs 1411.4->1396.3)
+3584,896,768,4,16384,,g1.soa=1;g2.soa=1,,1117 r125 LDS SoA load interleave (ar 1506.4->1484.4 / ag_rs 1454.9->1442.2)
+3584,896,768,4,32768,,g1.soa=1;g2.soa=1,,1117 r125 LDS SoA load interleave (ar 2670.0->2629.9 / ag_rs 2588.7->2553.0)

@@ -963,19 +963,22 @@ def test_route_gives_minus_one_routes_no_row(valid):
     assert rows[:valid].unique().numel() == valid * topk
 
 
-@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("quant", ["route_quant_front", "multidest", "compact"])
 @pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
-def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkeypatch):
+def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, quant, monkeypatch):
     """Rows past num_local_tokens arrive routed to expert -1, as the router
-    leaves them under num_valid_rows. The token-multidest quant (TP batches of
-    64+ tokens) must give them no grouped row: they come out 0, and the real
+    leaves them under num_valid_rows. The stage-1 quant of a TP batch -- the
+    route + quant front kernel, or the token-multidest quant (64+ tokens) it
+    replaces -- must give them no grouped row: they come out 0, and the real
     rows come out as they do when every row is real."""
     _require_gfx1250()
     from aiter.ops.flydsl import moe_kernels
 
-    getter = "_get_compiled_token_multidest_" + (
-        "compact_quant" if compact else "quant"
-    )
+    getter = {
+        "route_quant_front": "_get_compiled_route_quant_front",
+        "multidest": "_get_compiled_token_multidest_quant",
+        "compact": "_get_compiled_token_multidest_compact_quant",
+    }[quant]
     original = getattr(moe_kernels, getter)
     calls = []
 
@@ -984,7 +987,9 @@ def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkey
         return original(*args, **kwargs)
 
     monkeypatch.setattr(moe_kernels, getter, counted)
-    if compact:
+    if quant == "multidest":
+        monkeypatch.setenv("AITER_FLYDSL_ROUTE_QUANT_FRONT", "0")
+    if quant == "compact":
         # The compact-scale variant otherwise starts at 1024+ tokens.
         monkeypatch.setenv("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS", "64")
     tokens, valid = 128, 77
@@ -1171,6 +1176,169 @@ def test_grouped_swiglu_m3_tp_decode(tokens):
         activation=ActivationType.Swiglu,
         check_aot_cache=False,
     )
+
+
+def _fused_shared_case(experts, tokens, topk, model_dim, inter_dim, seed=0):
+    """Inputs and fp32 reference for A4W4 routed experts + one A8W8 (MXFP8)
+    shared expert, the last id."""
+    routed = experts - 1
+    torch.manual_seed(seed)
+    gen = bench_init.make_generator(seed)
+    w1 = _pattern_packed(
+        routed, 2 * inter_dim, model_dim // 2, data_init="uniform", generator=gen
+    )
+    w2 = _pattern_packed(
+        routed, model_dim, inter_dim // 2, data_init="uniform", generator=gen
+    )
+    s1 = init_weight_scales(
+        routed,
+        2 * inter_dim,
+        model_dim // SCALE_BLOCK,
+        scale_init="auto",
+        generator=gen,
+    )
+    s2 = init_weight_scales(
+        routed, model_dim, inter_dim // SCALE_BLOCK, scale_init="auto", generator=gen
+    )
+    sw1 = bench_init.fill_fp8((2 * inter_dim, model_dim), "uniform", gen)
+    sw2 = bench_init.fill_fp8((model_dim, inter_dim), "uniform", gen)
+    ss1 = init_weight_scales(
+        1, 2 * inter_dim, model_dim // SCALE_BLOCK, scale_init="auto", generator=gen
+    )
+    ss2 = init_weight_scales(
+        1, model_dim, inter_dim // SCALE_BLOCK, scale_init="auto", generator=gen
+    )
+    hidden = _init_hidden((tokens, model_dim), "a4w4", "uniform", gen)
+    topk_id, topk_w = _make_topk(hidden, experts, topk, 1)
+    # A non-unit weight on the shared column, so its route weight is exercised.
+    topk_w = topk_w.clone()
+    topk_w[:, -1] = 0.75
+
+    kwargs = {
+        "w1": moe_shuffle_weight(
+            w1, experts_cnt=routed, is_guinterleave=True, gate_up=True
+        ).view(dtypes.fp4x2),
+        "w2": moe_shuffle_weight(w2, experts_cnt=routed).view(dtypes.fp4x2),
+        "w1_scale": moe_shuffle_scale(
+            s1.contiguous(), experts_cnt=routed, is_guinterleave=True, gate_up=True
+        ),
+        "w2_scale": moe_shuffle_scale(s2.contiguous(), experts_cnt=routed),
+        "shared_w1": moe_shuffle_weight(
+            sw1.view(1, 2 * inter_dim, model_dim),
+            experts_cnt=1,
+            is_guinterleave=True,
+            gate_up=True,
+        ),
+        "shared_w2": moe_shuffle_weight(
+            sw2.view(1, model_dim, inter_dim), experts_cnt=1
+        ),
+        "shared_w1_scale": moe_shuffle_scale(
+            ss1.contiguous(), experts_cnt=1, is_guinterleave=True, gate_up=True
+        ),
+        "shared_w2_scale": moe_shuffle_scale(ss2.contiguous(), experts_cnt=1),
+        "shared_expert_id": routed,
+    }
+
+    def reference(hidden, topk_w, topk_id):
+        zeros1 = torch.zeros((routed, 2 * inter_dim), device=hidden.device)
+        zeros2 = torch.zeros((routed, model_dim), device=hidden.device)
+        ref = _torch_moe_ref(
+            hidden,
+            w1,
+            s1,
+            zeros1,
+            w2,
+            s2,
+            zeros2,
+            topk_w[:, :-1].contiguous(),
+            topk_id[:, :-1].contiguous(),
+            data_format="a4w4",
+            activation=ActivationType.Swiglu,
+            swiglu_limit=7.0,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        # The shared expert is A8W8: MXFP8 activations against MXFP8 weights.
+        ids = torch.zeros((hidden.shape[0], 1), dtype=torch.int32, device=hidden.device)
+        shared = _torch_moe_ref(
+            hidden,
+            sw1.view(1, 2 * inter_dim, model_dim),
+            ss1,
+            torch.zeros((1, 2 * inter_dim), device=hidden.device),
+            sw2.view(1, model_dim, inter_dim),
+            ss2,
+            torch.zeros((1, model_dim), device=hidden.device),
+            topk_w[:, -1:].contiguous(),
+            ids,
+            data_format="a8w4",
+            activation=ActivationType.Swiglu,
+            swiglu_limit=7.0,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        return (ref.float() + shared.float()).to(torch.bfloat16)
+
+    return hidden, topk_w, topk_id, kwargs, reference
+
+
+@pytest.mark.parametrize(
+    "experts,tokens,topk,model_dim,inter_dim",
+    [
+        (5, 8, 3, 512, 512),
+        (5, 100, 3, 512, 512),
+        # MiniMax-M3.1 per-rank TP4: 128 routed MXFP4 + the MXFP8 shared expert.
+        (129, 1, 5, 6144, 768),
+        (129, 17, 5, 6144, 768),
+        (129, 256, 5, 6144, 768),
+    ],
+)
+def test_grouped_fused_mxfp8_shared_expert(experts, tokens, topk, model_dim, inter_dim):
+    """The A8W8 shared expert's tiles run inside the routed A4W4 launches."""
+    _require_gfx1250()
+    hidden, topk_w, topk_id, kwargs, reference = _fused_shared_case(
+        experts, tokens, topk, model_dim, inter_dim
+    )
+
+    def call(hidden, topk_w, topk_id):
+        return fused_moe(
+            hidden,
+            kwargs["w1"],
+            kwargs["w2"],
+            topk_w,
+            topk_id,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=kwargs["w1_scale"],
+            w2_scale=kwargs["w2_scale"],
+            gate_mode=GateMode.INTERLEAVE.value,
+            dtype=dtypes.bf16,
+            swiglu_limit=7.0,
+            shared_w1=kwargs["shared_w1"],
+            shared_w2=kwargs["shared_w2"],
+            shared_w1_scale=kwargs["shared_w1_scale"],
+            shared_w2_scale=kwargs["shared_w2_scale"],
+            shared_expert_id=kwargs["shared_expert_id"],
+        )
+
+    eager = _logits_diff(
+        call(hidden, topk_w, topk_id), reference(hidden, topk_w, topk_id)
+    )
+    assert eager < 1e-5, f"eager logits_diff={eager:.3e}"
+
+    # HIP graph, then a replay on other inputs: the grid is static, the shared
+    # expert's first row comes from the routing on the device.
+    live = [hidden.clone(), topk_w.clone(), topk_id.clone()]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = call(*live)
+    other = _fused_shared_case(experts, tokens, topk, model_dim, inter_dim, seed=3)
+    for src in ((hidden, topk_w, topk_id), other[:3]):
+        for dst, value in zip(live, src):
+            dst.copy_(value)
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = _logits_diff(out, reference(*src))
+        assert replayed < 1e-5, f"graph replay logits_diff={replayed:.3e}"
 
 
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])

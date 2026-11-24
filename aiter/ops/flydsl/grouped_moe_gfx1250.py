@@ -364,6 +364,13 @@ def _use_grouped_gemm_enabled() -> bool:
     return env_enabled or is_gfx1250
 
 
+@functools.lru_cache(maxsize=64)
+def _identity_rows(rows: int, device) -> torch.Tensor:
+    """Route map of a per-token buffer: row i is token i. Cached, so a CUDA
+    graph capture does not record its fill."""
+    return torch.arange(rows, dtype=torch.int32, device=device)
+
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be > 0, got {alignment}")
@@ -765,6 +772,7 @@ def _grouped_a8w4_tdm_moe(
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
     output=None,
+    fused_shared=None,
 ):
     import functools
 
@@ -774,7 +782,9 @@ def _grouped_a8w4_tdm_moe(
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
+        flydsl_moe_route_quant_front,
         flydsl_moe_topids_to_rows,
+        route_quant_front_supported,
     )
 
     device = hidden_states.device
@@ -790,6 +800,16 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    if fused_shared is not None:
+        # The fused shared-expert kernel builds the plain staged layout only.
+        a_preshuffle = tdm_as_in_prologue = lds_soa_load_interleave = 0
+        if bias1 is not None or bias2 is not None:
+            raise NotImplementedError("fused shared expert does not support bias")
+        if hidden_states.dtype != dtype:
+            raise NotImplementedError(
+                "fused shared expert quantizes the activations itself; got "
+                f"{hidden_states.dtype} hidden states"
+            )
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
     a_preshuffled = bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
@@ -949,6 +969,21 @@ def _grouped_a8w4_tdm_moe(
         )
     else:
         _apre_row_to_token = None
+    # ... and the stage-1 quant of a BF16 input can ride the same launch.
+    _front_route_quant = (
+        _fused_tp_route
+        and data_format == "fp4"
+        and a1_scale is None
+        and hidden_states.dtype == torch.bfloat16
+        and not a_preshuffled
+        and route_quant_front_supported(token_num, topk, E, model_dim)
+        and not _use_fused_quant_preshuffle(model_dim, wmma_rep, "fp4", token_num, topk)
+    )
+    if fused_shared is not None and not _fused_tp_route:
+        raise NotImplementedError(
+            "fused shared expert needs the single-launch route (no EP, at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_NUMEL} routes), got {token_num * topk} routes"
+        )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -1089,9 +1124,34 @@ def _grouped_a8w4_tdm_moe(
         psum = None
     elif herd_psum is not None:
         psum = herd_psum
+    elif _front_route_quant:
+        # The route rides the stage-1 quant launch: every workgroup derives the
+        # same rows from the routing alone. A fused shared expert's MXFP8
+        # per-token activations (row = token) come out of it too.
+        (
+            _masked_m,
+            topids_to_rows,
+            psum,
+            *_front_a1,
+        ) = flydsl_moe_route_quant_front(
+            hidden_states.reshape(token_num, model_dim),
+            topk_ids,
+            E,
+            contiguous_m,
+            _align_m,
+            wmma_rep=wmma_rep,
+            shared_rows=(
+                _tdm_align_up(token_num, 128) if fused_shared is not None else 0
+            ),
+        )
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
-            topk_ids, E, max_m, _align_m
+            topk_ids,
+            E,
+            max_m,
+            _align_m,
+            # The shared expert's tiles read per-token buffers: row = token.
+            identity_expert=(int(E) - 1 if fused_shared is not None else -1),
         )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
@@ -1315,6 +1375,8 @@ def _grouped_a8w4_tdm_moe(
             max_tok=int(stage2_scatter.max_tokens_per_rank),
             slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
+    elif _front_route_quant:
+        a1_payload, a1_scale = _front_a1[:2]
     else:
         a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
             hidden_states.reshape(1, token_num, _src_width),
@@ -1355,6 +1417,62 @@ def _grouped_a8w4_tdm_moe(
     _fuse_quant = not disable_gemm1_requant and not disable_gemm1_act
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    # Fused shared expert (the last id), A8W8: MXFP8 (w1, w1_scale, w2,
+    # w2_scale) in their own tensors and MXFP8 activations in per-token buffers
+    # (row = token), read by that expert's tiles inside the same launches.
+    _sh1_kw, _sh2_kw = {}, {}
+    if fused_shared is not None:
+        if not _fuse_quant:
+            raise NotImplementedError(
+                "fused shared expert needs gemm1's fused activation + quant"
+            )
+        _sw1, _sw1s, _sw2, _sw2s = fused_shared
+        # A whole number of the tallest shared tile, so no tile reads past it.
+        _sh_cap = _tdm_align_up(token_num, 128)
+        if _front_route_quant:
+            _sh_a1, _sh_a1_scale = _front_a1[2:]
+        else:
+            _sh_a1, _sh_a1_scale = flydsl_moe_fused_quant_preshuffle(
+                hidden_states.reshape(1, token_num, _src_width),
+                1,
+                _sh_cap,
+                wmma_rep=wmma_rep,
+                quant_mode="fp8",
+                masked_m=None,
+                topids_to_rows=_identity_rows(token_num, device),
+                source_topk=1,
+            )
+        _sh_a2 = torch.empty((1, _sh_cap, inter_dim), dtype=torch.uint8, device=device)
+        _sh_a2_scale = torch.empty(
+            (1, _sh_cap // wmma_rep2, (inter_dim + 127) // 128 * 4 * wmma_rep2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        _sh_rows = {
+            "shared_rows": int(token_num),
+            "shared_routes": int(_routes),
+            "shared_row_align": int(_align_m),
+        }
+        _sh1_kw = {
+            "shared_w": _grouped_weight_uint8(_sw1),
+            "shared_w_scales": _grouped_weight_uint8(_sw1s)
+            .reshape(-1)
+            .view(torch.int32),
+            "shared_a": _sh_a1,
+            "shared_a_scales": _sh_a1_scale,
+            "shared_out": _sh_a2,
+            "shared_quant_scale": _sh_a2_scale,
+            **_sh_rows,
+        }
+        _sh2_kw = {
+            "shared_w": _grouped_weight_uint8(_sw2),
+            "shared_w_scales": _grouped_weight_uint8(_sw2s)
+            .reshape(-1)
+            .view(torch.int32),
+            "shared_a": _sh_a2,
+            "shared_a_scales": _sh_a2_scale,
+            **_sh_rows,
+        }
 
     if _fuse_quant:
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
@@ -1419,6 +1537,7 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
+            **_sh1_kw,
         )
     else:
         # Raw GEMM1 writes both gate/up columns when activation moves to quant.
@@ -1465,6 +1584,7 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
+            **_sh1_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
@@ -1514,6 +1634,7 @@ def _grouped_a8w4_tdm_moe(
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
+        **_sh2_kw,
     )
 
     if kernel_bench_callable is not None:
@@ -1603,6 +1724,7 @@ def _grouped_a8w4_tdm_moe(
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
                         **_situ_kw,
+                        **_sh1_kw,
                     ),
                 )
             )
@@ -1647,6 +1769,7 @@ def _grouped_a8w4_tdm_moe(
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
                         **_situ_kw,
+                        **_sh1_kw,
                     ),
                 )
             )
@@ -1686,6 +1809,7 @@ def _grouped_a8w4_tdm_moe(
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
+                    **_sh2_kw,
                 ),
             )
         )
@@ -1758,8 +1882,12 @@ def grouped_gemm_gfx1250_a8w4(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
+    fused_shared: tuple | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
+
+    ``fused_shared`` is the shared expert's MXFP8 ``(w1, w1_scale, w2,
+    w2_scale)``; see ``grouped_fused_shared_gfx1250``.
 
     ``w1`` MUST be GUGU: gate/up row-interleaved ([g0,u0,g1,u1,...]), i.e. what
     ``moe_shuffle_weight(..., is_guinterleave=True, gate_up=True)`` produces.
@@ -2108,6 +2236,7 @@ def grouped_gemm_gfx1250_a8w4(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            fused_shared=fused_shared,
             **_tdm_kw,
         )
 
@@ -2119,6 +2248,106 @@ def grouped_gemm_gfx1250_a8w4(
     # (batched_gemm_mxfp4); grouped kernels are JIT-compiled at first use
     # until that is added back.
     return None
+
+
+def grouped_fused_shared_gfx1250(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    shared_w1: torch.Tensor,
+    shared_w2: torch.Tensor,
+    shared_w1_scale: torch.Tensor,
+    shared_w2_scale: torch.Tensor,
+    shared_expert_id: int,
+    activation: ActivationType,
+    quant_type: QuantType,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    dtype: torch.dtype | None = None,
+    swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    num_local_tokens: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+):
+    """Grouped MXFP4 MoE with a fused A8W8 (MXFP8) shared expert (gfx1250).
+
+    The routed experts are A4W4: MXFP4 weights (``w1`` GUGU, as
+    ``grouped_gemm_gfx1250_a8w4`` reads it) and MXFP4 activations, ids
+    ``0 .. shared_expert_id - 1``. ``topk_ids`` names the shared expert as
+    ``shared_expert_id`` for every token (padding rows, routed to -1, come
+    last) and ``topk_weight`` carries its weight. The routed tensors may end
+    in a dummy row for that id, which is never read.
+
+    The shared expert is A8W8: its weights are MXFP8 in their own tensors,
+    ``shared_w1`` ``[2 * inter_dim, model_dim]`` GUGU and ``shared_w2``
+    ``[model_dim, inter_dim]`` (a leading dimension of 1 is accepted), both
+    through ``moe_shuffle_weight``, with E8M0 scales through
+    ``moe_shuffle_scale``; its activations are quantized to MXFP8 here, for
+    both stages. Both stages run the shared expert's tiles inside the routed
+    launches; one extra launch quantizes its stage-1 activations.
+    """
+    E = int(shared_expert_id) + 1
+    if w1.shape[0] not in (E - 1, E) or w2.shape[0] != w1.shape[0]:
+        raise ValueError(
+            f"routed weights must hold {E - 1} experts (optionally one dummy "
+            f"row for the shared id), got {w1.shape[0]} / {w2.shape[0]}"
+        )
+    model_dim = int(w2.shape[1])
+    inter_dim = int(w2.shape[2]) * (model_dim // int(w1.shape[-1]))
+    if shared_w1.numel() != 2 * inter_dim * model_dim:
+        raise ValueError(
+            f"shared_w1 must be MXFP8 [{2 * inter_dim}, {model_dim}], got "
+            f"{tuple(shared_w1.shape)}"
+        )
+    if shared_w2.numel() != model_dim * inter_dim:
+        raise ValueError(
+            f"shared_w2 must be MXFP8 [{model_dim}, {inter_dim}], got "
+            f"{tuple(shared_w2.shape)}"
+        )
+    if shared_w1_scale.numel() != 2 * inter_dim * model_dim // 32:
+        raise ValueError("shared_w1_scale must hold one E8M0 per 32 weights")
+    if shared_w2_scale.numel() != model_dim * inter_dim // 32:
+        raise ValueError("shared_w2_scale must hold one E8M0 per 32 weights")
+    out = grouped_gemm_gfx1250_a8w4(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        E=E,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=hidden_states.dtype if dtype is None else dtype,
+        activation=activation,
+        quant_type=quant_type,
+        q_dtype_a=dtypes.fp4x2,
+        q_dtype_w=dtypes.fp4x2,
+        isG1U1=True,
+        doweight_stage1=False,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        expert_mask=None,
+        hidden_pad=0,
+        intermediate_pad=0,
+        bias1=None,
+        bias2=None,
+        swiglu_limit=swiglu_limit,
+        num_local_tokens=num_local_tokens,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        output=output,
+        fused_shared=(shared_w1, shared_w1_scale, shared_w2, shared_w2_scale),
+    )
+    if out is None:
+        raise NotImplementedError(
+            "gfx1250 fused shared expert needs the grouped MXFP4 MoE path "
+            "(per_1x32, SiLU / SwiGLU / SiTUv2)"
+        )
+    return out
 
 
 # --- Functions moved from moe_kernels.py for grouped gemm ---
@@ -2186,12 +2415,10 @@ def _get_compiled_route_psum_fused():
     return build_moe_route_psum_fused_module()
 
 
-# One workgroup handles every route. NUMEL is advisory -- the route sweep is
-# grid-stride, so a larger count is correct but stops being worth fusing; on
-# gfx1250 the split launches catch up at about 2.5K routes.
-# EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
-# are both one slot per lane.
-_FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
+# One workgroup handles every route. Both are hard limits, enforced below: a
+# thread owns a fixed number of routes (its ids and slots stay in registers),
+# and the scan and the LDS route counter are both one slot per lane.
+_FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
 
 
@@ -2200,12 +2427,18 @@ def fused_route_psum_remap(
     experts: int,
     max_m: int,
     tile_m: int,
+    identity_expert: int = -1,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
     Equivalent to ``flydsl_moe_topids_to_rows`` followed by
     ``contiguous_psum_remap``, but fused into one workgroup. Returns
     (masked_m, topids_to_rows[token_num, topk], psum).
+
+    ``identity_expert`` names an expert whose rows stay in token order (row i
+    of that expert is token i): a shared expert every token routes to, whose
+    tiles read per-token buffers. The tokens routed to it must be the first
+    tokens (padding rows, routed to -1, come last).
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
@@ -2219,6 +2452,12 @@ def fused_route_psum_remap(
         raise ValueError(
             f"fused_route_psum_remap supports at most "
             f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}; "
+            f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
+        )
+    if numel > _FUSED_ROUTE_PSUM_MAX_NUMEL:
+        raise ValueError(
+            f"fused_route_psum_remap supports at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_NUMEL} routes, got {numel}; "
             f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
         )
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
@@ -2237,6 +2476,8 @@ def fused_route_psum_remap(
         experts,
         int(max_m),
         int(tile_m),
+        int(identity_expert),
+        int(topk),
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum

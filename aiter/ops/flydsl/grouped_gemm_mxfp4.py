@@ -10,6 +10,8 @@ import os
 import flydsl.expr as fx
 import torch
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
@@ -101,6 +103,174 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
+def _shared_tile_m(shared_rows: int) -> int:
+    """Row cap of the fused shared expert's tile: the batch, up to 128 rows."""
+    env = os.environ.get("AITER_FLYDSL_SHARED_TILE_M")
+    if env is not None:
+        cap = int(env)
+        if cap < 16 or cap & (cap - 1):
+            raise ValueError("AITER_FLYDSL_SHARED_TILE_M must be a power of two >= 16")
+        return cap
+    cap = 16
+    while cap < min(int(shared_rows), 128):
+        cap *= 2
+    return cap
+
+
+def _launch_shared_w8(
+    out,
+    a,
+    w,
+    a_scales,
+    w_scales,
+    m_tile_map,
+    shared_w,
+    shared_w_scales,
+    *,
+    shared_a,
+    shared_a_scales,
+    shared_out,
+    shared_quant_scale,
+    shared_rows,
+    contiguous_routes,
+    row_align,
+    n_experts,
+    contiguous_m,
+    N,
+    K,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    num_buffers,
+    out_is_f16,
+    a_is_fp4,
+    stage1_act,
+    swiglu_limit,
+    stream,
+    stage1_quant_out,
+    quant_scale,
+    quant_wmma_rep,
+    waves_per_tensor_tdm,
+    next_stage_prefetch,
+    tdm_b_th,
+    situ_beta,
+    situ_linear_beta,
+    rolled_drain,
+    unsupported,
+):
+    """Launch the grouped GEMM with the A8W8 shared expert fused in.
+
+    ``shared_a`` / ``shared_a_scales`` are the shared expert's MXFP8
+    activations, one row per token (``shared_a.shape[-2]`` rows allocated,
+    ``shared_rows`` in use). Stage 1 writes its MXFP8 output to ``shared_out``
+    / ``shared_quant_scale``; stage 2 writes into ``out``. Clusters, persistent
+    workers and intra-workgroup split-K are routed-kernel options the fused
+    kernel does not build; the caller's CSV values for them are ignored.
+    """
+    from .kernels.mxfp4_shared_w8_gfx1250_tdm import launch_gemm_a8w4_tdm_shared_w8
+
+    bad = [name for name, value in unsupported.items() if value]
+    if bad:
+        raise NotImplementedError(
+            f"grouped GEMM with a fused MXFP8 shared expert does not support {bad}"
+        )
+    if shared_w_scales is None or shared_a is None or shared_a_scales is None:
+        raise ValueError("shared_w requires shared_w_scales, shared_a, shared_a_scales")
+    if stage1_act and not stage1_quant_out:
+        raise NotImplementedError(
+            "the fused shared expert needs gemm1's fused activation + quant"
+        )
+    if stage1_quant_out and (shared_out is None or shared_quant_scale is None):
+        raise ValueError("stage 1 needs shared_out and shared_quant_scale")
+    shared_cap = int(shared_a.shape[-2])
+    if shared_cap < shared_rows or shared_cap % 128:
+        raise ValueError(
+            f"shared_a must hold the {shared_rows} shared rows in a multiple of "
+            f"128 rows, got {shared_cap}"
+        )
+    if K % tile_k or N % tile_n:
+        raise NotImplementedError(
+            "fused MXFP8 shared expert needs whole tiles, got "
+            f"N={N}/{tile_n}, K={K}/{tile_k}"
+        )
+    if row_align % tile_m:
+        raise ValueError(f"row_align={row_align} must be a multiple of tile_m={tile_m}")
+    num_buffers = min(num_buffers, max(1, K // tile_k))
+    out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
+    if stage1_quant_out:
+        out_dtype = fx.Uint8
+    quant_scale_tensor = out if quant_scale is None else quant_scale
+    gemm_spec = (
+        int(N),
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        num_buffers,
+        a_is_fp4,
+    )
+    route_spec = (n_experts, stage1_act)
+    # Workgroups per CU this grid can fill: at most one M tile per route and
+    # one partial tile per routed expert, times the N tiles.
+    routes = max(0, int(contiguous_routes) - int(shared_rows))
+    m_tiles = -(-routes // tile_m) + min(n_experts - 1, routes)
+    min_residency = -(-(m_tiles * (N // tile_n)) // get_cu_num())
+    shared_spec = (int(row_align), _shared_tile_m(shared_rows), min_residency)
+    quant_spec = (stage1_quant_out, quant_wmma_rep)
+    tdm_spec = (
+        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
+        _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm),
+        _select_tdm_b_th(tdm_b_th),
+    )
+    _run_compiled(
+        launch_gemm_a8w4_tdm_shared_w8,
+        ptr_arg(out, out_dtype),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scales, fx.Int32),
+        ptr_arg(w_scales, fx.Int32),
+        ptr_arg(out if shared_out is None else shared_out, out_dtype),
+        ptr_arg(shared_a),
+        ptr_arg(shared_w),
+        ptr_arg(shared_a_scales, fx.Int32),
+        ptr_arg(shared_w_scales, fx.Int32),
+        ptr_arg(
+            quant_scale_tensor if shared_quant_scale is None else shared_quant_scale
+        ),
+        contiguous_m,
+        int(shared_rows),
+        shared_cap,
+        stream,
+        N,
+        *gemm_spec,
+        ptr_arg(m_tile_map),
+        *route_spec,
+        float(swiglu_limit),
+        *shared_spec,
+        *quant_spec,
+        ptr_arg(quant_scale_tensor),
+        *tdm_spec,
+        float(situ_beta),
+        float(situ_linear_beta),
+        int(rolled_drain),
+        specialization_key=(
+            "shared_w8",
+            gemm_spec,
+            route_spec,
+            shared_spec,
+            quant_spec,
+            tdm_spec,
+            int(rolled_drain),
+        ),
+    )
+    return out
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -149,8 +319,26 @@ def flydsl_grouped_gemm_a8w4_masked(
     gemm_stage=None,
     m_align=0,
     k_waves=1,
+    shared_w=None,
+    shared_w_scales=None,
+    shared_a=None,
+    shared_a_scales=None,
+    shared_out=None,
+    shared_quant_scale=None,
+    shared_rows=0,
+    shared_routes=0,
+    shared_row_align=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
+
+    ``shared_w`` / ``shared_w_scales`` fuse an A8W8 shared expert (the last
+    expert id) into the launch: its tiles read these MXFP8 weights and the
+    per-token MXFP8 activations ``shared_a`` / ``shared_a_scales`` (at most
+    ``shared_rows`` tokens). Stage 1 writes that expert's MXFP8 output to
+    ``shared_out`` / ``shared_quant_scale``; stage 2 writes its rows into
+    ``out`` where the contiguous layout, whose experts start on multiples of
+    ``shared_row_align``, holds that expert in token order. ``shared_routes``
+    is the layout's route count, the shared expert's included.
 
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
@@ -181,6 +369,58 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     if stream is None:
         stream = current_stream_arg()
+    if shared_w is not None:
+        return _launch_shared_w8(
+            out,
+            a,
+            w,
+            a_scales,
+            w_scales,
+            m_tile_map,
+            shared_w,
+            shared_w_scales,
+            shared_a=shared_a,
+            shared_a_scales=shared_a_scales,
+            shared_out=shared_out,
+            shared_quant_scale=shared_quant_scale,
+            shared_rows=shared_rows,
+            contiguous_routes=shared_routes,
+            row_align=shared_row_align,
+            n_experts=n_experts,
+            contiguous_m=contiguous_m,
+            N=N,
+            K=K,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            out_is_f16=out_is_f16,
+            a_is_fp4=a_is_fp4,
+            stage1_act=stage1_act,
+            swiglu_limit=swiglu_limit,
+            stream=stream,
+            stage1_quant_out=stage1_quant_out,
+            quant_scale=quant_scale,
+            quant_wmma_rep=quant_wmma_rep,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_b_th=tdm_b_th,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            rolled_drain=rolled_drain,
+            unsupported={
+                "a_preshuffled": a_preshuffled,
+                "bias": bias is not None,
+                "tdm_as_in_prologue": tdm_as_in_prologue,
+                "lds_soa_load_interleave": lds_soa_load_interleave,
+                "stage2_scatter": stage2_scatter is not None,
+                "row_major_ascale": row_major_ascale,
+                "a_row_stride_bytes": a_row_stride_bytes,
+                "m_align": m_align,
+            },
+        )
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")

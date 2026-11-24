@@ -149,7 +149,11 @@ class SymmetricArena:
     Destruction is not collective: synchronize every rank before dropping an instance.
     In containers on the host network ROCm 7.1 needs HSA_ENABLE_IPC_MODE_LEGACY=1."""
 
-    def __init__(self, *, group=None, device: torch.device | None = None):
+    def __init__(self, *, group=None, device: torch.device | None = None, align: int = 0):
+        # align (a power of two, 0: none): the arena starts on an address that is a
+        # multiple of it on every rank, so a region reserved with align= is aligned in
+        # memory too (regions peers write: see ROCm/aiter#7937's 2 MiB inbox)
+        self._align = int(align)
         self.group = group
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.rank = dist.get_rank(group=group)
@@ -160,12 +164,13 @@ class SymmetricArena:
         self._base_ptrs: tuple[int, ...] = ()
         self._opened: list[bytes] = []
 
-    def reserve(self, name: str, shape, dtype: torch.dtype) -> _Slice:
+    def reserve(self, name: str, shape, dtype: torch.dtype, align: int = 0) -> _Slice:
         """Carve out a named region. Must run in the same order on every rank."""
         if self._storage is not None or name in self._slices:
             raise RuntimeError(f"cannot reserve {name!r}")
         shape = tuple(int(s) for s in shape)
-        offset = ceildiv(self._cursor, _ALIGN) * _ALIGN
+        al = max(_ALIGN, int(align))
+        offset = ceildiv(self._cursor, al) * al
         nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
         self._cursor = offset + nbytes
         self._slices[name] = _Slice(offset, nbytes, shape, dtype)
@@ -176,7 +181,9 @@ class SymmetricArena:
         rank fails)."""
         total = ceildiv(self._cursor, _ALIGN) * _ALIGN
         with _no_expandable_segments():
-            self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            raw = torch.zeros(total + self._align, dtype=torch.uint8, device=self.device)
+        skip = (-int(raw.data_ptr())) % self._align if self._align else 0
+        self._storage = raw[skip : skip + total]
         base_ptr = int(self._storage.data_ptr())
         for s in self._slices.values():
             s.local = self._storage[s.offset : s.offset + s.nbytes].view(s.dtype)
