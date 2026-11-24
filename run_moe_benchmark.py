@@ -7,7 +7,8 @@ total experts and topk by one. --tokens selects one or more token counts;
 omitting it runs all seventeen default counts. Use --container dsr1_ep4 to
 override the default hyg_fyd1 container.
 Docker access is detected automatically; sudo -n is used when direct Docker
-access is denied.
+access is denied. Every Docker command runs through the host gpu-lock, including
+metadata probes. GPU workers run in the foreground without timeouts.
 
 Pin is requested as 1 for three fresh processes, each calling the canonical
 op test directly with all token counts after --tokens. APRE, tiles, and clusters use
@@ -24,7 +25,6 @@ import json
 import math
 import os
 import shutil
-import signal
 import statistics
 import subprocess
 from pathlib import Path
@@ -197,17 +197,23 @@ def write_json(path, value):
 
 
 def capture(command, repo, timeout=20):
-    return subprocess.run(
-        command,
-        cwd=repo,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
-    )
+    options = {
+        "cwd": repo,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if Path(command[0]).name == "gpu-lock":
+        process = subprocess.Popen(command, **options, start_new_session=True)
+        try:
+            output, _ = process.communicate()
+        except BaseException:
+            wait_for_worker(process, drain=True)
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, output)
+    return subprocess.run(command, **options, timeout=timeout, check=False)
 
 
 def checked(command, repo):
@@ -220,8 +226,11 @@ def checked(command, repo):
 
 
 def detect_docker_command(repo):
+    gpu_lock = shutil.which("gpu-lock")
+    if not gpu_lock:
+        raise RuntimeError("Host gpu-lock is required for every Docker command.")
     probe = ["info", "--format", "{{.ServerVersion}}"]
-    command = ["docker"]
+    command = [gpu_lock, "docker"]
     result = capture(command + probe, repo)
     if result.returncode == 0:
         return command
@@ -229,7 +238,7 @@ def detect_docker_command(repo):
         raise RuntimeError(f"Cannot access Docker: {result.stdout.strip()}")
     if not shutil.which("sudo"):
         raise RuntimeError("Docker access requires sudo, but sudo is unavailable.")
-    command = ["sudo", "-n", "docker"]
+    command = [gpu_lock, "sudo", "-n", "docker"]
     result = capture(command + probe, repo)
     if result.returncode:
         raise RuntimeError(
@@ -301,41 +310,16 @@ def make_plan(
     ]
 
 
-def stop_own_worker(repo, container, task, process, docker_command):
-    # The unique result path must still occur in this PID's command line.
-    # Never use a broad pkill or terminate another user's GPU process.
-    pid_file = Path(task["pid_file"])
-    if pid_file.is_file():
-        code = (
-            "import os,signal,sys; p=int(sys.argv[1]); "
-            "path=f'/proc/{p}/cmdline'; "
-            "cmd=open(path,'rb').read() if os.path.exists(path) else b''; "
-            "os.kill(p,signal.SIGKILL) if sys.argv[2].encode() in cmd else None"
-        )
+def wait_for_worker(process, *, drain=False):
+    # Keep the host Docker client and its lock alive until the worker exits.
+    while process.poll() is None:
         try:
-            capture(
-                [
-                    *docker_command,
-                    "exec",
-                    container,
-                    "python3",
-                    "-c",
-                    code,
-                    pid_file.read_text(encoding="utf-8").strip(),
-                    task["result"],
-                ],
-                repo,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass  # The container's timeout independently bounds the worker.
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=2)
+            if drain:
+                process.communicate()
+            else:
+                process.wait()
+        except KeyboardInterrupt:
+            print("Waiting for the current GPU worker to exit normally.", flush=True)
 
 
 def validate_row(
@@ -669,6 +653,8 @@ def main():
                     "pin_environment": "AITER_FLYDSL_EXPLICIT_VGPR_PARTITION",
                     "apre_policy": "repository default",
                     "gpu_idle_check": False,
+                    "gpu_access": "host gpu-lock for every Docker command",
+                    "gpu_job_timeout": None,
                     "workers": plan,
                 },
                 indent=2,
@@ -725,7 +711,8 @@ def main():
         "source_sha256": source_hashes(),
         "status": "running",
         "samples": [],
-        "test_timeout_seconds": len(args.tokens) * 120,
+        "gpu_job_timeout": None,
+        "gpu_access": "host gpu-lock for every Docker command",
         "gpu_idle_check": False,
         "completed_processes": 0,
         "invocation": "canonical multi-token op-test CLI via runpy",
@@ -779,7 +766,6 @@ def main():
             "import importlib.metadata as m,json,os,shutil,sys; from pathlib import Path; "
             "repo=Path(sys.argv[1]); root=Path(sys.argv[2]); "
             f"assert (repo/{TEST!r}).is_file(); "
-            "assert shutil.which('timeout'); "
             "(root/'container_environment.json').write_text("
             "json.dumps({'packages':{k:m.version(k) for k in ('flydsl','torch')},"
             "'override_names':[k for k in os.environ if "
@@ -844,10 +830,6 @@ def main():
                 "-w",
                 str(repo),
                 args.container,
-                "timeout",
-                "--signal=TERM",
-                "--kill-after=3s",
-                f"{state['test_timeout_seconds'] - 5}s",
                 "env",
             ]
             for name in state["cleared_container_overrides"]:
@@ -870,20 +852,12 @@ def main():
                     start_new_session=True,
                 )
                 try:
-                    rc = process.wait(timeout=state["test_timeout_seconds"])
-                except subprocess.TimeoutExpired:
-                    stop_own_worker(repo, args.container, task, process, docker_command)
-                    raise RuntimeError(
-                        f"{label} exceeded {state['test_timeout_seconds']} seconds; its own worker was stopped"
-                    )
+                    rc = process.wait()
                 except BaseException:
-                    stop_own_worker(repo, args.container, task, process, docker_command)
+                    wait_for_worker(process)
                     raise
             if rc:
-                stop_own_worker(repo, args.container, task, process, docker_command)
-                raise RuntimeError(
-                    f"{label} failed or timed out (returncode={rc}); see {label}.log"
-                )
+                raise RuntimeError(f"{label} failed (returncode={rc}); see {label}.log")
             checked(
                 [
                     *docker_command,
