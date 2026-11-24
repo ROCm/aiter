@@ -1068,11 +1068,13 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
-        # AOT cache entry, so let those cases compile on demand.
+        # AOT cache entry, so let those cases compile on demand. Neither do
+        # whole-graph impl__ rows, until aiter/aot/flydsl/moe.py replays them.
         kwargs["check_aot_cache"] = (
             args.csv_filter is None
             and not post_reduce
             and kwargs["actType"] != aiter.ActivationType.Situv2
+            and not kernel_name1.startswith("impl__")
         )
         # Only Swiglu callers pass an expert bias; the AOT cache has no bias
         # variant for other activations.

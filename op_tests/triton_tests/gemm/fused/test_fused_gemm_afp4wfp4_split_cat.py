@@ -16,6 +16,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     e8m0_to_f32,
     mxfp4_to_f32,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 SCALE_GROUP_SIZE = 32
 
@@ -50,38 +51,6 @@ def run_triton(
         else fused_gemm_afp4wfp4_split_cat
     )
     return fn(x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype)
-
-
-def get_shapes():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 4)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (320, 1280, 8192),
-        (8192, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (320, 8192, 1024),
-        (8192, 8192, 1024),
-        (2048, 2048, 2049),
-        (159, 17389, 597),
-        (16, 576, 7168),
-    ]
-    x_vals += [
-        (16, 4096, 512),
-        (32, 4096, 512),
-        (64, 4096, 512),
-        (128, 4096, 512),
-        (256, 4096, 512),
-        (1024, 4096, 512),
-    ]
-    return x_vals
 
 
 def generate_fused_gemm_afp4wfp4_split_cat_inputs(
@@ -175,7 +144,7 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     [
         (dtype, *shape, d, s3, layout, shuffle)
         for dtype in ["bf16"]
-        for shape in get_shapes()
+        for shape in get_shapes(k_mult=256)
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]
@@ -192,6 +161,8 @@ def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
     # skip tests
     if N % D != 0:
         pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
+    if not shuffle and K > 4096 and K % 1024 != 0:
+        pytest.skip("Unshuffled split-K needs K % 1024 == 0 for K > 4096")
 
     # deconstruct N
     S = N // D

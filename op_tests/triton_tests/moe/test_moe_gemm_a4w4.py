@@ -187,12 +187,12 @@ def test_op(
     backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+    if get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("Kernel not supported on this GPU.")
     if not is_fp4_avail():
         pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
 
-    if backend == "gluon" and get_arch() != "gfx1250":
+    if backend == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
@@ -201,13 +201,15 @@ def test_op(
             )
         # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
         # K//32 divisible by 4; gfx950 still needs 8.
-        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 4) != 0):
+        if get_arch() in ("gfx1250", "gfx1250-strict") and (
+            n % 32 != 0 or k % (32 * 4) != 0
+        ):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )
 
     if preshuffle_weights:
-        if get_arch() != "gfx1250":
+        if get_arch() not in ("gfx1250", "gfx1250-strict"):
             pytest.skip("Preshuffling weights is only supported on gfx1250")
         if backend == "triton":
             pytest.skip("Preshuffled weights are decoded by the gluon kernel only")
@@ -245,7 +247,7 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         elif get_arch() == "gfx950":
