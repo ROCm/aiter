@@ -321,32 +321,19 @@ def test_fp8_mqa_logits_rows8_kernel_is_available():
     assert mqa_module._gluon_fp8_mqa_logits_rows8_kernel is not None
 
 
+# fmt: off
+_ROWS8_GATE_CASES = [
+    (8, 4096, False), (8, 4097, False), (24, 4223, False), (4096, 4095, False),
+    (2040, 4096, False), (1024, 9216, False), (256, 46080, False), (64, 193536, False),
+    (2040, 6145, True), (2048, 4096, True), (4096, 4096, True), (4096, 8192, True),
+    (4104, 8192, True), (2048, 32768, True), (1024, 9217, True), (1024, 65536, True),
+    (1856, 116480, True), (256, 46081, True), (64, 193537, True), (64, 1048576, True),
+]
+# fmt: on
+
+
 @requires_rows8
-@pytest.mark.parametrize(
-    "s_q,s_k,expected",
-    [
-        (8, 4096, False),
-        (8, 4097, False),
-        (24, 4223, False),
-        (4096, 4095, False),
-        (2040, 4096, False),
-        (1024, 9216, False),
-        (256, 46080, False),
-        (64, 193536, False),
-        (2040, 6145, True),
-        (2048, 4096, True),
-        (4096, 4096, True),
-        (4096, 8192, True),
-        (4104, 8192, True),
-        (2048, 32768, True),
-        (1024, 9217, True),
-        (1024, 65536, True),
-        (1856, 116480, True),
-        (256, 46081, True),
-        (64, 193537, True),
-        (64, 1048576, True),
-    ],
-)
+@pytest.mark.parametrize("s_q,s_k,expected", _ROWS8_GATE_CASES)
 def test_fp8_mqa_logits_rows8_gate(s_q, s_k, expected):
     """The eight-row path needs min_programs programs and min_seq_len_kv keys."""
     assert (mqa_module._gfx950_rows8_launch(s_q, s_k) is not None) == expected
@@ -525,11 +512,9 @@ def test_fp8_mqa_logits_rows8_matches_existing_route(
 
 
 def _request_batch_inputs(layout):
-    """FP8 inputs for a batch of requests. ``layout`` lists (rows, keys) of each
-    request: its rows follow the previous request's, its keys follow the
-    previous request's keys, and row i sees its request's first
-    ``keys - rows + i + 1`` keys. ``keys > rows`` is a resumed request, whose
-    first row already sees ``keys - rows + 1`` keys."""
+    """FP8 inputs for a batch of requests, (rows, keys) each, one after the
+    other. Row i of a request sees its first ``keys - rows + i + 1`` keys;
+    ``keys > rows`` is a resumed request."""
     s_q, s_k = sum(rows for rows, _ in layout), sum(keys for _, keys in layout)
     q = torch.randn(s_q, 32, 128, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, 128, device="cuda", dtype=torch.bfloat16)

@@ -72,24 +72,18 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 _GFX942_CU_LDS_BYTES = 64 * 1024
 
 
-def _gfx950_kv_splits(
-    seq_len,
-    seq_len_kv,
-    block_m,
-    num_warps,
-    waves_per_eu,
-    min_split_kv=16384,
-    split_rounds=8,
-):
+def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
     """How many workgroups to put on one query row block's KV walk."""
+    MIN_SPLIT_KV = 16384
     GFX950_SIMDS = 256 * 4
-    target_wgs = split_rounds * waves_per_eu * GFX950_SIMDS // num_warps
+    SPLIT_ROUNDS = 8
+    target_wgs = SPLIT_ROUNDS * waves_per_eu * GFX950_SIMDS // num_warps
     num_blocks = triton.cdiv(seq_len, block_m)
     if num_blocks >= target_wgs:
         return 1
     return min(
         target_wgs // num_blocks,
-        max(1, triton.cdiv(seq_len_kv, min_split_kv)),
+        max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
     )
 
 
@@ -100,14 +94,12 @@ def _gfx950_rows8_launch(seq_len, seq_len_kv, check_min_programs=True):
     A grid below ``min_programs`` does not fill the GPU, and the existing path
     is faster. Tests pass ``check_min_programs=False`` to use small shapes.
 
-    A block of eight rows is a coarse unit of work. The blocks of one batch
-    walk very different numbers of keys: a resumed request next to fresh ones,
-    causal windows, a block with rows of two requests. With few programs per
-    compute unit the longest ones set the end time, so this path cuts a
-    block's walk into more and shorter programs than the two-row path
-    (``min_split_kv`` keys each, ``split_rounds`` rounds of the GPU).
-    ``min_split_kv`` is below ``min_seq_len_kv``: every block gets two programs
-    or more unless the batch already has ``split_rounds`` rounds of blocks.
+    The blocks of one batch walk very different numbers of keys (a resumed
+    request next to fresh ones, a block with rows of two requests), and a block
+    of eight rows is a coarse unit: with few programs per compute unit the
+    longest ones set the end time. So this path has its own split rule, with
+    shorter programs than the two-row path: ``min_split_kv`` keys each, up to
+    ``split_rounds`` rounds of the GPU.
     """
     config_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
     config = dict(load_config_json(f"{config_dir}/DEFAULT.json")["rows8"])
@@ -117,14 +109,12 @@ def _gfx950_rows8_launch(seq_len, seq_len_kv, check_min_programs=True):
     split_rounds = config.pop("split_rounds")
     if seq_len_kv < min_seq_len_kv:
         return None
-    num_kv_splits = _gfx950_kv_splits(
-        seq_len,
-        seq_len_kv,
-        config["BLOCK_M"],
-        config["NUM_WARPS"],
-        config["WAVES_PER_EU"],
-        min_split_kv,
-        split_rounds,
+    num_blocks = max(seq_len // config["BLOCK_M"], 1)
+    # One round is one workgroup for each wave slot of the 256 compute units.
+    round_wgs = config["WAVES_PER_EU"] * 256 * 4 // config["NUM_WARPS"]
+    num_kv_splits = min(
+        max(split_rounds * round_wgs // num_blocks, 1),
+        triton.cdiv(seq_len_kv, min_split_kv),
     )
     programs = (seq_len // config["BLOCK_M"]) * num_kv_splits
     if check_min_programs and programs < min_programs:
