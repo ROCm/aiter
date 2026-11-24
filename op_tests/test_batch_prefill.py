@@ -6,6 +6,7 @@ import ctypes
 import itertools
 import math
 import os
+import sys
 import weakref
 
 import pandas as pd
@@ -17,6 +18,13 @@ import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
+)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from op_tests.triton_tests.utils.test_common_utils import (
+    is_gpu_memory_fault,
+    run_in_subprocess,
 )
 
 
@@ -2934,6 +2942,7 @@ def ref_masked_attention_with_sink(
     window_left,
     sink_size,
     sink_ptr_value,
+    window_right=0,
 ):
     """
     Reference attention with StreamLLM sink semantics.
@@ -2943,6 +2952,7 @@ def ref_masked_attention_with_sink(
         key:            [seqlen_k, num_heads, head_dim]
         value:          [seqlen_k, num_heads, head_dim]
         window_left:    left window size (-1 = infinite)
+        window_right:   right window size (-1 = infinite, 0 = causal)
         sink_size:      number of KV tokens at start always attended
         sink_ptr_value: per-head float tensor [num_heads] or None.
                         When not None, a virtual sink token with this scaled
@@ -2952,7 +2962,8 @@ def ref_masked_attention_with_sink(
     Valid KV range for query at absolute position abs_q = seqlen_k - seqlen_q + i_q:
         k < sink_size   (sink region, always valid)
         OR
-        abs_q - window_left <= k <= abs_q   (window region, window_left=-1 means k >= 0)
+        abs_q - window_left <= k <= abs_q + window_right
+        (negative window bounds are unlimited)
     """
     head_dim = query.shape[2]
     seqlen_q = query.shape[0]
@@ -2968,7 +2979,7 @@ def ref_masked_attention_with_sink(
     i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
     i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
     abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
-    k_end = abs_q  # causal boundary
+    k_end = seqlen_k - 1 if window_right < 0 else abs_q + window_right
     if window_left < 0:
         k_start_window = torch.zeros_like(abs_q)
     else:
@@ -3660,40 +3671,6 @@ def make_guarded_int32_tensor(values, device: int = 0):
 # Subprocess isolation is REQUIRED: GPU memory fault sends SIGABRT/SIGPIPE to
 # the entire process; no try/except in pytest can catch it.
 # ---------------------------------------------------------------------------
-def _aick1171_run_in_subprocess(child_code: str, timeout: int = 180):
-    """Run AICK-1171-shaped test body in a fresh Python subprocess.
-    HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 prevents multi-GB GPU coredump files
-    when the host has the coredump tool installed (verified env var name on
-    ROCm 7.2.0 via `strings libhsa-runtime64.so | grep coredump`)."""
-    import subprocess as _sub
-    import sys as _sys
-
-    env = dict(os.environ)
-    env["HSA_DISABLE_COREDUMP_ON_EXCEPTION"] = "1"
-    return _sub.run(
-        [_sys.executable, "-c", child_code],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-        check=False,
-    )
-
-
-def _aick1171_fault_signature(rc: int, stderr: str) -> bool:
-    """Detect HSA GPU memory-fault death.
-
-    Empirically on ROCm 7.2.0 / MI300X the signal is SIGABRT (-6); on
-    ROCm 7.x with different coredump-tool config it can be SIGPIPE (-13).
-    Match on (process killed by ANY signal) AND (HSA fault keyword in
-    stderr) -- both conditions must hold to avoid false positives from
-    unrelated SIGPIPE / SIGABRT.
-    """
-    killed_by_signal = (rc < 0) or (128 <= rc < 256)
-    if not killed_by_signal:
-        return False
-    msg = stderr.lower()
-    return "memory access fault" in msg or "hsa_status_error_memory_fault" in msg
 
 
 # The OOB read at page_idx[128] overruns the kv_page_indices buffer (not
@@ -3800,9 +3777,9 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
         print('AICK1171_GUARD_PAGE_OK', flush=True)
     """)
 
-    result = _aick1171_run_in_subprocess(child_code)
+    result = run_in_subprocess(child_code)
 
-    if _aick1171_fault_signature(result.returncode, result.stderr):
+    if is_gpu_memory_fault(result.returncode, result.stderr):
         pytest.fail(
             "AICK-1171 hard fault detected -- V prefetch read past "
             "kv_page_indices buffer end and hit guard page.\n"
@@ -3941,6 +3918,69 @@ def test_batch_prefill_virtual_sink(qo_len, window_left, with_sink):
     torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
 
 
+_FULL_ATTENTION_CASES = [
+    (False, (-1, -1)),
+    (False, (100, -1)),
+    (False, (-1, 100)),
+    (False, (100, 100)),
+    (True, (-1, -1)),
+    (True, (2, -1)),
+]
+
+
+@pytest.mark.parametrize("qo_len", [1, 4])
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal,window", _FULL_ATTENTION_CASES)
+def test_batch_prefill_full_attention(qo_len, with_sink, causal, window):
+    torch.manual_seed(42)
+    kv_lens, num_heads, num_kv_heads, head_dim = (37, 100), 8, 2, 128
+    q = torch.randn(
+        (2 * qo_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(
+        (sum(kv_lens), num_kv_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    v = torch.randn_like(k)
+    sink = (
+        torch.linspace(-1.0, 3.0, num_heads, dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    indices = torch.randperm(sum(kv_lens), device=q.device).to(torch.int32)
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=q.device),
+        indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=max(kv_lens),
+        causal=causal,
+        window_size=window,
+        sink_size=2,
+        sink_ptr=sink,
+    )
+    expected = []
+    offset = 0
+    for i, kv_len in enumerate(kv_lens):
+        pages = indices[offset : offset + kv_len].long()
+        expected.append(
+            ref_masked_attention_with_sink(
+                q[i * qo_len : (i + 1) * qo_len],
+                k[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                v[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                window[0],
+                2,
+                sink,
+                window_right=0 if causal else window[1],
+            )
+        )
+        offset += kv_len
+    rtol, atol = get_tolerances(q.dtype)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3971,3 +4011,8 @@ if __name__ == "__main__":
 
     for case in _VIRTUAL_SINK_CASES:
         test_batch_prefill_virtual_sink(*case)
+
+    for qo_len, with_sink, (causal, window) in itertools.product(
+        [1, 4], [False, True], _FULL_ATTENTION_CASES
+    ):
+        test_batch_prefill_full_attention(qo_len, with_sink, causal, window)

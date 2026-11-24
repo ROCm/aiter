@@ -9,6 +9,7 @@ import torch
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Debug
 DEBUG = False
@@ -220,17 +221,6 @@ def quantize_to_fp4(w_fp32):
     return w_packed, w_scales_e8m0
 
 
-def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
-    # GPT-OSS-120B attention projections
-    x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
-    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
-    x_vals += [(v, 57344, 8192) for v in (128, 2048)]  # LL3 405B FC1 (reduced)
-    return x_vals
-
-
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=1)
@@ -326,7 +316,7 @@ def run_torch_emulation(x, w, x_scales, w_scales, dtype):
 e5m2_type, e4m3_type = types.get_fp8_dtypes()
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 # @pytest.mark.parametrize("M, N, K", [
 #     (2, 2, 32),
 #     (4, 4, 32),

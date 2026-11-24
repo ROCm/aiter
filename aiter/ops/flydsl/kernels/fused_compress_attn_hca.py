@@ -320,7 +320,11 @@ def _build_compress_forward_kernel(
                 sc_list = _load_f32_vec(score_state_buf, base_sc_off)
                 neg_inf = fx.Float32(c_neg_inf)
                 sc_padded = [is_pad.select(neg_inf, sc_list[i]) for i in range(VEC)]
-                return kv_list, sc_padded
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                zero = fx.Float32(c_zero_f32)
+                kv_padded = [is_pad.select(zero, kv_list[i]) for i in range(VEC)]
+                return kv_padded, sc_padded
 
             def _softmax_step_padded(
                 m_old_list, kv_old_list, w_old_list, score_k_list, kv_k_list
@@ -1006,7 +1010,7 @@ def flydsl_hca_compress_attn(
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1250", "gfx1250-strict"):
         from .fused_compress_attn_hca_gfx1250 import flydsl_hca_compress_attn_gfx1250
 
         return flydsl_hca_compress_attn_gfx1250(
@@ -1256,7 +1260,7 @@ def flydsl_hca_compress_forward(
     """
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1250", "gfx1250-strict"):
         raise NotImplementedError(
             "flydsl_hca_compress_forward standalone pool: gfx1250 path not wired"
         )

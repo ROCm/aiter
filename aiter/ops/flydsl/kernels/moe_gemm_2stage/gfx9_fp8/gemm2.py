@@ -34,6 +34,7 @@ def compile_moe_gemm2(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    has_num_local_tokens=False,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -47,6 +48,8 @@ def compile_moe_gemm2(
     )
     if alg == "batch1":
         assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
+    # The sorted algorithms bound the rows in moe_sorting.
+    assert not has_num_local_tokens or alg == "batch1"
     if alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
         assert N % 256 == 0, (
@@ -138,7 +141,7 @@ def compile_moe_gemm2(
     def _make_down_weight_view(p_weight, expert_id):
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + fx.Int64(expert_id) * N * K,
             fx.make_layout(
                 ((16, N // 16), (element_num, K // element_num)),
                 ((element_num, 16 * K), (1, 16 * element_num)),
@@ -290,6 +293,7 @@ def compile_moe_gemm2(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
@@ -306,6 +310,10 @@ def compile_moe_gemm2(
         arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
         expert_id = arg_p_topk_ids[route_idx]
+        if const_expr(has_num_local_tokens):
+            # Rows at and past the count (CUDA-graph padding) run no route.
+            num_rows = fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_local_tokens))[0]
+            expert_id = (fx.Int32(batch_idx) < num_rows).select(expert_id, fx.Int32(-1))
         topk_weight = arg_p_topk_weights[route_idx]
         # Routing gives pad rows expert -1, which sorting would drop.
         if expert_id >= 0:
@@ -370,6 +378,8 @@ def compile_moe_gemm2(
         p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
+        # The cache holds IR of one trace, and a launcher can be traced again.
+        flyobj.clear_all()
         e_idx = fx.gpu.block_idx.y
 
         flyobj.bid = e_idx
@@ -399,7 +409,7 @@ def compile_moe_gemm2(
 
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),
@@ -490,18 +500,21 @@ def compile_moe_gemm2(
             frag_act = flyobj.load_tiled_mma_fragB(mm, ldsA, copy_atom_bits=128)
             fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
 
+            # The second mode (tokens, the MMA's N) broadcasts the per-channel scale
+            # with stride 0 and spans one whole N tile (16): FlyDSL >= 0.5.1 rejects
+            # a fragment view whose extent is not a multiple of the tile.
             arg_w_scale = None
             if const_expr(weight_quant_type == "per_tensor"):
                 arg_w_scale = fx.make_view(
-                    fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 1), (0, 0))
+                    fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 16), (0, 0))
                 )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 16))
             if const_expr(weight_quant_type == "ptpc"):
                 arg_w_scale = fx.make_view(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
-                    fx.make_layout((N, 1), (1, 0)),
+                    fx.make_layout((N, 16), (1, 0)),
                 )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 16))
 
             arg_a_scale = None
             if const_expr(act_quant_type == "per_tensor"):
@@ -603,7 +616,6 @@ def compile_moe_gemm2(
             def postprocess_store2lds(fragC, ldsc_idx):
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
-                # A closure helper keeps BF16 rounding in this kernel's JIT cache key.
                 _cvt_f32_to_bf16(fragC, fragC_bf16)
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
@@ -753,6 +765,7 @@ def compile_moe_gemm2(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
         task_num: fx.Int32,
         stream: fx.Stream,
     ):
@@ -760,7 +773,13 @@ def compile_moe_gemm2(
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         batch_size = task_num // TOPK
         moe_2stage_down_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_topk_weights,
+            p_w_scale,
+            p_num_local_tokens,
         ).launch(
             grid=(num_n_blocks, TOPK, batch_size),
             block=(64, 1, 1),

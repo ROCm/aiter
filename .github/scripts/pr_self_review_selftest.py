@@ -75,6 +75,16 @@ class PRSelfReviewSelftest(unittest.TestCase):
             signal, r"(?m)^\s+(?:issues|pull-requests|statuses): write$"
         )
 
+    def test_workflow_gates_drafts_and_passes_event_context(self) -> None:
+        privileged = (WORKFLOWS / "pr-self-review.yml").read_text()
+        # Draft pull requests stay silent except for the one converted_to_draft
+        # run that grays out a stale verdict.
+        self.assertIn("github.event.action == 'converted_to_draft'", privileged)
+        self.assertIn("github.event.pull_request.draft == false", privileged)
+        # The gray-out branch needs the pull-request action to detect the
+        # conversion.
+        self.assertIn("PR_EVENT_ACTION: ${{ github.event.action }}", privileged)
+
     def test_sections_stop_at_next_parent_heading(self) -> None:
         issues, answers = gate.validate_author_answers(
             valid_body(), "abcdef1234567890", []
@@ -146,6 +156,196 @@ class PRSelfReviewSelftest(unittest.TestCase):
         self.assertTrue(result.ci_unavailable)
         self.assertTrue(result.ci_pending)
         self.assertEqual(set(result.ci.values()), {"unavailable"})
+
+    def test_gpu_gate_not_required_for_ci_only_changes(self) -> None:
+        ci_only = gate.required_checks(
+            [".github/workflows/x.yml", "docs/gate.md", "CONTRIBUTE.md"]
+        )
+        self.assertNotIn("Aiter Test Gate", ci_only)
+        self.assertEqual(set(ci_only), {"Black", "Ruff", "Repository dependency"})
+
+        mixed = gate.required_checks([".github/workflows/x.yml", "aiter/ops/x.py"])
+        self.assertIn("Aiter Test Gate", mixed)
+
+        self.assertEqual(set(gate.required_checks([])), set(gate.REQUIRED_CHECKS))
+
+    def test_ci_only_pr_becomes_ready_without_gpu_gate(self) -> None:
+        api = RequestAPI(
+            {
+                "pulls/9": {
+                    "head": {"sha": "head0000000"},
+                    "html_url": "https://example/pr/9",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "body": valid_body("head0000000"),
+                },
+                "pulls/9/files": [
+                    {"filename": ".github/workflows/x.yml", "status": "modified"},
+                    {"filename": "docs/gate.md", "status": "modified"},
+                ],
+                "graphql": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": "head0000000",
+                            "reviews": {"nodes": []},
+                            "reviewThreads": {"nodes": []},
+                        }
+                    }
+                },
+                "commits/head0000000/check-runs?filter=latest&per_page=100": {
+                    "check_runs": [
+                        {
+                            "name": "Black",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Ruff",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Check Repository Dependency",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                    ]
+                },
+            }
+        )
+        result = gate.evaluate(api, 9, "shadow")
+        self.assertEqual(set(result.ci), {"Black", "Ruff", "Repository dependency"})
+        self.assertFalse(result.ci_pending)
+        self.assertTrue(gate.render(result).startswith("# READY FOR HUMAN REVIEW"))
+
+    def test_gpu_pr_still_waits_for_the_aiter_test_gate(self) -> None:
+        api = RequestAPI(
+            {
+                "pulls/10": {
+                    "head": {"sha": "head0000000"},
+                    "html_url": "https://example/pr/10",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "body": valid_body("head0000000"),
+                },
+                "pulls/10/files": [
+                    {"filename": "aiter/ops/matmul.py", "status": "modified"}
+                ],
+                "graphql": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": "head0000000",
+                            "reviews": {"nodes": []},
+                            "reviewThreads": {"nodes": []},
+                        }
+                    }
+                },
+                "commits/head0000000/check-runs?filter=latest&per_page=100": {
+                    "check_runs": [
+                        {
+                            "name": "Black",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Ruff",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Check Repository Dependency",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                    ]
+                },
+            }
+        )
+        result = gate.evaluate(api, 10, "shadow")
+        self.assertEqual(result.ci["Aiter Test Gate"], "missing")
+        self.assertTrue(result.ci_pending)
+        self.assertTrue(gate.render(result).startswith("# CI IN PROGRESS"))
+        # No event may turn incomplete evidence into a verdict; only a manual
+        # refresh writes the neutral progress report.
+        self.assertFalse(gate.should_write("pull_request_target", result))
+        self.assertFalse(gate.should_write("workflow_run", result))
+        self.assertTrue(gate.should_write("workflow_dispatch", result))
+
+    def test_titles_separate_author_input_ci_progress_and_verdict(self) -> None:
+        common = {
+            "head_sha": "a" * 40,
+            "pr_url": "https://example/pr/1",
+            "draft": False,
+            "mode": "enforce",
+            "question": "Why?",
+        }
+        passed = {name: "passed" for name in gate.REQUIRED_CHECKS}
+
+        waiting = gate.Result(
+            **common, author_issues=["missing `### Reviewed revision`"], ci=passed
+        )
+        self.assertTrue(gate.render(waiting).startswith("# WAITING ON AUTHOR"))
+
+        in_progress = gate.Result(**common, ci={**passed, "Aiter Test Gate": "missing"})
+        self.assertTrue(gate.render(in_progress).startswith("# CI IN PROGRESS"))
+
+        ready = gate.Result(**common, ci=passed)
+        self.assertTrue(gate.render(ready).startswith("# READY FOR HUMAN REVIEW"))
+
+        failed = gate.Result(**common, ci={**passed, "Ruff": "failed"})
+        self.assertTrue(gate.render(failed).startswith("# NOT READY FOR HUMAN REVIEW"))
+
+    def test_drafts_stay_silent_except_the_conversion_gray_out(self) -> None:
+        note = gate.render_draft_note("b" * 40, "shadow")
+        self.assertIn("# DRAFT — evaluation paused", note)
+        self.assertIn("no verdict applies", note)
+        self.assertIn(gate.MARKER, note)
+
+        common = {
+            "head_sha": "a" * 40,
+            "pr_url": "https://example/pr/1",
+            "mode": "shadow",
+            "question": "Why?",
+            "ci": {name: "passed" for name in gate.REQUIRED_CHECKS},
+        }
+        draft = gate.Result(**common, draft=True)
+        for event in ("pull_request_target", "workflow_run", "workflow_dispatch"):
+            self.assertFalse(gate.should_write(event, draft))
+
+    def test_author_facing_findings_post_before_ci_completes(self) -> None:
+        common = {
+            "head_sha": "a" * 40,
+            "pr_url": "https://example/pr/1",
+            "draft": False,
+            "mode": "shadow",
+            "question": "Why?",
+            "ci": {
+                "Black": "passed",
+                "Ruff": "passed",
+                "Repository dependency": "passed",
+                "Aiter Test Gate": "missing",
+            },
+        }
+        missing_answers = gate.Result(
+            **common, author_issues=["`Behavior and intent` has no substantive answer"]
+        )
+        self.assertTrue(gate.render(missing_answers).startswith("# WAITING ON AUTHOR"))
+        self.assertTrue(gate.should_write("pull_request_target", missing_answers))
+
+        dirty_diff = gate.Result(
+            **common,
+            hygiene_issues=["generated/debug artifact is committed: `x.pyc`"],
+        )
+        self.assertTrue(gate.should_write("pull_request_target", dirty_diff))
+
+        # Once the evidence is complete, any event may carry the verdict: an
+        # author who fixes their answers after CI finished must not wait for a
+        # workflow completion that will never come.
+        complete = gate.Result(
+            **{**common, "ci": {name: "passed" for name in gate.REQUIRED_CHECKS}}
+        )
+        self.assertTrue(gate.should_write("pull_request_target", complete))
+        self.assertTrue(gate.should_write("workflow_run", complete))
 
     def test_fork_workflow_run_resolves_by_head_identity(self) -> None:
         api = RequestAPI({})

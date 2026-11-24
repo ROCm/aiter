@@ -61,6 +61,27 @@ REQUIRED_CHECKS = {
 }
 PASS_CONCLUSIONS = {"success"}
 
+# Pure CI or documentation changes never trigger the Aiter Test workflow, so its gate
+# check-run structurally cannot exist on such PRs. Keeping it required there makes those
+# PRs permanently "not ready" -- a false positive with no CI signal to wait for.
+CI_ONLY_PREFIXES = (".github/", "docs/")
+CI_ONLY_SUFFIXES = (".md", ".rst")
+
+
+def required_checks(paths: list[str]) -> dict[str, set[str]]:
+    """Drop the Aiter Test Gate requirement when all changed paths are CI-only or
+    documentation; everything else keeps the full four-check requirement."""
+    if paths and all(
+        path.startswith(CI_ONLY_PREFIXES) or path.endswith(CI_ONLY_SUFFIXES)
+        for path in paths
+    ):
+        return {
+            label: aliases
+            for label, aliases in REQUIRED_CHECKS.items()
+            if label != "Aiter Test Gate"
+        }
+    return REQUIRED_CHECKS
+
 
 class APIError(RuntimeError):
     pass
@@ -432,13 +453,17 @@ def inspect_copilot(
     return issues[:20], advisories[:20]
 
 
-def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
+def inspect_ci(
+    api: GitHub, head_sha: str, required: dict[str, set[str]] | None = None
+) -> dict[str, str]:
+    if required is None:
+        required = REQUIRED_CHECKS
     if not head_sha:
-        return {name: "missing" for name in REQUIRED_CHECKS}
+        return {name: "missing" for name in required}
     result = api.request(f"commits/{head_sha}/check-runs?filter=latest&per_page=100")
     runs = result.get("check_runs") if isinstance(result, dict) else []
     states: dict[str, str] = {}
-    for label, aliases in REQUIRED_CHECKS.items():
+    for label, aliases in required.items():
         matches = [run for run in runs or [] if run.get("name") in aliases]
         if not matches:
             states[label] = "missing"
@@ -492,10 +517,11 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
     )
     copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
     ci_unavailable = False
+    required = required_checks(paths)
     try:
-        ci = inspect_ci(api, head_sha)
+        ci = inspect_ci(api, head_sha, required)
     except APIError:
-        ci = {name: "unavailable" for name in REQUIRED_CHECKS}
+        ci = {name: "unavailable" for name in required}
         ci_unavailable = True
     result = Result(
         head_sha=head_sha,
@@ -545,8 +571,19 @@ def append_findings(lines: list[str], level: str, findings: list[str]) -> None:
 
 
 def render(result: Result) -> str:
-    ready = not result.blocking and not result.ci_pending
-    conclusion = "READY FOR HUMAN REVIEW" if ready else "NOT READY FOR HUMAN REVIEW"
+    # The title keeps three semantics apart that one boolean used to collapse:
+    # missing author input, evidence that is not complete yet, and a verdict. A
+    # verdict can only appear once every required check has a concluded state, so
+    # a pull-request event that races ahead of its own CI renders neutral titles
+    # instead of a premature NOT READY.
+    if result.author_issues:
+        conclusion = "WAITING ON AUTHOR"
+    elif result.ci_pending and not result.blocking:
+        conclusion = "CI IN PROGRESS"
+    elif result.blocking:
+        conclusion = "NOT READY FOR HUMAN REVIEW"
+    else:
+        conclusion = "READY FOR HUMAN REVIEW"
 
     lines = [
         f"# {conclusion}",
@@ -635,7 +672,7 @@ def render(result: Result) -> str:
             )
         if result.ci_pending:
             lines.append(
-                "- Required CI is incomplete; this PR is not ready for human review."
+                "- Required CI is incomplete; the CI verdict appears once it completes."
             )
         if result.ci_failed:
             lines.append("- Required CI failed; fix it before requesting human review.")
@@ -653,6 +690,63 @@ def render(result: Result) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_draft_note(head_sha: str, mode: str) -> str:
+    """Neutral gray-out posted once when a pull request converts to draft, so no
+    stale verdict outlives the conversion while the author keeps working."""
+    lines = [
+        "# DRAFT — evaluation paused",
+        "",
+        "## PR Self-Review",
+        "",
+        f"Revision `{head_sha[:12]}` · mode `{mode}`",
+        "",
+        (
+            "This pull request is a draft, so readiness evaluation is paused and no"
+            " verdict applies. Evaluation resumes when it is marked ready for review"
+            " and the required CI completes."
+        ),
+        "",
+        MARKER,
+    ]
+    return "\n".join(lines)
+
+
+def should_write(event_name: str, result: Result) -> bool:
+    """Whether this event may write a readiness report.
+
+    Draft pull requests stay silent: the gray-out at conversion is the one draft
+    write, and a draft that converted while this run was queued must not post a
+    verdict on top of it. Author-facing findings -- missing self-review answers
+    and hygiene problems in the diff -- rest on evidence that exists the moment
+    the pull request changes, so any event may report them. A readiness verdict
+    additionally needs every required check in a concluded state, so it first
+    becomes writable when the final required workflow completes; a manual
+    workflow_dispatch refresh always writes what is currently known.
+    """
+    if result.draft:
+        return False
+    if event_name == "workflow_dispatch":
+        return True
+    if result.author_issues or result.hygiene_issues:
+        return True
+    return not result.ci_pending
+
+
+def apply_comment(
+    api: GitHub, number: int, body: str, mode: str, own_login: str
+) -> str:
+    try:
+        return upsert_comment(api, number, body, own_login)
+    except APIError as exc:
+        if mode == "enforce":
+            raise
+        print(
+            f"::warning title=PR Self-Review sticky comment::"
+            f"shadow mode could not write comment: {exc}"
+        )
+        return ""
 
 
 def upsert_comment(api: GitHub, number: int, body: str, own_login: str) -> str:
@@ -767,20 +861,36 @@ def main(argv: list[str]) -> int:
     if number is None:
         print("No open main-targeting pull request matched this workflow run.")
         return 0
+
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    action = os.environ.get("PR_EVENT_ACTION", "")
+
+    if event_name == "pull_request_target" and action == "converted_to_draft":
+        # One neutral write so no stale verdict outlives the conversion; the draft
+        # itself stays silent afterwards. No evaluation sweep and no status write:
+        # a draft cannot merge, so the previous per-SHA status is moot.
+        pr = api.request(f"pulls/{number}")
+        if pr.get("draft"):
+            body = render_draft_note(((pr.get("head") or {}).get("sha")) or "", mode)
+            print(body)
+            if args.apply:
+                own_login = resolve_own_login(api)
+                apply_comment(api, number, body, mode, own_login)
+            return 0
+        # Marked ready again before this run started; fall through to evaluation.
+
     result = evaluate(api, number, mode)
+    if not should_write(event_name, result):
+        print(
+            "Pull request is a draft, or the evidence for a verdict is not"
+            " complete; nothing written."
+        )
+        return 0
     body = render(result)
     print(body)
     if args.apply:
         own_login = resolve_own_login(api)
-        url = ""
-        try:
-            url = upsert_comment(api, number, body, own_login)
-        except APIError as exc:
-            if mode == "enforce":
-                raise
-            print(
-                f"::warning title=PR Self-Review sticky comment::shadow mode could not write comment: {exc}"
-            )
+        url = apply_comment(api, number, body, mode, own_login)
         # PR checks and branch protection are attached to the PR head commit.
         try:
             post_status(api, result.head_sha, result, url or result.pr_url, own_login)
