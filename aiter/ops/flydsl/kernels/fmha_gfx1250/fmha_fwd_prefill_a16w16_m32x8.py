@@ -876,6 +876,14 @@ def _attention_prologue(
     def _v_lds_buf(slot_idx):  # V[slot_idx][0] == the slot base one chunk in
         return _k_lds_buf(slot_idx) + fx.Int32(LDS_CHUNK_BYTES)
 
+    def _k_lds_buf_rt(slot_idx):
+        """``_k_lds_buf`` for a RUNTIME slot index. Same affine form -- the pair grouping
+        is non-uniform in ``slot_idx`` but affine once it splits into (hi, lo) bits, so
+        this is a shift, an and and two mul-adds, all wave-uniform."""
+        return lds_base + (slot_idx >> fx.Int32(1)) * fx.Int32(_GROUP_BYTES) + (
+            slot_idx & fx.Int32(1)
+        ) * fx.Int32(slot_bytes)
+
     # Logical slot -> physical slot. Q owns group 1 (physical slots 2 and 3), so the two
     # slots the prologue must fill BEFORE Q is drained -- logical 0 (the zeroed V) and
     # logical 1 (tile start) -- take group 0. Logical 2 (tile start+1) lands on Q's group
@@ -1183,6 +1191,8 @@ def _attention_prologue(
         "last_tile_idx": last_tile_idx,
         "start_tile_idx": start_tile_idx,
         "kv_policy": _kv_policy,
+        "slot_base": _k_lds_buf_rt,  # runtime slot index -> its low-half LDS base
+        "split_bufs": _split_bufs,  # base -> the two split bases, in this SIMD's order
         "kv_counts": kv_counts,
         "kv_drain": _prologue_drain,
         "q_frags": q_frags,
@@ -1382,6 +1392,8 @@ def _attention_core_multi_kv_tiles(
     last_tile_idx = prologue["last_tile_idx"]
     start_tile_idx = prologue["start_tile_idx"]
     kv_policy = prologue["kv_policy"]
+    _k_lds_buf_rt = prologue["slot_base"]
+    _split_bufs = prologue["split_bufs"]
     _tile_row0 = kv_policy.tile_row0
     _kv_valid = kv_policy.kv_valid
     # In-loop fence depth. At distance 2 the tile this body READS was issued two bodies
@@ -1489,16 +1501,12 @@ def _attention_core_multi_kv_tiles(
         v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(_PHYSICAL_SLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
-    _num_k_bases = len(k_lds_ld[0])  # ds bases per K buffer (one per LDS split)
-    _num_v_bases = len(v_lds_ld[0])
-    _k_bases_idx = len(_init)
-    for i in range(N_KV_PP):
-        _init = _init + k_lds_ld[i]
-    _v_bases_idx = len(_init)
-    for i in range(N_KV_PP):
-        _init = _init + v_lds_ld[i]
-    _slot_bases_idx = len(_init)
-    _init = _init + [_raw(_k_lds_buf(_PHYSICAL_SLOT[i])) for i in range(N_KV_PP)]
+    # ONE carried phase instead of the 4 slots' ds pointers. Rotating those was a cyclic
+    # permutation of 20 loop-carried registers, which the allocator can only implement as
+    # a copy chain at the loop header; the bases are cheap to recompute (``_k_lds_buf_rt``)
+    # and only 6 of the 20 are live in a body.
+    _phase_idx = len(_init)
+    _init = _init + [_raw(fx.Int32(0))]
 
     # Carried ring head: _num_head_carry of the first body's V loads, issued here (slot 0 is resident
     # -- the prologue fence just drained it) and thereafter at the end of each body.
@@ -1584,27 +1592,21 @@ def _attention_core_multi_kv_tiles(
             ]
             for q_tile_idx in range(num_q_tiles)
         ]
-        k_slots = [
-            list(
-                state[
-                    _k_bases_idx
-                    + i * _num_k_bases : _k_bases_idx
-                    + (i + 1) * _num_k_bases
-                ]
+        phase = fx.Int32(state[_phase_idx])
+
+        def _phys_base(i):  # logical slot i of this body -> its physical low-half base
+            return _k_lds_buf_rt((phase + fx.Int32(i)) & fx.Int32(N_KV_PP - 1))
+
+        def _k_slot(i):
+            return k_mgr.ds_load_ptrs(
+                ptr_lds=_split_bufs(_phys_base(i)), lane_idx=lane_idx
             )
-            for i in range(N_KV_PP)
-        ]
-        v_slots = [
-            list(
-                state[
-                    _v_bases_idx
-                    + i * _num_v_bases : _v_bases_idx
-                    + (i + 1) * _num_v_bases
-                ]
+
+        def _v_slot(i):
+            return v_mgr.ds_load_ptrs(
+                ptr_lds=_split_bufs(_phys_base(i) + fx.Int32(LDS_CHUNK_BYTES)),
+                lane_idx=lane_idx,
             )
-            for i in range(N_KV_PP)
-        ]
-        slot_of = [fx.Int32(state[_slot_bases_idx + i]) for i in range(N_KV_PP)]
         head_carry = [
             fx.Vector(state[_head_carry_idx + i]) for i in range(_num_head_carry)
         ]
@@ -1613,10 +1615,10 @@ def _attention_core_multi_kv_tiles(
         )
         # The ring's LDS base pointers: banked with the fragments they feed.
         v_curr = [
-            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in v_slots[0]
+            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in _v_slot(0)
         ]  # tile tile_idx-1: this body's PV
         k_curr = [
-            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in k_slots[1]
+            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in _k_slot(1)
         ]  # tile tile_idx:   this body's QK
 
         # Tile prefetched by this body, CLAMPED to the last tile rather than guarded off
@@ -1628,7 +1630,7 @@ def _attention_core_multi_kv_tiles(
         # occupy disjoint chunks of it, and the slot last held tile tile_idx-2, dead since body
         # tile_idx-1 -- so the distance is the same on both and the slot arithmetic has no half
         # to branch on.
-        write_slot = slot_of[N_KV_PP - 1]
+        write_slot = _phys_base(N_KV_PP - 1)
         prefetch_tile_idx = tile_idx + fx.Int32(KV_PREFETCH_DISTANCE)
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
@@ -1860,7 +1862,7 @@ def _attention_core_multi_kv_tiles(
             # before the barrier preceding the gemm that consumes it, ahead of the
             # narrowing for the same reason.
             head_next = _issue_head(
-                lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
+                lambda j: v_mgr.load_one_to_reg(_v_slot(1), j), 0, _num_head_carry
             )
             carry_next = carry_f32
 
@@ -1874,12 +1876,7 @@ def _attention_core_multi_kv_tiles(
                 + [_raw(_o_pack(o_out[q_tile_idx]))]
                 + [_raw(cv) for cv in carry_next[q_tile_idx]]
             )
-        rotation = list(range(1, N_KV_PP)) + [0]
-        for i in rotation:
-            out += k_slots[i]
-        for i in rotation:
-            out += v_slots[i]
-        out += [_raw(slot_of[i]) for i in rotation]
+        out += [_raw((phase + fx.Int32(1)) & fx.Int32(N_KV_PP - 1))]
         out += [_raw(h) for h in head_next]
         out += [_raw(v) for v in kv_state_next]
         return out
