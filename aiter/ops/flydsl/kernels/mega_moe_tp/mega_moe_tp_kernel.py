@@ -784,7 +784,13 @@ def compile_bigm_kernel(
     # (XL, the y gather) the y rows on the idle input-gather queue QX: MORI puts a peer's
     # queues on its two SDMA engines by parity, so the RS (QE) and the y gather then run on
     # different engines (on QQ both share one). AITER_BIGM_YQ=3: QQ
-    QY = QX if XL and tailq == 3 and str(_opt("AITER_BIGM_YQ", os.environ.get("AITER_BIGM_YQ", "2"))) == "2" else QQ
+    QY = (
+        QX
+        if XL
+        and tailq == 3
+        and str(_opt("AITER_BIGM_YQ", os.environ.get("AITER_BIGM_YQ", "2"))) == "2"
+        else QQ
+    )
     if QY != QQ:
         PPC[QY], PPC[QQ] = PPC[QQ], 0
     ZX = 16  # io: rows per input item (quant + routing copy)
@@ -1199,7 +1205,6 @@ def compile_bigm_kernel(
 
         def yflag_v():
             return (a["yl"] & i32(0xFFFFFF)) | i32(0x5A000000)
-
 
         def wp(name):  # local window address of a region
             return wb + a["off_" + name]
@@ -2104,7 +2109,7 @@ def compile_bigm_kernel(
                     f8 = acc[8 * h : 8 * h + 8]
                     yb = pack_bf16x8(f8)
                     p = c16 * i32(2) + i32(h)
-                    if live:
+                    if live:  # noqa: SIM102 - preserve FlyDSL branches
                         if own:
                             bst(
                                 yb,
@@ -2360,11 +2365,11 @@ def compile_bigm_kernel(
             if const_expr(YDB):
                 wait_vm(0)  # (the item's peer stores landed before it counts as done)
             done_last(k, P_RF, cnt(P_RF, s))
-            if const_expr(YDS or YDB):  # noqa: SIM102 - preserve FlyDSL branches
+            if const_expr(YDS or YDB):
                 if done_at(sbc(k, 1, b), sb // i32(ZQ)):  # noqa: SIM102
                     # every item of the sub-block stored (each item's stores waited): its
                     # flag to every peer, after a system release
-                    if tid < i32(tp):
+                    if tid < i32(tp):  # noqa: SIM102
                         if tid != rank:
                             fence_release(fx.rocdl.SyncScope.OneAs)
                             fo = ((rank * i32(C) + k) * i32(NSB) + b) * i32(4)
@@ -2469,7 +2474,9 @@ def compile_bigm_kernel(
                                 fx.Int32(
                                     bld(
                                         rq,
-                                        g * i32(RB) + i32(SCO) + (c16 // i32(2)) * i32(4),
+                                        g * i32(RB)
+                                        + i32(SCO)
+                                        + (c16 // i32(2)) * i32(4),
                                         0,
                                         T.i32,
                                         CAUX,
@@ -2516,7 +2523,7 @@ def compile_bigm_kernel(
                             cur = g_ld_sys(fa)
                         if cur != want:
                             g_st_sys(ca(i32(C_ERR)), i32(1))
-            if const_expr(YDS or YDB):
+            if const_expr(YDS or YDB):  # noqa: SIM102 - preserve FlyDSL branches
                 if tid == i32(0):
                     g_st_sys(ca(i32(C_ERR + 20)), a["yl"])
             if const_expr(tailq == 1):
@@ -2579,7 +2586,7 @@ def compile_bigm_kernel(
             if t == gw_lo:
                 item_gw()
             gpu.barrier()
-            if const_expr(BTRACE):
+            if const_expr(BTRACE):  # noqa: SIM102 - preserve FlyDSL branches
                 # (debug) item record [kind | chunk << 8, start, end, index] at slot (XCD, ticket)
                 if tid == i32(0):
                     rec = fx.Int64(BTRACE) + fx.Int64(

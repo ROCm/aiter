@@ -355,9 +355,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         L, tid, a, expert, i0, nnb, P, MTE=None, kr=None, out=None, bnt=True, W8=False
     ):
         MTE = MT if MTE is None else MTE
-        lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(
-            tid, a, expert, i0, W8=W8
-        )
+        lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0, W8=W8)
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         # (W8: the ring's slots in pairs: half the depth, twice the B ops per k-step)
         NSKW = nsk // 2 if W8 else nsk
@@ -466,9 +464,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         accumulators added through LDS (its own B ring), act + MXFP4 by the first pair
         """
         MTE = MT
-        lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(
-            tid, a, expert, i0, True, W8
-        )
+        lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0, True, W8)
         NSKW = nsk // 2 if W8 else nsk
         SLOTW = 2 * SLOT if W8 else SLOT
         OPSW = OPS + 4 if W8 else OPS
@@ -988,9 +984,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                             slot + i32(t * 2048 + h * 1024),
                             rw,
                             lane * i32(16),
-                            (n0 + i32(t * 16)) * i32(I)
-                            + k * i32(2048)
-                            + i32(h * 1024),
+                            (n0 + i32(t * 16)) * i32(I) + k * i32(2048) + i32(h * 1024),
                             nt=bnt,
                         )
                 else:
@@ -1259,7 +1253,8 @@ def bigm_lds(RG, NAB, I):
 
 def _i8x4_fast(f, inv):
     """4 f32 * inv (|.| <= 127) -> int8 x 4 in an i32: + 1.5 * 2^23 rounds to the nearest
-    even integer in the low mantissa byte (two's complement), v_perm gathers the bytes"""
+    even integer in the low mantissa byte (two's complement), v_perm gathers the bytes
+    """
     mg = fx.Float32(12582912.0)
     v = [fx.Float32(x * inv + mg).bitcast(fx.Int32) for x in f]
     lo = fx.Int32(rocdl.perm_b32(v[1], v[0], i32(0x0C0C0400)))
@@ -1268,8 +1263,21 @@ def _i8x4_fast(f, inv):
 
 
 def build_bigm_unit(
-    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0), raux=0, mtc=0,
-    i8r=False, sh8=False,
+    H,
+    I,
+    TOPK,
+    RG,
+    NAB,
+    BST,
+    BS2,
+    act,
+    swiglu_limit,
+    R8,
+    situ=(1.0, 1.0),
+    raux=0,
+    mtc=0,
+    i8r=False,
+    sh8=False,
 ):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
@@ -1333,8 +1341,6 @@ def build_bigm_unit(
             if pos == KS2 - 1:
                 n += NST2
         return min(n, 63)
-
-    WAIT2 = [_wait2(kk) for kk in range(KS2)]
 
     def act_batch(gs, us):
         return _activation_mul_batch(
@@ -1437,7 +1443,12 @@ def build_bigm_unit(
                 icol0 = p * i32(NW * 32) + w * i32(32)
                 KHB = H if W8 else KH  # (W8: row bytes of the MXFP8 w1)
                 vg0 = icol0 * i32(KHB) + lane * i32(16)
-                vs = (vg0, vg0 + i32(16 * KHB), vg0 + i32(I * KHB), vg0 + i32((I + 16) * KHB))
+                vs = (
+                    vg0,
+                    vg0 + i32(16 * KHB),
+                    vg0 + i32(I * KHB),
+                    vg0 + i32((I + 16) * KHB),
+                )
                 b = []
                 for k in range_constexpr(KCK):
                     for t in range_constexpr(4):
@@ -1452,12 +1463,19 @@ def build_bigm_unit(
                         else:
                             b.append(
                                 fx.Vector(
-                                    bld(rw1, vs[t], (c * i32(KCK) + i32(k)) * i32(1024), V4I)
+                                    bld(
+                                        rw1,
+                                        vs[t],
+                                        (c * i32(KCK) + i32(k)) * i32(1024),
+                                        V4I,
+                                    )
                                 )
                             )
                 # one scale word = 2 k-steps
                 cw = (c * i32(KCK)) // i32(2)
-                sg = ((es * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256) + cw * i32(256)
+                sg = ((es * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256) + cw * i32(
+                    256
+                )
                 su = ((es * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
                 su = su + cw * i32(256)
                 vso = lane * i32(4)
@@ -1618,6 +1636,7 @@ def build_bigm_unit(
             wait_vm(0)
             wait_lgkm0()  # the intermediate's LDS writes land before other waves read them
             gpu.barrier()
+
         return part_g1
 
     part_g1 = _mk_g1(False)
@@ -1626,7 +1645,9 @@ def build_bigm_unit(
     def _mk_g2(W8):
         # (W8: B2 fragments of 8 dwords: half the B2 ring depth, twice the tile ops)
         BS2_ = (
-            max(d for d in range(1, max(1, BS2 // 2) + 1) if KS2 % d == 0) if W8 else BS2
+            max(d for d in range(1, max(1, BS2 // 2) + 1) if KS2 % d == 0)
+            if W8
+            else BS2
         )
         NB2_ = 10 if W8 else NB2
         WAIT2_ = [_wait2(kk, BS2_, NB2_) for kk in range(KS2)]
@@ -1659,7 +1680,9 @@ def build_bigm_unit(
                             bld(
                                 rw2,
                                 lane * i32(16),
-                                (n0 + i32(t * 16)) * i32(I) + kk * i32(2048) + i32(1024),
+                                (n0 + i32(t * 16)) * i32(I)
+                                + kk * i32(2048)
+                                + i32(1024),
                                 V4I,
                             ),
                         )
@@ -1682,7 +1705,12 @@ def build_bigm_unit(
                     vo = lane * i32(4)
                     b.append(
                         fx.Int32(
-                            bld(rws2, vo, (rb * i32(CH2) + kk // i32(2)) * i32(256), T.i32)
+                            bld(
+                                rws2,
+                                vo,
+                                (rb * i32(CH2) + kk // i32(2)) * i32(256),
+                                T.i32,
+                            )
                         )
                     )
                 # the loads stay where the ring issues them (no sinking)
@@ -1750,7 +1778,13 @@ def build_bigm_unit(
                             raux,
                         )
                         soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
-                        bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, raux)
+                        bst(
+                            sc,
+                            r_routes,
+                            (ok & (q4 == i32(0))).select(soff, oob),
+                            0,
+                            raux,
+                        )
                 elif const_expr(STG and i8r):
                     # int8 route rows quantized in registers (a lane: 4 columns of a row in each
                     # of the 4 tiles; the row's 64 columns on the 4 lanes l % 16), staged as
@@ -1776,7 +1810,9 @@ def build_bigm_unit(
                         if q4 == i32(0):
                             lds_st(
                                 L,
-                                i32(SST) + row * i32(H // 16) + (n0 // i32(64)) * i32(4),
+                                i32(SST)
+                                + row * i32(H // 16)
+                                + (n0 // i32(64)) * i32(4),
                                 sc.bitcast(fx.Int32),
                                 align=4,
                             )
@@ -1786,7 +1822,10 @@ def build_bigm_unit(
                         ok = row < rows
                         rix = lds_ld_i32(L, i32(LRIX) + ok.select(row, i32(0)) * i32(4))
                         v = lds_ld(
-                            L, stg + row * i32(64) + (c ^ (row & i32(3))) * i32(16), V4I, 16
+                            L,
+                            stg + row * i32(64) + (c ^ (row & i32(3))) * i32(16),
+                            V4I,
+                            16,
                         )
                         bst(
                             v,
@@ -1885,7 +1924,10 @@ def build_bigm_unit(
                         afs.append(
                             lds_ld(
                                 L,
-                                i32(LINT) + row * i32(SIS) + i32(kk * 64) + q4 * i32(16),
+                                i32(LINT)
+                                + row * i32(SIS)
+                                + i32(kk * 64)
+                                + q4 * i32(16),
                                 V4I,
                                 16,
                             )
@@ -1926,9 +1968,7 @@ def build_bigm_unit(
                     r_ = idx // i32(W4)
                     ok = (r_ < rows) & (idx < i32(RG * W4))
                     rix = lds_ld_i32(L, i32(LRIX) + ok.select(r_, i32(0)) * i32(4))
-                    v = lds_ld(
-                        L, i32(SST) + ok.select(idx, i32(0)) * i32(16), V4I, 16
-                    )
+                    v = lds_ld(L, i32(SST) + ok.select(idx, i32(0)) * i32(16), V4I, 16)
                     bst(
                         v,
                         r_routes,
@@ -1942,6 +1982,7 @@ def build_bigm_unit(
                         raux,
                     )
             wait_vm(0)
+
         return part_g2
 
     part_g2 = _mk_g2(False)
@@ -1949,7 +1990,22 @@ def build_bigm_unit(
 
     @flyc.jit
     def unit_body(
-        L, tid, e, r0, rows, rr, rwt, rx, rxs, w1, w2, rws1, rws2, r_routes, oob, sh=None
+        L,
+        tid,
+        e,
+        r0,
+        rows,
+        rr,
+        rwt,
+        rx,
+        rxs,
+        w1,
+        w2,
+        rws1,
+        rws2,
+        r_routes,
+        oob,
+        sh=None,
     ):
         part_fill(L, tid, r0, rows, rr, rwt)
         if const_expr(sh is not None):

@@ -84,13 +84,13 @@ from .kernels.mega_moe_tp.mega_moe_tp_config import PAD
 ERR_BIGM = 32
 
 __all__ = [
-    "shuffle_weight_mega_fp8",
     "COMM_MODES",
     "ERR_BIGM",
     "MegaMoeTP",
     "MegaMoeTPConfig",
     "MegaMoeTPLDSError",
     "mega_moe_tp_supported",
+    "shuffle_weight_mega_fp8",
 ]
 
 _ACTS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
@@ -104,7 +104,9 @@ def shuffle_weight_mega_fp8(w: torch.Tensor) -> torch.Tensor:
     fp4_utils.e8m0_shuffle of [N, K / 32], as MXFP4's."""
     N, K = w.shape[-2:]
     if N % 16 or K % 128:
-        raise ValueError(f"shuffle_weight_mega_fp8: need N % 16 == 0, K % 128 == 0: {N} {K}")
+        raise ValueError(
+            f"shuffle_weight_mega_fp8: need N % 16 == 0, K % 128 == 0: {N} {K}"
+        )
     u = w.reshape(-1, N, K).view(torch.uint8).view(-1, N // 16, 16, K // 128, 2, 4, 16)
     return u.permute(0, 1, 3, 4, 5, 2, 6).contiguous().view(w.shape).view(w.dtype)
 
@@ -188,7 +190,9 @@ class MegaMoeTP:
         of them) are MXFP4; else every expert is MXFP4 in w1 / w2."""
         shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
         if any(t is not None for t in shared) and any(t is None for t in shared):
-            raise ValueError("MegaMoeTP: the shared expert's four MXFP8 tensors, or none")
+            raise ValueError(
+                "MegaMoeTP: the shared expert's four MXFP8 tensors, or none"
+            )
         shared = None if w1_shared is None else shared
         self.shared = shared
         if cfg.activation not in _ACTS:
@@ -237,32 +241,32 @@ class MegaMoeTP:
         # the small engine holds what it can, big-M takes the rest (an explicit
         # bigm_min_tokens above the small engine's capacity: lowered to it, below)
         fit = (big_ok and bmin != 0) or cfg.fit_max_local
-        self._engine_kw = dict(
-            rank=cfg.rank,
-            world_size=cfg.world_size,
-            model_dim=cfg.model_dim,
-            inter_dim=cfg.inter_dim,
-            experts=cfg.experts,
-            topk=cfg.topk,
-            max_local_tokens=small_max,
-            w1=w1,
-            w1_scale=w1_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-            activation=act,
-            situ_beta=cfg.beta if situ and cfg.beta is not None else 1.0,
-            situ_linear_beta=(
+        self._engine_kw = {
+            "rank": cfg.rank,
+            "world_size": cfg.world_size,
+            "model_dim": cfg.model_dim,
+            "inter_dim": cfg.inter_dim,
+            "experts": cfg.experts,
+            "topk": cfg.topk,
+            "max_local_tokens": small_max,
+            "w1": w1,
+            "w1_scale": w1_scale,
+            "w2": w2,
+            "w2_scale": w2_scale,
+            "activation": act,
+            "situ_beta": cfg.beta if situ and cfg.beta is not None else 1.0,
+            "situ_linear_beta": (
                 cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0
             ),
-            swiglu_limit=cfg.swiglu_limit,
-            comm_mode=cfg.comm_mode,
+            "swiglu_limit": cfg.swiglu_limit,
+            "comm_mode": cfg.comm_mode,
             # ("int8": the big-M kernel's; the small engine runs its 8-bit (FP8) path, the
             # small-M schedule)
-            comm_dtype="fp8" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
-            ar_gather=cfg.ar_gather,
-            schedule=cfg.schedule,
-            act_dtype="fp4" if cfg.act_dtype == "auto" else cfg.act_dtype,
-            lb={
+            "comm_dtype": "fp8" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
+            "ar_gather": cfg.ar_gather,
+            "schedule": cfg.schedule,
+            "act_dtype": "fp4" if cfg.act_dtype == "auto" else cfg.act_dtype,
+            "lb": {
                 "min": cfg.lb_min,
                 "mt": cfg.lb_mt,
                 "mt_small": cfg.lb_mt_small,
@@ -270,13 +274,13 @@ class MegaMoeTP:
                 "npp": cfg.lb_npp,
                 "q": cfg.lb_q,
             },
-            tail_eps=cfg.tail_eps,
-            tail_gemma=cfg.tail_gemma,
-            group=group,
-            device=device,
-            fit_max_local=fit,
-            shared=shared,
-        )
+            "tail_eps": cfg.tail_eps,
+            "tail_gemma": cfg.tail_gemma,
+            "group": group,
+            "device": device,
+            "fit_max_local": fit,
+            "shared": shared,
+        }
         self.engine = MegaMoeTPEngine(**self._engine_kw)
         if big_ok and bmin != 0 and self.engine.mmax < small_max:
             lim = self.engine.mmax + 1
@@ -290,8 +294,12 @@ class MegaMoeTP:
             m16 = min(small_max, self.a16_local - 1)
             if m16 >= 1:
                 self.engine16 = MegaMoeTPEngine(
-                    **{**self._engine_kw, "max_local_tokens": m16, "act_dtype": "bf16",
-                       "fit_max_local": True}
+                    **{
+                        **self._engine_kw,
+                        "max_local_tokens": m16,
+                        "act_dtype": "bf16",
+                        "fit_max_local": True,
+                    }
                 )
 
     def _eng(self, local_tokens: int):

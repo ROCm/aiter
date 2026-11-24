@@ -551,7 +551,9 @@ class MegaMoeTPEngine:
             ("w2_scale", w[3], E * H * I // 32),
         ]
         if (shared is not None) != self.sh8:
-            raise ValueError("shared: the MXFP8 shared expert's weights, iff built with them")
+            raise ValueError(
+                "shared: the MXFP8 shared expert's weights, iff built with them"
+            )
         if self.sh8:
             sh = tuple(t.view(torch.uint8) for t in shared)
             need += [

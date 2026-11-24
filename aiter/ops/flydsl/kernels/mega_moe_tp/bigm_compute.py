@@ -397,9 +397,7 @@ class MegaMoeTPBigM:
             sfx = (
                 "_bf16"
                 if o.get("AITER_BIGM_EB") == "1"
-                else "_int8"
-                if o.get("AITER_BIGM_YG8") == "1"
-                else ""
+                else "_int8" if o.get("AITER_BIGM_YG8") == "1" else ""
             )
             if sfx:
                 tu = nearest(
@@ -473,7 +471,9 @@ class MegaMoeTPBigM:
     def set_weights(self, w1, w1_scale, w2, w2_scale, shared=None):
         """the next launches use another layer's weights of the same shape"""
         if (shared is not None) != self.sh8:
-            raise ValueError("MegaMoeTP big-M: the shared expert's MXFP8 weights, iff built so")
+            raise ValueError(
+                "MegaMoeTP big-M: the shared expert's MXFP8 weights, iff built so"
+            )
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
@@ -668,7 +668,9 @@ class MegaMoeTPBigM:
     def ygout_bf16(self, T):
         """(YDC, no caller output) an internal [T, H] bf16 output"""
         if getattr(self, "_ygb", None) is None or self._ygb.shape[0] < T:
-            self._ygb = torch.empty((T, self.H), dtype=torch.bfloat16, device=self.device)
+            self._ygb = torch.empty(
+                (T, self.H), dtype=torch.bfloat16, device=self.device
+            )
         return self._ygb[:T]
 
     def _moe(

@@ -496,7 +496,15 @@ def kernel_config(
         + ("_xd" if XD else "")
         + ("_alq" if sm and ar and alq else "")
         + ("_sh8" if sh8 else "")
-        + ("_llb" if sm and ar and comm_bf16 and not ar2 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1" else "")
+        + (
+            "_llb"
+            if sm
+            and ar
+            and comm_bf16
+            and not ar2
+            and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
+            else ""
+        )
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
@@ -514,7 +522,10 @@ def kernel_config(
     # (2x the bf16 rows), in the recv region's two planes. Measured slower (n=1 +2 us, n=64
     # +70 us: the bytes and the 16 polled packets per lane): opt-in, AITER_MEGAMOE_TP_LLB=1
     LLB = bool(
-        RAW and ARLL and comm_bf16 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
+        RAW
+        and ARLL
+        and comm_bf16
+        and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
     )
     # the shared expert (the last one, E - 1) with MXFP8 weights (their own tensors: w1h /
     # w2h + e8m0 scales), the routed ones MXFP4: its GEMM1 / GEMM2 take the W8 loaders

@@ -149,6 +149,7 @@ def build_communication(kc: KernelCtx) -> dict:
         if tid == i32(NT):
             i = i32(gpu.block_id("x")) * i32(32) + i32(slot)
             g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
+
     # the all-gather's destination ranks (ALQ: this one)
     AGP = 1 if ALQ else TPC
     # (RAW) the route rows' column groups (GEMM2 iterations, NW x 64 columns) per RS chunk
@@ -670,7 +671,9 @@ def build_communication(kc: KernelCtx) -> dict:
                 off = (prow * i32(H) + col) * i32(4)
                 bst(p0, r_dst, off, 0, AUX_SYS)
                 bst(p1, r_dst, off + i32(16), 0, AUX_SYS)
-        elif const_expr(comm_bf16 or RAW):  # (RAW: bf16, then the item's flag: _raw_part)
+        elif const_expr(
+            comm_bf16 or RAW
+        ):  # (RAW: bf16, then the item's flag: _raw_part)
             if ok:
                 bst(pack_bf16x8(acc), r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
         else:
