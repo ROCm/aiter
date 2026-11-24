@@ -74,6 +74,16 @@ def _load_i32(div, idx):
     )
 
 
+def _sgpr(v):
+    """A wave-uniform value moved to an SGPR.
+
+    Wave-derived terms (wave_m, wave_n, the tile count) left in VGPRs
+    competed with the 128 accumulators and spilled; their reloads' vmcnt
+    waits drained LDS-DMA and epilogue stores (ATT).
+    """
+    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(v).ir_value()))
+
+
 def _load_i32_lane(div, idx):
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
@@ -178,7 +188,7 @@ class StoreSlotBf16:
         self.ids_div = ids_div
         self.w_div = w_div
         self.route = route
-        self.wave_row = fx.thread_idx.x // 64 * 32 + fx.thread_idx.x % 32
+        self.wave_row = _sgpr(fx.thread_idx.x // 64) * 32 + fx.thread_idx.x % 32
         self.lane_row = fx.thread_idx.x % 16
         self.lane_col = _lane_col8()
         n_rows = n_tokens * topk
@@ -660,10 +670,11 @@ def compile_moe_bs_gemm_8w(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
         lane_id = fx.thread_idx.x % 64
-        wave_id = fx.thread_idx.x // 64
+        wave_id = _sgpr(fx.thread_idx.x // 64)
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        lagging = rocdl.readfirstlane(fx.Int32.ir_type, 1 - wave_m)
+        lagging = (1 - wave_m).ir_value()
+        leading = wave_m.ir_value()
 
         a_div = fx.logical_divide(
             make_fp8_buffer_tensor(A, F8_IR_t), fx.make_layout(1, 1)
@@ -954,7 +965,7 @@ def compile_moe_bs_gemm_8w(
             c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0, set_prio=False)
             rocdl.s_setprio(0)
             # Pairs the lagging group's last barrier above (see the dense kernel).
-            barrier_if_zero(rocdl.readfirstlane(fx.Int32.ir_type, wave_m))
+            barrier_if_zero(leading)
 
             base_row = row0 + wave_m * A_GRP_ROWS
             col0 = half_row0(nb, 0) + wave_n * B_GRP_ROWS
@@ -979,10 +990,23 @@ def compile_moe_bs_gemm_8w(
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
         start = (bid % NUM_XCDS) * (grid // NUM_XCDS) + bid // NUM_XCDS
-        n_tiles = (_load_i32(nv_div, 0) // BLOCK_M) * NB
-        for tile, state in range(start, n_tiles, grid, init=[fx.Int32(0)]):
-            run_tile(fx.Int32(tile), state[0] & 1)
-            _ = yield [state[0] + 1]
+        n_tiles = _sgpr((_load_i32(nv_div, 0) // BLOCK_M) * NB)
+        if const_expr(gather):
+            # i32 bounds and implicit carried state keep this an i32 loop: an
+            # init= loop is index (i64), and with no scalar 64-bit less-than
+            # its bound sits in a VGPR pair that spills; the reload's vmcnt(0)
+            # at the tile's end then also waits out the epilogue stores.
+            # Stage 1 (32 KB of fp8 stores a tile) is ~2% faster without it,
+            # stage 2 (128 KB of bf16) 2-5% slower: there the drain keeps its
+            # stores off the next tile's first loads (A/B twice, ABAB).
+            trip = fx.Int32(0)
+            for tile in range(start, n_tiles, grid):
+                run_tile(fx.Int32(tile), trip & 1)
+                trip = trip + 1
+        else:
+            for tile, state in range(start, n_tiles, grid, init=[fx.Int32(0)]):
+                run_tile(fx.Int32(tile), state[0] & 1)
+                _ = yield [state[0] + 1]
 
     @flyc.jit
     def launch(
