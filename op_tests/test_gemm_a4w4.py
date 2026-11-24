@@ -10,7 +10,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import _FLYDSL_AVAILABLE, gemm_a4w4
@@ -316,7 +316,17 @@ def test_gemm(dtype, M, N, K):
     return ret
 
 
-ASM_F4_256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+def _asm_f4_kernels():
+    """Rows of this arch's asm kernel table, the table the launcher reads,
+    that take preshuffled B and are not persistent (ps=0)."""
+    path = os.path.join(
+        AITER_ASM_DIR, get_gfx(), "f4gemm", "f4gemm_bf16_per1x32Fp4.csv"
+    )
+    if not os.path.isfile(path):
+        return []
+    table = pd.read_csv(path, comment="#")
+    rows = table[(table["bpreshuffle"] == 1) & (table["ps"] == 0)]
+    return list(rows.itertuples(index=False))
 
 
 def _quant_rows(rows, k, chunk=65536):
@@ -334,12 +344,15 @@ def _quant_rows(rows, k, chunk=65536):
     return torch.cat(q), torch.cat(s), torch.cat(s_sh)
 
 
-def _check_asm_f4_exact(x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case):
-    """Run BpreShuffle_256x256; every element of out must match the reference."""
+def _check_asm_f4_exact(
+    x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, name, case
+):
+    """Run one asm kernel by name; every element of out must match the
+    reference."""
     out.fill_(float("nan"))
     wshuffle = shuffle_weight(w, layout=(16, 16))
     aiter.gemm_a4w4_asm(
-        x, wshuffle, x_scales_sh, w_scales_sh, out, ASM_F4_256, log2_k_split=0
+        x, wshuffle, x_scales_sh, w_scales_sh, out, name, log2_k_split=0
     )
     m, n = out.shape
     rb = max(1, (1 << 28) // max(n, x.shape[1] * 2))
@@ -349,35 +362,46 @@ def _check_asm_f4_exact(x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out,
         ref = run_torch(x[rows], w, x_scales[rows], w_scales, dtypes.bf16).float()
         got = out[rows].float()
         bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
-    assert bad == 0, f"a4w4 asm 256x256 {case}: {bad} of {m * n} elements wrong"
-    aiter.logger.info(f"a4w4 asm 256x256 {case}: exact")
+    assert bad == 0, f"a4w4 asm {name} {case}: {bad} of {m * n} elements wrong"
+    aiter.logger.info(f"a4w4 asm {name} {case}: exact")
 
 
 def check_asm_4gib_operands():
-    """A or out of 4 GiB or more on BpreShuffle_256x256 must be exact.
+    """A or out of 4 GiB or more must be exact, for every kernel that
+    _asm_f4_kernels() selects.
 
-    Each operand's buffer descriptor holds a 32-bit size; the kernel gives
+    Each operand's buffer descriptor holds a 32-bit size; the kernels give
     every tile its own 64-bit base.
     """
+    kernels = _asm_f4_kernels()
     for operand, m, n, k in (
         ("out", 20192, 106496, 512),
-        ("A", (1 << 33) // 8192 + 256, 256, 8192),
+        ("A", (1 << 33) // 8192 + 256, 512, 8192),
     ):
         x, x_scales, x_scales_sh = _quant_rows(m, k)
         w, w_scales, w_scales_sh = _quant_rows(n, k)
         out = torch.empty((m, n), dtype=dtypes.bf16)
         case = f"{operand} > 4 GiB {(m, n, k)}"
-        _check_asm_f4_exact(
-            x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case
-        )
+        for kn in kernels:
+            _check_asm_f4_exact(
+                x,
+                w,
+                x_scales,
+                w_scales,
+                x_scales_sh,
+                w_scales_sh,
+                out,
+                kn.knl_name,
+                case,
+            )
         del x, w, out
 
 
 def check_asm_last_tile_at_allocation_end():
     """A ends an allocation and the last M tile has 1 row, at small K.
 
-    The kernel lowers each tile's descriptor size by a fixed step per K step
-    it prefetches, also past the end of K; it must stop at zero there. If it
+    The kernels lower each tile's descriptor size by a fixed step per K step
+    they prefetch, also past the end of K; it must stop at zero there. If it
     wrapped, those prefetches would read past the end of A, which faults
     (aborting the process) when A ends the allocation.
     """
@@ -387,22 +411,32 @@ def check_asm_last_tile_at_allocation_end():
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     torch.cuda.empty_cache()
     buf = torch.empty(64 << 20, dtype=torch.uint8)
-    m, n = 257, 256
-    for k in (256, 512):
-        xb = torch.randn((m, k), dtype=dtypes.bf16)
-        wb = torch.randn((n, k), dtype=dtypes.bf16)
-        x, x_scales_sh = quant_func(xb, shuffle=True)
-        w, w_scales_sh = quant_func(wb, shuffle=True)
-        x_scales = quant_func(xb, shuffle=False)[1].view(torch.uint8)
-        w_scales = quant_func(wb, shuffle=False)[1].view(torch.uint8)
-        nbytes = x.numel() * x.element_size()
-        xa = buf[buf.numel() - nbytes :].view(x.dtype).view(x.shape)
-        xa.copy_(x)
-        out = torch.empty((m, n), dtype=dtypes.bf16)
-        case = f"A at allocation end {(m, n, k)}"
-        _check_asm_f4_exact(
-            xa, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case
-        )
+    n = 512
+    for kn in _asm_f4_kernels():
+        m = kn.tile_M + 1
+        for k in (256, 512):
+            xb = torch.randn((m, k), dtype=dtypes.bf16)
+            wb = torch.randn((n, k), dtype=dtypes.bf16)
+            x, x_scales_sh = quant_func(xb, shuffle=True)
+            w, w_scales_sh = quant_func(wb, shuffle=True)
+            x_scales = quant_func(xb, shuffle=False)[1].view(torch.uint8)
+            w_scales = quant_func(wb, shuffle=False)[1].view(torch.uint8)
+            nbytes = x.numel() * x.element_size()
+            xa = buf[buf.numel() - nbytes :].view(x.dtype).view(x.shape)
+            xa.copy_(x)
+            out = torch.empty((m, n), dtype=dtypes.bf16)
+            case = f"A at allocation end {(m, n, k)}"
+            _check_asm_f4_exact(
+                xa,
+                w,
+                x_scales,
+                w_scales,
+                x_scales_sh,
+                w_scales_sh,
+                out,
+                kn.knl_name,
+                case,
+            )
 
 
 @benchmark()

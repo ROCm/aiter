@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 import random
 from functools import lru_cache
 
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
@@ -687,12 +688,16 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
-ASM_PF3 = "_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE"
-ASM_BSHUFFLE = "_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE"
-ASM_CLEAN = "_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE"
-ASM_BSHUFFLE_CLEAN = "_ZN5aiter48bf16gemm_fp32bf16_tn_64x64_bshuffle_splitk_cleanE"
-ASM_256 = "_ZN5aiter24bf16gemm_bf16_tn_256x256E"
-ASM_256_BPRE = "_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE"
+def _asm_kernels(split_k):
+    """Rows of this arch's asm kernel table, the table the launcher reads.
+
+    split_k selects the kernels that split K (*_clean) or the others.
+    """
+    path = os.path.join(AITER_ASM_DIR, get_gfx(), "bf16gemm", "bf16gemm_fp32bf16.csv")
+    if not os.path.isfile(path):
+        return []
+    table = pd.read_csv(path)
+    return list(table[table["splitK"] == int(split_k)].itertuples(index=False))
 
 
 def _check_asm_exact(x, w, out, name, bpreshuffle, split, case):
@@ -713,33 +718,30 @@ def _check_asm_exact(x, w, out, name, bpreshuffle, split, case):
 
 
 def test_asm_4gib_operands():
-    """A or out of 4 GiB or more must be exact.
+    """A or out of 4 GiB or more must be exact, for every kernel in the table.
 
     Each buffer descriptor holds a 32-bit size; the kernels give every tile
-    its own 64-bit base. One kernel per separately built kind: plain-B and
-    preshuffled-B split-K, *_clean split-K and (gfx950) 256x256.
+    its own 64-bit base.
     """
-    gfx = get_gfx()
-    if gfx not in ("gfx942", "gfx950"):
-        return
-    kernels = [(ASM_PF3, False, 1), (ASM_BSHUFFLE, True, 1)]
-    if gfx == "gfx950":
-        kernels += [(ASM_256, False, 1), (ASM_256_BPRE, True, 1)]
-    # *_clean kernels split K and need at most 1024 tiles, so only A or B
-    # can reach 4 GiB.
-    clean = [(ASM_CLEAN, False, 2), (ASM_BSHUFFLE_CLEAN, True, 2)]
+    # Split-K with bf16 output adds bf16 partial sums, so split-K runs use
+    # FP32 output. Split-K needs at most 1024 tiles, so only A or B can reach
+    # 4 GiB there.
     cases = [
-        ("A", (1 << 31) // 8192 + 256, 256, 8192, dtypes.bf16, kernels),
-        ("out", 16384, (1 << 31) // 16384 + 256, 128, dtypes.bf16, kernels),
-        ("A", 32768, 64, (1 << 16) + 256, dtypes.fp32, clean),
+        ("A", (1 << 31) // 8192 + 256, 256, 8192, dtypes.bf16, False),
+        ("out", 16384, (1 << 31) // 16384 + 256, 128, dtypes.bf16, False),
+        ("A", 32768, 64, (1 << 16) + 256, dtypes.fp32, True),
     ]
-    for operand, m, n, k, otype, names in cases:
+    for operand, m, n, k, otype, split_k in cases:
+        kernels = _asm_kernels(split_k)
+        if not kernels:
+            continue
         x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
         w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
         out = torch.empty(m, n, dtype=otype, device="cuda")
-        for name, bpreshuffle, split in names:
+        for kn in kernels:
             case = f"{operand} > 4 GiB {(m, n, k)} {otype}"
-            _check_asm_exact(x, w, out, name, bpreshuffle, split, case)
+            split = 2 if split_k else 1
+            _check_asm_exact(x, w, out, kn.knl_name, bool(kn.bPreshuffle), split, case)
         del x, w, out
 
 
@@ -752,33 +754,29 @@ def test_asm_last_tile_at_allocation_end():
     prefetches would read past the end of A, which faults (aborting the
     process) when A ends the allocation.
     """
-    gfx = get_gfx()
-    if gfx not in ("gfx942", "gfx950"):
-        return
-    # (name, bpreshuffle, splitK, out dtype, M tile rows, K values). Split-K
-    # with bf16 output adds bf16 partial sums, so split-K runs use FP32 output.
-    kernels = [
-        (ASM_PF3, False, 1, dtypes.bf16, 64, (64, 128)),
-        (ASM_BSHUFFLE, True, 1, dtypes.bf16, 64, (64, 128)),
-        (ASM_CLEAN, False, 2, dtypes.fp32, 64, (128,)),
-    ]
-    if gfx == "gfx950":
-        kernels += [(ASM_256, False, 1, dtypes.bf16, 256, (64, 128))]
     # A fresh 64 MiB block is a whole caching-allocator segment, so the memory
     # after it is normally unmapped; empty the cache so it is not cut from a
     # larger one.
     torch.cuda.empty_cache()
     buf = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     n = 256
-    for name, bpreshuffle, split, otype, tile, ks in kernels:
-        for k in ks:
-            m = tile + 1
-            x = buf[buf.numel() - m * k * 2 :].view(dtypes.bf16).view(m, k)
-            x.copy_(torch.randn(m, k, dtype=dtypes.bf16, device="cuda"))
-            w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
-            out = torch.empty(m, n, dtype=otype, device="cuda")
-            case = f"A at allocation end {(m, n, k)} {otype}"
-            _check_asm_exact(x, w, out, name, bpreshuffle, split, case)
+    # Split-K needs two K steps, so it starts at K = 128.
+    for split_k, otype, ks in (
+        (False, dtypes.bf16, (64, 128)),
+        (True, dtypes.fp32, (128,)),
+    ):
+        for kn in _asm_kernels(split_k):
+            for k in ks:
+                m = kn.tileM + 1
+                x = buf[buf.numel() - m * k * 2 :].view(dtypes.bf16).view(m, k)
+                x.copy_(torch.randn(m, k, dtype=dtypes.bf16, device="cuda"))
+                w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+                out = torch.empty(m, n, dtype=otype, device="cuda")
+                case = f"A at allocation end {(m, n, k)} {otype}"
+                split = 2 if split_k else 1
+                _check_asm_exact(
+                    x, w, out, kn.knl_name, bool(kn.bPreshuffle), split, case
+                )
 
 
 parser = argparse.ArgumentParser(
