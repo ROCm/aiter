@@ -12,9 +12,10 @@ Every function is a thin, self-contained wrapper around one AMD scaled-MFMA / cv
 instruction or a small fixed activation formula; none carries scheduling state of its own
 (the tile loop, prefetch ring and LDS layout that call these live in the model-side fused
 kernel, not in amd-kernels). A raw inline-asm / LLVM-intrinsic call is kept here, per aiter's
-own FlyDSL rule, because FlyDSL has no published wrapper for ``v_mfma_scale_f32_16x16x128_f8f6f4``
-(the gfx950 scaled-MFMA op with explicit ``op_sel``/``cbsz``/``blgp`` immediates these call
-sites need) or for ``llvm.amdgcn.cvt.scalef32.pk.fp4.f32`` / ``...pk.fp8.f32``.
+own FlyDSL rule, for ``v_mfma_scale_f32_16x16x128_f8f6f4`` only: FlyDSL has no published wrapper
+for the gfx950 scaled-MFMA op with the explicit ``op_sel``/``cbsz``/``blgp`` immediates these
+call sites need. The packed fp4 / fp8 converts go through FlyDSL's ``rocdl.cvt_scalef32_pk_*``
+wrappers, as ``mega_moe_tp/common.py`` does.
 """
 
 import flydsl.expr as fx
@@ -113,14 +114,11 @@ def _mfma8(a, b, acc, sa, sb, b_byte, transpose=False):
 
 
 def _fp4(old, a, b, scale, sel):
-    """FP32 pair -> packed MXFP4 (FlyDSL has no wrapper for this intrinsic)."""
+    """FP32 pair -> packed MXFP4 into byte pair ``sel`` of ``old``
+    (``v_cvt_scalef32_pk_fp4_f32``, through FlyDSL's rocdl wrapper)."""
     return fx.Int32(
-        llvm.call_intrinsic(
-            T.i32,
-            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
-            [_raw(old), _raw(a), _raw(b), _raw(scale), _raw(fx.Int32(sel))],
-            [],
-            [],
+        fx.rocdl.cvt_scalef32_pk_fp4_f32(
+            T.i32, _raw(old), _raw(a), _raw(b), _raw(scale), sel
         )
     )
 
@@ -136,22 +134,10 @@ def _e8m0_fp8(amax):
 
 def _fp8(old, a, b, scale, hi):
     """``v_cvt_scalef32_pk_fp8_f32``: (a, b) / scale -> 2 e4m3 into the low (``hi`` False) or
-    high half of ``old``."""
-    ty = ir.VectorType.get([2], ir.IntegerType.get_signless(16))
+    high half of ``old`` (through FlyDSL's rocdl wrapper)."""
+    ty = T.vec(2, T.i16)
     old_v = llvm.bitcast(ty, fx.as_ir_value(old))
-    res = llvm.call_intrinsic(
-        ty,
-        "llvm.amdgcn.cvt.scalef32.pk.fp8.f32",
-        [
-            old_v,
-            fx.as_ir_value(a),
-            fx.as_ir_value(b),
-            fx.as_ir_value(scale),
-            fx.Boolean(hi).ir_value(),
-        ],
-        [],
-        [],
-    )
+    res = fx.rocdl.cvt_scalef32_pk_fp8_f32(ty, old_v, _raw(a), _raw(b), _raw(scale), hi)
     return fx.Int32(llvm.bitcast(T.i32, res))
 
 

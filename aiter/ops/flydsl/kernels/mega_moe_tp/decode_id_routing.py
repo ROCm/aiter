@@ -30,7 +30,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-E, TOPK, MAX_PAIRS = 128, 4, 256
+E, TOPK = 128, 4
 HIST = 256  # 128 experts, 64 per-lane dummy slots; 64 lanes x 16 B zeroed in one store
 TAB = 80  # 16 rows, 64 per-lane dummy slots
 WAVE_BYTES = (HIST + TAB) * 4  # one wave's LDS slice
@@ -67,13 +67,19 @@ def _ptr(addr):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(addr)))
 
 
-def wave_expert(ids, m, block, lane, hb, pairs=MAX_PAIRS):
+def wave_expert(ids, m, block, lane, hb, pairs):
     """(expert of canonical 16-row block ``block``, its first rank, number of blocks, the
     lane's pair ids).
 
     Args:
         hb: the wave's ``WAVE_BYTES`` LDS slice.
-        pairs: the pair slots scanned, a compile-time multiple of 64, >= M * 4.
+        pairs: the pair slots scanned, a compile-time multiple of 64 that is >= M * 4
+            (``decode_tile_primitives.id_pairs_for(m)``). Required, with no default: a
+            capacity below M * 4 would silently leave the trailing tokens unrouted.
+
+    A routing id outside ``[0, E)`` (negative or >= E, e.g. a padding / dropped-token marker) is
+    ignored: it lands in the lane's private dummy slot and matches no expert, so it neither
+    perturbs the histogram nor any block's rows.
     """
     n_pairs = m * TOPK
     ir_ = buffer_ops.create_buffer_resource(
@@ -92,7 +98,7 @@ def wave_expert(ids, m, block, lane, hb, pairs=MAX_PAIRS):
     llvm.StoreOp(_raw(fx.Int32(m)), _ptr(hb + HIST * 4 + lane * 4), alignment=4)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     for c in range_constexpr(len(vals)):
-        slot = (vals[c] >= 0).select(vals[c], E + lane)
+        slot = ((vals[c] >= 0) & (vals[c] < E)).select(vals[c], E + lane)
         llvm.AtomicRMWOp(
             llvm.AtomicBinOp.add,
             _ptr(hb + slot * 4),
