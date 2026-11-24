@@ -288,6 +288,8 @@ def compile_pa_decode_tile(
     the head term, and the in-page term stays i32.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    # kv_scale_dtype is the dtype of the K/V block scales, not of K/V: packed e2m1
+    # K/V with E4M3 scales is NVFP4. FP8, BF16 and MXFP4 callers leave it None.
     nvfp4 = kv_scale_dtype == torch.float8_e4m3fn
     if kv_scale_dtype is not None and not nvfp4:
         raise ValueError(f"Unsupported PA KV scale dtype {kv_scale_dtype}")
