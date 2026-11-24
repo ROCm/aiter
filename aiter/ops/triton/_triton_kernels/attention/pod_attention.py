@@ -1,9 +1,10 @@
-import triton
-import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 import importlib.util
 from pathlib import Path
+
+import triton
+import triton.language as tl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 file_path = Path("./aiter/ops/triton/lean_atten.py").resolve()
 module_name = "la_persistent"
@@ -176,6 +177,7 @@ def pod_persistent(
     prefill_ratio: tl.constexpr,
     decode_ratio: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_cus: tl.constexpr,
 ):
 
     # cu_id: 4 bits, se_id: 2 bits, xcc_id: 4 bits
@@ -194,7 +196,7 @@ def pod_persistent(
     if ticket < prefill_ratio:
         op = 1  # 1 - prefill
 
-    current_pid = tl.program_id(0) % 304
+    current_pid = tl.program_id(0) % num_cus
     # if gcu_id==352:
     #    tl.device_print("ticket is", ticket)
     #    tl.device_print("op is ", op)

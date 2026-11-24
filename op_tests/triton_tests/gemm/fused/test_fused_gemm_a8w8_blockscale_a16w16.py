@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+import torch.nn.functional as F
+import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
 )
@@ -16,7 +18,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-import torch.nn.functional as F
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 
@@ -69,20 +71,7 @@ def run_triton(
     )
 
 
-def get_x_vals():
-
-    x_vals = [(1, 1, 1, 128)]  # minimal case
-    x_vals += [
-        (m, n1, n2, k)
-        for k in [1024, 8192, 7168]
-        for n2 in [256, 512]
-        for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
-    ]
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N1, N2, K", get_x_vals())
+@pytest.mark.parametrize("M, N1, N2, K", get_shapes(k_mult=128, n2=[256, 512]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])

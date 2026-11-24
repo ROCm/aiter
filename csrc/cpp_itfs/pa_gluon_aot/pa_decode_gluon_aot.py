@@ -4,15 +4,15 @@ import subprocess
 import time
 from pathlib import Path
 
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 import torch
 import triton
 import triton.language as tl
 from jinja2 import Template
 
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
+import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
@@ -79,7 +79,7 @@ def clean_directory_except_so(directory_path):
                 try:
                     os.remove(file_path)
                     # print(f"Deleted file: {file_path}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"Error deleting file {file_path}: {e}")
 
         # Process directories (after files have been processed)
@@ -92,7 +92,7 @@ def clean_directory_except_so(directory_path):
                     if item.endswith(".so"):
                         has_so_files = True
                         break
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Error accessing directory {dir_path}: {e}")
                 continue
 
@@ -101,7 +101,7 @@ def clean_directory_except_so(directory_path):
                 try:
                     shutil.rmtree(dir_path)
                     # print(f"Deleted directory: {dir_path}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"Error deleting directory {dir_path}: {e}")
 
 
@@ -119,7 +119,7 @@ def compile(
     is_causal: int,
     use_sinks: int,
     cdna_version: int,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
@@ -248,7 +248,7 @@ def compile(
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
             "i32:16",  # max_context_partition_num
-            f"{str(compute_type_tl)}",
+            f"{compute_type_tl!s}",
             f"{query_seq_len}",  # QUERY_SEQ_LEN (constexpr)
             f"{one_query_group_size}",  # ONE_QUERY_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",
@@ -392,6 +392,7 @@ def compile(
                 capture_output=True,
                 text=True,
                 timeout=100,
+                check=False,
             )
             if result.returncode != 0 and result.stderr:
                 print(f"Warning: {result.stderr}")

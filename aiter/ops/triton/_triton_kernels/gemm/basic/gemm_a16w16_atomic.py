@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
 import triton
+import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16w16_atomic_repr = make_kernel_repr(
     "_gemm_a16_w16_atomic_kernel",
@@ -19,7 +22,7 @@ _gemm_a16w16_atomic_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "cache_modifier",
         "EVEN_K",
-        "GRID_MN",
+        "ACCUMULATE",
     ],
 )
 
@@ -29,8 +32,6 @@ _gemm_a16w16_atomic_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"]) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w16_atomic_repr)
@@ -56,9 +57,10 @@ def _gemm_a16_w16_atomic_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     cache_modifier: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    ACCUMULATE: tl.constexpr = False,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """Kernel for computing the matmul C = A x B, or C += A x B with ACCUMULATE.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
 
@@ -79,7 +81,8 @@ def _gemm_a16_w16_atomic_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        pid = remap_xcd(pid, grid_mn, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -134,6 +137,9 @@ def _gemm_a16_w16_atomic_kernel(
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if NUM_KSPLIT == 1:
+            if ACCUMULATE:
+                c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0).to(acc_dtype)
+                c = (accumulator + c_prev).to(c_ptr.type.element_ty)
             tl.store(c_ptrs, c, mask=c_mask)
         else:
             tl.atomic_add(c_ptrs, c, mask=c_mask, sem="relaxed")

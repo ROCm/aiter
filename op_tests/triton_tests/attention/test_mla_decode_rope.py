@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 from typing import Any
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
-    decode_attention_fwd_grouped_rope,
     _get_config,
+    decode_attention_fwd_grouped_rope,
 )
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
@@ -84,7 +85,11 @@ def input_helper(
 def ref_preprocess(kv_cache, kv_lora_rank):
     latent_cache = kv_cache
     v_input = latent_cache[..., :kv_lora_rank]
-    v_input = v_input.contiguous().unsqueeze(1)
+    # .contiguous() is a no-op (returns the same storage) when a leading dim has
+    # size 1, since PyTorch ignores strides on size-1 dims when checking
+    # contiguity. That aliases v_input with latent_cache, which then breaks the
+    # in-place write into k_input below. clone() always allocates fresh memory.
+    v_input = v_input.clone(memory_format=torch.contiguous_format).unsqueeze(1)
     k_input = latent_cache.unsqueeze(1)
     k_input[..., :kv_lora_rank] = v_input
     return k_input, v_input
@@ -111,8 +116,8 @@ def ref_compute(
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
     if use_rope:
-        q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-            device
+        q_input = torch.empty(
+            B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
         )
         q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -188,8 +193,8 @@ def ref_compute_full_fwd(
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
-    q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-        device
+    q_input = torch.empty(
+        B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
     )
     q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -245,7 +250,9 @@ def ref_compute_full_fwd(
 
 
 def get_config(dtype: torch.dtype):
-    config: dict[str, Any] = _get_config()
+    # _get_config() returns the shared cached dict and the launch helpers
+    # write derived fields into its sub-configs — work on a copy.
+    config: dict[str, Any] = copy.deepcopy(_get_config())
     base_config_key: str = "fwd_grouped_kernel_stage1_rope"
     fp32_config_key: str = f"{base_config_key}_fp32"
     config_key: str = (

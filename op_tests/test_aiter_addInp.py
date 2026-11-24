@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
+
+import argparse
 
 import torch
+from torch.profiler import ProfilerActivity, profile
+
 import aiter
-from torch.profiler import profile, ProfilerActivity
 from aiter import dtypes
-import argparse
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -142,8 +146,8 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         profile_memory=True,
-        with_stack=True,
-        with_modules=True,
+        with_stack=False,
+        with_modules=False,
         record_shapes=True,
     ) as prof:
         for j in range(100):
@@ -156,11 +160,15 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
             # result_con = result.contiguous()
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
+    # Warm up outside the profiled region: the first call JIT-builds and dlopens the
+    # aiter module, which would otherwise dominate the measured CPU time.
+    aiter.add_(tensor0.clone(), tensor1.clone())
+
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         profile_memory=True,
-        with_stack=True,
-        with_modules=True,
+        with_stack=False,
+        with_modules=False,
         record_shapes=True,
     ) as prof:
         for j in range(100):

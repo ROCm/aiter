@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from aiter.ops.triton.utils.types import _is_fp8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
+    _get_config,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
-    _get_config,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -38,23 +37,23 @@ def flash_attn_onekernel_backward(
     dv: torch.Tensor,
     dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, any]] = None,
+    philox_seed: int | None = 0,
+    philox_offset: int | None = 0,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    descale_do: torch.Tensor | None = None,
+    USE_INT64_STRIDES: bool | None = False,
+    sink: torch.Tensor | None = None,
+    dsink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
     sliding_window: int = 0,
 ):
     """
@@ -102,8 +101,14 @@ def flash_attn_onekernel_backward(
         torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
     """
     _LOGGER.info(
-        f"FLASH_ATTN_ONEKERNEL_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
-        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+        "FLASH_ATTN_ONEKERNEL_BKWD: do=%s q=%s  k=%s  v=%s dq=%s  dk=%s  dv=%s",
+        tuple(do.shape),
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(dq.shape),
+        tuple(dk.shape),
+        tuple(dv.shape),
     )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -133,14 +138,14 @@ def flash_attn_onekernel_backward(
             stride_descale_do_z,
         )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_VARLEN = cu_seqlens_q is not None
 
     # get strides and shape
     if IS_VARLEN:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
         # v is [total_tokens, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = (
+        batch, _seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
@@ -159,7 +164,7 @@ def flash_attn_onekernel_backward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v]
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
+        batch, _seqlen_q, num_q_heads = q.shape[:-1]
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
@@ -232,6 +237,7 @@ def flash_attn_onekernel_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
 
     # dropout_mask
@@ -318,6 +324,7 @@ def flash_attn_onekernel_backward(
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
+            enable_fp_fusion=True,
         )
     else:
         bwd_kernel_noncausal[grid](
@@ -375,6 +382,7 @@ def flash_attn_onekernel_backward(
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
+            enable_fp_fusion=True,
         )
 
     return delta

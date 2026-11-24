@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,13 +17,12 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict_batched, write_lookup_header  # noqa: E402
-
-from batched_gemm_a8w8_common import (  # noqa: E402
+from batched_gemm_a8w8_common import (
     default_kernels_dict,
     kernelInstance,
     kernels_list,
 )
+from chip_info import build_tune_dict_batched, write_lookup_header
 
 
 class batched_gemm_a8w8_fwd_codegen:
@@ -85,10 +84,10 @@ torch::Tensor
                 {k.WAVE_TILE_N},
                 {k.WAVE_MAP_M},
                 {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+                S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
                 {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
                 {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
                 ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
@@ -108,10 +107,10 @@ torch::Tensor
             {k.WAVE_TILE_N},
             {k.WAVE_MAP_M},
             {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
             ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
@@ -240,8 +239,10 @@ torch::Tensor
             os.path.join(self.working_path, "batched_gemm_a8w8_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -252,7 +253,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

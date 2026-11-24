@@ -31,17 +31,13 @@
 // See detailed examples and explanations inline with each strategy class.
 // ============================================================================
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
-#include "dispatch_utils.h"
+#include "topk_plain.h"
+
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "opus/opus.hpp"
-#include "py_itfs_common.h"
 #include "quick_all_reduce_base.h"
 
 #define HIP_CHECK(val)                                \
@@ -82,7 +78,13 @@ extern void radix_topk_dispatch(void* buf,
                                 float* out,
                                 int* out_idx,
                                 bool greater,
-                                hipStream_t stream);
+                                hipStream_t stream,
+                                bool nan_high,
+                                int64_t pitch);
+
+// Whether radix_topk_dispatch reads `batch_size` uniform rows of `len` at a pitch
+// of their own (defined in topk_per_row_kernels.cu).
+extern bool radix_topk_reads_pitch(int batch_size, int64_t len, int k);
 
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
@@ -105,7 +107,10 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int stride0,
                                   int stride1,
                                   int k,
-                                  hipStream_t stream);
+                                  void* workspace,
+                                  hipStream_t stream,
+                                  bool nan_high  = false,
+                                  int64_t pitch = -1);
 
 // Helper function to determine if topk_per_row kernel should be used
 // Based on: n + K log²K ≥ 3 × Factor(n) × n
@@ -2349,7 +2354,9 @@ void topk_kernel_launcher(int block_per_batch,
     }
 }
 
-// Uniform length version of AdaptiveTopK
+// Uniform length version of AdaptiveTopK: rows `len` wide and `pitch` apart, a
+// negative `pitch` meaning `len`. Only the radix path reads a pitch of its own,
+// and only where radix_topk_reads_pitch holds.
 template <bool greater, typename T, typename IdxT>
 void AdaptiveTopK(int batch_size,
                   IdxT len,
@@ -2357,7 +2364,10 @@ void AdaptiveTopK(int batch_size,
                   const T* __restrict__ in,
                   T* __restrict__ out,
                   IdxT* __restrict__ out_idx,
-                  hipStream_t stream = 0)
+                  void* workspace,
+                  hipStream_t stream = 0,
+                  bool nan_high      = false,
+                  int64_t pitch      = -1)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
@@ -2378,11 +2388,17 @@ void AdaptiveTopK(int batch_size,
                                                static_cast<int>(len),
                                                1,
                                                k,
-                                               stream);
+                                               workspace,
+                                               stream,
+                                               nan_high,
+                                               pitch);
 
             return;
         }
     }
+    (void)workspace; // only the radix path above consumes the caller workspace
+    AITER_CHECK(pitch < 0 || pitch == len,
+                "topk_plain: the block-sort fallback reads rows ", len, " apart, not ", pitch);
 
     const int capacity  = utils::calc_capacity(k);
     int block_per_batch = 0;
@@ -2420,7 +2436,9 @@ void AdaptiveTopK(int batch_size,
                   const IdxT* __restrict__ rowEnds,
                   int64_t stride0,
                   int64_t stride1,
-                  hipStream_t stream = 0)
+                  void* workspace,
+                  hipStream_t stream = 0,
+                  bool nan_high      = false)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
@@ -2441,7 +2459,9 @@ void AdaptiveTopK(int batch_size,
                                                static_cast<int>(stride0),
                                                static_cast<int>(stride1),
                                                k,
-                                               stream);
+                                               workspace,
+                                               stream,
+                                               nan_high);
 
             return;
         }
@@ -2458,13 +2478,17 @@ void AdaptiveTopK(int batch_size,
             if(len <= 0)
                 continue;
 
-            // Call the uniform length version for each batch
+            // Call the uniform length version for each batch. The single caller
+            // workspace is reused serially across batches (same stream); it is
+            // sized for the top-level (batch, stride0) call, which dominates each
+            // per-batch (1, len) size, so it is always large enough.
             AdaptiveTopK<greater, T, IdxT>(1, // single batch
                                            len,
                                            k,
                                            in + batch_id * stride0 + start * stride1,
                                            out + batch_id * k,
                                            out_idx + batch_id * k,
+                                           workspace,
                                            stream);
         }
     }
@@ -2472,7 +2496,10 @@ void AdaptiveTopK(int batch_size,
 
 } // namespace topk
 
-// Helper function to call topk_per_row kernel (outside topk namespace)
+// Helper function to call topk_per_row kernel (outside topk namespace).
+// `workspace` is a caller-provided device scratch buffer, allocated + cached on
+// the Python side (see topk_plain in topk_plain.py) and sized via
+// topk_plain_workspace_size, so this launcher never allocates device memory.
 template <typename IdxT>
 void topk_per_row_kernel_launcher(const float* in,
                                   const IdxT* rowStarts,
@@ -2483,18 +2510,19 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int stride0,
                                   int stride1,
                                   int k,
-                                  hipStream_t stream)
+                                  void* workspace,
+                                  hipStream_t stream,
+                                  bool nan_high,
+                                  int64_t pitch)
 {
+    AITER_CHECK(workspace != nullptr,
+                "topk_plain: the radix top-k path requires a caller-provided workspace");
 
     size_t buf_size = 0;
     static constexpr bool is_largest = true;
 
-    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0, k);
-    auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
-    torch::Tensor workspace = torch::empty({workspace_size}, options);
-
     radix_topk_dispatch(
-        static_cast<void*>(workspace.data_ptr<uint8_t>()),
+        workspace,
         buf_size,
         in,
         batch_size,
@@ -2505,57 +2533,89 @@ void topk_per_row_kernel_launcher(const float* in,
         const_cast<float*>(out),
         out_idx,
         is_largest,
-        stream);
+        stream,
+        nan_high,
+        pitch);
 }
 
-void topk_plain(torch::Tensor& values,   // [batch, len]
-                torch::Tensor& topk_ids, // [batch, k]
-                torch::Tensor& topk_out, // [batch, k]
+// Map the hip runtime element type bound by the dispatch macro to the ck_tile
+// element type the kernels expect (torch-free replacement for t2ck).
+template <typename T> struct hip2ck;
+template <> struct hip2ck<float>        { using type = ck_tile::fp32_t; };
+template <> struct hip2ck<__half>       { using type = ck_tile::fp16_t; };
+template <> struct hip2ck<hip_bfloat16> { using type = ck_tile::bf16_t; };
+
+void topk_plain(aiter_tensor_t& values,                  // [batch, len]
+                aiter_tensor_t& topk_ids,                // [batch, k]
+                std::optional<aiter_tensor_t> topk_out,  // [batch, k], optional
                 int topk,
                 bool largest,
-                torch::Tensor rowStarts,
-                torch::Tensor rowEnds,
+                std::optional<aiter_tensor_t> rowStarts,
+                std::optional<aiter_tensor_t> rowEnds,
                 int64_t stride0,
-                int64_t stride1)
+                int64_t stride1,
+                std::optional<aiter_tensor_t> workspace,
+                bool nan_high)
 {
     const int32_t max_len = values.size(-1);
     const int32_t batch   = values.size(0);
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(values.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // Caller-provided device scratch for the radix path (fp32 only); allocated +
+    // cached on the Python side and passed in so this host code never allocates.
+    void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     // Check if we're using variable length mode
-    // Empty tensors have defined() = true but numel() = 0, so check both
-    const bool use_variable_length =
-        rowStarts.defined() && rowEnds.defined() && rowStarts.numel() > 0 && rowEnds.numel() > 0;
+    // Empty tensors are conveyed as nullopt or numel()==0, so check both.
+    const bool use_variable_length = rowStarts.has_value() && rowEnds.has_value() &&
+                                     rowStarts.value().numel() > 0 && rowEnds.value().numel() > 0;
 
     // Set default stride values if not specified
     if(stride0 < 0)
         stride0 = max_len;
+    AITER_CHECK(use_variable_length || stride0 >= max_len,
+                "topk_plain: uniform rows of ", max_len, " at a pitch of ", stride0);
 
     // Dispatch based on value tensor dtype
-    VLLM_DISPATCH_FLOATING_TYPES(values.scalar_type(), "topk_plain", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(values.dtype(), "topk_plain", [&] {
+        using input_dtype = typename hip2ck<scalar_t>::type;
         // Dispatch based on index tensor dtype
-        if(topk_ids.scalar_type() != torch::kInt32)
+        if(topk_ids.dtype() != AITER_DTYPE_i32)
         {
-            AT_ERROR("Unsupported index type for topk_ids");
+            AITER_CHECK(false, "topk_plain: unsupported index type for topk_ids");
         }
 
         using IdxT = int32_t;
-        // Get raw pointers using the PyTorch scalar_t type, not input_dtype
-        const scalar_t* values_ptr = values.data_ptr<scalar_t>();
-        scalar_t* topk_out_ptr     = topk_out.data_ptr<scalar_t>();
-        IdxT* topk_ids_ptr         = topk_ids.data_ptr<IdxT>();
+        // aiter_tensor_t::data_ptr() is void*; cast straight to the kernel element
+        // type (bit-identical layout to the hip runtime type bound above).
+        const input_dtype* values_kernel_ptr =
+            static_cast<const input_dtype*>(values.data_ptr());
+        input_dtype* topk_out_kernel_ptr =
+            topk_out.has_value() ? static_cast<input_dtype*>(topk_out.value().data_ptr())
+                                 : nullptr;
+        IdxT* topk_ids_ptr = static_cast<IdxT*>(topk_ids.data_ptr());
 
-        // Cast to input_dtype for the kernel
-        const input_dtype* values_kernel_ptr = reinterpret_cast<const input_dtype*>(values_ptr);
-        input_dtype* topk_out_kernel_ptr     = reinterpret_cast<input_dtype*>(topk_out_ptr);
+        // Only the radix path has a build that skips the values; the block-sort
+        // fallback under AdaptiveTopK writes them unconditionally. Asked here
+        // rather than left to fail inside a kernel, and asked through the same
+        // predicate `topk_plain_batches_ragged_rows` answers with so the two cannot
+        // drift apart.
+        AITER_CHECK(topk_out_kernel_ptr != nullptr ||
+                        (std::is_same_v<input_dtype, ck_tile::fp32_t> && largest &&
+                         should_use_topk_radix<int64_t>(max_len, topk)),
+                    "topk_plain: topk_out may only be omitted where "
+                    "topk_plain_batches_ragged_rows() is true");
+        // NaN of either sign above +inf: the radix build that writes no values.
+        AITER_CHECK(!nan_high || topk_out_kernel_ptr == nullptr,
+                    "topk_plain: nan_high is served with topk_out omitted only");
 
         if(use_variable_length)
         {
             // Variable length mode: use rowStarts/rowEnds
-            const IdxT* rowStarts_ptr = rowStarts.data_ptr<IdxT>();
-            const IdxT* rowEnds_ptr   = rowEnds.data_ptr<IdxT>();
+            const IdxT* rowStarts_ptr = static_cast<const IdxT*>(rowStarts.value().data_ptr());
+            const IdxT* rowEnds_ptr   = static_cast<const IdxT*>(rowEnds.value().data_ptr());
 
             if(largest)
             {
@@ -2569,7 +2629,9 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
                                                             rowEnds_ptr,
                                                             stride0,
                                                             stride1,
-                                                            stream);
+                                                            ws_ptr,
+                                                            stream,
+                                                            nan_high);
             }
             else
             {
@@ -2583,6 +2645,7 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
                                                              rowEnds_ptr,
                                                              stride0,
                                                              stride1,
+                                                             ws_ptr,
                                                              stream);
             }
         }
@@ -2596,7 +2659,10 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
                                                             values_kernel_ptr,
                                                             topk_out_kernel_ptr,
                                                             topk_ids_ptr,
-                                                            stream);
+                                                            ws_ptr,
+                                                            stream,
+                                                            nan_high,
+                                                            stride0);
             }
             else
             {
@@ -2606,8 +2672,29 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
                                                              values_kernel_ptr,
                                                              topk_out_kernel_ptr,
                                                              topk_ids_ptr,
-                                                             stream);
+                                                             ws_ptr,
+                                                             stream,
+                                                             false,
+                                                             stride0);
             }
         }
     });
+}
+
+// Exposed to Python so topk_plain's radix scratch can be sized, allocated and
+// cached on the Python side (torch caching allocator) and passed in. Returns the
+// max(mb, ob) workspace for the float radix path; only fp32 inputs reach that
+// path, so non-fp32 callers do not need to allocate a workspace at all.
+int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
+{
+    return invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(
+        static_cast<int32_t>(numRows), static_cast<int32_t>(stride0), static_cast<int>(k));
+}
+
+bool topk_plain_uses_radix(int64_t width, int64_t k) { return should_use_topk_radix(width, k); }
+
+bool topk_plain_reads_pitch(int64_t numRows, int64_t width, int64_t k)
+{
+    return should_use_topk_radix(width, k) &&
+           radix_topk_reads_pitch(static_cast<int>(numRows), width, static_cast<int>(k));
 }

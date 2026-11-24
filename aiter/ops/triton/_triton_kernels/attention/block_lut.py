@@ -10,8 +10,17 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit()
+_block_attn_mask_to_lut_kernel_repr = make_kernel_repr(
+    "_block_attn_mask_to_lut_kernel",
+    [
+        "BLOCK_KB",
+    ],
+)
+
+
+@triton.jit(repr=_block_attn_mask_to_lut_kernel_repr)
 def _block_attn_mask_to_lut_kernel(
     mask_ptr,
     lut_start_ptr,

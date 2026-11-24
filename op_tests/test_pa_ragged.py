@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
-from typing import List, Optional, Tuple, Union
-import itertools
-import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
-from aiter import dtypes
-from enum import Enum
-from einops import rearrange
 import argparse
+import itertools
+import random
+from enum import Enum
+
+import pytest
+import torch
+from einops import rearrange
+
+import aiter
+from aiter import dtypes, pertoken_quant
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -26,8 +26,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -46,7 +46,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -56,11 +56,11 @@ def kv_cache_factory(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -71,7 +71,7 @@ def kv_cache_factory(
 
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -81,7 +81,7 @@ def kv_cache_factory(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -127,7 +127,7 @@ def ref_masked_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
-    attn_mask: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
     logits_soft_cap: float = 0.0,
 ) -> torch.Tensor:
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
@@ -147,7 +147,7 @@ def pertoken_quant_kvcache_symm(
     value_cache: torch.Tensor,
     quant_dtype: torch.dtype,  # e.g. dtypes.fp8
     scale_dtype: torch.dtype = dtypes.fp32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = key_cache.shape[0]
     num_heads = key_cache.shape[1]
     head_dim = value_cache.shape[2]
@@ -230,8 +230,8 @@ def run_torch(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -292,8 +292,8 @@ def run_torch_new(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -449,6 +449,77 @@ def _run_paged_attention_ragged_nhd(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("seq_len", [256, 512])
+def test_paged_attention_ragged_fp8_logits_stay_in_normal_range(seq_len):
+    """FP8 KV decode must not lose precision to subnormal softmax probabilities.
+
+    Regression test for the e4m3 logits rescale. On the FP8 path the softmax
+    probabilities are cast to e4m3; normalizing them to sum=1 first leaves them
+    near ``1/seq_len``, which at a 256-token partition is ~2^-8 -- SUBNORMAL in
+    e4m3, whose smallest normal is 2^-6. The relative ulp there is 1/2, so the
+    cast injects error that scales with how far below 2^-6 the probabilities
+    sit. The BF16 path has the exponent range to hold those values exactly,
+    which is why only the FP8 branch needs the rescale.
+
+    Both arms are the same kernel over the same KV values -- one reading the
+    cache as FP8, the other as BF16 upcast from that same FP8 -- so the only
+    difference measured here is the in-kernel probability cast.
+
+    An elementwise ``assert_close`` does not see this at these lengths: the
+    output is a probability-weighted sum over ``seq_len`` values, so individual
+    errors average out and no single element exceeds a 3e-2 tolerance. The
+    aggregate relative error does see it. Measured on gfx950 / ROCm 7.2.4,
+    seq_len 512: 9.55% without the rescale, 3.40% with it. The residual is the
+    floor for this design -- the probabilities are still e4m3, just no longer
+    subnormal.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = 2
+    num_query_heads = 96
+    num_kv_heads = 8
+    head_size = 128
+    block_size = 1
+    num_blocks = num_seqs * seq_len
+
+    query = torch.randn(
+        (num_seqs, num_query_heads, head_size), dtype=dtypes.bf16, device=device
+    )
+    key_fp8 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    ).to(dtypes.fp8)
+    value_fp8 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    ).to(dtypes.fp8)
+
+    kv_indptr = torch.arange(
+        0, (num_seqs + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+    )
+    kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones((num_seqs,), dtype=torch.int32, device=device)
+
+    args = (kv_indptr, kv_page_indices, kv_last_page_lens, seq_len)
+    expected = _run_paged_attention_ragged_nhd(
+        query, key_fp8.to(dtypes.bf16), value_fp8.to(dtypes.bf16), *args, "auto"
+    )
+    actual = _run_paged_attention_ragged_nhd(
+        query, key_fp8, value_fp8, *args, "fp8_e4m3"
+    )
+
+    expected, actual = expected.float(), actual.float()
+    rel_err = ((actual - expected).abs().sum() / expected.abs().sum()).item()
+    assert rel_err < 6e-2, (
+        f"FP8 decode diverges from the BF16 path by {rel_err:.2%} at "
+        f"seq_len={seq_len}; softmax probabilities are likely being cast to "
+        f"e4m3 while subnormal (expected <6%, ~3.4% when correct)"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_paged_attention_ragged_glm_gqa_fp8_kv_nhd():
     """GLM-style GQA decode should consume FP8 KV cache directly.
 
@@ -590,7 +661,7 @@ def dump_input(
     kv_cache_dtype: str,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
 ):
@@ -670,7 +741,7 @@ DUMP_OUTPUT = False  # whether to dump output
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     block_size: int,
@@ -695,9 +766,8 @@ def test_paged_attention(
             or quant_cache_dtype not in [None, dtypes.i8]
         ):
             pytest.skip()
-    elif pa_variant == PAVariant.Naive:
-        if use_alibi:
-            pytest.skip()
+    elif pa_variant == PAVariant.Naive and use_alibi:
+        pytest.skip()
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -889,9 +959,9 @@ def test_paged_attention(
         else:
             k_quant_, k_scale_, v_quant_, v_scale_ = (
                 key_cache,
-                torch.empty((0)),
+                torch.empty(0),
                 value_cache,
-                torch.empty((0)),
+                torch.empty(0),
             )
 
             out_aiter_naive, time_aiter_naive = run_aiter_naive(
@@ -1039,7 +1109,19 @@ if __name__ == "__main__":
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
-    if not args.pa_variant == [PAVariant.Shomy, PAVariant.Asm]:
+
+    # CI runs this file as `python3 op_tests/test_pa_ragged.py` (see
+    # .github/scripts/aiter_test.sh), not under pytest, so the pytest-style
+    # tests below are only reached if called from here. Run the FP8 KV checks
+    # first: they take ~18s and they are the ones guarding in-kernel precision,
+    # so a failure should surface before the long sweep rather than after it.
+    print("[test] FP8 KV cache checks")
+    test_paged_attention_ragged_glm_gqa_fp8_kv_nhd()
+    for seq_len in (256, 512):
+        test_paged_attention_ragged_fp8_logits_stay_in_normal_range(seq_len)
+    print("[test] FP8 KV cache checks passed")
+
+    if args.pa_variant != [PAVariant.Shomy, PAVariant.Asm]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
@@ -1051,12 +1133,10 @@ if __name__ == "__main__":
         args.quant_cache_dtype,
     ):
 
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
-        elif pa_variant == PAVariant.Asm:
-            if quant_cache_dtype not in [None, dtypes.i8]:
-                continue
+        if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
+            continue
+        if pa_variant == PAVariant.Asm and quant_cache_dtype not in [None, dtypes.i8]:
+            continue
 
         test_paged_attention(
             ctx_len,

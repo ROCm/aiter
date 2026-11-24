@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _per_token_quant(
@@ -40,7 +42,16 @@ def _per_token_quant(
     return qx
 
 
-@triton.jit
+_rms_norm_kernel_repr = make_kernel_repr(
+    "_rms_norm_kernel",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+    ],
+)
+
+
+@triton.jit(repr=_rms_norm_kernel_repr)
 def _rms_norm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -60,7 +71,6 @@ def _rms_norm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call rms_norm function
@@ -75,11 +85,12 @@ def _rms_norm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
 
@@ -137,7 +148,7 @@ def _rms_norm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -158,7 +169,21 @@ def _rms_norm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_rms_norm_kernel_repr = make_kernel_repr(
+    "_quant_rms_norm_kernel",
+    [
+        "DTYPE_MAX",
+        "CLAMP_MAX",
+        "IS_SMOOTH",
+        "CLAMP_OUT",
+        "DUMP_INTERMEDIATE",
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+    ],
+)
+
+
+@triton.jit(repr=_quant_rms_norm_kernel_repr)
 def _quant_rms_norm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -191,7 +216,6 @@ def _quant_rms_norm_kernel(
     DUMP_INTERMEDIATE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call rmsnorm2d_fwd_with_smoothquant or
@@ -208,11 +232,12 @@ def _quant_rms_norm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_aux_ptr = aux_ptr + row_idx * aux_row_stride
@@ -344,7 +369,7 @@ def _quant_rms_norm_kernel(
             tl.store(output_ptrs, output.to(output_ptr.dtype.element_ty), mask=mask)
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -389,7 +414,16 @@ def _quant_rms_norm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
+    "_fused_add_rmsnorm_kernel",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+    ],
+)
+
+
+@triton.jit(repr=_fused_add_rmsnorm_kernel_repr)
 def _fused_add_rmsnorm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -411,7 +445,6 @@ def _fused_add_rmsnorm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call
@@ -429,11 +462,12 @@ def _fused_add_rmsnorm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
@@ -509,7 +543,7 @@ def _fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -538,7 +572,18 @@ def _fused_add_rmsnorm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
+    "_quant_fused_add_rmsnorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+    ],
+)
+
+
+@triton.jit(repr=_quant_fused_add_rmsnorm_kernel_repr)
 def _quant_fused_add_rmsnorm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -568,7 +613,6 @@ def _quant_fused_add_rmsnorm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call
@@ -588,11 +632,12 @@ def _quant_fused_add_rmsnorm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
@@ -724,7 +769,7 @@ def _quant_fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -767,7 +812,17 @@ def _quant_fused_add_rmsnorm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_rmsnorm_bwd_triton_repr = make_kernel_repr(
+    "_rmsnorm_bwd_triton",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_triton_repr)
 def _rmsnorm_bwd_triton(
     grad_output_ptr,
     input_ptr,
@@ -909,7 +964,16 @@ def _rmsnorm_bwd_triton(
         )
 
 
-@triton.jit
+_rmsnorm_bwd_dg_reduce_triton_repr = make_kernel_repr(
+    "_rmsnorm_bwd_dg_reduce_triton",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_dg_reduce_triton_repr)
 def _rmsnorm_bwd_dg_reduce_triton(
     dg_in_ptr,
     dg_out_ptr,
@@ -939,7 +1003,18 @@ def _rmsnorm_bwd_dg_reduce_triton(
     )
 
 
-@triton.jit
+_rmsnorm_kernel_large_m_small_n_repr = make_kernel_repr(
+    "_rmsnorm_kernel_large_m_small_n",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "NUM_WARPS",
+        "NUM_STAGES",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_kernel_large_m_small_n_repr)
 def _rmsnorm_kernel_large_m_small_n(
     X,
     Y,
@@ -954,10 +1029,12 @@ def _rmsnorm_kernel_large_m_small_n(
     stride_yn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_off = tl.arange(0, BLOCK_N)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
 
     mask_m = m_off < M
     mask_n = n_off < N
@@ -984,3 +1061,72 @@ def _rmsnorm_kernel_large_m_small_n(
 
     if RSIGMA is not None:
         tl.store(RSIGMA + m_off, rsigma, mask=mask_m)
+
+
+_rmsnorm_bwd_kernel_large_m_small_n_repr = make_kernel_repr(
+    "_rmsnorm_bwd_kernel_large_m_small_n",
+    ["BLOCK_M", "BLOCK_N", "NUM_WARPS", "NUM_STAGES"],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_kernel_large_m_small_n_repr)
+def _rmsnorm_bwd_kernel_large_m_small_n(
+    grad_output_ptr,  # [M, N]
+    input_ptr,  # [M, N]
+    g_ptr,  # [N]
+    rsigma_ptr,  # [M]
+    dx_ptr,  # [M, N]
+    dg_ptr,  # [num_programs, N] partial dgamma
+    input_row_stride,
+    output_row_stride,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # Specialization for large-M / small-N (e.g. Qwen3 per-head q/k norm,
+    # M=b*s*heads, N=head_dim). The generic _rmsnorm_bwd_triton caps the grid at
+    # get_num_sms() programs and grid-strides over rows, serializing ~M/SMs rows
+    # per program. Here each program owns a BLOCK_M x BLOCK_N tile, so the row
+    # dimension is parallelized across the whole grid (mirror of the forward
+    # _rmsnorm_kernel_large_m_small_n). dgamma is reduced over rows within the
+    # block into a per-program partial, then finished by _rmsnorm_bwd_dg_reduce.
+    pid_m = tl.program_id(0)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
+
+    mask_m = m_off < M
+    mask_n = n_off < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x = tl.load(
+        input_ptr + m_off[:, None] * input_row_stride + n_off[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    grad_output = tl.load(
+        grad_output_ptr + m_off[:, None] * output_row_stride + n_off[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    g = tl.load(g_ptr + n_off, mask=mask_n, other=0.0).to(tl.float32)
+    norm_factor = tl.load(rsigma_ptr + m_off, mask=mask_m, other=0.0).to(tl.float32)
+
+    # per-row grad_sum over N (masked-out cols already contribute 0)
+    grad_sum = tl.sum(grad_output * x * g[None, :], axis=1)  # [BLOCK_M]
+
+    coeff = (norm_factor * norm_factor * norm_factor) * (grad_sum / N)  # [BLOCK_M]
+    grad_input = grad_output * norm_factor[:, None] * g[None, :] - coeff[:, None] * x
+    tl.store(
+        dx_ptr + m_off[:, None] * input_row_stride + n_off[None, :],
+        grad_input.to(dx_ptr.type.element_ty),
+        mask=mask,
+    )
+
+    # partial dgamma: reduce this block's rows (masked rows contribute 0)
+    dg = grad_output * x * norm_factor[:, None]
+    dg = tl.where(mask, dg, 0.0)
+    dg_partial = tl.sum(dg, axis=0)  # [BLOCK_N]
+    tl.store(dg_ptr + tl.cast(pid_m, tl.int64) * N + n_off, dg_partial, mask=mask_n)

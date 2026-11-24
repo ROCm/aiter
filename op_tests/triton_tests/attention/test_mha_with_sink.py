@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
@@ -10,12 +10,16 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
 )
-from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
+from op_tests.triton_tests.attention.mha_test_utils import (
+    pad_rearrange_dropout_mask,
+    skip_if_gluon_unsupported,
+)
 
 arch = get_arch()
 
@@ -24,12 +28,98 @@ arch = get_arch()
 # pytest op_tests/triton_tests/attention/test_mha_with_sink.py -q
 
 
+@pytest.mark.parametrize("DTYPE", ["bf16", "fp16", "fp32", "fp8"])
+@pytest.mark.parametrize("SEQLEN_K", [128, 1024])
+def test_mha_gluon_large_sink(DTYPE: str, SEQLEN_K: int):
+    """A dominant sink gives finite zero output in the short and pipelined loops."""
+    skip_if_gluon_unsupported("gluon")
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+        "fp8": get_fp8_e4m3_dtype(),
+    }[DTYPE]
+    q = torch.full((1, 128, 1, 128), 4.0, device="cuda", dtype=torch.float32)
+    k = torch.full((1, SEQLEN_K, 1, 128), 4.0, device="cuda", dtype=torch.float32)
+    v = torch.ones((1, SEQLEN_K, 1, 128), device="cuda", dtype=torch.float32)
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    sink = torch.full((1,), 1e10, device="cuda", dtype=torch.float32)
+    kwargs = {}
+    if DTYPE == "fp8":
+        descale = torch.ones((1, 1), device="cuda", dtype=torch.float32)
+        kwargs = {"q_descale": descale, "k_descale": descale, "v_descale": descale}
+
+    out, lse = flash_attn_func(
+        q, k, v, sink=sink, causal=False, return_lse=True, backend="gluon", **kwargs
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+    torch.testing.assert_close(lse, sink.expand_as(lse), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(17, 49), (300, 1100), (49, 17)])
+@pytest.mark.parametrize("WINDOW_SIZE", [(0, 0), (0, -1), (-1, 0), (32, 0)])
+def test_mha_gluon_zero_window(
+    VARLEN: bool, SEQLEN_Q: int, SEQLEN_K: int, WINDOW_SIZE: tuple[int, int]
+):
+    """Zero window bounds use bottom-right alignment, including fully masked rows."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(27)
+    q = torch.randn((2, SEQLEN_Q, 4, 64), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, SEQLEN_K, 2, 64), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    if VARLEN:
+        cu_seqlens_q = torch.arange(3, device="cuda", dtype=torch.int32) * SEQLEN_Q
+        cu_seqlens_k = torch.arange(3, device="cuda", dtype=torch.int32) * SEQLEN_K
+        out, lse = flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            SEQLEN_Q,
+            SEQLEN_K,
+            causal=False,
+            window_size=WINDOW_SIZE,
+            return_lse=True,
+            backend="gluon",
+        )
+        out = out.reshape_as(q)
+        lse = lse.reshape(2, SEQLEN_Q, 4).transpose(1, 2)
+    else:
+        out, lse = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=False,
+            window_size=WINDOW_SIZE,
+            return_lse=True,
+            backend="gluon",
+        )
+
+    out_ref, _, lse_ref = attention_ref(
+        q.float(), k.float(), v.float(), causal=False, window_size=WINDOW_SIZE
+    )
+    torch.testing.assert_close(out.float(), out_ref, atol=1e-2, rtol=1e-2)
+    finite = torch.isfinite(lse_ref)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], atol=1e-2, rtol=1e-3)
+    # Gluon uses zero LSE for a fully masked causal row; attention_ref uses -inf.
+    torch.testing.assert_close(
+        lse[~finite], torch.zeros_like(lse[~finite]), atol=0, rtol=0
+    )
+
+
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 64), (32, 128), (1024, 1024)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_with_sink(
     BATCH: int,
     SEQLEN_Q: int,
@@ -39,11 +129,17 @@ def test_mha_with_sink(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
     # Keep sink coverage aligned with the baseline MHA tests.
     # Causal + dropout backward is still disabled in `test_mha_backward`.
-    TEST_BWD: bool = not (CAUSAL and HAS_DROPOUT)
+    # The Gluon backend is forward-only.
+    TEST_BWD: bool = not (CAUSAL and HAS_DROPOUT) and backend != "gluon"
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
@@ -81,6 +177,7 @@ def test_mha_with_sink(
             return_lse=HAS_DROPOUT,
             return_attn_probs=HAS_DROPOUT,
             sink=sink,
+            backend=backend,
         )
     if HAS_DROPOUT:
         assert len(triton_out) == 3
@@ -162,6 +259,7 @@ def test_mha_with_sink(
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen_with_sink(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -170,12 +268,18 @@ def test_mha_varlen_with_sink(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     BATCH = 2
     HAS_DROPOUT: bool = DROPOUT > 0.0
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
     # Keep sink coverage aligned with the baseline MHA tests.
     # Dropout backward is still disabled in `test_mha_backward_varlen`.
-    TEST_BWD: bool = not HAS_DROPOUT
+    # The Gluon backend is forward-only.
+    TEST_BWD: bool = not HAS_DROPOUT and backend != "gluon"
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
@@ -237,6 +341,7 @@ def test_mha_varlen_with_sink(
             return_lse=HAS_DROPOUT,
             return_attn_probs=HAS_DROPOUT,
             sink=sink,
+            backend=backend,
         )
     if HAS_DROPOUT:
         assert len(triton_out) == 3
@@ -338,6 +443,7 @@ def test_mha_varlen_with_sink(
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_with_sink_sliding_window(
     BATCH: int,
     SEQLEN_Q: int,
@@ -347,7 +453,11 @@ def test_mha_with_sink_sliding_window(
     HEAD_SZ: int,
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
+    backend: str,
 ):
+    skip_if_gluon_unsupported(backend)
+    # The Gluon backend is forward-only.
+    TEST_BWD: bool = backend != "gluon"
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
@@ -357,27 +467,27 @@ def test_mha_with_sink_sliding_window(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
     k = torch.randn(
         (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
     v = torch.randn(
         (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
     sink = torch.randn(
-        (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=True
+        (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=TEST_BWD
     )
 
     window_size = (WINDOW_SIZE_LEFT, -1)
 
-    with torch.set_grad_enabled(True):
+    with torch.set_grad_enabled(TEST_BWD):
         triton_out = flash_attn_func(
             q,
             k,
@@ -385,9 +495,10 @@ def test_mha_with_sink_sliding_window(
             causal=CAUSAL,
             window_size=window_size,
             sink=sink,
+            backend=backend,
         )
 
-    with torch.set_grad_enabled(True):
+    with torch.set_grad_enabled(TEST_BWD):
         torch_out, _, _ = attention_ref(
             q,
             k,
@@ -406,6 +517,9 @@ def test_mha_with_sink_sliding_window(
         rtol=fwd_rtol,
         msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
     )
+
+    if not TEST_BWD:
+        return
 
     do = torch.randn_like(q)
 
@@ -455,6 +569,7 @@ def test_mha_with_sink_sliding_window(
 @pytest.mark.parametrize("HEAD_SZ", [64])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_sliding_window_no_sink(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -463,8 +578,12 @@ def test_mha_sliding_window_no_sink(
     HEAD_SZ: int,
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
+    backend: str,
 ):
     BATCH = 1
+    skip_if_gluon_unsupported(backend)
+    # The Gluon backend is forward-only.
+    TEST_BWD: bool = backend != "gluon"
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
@@ -474,33 +593,34 @@ def test_mha_sliding_window_no_sink(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
     k = torch.randn(
         (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
     v = torch.randn(
         (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
         device=device,
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=TEST_BWD,
     )
 
     window_size = (WINDOW_SIZE_LEFT, -1)
 
-    with torch.set_grad_enabled(True):
+    with torch.set_grad_enabled(TEST_BWD):
         triton_out = flash_attn_func(
             q,
             k,
             v,
             causal=CAUSAL,
             window_size=window_size,
+            backend=backend,
         )
 
-    with torch.set_grad_enabled(True):
+    with torch.set_grad_enabled(TEST_BWD):
         torch_out, _, _ = attention_ref(
             q,
             k,
@@ -518,6 +638,9 @@ def test_mha_sliding_window_no_sink(
         rtol=fwd_rtol,
         msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
     )
+
+    if not TEST_BWD:
+        return
 
     do = torch.randn_like(q)
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import itertools
 import os
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -29,15 +31,12 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):
-    m, k = x.shape
-    n, k = w.shape
+    m, _k = x.shape
+    n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
@@ -60,8 +59,8 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 
 
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
-    m, k = x.shape
-    n, k = weight.shape
+    m, _k = x.shape
+    _n, _k = weight.shape
     res = aiter.gemm_a4w4_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
@@ -80,7 +79,7 @@ def run_gemm_a4w4_blockscale_asm(
     bpreshuffle=True,
     splitK=None,
 ):
-    m, k = x.shape
+    m, _k = x.shape
     # if splitK is not None and splitK > 0:
     #    out_reset = torch.zeros(
     #        out.shape[0], out.shape[1], dtype=dtype, device=torch.cuda.current_device()
@@ -103,8 +102,8 @@ def run_gemm_a4w4_blockscale_asm(
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     torch.manual_seed(seed)
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((m, k), dtype=dtype, device=device)  #
-    w = torch.randn((n, k), dtype=dtype, device=device)  #
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    w = torch.randn((n, k), dtype=dtype, device=device)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)
@@ -127,8 +126,67 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     }
 
 
+def preshuffle_candidates(M, N, K, backends, split_k):
+    """Reuse the FlyDSL catalog; sweep Triton tiles/splits with replayable names."""
+    if M < 32 or N % 16 or K % 256:
+        return []
+    names = []
+    if "flydsl" in backends:
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+            candidates_for,
+        )
+
+        names.extend(
+            ki.name
+            for _, ki in candidates_for(
+                "fp4",
+                "fp4",
+                M,
+                N,
+                K,
+                a_scale_block="1x32",
+                b_scale_block="1x32",
+                a_scale_layout="mfma_tile",
+                b_scale_layout="mfma_tile",
+            )
+            if split_k or ki.split_k == 1
+        )
+    if "triton" in backends:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import _get_config
+
+        config, _ = _get_config(M, N, K // 2, shuffle=True)
+        if not split_k:
+            config = dict(config, NUM_KSPLIT=1)
+        cache = (config["cache_modifier"] or "none").lstrip(".")
+        names.append(
+            f"triton_preshuffle_bm{config['BLOCK_SIZE_M']}_bn{config['BLOCK_SIZE_N']}"
+            f"_bk{config['BLOCK_SIZE_K']}_ks{config['NUM_KSPLIT']}"
+            f"_w{config['num_warps']}_wpe{config['waves_per_eu']}"
+            f"_s{config['num_stages']}_g{config['GROUP_SIZE_M']}"
+            f"_mi{config['matrix_instr_nonkdim']}_cm{cache}"
+        )
+        splits = (1, 2, 4, 7, 8, 14, 16, 28, 32) if split_k else (1,)
+        for tm, tn, sk, stages in itertools.product(
+            (32, 64), (64, 128), splits, (2, 3)
+        ):
+            if tm <= M:
+                names.append(
+                    f"triton_preshuffle_bm{tm}_bn{tn}_bk256_ks{sk}_w4_wpe2_s{stages}_g1_mi16_cmcg"
+                )
+    return names
+
+
+def run_gemm_preshuffle(x, w, x_scale, w_scale, out, kernel_name):
+    from aiter.ops.gemm_op_a4w4 import _gemm_a4w4_preshuffle
+
+    result = _gemm_a4w4_preshuffle(x, w, x_scale, w_scale, out, kernel_name)
+    if result is None:
+        raise ValueError(f"Unlaunchable A4W4 tune candidate: {kernel_name}")
+    return result
+
+
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
@@ -143,11 +201,15 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             del get_GEMM_config.gemm_dict
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--backends",
+            default="ck,asm",
+            help="Comma-separated candidates: ck,asm,triton,flydsl (gfx950 preshuffle)",
+        )
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
@@ -186,7 +248,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
@@ -201,14 +263,14 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
             return {}
-        df = pd.read_csv(file)
+        df = pd.read_csv(file, comment="#")
         shuffle_df = (
             df[df["bpreshuffle"] == 1]
             .reset_index()
-            .sort_values(by=["tile_M", "tile_N", "splitK"])
+            .sort_values(by=["tile_M", "tile_N", "splitK", "ps"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_M", "tile_N", "splitK"])["knl_name"]
+            shuffle_df.groupby(["tile_M", "tile_N", "splitK", "ps"])["knl_name"]
             .apply(list)
             .to_dict()
         )
@@ -258,6 +320,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         ]
         ref_keys = ["x", "w", "x_scales", "w_scales"]
         seed = 0
+        backends = set(args.backends.split(","))
+        if not backends or not backends <= {"ck", "asm", "triton", "flydsl"}:
+            raise ValueError(f"Unknown --backends: {args.backends}")
         for shape_idx in range(len(untunedf)):
             row = untunedf.iloc[shape_idx]
             # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
@@ -265,7 +330,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
             total_kernel_nums = 0
 
-            for kernel_idx in range(ck_kernels_num):
+            for kernel_idx in range(ck_kernels_num) if "ck" in backends else ():
                 kernel = kernels_list[kernel_idx]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
@@ -315,15 +380,15 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
-            asm_tiles = [key for key in asm_kernels.keys()]
-            for key in asm_tiles:
-                tile_m, tile_n, splitk = key
+            asm_tiles = [key for key in asm_kernels]
+            for key in asm_tiles if "asm" in backends else ():
+                tile_m, tile_n, splitk, _ps = key
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
                     if useSplitK
                     else 0
                 )
-                kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
+                kernelName = asm_kernels.get(key, [])
                 if len(kernelName) == 0:
                     print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                     continue
@@ -366,6 +431,30 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     asm_kernels_id = asm_kernels_id + 1
 
                     total_kernel_nums = total_kernel_nums + 1
+            for candidate_id, name in enumerate(
+                preshuffle_candidates(M, N, K, backends, useSplitK)
+            ):
+                info = ((gfx, cu_num, M, N, K), 100000 + candidate_id, 0, name)
+                task.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed),
+                        run_gemm_preshuffle,
+                        (gemm_ck_keys, name),
+                        {"num_warmup": 10, "num_iters": 101},
+                        run_torch,
+                        (ref_keys, dtypes.bf16),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                        None,
+                        None,
+                        ("out_ck",),
+                    )
+                )
+                total_kernel_nums += 1
             tasks_in_data.append((total_kernel_nums, ()))
 
         ret = []

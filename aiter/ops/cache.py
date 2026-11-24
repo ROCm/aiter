@@ -3,7 +3,7 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
@@ -27,8 +27,8 @@ def reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     asm_layout: bool = False,
 ) -> None: ...
 
@@ -98,6 +98,17 @@ def concat_and_cache_mla(
 
 
 @compile_ops("module_cache", develop=True)
+def concat_and_cache_mla_seg(
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank]
+    k_pe: Tensor,  # [num_tokens, pe_dim]
+    kv_cache: Tensor,  # [num_blocks, page_size*(kv_lora_rank + pe_dim)] flat (seg layout)
+    slot_mapping: Tensor,  # [num_tokens]
+    kv_cache_dtype: str,
+    scale: Tensor,  # [1] fp32 static scale
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def indexer_k_quant_and_cache(
     k: Tensor,
     kv_cache: Tensor,
@@ -111,24 +122,48 @@ def indexer_k_quant_and_cache(
 @compile_ops("module_cache", develop=True)
 def indexer_qk_rope_quant_and_cache(
     q: Tensor,
-    q_out: Tensor,
+    q_out: Tensor,  # fp8 [T, H, head_dim] | fp4 u8 [T, H, head_dim // 2]
     weights: Tensor,
-    weights_out: Tensor,
+    weights_out: Tensor,  # fp8: fp32 w * q_scale * weights_scale; fp4: q.dtype plain w
     k: Tensor,
-    kv_cache: Tensor,
+    kv_cache: Tensor,  # fp8 [num_blocks, block_size, cache_stride]
+    # fp4 u8 [num_blocks, k_tiles, 4, kv_block_size, 16]
     slot_mapping: Tensor,
     norm_weight: Tensor,
     norm_bias: Tensor,
-    positions: Tensor,
-    cos_cache: Tensor,
-    sin_cache: Tensor,
+    positions: Tensor | None,
+    cos_cache: Tensor | None,
+    sin_cache: Tensor | None,
     epsilon: float,
-    quant_block_size: int,
+    quant_block_size: int,  # fp8: head_dim; fp4: 32
     scale_fmt: str,
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
-) -> None: ...
+    # False (default): slot<0 rows skip the whole fused op.
+    # True (DCP): compute Q/weights for every row; only valid slots write K cache.
+    compute_all_q_rope: bool = False,
+    # Supplying both scale buffers switches the op to the packed e2m1 + e8m0
+    # layout that flydsl_pa_mqa_logits_fp4 consumes directly.
+    q_scale_out: Tensor | None = None,  # u8 [T, k_tiles, 4, 16, round_up(H // 16, 4)]
+    kv_cache_scale: Tensor | None = None,  # u8 [num_blocks, k_tiles, 4, kv_block_size]
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
+) -> None:
+    """Normalize K, apply RoPE, quantize Q/K, and write the index cache.
+
+    Defaults preserve FP8 and FlyDSL FP4 output. ``scale_layout="opus"``
+    selects gfx950 BF16 inputs, D=128, H=32/64 and 64-row FP4 pages:
+    Q scales [T,2,32,H/16], K data [pages,4,64,16], K scales [pages,2,32,4].
+    OPUS supports rope_dim=0 (no position/tables needed) or 64, and clamps
+    positions to the table. Head weights are copied without scaling.
+    The no-RoPE path uses BF16-rounded LayerNorm affine parameters, matching
+    the DSA unfused path; RoPE64 retains FP32 affine parameters.
+    Slots must be unique when nonnegative and below the cache capacity.
+    Negative/missing OPUS slots skip K, and skip Q unless compute_all_q_rope
+    is True. K has T rows; slots may have fewer rows than Q for DCP padding.
+    """
 
 
 @compile_ops("module_cache", develop=True)
@@ -158,4 +193,68 @@ def fused_qk_rope_concat_and_cache_mla(
     sin_cache: Tensor,  # [max_position, rot_dim//2]
     is_neox: bool,
     is_nope_first: bool,
+    # False (default, non-DCP): slot<0 tokens early-return (skip Q RoPE + q_out).
+    # True (DCP): compute Q RoPE for every token (needed after head all-gather).
+    compute_all_q_rope: bool = False,
 ) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_concat_and_cache_mla(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_c: Tensor,  # Kimi MLA: [..., kv_lora_rank=512], one KV head
+    k_pe: Tensor,  # [..., pe_dim=64]
+    kv_cache: Tensor,
+    q_out: Tensor,
+    slot_mapping: Tensor,
+    k_scale: Tensor,
+    q_scale: Tensor,
+    is_nope_first: bool,
+    # False (default): slot<0 tokens early-return. True (DCP): compute Q for
+    # every token while guarding only the owner-specific K-cache write.
+    compute_all_q: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_rope_concat_and_cache_mla_seg(
+    q_nope: Tensor,  # [num_tokens, num_heads, kv_lora_rank=512]
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim=64]
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank=512]
+    k_pe: Tensor,  # [num_tokens, pe_dim=64]
+    kv_cache: Tensor,  # [num_blocks, page_size*kv_lora + page_size*pe] flat fp8
+    q_out: Tensor,  # [num_tokens, num_heads, q_out_dim>=576] fp8 (tail untouched)
+    slot_mapping: Tensor,  # [num_tokens]
+    k_scale: Tensor,  # [1] fp32 static scale
+    q_scale: Tensor,  # [1] fp32 static scale
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, pe_dim//2=32]
+    sin_cache: Tensor,  # [max_position, pe_dim//2=32]
+    is_neox: bool,
+    is_nope_first: bool = True,
+) -> None: ...
+
+
+@compile_ops("module_dsv4_dequant_gather_k", develop=True)
+def dsv4_dequantize_and_gather_k(
+    out: Tensor,
+    k_cache: Tensor,
+    seq_lens: Tensor,
+    gather_lens: Tensor | None,
+    block_table: Tensor,
+    block_size: int,
+    offset: int = 0,
+    use_fnuz: bool = False,
+) -> None:
+    """Gather and dequantize the DeepSeek V4 paged K record into bf16.
+
+    ``k_cache`` is ``[num_blocks, block_size, 584]`` uint8: per token 448 fp8
+    e4m3 NoPE dims then 64 bf16 RoPE dims, with the block's 8-byte-per-token
+    UE8M0 scale region (7 scales of 64 dims + pad) after all of its token data.
+
+    Writes ``out[r, offset + i, :512]`` for ``i`` in ``[0, gather_lens[r])``,
+    reading sequence positions ``seq_lens[r] - gather_lens[r]`` onward.
+    ``gather_lens=None`` gathers the whole sequence. ``use_fnuz`` must match
+    the encoder of this cache: e4m3fnuz when True, OCP e4m3 when False.
+    """

@@ -7,15 +7,21 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from threading import Event
-from typing import Any, Optional, Union
+from typing import Any
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.distributed import ProcessGroup
-from zmq import IPV6  # type: ignore
-from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
+from zmq import (  # type: ignore
+    IPV6,  # type: ignore
+    SUB,
+    SUBSCRIBE,
+    XPUB,
+    XPUB_VERBOSE,
+    Context,
+)
 
 # import vllm.envs as envs
 # from vllm.distributed.utils import StatelessProcessGroup, sched_yield
@@ -33,17 +39,17 @@ VLLM_SLEEP_WHEN_IDLE = False
 
 # logger = init_logger(__name__)
 from aiter import logger
+
 from .utils import (
     get_ip,
     get_open_port,
-    is_valid_ipv6_address,
     get_open_zmq_ipc_path,
+    is_valid_ipv6_address,
     sched_yield,
 )
 
 
 class SpinTimer:
-
     def record_activity(self):
         pass
 
@@ -80,13 +86,12 @@ class SpinSleepTimer(SpinTimer):
 
 
 class ShmRingBuffer:
-
     def __init__(
         self,
         n_reader: int,
         max_chunk_bytes: int,
         max_chunks: int,
-        name: Optional[str] = None,
+        name: str | None = None,
     ):
         """
         A shared memory ring buffer implementation for broadcast communication.
@@ -136,7 +141,7 @@ class ShmRingBuffer:
         created object to other processes by pickling it. The other processes will
         get the name of the shared memory and open it, so that they can access the
         same shared memory buffer.
-        """  # noqa
+        """
         self.n_reader = n_reader
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
@@ -168,7 +173,7 @@ class ShmRingBuffer:
             ):
                 try:
                     self.shared_memory = shared_memory.SharedMemory(name=name)
-                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
+                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html
                     # Some platforms allocate memory based on page size,
                     # so the shared memory block size may be larger or equal
                     # to the requested size. The size parameter is ignored
@@ -194,11 +199,19 @@ class ShmRingBuffer:
             self.handle(),
         )
 
+    def close(self):
+        shm = getattr(self, "shared_memory", None)
+        if shm is not None:
+            try:
+                shm.close()
+                if self.is_creator:
+                    shm.unlink()
+            except FileNotFoundError:
+                pass
+            self.shared_memory = None
+
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        self.close()
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -219,22 +232,21 @@ class ShmRingBuffer:
 class Handle:
     local_reader_ranks: list[int] = field(default_factory=list)
 
-    buffer_handle: Optional[tuple[int, int, int, str]] = None
-    local_subscribe_addr: Optional[str] = None
-    remote_subscribe_addr: Optional[str] = None
+    buffer_handle: tuple[int, int, int, str] | None = None
+    local_subscribe_addr: str | None = None
+    remote_subscribe_addr: str | None = None
     remote_addr_ipv6: bool = False
 
 
 class MessageQueue:
-
     def __init__(
         self,
         n_reader,  # number of all readers
         n_local_reader,  # number of local readers through shared memory
-        local_reader_ranks: Optional[list[int]] = None,
+        local_reader_ranks: list[int] | None = None,
         max_chunk_bytes: int = 1024 * 1024 * 10,
         max_chunks: int = 10,
-        connect_ip: Optional[str] = None,
+        connect_ip: str | None = None,
     ):
         if local_reader_ranks is None:
             local_reader_ranks = list(range(n_local_reader))
@@ -245,6 +257,7 @@ class MessageQueue:
         self.n_remote_reader = n_remote_reader
 
         context = Context()
+        self.context = context
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -311,6 +324,32 @@ class MessageQueue:
     def export_handle(self) -> Handle:
         return self.handle
 
+    def close(self):
+        # Deterministically release the OS resources that outlive the process:
+        # the creator's psm shared-memory segment (unlinked via buffer.close())
+        # and the zmq IPC/TCP sockets + IO thread. Relying on __del__/GC leaks
+        # these when a rank is killed (e.g. a distributed timeout), which
+        # accumulates in /dev/shm across repeated group create/destroy cycles.
+        buf = getattr(self, "buffer", None)
+        if buf is not None:
+            buf.close()
+            self.buffer = None
+        ctx = getattr(self, "context", None)
+        if ctx is not None:
+            # destroy() closes any sockets still open on this context
+            # (local/remote) and terminates its IO thread; linger=0 drops
+            # anything undelivered instead of blocking teardown.
+            try:
+                ctx.destroy(linger=0)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self.context = None
+            self.local_socket = None
+            self.remote_socket = None
+
+    def __del__(self):
+        self.close()
+
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
@@ -318,6 +357,7 @@ class MessageQueue:
         self._is_writer = False
 
         context = Context()
+        self.context = context
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None
@@ -391,7 +431,7 @@ class MessageQueue:
             assert recv == b"READY"
 
     @contextmanager
-    def acquire_write(self, timeout: Optional[float] = None):
+    def acquire_write(self, timeout: float | None = None):
         assert self._is_writer, "Only writers can acquire write"
         start_time = time.monotonic()
         n_warning = 1
@@ -451,8 +491,8 @@ class MessageQueue:
     @contextmanager
     def acquire_read(
         self,
-        timeout: Optional[float] = None,
-        cancel: Optional[Event] = None,
+        timeout: float | None = None,
+        cancel: Event | None = None,
         indefinite: bool = False,
     ):
         assert self._is_local_reader, "Only readers can acquire read"
@@ -509,7 +549,7 @@ class MessageQueue:
                 self._read_spin_timer.record_activity()
                 break
 
-    def enqueue(self, obj, timeout: Optional[float] = None):
+    def enqueue(self, obj, timeout: float | None = None):
         """Write to message queue with optional timeout (in seconds)"""
         assert self._is_writer, "Only writers can enqueue"
         serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -527,8 +567,8 @@ class MessageQueue:
 
     def dequeue(
         self,
-        timeout: Optional[float] = None,
-        cancel: Optional[Event] = None,
+        timeout: float | None = None,
+        cancel: Event | None = None,
         indefinite: bool = False,
     ):
         """Read from message queue with optional timeout (in seconds)"""
@@ -549,7 +589,7 @@ class MessageQueue:
         return obj
 
     @staticmethod
-    def recv(socket: zmq.Socket, timeout: Optional[float]) -> Any:
+    def recv(socket: zmq.Socket, timeout: float | None) -> Any:
         timeout_ms = None if timeout is None else int(timeout * 1000)
         if not socket.poll(timeout=timeout_ms):
             raise TimeoutError

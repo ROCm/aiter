@@ -2,13 +2,164 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple, Union
+
 import torch
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import is_fp8
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.attention.dao_ai import (
+    flash_attn_3,
+)
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    is_fp8,
+)
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    *,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    k_new: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    page_table: torch.Tensor | None = None,
+    kv_batch_idx: torch.Tensor | None = None,
+    leftpad_k: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    seqlens_rotary: torch.Tensor | None = None,
+    rotary_interleaved: bool = True,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    num_splits: int = 1,
+    pack_gqa: bool | None = None,
+    sm_margin: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The MHA v3 forward: returns out and softmax_lse. FlashAttention's FA3 interface
+    calls it; the autograd functions below call it too."""
+    out, softmax_lse, _, _ = flash_attn_3.fwd(
+        q,
+        k,
+        v,
+        k_new,
+        v_new,
+        qv,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+        softcap,
+        rotary_interleaved,
+        None,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )
+    return out, softmax_lse
+
+
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    softmax_scale: float,
+    causal: bool,
+    *,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    sm_margin: int = 0,
+) -> torch.Tensor:
+    """The MHA v3 backward for a forward of _flash_attn_forward: writes dq, dk, dv and
+    returns the softmax delta."""
+    (softmax_d,) = flash_attn_3.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        sm_margin,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    return softmax_d
+
+
+def _flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Combine split-KV partial outputs, as FlashAttention's flash_attn_combine does."""
+    return flash_attn_3.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
 class _FlashAttnV3Func(torch.autograd.Function):
@@ -20,15 +171,15 @@ class _FlashAttnV3Func(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: float | None,
         causal: bool,
-        qv: Optional[torch.Tensor],
-        q_descale: Optional[torch.Tensor],
-        k_descale: Optional[torch.Tensor],
-        v_descale: Optional[torch.Tensor],
-        window_size: Tuple[int, int],
+        qv: torch.Tensor | None,
+        q_descale: torch.Tensor | None,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         num_splits: int,
-        pack_gqa: Optional[bool],
+        pack_gqa: bool | None,
         deterministic: bool,
         sm_margin: int,
     ):
@@ -51,41 +202,23 @@ class _FlashAttnV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        out, softmax_lse, _, _ = flash_attn_3.fwd(
+        out, softmax_lse = _flash_attn_forward(
             q,
             k,
             v,
-            None,  # k_new
-            None,  # v_new
-            None,  # qv
-            None,  # out tensor (allocate inside)
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # cu_seqlens_k_new
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # max_seqlen_q
-            None,  # max_seqlen_k
-            None,  # page_table
-            None,  # kv_batch_idx
-            None,  # leftpad_k
-            None,  # rotary_cos
-            None,  # rotary_sin
-            None,  # seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
             softmax_scale,
             causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,  # scheduler_metadata
-            num_splits,
-            pack_gqa,
-            sm_margin,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=False,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
         )
 
         ctx.save_for_backward(
@@ -109,7 +242,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
         dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
         dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
 
-        _delta = flash_attn_3.bwd(
+        _delta = _flash_attn_backward(
             dout,
             q,
             k,
@@ -119,19 +252,13 @@ class _FlashAttnV3Func(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # max_seqlen_q
-            None,  # max_seqlen_k
             ctx.softmax_scale,
             ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.softcap,
-            ctx.deterministic,
-            ctx.sm_margin,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            softcap=ctx.softcap,
+            deterministic=ctx.deterministic,
+            sm_margin=ctx.sm_margin,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -160,17 +287,17 @@ def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    qv: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    window_size: Tuple[int, int] = (-1, -1),
+    qv: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     deterministic: bool = False,
     sm_margin: int = 0,
 ):
@@ -228,41 +355,25 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in varlen v3 yet")
 
-        out, softmax_lse, _, _ = flash_attn_3.fwd(
+        out, softmax_lse = _flash_attn_forward(
             q,
             k,
             v,
-            None,  # k_new
-            None,  # v_new
-            None,  # qv
-            None,  # out tensor
-            cu_seqlens_q,
-            cu_seqlens_k,
-            None,  # cu_seqlens_k_new
-            None,  # seqused_q
-            None,  # seqused_k
-            max_seqlen_q,
-            max_seqlen_k,
-            None,  # page_table
-            None,  # kv_batch_idx
-            None,  # leftpad_k
-            None,  # rotary_cos
-            None,  # rotary_sin
-            None,  # seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
             softmax_scale,
             causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,  # scheduler_metadata
-            1,  # num_splits
-            None,  # pack_gqa
-            sm_margin,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=False,
+            sm_margin=sm_margin,
         )
 
         ctx.save_for_backward(
@@ -290,7 +401,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
         dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
 
-        _delta = flash_attn_3.bwd(
+        _delta = _flash_attn_backward(
             dout,
             q,
             k,
@@ -300,19 +411,17 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             dq,
             dk,
             dv,
-            ctx.cu_seqlens_q,
-            ctx.cu_seqlens_k,
-            None,  # seqused_q
-            None,  # seqused_k
-            ctx.max_seqlen_q,
-            ctx.max_seqlen_k,
             ctx.softmax_scale,
             ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.softcap,
-            ctx.deterministic,
-            ctx.sm_margin,
+            cu_seqlens_q=ctx.cu_seqlens_q,
+            cu_seqlens_k=ctx.cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            softcap=ctx.softcap,
+            deterministic=ctx.deterministic,
+            sm_margin=ctx.sm_margin,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -346,12 +455,12 @@ def flash_attn_varlen_func(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    window_size: Tuple[int, int] = (-1, -1),
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     deterministic: bool = False,
@@ -383,32 +492,32 @@ def flash_attn_with_kvcache_fake_tensor(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    qv: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     causal: bool = True,
     window_size_left: int = -1,
     window_size_right: int = -1,
     attention_chunk: int = 0,
     softcap: float = 0.0,
     num_splits: int = 0,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     sm_margin: int = 0,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
     return_softmax_lse: bool = False,
-    page_table: Optional[torch.Tensor] = None,
-    kv_batch_idx: Optional[torch.Tensor] = None,
-    leftpad_k: Optional[torch.Tensor] = None,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    seqlens_rotary: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    page_table: torch.Tensor | None = None,
+    kv_batch_idx: torch.Tensor | None = None,
+    leftpad_k: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    seqlens_rotary: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
 ):
 
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L218
@@ -457,69 +566,63 @@ def _flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    qv: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,  # Only accepts Tensor, not int
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | None = None,  # Only accepts Tensor, not int
+    softmax_scale: float | None = None,
     causal: bool = True,
     window_size_left: int = -1,
     window_size_right: int = -1,
     attention_chunk: int = 0,
     softcap: float = 0.0,
     num_splits: int = 0,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     sm_margin: int = 0,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
     return_softmax_lse: bool = False,
-    page_table: Optional[torch.Tensor] = None,
-    kv_batch_idx: Optional[torch.Tensor] = None,
-    leftpad_k: Optional[torch.Tensor] = None,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    seqlens_rotary: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k_new: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    page_table: torch.Tensor | None = None,
+    kv_batch_idx: torch.Tensor | None = None,
+    leftpad_k: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    seqlens_rotary: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
 
-    out, softmax_lse, _, _ = flash_attn_3.fwd(
+    out, softmax_lse = _flash_attn_forward(
         q,
         k_cache,
         v_cache,
-        k,
-        v,
-        None,  # qv
-        None,  # out allocate
-        cu_seqlens_q,
-        None,  # cu_seqlens_k
-        cu_seqlens_k_new,
-        None,  # seqused_q
-        cache_seqlens,  # seqused_k
-        max_seqlen_q,
-        None,  # max_seqlen_k
-        page_table,
-        kv_batch_idx,
-        leftpad_k,
-        rotary_cos,
-        rotary_sin,
-        seqlens_rotary,
-        q_descale,
-        k_descale,
-        v_descale,
         softmax_scale,
         causal,
-        window_size_left,
-        window_size_right,
-        attention_chunk,
-        softcap,
-        False,  # rotary_interleaved
-        None,  # scheduler_metadata
-        num_splits if num_splits != 0 else 1,
-        pack_gqa,
-        sm_margin,
+        k_new=k,
+        v_new=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k_new,
+        seqused_k=cache_seqlens,
+        max_seqlen_q=max_seqlen_q,
+        page_table=page_table,
+        kv_batch_idx=kv_batch_idx,
+        leftpad_k=leftpad_k,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        seqlens_rotary=seqlens_rotary,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        rotary_interleaved=False,
+        num_splits=num_splits if num_splits != 0 else 1,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
     )
     return (out, softmax_lse)
 
@@ -528,31 +631,31 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    qv: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[Union[torch.Tensor, int]] = None,
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | int | None = None,
+    softmax_scale: float | None = None,
     causal: bool = True,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     num_splits: int = 0,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     sm_margin: int = 0,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
     return_softmax_lse: bool = False,
-    page_table: Optional[torch.Tensor] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    rotary_seqlens: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    page_table: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    rotary_seqlens: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
 ):
     """
     Arguments mirror Hopper's `flash_attn_with_kvcache` with current backend limitations.
@@ -650,8 +753,8 @@ def _quantize_bshd(
     x: torch.Tensor,
     fp8_dtype: torch.dtype,
     clamp_val=1e-9,
-    group_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
 
@@ -733,8 +836,8 @@ def _quantize_thd(
     fp8_dtype: torch.dtype,
     cu_seqlens: torch.Tensor,
     clamp_val=1e-9,
-    group_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor to FP8 format for varlen inputs, returning an FP8 tensor and a descale factor.
 
@@ -862,15 +965,15 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
         q: torch.Tensor,  # High precision (BF16/FP32)
         k: torch.Tensor,  # High precision (BF16/FP32)
         v: torch.Tensor,  # High precision (BF16/FP32)
-        softmax_scale: Optional[float],
+        softmax_scale: float | None,
         causal: bool,
-        window_size: Tuple[int, int],
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         deterministic: bool,
         sm_margin: int,
     ):
-        batch, seqlen, num_q_heads, head_dim = q.shape
+        batch, _seqlen, num_q_heads, head_dim = q.shape
         _, _, num_kv_heads, _ = k.shape
 
         # Quantize inputs to FP8
@@ -915,41 +1018,21 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             )
 
         # Call flash attention forward
-        out, softmax_lse, _, _ = flash_attn_3.fwd(
+        out, softmax_lse = _flash_attn_forward(
             q_fp8,
             k_fp8,
             v_fp8,
-            None,
-            None,
-            None,
-            None,  # k_new, v_new, qv, out
-            None,
-            None,
-            None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
-            None,
-            None,
-            None,
-            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
-            None,
-            None,
-            None,  # page_table, kv_batch_idx, leftpad_k
-            None,
-            None,
-            None,  # rotary_cos, rotary_sin, seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
             softmax_scale,
             causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,
-            1,
-            None,
-            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=False,
+            sm_margin=sm_margin,
         )
 
         # Save tensors needed for backward
@@ -983,7 +1066,7 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
         dv = torch.empty(v_fp8.shape, dtype=torch.float32, device=v_fp8.device)
 
         # Call flash attention backward - gradients are written in-place
-        _delta = flash_attn_3.bwd(
+        _delta = _flash_attn_backward(
             grad_output,
             q_fp8,
             k_fp8,
@@ -993,19 +1076,13 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # max_seqlen_q
-            None,  # max_seqlen_k
             ctx.softmax_scale,
             ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.softcap,
-            ctx.deterministic,
-            ctx.sm_margin,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            softcap=ctx.softcap,
+            deterministic=ctx.deterministic,
+            sm_margin=ctx.sm_margin,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -1035,14 +1112,14 @@ def flash_attn_fp8_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    qv: Optional[torch.Tensor] = None,
-    window_size: Tuple[int, int] = (-1, -1),
+    qv: torch.Tensor | None = None,
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     deterministic: bool = False,
     sm_margin: int = 0,
 ):
@@ -1146,9 +1223,9 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        softmax_scale: Optional[float],
+        softmax_scale: float | None,
         causal: bool,
-        window_size: Tuple[int, int],
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         deterministic: bool,
@@ -1207,41 +1284,25 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             )
 
         # Call flash attention varlen forward
-        out, softmax_lse, _, _ = flash_attn_3.fwd(
+        out, softmax_lse = _flash_attn_forward(
             q_fp8,
             k_fp8,
             v_fp8,
-            None,  # k_new
-            None,  # v_new
-            None,  # qv
-            None,  # out tensor
-            cu_seqlens_q,
-            cu_seqlens_k,
-            None,  # cu_seqlens_k_new
-            None,  # seqused_q
-            None,  # seqused_k
-            max_seqlen_q,
-            max_seqlen_k,
-            None,  # page_table
-            None,  # kv_batch_idx
-            None,  # leftpad_k
-            None,  # rotary_cos
-            None,  # rotary_sin
-            None,  # seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
             softmax_scale,
             causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,  # scheduler_metadata
-            1,  # num_splits
-            None,  # pack_gqa
-            sm_margin,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=False,
+            sm_margin=sm_margin,
         )
 
         # Save tensors needed for backward
@@ -1279,7 +1340,7 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
         dv = torch.empty(v_fp8.shape, dtype=torch.float32, device=v_fp8.device)
 
         # Call flash attention varlen backward - gradients are written in-place
-        _delta = flash_attn_3.bwd(
+        _delta = _flash_attn_backward(
             grad_output,
             q_fp8,
             k_fp8,
@@ -1289,19 +1350,17 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             dq,
             dk,
             dv,
-            ctx.cu_seqlens_q,
-            ctx.cu_seqlens_k,
-            None,  # seqused_q
-            None,  # seqused_k
-            ctx.max_seqlen_q,
-            ctx.max_seqlen_k,
             ctx.softmax_scale,
             ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.softcap,
-            ctx.deterministic,
-            ctx.sm_margin,
+            cu_seqlens_q=ctx.cu_seqlens_q,
+            cu_seqlens_k=ctx.cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            window_size_left=int(ctx.window_size[0]),
+            window_size_right=int(ctx.window_size[1]),
+            softcap=ctx.softcap,
+            deterministic=ctx.deterministic,
+            sm_margin=ctx.sm_margin,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
@@ -1339,9 +1398,9 @@ def flash_attn_varlen_fp8_func(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     deterministic: bool = False,

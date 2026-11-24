@@ -23,18 +23,19 @@ After running, check the generated trace file (e.g., trace_rank0.json)
 and search for "record_param_comms" events.
 """
 
-import os
 import json
+import os
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
 
 from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_reduce_scatter,
-    tensor_model_parallel_all_gather,
 )
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
@@ -44,6 +45,22 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from aiter.dist.utils import get_open_port
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def run_worker(local_rank, world_size):
@@ -94,7 +111,7 @@ def run_worker(local_rank, world_size):
             residual = torch.randn(shape, dtype=torch.float16, device=device)
             weight = torch.randn(hidden_size, dtype=torch.float16, device=device)
             eps = 1e-5
-            out2, residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            out2, _residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                 out1, residual, weight, eps
             )
             torch.cuda.synchronize()
@@ -148,6 +165,7 @@ def run_worker(local_rank, world_size):
 
     # Cleanup
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
 
@@ -156,8 +174,8 @@ def main():
     # Check if we're already in a torchrun environment
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # Running under torchrun, use environment variables directly
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         run_worker(local_rank, world_size)
     else:
         # Not in torchrun, spawn processes manually
@@ -167,6 +185,9 @@ def main():
             return
 
         print(f"Spawning {world_size} processes for {world_size} GPUs...")
+        # A free port instead of the fixed 29500 fallback in run_worker, which
+        # fails with EADDRINUSE whenever anything else on the host holds it.
+        os.environ.setdefault("MASTER_PORT", str(get_open_port()))
         mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
 
 

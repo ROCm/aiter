@@ -3,8 +3,9 @@
 
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -49,8 +50,11 @@ def cat_and_cache_mla(
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
     _LOGGER.info(
-        f"CAT_AND_CACHE_MLA: k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
-        + f"kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+        "CAT_AND_CACHE_MLA: k_nope=%s k_pe=%s kv_cache=%s slot_mapping=%s",
+        tuple(k_nope.shape),
+        tuple(k_pe.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
     )
 
     b, kh, d_nope = k_nope.shape
@@ -67,7 +71,7 @@ def cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_rope // 16
         SCALE_K_WIDTH_NOPE = (
@@ -82,13 +86,13 @@ def cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (
-        b == bk and b_slot == b_slot
+        b == bk and b_slot == b_slot  # noqa: PLR0124
     ), "K batch dimensions and slot_mapping should be identical (bk == bk == b_slot)"
     assert kh == kh2 == h_cache, "K head should be identical"
     if kv_cache.dtype == torch.uint8:

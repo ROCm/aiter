@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 try:
-    from triton.tools.compile import compile_kernel, CompileArgs
+    from triton.tools.compile import CompileArgs, compile_kernel
 except ImportError:
     print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 
@@ -38,7 +38,7 @@ def matmul_fp16(
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(tl.cdiv(K, BLOCK_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)

@@ -51,12 +51,15 @@ _pa_decode_sparse_repr = make_kernel_repr(
 @triton.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D]
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
-    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32 (unused when KV_SPLITS==1)
+    attn_sink_ptr,  # [H] (only used when KV_SPLITS==1)
+    out_ptr,  # [N, H, D] (only used when KV_SPLITS==1)
+    total_pages,
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
@@ -72,6 +75,9 @@ def _pa_decode_sparse(
     ap_stride_k: tl.constexpr,
     ap_stride_h: tl.constexpr,
     ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -79,14 +85,23 @@ def _pa_decode_sparse(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_INVALID: tl.constexpr,
+    num_warps: tl.constexpr,
 ):
     """3D split-K sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
     Each program owns one token, one head-block, and one slice of the token's
-    sparse K range. The attn_sink fold-in lives in the reduce kernel — splits
-    only emit (m_i, l_i, acc) in pre-sink form. ``BLOCK_H`` is widened so a
-    single head-block program can cover many heads, killing the MLA-style KV
-    re-fetch across head-block programs.
+    sparse K range. ``BLOCK_H`` is widened so a single head-block program can
+    cover many heads, killing the MLA-style KV re-fetch across head-block
+    programs.
+
+    When ``KV_SPLITS > 1``: only emits pre-sink (m_i, l_i, acc) partials; the
+    reduce kernel folds in ``attn_sink`` and normalises.
+
+    When ``KV_SPLITS == 1``: the whole softmax happens in one CTA, so we fold
+    the sink in as the initial running max (virtual K of weight 1) and divide
+    by L inline before writing the final result to ``out``. No partial
+    buffers, no reduce.
     """
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -105,6 +120,11 @@ def _pa_decode_sparse(
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
+    # Fold log2(e) into q so QK scores land in the base-2 domain and the
+    # per-element softmax uses the bare exp2 HW instruction.
+    LOG2E = 1.4426950408889634
+    qk_scale = softmax_scale * LOG2E
+    q = (q.to(tl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
 
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
@@ -114,15 +134,35 @@ def _pa_decode_sparse(
     # tiles_per_segment, early-return for trailing segments past the end.
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+        if KV_SPLITS == 1:
+            # A token with no keys. Split, the reduce writes it as zeros; the
+            # single-CTA path has no reduce behind it, so it must do the same.
+            tl.store(
+                out_ptr
+                + t * out_stride_t
+                + h_offs[:, None] * out_stride_h
+                + d_offs[None, :] * out_stride_d,
+                tl.zeros((BLOCK_H, BLOCK_D), dtype=out_ptr.dtype.element_ty),
+                mask=h_mask[:, None] & d_mask[None, :],
+            )
         return
 
     num_tiles = tl.cdiv(kv_len, BLOCK_K)
     tile_start = pid_k * tiles_per_segment
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
-    neg_large = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    if KV_SPLITS == 1:
+        sink = (
+            tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+                tl.float32
+            )
+            * LOG2E
+        )
+        m_i = sink
+        l_i = tl.exp2(sink - m_i)
+    else:
+        m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
@@ -135,23 +175,40 @@ def _pa_decode_sparse(
             mask=in_range,
             other=-1,
         )
-        valid = in_range & (slot >= 0)
+        # in_range masks the partial final tile (always needed); the slot >= 0
+        # term skips -1 sentinels and is dropped when the caller guarantees none.
+        if HAS_INVALID:
+            valid = in_range & (slot >= 0)
+        else:
+            valid = in_range
 
+        # 64-bit before the multiply: a slot index fits 32 bits (the index
+        # buffer is int32 by ABI) but `slot * kv_stride_n` does not. A unified
+        # V4 pool runs to ~150M rows, so at a 512-element row the product
+        # passes 2^31 only 2.8% of the way in and every row above that is read
+        # from a wrapped address -- silently, since the wrapped offset still
+        # lands inside the same allocation.
+        slot_off = slot.to(tl.int64)
         kv = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + slot_off[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
 
-        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        scores = tl.dot(q, tl.trans(kv))
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
+        # A tile with no valid key (all sentinels / out-of-range) leaves
+        # m_new == -inf, so exp2(m_i - m_new) = exp2(-inf + inf) = NaN. With
+        # l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the
+        # split's partials (and the reduce). Treat such a tile as a no-op; p's
+        # NaNs are dropped by the where below.
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+        p = tl.exp2(scores - m_new[:, None])
         p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
@@ -159,29 +216,41 @@ def _pa_decode_sparse(
         m_i = m_new
         l_i = l_new
 
-    # Emit partials. The reduce reads (m, l, acc) per split and folds in the
-    # sink there, so we do *not* touch attn_sink here.
-    m_base = t * mp_stride_t + pid_k * mp_stride_k
-    tl.store(
-        m_partial_ptr + m_base + h_offs * mp_stride_h,
-        m_i,
-        mask=h_mask,
-    )
-    l_base = t * lp_stride_t + pid_k * lp_stride_k
-    tl.store(
-        l_partial_ptr + l_base + h_offs * lp_stride_h,
-        l_i,
-        mask=h_mask,
-    )
-    a_base = t * ap_stride_t + pid_k * ap_stride_k
-    tl.store(
-        acc_partial_ptr
-        + a_base
-        + h_offs[:, None] * ap_stride_h
-        + d_offs[None, :] * ap_stride_d,
-        acc,
-        mask=h_mask[:, None] & d_mask[None, :],
-    )
+    if KV_SPLITS == 1:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        tl.store(
+            out_ptr
+            + t * out_stride_t
+            + h_offs[:, None] * out_stride_h
+            + d_offs[None, :] * out_stride_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+    else:
+        # Emit partials. The reduce reads (m, l, acc) per split and folds in
+        # the sink there, so we do *not* touch attn_sink here.
+        m_base = t * mp_stride_t + pid_k * mp_stride_k
+        tl.store(
+            m_partial_ptr + m_base + h_offs * mp_stride_h,
+            m_i,
+            mask=h_mask,
+        )
+        l_base = t * lp_stride_t + pid_k * lp_stride_k
+        tl.store(
+            l_partial_ptr + l_base + h_offs * lp_stride_h,
+            l_i,
+            mask=h_mask,
+        )
+        a_base = t * ap_stride_t + pid_k * ap_stride_k
+        tl.store(
+            acc_partial_ptr
+            + a_base
+            + h_offs[:, None] * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            acc,
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
 
 
 _pa_decode_sparse_reduce_repr = make_kernel_repr(
@@ -204,6 +273,7 @@ def _pa_decode_sparse_reduce(
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32 — used to derive per-token kv_len
+    extra_indptr_ptr,  # [N+1] int32 — the extra stream's, when HAS_EXTRA
     out_ptr,  # [N, H, D]
     mp_stride_t: tl.constexpr,
     mp_stride_k: tl.constexpr,
@@ -224,6 +294,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
     """Combine KV_SPLITS partials, fold in attn_sink, write final output.
 
@@ -244,13 +315,18 @@ def _pa_decode_sparse_reduce(
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    # Counted in TILES so the extra stream's can join the total; this is the
+    # same split, since cdiv(cdiv(L, BLOCK_K), S) == cdiv(L, S*BLOCK_K).
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + t)
+        extra_end = tl.load(extra_indptr_ptr + t + 1)
+        num_tiles += tl.cdiv(extra_end - extra_start, BLOCK_K)
+    tiles_per_segment = tl.cdiv(num_tiles, KV_SPLITS)
     # Only the first ``act_num_segments`` slots of the partial buffer were
     # actually written by the split kernel; the rest are stale.
-    act_num_segments = tl.cdiv(kv_len, tiles_per_segment * BLOCK_K)
+    act_num_segments = tl.cdiv(num_tiles, tl.maximum(tiles_per_segment, 1))
     segm_mask = k_offs < act_num_segments
-
-    neg_large = -3.4028234663852886e38
 
     m_p = tl.load(
         m_partial_ptr
@@ -258,7 +334,7 @@ def _pa_decode_sparse_reduce(
         + k_offs[:, None] * mp_stride_k
         + h_offs[None, :] * mp_stride_h,
         mask=segm_mask[:, None] & h_mask[None, :],
-        other=neg_large,
+        other=float("-inf"),
     )  # [KV_SPLITS, BLOCK_H]
     l_p = tl.load(
         l_partial_ptr
@@ -278,17 +354,37 @@ def _pa_decode_sparse_reduce(
         other=0.0,
     )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
+    # The main kernel emits base-2 partials (scores scaled by softmax_scale *
+    # log2(e)), so the combine is exp2 and the sink is lifted by log2(e).
+    LOG2E = 1.4426950408889634
+
     # Pre-sink combine across splits.
     m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
-    alpha_split = tl.exp(m_p - m_max[None, :])  # [KV_SPLITS, BLOCK_H]
-    l_combined = tl.sum(l_p * alpha_split, axis=0)  # [BLOCK_H]
-    acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
+    # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than
+    # evaluating exp(m_p - m_max): when a token has *no* valid key at all,
+    # m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
+    alpha_split = tl.where(
+        m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
+    )  # [KV_SPLITS, BLOCK_H]
+    # A split with zero valid keys (all -inf / sentinels) carries m_p == -inf and
+    # may have written NaN l/acc partials (the gluon main kernel does, since it
+    # has no dead-tile guard). alpha_split is 0 there, but NaN * 0 == NaN would
+    # still leak through the sum, zeroing the whole token's output. Mask the full
+    # term (not just the weight) so dead splits contribute exactly 0.
+    is_dead = m_p == float("-inf")  # [KV_SPLITS, BLOCK_H]
+    l_combined = tl.sum(tl.where(is_dead, 0.0, l_p * alpha_split), axis=0)  # [BLOCK_H]
+    acc_combined = tl.sum(
+        tl.where(is_dead[:, :, None], 0.0, a_p * alpha_split[:, :, None]), axis=0
+    )  # [BLOCK_H, BLOCK_D]
 
-    # Fold attn_sink as a virtual K of weight 1.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    # Fold attn_sink as a virtual K of weight 1, lifted into the base-2 domain.
+    sink = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(tl.float32)
+        * LOG2E
+    )
     m_final = tl.maximum(m_max, sink)
-    alpha_kv = tl.exp(m_max - m_final)
-    alpha_sink = tl.exp(sink - m_final)
+    alpha_kv = tl.exp2(m_max - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
     l_final = l_combined * alpha_kv + alpha_sink
     acc_final = acc_combined * alpha_kv[:, None]
 

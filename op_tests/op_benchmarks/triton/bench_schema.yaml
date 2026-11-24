@@ -29,9 +29,6 @@ benchmarks:
   gemm_a16w16:
     input_columns: [M, N, K]
     output_columns: [TFLOPS]
-  gemm_afp4wfp4_pre_quant_atomic:
-    input_columns: [M, N, K]
-    output_columns: [TFLOPS]
   gemm_afp4wfp4:
     input_columns: [M, N, K]
     output_columns: [TFLOPS]

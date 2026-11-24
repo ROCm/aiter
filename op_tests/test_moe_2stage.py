@@ -1,35 +1,55 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import itertools
-import aiter
-from aiter import dtypes
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.int4_utils import (
-    rearrange_4bit_elements,
-    convert_int8_to_uint32_int4,
-)
-from aiter.ops.quant import per_1x32_i4_quant
-from aiter.utility import fp4_utils
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx, get_cu_num
 import argparse
-import os
-import pandas as pd
+import gc
+import itertools
 import logging
+import os
+import sys
+from contextlib import ExitStack, nullcontext
 
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes, presorted_moe
+from aiter.aot.flydsl.common import override_env, run_only_env
+from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
-    fused_topk,
+    AsmMoeMode,
+    _flydsl_route_output_nbytes,
+    _is_flydsl_stage2,
+    _stage2_runtime_uses_route_reduce,
+    cktile_moe_stage1,
+    cktile_moe_stage2,
     fused_moe,
+    fused_topk,
     get_2stage_cfgs,
     get_padded_M,
+    resolve_activation_dtype,
+    swiglu,
+    torch_moe_act,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.aot.flydsl.common import fail_on_aot_cache_miss
-from aiter.ops.flydsl.moe_common import GateMode
-import aiter.ops.flydsl.moe_kernels as _aiter_mk
+from aiter.int4_utils import (
+    convert_int8_to_uint32_int4,
+    rearrange_4bit_elements,
+)
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
+from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.utility import fp4_utils
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -40,18 +60,65 @@ except ModuleNotFoundError as e:
 
 
 from aiter.ops.shuffle import (
-    shuffle_weight,
-    shuffle_scale_a16w4,
-    shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
+    shuffle_scale_a16w4,
     shuffle_scale_for_int4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
 )
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MOE_2STAGE_TOKENS = [
+    1,
+    3,
+    5,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    4096,
+    8192,
+    163840,
+]
+_STANDARD_MOE_2STAGE_TOKENS = [1, 16, 32, 64, 128, 256, 1024, 4096]
+
+# The default script behavior must keep the historical full sweep. CI can opt
+# into the reduced representative-token standard profile, while the explicit
+# "full" profile preserves the parsed CLI arguments unchanged.
+AITER_MOE_2STAGE_CI_PROFILE = os.environ.get(
+    "AITER_MOE_2STAGE_CI_PROFILE", "default"
+).lower()
+
+if AITER_MOE_2STAGE_CI_PROFILE == "standard":
+    logger.info("moe_2stage active CI profile: standard")
+elif AITER_MOE_2STAGE_CI_PROFILE == "full":
+    logger.info("moe_2stage active CI profile: full")
+else:
+    logger.info("moe_2stage active CI profile: default")
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
 @benchmark()
@@ -74,11 +141,30 @@ def test_fmoe(
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
+    kernel_bench=False,
+    disable_stage1_bias=False,
+    disable_stage2_bias=False,
+    ref_dtype="bf16",
+    gate_up_layout: bool | None = None,
+    expected_kernel1: str | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    if actType == aiter.ActivationType.Situv2:
+        beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     torch_quant = aiter.get_torch_quant(qType)
+    # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
+    is_mxfp8 = (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp8
+        and WQDType == dtypes.fp8
+    )
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -91,13 +177,32 @@ def test_fmoe(
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+    if disable_stage1_bias:
+        exp_bias1 = None
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
     if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    if AITER_MOE_EXPERT_BALANCE:
+    if disable_stage2_bias:
+        exp_bias2 = None
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
         end_col = topk
@@ -125,6 +230,13 @@ def test_fmoe(
         w1_qt = w1_qt.view(dtypes.i4x2)
         w2_qt, w2_scale = per_1x32_i4_quant(w2)
         w2_qt = w2_qt.view(dtypes.i4x2)
+    elif is_mxfp8:  # mxfp8: fp8 weights, per-1x32 e8m0 scale
+        w1_qt, w1_scale = per_1x32_f8_scale_f8_quant(
+            w1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w2_qt, w2_scale = per_1x32_f8_scale_f8_quant(
+            w2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -159,12 +271,25 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    if qType == aiter.QuantType.per_1x32 and WQDType != dtypes.i4x2:
+    if qType == aiter.QuantType.per_1x32 and WQDType not in (
+        dtypes.i4x2,
+        dtypes.fp8,
+    ):
+        # fp4x2 weights pack 2 nibbles/byte -> halved last dim. fp8 (mxfp8) and
+        # i4x2 keep their stored shape.
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
     else:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+
+    # Match fused_moe's runtime activation dtype. SiTUv2 can be requested as
+    # a16w4 by the caller but dispatched as a8w4 on gfx950.
+    reference_aq_dtype = AQDType
+    if actType == aiter.ActivationType.Situv2:
+        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
+        if runtime_aq_dtype is not None:
+            reference_aq_dtype = runtime_aq_dtype
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -175,12 +300,22 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and reference_aq_dtype == dtypes.fp8
         and WQDType == dtypes.fp4x2
-    ):  # a16w4 & a8w4
-        a1_qt = input.to(dtypes.bf16)
-        a1_scale = None
-    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+    ):
+        a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
+            input, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+    elif (
+        (
+            qType == aiter.QuantType.per_1x32
+            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and WQDType == dtypes.fp4x2
+        )
+        or is_mxfp8
+        or qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.i4x2
+    ):  # a16w4 & a8w4 & mxfp8
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
@@ -189,11 +324,21 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.bf16
+        and WQDType == dtypes.fp4x2
+        and actType in (aiter.ActivationType.Situv2, aiter.ActivationType.Relu2)
+    ):  # a16w4 SiTUv2 / Relu2: no per-expert bias supported by these kernels.
+        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
+        # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
+        exp_bias1 = exp_bias2 = None
+        exp_bias1_aiter = exp_bias2_aiter = None
+    elif (
+        qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
-        exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
-        exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    ):  # a8w4 (fp8 A) mxfp4
+        exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
+        exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
         qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
     ):  # a16wi4: no bias
@@ -243,11 +388,19 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 / a8w4
+        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
+        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
+        _w1_gu = (AQDType == dtypes.fp8) if gate_up_layout is None else gate_up_layout
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -259,6 +412,53 @@ def test_fmoe(
 
     # # ######################## stage 1 start ###########
     stage1_ref_dtype = dtype
+    # a16w4 Swiglu tuned onto an asm FLAT 1-stage kernel (SwiGLU OAI, gfx950):
+    # the kernel quantizes X and the fp32 SwiGLU output to MXFP4 in-kernel, so
+    # the reference must quantize both too.
+    asm_flat_mxfp4 = False
+    if (
+        actType == aiter.ActivationType.Swiglu
+        and (qType, AQDType, WQDType) == _PER1X32_BF16_FP4
+        and GateMode(gateMode) == GateMode.SEPARATED
+        and _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        == dtypes.bf16
+    ):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            dtypes.bf16,
+            WQDType,
+            qType,
+            use_g1u1,
+            actType,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            getattr(w1_qt_aiter, "is_shuffled", False)
+            or getattr(w2_qt_aiter, "is_shuffled", False),
+            gateMode,
+            has_stage1_bias=exp_bias1_aiter is not None,
+            has_stage2_bias=exp_bias2_aiter is not None,
+            swiglu_limit=swiglu_limit,
+            opus_weights_shuffled=getattr(w1_qt_aiter, "is_shuffled", False)
+            and getattr(w2_qt_aiter, "is_shuffled", False),
+            gate_up_interleave=getattr(w1_qt_aiter, "gate_up_interleave", None),
+        )
+        asm_flat_mxfp4 = bool(metadata.run_1stage and metadata.flat)
+        if asm_flat_mxfp4:
+            a1_qt, a1_scale = torch_quant(input, quant_dtype=dtypes.fp4x2)
+            stage1_ref_dtype = dtypes.fp32
+        if expected_kernel1 is not None:
+            got = metadata.stage1.keywords.get("kernelName") if asm_flat_mxfp4 else None
+            assert (
+                got == expected_kernel1
+            ), f"{token=}: expected {expected_kernel1}, dispatched {got or 'non-asm'}"
     if (
         actType == aiter.ActivationType.Swiglu
         and qType == aiter.QuantType.per_1x32
@@ -292,6 +492,13 @@ def test_fmoe(
                 # Keep the torch reference at f32 until the quantization step.
                 stage1_ref_dtype = dtypes.fp32
 
+    # --ref-dtype fp32: keep the reference intermediate in fp32 so the a2 mxfp4
+    # amax is taken over fp32 (not bf16). This mirrors the fused asm kernel, which
+    # computes amax on the in-register fp32 silu result (no bf16 round-trip that
+    # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
+    if ref_dtype == "fp32":
+        stage1_ref_dtype = dtypes.fp32
+
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -306,6 +513,9 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
+        # SiTUv2 defaults were resolved above; other activations ignore these values.
+        situ_beta=1.0 if beta is None else float(beta),
+        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
 
     # ######################## stage 2 start ###########
@@ -314,11 +524,21 @@ def test_fmoe(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )
         a2_scale = a2_scale.view(token, topk, -1)
+    elif asm_flat_mxfp4:
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=dtypes.fp4x2)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.fp8
+        and WQDType == dtypes.fp4x2
+    ):
+        a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
+            out1_ref, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
+    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a2_qt = out1_ref
         a2_scale = None
     elif (
@@ -345,6 +565,64 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    _fused_moe_kwargs = {
+        "w1_scale": w1_scale_aiter,
+        "w2_scale": w2_scale_aiter,
+        "quant_type": qType,
+        "activation": actType,
+        "doweight_stage1": doweight_stage1,
+        "intermediate_pad": intermediate_pad,
+        "hidden_pad": hidden_pad,
+        "bias1": exp_bias1_aiter,
+        "bias2": exp_bias2_aiter,
+        "swiglu_limit": swiglu_limit,
+        "beta": beta,
+        "linear_beta": linear_beta,
+        "gate_mode": gateMode,
+    }
+
+    if kernel_bench:
+        # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
+        # fused_moe call populates the per-stage launch callables (via the opt-in
+        # kernel_bench_callable hook) and yields a correct output; then loop each
+        # captured kernel launch alone (excludes input prep / quant / sorting).
+        kernel_bench_callable = []
+        aiter.fused_moe.kernel_bench_callable = kernel_bench_callable
+        try:
+            out2_ck = fused_moe(
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                **_fused_moe_kwargs,
+            )
+        finally:
+            aiter.fused_moe.kernel_bench_callable = None
+        kernel_us = {}
+        for _name, _call in kernel_bench_callable:
+            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            kernel_us[_name] = _us
+        us1 = kernel_us.get("stage1")
+        us2_stage = kernel_us.get("stage2")
+        if not kernel_us:
+            logger.warning(
+                "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
+                AQDType,
+            )
+        else:
+            logger.info(
+                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+                "n/a" if us1 is None else f"{us1:.2f}",
+                "n/a" if us2_stage is None else f"{us2_stage:.2f}",
+                AQDType,
+            )
+        return {
+            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us_stage1": us1,
+            "us_stage2": us2_stage,
+        }
+
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -352,19 +630,9 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        w1_scale=w1_scale_aiter,
-        w2_scale=w2_scale_aiter,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-        intermediate_pad=intermediate_pad,
-        hidden_pad=hidden_pad,
-        bias1=exp_bias1_aiter,
-        bias2=exp_bias2_aiter,
-        swiglu_limit=swiglu_limit,
-        gate_mode=gateMode,
         num_iters=5,
         num_warmup=2,
+        **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
@@ -372,13 +640,18 @@ def test_fmoe(
     # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
     has_nan = out2_ck.isnan().any().item()
     if has_nan:
-        logging.error(
+        logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
     err = checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        # MXFP4 intermediates quantized from fp32 sums accumulated in another
+        # order land one fp4 step apart near rounding boundaries; that moves
+        # 10-35% of outputs by > 0.01 with the result unchanged (logits_diff
+        # ~1e-4). Accuracy for that path is gated on logits_diff below.
+        tol_err_ratio=1.0 if asm_flat_mxfp4 else 0.05,
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -389,7 +662,7 @@ def test_fmoe(
 
     logits_diff = calc_diff(out2_ref, out2_ck)
     if logits_diff > 1e-3:
-        logging.warning(
+        logger.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
@@ -397,17 +670,18 @@ def test_fmoe(
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+        # asm FLAT SwiGLU OAI measures ~3e-5..1e-4; a wrong activation is >= 1e-2.
+        assert (
+            not asm_flat_mxfp4 or logits_diff < 2e-3
+        ), f"accuracy check failed (asm FLAT MXFP4): logits_diff={logits_diff}"
     elif has_nan:
-        logging.warning("accuracy check failed (non-strict): output contains NaN")
+        logger.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
-        logging.warning(
+        logger.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
-
-
-test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
 
 
 l_quant = [
@@ -420,6 +694,7 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16wi4
+    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8),  # mxfp8 (a8w8)
 ]
 
 
@@ -453,20 +728,7 @@ parser.add_argument(
     "--tokenNum",
     type=int,
     nargs="*",
-    default=[
-        1,
-        3,
-        5,
-        16,
-        32,
-        64,
-        128,
-        256,
-        1024,
-        4096,
-        8192,
-        163840,
-    ],
+    default=_DEFAULT_MOE_2STAGE_TOKENS,
     help="""Number of tokens.
     e.g.: -t 1024""",
 )
@@ -485,7 +747,8 @@ parser.add_argument(
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
     7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
-    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,""",
+    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,
+    9: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8,  # mxfp8 (a8w8),""",
 )
 
 parser.add_argument(
@@ -548,9 +811,36 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
+    "--stage1-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-1
+    bias. Default is [True] for backward compatibility. Use
+    --stage1-bias f for bias-free models, or --stage1-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
+    "--stage2-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-2
+    bias. Default is [True] for backward compatibility. Use
+    --stage2-bias f for bias-free models, or --stage2-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
-    help="Skip validating flydsl shapes from tuned fmoe CSVs.",
+    help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
+)
+parser.add_argument(
+    "--csv-filter",
+    nargs="*",
+    default=None,
+    help="Only run CSV rows whose kernelName1/2 contain any of these substrings "
+    "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
 )
 parser.add_argument(
     "--no-legacy",
@@ -558,15 +848,59 @@ parser.add_argument(
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
 parser.add_argument(
+    "--bm16-scale-boundary",
+    action="store_true",
+    help="Run only the deterministic BM16 tiled-scale boundary regression.",
+)
+parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
-    default=0.0,
-    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+    default=None,
+    help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
+)
+parser.add_argument(
+    "--beta",
+    type=float,
+    default=None,
+    help="SiTUv2 gate scale param (beta). Default None uses the kernel default (4.0).",
+)
+parser.add_argument(
+    "--linear-beta",
+    type=float,
+    default=None,
+    help="SiTUv2 up (linear) scale param (linear_beta). "
+    "Default None uses the kernel default (25.0).",
+)
+parser.add_argument(
+    "--kernel",
+    action="store_true",
+    help="""Time the stage1 / stage2 kernels in isolation (loop each launch
+    alone, excluding input prep) and report them as us_stage1 / us_stage2.
+    Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
+    n/a.""",
+)
+parser.add_argument(
+    "--ref-dtype",
+    choices=["bf16", "fp32"],
+    default="bf16",
+    help="Precision of the torch reference stage-1 intermediate. 'fp32' keeps it "
+    "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
+    "kernel, which computes amax on the in-register fp32 silu result, instead "
+    "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
 )
 
 args = parser.parse_args()
 
+ci_profile = os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
+if ci_profile == "standard":
+    # Standard CI keeps the representative-token sweep but must not disable the
+    # FlyDSL/Opus CSV validation path; that would silently weaken the check.
+    args.tokenNum = _STANDARD_MOE_2STAGE_TOKENS
+# Outside the "standard" profile, preserve whatever argparse already parsed:
+# the historical full-sweep default when "-t"/"--tokenNum" is omitted, or the
+# caller's explicit token selection otherwise. Neither "full" nor the unset/
+# "default" profile should discard an explicit "-t" override.
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
@@ -602,48 +936,73 @@ def _str2enum(s, enum_cls):
 
 
 def _row_to_kwargs(row):
-    # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
-    return dict(
-        dtype=_str2dtype(row["dtype"]),
-        token=int(row["token"]),
-        model_dim=int(row["model_dim"]),
-        inter_dim=int(row["inter_dim"]),
-        E=int(row["expert"]),
-        topk=int(row["topk"]),
-        actType=act_type,
-        gateMode=gate_mode,
-        qType=q_type,
-        AQDType=aq_dtype,
-        WQDType=wq_dtype,
-        use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
-        doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
-        hidden_pad=0,
-        intermediate_pad=0,
-        preshuffle=True,
-    )
+    gate_mode = _effective_gate_mode(q_type, aq_dtype, wq_dtype)
+    return {
+        "dtype": _str2dtype(row["dtype"]),
+        "token": int(row["token"]),
+        "model_dim": int(row["model_dim"]),
+        "inter_dim": inter_dim,
+        "E": int(row["expert"]),
+        "topk": int(row["topk"]),
+        "actType": act_type,
+        "gateMode": gate_mode,
+        "qType": q_type,
+        "AQDType": aq_dtype,
+        "WQDType": wq_dtype,
+        "use_g1u1": dtypes.str2bool(str(row["use_g1u1"])),
+        "doweight_stage1": dtypes.str2bool(str(row["doweight_stage1"])),
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "preshuffle": True,
+        "swiglu_limit": _effective_swiglu_limit(
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit, act_type
+        ),
+    }
 
 
 def _iter_csv_cases():
-    """Yield (kwargs, extras) for every row of every selected model csv."""
+    """Yield FlyDSL/Opus and SwiGLU OAI asm FLAT cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
     for _, row in rows.iterrows():
+        tag = row.get("_tag", "")
+        if pd.notna(tag) and str(tag).strip():
+            continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+        post_reduce = row.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
+        is_swiglu_oai_asm = _SWIGLU_OAI_ASM_TAG in kernel_name1
+        # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
+        # include them so the test harness exercises the emsort path. Only
+        # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
+        # per_1x128 blockscale fp8, ...) quantize weights differently and
+        # test_fmoe's host-side quant paths do not cover them.
+        if (
+            "flydsl_" not in kernel_name1
+            and "flydsl_" not in kernel_name2
+            and not kernel_name1.startswith("opus_moe1_")
+            and not (
+                (kernel_name1.startswith("_ZN5aiter") or post_reduce)
+                and str(row.get("q_type", "")) == "QuantType.per_1x32"
+            )
+        ):
             continue
+        if args.csv_filter:
+            _kn = kernel_name1 + " " + kernel_name2
+            if not any(sub in _kn for sub in args.csv_filter):
+                continue
         try:
             kwargs = _row_to_kwargs(row)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             aiter.logger.warning(
                 "skip row token=%s dim=(%s,%s): parse error %s",
                 row.get("token"),
@@ -652,31 +1011,71 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
+            kwargs["linear_beta"] = (
+                25.0 if args.linear_beta is None else float(args.linear_beta)
+            )
         # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
-        # Skip CSV rows that are tuned for a different mode to avoid comparing
-        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
-        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            kwargs["token"],
-            kwargs["actType"],
-            kwargs["gateMode"],
-            kwargs["qType"],
-            kwargs["AQDType"],
-            kwargs["WQDType"],
-        )
+        # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
+        # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
+                kwargs["qType"], kwargs["WQDType"]
+            )
+            runtime_mode = "SiTUv2 MXFP4"
+            # SiTUv2 a16w4 never ran before this ordering fix and every row
+            # fails: _effective_gate_mode asks for INTERLEAVE while stage1 binds
+            # gate_mode="separated" for non-fp8 activations.
+            if kwargs["AQDType"] == dtypes.bf16 and kwargs["WQDType"] == dtypes.fp4x2:
+                continue
+        else:
+            expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+                kwargs["token"],
+                kwargs["actType"],
+                kwargs["gateMode"],
+                kwargs["qType"],
+                kwargs["AQDType"],
+                kwargs["WQDType"],
+            )
+            runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
             aiter.logger.info(
                 "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
-                "current Swiglu MXFP4 runtime mode (expected %s)",
+                "current %s runtime mode (expected %s)",
                 row.get("token"),
                 row.get("model_dim"),
                 row.get("inter_dim"),
                 kwargs["AQDType"],
+                runtime_mode,
                 expected_aq_dtype,
             )
             continue
         kwargs["strict_accuracy"] = True
-        kwargs["check_aot_cache"] = True
+        # Targeted configs and env-selected SiTUv2 modes have no pre-registered
+        # AOT cache entry, so let those cases compile on demand. Neither do
+        # whole-graph impl__ rows, until aiter/aot/flydsl/moe.py replays them.
+        kwargs["check_aot_cache"] = (
+            args.csv_filter is None
+            and not post_reduce
+            and kwargs["actType"] != aiter.ActivationType.Situv2
+            and not kernel_name1.startswith("impl__")
+        )
+        # Only Swiglu callers pass an expert bias; the AOT cache has no bias
+        # variant for other activations.
+        kwargs["disable_stage1_bias"] = kwargs["actType"] != aiter.ActivationType.Swiglu
+        kwargs["disable_stage2_bias"] = (
+            post_reduce
+            or kernel_name2.startswith("opus_")
+            or kwargs["disable_stage1_bias"]
+        )
+        if is_swiglu_oai_asm:
+            # The asm FLAT kernels take no per-expert bias; with one, fused_moe
+            # discards the row. Run bias-free and require the row's kernel.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
+            kwargs["check_aot_cache"] = False
+            kwargs["expected_kernel1"] = kernel_name1
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -688,17 +1087,92 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
+# gfx950 SwiGLU OAI MXFP4 FLAT 1-stage asm kernels (hsa/gfx950/fmoe/swiglu_oai).
+_SWIGLU_OAI_ASM_TAG = "swiglu_oai"
+_SWIGLU_OAI_16X32 = "_ZN5aiter53fmoe_bf16_pertokenMXfp4_g1u1_flat_vs_swiglu_oai_16x32E"
+_SWIGLU_OAI_16X128 = (
+    "_ZN5aiter56fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_swiglu_oai_16x128E"
+)
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+# SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8 activation
+# (a4w4 fp4 act, a8w4 fp8 act). Any other quant would silently fall off the
+# FlyDSL path, so SiTUv2 is skipped for those combos.
+_SITUV2_SUPPORTED_TRIPLES = (_PER1X32_FP8_FP4, _PER1X32_FP4_FP4)
+
+
+def _situv2_beta_kwargs(act_type):
+    """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
+    for every other activation so silu/swiglu/gelu behavior is unchanged."""
+    if act_type == aiter.ActivationType.Situv2:
+        return {"beta": args.beta, "linear_beta": args.linear_beta}
+    return {}
+
+
+def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
+    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
+    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
+    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+        return GateMode.SEPARATED.value
+    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
+    # property (not a tuned-config key); request INTERLEAVE here for them.
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
+        return GateMode.INTERLEAVE.value
+    # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
+    if (
+        q_type == aiter.QuantType.per_1x32
+        and aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+    ):
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
 
-def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit, act_type):
+    if (
+        quant_type
+        in (
+            aiter.QuantType.per_1x128,
+            aiter.QuantType.per_128x128,
+            aiter.QuantType.per_Token,
+            aiter.QuantType.per_Tensor,
+        )
+        and aq_dtype == wq_dtype == dtypes.fp8
+    ):
+        # Only SiLU applies the limit here; the torch reference would still
+        # clamp the gate and up inputs of any other activation.
+        return swiglu_limit if act_type == aiter.ActivationType.Silu else None
+    if (quant_type, aq_dtype, wq_dtype) in (
+        _PER1X32_BF16_FP4,
+        _PER1X32_FP8_FP4,
+        _PER1X32_FP4_FP4,
+    ):
         return swiglu_limit
-    return 0.0
+    return None
+
+
+def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
+    """Mirror fused_moe's SiTUv2 MXFP4 activation-dtype routing."""
+    if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
+        return None
+
+    if get_gfx() == "gfx1250":
+        return (
+            dtypes.fp8
+            if os.environ.get("AITER_FORCE_A8W4", "0") == "1"
+            else dtypes.fp4x2
+        )
+
+    # fused_moe tests SiTUv2 ahead of the Swiglu/INTERLEAVE branch, so gate mode
+    # and token count do not enter into it -- mirror that order here, otherwise
+    # a4w4/a8w4 rows are skipped as "mode mismatch" under gate_mode=INTERLEAVE
+    # and the opt-in paths go untested.
+    if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+        return dtypes.fp8
+    if os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+        return dtypes.fp4x2
+    return dtypes.bf16
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -721,6 +1195,150 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
+def _moe_2stage_reference_workspace_gib(kwargs):
+    token = kwargs["token"]
+    topk = kwargs["topk"]
+    model_dim = kwargs["model_dim"]
+    inter_dim = kwargs["inter_dim"]
+    expert = kwargs["E"]
+    stage1_dim = inter_dim * 2 if kwargs["use_g1u1"] else inter_dim
+
+    # torch_moe_stage1/2 materialize routed fp32 activations and dequantized
+    # fp32 weights. This is a preflight estimate; OOM is still caught per case.
+    routed_activation_bytes = token * topk * (model_dim * 2 + stage1_dim) * 4
+    dequant_weight_bytes = expert * model_dim * (stage1_dim + inter_dim) * 4
+    input_score_bytes = token * (model_dim + expert) * 2
+    return (routed_activation_bytes + dequant_weight_bytes + input_score_bytes) / (
+        1024**3
+    )
+
+
+def _moe_2stage_route_workspace_skip_reason(kwargs):
+    """Return a reason when effective route-reduce exceeds 32-bit addressing."""
+    token = kwargs["token"]
+    model_dim = kwargs["model_dim"]
+    topk = kwargs["topk"]
+    q_dtype_a = resolve_activation_dtype(
+        kwargs["qType"],
+        kwargs["WQDType"],
+        activation=kwargs["actType"],
+        gate_mode=kwargs["gateMode"],
+        M=token,
+        hidden_dtype=kwargs["dtype"],
+        gfx=get_gfx(),
+    )
+    if q_dtype_a is None:
+        return None
+    is_shuffled = not (
+        kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] == dtypes.fp4x2
+        and not kwargs.get("preshuffle", False)
+    )
+    supports_expert_bias = (
+        kwargs["qType"] == aiter.QuantType.per_1x32
+        and kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
+        and kwargs["actType"] != aiter.ActivationType.Situv2
+    )
+    try:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            kwargs["inter_dim"],
+            kwargs["E"],
+            topk,
+            kwargs["dtype"],
+            q_dtype_a,
+            kwargs["WQDType"],
+            kwargs["qType"],
+            kwargs["use_g1u1"],
+            kwargs["actType"],
+            kwargs["doweight_stage1"],
+            kwargs.get("hidden_pad", 0),
+            kwargs.get("intermediate_pad", 0),
+            is_shuffled,
+            kwargs["gateMode"],
+            situ_beta=kwargs.get("beta", 1.0),
+            situ_linear_beta=kwargs.get("linear_beta", 1.0),
+            swiglu_limit=kwargs.get("swiglu_limit"),
+            opus_weights_shuffled=is_shuffled,
+            has_stage1_bias=supports_expert_bias,
+            has_stage2_bias=(
+                supports_expert_bias and not kwargs.get("disable_stage2_bias", False)
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        aiter.logger.warning(
+            "moe_2stage: failed to resolve stage2 mode during preflight; "
+            "continuing to runtime validation: %s",
+            exc,
+        )
+        return None
+    if not _is_flydsl_stage2(metadata.stage2):
+        return None
+    if not _stage2_runtime_uses_route_reduce(metadata.stage2, token, model_dim):
+        return None
+    route_bytes = _flydsl_route_output_nbytes(
+        metadata.stage2,
+        token,
+        topk,
+        model_dim,
+        torch.empty((), dtype=kwargs["dtype"]).element_size(),
+    )
+    if route_bytes <= FHMOE_BUFFER_MAX_BYTES:
+        return None
+    return (
+        f"FlyDSL stage2 reduce workspace {route_bytes / (1024**3):.1f} GiB "
+        "exceeds the current 32-bit buffer-addressing limit"
+    )
+
+
+def _format_moe_2stage_case(kwargs):
+    return (
+        f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
+        f"E={kwargs['E']}, topk={kwargs['topk']}, act={kwargs['actType']}, "
+        f"q={kwargs['qType']}, aq={kwargs['AQDType']}, wq={kwargs['WQDType']}, "
+        f"use_g1u1={kwargs['use_g1u1']}, doweight_stage1={kwargs['doweight_stage1']}"
+    )
+
+
+def _moe_2stage_skip_reason(kwargs):
+    route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
+    if route_workspace_reason is not None:
+        return route_workspace_reason
+
+    # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
+    max_free_memory_fraction = float(
+        os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
+    )
+    if max_free_memory_fraction <= 0:
+        return None
+
+    reference_gib = _moe_2stage_reference_workspace_gib(kwargs)
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except RuntimeError as exc:
+        aiter.logger.warning(
+            "moe_2stage: failed to query GPU memory, continuing without "
+            "preflight skip: %s",
+            exc,
+        )
+        return None
+
+    free_gib = free_bytes / (1024**3)
+    total_gib = total_bytes / (1024**3)
+    max_reference_gib = free_gib * max_free_memory_fraction
+    if reference_gib <= max_reference_gib:
+        return None
+
+    return (
+        f"estimated reference workspace {reference_gib:.1f} GiB exceeds "
+        f"{max_free_memory_fraction:.0%} of current free GPU memory "
+        f"({max_reference_gib:.1f} GiB of {free_gib:.1f} GiB free, "
+        f"{total_gib:.1f} GiB total)"
+    )
+
+
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
     extras = {"model": "legacy"}
@@ -735,6 +1353,7 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
+        use_g1u1=True,
         **over,
     ):
         return dict(
@@ -745,14 +1364,17 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(quant_type, aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
-            use_g1u1=True,
+            use_g1u1=use_g1u1,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            swiglu_limit=_effective_swiglu_limit(
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit, act_type
+            ),
             **over,
         )
 
@@ -761,25 +1383,43 @@ def _iter_legacy_cases():
         (quant_type, aq_dtype, wq_dtype),
         (model_dim, inter_dim),
         doweight_stage1,
-    ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
+        stage1_bias,
+        stage2_bias,
+    ) in itertools.product(
+        args.dtype,
+        l_quant,
+        args.dim,
+        args.doweight_stage1,
+        args.stage1_bias,
+        args.stage2_bias,
+    ):
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
+            bf16_fp4_acts = [
+                act_type
+                for act_type in args.act
+                if act_type in (aiter.ActivationType.Swiglu, aiter.ActivationType.Relu2)
+            ] or [aiter.ActivationType.Swiglu]
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+                for act_type in bf16_fp4_acts:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
+                        ), extras
         elif triple == _PER1X32_FP8_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for act_type in args.act:
@@ -796,25 +1436,37 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
+                            **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
+                    if act_type == aiter.ActivationType.Relu2:
+                        continue
                     for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
-                        ), extras
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                use_g1u1=True,
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                                disable_stage1_bias=not stage1_bias,
+                                disable_stage2_bias=not stage2_bias,
+                                **_situv2_beta_kwargs(act_type),
+                            ),
+                            extras,
+                        )
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
                 yield _kw(
@@ -827,31 +1479,1681 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    disable_stage1_bias=not stage1_bias,
+                    disable_stage2_bias=not stage2_bias,
                 ), extras
         else:
             for act_type in args.act:
+                # SiTUv2 only routes to FlyDSL on per_1x32 + fp4/fp8; skip it for
+                # every other quant so we never compare an unsupported combo.
+                if (
+                    act_type == aiter.ActivationType.Situv2
+                    and triple not in _SITUV2_SUPPORTED_TRIPLES
+                ):
+                    continue
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                    ), extras
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
+                            **_situv2_beta_kwargs(act_type),
+                        ),
+                        extras,
+                    )
+
+
+def test_route_workspace_token_capacity():
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
+
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
+
+
+def test_presorted_moe_hook():
+    """register_presorted_moe() lets a caller's BM=16 route+sort replace fused_moe's.
+
+    Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). test_fmoe checks each batch with
+    fused_moe's own sort (moe_sorting) and with a registered presort (presorted)
+    against the torch reference; the presorted run must never reach moe_sorting.
+    The timed candidates (moe_sorting, presorted, and presorted output=, which
+    passes a caller-zeroed output as SGLang does) share one routing whose presort
+    is built beforehand, so only fused_moe is timed, and both presorted calls are
+    checked element-wise against the own sort at every batch. The summary table
+    has one row per batch with us/TFLOPS/TB/s per timed candidate, "ref err"
+    (test_fmoe's logits_diff vs the torch reference) for moe_sorting and
+    presorted, and "own err" (diff vs the own sort on the timed routing) for both
+    presorted calls. Its eager summed kernel time does not rank the two presorted
+    calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
+    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
+    copied back while a 4-byte-aligned one is used in place, and a registration
+    that does not match the call is ignored and still consumed, so it never
+    leaks into a later call, even when fused_moe exits before sorting.
+    """
+    global fused_moe
+    fm = aiter.fused_moe
+    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
+    dtype = dtypes.bf16
+
+    def presort(topk_ids, topk_weights, moe_buf=None):
+        ids, weights, experts, num_valid, _, m_indices, reverse = fm._adaptive_moe_sort(
+            topk_ids, topk_weights, E, topk_ids.shape[1], 16, model_dim, emit_aux=True
+        )
+        return {
+            "sorted_token_ids": ids,
+            "sorted_weights": weights,
+            "sorted_expert_ids": experts,
+            "num_valid_ids": num_valid,
+            "m_indices": m_indices,
+            "reverse_sorted": reverse,
+            "topk_ids_ptr": topk_ids.data_ptr(),
+            "topk_weights_ptr": topk_weights.data_ptr(),
+            "M": topk_ids.shape[0],
+            "block_m": 16,
+            "num_experts": E,
+            "topk": topk_ids.shape[1],
+            "moe_buf_zeroed": moe_buf is not None,
+            "moe_buf_ptr": 0 if moe_buf is None else moe_buf.data_ptr(),
+        }
+
+    real_fused_moe = fused_moe
+    real_sorting = fm.moe_sorting
+    sort_calls = []
+
+    def counting_sorting(*a, **kw):
+        sort_calls.append(1)
+        return real_sorting(*a, **kw)
+
+    # Accuracy only: test_fmoe times rotated copies of its inputs, so the presort
+    # is built inside each call here and test_fmoe's timings are not used.
+    def presorted_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw):
+        fm.register_presorted_moe(presort(topk_ids, topk_weights))
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw)
+
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    def prep(w):
+        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+        n_rows = scale.shape[0] * scale.shape[1]
+        return (
+            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+            fp4_utils.e8m0_shuffle(scale.view(n_rows, -1)).view(*scale.shape[:2], -1),
+        )
+
+    torch.manual_seed(0)
+    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
+    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
+    kwargs = {
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "quant_dtype_a": dtypes.fp4x2,
+    }
+
+    def route(token):
+        hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+        gating = torch.randn((token, E), dtype=dtype)
+        return (hidden, *fused_topk(hidden, gating, topk, True))
+
+    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    def check_close(ref, out, what):
+        # Element-wise first, so a low-magnitude row cannot hide behind the
+        # aggregate score. Atomic bf16 accumulation moves single elements by up to
+        # two bf16 steps (measured max abs 3.9e-3 at |ref| ~0.4, three runs), well
+        # inside the test_fmoe tolerances used here; a buffer that was not zeroed
+        # (1e3 fill) misses by orders of magnitude.
+        mismatch = checkAllclose(
+            ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg=what, printLog=False
+        )
+        assert mismatch == 0, f"{what}: {mismatch:.2%} of elements out of tolerance"
+        diff = calc_diff(ref, out)
+        assert diff < 1e-4, f"{what}: diff {diff}"
+
+    # The timed calls. As SGLang makes them, the router's sort (and its zeroing
+    # of the output fused_moe accumulates into) runs before fused_moe, so neither
+    # is timed; a caller-zeroed buffer just accumulates across the timed calls.
+    def own_sort(aux, hidden, topk_weights, topk_ids, buf):
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def presorted(aux, hidden, topk_weights, topk_ids, buf):
+        fm.register_presorted_moe(aux)
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def caller_zeroed(aux, hidden, topk_weights, topk_ids, buf):
+        fm.register_presorted_moe(aux)
+        return real_fused_moe(
+            hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
+        )
+
+    timed = {
+        "moe_sorting": own_sort,
+        "presorted": presorted,
+        "presorted output=": caller_zeroed,
+    }
+
+    candidates = {"moe_sorting": real_fused_moe, "presorted": presorted_fused_moe}
+    rows = []
+    try:
+        fm.moe_sorting = counting_sorting
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            # 512 is past the Opus crossover (3 * M * topk >= 4 * E), where
+            # fused_moe's own BM=16 sort is Opus rather than the adaptive one.
+            for token in (1, 4, 512):
+                # gate+up+down GEMMs per route; bytes are bf16 hidden in/out plus
+                # the fp4x2 weights and e8m0 scales of at most token*topk experts.
+                flops = 2 * 3 * token * topk * model_dim * inter_dim
+                w_vals = 3 * model_dim * inter_dim
+                act_bytes = 2 * token * model_dim * dtype.itemsize
+                w_bytes = min(E, token * topk) * (w_vals // 2 + w_vals // 32)
+                nbytes = act_bytes + w_bytes
+                row = {
+                    "token": token,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "E": E,
+                    "topk": topk,
+                    "gfx": get_gfx(),
+                }
+                for name, fn in candidates.items():
+                    # test_fmoe calls this module's fused_moe.
+                    fused_moe = fn
+                    sort_calls.clear()
+                    torch.manual_seed(token)
+                    ret = test_fmoe(
+                        dtype=dtype,
+                        token=token,
+                        model_dim=model_dim,
+                        inter_dim=inter_dim,
+                        E=E,
+                        topk=topk,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                    )
+                    fused_moe = real_fused_moe
+                    if name == "presorted":
+                        assert not sort_calls, f"token={token}: presort unused"
+                    else:
+                        assert sort_calls, f"token={token}: BM=16 aux path did not sort"
+                    # test_fmoe compares with the torch reference and fails when
+                    # checkAllclose misses and logits_diff (1 - cosine similarity,
+                    # recorded as ref err) exceeds 0.01.
+                    row[f"{name} ref err"] = ret["logits_diff"]
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                # On these inputs both presorted calls must match fused_moe's own
+                # sort element-wise (a differential check; test_fmoe above is the
+                # torch-reference one, on its own inputs).
+                hidden, topk_weights, topk_ids = route(token)
+                buf = torch.zeros((token, model_dim), dtype=dtype)
+                own = own_sort(None, hidden, topk_weights, topk_ids, buf)
+                sort_calls.clear()
+                aux = presort(topk_ids, topk_weights)
+                out = presorted(aux, hidden, topk_weights, topk_ids, buf)
+                check_close(own, out, f"token={token} presorted")
+                row["presorted own err"] = calc_diff(own, out)
+                aux_zeroed = presort(topk_ids, topk_weights, moe_buf=buf)
+                out = caller_zeroed(aux_zeroed, hidden, topk_weights, topk_ids, buf)
+                assert out is buf, f"token={token}: caller output not used"
+                check_close(own, out, f"token={token} presorted output=")
+                row["presorted output= own err"] = calc_diff(own, out)
+                # num_rotate_args=1: run_perftest otherwise times deep copies of
+                # its tensor arguments, whose topk_ids no longer match the
+                # registered presort, so the call would fall back to moe_sorting.
+                for name, fn in timed.items():
+                    reg = aux_zeroed if name == "presorted output=" else aux
+                    sort_calls.clear()
+                    _, us = run_perftest(
+                        fn, reg, hidden, topk_weights, topk_ids, buf, num_rotate_args=1
+                    )
+                    sorted_ = bool(sort_calls)
+                    assert sorted_ == (
+                        name == "moe_sorting"
+                    ), f"token={token}: {name} timed with moe_sorting={sorted_}"
+                    row[f"{name} us"] = us
+                    row[f"{name} TFLOPS"] = flops / us / 1e6
+                    row[f"{name} TB/s"] = nbytes / us / 1e6
+                rows.append(row)
+    finally:
+        fused_moe = real_fused_moe
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+    aiter.logger.info(
+        "moe_2stage presorted MoE hook summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    torch.manual_seed(0)
+    token = 1
+    hidden, topk_weights, topk_ids = route(token)
+
+    try:
+        fm.moe_sorting = counting_sorting
+        ref = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+        # Without output=, the buffer fused_moe allocates is zeroed even when it
+        # lands at the address the registration names as caller-zeroed (the
+        # allocator can hand back a freed block). Stand in a dirty buffer for
+        # that allocation.
+        stale = torch.full((token, model_dim), 1e3, dtype=dtype)
+        aux = presort(topk_ids, topk_weights, moe_buf=stale)
+        real_empty = torch.empty
+        handed = []
+
+        def dirty_empty(*a, **kw):
+            t = real_empty(*a, **kw)
+            if not handed and t.shape == stale.shape and t.dtype == dtype:
+                handed.append(t)
+                return stale
+            return t
+
+        fm.register_presorted_moe(aux)
+        try:
+            torch.empty = dirty_empty
+            out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+        finally:
+            torch.empty = real_empty
+        assert handed and out is stale, "presort did not allocate its own moe_buf"
+        check_close(ref, out, "reused-address moe_buf was not zeroed")
+
+        # An output at an odd bf16 element (2-byte aligned) cannot be the atomic
+        # moe_buf (GEMM2's 4-byte atomics fault on it): fused_moe uses a fresh
+        # one and copies back. A 4-byte-aligned one is used in place.
+        real_return = fm._return_output
+        copies = []
+
+        def tracking_return(ret, output):
+            copies.append(output is not None and ret is not output)
+            return real_return(ret, output)
+
+        for offset, copied in ((1, True), (2, False)):
+            pool = torch.empty(token * model_dim + offset, dtype=dtype)
+            buf = pool[offset:].view(token, model_dim)
+            sort_calls.clear()
+            copies.clear()
+            fm.register_presorted_moe(presort(topk_ids, topk_weights))
+            try:
+                fm._return_output = tracking_return
+                out = fused_moe(
+                    hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
+                )
+            finally:
+                fm._return_output = real_return
+            assert out is buf and not sort_calls
+            assert copies == [copied], f"{2 * offset}-byte offset: copied={copies}"
+            check_close(ref, out, f"{2 * offset}-byte-aligned output")
+
+        # Registered for another topk_ids or topk_weights tensor: ignored, and
+        # consumed.
+        for key in ("topk_ids_ptr", "topk_weights_ptr"):
+            sort_calls.clear()
+            aux = presort(topk_ids, topk_weights)
+            aux[key] = topk_ids.clone().data_ptr()
+            fm.register_presorted_moe(aux)
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+            assert len(sort_calls) == 1, f"a presort with a stale {key} was used"
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), "not consumed"
+
+        # A call that fails before sorting still consumes the registration.
+        fm.register_presorted_moe(presort(topk_ids, topk_weights))
+        bad = torch.empty((token + 1, model_dim), dtype=dtype)
+        try:
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=bad, **kwargs)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a wrong-shape output was accepted")
+        assert (
+            getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+        ), "not consumed on error"
+    finally:
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+    torch.cuda.synchronize()
+    aiter.logger.info("moe_2stage: presorted MoE hook contract passed")
+
+
+def test_presorted_moe_wrapper_error():
+    """A fused_moe call rejected in the public wrapper still drops a registration.
+
+    activation must be an ActivationType; a str fails in the wrapper before the
+    custom op (which normally consumes the registration) runs, on both the
+    routed and the FHMoE (shared-expert) paths. CommFusedMoeRuntime.run, which
+    calls _fused_moe_impl directly, must drop it too when it rejects its
+    arguments. Rejected before any MoE kernel launches.
+    """
+    from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
+
+    fm = aiter.fused_moe
+    x = torch.zeros((1, 1))
+    ids = torch.zeros((1, 1), dtype=torch.int32)
+    try:
+        for extra in ({}, {"shared_expert_id": 0}):
+            fm.register_presorted_moe({"M": 1})
+            try:
+                fused_moe(x, x, x, x, ids, activation="silu", **extra)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"activation='silu' was accepted ({extra})")
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), f"registration left live after a wrapper error ({extra})"
+        runtime_errors = {
+            "negative reduce_scatter_sizes": {"reduce_scatter_sizes": [-1]},
+            "both before_stage2 callbacks": {
+                "before_stage2": lambda: x,
+                "before_stage2_for_rows": lambda rows: x,
+            },
+        }
+        for case, kwargs in runtime_errors.items():
+            fm.register_presorted_moe({"M": 1})
+            try:
+                CommFusedMoeRuntime(runners=None).run(
+                    shared_partial=None, hidden_states=x, **kwargs
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{case} were accepted")
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), f"registration left live after a CommFusedMoeRuntime error ({case})"
+    finally:
+        fm.register_presorted_moe(None)
+    aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
+
+
+def _presorted_aux_stub(ids, weights, E, block_m=16):
+    """A registration whose sort tensors have the BM=16 aux-sort layout.
+
+    Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
+    matcher only checks the layout and no kernel reads them.
+    """
+    M, topk = ids.shape
+    BM = presorted_moe.PRESORTED_MOE_BLOCK_M
+    max_sorted = presorted_moe.aux_sort_capacity(M, topk, E, BM)
+    i32 = dtypes.i32
+    return {
+        "sorted_token_ids": torch.empty(max_sorted, dtype=i32, device=ids.device),
+        "sorted_weights": torch.empty(max_sorted, dtype=dtypes.fp32, device=ids.device),
+        "sorted_expert_ids": torch.empty(
+            max_sorted // BM, dtype=i32, device=ids.device
+        ),
+        "num_valid_ids": torch.empty(2, dtype=i32, device=ids.device),
+        "m_indices": torch.empty(max_sorted, dtype=i32, device=ids.device),
+        "reverse_sorted": torch.empty(M * topk, dtype=i32, device=ids.device),
+        "topk_ids_ptr": ids.data_ptr(),
+        "topk_weights_ptr": weights.data_ptr(),
+        "M": M,
+        "block_m": block_m,
+        "num_experts": E,
+        "topk": topk,
+    }
+
+
+def test_presorted_moe_layout_mismatch():
+    """A presort whose sort tensors break the BM=16 aux-sort layout is ignored.
+
+    The aux-sort stages size their buffers from sorted_token_ids and read the
+    other five tensors by sorted row, 16-row block or route, so a registration
+    with a wrong dtype, device, length or a missing tensor must fall back to
+    fused_moe's own sort rather than reach a kernel. No MoE kernel launch.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    good = _presorted_aux_stub(ids, weights, E)
+    max_sorted = good["sorted_token_ids"].numel()
+
+    def match(aux):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk
+        )
+
+    def resized(key, n, dtype=None):
+        t = good[key]
+        return torch.empty(n, dtype=dtype or t.dtype, device=t.device)
+
+    assert match(good) is not None, "a well-formed presort was rejected"
+    # sorted_weights / m_indices may be longer than sorted_token_ids.
+    longer = {
+        **good,
+        "sorted_weights": resized("sorted_weights", max_sorted + 16),
+        "m_indices": resized("m_indices", max_sorted + 16),
+    }
+    assert match(longer) is not None, "over-long weights or m_indices were rejected"
+
+    i32_keys = (
+        "sorted_token_ids",
+        "sorted_expert_ids",
+        "num_valid_ids",
+        "m_indices",
+        "reverse_sorted",
+    )
+    bad_cases = {
+        **{f"missing {k}": {k: None} for k in i32_keys + ("sorted_weights",)},
+        **{f"int64 {k}": {k: good[k].to(torch.int64)} for k in i32_keys},
+        "bf16 sorted_weights": {"sorted_weights": good["sorted_weights"].bfloat16()},
+        # meta stands in for "another device" without needing a second GPU.
+        "sorted_token_ids on another device": {
+            "sorted_token_ids": torch.empty(max_sorted, dtype=dtypes.i32, device="meta")
+        },
+        "non-contiguous m_indices": {
+            "m_indices": resized("m_indices", 2 * max_sorted)[::2]
+        },
+        "sorted_expert_ids not one per 16 rows": {
+            "sorted_expert_ids": resized("sorted_expert_ids", max_sorted // 16 + 1)
+        },
+        "BM=32 block count": {
+            "sorted_expert_ids": resized("sorted_expert_ids", max_sorted // 32)
+        },
+        "short sorted_weights": {
+            "sorted_weights": resized("sorted_weights", max_sorted - 1)
+        },
+        "short m_indices": {"m_indices": resized("m_indices", max_sorted - 16)},
+        "short reverse_sorted": {
+            "reverse_sorted": resized("reverse_sorted", M * topk - 1)
+        },
+        "long reverse_sorted": {
+            "reverse_sorted": resized("reverse_sorted", M * topk + 1)
+        },
+        "one-element num_valid_ids": {"num_valid_ids": resized("num_valid_ids", 1)},
+        # Same element count, but the stages read shape[0] as the row count.
+        "2-D sorted_token_ids": {
+            "sorted_token_ids": good["sorted_token_ids"].view(16, max_sorted // 16)
+        },
+        "2-D reverse_sorted": {"reverse_sorted": good["reverse_sorted"].view(M, topk)},
+        # Self-consistent, but too small to hold every route plus block padding.
+        "undersized sort": {
+            "sorted_token_ids": resized("sorted_token_ids", 16),
+            "sorted_weights": resized("sorted_weights", 16),
+            "m_indices": resized("m_indices", 16),
+            "sorted_expert_ids": resized("sorted_expert_ids", 1),
+        },
+        "empty sort": {
+            "sorted_token_ids": resized("sorted_token_ids", 0),
+            "sorted_expert_ids": resized("sorted_expert_ids", 0),
+        },
+    }
+    for name, change in bad_cases.items():
+        aux = {**good, **change}
+        for key, value in change.items():
+            if value is None:
+                del aux[key]
+        assert match(aux) is None, f"presort with {name} was accepted"
+    aiter.logger.info(
+        "moe_2stage: presorted MoE layout contract passed (%d mismatches)",
+        len(bad_cases),
+    )
+
+
+def test_presorted_moe_output_overlap():
+    """A presort is ignored when output overlaps one of its sort tensors.
+
+    The stages zero or write output while still reading the sort tensors, so
+    the call must fall back to fused_moe's own sort. No MoE kernel launch.
+    """
+    M, E, topk, model_dim = 4, 8, 2, 8
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+
+    def match(output):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, output=output
+        )
+
+    own = torch.empty((M, model_dim), dtype=dtypes.bf16)
+    assert match(own) is not None, "a presort with a separate output was rejected"
+    for key in presorted_moe._PRESORTED_MOE_SORT_KEYS:
+        t = aux[key]
+        backing = torch.empty(t.nbytes + M * model_dim * 2, dtype=torch.uint8)
+        aux[key] = backing[: t.nbytes].view(t.dtype)
+        # a contiguous output that starts inside the sort tensor
+        inside = backing[t.nbytes - 2 :][: M * model_dim * 2].view(dtypes.bf16)
+        assert match(inside.view(M, model_dim)) is None, f"output overlapping {key}"
+        aux[key] = t
+    aiter.logger.info("moe_2stage: presorted MoE output-overlap contract passed")
+
+
+def test_presorted_moe_block_m():
+    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+
+    kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
+    so a registration labelled block_m=32 that matches the call must still be
+    ignored. Checks the matcher fused_moe uses; no MoE kernel launches.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+
+    def match(block_m):
+        aux = _presorted_aux_stub(ids, weights, E, block_m=block_m)
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=block_m, num_experts=E, topk=topk
+        )
+
+    assert match(16) is not None, "a matching BM=16 presort was rejected"
+    assert match(32) is None, "a BM=32 presort was accepted"
+    # BM=16 kernels, but a caller's block_size_M hands the stages another size.
+    aux = _presorted_aux_stub(ids, weights, E)
+    for stage_block_m, ok in ((16, True), (32, False)):
+        got = presorted_moe.match_presorted_moe(
+            aux,
+            ids,
+            weights,
+            block_m=16,
+            num_experts=E,
+            topk=topk,
+            stage_block_m=stage_block_m,
+        )
+        assert (got is not None) == ok, f"block_size_M={stage_block_m}: {ok=}"
+    aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
+
+
+def test_presorted_moe_masked_call():
+    """A presort is ignored when the call passes expert_mask or num_local_tokens.
+
+    The presort covers every row of topk_ids with no expert mask, while
+    moe_sorting honors both, so such calls must fall back to moe_sorting.
+    Checks the matcher fused_moe uses; no MoE kernel launches.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+
+    def match(**kw):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, **kw
+        )
+
+    assert match() is not None, "a matching unmasked presort was rejected"
+    limit = torch.tensor([M - 1], dtype=torch.int32)
+    assert match(num_local_tokens=limit) is None, "presort used with num_local_tokens"
+    mask = torch.ones((E,), dtype=torch.int32)
+    assert match(expert_mask=mask) is None, "presort used with expert_mask"
+    aiter.logger.info("moe_2stage: presorted MoE masked-call contract passed")
+
+
+def test_presorted_moe_ignored_is_logged():
+    """A registration fused_moe ignores is logged once per reason, naming it.
+
+    A caller whose aux omits a key (here topk_weights_ptr) would otherwise lose
+    the presort on every call with nothing to show for it. Checks the matcher
+    fused_moe uses; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+    del aux["topk_weights_ptr"]
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    collect = Collect()
+    presorted_moe._PRESORTED_MOE_IGNORED.clear()
+    fm.logger.addHandler(collect)
+    try:
+        for _ in range(3):
+            assert (
+                presorted_moe.match_presorted_moe(
+                    aux, ids, weights, block_m=16, num_experts=E, topk=topk
+                )
+                is None
+            ), "a presort without topk_weights_ptr was accepted"
+    finally:
+        fm.logger.removeHandler(collect)
+    ignored = [m for m in collect.messages if "registered presort ignored" in m]
+    assert len(ignored) == 1, f"expected one log line, got {ignored}"
+    assert "no topk_weights_ptr" in ignored[0], ignored[0]
+    aiter.logger.info("moe_2stage: presorted MoE ignored-registration log passed")
+
+
+# Module scope: registering the op again in the same process raises.
+_CONSUMED_PRESORT_LAYERS = []
+
+
+@torch.library.custom_op("aiter_test::consume_presort", mutates_args=())
+def _consume_presort(x: torch.Tensor) -> torch.Tensor:
+    aux = presorted_moe.pop_presorted_moe()
+    _CONSUMED_PRESORT_LAYERS.append(aux and aux["layer"])
+    return x + 1
+
+
+@_consume_presort.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
+def test_presorted_moe_compile_order():
+    """Under torch.compile each registration still reaches the next consumer.
+
+    dynamo defers a traced thread-local store until its graph has run, so a
+    compiled loop of register + MoE layer would hand every layer the previous
+    step's last registration. A stand-in custom op consumes it the way
+    fused_moe_ does; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    seen = _CONSUMED_PRESORT_LAYERS
+
+    def layers(x):
+        for layer in range(3):
+            fm.register_presorted_moe({"layer": layer})
+            x = _consume_presort(x)
+        return x
+
+    compiled = torch.compile(layers, backend="aot_eager")
+    try:
+        for _ in range(2):
+            seen.clear()
+            compiled(torch.zeros(4))
+            assert seen == [0, 1, 2], f"registrations reached layers as {seen}"
+    finally:
+        fm.register_presorted_moe(None)
+        torch._dynamo.reset()
+    aiter.logger.info("moe_2stage: presorted MoE torch.compile order passed")
+
+
+def test_bm16_tiled_scale_boundary():
+    """Validate tuned BM16 dispatch and the 33-row scale boundary."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
+        return
+
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    expected_kernels = (
+        "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
+        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+    )
+    for token in (32, 64):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            7168,
+            512,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        assert metadata.block_m == 16
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == expected_kernels
+        stage1_params = get_flydsl_kernel_params(kernel_names[0])
+        stage2_params = get_flydsl_kernel_params(kernel_names[1])
+        assert stage1_params is not None
+        assert stage2_params is not None
+        assert stage1_params["tile_m"] == 16
+        assert stage1_params["waves_per_eu"] == 3
+        assert stage2_params["tile_m"] == 16
+        assert stage2_params["tile_n"] == 256
+        assert stage2_params.get("xcd_swizzle", 0) == 0
+
+    old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=torch.bfloat16,
+            token=33,
+            model_dim=7168,
+            inter_dim=512,
+            E=385,
+            topk=7,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.INTERLEAVE.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=True,
+            strict_accuracy=True,
+            check_aot_cache=False,
+        )
+    finally:
+        if old_moe_bound is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
+
+
+def test_output_buffer_contract():
+    """Validate output identity, copy-back, validation, and compile contracts."""
+    torch.manual_seed(0)
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
+    dtype = dtypes.bf16
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (hidden, w1, w2, topk_weights, topk_ids)
+
+    ref = fused_moe(*args)
+    # The comparisons below are exact, so check that is a kernel property.
+    assert torch.equal(ref, fused_moe(*args)), "fused_moe is not run-to-run stable"
+
+    def fresh_buffer():
+        return torch.full((token, model_dim), -7.0, dtype=dtype)
+
+    def call_and_read_back(buf):
+        out = fused_moe(*args, output=buf)
+        # Reading buf afterwards is the trap: compiled, it is answered from
+        # whatever the fake said the op returned.
+        return out.sum(), buf.sum()
+
+    sort = aiter.fused_moe._moe_sorting_impl
+
+    def sort_without_output(*a, **kw):
+        kw["output"] = None
+        return sort(*a, **kw)
+
+    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
+    # paths, which cannot take the caller's buffer and must copy their result into it.
+    for in_place in (True, False):
+        try:
+            if not in_place:
+                aiter.fused_moe._moe_sorting_impl = sort_without_output
+            buf = fresh_buffer()
+            assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
+            assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
+
+            eager = call_and_read_back(fresh_buffer())
+            compiled = torch.compile(call_and_read_back)(fresh_buffer())
+            assert [float(x) for x in eager] == [
+                float(x) for x in compiled
+            ], f"{in_place=}: eager {eager} != compiled {compiled}"
+            assert eager[0] == eager[1] == ref.sum()
+        finally:
+            aiter.fused_moe._moe_sorting_impl = sort
+
+    def expect_raise(described, **kwargs):
+        try:
+            fused_moe(*args, **kwargs)
+        except RuntimeError:
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_raise("a mis-shaped output", output=torch.empty((token, model_dim + 1)))
+    expect_raise(
+        "an output of the wrong dtype",
+        output=torch.empty((token, model_dim), dtype=dtypes.fp32),
+    )
+    expect_raise(
+        "a non-contiguous output",
+        output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
+    )
+    # moe_sorting zeroes output before stage1 reads hidden_states.
+    expect_raise("an output overlapping hidden_states", output=hidden)
+
+    # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
+    pool = torch.zeros((2 * token, model_dim), dtype=dtype)
+    pool[:token] = hidden
+    assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+
+    stage2_scatter = Stage2ScatterContext(
+        arena_handle=0,
+        combine_input_offset=0,
+        slot_stride_bytes=1,
+        max_tokens_per_rank=token,
+        world_size=1,
+        source_token_map=torch.zeros_like(topk_ids, dtype=dtypes.i32),
+    )
+
+    def call_with_stage2_scatter(buf):
+        return fused_moe(
+            *args,
+            stage2_scatter=stage2_scatter,
+            output=buf,
+        )
+
+    def expect_stage2_scatter_raise(described, call):
+        try:
+            call()
+        except RuntimeError as error:
+            assert "output= is incompatible with stage2_scatter" in str(error)
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter",
+        lambda: call_with_stage2_scatter(fresh_buffer()),
+    )
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter under torch.compile",
+        lambda: torch.compile(call_with_stage2_scatter)(fresh_buffer()),
+    )
+
+    aiter.logger.info("moe_2stage: output buffer contract passed")
+
+
+def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 non-split no-bias dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, E, topk = 6144, 1536, 129, 5
+    for gate_up_layout in (True, False):
+        for token in (128, 255, 256, 257, 512):
+            runtime_aq_dtype = dtypes.fp8 if token >= 256 else dtypes.bf16
+            metadata = get_2stage_cfgs(
+                get_padded_M(token),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                torch.bfloat16,
+                runtime_aq_dtype,
+                dtypes.fp4x2,
+                aiter.QuantType.per_1x32,
+                True,
+                aiter.ActivationType.Swiglu,
+                False,
+                0,
+                0,
+                True,
+                GateMode.INTERLEAVE.value,
+                has_stage1_bias=False,
+                has_stage2_bias=False,
+                gate_up_interleave=gate_up_layout,
+            )
+            stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+            stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+            assert stage1_func is cktile_moe_stage1, (
+                f"{gate_up_layout=} {token=}: expected CK-Tile stage1, got "
+                f"{stage1_func!r}"
+            )
+            assert stage2_func is cktile_moe_stage2, (
+                f"{gate_up_layout=} {token=}: expected CK-Tile stage2, got "
+                f"{stage2_func!r}"
+            )
+            dispatched_split_k = metadata.stage1.keywords["split_k"]
+            if gate_up_layout:
+                assert dispatched_split_k == 1, (
+                    f"{token=}: gate_up_layout=True (GUGU) must dispatch to the "
+                    f"fused split_k=1 gate-up kernel, got split_k={dispatched_split_k}"
+                )
+            else:
+                assert dispatched_split_k >= 2, (
+                    f"{token=}: gate_up_layout=False (GGUU) must dispatch to "
+                    f"split_k>=2 (NoBias_swiglu_SplitK path), got "
+                    f"split_k={dispatched_split_k}; this is the bf16/fp16-activation "
+                    "accuracy bug this PR originally fixed -- see PR discussion."
+                )
+            assert metadata.has_bias is False
+            assert metadata.stage2_has_bias is False
+
+            torch.manual_seed(0)
+            test_fmoe(
+                dtype=torch.bfloat16,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=E,
+                topk=topk,
+                actType=aiter.ActivationType.Swiglu,
+                gateMode=GateMode.INTERLEAVE.value,
+                qType=aiter.QuantType.per_1x32,
+                AQDType=dtypes.fp8 if token >= 256 else dtypes.bf16,
+                WQDType=dtypes.fp4x2,
+                use_g1u1=True,
+                preshuffle=True,
+                strict_accuracy=True,
+                check_aot_cache=False,
+                disable_stage1_bias=True,
+                disable_stage2_bias=True,
+                gate_up_layout=gate_up_layout,
+            )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 non-split no-bias dispatch regression test "
+        "(layout x M sweep) passed"
+    )
+
+
+def test_swiglu_mxfp4_untagged_layout_dispatch():
+    """Callers that never tag w1.gate_up_interleave (None) -- ATOM's MiniMax-M3, for
+    one -- must keep the CK-Tile split-k route with the standard post-activation
+    layout for bf16 activations. MiniMax-M3-MXFP4 at TP8 (per-rank MoE call:
+    model_dim 6144, inter_dim 512, intermediate_pad 0) fell through to the
+    unshuffled-weights fallback instead and decoded garbage until max tokens."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 untagged-layout dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, intermediate_pad, E, topk = 6144, 512, 0, 129, 5
+    for token in (1, 8, 32, 128):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            intermediate_pad,
+            True,
+            GateMode.SEPARATED.value,
+            swiglu_limit=7.0,
+            opus_weights_shuffled=True,
+            gate_up_interleave=None,
+        )
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        assert (
+            stage1_func is cktile_moe_stage1
+        ), f"{token=}: expected CK-Tile stage1, got {stage1_func!r}"
+        layout = metadata.stage1.keywords.get("post_activation_layout")
+        assert layout == "standard", (
+            f"{token=}: untagged gate/up layout with bf16 activations must keep "
+            f"post_activation_layout='standard', got {layout!r}"
+        )
+        assert metadata.stage1.keywords["split_k"] >= 2, (
+            f"{token=}: expected the CK-Tile split-k route, got "
+            f"split_k={metadata.stage1.keywords['split_k']}"
+        )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
+    )
+
+
+def _quant_blockscale_weight(w):
+    e, n, k = w.shape
+    blocks = w.view(e, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4).contiguous()
+    q, scale = aiter.pertoken_quant(
+        blocks.view(e, -1, 128 * 128), quant_dtype=dtypes.fp8
+    )
+    q = (
+        q.view(e, n // 128, k // 128, 128, 128)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view_as(w)
+    )
+    return q, scale.view(e, n // 128, k // 128)
+
+
+@benchmark()
+def test_blockscale_swiglu_limit(token, swiglu_limit):
+    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
+    torch.manual_seed(token)
+    x = torch.randn(token, model_dim, dtype=dtypes.bf16)
+    w1, s1 = _quant_blockscale_weight(
+        torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16) * 0.5
+    )
+    w2, s2 = _quant_blockscale_weight(
+        torch.randn(experts, model_dim, inter_dim, dtype=dtypes.bf16) / inter_dim**0.5
+    )
+    router = torch.randn(token, experts, dtype=dtypes.bf16)
+    weights, ids = fused_topk(x, router, topk, True)
+    xq, xs = aiter.pertoken_quant(x.view(token, -1, 128), quant_dtype=dtypes.fp8)
+    xq = xq.view_as(x)
+    stage1 = torch_moe_stage1(
+        xq,
+        w1,
+        w2,
+        weights,
+        ids,
+        dtype=dtypes.bf16,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.per_1x128,
+        a1_scale=xs.squeeze(-1),
+        w1_scale=s1,
+        swiglu_limit=swiglu_limit,
+    )
+
+    def stage2_reference(y):
+        yq, ys = aiter.pertoken_quant(y.view(token, -1, 128), quant_dtype=dtypes.fp8)
+        return torch_moe_stage2(
+            yq.view(token, topk, inter_dim),
+            w1,
+            w2,
+            weights,
+            ids,
+            dtype=dtypes.bf16,
+            quant_type=aiter.QuantType.per_1x128,
+            w2_scale=s2,
+            a2_scale=ys.view(token, topk, -1),
+            doweight=True,
+        )
+
+    def logits_difference(a, b):
+        a, b = a.double(), b.double()
+        return float(1 - 2 * (a * b).sum() / (a.square() + b.square()).sum())
+
+    ref = stage2_reference(stage1)
+    swapped_diff = None
+    if swiglu_limit == 1.0:
+        # Independently pin clamp-before-SiLU, not clamp(SiLU(gate)).
+        xd = (xq.float().view(token, -1, 128) * xs.float()).view_as(x)
+        wd = w1.float() * s1.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        gu = torch.einsum("md,end->men", xd, wd)
+        gu = gu[torch.arange(token)[:, None], ids.long()]
+        gate, up = gu.chunk(2, dim=-1)
+        swapped = torch.nn.functional.silu(gate).clamp(max=1.0) * up.clamp(-1.0, 1.0)
+        swapped_ref = stage2_reference(swapped.to(dtypes.bf16))
+        swapped_diff = logits_difference(ref, swapped_ref)
+        assert swapped_diff > 0.01, "test inputs must distinguish the clamp order"
+
+    w1_sh = shuffle_weight(w1, layout=(16, 16))
+    w2_sh = shuffle_weight(w2, layout=(16, 16))
+    out = torch.empty(token, model_dim, dtype=dtypes.bf16)
+    actual = fused_moe(
+        x,
+        w1_sh,
+        w2_sh,
+        weights,
+        ids,
+        w1_scale=s1,
+        w2_scale=s2,
+        quant_type=aiter.QuantType.per_128x128,
+        activation=aiter.ActivationType.Silu,
+        swiglu_limit=swiglu_limit,
+        output=out,
+    )
+    msg = f"blockscale limit={swiglu_limit}"
+    err = checkAllclose(ref.float(), actual.float(), rtol=0.05, atol=0.05, msg=msg)
+    logits_diff = logits_difference(ref, actual)
+    assert err < 0.05 and logits_diff < 1e-3, (err, logits_diff)
+    return {
+        "gfx": get_gfx(),
+        "ck logits_diff": logits_diff,
+        "ck err": err,
+        "swapped logits_diff": swapped_diff,
+    }
+
+
+def test_swiglu_limit_guards():
+    from aiter.ops.moe_limits import normalize_swiglu_limit as norm
+
+    def raises(error, fn, *args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except error:
+            return
+        raise AssertionError(f"expected {error.__name__}")
+
+    assert all(norm(x) is None for x in (None, 0, float("inf")))
+    assert norm(5) == 5.0
+    for invalid in (-1.0, float("nan")):
+        raises(ValueError, norm, invalid)
+    ck, asm = aiter.fused_moe.ck_moe_stage1, aiter.fused_moe.asm_stage1
+    kw = {"activation": aiter.ActivationType.Silu, "swiglu_limit": 5.0}
+    q = aiter.QuantType.No
+    raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
+    raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
+
+
+def run_blockscale_limit_cases():
+    rows = [
+        test_blockscale_swiglu_limit(token, limit)
+        for token, limit in itertools.product((1, 32, 1024), (1.0, 7.0, None))
+        # Without a limit, token > 32 takes the untuned ASM 1-stage default,
+        # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
+        if limit is not None or token <= 32
+    ]
+    aiter.logger.info(
+        "blockscale SiLU limit summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+# FP8 per_Token / per_Tensor SiLU limit: model_dim, inter_dim, experts, topk of
+# the shipped swiglu_limit=7 tuned rows. The tuned rows are gfx942 only; gfx950
+# runs the same cases on the default heuristic tiles.
+_PLAIN_FP8_LIMIT_SHAPE = (2048, 768, 128, 8)
+_PLAIN_FP8_LIMIT_GFX = ("gfx942", "gfx950")
+_plain_fp8_limit_weight_cache = {}
+
+
+def _plain_fp8_limit_weights(quant_type):
+    if quant_type in _plain_fp8_limit_weight_cache:
+        return _plain_fp8_limit_weight_cache[quant_type]
+    model_dim, inter_dim, experts, _ = _PLAIN_FP8_LIMIT_SHAPE
+    torch.manual_seed(0)
+    # Gate/up pre-activations of std ~8 put most of them past the limits swept.
+    w1 = torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16) * (
+        8.0 / model_dim**0.5
+    )
+    w2 = torch.randn(experts, model_dim, inter_dim, dtype=dtypes.bf16) / inter_dim**0.5
+    quantized = []
+    for w in (w1, w2):
+        if quant_type == aiter.QuantType.per_Tensor:
+            # One scale per expert, as the model's per-tensor checkpoints load.
+            q, scale = aiter.pertoken_quant(w.view(experts, -1), quant_dtype=dtypes.fp8)
+            q = q.view_as(w)
+        else:
+            q, scale = aiter.get_torch_quant(quant_type)(w, quant_dtype=dtypes.fp8)
+        quantized += [q, scale]
+    w1q, s1, w2q, s2 = quantized
+    weights = {
+        "w1": w1q,
+        "w1_scale": s1,
+        "w2": w2q,
+        "w2_scale": s2,
+        "w1_sh": shuffle_weight(w1q, layout=(16, 16)),
+        "w2_sh": shuffle_weight(w2q, layout=(16, 16)),
+    }
+    _plain_fp8_limit_weight_cache[quant_type] = weights
+    return weights
+
+
+@benchmark()
+def test_plain_fp8_swiglu_limit(quant_type, token, swiglu_limit):
+    model_dim, inter_dim, experts, topk = _PLAIN_FP8_LIMIT_SHAPE
+    w = _plain_fp8_limit_weights(quant_type)
+    torch.manual_seed(token)
+    x = torch.randn(token, model_dim, dtype=dtypes.bf16)
+    router = torch.randn(token, experts, dtype=dtypes.bf16)
+    weights, ids = fused_topk(x, router, topk, True)
+    torch_quant = aiter.get_torch_quant(quant_type)
+    xq, xs = torch_quant(x, quant_dtype=dtypes.fp8)
+
+    def stage2_reference(y):
+        yq, ys = torch_quant(y, quant_dtype=dtypes.fp8)
+        return torch_moe_stage2(
+            yq.view(token, topk, -1),
+            w["w1"],
+            w["w2"],
+            weights,
+            ids,
+            dtype=dtypes.bf16,
+            quant_type=quant_type,
+            w2_scale=w["w2_scale"],
+            a2_scale=ys,
+        ).float()
+
+    def stage1_reference(limit):
+        return torch_moe_stage1(
+            xq,
+            w["w1"],
+            w["w2"],
+            weights,
+            ids,
+            dtype=dtypes.bf16,
+            activation=aiter.ActivationType.Silu,
+            quant_type=quant_type,
+            a1_scale=xs,
+            w1_scale=w["w1_scale"],
+            swiglu_limit=limit,
+        )
+
+    def row_err(expected, actual):
+        # Relative L2 error of each token row; a NaN or zeroed row scores >= 1.
+        diff = (actual.float() - expected).norm(dim=1)
+        return (diff / expected.norm(dim=1)).nan_to_num(float("inf"))
+
+    ref = stage2_reference(stage1_reference(swiglu_limit))
+    unclamped_row_err = swapped_row_err = None
+    clamped = normalize_swiglu_limit(swiglu_limit) is not None
+    # The inputs must tell the clamp apart from no clamp, and at L=1 from
+    # clamp(SiLU(gate)) (L - silu(L) is 0.006 at L=7), or a pass proves nothing.
+    # Measured on gfx942: every row differs by >= 1.09 and >= 0.35.
+    if clamped:
+        unclamped = stage2_reference(stage1_reference(None))
+        unclamped_row_err = float(row_err(ref, unclamped).min())
+        assert unclamped_row_err > 0.5, f"limit not exercised: {unclamped_row_err=}"
+    if swiglu_limit == 1.0:
+        a = xq.float() * xs.float().view(-1, 1)
+        w1_scale = w["w1_scale"].float().view(experts, -1, 1)
+        gate_up = torch.zeros(token, topk, 2 * inter_dim)
+        for e in ids.unique().tolist():
+            t, k = (ids == e).nonzero(as_tuple=True)
+            gate_up[t, k] = a[t] @ (w["w1"][e].float() * w1_scale[e]).t()
+        gate, up = gate_up.chunk(2, dim=-1)
+        L = swiglu_limit
+        swapped = torch.nn.functional.silu(gate).clamp(max=L) * up.clamp(-L, L)
+        swapped_row_err = float(
+            row_err(ref, stage2_reference(swapped.to(dtypes.bf16))).min()
+        )
+        assert swapped_row_err > 0.2, f"clamp order not exercised: {swapped_row_err=}"
+
+    # NaN-filled so elements fused_moe leaves unwritten fail the comparison.
+    out = torch.full((token, model_dim), float("nan"), dtype=dtypes.bf16)
+    candidates = {
+        "fused_moe": lambda: fused_moe(
+            x,
+            w["w1_sh"],
+            w["w2_sh"],
+            weights,
+            ids,
+            w1_scale=w["w1_scale"],
+            w2_scale=w["w2_scale"],
+            quant_type=quant_type,
+            activation=aiter.ActivationType.Silu,
+            swiglu_limit=swiglu_limit,
+            output=out,
+        ),
+    }
+    flops = 6 * token * topk * model_dim * inter_dim
+    nbytes = (
+        ids.unique().numel() * 3 * inter_dim * model_dim * w["w1"].element_size()
+        + 2 * token * model_dim * x.element_size()
+    )
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "unclamped row err": unclamped_row_err,
+        "swapped row err": swapped_row_err,
+    }
+    for name, fn in candidates.items():
+        actual, us = run_perftest(fn, num_iters=20, num_warmup=3)
+        msg = f"{name} {quant_type} limit={swiglu_limit}"
+        err = checkAllclose(ref, actual.float(), rtol=0.05, atol=0.05, msg=msg)
+        # Outputs reach |64|+, where one FP8 step of the requantized stage-1
+        # output moves an element by ~0.15. Measured on gfx942: clamped rows
+        # <= 0.39% outside 0.05 and every case <= 0.036 row error. Unclamped
+        # per_Token at 64+ tokens runs the stock ASM 1-stage: 27% outside 0.05.
+        assert not clamped or err <= 0.01, f"{msg}: {err:.2%} outside rtol/atol"
+        worst_row = float(row_err(ref, actual).max())
+        assert worst_row < 0.05, f"{msg}: row error {worst_row}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+        ret[f"{name} row err"] = worst_row
+    return ret
+
+
+def test_plain_fp8_swiglu_limit_dispatch():
+    model_dim, inter_dim, experts, topk = _PLAIN_FP8_LIMIT_SHAPE
+    fused_moe_mod = sys.modules["aiter.fused_moe"]
+    fp8 = dtypes.fp8
+    quant_types = (aiter.QuantType.per_Token, aiter.QuantType.per_Tensor)
+
+    def dispatch(token, q, limit, inter=inter_dim, w_dtype=fp8):
+        get_2stage_cfgs.cache_clear()
+        return get_2stage_cfgs(
+            token,
+            model_dim,
+            inter,
+            experts,
+            topk,
+            dtypes.bf16,
+            w_dtype,
+            w_dtype,
+            q,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            swiglu_limit=limit,
+        )
+
+    def raises(error, match, fn, *args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except error as e:
+            assert match in str(e), e
+            return
+        raise AssertionError(f"expected {error.__name__} ({match})")
+
+    for q, token in itertools.product(quant_types, (1, 64, 1024)):
+        # Without a limit, 64+ per_Token tokens take ASM 1-stage.
+        for limit in (7.0, 5.0):
+            md = dispatch(token, q, limit)
+            name = md.stage1.keywords.get("kernelName", "")
+            assert md.stage1.func is fused_moe_mod.ck_moe_stage1, (q, token, limit)
+            assert not md.run_1stage and int(md.ksplit or 0) == 0, (q, token, limit)
+            assert not name or ("_silu_" in name and "Splitk" not in name), name
+        absent = dispatch(token, q, None)
+        for limit in (0.0, float("inf")):
+            md = dispatch(token, q, limit)
+            assert bool(md.run_1stage) == bool(absent.run_1stage), (q, token, limit)
+            assert int(md.ksplit or 0) == int(absent.ksplit or 0), (q, token, limit)
+            if not absent.run_1stage:
+                assert md.stage1.keywords["kernelName"] == (
+                    absent.stage1.keywords["kernelName"]
+                ), (q, token, limit)
+
+    # A row tagged with the requested limit wins; an incompatible one fails.
+    # block_m 32 instances; gfx950 FP8 uses the TypeCast CDE op and N=128 stage 2.
+    if get_gfx_runtime() == "gfx950":
+        cde1, cde2, tile2 = "TypeCast", "TypeCast", "256x32x128x256"
+    else:
+        cde1, cde2, tile2 = "MulABScale", "MulABScaleExpertWeight", "256x32x64x128"
+    kn1 = (
+        f"moe_ck2stages_gemm1_256x32x64x256_1x4_{cde1}_v1_Nswizzle0_Quant2_"
+        "MulRoutedWeight0_silu_F8_F8_B16"
+    )
+    kn2 = (
+        f"moe_ck2stages_gemm2_{tile2}_1x4_{cde2}_v1_Nswizzle0_Quant2_"
+        "MulRoutedWeight1_F8_F8_B16"
+    )
+    row = {"block_m": 32, "ksplit": 0, "run_1stage": 0, "kernelName1": kn1}
+    row.update(kernelName2=kn2, flat=0, nt=0, xbf16=0)
+    key = (get_gfx_runtime(), get_cu_num(), 1, model_dim, inter_dim, experts, topk)
+    key += ("ActivationType.Silu", str(dtypes.bf16), str(fp8), str(fp8))
+    key += (str(aiter.QuantType.per_Token), True, False)
+    cache = fused_moe_mod.cfg_2stages_by_limit_tag
+    slot = (AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE, "swiglu_limit=3")
+    saved = cache.get(slot)
+    try:
+        cache[slot] = ({key: row}, {})
+        md = dispatch(1, aiter.QuantType.per_Token, 3.0)
+        assert md.stage1.keywords["kernelName"] == kn1, md.stage1.keywords
+        assert md.stage2.keywords["kernelName"] == kn2, md.stage2.keywords
+        assert int(md.block_m) == 32, md.block_m
+        cache[slot] = ({key: {**row, "run_1stage": 1}}, {})
+        raises(ValueError, "Incompatible", dispatch, 1, aiter.QuantType.per_Token, 3.0)
+    finally:
+        if saved is None:
+            cache.pop(slot, None)
+        else:
+            cache[slot] = saved
+        get_2stage_cfgs.cache_clear()
+
+    for q in quant_types:
+        # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
+        # per_Token still has the gfx942 whole-graph backend for that shape.
+        # per_Tensor does not, so it raises.
+        if q == aiter.QuantType.per_Token and get_gfx_runtime() == "gfx942":
+            md = dispatch(64, q, 7.0, inter=192)
+            assert md.full_impl is not None and md.stage1 is None, md
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        raises(
+            NotImplementedError,
+            "swiglu_limit",
+            fused_moe_mod.asm_stage1,
+            *([None] * 6),
+            torch.empty(1, 1, 1),
+            topk,
+            32,
+            ksplit=0,
+            activation=aiter.ActivationType.Silu,
+            quant_type=q,
+            swiglu_limit=7.0,
+        )
+    raises(
+        NotImplementedError,
+        "swiglu_limit",
+        dispatch,
+        64,
+        aiter.QuantType.per_Token,
+        7.0,
+        w_dtype=dtypes.i8,
+    )
+    aiter.logger.info("moe_2stage: FP8 per_Token/per_Tensor SiLU limit dispatch passed")
+
+
+def run_plain_fp8_limit_cases():
+    if get_gfx_runtime() not in _PLAIN_FP8_LIMIT_GFX:
+        aiter.logger.warning(
+            "%s: skipping FP8 per_Token/per_Tensor SiLU limit cases (validated on %s)",
+            get_gfx_runtime(),
+            ", ".join(_PLAIN_FP8_LIMIT_GFX),
+        )
+        return
+    test_plain_fp8_swiglu_limit_dispatch()
+    # 64+ tokens select ASM 1-stage for per_Token without a limit.
+    rows = [
+        test_plain_fp8_swiglu_limit(q, token, limit)
+        for q, token, limit in itertools.product(
+            (aiter.QuantType.per_Token, aiter.QuantType.per_Tensor),
+            (1, 64, 1024),
+            (None, 0.0, float("inf"), 1.0, 7.0),
+        )
+    ]
+    aiter.logger.info(
+        "FP8 per_Token/per_Tensor SiLU limit summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+def test_swiglu_oai_flat_dispatch():
+    """MiniMax-M3 TP4 a16w4 decode (6144/768/129/top-5): tokens 1/2/4 -> asm
+    16x32, 8 -> asm 16x128 (SwiGLU OAI FLAT), 16 -> FlyDSL 2-stage. The asm
+    kernels hard-code alpha=1.702 / limit=7.0, take no bias and read GGUU
+    weights, so calls they cannot honour must fall back. Accuracy of these rows
+    runs through the tuned-CSV cases (test_fmoe, MXFP4-quantized reference)."""
+    # torch_moe reference helpers: OAI SwiGLU, not silu(gate) * up.
+    from aiter import fused_moe_dp_shared_expert as dp_moe
+
+    x = torch.randn((8, 128), device="cpu") * 4
+    gate, up = x.split([64, 64], dim=-1)
+    for act_fn in (torch_moe_act, dp_moe.torch_moe_act):
+        out = act_fn(x, None, 64, activation=aiter.ActivationType.Swiglu)
+        torch.testing.assert_close(out, swiglu(gate, up))
+
+    if get_gfx() != "gfx950" or get_cu_num() != 256:
+        aiter.logger.info(
+            "skip SwiGLU OAI FLAT dispatch test on %s/%d CUs", get_gfx(), get_cu_num()
+        )
+        return
+    expected = {
+        1: _SWIGLU_OAI_16X32,
+        2: _SWIGLU_OAI_16X32,
+        4: _SWIGLU_OAI_16X32,
+        8: _SWIGLU_OAI_16X128,
+        16: None,
+    }
+
+    def dispatched_kernel_metadata(token, gate_mode=GateMode.SEPARATED.value, **kw):
+        kw = {"gate_up_interleave": False, **kw}
+        return get_2stage_cfgs(
+            get_padded_M(token),
+            6144,
+            768,
+            129,
+            5,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            0,
+            True,
+            gate_mode,
+            opus_weights_shuffled=True,
+            **kw,
+        )
+
+    def dispatched_kernel(token, **kw):
+        metadata = dispatched_kernel_metadata(token, **kw)
+        if not (metadata.run_1stage and metadata.flat):
+            return None
+        return metadata.stage1.keywords.get("kernelName")
+
+    for token, kernel in expected.items():
+        got = dispatched_kernel(token)
+        assert got == kernel, f"{token=}: expected {kernel}, dispatched {got}"
+    for fallback in (
+        {"has_stage1_bias": True},
+        {"has_stage2_bias": True},
+        {"swiglu_limit": 5.0},
+        {"gate_mode": GateMode.INTERLEAVE.value},
+        {"gate_up_interleave": True},
+    ):
+        got = dispatched_kernel(1, **fallback)
+        assert got is None, f"{fallback}: asm row must be discarded, got {got}"
+
+    # The FLAT kernels read raw top-k routing. A SwiGLU 1-stage row with no
+    # kernel name (or not flat=1) would get host-sorted ids, so it must fall
+    # back instead of letting fmoe_g1u1 pick a FLAT kernel heuristically.
+    fused_moe_mod = sys.modules["aiter.fused_moe"]
+    primary = fused_moe_mod.cfg_2stages[0]
+    row_key = next(
+        k
+        for k, v in primary.items()
+        if v.get("kernelName1") == _SWIGLU_OAI_16X32
+        and k[2:7] == (1, 6144, 768, 129, 5)
+    )
+    tuned_row = primary[row_key]
+    try:
+        for override in (
+            {"kernelName1": ""},
+            {"kernelName1": float("nan")},
+            {"flat": AsmMoeMode.SORTED.value},
+        ):
+            primary[row_key] = {**tuned_row, **override}
+            get_2stage_cfgs.cache_clear()
+            metadata = dispatched_kernel_metadata(1)
+            assert (
+                not metadata.run_1stage
+            ), f"{override}: SwiGLU asm row must be discarded"
+    finally:
+        primary[row_key] = tuned_row
+        get_2stage_cfgs.cache_clear()
+    assert dispatched_kernel(1) == _SWIGLU_OAI_16X32
+
+    # fmoe_g1u1 itself rejects an unnamed SwiGLU OAI launch before kernel lookup.
+    dev = torch.device("cuda")
+    E, model_dim, inter_dim = 2, 512, 128
+
+    def fp4(*shape):
+        return torch.zeros(shape, dtype=torch.uint8, device=dev).view(dtypes.fp4x2)
+
+    u8 = torch.zeros(1, dtype=torch.uint8, device=dev)
+    try:
+        aiter.fmoe_g1u1(
+            torch.empty((1, model_dim), dtype=torch.bfloat16, device=dev),
+            torch.zeros((1, model_dim), dtype=torch.bfloat16, device=dev),
+            fp4(E, inter_dim * 2, model_dim // 2),
+            fp4(E, model_dim, inter_dim // 2),
+            torch.zeros(16, dtype=torch.int32, device=dev),
+            torch.zeros(16, dtype=torch.float32, device=dev),
+            torch.zeros(1, dtype=torch.int32, device=dev),
+            torch.zeros(2, dtype=torch.int32, device=dev),
+            1,
+            u8,
+            u8,
+            u8,
+            "",
+            activation=aiter.ActivationType.Swiglu.value,
+        )
+    except RuntimeError as e:
+        assert "explicit kernel name" in str(e), e
+    else:
+        raise AssertionError("fmoe_g1u1 must reject an unnamed SwiGLU OAI launch")
+    aiter.logger.info("moe_2stage: SwiGLU OAI FLAT dispatch regression test passed")
 
 
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _iter_with_env(case_iter, **env_overrides):
+    """Keep temporary environment overrides active while cases are consumed."""
+    with ExitStack() as stack:
+        for name, value in env_overrides.items():
+            stack.enter_context(override_env(name, value))
+        yield from case_iter
+
+
 _case_iters = []
-if not args.no_flydsl_csv:
-    _case_iters.append(_iter_csv_cases())
-if not args.no_legacy:
-    _case_iters.append(_iter_legacy_cases())
+test_route_workspace_token_capacity()
+if args.bm16_scale_boundary:
+    test_bm16_tiled_scale_boundary()
+else:
+    test_output_buffer_contract()
+    test_swiglu_limit_guards()
+    if get_gfx() in ("gfx942", "gfx950"):
+        run_blockscale_limit_cases()
+    run_plain_fp8_limit_cases()
+    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
+    test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_swiglu_oai_flat_dispatch()
+    # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
+    if not args.no_flydsl_csv and args.quant is None:
+        _case_iters.append(
+            _iter_with_env(
+                _iter_csv_cases(),
+                AITER_SITUV2_A8W4="1",
+                AITER_SITUV2_A4W4=None,
+            )
+        )
+    if not args.no_legacy:
+        _case_iters.append(_iter_legacy_cases())
+    test_presorted_moe_wrapper_error()
+    test_presorted_moe_block_m()
+    test_presorted_moe_output_overlap()
+    test_presorted_moe_masked_call()
+    test_presorted_moe_layout_mismatch()
+    test_presorted_moe_ignored_is_logged()
+    test_presorted_moe_compile_order()
+    # The hook test quantizes E=896 weights and times three candidates; skip it
+    # for an explicit CLI quant sweep, like the tuned-CSV validation above.
+    if args.quant is not None:
+        aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
+    elif get_gfx() == "gfx950":
+        test_presorted_moe_hook()
+    else:
+        aiter.logger.warning(
+            "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
+        )
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
@@ -880,12 +3182,14 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    swiglu_limit = _effective_swiglu_limit(
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-        args.swiglu_limit,
-    )
+    skip_reason = _moe_2stage_skip_reason(kwargs)
+    if skip_reason is not None:
+        aiter.logger.warning(
+            "skip moe_2stage case: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            skip_reason,
+        )
+        continue
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -895,18 +3199,29 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        run_test_fmoe = (
-            test_fmoe_with_aot_cache_check
-            if kwargs.get("check_aot_cache", False)
-            else test_fmoe
+        aot_guard = (
+            run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        with aot_guard:
+            ret = test_fmoe(
+                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+            )
+    except torch.cuda.OutOfMemoryError as exc:
+        aiter.logger.warning(
+            "skip moe_2stage case after OOM: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            exc,
+        )
+        ret = None
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
                 os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
             else:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
+        # Reclaim per-case VRAM to avoid OOM under fragmentation.
+        gc.collect()
+        torch.cuda.empty_cache()
     if ret is None:
         continue
     ret.update(extras)

@@ -1,0 +1,1733 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Multi-layer EP MoE end-to-end perf + accuracy on the mori v2 cco/FlyDSL op-layer.
+
+N (default 61, DeepSeek-V4-Pro) MoE layers are chained, each one a
+``MegaMoEGfx1250`` forward plus residual. Two switches pick its path:
+``--stage1_fused`` the dispatch (true: FlyDSL compact plan, false: mori) and
+``--stage2_fused`` the combine (true: gemm2-fused P2P scatter + FlyDSL reduce,
+false: plain fused_moe + mori combine). Either may be ``both``: every resulting
+configuration then runs in ONE process, sharing the weights, the tokens, the
+routings and the single fp32 reference, and lands as its own row of the summary
+table -- perf and accuracy compared column by column. (true, false) does not
+exist: the compact plan's rows only find their tokens through the gemm2 scatter.
+
+``--fused_shared_experts N`` fuses N shared experts into the MoE the way ATOM's
+DP+EP path hands them to MegaMoE (SharedExpertMode.LOCAL_REPLICA): every rank
+holds its own copy of them after its routed experts, so MegaMoE sees
+``-e + N * world`` experts and ``-k + N`` columns per token. The routed ids move
+up past the shared slots of the ranks before them, and every token gets N
+extra columns, weight 1, on its own rank's copies.
+
+``--routing`` decides how often each routed expert is picked; the top-k stays
+distinct per token either way. ``uniform`` (the default) draws it uniformly.
+``zipf`` gives the routed experts Zipf(``--zipf_s``) popularities, dealt to
+experts by a seeded permutation per layer that every rank shares, so the same
+experts run hot everywhere and their ranks receive more rows. ``zipf_rank``
+deals a different permutation on each rank, so each rank sends its own hot
+experts. ``--zipf_s 0`` is ``uniform`` again, id for id.
+
+Two isolated paths (never touch each other's intermediates; they only share the
+config, the bf16 weights and the per-layer routings):
+
+  * ``RefModel``  -- pure-torch fp32 reference (mxfp4-dequant weights, per-token
+    routed FFN, fused shared experts included, + residual, chained over N
+    layers). Uses NO mori/cco/fused_moe kernel. This is the ground truth
+    (mirrors test_moe_ep.py's torch_moe idea).
+  * ``DeviceMoEPipeline`` -- the device path: cco Communicator + MegaMoEGfx1250.
+    The whole N-layer dispatch->gemm->combine chain is captured into a SINGLE
+    CUDA graph; perf is measured with torch.profiler over graph replays (not
+    cuda.Event). Contains no fp32-reference logic.
+
+Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
+
+Launch (4x gfx1250; every env knob below is already the script's default):
+    cd <dir not under /app>   # avoid the /app/triton namespace shadow
+    torchrun --standalone --nproc_per_node=4 bench_mega_moe.py \
+      -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 \
+      --stage1_fused false --stage2_fused true
+    # --stage2_fused both adds the mori-combine baseline row that
+    # speedup_vs_base and stage2_overlap_rate are measured against.
+    # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
+    # The per-kernel table needs HIP's classic graph path: on the default one
+    # the ROCm torch profiler (roctracer) pins the names on the wrong kernels
+    # once the graph has a parallel branch (stage1_fused=true), and loses more
+    # kernel records. The classic path, though, times ~1% slower. So when a
+    # configuration runs stage1_fused, --profile_table 1 (the default) runs two
+    # passes: each rank first restarts with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 to
+    # profile only, then restarts again on the default path to time and verify.
+    # Setting DEBUG_HIP_GRAPH_CLASSIC_PATH yourself keeps it to one pass on that
+    # path; =0 drops the stage1_fused kernel tables, which that path would
+    # mislabel.
+
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
+           --stage1_fused --stage2_fused --dispatch_wire --combine --combine_quant
+           -tpr -hd -id -e -k --fused_shared_experts --routing --zipf_s -q
+           --data-init --seed --warmup --iters --prof_replays
+
+``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
+``aiter.benchmark_data_init.add_data_init_args``. ``--scale-init`` is accepted
+for CLI
+compatibility but unused here: every scale is derived by quantizing the
+generated weights, never drawn independently.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import tempfile
+import time
+
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.profiler as tprof
+
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    get_gfx,
+    get_torch_quant,
+)
+from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.utility import fp4_utils
+
+try:
+    from aiter.test_common import get_trace_perf
+except Exception:  # noqa: BLE001 # pragma: no cover
+    get_trace_perf = None
+
+# gfx1250 grouped mxfp4 kernel knobs, all overridable from the environment.
+# AITER_FORCE_A8W4 picks the ACTIVATION dtype of the grouped kernel: 0 -> fp4
+# (a4w4), 1 -> fp8 (a8w4). The weights are mxfp4 either way; -q only decides how
+# they are laid out. main() sets this from -q; the default below is the fallback.
+os.environ.setdefault("ENABLE_CK", "0")
+os.environ.setdefault("AITER_FORCE_A8W4", "0")
+os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
+os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
+
+os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
+
+# 0 withholds next_topk_ids, the way a model does: its next-layer routing depends
+# on this layer's output, so the compact plan lands on the critical path.
+_PLAN_PREFETCH = os.environ.get("AITER_MEGA_PLAN_PREFETCH", "1") != "0"
+
+QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
+# add_data_init_args' --scale-init default. Kept here so main() can tell whether
+# the caller asked for a scale distribution this test cannot honour.
+_DEFAULT_SCALE_INIT = "constant"
+
+# Internal: which pass of a split profile/time run this process is (see main()),
+# and where rank 0 of the profiling pass left its kernel tables.
+_PASS_ENV = "_BENCH_MEGA_MOE_PASS"
+_PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
+
+
+def _import_mori_comm():
+    """Import Mori's communicator (needed by every configuration)."""
+    from mori.cco import Communicator
+
+    return Communicator
+
+
+# Config / quant-path spec
+def resolve_spec(quant_key):
+    """How to prepare weights / quantize activations / call fused_moe for a quant
+    key.
+
+    Both keys are mxfp4-weight: the weights are per_1x32 either way and -q only
+    picks the activation dtype of the grouped GEMM. The gfx1250 grouped MoE GEMM
+    reads GUGU (gate/up row-interleaved) w1 only, so both ask for INTERLEAVE --
+    a SEPARATED layout is rejected outright by ``fused_moe`` on this arch.
+    """
+    return {
+        "key": quant_key,
+        "aiter_qtype": QuantType.per_1x32,
+        "gate_mode": GateMode.INTERLEAVE,
+        "activation": ActivationType.Silu,
+    }
+
+
+# The dispatch wire, honoured by every configuration.
+_DISPATCH_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+
+
+def resolve_dispatch_wire(wire, quant_key):
+    """What dispatch puts on the wire: bf16 | fp8 | fp4.
+
+    A quantizing wire is not a free choice -- the receiver hands the payload to
+    the grouped GEMM as its A operand, so it has to be the width that GEMM wants
+    (a8w4 -> fp8, a4w4 -> fp4), which is what ``auto`` resolves to. The other
+    pairing is a width error, not a slow path, so it is rejected here rather
+    than deep inside the gather.
+
+    One wire for every configuration: they differ in which kernels move the
+    tokens, and leaving them on different dispatch wires would put a payload
+    width difference on top of that.
+    """
+    if wire == "auto":
+        return _DISPATCH_WIRE_FOR_QUANT[quant_key]
+    if wire == "bf16":
+        return "bf16"
+    want = _DISPATCH_WIRE_FOR_QUANT[quant_key]
+    if wire != want:
+        raise ValueError(
+            f"-q {quant_key} wants a {want} A operand, so --dispatch_wire={wire} "
+            "would hand the GEMM the wrong payload width"
+        )
+    return wire
+
+
+def resolve_data_init(data_init):
+    """``--data-init`` is the shared ubench list form, meant to sweep several
+    distributions in one invocation. Here the weights are quantized and the whole
+    N-layer chain is captured into a CUDA graph once per process, so a run takes
+    exactly one distribution -- sweep by launching the script per distribution."""
+    dists = list(data_init) if isinstance(data_init, (list, tuple)) else [data_init]
+    if len(dists) != 1:
+        raise ValueError(
+            f"--data-init takes a single distribution here, got {dists}: the "
+            "weight quant and the graph capture are both per-run"
+        )
+    return dists[0]
+
+
+_FUSED_CHOICES = ("true", "false", "both")
+# The --combine_quant wires mori's combine (stage2_fused=false) offers.
+_MORI_COMBINE_QUANTS = ("none", "mxfp4")
+
+
+def resolve_modes(stage1_fused, stage2_fused):
+    """The (stage1_fused, stage2_fused) pairs one invocation benchmarks, in the
+    order they run, and whether ``both`` produced a pair that had to be skipped.
+
+    ``both`` expands to false then true. (true, false) is skipped when ``both``
+    produced it and rejected when asked for outright: the compact plan groups
+    the recv rows per expert, and only the gemm2 scatter maps them back."""
+
+    def values(choice):
+        return (False, True) if choice == "both" else (choice == "true",)
+
+    modes = [(s1, s2) for s1 in values(stage1_fused) for s2 in values(stage2_fused)]
+    valid = [mode for mode in modes if mode != (True, False)]
+    if not valid:
+        raise ValueError(
+            "--stage1_fused true requires --stage2_fused true: the compact plan "
+            "groups recv rows per expert, and only the gemm2 scatter maps them "
+            "back to their tokens"
+        )
+    return valid, len(valid) < len(modes)
+
+
+def mode_label(stage1_fused, stage2_fused):
+    return f"s1_{str(stage1_fused).lower()}_s2_{str(stage2_fused).lower()}"
+
+
+# Weight quantization + shuffle (device path) / dequant (reference)
+def _mxfp4_quant(w):
+    """per_1x32 mxfp4 quant: packed fp4x2 weight [E, d1, d2//2] + e8m0 scale."""
+    tq = get_torch_quant(QuantType.per_1x32)
+    w_qt, w_scale = tq(w, quant_dtype=dtypes.fp4x2)
+    w_qt = w_qt.view(w.shape[0], w.shape[1], w.shape[2] // 2)
+    return w_qt, w_scale
+
+
+def _mxfp4_dequant(w_qt, w_scale, orig_shape):
+    """Inverse of _mxfp4_quant to fp32 (matches the kernel's mxfp4_to_f32 x e8m0),
+    used by the reference so both sides see the same lossy weights."""
+    wf = fp4_utils.mxfp4_to_f32(w_qt).view(*orig_shape)
+    sf = fp4_utils.e8m0_to_f32(w_scale).view(orig_shape[0], orig_shape[1], -1)
+    sf = sf.unsqueeze(-1).expand(-1, -1, -1, 32).reshape(*orig_shape)
+    return (wf * sf).to(torch.float32)
+
+
+def _gguu_to_gugu_rows(t):
+    """`(E, 2*I, ...)` GGUU [g..,u..] -> GUGU [g0,u0,g1,u1,...]."""
+    _E, two_inter = t.shape[:2]
+    inter = two_inter // 2
+    g, u = t[:, :inter], t[:, inter:]
+    return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
+
+
+def raw_quant_weights(w1, w2):
+    """Quantize (unshuffled) a group of routed-expert weights."""
+    w1_qt, w1_s = _mxfp4_quant(w1)
+    w2_qt, w2_s = _mxfp4_quant(w2)
+    return w1_qt, w1_s, w2_qt, w2_s
+
+
+def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
+    """Layout-shuffle a group of `n_experts` quantized experts for the kernel.
+
+    Both mxfp4 keys share the grouped gfx1250 layout (GUGU-interleaved w1 + the
+    n32k4 e8m0 B-scale). The only difference is the weight DTYPE handed to
+    ``fused_moe``: it keys off ``w1.dtype`` to pick the activation dtype, so
+    uint8 selects the fp8-activation (a8w4) kernel and fp4x2 the fp4-activation
+    (a4w4) one. See ``grouped_moe_gfx1250._grouped_a8w4_tdm_moe``.
+    """
+    w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
+    w1_a = shuffle_weight(w1_phys, layout=(16, 16))
+    w2_a = shuffle_weight(w2_qt.view(torch.uint8), layout=(16, 16))
+    w1_ss = moe_shuffle_scale(
+        w1_s.contiguous(),
+        experts_cnt=n_experts,
+        is_guinterleave=True,
+        gate_up=True,
+    )
+    w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
+    if spec["key"] == "a4w4_mxfp4":
+        w1_a = w1_a.view(dtypes.fp4x2)
+        w2_a = w2_a.view(dtypes.fp4x2)
+    return w1_a, w2_a, w1_ss, w2_ss
+
+
+# Shared setup (fed to BOTH reference and device path)
+_WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
+_WEIGHT_AMPL = 0.1  # weight amplitude, was the literal `/ 10` below
+
+
+def make_shared_weights(
+    E, hdim, idim, dtype, dev, n_shared=0, seed=_WEIGHT_SEED, data_dist="norm"
+):
+    """One weight set reused by every layer. Same seed on all ranks so the global
+    expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2),
+    sw1/sw2 holding the ``n_shared`` fused shared experts (None without).
+
+    ``data_dist`` is a ``--data-init`` distribution. Every mode is scaled down by
+    _WEIGHT_AMPL: at unit amplitude the narrow fp4/fp8 activation quant saturates
+    and the N-layer residual chain diverges to NaN after a few layers."""
+    gen = make_generator(seed, device=dev)
+
+    def _w(experts, rows, cols):
+        # fill() only row-chunks its fp32 staging for 2-D shapes, so ask for the
+        # flat [experts*rows, cols] and view it back: at E=384 that caps the
+        # staging near 1 GiB instead of materializing the set in fp32.
+        w = fill((experts * rows, cols), data_dist, gen, dtype=dtype, device=dev)
+        return w.mul_(_WEIGHT_AMPL).view(experts, rows, cols)
+
+    w1 = _w(E, 2 * idim, hdim)
+    w2 = _w(E, hdim, idim)
+    sw1 = sw2 = None
+    if n_shared > 0:
+        sw1 = _w(n_shared, 2 * idim, hdim)
+        sw2 = _w(n_shared, hdim, idim)
+    return w1, w2, sw1, sw2
+
+
+ROUTING_MODES = ("uniform", "zipf", "zipf_rank")
+# Seeds the popularity permutations of --routing zipf/zipf_rank. Kept apart from
+# the per-rank token seeds so that zipf deals the SAME hot experts on every rank.
+_POPULARITY_SEED = 5150
+
+
+def _zipf_log_popularity(E, zipf_s, seed, dev):
+    """log p over the E routed experts: p is Zipf(zipf_s) over popularity ranks,
+    and a permutation seeded by ``seed`` deals those ranks to the experts, so the
+    hot experts land on random EP ranks instead of all on rank 0. A CPU
+    generator keeps the deal identical on every device."""
+    rank_of = torch.randperm(E, generator=torch.Generator().manual_seed(seed))
+    p = torch.arange(1, E + 1, dtype=torch.float64).pow(-float(zipf_s))[rank_of]
+    return (p / p.sum()).log().to(device=dev, dtype=torch.float32)
+
+
+def make_routings(
+    n_layers,
+    ct,
+    E,
+    topk,
+    dev,
+    seed,
+    expert_balance=False,
+    routing="uniform",
+    zipf_s=0.0,
+    popularity_seed=_POPULARITY_SEED,
+):
+    """Build retained per-layer routing for device and reference replay.
+
+    ``expert_balance`` mirrors ``AITER_MOE_EXPERT_BALANCE`` in
+    ``test_moe_2stage.py``: route slots walk the experts round-robin. Otherwise,
+    top-k is selected from random scores. Weights stay random and normalized in
+    both modes.
+
+    ``routing`` other than ``uniform`` skews which experts the scores pick: layer
+    ``l`` adds the log popularities dealt by ``popularity_seed + l`` to Gumbel
+    noise made from the same uniform draw, and its top-k is then a draw of
+    ``topk`` distinct experts without replacement, each pick proportional to its
+    popularity (Gumbel-top-k). Gumbel noise is monotone in the uniform draw, so
+    ``zipf_s=0`` picks exactly the uniform ids.
+    """
+    routings = []
+    balanced_ids = None
+    if expert_balance:
+        balanced_ids = (
+            torch.arange(ct * topk, device=dev, dtype=torch.int64) % E
+        ).reshape(ct, topk)
+    for layer_idx in range(n_layers):
+        gen = torch.Generator(device=dev).manual_seed(seed + layer_idx)
+        if expert_balance:
+            ids = balanced_ids
+        else:
+            score = torch.rand(ct, E, generator=gen, device=dev, dtype=torch.float32)
+            if routing != "uniform":
+                log_p = _zipf_log_popularity(
+                    E, zipf_s, popularity_seed + layer_idx, dev
+                )
+                # u == 0 scores -inf: that expert just cannot be picked there.
+                score = log_p - torch.log(-torch.log(score))
+            _, ids = score.topk(topk, dim=-1)  # distinct experts per token
+        wts = torch.rand(ct, topk, generator=gen, device=dev, dtype=torch.float32)
+        wts = wts / wts.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        routings.append((ids.to(dtypes.i32), wts))
+    return routings
+
+
+# ATOM fuses routed_scaling_factor into the routed weights, which leaves the
+# shared columns at 1.
+_SHARED_EXPERT_WEIGHT = 1.0
+
+
+def _append_shared_columns(ids, wts, first_id, n_shared):
+    shared_ids = torch.arange(
+        first_id, first_id + n_shared, dtype=ids.dtype, device=ids.device
+    ).expand(ids.shape[0], n_shared)
+    shared_wts = torch.full(
+        (ids.shape[0], n_shared),
+        _SHARED_EXPERT_WEIGHT,
+        dtype=wts.dtype,
+        device=wts.device,
+    )
+    return torch.cat((ids, shared_ids), dim=1), torch.cat((wts, shared_wts), dim=1)
+
+
+def shared_logical_routings(routings, E, n_shared):
+    """The reference's view: routed ids as they are, the fused shared experts as
+    ids E..E+n_shared-1."""
+    return [_append_shared_columns(ids, wts, E, n_shared) for ids, wts in routings]
+
+
+def shared_dispatch_routings(routings, routed_per_rank, rank, n_shared):
+    """MegaMoE's view: rank r owns slots [r*S, r*S + S), S = routed_per_rank +
+    n_shared, its routed experts first and its copies of the shared ones last. A
+    routed id moves up by n_shared for every rank before its own, and the shared
+    columns point at this rank's copies, so they never leave the rank."""
+    first_shared = rank * (routed_per_rank + n_shared) + routed_per_rank
+    out = []
+    for ids, wts in routings:
+        moved = ids + n_shared * torch.div(ids, routed_per_rank, rounding_mode="floor")
+        out.append(_append_shared_columns(moved, wts, first_shared, n_shared))
+    return out
+
+
+def routing_load_report(dist_ctx, routings, experts, n_shared):
+    """How the dispatch-space ``routings`` load the EP ranks (collective).
+
+    Every rank counts its routes per dispatch-space expert; rank 0 folds them
+    into one dict of the numbers that tell a skewed routing from a uniform one:
+    remote routes and distinct remote ranks per token (mean over layers), and
+    the hottest routed expert's rows over the routed mean and the busiest
+    rank's received rows over the mean (worst layer). Shared slots (the last
+    ``n_shared`` of each rank) are left out of the expert ratio: they take
+    exactly one row per local token by construction. Non-zero ranks get None."""
+    world, rank = dist_ctx.world, dist_ctx.rank
+    epr = experts // world
+    local = []
+    for ids, _wts in routings:
+        dest = ids.long() // epr
+        remote = dest != rank
+        # distinct remote ranks per token: one bit per destination rank
+        seen = torch.zeros(ids.shape[0], world, dtype=torch.bool, device=ids.device)
+        seen.scatter_(1, dest, True)
+        seen[:, rank] = False
+        local.append(
+            (
+                torch.bincount(ids.long().flatten(), minlength=experts).cpu(),
+                int(remote.sum()),
+                int(seen.sum()),
+                int(ids.shape[0]),
+            )
+        )
+    gathered = dist_ctx.gather_objects(local)
+    if rank != 0:
+        return None
+    routed_slot = torch.ones(experts, dtype=torch.bool)
+    for r in range(world):
+        routed_slot[(r + 1) * epr - n_shared : (r + 1) * epr] = False
+    stats = {"remote": [], "remote_ranks": [], "hot_expert": [], "busy_rank": []}
+    for layer in range(len(routings)):
+        load = sum(per_rank[layer][0] for per_rank in gathered).double()
+        tokens = sum(per_rank[layer][3] for per_rank in gathered)
+        rows_per_rank = load.view(world, epr).sum(dim=1)
+        routed = load[routed_slot]
+        stats["remote"].append(sum(p[layer][1] for p in gathered) / tokens)
+        stats["remote_ranks"].append(sum(p[layer][2] for p in gathered) / tokens)
+        stats["hot_expert"].append(float(routed.max() / routed.mean()))
+        stats["busy_rank"].append(float(rows_per_rank.max() / rows_per_rank.mean()))
+    return {
+        "remote_routes_per_token": sum(stats["remote"]) / len(stats["remote"]),
+        "remote_ranks_per_token": sum(stats["remote_ranks"])
+        / len(stats["remote_ranks"]),
+        "hot_expert_over_mean": max(stats["hot_expert"]),
+        "busy_rank_over_mean": max(stats["busy_rank"]),
+    }
+
+
+def _rmsnorm(x, eps=1e-6):
+    """RMSNorm (no learnable gain) on the last dim. Applied to each layer's MoE
+    input so activations stay unit-scale across the 61-layer residual chain --
+    without it the narrow activation quant (fp4/fp8) saturates and the chain
+    diverges to NaN after a few layers. Both device and reference use the SAME
+    normalization."""
+    xf = x.float()
+    n = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return n.to(x.dtype)
+
+
+def _calc_diff(x, y):
+    """1 - cosine similarity (fp64), mirrors test_moe_ep.py::_calc_diff."""
+    x, y = x.double(), y.double()
+    denom = (x * x + y * y).sum()
+    if denom == 0:
+        return 0.0
+    return float(1 - 2 * (x * y).sum() / denom)
+
+
+# Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
+# topk=6, --combine fused).
+#
+# _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
+# errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
+# about linearly in the layer count, then saturates as it approaches the bound.
+# Measured:
+#
+#                   L=1       L=2       L=4       L=8
+#   a4w4 mxfp8   0.021877  0.042683  0.080897  0.144881
+#   a8w4 mxfp8   0.001433  0.002871  0.005742  0.011369
+#   a4w4 mxfp4   0.028256  0.054782  0.102433  0.179518
+#   a8w4 mxfp4   0.007935  0.015777  0.030955  0.059003
+#
+# slope * L / (1 + sat * L) reproduces every row within 1%, so scaling that curve
+# keeps the SAME headroom at every layer count. A flat tol cannot: 0.1 rejects a
+# healthy 8-layer a4w4 run (0.145) yet passes anything at all on a8w4.
+#
+# The wire has to key the table alongside the quant: e2m1 keeps ~3 effective bits,
+# which costs a8w4 5.5x -- its GEMM baseline is small enough that the wire dominates
+# it -- against 1.3x on a4w4. mxfp8 in turn costs a flat +32% on a8w4 and +1.6% on
+# a4w4 over a bf16 wire, so bf16 rides the mxfp8 row.
+_ACC_TOL = {  # (quant key, combine wire) -> (per-layer slope, saturation)
+    ("a4w4_mxfp4", "mxfp8"): (0.0225, 0.031),
+    ("a8w4_mxfp4", "mxfp8"): (0.00143, 0.0012),
+    ("a4w4_mxfp4", "mxfp4"): (0.0296, 0.04),
+    ("a8w4_mxfp4", "mxfp4"): (0.0081, 0.012),
+}
+_ACC_TOL_SAFETY = 1.5
+
+
+def default_logits_tol(quant_key, combine_quant, n_layers):
+    # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
+    # Keyed on the COMBINE wire only: --stage2_fused false leaves it bf16 (its
+    # dispatch wire tracks --dispatch_wire, same as the fused combine's), and
+    # --combine_quant none does too; both stay under the mxfp8 curve.
+    slope, sat = _ACC_TOL[quant_key, "mxfp4" if combine_quant == "mxfp4" else "mxfp8"]
+    return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
+
+
+# torchrun rendezvous helper
+class Dist:
+    def __init__(self):
+        self.rank = int(os.environ["RANK"])
+        self.world = int(os.environ["WORLD_SIZE"])
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        if not dist.is_initialized():
+            # A split run's passes share one torchrun store; a per-pass key
+            # prefix keeps the later pass off the gloo keys the earlier one left.
+            store, _, _ = next(dist.rendezvous("env://"))
+            dist.init_process_group(
+                backend="gloo",
+                store=dist.PrefixStore(os.environ.get(_PASS_ENV, "single"), store),
+                rank=self.rank,
+                world_size=self.world,
+            )
+        torch.cuda.set_device(self.local_rank)
+
+    def bcast_uid(self, uid):
+        objs = [uid if self.rank == 0 else None]
+        dist.broadcast_object_list(objs, src=0)
+        return objs[0]
+
+    def allreduce_sum(self, value):
+        t = torch.tensor([value], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item())
+
+    def allreduce_avg_float(self, value):
+        """Average a scalar float across all ranks (collective; call on every rank)."""
+        t = torch.tensor([float(value)], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return float(t.item()) / self.world
+
+    def gather_objects(self, obj):
+        """All-gather a python object from every rank (collective). Returns a list
+        indexed by rank."""
+        out = [None] * self.world
+        dist.all_gather_object(out, obj)
+        return out
+
+    def shutdown(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Reference: pure-torch fp32 multi-layer chained MoE (ground truth, ISOLATED)
+class RefModel:
+    """fp32 reference. mxfp4-dequant weights (shared, lazily per expert), per-token
+    FFN summed over the routing's columns -- ids past the routed experts are the
+    fused shared ones, quantized the same way -- chained N layers with a
+    residual. Uses only torch + fp4_utils -- NO mori/cco/fused_moe. Runs in fp32
+    on `dev`; for tractable memory/time use a modest token count for --check."""
+
+    def __init__(self, w1_bf, w2_bf, sw1, sw2, spec, dev):
+        self.w1_bf, self.w2_bf = w1_bf, w2_bf
+        self.sw1, self.sw2 = sw1, sw2
+        self.spec = spec
+        self.dev = dev
+        self._cache = {}
+
+    def _expert(self, g):
+        wd = self._cache.get(g)
+        if wd is None:
+            n_routed = self.w1_bf.shape[0]
+            if g < n_routed:
+                w1_g = self.w1_bf[g : g + 1]
+                w2_g = self.w2_bf[g : g + 1]
+            else:
+                w1_g = self.sw1[g - n_routed : g - n_routed + 1]
+                w2_g = self.sw2[g - n_routed : g - n_routed + 1]
+            w1_qt, w1_s = _mxfp4_quant(w1_g)
+            w2_qt, w2_s = _mxfp4_quant(w2_g)
+            w1d = _mxfp4_dequant(w1_qt, w1_s, (1, *w1_g.shape[1:]))[0]
+            w2d = _mxfp4_dequant(w2_qt, w2_s, (1, *w2_g.shape[1:]))[0]
+            wd = self._cache[g] = (w1d, w2d)
+        return wd
+
+    @staticmethod
+    def _ffn(x, w1d, w2d):
+        gate, up = (x @ w1d.t()).chunk(2, dim=-1)
+        return (torch.nn.functional.silu(gate) * up) @ w2d.t()
+
+    def layer(self, x, ids, wts):
+        """x [ct,H] fp32; ids/wts [ct,topk]. RMSNorm the input, then the routed
+        FFN. Returns the block output [ct,H] fp32 (caller adds the residual)."""
+        xn = _rmsnorm(x)
+        out = torch.zeros_like(xn)
+        ids_l = ids.long()
+        for g in torch.unique(ids_l).tolist():
+            sel = ids_l == g
+            rows = sel.any(dim=1)
+            w = (wts * sel).sum(dim=1)
+            w1d, w2d = self._expert(int(g))
+            out[rows] += w[rows, None] * self._ffn(xn[rows], w1d, w2d)
+        return out
+
+    def run(self, x0, routings):
+        """Chain N layers with residual: x = x + layer(x). Returns bf16 [ct,H]."""
+        x = x0.float()
+        for ids, wts in routings:
+            x = x + self.layer(x, ids, wts)
+        return x.to(dtypes.bf16)
+
+
+# Device pipeline: N-layer dispatch->gemm->combine, one CUDA graph (ISOLATED)
+class DeviceMoEPipeline:
+    """Owns the cco Communicator + MegaMoEGfx1250 + a8w4 shuffled weights: this
+    rank's routed experts followed by its copies of the fused shared ones, the
+    layout ``routings`` (already in dispatch space) points into.
+    Each layer recomputes its own routing inside dispatch (e2e-faithful), and the
+    whole N-layer chain is captured into ONE CUDA graph and timed with
+    torch.profiler. No fp32-reference logic here."""
+
+    def __init__(
+        self,
+        dist_ctx,
+        E,
+        hdim,
+        idim,
+        topk,
+        spec,
+        n_layers,
+        w1_bf,
+        w2_bf,
+        sw1,
+        sw2,
+        routings,
+        ct,
+        stage1_fused=False,
+        stage2_fused=True,
+        combine_quant="none",
+    ):
+        self.dist_ctx = dist_ctx
+        self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
+        self.spec = spec
+        self.n_layers = n_layers
+        self.w1_bf, self.w2_bf = w1_bf, w2_bf
+        self.sw1, self.sw2 = sw1, sw2
+        self.routings = routings
+        self.ct = ct
+        self.stage1_fused = stage1_fused
+        self.stage2_fused = stage2_fused
+        self.combine_quant = combine_quant
+        self.EPR = E // dist_ctx.world
+        self.n_shared = 0 if sw1 is None else sw1.shape[0]
+        self.dev = torch.device("cuda", dist_ctx.local_rank)
+        self.comm = None
+        self.mega = None
+        self.graph = None
+        self.x0_static = None
+        self.out_static = None
+
+    # ---- initialization (grouped together) ---- #
+    def setup(self, x0):
+        Communicator = _import_mori_comm()
+        # torch.cuda.set_device sets the process HIP current device (== driver
+        # hipSetDevice) that cco keys off; Dist already set it, repeat for safety.
+        torch.cuda.set_device(self.dist_ctx.local_rank)
+        r = self.dist_ctx.rank
+
+        # this rank's LOCAL expert weights (quant + layout shuffle), a8w4.
+        w1_g = self.w1_bf[r * self.EPR : (r + 1) * self.EPR]
+        w2_g = self.w2_bf[r * self.EPR : (r + 1) * self.EPR]
+        if self.n_shared:
+            w1_g = torch.cat((w1_g, self.sw1))
+            w2_g = torch.cat((w2_g, self.sw2))
+        q1, gs1, q2, gs2 = raw_quant_weights(w1_g.contiguous(), w2_g.contiguous())
+        self.w1_a, self.w2_a, self.w1_s, self.w2_s = shuffle_group(
+            q1, gs1, q2, gs2, self.spec, self.EPR + self.n_shared
+        )
+
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+            MegaMoEGeometry,
+            MegaMoEGfx1250,
+            MegaMoERecipe,
+        )
+
+        # The recipe + geometry are per-model, so they are fixed here; the
+        # weights are per-layer and go to each forward() call. ONE op, reused by
+        # every layer. max_tokens_per_rank = ct.
+        recipe = MegaMoERecipe.from_legacy(
+            stage1_fused=self.stage1_fused,
+            stage2_fused=self.stage2_fused,
+            # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
+            dispatch_wire=self.spec["dispatch_wire"],
+            combine_quant=self.combine_quant,
+            activation=self.spec["activation"],
+            gate_mode=self.spec["gate_mode"].value,
+            quant_type=self.spec["aiter_qtype"],
+        )
+        geometry = MegaMoEGeometry(
+            rank=r,
+            world_size=self.dist_ctx.world,
+            model_dim=self.hdim,
+            inter_dim=self.idim,
+            experts=self.E + self.n_shared * self.dist_ctx.world,
+            topk=self.topk + self.n_shared,
+            max_tokens_per_rank=self.ct,
+        )
+        # The communicator carries nothing but this op's arena.
+        uid = Communicator.get_unique_id() if r == 0 else None
+        uid = self.dist_ctx.bcast_uid(uid)
+        self.comm = Communicator.init(
+            self.dist_ctx.world,
+            r,
+            uid,
+            per_rank_vmm=MegaMoEGfx1250.required_vmm_bytes(recipe, geometry),
+        )
+        self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=self.comm)
+        self.comm.barrier()
+
+    # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
+    def _layer_step(self, x, layer_idx):
+        ids, wts = self.routings[layer_idx]
+        xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
+        next_ids = (
+            self.routings[layer_idx + 1][0]
+            if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
+            else None
+        )
+        y = self.mega(
+            xn,
+            wts,
+            ids,
+            w1=self.w1_a,
+            w2=self.w2_a,
+            w1_scale=self.w1_s,
+            w2_scale=self.w2_s,
+            next_topk_ids=next_ids,
+            # Named per step, not inherited from construction: building the
+            # reduce and running it are separate decisions now.
+            combine_quant=self.combine_quant,
+        )
+        return x + y  # residual
+
+    def _pipeline(self, x0):
+        x = x0
+        if _PLAN_PREFETCH:
+            self.mega.prefetch_compact_plan(self.routings[0][0])
+        for layer_idx in range(self.n_layers):
+            x = self._layer_step(x, layer_idx)
+        return x
+
+    # ---- CUDA graph capture (all N layers in ONE graph) ---- #
+    # Eager passes before the capture. NOT a measurement knob, hence not on the
+    # CLI: they prime the fused_moe lru_cache, the JIT and the allocator, and
+    # without them that work would land inside the capture and fail it. 3 is what
+    # torch's own CUDA-graph guidance warms up with.
+    _CAPTURE_WARMUP = 3
+
+    def capture(self, x0):
+        self.x0_static = x0.clone()
+        # warmup on a side stream: primes fused_moe lru_cache + allocator.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(self._CAPTURE_WARMUP):
+                self._pipeline(self.x0_static)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.out_static = self._pipeline(self.x0_static)
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
+    # ---- perf: graph-replay wall-clock + torch.profiler breakdown ---- #
+    def bench(self, warmup=5, iters=10):
+        """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
+        already contains all N layers, so ONE replay is one full chain; `iters` of
+        them are timed individually after `warmup` untimed ones.
+        Returns stats = {min, median, mean, max} in us.
+
+        - a sample is the host wall-clock of one graph replay (one sync after; not
+          cuda.Event). For a GPU-bound MoE chain this ~= GPU time.
+        - min is the closest to an undisturbed replay, median to the steady state
+          of a GPU held at full load; the two drifting apart is what a straggler
+          rank or a throttled clock looks like, hence both are reported."""
+        assert iters >= 1, f"--iters must time at least one replay, got {iters}"
+
+        for _ in range(warmup):
+            self.graph.replay()
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
+        # each full N-layer graph replay is one measurement.
+        samples = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            self.graph.replay()
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - t0) * 1e6)
+        self.comm.barrier()
+
+        samples.sort()
+        return {
+            "min": samples[0],
+            "median": samples[len(samples) // 2],
+            "mean": sum(samples) / len(samples),
+            "max": samples[-1],
+        }
+
+    def profile(self, warmup=5, prof_replays=3):
+        """torch.profiler over `prof_replays` graph replays, after `warmup`
+        untimed ones, for the per-kernel breakdown. roctracer/kineto does surface
+        the per-kernel timeline inside the graph on this build, so this profiles
+        the actual graph (matches the measured per-layer wall) instead of a
+        separate eager pass. Returns prof_us.
+
+        NOTE: this ROCm torch build reports self_device_time_total == 0 for every
+        event (verified even for a plain matmul), so torch.profiler cannot give a
+        device-time number here; it is kept for the per-op (CPU-side) breakdown.
+        If a future build populates device time, prof_us below becomes > 0."""
+        for _ in range(warmup):
+            self.graph.replay()
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
+        with tprof.profile(
+            activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
+        ) as prof:
+            for _ in range(prof_replays):
+                self.graph.replay()
+            torch.cuda.synchronize()
+        self.comm.barrier()
+        self._prof = prof
+        return sum(_event_device_us(e) for e in prof.key_averages())
+
+    def final_output(self):
+        self.graph.replay()
+        torch.cuda.synchronize()
+        return self.out_static.detach().clone()
+
+    def teardown(self):
+        # Drop the graph and its static tensors too, not just the mori handles:
+        # with a `both` switch the next configuration captures its own N-layer
+        # graph right after this, and this graph's pool would otherwise stay
+        # reserved.
+        self.graph = None
+        self.x0_static = None
+        self.out_static = None
+        self._prof = None
+        if self.mega is not None:
+            self.mega.close()
+            self.mega = None
+        if self.comm is not None:
+            self.comm.destroy()
+            self.comm = None
+
+
+def _event_device_us(e):
+    """GPU-side self time (us) of a profiler key_averages event, across torch
+    versions (self_device_time_total on newer, self_cuda_time_total on older)."""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        v = getattr(e, attr, None)
+        if v:
+            return float(v)
+    return 0.0
+
+
+def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers, label):
+    """Replay the Mega graph while every rank monitors its local GPU.
+
+    The configuration's `label` goes into the SMI label so a run with a `both`
+    switch does not file two different pipelines under the same name."""
+    if os.environ.get("AITER_SMI_MONITOR", "0") != "1":
+        return
+
+    from aiter.smi_monitor import GpuMonitor, emit_smi_result
+
+    interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+    duration_s = float(os.environ.get("AITER_SMI_DURATION", "1.0"))
+    if interval_s <= 0 or duration_s <= 0 or median_us <= 0:
+        raise ValueError(
+            "Mega MoE SMI interval, duration and measured median must be positive"
+        )
+    replay_count = max(1, math.ceil(duration_s * 1e6 / median_us))
+
+    monitor = None
+    monitor_error = None
+    try:
+        monitor = GpuMonitor(
+            device_index=torch.cuda.current_device(), interval_s=interval_s
+        )
+        monitor.start()
+    except Exception as error:  # noqa: BLE001 - propagate to every rank
+        monitor_error = f"rank {dist_ctx.rank}: {type(error).__name__}: {error}"
+
+    monitor_errors = dist_ctx.gather_objects(monitor_error)
+    failed = [error for error in monitor_errors if error is not None]
+    if failed:
+        if monitor is not None:
+            monitor.stop()
+        raise RuntimeError("Mega MoE SMI monitor failed to start: " + "; ".join(failed))
+
+    # Gloo barriers align CPU submission without adding a GPU collective to the
+    # measured Mega graph window. Every rank executes exactly the same replay
+    # count; a local duration loop would diverge and deadlock the collectives.
+    dist.barrier()
+    window_start = time.perf_counter()
+    for _ in range(replay_count):
+        pipe.graph.replay()
+        torch.cuda.synchronize()
+    window_end = time.perf_counter()
+    monitor.stop()
+    dist.barrier()
+
+    samples = [
+        sample
+        for sample in monitor.samples
+        if window_start <= sample["timestamp_s"] <= window_end
+    ]
+    expected_samples = max(1, int(duration_s / interval_s))
+    base_label = os.environ.get("AITER_SMI_LABEL", "mega_moe")
+    local_result = {
+        "label": f"{base_label}/{label}/mega_graph_{n_layers}_layers",
+        "device": dist_ctx.local_rank,
+        "rank": dist_ctx.rank,
+        "interval_s": interval_s,
+        "duration_s": window_end - window_start,
+        "launches": replay_count,
+        "samples": len(samples),
+        "sample_status": (
+            "ok" if len(samples) >= max(2, expected_samples // 2) else "insufficient"
+        ),
+        "metrics": monitor.summary(start_s=window_start, end_s=window_end),
+    }
+    results = dist_ctx.gather_objects(local_result)
+    if dist_ctx.rank == 0:
+        for result in results:
+            emit_smi_result(result)
+
+
+def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
+    """Collect the torch.profiler per-kernel table ACROSS ranks (collective; call
+    on every rank). Each rank contributes {name: (self_device_us_total, count)};
+    rank 0 returns rows with each kernel's per-call self device time with ONE
+    COLUMN PER RANK plus the cross-rank mean, so a straggler (a throttled GPU, an
+    unbalanced expert distribution) shows up as a row that disagrees across
+    columns instead of being averaged away. `-` means the kernel never ran there.
+
+    Rows are ordered by total self device time (mean over ranks), so the kernels
+    that dominate the budget come first regardless of their per-call cost. Also
+    prints the TOTAL over ALL kernels and the implied device time per layer
+    (total / per_layer_denom, where per_layer_denom = replays * n_layers) so it
+    can be compared against the measured per_layer wall -- if they match, the GPU
+    has no idle bubble. Non-zero ranks return None."""
+    local = {}
+    for e in prof.key_averages():
+        local[e.key] = (_event_device_us(e), int(e.count))
+    per_rank = dist_ctx.gather_objects(local)
+    if dist_ctx.rank != 0:
+        return None
+    world = len(per_rank)
+    rows = []
+    total_self = 0.0
+    for name in {n for d in per_rank for n in d}:
+        present = [d[name] for d in per_rank if name in d]
+        avg_self = sum(s for s, _ in present) / len(present)
+        avg_count = sum(c for _, c in present) / len(present)
+        total_self += avg_self
+        per_call = [
+            (d[name][0] / d[name][1] if d.get(name) and d[name][1] else None)
+            for d in per_rank
+        ]
+        seen = [v for v in per_call if v is not None]
+        pc_avg = sum(seen) / len(seen) if seen else 0.0
+        rows.append((avg_self, name, per_call, pc_avg, avg_count))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
+    # Every kernel runs a whole number of times per layer, so a count off that
+    # grid means the profiler lost records: avg_us is per recorded call and
+    # holds, the totals undercount.
+    complete = True
+    for avg_self, _name, _per_call, _pc_avg, avg_count in rows:
+        per_layer = avg_count / per_layer_denom if per_layer_denom else 1.0
+        if avg_self > 0 and (
+            round(per_layer) < 1 or abs(per_layer - round(per_layer)) > 0.05
+        ):
+            complete = False
+    table_rows = []
+    for _avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
+        row = {
+            "kernel": name,
+            "avg_us": pc_avg,
+            "calls": avg_count,
+        }
+        row.update({f"rank{rank}_us": value for rank, value in enumerate(per_call)})
+        table_rows.append(row)
+    return {
+        "rows": table_rows,
+        "summary": [
+            {
+                "world_size": world,
+                "profiled_kernels": len(rows),
+                "total_self_device_us": total_self,
+                "device_us_per_layer": dev_per_layer,
+                "events_complete": complete,
+            }
+        ],
+    }
+
+
+def _stage2_overlap_rate(base, fused, idim):
+    """How much of stage 2's communication the fused combine hides behind gemm2.
+
+    ``base`` and ``fused`` are the kernel rows of a stage2_fused=false and a
+    stage2_fused=true run. Stage 2 is the second expert GEMM and everything
+    that moves its output home. base splits that into compute -- the K{idim}
+    GEMM plus the gather-reduce that lands the result -- and communication, the
+    mori combine; the two are separate kernels, so base pays for them back to
+    back. fused folds the scatter into the GEMM itself, so its stage 2 is that
+    one (heavier) GEMM plus the small fused combine. Whatever the sum of base's
+    two halves loses by becoming the fused total is time fused managed to
+    overlap, and the most it could ever hide is the smaller of the two halves --
+    hence the min() denominator, which puts a perfect overlap at 1.0 and no
+    overlap at 0.0.
+
+    Both fused combine kernels count, the sync one included: it is the wait the
+    fused path did not manage to hide, and dropping it would book that wait as
+    successful overlap.
+
+    gemm2 is matched by its K{idim} contraction, which is what separates it from
+    gemm1's K{hidden}. Returns None if any kernel the formula needs is absent, so
+    a run without kernel tables simply carries no rate."""
+
+    def total_us(rows, match):
+        hits = [r["avg_us"] for r in rows if match(r["kernel"])]
+        return sum(hits) if hits else None
+
+    if not base or not fused:
+        return None
+
+    def is_gemm2(name):
+        return f"_K{idim}_" in name
+
+    parts = (
+        total_us(base, is_gemm2),
+        total_us(base, lambda n: n.startswith("moe_gather_reduce")),
+        total_us(base, lambda n: n.startswith("mori_ep_combine")),
+        total_us(fused, is_gemm2),
+        total_us(fused, lambda n: n.startswith("ep_combine_fused")),
+    )
+    if any(p is None for p in parts):
+        return None
+    base_gemm2, base_gather, base_comm, fused_gemm2, fused_comm = parts
+    compute = base_gemm2 + base_gather
+    comm = base_comm
+    if min(compute, comm) <= 0:
+        return None
+    return (compute + comm - (fused_gemm2 + fused_comm)) / min(compute, comm)
+
+
+def _emit_table(name, rows, max_col_width=120):
+    """Print the rows twice: an aligned frame for whoever opens the log, then the
+    one machine-readable line the benchmark driver consumes.
+
+    Both render the same DataFrame -- print_json_table builds one anyway to
+    serialize it -- so the readable half costs nothing but keeps a 6 KB JSON line
+    from being the only view of a 21-kernel table. A single row is transposed;
+    with several rows the columns that hold the same value everywhere are hoisted
+    into a one-line prefix, which is what keeps the 20+ config columns of the
+    summary from repeating down the table.
+
+    Columns are capped at 100 characters by default to keep long kernel symbols
+    readable in the aligned table."""
+    df = pd.DataFrame([row for row in rows if row is not None])
+    print(f"\n# {name}", flush=True)
+    if df.empty:
+        print("# (no rows)", flush=True)
+    else:
+        # Decide what is constant BEFORE rounding: base and fused logits_diff
+        # agree to 4 decimals, and rounding first would hoist that difference out
+        # of the table as if the two modes had returned the same number.
+        const = [c for c in df.columns if df[c].nunique(dropna=False) == 1]
+        # Significant digits, not decimal places: the same table carries 555528.154
+        # us and a 0.475270 logits_diff, and rounding both to 3 decimals would
+        # print the two modes' accuracy as an identical 0.475.
+        for column in df.select_dtypes(include="float").columns:
+            df[column] = df[column].map(
+                lambda v: v if pd.isna(v) else float(f"{v:.6g}")
+            )
+        if len(df) == 1:
+            # astype(object) keeps each value's own type; transposing a numeric
+            # frame would otherwise widen the ints to float and print "4.000".
+            print(df.astype(object).T.to_string(header=False), flush=True)
+        else:
+            if const:
+                print(
+                    "# " + " ".join(f"{c}={df[c].iloc[0]}" for c in const), flush=True
+                )
+                df = df.drop(columns=const)
+            print(
+                df.to_string(index=False, max_colwidth=max_col_width),
+                flush=True,
+            )
+    print_json_table(name, rows)
+
+
+def _reexec():
+    """Restart this rank in a fresh interpreter with the current os.environ.
+    Same pid, so torchrun keeps tracking the rank."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+
+def _hand_off_to_timing_pass(dist_ctx, kernel_rows, prof_us):
+    """End the classic-path profiling pass: rank 0 parks its kernel tables in a
+    temp file, then every rank restarts on the default graph path to time."""
+    if dist_ctx.rank == 0:
+        fd, path = tempfile.mkstemp(prefix="bench_mega_moe_prof_", suffix=".json")
+        # JSON keys are strings, so each (stage1_fused, stage2_fused) goes as
+        # a list entry.
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {
+                    "kernel_rows": [
+                        [*mode, rows] for mode, rows in kernel_rows.items()
+                    ],
+                    "prof_us": [[*mode, us] for mode, us in prof_us.items()],
+                },
+                f,
+            )
+        os.environ[_PROFILE_FILE_ENV] = path
+    dist_ctx.shutdown()
+    os.environ[_PASS_ENV] = "time"
+    del os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"]
+    _reexec()
+
+
+def _take_profiling_pass_results():
+    """(kernel_rows, prof_us) the profiling pass left for this rank; only rank 0
+    gets any."""
+    path = os.environ.pop(_PROFILE_FILE_ENV, None)
+    if path is None:
+        return {}, {}
+    with open(path) as f:
+        data = json.load(f)
+    os.remove(path)
+    return (
+        {(s1, s2): rows for s1, s2, rows in data["kernel_rows"]},
+        {(s1, s2): us for s1, s2, us in data["prof_us"]},
+    )
+
+
+# Driver
+def main():
+    args = _parse_args()
+    # HIP reads its debug flags once, when the runtime starts, and importing
+    # aiter has already started it -- so the graph path only changes in a fresh
+    # interpreter. Only a stage1_fused graph has the parallel branch that gets
+    # mislabelled, so only a run with one is split: a "profile" pass on the
+    # classic path, then a "time" pass on the default one. Every other run is
+    # one "single" pass on whatever path the environment picks.
+    modes, skipped_unfused_compact = resolve_modes(args.stage1_fused, args.stage2_fused)
+    any_compact = any(stage1_fused for stage1_fused, _ in modes)
+    if (
+        args.profile_table
+        and any_compact
+        and _PASS_ENV not in os.environ
+        and "DEBUG_HIP_GRAPH_CLASSIC_PATH" not in os.environ
+    ):
+        os.environ[_PASS_ENV] = "profile"
+        os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"] = "1"
+        _reexec()
+    run_pass = os.environ.get(_PASS_ENV, "single")
+    profile_pass = run_pass == "profile"
+    dist_ctx = Dist()
+    dev = torch.device("cuda", dist_ctx.local_rank)
+    # Set, not setdefault: the wire has to match this, so a stale environment
+    # value would otherwise make -q a4w4_mxfp4 silently measure a8w4.
+    os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
+    spec = resolve_spec(args.quant_type)
+    spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
+
+    if get_gfx() != "gfx1250":
+        if dist_ctx.rank == 0:
+            print(f"skip: MegaMoEGfx1250 requires gfx1250, got {get_gfx()}")
+        dist_ctx.shutdown()
+        return
+
+    E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
+    n_shared = args.fused_shared_experts
+    ct, n_layers = args.token_per_rank, args.layers
+    expert_balance = (
+        os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+    )
+    assert (
+        E % dist_ctx.world == 0
+    ), f"E={E} must be divisible by world_size={dist_ctx.world}"
+    assert n_shared >= 0, f"--fused_shared_experts must be >= 0, got {n_shared}"
+    if args.routing != "uniform" and expert_balance:
+        raise ValueError(
+            f"--routing {args.routing} skews random scores, which "
+            "AITER_MOE_EXPERT_BALANCE=true replaces with a fixed round-robin"
+        )
+
+    data_dist = resolve_data_init(args.data_init)
+
+    classic_graph = os.environ.get("DEBUG_HIP_GRAPH_CLASSIC_PATH") == "1"
+    # Whether every configuration's kernel table can be taken on this graph
+    # path; the loop skips the ones that cannot.
+    labels_ok = classic_graph or not any_compact
+    run_profiler = bool(args.profile_table) and run_pass != "time"
+    if dist_ctx.rank == 0:
+        print(
+            f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
+            f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
+            f"stage1_fused={args.stage1_fused} stage2_fused={args.stage2_fused} "
+            f"dispatch_wire={spec['dispatch_wire']} "
+            f"combine_quant={args.combine_quant} "
+            f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
+            f"gate={spec['gate_mode'].name} fused_shared_experts={n_shared} "
+            f"routing={args.routing}"
+            f"{f' zipf_s={args.zipf_s}' if args.routing != 'uniform' else ''} "
+            f"expert_balance={expert_balance} data_init={data_dist} "
+            f"seed={args.seed} gfx={get_gfx()} "
+            f"hip_graph={'classic' if classic_graph else 'default'} pass={run_pass}",
+            flush=True,
+        )
+        if profile_pass:
+            print(
+                "# note: profiling pass on the HIP classic graph path, which labels "
+                "the kernel table right; timing and accuracy follow on the default "
+                "path in a fresh process",
+                flush=True,
+            )
+        elif classic_graph:
+            print(
+                "# note: HIP classic graph path (DEBUG_HIP_GRAPH_CLASSIC_PATH=1) "
+                "labels the kernel table right but times ~1% slower than the "
+                "default path -- unset it to time the default path",
+                flush=True,
+            )
+        elif run_pass == "single" and args.profile_table and not labels_ok:
+            print(
+                "# note: stage1_fused kernel tables and stage2_overlap_rate skipped "
+                "-- the default HIP graph path mislabels that graph's kernels; "
+                "unset DEBUG_HIP_GRAPH_CLASSIC_PATH to profile on the classic path",
+                flush=True,
+            )
+        if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:
+            print(
+                f"# note: --scale-init {' '.join(args.scale_init)} is ignored -- "
+                "every scale here comes from quantizing the generated weights",
+                flush=True,
+            )
+        if n_shared:
+            print(
+                f"# note: fused shared experts -- MegaMoE sees "
+                f"experts={E + n_shared * dist_ctx.world} topk={topk + n_shared} "
+                f"EPR={E // dist_ctx.world + n_shared}",
+                flush=True,
+            )
+        if skipped_unfused_compact:
+            print(
+                "# note: skipping stage1_fused=true stage2_fused=false -- the "
+                "compact plan needs the gemm2 scatter",
+                flush=True,
+            )
+
+    # ---- shared inputs: weights (same on all ranks) + this rank's tokens/routing.
+    # args.seed shifts all RNG; weights stay rank-independent (identical global
+    # experts), tokens/routing vary per rank. Default keeps runs reproducible.
+    # --data-init picks how the weights and the layer-0 tokens are filled; the
+    # routing stays random in every mode, since a zero/constant routing would
+    # collapse every token onto expert 0 and stop measuring dispatch/combine.
+    w1_bf, w2_bf, sw1, sw2 = make_shared_weights(
+        E,
+        hdim,
+        idim,
+        dtypes.bf16,
+        dev,
+        n_shared=n_shared,
+        seed=_WEIGHT_SEED + args.seed,
+        data_dist=data_dist,
+    )
+    x0 = fill(
+        (ct, hdim),
+        data_dist,
+        make_generator(1000 + dist_ctx.rank + args.seed, device=dev),
+        dtype=dtypes.bf16,
+        device=dev,
+    )
+    routings = make_routings(
+        n_layers,
+        ct,
+        E,
+        topk,
+        dev,
+        seed=4242 + 100 * dist_ctx.rank + args.seed,
+        expert_balance=expert_balance,
+        routing=args.routing,
+        zipf_s=args.zipf_s,
+        # zipf deals the same popularities on every rank, zipf_rank its own.
+        popularity_seed=_POPULARITY_SEED
+        + args.seed
+        + (100_000 * (dist_ctx.rank + 1) if args.routing == "zipf_rank" else 0),
+    )
+    ref_routings = dispatch_routings = routings
+    if n_shared:
+        ref_routings = shared_logical_routings(routings, E, n_shared)
+        dispatch_routings = shared_dispatch_routings(
+            routings, E // dist_ctx.world, dist_ctx.rank, n_shared
+        )
+    # Collective, so every rank builds it; rank 0 prints it and files it on
+    # every summary row so a log says which load it measured.
+    routing_load = routing_load_report(
+        dist_ctx, dispatch_routings, E + n_shared * dist_ctx.world, n_shared
+    )
+    if dist_ctx.rank == 0:
+        print(
+            "# routing load: "
+            + " ".join(f"{k}={v:.3f}" for k, v in routing_load.items()),
+            flush=True,
+        )
+
+    # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench,
+    # once per (stage1_fused, stage2_fused) configuration. Every rank walks
+    # `modes` in the same order, so the collectives inside the loop stay in step.
+    summary_rows = []
+    outputs = {}
+    # Per configuration, kept for the stage-2 overlap rate below; the time pass
+    # inherits them from the profile pass.
+    kernel_rows, prof_us_by_mode = {}, {}
+    if run_pass == "time":
+        kernel_rows, prof_us_by_mode = _take_profiling_pass_results()
+    for stage1_fused, stage2_fused in modes:
+        label = mode_label(stage1_fused, stage2_fused)
+        mode = stage1_fused, stage2_fused
+        combine_quant = args.combine_quant
+        if not stage2_fused and combine_quant not in _MORI_COMBINE_QUANTS:
+            combine_quant = "none"
+        if dist_ctx.rank == 0 and len(modes) > 1:
+            print(f"# ---- {label} ----", flush=True)
+        if dist_ctx.rank == 0 and combine_quant != args.combine_quant:
+            print(
+                f"# note: {label} combines through mori, which has no "
+                f"{args.combine_quant} wire -- running it on bf16",
+                flush=True,
+            )
+        pipe = DeviceMoEPipeline(
+            dist_ctx,
+            E,
+            hdim,
+            idim,
+            topk,
+            spec,
+            n_layers,
+            w1_bf,
+            w2_bf,
+            sw1,
+            sw2,
+            dispatch_routings,
+            ct,
+            stage1_fused=stage1_fused,
+            stage2_fused=stage2_fused,
+            combine_quant=combine_quant,
+        )
+        pipe.setup(x0)
+        pipe.capture(x0)
+        if not profile_pass:
+            stats = pipe.bench(warmup=args.warmup, iters=args.iters)
+            # Aggregate perf across ranks (collective calls -> run on every rank,
+            # and the dict is built in the same order everywhere so the
+            # allreduces stay in step).
+            stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
+            per_layer_us = stats["median"] / n_layers
+            _run_distributed_smi_replay(
+                pipe, dist_ctx, stats["median"], n_layers, label
+            )
+        # The default graph path mislabels a stage1_fused graph's kernels, and
+        # stage2_overlap_rate is read off those names, so neither is taken there.
+        if run_profiler and (classic_graph or not stage1_fused):
+            # The profile pass has not replayed the graph yet, so it warms up here.
+            prof_us = pipe.profile(
+                warmup=args.warmup if profile_pass else 0,
+                prof_replays=args.prof_replays,
+            )
+            prof_us_by_mode[mode] = dist_ctx.allreduce_avg_float(prof_us)
+            # Collective, so every rank calls it; only rank 0 gets the table.
+            tbl = _aggregate_prof_table(
+                pipe._prof,
+                dist_ctx,
+                per_layer_denom=args.prof_replays * n_layers,
+            )
+            if dist_ctx.rank == 0 and tbl is not None:
+                kernel_rows[mode] = tbl["rows"]
+            # Save a chrome/perfetto timeline per rank so the actual kernel
+            # timeline (and any gaps) can be inspected directly. Opt-in
+            # (--save_trace): the export can stall multi-rank graph-profile runs,
+            # so it is off by default.
+            if args.save_trace:
+                _trace_path = f"/tmp/mega_trace_{label}_rank{dist_ctx.rank}.json"
+                try:
+                    pipe._prof.export_chrome_trace(_trace_path)
+                    if dist_ctx.rank == 0:
+                        print(
+                            f"# trace saved: /tmp/mega_trace_{label}_rank*.json",
+                            flush=True,
+                        )
+                except Exception as _e:  # noqa: BLE001
+                    if dist_ctx.rank == 0:
+                        print(f"# trace export failed: {_e}", flush=True)
+            # One table per configuration, tagged with it: each runs a different
+            # kernel mix, so merging them into a single table would compare rows
+            # that never ran in the same pipeline.
+            if dist_ctx.rank == 0 and tbl is not None:
+                if not tbl["summary"][0]["events_complete"]:
+                    print(
+                        f"# note: {label} profiler lost kernel records -- avg_us "
+                        "holds, total_self_device_us and device_us_per_layer "
+                        "undercount",
+                        flush=True,
+                    )
+                _emit_table(f"mega_moe kernel profile [{label}]", tbl["rows"])
+                _emit_table(
+                    f"mega_moe kernel profile summary [{label}]", tbl["summary"]
+                )
+        if not profile_pass:
+            # Replay once more for the accuracy snapshot while the graph is still
+            # alive; teardown below frees it.
+            if args.acc_verify:
+                outputs[label] = pipe.final_output().float()
+                # MEGA_OUT_DUMP=<prefix>: this rank's logits, for a bitwise A/B
+                # between pipeline variants (e.g. AITER_MEGA_S1F=0/1).
+                if os.environ.get("MEGA_OUT_DUMP"):
+                    torch.save(
+                        outputs[label].cpu(),
+                        f"{os.environ['MEGA_OUT_DUMP']}_{label}_r{dist_ctx.rank}.pt",
+                    )
+            summary_rows.append(
+                {
+                    "quant_type": args.quant_type,
+                    "stage1_fused": stage1_fused,
+                    "stage2_fused": stage2_fused,
+                    "combine_quant": combine_quant,
+                    "data_init": data_dist,
+                    "seed": args.seed,
+                    "world_size": dist_ctx.world,
+                    "tokens_per_rank": ct,
+                    "experts": E,
+                    "topk": topk,
+                    "fused_shared_experts": n_shared,
+                    "routing": args.routing,
+                    "zipf_s": args.zipf_s if args.routing != "uniform" else None,
+                    **(routing_load or {}),
+                    "hidden": hdim,
+                    "intermediate": idim,
+                    "layers": n_layers,
+                    "warmup": args.warmup,
+                    "iters": args.iters,
+                    "min_us": stats["min"],
+                    "mean_us": stats["mean"],
+                    "median_us": stats["median"],
+                    "max_us": stats["max"],
+                    "per_layer_us": per_layer_us,
+                    "prof_device_us": prof_us_by_mode.get(mode) or None,
+                }
+            )
+        pipe.teardown()
+        del pipe
+        torch.cuda.empty_cache()
+    if profile_pass:
+        _hand_off_to_timing_pass(dist_ctx, kernel_rows, prof_us_by_mode)
+
+    # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
+    # ONE reference for every configuration: they differ only in how dispatch and
+    # combine move the tokens, so they answer to the same ground truth -- and
+    # this reference is by far the most expensive part of the run.
+    failures = []
+    if args.acc_verify:
+        auto_tol = args.logits_tol is None
+        ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
+        ref_out = ref.run(x0, ref_routings).float()
+        for row in summary_rows:
+            label = mode_label(row["stage1_fused"], row["stage2_fused"])
+            tol = (
+                default_logits_tol(args.quant_type, row["combine_quant"], n_layers)
+                if auto_tol
+                else args.logits_tol
+            )
+            tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
+            logits_diff = _calc_diff(ref_out, outputs[label])
+            errs = dist_ctx.allreduce_sum(0 if logits_diff < tol else 1)
+            avg_diff = dist_ctx.allreduce_avg_float(logits_diff)
+            row["logits_diff"] = avg_diff
+            row["logits_tol"] = tol
+            row["accuracy"] = "PASS" if errs == 0 else "FAIL"
+            if dist_ctx.rank == 0:
+                print(
+                    f"# MEGA-CHECK {label} layers={n_layers}: "
+                    f"{'PASS' if errs == 0 else 'FAIL'} "
+                    f"(avg logits_diff={avg_diff:.6f} over {dist_ctx.world} ranks, "
+                    f"tol={tol_desc})",
+                    flush=True,
+                )
+            if errs != 0:
+                failures.append(
+                    f"{label} failed on {errs}/{dist_ctx.world} "
+                    f"ranks: average logits_diff={avg_diff:.6f}, "
+                    f"tolerance={tol_desc}"
+                )
+
+    # The summary goes last so every row carries BOTH its perf and its accuracy.
+    # With more than one configuration the rows line up column by column, and
+    # speedup_vs_base measures each against the unfused (false, false) one.
+    if len(summary_rows) > 1:
+
+        def is_base(row):
+            return not row["stage1_fused"] and not row["stage2_fused"]
+
+        base_median = next((r["median_us"] for r in summary_rows if is_base(r)), None)
+        if base_median:
+            for row in summary_rows:
+                row["speedup_vs_base"] = base_median / row["median_us"]
+        # Needs both kernel tables, so it only exists when they were profiled on
+        # a graph path that labels them right. It describes what the fused
+        # combine did with base's stage 2, so it belongs on the (false, true)
+        # row; base is the 0.0 baseline. Not on a compact stage 1: its gemm2 runs
+        # a different grid, and the formula would book that difference as
+        # overlap.
+        overlap = _stage2_overlap_rate(
+            kernel_rows.get((False, False)), kernel_rows.get((False, True)), idim
+        )
+        if overlap is not None:
+            for row in summary_rows:
+                if not row["stage1_fused"]:
+                    row["stage2_overlap_rate"] = overlap if row["stage2_fused"] else 0.0
+    if dist_ctx.rank == 0:
+        _emit_table("mega_moe summary", summary_rows)
+
+    dist_ctx.shutdown()
+    if failures:
+        raise AssertionError("MegaMoE accuracy check failed -- " + "; ".join(failures))
+
+
+def _parse_args():
+    # Imported here, not at module scope: pulling in the mega package before
+    # FLYDSL_GPU_ARCH is set below would hand flydsl the wrong arch.
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import read_dispatch_wire_env
+
+    p = argparse.ArgumentParser(description="multi-layer EP MoE perf + accuracy")
+    p.add_argument(
+        "-q",
+        "--quant_type",
+        type=str,
+        choices=QUANT_KEYS,
+        default="a4w4_mxfp4",
+        help="quantization type",
+    )
+    p.add_argument(
+        "-tpr", "--token_per_rank", type=int, default=128, help="tokens per rank"
+    )
+    p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
+    p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")
+    p.add_argument(
+        "-e", "--expert", type=int, default=384, help="routed experts (global)"
+    )
+    p.add_argument("-k", "--topk", type=int, default=6, help="top-k")
+    p.add_argument(
+        "--fused_shared_experts",
+        type=int,
+        default=0,
+        help="shared experts fused into the MoE as a per-rank replica, the way "
+        "ATOM's DP+EP path runs them (see the module docstring)",
+    )
+    p.add_argument(
+        # Kept so the old spelling fails with a pointer rather than
+        # "unrecognized arguments": the dense shared FFN it drove is gone.
+        "--shared_experts",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--routing",
+        type=str,
+        choices=ROUTING_MODES,
+        default="uniform",
+        help="how often each routed expert is picked: uniform | zipf (Zipf "
+        "popularities shared by every rank) | zipf_rank (each rank its own); "
+        "see the module docstring",
+    )
+    p.add_argument(
+        "--zipf_s",
+        type=float,
+        default=0.5,
+        help="Zipf exponent of the routed-expert popularities under --routing "
+        "zipf/zipf_rank; 0 is uniform",
+    )
+    p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
+    # The shared ubench data-init knobs: --data-init, --scale-init and --seed.
+    # default_dist=norm reproduces the historical N(0,1)*0.1 weights, which is
+    # what the _ACC_TOL budget was calibrated against.
+    add_data_init_args(p, default_dist="norm", default_scale=_DEFAULT_SCALE_INIT)
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="untimed graph replays before the timed ones",
+    )
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=1,
+        help="timed graph replays; each one is a full --layers chain, reported as "
+        "min/median/mean/max",
+    )
+    p.add_argument(
+        "--prof_replays",
+        type=int,
+        default=3,
+        help="graph replays profiled for the --profile_table breakdown",
+    )
+    p.add_argument(
+        "--logits_tol",
+        type=float,
+        default=None,
+        help="end-to-end accuracy tol; default: the budget for --layers at this "
+        "quant and combine wire (see _ACC_TOL)",
+    )
+    p.add_argument(
+        "--acc_verify", type=int, default=1, help="run fp32 reference accuracy check"
+    )
+    p.add_argument(
+        "--profile_table", type=int, default=1, help="print per-kernel table"
+    )
+    p.add_argument(
+        "--save_trace",
+        type=int,
+        default=0,
+        help="export a chrome/perfetto timeline per rank to /tmp (opt-in; "
+        "can stall multi-rank graph-profile runs)",
+    )
+    p.add_argument(
+        "--stage1_fused",
+        type=str.lower,
+        choices=_FUSED_CHOICES,
+        default="false",
+        help="dispatch: true = FlyDSL compact plan fused with dispatch (needs an "
+        "fp8/fp4 --dispatch_wire), false = mori dispatch, both = run each",
+    )
+    p.add_argument(
+        "--stage2_fused",
+        type=str.lower,
+        choices=_FUSED_CHOICES,
+        default="true",
+        help="combine: true = gemm2-fused P2P scatter + FlyDSL reduce, false = "
+        "plain fused_moe + mori combine, both = run each. stage1_fused=true "
+        "needs stage2_fused=true",
+    )
+    p.add_argument(
+        "--dispatch_wire",
+        type=str,
+        choices=["auto", "bf16", "fp8", "fp4"],
+        default=(
+            read_dispatch_wire_env()
+            if "MEGA_DISPATCH_WIRE" in os.environ or "MEGA_WIRE" in os.environ
+            else "auto"
+        ),
+        help="what dispatch puts on the wire, in every configuration: bf16 sends "
+        "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
+        "on the sender and forward the e8m0 row. 'auto' picks what the quant "
+        "key's GEMM wants.",
+    )
+    p.add_argument(
+        "--combine_quant",
+        type=str,
+        choices=["none", "mxfp8", "mxfp4"],
+        default=os.environ.get("COMBINE_QUANT", "none"),
+        help="combine wire dtype: none (bf16) | mxfp8 (fp8 e4m3 payload) | mxfp4 "
+        "(fp4 e2m1 payload), both with a per-1x32 e8m0 scale plane. The mori "
+        "combine (stage2_fused=false) has no mxfp8 and runs those rows on bf16. "
+        "Falls back to $COMBINE_QUANT.",
+    )
+    args = p.parse_args()
+    if args.shared_experts is not None:
+        p.error(
+            "--shared_experts (a dense shared FFN added after the MoE) is gone; "
+            "use --fused_shared_experts N, which runs the shared experts inside "
+            "the MoE as a per-rank replica"
+        )
+    return args
+
+
+if __name__ == "__main__":
+    main()

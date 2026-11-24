@@ -23,6 +23,7 @@ limitations under the License.
 
 import os
 from functools import lru_cache
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -85,8 +86,8 @@ def generate_data(
 
 
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
-    scaleA = scaleA
-    scaleB = scaleB
+    scaleA = scaleA  # noqa: PLW0127
+    scaleB = scaleB  # noqa: PLW0127
     if indtype == dtypes.fp8:
         x = inp.to(dtypes.fp32) * scaleA
         weight = weights.to(dtypes.fp32) * scaleB
@@ -155,8 +156,12 @@ class Gemm:
         verbose=False,
         rtol=None,
         atol=None,
+        policy=None,
     ):
+        from aiter.utility.selection_policy import active_policy
+
         torch.cuda.empty_cache()
+        self.policy = active_policy() if policy is None else policy
         self.m = m
         self.k = k
         self.n = n
@@ -302,6 +307,7 @@ class Gemm:
             fast_mode == 1,
             timeout=self.timeout,
             verbose=self.verbose,
+            policy=self.policy,
         )
         if fast_mode == 1:
             self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
@@ -359,6 +365,9 @@ class Gemm:
 
     def run_solutions(self):
         self.run_fast_solutions()
+        # The fast screen keeps only topn by latency. A power winner can sit
+        # outside that window, so the accurate pass has to time every solution.
+        self.topn = self.policy.accurate_count(self.topn, len(self.hipb_sols))
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
@@ -376,7 +385,7 @@ class Gemm:
 
 
 class GemmTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
@@ -424,30 +433,34 @@ class GemmTuner(GemmCommonTuner):
 
     def __init__(
         self,
-        key=[
-            "gfx",
-            "cu_num",
-            "M",
-            "N",
-            "K",
-            "bias",
-            "dtype",
-            "outdtype",
-            "scaleAB",
-            "bpreshuffle",
-        ],
-        resultList=[
-            "libtype",
-            "solidx",
-            "splitK",
-            "us",
-            "kernelName",
-            "err_ratio",
-            "tflops",
-            "bw",
-        ],
+        key=None,
+        resultList=None,
         description="GemmTuner (hipblaslt-only)",
     ):
+        if resultList is None:
+            resultList = [
+                "libtype",
+                "solidx",
+                "splitK",
+                "us",
+                "kernelName",
+                "err_ratio",
+                "tflops",
+                "bw",
+            ]
+        if key is None:
+            key = [
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "bias",
+                "dtype",
+                "outdtype",
+                "scaleAB",
+                "bpreshuffle",
+            ]
         super().__init__(
             "GemmTuner",
             key=key,
@@ -462,14 +475,14 @@ class GemmTuner(GemmCommonTuner):
         self.num_warmup = 10
 
     def _clear_op_caches(self):
-        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+        from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
 
         get_GEMM_A16W16_config_.cache_clear()
         get_GEMM_A16W16_config.cache_clear()
 
     def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
         from aiter.tuned_gemm import gemm_a16w16
-        from aiter.test_common import run_perftest, checkAllclose
 
         untunedf = self.untunedf
         results = []
@@ -540,7 +553,7 @@ class GemmTuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
@@ -553,10 +566,10 @@ class GemmTuner(GemmCommonTuner):
         outbpe,
     ):
         """calculate TFLOPS and bandwidth"""
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time <= 0:
             return -1, -1
-        gfx, cu_num, m, n, k = info
+        _gfx, _cu_num, m, n, k = info
         flops = m * n * k * 2
         tflops = round(flops / (time * 1000000), 2)
 
@@ -700,6 +713,7 @@ class GemmTuner(GemmCommonTuner):
                 num_warmup=self.num_warmup,
                 timeout=args.timeout,
                 verbose=args.verbose,
+                policy=self.policy_for(args),
             )
 
             ret.extend(gemmobj.run_solutions())
@@ -711,8 +725,10 @@ class GemmTuner(GemmCommonTuner):
         return ret
 
     def processResult(self, rets, fast_mode):
+        columns = list(self.columns)
         results = []
-        for info, us, err_ratio in rets:
+        for el in rets:
+            info, us, err_ratio = el
             res_one = []
             solidx = info[1]
             splitK = info[2]
@@ -720,8 +736,7 @@ class GemmTuner(GemmCommonTuner):
             libtype = info[4]
             res_one.append(get_gfx())
             res_one.append(get_cu_num())
-            for ele in info[0]:
-                res_one.append(ele)
+            res_one.extend(info[0])
 
             res_one.append(libtype)
             res_one.append(int(solidx))
@@ -742,19 +757,26 @@ class GemmTuner(GemmCommonTuner):
             )
             res_one.append(tflops)
             res_one.append(bw)
+            extra, _watt_text = self.policy.result_metrics(el, tflops)
+            for name, values in extra.items():
+                if name not in columns:
+                    columns.append(name)
+                res_one.extend(values)
 
             results.append(res_one)
-        gtimedf = pd.DataFrame(results, columns=self.columns)
-        gtimedf = gtimedf.sort_values(by="us")
+        gtimedf = pd.DataFrame(results, columns=columns)
+        gtimedf = self.policy.sort_frame(gtimedf)
         return gtimedf
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         from collections import defaultdict
 
+        policy = self.policy_for(args)
         grouped_rets = defaultdict(list)
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info, us, max_err_ratio))
+        for el in rets:
+            info, _us, _max_err_ratio = el
+            grouped_rets[info[0]].append(el)
 
         grouped_results = list(grouped_rets.items())
         gtimedf_dic = {}
@@ -766,6 +788,7 @@ class GemmTuner(GemmCommonTuner):
                 gtimedf_dic.values(),
                 ignore_index=True,
             )
+            resultsdf = self.power_metrics(resultsdf)
         else:
             resultsdf = pd.DataFrame(self.columns)
         self.save_profile(resultsdf, args.profile_file)
@@ -773,7 +796,7 @@ class GemmTuner(GemmCommonTuner):
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():
             gtimedf_dic[key] = df[df["err_ratio"] < args.errRatio]
-            best_gtimedf = gtimedf_dic[key].sort_values(by="us")
+            best_gtimedf = policy.sort_frame(gtimedf_dic[key])
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No valid hipblaslt solutions found!", flush=True)
@@ -788,7 +811,10 @@ class GemmTuner(GemmCommonTuner):
             else:
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
-            print(f"{key} >>> Fastest Solution is \n {resultdf1}", flush=True)
+            print(
+                f"{key} >>> selected ({policy.name}) solution is \n {resultdf1}",
+                flush=True,
+            )
         return best_gtimedfs
 
     def save_profile(self, timedf, profile_file):
@@ -802,7 +828,7 @@ class GemmTuner(GemmCommonTuner):
             resultsdf.to_csv(profile_file, index=False)
 
     def set_run_iters(self, input, inputdtype):
-        gfx, cu_num, m, n, k, *rest = input
+        _gfx, _cu_num, m, n, k, *_rest = input
         flops = m * n * k * 2
         if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30

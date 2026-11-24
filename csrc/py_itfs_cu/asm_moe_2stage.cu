@@ -217,6 +217,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int stride_X = input->stride(0) * input->element_size();
     int stride_GU = dim * w1->element_size();
 
+    // This 2-stage ASM kernel only supports fp32 weight/activation scales
+    // (per_Token / per_1x128 quant). It must NOT receive an fp8_e8m0-viewed
+    // scale: eGUQs below assumes 4-byte fp32 elements, so a 1-byte e8m0 view
+    // inflates the expert stride 4x and reads weight scales out of bounds.
+    AITER_CHECK(!w1_scale || w1_scale->dtype() == AITER_DTYPE_fp32, __func__,
+                " expects fp32 w1_scale, got ", AiterDtype_to_str(w1_scale->dtype()));
+    AITER_CHECK(!a1_scale || a1_scale->dtype() == AITER_DTYPE_fp32, __func__,
+                " expects fp32 a1_scale, got ", AiterDtype_to_str(a1_scale->dtype()));
+
     int stride_expert_GU = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale ? w1_scale->stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);

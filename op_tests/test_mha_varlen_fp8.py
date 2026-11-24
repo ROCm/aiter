@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import math
+
+import pandas as pd
+import pytest
 import torch
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, per_tensor_quant
+from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.test_common import run_perftest
-from aiter import per_tensor_quant
 from aiter.test_mha_common import (
+    attention_ref,
     generate_qkv,
     generate_random_padding_mask,
 )
-import pytest
-import pandas as pd
-import argparse
-import math
 
 benchmark = {}
 
@@ -32,8 +35,41 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    return_lse=False,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        if return_lse:
+
+            def run_fp8_lse():
+                out, lse, _, _ = _flash_attn_varlen_forward(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    None,
+                    None,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    min_seqlen_q,
+                    0.0,
+                    q.shape[-1] ** -0.5,
+                    causal=causal,
+                    logits_soft_cap=0.0,
+                    window_size_left=int(window_size[0]),
+                    window_size_right=int(window_size[1]),
+                    sink_size=0,
+                    bias=None,
+                    alibi_slopes=None,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_lse=True,
+                    return_softmax=False,
+                )
+                return out, lse
+
+            return run_perftest(run_fp8_lse)
         return run_perftest(
             aiter.flash_attn_varlen_fp8_pertensor_func,
             q,
@@ -111,6 +147,7 @@ def test_flash_attn_varlen_output(
     min_seqlen_q,
     causal,
     local,
+    return_lse=False,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -169,7 +206,7 @@ def test_flash_attn_varlen_output(
     k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
     v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
-    out, us_quant_fwd = run_ck(
+    quant_result, us_quant_fwd = run_ck(
         q_quant,
         k_quant,
         v_quant,
@@ -183,7 +220,12 @@ def test_flash_attn_varlen_output(
         q_descale,
         k_descale,
         v_descale,
+        return_lse,
     )
+    if return_lse:
+        out, lse = quant_result
+    else:
+        out = quant_result
 
     out_ref, us_fwd = run_ck(
         q,
@@ -210,6 +252,31 @@ def test_flash_attn_varlen_output(
     print(f"Output nrms: {nrms}")
     print(f"Output max diff: {max_diff}")
     assert max_diff < 0.055
+
+    if return_lse:
+        q_dequant = q_quant.float() * q_descale
+        k_dequant = k_quant.float() * k_descale
+        v_dequant = v_quant.float() * v_descale
+        lse_ref_parts = []
+        for i in range(len(cu_seqlens_q) - 1):
+            q_start, q_end = cu_seqlens_q[i : i + 2].tolist()
+            k_start, k_end = cu_seqlens_k[i : i + 2].tolist()
+            _, _, lse_ref_part = attention_ref(
+                q_dequant[q_start:q_end].unsqueeze(0),
+                k_dequant[k_start:k_end].unsqueeze(0),
+                v_dequant[k_start:k_end].unsqueeze(0),
+                causal=causal,
+                window_size=window_size,
+                upcast=True,
+            )
+            lse_ref_parts.append(lse_ref_part.squeeze(0))
+        lse_ref = torch.cat(lse_ref_parts, dim=1)
+        finite = torch.isfinite(lse_ref)
+        assert torch.equal(torch.isneginf(lse), torch.isneginf(lse_ref))
+        lse_max_diff = (lse[finite] - lse_ref[finite]).abs().max().item()
+        print(f"LSE max diff: {lse_max_diff}")
+        assert lse_max_diff < 0.01
+        benchmark["lse_max_diff"] = lse_max_diff
 
     fwd_flop = 0
     dtype_bytes = torch.finfo(dtype).bits // 8
@@ -328,6 +395,11 @@ parser.add_argument(
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
+parser.add_argument(
+    "--lse",
+    action="store_true",
+    help="Request and verify log-sum-exp output.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -348,6 +420,7 @@ if __name__ == "__main__":
         args.min_seqlen_q,
         args.causal,
         args.local,
+        args.lse,
     )
     collected.append(benchmark)
 

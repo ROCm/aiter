@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
+    _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -22,6 +22,10 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     grids (large ``num_local_heads``) amortize per-program constant work
     (cos/sin offset prep, etc.) better with larger BM; small head grids need
     more M-tiles for occupancy, which favors smaller BM.
+
+    Arches with a ``fused_reduce_qk_norm_rope_swa_write`` config (gfx950) take the
+    target BM, ``num_warps`` and ``waves_per_eu`` from it; the split-K cap and the
+    shrink to M below still apply.
     """
     # Register-pressure cap from the splitk fp32 q-tile.
     if num_splitk >= 4:
@@ -31,12 +35,20 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     else:
         cap = 16
 
-    if num_local_heads >= 64:
-        target = 16
-    elif num_local_heads >= 16:
-        target = 8
+    config = _get_config(num_local_heads)
+    if config is None:
+        if num_local_heads >= 64:
+            target = 16
+        elif num_local_heads >= 16:
+            target = 8
+        else:
+            target = 4
+        num_warps = 4
+        waves_per_eu = 1
     else:
-        target = 4
+        target = config["BLOCK_SIZE_M"]
+        num_warps = config["num_warps"]
+        waves_per_eu = config["waves_per_eu"]
 
     bm = min(target, cap)
 
@@ -45,29 +57,26 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     while bm > 1 and bm > M:
         bm //= 2
 
-    num_warps = 4
-    waves_per_eu = 1
-
     return bm, num_warps, waves_per_eu
 
 
 def fused_reduce_qk_norm_rope_swa_write(
     q: torch.Tensor,
     kv: torch.Tensor,
-    q_norm_weight: Optional[torch.Tensor],
-    kv_norm_weight: Optional[torch.Tensor],
+    q_norm_weight: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor | None,
     q_rms_eps: float,
     kv_rms_eps: float,
     rope_head_dim: int,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     positions: torch.Tensor,
-    q_out: Optional[torch.Tensor] = None,
+    q_out: torch.Tensor | None = None,
     is_neox: bool = False,
-    write_indices: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
+    write_indices: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    swa_kv: torch.Tensor | None = None,
     win: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -139,9 +148,13 @@ def fused_reduce_qk_norm_rope_swa_write(
         assert state_slot_mapping.dim() == 1
 
     _LOGGER.info(
-        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE "
-        f"M={M} num_splitk={num_splitk} heads={num_local_heads} "
-        f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
+        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE M=%d num_splitk=%d heads=%d D=%d rd=%d HAS_SWA=%s",
+        M,
+        num_splitk,
+        num_local_heads,
+        head_dim,
+        rope_head_dim,
+        HAS_SWA,
     )
 
     BLOCK_SIZE_M, num_warps, waves_per_eu = _pick_block_size_m(

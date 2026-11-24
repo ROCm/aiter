@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _per_token_quant(
@@ -25,7 +27,15 @@ def _per_token_quant(
     return qx, scale_out
 
 
-@triton.jit
+_layernorm_kernel_repr = make_kernel_repr(
+    "_layernorm_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_kernel_repr)
 def _layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -70,7 +80,7 @@ def _layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         _mean += x_block
@@ -86,7 +96,7 @@ def _layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         x_block = x_block - mean
@@ -109,7 +119,7 @@ def _layernorm_kernel(
 
     # Normalize and store
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -129,7 +139,15 @@ def _layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
 
 
-@triton.jit
+_fused_add_layernorm_kernel_repr = make_kernel_repr(
+    "_fused_add_layernorm_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_add_layernorm_kernel_repr)
 def _fused_add_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -181,7 +199,7 @@ def _fused_add_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
         res_in_block = tl.load(res_in_ptr_start + col_offsets)
@@ -205,7 +223,7 @@ def _fused_add_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(res_out_ptr_start + col_offsets).to(
             tl.float32
@@ -230,7 +248,7 @@ def _fused_add_layernorm_kernel(
 
     # Normalize and store
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -252,7 +270,17 @@ def _fused_add_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
 
 
-@triton.jit
+_quant_layernorm_kernel_repr = make_kernel_repr(
+    "_quant_layernorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_quant_layernorm_kernel_repr)
 def _quant_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -306,7 +334,7 @@ def _quant_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         _mean += x_block
@@ -322,7 +350,7 @@ def _quant_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
         x_block = x_block - mean
@@ -343,7 +371,7 @@ def _quant_layernorm_kernel(
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -385,7 +413,7 @@ def _quant_layernorm_kernel(
 
     # Apply quantization and write output
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
 
@@ -406,7 +434,17 @@ def _quant_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_fused_add_layernorm_kernel_repr = make_kernel_repr(
+    "_quant_fused_add_layernorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_quant_fused_add_layernorm_kernel_repr)
 def _quant_fused_add_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -466,7 +504,7 @@ def _quant_fused_add_layernorm_kernel(
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
         res_in_block = tl.load(res_in_ptr_start + col_offsets)
@@ -490,7 +528,7 @@ def _quant_fused_add_layernorm_kernel(
     # Calculate variance
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         x_block = tl.load(res_out_ptr_start + col_offsets).to(
             tl.float32
@@ -513,7 +551,7 @@ def _quant_fused_add_layernorm_kernel(
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         w_block = tl.load(w_ptr + col_offsets)
         b_block = tl.load(b_ptr + col_offsets)
@@ -557,7 +595,7 @@ def _quant_fused_add_layernorm_kernel(
 
     # Apply quantization and write output
     loop_num_l = loop_num
-    for b in range(0, loop_num_l):
+    for b in range(loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
 
@@ -578,7 +616,18 @@ def _quant_fused_add_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_layernorm_bwd_dx_fused_triton_repr = make_kernel_repr(
+    "_layernorm_bwd_dx_fused_triton",
+    [
+        "NUM_ROWS",
+        "BLOCK_SIZE_N",
+        "USE_BLOCKED",
+        "IGNORE_DW_DB",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dx_fused_triton_repr)
 def _layernorm_bwd_dx_fused_triton(
     DX,  # pointer to the input gradient
     DY,  # pointer to the output gradient
@@ -609,7 +658,7 @@ def _layernorm_bwd_dx_fused_triton(
         num_col_blocks = tl.cdiv(N, BLOCK_SIZE_N) - 1
         row = pid
 
-        for _ in range(0, rows_per_tile):
+        for _ in range(rows_per_tile):
             # Load row statistics:
             mean = tl.load(Mean + row)
             rstd = tl.load(Rstd + row)
@@ -716,7 +765,7 @@ def _layernorm_bwd_dx_fused_triton(
             dw_row = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
             db_row = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
 
-        for _ in range(0, rows_per_tile):
+        for _ in range(rows_per_tile):
             # Compute pointers:
             x_ptrs = X + row * stride
             dy_ptrs = DY + row * stride
@@ -751,7 +800,16 @@ def _layernorm_bwd_dx_fused_triton(
             tl.store(DB + pid * N + cols, db_row.to(DB.type.element_ty), mask=mask)
 
 
-@triton.jit
+_layernorm_bwd_dwdb_triton_repr = make_kernel_repr(
+    "_layernorm_bwd_dwdb_triton",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dwdb_triton_repr)
 def _layernorm_bwd_dwdb_triton(
     DW,  # pointer to the partial sum of weights gradient
     DB,  # pointer to the partial sum of biases gradient
@@ -781,7 +839,16 @@ def _layernorm_bwd_dwdb_triton(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.type.element_ty), mask=cols < N)
 
 
-@triton.jit
+_layernorm_bwd_dwdb_triton_v2_repr = make_kernel_repr(
+    "_layernorm_bwd_dwdb_triton_v2",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dwdb_triton_v2_repr)
 def _layernorm_bwd_dwdb_triton_v2(
     X,  # pointer to the input
     DY,  # pointer to the output gradient

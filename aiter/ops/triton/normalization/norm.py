@@ -3,18 +3,18 @@
 
 import torch
 import triton
-from typing import Optional
+
 from aiter.ops.triton._triton_kernels.normalization.norm import (
-    _layernorm_kernel,
     _fused_add_layernorm_kernel,
-    _quant_layernorm_kernel,
-    _quant_fused_add_layernorm_kernel,
-    _layernorm_bwd_dx_fused_triton,
     _layernorm_bwd_dwdb_triton,
     _layernorm_bwd_dwdb_triton_v2,
+    _layernorm_bwd_dx_fused_triton,
+    _layernorm_kernel,
+    _quant_fused_add_layernorm_kernel,
+    _quant_layernorm_kernel,
 )
-from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
@@ -38,8 +38,6 @@ def _layernorm_forward(
     _layernorm_kernel[(M,)](
         x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
     )
-
-    return
 
 
 def _layernorm_forward_with_add(
@@ -76,8 +74,6 @@ def _layernorm_forward_with_add(
         epsilon,
         BLOCK_SIZE,
     )
-
-    return
 
 
 def _layernorm_backward(
@@ -136,7 +132,7 @@ def _layernorm_backward(
         num_warps=num_warps,
         IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
     )
-    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)  # noqa: E731
+    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
     if not IGNORE_DW_DB_IN_FUSED:
         dwdb_block_n = max(16, N // 256)
         dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
@@ -250,7 +246,7 @@ def layer_norm(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization over a mini-batch of inputs.
@@ -264,7 +260,9 @@ def layer_norm(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    _LOGGER.info(f"LAYERNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    _LOGGER.info(
+        "LAYERNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
+    )
     return _LayerNorm.apply(input, weight, bias, eps, torch.is_grad_enabled())
 
 
@@ -276,7 +274,7 @@ def layernorm2d_fwd_with_add(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two inputs and then applies Layer Normalization
@@ -295,7 +293,10 @@ def layernorm2d_fwd_with_add(
     - residual_out: Output tensor that is input + residual_in with shape (M, N).
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+        "LAYERNORM_2D_FWD_ADD: input=%s weight=%s residual_in=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
     )
     return _Layernorm2dFwdWithAdd.apply(
         out,
@@ -316,7 +317,7 @@ def layernorm2d_fwd_with_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -334,7 +335,10 @@ def layernorm2d_fwd_with_dynamicquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_DYNAMICQUANT: input=%s weight=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 
@@ -379,7 +383,7 @@ def layernorm2d_fwd_with_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -396,7 +400,11 @@ def layernorm2d_fwd_with_smoothquant(
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 
@@ -441,7 +449,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two input toegether, then does layer Normalization before quantizing the final output
@@ -461,7 +469,11 @@ def layernorm2d_fwd_with_add_dynamicquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+        "LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input=%s weight=%s residual_in=%s yscale=%s  ",
+        input.shape,
+        weight.shape,
+        residual_in.shape,
+        yscale.shape,
     )
     M, N = input.shape
 
@@ -510,7 +522,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -531,8 +543,12 @@ def layernorm2d_fwd_with_add_smoothquant(
     """
 
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input=%s weight=%s residual_in=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 

@@ -7,8 +7,8 @@
 ARG BASE_DOCKER="rocm/pytorch:latest"
 FROM $BASE_DOCKER
 RUN pip install pandas zmq einops && \
-    pip install numpy==1.26.2 && \
-    pip install --pre flydsl  # optional: FlyDSL MOE kernels
+    pip install numpy==1.26.2
+# FlyDSL is a required dependency and is installed automatically by `setup.py develop` below.
 # Create a new user
 RUN useradd -m newuser
 # Switch to the new user

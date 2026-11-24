@@ -20,6 +20,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -61,11 +69,11 @@ jobs:
   sglang:
     if: needs.select-sglang-tests.outputs.has_tests == 'true'
     name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
-    needs: [check-signal, select-sglang-tests]
+    needs: [check-signal, select-sglang-tests, ci_config]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
 
     env:
@@ -86,17 +94,18 @@ jobs:
           SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-downstream"
           rm -rf "${SGLANG_WORKSPACE}"
           git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
-          test -d "${SGLANG_WORKSPACE}/sgl-kernel"
+          test -d "${SGLANG_WORKSPACE}/python/sglang/kernels/aot"
           test -d "${SGLANG_WORKSPACE}/python"
           echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -116,8 +125,8 @@ jobs:
           set -ex
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
-          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
-          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python; test -d /models'
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/python/sglang/kernels/aot; test -d /sglang-checkout/python; test -d /models'
 
       - name: Setup pip config
         run: |
@@ -130,6 +139,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
+          # sglang's own dependency script installs lmms-eval, which hard-pins
+          # numpy==1.26.4 and so downgrades the image's 2.x. Everything compiled
+          # into the image -- sglang's kernels among them -- was built against
+          # the NumPy 2 C-API, and the server then cannot import at all. Put the
+          # ABI back before anything tries to run on it.
+          bash scripts/ci/amd/amd_ci_exec.sh pip install --upgrade "numpy>=2,<3"
+          bash scripts/ci/amd/amd_ci_exec.sh python -c "import numpy; print('numpy', numpy.__version__)"
 
       - name: Install aiter under test
         id: install_aiter_under_test
@@ -164,6 +180,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e AITER_USE_SYSTEM_TRITON=1 \
+            -e SGLANG_SET_CPU_AFFINITY=0 \
             "${MODEL_ENV_ARGS[@]}" \
             ${EXTRA_EXEC_ARGS} \
             ${TEST_COMMAND} || TEST_EXIT_CODE=$?

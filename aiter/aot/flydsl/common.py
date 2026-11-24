@@ -5,50 +5,23 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ProcessPoolExecutor
-from contextlib import contextmanager
-import functools
-import inspect
-from dataclasses import dataclass
-import enum
+import json
+import multiprocessing
 import os
-from typing import Any, Callable, Iterator
+import re
+import shutil
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from multiprocessing.connection import wait as wait_for_sentinels
+from typing import Any
 
-# Cap on the entries embedded in the AssertionError message -- beyond
-# this we append a "(... N more)" suffix. Per-kernel diagnostics still
-# go to stdout from compile_one_config's [FAIL] prints; the exception
-# text just needs enough to point at the problem.
-_MAX_ERRORS_IN_MSG = 10
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
 
-# Default ceiling for the FlyDSL AOT process pool, applied on top of
-# affinity-aware CPU count. Each worker re-imports torch + FlyDSL
-# (~1.5-2.5 GB RSS), so 64 x 2 GB ~= 128 GB -- fits comfortably on a
-# typical 64+ core build host with >=256 GB RAM, but containers with
-# tighter cgroup memory caps may want to lower via AITER_FLYDSL_AOT_WORKERS.
-_DEFAULT_MAX_WORKERS = 64
-
-
-class OpKind(enum.Enum):
-    """FlyDSL AOT kernel categories -- enum so typos at call sites become
-    construction errors instead of silently routing to the wrong code path."""
-
-    MOE = "moe"
-    GEMM = "gemm"
-    CHUNK_GDN_H = "chunk_gdn_h"
-
-
-@dataclass(frozen=True)
-class JobLabel:
-    """Diagnostic label attached to a submitted future. Replaces the
-    earlier string-formatted label that wait_aot had to parse back into
-    a kind via ``label.startswith(OpKind.MOE.name)`` -- a heuristic that
-    silently misattributed crashes if a future OpKind member was added."""
-
-    kind: OpKind
-    kernel_name: str
-
-    def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
+_DEFAULT_KERNEL_TIMEOUT = 1200.0
+_DEFAULT_MAX_RETRIES = 2
 
 
 _CU_NUM_TO_ARCH = {
@@ -93,99 +66,6 @@ def collect_aot_jobs(
     return dedupe_jobs(jobs)
 
 
-def raise_if_aot_cache_miss(
-    case_kwargs: dict[str, Any],
-    cache_misses: list[tuple[str, int, Any, Any, int]],
-    last_cache_key: dict[int, Any],
-) -> None:
-    if not cache_misses:
-        return
-
-    details = []
-    for name, jf_id, manager_key, cache_dir, miss_count in cache_misses:
-        exists = cache_dir.exists() if cache_dir is not None else False
-        pkl_count = sum(1 for _ in cache_dir.glob("*.pkl")) if exists else 0
-        cache_key = last_cache_key.get(jf_id)
-        cache_key_str = (
-            "\n".join(f"      {item!r}" for item in cache_key)
-            if cache_key
-            else "<unknown>"
-        )
-        details.append(
-            f"  {name}: +{miss_count} miss, manager_key={manager_key}\n"
-            f"    cache_dir={cache_dir} (exists={exists}, pkl_count={pkl_count})\n"
-            f"    looked-up cache_key:\n{cache_key_str}"
-        )
-
-    raise RuntimeError(
-        "AOT cache miss for case " + repr(case_kwargs) + ":\n" + "\n".join(details)
-    )
-
-
-def fail_on_aot_cache_miss(
-    run_compiled_module: Any,
-    run_compiled_name: str = "_run_compiled",
-) -> Callable:
-    """Fail a wrapped test when a patched FlyDSL run helper reports cache misses."""
-
-    def decorator(func: Callable) -> Callable:
-        jit_fns_seen = []
-        last_cache_key = {}
-
-        def case_arguments(args, kwargs):
-            try:
-                bound = inspect.signature(func).bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                return dict(bound.arguments)
-            except Exception:
-                case_kwargs = dict(kwargs)
-                if args:
-                    case_kwargs["args"] = args
-                return case_kwargs
-
-        def aot_cache_misses():
-            misses = []
-            for jf in jit_fns_seen:
-                info = jf.cache_info()
-                if info is None or info.misses == 0:
-                    continue
-                cache_dir = getattr(jf.cache_manager, "cache_dir", None)
-                misses.append(
-                    (jf.func.__name__, id(jf), jf.manager_key, cache_dir, info.misses)
-                )
-            return misses
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            orig_run_compiled = getattr(run_compiled_module, run_compiled_name)
-
-            def run_compiled_tracked(exe, compile_args):
-                if exe not in jit_fns_seen:
-                    jit_fns_seen.append(exe)
-                try:
-                    exe._ensure_sig()
-                    bound = exe._sig.bind(*compile_args)
-                    bound.apply_defaults()
-                    last_cache_key[id(exe)] = exe._build_full_cache_key(bound.arguments)
-                except Exception:
-                    pass
-                return orig_run_compiled(exe, compile_args)
-
-            setattr(run_compiled_module, run_compiled_name, run_compiled_tracked)
-            try:
-                ret = func(*args, **kwargs)
-                raise_if_aot_cache_miss(
-                    case_arguments(args, kwargs), aot_cache_misses(), last_cache_key
-                )
-                return ret
-            finally:
-                setattr(run_compiled_module, run_compiled_name, orig_run_compiled)
-
-        return wrapper
-
-    return decorator
-
-
 @contextmanager
 def compile_only_env() -> Iterator[None]:
     prev = os.environ.get("COMPILE_ONLY")
@@ -197,6 +77,18 @@ def compile_only_env() -> Iterator[None]:
             os.environ.pop("COMPILE_ONLY", None)
         else:
             os.environ["COMPILE_ONLY"] = prev
+
+
+@contextmanager
+def run_only_env() -> Iterator[None]:
+    """Force FlyDSL run-only mode: load AOT artifacts, never JIT-compile.
+
+    Any kernel without a usable AOT cache raises RuntimeError at the call
+    site (naming the missing artifact and its cache dir) instead of silently
+    masking missing precompiled coverage.
+    """
+    with override_env("FLYDSL_RUNTIME_RUN_ONLY", "1"):
+        yield
 
 
 @contextmanager
@@ -215,168 +107,485 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
-    if kind is OpKind.MOE:
-        from .moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GEMM:
-        from .gemm import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+def aot_target_archs() -> set[str] | None:
+    """The archs ``GPU_ARCHS`` names, as the wheel build sets it; ``None``
+    when it is unset or ``native``, meaning every arch the tables have."""
+    value = os.environ.get("GPU_ARCHS", "").strip()
+    if not value or value.lower() == "native":
+        return None
+    return {arch.strip() for arch in value.split(";") if arch.strip()}
 
 
-def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, Any]]:
-    """Per-kernel worker -- runs in a ProcessPoolExecutor child process.
-    Top-level so it's picklable. Imports compile_one_config lazily so
-    the pickle wire payload is just (kind, job-dict)."""
-    if kind is OpKind.MOE:
-        from .moe import compile_one_config
-    elif kind is OpKind.GEMM:
-        from .gemm import compile_one_config
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import compile_one_config
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return kind, compile_one_config(**job)
+def resolve_target_arch(job_arch: str, targets: set[str] | None) -> str | None:
+    """Exact requested target arch in the same kernel family as ``job_arch``, or
+    ``None`` when no requested target shares its family.
 
-
-def _affinity_aware_cpu_count() -> int:
-    """Return the number of CPUs this process is actually allowed to
-    use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
-    cpuset constraints common in CI containers; ``sched_getaffinity``
-    is the right answer where available (Linux). Fallback to
-    ``cpu_count`` otherwise. Clamped to >=1 -- empty-affinity-set or
-    None-from-cpu_count would otherwise yield 0 and break the
-    ``ProcessPoolExecutor(max_workers=0)`` call site."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 0
-    return max(n, 1)
-
-
-def start_aot(
-    cache_dir: str,
-) -> tuple[ProcessPoolExecutor | None, dict[Future, JobLabel]]:
-    """Start FlyDSL AOT compilation in background processes.
-
-    Submits one task per kernel (across all OpKind members) to a single
-    shared ProcessPoolExecutor. Pool size is configurable via env:
-
-      AITER_FLYDSL_AOT_WORKERS -- explicit worker count. Non-integer
-                                 values raise ValueError; "0" / negatives
-                                 are clamped to 1.
-                                 default: min(_affinity_aware_cpu_count(),
-                                 _DEFAULT_MAX_WORKERS) -- affinity/cpuset-
-                                 aware count capped at the module
-                                 constant.
-
-    Returns (pool, futures_dict) -- caller must call ``wait_aot``
-    to collect results and raise on failure. If there are no jobs to
-    compile, returns (None, {}) and ``wait_aot`` becomes a no-op.
+    ``gfx1250-strict`` (MI450 A0) and ``gfx1250`` (B0) are one source/kernel
+    family, so a ``gfx1250``-tuned row is selected for a ``gfx1250-strict`` build
+    and **compiled for the exact requested target** (producing the strict
+    ``0xeb`` code object, not ``gfx1250`` ``0x49``). ``targets`` is ``None``
+    (GPU_ARCHS unset/native) keeps ``job_arch`` as-is.
     """
+    if not targets:
+        return job_arch
+    fam = base_gfx_arch(job_arch)
+    for t in sorted(targets):
+        if base_gfx_arch(t) == fam:
+            return t
+    return None
+
+
+def assert_targets_covered(
+    targets: set[str] | None, available_archs, matched_archs, label: str
+) -> None:
+    """Raise when a requested arch's kernel family exists in the tuned data but
+    produced no job -- the strict-AOT filter bug that silently emitted an empty
+    wheel while reporting success (``GPU_ARCHS=gfx1250-strict`` -> 0 artifacts,
+    "succeeded"). A family genuinely absent from the tables (the op has no
+    kernels for that arch) is fine and not an error.
+    """
+    if not targets:
+        return
+    avail_fams = {base_gfx_arch(a) for a in available_archs}
+    matched_fams = {base_gfx_arch(a) for a in matched_archs}
+    dropped = sorted(
+        t
+        for t in targets
+        if base_gfx_arch(t) in avail_fams and base_gfx_arch(t) not in matched_fams
+    )
+    if dropped:
+        raise RuntimeError(
+            f"[aiter] {label}: tuned rows exist for {dropped}'s kernel family but "
+            f"none were selected for the requested target; refusing to emit a "
+            f"partial wheel (strict-AOT filter bug)"
+        )
+
+
+def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
+    """Environment of a process that replays the runtime for ``arch``. aiter
+    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
+    process starts with ``GPU_ARCHS`` naming ``arch`` and with
+    ``AITER_AOT_REPLAY=1``, under which aiter's runtime arch queries answer
+    ``arch`` instead of probing a device. The GPUs stay hidden, and aiter is
+    imported in full rather than in AOT mode."""
+    env = dict(os.environ)
+    env.pop("AITER_AOT_IMPORT", None)
+    env.update(
+        GPU_ARCHS=arch,
+        AITER_AOT_REPLAY="1",
+        # An empty list hides every GPU. "-1" would too, but ROCm 10's
+        # rocprofiler-sdk aborts any process it is loaded into on "-1".
+        HIP_VISIBLE_DEVICES="",
+        ROCR_VISIBLE_DEVICES="",
+        CUDA_VISIBLE_DEVICES="",
+    )
+    if workers is not None:
+        env["AITER_MAX_JOBS"] = str(workers)
+    return env
+
+
+def check_replay_process(arch: str) -> None:
+    """Raise unless this process started with ``replay_env(arch)``, so that
+    what aiter fixed at import belongs to ``arch``."""
+    from aiter.utility import dtypes
+
+    if os.environ.get("AITER_AOT_REPLAY") != "1" or os.environ.get("GPU_ARCHS") != arch:
+        raise RuntimeError(
+            f"replaying {arch} needs AITER_AOT_REPLAY=1 and GPU_ARCHS={arch} set "
+            "before aiter is imported (see replay_env)"
+        )
+    expected = dtypes.defaultDtypes[arch]["fp8"]
+    if dtypes.fp8 is not expected:
+        raise RuntimeError(
+            f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
+            f"{arch} needs {expected}"
+        )
+
+
+def _run_one_to_file(
+    worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
+) -> None:
+    configure_worker_subprocesses()
+    result = worker(**kwargs)
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(result, f)
+    os.replace(tmp_path, out_path)
+
+
+def get_kernel_timeout() -> float:
+    env = os.environ.get("AITER_FLYDSL_AOT_TIMEOUT")
+    if env is None:
+        return _DEFAULT_KERNEL_TIMEOUT
+    try:
+        return max(float(env), 0.0)
+    except ValueError as e:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_TIMEOUT must be a number of seconds, got {env!r}"
+        ) from e
+
+
+def get_max_retries() -> int:
+    env = os.environ.get("AITER_FLYDSL_AOT_MAX_RETRIES")
+    if env is None:
+        return _DEFAULT_MAX_RETRIES
+    try:
+        return max(int(env), 0)
+    except ValueError as e:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_MAX_RETRIES must be an integer, got {env!r}"
+        ) from e
+
+
+def get_max_workers(num_jobs: int) -> int:
+    return get_worker_count_for(num_jobs)
+
+
+def worker_waves(workers: int, jobs_per_arch: dict[str, int]) -> list[dict[str, int]]:
+    """The per-arch replay processes to run side by side, wave after wave, and
+    the workers each runs, such that no wave runs more than ``workers`` in all:
+    as many archs as the budget gives a worker each, the largest first, the
+    budget split among them by job count (largest remainder)."""
+    archs = sorted(jobs_per_arch, key=lambda arch: (-jobs_per_arch[arch], arch))
+    workers = max(1, workers)
+    waves = []
+    for start in range(0, len(archs), workers):
+        wave = archs[start : start + workers]
+        total = sum(jobs_per_arch[arch] for arch in wave)
+        extra = {
+            arch: (workers - len(wave)) * jobs_per_arch[arch] / total for arch in wave
+        }
+        shares = {arch: 1 + int(extra[arch]) for arch in wave}
+        rest = workers - sum(shares.values())
+        by_remainder = sorted(wave, key=lambda arch: int(extra[arch]) - extra[arch])
+        for arch in by_remainder[:rest]:
+            shares[arch] += 1
+        waves.append(shares)
+    return waves
+
+
+def _run_file_pool(
+    specs: list[tuple[Callable[..., dict[str, Any]], dict[str, Any], Any]],
+    max_workers: int,
+    kernel_timeout: float,
+    max_retries: int,
+    result_dir: str,
+    start_method: str = "fork",
+) -> list[dict[str, Any] | None]:
+    ctx = multiprocessing.get_context(start_method)
+    n = len(specs)
+    results: list[dict[str, Any] | None] = [None] * n
+    attempts = [0] * n
+    retries_used = 0
+    completed = 0
+    progress_stride = max(1, n // 20)
+
+    queue = list(range(n))
+    queue.reverse()  # pop() from the tail -> submission order; retries appended
+    running: dict[Any, tuple[int, float | None]] = {}  # proc -> (idx, deadline)
+
+    def launch() -> None:
+        while queue and len(running) < max_workers:
+            idx = queue.pop()
+            worker, kwargs, _label = specs[idx]
+            out_path = os.path.join(result_dir, f"k{idx}.json")
+            try:
+                os.remove(out_path)  # clear any stale file from a prior attempt
+            except OSError:
+                pass
+            proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
+            proc.start()
+            deadline = (
+                (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
+            )
+            running[proc] = (idx, deadline)
+
+    def note_done() -> None:
+        """Mark one spec as finalized (succeeded or definitively failed) and emit
+        a throttled overall-progress line."""
+        nonlocal completed
+        completed += 1
+        if completed % progress_stride == 0 or completed == n:
+            print(f"  ... {completed}/{n} kernels done", flush=True)
+
+    def retry_or_drop(idx: int, reason: str) -> None:
+        """Abnormal exit: requeue for retry, or -- once retries are exhausted --
+        give up, leaving results[idx]=None to mark the worker as dead/killed."""
+        nonlocal retries_used
+        if attempts[idx] < max_retries:
+            attempts[idx] += 1
+            retries_used += 1
+            queue.append(idx)
+            print(
+                f"[aiter] FlyDSL {specs[idx][2]} {reason}; "
+                f"retry {attempts[idx]}/{max_retries}",
+                flush=True,
+            )
+        else:
+            note_done()  # terminal: results[idx] stays None (== died/killed)
+
+    def reap(proc: Any) -> None:
+        idx, _ = running.pop(proc)
+        out_path = os.path.join(result_dir, f"k{idx}.json")
+        if proc.exitcode != 0:
+            # Worker died abnormally (OOM-kill -9, segfault -11, ...) before
+            # writing its result. Transient -> retry (terminal once retries run
+            # out, leaving results[idx]=None).
+            retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
+            return
+        # Clean exit (exitcode 0): deterministic, never retried.
+        result: dict[str, Any] | None = None
+        if os.path.isfile(out_path):
+            try:
+                with open(out_path) as f:
+                    result = json.load(f)
+            except Exception:  # noqa: BLE001
+                result = None
+        if result is None:
+            label = specs[idx][2]
+            result = {"kernel_name": str(label), "compile_time": None}
+        results[idx] = result
+        note_done()
+
+    try:
+        launch()
+        while running:
+            if kernel_timeout > 0:
+                nearest = min(d for (_, d) in running.values() if d is not None)
+                wait_timeout: float | None = max(0.0, nearest - time.monotonic())
+            else:
+                wait_timeout = None
+            wait_for_sentinels([p.sentinel for p in running], timeout=wait_timeout)
+
+            for proc in list(running):
+                if not proc.is_alive():
+                    proc.join()
+                    reap(proc)
+
+            if kernel_timeout > 0:
+                now = time.monotonic()
+                for proc in list(running):
+                    idx, deadline = running[proc]
+                    if deadline is not None and now > deadline and proc.is_alive():
+                        proc.kill()
+                        proc.join()
+                        running.pop(proc)
+                        retry_or_drop(
+                            idx,
+                            f"exceeded per-kernel timeout ({kernel_timeout:.0f}s); killed",
+                        )
+
+            launch()  # refill freed slots (including any just-requeued retries)
+    finally:
+        # Kill any survivors (e.g. on an unexpected exception) so we never leave
+        # orphaned compilers blocking the caller's exit.
+        for proc in list(running):
+            try:
+                if proc.is_alive():
+                    proc.kill()
+            except Exception:  # noqa: BLE001,S110
+                pass
+
+    if retries_used:
+        print(
+            f"[aiter] FlyDSL AOT: {retries_used} retr"
+            f"{'y' if retries_used == 1 else 'ies'} after abnormal worker exits",
+            flush=True,
+        )
+    return results
+
+
+def run_jobs_parallel(
+    worker: Callable[..., dict[str, Any]],
+    jobs: list[dict[str, Any]],
+    *,
+    start_method: str = "fork",
+) -> list[dict[str, Any]]:
+    if not jobs:
+        return []
+    max_workers = get_max_workers(len(jobs))
+    print(
+        f"[aiter] FlyDSL AOT: {len(jobs)} kernels, {max_workers} worker processes",
+        flush=True,
+    )
+    result_dir = tempfile.mkdtemp(prefix="aot_results_")
+    try:
+        specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
+        raw = _run_file_pool(
+            specs,
+            max_workers,
+            get_kernel_timeout(),
+            get_max_retries(),
+            result_dir,
+            start_method,
+        )
+    finally:
+        shutil.rmtree(result_dir, ignore_errors=True)
+    out: list[dict[str, Any]] = []
+    for job, res in zip(jobs, raw):
+        if res is None:
+            out.append(
+                {"kernel_name": job.get("kernel_name", "?"), "compile_time": None}
+            )
+        else:
+            out.append(res)
+    return out
+
+
+# The FlyDSL AOT modules setup.py runs, each replaying the runtime of its ops.
+AOT_MODULES = (
+    "aiter.aot.flydsl.gemm",
+    "aiter.aot.flydsl.conv",
+    "aiter.aot.flydsl.chunk_gdn_h",
+    "aiter.aot.flydsl.gdn_fused_prefill",
+    "aiter.aot.flydsl.fmha_fp8",
+    "aiter.aot.flydsl.pa_decode_plan",
+)
+
+
+STRICT_ERRATA_TABLES = frozenset(
+    {"a8w8_bpreshuffle_tuned_gemm", "a4w4_mxscale_bpreshuffle_tuned_gemm"}
+)
+
+
+def is_strict_identity(arch: str) -> bool:
+    """True for a gfx1250-strict-family arch (not the plain gfx1250 base)."""
+    return base_gfx_arch(arch) != arch
+
+
+@contextmanager
+def fail_build_on_missing_target_feature():
+    """Fail an AOT build that dropped a matmul for a disabled target feature.
+
+    gfx1250-strict disables some WMMA features (F4, fp8 16x16x128) for A0 errata;
+    a kernel that needs one compiles to a hollow, compute-less object with rc 0
+    and the LLVM diagnostic 'requires target feature ...'. That line is written
+    to the real stderr fd by the C++ backend (a Python-level redirect misses it),
+    so this captures fd 2, tees it back, and raises if the marker appears --
+    refusing to ship a hollow wheel. An errata op reaching here was not gated off
+    the strict build (see STRICT_ERRATA_TABLES / the MoE mxfp4 skip)."""
+    import sys
+    import threading
+
+    if os.environ.get("AITER_AOT_FEATURE_GUARD") == "1":
+        # An enclosing build already captures fd 2 (this process or a parent,
+        # via the inherited env); a second capture would double-handle it.
+        yield
+        return
+
+    marker = b"requires target feature"
+    r_fd, w_fd = os.pipe()
+    real_err = os.dup(2)
+    hit = []
+
+    def pump():
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            os.write(real_err, chunk)
+            buf = (buf + chunk)[-(len(marker) + 4096) :]
+            if marker in buf:
+                hit.append(True)
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    os.environ["AITER_AOT_FEATURE_GUARD"] = "1"
+    sys.stderr.flush()
+    os.dup2(w_fd, 2)
+    os.close(w_fd)
+    try:
+        yield
+    finally:
+        os.environ.pop("AITER_AOT_FEATURE_GUARD", None)
+        sys.stderr.flush()
+        os.dup2(real_err, 2)
+        os.close(real_err)
+        t.join(timeout=10)
+        os.close(r_fd)
+    if hit:
+        raise AssertionError(
+            "[aiter] AOT build dropped a matmul for a missing target feature "
+            "('requires target feature' in the compiler output): a gfx1250-strict "
+            "build produced hollow, compute-less kernels. An errata op was not "
+            "gated off the strict build. Refusing to ship a hollow wheel."
+        )
+
+
+_STRICT_ERRATA_KERNEL_RE = re.compile(
+    r"@((?:gemm_a4w4|gemm_a8w8_ptpc|mxfp4_tdm_fp4)\w*)"
+)
+_ROCDL_CHIP_RE = re.compile(r'#rocdl\.target<[^>]*chip\s*=\s*"([^"]+)"')
+
+
+def assert_no_strict_errata_products(cache_dir: str) -> None:
+    """For a strict build, fail if the cache still holds an errata-family kernel.
+
+    A stale hollow object left by an earlier build survives in the persisted
+    FlyDSL cache, and the compile-time guard cannot see it (a cache hit recompiles
+    nothing and prints no diagnostic). Cache paths carry the launcher name and a
+    hash, not the kernel (ptpc shares launch_gemm_a8w8 with mx128, fp4 MoE shares
+    launch_gemm_a8w4_tdm with fp8), so read the kernels inside each object; and
+    judge only objects built for a strict target, so a mixed gfx1250 + strict
+    build keeps its legitimate gfx1250 ones."""
+    import glob
+    import pickle
+
+    targets = aot_target_archs()
+    if not targets or not any(is_strict_identity(t) for t in targets):
+        return
+    found: list[str] = []
+    for path in glob.glob(os.path.join(cache_dir, "*", "*.pkl")):
+        try:
+            with open(path, "rb") as fh:
+                ir = getattr(pickle.load(fh), "_ir_text", "") or ""
+        except Exception:  # noqa: BLE001, S112  not a readable FlyDSL object
+            continue
+        if not any(is_strict_identity(chip) for chip in _ROCDL_CHIP_RE.findall(ir)):
+            continue
+        match = _STRICT_ERRATA_KERNEL_RE.search(ir)
+        if match:
+            found.append(f"{os.path.basename(os.path.dirname(path))}:{match.group(1)}")
+    if found:
+        raise AssertionError(
+            f"[aiter] gfx1250-strict AOT cache holds {len(found)} errata-family "
+            "kernel object(s) that strict gates off -- likely stale hollow kernels "
+            "a cache hit left from an earlier build. Clear the FlyDSL cache before a "
+            f"strict wheel build. Offenders (first 3): {sorted(found)[:3]}"
+        )
+
+
+def run_aot(cache_dir: str) -> None:
+    """Build the FlyDSL AOT cache of every module, as ``setup.py`` does. Each
+    replays aiter's runtime, which needs aiter fully imported for the target
+    arch, so each arch replays in a process of its own."""
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
+    from .mega_moe import run as run_mega_moe_replay
+    from .moe import DEFAULT_CSVS as MOE_CSVS
+    from .moe import run as run_moe_replay
+    from .replay import run_default
 
-    all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in OpKind:
-        for job in _collect_aot_jobs_for(kind):
-            all_jobs.append((kind, job))
-
-    if not all_jobs:
-        print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
-        return None, {}
-
-    max_workers = min(max_workers, len(all_jobs))
-    print(
-        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
-    )
-
-    # Default fork start method is fine here: _compile_one immediately
-    # delegates to compile_one_config, which shells out to the FlyDSL
-    # compiler subprocess. The child never re-enters torch / FlyDSL /
-    # sccache-client Python in a way that would acquire an inherited
-    # mutex, so the classic fork-after-import deadlock pattern (parent
-    # thread holds lock at fork time -> child tries to acquire same lock
-    # -> deadlock) doesn't apply. Validated empirically at 64 workers
-    # (test job 299597), no hangs.
-    pool = ProcessPoolExecutor(max_workers=max_workers)
-    futures: dict[Future, JobLabel] = {}
-    for kind, job in all_jobs:
-        f = pool.submit(_compile_one, kind, job)
-        futures[f] = JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?")))
-    return pool, futures
-
-
-def wait_aot(pool: ProcessPoolExecutor | None, futures: dict[Future, JobLabel]) -> None:
-    """Wait for FlyDSL AOT workers and raise on any failure.
-
-    Aggregates per-kernel results back to per-kind tallies for log
-    parity with the previous run_aot_worker output."""
-    if pool is None or not futures:
-        return
-    try:
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for future in futures:
-            label = futures[future]
-            try:
-                kind, result = future.result()
-                if result.get("compile_time") is not None:
-                    ok_by_kind[kind] += 1
-                else:
-                    fail_by_kind[kind] += 1
-                    # A None compile_time means compile_one_config returned
-                    # cleanly but didn't produce a kernel -- still a
-                    # failure that the original wait_aot raised on.
-                    errors.append(f"FlyDSL {label} produced no kernel")
-            except Exception as worker_err:
-                # Use the JobLabel's kind directly -- no string parsing,
-                # so a future OpKind addition won't silently misattribute.
-                fail_by_kind[label.kind] += 1
-                errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
-        for kind in OpKind:
-            print(
-                f"[aiter] FlyDSL {kind.name} AOT: "
-                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
-            )
-        if errors:
-            # Dedupe before truncating: a BrokenProcessPool cascades to
-            # every remaining future.result() call with the SAME message,
-            # which would otherwise fill the cap with copies of one
-            # symptom and bury the actual first crash.
-            seen: set[str] = set()
-            unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
-            head = unique_errors[:_MAX_ERRORS_IN_MSG]
-            suffix = ""
-            if len(unique_errors) > _MAX_ERRORS_IN_MSG:
-                suffix = (
-                    f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
+    with fail_build_on_missing_target_feature():
+        errors = []
+        moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+        if moe_failed_archs:
+            errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
+        if run_mega_moe_replay():
+            errors.append("FlyDSL MEGA_MOE replay failed")
+        for module_name in AOT_MODULES:
+            failed_archs = run_default(module_name)
+            if failed_archs:
+                label = module_name.rsplit(".", 1)[-1].upper()
+                errors.append(
+                    f"FlyDSL {label} replay failed for {failed_archs} arch(es)"
                 )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
-            raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
-            )
-    finally:
-        pool.shutdown(wait=False)
+        if errors:
+            raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
+
+    assert_no_strict_errata_products(cache_dir)

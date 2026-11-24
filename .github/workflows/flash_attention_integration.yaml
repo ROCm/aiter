@@ -5,7 +5,14 @@ on:
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/_triton_kernels/attention/dao_ai/**'
+      - 'aiter/ops/triton/attention/mha.py'
       - 'aiter/ops/triton/attention/mha_v3.py'
+      - 'op_tests/op_benchmarks/triton/bench_mha.py'
+      - 'op_tests/op_benchmarks/triton/compare_mha.py'
+      - 'op_tests/op_benchmarks/triton/utils/argparse.py'
+      - 'op_tests/op_benchmarks/triton/utils/benchmark_utils.py'
+      - 'aiter/test_mha_common.py'
       - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
       - 'csrc/py_itfs_ck/mha_*'
@@ -13,11 +20,21 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/scripts/flash_attention/**'
+      - '.github/workflows/ci-config.yaml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/_triton_kernels/attention/dao_ai/**'
+      - 'aiter/ops/triton/attention/mha.py'
       - 'aiter/ops/triton/attention/mha_v3.py'
+      - 'op_tests/op_benchmarks/triton/bench_mha.py'
+      - 'op_tests/op_benchmarks/triton/compare_mha.py'
+      - 'op_tests/op_benchmarks/triton/utils/argparse.py'
+      - 'op_tests/op_benchmarks/triton/utils/benchmark_utils.py'
+      - 'aiter/test_mha_common.py'
       - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
       - 'csrc/py_itfs_ck/mha_*'
@@ -25,6 +42,8 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/scripts/flash_attention/**'
+      - '.github/workflows/ci-config.yaml'
   workflow_dispatch:
 
 concurrency:
@@ -32,15 +51,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
+  # Keep on upstream (Dao-AILab) main; do not re-point at a personal fork/branch.
   FA_BRANCH: main
   FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
-  BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
   AITER_SUBMODULE_PATH: third_party/aiter
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
 
 jobs:
+  ci_config:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -56,6 +80,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   prechecks:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     outputs:
       run_triton: ${{ steps.gate.outputs.run_triton }}
@@ -73,9 +98,18 @@ jobs:
               - 'setup.py'
               - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
+              - '.github/scripts/flash_attention/**'
+              - '.github/workflows/ci-config.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+              - 'aiter/ops/triton/_triton_kernels/attention/dao_ai/**'
+              - 'aiter/ops/triton/attention/mha.py'
               - 'aiter/ops/triton/attention/mha_v3.py'
+              - 'op_tests/op_benchmarks/triton/bench_mha.py'
+              - 'op_tests/op_benchmarks/triton/compare_mha.py'
+              - 'op_tests/op_benchmarks/triton/utils/argparse.py'
+              - 'op_tests/op_benchmarks/triton/utils/benchmark_utils.py'
+              - 'aiter/test_mha_common.py'
               - 'aiter/ops/triton/__init__.py'
             ck:
               - 'aiter/ops/mha.py'
@@ -100,16 +134,18 @@ jobs:
   # Triton Backend
   # =============================================================================
   flash_attention_triton:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Flash Attention - Triton / ${{ matrix.label }} (1 GPU)
-    needs: [check-signal, prechecks]
+    needs: [check-signal, prechecks, ci_config]
     runs-on: ${{ matrix.runner }}
+    env:
+      BASE_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-dpx-1
+            label: MI350X-DPX
           - runner: aiter-gfx1100
             label: RDNA3
             optional: true
@@ -125,10 +161,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -155,15 +192,12 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
-          # Install FA (setup.py handles submodule init and installs its pinned aiter)
-          RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
-              cd /flash-attention && \
-              FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-              pip install --no-build-isolation .
-
-          # Override with PR aiter
+          # The aiter under test, and flash-attention built against it. One script, shared with
+          # the windows job, because the ORDER is the whole recipe.
           COPY . /aiter
-          RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
+          ENV FA_BRANCH=${{ env.FA_BRANCH }}
+          ENV FA_REPOSITORY_URL=${{ env.FA_REPOSITORY_URL }}
+          RUN bash /aiter/.github/scripts/flash_attention/install.sh /aiter /flash-attention
 
           # Verify aiter is installed from PR branch
           RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
@@ -175,6 +209,21 @@ jobs:
       - name: Build Docker image (v2)
         run: docker build -t fa_triton_test:ci -f Dockerfile.triton .
 
+      # Persist the Triton JIT cache across runs via the GH cache backend (node-
+      # independent; nothing left on the runners). Kernel compilation dominates these
+      # GPU test steps, so a warm cache keeps them under their step timeouts. Keyed per
+      # arch + commit SHA (restore-keys warm-starts from the previous commit; only
+      # changed kernels recompile). Pure speed layer: Triton keys each kernel by its own
+      # content hash, so a cache hit never serves a stale kernel. Mounted below at
+      # /root/.triton.
+      - name: Triton JIT cache
+        uses: actions/cache@v4
+        with:
+          path: .triton-cache
+          key: triton-${{ matrix.label }}-${{ github.sha }}
+          restore-keys: |
+            triton-${{ matrix.label }}-
+
       - name: Start CI container (v2)
         run: |
           docker ps -aq -f name=fa_triton_test | xargs -r docker stop | xargs -r docker rm || true
@@ -185,63 +234,60 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_test \
             fa_triton_test:ci
 
-      - name: Run benchmarks (v2)
+      - name: Run FA benchmark (v2)
         if: ${{ github.event_name != 'push' }}
         timeout-minutes: 60
         run: |
           set -o pipefail
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            python benchmarks/benchmark_flash_attention.py
-          " |& tee benchmark_fa_triton_${{ matrix.label }}.log
-          docker exec fa_triton_test bash -c "
-            cd /aiter
-            python op_tests/op_benchmarks/triton/bench_mha.py \
-              -impl dao_ai -metric throughput -o /tmp/bench_dao_ai
-          " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/bench.sh fa \
+            |& tee benchmark_fa_triton_${{ matrix.label }}.log
+
+      # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
+      # (all arches) and on push-to-main for MI350X DPX, where the baseline is published.
+      - name: Run MHA bench (v2)
+        if: ${{ github.event_name != 'push' || matrix.label == 'MI350X-DPX' }}
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/bench.sh mha /tmp/bench_dao_ai \
+            |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
 
+      # Full correctness suite (output + varlen + kvcache) runs on MI350X DPX (and any
+      # non-RDNA arch). RDNA3 has its own reduced version below.
       - name: PR correctness tests (v2)
-        if: ${{ github.event_name != 'push' }}
+        if: ${{ github.event_name != 'push' && matrix.label != 'RDNA3' }}
         timeout-minutes: 90
         run: |
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_output \
-              -k '2048-2048' && \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output \
-              -k '1024-1024' && \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
-              -k '16-20000'
-          "
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-pr
+
+      # RDNA3 is much slower (and optional), so the full varlen + kvcache sweep blows
+      # the 90-min cap. It runs only the output test.
+      - name: PR correctness tests (v2) [RDNA3]
+        if: ${{ github.event_name != 'push' && matrix.label == 'RDNA3' }}
+        timeout-minutes: 90
+        run: |
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-pr-rdna3
 
       - name: Post-merge correctness tests (v2)
-        if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name == 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 360
         run: |
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py
-          "
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-full
 
       - name: Clean up v2 container
         if: always()
@@ -254,7 +300,7 @@ jobs:
       # Flash Attention v3 (Hopper)
       # ===========================================
       - name: Generate Dockerfile (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: |
           cat <<'EOF' > Dockerfile.triton_v3
           FROM ${{ env.BASE_IMAGE }}
@@ -262,13 +308,17 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
+          COPY . /aiter
+
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
+              rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              rm -rf /flash-attention/.git && \
               cd /flash-attention/hopper && \
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
               FLASH_ATTENTION_FORCE_BUILD=TRUE \
               pip install --no-build-isolation .
 
-          COPY . /aiter
           RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
 
           RUN pip show flash-attn-3 && pip show amd-aiter && pip show triton && \
@@ -278,11 +328,11 @@ jobs:
           EOF
 
       - name: Build Docker image (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: docker build -t fa_triton_v3_test:ci -f Dockerfile.triton_v3 .
 
       - name: Start CI container (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: |
           docker ps -aq -f name=fa_triton_v3_test | xargs -r docker stop | xargs -r docker rm || true
 
@@ -292,51 +342,34 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_v3_test \
             fa_triton_v3_test:ci
 
       - name: PR correctness tests (v3)
-        if: ${{ github.event_name != 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name != 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 90
         run: |
-          docker exec fa_triton_v3_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            export PYTHONPATH=/flash-attention/hopper:\${PYTHONPATH:-}
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_output \
-              -k '4096-4096' && \
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output \
-              -k '1024-1024' && \
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
-              -k '16-20000'
-          "
+          docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-pr
 
       - name: Post-merge correctness tests (v3)
-        if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name == 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 360
         run: |
-          docker exec fa_triton_v3_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            export PYTHONPATH=/flash-attention/hopper:\${PYTHONPATH:-}
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py
-          "
+          docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-full
 
       - name: Clean up v3 container
-        if: ${{ always() && matrix.label == 'MI35X' }}
+        if: ${{ always() && matrix.label == 'MI350X-DPX' }}
         run: |
           docker stop fa_triton_v3_test || true
           docker rm -f fa_triton_v3_test || true
@@ -345,8 +378,17 @@ jobs:
       # ===========================================
       # Artifacts
       # ===========================================
+      # The single home for the MHA bench CSV: the current-run source for the PR
+      # perf compare (fa_mha_bench job) AND, on push-to-main, the baseline it diffs
+      # against (fetched by commit). One artifact, 90-day retention so a baseline
+      # outlives the raw run. Uploaded on PRs (all arches) and push-to-main (MI350X DPX,
+      # for the baseline). push only fires on main, so no ref guard is needed.
       - name: Upload benchmark results
-        if: ${{ success() && github.event_name != 'push' }}
+        if: ${{ success() && (github.event_name != 'push' || matrix.label == 'MI350X-DPX') }}
+        # Best-effort: the bench already ran, and GitHub's artifact backend times out
+        # transiently (CreateArtifact), so an upload flake must not fail the whole bench
+        # job. A missing artifact just means the PR compare warns "no baseline" (warn-only).
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: flash-attention-triton-benchmark-${{ matrix.label }}
@@ -354,22 +396,120 @@ jobs:
             benchmark_fa_triton_${{ matrix.label }}.log
             benchmark_mha_daoai_${{ matrix.label }}.log
             bench_dao_ai_${{ matrix.label }}/
-          retention-days: 7
+          retention-days: 90
+
+  # =============================================================================
+  # FA MHA Bench (main-vs-branch perf compare)
+  # =============================================================================
+  # On a PR: diff the PR's MHA bench CSV against the last main baseline with
+  # compare_mha.py (throughput, higher=faster) and write the table to the job
+  # summary. Warn-only. CPU-only (compare_mha.py is stdlib, no GPU), so it runs
+  # off the GPU runner. Mirrors the tuned_op_bench job in aiter-test.yaml.
+  # CSVs come from the MI350X DPX leg only (single arch, no cross-arch noise).
+  fa_mha_bench:
+    name: FA MHA Bench
+    if: >-
+      always() && !cancelled() &&
+      !github.event.pull_request.draft &&
+      github.event_name == 'pull_request'
+    needs: [flash_attention_triton]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download current MHA bench CSV (MI350X DPX)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flash-attention-triton-benchmark-MI350X-DPX
+          path: /tmp/current/
+
+      - name: Locate current CSV
+        id: current
+        run: |
+          csv=$(find /tmp/current -name bench_mha.csv 2>/dev/null | head -1)
+          if [[ -z "$csv" ]]; then
+            echo "::warning::No current MHA bench CSV found (MI350X DPX leg may have failed); skipping perf compare."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$csv" /tmp/current.csv
+          echo "Current CSV: $csv ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v21
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: flash-attention-triton-benchmark-MI350X-DPX
+          path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
+          if_no_artifact_found: warn
+
+      - name: Fallback baseline from latest main
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v21
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          branch: main
+          name: flash-attention-triton-benchmark-MI350X-DPX
+          path: /tmp/baseline_main/
+          allow_forks: false
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          # The download steps may not create these dirs when no artifact is found;
+          # mkdir + `|| true` keep the no-baseline path from aborting under pipefail.
+          mkdir -p /tmp/baseline_pinned /tmp/baseline_main
+          baseline_csv=$(find /tmp/baseline_pinned -name bench_mha.csv 2>/dev/null | head -1 || true)
+          if [[ -z "$baseline_csv" ]]; then
+            baseline_csv=$(find /tmp/baseline_main -name bench_mha.csv 2>/dev/null | head -1 || true)
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+            echo "::warning::No MHA bench baseline found; skipping perf compare."
+            {
+              echo "## FA MHA Bench"
+              echo
+              echo "_No baseline available. First run, or main has not published a baseline yet._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## FA MHA Bench (vs main baseline, MI350X DPX)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 op_tests/op_benchmarks/triton/compare_mha.py \
+            "$baseline_csv" /tmp/current.csv | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # Windows Smoke Test
   # =============================================================================
   windows_smoke:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Windows Smoke Test
     needs: [prechecks]
     runs-on: windows-latest
     steps:
+      - name: Configure Git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
+
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -383,18 +523,12 @@ jobs:
           pip install triton-windows
         shell: bash
 
-      - name: Install aiter
-        run: pip install -e . --no-build-isolation
-        shell: bash
-
-      - name: Install flash-attention (Triton backend)
+      - name: Install aiter and flash-attention (Triton backend)
         run: |
-          git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} "$RUNNER_TEMP/flash-attention"
-          rm -rf "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
-          cp -a . "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
-          rm -rf "$RUNNER_TEMP/flash-attention/.git"
-          cd "$RUNNER_TEMP/flash-attention"
-          BUILD_TARGET=rocm FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install --no-build-isolation --no-deps -e .
+          # Invoked through `bash` rather than executed: this job is windows-latest, where the
+          # exec bit does not survive checkout.
+          BUILD_TARGET=rocm bash .github/scripts/flash_attention/install.sh \
+            . "$RUNNER_TEMP/flash-attention" editable
         shell: bash
 
       - name: Verify FA imports aiter Triton backend
@@ -412,7 +546,7 @@ jobs:
 
   # AITER_TRITON_ONLY import contract (no C++ JIT, no GPU, no ROCm runtime).
   triton_only_smoke:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Triton-only Smoke
     needs: [prechecks]
     runs-on: ubuntu-latest
@@ -452,8 +586,10 @@ jobs:
     if: false  # Disabled until CK tests are ready
     # if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
     name: Flash Attention - CK (1 GPU)
-    needs: [check-signal, prechecks]
-    runs-on: linux-aiter-mi35x-1
+    needs: [check-signal, prechecks, ci_config]
+    runs-on: linux-aiter-do-mi350x-dpx-1
+    env:
+      BASE_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout aiter repo
@@ -465,10 +601,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -564,4 +701,3 @@ jobs:
           docker stop fa_ck_test || true
           docker rm -f fa_ck_test || true
           docker rmi fa_ck_test:ci || true
-

@@ -1,7 +1,8 @@
-import torch
-
 import importlib.util
 from pathlib import Path
+
+import torch
+
 from aiter.ops.triton._triton_kernels.quant.quant import (
     pod_persistent,
 )
@@ -93,7 +94,7 @@ def pod_attention(
             matching respective query tensors.
     """
     _LOGGER.info(
-        f"POD_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "POD_ATTENTION: q=%s k=%s v=%s", tuple(q.shape), tuple(k.shape), tuple(v.shape)
     )
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -110,8 +111,8 @@ def pod_attention(
     qk_scale = sm_scale * 1.44269504
 
     # We assume the kernel functions fused by pod attention are persistent kernel functions
-    # For gfx942, we launch total 608 WGs. Each CU will get 2 WG --- one WG will be doing decode and one prefill
-    # For different decode:prefill ratios, assign (decode+prefill)*304 number of WGs
+    # The launch has two WGs per CU (decode and prefill); use the CU count
+    # to fold program IDs.
     total_wgs = total_programs // 2
 
     (
@@ -121,7 +122,7 @@ def pod_attention(
         max_tiles_per_wg,
         tiles_per_head,
         num_splits,
-        even_split,
+        _even_split,
     ) = get_num_splits_and_buffer_sizes(
         False,  # causal
         batch_size,
@@ -162,7 +163,7 @@ def pod_attention(
         max_tiles_per_wg_pf,
         tiles_per_head_pf,
         num_splits_pf,
-        even_split_pf,
+        _even_split_pf,
     ) = get_num_splits_and_buffer_sizes(
         True,  # causal,
         batch_size_pf,
@@ -279,6 +280,7 @@ def pod_attention(
         prefill_ratio=prefill_ratio,
         decode_ratio=decode_ratio,
         max_output_tile_cnt=max_output_tile_cnt,
+        num_cus=total_wgs,
     )
     # torch.cuda.synchronize()
     print(
@@ -338,7 +340,7 @@ def get_num_splits_and_buffer_sizes(
     tiles_per_head = 0
     if causal:
         # Prefill - Causal
-        for i in range(0, num_m_blocks):
+        for i in range(num_m_blocks):
             tiles_per_head += (((i + 1) * BLOCK_M) + BLOCK_N - 1) // BLOCK_N
     else:
         # Decode or Not Causal

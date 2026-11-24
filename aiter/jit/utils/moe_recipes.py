@@ -5,7 +5,6 @@
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
 
 _DTYPE_MAP = {
     "torch.float8_e4m3fn": "f8",
@@ -17,6 +16,8 @@ _DTYPE_MAP = {
 }
 
 _QUANT_ALIAS = {"per_128x128": "per_1x128"}
+# Bump when the MoeKernel launch signature changes.
+MOE_MODULE_ABI_TAG = "abi2"
 
 
 def _build_moe_variant(
@@ -29,9 +30,11 @@ def _build_moe_variant(
     mul_routed_weight_stage: int,
     preshuffle_mode: bool,
     is_splitk: bool,
-) -> Tuple[str, list]:
+    runtime_swiglu_limit: bool = False,
+) -> tuple[str, list]:
     parts = [
         "module_moe_ck2stages",
+        MOE_MODULE_ABI_TAG,
         a_dtype,
         b_dtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",
@@ -42,12 +45,16 @@ def _build_moe_variant(
     ]
     if is_splitk:
         parts.append("splitk")
+    if runtime_swiglu_limit:
+        parts.append("runtime_swiglu_limit")
 
     flags = ""
     if preshuffle_mode and b_dtype == "fp4x2":
         flags += " --preshuffle"
     if is_splitk:
         flags += " --issplitk"
+    if runtime_swiglu_limit:
+        flags += " --runtime-swiglu-limit"
 
     md_name = "_".join(parts)
     blob_gen_cmd = [
@@ -81,7 +88,7 @@ def _normalize_activation(activation: str) -> str:
     return _normalize_enum_str(activation)
 
 
-def _infer_preshuffle_modes(b_dtype: str, quant_type: str) -> List[bool]:
+def _infer_preshuffle_modes(b_dtype: str, quant_type: str) -> list[bool]:
     """Infer preshuffle modes based on runtime behavior.
 
     - fp4x2: may or may not be pre-shuffled -> both off and on
@@ -93,7 +100,7 @@ def _infer_preshuffle_modes(b_dtype: str, quant_type: str) -> List[bool]:
     return [True]
 
 
-def _should_include_splitk(row: Dict, quant_type: str) -> bool:
+def _should_include_splitk(row: dict, quant_type: str) -> bool:
     """splitk only applies to f8/f8 per_1x128 (blockscale) kernels."""
     if quant_type != "per_1x128":
         return False
@@ -106,7 +113,11 @@ def _should_include_splitk(row: Dict, quant_type: str) -> bool:
         return False
 
 
-def _get_mul_weight_stage(row: Dict) -> int:
+def _has_runtime_swiglu_limit(row: dict) -> bool:
+    return "swiglu_limit=" in str(row.get("_tag") or "")
+
+
+def _get_mul_weight_stage(row: dict) -> int:
     value = row.get("doweight_stage1")
     if not value:
         return 2
@@ -116,13 +127,29 @@ def _get_mul_weight_stage(row: Dict) -> int:
     return 2
 
 
-def _get_tuned_fmoe_rows() -> List[Dict]:
+def _get_tuned_fmoe_rows() -> list[dict]:
     configs_dir = Path(__file__).resolve().parents[2] / "configs"
     model_configs_dir = configs_dir / "model_configs"
     tuned_paths = [configs_dir / "tuned_fmoe.csv"]
-    tuned_paths.extend(sorted(model_configs_dir.glob("*tuned_fmoe*.csv")))
+    # NOTE: "*tuned_fmoe*.csv" also matches "*untuned_fmoe*.csv" (substring).
+    # Untuned CSVs list problem shapes to tune, not resolved kernels, and have
+    # no kernelName columns — so the flydsl-skip in the prebuild enumerator does
+    # not catch them and they get force-compiled as CK 2stages (e.g. GLM-5.2
+    # MXFP8 Silu per_1x32, which has no working CK instance). Exclude untuned.
+    tuned_paths.extend(
+        p
+        for p in sorted(model_configs_dir.glob("*tuned_fmoe*.csv"))
+        if "untuned" not in p.name
+    )
+    # Rows tuned with --swiglu_limit form their own family.
+    tuned_paths.append(configs_dir / "tuned_swiglu_limit_fmoe.csv")
+    tuned_paths.extend(
+        p
+        for p in sorted(model_configs_dir.glob("*tuned_swiglu_limit_fmoe*.csv"))
+        if "untuned" not in p.name
+    )
 
-    rows: List[Dict] = []
+    rows: list[dict] = []
     for path in tuned_paths:
         if not path.exists():
             continue
@@ -131,9 +158,9 @@ def _get_tuned_fmoe_rows() -> List[Dict]:
     return rows
 
 
-def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
-    seen: Set[Tuple] = set()
-    results: List[Dict] = []
+def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
+    seen: set[tuple] = set()
+    results: list[dict] = []
     for row in _get_tuned_fmoe_rows():
         kn1 = (row.get("kernelName1") or "").strip()
         kn2 = (row.get("kernelName2") or "").strip()
@@ -147,8 +174,17 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
         activation = _normalize_activation(row["act_type"])
         mul_weight_stage = _get_mul_weight_stage(row)
         need_splitk = _should_include_splitk(row, quant_type)
+        runtime_swiglu_limit = (
+            _has_runtime_swiglu_limit(row)
+            and activation == "silu"
+            and quant_type in ("per_1x128", "per_token", "per_tensor")
+            and a_dtype == "f8"
+            and b_dtype == "f8"
+        )
 
-        if activation == "swiglu":
+        if activation in ("swiglu", "situv2"):
+            # Swiglu / SiTUv2 MXFP4 MoE are owned by FlyDSL; CK 2stages codegen
+            # has no matching instance, so skip these from the CK prebuild.
             continue
 
         # A16W4 per_1x32 (bf16 activation, int4 weight) is owned by FlyDSL,
@@ -158,29 +194,35 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
 
         for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type):
             for splitk in [False, True] if need_splitk else [False]:
-                key = (
-                    a_dtype,
-                    b_dtype,
-                    c_dtype,
-                    quant_type,
-                    activation,
-                    mul_weight_stage,
-                    preshuffle,
-                    splitk,
+                runtime_limit_variants = (
+                    (False, True) if runtime_swiglu_limit and not splitk else (False,)
                 )
-                if key in seen:
-                    continue
-                seen.add(key)
-                md_name, blob_gen_cmd = _build_moe_variant(
-                    aiter_csrc_dir=aiter_csrc_dir,
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    c_dtype=c_dtype,
-                    activation=activation,
-                    quant_type=quant_type,
-                    mul_routed_weight_stage=mul_weight_stage,
-                    preshuffle_mode=preshuffle,
-                    is_splitk=splitk,
-                )
-                results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
+                for enable_runtime_limit in runtime_limit_variants:
+                    key = (
+                        a_dtype,
+                        b_dtype,
+                        c_dtype,
+                        quant_type,
+                        activation,
+                        mul_weight_stage,
+                        preshuffle,
+                        splitk,
+                        enable_runtime_limit,
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    md_name, blob_gen_cmd = _build_moe_variant(
+                        aiter_csrc_dir=aiter_csrc_dir,
+                        a_dtype=a_dtype,
+                        b_dtype=b_dtype,
+                        c_dtype=c_dtype,
+                        activation=activation,
+                        quant_type=quant_type,
+                        mul_routed_weight_stage=mul_weight_stage,
+                        preshuffle_mode=preshuffle,
+                        is_splitk=splitk,
+                        runtime_swiglu_limit=enable_runtime_limit,
+                    )
+                    results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
     return results

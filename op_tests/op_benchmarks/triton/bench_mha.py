@@ -1,32 +1,47 @@
-import torch
-import warnings
 import argparse
-import itertools
 import dataclasses
+import functools
+import itertools
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+
+import torch
 import triton
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    mha_set_use_fused_bwd_kernel,
     mha_set_impl,
+    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 
@@ -42,10 +57,16 @@ class BenchRun:
     profile_dir: str | None
     print_vgpr: bool
     bench_torch: bool
-    window_size_left: int = -1
+    bencher: RotatingBufferBench
+    backend: str = "triton"
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
+
+# The (left, right) window variants the default sweep benches: dense + a representative
+# causal sliding window. A swept axis like the default function/dtype sets; override with
+# --window-size-left/right to bench one specific window instead.
+DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
 
 
 @dataclass(frozen=True)
@@ -63,13 +84,27 @@ class BenchConfig:
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
     model: str | None = None
+    # Sliding window (left, right) for THIS config. (-1, -1) is dense (off); either
+    # bound >= 0 makes it a window (-1 on a side means unbounded that side).
+    window_size_left: int = -1
+    window_size_right: int = -1
+
+    @property
+    def has_sliding_window(self) -> bool:
+        # dense iff BOTH bounds are off (-1); either set = a window (kernel semantics).
+        return self.window_size_left >= 0 or self.window_size_right >= 0
 
     def __str__(self) -> str:
         label = self.model or "custom"
+        window = (
+            f" window=({self.window_size_left},{self.window_size_right})"
+            if self.has_sliding_window
+            else ""
+        )
         return (
             f"{label} B={self.batch} HQ={self.hq} HK={self.hk} "
             f"sq={self.sq} sk={self.sk} d={self.d_head} "
-            f"{self.function} {self.dtype_str} causal={self.causal}"
+            f"{self.function} {self.dtype_str} causal={self.causal}{window}"
         )
 
     @property
@@ -97,22 +132,29 @@ class BenchConfig:
             total *= 2  # grads are same size as inputs
         return total
 
-    def to_tuple(self) -> tuple:
-        return (
-            self.model,
-            self.batch,
-            self.hq,
-            self.hk,
-            self.sq,
-            self.sk,
-            self.d_head,
-            self.d_head_v,
-            self.causal,
-            self.function,
-            self.dtype_str,
-            self.impl,
-            self.fused,
-        )
+    def to_dict(self) -> dict:
+        """The row's key columns as {csv_column: value}, in CSV order: the single
+        source of truth for the CSV header, the triton x-axis, and each written row
+        (the metric is appended separately by the writer, being the measurement, not
+        a key). CSV names differ from the field names as they are the boundary contract.
+        """
+        return {
+            "model": self.model,
+            "BATCH": self.batch,
+            "HQ": self.hq,
+            "HK": self.hk,
+            "N_CTX_Q": self.sq,
+            "N_CTX_K": self.sk,
+            "D_HEAD": self.d_head,
+            "D_HEAD_V": self.d_head_v,
+            "causal": self.causal,
+            "function": self.function,
+            "dtype": self.dtype_str,
+            "impl": self.impl,
+            "fused": self.fused,
+            "window_left": self.window_size_left,
+            "window_right": self.window_size_right,
+        }
 
 
 def _count_valid_attention_elements(
@@ -121,7 +163,7 @@ def _count_valid_attention_elements(
     causal: bool,
     window_size: tuple[int, int],
 ) -> int:
-    window_size_left, _ = window_size
+    window_size_left, window_size_right = window_size
     shift = seqlen_k - seqlen_q
     total = 0
 
@@ -129,6 +171,11 @@ def _count_valid_attention_elements(
         right = seqlen_k - 1
         if causal:
             right = min(right, q_idx + shift)
+        # A finite right edge caps how far ahead a query attends; honor it so the
+        # FLOP count is correct for symmetric / right-bounded windows, not just the
+        # causal (right=0) case. A negative right is the "off" sentinel -> no cap.
+        if window_size_right >= 0:
+            right = min(right, q_idx + shift + window_size_right)
         left = 0
         if window_size_left >= 0:
             left = max(left, q_idx + shift - window_size_left)
@@ -150,6 +197,7 @@ def _make_attn_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -169,6 +217,7 @@ def _make_varlen_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -206,6 +255,7 @@ def _make_kvcache_fn(q, k_cache, v_cache, **kw):
         cache_seqlens=kw["cache_seqlens"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
     )
 
 
@@ -225,8 +275,55 @@ _MAKE_FN_FP8 = {
 }
 
 
-def get_make_fn(function: str, dtype: str) -> Callable:
+# Gluon fp8 entry points
+# Unlike mha_v3's fp8 wrappers, which take high-precision inputs and quantize on
+# every call, the gluon kernel takes pre-quantized fp8 q/k/v plus descales. The
+# caller (_make_pool_entry with quantize=True) quantizes q/k/v and passes the
+# descales in via kw["q_descale"] / kw["k_descale"] / kw["v_descale"].
+def _make_fp8_gluon_fn(q_fp8, k_fp8, v_fp8, **kw):
+    return lambda: flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=kw["q_descale"],
+        k_descale=kw["k_descale"],
+        v_descale=kw["v_descale"],
+        backend="gluon",
+    )
+
+
+def _make_fp8_varlen_gluon_fn(q_fp8, k_fp8, v_fp8, **kw):
+    return lambda: flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=kw["q_descale"],
+        k_descale=kw["k_descale"],
+        v_descale=kw["v_descale"],
+        backend="gluon",
+    )
+
+
+_MAKE_FN_FP8_GLUON = {
+    "fwd": _make_fp8_gluon_fn,
+    "fwd_varlen": _make_fp8_varlen_gluon_fn,
+}
+
+
+def get_make_fn(function: str, dtype: str, backend: str = "triton") -> Callable:
     if dtype == "fp8":
+        if backend == "gluon":
+            return _MAKE_FN_FP8_GLUON[function]
         return _MAKE_FN_FP8[function]
     return _MAKE_FN[function]
 
@@ -241,7 +338,7 @@ def make_workloads(
 ) -> tuple[list[tuple], list[tuple]]:
     """Generate realistic workloads from vLLM scheduler parameters.
 
-    Prefill: batch × sq = num_tokens (token budget per step).
+    Prefill: batch x sq = num_tokens (token budget per step).
     Decode: batch = min(num_tokens, max_num_seqs), sq=1.
     Returns (prefill_workloads, decode_workloads).
     Each entry is (batch, sq, sk, causal, functions).
@@ -262,6 +359,7 @@ def model_benchmark_configs(
     *,
     dtypes: list[str],
     functions: list[str],
+    windows: list[tuple[int, int]],
     impl: str,
     fused: bool,
     model: str | None = None,
@@ -277,7 +375,7 @@ def model_benchmark_configs(
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        HEAD_DIM = config["hidden_size"] // HQ
+        HEAD_DIM = config.get("head_dim", config["hidden_size"] // HQ)
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
@@ -305,23 +403,26 @@ def model_benchmark_configs(
             for fn in workload_fns:
                 if fn not in functions:
                     continue
-                fa_configs.append(
-                    BenchConfig(
-                        model=model_name,
-                        batch=b,
-                        hq=HQ,
-                        hk=HK,
-                        sq=sq,
-                        sk=sk,
-                        d_head=HEAD_DIM,
-                        d_head_v=HEAD_DIM,
-                        causal=causal,
-                        function=fn,
-                        dtype_str=d,
-                        impl=impl,
-                        fused=fused and d != "fp8",
+                for wl, wr in windows:
+                    fa_configs.append(
+                        BenchConfig(
+                            model=model_name,
+                            batch=b,
+                            hq=HQ,
+                            hk=HK,
+                            sq=sq,
+                            sk=sk,
+                            d_head=HEAD_DIM,
+                            d_head_v=HEAD_DIM,
+                            causal=causal,
+                            function=fn,
+                            dtype_str=d,
+                            impl=impl,
+                            fused=fused and d != "fp8",
+                            window_size_left=wl,
+                            window_size_right=wr,
+                        )
                     )
-                )
 
     return fa_configs
 
@@ -339,7 +440,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -358,25 +461,13 @@ def pad_rearrange_dropout_mask(
 
 
 def _make_triton_benchmark(run: BenchRun) -> list:
-    x_names = [
-        "model",
-        "BATCH",
-        "HQ",
-        "HK",
-        "N_CTX_Q",
-        "N_CTX_K",
-        "D_HEAD",
-        "D_HEAD_V",
-        "causal",
-        "function",
-        "dtype",
-        "impl",
-        "fused",
-    ]
+    # Row schema (names + order) comes from BenchConfig.to_dict(); configs are
+    # non-empty here (run_benchmark returns early otherwise).
+    x_names = list(run.configs[0].to_dict())
     return [
         triton.testing.Benchmark(
             x_names=x_names,
-            x_vals=[c.to_tuple() for c in run.configs],
+            x_vals=[tuple(c.to_dict().values()) for c in run.configs],
             line_arg="provider",
             line_vals=[run.unit],
             line_names=[run.unit],
@@ -404,22 +495,8 @@ class _CsvWriter:
 
         os.makedirs(run.save_path, exist_ok=True)
         self._path = os.path.join(run.save_path, f"{run.plot_name}.csv")
-        header = [
-            "model",
-            "BATCH",
-            "HQ",
-            "HK",
-            "N_CTX_Q",
-            "N_CTX_K",
-            "D_HEAD",
-            "D_HEAD_V",
-            "causal",
-            "function",
-            "dtype",
-            "impl",
-            "fused",
-            run.unit,
-        ]
+        # Header = the row's key columns (from to_dict) + the metric (the unit).
+        header = [*run.configs[0].to_dict(), run.unit]
         with open(self._path, "w") as f:
             f.write(",".join(header) + "\n")
 
@@ -430,8 +507,8 @@ class _CsvWriter:
             self._skipped += 1
             return
         with open(self._path, "a") as f:
-            row = ",".join(str(x) for x in config.to_tuple()) + f",{value}\n"
-            f.write(row)
+            cells = [*config.to_dict().values(), value]
+            f.write(",".join(str(x) for x in cells) + "\n")
         self._written += 1
 
     def summary(self) -> None:
@@ -454,7 +531,7 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     for c in configs:
         if c.estimated_memory > limit:
             print(
-                f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
+                f"[SKIP] {c} -- {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
                 flush=True,
             )
         else:
@@ -467,6 +544,9 @@ def run_benchmark(run: BenchRun):
     filtered = _filter_by_memory(run.configs)
     if len(filtered) < len(run.configs):
         run = dataclasses.replace(run, configs=filtered)
+    if not run.configs:
+        print("[bench] no configs to run (all filtered by memory).", flush=True)
+        return
     total = len(run.configs)
     counter = 0
     csv = _CsvWriter(run)
@@ -486,6 +566,8 @@ def run_benchmark(run: BenchRun):
         dtype,
         impl,
         fused,
+        window_left,
+        window_right,
         torch_dtype,
         unit,
         provider,
@@ -498,9 +580,15 @@ def run_benchmark(run: BenchRun):
         config = run.configs[counter - 1]
         label = model or "custom"
         mem_gb = config.estimated_memory / 1e9
+        window_str = (
+            f" window=({window_left},{window_right})"
+            if window_left >= 0 or window_right >= 0
+            else ""
+        )
         print(
             f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
-            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal} ({mem_gb:.1f}GB)",
+            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} "
+            f"causal={causal}{window_str} ({mem_gb:.1f}GB)",
             flush=True,
         )
         try:
@@ -518,6 +606,8 @@ def run_benchmark(run: BenchRun):
                 dtype,
                 impl,
                 fused,
+                window_left,
+                window_right,
                 torch_dtype,
                 unit,
                 dropout,
@@ -525,7 +615,7 @@ def run_benchmark(run: BenchRun):
                 device,
                 run,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  [SKIP] {e}", flush=True)
             value = None
         finally:
@@ -547,6 +637,8 @@ def run_benchmark(run: BenchRun):
         dtype,
         impl,
         fused,
+        window_size_left,
+        window_size_right,
         torch_dtype,
         unit,
         dropout,
@@ -558,139 +650,60 @@ def run_benchmark(run: BenchRun):
         is_bwd = function.startswith("bwd")
         is_varlen = "varlen" in function
         is_decode = function == "fwd_kvcache"
+        is_gluon = run.backend == "gluon"
         requires_grad = is_bwd
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        window_size = (run.window_size_left, -1)
-        has_sliding_window = run.window_size_left >= 0
+        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
+        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
+        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
+        window_size = (window_size_left, window_size_right)
         if impl != "default":
             mha_set_impl(impl)
-        if (fused or dtype == "fp8") and (has_pe or run.sink or has_sliding_window):
+        # SWA runs on the dao_ai path (any dtype), the fp8 path (routes to FA3, which
+        # has it) and the Gluon backend; only native non-fp8 triton lacks it (left-only,
+        # right rejected). Skip that combo cleanly rather than hard-error mid-sweep.
+        if has_sliding_window and not is_gluon and impl != "dao_ai" and dtype != "fp8":
             warnings.warn(
-                "Skipping: PE, sink, or sliding window not supported with fused bwd / fp8."
+                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
+        if is_gluon and window_size_right >= 0:
+            warnings.warn("Skipping: Gluon backend does not support a right window.")
+            return 0
+        if (fused or dtype == "fp8") and (has_pe or run.sink):
+            warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
+            return 0
+        # The Gluon kernel is forward-only and has no KV cache path
+        # (see aiter.ops.triton.attention.mha gluon backend).
+        if is_gluon and (is_bwd or is_decode):
+            warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
+            return 0
         mha_set_use_fused_bwd_kernel(fused)
-        make_fn = get_make_fn(function, dtype)
+        make_fn = get_make_fn(function, dtype, run.backend)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
             sm_scale = 1.0 / (D_HEAD**0.5)
 
-        # Generate base inputs
-        q = torch.randn(
-            (BATCH, N_CTX_Q, HQ, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        k = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        v = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD_V),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        sink = (
-            torch.randn(
-                (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
-            )
-            if run.sink
-            else None
-        )
-
         # FLOPS calculation variables
         total_flops = 0.0
-
-        # Input preparation
-        if is_decode:
-            # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
-            q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
-            k_cache = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
-            v_cache = v[:, :N_CTX_K, :, :D_HEAD_V]
-            cache_seqlens = torch.full(
-                (BATCH,), N_CTX_K, dtype=torch.int32, device=device
-            )
-            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-
-            fn_kwargs = dict(
-                sm_scale=sm_scale,
-                causal=causal,
-                cache_seqlens=cache_seqlens,
-            )
-            fn = make_fn(q_input, k_cache, v_cache, **fn_kwargs)
-            if fn is None:
-                return 0
-        elif is_varlen:
+        # Varlen's padding mask must be generated once per benchmark point (not per
+        # rotating-buffer pool entry): it fixes cu_seqlens/max_seqlen (and so every
+        # entry's unpadded tensor shapes) so a CUDA graph can capture across entries
+        # that only vary q/k/v content, not shape.
+        query_padding_mask = key_padding_mask = None
+        if is_varlen:
             query_padding_mask = generate_random_padding_mask(
                 N_CTX_Q, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
             key_padding_mask = generate_random_padding_mask(
                 N_CTX_K, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
-            (
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                q,
-                k,
-                v,
-                _,
-                _,
-                _,
-            ) = generate_qkv(
-                q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
-            )
-            q_unpad.requires_grad = requires_grad
-            k_unpad.requires_grad = requires_grad
-            v_unpad.requires_grad = requires_grad
-
-            q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
-
-            num_contexts = len(cu_seqlens_q) - 1
-            for i in range(num_contexts):
-                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                total_flops += (
-                    _count_valid_attention_elements(
-                        seqlen_q, seqlen_k, causal, window_size
-                    )
-                    * HQ
-                    * (D_HEAD + D_HEAD_V)
-                    * 2.0
-                )
-
-            fn_kwargs = dict(
-                sm_scale=sm_scale,
-                causal=causal,
-                dropout=dropout,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-                sink=sink,
-                window_size=window_size,
-                has_pe=has_pe,
-                has_sink=run.sink,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-            )
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+        elif is_decode:
+            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
         else:
-            q_input, k_input, v_input = q, k, v
-
             total_flops += (
                 2.0
                 * BATCH
@@ -699,45 +712,172 @@ def run_benchmark(run: BenchRun):
                 * (D_HEAD + D_HEAD_V)
             )
 
-            fn_kwargs = dict(
-                sm_scale=sm_scale,
-                causal=causal,
-                dropout=dropout,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-                sink=sink,
-                window_size=window_size,
-                has_pe=has_pe,
-                has_sink=run.sink,
+        def _make_pool_entry(quantize: bool = False):
+            """Build one rotating-buffer pool entry.
+
+            If ``quantize`` is set, q/k/v are quantized to fp8 (per batch/head)
+            here, outside the timed call; the returned q/k/v inputs are the fp8
+            tensors and the descales are forwarded to ``make_fn`` via fn_kwargs.
+            """
+            q = torch.randn(
+                (BATCH, N_CTX_Q, HQ, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
             )
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+            k = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            v = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD_V),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            sink = (
+                torch.randn(
+                    (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
+                )
+                if run.sink
+                else None
+            )
 
-        if is_bwd:
-            with torch.enable_grad():
-                triton_out = fn()[0]
-                d_out = torch.randn_like(triton_out)
+            cu_seqlens_q = cu_seqlens_k = None
+            if is_decode:
+                # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
+                q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
+                k_input = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
+                v_input = v[:, :N_CTX_K, :, :D_HEAD_V]
+                cache_seqlens = torch.full(
+                    (BATCH,), N_CTX_K, dtype=torch.int32, device=device
+                )
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "cache_seqlens": cache_seqlens,
+                }
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            elif is_varlen:
+                (
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = generate_qkv(
+                    q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
+                )
+                q_unpad.requires_grad = requires_grad
+                k_unpad.requires_grad = requires_grad
+                v_unpad.requires_grad = requires_grad
 
-                grad_inputs = (q_input, k_input, v_input)
-                if sink is not None:
-                    grad_inputs += (sink,)
+                q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
 
-                def fn():
-                    grads = torch.autograd.grad(
-                        triton_out,
-                        grad_inputs,
-                        d_out,
-                        retain_graph=True,
-                    )
-                    return grads
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                }
+            else:
+                q_input, k_input, v_input = q, k, v
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                }
+
+            if quantize:
+                fp8_dtype = get_fp8_e4m3_dtype()
+                q_input, q_descale = quantize_fp8_per_bh(
+                    q_input, fp8_dtype, cu_seqlens_q
+                )
+                k_input, k_descale = quantize_fp8_per_bh(
+                    k_input, fp8_dtype, cu_seqlens_k
+                )
+                v_input, v_descale = quantize_fp8_per_bh(
+                    v_input, fp8_dtype, cu_seqlens_k
+                )
+                fn_kwargs.update(
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+                )
+
+            if not is_decode:
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+
+            if is_bwd:
+                with torch.enable_grad():
+                    triton_out = fwd_fn()[0]
+                    d_out = torch.randn_like(triton_out)
+
+                    grad_inputs = (q_input, k_input, v_input)
+                    if sink is not None:
+                        grad_inputs += (sink,)
+
+                    def call():
+                        return torch.autograd.grad(
+                            triton_out,
+                            grad_inputs,
+                            d_out,
+                            retain_graph=True,
+                        )
+
+            else:
+                call = fwd_fn
+
+            return q_input, k_input, v_input, call, cu_seqlens_q, cu_seqlens_k
+
+        _out_val_keys = [
+            "q_input",
+            "k_input",
+            "v_input",
+            "call",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+        ]
+
+        # The gluon fp8 kernel takes pre-quantized fp8 q/k/v plus descales, so
+        # quantize once per pool entry, outside the timed call.
+        quantize_inputs = is_gluon and dtype == "fp8"
+        make_pool_entry = functools.partial(_make_pool_entry, quantize=quantize_inputs)
 
         if run.profile_dir is not None:
             import os
 
+            entry = dict(zip(_out_val_keys, make_pool_entry()))
+            call = entry["call"]
+
             # Warmup
             for _ in range(3):
-                fn()
+                call()
                 torch.cuda.synchronize()
 
             prof = torch.profiler.profile(
@@ -750,7 +890,7 @@ def run_benchmark(run: BenchRun):
             )
             prof.start()
             for _ in range(5):
-                fn()
+                call()
                 torch.cuda.synchronize()
             prof.stop()
 
@@ -769,21 +909,75 @@ def run_benchmark(run: BenchRun):
             prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
             return 0
 
-        ms = triton.testing.do_bench(fn)
+        if is_bwd:
+            if not hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
+                raise RuntimeError(
+                    "torch.autograd.graph.set_override_stale_capture_stream is not available "
+                    f"(found torch {torch.__version__}); PyTorch >= 2.13 is required."
+                )
+            # autograd.grad's graph is built on the default stream; let CUDA graph
+            # capture (on its own side stream) adopt that stale reference.
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
+        # mha_v3's non-gluon fp8 wrappers (flash_attn_fp8_func / _varlen_fp8_func)
+        # quantize their high-precision inputs on every call, by design (see the
+        # module docstring). That quantization does a CPU->GPU copy, which CUDA
+        # graph capture disallows mid-capture, so this one combo can't use the
+        # rotating-buffer/capture path -- fall back to the original single-buffer
+        # plain do_bench. The gluon fp8 path pre-quantizes outside the returned
+        # call (see _make_pool_entry's quantize flag) and has no such restriction.
+        needs_plain_do_bench = dtype == "fp8" and not is_gluon
+
+        # Pool length floor is lowered to 2 in parse_args (--rot-bufs-min-pool-len).
+        if not needs_plain_do_bench:
+            rot_bufs = run.bencher.build_pool(
+                [make_pool_entry],
+                [_out_val_keys],
+            )
+            sample = rot_bufs[0]
+        else:
+            sample = dict(zip(_out_val_keys, make_pool_entry()))
+
+        base_elem = torch.tensor([], dtype=torch_dtype).element_size()
+        if is_varlen:
+            num_contexts = len(sample["cu_seqlens_q"]) - 1
+            for i in range(num_contexts):
+                seqlen_q = (
+                    sample["cu_seqlens_q"][i + 1] - sample["cu_seqlens_q"][i]
+                ).item()
+                seqlen_k = (
+                    sample["cu_seqlens_k"][i + 1] - sample["cu_seqlens_k"][i]
+                ).item()
+                total_flops += (
+                    _count_valid_attention_elements(
+                        seqlen_q, seqlen_k, causal, window_size
+                    )
+                    * HQ
+                    * (D_HEAD + D_HEAD_V)
+                    * 2.0
+                )
+            total_num_tokens_q = sample["cu_seqlens_q"][-1].item()
+            total_num_tokens_k = sample["cu_seqlens_k"][-1].item()
+        else:
+            total_num_tokens_q = BATCH * N_CTX_Q
+            total_num_tokens_k = BATCH * N_CTX_K
+
+        if needs_plain_do_bench:
+            ms = triton.testing.do_bench(sample["call"])
+        else:
+
+            def _run(call, **_):
+                call()
+
+            ms = run.bencher.bench(_run)
 
         if is_bwd:
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        if is_varlen:
-            total_num_tokens_q = cu_seqlens_q[-1].item()
-            total_num_tokens_k = cu_seqlens_k[-1].item()
-        else:
-            total_num_tokens_q = BATCH * N_CTX_Q
-            total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        q_size = total_num_tokens_q * HQ * D_HEAD * base_elem
+        k_size = total_num_tokens_k * HK * D_HEAD * base_elem
+        v_size = total_num_tokens_k * HK * D_HEAD_V * base_elem
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * base_elem
         if is_bwd:
             # read q, k, v, do
             mem_read = q_size + k_size + v_size + o_size
@@ -805,7 +999,7 @@ def run_benchmark(run: BenchRun):
 
     try:
         bench_mha.run(print_data=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"\n[WARN] benchmark failed: {e}", flush=True)
     finally:
         csv.summary()
@@ -834,6 +1028,14 @@ arg_to_torch_dtype = {
 
 def parse_args(args: list[str] | None = None) -> BenchRun:
     parser = get_parser(kernel_name="FlashAttention")
+    # Configs here range from tiny decode steps to multi-GB prefill shapes
+    # (estimated_memory / _filter_by_memory exist for exactly this reason), and
+    # the pool-size caps cannot push pool_len below min_pool_len, so the default
+    # floor of 4 entries could quadruple an already multi-GB config and OOM
+    # (backward retains even more per entry: out, d_out and the autograd graph).
+    # Large tensors already exceed L2 on their own and gain little from more
+    # rotation, so use a floor of 2.
+    override_parser_action(parser, action="--rot-bufs-min-pool-len", default=2)
     parser.add_argument(
         "-fn",
         type=str,
@@ -868,14 +1070,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="throughput",
-        choices=["time", "throughput", "bandwidth"],
-        default=None,
-        help="Metrics for the kernel benchmark.",
-    )
+
     parser.add_argument(
         "-persistent",
         nargs="?",
@@ -906,13 +1101,19 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         type=str,
         default="default",
         choices=["default", "dao_ai"],
-        help="MHA forward implementation: default (_attn_fwd) or dao_ai (flash_attn_triton_amd)",
+        help="MHA forward implementation: default (_attn_fwd) or dao_ai (Dao-AI FlashAttention)",
     )
     parser.add_argument(
         "--window-size-left",
         type=int,
         default=-1,
-        help="left sliding window size (-1 disables sliding window attention)",
+        help="left sliding window size (-1 = no left bound; dense only when both -1)",
+    )
+    parser.add_argument(
+        "--window-size-right",
+        type=int,
+        default=-1,
+        help="right sliding window size (-1 = no right bound)",
     )
     parsed = parser.parse_args(args=args)
 
@@ -952,6 +1153,11 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     impl = parsed.impl
     fused = parsed.fused_bwd
     functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
+    windows = (
+        [(parsed.window_size_left, parsed.window_size_right)]
+        if parsed.window_size_left >= 0 or parsed.window_size_right >= 0
+        else DEFAULT_WINDOWS
+    )
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -974,14 +1180,18 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
+                window_size_left=wl,
+                window_size_right=wr,
             )
             for c, fn, d in itertools.product(causals, functions, dtypes)
+            for wl, wr in windows
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
             model=parsed.model,
@@ -991,6 +1201,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
         )
@@ -1006,7 +1217,10 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         profile_dir=parsed.profile,
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
-        window_size_left=parsed.window_size_left,
+        bencher=RotatingBufferBench.from_dict(
+            {**get_rot_bufs_kwargs(parsed), **get_do_bench_graph_kwargs(parsed)}
+        ),
+        backend=parsed.backend,
     )
 
 

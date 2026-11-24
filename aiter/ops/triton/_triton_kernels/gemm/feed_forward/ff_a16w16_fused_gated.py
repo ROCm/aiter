@@ -1,21 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-import triton
+_ff_a16w16_fused_gated_repr = make_kernel_repr(
+    "_ff_a16w16_fused_gated",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+    ],
+)
 
 
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_ff_a16w16_fused_gated_repr)
 def _ff_a16w16_fused_gated(
     x_ptr,
     w1_ptr,
@@ -38,7 +54,6 @@ def _ff_a16w16_fused_gated(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
@@ -63,7 +78,8 @@ def _ff_a16w16_fused_gated(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    remap_xcd(pid, GRID_MN)
+    grid_mn = num_pid_m * num_pid_n
+    remap_xcd(pid, grid_mn)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
@@ -86,7 +102,7 @@ def _ff_a16w16_fused_gated(
         0, BLOCK_SIZE_N // 2
     )
     offs_w1n1 = (
-        (pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2))
+        pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
     ) + (N // 2)
     w1n0_ptrs = w1_ptr + (
         offs_k[:, None] * stride_w1k + offs_w1n0[None, :] * stride_w1n
@@ -97,7 +113,7 @@ def _ff_a16w16_fused_gated(
     acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
     acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
@@ -161,7 +177,7 @@ def _ff_a16w16_fused_gated(
     w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
     y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs,

@@ -1,7 +1,8 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.fusions.fused_qk_concat import fused_qk_cat, fused_qk_rope_cat
-from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
+from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
 
 
 def generate_qk_inputs(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):
@@ -112,3 +113,26 @@ def test_qk_rope_cat(
 
     torch.testing.assert_close(q_torch, q_triton)
     torch.testing.assert_close(k_torch, k_triton)
+
+
+@pytest.mark.parametrize("rope", [False, True])
+def test_qk_concat_large_m_strided(rope: bool):
+    B, QH, D_nope, D_pe = 4096, 16, 512, 64
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    q_nope = torch.randn((QH, B, D_nope), dtype=dtype, device="cuda").transpose(0, 1)
+    q_pe = torch.randn((B, QH, 128 + D_pe), dtype=dtype, device="cuda")[..., 128:]
+    latent = torch.randn((B, 1, D_nope + D_pe), dtype=dtype, device="cuda")
+    k_nope, k_pe = latent[..., :D_nope], latent[..., D_nope:]
+
+    if rope:
+        pos, freqs, cos, sin = generate_rope_cached_freqs(B, 131072, D_pe // 2, dtype)
+        ref = ref_qk_rope_cat(
+            q_nope, q_pe, k_nope, k_pe, freqs[pos].squeeze(-2), True, RotateStyle.GPTJ
+        )
+        out = fused_qk_rope_cat(q_nope, q_pe, k_nope, k_pe, pos, cos, sin, False)
+    else:
+        ref = ref_qk_cat(q_nope, q_pe, k_nope, k_pe)
+        out = fused_qk_cat(q_nope, q_pe, k_nope, k_pe)
+
+    torch.testing.assert_close(ref, out)

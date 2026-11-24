@@ -1,37 +1,50 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import triton
-import torch
-from aiter.ops.triton.utils.device_info import get_num_sms
 import math
-from aiter.ops.triton._triton_kernels.attention.mla import (
-    _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
-)
+
+import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
-from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_decode_fwd_reduce_kernel as triton_mla_decode_fwd_reduce_kernel,
+)
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
+)
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
 except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
+    gluon_mla_decode_fwd_reduce_kernel = None
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -62,51 +75,86 @@ def select_3d_config(
     q_dtype,
     kv_dtype,
     shuffled_kv_cache,
+    BLOCK_M,
 ):
+    attn_num_warps = 2
     reduce_num_warps = 2
-    attn_warps = 2
-    waves_per_eu = 1
+    attn_waves_per_eu = 1
+    reduce_waves_per_eu = 2
     num_segments = 0
     TILE_SIZE = block_size
+    seg_cap = 128
+    tuned = None
     if IS_DEVICE_ARCH_GFX12:
-        attn_warps = 2
-        waves_per_eu = 1
-        if shuffled_kv_cache:
-            if kv_dtype == torch.uint8:
-                assert (
-                    block_size == 128
-                ), "Only block_size == 128 is supported for FP4 KV cache"
+        # If we cannot infer max_seqlen_k during graph capture
+        maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
+        if BLOCK_M > 32:
+            attn_num_warps = 4
+        reduce_num_warps = 4
+        attn_waves_per_eu = 1
+        # Apply measured reduce occupancy when this dispatch arch has a config;
+        # otherwise retain the selector's default.
+        cfg_dir = resolve_config_dir(
+            "attention", "MLA-DECODE", backend="gluon", arch=DEVICE_ARCH
+        )
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+        if table is not None:
+            reduce_waves_per_eu = table.get(
+                "triton_mla_decode_fwd_reduce_kernel", {}
+            ).get("waves_per_eu", reduce_waves_per_eu)
+        if shuffled_kv_cache and kv_dtype == torch.uint8:
+            assert (
+                block_size == 128
+            ), "Only block_size == 128 is supported for FP4 KV cache"
 
-        occ = waves_per_eu * 4 // attn_warps
-        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        occ = attn_waves_per_eu * 4 // attn_num_warps
+        MAX_SEGMENTS = max(1, math.ceil(maybe_guess_max_seqlen_k / TILE_SIZE))
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
+    else:
+        # Tuned split-KV launch values, per KV cache dtype. Only archs and KV
+        # dtypes with a tuned entry use them.
+        tuned = load_config_json(
+            f"{resolve_config_dir('attention', 'MLA_DECODE')}/DEFAULT.json",
+            required=False,
+        )
+        if tuned is not None:
+            tuned = tuned.get(str(kv_dtype).removeprefix("torch."))
+        if tuned is not None:
+            attn_num_warps = tuned["attn"]["num_warps"]
+            seg_cap = tuned["attn"]["MAX_SEGMENTS"]
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
         num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
         num_segments = min(num_segments, MAX_SEGMENTS)
         num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
+        num_segments = min(num_segments, seg_cap)
         MIN_SEGMENTS = max(8, num_segments)
         num_segments = max(num_segments, MIN_SEGMENTS)
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
+        if tuned is not None:
+            # The reduce kernel holds a [NUM_SEGMENTS, KV_LORA_RANK] fp32 tile.
+            # One warp spills it to scratch from 16 segments, much more from 32.
+            reduce_num_warps = tuned["reduce"]["num_warps"]
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
-        "num_warps": attn_warps,
-        "waves_per_eu": waves_per_eu,
-        "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
+        "num_warps": attn_num_warps,
+        "waves_per_eu": attn_waves_per_eu,
+        "num_stages": (
+            2 if DEVICE_ARCH in ("gfx1250", "gfx1250-strict", "gfx950") else 1
+        ),
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "waves_per_eu": 2,
+        "waves_per_eu": reduce_waves_per_eu,
         "num_stages": 1,
     }
     return attn_config, reduce_config
@@ -134,8 +182,8 @@ def mla_prefill_fwd(
         not shuffled_kv_cache
     ), "Shuffled kv cache is not supported in mla_prefill_fwd"
 
-    total_num_tokens, num_query_heads, qk_head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+    _total_num_tokens, num_query_heads, qk_head_dim = q.shape
+    _num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     q_dtype = q.dtype
@@ -151,7 +199,12 @@ def mla_prefill_fwd(
     # BLOCK_M = 128
     BLOCK_M = 16
     BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1
+    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+    BLOCK_Q = max(BLOCK_Q, 1)
+    # When num_queries_per_kv > BLOCK_M the query heads of a single KV head do
+    # not fit into one BLOCK_M tile, so we split them across NUM_HEAD_BLOCKS
+    # blocks along the head dimension.
+    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -162,7 +215,7 @@ def mla_prefill_fwd(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     # cu_count = get_num_sms()
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks = (q.shape[0] // BLOCK_Q + num_seqs) * NUM_HEAD_BLOCKS
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
     attn_config = select_2d_config(
@@ -201,6 +254,7 @@ def mla_prefill_fwd(
             num_seqs=num_seqs,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             WARP_SIZE=WARP_SIZE,
             QUERY_DTYPE=QUERY_DTYPE,
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
@@ -235,9 +289,65 @@ def mla_prefill_fwd(
             num_seqs=num_seqs,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
     return out
+
+
+def _pipelined_unshuffled_lds_bytes(
+    block_size,
+    block_m,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    kv_elem_size,
+    q_elem_size,
+    num_stages=2,
+    q_from_lds=False,
+):
+    # num_stages TDM stages of KV, whose LoRA and RoPE rows are each padded by
+    # 16 bytes, plus the Q tile, whose LoRA and RoPE rows are each padded by 8
+    # elements, or by 16 when the kernel reads Q from LDS inside the loop.
+    kv_row = (kv_lora_rank + qk_rope_head_dim) * kv_elem_size + 2 * 16
+    q_pad = 16 if q_from_lds else 8
+    q_row = (kv_lora_rank + qk_rope_head_dim + 2 * q_pad) * q_elem_size
+    return num_stages * block_size * kv_row + block_m * q_row
+
+
+def _tuned_decode_config(
+    kernel, query_dtype, kv_cache_dtype, num_queries_per_kv, num_seqs, max_seqlen_kv
+):
+    """Measured overrides of select_3d_config's attention config, keyed on query
+    heads per KV head (H), sequences (B) and max_seqlen_kv (KV). Empty where
+    nothing was measured."""
+    # Zero means max_seqlen_kv is unknown (graph capture), not a short context.
+    if max_seqlen_kv == 0:
+        return {}
+    cfg_dir = resolve_config_dir(
+        "attention", "MLA-DECODE", backend="gluon", arch=DEVICE_ARCH
+    )
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    entries = table.get(kernel, {}).get(f"{query_dtype}_{kv_cache_dtype}")
+    if entries is None:
+        return {}
+    return select_leq_config(
+        entries,
+        axes=("H", "B", "KV"),
+        H=num_queries_per_kv,
+        B=num_seqs,
+        KV=max_seqlen_kv,
+    )
+
+
+def _fits_int32_offsets(tensor):
+    # Kernels receive a pointer to the view origin, so storage_offset is not
+    # part of the relative index. numel alone does not bound a strided view.
+    strides = tensor.stride()
+    return (
+        all(0 <= stride < 2**31 for stride in strides)
+        and sum((size - 1) * stride for size, stride in zip(tensor.shape, strides))
+        < 2**31
+    )
 
 
 def mla_decode_fwd(
@@ -319,27 +429,24 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
+    MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
+    if num_queries_per_kv <= 16:
+        BLOCK_M = 16
+    else:
+        BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1
-    # Ideally we would launch with kernel with:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
-    # However, it is slow to realize the query_lens on cpu.
-    # Instead we use upper-bound:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)]
-    #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
-    #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
-    #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
-    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
+    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+    BLOCK_Q = max(BLOCK_Q, 1)
+    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
-        total_num_q_blocks = num_seqs
+        total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
     else:
-        total_num_q_blocks = ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs
+        total_num_q_blocks = (
+            ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
+        )
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 
@@ -351,9 +458,127 @@ def mla_decode_fwd(
         q_dtype,
         kv_buffer_dtype,
         shuffled_kv_cache,
+        BLOCK_M,
     )
 
-    NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    use_lds_pipeline = (
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+        and ALL_DECODE
+        and total_num_tokens == num_seqs
+        and shuffled_kv_cache
+        and QUERY_DTYPE == "fp8"
+        and KV_CACHE_DTYPE == "fp8"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and block_size == 64
+        and num_query_heads == 128 * num_kv_heads
+        and NUM_HEAD_BLOCKS == 1
+        and (
+            selected_num_segments == 1
+            # Zero means unknown, not a short context. Preserve partial-output
+            # semantics when skip_reduce requests multiple segments.
+            or (not skip_reduce and 0 < max_seqlen_kv <= 3 * block_size)
+        )
+        and q_scales is None
+        and q.stride(2) == 1
+        and kv_buffer.stride(3) == 1
+        and 0 < kv_buffer.stride(1) < 2**31
+        and num_blocks * num_kv_heads < 2**31
+        and out.stride(2) == 1
+        and block_tables.stride(1) == 1
+        and _fits_int32_offsets(q)
+        and _fits_int32_offsets(out)
+        and _fits_int32_offsets(block_tables)
+    )
+    # The pipelined kernel reads unshuffled pages as tiles of one flat token
+    # table. Multi-token decode stays on the non-pipelined kernel: the pipelined
+    # epilogue always processes a tile, even in a segment past a query's prefix.
+    use_pipelined_unshuffled = (
+        IS_DEVICE_ARCH_GFX12
+        and not shuffled_kv_cache
+        and ALL_DECODE
+        and KV_CACHE_DTYPE in ("bf16", "fp8")
+        and block_size in (64, 128)
+        and q.stride(2) == 1
+        and out.stride(2) == 1
+        and block_tables.stride(1) == 1
+        and kv_buffer.stride(3) == 1
+        and kv_buffer.stride(0) == block_size * kv_buffer.stride(1)
+        and (
+            num_kv_heads == 1 or kv_buffer.stride(2) == kv_lora_rank + qk_rope_head_dim
+        )
+        and num_blocks * block_size < 2**31
+        # Leave headroom in gfx1250's 320 KB LDS for layout-conversion scratch.
+        and _pipelined_unshuffled_lds_bytes(
+            block_size,
+            BLOCK_M,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.element_size(),
+            q.element_size(),
+        )
+        <= 256 * 1024
+    )
+    if use_pipelined_unshuffled:
+        tuned = _tuned_decode_config(
+            "pipelined_unshuffled",
+            QUERY_DTYPE,
+            KV_CACHE_DTYPE,
+            num_queries_per_kv,
+            num_seqs,
+            max_seqlen_kv,
+        )
+        # Overrides may increase stages or Q padding even when the heuristic fits.
+        # Reject the whole override before changing tiles or either segment count.
+        if (
+            _pipelined_unshuffled_lds_bytes(
+                block_size,
+                tuned.get("BLOCK_M", BLOCK_M),
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.element_size(),
+                q.element_size(),
+                tuned.get("num_stages", attn_config["num_stages"]),
+                tuned.get("Q_FROM_LDS", attn_config.get("Q_FROM_LDS", False)),
+            )
+            > 256 * 1024
+        ):
+            tuned = {}
+        if "BLOCK_M" in tuned:
+            # A smaller head tile needs less LDS, so the gate above still holds.
+            assert (
+                tuned["BLOCK_M"] <= BLOCK_M
+            ), f"tuned BLOCK_M {tuned['BLOCK_M']} exceeds the default {BLOCK_M}"
+            BLOCK_M = tuned.pop("BLOCK_M")
+            BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
+            NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+            total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
+        if "NUM_SEGMENTS_PER_SEQ" in tuned:
+            # The reduce kernel indexes segments with tl.arange: keep a power of 2.
+            tuned["NUM_SEGMENTS_PER_SEQ"] = triton.next_power_of_2(
+                min(
+                    tuned["NUM_SEGMENTS_PER_SEQ"],
+                    triton.cdiv(max_seqlen_kv, block_size),
+                )
+            )
+            reduce_config["NUM_SEGMENTS_PER_SEQ"] = tuned["NUM_SEGMENTS_PER_SEQ"]
+        attn_config.update(tuned)
+        assert (
+            _pipelined_unshuffled_lds_bytes(
+                block_size,
+                BLOCK_M,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.element_size(),
+                q.element_size(),
+                attn_config["num_stages"],
+                attn_config.get("Q_FROM_LDS", False),
+            )
+            <= 256 * 1024
+        ), f"tuned config {tuned} exceeds the pipelined kernel's LDS budget"
+        selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
@@ -382,8 +607,25 @@ def mla_decode_fwd(
         segm_max = out  # dummy ptr
         segm_expsum = out  # dummy ptr
 
+    if use_lds_pipeline:
+        attn_config.update(
+            NUM_SEGMENTS_PER_SEQ=1,
+            num_warps=4,
+            num_stages=4,
+            waves_per_eu=1,
+            USE_LDS_PIPELINE=True,
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            # TDM needs aligned BF16 rows. Other output views use direct stores.
+            TDM_STORE=(
+                out.dtype == torch.bfloat16
+                and out.data_ptr() % 16 == 0
+                and out.stride(0) % 8 == 0
+                and out.stride(1) % 8 == 0
+            ),
+        )
     if IS_DEVICE_ARCH_GFX12:
-        if shuffled_kv_cache:
+        if shuffled_kv_cache or use_pipelined_unshuffled:
             impl = gluon_mla_decode_fwd_kernel
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
@@ -430,6 +672,7 @@ def mla_decode_fwd(
             QUERY_DTYPE=QUERY_DTYPE,
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
     else:
@@ -462,6 +705,7 @@ def mla_decode_fwd(
             num_tokens_per_seq=num_tokens_per_seq,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             ALL_DECODE=ALL_DECODE,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             IS_Q_FP8=(q_dtype == e4m3_dtype),
@@ -474,7 +718,15 @@ def mla_decode_fwd(
     elif skip_reduce:
         return segm_output, segm_max, segm_expsum
 
-    _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
+    # Temporarily disable gluon reduce kernel, optimize later
+    # if IS_DEVICE_ARCH_GFX12:
+    #     _reduce_kernel = gluon_mla_decode_fwd_reduce_kernel
+    # else:
+    #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -487,9 +739,11 @@ def mla_decode_fwd(
         output_stride_1=out.stride(1),
         block_tables_stride=block_tables.stride(0),
         num_tokens_per_seq=num_tokens_per_seq,
+        total_num_tokens=total_num_tokens,
         KV_LORA_RANK=kv_lora_rank,
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
+        ALL_DECODE=ALL_DECODE,
         **reduce_config,
     )
     return out

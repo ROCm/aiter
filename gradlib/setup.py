@@ -17,6 +17,7 @@
 
 import os
 import sys
+
 import torch
 from setuptools import setup
 
@@ -51,7 +52,7 @@ torch_dir = torch.__path__[0]
 if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGenerator.h")):
     generator_flag = ["-DOLD_GENERATOR"]
 
-print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+print(f"\n\ntorch.__version__  = {torch.__version__}\n\n")
 TORCH_MAJOR = int(torch.__version__.split(".")[0])
 TORCH_MINOR = int(torch.__version__.split(".")[1])
 

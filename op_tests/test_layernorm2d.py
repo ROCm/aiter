@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
 import torch.nn.functional as F
+
 import aiter
-from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
-import argparse
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -62,11 +64,11 @@ def test_layernorm2d(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
+    _q, k, _v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
 
 
@@ -79,12 +81,12 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
     hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
+    _q, _k, _v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
 
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg="res check")
 

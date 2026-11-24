@@ -3,16 +3,18 @@
 
 import pytest
 import torch
+
 import aiter
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.triton.normalization.rmsnorm import (
+    _should_use_large_m_small_n,
     rms_norm,
     rmsnorm2d_fwd_with_add,
-    rmsnorm2d_fwd_with_smoothquant,
-    rmsnorm2d_fwd_with_dynamicquant,
-    rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
+    rmsnorm2d_fwd_with_add_smoothquant,
+    rmsnorm2d_fwd_with_dynamicquant,
+    rmsnorm2d_fwd_with_smoothquant,
 )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
@@ -23,7 +25,7 @@ def generate_rmsnorm_inputs(M, N, dtype):
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    M, N = x.shape
+    _M, N = x.shape
     # cast to float32 as the triton kernel
     x_f32 = x.float()
     g_f32 = g.float()
@@ -118,6 +120,14 @@ def get_vals():
         (364800, 128),
         (16380, 1536),
         # (29, 17389), // Temporarily disable this test due to abort issues on CI
+        # Large-M / small-N shapes that dispatch to _rmsnorm_kernel_large_m_small_n
+        # and _rmsnorm_bwd_kernel_large_m_small_n (M > 8192, N <= 1024).
+        # Representative of Qwen3 per-head q/k norm (b*s*heads, head_dim).
+        (16384, 128),
+        (32768, 64),
+        (16384, 512),
+        (16384, 1024),
+        (16385, 513),  # non-power-of-two N and M not divisible by BLOCK_M
     ]
 
     return vals
@@ -156,8 +166,15 @@ def test_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if M == 364800 and N == 128:
+        if _should_use_large_m_small_n(M, N):
+            # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
+            # the per-block rounding accumulated over BLOCK_M rows.
             atol, rtol = 1e-2, 1e-2
+        elif N >= 32768:
+            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
+            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
+            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
+            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4
@@ -209,8 +226,15 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if M == 364800 and N == 128:
+        if _should_use_large_m_small_n(M, N, backward=True):
+            # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
+            # the per-block rounding accumulated over BLOCK_M rows.
             atol, rtol = 1e-2, 1e-2
+        elif N >= 32768:
+            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
+            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
+            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
+            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4
@@ -226,6 +250,29 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
     torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+def test_fused_add_rmsnorm_gemma_norm(in_dtype_str):
+    in_dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    M, N = 4, 1024
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    res = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    residual_out = torch.empty_like(x)
+    output = torch.empty_like(x)
+
+    aiter.rmsnorm2d_fwd_with_add(
+        output, x, res, residual_out, weight, 1e-5, gemma_norm=True
+    )
+
+    ref_residual = x + res
+    ref_output = torch_rmsnorm(ref_residual, weight + 1, in_dtype, 1e-5)
+
+    torch.testing.assert_close(residual_out, ref_residual, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -350,12 +397,12 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     B_T = B * T
     # Use integers to ensure consistent results across layouts,
     # avoiding discrepancies in floating-point reductions with varying data layouts
-    x = torch.floor(torch.distributions.Uniform(-3, 3).sample((B_T, D))).to(
-        dtype=dtype, device="cuda"
-    )
-    w = torch.floor(torch.distributions.Uniform(-3, 3).sample((D,))).to(
-        dtype=dtype, device="cuda"
-    )
+    x = torch.floor(
+        torch.empty((B_T, D), device="cuda", dtype=torch.float32).uniform_(-3, 3)
+    ).to(dtype)
+    w = torch.floor(
+        torch.empty((D,), device="cuda", dtype=torch.float32).uniform_(-3, 3)
+    ).to(dtype)
 
     EPS = 1e-6
     quant_dtype = torch.float8_e4m3fnuz

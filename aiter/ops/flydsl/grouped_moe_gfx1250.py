@@ -1,0 +1,2776 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""gfx1250 grouped MoE GEMM (a8w4 / a4w4) via FlyDSL.
+
+Supports optional DeepGEMM-style contiguous-M scheduler
+(AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
+For A4W4, the matched tuned CSV row's ``a_preshuffle`` field selects packed
+(M/16, K/128, 4, 16, 16-byte) A for both grouped GEMMs. The field defaults to
+zero and follows the same token-bucket lookup as the other kernel parameters.
+Set AITER_GROUPED_A4W4_A_PRESHUFFLE=1/0 to override the CSV selection.
+Set AITER_FLYDSL_DISABLE_GEMM1_ACT=1 to move gate/up activation out of GEMM1
+into the separate quant/preshuffle kernel (also disables GEMM1 requantization).
+"""
+
+import csv
+import functools
+import os
+import threading
+
+import flydsl.expr as fx
+import torch
+
+from aiter import ActivationType, QuantType, dtypes, logger
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    current_stream_arg,
+    ptr_arg,
+)
+
+# Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
+_TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
+_GROUPED_CONFIG_CACHE = {}
+_WARNED_NAIVE_EPILOGUE = False
+# Cache the contiguous uint8 view of static MoE weights so a non-contiguous
+# weight is materialized at most once (not re-copied on every fused_moe call).
+_GROUPED_WEIGHT_CACHE = {}
+
+# Opt-in kernel-bench hook: a caller sets a list here to collect
+# (name, callable) per-kernel launches; None in production.
+kernel_bench_callable = None
+
+# fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
+# (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
+_MEGA_DISPATCH_TLS = threading.local()
+
+
+def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
+    _MEGA_DISPATCH_TLS.ctx = ctx
+
+
+def _flydsl_dispatch_context():
+    return getattr(_MEGA_DISPATCH_TLS, "ctx", None)
+
+
+def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
+    """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
+    key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
+    cached = _GROUPED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = (w if w.dtype == torch.uint8 else w.view(torch.uint8)).contiguous()
+    if len(_GROUPED_WEIGHT_CACHE) > 64:
+        _GROUPED_WEIGHT_CACHE.clear()
+    _GROUPED_WEIGHT_CACHE[key] = out
+    return out
+
+
+def _as_bool(value, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip() in _TRUTHY_ENV
+
+
+def _as_int(value, default: int | None) -> int | None:
+    # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
+    # cell can come back as the literal "nan"; read those as unset like _cell.
+    # The model_configs/ merge goes through pandas, which stores an int column
+    # with blank cells as float; accept such integral floats, reject the rest.
+    text = "" if value is None else str(value).strip()
+    if text == "" or text.lower() in ("nan", "none"):
+        return default
+    number = float(text)
+    if not number.is_integer():
+        raise ValueError(f"expected an integer config value, got {text!r}")
+    return int(number)
+
+
+def _dtype_name(dtype) -> str:
+    if dtype is torch.bfloat16 or dtype == dtypes.bf16:
+        return "torch.bfloat16"
+    if dtype is torch.float16 or dtype == dtypes.fp16:
+        return "torch.float16"
+    return str(dtype)
+
+
+def _enum_name(value) -> str:
+    if hasattr(value, "name"):
+        return f"{type(value).__name__}.{value.name}"
+    return str(value)
+
+
+def _load_grouped_config_rows():
+    cfg_path = os.environ.get("AITER_CONFIG_GROUPED_FMOE")
+    if not cfg_path:
+        try:
+            from aiter.jit.core import AITER_CONFIGS
+
+            cfg_path = AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE
+        except Exception:  # noqa: BLE001
+            cfg_path = ""
+    cached = _GROUPED_CONFIG_CACHE.get(cfg_path)
+    if cached is not None:
+        return cached
+    rows = []
+    for path in str(cfg_path).split(os.pathsep):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            rows.extend(csv.DictReader(f))
+    _GROUPED_CONFIG_CACHE[cfg_path] = rows
+    return rows
+
+
+def _next_pow2(n):
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _get_padded_m(m):
+    return min(_next_pow2(m), 131072)
+
+
+@functools.lru_cache(maxsize=1024)
+def _find_grouped_config(
+    *,
+    token_num: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_fused: bool = False,
+):
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "gfx": str(get_gfx()),
+        "cu_num": str(get_cu_num()),
+        "token": str(int(token_num)),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        # gemm2 also does the EP scatter, which shifts the stage2 tile optimum
+        # away from the plain-GEMM one. Rows leaving this blank serve both paths.
+        "ep_fused": "1" if ep_fused else "0",
+    }
+    rows = _load_grouped_config_rows()
+    # A0 bring-up: reuse gfx1250 family rows when strict has none of its own.
+    if base_gfx_arch(keys["gfx"]) != keys["gfx"] and keys["gfx"] not in {
+        str(r.get("gfx") or "").strip() for r in rows
+    }:
+        keys["gfx"] = base_gfx_arch(keys["gfx"])
+
+    # Hardware is locked by (gfx, cu_num): gfx (architecture) is always a hard
+    # constraint, while cu_num can be relaxed as a fallback. Columns missing from
+    # the CSV (e.g. older configs without a 'gfx' column) are skipped, so this
+    # stays backward compatible with pre-gfx tuned files.
+    # The tuner rewrites its frame through ``astype(str)``, so a blank cell can
+    # come back as the literal "nan"; read those as unset (wildcard) instead of
+    # as a value that matches nothing.
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        if value.lower() in ("nan", "none"):
+            return ""
+        # pandas/astype(str) turns int flags into "1.0"/"0.0"; keys use "1"/"0".
+        if value in ("1.0", "0.0") and k in (
+            "ep_fused",
+            "use_g1u1",
+            "doweight_stage1",
+        ):
+            return value[0]
+        try:
+            f = float(value)
+            if f == int(f):
+                return str(int(f))
+        except ValueError:
+            pass
+        return value
+
+    max_token = 0
+
+    def _matches(row, *, require_cu_num: bool):
+        nonlocal max_token
+        for k, v in keys.items():
+            if k == "token" or (k == "cu_num" and not require_cu_num):
+                continue
+            cell = _cell(row, k)
+            if cell and cell != v:
+                return False
+        token = _cell(row, "token")
+        if token.isdigit():
+            max_token = max(max_token, int(token))
+        return not token or token == keys["token"]
+
+    def _find_matches():
+        matches = [row for row in rows if _matches(row, require_cu_num=True)]
+        if not matches:
+            matches = [row for row in rows if _matches(row, require_cu_num=False)]
+        return matches
+
+    matches = _find_matches()
+    if not matches and 0 < max_token < token_num:
+        # Cap lookup at the largest compatible tuned token, not gaps.
+        keys["token"] = str(max_token)
+        matches = _find_matches()
+    # A row that names ep_fused explicitly was tuned for that path, so it wins
+    # over an otherwise equal row that serves both. Measuring the fused path
+    # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
+    # must use the multi-GPU benchmark.
+    ep_specific = [row for row in matches if _cell(row, "ep_fused")]
+    if ep_specific:
+        matches = ep_specific
+    if not matches:
+        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            print(
+                f"[grouped-gemm-debug] no grouped CSV config match for {keys}; "
+                f"loaded_rows={len(rows)}",
+                flush=True,
+            )
+        logger.info(
+            "grouped CSV config miss token=%s model_dim=%s inter_dim=%s "
+            "experts=%s topk=%s ep_fused=%s; tile stays at the caller default",
+            keys["token"],
+            keys["model_dim"],
+            keys["inter_dim"],
+            keys["expert"],
+            keys["topk"],
+            keys["ep_fused"],
+        )
+        return None
+
+    # Unmeasured rows sort last: a hand-written row's blank or 0 `us` reads as
+    # infinitely fast and would beat every real measurement for the same shape.
+    def _by_measured_us(row):
+        try:
+            us = float(_cell(row, "us") or 0.0)
+        except ValueError:
+            us = 0.0
+        return (us <= 0.0, us)
+
+    matches.sort(key=_by_measured_us)
+    chosen = matches[0]
+    # Once per shape: lru_cache runs this body a single time for each key, and
+    # a serving step looks the same bucket up on every forward.
+    logger.info(
+        "grouped CSV config selected token=%s model_dim=%s inter_dim=%s "
+        "experts=%s topk=%s ep_fused=%s tile=%sx%sx%s tile2=%sx%sx%s "
+        "buffers=%s/%s",
+        keys["token"],
+        keys["model_dim"],
+        keys["inter_dim"],
+        keys["expert"],
+        keys["topk"],
+        keys["ep_fused"],
+        chosen.get("tile_m"),
+        chosen.get("tile_n"),
+        chosen.get("tile_k"),
+        chosen.get("tile_m2"),
+        chosen.get("tile_n2"),
+        chosen.get("tile_k2"),
+        chosen.get("num_buffers"),
+        chosen.get("num_buffer_stage2"),
+    )
+    return chosen
+
+
+@functools.lru_cache(maxsize=1024)
+def _widest_grouped_tile(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_fused: bool = False,
+) -> int | None:
+    """Largest ``max(tile_m, tile_m2)`` tuned for this shape, any token bucket.
+
+    The compact arena is allocated once, but a step looks its tile up from its
+    own recv-token bucket. Those tiles are not monotonic, and the full-arena
+    bucket often has no row of its own; sizing the arena from that miss (the
+    tile_m=64 default) then clamps every larger tuned tile down to 64.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "gfx": str(get_gfx()),
+        "cu_num": str(get_cu_num()),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        "ep_fused": "1" if ep_fused else "0",
+    }
+
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
+    def _matches(row, *, require_cu_num: bool):
+        for k, v in keys.items():
+            if k == "cu_num" and not require_cu_num:
+                continue
+            cell = _cell(row, k)
+            if cell and cell != v:
+                return False
+        return True
+
+    rows = _load_grouped_config_rows()
+    matches = [row for row in rows if _matches(row, require_cu_num=True)]
+    if not matches:
+        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    widest = 0
+    for row in matches:
+        for column in ("tile_m", "tile_m2"):
+            try:
+                widest = max(widest, int(float(_cell(row, column) or 0)))
+            except ValueError:
+                continue
+    return widest or None
+
+
+def _use_grouped_gemm_enabled() -> bool:
+    env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
+    return env_enabled or is_gfx1250
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError(f"alignment must be > 0, got {alignment}")
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _make_contiguous_psum_layout(
+    *,
+    masked_m: torch.Tensor,
+    rows_to_tokens: torch.Tensor,
+    topids_to_rows: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+    token_num: int,
+    topk: int,
+):
+    """Build DeepGEMM psum layout.
+
+    ``contiguous_m`` is a static upper bound, which keeps this CUDAGraph-safe.
+    """
+    device = masked_m.device
+
+    starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
+    ub = int(token_num) * int(topk) + int(experts) * int(tile_m) - int(topk)
+    contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+
+    old_flat = topids_to_rows.reshape(-1)
+    expert = torch.div(old_flat, int(max_m), rounding_mode="floor")
+    slot = old_flat - expert * int(max_m)
+    new_flat = starts_t[expert.to(torch.long)] + slot
+    remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
+
+    # Inverse map (contiguous row -> source token) via one scatter.
+    remapped_rows = torch.full(
+        (int(contiguous_m),), -1, device=device, dtype=torch.int32
+    )
+    src_tokens = rows_to_tokens[old_flat.to(torch.long)]
+    remapped_rows[new_flat.to(torch.long)] = src_tokens
+
+    return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
+
+
+def _grouped_a8w4_preshuffle_e8m0_scale(
+    scale: torch.Tensor,
+    warp_tile: int,
+    scale_k_per_tile: int = 4,
+) -> torch.Tensor:
+    # Preshuffle row/k-scale axes; experts stay as the leading batch dim.
+    scale = scale.view(torch.uint8).contiguous()
+    E, _, k_scale = scale.shape
+    wmma_rep = int(warp_tile) // 16
+    k_groups = k_scale // scale_k_per_tile
+    k_wmma_steps = scale_k_per_tile // 4
+    g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
+    # Keep one WMMA's 16 scale dwords contiguous. A full-wave LDS read then
+    # fills two adjacent M16 scale operands, selected by SCL_OPSEL_B.
+    g = g.permute(0, 1, 4, 5, 2, 3, 6).contiguous()
+    return g.reshape(E, -1, k_groups * k_wmma_steps * wmma_rep * 4)
+
+
+def _grouped_a8w4_prepare_scale_batch(
+    scale: torch.Tensor,
+    *,
+    experts: int,
+    rows: int,
+    k_dim: int,
+    warp_tile: int,
+    tile_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    scale_u8 = scale.view(torch.uint8).contiguous()
+    raw_shape = (experts, rows, k_dim // 32)
+    wmma_rep = int(warp_tile) // 16
+    preshuffled_shape = (experts, rows // wmma_rep, (k_dim // 32) * wmma_rep)
+    if tuple(scale_u8.shape) == preshuffled_shape:
+        return scale_u8
+    if tuple(scale_u8.shape) == (experts * rows, k_dim // 32):
+        scale_u8 = scale_u8.view(raw_shape)
+    elif tuple(scale_u8.shape) != raw_shape:
+        raise ValueError(
+            f"scale shape must be raw {raw_shape}, "
+            f"flat raw {(experts * rows, k_dim // 32)} "
+            f"or preshuffled {preshuffled_shape}, got {tuple(scale_u8.shape)}"
+        )
+    scale_k_per_tile = int(tile_k) // 32
+    return _grouped_a8w4_preshuffle_e8m0_scale(
+        scale_u8, warp_tile=warp_tile, scale_k_per_tile=scale_k_per_tile
+    ).to(device=device)
+
+
+# The rebuild is an extra launch with a fixed cost, while coalescing the scale
+# write only pays off in proportion to the token count, so small batches are
+# better served by the inline interleaved write -- and wmma_rep=1, whose
+# interleave stride is narrower, stays better served for longer. Empirical rather
+# than derived; retune per arch and shape through the env override below.
+_COMPACT_MIN_TOKENS = 1024
+_COMPACT_MIN_TOKENS_NARROW_STRIDE = 2048
+
+
+def _compact_scale_min_tokens(wmma_rep: int) -> int:
+    """Smallest batch that takes the compact + rebuild path."""
+    default = (
+        _COMPACT_MIN_TOKENS_NARROW_STRIDE if wmma_rep == 1 else _COMPACT_MIN_TOKENS
+    )
+    raw = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS=%r is not an integer; using %d",
+            raw,
+            default,
+        )
+        return default
+
+
+def _use_fused_quant_preshuffle(
+    model_dim: int, wmma_rep: int, quant_mode: str, token_num: int, topk: int
+) -> bool:
+    """Can this call take the compact quant + scale-rebuild path?
+
+    The caller sizes token-indexed buffers on the answer, so it needs it up front
+    rather than letting the launch decide.
+    """
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        fused_quant_preshuffle_supported,
+    )
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    return (
+        token_num >= _compact_scale_min_tokens(wmma_rep)
+        and token_multidest_eligible(token_num, topk)
+        and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
+    )
+
+
+@functools.cache
+def _get_compiled_g2l_lut(max_experts: int = 512, clear_counter: bool = True):
+    """Compile and cache the single-block FlyDSL g2l-LUT builder."""
+    from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
+
+    return build_moe_g2l_lut_module(
+        clear_counter=clear_counter, max_experts=max_experts
+    )
+
+
+# Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
+# masks fall back to the torch chain.
+_G2L_MAX_N = 1024
+
+
+_G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+_G2L_FUSED_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def route_counter_buffer(E: int, device, apre_fold: bool = False) -> torch.Tensor:
+    """Return the persistent ``(E,)`` per-expert route counter.
+
+    Its stable address lets the preceding TDM dispatch clear it at the tail of
+    the existing launch. The route kernel therefore starts from zero without a
+    separate launch or a grid-wide barrier. Allocation is zeroed as well so the
+    first invocation is safe before a dispatch variant owns the reset.
+    ``apre_fold`` selects a separate counter that the A-preshuffle scatter
+    clears after each use.
+    """
+    key = (int(E), str(device), bool(apre_fold))
+    buf = _G2L_COUNTER_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros(int(E), dtype=torch.int32, device=device)
+        _G2L_COUNTER_CACHE[key] = buf
+    return buf[: int(E)]
+
+
+def route_fused_workspace(E: int, device):
+    """Return persistent route+prefix workspace sharing dispatch reset."""
+    key = (int(E), str(device))
+    backing = _G2L_FUSED_CACHE.get(key)
+    if backing is None:
+        backing = torch.zeros(4 * int(E) + 5, dtype=torch.int32, device=device)
+        _G2L_FUSED_CACHE[key] = backing
+    else:
+        backing.zero_()
+    e = int(E)
+    count = backing[:e]
+    barrier = backing[e : e + 5]
+    slots = backing[e + 5 : 2 * e + 5]
+    starts = backing[2 * e + 5 : 3 * e + 5]
+    psum = backing[3 * e + 5 : 4 * e + 5]
+    return count, barrier, slots, starts, psum
+
+
+def _build_g2l_lut(
+    expert_mask: torch.Tensor,
+    E: int,
+    device,
+    nvt: torch.Tensor | None = None,
+    topk: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Build the EP global->local expert LUT (and zero the route counter).
+
+    Returns ``(g2l_lut, counter, nvr)`` where ``counter`` is the zero-inited
+    ``(E,)`` per-bucket route counter produced by the fused kernel (or ``None``
+    on the torch fallback, so callers allocate/zero it themselves) and ``nvr`` is
+    the ``(1,)`` int32 ``num_valid_routes = nvt * topk`` scalar the same kernel
+    computes on-device (or ``None`` when ``nvt``/``topk`` are not supplied or the
+    torch fallback is taken, so callers compute it themselves). Folding the
+    ``nvt * topk`` into this pre-route kernel removes the standalone torch
+    elementwise ``* topk`` launch on the EP decode hot path.
+
+    ``g2l_lut[global_id]`` gives the local bucket in [0, E) for enabled experts
+    or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
+    ``device``.
+
+    Fast path: a single FlyDSL kernel (``moe_g2l_lut``) does ``ne + cumsum + sub
+    + where`` in one pass -- one launch instead of ~6 elementwise/scan kernels,
+    and on the same compiler/runtime as the rest of the gfx1250 grouped path
+    (no Triton in the decode hot path). This depends only on ``expert_mask``
+    (static per rank) but cannot be memoised here: ``fused_moe`` is dispatched
+    through ``torch.ops.aiter.*``, so the op layer hands this function a fresh
+    copy of ``expert_mask`` (new object *and* storage) on essentially every call,
+    so neither object- nor data_ptr-keyed caching hits. Collapsing the chain into
+    one kernel is the portable win; fully removing it would require precomputing
+    the LUT at ``expert_mask`` creation and threading it through the op schema.
+    """
+    n = expert_mask.numel()
+    # nvr is only folded in when both the dynamic-token scalar and topk are known.
+    _want_nvr = nvt is not None and topk is not None
+    if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
+        try:
+            mask = (
+                expert_mask.to(device=device, dtype=torch.int32)
+                .reshape(-1)
+                .contiguous()
+            )
+            lut = torch.empty(n, dtype=torch.int32, device=device)
+            # The kernel also zero-inits this per-bucket route counter (folds the
+            # separate host torch.zeros(E) that moe_route_g2l increments).
+            counter = route_counter_buffer(E, device)
+            # (1,) int32 num_valid_routes = nvt * topk, computed on-device by the
+            # same single-block kernel (folds the standalone torch ``* topk``). A
+            # valid nvt pointer is always passed so the kernel store is uniform;
+            # the result is only surfaced to the caller when nvr was requested.
+            nvt_i32 = (
+                nvt.reshape(-1)[:1].to(device=device, dtype=torch.int32).contiguous()
+                if _want_nvr
+                else torch.zeros(1, dtype=torch.int32, device=device)
+            )
+            nvr = torch.empty(1, dtype=torch.int32, device=device)
+            lut_launcher = _get_compiled_g2l_lut(
+                max_experts=512 if n <= 512 else 1024,
+                clear_counter=not (
+                    _flydsl_dispatch_context() is not None
+                    and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
+                    in ("1", "true", "True")
+                ),
+            )
+            _run_compiled(
+                lut_launcher,
+                ptr_arg(mask),
+                ptr_arg(lut),
+                ptr_arg(counter),
+                ptr_arg(nvt_i32),
+                ptr_arg(nvr),
+                int(n),
+                int(E),
+                int(topk) if _want_nvr else 0,
+                torch.cuda.current_stream(),
+            )
+            return lut, counter, (nvr if _want_nvr else None)
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            logger.debug(
+                "[grouped_a8w4] flydsl g2l build unavailable (%s); "
+                "falling back to torch",
+                exc,
+            )
+    mask_bool = expert_mask.to(device=device).reshape(-1) != 0
+    lut = torch.cumsum(mask_bool.to(torch.int32), 0) - 1
+    lut = (
+        torch.where(mask_bool, lut, torch.full_like(lut, E))
+        .to(torch.int32)
+        .contiguous()
+    )
+    return lut, None, None
+
+
+def _tdm_align_up(x: int, a: int) -> int:
+    return ((int(x) + a - 1) // a) * a
+
+
+def get_wmma_m_rep(
+    tile_m: int, tile_n: int, m_warp: int, n_warp: int, label: str
+) -> int:
+    """Validate a wave grid against its tile and return the WMMA M-repeat.
+
+    The kernel splits a workgroup into ``m_warp x n_warp`` waves, so each wave
+    owns a ``(tile_m // m_warp) x (tile_n // n_warp)`` block that must be
+    WMMA-aligned. The M-repeat also fixes the preshuffled A-scale layout the
+    quant kernels have to produce, so it must be derived from the wave tile --
+    not from ``tile_m`` -- whenever ``m_warp > 1``.
+    """
+    # WMMA tile and wave geometry of the gfx1250 TDM GEMM (see
+    # kernels/mxfp4_preshuffle_gfx1250_tdm.py).
+    wmma_m, wmma_n = 16, 16
+    wave_size, max_block = 32, 1024
+
+    m_warp, n_warp = int(m_warp), int(n_warp)
+    if m_warp < 1 or n_warp < 1:
+        raise ValueError(
+            f"[grouped-moe {label}] m_warp/n_warp must be >= 1, got "
+            f"{m_warp}x{n_warp}"
+        )
+    if tile_m % (m_warp * wmma_m) or tile_n % (n_warp * wmma_n):
+        raise ValueError(
+            f"[grouped-moe {label}] tile {tile_m}x{tile_n} does not split into "
+            f"{m_warp}x{n_warp} waves of {wmma_m}x{wmma_n} WMMA tiles"
+        )
+    if m_warp * n_warp * wave_size > max_block:
+        raise ValueError(
+            f"[grouped-moe {label}] wave grid {m_warp}x{n_warp} needs "
+            f"{m_warp * n_warp * wave_size} threads > {max_block}"
+        )
+    return tile_m // m_warp // wmma_m
+
+
+@functools.cache
+def _log_tile_fit_once(msg: str) -> None:
+    logger.info("[grouped-moe] default tile narrowed to fit the shape: %s", msg)
+
+
+def _fit_tile_n(n: int, tile_n: int, n_warp: int) -> tuple[int, int]:
+    """Halve ``tile_n`` (and ``n_warp`` while its wave tile stays >= 64) until
+    it divides ``n``."""
+    while n % tile_n and tile_n > 64:
+        tile_n //= 2
+        if tile_n // n_warp < 64 and n_warp > 1:
+            n_warp //= 2
+    if n % tile_n:
+        raise ValueError(f"[grouped-moe] no N tile divides N={n}")
+    return tile_n, n_warp
+
+
+def _grouped_a8w4_tdm_moe(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    E,
+    model_dim,
+    inter_dim,
+    dtype,
+    activation,
+    w1_scale,
+    w2_scale,
+    bias1,
+    bias2,
+    swiglu_limit,
+    doweight_stage1,
+    tile_m=64,
+    tile_n=256,
+    tile_k=128,
+    m_warp=1,
+    n_warp=4,
+    num_buffers=3,
+    tile_m2=None,
+    tile_n2=None,
+    tile_k2=None,
+    m_warp2=None,
+    n_warp2=None,
+    num_buffers2=None,
+    cluster_m=-1,
+    cluster_n=-1,
+    cluster_m2=-1,
+    cluster_n2=None,
+    waves_per_tensor_tdm=-1,
+    waves_per_tensor_tdm2=None,
+    next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    tdm_b_th=0,
+    lds_soa_load_interleave=0,
+    rolled_drain=0,
+    a_preshuffle=0,
+    persistent_workers=0,
+    persistent_workers2=0,
+    k_waves1=1,
+    k_waves2=1,
+    tiles_configured=False,
+    data_format="a8w4",
+    expert_mask=None,
+    num_local_tokens=None,
+    stage2_scatter: Stage2ScatterContext | None = None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    a1_scale=None,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
+    output=None,
+):
+    import functools
+
+    import torch
+
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_moe_fused_ep_route_quant_compact,
+        flydsl_moe_fused_quant_preshuffle,
+        flydsl_moe_topids_to_rows,
+    )
+
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    if herd_topk:
+        topk = int(herd_topk)
+    herd_psum = None
+    herd_gather_w = None
+    enable_ep_scatter = stage2_scatter is not None
+    _compact_ctx = _flydsl_dispatch_context()
+    _compact = bool(
+        _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
+    )
+    if _compact:
+        stage2_scatter = _compact_ctx
+    _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
+    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    if tile_m2 is None:
+        tile_m2 = tile_m
+    if tile_n2 is None:
+        tile_n2 = tile_n
+    if tile_k2 is None:
+        tile_k2 = tile_k
+    if num_buffers2 is None:
+        num_buffers2 = num_buffers
+    if waves_per_tensor_tdm2 is None:
+        waves_per_tensor_tdm2 = waves_per_tensor_tdm
+    if m_warp2 is None:
+        m_warp2 = m_warp
+    if n_warp2 is None:
+        n_warp2 = n_warp
+    _gemm2_m_align = 0
+    if cluster_n2 is None:
+        # The two stages want different cluster widths: gemm1 gains from the
+        # multicast of its shared A operand, while gemm2 loses more than it
+        # gains once its scatter epilogue runs on a narrower tile_m2. Blank
+        # keeps gemm2 on gemm1's width, i.e. the historical behaviour.
+        cluster_n2 = cluster_n
+    if _compact:
+        # The plan padded every expert's row count up to this alignment, and its
+        # psum is what the GEMM binary-searches as its m-tile map. A tile wider
+        # than the alignment would cover the tail of one expert and the head of
+        # the next, so the tile follows the plan rather than the CSV alone.
+        _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
+        if _plan_align:
+            tile_m = min(int(tile_m), _plan_align)
+            tile_m2 = min(int(tile_m2), _plan_align)
+            # psum holds each expert's unpadded end, so a gemm2 tile narrower
+            # than the alignment can start in an expert's padding; gemm2 must
+            # skip those or it scatters stale ep_rowmap rows into live slots.
+            if tile_m2 < _plan_align:
+                _gemm2_m_align = _plan_align
+            if _plan_align % tile_m or _plan_align % tile_m2:
+                raise ValueError(
+                    f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
+                    f"the compact plan's row alignment {_plan_align}"
+                )
+    # The B loads do not clamp N, so a partial last N tile would read the next
+    # expert's rows (and fault past the last one), and a half-k128 K tail
+    # (K % 128 == 64) only runs with a k128 tile. A tile the caller configured
+    # (CSV row or AITER_TDM_* override) must already fit; only the built-in
+    # default, e.g. 256 wide at inter_dim=576 (N=1152), is narrowed, and the
+    # tile that actually launches is logged.
+    fit_n, fit_nw = _fit_tile_n(2 * inter_dim, tile_n, n_warp)
+    fit_n2, fit_nw2 = _fit_tile_n(model_dim, tile_n2, n_warp2)
+    fit_k = 128 if model_dim % 128 else tile_k
+    fit_k2 = 128 if inter_dim % 128 else tile_k2
+    asked = (tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2)
+    fitted = (fit_n, fit_nw, fit_k, fit_n2, fit_nw2, fit_k2)
+    if fitted != asked:
+        _fit_msg = (
+            f"gemm1 (N={2 * inter_dim}, K={model_dim}) tile_n/n_warp/tile_k "
+            f"{tile_n}/{n_warp}/{tile_k} -> {fit_n}/{fit_nw}/{fit_k}; "
+            f"gemm2 (N={model_dim}, K={inter_dim}) tile_n2/n_warp2/tile_k2 "
+            f"{tile_n2}/{n_warp2}/{tile_k2} -> {fit_n2}/{fit_nw2}/{fit_k2}"
+        )
+        if tiles_configured:
+            raise ValueError(
+                f"[grouped-moe] configured tile does not fit the shape: {_fit_msg}"
+            )
+        _log_tile_fit_once(_fit_msg)
+        tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2 = fitted
+    wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
+    wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    _align_m = max(tile_m, tile_m2)
+    # Both GEMMs walk the same contiguous layout, each with its own tile height,
+    # so every expert must start on a row that is a multiple of both. Aligning to
+    # the larger tile only achieves that when it is a multiple of the smaller one.
+    if _align_m % tile_m or _align_m % tile_m2:
+        raise ValueError(
+            f"[grouped-moe] tile_m={tile_m} and tile_m2={tile_m2} must both "
+            f"divide their max ({_align_m}); otherwise a GEMM tile straddles "
+            "two experts and silently computes against the wrong weights"
+        )
+    # Empty experts take no rows, so at most min(E, routes) experts pad their
+    # tail: a decode batch launches a few M tiles instead of one per expert.
+    _routes = token_num * topk
+    contiguous_m = max(
+        _align_m,
+        _tdm_align_up(
+            min(
+                _routes + E * _align_m - topk,
+                _routes + min(E, _routes) * (_align_m - 1),
+            ),
+            _align_m,
+        ),
+    )
+    max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
+    if _compact:
+        # Rows this step can hold, falling back to the arena's when the caller
+        # gave no bound. The arena is sized for a full prefill, so spending it on
+        # a decode step both oversizes the grid and pads every expert.
+        _compact_rows = int(getattr(_compact_ctx, "compact_rows", 0) or 0)
+        contiguous_m = int(hidden_states.shape[0])
+        if _compact_rows:
+            contiguous_m = min(_compact_rows, contiguous_m)
+        max_m = contiguous_m
+
+    # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
+    # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
+    # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
+    # (kept -> weight_dtype, dropped -> 0), and skips the EP dead-tail (routes >=
+    # num_valid_routes / tokens >= num_valid_tokens). Non-local routes claim no
+    # per-expert slot, so ``_masked_m`` / ``psum`` -- and the rows the GEMMs
+    # actually compute -- cover only the routes this rank owns. ``contiguous_m``
+    # stays the static worst case to keep the launch grid CUDAGraph-safe; the
+    # surplus tiles fall past ``psum`` and exit early. The TDM batched GEMMs
+    # themselves are EP-agnostic: they operate on the routed contiguous layout.
+    _is_ep = expert_mask is not None
+    _g2l_lut = None
+    _g2l_counter = None
+    _gather_w_buf = None
+    _ep_nvr = None
+    _ep_nvt = None
+    _fuse_ep_route_quant = False
+    ep_rowmap = None
+    # Small TP batches: one workgroup counts, scans and remaps every route, in
+    # place of the counter fill, route and psum-remap launches; it runs where the
+    # psum is built below. HERD routes carry K+1 candidates per row and are
+    # dropped to K by herd_route_psum, which this kernel does not do.
+    _fused_tp_route = (
+        not herd_topk
+        and not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
+    # MegaMoE A-preshuffle EP path: the LDS route kernel -1-fills row_to_token
+    # (no fill launch), routes on MegaMoE's aligned per-rank expert slice (no
+    # g2l-LUT launch), and the apre scatter zeroes the route counter after the
+    # psum remap, its last reader.
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        MAX_ROUTE_BUCKETS as _ROUTE_LDS_MAX_BUCKETS,
+    )
+
+    _apre_route_fold = (
+        _is_ep
+        and enable_ep_scatter
+        and a_preshuffled
+        and not _compact
+        and int(E) <= _ROUTE_LDS_MAX_BUCKETS
+        and num_local_tokens is not None
+        and os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+        and os.environ.get("AITER_TDM_APRE_ROUTE_FOLD", "1") in ("1", "true", "True")
+    )
+    if a_preshuffled:
+        _apre_row_to_token = (
+            torch.empty((int(contiguous_m),), dtype=torch.int32, device=device)
+            if _apre_route_fold
+            else torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
+        )
+    else:
+        _apre_row_to_token = None
+    if _compact:
+        _masked_m = stage2_scatter.compact_masked_m
+        topids_to_rows = None
+    elif _is_ep:
+        if num_local_tokens is not None:
+            _ep_nvt = (
+                num_local_tokens.reshape(-1)[:1]
+                .to(device=device, dtype=torch.int32)
+                .contiguous()
+            )
+        else:
+            # torch.full builds directly on-device (fill kernel, no H2D copy), so
+            # this stays legal under CUDA graph capture. torch.tensor([...],
+            # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
+            # capture rejects unless pinned.
+            _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
+        _direct_ep_mask = (
+            _flydsl_dispatch_context() is not None or _apre_route_fold
+        ) and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in (
+            "1",
+            "true",
+            "True",
+        )
+        _fuse_ep_route_quant = (
+            _direct_ep_mask
+            and enable_ep_scatter
+            and not _a_preshuffle_requested
+            and int(E) <= 256
+            and a1_scale is not None
+            and hidden_states.dtype
+            in (
+                dtypes.fp8,
+                torch.uint8,
+                dtypes.fp4x2,
+            )
+            and os.environ.get("AITER_TDM_FUSE_ROUTE_QUANT", "0")
+            in ("1", "true", "True")
+        )
+        if _fuse_ep_route_quant:
+            _g2l_counter = route_counter_buffer(E, device)
+            _ep_nvr = _ep_nvt
+            _masked_m = None
+            topids_to_rows = None
+        elif _direct_ep_mask:
+            # MegaMoE assigns each rank one aligned contiguous E-expert slice.
+            # The route kernel can therefore test mask[global_id] and map with
+            # global_id % E directly; no LUT/cumsum launch is needed.
+            _g2l_lut = (
+                expert_mask.to(device=device, dtype=torch.int32)
+                .reshape(-1)
+                .contiguous()
+            )
+            # The apre fold keeps its own counter: it relies on the counter
+            # being zero on entry, and the LUT path leaves the shared one dirty.
+            _g2l_counter = (
+                route_counter_buffer(E, device, apre_fold=True)
+                if _apre_route_fold
+                else route_counter_buffer(E, device)
+            )
+            _ep_nvr = torch.empty(1, dtype=torch.int32, device=device)
+        else:
+            _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
+                expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
+            )
+            _ep_nvr = (
+                _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
+            )
+        # Pre-allocate ep_rowmap so the route kernel can fuse its sentinel fill
+        # (fire-and-forget stores interleaved with route work, no extra barrier).
+        if enable_ep_scatter:
+            ep_rowmap = torch.empty(
+                (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
+            )
+        if not _fuse_ep_route_quant:
+            # Route kernel writes every entry (kept -> weight_dtype cast,
+            # dropped -> 0), so the buffer is fully kernel-written.
+            _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+                topk_ids,
+                E,
+                max_m,
+                g2l_lut=_g2l_lut,
+                gather_w=_gather_w_buf,
+                weight_in=topk_weight,
+                counter=_g2l_counter,
+                num_local_tokens=num_local_tokens,
+                num_valid_routes=_ep_nvr,
+                ep_rowmap=ep_rowmap,
+                contiguous_expert_mask=_direct_ep_mask,
+                row_to_token=_apre_row_to_token if _apre_route_fold else None,
+            )
+    elif not _fused_tp_route:
+        _fuse_ep_route_quant = False
+        if herd_topk:
+            from aiter.ops.flydsl.herd_topk import herd_route_psum
+
+            herd_gather_w, _, _masked_m, topids_to_rows, herd_psum = herd_route_psum(
+                topk_weight,
+                topk_ids,
+                E,
+                _align_m,
+                herd_routed_scaling_factor,
+                num_valid_rows=num_local_tokens,
+            )
+        else:
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        ep_rowmap = None
+    # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
+    # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
+    ep_scatter_params = None
+    if enable_ep_scatter:
+        if _compact:
+            ep_rowmap = stage2_scatter.compact_ep_rowmap
+        else:
+            ep_scatter_params = {
+                "gather_w": _gather_w_buf,
+                "tis": stage2_scatter.source_token_map,
+                "ep_rowmap": ep_rowmap,
+                "topk": int(topk),
+                "max_tok": int(stage2_scatter.max_tokens_per_rank),
+                "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
+            }
+    _fuse_psum_quant = (
+        _is_ep
+        and enable_ep_scatter
+        and not _compact
+        and not a_preshuffled
+        and not _fuse_ep_route_quant
+        and int(E) <= 256
+        and dtype in (torch.bfloat16, dtypes.bf16)
+        and _flydsl_dispatch_context() is not None
+        and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
+    )
+    ep_psum_params = None
+    if _compact:
+        psum = stage2_scatter.compact_psum
+    elif _fuse_ep_route_quant:
+        psum = None
+    elif herd_psum is not None:
+        psum = herd_psum
+    elif _fused_tp_route:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids, E, max_m, _align_m
+        )
+    elif _fuse_psum_quant:
+        # The remapper's scan and ep_rowmap scatter ride the quant kernel:
+        # every workgroup re-derives the (E,) prefix in LDS, so this launch
+        # disappears without a grid-wide wait.  Every row below psum[e] has
+        # exactly one kept route and is overwritten below; GEMM2 clamps its
+        # rowmap TDM load to mn_oob, so padding rows need no sentinel fill.
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        ep_psum_params = {
+            "masked_m": _masked_m,
+            "psum": psum,
+            "gather_w": _gather_w_buf,
+            "tis": stage2_scatter.source_token_map,
+            "ep_rowmap": ep_rowmap,
+            "experts": int(E),
+            "tile_m": int(tile_m),
+            "topk": int(topk),
+            "max_tok": int(stage2_scatter.max_tokens_per_rank),
+            "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
+            "route_max_m": int(max_m),
+        }
+    else:
+        # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
+        # start aligned only to tile_m would let a gemm2 tile cross an expert
+        # boundary (see the divisibility check above).
+        _starts, psum, _ = contiguous_psum_remap(
+            _masked_m,
+            topids_to_rows,
+            E,
+            max_m,
+            _align_m,
+            num_valid_routes=_ep_nvr,
+            ep_scatter_params=ep_scatter_params,
+            row_to_token=_apre_row_to_token,
+            topk=int(topk),
+        )
+        psum = psum.to(torch.int32).contiguous()
+    # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
+    _ep_gemm2_kwargs = (
+        {
+            "stage2_scatter": stage2_scatter,
+            "ep_destination_stride": (
+                int(stage2_scatter.max_tokens_per_rank) * int(topk)
+            ),
+            "ep_row_map": ep_rowmap,
+        }
+        if enable_ep_scatter
+        else {}
+    )
+    if _gemm2_m_align:
+        _ep_gemm2_kwargs["m_align"] = _gemm2_m_align
+
+    out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
+    two_inter = 2 * inter_dim
+    # Stage1 epilogue code: 1 silu, 2 swiglu, 3 SiTUv2. The caller has already
+    # rejected anything else.
+    if activation == ActivationType.Swiglu:
+        stage1_act = 2
+    elif activation == ActivationType.Situv2:
+        stage1_act = 3
+    else:
+        stage1_act = 1
+    # SiTUv2 is bounded by construction and takes no clamp, so the limit only
+    # ever applies to swiglu.
+    sl = (
+        float(swiglu_limit)
+        if swiglu_limit
+        else (7.0 if activation == ActivationType.Swiglu else float("inf"))
+    )
+    _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    disable_gemm1_act = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT"), False
+    )
+    _a2_activation_kw = {}
+    if disable_gemm1_act:
+        _a2_activation_kw = {
+            "activation": stage1_act,
+            "swiglu_limit": sl,
+            **_situ_kw,
+        }
+        stage1_act = 0
+
+    _b1 = bias1.contiguous() if bias1 is not None and bias1.numel() > 0 else None
+    _b2 = bias2.contiguous() if bias2 is not None and bias2.numel() > 0 else None
+    _is_fp4 = data_format == "fp4"
+    _quant_mode = "fp4" if _is_fp4 else "fp8"
+    _a_is_fp4 = 1 if _is_fp4 else 0
+
+    # Bound once, because the quant pass below rebinds a1_scale to the
+    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
+    # shape, so nothing downstream could tell which one it was handed.
+    src_a1_scale = a1_scale
+    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
+        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
+        # exponent bytes; reinterpret their storage without converting values.
+        src_a1_scale = src_a1_scale.view(torch.uint8)
+
+    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
+    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
+    # for this pair.
+    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
+        dtypes.fp8,
+        torch.uint8,
+        dtypes.fp4x2,
+    )
+    _row_gather = _compact and bool(getattr(_compact_ctx, "compact_row_gather", False))
+    if _row_gather and not _prequantized:
+        raise ValueError(
+            "[grouped-moe compact] dispatch shipped token-major rows for GEMM1 "
+            "to scatter, but only a prequantized A can be scattered; got "
+            f"{hidden_states.dtype} with a1_scale="
+            f"{None if src_a1_scale is None else src_a1_scale.dtype}"
+        )
+    if src_a1_scale is not None and not _prequantized:
+        # Loud rather than silently re-quantizing something already quantized.
+        assert hidden_states.dtype == dtype, (
+            f"a1_scale given with hidden_states dtype {hidden_states.dtype}: "
+            "expected packed MX bytes (pre-quantized) or the model dtype (ignored)"
+        )
+    # Checked, not inferred: a wire disagreeing with the GEMM's data_format would
+    # read into the next token's bytes and produce plausible garbage.
+    _src_width = hidden_states.shape[-1]
+    if _prequantized:
+        _want_width = model_dim // 2 if _is_fp4 else model_dim
+        assert _src_width == _want_width, (
+            f"prequantized {_quant_mode} payload should be {_want_width} B per "
+            f"row at model_dim {model_dim}, got {_src_width}"
+        )
+
+    # A quantizing TDM dispatch lands the e8m0 row on the wire row-major.
+    # Compact dispatch is already in GEMM row order, so gemm1 interleaves on
+    # the LDS read. The mori path still has to gather into grouped rows; it
+    # writes those scales row-major too. Scattering them into the interleaved
+    # layout in this kernel, then having gemm1 read that layout, was slower
+    # than one coalesced store plus the row-major LDS read -- BUT only on the
+    # decode kernel (tile_m=256, wmma_rep=8). gemm1's row-major A-scale read is
+    # a strided ds_read with a 2-way bank conflict; on the prefill tile
+    # (tile_m=64, m_warp=1) that conflict costs more than the preshuffle saves
+    # (measured: gemm1 +18%, net +9us/layer at 4k tokens), and on tiny decode
+    # batches (<~1k tokens) the small-M gemm1 regresses too. Gate on both so
+    # prefill and ramp steps keep the original interleaved store untouched.
+    _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
+    _row_major_a1 = (
+        _prequantized
+        and not a_preshuffled
+        and not _compact
+        and not _fuse_ep_route_quant
+        and ep_psum_params is None
+        and int(tile_m) >= 256
+        and int(token_num) >= _rm_min_tokens
+        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
+    )
+    _row_major_ascale = (_compact and _prequantized) or _row_major_a1
+    # Local quant instead writes one compact row-major row per token and rebuilds
+    # the interleaved layout gemm1 reads in a second pass, so neither write lands
+    # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
+    # dummy topk_ids, so its token count cannot size a per-token scale buffer.
+    _compact_ascale = (
+        not _compact
+        and not _prequantized
+        and not a_preshuffled
+        and _ep_nvr is None
+        and _use_fused_quant_preshuffle(
+            model_dim, wmma_rep, _quant_mode, token_num, topk
+        )
+    )
+    _compact_ascale_buf = None
+    _row_to_token = _apre_row_to_token
+    if _compact_ascale:
+        _compact_ascale_buf = torch.empty(
+            (token_num, model_dim // 32), dtype=torch.uint8, device=device
+        )
+        # -1 marks tile padding no route points at, which the rebuild zero-fills.
+        _row_to_token = torch.full(
+            (int(contiguous_m),), -1, dtype=torch.int32, device=device
+        )
+    _a1_wire_stride = (
+        int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
+    )
+    if _compact and _prequantized:
+        a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
+        a1_scale = src_a1_scale
+        if _row_gather:
+            # The wire carries one deduplicated payload per token/peer. Scatter
+            # it once into final expert-row order so GEMM1 remains a contiguous
+            # TDM load instead of repeating indexed gathers for every K tile.
+            a1_payload, a1_scale = flydsl_moe_scatter_copy_compact(
+                a1_payload,
+                a1_scale,
+                stage2_scatter.compact_ep_rowmap,
+                wire_row_stride=int(stage2_scatter.compact_wire_row_stride),
+                topk=int(topk),
+                masked_m=stage2_scatter.compact_masked_m,
+                psum=stage2_scatter.compact_psum,
+            )
+            _row_gather = False
+            _a1_wire_stride = 0
+    elif _fuse_ep_route_quant:
+        route_ws = route_fused_workspace(E, device)
+        (
+            a1_payload,
+            a1_scale,
+            _masked_m,
+            topids_to_rows,
+            _starts,
+            psum,
+        ) = flydsl_moe_fused_ep_route_quant_compact(
+            hidden_states.reshape(token_num, _src_width),
+            src_a1_scale,
+            topk_ids,
+            topk_weight,
+            _ep_nvt,
+            E=E,
+            tile_m=tile_m,
+            contiguous_m=contiguous_m,
+            wmma_rep=wmma_rep,
+            quant_mode=_quant_mode,
+            route_workspace=route_ws,
+            tis=stage2_scatter.source_token_map,
+            ep_rowmap=ep_rowmap,
+            max_tok=int(stage2_scatter.max_tokens_per_rank),
+            slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
+        )
+    else:
+        a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+            hidden_states.reshape(1, token_num, _src_width),
+            1,
+            contiguous_m,
+            wmma_rep=wmma_rep,
+            quant_mode=_quant_mode,
+            masked_m=None,
+            topids_to_rows=topids_to_rows,
+            source_topk=topk,
+            num_valid_routes=_ep_nvr,
+            prequantized_scale=src_a1_scale if _prequantized else None,
+            out_scale=_compact_ascale_buf,
+            row_to_token=_row_to_token,
+            ep_psum_params=ep_psum_params,
+            row_major_scale=_row_major_a1,
+            payload_preshuffled=a_preshuffled,
+            clear_counter=(
+                _g2l_counter if _apre_route_fold and _direct_ep_mask else None
+            ),
+        )
+        if _compact_ascale:
+            a1_scale = flydsl_moe_scatter_preshuffle_scale(
+                _compact_ascale_buf,
+                _row_to_token,
+                1,
+                contiguous_m,
+                wmma_rep=wmma_rep,
+                scale_k_per_tile=tile_k // 32,
+            )
+
+    # Fuse gemm1 activation + MX quantization + scale preshuffle into the
+    # kernel epilogue, eliminating the standalone
+    # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
+    disable_gemm1_requant = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+    )
+    _fuse_quant = not disable_gemm1_requant and not disable_gemm1_act
+    w1_u8 = _grouped_weight_uint8(w1)
+    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+
+    if _fuse_quant:
+        # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
+        # These are written directly by the kernel's fused quant epilogue.
+        payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
+        # One e8m0 byte per 32-element MX block, laid out per whole k128 (four
+        # blocks), so a half-k128 tail (inter_dim % 128 == 64) keeps a padded
+        # dword that gemm1 fills with a finite scale.
+        scale_bytes = (inter_dim + 127) // 128 * 4
+        a2_payload = torch.empty(
+            (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
+        )
+        a2_scale = torch.empty(
+            (1, contiguous_m // wmma_rep2, scale_bytes * wmma_rep2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
+        # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
+        # quant_scale / arg_quant_scale). Under S1F the compact context swaps
+        # in the fused dispatch + GEMM1 stage-1 kernel with the same signature.
+        _stage1_gemm1 = (
+            getattr(stage2_scatter, "stage1_gemm1", None) if _compact else None
+        )
+        (_stage1_gemm1 or flydsl_grouped_gemm_a8w4_masked)(
+            a2_payload.view(torch.uint8),
+            a1_payload,
+            w1_u8,
+            a1_scale,
+            w1s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
+            stage1_act=stage1_act,
+            bias=_b1,
+            swiglu_limit=sl,
+            num_buffers=num_buffers,
+            stage1_quant_out=1,
+            quant_scale=a2_scale,
+            quant_wmma_rep=wmma_rep2,
+            persistent_workers=persistent_workers,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
+            k_waves=k_waves1,
+            row_major_ascale=int(_row_major_ascale),
+            a_row_stride_bytes=_a1_wire_stride,
+            a_scale_row_stride_bytes=_a1_wire_stride,
+            **_situ_kw,
+        )
+    else:
+        # Raw GEMM1 writes both gate/up columns when activation moves to quant.
+        y = torch.empty(
+            (1, contiguous_m, two_inter if disable_gemm1_act else inter_dim),
+            dtype=dtype,
+            device=device,
+        )
+        flydsl_grouped_gemm_a8w4_masked(
+            y,
+            a1_payload,
+            w1_u8,
+            a1_scale,
+            w1s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
+            stage1_act=stage1_act,
+            bias=_b1,
+            swiglu_limit=sl,
+            num_buffers=num_buffers,
+            persistent_workers=persistent_workers,
+            gemm_stage=1,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
+            k_waves=k_waves1,
+            row_major_ascale=int(_row_major_ascale),
+            a_row_stride_bytes=_a1_wire_stride,
+            a_scale_row_stride_bytes=_a1_wire_stride,
+            **_situ_kw,
+        )
+        a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+            y,
+            1,
+            contiguous_m,
+            wmma_rep=wmma_rep2,
+            quant_mode=_quant_mode,
+            masked_m=None,
+            topids_to_rows=None,
+            payload_preshuffled=a_preshuffled,
+            **_a2_activation_kw,
+        )
+
+    grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    w2_u8 = _grouped_weight_uint8(w2)
+    w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        grouped_out,
+        a2_payload,
+        w2_u8,
+        a2_scale,
+        w2s_i32,
+        psum,
+        n_experts=E,
+        contiguous_m=contiguous_m,
+        N=model_dim,
+        K=inter_dim,
+        tile_m=tile_m2,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
+        m_warp=m_warp2,
+        n_warp=n_warp2,
+        out_is_f16=out_is_f16,
+        a_is_fp4=_a_is_fp4,
+        a_preshuffled=int(a_preshuffled),
+        stage1_act=0,
+        bias=_b2,
+        num_buffers=num_buffers2,
+        persistent_workers=persistent_workers2,
+        cluster_m=cluster_m2,
+        cluster_n=cluster_n2,
+        waves_per_tensor_tdm=waves_per_tensor_tdm2,
+        next_stage_prefetch=next_stage_prefetch,
+        tdm_as_in_prologue=tdm_as_in_prologue,
+        tdm_b_th=tdm_b_th,
+        lds_soa_load_interleave=lds_soa_load_interleave,
+        rolled_drain=rolled_drain,
+        k_waves=k_waves2,
+        **_ep_gemm2_kwargs,
+    )
+
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "quant_a1",
+                functools.partial(
+                    flydsl_moe_fused_quant_preshuffle,
+                    hidden_states.reshape(1, token_num, _src_width),
+                    1,
+                    contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode,
+                    masked_m=None,
+                    topids_to_rows=topids_to_rows,
+                    source_topk=topk,
+                    num_valid_routes=_ep_nvr,
+                    prequantized_scale=src_a1_scale if _prequantized else None,
+                    out_payload=a1_payload,
+                    out_scale=a1_scale,
+                    row_to_token=_apre_row_to_token,
+                    row_major_scale=_row_major_a1,
+                    payload_preshuffled=a_preshuffled,
+                ),
+            )
+        )
+        if not _fuse_quant:
+            kernel_bench_callable.append(
+                (
+                    "quant_a2",
+                    functools.partial(
+                        flydsl_moe_fused_quant_preshuffle,
+                        y,
+                        1,
+                        contiguous_m,
+                        wmma_rep=wmma_rep2,
+                        quant_mode=_quant_mode,
+                        masked_m=None,
+                        topids_to_rows=None,
+                        out_payload=a2_payload,
+                        out_scale=a2_scale,
+                        payload_preshuffled=a_preshuffled,
+                        **_a2_activation_kw,
+                    ),
+                )
+            )
+        if _fuse_quant:
+            kernel_bench_callable.append(
+                (
+                    "gemm1",
+                    functools.partial(
+                        flydsl_grouped_gemm_a8w4_masked,
+                        a2_payload.view(torch.uint8),
+                        a1_payload,
+                        w1_u8,
+                        a1_scale,
+                        w1s_i32,
+                        psum,
+                        n_experts=E,
+                        contiguous_m=contiguous_m,
+                        N=two_inter,
+                        K=model_dim,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        tile_k=tile_k,
+                        m_warp=m_warp,
+                        n_warp=n_warp,
+                        out_is_f16=out_is_f16,
+                        a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
+                        stage1_act=stage1_act,
+                        bias=_b1,
+                        swiglu_limit=sl,
+                        num_buffers=num_buffers,
+                        stage1_quant_out=1,
+                        quant_scale=a2_scale,
+                        quant_wmma_rep=wmma_rep2,
+                        persistent_workers=persistent_workers,
+                        cluster_m=cluster_m,
+                        cluster_n=cluster_n,
+                        waves_per_tensor_tdm=waves_per_tensor_tdm,
+                        next_stage_prefetch=next_stage_prefetch,
+                        tdm_as_in_prologue=tdm_as_in_prologue,
+                        tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
+                        rolled_drain=rolled_drain,
+                        k_waves=k_waves1,
+                        **_situ_kw,
+                    ),
+                )
+            )
+        else:
+            kernel_bench_callable.append(
+                (
+                    "gemm1",
+                    functools.partial(
+                        flydsl_grouped_gemm_a8w4_masked,
+                        y,
+                        a1_payload,
+                        w1_u8,
+                        a1_scale,
+                        w1s_i32,
+                        psum,
+                        n_experts=E,
+                        contiguous_m=contiguous_m,
+                        N=two_inter,
+                        K=model_dim,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        tile_k=tile_k,
+                        m_warp=m_warp,
+                        n_warp=n_warp,
+                        out_is_f16=out_is_f16,
+                        a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
+                        stage1_act=stage1_act,
+                        bias=_b1,
+                        swiglu_limit=sl,
+                        num_buffers=num_buffers,
+                        persistent_workers=persistent_workers,
+                        gemm_stage=1,
+                        cluster_m=cluster_m,
+                        cluster_n=cluster_n,
+                        waves_per_tensor_tdm=waves_per_tensor_tdm,
+                        next_stage_prefetch=next_stage_prefetch,
+                        tdm_as_in_prologue=tdm_as_in_prologue,
+                        tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
+                        rolled_drain=rolled_drain,
+                        k_waves=k_waves1,
+                        **_situ_kw,
+                    ),
+                )
+            )
+        kernel_bench_callable.append(
+            (
+                "gemm2",
+                functools.partial(
+                    flydsl_grouped_gemm_a8w4_masked,
+                    grouped_out,
+                    a2_payload,
+                    w2_u8,
+                    a2_scale,
+                    w2s_i32,
+                    psum,
+                    n_experts=E,
+                    contiguous_m=contiguous_m,
+                    N=model_dim,
+                    K=inter_dim,
+                    tile_m=tile_m2,
+                    tile_n=tile_n2,
+                    tile_k=tile_k2,
+                    m_warp=m_warp2,
+                    n_warp=n_warp2,
+                    out_is_f16=out_is_f16,
+                    a_is_fp4=_a_is_fp4,
+                    a_preshuffled=int(a_preshuffled),
+                    stage1_act=0,
+                    bias=_b2,
+                    num_buffers=num_buffers2,
+                    persistent_workers=persistent_workers2,
+                    cluster_m=cluster_m2,
+                    cluster_n=cluster_n2,
+                    waves_per_tensor_tdm=waves_per_tensor_tdm2,
+                    next_stage_prefetch=next_stage_prefetch,
+                    tdm_as_in_prologue=tdm_as_in_prologue,
+                    tdm_b_th=tdm_b_th,
+                    lds_soa_load_interleave=lds_soa_load_interleave,
+                    rolled_drain=rolled_drain,
+                    k_waves=k_waves2,
+                ),
+            )
+        )
+
+    if enable_ep_scatter:
+        # GEMM2 already P2P-wrote every route-weighted result into the peers'
+        # combine buffers, so this only satisfies the custom-op's return contract;
+        # MegaMoE ignores its contents and consumes comb_inp instead.
+        return torch.empty((token_num, model_dim), dtype=dtype, device=device)
+
+    moe_out = (
+        torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        if output is None
+        else output
+    )
+    if _is_ep:
+        # Route kernel already produced gather weights (dropped routes zeroed);
+        # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens, and
+        # non-local routes read through a zero-sized descriptor (DROPPED_ROUTE_ROW),
+        # so a token whose every route is remote reduces to zeros.
+        gather_w = _gather_w_buf
+    elif herd_gather_w is not None:
+        gather_w = herd_gather_w
+    else:
+        gather_w = (
+            torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
+            if doweight_stage1
+            else topk_weight.contiguous()
+        )
+    flydsl_moe_gather_reduce(
+        grouped_out,
+        topids_to_rows,
+        gather_w,
+        out=moe_out,
+        num_valid_tokens=(_ep_nvt if _is_ep else None),
+    )
+    return moe_out
+
+
+def grouped_gemm_gfx1250_a8w4(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    E: int,
+    model_dim: int,
+    inter_dim: int,
+    dtype: torch.dtype,
+    activation: ActivationType,
+    quant_type: QuantType,
+    q_dtype_a,
+    q_dtype_w,
+    isG1U1: bool,
+    doweight_stage1: bool,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    expert_mask: torch.Tensor | None,
+    hidden_pad: int,
+    intermediate_pad: int,
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
+    swiglu_limit: float | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    stage2_scatter: Stage2ScatterContext | None = None,
+    a1_scale: torch.Tensor | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
+    output: torch.Tensor | None = None,
+):
+    """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
+
+    ``w1`` MUST be GUGU: gate/up row-interleaved ([g0,u0,g1,u1,...]), i.e. what
+    ``moe_shuffle_weight(..., is_guinterleave=True, gate_up=True)`` produces.
+    The TDM kernel reads that layout unconditionally -- passing GGUU (separated
+    gate/up) weights is not detected and yields wrong results.
+
+    Returns ``None`` when the shape/dtype/arch is not served here, so the caller
+    can fall back to the generic MoE. ``output``, a [token_num, model_dim]
+    buffer, receives the result in place of a fresh tensor.
+    """
+
+    # Read once per call (still honours a runtime change of the variable): when
+    # it is off -- always, in serving -- no debug message is formatted at all.
+    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+    def _grouped_dbg(msg, stacklevel: int = 1):
+        # ``msg`` may be a zero-arg callable so call sites only build their
+        # f-string when debugging is on.
+        if _dbg_on:
+            import inspect
+
+            if callable(msg):
+                msg = msg()
+            frame = inspect.stack()[stacklevel]
+            print(
+                f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}",
+                flush=True,
+            )
+
+    def _fmt(v):
+        if isinstance(v, torch.Tensor):
+            return f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype})"
+        return repr(v)
+
+    _grouped_dbg(
+        lambda: "inputs: "
+        + ", ".join(
+            f"{k}={_fmt(v)}"
+            for k, v in [
+                ("hidden_states", hidden_states),
+                ("w1", w1),
+                ("w2", w2),
+                ("topk_weight", topk_weight),
+                ("topk_ids", topk_ids),
+                ("E", E),
+                ("model_dim", model_dim),
+                ("inter_dim", inter_dim),
+                ("dtype", dtype),
+                ("activation", activation),
+                ("quant_type", quant_type),
+                ("q_dtype_a", q_dtype_a),
+                ("q_dtype_w", q_dtype_w),
+                ("isG1U1", isG1U1),
+                ("doweight_stage1", doweight_stage1),
+                ("w1_scale", w1_scale),
+                ("w2_scale", w2_scale),
+                ("expert_mask", expert_mask),
+                ("hidden_pad", hidden_pad),
+                ("intermediate_pad", intermediate_pad),
+                ("bias1", bias1),
+                ("bias2", bias2),
+            ]
+        )
+    )
+    _grouped_dbg("enter grouped helper")
+    # Main opt-in plus legacy kill switch.
+    if not _use_grouped_gemm_enabled():
+        _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
+        return None
+    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+        _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
+        return None
+    _is_ep = expert_mask is not None
+    if _is_ep:
+        _grouped_dbg(
+            lambda: f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}"
+        )
+    if hidden_pad != 0 or intermediate_pad != 0:
+        hidden_pad = 0
+        intermediate_pad = 0
+        _grouped_dbg("haspad")
+        # return None
+    if not isG1U1 or quant_type != QuantType.per_1x32:
+        _grouped_dbg("not g1u1 or not 1x32")
+        return None
+    if activation not in (
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Situv2,
+    ):
+        _grouped_dbg("unsupported activation")
+        return None
+    # mxfp4 weights arrive as fp4x2 or as the uint8 view of the same bytes --
+    # ATOM's loader keeps them uint8, and MegaMoE accepts both. Requiring the
+    # packed dtype on the a4w4 arm alone silently routed a4w4-with-uint8-weights
+    # to the 2-stage fallback.
+    w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
+    is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and w_is_mxfp4
+    is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4
+    if not (is_grouped_a4w4 or is_grouped_a8w4):
+        return None
+    data_format = "fp4" if is_grouped_a4w4 else "a8w4"
+    q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
+    _grouped_dbg(lambda: f"eligible data_format={data_format}")
+    if w1_scale is None or w2_scale is None:
+        return None
+    # The env overrides only matter off gfx1250 (same condition, evaluated
+    # lazily so the native-arch path skips the four env reads).
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
+        _gfx_env = ";".join(
+            str(os.environ.get(k, "")).lower()
+            for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+        )
+        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        if "gfx1250" not in _gfx_env and not _force_gfx1250:
+            return None
+
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    _cctx = _flydsl_dispatch_context()
+    if herd_topk:
+        if _cctx is not None:
+            raise ValueError("herd_topk does not support a MegaMoE dispatch context")
+        topk = herd_topk
+    _csv_tokens = token_num
+    if _cctx is not None and getattr(_cctx, "compact_layout", False):
+        # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
+        # as the token count. CSV still keys off the recv-token bucket -- this
+        # step's, when the caller bounded it. Keying off the arena capacity
+        # instead ran every decode step on the tile tuned for a full prefill
+        # arena, which is also the tile the compact plan then pads to.
+        _csv_tokens = int(getattr(_cctx, "compact_recv_bound", 0) or 0) or (
+            int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
+        )
+    if token_num == 0:
+        # No tokens to compute (common in EP when a rank receives 0 dispatched
+        # tokens). The grouped route/GEMM kernels would launch with a zero-sized
+        # grid -> hipErrorInvalidValue, so short-circuit to an empty output.
+        return torch.zeros((0, model_dim), dtype=dtype, device=device)
+    # Defaults for the tile knobs the TDM path reads; the CSV row overrides them.
+    tile_m = 64
+    n_warp = 4
+    num_buffers = 2
+    cfg_row = _find_grouped_config(
+        token_num=_get_padded_m(_csv_tokens),
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        # In EP each rank only holds a subset of experts, so the caller-visible
+        # topk is not a stable tuning key; use -1 to match EP-agnostic CSV rows.
+        topk=(-1 if _is_ep else topk),
+        activation=activation,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w_key,
+        quant_type=quant_type,
+        ep_fused=stage2_scatter is not None,
+    )
+    if cfg_row is not None:
+        tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
+        n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
+        num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        _grouped_dbg(lambda: f"using grouped CSV config: {cfg_row}")
+    else:
+        logger.info(
+            "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
+            "experts=%d topk=%d ep_fused=%s act=%s dtype=%s q_dtype_a=%s "
+            "q_dtype_w=%s quant_type=%s); using defaults tile_m=%d n_warp=%d "
+            "num_buffers=%d",
+            _get_padded_m(_csv_tokens),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            stage2_scatter is not None,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w_key,
+            quant_type,
+            tile_m,
+            n_warp,
+            num_buffers,
+        )
+    # TDM batched kernel dispatch. EP (expert_mask) goes through the same TDM
+    # GEMM; its route/quant/gather wiring lives in _grouped_a8w4_tdm_moe.
+    # doweight_stage1 is not supported with EP here (the route kernel owns the
+    # gather weights), so those calls return None for the generic fallback.
+    if expert_mask is None or not doweight_stage1:
+        _tdm_kw = {}
+        if cfg_row is not None:
+            _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
+            _tdm_kw["tile_n"] = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
+            _tdm_kw["tile_k"] = _as_int(cfg_row.get("tile_k"), 128)
+            _tdm_kw["m_warp"] = _as_int(cfg_row.get("m_warp"), 1)
+            _tdm_kw["n_warp"] = _as_int(cfg_row.get("n_warp"), n_warp)
+            _tdm_kw["num_buffers"] = _as_int(cfg_row.get("num_buffers"), num_buffers)
+            _tdm_kw["tile_m2"] = _as_int(cfg_row.get("tile_m2"), _tdm_kw["tile_m"])
+            _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
+            _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
+            _tdm_kw["m_warp2"] = _as_int(cfg_row.get("m_warp2"), _tdm_kw["m_warp"])
+            _tdm_kw["n_warp2"] = _as_int(cfg_row.get("n_warp2"), _tdm_kw["n_warp"])
+            _tdm_kw["num_buffers2"] = _as_int(
+                cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
+            )
+            _tdm_kw["cluster_m"] = _as_int(cfg_row.get("cluster_m"), -1)
+            _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_m2"] = _as_int(cfg_row.get("cluster_m2"), -1)
+            _tdm_kw["cluster_n2"] = _as_int(
+                cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
+            )
+            _tdm_kw["waves_per_tensor_tdm"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["waves_per_tensor_tdm2"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm2"),
+                _tdm_kw["waves_per_tensor_tdm"],
+            )
+            _tdm_kw["next_stage_prefetch"] = _as_int(
+                cfg_row.get("next_stage_prefetch"), 0
+            )
+            _tdm_kw["tdm_as_in_prologue"] = _as_int(
+                cfg_row.get("tdm_as_in_prologue"), 0
+            )
+            _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave"), 0
+            )
+            _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
+            # split_k1/split_k2 split each GEMM's K across that many wave groups
+            # inside one workgroup (k_waves); the grid stays the same. Blank or 0
+            # (the model_configs/ merge fills a column an older table lacks with
+            # 0) means unset, i.e. no split.
+            _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
+            _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
+            # Follow the matched CSV bucket, including padded token counts
+            # (for example, 6144 -> 8192), just like the other kernel knobs.
+            _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
+            # GEMM1 always has a local epilogue; stage2_scatter only changes
+            # GEMM2, so it does not restrict GEMM1's persistent scheduler.
+            _tdm_kw["persistent_workers"] = _as_int(
+                cfg_row.get("persistent_workers"), 0
+            )
+            # The persistent GEMM2 scheduler supports an ordinary EP scatter,
+            # but quantized scatter requires the nonpersistent grid.
+            if stage2_scatter is None or not stage2_scatter.combine_quant_bits:
+                _tdm_kw["persistent_workers2"] = _as_int(
+                    cfg_row.get("persistent_workers2"), 0
+                )
+
+        # Env overrides for tuning (present-check so any set value wins over CSV /
+        # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
+        # AITER_TDM_TILE_M / _TILE_N / _TILE_K / _NUM_BUFFERS (+ *_M2/_N2/_K2/
+        # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles, and
+        # AITER_TDM_M_WARP / _N_WARP (+ *_M_WARP2/_N_WARP2) to sweep the wave grid.
+        def _tdm_env(name):
+            v = os.environ.get(name)
+            return int(v) if (v is not None and v != "") else None
+
+        if is_grouped_a4w4:
+            _ov_apre = _tdm_env("AITER_GROUPED_A4W4_A_PRESHUFFLE")
+            if _ov_apre is not None:
+                _tdm_kw["a_preshuffle"] = _ov_apre
+
+        _ov_m = _tdm_env("AITER_TDM_TILE_M")
+        _ov_n = _tdm_env("AITER_TDM_TILE_N")
+        _ov_k = _tdm_env("AITER_TDM_TILE_K")
+        _ov_nb = _tdm_env("AITER_TDM_NUM_BUFFERS")
+        _ov_m2 = _tdm_env("AITER_TDM_TILE_M2")
+        _ov_n2 = _tdm_env("AITER_TDM_TILE_N2")
+        _ov_k2 = _tdm_env("AITER_TDM_TILE_K2")
+        _ov_nb2 = _tdm_env("AITER_TDM_NUM_BUFFERS2")
+        if any(
+            v is not None
+            for v in (_ov_m, _ov_n, _ov_k, _ov_nb, _ov_m2, _ov_n2, _ov_k2, _ov_nb2)
+        ):
+            _base_m = _ov_m if _ov_m is not None else _tdm_kw.get("tile_m", tile_m)
+            _base_n = (
+                _ov_n if _ov_n is not None else _tdm_kw.get("tile_n", int(n_warp) * 64)
+            )
+            _base_k = _ov_k if _ov_k is not None else _tdm_kw.get("tile_k", 128)
+            _base_nb = (
+                _ov_nb
+                if _ov_nb is not None
+                else _tdm_kw.get("num_buffers", num_buffers)
+            )
+            _tdm_kw["tile_m"] = _base_m
+            _tdm_kw["tile_n"] = _base_n
+            _tdm_kw["tile_k"] = _base_k
+            _tdm_kw["num_buffers"] = _base_nb
+            # Stage2 ties to the (possibly overridden) stage1 base unless its own
+            # *_M2/_N2/_K2/_NUM_BUFFERS2 override is set. This intentionally
+            # discards any CSV stage2 value so an env sweep stays self-consistent.
+            _tdm_kw["tile_m2"] = _ov_m2 if _ov_m2 is not None else _base_m
+            _tdm_kw["tile_n2"] = _ov_n2 if _ov_n2 is not None else _base_n
+            _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
+            _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
+
+        # Wave grid overrides, same stage1 -> stage2 fallback as the tiles above.
+        _ov_mw = _tdm_env("AITER_TDM_M_WARP")
+        _ov_nw = _tdm_env("AITER_TDM_N_WARP")
+        _ov_mw2 = _tdm_env("AITER_TDM_M_WARP2")
+        _ov_nw2 = _tdm_env("AITER_TDM_N_WARP2")
+        if any(v is not None for v in (_ov_mw, _ov_nw, _ov_mw2, _ov_nw2)):
+            _base_mw = _ov_mw if _ov_mw is not None else _tdm_kw.get("m_warp", 1)
+            _base_nw = _ov_nw if _ov_nw is not None else _tdm_kw.get("n_warp", n_warp)
+            _tdm_kw["m_warp"] = _base_mw
+            _tdm_kw["n_warp"] = _base_nw
+            _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
+            _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A tile from the CSV row or an AITER_TDM_* override must fit as given;
+        # only the built-in default may be narrowed (see _grouped_a8w4_tdm_moe).
+        _tdm_kw["tiles_configured"] = any(
+            k in _tdm_kw
+            for k in ("tile_n", "tile_k", "n_warp", "tile_n2", "tile_k2", "n_warp2")
+        )
+        return _grouped_a8w4_tdm_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=E,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            doweight_stage1=doweight_stage1,
+            data_format=data_format,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
+            stage2_scatter=stage2_scatter,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            a1_scale=a1_scale,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
+            output=output,
+            **_tdm_kw,
+        )
+
+    # Only the TDM grouped path is kept; the previous non-TDM grouped
+    # GEMM (gemm_mxscale_gfx1250 / moe_grouped_gemm_mxscale_gfx1250) was
+    # removed. Anything the TDM path cannot serve falls back to the caller's
+    # generic MoE via None.
+    # TODO(aot): AOT has no coverage for the TDM batched GEMM
+    # (batched_gemm_mxfp4); grouped kernels are JIT-compiled at first use
+    # until that is added back.
+    return None
+
+
+# --- Functions moved from moe_kernels.py for grouped gemm ---
+@functools.cache
+def _get_compiled_gather_reduce(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    vec_dwords: int = 2,
+    w_dtype: str = "f32",
+):
+    """Compile and cache the one-pass MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_module,
+    )
+
+    return build_moe_gather_reduce_module(
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+    )
+
+
+def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
+    """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
+    out_dwords = int(model_dim) // 2
+    n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
+    return 4 if int(token_num) * n_iters_v4 >= 256 else 2
+
+
+@functools.cache
+def _get_compiled_route_maps():
+    """Compile and cache the atomic route -> grouped-row map kernel."""
+    from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_route_maps_module
+
+    return build_moe_route_maps_module()
+
+
+@functools.cache
+def _get_compiled_contiguous_psum():
+    """Compile and cache the contiguous M-tile prefix-sum kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_module,
+    )
+
+    return build_moe_contiguous_psum_module()
+
+
+@functools.cache
+def _get_compiled_contiguous_psum_remap():
+    """Compile and cache the contiguous prefix-sum + row-remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_module,
+    )
+
+    return build_moe_contiguous_psum_remap_module()
+
+
+@functools.cache
+def _get_compiled_route_psum_fused():
+    """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_route_psum_fused_module,
+    )
+
+    return build_moe_route_psum_fused_module()
+
+
+# One workgroup handles every route. NUMEL is advisory -- the route sweep is
+# grid-stride, so a larger count is correct but stops being worth fusing; on
+# gfx1250 the split launches catch up at about 2.5K routes.
+# EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
+# are both one slot per lane.
+_FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
+_FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+
+
+def fused_route_psum_remap(
+    topk_ids: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+):
+    """Single-launch route+atomic+psum+remap for small token counts.
+
+    Equivalent to ``flydsl_moe_topids_to_rows`` followed by
+    ``contiguous_psum_remap``, but fused into one workgroup. Returns
+    (masked_m, topids_to_rows[token_num, topk], psum).
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    # Unlike contiguous_psum/_remap, this kernel's scan is still single-pass:
+    # its LDS route counter is one slot per expert, so widening E needs a bigger
+    # allocation, not just a carry. Fail loudly rather than silently drop the
+    # experts past the block, which is the bug the chunked scan fixed there.
+    if experts > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
+        raise ValueError(
+            f"fused_route_psum_remap supports at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}; "
+            f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
+        )
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    launch = _get_compiled_route_psum_fused()
+    _run_compiled(
+        launch,
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(numel),
+        experts,
+        int(max_m),
+        int(tile_m),
+        current_stream_arg(),
+    )
+    return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
+    """Tile-aligned exclusive prefix sum over per-expert counts."""
+    device = masked_m.device
+    experts = int(experts)
+    masked_m_i32 = masked_m[:experts].to(torch.int32)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
+    launch = _get_compiled_contiguous_psum()
+    _run_compiled(
+        launch,
+        ptr_arg(masked_m_i32),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(contiguous_m_t),
+        experts,
+        int(tile_m),
+        torch.cuda.current_stream(),
+    )
+    return starts, psum, contiguous_m_t
+
+
+@functools.cache
+def _get_compiled_contiguous_psum_remap_ep():
+    """psum + remap fused with the gemm2 EP ep_rowmap build."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_ep_module,
+    )
+
+    return build_moe_contiguous_psum_remap_ep_module()
+
+
+def contiguous_psum_remap(
+    masked_m: torch.Tensor,
+    topids_to_rows: torch.Tensor,
+    experts: int,
+    route_max_m: int,
+    tile_m: int,
+    num_valid_routes: torch.Tensor | None = None,
+    ep_scatter_params: dict | None = None,
+    row_to_token: torch.Tensor | None = None,
+    topk: int = 1,
+):
+    """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
+
+    With ``ep_scatter_params`` (gather_w/tis/ep_rowmap/topk/max_tok/slot_stride)
+    the same pass also scatters the gemm2-fused EP row map, reusing the final row
+    it just computed.
+    """
+    device = masked_m.device
+    experts = int(experts)
+    masked_m_i32 = masked_m[:experts].to(torch.int32)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
+    topids_flat = topids_to_rows.reshape(-1)
+    # Only remap the valid routes; dead-tail rows are unwritten and must not be
+    # used as a row index. Default (no truncation) covers every route.
+    if num_valid_routes is None:
+        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
+        # pointer as "no truncation".
+        num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        num_valid_routes_i32 = (
+            num_valid_routes.reshape(-1)[:1]
+            .to(device=device, dtype=torch.int32)
+            .contiguous()
+        )
+    row_to_token_i32 = (
+        row_to_token.reshape(-1)
+        if row_to_token is not None
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    if ep_scatter_params is not None:
+        launch = _get_compiled_contiguous_psum_remap_ep()
+        # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
+        # interleaved with route work for free.  No host .fill_() needed.
+        _run_compiled(
+            launch,
+            ptr_arg(masked_m_i32),
+            ptr_arg(topids_flat),
+            ptr_arg(starts),
+            ptr_arg(psum),
+            ptr_arg(contiguous_m_t),
+            experts,
+            int(route_max_m),
+            int(tile_m),
+            ptr_arg(num_valid_routes_i32),
+            ptr_arg(ep_scatter_params["gather_w"].reshape(-1)),
+            ptr_arg(ep_scatter_params["tis"].reshape(-1)),
+            ptr_arg(ep_scatter_params["ep_rowmap"].reshape(-1)),
+            int(ep_scatter_params["topk"]),
+            int(ep_scatter_params["max_tok"]),
+            int(ep_scatter_params["slot_stride"]),
+            ptr_arg(row_to_token_i32),
+            current_stream_arg(),
+        )
+        return starts, psum, contiguous_m_t
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
+
+    assert experts <= MAX_REMAP_EXPERTS, (
+        f"contiguous_psum_remap holds one start per expert in LDS: "
+        f"experts={experts} exceeds MAX_REMAP_EXPERTS={MAX_REMAP_EXPERTS}"
+    )
+    launch = _get_compiled_contiguous_psum_remap()
+    _run_compiled(
+        launch,
+        ptr_arg(masked_m_i32),
+        ptr_arg(topids_flat),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(contiguous_m_t),
+        int(topids_flat.numel()),
+        experts,
+        int(route_max_m),
+        int(tile_m),
+        ptr_arg(num_valid_routes_i32),
+        ptr_arg(row_to_token_i32),
+        int(topk),
+        current_stream_arg(),
+    )
+    return starts, psum, contiguous_m_t
+
+
+def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
+    """Atomic-scatter route maps. Returns (topids_to_rows, rows_to_tokens, masked_m)."""
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
+    atomic_buffer = torch.zeros(E, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
+    grid_blocks = (numel + 255) // 256
+    launch = _get_compiled_route_maps()
+    _run_compiled(
+        launch,
+        ptr_arg(topk_ids_i32, fx.Int32),
+        ptr_arg(atomic_buffer, fx.Int32),
+        ptr_arg(topids_to_rows, fx.Int32),
+        ptr_arg(rows_to_tokens, fx.Int32),
+        numel,
+        topk,
+        max_m,
+        grid_blocks,
+        torch.cuda.current_stream(),
+    )
+    masked_m = atomic_buffer
+    return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
+
+
+def flydsl_moe_gather_reduce(
+    grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
+    topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
+    gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
+    out: torch.Tensor | None = None,
+    num_valid_tokens: (
+        torch.Tensor | None
+    ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+) -> torch.Tensor:
+    """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
+
+    ``gather_w`` may be f32 (native route weights, no host-side cast) or match
+    ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way. Slots
+    holding ``moe_route_maps.DROPPED_ROUTE_ROW`` (EP routes with no grouped row)
+    contribute 0 without touching ``grouped_out``.
+    """
+    if grouped_out.dim() == 4:
+        split_k, E, max_m, model_dim = grouped_out.shape
+    else:
+        split_k = 1
+        E, max_m, model_dim = grouped_out.shape
+    token_num, topk = topids_to_rows.shape
+    device = grouped_out.device
+    if grouped_out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif grouped_out.dtype == torch.float16:
+        out_dtype = "f16"
+    else:
+        raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
+    if gather_w.dtype == torch.float32:
+        w_dtype = "f32"
+    elif gather_w.dtype == torch.bfloat16:
+        w_dtype = "bf16"
+    elif gather_w.dtype == torch.float16:
+        w_dtype = "f16"
+    else:
+        raise ValueError(
+            f"unsupported gather_w dtype {gather_w.dtype}; need f32/bf16/f16"
+        )
+
+    grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
+    if out is None:
+        out = torch.empty(
+            (token_num, model_dim), dtype=grouped_out.dtype, device=device
+        )
+
+    gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    launch = _get_compiled_gather_reduce(
+        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+    )
+    slice_stride_dw = E * max_m * (model_dim // 2)
+    # Skip dead-tail output tokens whose route map is unwritten. Default (no
+    # truncation) processes every token.
+    if num_valid_tokens is None:
+        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
+        # pointer as "no truncation".
+        num_valid_tokens_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        num_valid_tokens_i32 = (
+            num_valid_tokens.reshape(-1)[:1]
+            .to(device=device, dtype=torch.int32)
+            .contiguous()
+        )
+    _run_compiled(
+        launch,
+        ptr_arg(grouped_out_flat),
+        ptr_arg(topids_to_rows),
+        ptr_arg(gather_w),
+        ptr_arg(out),
+        token_num,
+        slice_stride_dw,
+        ptr_arg(num_valid_tokens_i32),
+        current_stream_arg(),
+    )
+    return out
+
+
+# MoE route-gather (scatter-copy) input layout helpers
+
+
+@functools.cache
+def _get_compiled_scatter_copy(row_bytes: int):
+    """Compile and cache the one-pass row scatter-copy kernel (per row width)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_token_module,
+    )
+
+    return build_moe_scatter_copy_token_module(row_bytes)
+
+
+def flydsl_moe_scatter_copy_token(
+    a1_payload: torch.Tensor,  # (token_num, payload_w) uint8
+    a1_scale_token_u8: torch.Tensor | None,  # (token_num, scale_w) uint8 or None
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
+    E: int,
+    max_m: int,
+    grouped_a1: torch.Tensor | None = None,  # (E, max_m, payload_w) uint8 out
+    a1_scale_raw: torch.Tensor | None = None,  # (E, max_m, scale_w) uint8 out
+):
+    """Copy token payload/scale into grouped layout via rows_to_tokens map.
+
+    Returns (grouped_a1, a1_scale_raw)."""
+    device = a1_payload.device
+    payload_w = a1_payload.shape[1]
+    num_dst = E * max_m
+
+    if grouped_a1 is None:
+        grouped_a1 = torch.zeros(
+            (E, max_m, payload_w), dtype=torch.uint8, device=device
+        )
+    launch_p = _get_compiled_scatter_copy(payload_w)
+    payload_src = a1_payload.contiguous().view(-1, payload_w)
+    payload_dst = grouped_a1.view(num_dst, payload_w)
+    _run_compiled(
+        launch_p,
+        ptr_arg(payload_src, fx.Uint8),
+        ptr_arg(payload_dst, fx.Uint8),
+        ptr_arg(rows_to_tokens, fx.Int32),
+        num_dst,
+        torch.cuda.current_stream(),
+    )
+
+    if a1_scale_token_u8 is not None:
+        scale_w = a1_scale_token_u8.shape[1]
+        if a1_scale_raw is None:
+            a1_scale_raw = torch.zeros(
+                (E, max_m, scale_w), dtype=torch.uint8, device=device
+            )
+        launch_s = _get_compiled_scatter_copy(scale_w)
+        scale_src = a1_scale_token_u8.contiguous().view(-1, scale_w)
+        scale_dst = a1_scale_raw.view(num_dst, scale_w)
+        _run_compiled(
+            launch_s,
+            ptr_arg(scale_src, fx.Uint8),
+            ptr_arg(scale_dst, fx.Uint8),
+            ptr_arg(rows_to_tokens, fx.Int32),
+            num_dst,
+            torch.cuda.current_stream(),
+        )
+
+    return grouped_a1, a1_scale_raw
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy(row_bytes: int):
+    """Compile the compact-wire row scatter once per copied row width."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_module,
+    )
+
+    return build_moe_scatter_copy_compact_module(row_bytes)
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy_pair(payload_bytes: int, scale_bytes: int):
+    """Compile the paired payload + scale compact scatter once per shape."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_pair_module,
+    )
+
+    return build_moe_scatter_copy_compact_pair_module(payload_bytes, scale_bytes)
+
+
+def flydsl_moe_scatter_copy_compact(
+    a1_payload: torch.Tensor,
+    a1_scale: torch.Tensor | None,
+    ep_rowmap: torch.Tensor,
+    *,
+    wire_row_stride: int,
+    topk: int,
+    grouped_payload: torch.Tensor | None = None,
+    grouped_scale: torch.Tensor | None = None,
+    masked_m: torch.Tensor | None = None,
+    psum: torch.Tensor | None = None,
+):
+    """Materialize compact token-major wire rows in expert-contiguous order.
+
+    Compact dispatch keeps one payload per source token and peer. ``ep_rowmap``
+    names that source payload for each final expert row. Scatter it once before
+    GEMM1 so the grouped kernel can use its normal contiguous-A TDM loads.
+    """
+    if wire_row_stride <= 0:
+        raise ValueError(f"wire_row_stride must be positive, got {wire_row_stride}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    num_dst = int(ep_rowmap.shape[0]) - 1
+    if num_dst <= 0:
+        raise ValueError(f"ep_rowmap needs at least two rows, got {ep_rowmap.shape}")
+    device = a1_payload.device
+    payload_w = int(a1_payload.shape[-1])
+    if wire_row_stride % 16 == 0:
+        payload_unit = 16
+    elif wire_row_stride % 8 == 0:
+        payload_unit = 8
+    elif wire_row_stride % 4 == 0:
+        payload_unit = 4
+    else:
+        payload_unit = 1
+    if wire_row_stride % payload_unit:
+        raise ValueError("compact wire stride is not a whole copy unit")
+    if grouped_payload is None:
+        grouped_payload = torch.empty(
+            (1, num_dst, payload_w), dtype=torch.uint8, device=device
+        )
+    if (
+        a1_scale is not None
+        and payload_w % 16 == 0
+        and int(a1_scale.shape[-1]) % 16 == 0
+        and wire_row_stride % 16 == 0
+    ):
+        scale_w = int(a1_scale.shape[-1])
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+            )
+        if (
+            masked_m is not None
+            and psum is not None
+            and int(masked_m.shape[0]) == int(psum.shape[0])
+            and int(masked_m.shape[0]) > 0
+        ):
+            n_experts = int(masked_m.shape[0])
+            # About 32 live rows per block when the row cap is spread across
+            # experts. The y grid is a host upper bound, so a captured graph
+            # stays static; a short expert just leaves its extra blocks idle.
+            n_split = max(
+                1, min(32, (num_dst + n_experts * 32 - 1) // (n_experts * 32))
+            )
+            _run_compiled(
+                _get_compiled_compact_scatter_copy_pair(payload_w, scale_w),
+                ptr_arg(a1_payload, fx.Uint8),
+                ptr_arg(a1_scale, fx.Uint8),
+                ptr_arg(grouped_payload, fx.Uint8),
+                ptr_arg(grouped_scale, fx.Uint8),
+                ptr_arg(ep_rowmap, fx.Int32),
+                ptr_arg(masked_m, fx.Int32),
+                ptr_arg(psum, fx.Int32),
+                wire_row_stride // 16,
+                topk,
+                n_experts,
+                n_split,
+                fx.Stream(torch.cuda.current_stream()),
+            )
+            return grouped_payload, grouped_scale
+    _run_compiled(
+        _get_compiled_compact_scatter_copy(payload_w),
+        ptr_arg(a1_payload, fx.Uint8),
+        ptr_arg(grouped_payload, fx.Uint8),
+        ptr_arg(ep_rowmap, fx.Int32),
+        wire_row_stride // payload_unit,
+        topk,
+        num_dst,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+
+    if a1_scale is not None:
+        scale_w = int(a1_scale.shape[-1])
+        if wire_row_stride % 16 == 0:
+            scale_unit = 16
+        elif wire_row_stride % 8 == 0:
+            scale_unit = 8
+        elif wire_row_stride % 4 == 0:
+            scale_unit = 4
+        else:
+            scale_unit = 1
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+            )
+        _run_compiled(
+            _get_compiled_compact_scatter_copy(scale_w),
+            ptr_arg(a1_scale, fx.Uint8),
+            ptr_arg(grouped_scale, fx.Uint8),
+            ptr_arg(ep_rowmap, fx.Int32),
+            wire_row_stride // scale_unit,
+            topk,
+            num_dst,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+    return grouped_payload, grouped_scale
+
+
+@functools.cache
+def _get_compiled_scatter_preshuffle_scale(
+    row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
+):
+    """Compile and cache the WMMA-preshuffle scale kernel (with/without gather)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
+        build_moe_scatter_copy_preshuffle_scale_module,
+    )
+
+    return build_moe_scatter_copy_preshuffle_scale_module(
+        row_bytes, wmma_rep, scale_k_per_tile, gather=gather
+    )
+
+
+def flydsl_moe_scatter_preshuffle_scale(
+    a1_scale_token_u8: torch.Tensor,  # (token_num, scale_w) uint8
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    grouped_a1_scale: (
+        torch.Tensor | None
+    ) = None,  # (E, max_m//wmma_rep, scale_w*wmma_rep)
+):
+    """Fused route-gather + WMMA preshuffle for e8m0 scale rows.
+
+    Returns ``grouped_a1_scale``.
+    """
+    device = a1_scale_token_u8.device
+    scale_w = a1_scale_token_u8.shape[1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    tiles_per_expert = max_m // rows_per_tile
+
+    if grouped_a1_scale is None:
+        grouped_a1_scale = torch.empty(
+            (E, max_m // wmma_rep, scale_w * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        scale_w, wmma_rep, scale_k_per_tile, True
+    )
+    scale_src = a1_scale_token_u8.contiguous().view(-1, scale_w)
+    scale_dst = grouped_a1_scale.view(E * (max_m // wmma_rep), scale_w * wmma_rep)
+    _run_compiled(
+        launch,
+        ptr_arg(scale_src, fx.Uint8),
+        ptr_arg(scale_dst, fx.Uint8),
+        ptr_arg(rows_to_tokens, fx.Int32),
+        max_m,
+        E,
+        tiles_per_expert,
+        current_stream_arg(),
+    )
+    return grouped_a1_scale
+
+
+def flydsl_moe_preshuffle_scale(
+    scale_grouped_u8: torch.Tensor,  # (E, max_m, scale_w) or (E*max_m, scale_w) uint8
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    out: torch.Tensor | None = None,  # (E, max_m//wmma_rep, scale_w*wmma_rep)
+):
+    """Preshuffle grouped row-major e8m0 scale into WMMA layout. Returns out."""
+    device = scale_grouped_u8.device
+    scale_w = scale_grouped_u8.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    tiles_per_expert = max_m // rows_per_tile
+
+    if out is None:
+        out = torch.empty(
+            (E, max_m // wmma_rep, scale_w * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        scale_w, wmma_rep, scale_k_per_tile, False
+    )
+    scale_src = scale_grouped_u8.contiguous().view(E * max_m, scale_w)
+    scale_dst = out.view(E * (max_m // wmma_rep), scale_w * wmma_rep)
+    _run_compiled(
+        launch,
+        ptr_arg(scale_src, fx.Uint8),
+        ptr_arg(scale_dst, fx.Uint8),
+        max_m,
+        E,
+        tiles_per_expert,
+        torch.cuda.current_stream(),
+    )
+    return out

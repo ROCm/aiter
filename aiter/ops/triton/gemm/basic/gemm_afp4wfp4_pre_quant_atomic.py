@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     gemm_a16wfp4,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -15,9 +15,9 @@ def gemm_afp4wfp4_pre_quant(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     _LOGGER.info(
         "gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to gemm_a16wfp4"

@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 from enum import Enum
+
+import pytest
+import torch
+
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils import types
-from typing import Union
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Debug
 DEBUG = False
@@ -50,8 +52,8 @@ def generate_gemm_a8wfp4_inputs(
     M: int,
     N: int,
     K: int,
-    a_dtype: Union[torch.dtype, str],
-    out_dtype: Union[torch.dtype, str],
+    a_dtype: torch.dtype | str,
+    out_dtype: torch.dtype | str,
     output: bool = False,
     layout: str = "TN",
 ):
@@ -163,7 +165,7 @@ def quantize_to_fp4(w_fp32):
         w_packed: packed fp4 tensor [N, K//2]
         w_scales: e8m0 scale factors [N, K//SCALE_GROUP_SIZE]
     """
-    N, K = w_fp32.shape
+    _N, K = w_fp32.shape
 
     # scale to fit in fp4 range
     max_w = w_fp32.abs().float().amax(dim=1, keepdim=True)  # [N, 1]
@@ -219,17 +221,6 @@ def quantize_to_fp4(w_fp32):
     return w_packed, w_scales_e8m0
 
 
-def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
-    # GPT-OSS-120B attention projections
-    x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
-    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
-    x_vals += [(v, 57344, 8192) for v in (128, 2048)]  # LL3 405B FC1 (reduced)
-    return x_vals
-
-
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=1)
@@ -240,7 +231,7 @@ def mxfp4_to_f32(x):
 
 
 def e8m0_to_f32(x):
-    x_f32 = 2 ** ((x.to(torch.float32) - 127))
+    x_f32 = 2 ** (x.to(torch.float32) - 127)
     x_f32[x == 128] = float("nan")
     return x_f32
 
@@ -325,7 +316,7 @@ def run_torch_emulation(x, w, x_scales, w_scales, dtype):
 e5m2_type, e4m3_type = types.get_fp8_dtypes()
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 # @pytest.mark.parametrize("M, N, K", [
 #     (2, 2, 32),
 #     (4, 4, 32),

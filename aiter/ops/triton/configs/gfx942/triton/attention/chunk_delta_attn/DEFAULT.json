@@ -1,0 +1,8 @@
+{
+    "chunk_gla_fwd_kernel_o": {
+        "BK": 32,
+        "BV": 128,
+        "num_warps": 4,
+        "num_stages": 2
+    }
+}

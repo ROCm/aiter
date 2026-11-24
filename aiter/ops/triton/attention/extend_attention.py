@@ -17,18 +17,16 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
-from typing import Optional
 import torch
 import triton
 
-
-from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.attention.extend_attention import (
     _fwd_kernel,
     _get_config,
 )
+from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -50,7 +48,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """
     Attention for prefill with KV cache (extend phase).
@@ -79,8 +77,12 @@ def extend_attention_fwd(
         None. Results written in-place to o_extend.
     """
     _LOGGER.info(
-        f"EXTEND_ATTENTION_FWD: q_extend={tuple(q_extend.shape)} k_extend={tuple(k_extend.shape)} v_extend={tuple(v_extend.shape)} "
-        + f"k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+        "EXTEND_ATTENTION_FWD: q_extend=%s k_extend=%s v_extend=%s k_buffer=%s v_buffer=%s",
+        tuple(q_extend.shape),
+        tuple(k_extend.shape),
+        tuple(v_extend.shape),
+        tuple(k_buffer.shape),
+        tuple(v_buffer.shape),
     )
 
     Lq, Lv = (
@@ -188,8 +190,11 @@ def redundant_attention(
         None. Results written in-place to o_extend.
     """
     _LOGGER.info(
-        f"REDUNDANT_ATTENTION: q_extend={tuple(q_extend.shape)} o_extend={tuple(o_extend.shape)} \
-        k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+        "REDUNDANT_ATTENTION: q_extend=%s o_extend=%s         k_buffer=%s v_buffer=%s",
+        tuple(q_extend.shape),
+        tuple(o_extend.shape),
+        tuple(k_buffer.shape),
+        tuple(v_buffer.shape),
     )
     total_token_num = k_buffer.shape[0]
     B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]

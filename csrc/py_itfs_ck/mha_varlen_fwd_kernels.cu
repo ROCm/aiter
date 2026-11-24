@@ -136,7 +136,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         static_cast<int>(bias_type),
                         has_lse,
                         static_cast<int>(qscale_type),
-                        mask.sink > 0, // hsa_sink
+                        (mask.sink > 0) || (sink_ptr != nullptr), // has_sink: true for streaming-sink window OR a learned per-head sink_ptr (e.g. gpt-oss, sink_size==0)
                         q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
@@ -496,7 +496,7 @@ mha_varlen_fwd(
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
-    bool has_sink = mask.sink > 0;
+    bool has_sink = (mask.sink > 0) || sink_ptr.has_value();
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);

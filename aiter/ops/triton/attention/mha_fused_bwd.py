@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import torch
 import triton
 
-from aiter.ops.triton.utils.types import _is_fp8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
-    _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
+    _bwd_preprocess,
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -30,21 +29,21 @@ def flash_attn_fused_backward(
     dv: torch.Tensor,
     dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    config: Optional[Dict[str, any]] = None,
+    philox_seed: int | None = 0,
+    philox_offset: int | None = 0,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    descale_do: torch.Tensor | None = None,
+    USE_INT64_STRIDES: bool | None = False,
+    config: dict[str, any] | None = None,
 ):
     """
     Flash Attention fused backward pass computing dQ, dK, dV in a single kernel using atomics.
@@ -88,8 +87,14 @@ def flash_attn_fused_backward(
         torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
     """
     _LOGGER.info(
-        f"FLASH_ATTN_FUSED_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
-        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+        "FLASH_ATTN_FUSED_BKWD: do=%s q=%s  k=%s  v=%s dq=%s  dk=%s  dv=%s",
+        tuple(do.shape),
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(dq.shape),
+        tuple(dk.shape),
+        tuple(dv.shape),
     )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -119,12 +124,12 @@ def flash_attn_fused_backward(
             stride_descale_do_z,
         )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_VARLEN = cu_seqlens_q is not None
 
     # get strides and shape
     if IS_VARLEN:
         # Layout for q,k,v is thd ie [total tokens, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = (
+        batch, _seqlen_q, num_q_heads, head_sz = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
@@ -141,7 +146,7 @@ def flash_attn_fused_backward(
         do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
     else:
         # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        batch, _seqlen_q, num_q_heads, head_sz = q.shape
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
@@ -192,6 +197,7 @@ def flash_attn_fused_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
     # dropout_mask
     use_dropout = dropout_p > 0.0
@@ -264,6 +270,7 @@ def flash_attn_fused_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
     else:
         # in non causal inner loop over grouped q heads
@@ -312,6 +319,7 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
 
     return delta

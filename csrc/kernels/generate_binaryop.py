@@ -5,7 +5,7 @@
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 
 
 def get_if_str(idx, total, last_else=True):
@@ -113,7 +113,7 @@ bool binary_op_impl(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t
         auto broadcast_3d_case = [&] (int bcast_dim)
         {
           constexpr int bcast_pattern[3] = {PATTERN_BROADCAST_0, PATTERN_BROADCAST_1, PATTERN_BROADCAST_2};
-          if (!is_support && (input.size(bcast_dim) == 1 || other.size(bcast_dim)) && input.size(bcast_dim) != other.size(bcast_dim))
+          if (!is_support && (input.size(bcast_dim) == 1 || other.size(bcast_dim) == 1) && input.size(bcast_dim) != other.size(bcast_dim))
           {
             is_support = true;
             for (int i = 0; i < 3; ++i)
@@ -320,7 +320,7 @@ bool binary_op_dispatch(const std::string& op_type,
     class h_instance:
         F_op_type: str
         F_dtype_pair: str  # "in0_type,in1_type"
-        instance_list: List[Any]
+        instance_list: list[Any]
 
         @property
         def name(self) -> str:

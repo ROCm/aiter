@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16 import (
     ff_a16w16_gated,
     ff_a16w16_nogate,
@@ -8,11 +9,11 @@ from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     ff_gated_test,
     ff_ungated_test,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 @pytest.mark.parametrize("activation", ["gelu_tanh", "silu_exp2", "relu", None])
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
+@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_ungated(
@@ -32,7 +33,7 @@ def test_ff_a16w16_ungated(
 
 
 @pytest.mark.parametrize("activation", ["gelu_tanh", "silu_exp2", "relu", None])
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
+@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_gated(

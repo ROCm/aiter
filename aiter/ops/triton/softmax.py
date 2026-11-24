@@ -1,5 +1,6 @@
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -16,7 +17,7 @@ def softmax(x):
     Returns:
         torch.Tensor: Output with same shape as x, softmax applied along last dimension.
     """
-    _LOGGER.info(f"SOFTMAX: x={tuple(x.shape)}")
+    _LOGGER.info("SOFTMAX: x=%s", tuple(x.shape))
     n_rows, n_cols = x.shape
 
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -29,7 +30,7 @@ def softmax(x):
 
     num_programs = n_rows
 
-    grid = lambda meta: (num_programs,)  # noqa: E731
+    grid = lambda meta: (num_programs,)
     _softmax_kernel_online[grid](
         y,
         x,

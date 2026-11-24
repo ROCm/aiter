@@ -1,13 +1,14 @@
-import random
-from typing import List, Optional, Tuple, Union
 import itertools
-import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
+import random
 from enum import Enum
+
+import pytest
+import torch
 from einops import rearrange
+
+import aiter
+from aiter import pertoken_quant
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from csrc.cpp_itfs.pa.pa_ragged import paged_attention_ragged
 
 uniform_range = (-1, 1)
@@ -22,8 +23,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -42,7 +43,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -52,11 +53,11 @@ def kv_cache_factory(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -67,7 +68,7 @@ def kv_cache_factory(
 
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -77,7 +78,7 @@ def kv_cache_factory(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -123,7 +124,7 @@ def ref_masked_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
-    attn_mask: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
     logits_soft_cap: float = 0.0,
 ) -> torch.Tensor:
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
@@ -143,7 +144,7 @@ def pertoken_quant_kvcache_symm(
     value_cache: torch.Tensor,
     quant_dtype: torch.dtype,  # e.g. torch.float8_e4m3fnuz
     scale_dtype: torch.dtype = torch.float32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = key_cache.shape[0]
     num_heads = key_cache.shape[1]
     head_dim = value_cache.shape[2]
@@ -230,8 +231,8 @@ def run_torch(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -292,8 +293,8 @@ def run_torch_new(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -472,7 +473,7 @@ def dump_input(
     kv_cache_dtype: str,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
 ):
@@ -552,7 +553,7 @@ DUMP_OUTPUT = False  # whether to dump output
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     block_size: int,
@@ -577,9 +578,8 @@ def test_paged_attention(
             or quant_cache_dtype not in [None, torch.int8]
         ):
             pytest.skip()
-    elif pa_variant == PAVariant.Naive:
-        if use_alibi:
-            pytest.skip()
+    elif pa_variant == PAVariant.Naive and use_alibi:
+        pytest.skip()
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -771,9 +771,9 @@ def test_paged_attention(
         else:
             k_quant_, k_scale_, v_quant_, v_scale_ = (
                 key_cache,
-                torch.empty((0)),
+                torch.empty(0),
                 value_cache,
-                torch.empty((0)),
+                torch.empty(0),
             )
 
             out_aiter_naive, time_aiter_naive = run_aiter_naive(
@@ -886,12 +886,10 @@ if __name__ == "__main__":
         [None, torch.float8_e4m3fnuz, torch.int8],
     ):
 
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
-        elif pa_variant == PAVariant.Asm:
-            if quant_cache_dtype not in [None, torch.int8]:
-                continue
+        if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
+            continue
+        if pa_variant == PAVariant.Asm and quant_cache_dtype not in [None, torch.int8]:
+            continue
 
         test_paged_attention(
             ctx_len,

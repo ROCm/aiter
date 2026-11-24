@@ -27,6 +27,7 @@ if get_gfx() != "gfx950":
 
 import torch
 import torch.nn.functional as F
+
 from aiter import dtypes
 from aiter.test_common import checkAllclose
 
@@ -61,7 +62,7 @@ def run_cktile_tune(x, weight, x_scale, w_scale, kernel_id, dtype=dtypes.bf16):
     """Invoke a specific CKTile kernel by ID via the tune entry point."""
     from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_cktile_tune
 
-    m, k = x.shape
+    m, _k = x.shape
     n = weight.shape[0]
     Y = torch.empty(m, n, dtype=dtype, device=x.device)
     return gemm_a8w8_blockscale_cktile_tune(

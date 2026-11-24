@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -12,8 +12,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
     _gemm_a16w8_blockscale_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -22,11 +22,11 @@ def gemm_a16w8_blockscale(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    prequant: Optional[bool] = False,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    prequant: bool | None = False,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -43,7 +43,10 @@ def gemm_a16w8_blockscale(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -59,6 +62,9 @@ def gemm_a16w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
@@ -71,8 +77,6 @@ def gemm_a16w8_blockscale(
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    compute_splitk_params(config, K)
-
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
@@ -84,7 +88,7 @@ def gemm_a16w8_blockscale(
         else torch.iinfo(w.dtype).max
     )
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -153,11 +157,11 @@ def gemm_a16w8_blockscale_preshuffle(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    prequant: Optional[bool] = False,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    prequant: bool | None = False,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -174,7 +178,10 @@ def gemm_a16w8_blockscale_preshuffle(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -188,6 +195,9 @@ def gemm_a16w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
@@ -199,8 +209,6 @@ def gemm_a16w8_blockscale_preshuffle(
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
@@ -221,7 +229,7 @@ def gemm_a16w8_blockscale_preshuffle(
         else torch.iinfo(w.dtype).max
     )
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

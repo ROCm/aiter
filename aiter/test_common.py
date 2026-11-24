@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-import torch.profiler as tpf
-import os
 import copy
+import multiprocessing as mp
+import os
+from functools import wraps
+
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
+import torch
+import torch.profiler as tpf
+
 from aiter import logger
 
 pd.set_option("display.max_rows", 200)
@@ -50,6 +53,7 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    profile_warm_iters=1,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -75,7 +79,7 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", 0)) or use_cuda_event:
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -85,7 +89,6 @@ def perftest(
                     end_event.record()
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
-                    torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
                 if use_cuda_event:
@@ -106,7 +109,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -119,8 +122,38 @@ def perftest(
                     with_modules=True,
                 ) as prof:
                     run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
+                avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
+
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                # Import lazily: normal library/test use has no amdsmi dependency.
+                from aiter.smi_monitor import replay_with_smi_metadata
+
+                if testGraph:
+                    replay = graph.replay
+                    # One replay contains num_iters calls captured above.
+                    replay_us = avg * num_iters
+                else:
+                    replay_index = 0
+
+                    def replay():
+                        nonlocal replay_index
+                        replay_args, replay_kwargs = rotate_args[
+                            replay_index % len(rotate_args)
+                        ]
+                        replay_index += 1
+                        return func(*replay_args, **replay_kwargs)
+
+                    replay_us = avg
+
+                replay_with_smi_metadata(
+                    func,
+                    args,
+                    kwargs,
+                    replay,
+                    synchronize=torch.cuda.synchronize,
+                    estimated_us=replay_us,
+                )
 
             return data, avg
 
@@ -133,7 +166,13 @@ def benchmark():
     def decorator(func):
         def wrapper(*args, **kwargs):
             callargs = log_args(func, *args, **kwargs)
-            ret = func(*args, **kwargs)
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                from aiter.smi_monitor import benchmark_call_context
+
+                with benchmark_call_context(func, callargs):
+                    ret = func(*args, **kwargs)
+            else:
+                ret = func(*args, **kwargs)
             if ret is not None:
                 callargs.update(ret)
             return callargs
@@ -210,6 +249,7 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    profile_warm_iters=1,
     **kwargs,
 ):
     @perftest(
@@ -219,7 +259,9 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        profile_warm_iters=profile_warm_iters,
     )
+    @wraps(func)
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
 
@@ -315,16 +357,15 @@ def post_process_data(df, num_iters, warm_iter=1):
     indices_to_add = [idx for sublist in index_sublists for idx in sublist]
     indices.update(indices_to_add)
     indices.update(dropped_indexs)
-    if int(os.environ.get("AITER_LOG_MORE", 0)):
+    if int(os.environ.get("AITER_LOG_MORE", "0")):
         logger.info(f"abnormal data indices: {indices}")
         for i in indices:
             logger.info(f"abnormal data: {df.iloc[i]['self_device_time_total']}")
     return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
-def get_trace_perf(prof, num_iters):
+def get_trace_perf(prof, num_iters, warm_iter=1):
     assert num_iters > 1
-    warm_iter = 1
     num_iters -= warm_iter
     df = []
     cols = [
@@ -397,11 +438,13 @@ def get_trace_perf(prof, num_iters):
             df.at[avg_name, el] = df[el].sum() / num_iters
         else:
             df.at[avg_name, el] = df[el].sum() / actual_iters
-    if int(os.environ.get("AITER_LOG_MORE", 0)):
+    if int(os.environ.get("AITER_LOG_MORE", "0")):
         pd.set_option("display.expand_frame_repr", False)
-        pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
-        logger.info(f"{df}")
+        # ``name`` is the only potentially long text column in this profiler
+        # table. Keep its full kernel symbol for downstream log parsers without
+        # changing pandas' process-wide column-width setting.
+        logger.info(df.to_string(max_colwidth=None))
     return df.at[avg_name, "device_time_sum"]
 
 
@@ -485,8 +528,26 @@ def checkAllclose(
     printLog=True,
     max_abs_delta=None,
     catastrophic_check=False,
+    mask=None,
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+    # mask (bool, broadcastable to a/b): True = compare, False = ignore.
+    # Error ratio is taken over the checked elements only.
+    if mask is not None:
+        mask = mask.to(device=isClose.device, dtype=torch.bool).broadcast_to(
+            isClose.shape
+        )
+        isClose = isClose | ~mask
+        denom = int(mask.sum().item())
+        if denom == 0:
+            if printLog:
+                logger.info(
+                    f"{msg}[checkAllclose {atol=} {rtol=} "
+                    f"\033[33mskipped: empty mask\033[0m]"
+                )
+            return 0
+    else:
+        denom = a.numel()
 
     if isClose.all():
         if printLog:
@@ -494,10 +555,10 @@ def checkAllclose(
         return 0
     else:
         try:
-            mask = ~isClose
-            num = mask.sum()
+            mismatch = ~isClose
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -505,14 +566,15 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
         except RuntimeError:
-            mask = ~isClose.to("cpu")
-            num = mask.sum()
+            a, b = a.to("cpu"), b.to("cpu")
+            mismatch = ~isClose.to("cpu")
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -520,8 +582,8 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
 
         actual_max_delta = delta.max().item()
@@ -529,8 +591,13 @@ def checkAllclose(
             actual_max_delta, a, b, max_abs_delta, catastrophic_check
         )
 
+        # Real failures log at ERROR so they survive a WARNING-level logger (pytest);
+        # a mismatch within tol_err_ratio is accepted, so it stays at INFO like passed~.
+        report = (
+            logger.error if is_catastrophic or percent > tol_err_ratio else logger.info
+        )
         if is_catastrophic:
-            logger.info(
+            report(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mcatastrophic!\033[0m] max abs delta {actual_max_delta:.4f}
     a    : {a.shape}
            {a_msked[:printNum]}
@@ -540,7 +607,7 @@ def checkAllclose(
            {delta[:printNum]}"""
             )
         elif percent > tol_err_ratio:
-            logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
+            report(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
@@ -548,21 +615,36 @@ def checkAllclose(
     delta:
            {delta[:printNum]}""")
         else:
-            logger.info(
+            report(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
-        logger.info(
-            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
+        report(
+            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {denom}) elements"
         )
         if is_catastrophic:
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
-                f"{percent:.1%} ({num} of {a.numel()}) elements mismatch"
+                f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
         return percent
 
 
-def tensor_dump(x: torch.tensor, name: str, dir="./"):
+def assertAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", **kwargs):
+    """checkAllclose only logs and returns the mismatch ratio; this variant fails
+    the test when the mismatch ratio exceeds tol_err_ratio, i.e. exactly the
+    cases checkAllclose already reports as failed."""
+    # Own the separator so no caller has to pad msg; checkAllclose interpolates it too.
+    prefix = f"{msg.strip()} " if msg.strip() else ""
+    ratio = checkAllclose(
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=prefix, **kwargs
+    )
+    assert (
+        ratio <= tol_err_ratio
+    ), f"{prefix}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
+    return ratio
+
+
+def tensor_dump(x: torch.Tensor, name: str, dir="./"):
     x_cpu = x.cpu().view(torch.uint8)
     filename = f"{dir}/{name}.bin"
     x_cpu.numpy().tofile(filename)
@@ -575,5 +657,6 @@ def tensor_dump(x: torch.tensor, name: str, dir="./"):
 def tensor_load(filename: str):
     DWs = np.fromfile(filename, dtype=np.uint32)
     metafile = ".".join(filename.split(".")[:-1]) + ".meta"
-    shape, dtype = [eval(line.strip()) for line in open(metafile)]
+    with open(metafile) as fh:
+        shape, dtype = [eval(line.strip()) for line in fh]
     return torch.tensor(DWs).view(dtype).view(shape)

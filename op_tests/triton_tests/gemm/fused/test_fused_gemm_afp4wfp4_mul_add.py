@@ -2,33 +2,28 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
 import torch
+
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
-)
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    run_torch as run_torch_gemm_afp4wfp4,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,
 )
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     run_torch as run_torch_fused_mul_add,
 )
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    run_torch as run_torch_gemm_afp4wfp4,
+)
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-def get_x_vals():
-
-    x_vals = [(v, 7168, 256) for v in [1, 2, 4, 8, 16, 31, 32, 1024]]
-    # x_vals += [(1, 1, 32)]  # minimal case
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=256, max_size=1024 * 7168 * 256))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
@@ -84,7 +79,7 @@ def test_fused_gemm_afp4wfp4_mul_add(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

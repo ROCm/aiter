@@ -4,10 +4,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_fp4_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
     "_fused_fp4_bmm_rope_cat_and_cache_mla_kernel",
@@ -101,8 +102,6 @@ def _unit_rope(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_fp4_bmm_rope_cat_and_cache_mla_repr)
@@ -195,7 +194,6 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
     HAVE_Y_SCALE: tl.constexpr,
     HAVE_K_SCALE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr = ".ca",
 ):
     """
@@ -244,15 +242,16 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             c_scale = 1
         c_scale_rcprl = (1 / c_scale).to(tl.float32)
 
-        pid_head = pid // (NUM_KSPLIT * GRID_MN)
-        pid_unified = pid % (NUM_KSPLIT * GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        pid_head = pid // (NUM_KSPLIT * grid_mn)
+        pid_unified = pid % (NUM_KSPLIT * grid_mn)
         pid_k = pid_unified % NUM_KSPLIT
         pid_tile = pid_unified // NUM_KSPLIT
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
         if NUM_KSPLIT == 1:
-            # remap_xcd(pid_tile, GRID_MN)
+            # remap_xcd(pid_tile, grid_mn)
             pid_m, pid_n = pid_grid(
                 pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
             )
@@ -285,9 +284,8 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 + offs_bn[None, :] * stride_bn
             )
 
-            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-                0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-            )
+            offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
             b_scale_ptrs = (
                 b_scales_ptr
                 + pid_head_i64 * stride_bsb_i64
@@ -298,15 +296,22 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
             for k_idx in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-                b_scales = tl.load(b_scale_ptrs)
-
                 if EVEN_K:
+                    b_scales = tl.load(b_scale_ptrs)
                     a_bf16 = tl.load(a_ptrs)
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
+                    # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                    # in e8m0, which dot_scaled propagates even where the masked-off
+                    # data is zero. Read those groups as 127, a scale of 2^0.
+                    scale_mask = offs_scale_k[None, :] < (
+                        2 * K // SCALE_GROUP_SIZE
+                        - k_idx * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                    )
+                    b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                     a_bf16 = tl.load(
                         a_ptrs,
-                        mask=offs_k_bf16[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        mask=offs_k_bf16[None, :] < 2 * K - k_idx * BLOCK_SIZE_K,
                         other=0,
                     )
                     b = tl.load(
@@ -347,7 +352,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 c_ptrs = (
                     c_ptr
                     + pid_head_i64 * stride_cb
-                    + pid_k * stride_ck
+                    + pid_k.to(tl.int64) * stride_ck
                     + offs_cm[:, None] * stride_cm
                     + offs_cn[None, :] * stride_cn
                 )
@@ -417,18 +422,15 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
             )
 
-        if OUTPUT_Q_NOPE_ZEROS:
-            if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros(
-                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + dk_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS and pid_adjusted < num_decode_toks_for_zeros * QH:
+            z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + dk_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
@@ -590,7 +592,7 @@ def _fused_fp4_bmm_reduce_kernel(
     c_in_ptrs = (
         c_in_ptr
         + pid_head * stride_c_in_b
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -625,8 +627,6 @@ def _fused_fp4_bmm_reduce_kernel(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr)
@@ -710,7 +710,6 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr = ".ca",
 ):
     """
@@ -755,8 +754,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         tl.assume(stride_cm_i64 > 0)
         tl.assume(stride_cn_i64 > 0)
 
-        pid_head = pid // GRID_MN
-        pid_tile = pid % GRID_MN
+        grid_mn = num_pid_m * num_pid_n
+        pid_head = pid // grid_mn
+        pid_tile = pid % grid_mn
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
@@ -798,7 +798,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k_idx in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k_idx in range(tl.cdiv(K, BLOCK_SIZE_K)):
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
@@ -902,18 +902,15 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
             )
 
-        if OUTPUT_Q_NOPE_ZEROS:
-            if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros(
-                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + dk_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS and pid_adjusted < num_decode_toks_for_zeros * QH:
+            z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + dk_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
@@ -1041,3 +1038,33 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
+
+
+def _get_fp4_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Own config family: the fused BMM + RoPE grid prefers different tiles
+    # than the standalone batched_gemm_a16wfp4 kernel.
+    return get_gemm_config(
+        "FUSED-FP4-BMM-ROPE-CAT-AND-CACHE-MLA",
+        M,
+        N,
+        2 * K,
+    )
+
+
+def _get_fp8_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Own config family: the fused BMM + RoPE grid prefers different tiles
+    # than the standalone batched_gemm_a8w8 prequant kernel.
+    return get_gemm_config(
+        "FUSED-FP8-BMM-ROPE-CAT-AND-CACHE-MLA",
+        M,
+        N,
+        K,
+    )

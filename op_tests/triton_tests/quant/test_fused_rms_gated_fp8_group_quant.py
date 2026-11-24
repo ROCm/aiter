@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.quant.fused_fp8_quant import (
+from aiter.ops.triton.quant import (
     fused_rms_gated_fp8_group_quant,
     get_fp8_min_max_bounds,
 )
@@ -170,6 +170,7 @@ def test_fused_rms_gated_fp8_group_quant_sweep(M: int, N: int, group_size: int):
 
 @cuda_ok
 def test_fused_rms_gated_fp8_group_quant_group_size_errors():
+    torch.manual_seed(0)
     device = "cuda"
     x = torch.randn(2, 128, device=device, dtype=torch.bfloat16)
     z = torch.randn_like(x)

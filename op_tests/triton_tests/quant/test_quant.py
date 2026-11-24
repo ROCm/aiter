@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.quant import (
-    static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,
+    static_per_tensor_quant_fp8_i8,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -138,7 +138,6 @@ def torch_dynamic_per_token_quant_fp8_i8(x, dtype_quant):
 @pytest.mark.parametrize("dtype_quant", [torch.int8, get_fp8_e4m3_dtype()])
 def test_dynamic_per_token_quant(M: int, N: int, dtype_in, dtype_quant):
     torch.manual_seed(20)
-    torch.set_printoptions(precision=7, threshold=4000)
     x = torch.rand((M, N), dtype=dtype_in, device="cuda")
 
     torch_out, torch_scale_out = torch_dynamic_per_token_quant_fp8_i8(x, dtype_quant)
