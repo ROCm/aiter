@@ -151,7 +151,49 @@ def qkv_chain_cooperative_insert(
         and slot_mapping.numel() >= m
         and index_slot_mapping.numel() >= m
     )
+    for name, t in (
+        ("activation_scale", activation_scale),
+        ("weight", weight),
+        ("weight_scale", weight_scale),
+        ("q_norm_weight", q_norm_weight),
+        ("k_norm_weight", k_norm_weight),
+        ("index_q_norm_weight", index_q_norm_weight),
+        ("index_k_norm_weight", index_k_norm_weight),
+        ("cos_sin_cache", cos_sin_cache),
+        ("positions", positions),
+        ("slot_mapping", slot_mapping),
+        ("index_slot_mapping", index_slot_mapping),
+        ("kv_cache", kv_cache),
+        ("index_cache", index_cache),
+        ("k_scale", k_scale),
+        ("v_scale", v_scale),
+        ("q_out", q_out),
+        ("index_q_out", index_q_out),
+    ):
+        # raw pointers: every operand on the activation's device
+        assert t.device == activation.device, f"{name} is on {t.device}"
+    for name, t in (
+        ("q_norm_weight", q_norm_weight),
+        ("k_norm_weight", k_norm_weight),
+        ("index_q_norm_weight", index_q_norm_weight),
+        ("index_k_norm_weight", index_k_norm_weight),
+    ):
+        assert (
+            t.dtype == torch.bfloat16 and t.is_contiguous() and t.numel() >= 128
+        ), f"{name}: needs 128 contiguous bf16"
+    assert cos_sin_cache.dtype == torch.bfloat16 and cos_sin_cache.is_contiguous()
+    for name, t in (
+        ("positions", positions),
+        ("slot_mapping", slot_mapping),
+        ("index_slot_mapping", index_slot_mapping),
+    ):
+        assert (
+            t.dtype == torch.int64 and t.is_contiguous() and t.numel() >= m
+        ), f"{name}: needs {m} contiguous int64"
+    assert k_scale.numel() >= 1 and v_scale.numel() >= 1
     assert q_out.dtype == torch.bfloat16 and q_out.is_contiguous()
+    assert tuple(q_out.shape) == (m, num_heads * 128), f"q_out {tuple(q_out.shape)}"
+    assert index_q_out.shape[0] >= m and index_q_out.shape[1] == 128
     assert (
         index_q_out.dtype == torch.float8_e4m3fn
         and index_q_out.stride(1) == 1
@@ -168,6 +210,21 @@ def qkv_chain_cooperative_insert(
         and index_cache.stride(2) == 1
     )
     dev = activation.device
+    with torch.cuda.device(dev):
+        _launch(
+            dev, m, activation, weight, activation_scale, weight_scale, q_out,
+            index_q_out, q_norm_weight, k_norm_weight, index_q_norm_weight,
+            index_k_norm_weight, cos_sin_cache, positions, slot_mapping,
+            index_slot_mapping, kv_cache, index_cache, k_scale, v_scale, eps,
+        )  # fmt: skip
+
+
+def _launch(
+    dev, m, activation, weight, activation_scale, weight_scale, q_out, index_q_out,
+    q_norm_weight, k_norm_weight, index_q_norm_weight, index_k_norm_weight,
+    cos_sin_cache, positions, slot_mapping, index_slot_mapping, kv_cache,
+    index_cache, k_scale, v_scale, eps,
+):  # fmt: skip
     slab = torch.empty((KS, m, N), dtype=torch.float32, device=dev)
     _run_compiled(
         compile_qkv_cooperative((m + 15) // 16 * 16),
@@ -198,5 +255,6 @@ def qkv_chain_cooperative_insert(
         index_cache.stride(0),
         cos_sin_cache.shape[0],
         struct.unpack("<i", struct.pack("<f", eps))[0],
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(dev),
+        specialization_key=("dev", dev.index),
     )

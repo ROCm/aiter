@@ -77,9 +77,13 @@ def test_chain_matches_public_path(m, skip):
     wsh, w_scale, chain_scale, qw, kw, iqw, ikw, cs, ks, vs = _weights()
     x, pos, slot = make_inputs(m, m + skip, skip)
     outs = []
+    g = torch.Generator(device="cuda").manual_seed(7)
+    # both implementations start from the same nonzero pages: bytes outside the inserted tokens must stay as they were
+    kv_init = torch.randint(1, 256, (NB, 2, 128, 72), generator=g, dtype=torch.uint8)
+    ix_init = torch.randint(1, 256, (NB, 128, 72), generator=g, dtype=torch.uint8)
     for impl in ("ref", "chain"):
-        kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8)
-        ix = torch.zeros(NB, 128, 72, dtype=torch.uint8)
+        kv = kv_init.clone()
+        ix = ix_init.clone()
         q = torch.empty(m, 2048, dtype=torch.bfloat16)
         iq = torch.empty(m, 128, dtype=dtypes.fp8)
         if impl == "ref":
@@ -156,11 +160,21 @@ def test_chain_matches_public_path(m, skip):
     assert (
         miq < 0.05 * iq0.float().abs().mean().item() + 1e-3
     ), f"index q mean diff {miq}"
-    for name, a, b in (("kv", kv0, kv1), ("index", ix0, ix1)):
-        frac = (a != b).float().mean().item()
-        assert frac < 0.03, f"{name} pages differ in {frac:.4f} of bytes"
-    if skip:  # whole skipped requests (slot -1) write no page bytes
-        assert (kv1 != 0).any() and (ix1 != 0).any()
+    for name, ref, out, init in (
+        ("kv", kv0, kv1, kv_init),
+        ("index", ix0, ix1, ix_init),
+    ):
+        touched = (
+            ref != init
+        )  # bytes the reference insert wrote (skipped slots, -1, write none)
+        assert touched.any(), f"{name}: the reference wrote nothing"
+        stray = ((out != init) & ~touched).sum().item()
+        assert stray == 0, f"{name}: {stray} bytes written outside the inserted tokens"
+        frac = (out != ref)[touched].float().mean().item()
+        assert frac < 0.03, f"{name} inserted bytes differ in {frac:.4f}"
+        assert (out != init)[
+            touched
+        ].float().mean().item() > 0.97, f"{name}: inserts missing"
 
 
 @needs_gfx950
@@ -224,3 +238,10 @@ def test_chain_graph_replay_matches_eager():
             and torch.equal(kv, eager[1])
             and torch.equal(ix, eager[2])
         )
+
+
+if __name__ == "__main__":
+    # CI runs op tests as `python3 <file>` (.github/scripts/aiter_test.sh): run the cases under pytest
+    import sys
+
+    sys.exit(pytest.main([__file__, "-q"]))
