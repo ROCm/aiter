@@ -67,13 +67,35 @@ def _ref_output(input_tensor, dim, rank, tp_size):
     return out.to(input_tensor.dtype)
 
 
-def _run_reduce_scatter_case(rankID, tp_size, case_idx, shape, dim, dtype):
+class _TorchDistributedReduceScatters:
+    """Counts the torch.distributed reduce-scatters issued inside the block."""
+
+    def __enter__(self):
+        self.count = 0
+        self._reduce_scatter_tensor = dist.reduce_scatter_tensor
+
+        def counted(*args, **kwargs):
+            self.count += 1
+            return self._reduce_scatter_tensor(*args, **kwargs)
+
+        dist.reduce_scatter_tensor = counted
+        return self
+
+    def __exit__(self, *exc):
+        dist.reduce_scatter_tensor = self._reduce_scatter_tensor
+
+
+def _run_reduce_scatter_case(rankID, tp_size, case_idx, shape, dim, dtype, use_custom):
     """Run one reduce_scatter case on an initialized rank and compare its
     output against the analytic reference.
 
     Every rank draws the same ``rand_seed`` from the ``case_idx`` seed, so
     each builds the identical input and its own reference slice locally;
-    only the error scalars and latency go back to the parent."""
+    only the error scalars and latency go back to the parent.
+
+    Without use_custom the case also compiles the call with fullgraph=True:
+    dynamo traces torch.distributed's reduce-scatter, not PyNccl's ctypes
+    call, so the group has to keep torch.distributed while it traces."""
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     rand_seed = torch.randint(
         1, 16, (tp_size,), dtype=dtype, device="cuda", generator=gen
@@ -81,17 +103,27 @@ def _run_reduce_scatter_case(rankID, tp_size, case_idx, shape, dim, dtype):
     x = _build_input(shape, dtype, tp_size, rand_seed)
     ref = _ref_output(x, dim, rankID, tp_size)
 
+    def reduce_scatter(x):
+        return tensor_model_parallel_reduce_scatter(x, use_custom=use_custom, dim=dim)
+
     @perftest()
     def run_ca(x):
-        return tensor_model_parallel_reduce_scatter(x, use_custom=True, dim=dim)
+        return reduce_scatter(x)
 
-    out, us = run_ca(x)
+    with _TorchDistributedReduceScatters() as reduce_scatters:
+        out, us = run_ca(x)
     diff = (out.float() - ref.float()).abs()
-    return {
+    result = {
         "us": us,
         "max_abs_err": diff.max().item(),
         "mean_abs_err": diff.mean().item(),
+        "torch_distributed": reduce_scatters.count > 0,
     }
+    if not use_custom:
+        torch._dynamo.reset()
+        compiled = torch.compile(reduce_scatter, fullgraph=True, backend="eager")
+        result["compiled_equal"] = torch.equal(compiled(x), out)
+    return result
 
 
 def reduce_scatter_sweep(
@@ -102,6 +134,7 @@ def reduce_scatter_sweep(
     dtype,
     distributed_init_method: str | None = None,
     force_fallback=False,
+    use_custom=True,
 ):
     """Per-rank worker. Runs every ``(label, shape, dim)`` case inside a
     single distributed init and returns one result dict per case.
@@ -136,7 +169,9 @@ def reduce_scatter_sweep(
     torch.cuda.synchronize()
 
     results = [
-        _run_reduce_scatter_case(rankID, tp_size, case_idx, shape, dim, dtype)
+        _run_reduce_scatter_case(
+            rankID, tp_size, case_idx, shape, dim, dtype, use_custom
+        )
         for case_idx, (_label, shape, dim) in enumerate(cases)
     ]
 
@@ -148,13 +183,14 @@ def reduce_scatter_sweep(
     return results
 
 
-def run_suite(cases, dtype, tp_size, force_fallback=False):
+def run_suite(cases, dtype, tp_size, force_fallback=False, use_custom=True):
     """End-to-end one suite: spawn tp_size processes that share one TP group
     and run every case, then fold the per-rank accuracy against the analytic
     PyTorch reference and the latency into one summary row per case.
 
     force_fallback routes every reduce_scatter through the pynccl fallback
-    (custom AR disabled) instead of the custom kernel.
+    (custom AR disabled) instead of the custom kernel. use_custom=False takes
+    GroupCoordinator's NCCL path, which runs on the TP group's PyNccl.
 
     No external-library comparison — other libs (torch.distributed /
     pynccl) don't support scatter on non-zero dims, so latency-vs-them
@@ -166,12 +202,22 @@ def run_suite(cases, dtype, tp_size, force_fallback=False):
         rets = [
             pool.apply_async(
                 reduce_scatter_sweep,
-                args=(tp_size, 1, rank, cases, dtype, init_method, force_fallback),
+                args=(
+                    tp_size,
+                    1,
+                    rank,
+                    cases,
+                    dtype,
+                    init_method,
+                    force_fallback,
+                    use_custom,
+                ),
             )
             for rank in range(tp_size)
         ]
         per_rank = [el.get() for el in rets]
 
+    path = "fallback" if force_fallback else "custom" if use_custom else "nccl"
     rows = []
     for i, (label, shape, dim) in enumerate(cases):
         rank_results = [results[i] for results in per_rank]
@@ -179,7 +225,7 @@ def run_suite(cases, dtype, tp_size, force_fallback=False):
         rows.append(
             {
                 "case": label,
-                "path": "fallback" if force_fallback else "custom",
+                "path": path,
                 "shape": str(tuple(shape)),
                 "dim": dim,
                 "dtype": str(dtype).split(".")[-1],
@@ -188,6 +234,12 @@ def run_suite(cases, dtype, tp_size, force_fallback=False):
                 "mean_abs_err": max(r["mean_abs_err"] for r in rank_results),
                 "min_us": min(custom_us),
                 "max_us": max(custom_us),
+                "torch_distributed": any(r["torch_distributed"] for r in rank_results),
+                "compiled_equal": (
+                    None
+                    if use_custom
+                    else all(r["compiled_equal"] for r in rank_results)
+                ),
             }
         )
     return rows
@@ -257,7 +309,9 @@ def build_fallback_cases(tp_size, dtype):
     results, so it returned a transposed (garbage) tensor for non-zero dims.
 
     Only the requirement shape[dim] % tp_size == 0 matters here (no pack/vec
-    alignment gates on the fallback), so keep the shapes small."""
+    alignment gates on the fallback), so keep the shapes small. The nccl suite
+    (use_custom=False) scatters the same shapes through GroupCoordinator's
+    own movedim and PyNccl call."""
     return [
         ("fallback_dim0", (4 * tp_size, 8, 6), 0),
         ("fallback_dim1_mid", (5, 4 * tp_size, 6), 1),
@@ -295,14 +349,16 @@ parser.add_argument(
     "-s",
     "--suite",
     type=str,
-    choices=["custom", "fallback", "all"],
+    choices=["custom", "fallback", "nccl", "all"],
     default="all",
-    help="which kernel path to test: custom kernel, pynccl fallback, or both",
+    help="which kernel path to test: custom kernel, pynccl fallback, "
+    "use_custom=False (nccl), or all",
 )
 
-# The fallback path uses int-valued bf16 inputs whose reduced sum is exact, so a
-# correct result matches the reference to the bit; any nonzero error means the
-# non-zero-dim fallback mis-laid-out its output (the bug this guards against).
+# The fallback and nccl paths use int-valued bf16 inputs whose reduced sum is
+# exact, so a correct result matches the reference to the bit; any nonzero error
+# means the non-zero-dim path mis-laid-out its output (the bug this guards
+# against).
 FALLBACK_TOL = 1e-6
 
 
@@ -319,25 +375,29 @@ if __name__ == "__main__":
     rows = []
     failures = []
     for dtype in dtypes_to_run:
-        # (case-list, force_fallback) per selected suite; one TP group each.
+        # (case-list, force_fallback, use_custom) per selected suite; one TP
+        # group each.
         suites = []
         if args.suite in ("custom", "all"):
-            suites.append((build_cases(tp_size, dtype), False))
+            suites.append((build_cases(tp_size, dtype), False, True))
         if args.suite in ("fallback", "all"):
-            suites.append((build_fallback_cases(tp_size, dtype), True))
+            suites.append((build_fallback_cases(tp_size, dtype), True, True))
+        if args.suite in ("nccl", "all"):
+            suites.append((build_fallback_cases(tp_size, dtype), False, False))
 
-        for all_cases, force_fallback in suites:
+        for all_cases, force_fallback, use_custom in suites:
             if args.case is None:
                 cases_to_run = all_cases
             else:
                 cases_to_run = [c for c in all_cases if c[0] == args.case]
             if not cases_to_run:
                 continue
-            path = "fallback" if force_fallback else "custom"
-            suite_rows = run_suite(cases_to_run, dtype, tp_size, force_fallback)
+            suite_rows = run_suite(
+                cases_to_run, dtype, tp_size, force_fallback, use_custom
+            )
             for (label, shape, dim), row in zip(cases_to_run, suite_rows):
                 print(
-                    f"\n=== [{path}] {label}  shape={shape}  dim={dim}  "
+                    f"\n=== [{row['path']}] {label}  shape={shape}  dim={dim}  "
                     f"dtype={dtype}  tp={tp_size} ==="
                 )
                 print(
@@ -346,17 +406,27 @@ if __name__ == "__main__":
                     f"latency={row['min_us']:.2f}-{row['max_us']:.2f}us"
                 )
                 rows.append(row)
-                # Fallback cases have an exact reference -> any error is a bug.
-                if force_fallback and row["max_abs_err"] > FALLBACK_TOL:
+                # Fallback and nccl cases have an exact reference -> any error
+                # is a bug.
+                if (force_fallback or not use_custom) and row[
+                    "max_abs_err"
+                ] > FALLBACK_TOL:
                     failures.append(
-                        f"{label} (dim={dim}): max_abs_err={row['max_abs_err']:.4g}"
+                        f"[{row['path']}] {label} (dim={dim}): "
+                        f"max_abs_err={row['max_abs_err']:.4g}"
+                    )
+                # The NCCL path runs on PyNccl, except while dynamo traces.
+                if not use_custom and (
+                    row["torch_distributed"] or not row["compiled_equal"]
+                ):
+                    failures.append(
+                        f"[nccl] {label} (dim={dim}): went through "
+                        f"torch.distributed={row['torch_distributed']}, "
+                        f"compiled result equal={row['compiled_equal']}"
                     )
 
     df = pd.DataFrame(rows)
     print("\n=== reduce_scatter summary ===")
     print(df.to_markdown(index=False, floatfmt=".4g"))
 
-    assert not failures, (
-        "reduce_scatter fallback produced wrong results (non-zero-dim layout bug):\n  "
-        + "\n  ".join(failures)
-    )
+    assert not failures, "reduce_scatter failed:\n  " + "\n  ".join(failures)
