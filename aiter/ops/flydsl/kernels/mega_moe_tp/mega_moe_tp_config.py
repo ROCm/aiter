@@ -405,8 +405,6 @@ def kernel_config(
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
     VPL = ceildiv(CW // 8, 64)
-    SCAN_IT = ceildiv(min(TMAX, DYN_MAX) * TOPK // 4, NT)
-    SCAN_G = 16
     NPC = 1 if lb else KS2
     # (bf16 comm: no LL packets, except small-M, whose RAW route rows / partials are bf16)
     assert not (comm_bf16 and ll_rs and not sm)

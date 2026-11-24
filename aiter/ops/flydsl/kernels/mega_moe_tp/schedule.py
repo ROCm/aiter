@@ -475,7 +475,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         for it in range_constexpr(ceildiv(E, NT)):
             _dyn_list(L, tid + i32(it * NT))
         cbar(L, tid)
-        _chunk_table(L, tid, True)
+        _chunk_table(L, tid)
         lb_scatter(L, tid, a, lo, hi)
         _lb_units(L, tid)
         cbar(L, tid)
@@ -522,7 +522,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         return pre, tot
 
     @flyc.jit
-    def _chunk_table(L, tid, offs=False):
+    def _chunk_table(L, tid):
         nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
         w = tid // i32(64)
         lane = tid % i32(64)
@@ -534,13 +534,10 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_ld_i32(L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(E - 1))) * i32(4)),
                 i32(0),
             )
-            r = lds_ld_i32(L, L_DCNT + e * i32(4))
-            r = live.select(r, i32(0)) if offs else r
+            r = live.select(lds_ld_i32(L, L_DCNT + e * i32(4)), i32(0))
             ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
             ce = live.select(ce, i32(0))
-            sums = [_wave_prefix(ce, 8)] + (
-                [_wave_prefix(r, TMAX.bit_length())] if offs else []
-            )
+            sums = [_wave_prefix(ce, 8), _wave_prefix(r, TMAX.bit_length())]
             if lane == i32(0):
                 for q in range_constexpr(len(sums)):
                     lds_st(L, L_WSUM + (w + i32(q * NW)) * i32(4), sums[q][1])
@@ -554,9 +551,8 @@ def build_schedule(kc: KernelCtx) -> dict:
                     total = total + sv
                 off.append(o)
                 base[q] = base[q] + total
-            if const_expr(offs):  # noqa: SIM102
-                if live:
-                    lds_st(L, L_EOFF + e * i32(4), off[1])
+            if live:
+                lds_st(L, L_EOFF + e * i32(4), off[1])
             for c_ in range(i32(0), ce, i32(1)):
                 c = i32(c_)
                 lds_st(
@@ -567,8 +563,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             cbar(L, tid)
         if tid == i32(0):
             lds_st(L, L_CTL + C_NCH * 4, base[0])
-        if const_expr(offs):
-            cbar(L, tid)
+        cbar(L, tid)
 
     @flyc.jit
     def lb_scatter(L, tid, a, lo, hi):

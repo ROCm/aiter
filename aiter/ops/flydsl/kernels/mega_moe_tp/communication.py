@@ -40,7 +40,6 @@ from .common import (
     fp8x4_unpack,
     fp8x8_decode,
     g_add_agent,
-    g_ld_i32,
     g_ld_rel,
     g_ld_sys,
     g_or_agent,
@@ -131,7 +130,7 @@ def build_communication(kc: KernelCtx) -> dict:
     (L_WSUM,) = kc.get("L_WSUM")
     L_ROFF, L_RLI, L_RLW, RL = kc.get("L_ROFF L_RLI L_RLW RL")
     MT, NBW, NCH, NCK, NMETA, NPC, NV = kc.get("MT NBW NCH NCK NMETA NPC NV")
-    RG, SCAN_G, SCAN_IT, SI_STRIDE = kc.get("RG SCAN_G SCAN_IT SI_STRIDE")
+    RG, SI_STRIDE = kc.get("RG SI_STRIDE")
     TMAX, TN, TOPK, TPC, VPL, XB, XLPR = kc.get("TMAX TN TOPK TPC VPL XB XLPR")
     a8, act, agr, ar, comm_bf16 = kc.get("a8 act agr ar comm_bf16")
     a16, APL, XSB, SIB = kc.get("a16 APL XSB SIB")
@@ -320,8 +319,7 @@ def build_communication(kc: KernelCtx) -> dict:
         if ce == i32(1):
             _gather_scan(L, tid, a, expert, key)
         else:
-            inv = fx.Float32(1.0) / ce.to(fx.Float32)
-            _gather_scan(L, tid, a, expert, key, (cc, ce, inv))
+            _gather_scan(L, tid, a, expert, key, (cc, ce))
 
     @flyc.jit
     def _gather_list(L, tid, expert, key, cc, ce):
@@ -341,109 +339,48 @@ def build_communication(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_GEXP * 4, key)
         cbar(L, tid)
 
-    def _in_chunk(idx, chunk):
-        if chunk is None:
-            return fx.Boolean(True)
-        cc, ce, inv = chunk
-        t = idx // i32(TOPK)
-        q = ((t.to(fx.Float32) + fx.Float32(0.5)) * inv).to(fx.Int32)
-        return (t - q * ce) == cc
-
     @flyc.jit
     def _gather_scan(L, tid, a, expert, key, chunk=None):
-        ids_addr, tw_addr, ttot = a["ids"], a["tw"], a["ttot"]
+        """the expert's routes out of the registers (route_regs), in a deterministic order
+        (wave-major, then the register layout): every CTA lists a chunk's routes alike
+        (split-K GEMM1 pieces sum their partial rows). chunk (cc, ce): the routes of rank
+        cc mod ce in that order (at most ceil(routes / ce) rows: the plan's ce =
+        ceil(routes / rch) bounds a chunk by rch for any routing; token residues would not)
+        """
         cbar(L, tid)
-        if const_expr("rregs" not in a):  # (the atomic slot counter)
-            if tid == i32(0):
-                lds_st(L, L_CTL + C_CNT * 4, i32(0))
-            cbar(L, tid)
-        n = ttot * i32(TOPK)
-        rid = rsrc(ids_addr, n * i32(16 if MLL else 4))
-        if const_expr("rregs" in a):  # the routes in registers (route_regs)
-            # deterministic order (wave-major, then the register layout): every CTA lists
-            # a chunk's routes alike (split-K GEMM1 pieces sum their partial rows)
-            # chunk cc of ce: the expert's routes of rank cc mod ce in that order (at most
-            # ceil(routes / ce) rows: the plan's ce = ceil(routes / rch) bounds a chunk by
-            # rch for any routing; token residues would not)
-            hits, run = [], i32(0)
-            for idx, e, wv, live in a["rregs"]:
-                hit = live & (e == expert)
-                pos, cnt = wave_rank(hit)
-                hits.append((hit, run + pos, idx, wv))
-                run = run + cnt
-            w = tid // i32(64)
-            if (tid % i32(64)) == i32(0):
-                lds_st(L, L_WSUM + w * i32(4), run)
-            cbar(L, tid)
-            base, tot = i32(0), i32(0)
-            for v in range_constexpr(NW):
-                cv = lds_ld_i32(L, L_WSUM + i32(v * 4))
-                base = base + (i32(v) < w).select(cv, i32(0))
-                tot = tot + cv
+        hits, run = [], i32(0)
+        for idx, e, wv, live in a["rregs"]:
+            hit = live & (e == expert)
+            pos, cnt = wave_rank(hit)
+            hits.append((hit, run + pos, idx, wv))
+            run = run + cnt
+        w = tid // i32(64)
+        if (tid % i32(64)) == i32(0):
+            lds_st(L, L_WSUM + w * i32(4), run)
+        cbar(L, tid)
+        base, tot = i32(0), i32(0)
+        for v in range_constexpr(NW):
+            cv = lds_ld_i32(L, L_WSUM + i32(v * 4))
+            base = base + (i32(v) < w).select(cv, i32(0))
+            tot = tot + cv
+        if const_expr(chunk is not None):
+            cc, ce = chunk
+            tot = fx.max(tot - cc + ce - i32(1), i32(0)) // ce
+        # (every wave: its own later read of C_CNT sees it, no barrier)
+        if (tid % i32(64)) == i32(0):
+            lds_st(L, L_CTL + C_CNT * 4, tot)
+        for hit, pos, idx, wv in hits:
+            slot = base + pos
             if const_expr(chunk is not None):
-                cc, ce, _ = chunk
-                tot = fx.max(tot - cc + ce - i32(1), i32(0)) // ce
-            # (every wave: its own later read of C_CNT sees it, no barrier)
-            if (tid % i32(64)) == i32(0):
-                lds_st(L, L_CTL + C_CNT * 4, tot)
-            for hit, pos, idx, wv in hits:
-                slot = base + pos
-                if const_expr(chunk is not None):
-                    hit = hit & ((slot % ce) == cc)
-                    slot = slot // ce
-                if hit & (slot < i32(TMAX)):
-                    lds_st(L, L_RIX + slot * i32(4), idx)
-                    lds_st(L, L_WT + slot * i32(4), wv)
-        elif const_expr(MLL):
-            for i_ in range(tid, n, i32(NT)):
-                i = i32(i_)
-                pk = fx.Vector(bld(rid, i * i32(16), 0, V4I, 0))
-                hit = (fx.Int32(pk[0]) == expert) & _in_chunk(i, chunk)
-                _gather_one(L, i, hit, fx.Int32(pk[2]))
-        else:
-            n4 = n // i32(4)
-            rtw = rsrc(tw_addr, n * i32(4))
-            for g0 in range_constexpr(0, SCAN_IT, SCAN_G):
-                its = list(range(g0, min(g0 + SCAN_G, SCAN_IT)))
-                vs, ws = [], []
-                for it in its:
-                    q = fx.min(tid + i32(it * NT), n4 - i32(1))
-                    vs.append(fx.Vector(bld(rid, q * i32(16), 0, V4I, 0)))
-                    ws.append(fx.Vector(bld(rtw, q * i32(16), 0, V4I, 0)))
-                hits, run = [], i32(0)
-                for x, it in enumerate(its):
-                    q = tid + i32(it * NT)
-                    for j in range_constexpr(4):
-                        idx = q * i32(4) + i32(j)
-                        hit = (
-                            (q < n4)
-                            & (fx.Int32(vs[x][j]) == expert)
-                            & _in_chunk(idx, chunk)
-                        )
-                        pos, cnt = wave_rank(hit)
-                        hits.append((hit, run + pos, idx, ws[x][j]))
-                        run = run + cnt
-                base = _wave_claim(L, tid, run)
-                for hit, pos, idx, wv in hits:
-                    slot = base + pos
-                    if hit & (slot < i32(TMAX)):
-                        lds_st(L, L_RIX + slot * i32(4), idx)
-                        lds_st(L, L_WT + slot * i32(4), fx.Int32(wv))
-            for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
-                idx = i32(idx_)
-                e = g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * 4)
-                wv = g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * 4)
-                _gather_one(L, idx, (e == expert) & _in_chunk(idx, chunk), wv)
-        if const_expr("rregs" in a):
-            # (every wave stores the key before the one barrier: no reader sees it early)
-            if (tid % i32(64)) == i32(0):
-                lds_st(L, L_CTL + C_GEXP * 4, key)
-            cbar(L, tid)
-        else:
-            cbar(L, tid)
-            if tid == i32(0):
-                lds_st(L, L_CTL + C_GEXP * 4, key)
-            cbar(L, tid)
+                hit = hit & ((slot % ce) == cc)
+                slot = slot // ce
+            if hit & (slot < i32(TMAX)):
+                lds_st(L, L_RIX + slot * i32(4), idx)
+                lds_st(L, L_WT + slot * i32(4), wv)
+        # (every wave stores the key before the one barrier: no reader sees it early)
+        if (tid % i32(64)) == i32(0):
+            lds_st(L, L_CTL + C_GEXP * 4, key)
+        cbar(L, tid)
 
     @flyc.jit
     def zero_masked(L, lane, a, w0, nw):
@@ -526,21 +463,6 @@ def build_communication(kc: KernelCtx) -> dict:
             row = q // ng
             ridx = lds_ld_i32(L, L_RIX + row * i32(4))
             bst(a["epoch"], rf, _raw_flag(a, pidx, ridx, g0 + q - row * ng), 0, AUX_SYS)
-
-    @flyc.jit
-    def _wave_claim(L, tid, n):
-        got = i32(0)
-        if ((tid % i32(64)) == i32(0)) & (n > i32(0)):
-            got = lds_atomic_add(L, L_CTL + C_CNT * 4, n)
-        return uni(got)
-
-    @flyc.jit
-    def _gather_one(L, idx, hit, wv):
-        if hit:
-            slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
-            if slot < i32(TMAX):
-                lds_st(L, L_RIX + slot * i32(4), idx)
-                lds_st(L, L_WT + slot * i32(4), wv)
 
     def _xd_dst(L, a, row, i0):
         """(XD) the intermediate row's xg data / scale resources and its offsets (rows past
@@ -1040,10 +962,16 @@ def build_communication(kc: KernelCtx) -> dict:
             r1 = fx.Boolean(True)
             for p in range_constexpr(MAX_TP):
                 pc = fx.min(i32(p), a["tp"] - i32(1))
-                off = (
-                    (pc * a["mmax"] + fin_key(a)) * i32(H) + c * i32(CW) + i32(CW - 8)
-                ) * i32(2)
-                t = fx.Int32(bld(r_recv, off + i32(4), 0, T.i32, AUX_SYS))
+                if const_expr(RAW):
+                    # (bf16 partial rows carry no packet epoch: the chunk's flag, _raw_part)
+                    off = _raw_pflag(a, pc * a["mmax"] + fin_key(a), c * i32(CW))
+                else:
+                    off = (
+                        (pc * a["mmax"] + fin_key(a)) * i32(H)
+                        + c * i32(CW)
+                        + i32(CW - 8)
+                    ) * i32(2) + i32(4)
+                t = fx.Int32(bld(r_recv, off, 0, T.i32, AUX_SYS))
                 r1 = r1 & ((i32(p) >= a["tp"]) | (t == epoch))
             return r1
         rf = own_rs(a, "off_flag")

@@ -186,12 +186,13 @@ class MegaMoeTPBigM:
             and not self.yg8
             and dict(self.opts).get("AITER_BIGM_YDC") == "1"
         )
+        sd = self.sd = SdmaComm(group=group, num_queues=NQ, device=device)
+        # (sd.device: the resolved one -- device may be None)
         self.ygout = (
-            torch.empty((T, H), dtype=torch.bfloat16, device=device)
+            torch.empty((T, H), dtype=torch.bfloat16, device=sd.device)
             if self.yg8
             else None
         )
-        sd = self.sd = SdmaComm(group=group, num_queues=NQ, device=device)
         for r_ in self.REGIONS:
             sd.reserve(r_, sizes[r_])
         # gather_rows: every rank's bf16 tail rows (not a kernel region)
@@ -343,7 +344,9 @@ class MegaMoeTPBigM:
         return int(self.ctrl[C_ERR].item())
 
     def clear_errors(self) -> None:
-        self.ctrl[C_ERR:].zero_()
+        # (the watchdog word only: the words after it persist across launches, e.g. the
+        # YDS / YDB launch number at C_ERR + 20 -- every rank's must stay in step)
+        self.ctrl[C_ERR].zero_()
 
     def error_flag(self):
         """The sticky watchdog word as a 1-element device tensor (no sync): 1 if a wait gave
@@ -552,7 +555,7 @@ class MegaMoeTPBigM:
             if gather:
                 # full: (x, topk_weights, topk_ids) of the replicated batch [tp * m] (ar):
                 # every rank quantizes every row itself, no input / routing gather
-                if self.ydc and out is not None:
+                if self.ydc and out is not None and full is not None:
                     return self._moe(
                         x, topk_weights, topk_ids, out, None, local, gather, full
                     )

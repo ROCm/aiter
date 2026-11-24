@@ -808,8 +808,9 @@ class MegaMoeTPEngine:
                 and (fp8 or self.sm_b16)
                 and tot <= self.dyn_max
                 and self._sm_fits(tot)
-                # (a tuned batch measured faster on the dynamic schedule: sm 0)
-                and bool(self._sm_tuned(tot).get("sm", 1))
+                # (a tuned batch measured faster on the dynamic schedule: sm 0 -- not for
+                # the MXFP8 shared expert / bf16 activations, which only small-M runs)
+                and (self.sh8 or self.a16 or bool(self._sm_tuned(tot).get("sm", 1)))
             )
             if sm:
                 cfg = LaunchCfg(

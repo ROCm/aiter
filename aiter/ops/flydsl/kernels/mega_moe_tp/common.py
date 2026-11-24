@@ -165,10 +165,6 @@ def g_or_agent(addr, v):
     fx.atomic_or(gptr(addr), i32(v), syncscope="agent")
 
 
-def g_ld_i32(addr):
-    return i32(fx.generic_load(gptr(addr), dtype=fx.Int32))
-
-
 def uni(v):
     return i32(rocdl.readfirstlane(T.i32, i32(v)))
 

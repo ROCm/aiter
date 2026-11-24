@@ -88,7 +88,7 @@ C_JSH = 69
 
 def build_smallm(kc: KernelCtx) -> dict:
     """The small-M schedule device functions of one instance (added to kc)."""
-    GPC, H, I, KS2, L_CTL, L_DCH = kc.get("GPC H I KS2 L_CTL L_DCH")
+    GPC, I, KS2, L_CTL, L_DCH = kc.get("GPC I KS2 L_CTL L_DCH")
     (TOPK,) = kc.get("TOPK")
     NCK, cbar, ctrl_at = kc.get("NCK cbar ctrl_at")
     gather_routes_chunk, gemm1, gemm2 = kc.get("gather_routes_chunk gemm1 gemm2")
@@ -155,7 +155,7 @@ def build_smallm(kc: KernelCtx) -> dict:
     def smf(a, b, bank):
         return ctrl_at(a, i32(CTRL_SMF) + (bank * i32(NCTA_MAX) + b) * i32(G1C_STRIDE))
 
-    def _plan_scalars(L, nun):
+    def _plan_scalars(nun):
         """the G1 layout scalars of this CTA (sm_units / sm_g2_runs)"""
         C = i32(gpu.grid_dim.x)
         x = _xcd_rank(C)
@@ -212,7 +212,7 @@ def build_smallm(kc: KernelCtx) -> dict:
             ce_l = last.shrui(i32(16)) & i32(0xFF)
             jsh = ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0))
             lds_st(L, L_CTL + C_JSH * 4, jsh)
-            g = _plan_scalars(L, nun)
+            g = _plan_scalars(nun)
             C, x, sk, q, r, hb, hp = g.C, g.x, g.sk, g.q, g.r, g.hb, g.hp
             sh2, rr, cont, hi, b0, j0, nc, n = (
                 g.sh2,
@@ -278,7 +278,7 @@ def build_smallm(kc: KernelCtx) -> dict:
         if (tid % i32(64)) == i32(0):
             spin_lds_ge(L, L_CTL + C_PLAN * 4, i32(1))
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
-            g = _plan_scalars(L, nun)
+            g = _plan_scalars(nun)
             C, x, sk, q, r, hb, hp = g.C, g.x, g.sk, g.q, g.r, g.hb, g.hp
             rr, cont, hi = g.rr, g.cont, g.hi
             qg = (sk == i32(1)).select(i32(1), i32(QF))

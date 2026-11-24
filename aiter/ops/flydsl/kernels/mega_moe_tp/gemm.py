@@ -83,7 +83,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     L_B1, L_B1S, L_CTL, L_DCH, L_INTER = kc.get("L_B1 L_B1S L_CTL L_DCH L_INTER")
     L_INTERS, L_RING, L_RIX, L_WT, MT = kc.get("L_INTERS L_RING L_RIX L_WT MT")
     MTSKIP, NA_L, NA_ROWOPS, NAB, NCG = kc.get("MTSKIP NA_L NA_ROWOPS NAB NCG")
-    XD, AGS_OV, AGS_RS, ABS = kc.get("XD AGS_OV AGS_RS ABS")
+    XD, AGS_OV, AGS_RS = kc.get("XD AGS_OV AGS_RS")
     (RAW,) = kc.get("RAW")
     (ag_rows,) = kc.get("ag_rows")
     # (small-M) a unit's MFMAs over its row tiles only up to 16 rows: 1 tile, else MT
@@ -94,7 +94,6 @@ def build_gemm(kc: KernelCtx) -> dict:
     SDD = kc.SM
     # (experiment) GEMM1 B prefetch into L2, BPF k-steps ahead of the ring (0: off)
     BPF = kc.BPF
-    BPFO = 1 if BPF > 0 else 0  # (its one VMEM op per k-step)
     (L_BPF,) = kc.get("L_BPF")
     # (HB) half block: 64 columns of GEMM1, wave w: columns 32 (w % 2), K half w // 2
     KH = KS1 // 2
@@ -131,42 +130,40 @@ def build_gemm(kc: KernelCtx) -> dict:
         return i32(1)
 
     @flyc.jit
-    def _gemm1_disp(
-        L, tid, a, expert, i0, nnb, mte=None, kr=None, out=None, bnt=True, W8=False
-    ):
+    def _gemm1_disp(L, tid, a, expert, i0, nnb, mte=None, kr=None, out=None, bnt=True):
         if const_expr(npp > 1 and kr is None):
             if (nnb % i32(npp)) == i32(0):
-                _gemm1(L, tid, a, expert, i0, nnb, npp, mte, bnt=bnt, W8=W8)
+                _gemm1(L, tid, a, expert, i0, nnb, npp, mte, bnt=bnt)
             else:
-                _gemm1(L, tid, a, expert, i0, nnb, 1, mte, bnt=bnt, W8=W8)
+                _gemm1(L, tid, a, expert, i0, nnb, 1, mte, bnt=bnt)
         else:
-            _gemm1(L, tid, a, expert, i0, nnb, 1, mte, kr, out, bnt=bnt, W8=W8)
+            _gemm1(L, tid, a, expert, i0, nnb, 1, mte, kr, out, bnt=bnt)
 
     @flyc.jit
-    def _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, bnt, W8=False):
+    def _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, bnt):
         if const_expr(HB and half is not None):
             if half:
-                _gemm1h(L, tid, a, expert, i0, bnt=bnt, W8=W8)
+                _gemm1h(L, tid, a, expert, i0, bnt=bnt)
             else:
-                _gemm1_rows(L, tid, a, expert, i0, nnb, rows, None, None, bnt, W8)
+                _gemm1_rows(L, tid, a, expert, i0, nnb, rows, None, None, bnt)
         else:
-            _gemm1_rows(L, tid, a, expert, i0, nnb, rows, kr, out, bnt, W8)
+            _gemm1_rows(L, tid, a, expert, i0, nnb, rows, kr, out, bnt)
 
     @flyc.jit
-    def _gemm1_rows(L, tid, a, expert, i0, nnb, rows, kr, out, bnt, W8=False):
+    def _gemm1_rows(L, tid, a, expert, i0, nnb, rows, kr, out, bnt):
         """(MTSKIP / SMSKIP) the row tiles up to the unit's rows only"""
         if const_expr(MTSKIP and rows is not None):
             if uni(rows) <= i32(3 * 16):
-                _gemm1_disp(L, tid, a, expert, i0, nnb, 3, bnt=bnt, W8=W8)
+                _gemm1_disp(L, tid, a, expert, i0, nnb, 3, bnt=bnt)
             else:
-                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt, W8=W8)
+                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
         elif const_expr(SMSKIP and rows is not None and kr is None):
             if uni(rows) <= i32(16):
-                _gemm1_disp(L, tid, a, expert, i0, nnb, 1, bnt=bnt, W8=W8)
+                _gemm1_disp(L, tid, a, expert, i0, nnb, 1, bnt=bnt)
             else:
-                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt, W8=W8)
+                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
         else:
-            _gemm1_disp(L, tid, a, expert, i0, nnb, None, kr, out, bnt=bnt, W8=W8)
+            _gemm1_disp(L, tid, a, expert, i0, nnb, None, kr, out, bnt=bnt)
 
     @flyc.jit
     def gemm1(
@@ -174,18 +171,18 @@ def build_gemm(kc: KernelCtx) -> dict:
     ):
         """kr: (k0, nk) only k-steps [k0, k0 + nk) of the K dim (nk a multiple of the
         k-step interleave, 4); out: the per-group epilogue (default: act + MXFP4 to
-        L_INTER), called as out(L, lane, w, a, accs, grp, P, MTE); half (HB): a 64-column
-        half block instead (nnb unused); dup: the expert's weights read by several row
-        chunks: cacheable loads (their concurrent reads meet in L2), else non-temporal
-        """
+        L_INTER), called as out(L, lane, w, a, accs, grp, P, MTE, i0); half (HB): a
+        64-column half block instead (nnb unused); dup: the expert's weights read by
+        several row chunks: cacheable loads (their concurrent reads meet in L2), else
+        non-temporal"""
         nnb = uni(nnb)
         if const_expr(SH8):
             if uni(expert) == i32(SH):
                 _gemm1_w8(L, tid, a, expert, i0, nnb, kr, out, half)
             else:
-                _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup, False)
+                _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup)
         else:
-            _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup, False)
+            _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup)
         wait_vm(0)
         cbar(L, tid)
 
@@ -203,13 +200,13 @@ def build_gemm(kc: KernelCtx) -> dict:
             _gemm1(L, tid, a, expert, i0, nnb, 1, None, kr, out, bnt=False, W8=True)
 
     @flyc.jit
-    def _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup, W8):
+    def _gemm1_dup(L, tid, a, expert, i0, nnb, rows, kr, out, half, dup):
         if const_expr(dup is None):
-            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, True, W8)
+            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, True)
         elif dup:
-            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, False, W8)
+            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, False)
         else:
-            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, True, W8)
+            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, True)
 
     def _g1_operands(tid, a, expert, i0, half=False, W8=False):
         lane = tid % i32(64)
@@ -447,7 +444,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                         )
                         wait_lgkm0()
                         rocdl.sched_barrier(0)
-                        issue_b(g + i32(NSKW), s_ % NSKW, s_ % 2 == 1)
+                        issue_b(g + i32(NSKW), s_ % NSKW, (s_ + NSKW) % 2 == 1)
                         rocdl.sched_barrier(0)
                     if k == KCS - 1:
                         release_a_chunk(L, lane, buf)
@@ -517,7 +514,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 _g1_mfma(acc, 0, b, sgw, suw, ks & 1, abuf, asbuf, lane, k, MTE, W8)
                 wait_lgkm0()
                 rocdl.sched_barrier(0)
-                issue_b(g + i32(NSKW), ks % NSKW, ks % 2 == 1)
+                issue_b(g + i32(NSKW), ks % NSKW, (ks + NSKW) % 2 == 1)
                 rocdl.sched_barrier(0)
                 if k == KCS - 1:
                     release_a_chunk(L, lane, buf)
@@ -817,31 +814,31 @@ def build_gemm(kc: KernelCtx) -> dict:
             **kw,
         )
 
-        def run(bnt, W8=False):
+        def run(bnt):
             if const_expr(MTSKIP):
                 if uni(rows) <= i32(3 * 16):
-                    g(mte=3, bnt=bnt, W8=W8)
+                    g(mte=3, bnt=bnt)
                 else:
-                    g(bnt=bnt, W8=W8)
+                    g(bnt=bnt)
             else:
-                g(bnt=bnt, W8=W8)
+                g(bnt=bnt)
 
-        def run_dup(W8):
+        def run_dup():
             # (dup: as gemm1's)
             if const_expr(dup is None):
-                run(True, W8)
+                run(True)
             elif dup:
-                run(False, W8)
+                run(False)
             else:
-                run(True, W8)
+                run(True)
 
         if const_expr(SH8):
             if uni(expert) == i32(SH):
                 g(bnt=False, W8=True)  # (one variant, as _gemm1_w8)
             else:
-                run_dup(False)
+                run_dup()
         else:
-            run_dup(False)
+            run_dup()
 
     @flyc.jit
     def _gemm2(
@@ -1311,8 +1308,6 @@ def build_bigm_unit(
     assert AR in (16, 32) and 64 % (AR * KCK) == 0
     NAJ = AR // RPJ  # dma16 per wave per chunk (RPJ rows x RBA B each)
     NA = NAJ + 1  # A ops per wave per chunk: dma16s + 1 x dma4 (scales)
-    # B ops per wave per chunk: 2 k-steps x 4 tiles + gate / up scale words
-    NB = 4 * KCK + 2
     # sched barrier mask after the GEMM2 B issue groups (only VMEM is held)
     SCM = 0x38F
     NB2 = 6  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
@@ -1322,13 +1317,10 @@ def build_bigm_unit(
     # the A ring) and stored as whole 64 B / 224 B row segments
     SST = lay["LA"] + NW * RG * 64
     assert not i8r or SST + RG * (H // 16) <= lay["LA"] + NAB * RG * 64 * KCK
+    # (i8r stores only through the staged epilogue, STG below: else bf16 rows would be
+    # stored where the reader decodes int8)
+    assert not i8r or NAB * RBA >= NW * 128, (NAB, RBA)
     NST2 = MTE if i8r else 2 * MTE  # route stores per wave per group
-    # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1). By the
-    # count alone A(c) has landed once (NA + NB) * (NAB - 2) newer ops remain, but its LDS
-    # writes (direct-to-LDS loads) can still be in flight then: one chunk's ops more are
-    # awaited (else a unit now and then reads stale A rows of a chunk, small units mostly)
-    WAIT1 = max(min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 3)), 0)
-    assert WAIT1 <= 63
 
     def _wait2(kk, BS2=BS2, NB2=NB2):
         # GEMM2: B2 of step s was issued BS2 steps earlier; every step issues NB2 B2 ops and
@@ -1374,6 +1366,10 @@ def build_bigm_unit(
         BST_ = 1 if W8 else BST
         NB_ = (8 if W8 else 4) * KCK + 2  # B ops per chunk
         NBE = 4 * KCK + 2  # B ring entries per chunk (W8: 8-dword fragments)
+        # steady-state GEMM1 issue order per chunk c: B(c + BST_), then A(c + NAB - 1). By the
+        # count alone A(c) has landed once (NA + NB_) * (NAB - 2) newer ops remain, but its LDS
+        # writes (direct-to-LDS loads) can still be in flight then: one chunk's ops more are
+        # awaited (else a unit now and then reads stale A rows of a chunk, small units mostly)
         WAIT1_ = max(min(NA + (NA + NB_) * (BST_ - 1), (NA + NB_) * (NAB - 3)), 0)
         assert WAIT1_ <= 63
 
@@ -1510,26 +1506,6 @@ def build_bigm_unit(
                     rocdl.sched_mfma(4)
                     rocdl.sched_dsrd(2)
                 return acc, (nafs, nsas)
-
-            def g1_chunk(acc, bq, buf, c):
-                # c: the chunk (compile time)
-                sgw, suw = bq[4 * KCK], bq[4 * KCK + 1]
-                for k in range_constexpr(KCK):
-                    kp = (c * KCK + k) % 2  # the global k-step's half of the scale word
-                    sc = [
-                        (x >> i32(8 * (kp * 2 + h))) & i32(0xFF)
-                        for x in (sgw, suw)
-                        for h in (0, 1)
-                    ]
-                    afs = [a_frag_m(buf, m, k) for m in range(MTE)]
-                    sas = [a_scale_m(buf, m, k) for m in range(MTE)]
-                    for m in range_constexpr(MTE):
-                        for t in range_constexpr(4):
-                            j = (t // 2) * 2 * MTE + m * 2 + t % 2
-                            acc[j] = mfma(
-                                bq[k * 4 + t], afs[m], acc[j], sc[t], sas[m], a8=W8
-                            )
-                return acc
 
             def act_store(acc, p):
                 for m in range_constexpr(MTE):

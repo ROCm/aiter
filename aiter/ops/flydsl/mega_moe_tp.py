@@ -30,7 +30,7 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
-Large batches (Swiglu or Silu, fp4, from ``bigm_min_tokens`` global tokens; default: the
+Large batches (fp4 activations, from ``bigm_min_tokens`` global tokens; default: the
 batches the small-batch engine cannot hold, e.g. beyond 2048 local tokens on 256 CUs; 0
 disables) run the big-M kernel (chunked, SDMA, per-batch tuned configs from
 configs/mega_moe_tp_bigm_tuned.csv) behind the same ``forward``; it needs MORI built with
@@ -57,10 +57,10 @@ intermediate exported) from GEMM2 (output column shares over the full inter dim:
 w2 rows, one partial row per route) and evens the bytes per CTA. Its per-batch launch
 configs (row tile, CTAs, ar two-shot all-reduce) come from configs/mega_moe_tp_sm_tuned.csv
 (``AITER_CONFIG_MEGA_MOE_TP_SM``); ar batches from 64 tokens all-reduce in two shots
-(reduce-scatter, then the owners' rows to every rank). AITER_MEGAMOE_TP_SMALLM=0 disables it, "all" runs it from 1 token; batches from an
-explicit lb_min on stay on the LB schedule. A fused-tail forward of a small-M batch the LB
-schedule takes runs it there (as before; its y then differs in rounding from the plain
-forward's).
+(reduce-scatter, then the owners' rows to every rank). AITER_MEGAMOE_TP_SMALLM=0 disables
+it, "all" runs it from 1 token; batches from an explicit lb_min on stay on the LB schedule.
+A fused-tail forward of a small-M batch the LB schedule takes runs it there (as before; its
+y then differs in rounding from the plain forward's).
 """
 
 from __future__ import annotations
@@ -109,6 +109,13 @@ def shuffle_weight_mega_fp8(w: torch.Tensor) -> torch.Tensor:
         )
     u = w.reshape(-1, N, K).view(torch.uint8).view(-1, N // 16, 16, K // 128, 2, 4, 16)
     return u.permute(0, 1, 3, 4, 5, 2, 6).contiguous().view(w.shape).view(w.dtype)
+
+
+def _shared(*tensors):
+    """the shared expert's four MXFP8 tensors (w1, w1_scale, w2, w2_scale), or None"""
+    if any(t is not None for t in tensors) and any(t is None for t in tensors):
+        raise ValueError("MegaMoeTP: the shared expert's four MXFP8 tensors, or none")
+    return None if tensors[0] is None else tensors
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -188,12 +195,7 @@ class MegaMoeTP:
         """w1_shared ... : the shared expert (the last one, cfg.experts - 1) as MXFP8
         (shuffle_weight_mega_fp8 + e8m0_shuffle) while the routed ones (w1 / w2: experts - 1
         of them) are MXFP4; else every expert is MXFP4 in w1 / w2."""
-        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
-        if any(t is not None for t in shared) and any(t is None for t in shared):
-            raise ValueError(
-                "MegaMoeTP: the shared expert's four MXFP8 tensors, or none"
-            )
-        shared = None if w1_shared is None else shared
+        shared = _shared(w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
         self.shared = shared
         if cfg.activation not in _ACTS:
             raise ValueError(f"MegaMoeTP: unsupported activation {cfg.activation}")
@@ -207,12 +209,10 @@ class MegaMoeTP:
         bmin = cfg.bigm_min_tokens
         if bmin is not None and bmin < 0:
             raise ValueError(f"MegaMoeTP: bigm_min_tokens {bmin} < 0")
-        # the shapes the big-M kernel takes: H % 256, < 512 routed experts (+ the last one,
+        # the shapes the big-M kernel takes: H % 256, < 1024 routed experts (+ the last one,
         # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
         big_ok = (
-            cfg.activation
-            in (ActivationType.Swiglu, ActivationType.Silu, ActivationType.Situv2)
-            and cfg.act_dtype in ("fp4", "auto")
+            cfg.act_dtype in ("fp4", "auto")
             and cfg.model_dim % 256 == 0
             and 0 < cfg.experts - 1 < 1024
             and cfg.topk - 1 <= 64
@@ -241,7 +241,7 @@ class MegaMoeTP:
         # the small engine holds what it can, big-M takes the rest (an explicit
         # bigm_min_tokens above the small engine's capacity: lowered to it, below)
         fit = (big_ok and bmin != 0) or cfg.fit_max_local
-        self._engine_kw = {
+        kw = {
             "rank": cfg.rank,
             "world_size": cfg.world_size,
             "model_dim": cfg.model_dim,
@@ -281,7 +281,7 @@ class MegaMoeTP:
             "fit_max_local": fit,
             "shared": shared,
         }
-        self.engine = MegaMoeTPEngine(**self._engine_kw)
+        self.engine = MegaMoeTPEngine(**kw)
         if big_ok and bmin != 0 and self.engine.mmax < small_max:
             lim = self.engine.mmax + 1
             self.bigm_m = min(self.bigm_m, lim) if self.bigm_m else lim
@@ -295,7 +295,7 @@ class MegaMoeTP:
             if m16 >= 1:
                 self.engine16 = MegaMoeTPEngine(
                     **{
-                        **self._engine_kw,
+                        **kw,
                         "max_local_tokens": m16,
                         "act_dtype": "bf16",
                         "fit_max_local": True,
@@ -436,10 +436,16 @@ class MegaMoeTP:
                     cfg.beta if cfg.beta is not None else 1.0,
                     cfg.linear_beta if cfg.linear_beta is not None else 1.0,
                 ),
-                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise) and a
-                # bf16 reduce-scatter (int8 / int4 otherwise)
+                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 / int8
+                # otherwise: a tuned row's I8R is not for the bf16 reduce-scatter) and a bf16
+                # reduce-scatter (int8 / int4 otherwise)
                 opts=(
-                    {"AITER_BIGM_R8": "0", "AITER_BIGM_EB": "1", "AITER_BIGM_E4": "0"}
+                    {
+                        "AITER_BIGM_R8": "0",
+                        "AITER_BIGM_I8R": "0",
+                        "AITER_BIGM_EB": "1",
+                        "AITER_BIGM_E4": "0",
+                    }
                     if cfg.comm_dtype == "bf16"
                     # "int8": the reduce-scatter (and the ar y gather) as int8 rows + an f32
                     # scale per 32 (deterministic); the route rows per the tuned rows (mode
@@ -472,8 +478,7 @@ class MegaMoeTP:
     ) -> None:
         """Run the next forwards on another layer's weights of the same shape (and the same
         shared expert format)."""
-        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
-        shared = None if w1_shared is None else shared
+        shared = _shared(w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
         for eng in self._engines():
             eng.set_weights(w1, w1_scale, w2, w2_scale, shared)
         self.shared = shared

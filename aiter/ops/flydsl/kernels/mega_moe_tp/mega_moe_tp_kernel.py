@@ -634,10 +634,11 @@ def compile_mega_moe_tp(
 #       -> SDMA gather (G); or the y gather of the ar mode)
 #   GW  wait every G; advance the persistent signal base
 #
-# All communication is MORI SDMA (puts with remote signals) issued and awaited inside the
-# kernel; the GEMM1 -> GEMM2 intermediate stays in LDS. CTAs (one per CU, 4 waves) claim
-# items with a per-XCD atomic ticket in a fixed phase order; an item only waits on items
-# before it (and on peers' puts of earlier items), so the schedule cannot deadlock.
+# Communication is MORI SDMA (puts with remote signals; the YDS / YDB y gather: shader stores
+# + flags) issued and awaited inside the kernel; the GEMM1 -> GEMM2 intermediate stays in
+# LDS. CTAs (one per CU, 4 waves) claim items with a per-XCD atomic ticket in a fixed phase
+# order; an item only waits on items before it (and on peers' puts of earlier items), so
+# the schedule cannot deadlock.
 # Data another XCD reads in the same launch is stored write-through (sc0 | sc1).
 const_expr = fx.const_expr
 
@@ -803,6 +804,8 @@ def compile_bigm_kernel(
     # (Kimi K3.1's 16) -- the topk sum reads ~half the bytes (TP8 16k: RQ -25%, total -6%)
     I8R = int(_opt("AITER_BIGM_I8R", "0")) and not R8
     assert not I8R or not (EB or E4)
+    # (the I8R topk sum: one thread per 16 columns, no column loop)
+    assert not I8R or H // 16 <= NT, H
     lay, unit_body = build_bigm_unit(
         H,
         I,
@@ -847,7 +850,7 @@ def compile_bigm_kernel(
         assert NSCR <= LBASE, (NSCR, LBASE)
         LH = 0
     LB2 = LH + 4 * NES  # [NE] bases
-    LP = LB2 + 4 * NES  # [SRT * K1] route positions of a sort item ([NE] plan scratch)
+    LP = LB2 + 4 * NES  # the S2 plan's scratch ([NE]; the space of [SRT * K1] ints)
     LDS_BYTES = max(LTID + 4 * NT, LH + NSCR)  # LTID: [NT] each thread's id (own_tid)
     assert LDS_BYTES <= 160 * 1024, LDS_BYTES
 
@@ -1199,7 +1202,7 @@ def compile_bigm_kernel(
             return ctrl + fx.Int64(i * i32(4))
 
         if const_expr(YDS or YDB):
-            # (YDS) this launch's number: the persistent count (read before any item; the GW
+            # (YDS / YDB) this launch's number: the persistent count (read before any item; the GW
             # item stores it + 1 at the end) + 1
             a["yl"] = g_ld_sys(ca(i32(C_ERR + 20))) + i32(1)
 
@@ -1622,13 +1625,13 @@ def compile_bigm_kernel(
                 lds_st(L, i32(LSC) + w * i32(4), x)
             gpu.barrier()
             ws = [lds_ld_i32(L, i32(LSC + 4 * i_)) for i_ in range(NW)]
-            before = i32(0)
+            below = i32(0)  # (the earlier waves' sum)
             tot = i32(0)
             for i_ in range_constexpr(NW):
-                before = before + (i32(i_) < w).select(ws[i_], i32(0))
+                below = below + (i32(i_) < w).select(ws[i_], i32(0))
                 tot = tot + ws[i_]
             gpu.barrier()
-            return x - v + before, tot
+            return x - v + below, tot
 
         def blk_prefix(tid, vf):
             """exclusive prefixes of vf(e) over the experts e < each own expert (tid + b NT),
@@ -2399,9 +2402,9 @@ def compile_bigm_kernel(
 
         @flyc.jit
         def item_yd(k, j):
-            """(YG8) ZQ gathered y rows of chunk k (rank p's, its sub-block b): once in (p this
-            rank: its RF items done; else p's puts of the sub-block landed), int8 -> bf16 yout
-            """
+            """ZQ gathered y rows of chunk k (rank p's, its sub-block b): once in (p this rank:
+            its RF items done; else p's puts / flag of the sub-block landed), YG8: int8 ->
+            bf16 yout; YDC: the bf16 rows copied to yout"""
             tid = own_tid()
             o, s = chunk(k)
             sb = s // i32(NSB)

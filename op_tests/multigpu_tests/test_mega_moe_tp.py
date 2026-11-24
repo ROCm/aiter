@@ -28,7 +28,7 @@ import torch.distributed as dist
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
 from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
@@ -808,8 +808,10 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
     }
     if mode == "ar":  # the MXFP8 all-gather second hop exists only for ar
         candidates["megamoe_tp ag8"] = ("fp8", "fp8")
+        # (bf16 partials + the MXFP8 second hop: the finals polled on the partials' flags)
+        candidates["megamoe_tp bf16comm ag8"] = ("bf16", "fp8")
     flops, nbytes = _work(shape, wt, c, tokens)
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, (comm, agather) in candidates.items():
         layer = _layer(model, mode, comm, agather)
         out = torch.empty_like(c.ref, dtype=dtypes.bf16)
@@ -873,7 +875,7 @@ def test_mega_moe_tp_case(model: str, mode: str, case: str):
     else:
         out = MODEL_CASES[case](shape, wt, S.ctx, S)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rel_l2": out if isinstance(out, float) else None,
         "note": out if isinstance(out, str) else "",
     }
@@ -930,7 +932,7 @@ def test_sp_rs_norm(hidden: int, tokens: int, router: bool):
     flops = 2 * tokens * E * hidden if router else 0
     nbytes = ctx.world * 2 * hidden * (tokens + 3 * m + (E if router else 0))
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "sp_rs_norm us": us,
         "sp_rs_norm TFLOPS": flops / us / 1e6,
         "sp_rs_norm TB/s": nbytes / us / 1e6,
@@ -974,9 +976,11 @@ def summarize(name: str, rows: list) -> None:
 def main() -> int:
     global S
     # whole-op arch gate before anything launches (positive allow-list)
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         if int(os.environ.get("RANK", "0")) == 0:
-            aiter.logger.warning("MegaMoE TP unsupported on %s; skipping", get_gfx())
+            aiter.logger.warning(
+                "MegaMoE TP unsupported on %s; skipping", get_gfx_runtime()
+            )
         return 0
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
