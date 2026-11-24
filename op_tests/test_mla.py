@@ -1080,7 +1080,7 @@ parser.add_argument(
 parser.add_argument(
     "--softmax-underflow",
     action="store_true",
-    help="Run gfx950 FP8 non-persistent uniform/long-tail checks (KV=2048, split=1).",
+    help="Run gfx942/gfx950 FP8 non-persistent uniform/long-tail checks (KV=2048, split=1).",
 )
 
 

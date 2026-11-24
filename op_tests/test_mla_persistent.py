@@ -2074,22 +2074,33 @@ _ROPE_DIM = 64
 _HEAD_DIM = _KV_LORA_RANK + _ROPE_DIM
 _PAGE_SIZE = 1
 _SOFTMAX_SCALE = 1.0 / 16.0
-_FP8_MAX = 448.0
+# The kernels scale P to the top of the FP8 range before the cast: e4m3fn (gfx950)
+# max 448, e4m3fnuz (gfx942) max 240. The long-tail score puts every tail P below
+# the smallest normal FP8 value: e^-7 for e4m3fn, e^-8 for e4m3fnuz, whose normal
+# range reaches one binade further down.
+_FP8_P_SCALE = {"gfx942": 240.0, "gfx950": 448.0}
+_LONG_TAIL_SCORE = {"gfx942": -2.0, "gfx950": -1.75}
+# (nhead, q_len, persistent, page_size) per arch whose code objects scale P; others
+# are skipped. gfx942 uses its QH64 kernel only with page size 64 (16-head fold else).
+_P_SCALED = {"gfx942": {(16, 1, False, 1), (64, 1, True, 64)}}
 
 
-def _make_case(*, long_tail: bool, nhead: int = _HEADS, q_len: int = 1):
+def _make_case(
+    *, long_tail: bool, nhead: int = _HEADS, q_len: int = 1, page_size=_PAGE_SIZE
+):
+    num_pages = _KV_LEN // page_size
     query = torch.zeros((q_len, nhead, _HEAD_DIM), device="cuda", dtype=torch.float32)
     query[..., _KV_LORA_RANK:] = 1.0
     cache = torch.ones(
-        (_KV_LEN, _PAGE_SIZE, 1, _HEAD_DIM), device="cuda", dtype=torch.float32
+        (num_pages, page_size, 1, _HEAD_DIM), device="cuda", dtype=torch.float32
     )
-    cache[..., _KV_LORA_RANK:] = -1.75 if long_tail else 0.0
+    cache[..., _KV_LORA_RANK:] = _LONG_TAIL_SCORE[get_gfx()] if long_tail else 0.0
     if long_tail:
-        cache[0, ..., _KV_LORA_RANK:] = 0.0
+        cache[0, 0, ..., _KV_LORA_RANK:] = 0.0
     qo_indptr = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
-    kv_indptr = torch.tensor([0, _KV_LEN], device="cuda", dtype=torch.int32)
-    kv_indices = torch.arange(_KV_LEN, device="cuda", dtype=torch.int32)
-    last_pages = torch.ones(1, device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, num_pages], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(num_pages, device="cuda", dtype=torch.int32)
+    last_pages = torch.full((1,), page_size, device="cuda", dtype=torch.int32)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
     return (
         query.to(dtypes.fp8),
@@ -2104,7 +2115,7 @@ def _make_case(*, long_tail: bool, nhead: int = _HEADS, q_len: int = 1):
 
 def _reference(query, cache, *, cp_world_size=1):
     query = query.float()
-    cache = cache[:, 0].float()
+    cache = cache.flatten(0, 1).float()  # pages -> tokens
     outputs = [[], [], []]
     rank_lses = []
     for rank in range(cp_world_size):
@@ -2116,7 +2127,7 @@ def _reference(query, cache, *, cp_world_size=1):
                 cache.shape[0] - query.shape[0] + query_index - rank
             ) // cp_world_size + 1
             for variant, (quantize, p_scale) in enumerate(
-                ((False, 1.0), (True, 1.0), (True, _FP8_MAX))
+                ((False, 1.0), (True, 1.0), (True, _FP8_P_SCALE[get_gfx()]))
             ):
                 output, lse = ref_masked_attention(
                     query[query_index : query_index + 1],
@@ -2143,6 +2154,7 @@ def _reference(query, cache, *, cp_world_size=1):
 
 def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
     query, cache, qo_indptr, kv_indptr, kv_indices, last_pages, scale = case
+    page_size = cache.shape[1]
     global_kv_indptr = kv_indptr if cp_world_size > 1 else None
     if cp_world_size > 1:
         kv_indices = kv_indices[cp_rank::cp_world_size].contiguous()
@@ -2166,7 +2178,7 @@ def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
             1,
             query.dtype,
             cache.dtype,
-            _PAGE_SIZE,
+            page_size,
             q_len,
             q_len,
             1,
@@ -2181,7 +2193,7 @@ def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
         kv_indices,
         last_pages,
         q_len,
-        _PAGE_SIZE,
+        page_size,
         1,
         _SOFTMAX_SCALE,
         q_scale=scale,
@@ -2230,10 +2242,17 @@ def test_mla_fp8_softmax_underflow(
     persistent=False,
     return_lse=False,
     cp_world_size=1,
+    page_size=_PAGE_SIZE,
 ):
     gfx = get_gfx()
-    if gfx != "gfx950":
-        print(f"Skipping: requires gfx950, got {gfx}")
+    if gfx not in _FP8_P_SCALE:
+        print(f"Skipping: requires gfx942 or gfx950, got {gfx}")
+        return
+    if gfx in _P_SCALED and (nhead, q_len, persistent, page_size) not in _P_SCALED[gfx]:
+        print(
+            f"Skipping: no P-scaled {gfx} kernel for "
+            f"{nhead=}, {q_len=}, {persistent=}, {page_size=}"
+        )
         return
     if cp_world_size > 1:
         persistent = True
@@ -2244,11 +2263,14 @@ def test_mla_fp8_softmax_underflow(
         "cp_world_size": cp_world_size,
     }
     print(
-        f"Case: {nhead=}, {q_len=}, {persistent=}, {return_lse=}, {cp_world_size=}",
+        f"Case: {nhead=}, {q_len=}, {persistent=}, {return_lse=}, {cp_world_size=}, "
+        f"{page_size=}",
         flush=True,
     )
     for long_tail in (False, True):
-        case = _make_case(long_tail=long_tail, nhead=nhead, q_len=q_len)
+        case = _make_case(
+            long_tail=long_tail, nhead=nhead, q_len=q_len, page_size=page_size
+        )
         output, lse = _run_aiter(case, **run_args)
         fp32, unscaled, scaled, expected_lse = _reference(
             case[0], case[1], cp_world_size=cp_world_size
@@ -2444,7 +2466,7 @@ parser.add_argument(
 parser.add_argument(
     "--softmax-underflow",
     action="store_true",
-    help="Run gfx950 FP8 persistent/LSE/CP uniform/long-tail checks (KV=2048, split=1).",
+    help="Run gfx942/gfx950 FP8 persistent/LSE/CP uniform/long-tail checks (KV=2048, split=1).",
 )
 parser.add_argument(
     "--cp-world-size",
@@ -2470,6 +2492,10 @@ def main():
             or any(nhead not in (16, 32) or q_len != 4 for nhead, q_len in args.nhead)
         ):
             parser.error("CP underflow requires -n 16,4 and/or 32,4 with -lse")
+        if args.block_size not in (1, 64) or (
+            args.cp_world_size > 1 and args.block_size != 1
+        ):
+            parser.error("Underflow checks use -blk 1, or -blk 64 without CP")
         for nhead, q_len in args.nhead:
             test_mla_fp8_softmax_underflow(
                 nhead=nhead,
@@ -2477,6 +2503,7 @@ def main():
                 persistent=True,
                 return_lse=args.return_lse,
                 cp_world_size=args.cp_world_size,
+                page_size=args.block_size,
             )
         return
     if args.cp_world_size != 1:
