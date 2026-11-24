@@ -710,3 +710,42 @@ def rmsnorm(
     epsilon: float,
     gemma_norm: bool = False,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def qkv_a_rmsnorm_fp4(
+    q_out: Tensor,
+    q_scale: Tensor,
+    kv_out: Tensor,
+    q_in: Tensor,
+    kv_in: Tensor,
+    q_weight: Tensor,
+    kv_weight: Tensor,
+    q_eps: float,
+    kv_eps: float,
+    gemma_norm: bool = False,
+) -> None:
+    """DeepSeek MLA q_a + kv_a RMSNorm in one launch on a wave32 GPU.
+
+    q (``1024 < n <= 1536``, ``n % 128 == 0``) leaves as MXFP4 in ``q_out`` (m, n // 2)
+    with its e8m0 scale in ``q_scale``, a contiguous ``(pad32(m), n // 32)`` byte tensor
+    in the gfx1250 ASM GEMM A-scale layout (pad rows 0x7F). kv (``n <= 512``) leaves as
+    bf16 in ``kv_out``; an empty ``kv_in`` skips it. Bit-exact with ``rmsnorm`` followed
+    by ``per_1x32_mx_quant_hip(scale_layout_m32k4=True)`` for q and ``rmsnorm`` for kv.
+    Inputs and outputs are 2D tensors on the same GPU; weights are contiguous 1D
+    bf16 tensors of the matching width. Row pointers and bf16 weights must be
+    16-byte aligned, and row strides must fit int32. wave64 GPUs are rejected.
+    """
+
+
+def qkv_a_rmsnorm_fp4_supported(q_dim: int, kv_dim: int) -> bool:
+    """Whether ``qkv_a_rmsnorm_fp4`` serves a q width of ``q_dim`` and a kv width
+    of ``kv_dim`` (0 for no kv) on this device: the widths its launch accepts
+    on the gfx1250 family, the wave32 arch it is built and checked for. Callers
+    use this instead of repeating the launch's checks."""
+    return (
+        get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+        and 1024 < q_dim <= 1536
+        and q_dim % 128 == 0
+        and (kv_dim == 0 or (0 < kv_dim <= 512 and kv_dim % 8 == 0))
+    )
