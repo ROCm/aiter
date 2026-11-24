@@ -19,11 +19,14 @@ from aiter.ops import topk as T
 from aiter.ops import topk_decode_gate as G
 from aiter.ops import topk_select as S
 from aiter.ops.asm.asm_utils import load_hip
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _launcher_on,
+    _run_compiled,
+    wave_size_of,
+)
 from aiter.ops.flydsl.kernels.topk import (
     topk_per_row_decode_adaptive as adaptive_kernel,
 )
-from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
 from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES

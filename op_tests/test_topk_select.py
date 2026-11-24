@@ -1187,7 +1187,7 @@ def test_launcher_per_device():
     `test_cross_device` needs two GPUs and CI has one, so this asks for a device
     id nothing is launched on: the copy is made, never run.
     """
-    from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
+    from aiter.ops.flydsl.kernels.tensor_shim import _launcher_on
     from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
         build_topk_per_row_radix_stream_module,
     )

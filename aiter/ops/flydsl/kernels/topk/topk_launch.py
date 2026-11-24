@@ -5,9 +5,9 @@
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _launcher_on, _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-__all__ = ["_launcher_on", "run_topk_launcher"]
+__all__ = ["run_topk_launcher"]
 
 
 def _launch_key(args):
