@@ -8,7 +8,10 @@ FlyDSL QSA sparse attention; they are not a public op.
 Recovery does not validate the selection layout; it writes each row's sorted complete blocks.
 Compaction builds each union candidate tile's block union and membership from those rows, in LDS.
 The next launch sorts tasks and builds disjoint mask partitions; with a slot table it also maps
-the union blocks to pool blocks. Plans use one stream's scratch and are pinned for graphs.
+the union blocks to pool blocks. FP8 plans may split a short prefill's long union tasks into key
+ranges, or keep only a core of a union and leave each row's other blocks to the direct kernel
+(CORE_RATIOS); residual_tile lists them, run by the FP8 pack launch. Plans use one stream's
+scratch and are pinned for graphs.
 """
 
 import math
@@ -20,10 +23,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
     _buffer,
     _buffer_store_words,
@@ -44,6 +47,31 @@ LIMITS = 8  # union step limits the route compares: max * 2**(-j/2) for j < 7, t
 SORT_WIDTHS = (1, 2, 4, 8, 16)
 EXCHANGE_WORDS = 1024  # K3 LDS: one cross-wave sort exchange round, then route partials
 ORDER_WORDS = EXCHANGE_WORDS + 4 * (2 + 4 * LIMITS)
+# FP8 union plans of fewer tasks than CUs (a short prefill leaves CUs idle while its longest
+# causal tiles run): K3 splits a task of more N64 steps than the even load (steps +
+# SPLIT_OVERHEAD per task over the CUs) into SPLIT_PARTS key ranges, run as separate CTA slots,
+# for at most SPLIT_SLOTS tasks; the part finishing last merges their partial O / m / l records
+# (PARTIAL_FLOATS each: 128 rows x 256 FP32, then m and l of 256 lanes). With a task per CU
+# or more the parts only pair with other tasks behind the ~10 us task overhead, which costs
+# what the shorter longest task saves (dense2048 H6: +1%).
+SPLIT_PARTS = 2
+SPLIT_SLOTS = 64
+SPLIT_OVERHEAD = 6.0
+PARTIAL_FLOATS = 128 * 256 + 2 * 256
+# K3 LDS past ORDER_WORDS for the split policy: reduction / scan partials, then the slot of
+# each task (so at most SPLIT_TASKS tasks per split-capable plan).
+SPLIT_TASKS = 1024
+SPLIT_WORDS = 8 + SPLIT_TASKS
+# FP8 union tiles may keep only a core of their union (CORE_RATIOS by query heads per KV head;
+# others keep whole unions): the blocks at least ceil(ratio * rows) of the tile's rows select,
+# plus its diagonal (blocks from the first row's causal tail block on). Each row's other complete
+# blocks are its residual, which the direct kernel attends and merges into the union output by
+# log-sum-exp. K2 keeps the core when its union steps plus the residual direct work cost less
+# than the whole union. Residual direct work in BN32 direct steps, per (row, block) pair and per
+# row (fitted on the residual direct of SGLang-captured 12k selections).
+CORE_RATIOS = {12: 0.5, 6: 0.2}
+RESIDUAL_PAIR = 0.112
+RESIDUAL_ROW = 3.08
 
 
 @dataclass(kw_only=True)
@@ -63,6 +91,10 @@ class SparsePlan:
     block_capacity: int
     max_blocks: int
     num_tiles: int
+    # Tiles 0 .. union_tiles - 1 are union candidates (K2 compacts them, scratch holds them).
+    # A batch-invariant plan follows them with direct-only tiles of the requests below the
+    # union planning rows: their counts and costs stay 0, so K3 publishes them direct.
+    union_tiles: int
     grid: int
     route_costs: tuple
     route_model: tuple  # platform union_fixed, union_step, row_step, route_margin
@@ -78,10 +110,26 @@ class SparsePlan:
     direct_meta: torch.Tensor | None = None
     direct_list: torch.Tensor | None = None
     direct_groups: int = 0
+    # Key-range parts per task (SPLIT_PARTS for a split-capable FP8 plan, else 1); with
+    # split > 1 task_order entries encode (task, slot, part, split) and the union kernel
+    # writes / merges partial records (partials, split_counters).
+    split: int = 1
+    partials: torch.Tensor | None = None
+    split_counters: torch.Tensor | None = None
+    # Core/residual tiles (core_ratio > 0): K2 writes each tile's residual direct steps (0: whole
+    # union); for active core tiles the residual launch rewrites each row's block_indices to its
+    # residual blocks and residual_rows to their count, and the union kernel writes each union
+    # row's log-sum-exp (lse, log2 units) for the direct merge.
+    core_ratio: float = 0.0
+    residual: torch.Tensor | None = None
+    residual_rows: torch.Tensor | None = None
+    lse: torch.Tensor | None = None
+    rows: int = 0
+    heads: int = 0
 
 
 def _ballot(pred):
-    return fx.Int64(rocdl.ballot(fx.Int64.ir_type, pred))
+    return prim.ballot(pred)
 
 
 # gfx9 DPP controls: quad_perm xor 1 / 2 / 3, row_half_mirror (xor 7), row_mirror (xor 15).
@@ -96,13 +144,12 @@ def _lane_xor(value, mask):
             [_lane_xor(halves[0], mask), _lane_xor(halves[1], mask)], fx.Int32
         ).bitcast(fx.Int64)[0]
     if mask not in _DPP_XOR:
-        return value.shuffle_xor(mask, 64)
-    # Raw DPP (no fx wrapper): row-local moves instead of LDS-crossbar shuffles cut the
-    # latency-bound K1 by 10-14% on small calls.
-    raw = value.ir_value()
+        return fx.gpu.shuffle_xor(value, mask, 64)
+    # Row-local DPP moves instead of LDS-crossbar shuffles cut the latency-bound K1 by
+    # 10-14% on small calls.
     for control in _DPP_XOR[mask]:
-        raw = rocdl.update_dpp(fx.Int32.ir_type, raw, raw, control, 0xF, 0xF, True)
-    return fx.Int32(raw)
+        value = prim.dpp_move(value, control)
+    return value
 
 
 def _wave_reduce(value, op):
@@ -211,16 +258,23 @@ def _recover_row(
     visible = _uniform(POSITIONS[row]) + 1
     complete = _min(visible >> 2, fx.Int32(TOPK))
     indices = _buffer(INDICES, ROWS * row_bytes)
-    unsorted = fx.Boolean(False)
     # Lane holds columns 64 * k + lane: each load, store and scatter spans 64 adjacent ones.
     keys = []
     for k in fx.range_constexpr(columns):
         column = k * 64 + lane
-        full = column < complete
         block = _buffer_words(indices, row * row_bytes + column * 16, 1)[0] >> 2
-        unsorted = unsorted | (full & (block != column))
-        keys.append(full.select(block, fx.Int32(INT_MAX)))
-    # Rows that select their first blocks in order (complete causal prefixes) skip the sort.
+        keys.append((column < complete).select(block, fx.Int32(INT_MAX)))
+    # Rows whose complete blocks already ascend skip the sort: complete causal prefixes and the
+    # indexer's ascending top-k. Lane 63 takes the next column from lane 0's next key.
+    next_lane = ((lane + 1) & 63) * 4
+    unsorted = fx.Boolean(False)
+    for k in fx.range_constexpr(columns):
+        column = k * 64 + lane
+        source = (
+            keys[k] if k + 1 == columns else (lane == 0).select(keys[k + 1], keys[k])
+        )
+        following = prim.bpermute(next_lane, source)
+        unsorted = unsorted | ((column + 1 < complete) & (keys[k] > following))
     if _ballot(unsorted) != 0:
         # The sort holds keys width * lane .. width * lane + width - 1: transpose through the
         # wave's LDS, INT_MAX past the last column.
@@ -295,7 +349,7 @@ def _recover_launch(
 # membership word and compacts the nonzero words in block order. Longer ranges go a
 # WINDOW_BLOCKS-block window at a time: blocks set bits of a presence bitmap, a CTA-wide prefix
 # over its words ranks every present block, and membership accumulates in LDS by union index,
-# MEMBER_BYTES at a time. A tile whose padded union exceeds `ratio` times its direct work is
+# a chunk at a time. A tile whose padded union exceeds `ratio` times its direct work is
 # routed direct (its count is then partial). Work grows with the rows' selections, plus one
 # bitmap word per 32 blocks of a long range; no scratch grows with tiles x KV blocks.
 
@@ -308,10 +362,16 @@ WORDS = WINDOW_BLOCKS // 32
 # LDS of a launch whose longest range does not fit densely: two CTAs per CU.
 LDS_BUDGET = 32768
 # Windowed LDS: presence words, their exclusive prefix counts in the window, then a membership
-# chunk up to the waves' scan totals, which always take the last SCAN_BYTES.
-SCAN_BYTES = max(COMPACT_THREADS) // 64 * 4
+# chunk up to the waves' scan totals, which always take the last scan bytes: a total per wave
+# (SCAN_BYTES), three on a core/residual plan (a dense tile's union, core and residual pair
+# counts).
+SCAN_WAVES = max(COMPACT_THREADS) // 64
+SCAN_BYTES = SCAN_WAVES * 4
 PRESENCE, PREFIX, MEMBER = 0, WORDS * 4, 2 * WORDS * 4
-MEMBER_BYTES = LDS_BUDGET - SCAN_BYTES - MEMBER
+
+
+def _scan_bytes(core):
+    return (3 if core else 1) * SCAN_BYTES
 
 
 def _resource(tensor, size_bytes, offset=None):
@@ -332,15 +392,13 @@ def _put(buffer, index, value):
 
 
 def _cta_sync():
-    fx.memory_fence(syncscope="workgroup")
-    rocdl.s_barrier()
-    fx.memory_fence(syncscope="workgroup")
+    fx.gpu.barrier()
 
 
 def _inclusive_scan(value, lane):
     for offset in (1, 2, 4, 8, 16, 32):
         source = ((lane - offset) & 63) * 4
-        other = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source, value))
+        other = prim.bpermute(source, value)
         value = (lane >= offset).select(value + other, value)
     return value
 
@@ -497,12 +555,7 @@ def _owned(cta, count):
 
 
 def _below(mask):
-    low = rocdl.mbcnt_lo(
-        fx.Int32.ir_type, fx.Int32(mask).ir_value(), fx.Int32(0).ir_value()
-    )
-    return fx.Int32(
-        rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
-    )
+    return prim.lanes_below(mask)
 
 
 def _count(mask):
@@ -520,18 +573,45 @@ def _wave_bases(cta, total):
 
 
 @flyc.jit
-def _put_word(cta, index, word, base, mask):
-    if word != _zero(cta.wide):
+def _put_word(cta, index, word, base, mask, take):
+    if take:
         destination = base + _below(mask)
         _put(cta.output, destination, index)
         _put_entry(cta.members, destination, word, cta.wide)
 
 
+def _kept(cta, word, index):
+    """(present, core, rows) of a dense membership word: core when at least cta.threshold of
+    the tile's rows select the block or it lies on the tile's diagonal."""
+    present = word != _zero(cta.wide)
+    rows = fx.Int32(fx.ctpop(word))
+    core = present & ((rows >= cta.threshold) | (index >= cta.diagonal))
+    return present, core, rows
+
+
 @flyc.jit
-def _dense(cta, end, budget):
-    """(union size, whether over budget) of a tile whose causal range fits the LDS, one word
-    per block. Each wave compacts its contiguous share 64 words at a time, so the outputs
-    coalesce."""
+def _put_wave_totals(cta, total, core, pairs):
+    if cta.lane == 0:
+        _lds_store(cta.scan + cta.wave * 4, total)
+        _lds_store(cta.scan + (SCAN_WAVES + cta.wave) * 4, core)
+        _lds_store(cta.scan + (2 * SCAN_WAVES + cta.wave) * 4, pairs)
+    _cta_sync()
+
+
+def _wave_sums(cta, region):
+    """(this wave's exclusive prefix, CTA total) of the waves' totals in scan region `region`."""
+    running, total = fx.Int32(0), fx.Int32(0)
+    for w in range(cta.threads // 64):
+        value = _lds_load(cta.scan + (region * SCAN_WAVES + w) * 4)
+        running = running + (fx.Int32(w) < cta.wave).select(value, fx.Int32(0))
+        total = total + value
+    return running, total
+
+
+@flyc.jit
+def _dense_words(cta, end):
+    """One word per block of the tile's causal range in LDS, each row's bit ORed in; returns
+    this wave's contiguous share [lo, hi) of the words, a multiple of 64."""
     size = _entry_bytes(cta.wide)
     zero = _zero(cta.wide)
     for index in range(cta.tid, end, fx.Int32(cta.threads)):
@@ -543,6 +623,17 @@ def _dense(cta, end, budget):
     per = ((end + waves - 1) // waves + 63) & ~63
     lo = _min(cta.wave * per, end)
     hi = _min(lo + per, end)
+    return lo, hi
+
+
+@flyc.jit
+def _dense(cta, end, budget):
+    """(union size, whether over budget) of a tile whose causal range fits the LDS, one word
+    per block. Each wave compacts its contiguous share 64 words at a time, so the outputs
+    coalesce."""
+    size = _entry_bytes(cta.wide)
+    zero = _zero(cta.wide)
+    lo, hi = _dense_words(cta, end)
     total = fx.Int32(0)
     for start in range(lo, hi, fx.Int32(64)):
         index = fx.Int32(start) + cta.lane
@@ -557,9 +648,53 @@ def _dense(cta, end, budget):
             address = cta.shared + _min(index, end - 1) * size
             word = (index < hi).select(_load_entry(address, cta.wide), zero)
             mask = _ballot(word != zero)
-            _put_word(cta, index, word, base, mask)
+            _put_word(cta, index, word, base, mask, word != zero)
             base = base + _count(mask)
     return present, over
+
+
+@flyc.jit
+def _dense_core(cta, end, budget):
+    """_dense of a core/residual plan: (union size, whether over budget, residual direct
+    steps). The union keeps only its core words when that costs less (union steps plus the
+    residual direct work); the residual is 0 otherwise."""
+    size = _entry_bytes(cta.wide)
+    zero = _zero(cta.wide)
+    lo, hi = _dense_words(cta, end)
+    total, core, pairs = fx.Int32(0), fx.Int32(0), fx.Int32(0)
+    for start in range(lo, hi, fx.Int32(64)):
+        index = fx.Int32(start) + cta.lane
+        address = cta.shared + _min(index, end - 1) * size
+        word = (index < hi).select(_load_entry(address, cta.wide), zero)
+        listed, kept, rows = _kept(cta, word, index)
+        total = total + _count(_ballot(listed))
+        core = core + _count(_ballot(kept))
+        pairs = pairs + (listed & ~kept).select(rows, fx.Int32(0))
+    _put_wave_totals(cta, total, core, _wave_reduce(pairs, operator.add))
+    base_all, total_all = _wave_sums(cta, 0)
+    base_core, core_all = _wave_sums(cta, 1)
+    _, pairs_all = _wave_sums(cta, 2)
+    residual = fx.Float32(RESIDUAL_PAIR) * pairs_all.to(fx.Float32) + fx.Float32(
+        RESIDUAL_ROW
+    ) * fx.Float32(cta.nrows)
+    whole = (16 * ((total_all + 15) >> 4)).to(fx.Float32)
+    split_cost = (16 * ((core_all + 15) >> 4)).to(fx.Float32) + cta.ratio * residual
+    use = (pairs_all > 0) & (split_cost < whole)
+    present = use.select(core_all, total_all)
+    base = use.select(base_core, base_all)
+    over = (use.select(split_cost, whole) > budget).select(fx.Int32(1), fx.Int32(0))
+    if over == 0:
+        for start in range(lo, hi, fx.Int32(64)):
+            index = fx.Int32(start) + cta.lane
+            address = cta.shared + _min(index, end - 1) * size
+            word = (index < hi).select(_load_entry(address, cta.wide), zero)
+            listed, kept, _ = _kept(cta, word, index)
+            take = listed & (kept | ~use)
+            mask = _ballot(take)
+            _put_word(cta, index, word, base, mask, take)
+            base = base + _count(mask)
+    steps = use.select(fx.Int32(residual + fx.Float32(0.5)), fx.Int32(0))
+    return present, over, steps
 
 
 @flyc.jit
@@ -603,7 +738,8 @@ def _window(cta, w0, w1, count, budget):
     if over == 0:
         _emit_blocks(cta, count, w0, lo, hi)
         size = _entry_bytes(cta.wide)
-        entries = MEMBER_BYTES // size
+        # The membership chunk ends where the scan totals start.
+        entries = (LDS_BUDGET - _scan_bytes(cta.core) - MEMBER) // size
         for start in range(fx.Int32(0), present, fx.Int32(entries)):
             c0 = fx.Int32(start)
             # Union indices c0 .. c0 + filled - 1 of this chunk.
@@ -631,13 +767,16 @@ def _tile(
     MEMBERSHIP,
     COUNTS,
     COSTS,
+    RESIDUAL,
     DIRECT_FLAG,
     max_blocks,
     capacity,
     ratio,
+    core_ratio,
     dense_limit,
     lds_bytes,
     wide,
+    core,
     threads,
     topk,
 ):
@@ -664,13 +803,14 @@ def _tile(
     # MEMBERSHIP is an int32 view; 64-bit entries take two words.
     cta = SimpleNamespace(
         shared=shared,
-        scan=shared + lds_bytes - SCAN_BYTES,
+        scan=shared + lds_bytes - _scan_bytes(core),
         tid=tid,
         wave=wave,
         lane=lane,
         threads=threads,
         topk=topk,
         wide=wide,
+        core=core,
         nrows=rows,
         position=position,
         max_blocks=max_blocks,
@@ -682,9 +822,19 @@ def _tile(
             fx.Int64(tile) * fx.Int64(capacity * (size // 4)),
         ),
     )
-    count, over = fx.Int32(0), fx.Int32(0)
+    if fx.const_expr(core):
+        cta.ratio = ratio
+        # ceil(core_ratio * rows), at least 1 (a whole union).
+        cta.threshold = fx.max(
+            fx.Int32(fx.Float32(rows) * core_ratio + fx.Float32(0.999)), fx.Int32(1)
+        )
+        cta.diagonal = (position + 1) >> 2
+    count, over, residual = fx.Int32(0), fx.Int32(0), fx.Int32(0)
     if end <= dense_limit:
-        count, over = _dense(cta, end, budget)
+        if fx.const_expr(core):
+            count, over, residual = _dense_core(cta, end, budget)
+        else:
+            count, over = _dense(cta, end, budget)
     else:
         w0 = fx.Int32(0)
         while (w0 < end) & (over == 0):
@@ -697,6 +847,12 @@ def _tile(
         _put(costs, fx.Int32(0), direct_steps)
         _put(costs, fx.Int32(1), row_steps)
         _put(costs, fx.Int32(2), (over == 0).select(fx.Int32(1), fx.Int32(0)))
+        if fx.const_expr(core):
+            _put(
+                _resource(RESIDUAL, 4, fx.Int64(tile)),
+                fx.Int32(0),
+                (over == 0).select(residual, fx.Int32(0)),
+            )
         if program == 0:
             flag = _resource(DIRECT_FLAG, 8)
             _put(flag, fx.Int32(0), fx.Int32(0))
@@ -711,13 +867,16 @@ def _compact_kernel(
     MEMBERSHIP: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     MAX_BLOCKS: fx.Int32,
     CAPACITY: fx.Int32,
     RATIO: fx.Float32,
+    CORE_RATIO: fx.Float32,
     DENSE_LIMIT: fx.Int32,
     LDS_BYTES: fx.Int32,
     MEMBERS64: fx.Constexpr[bool],
+    CORE: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
 ):
     _tile(
@@ -727,13 +886,16 @@ def _compact_kernel(
         MEMBERSHIP,
         COUNTS,
         COSTS,
+        RESIDUAL,
         DIRECT_FLAG,
         MAX_BLOCKS,
         CAPACITY,
         RATIO,
+        CORE_RATIO,
         DENSE_LIMIT,
         LDS_BYTES,
         MEMBERS64,
+        CORE,
         COMPACT_THREADS[0],
         TOPK,
     )
@@ -747,13 +909,16 @@ def _compact_kernel_large(
     MEMBERSHIP: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     MAX_BLOCKS: fx.Int32,
     CAPACITY: fx.Int32,
     RATIO: fx.Float32,
+    CORE_RATIO: fx.Float32,
     DENSE_LIMIT: fx.Int32,
     LDS_BYTES: fx.Int32,
     MEMBERS64: fx.Constexpr[bool],
+    CORE: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
 ):
     _tile(
@@ -763,13 +928,16 @@ def _compact_kernel_large(
         MEMBERSHIP,
         COUNTS,
         COSTS,
+        RESIDUAL,
         DIRECT_FLAG,
         MAX_BLOCKS,
         CAPACITY,
         RATIO,
+        CORE_RATIO,
         DENSE_LIMIT,
         LDS_BYTES,
         MEMBERS64,
+        CORE,
         COMPACT_THREADS[1],
         TOPK,
     )
@@ -783,15 +951,18 @@ def _compact_launch(
     MEMBERSHIP: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     MAX_BLOCKS: fx.Int32,
     CAPACITY: fx.Int32,
     RATIO: fx.Float32,
+    CORE_RATIO: fx.Float32,
     DENSE_LIMIT: fx.Int32,
     LDS_BYTES: fx.Int32,
     TILES: fx.Int32,
     MEMBERS64: fx.Constexpr[bool],
     LARGE: fx.Constexpr[bool],
+    CORE: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
@@ -803,13 +974,16 @@ def _compact_launch(
             MEMBERSHIP,
             COUNTS,
             COSTS,
+            RESIDUAL,
             DIRECT_FLAG,
             MAX_BLOCKS,
             CAPACITY,
             RATIO,
+            CORE_RATIO,
             DENSE_LIMIT,
             LDS_BYTES,
             MEMBERS64,
+            CORE,
             TOPK,
         )
         if fx.const_expr(LARGE):
@@ -828,15 +1002,16 @@ def _compact_launch(
             )
 
 
-def lds_layout(max_blocks, wide):
+def lds_layout(max_blocks, wide, core=False):
     """(LDS bytes, longest causal range in blocks compacted densely) of a K2 launch: one
     word per block when the plan's longest range fits LDS_BUDGET, else LDS_BUDGET (ranges
-    up to it still dense, longer ones windowed).
+    up to it still dense, longer ones windowed). core: a core/residual plan's scan totals.
     """
-    dense = (-(-max_blocks // 64) * 64) * _entry_bytes(wide) + SCAN_BYTES
+    scan = _scan_bytes(core)
+    dense = (-(-max_blocks // 64) * 64) * _entry_bytes(wide) + scan
     if dense <= LDS_BUDGET:
         return dense, max_blocks
-    return LDS_BUDGET, (LDS_BUDGET - SCAN_BYTES) // _entry_bytes(wide)
+    return LDS_BUDGET, (LDS_BUDGET - scan) // _entry_bytes(wide)
 
 
 def _block_reduce(values, ops, scratch, offset, wave):
@@ -886,12 +1061,14 @@ def _route_choice(totals, limits, task_share, step, fixed, model):
 def _route(
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     scratch,
     TILES: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
     ROUTE_MODEL: fx.Constexpr[tuple],
+    CORE: fx.Constexpr[bool],
 ):
     # Union and direct run back to back, so one long union task or a few direct rows set a
     # latency floor the per-tile rule cannot see. Return the most N64 steps a union tile keeps:
@@ -922,11 +1099,13 @@ def _route(
             direct = COSTS[tile * 3]
             row = COSTS[tile * 3 + 1]
             union = COSTS[tile * 3 + 2] == 1
+            # A kept core tile's rows attend their residual blocks in the direct phase.
+            residual = RESIDUAL[tile] if CORE else zero
             for j in fx.range_constexpr(LIMITS):
                 keep = union & (steps <= limits[j])
                 kept_sum[j] = kept_sum[j] + keep.select(steps, zero)
                 kept_max[j] = fx.max(kept_max[j], keep.select(steps, zero))
-                direct_sum[j] = direct_sum[j] + keep.select(zero, direct)
+                direct_sum[j] = direct_sum[j] + keep.select(residual, direct)
                 direct_max[j] = fx.max(direct_max[j], keep.select(zero, row))
         totals = _block_reduce(
             [
@@ -949,9 +1128,11 @@ def _route(
 def _order(
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    COUNTERS: fx.Tensor,
     scratch,
     program,
     threshold,
@@ -963,44 +1144,173 @@ def _order(
     SLICES: fx.Constexpr[int],
     WIDE: fx.Constexpr[bool],
     WIDTH: fx.Constexpr[int],
+    SPLIT: fx.Constexpr[int],
+    CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
 ):
     key = fx.Int64 if WIDE else fx.Int32
     tid = fx.thread_idx.x
+    lane, wave = tid & 63, _uniform(tid >> 6)
     per_head = TASKS // HK
-    keys = []
+    # Entry rank r: task r % TASKS (hkv-major), key-range part r // TASKS.
+    entries = TASKS * SPLIT
+    info = []
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
-        valid = (position < SIZE) & (rank < TASKS)
-        tile = (rank % per_head) // SLICES
+        valid = (position < SIZE) & (rank < entries)
+        task, part = rank, fx.Int32(0)
+        if fx.const_expr(SPLIT > 1):
+            task, part = rank % TASKS, rank // TASKS
+        tile = (task % per_head) // SLICES
         steps = (valid.select(COUNTS[tile], fx.Int32(0)) + 15) >> 4
         union = valid.select(COSTS[tile * 3 + 2], fx.Int32(0)) == 1
         active = union & (steps <= threshold)
-        # The first head's first slice of each tile publishes the route; any direct tile
-        # raises the flag compact cleared, which gated pack/direct launches read.
-        if valid & (rank < per_head) & (rank % SLICES == 0):
+        # The first head's first slice of each tile publishes the route; any direct tile, or
+        # union tile with residual blocks, raises the flag compact cleared, which gated
+        # pack/direct launches read.
+        if valid & (part == 0) & (task < per_head) & (task % SLICES == 0):
             ACTIVE[tile] = active.select(fx.Int32(1), fx.Int32(0))
-            if ~active:
+            direct = ~active
+            if fx.const_expr(CORE):
+                direct = direct | (RESIDUAL[tile] > 0)
+            if direct:
                 DIRECT_FLAG[0] = 1
-        cost = key(active.select(steps, fx.Int32(0)))
-        rank_key = (cost << key(SHIFT)) + key(TASKS - 1 - rank)
+        info.append((rank, valid, task, part, steps, active))
+    split = [fx.Int32(0)] * WIDTH
+    slot = [fx.Int32(0)] * WIDTH
+    if fx.const_expr(SPLIT > 1):
+        # Even per-CTA load of the active tasks (steps plus a task overhead), then the tasks
+        # above it take a slot (task order, at most SPLIT_SLOTS) and SPLIT key ranges.
+        base = ORDER_WORDS
+        table = ORDER_WORDS + 8
+        zero = fx.Int32(0)
+        total, count = zero, zero
+        for rank, valid, task, part, steps, active in info:
+            first = valid & (part == 0) & active
+            total = total + first.select(steps, zero)
+            count = count + first.select(fx.Int32(1), zero)
+        total, count = _block_reduce(
+            [total, count], [operator.add, operator.add], scratch, base, wave
+        )
+        even = (
+            total.to(fx.Float32) + fx.Float32(SPLIT_OVERHEAD) * count.to(fx.Float32)
+        ) / GRID.to(fx.Float32)
+        wanted = []
+        for rank, valid, task, part, steps, active in info:
+            wanted.append(
+                valid
+                & (part == 0)
+                & active
+                & (steps >= 2)
+                & (steps.to(fx.Float32) > even)
+            )
+        local = zero
+        for w in wanted:
+            local = local + w.select(fx.Int32(1), zero)
+        fx.gpu.barrier()
+        inclusive = _inclusive_scan(local, lane)
+        if lane == 63:
+            scratch[base + wave] = inclusive
+        fx.gpu.barrier()
+        running = inclusive - local
+        for w in fx.range_constexpr(THREADS // 64):
+            running = running + (fx.Int32(w) < wave).select(scratch[base + w], zero)
+        for e in fx.range_constexpr(WIDTH):
+            rank, valid, task, part, steps, active = info[e]
+            taken = wanted[e] & (running < SPLIT_SLOTS)
+            if valid & (part == 0):
+                scratch[table + task] = taken.select(running, fx.Int32(-1))
+            running = running + wanted[e].select(fx.Int32(1), zero)
+        fx.gpu.barrier()
+        for e in fx.range_constexpr(WIDTH):
+            rank, valid, task, part, steps, active = info[e]
+            owner = valid.select(scratch[table + task], fx.Int32(-1))
+            split[e] = (owner >= 0).select(fx.Int32(1), zero)
+            slot[e] = (owner >= 0).select(owner, zero)
+        if tid < SPLIT_SLOTS:
+            COUNTERS[tid] = 0
+    keys = []
+    for e in fx.range_constexpr(WIDTH):
+        rank, valid, task, part, steps, active = info[e]
+        cost = active.select(steps, fx.Int32(0))
+        if fx.const_expr(SPLIT > 1):
+            # Part 0 of a split task runs the first ceil(steps / 2) N64 steps.
+            cost = (split[e] != 0).select((steps + 1 - part) >> 1, cost)
+            valid = valid & ((part == 0) | (split[e] != 0))
+        rank_key = (key(cost) << key(SHIFT)) + key(entries - 1 - rank)
         keys.append(valid.select(rank_key, key(-1)))
-    cta = (scratch, tid, _uniform(tid >> 6), WIDE)
+    cta = (scratch, tid, wave, WIDE)
     keys = _bitonic(keys, tid & 63, True, cta)
+    # The FP8 union kernel ends a CTA's task loop at its first idle entry. With several order
+    # CTAs (CHUNKED: chunks of SIZE entries) each places its runnable entries after those of the
+    # earlier chunks and its idle ones after every runnable entry, so each CTA still meets all
+    # of its runnable tasks first. One order CTA (a split plan always) places them as sorted.
+    before, own, total = fx.Int32(0), fx.Int32(0), fx.Int32(0)
+    if fx.const_expr(CHUNKED):
+        before, own, total = _runnable_counts(
+            COUNTS, COSTS, scratch, program, threshold, entries, SIZE, per_head, SLICES
+        )
     # Sort hkv-major (tie order), publish the tile-major task the union kernel runs.
     mask = (key(1) << key(SHIFT)) - 1
-    rounded = (TASKS + GRID - 1) // GRID * GRID
+    rounded = (entries + GRID - 1) // GRID * GRID
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
-        task = TASKS - 1 - fx.Int32(keys[e] & mask)
-        task = (keys[e] >= 0).select(
-            (task % per_head) * HK + task // per_head, fx.Int32(-1)
-        )
+        if fx.const_expr(CHUNKED):
+            runnable = (keys[e] >> key(SHIFT)) > key(0)
+            rank = runnable.select(
+                before + position, total + program * SIZE - before + position - own
+            )
+        entry = entries - 1 - fx.Int32(keys[e] & mask)
+        task = entry
+        if fx.const_expr(SPLIT > 1):
+            task = entry % TASKS
+        value = (task % per_head) * HK + task // per_head
+        if fx.const_expr(SPLIT > 1):
+            # (task, slot, part, split): the slot table outlived the sort's exchange rounds.
+            owner = scratch[ORDER_WORDS + 8 + _min(task, fx.Int32(SPLIT_TASKS - 1))]
+            value = (
+                (value << 8)
+                | ((owner >= 0).select(owner, fx.Int32(0)) << 2)
+                | ((entry // TASKS) << 1)
+                | (owner >= 0).select(fx.Int32(1), fx.Int32(0))
+            )
+        value = (keys[e] >= 0).select(value, fx.Int32(-1))
         row, column = rank // GRID, rank % GRID
         destination = row * GRID + ((row & 1) == 0).select(column, GRID - 1 - column)
         if (position < SIZE) & (destination < rounded):
-            ORDER[destination] = task
+            ORDER[destination] = value
+
+
+@flyc.jit
+def _runnable_counts(
+    COUNTS, COSTS, scratch, program, threshold, entries, SIZE, per_head, SLICES
+):
+    """Runnable entries (union tile within the threshold, steps > 0: cost > 0 in _order's
+    keys) of the chunks before chunk `program`, of chunk `program` and of all chunks. Several
+    order CTAs come only with an unsplit plan: entry = task."""
+    tid = fx.thread_idx.x
+    zero = fx.Int32(0)
+    first = program * SIZE
+    before, own, total = zero, zero, zero
+    for index in range(tid, entries, THREADS):
+        task = fx.Int32(index)
+        tile = (task % per_head) // SLICES
+        steps = (COUNTS[tile] + 15) >> 4
+        union = COSTS[tile * 3 + 2] == 1
+        one = (union & (steps <= threshold) & (steps > 0)).select(fx.Int32(1), zero)
+        before = before + (task < first).select(one, zero)
+        own = own + ((task >= first) & (task < first + SIZE)).select(one, zero)
+        total = total + one
+    # The sort's exchange words are free again.
+    return _block_reduce(
+        [before, own, total],
+        [operator.add] * 3,
+        scratch,
+        0,
+        _uniform(tid >> 6),
+    )
 
 
 def _claim(flag, count):
@@ -1135,6 +1445,7 @@ def _order_masks_kernel(
     SLOTS: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
@@ -1147,6 +1458,7 @@ def _order_masks_kernel(
     QUERY_TILES: fx.Tensor,
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    COUNTERS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1165,12 +1477,16 @@ def _order_masks_kernel(
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
+    CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
 ):
+    words = ORDER_WORDS + (SPLIT_WORDS if SPLIT > 1 else 0)
     scratch = (
         fx.SharedAllocator()
-        .allocate(fx.Array[fx.Int32, ORDER_WORDS, 16])
+        .allocate(fx.Array[fx.Int32, words, 16])
         .peek()
-        .view(fx.make_layout(ORDER_WORDS, 1))
+        .view(fx.make_layout(words, 1))
     )
     program = fx.block_idx.x
     # Order CTAs, then one mask CTA per tile, then the raw direct group-list CTAs.
@@ -1180,12 +1496,14 @@ def _order_masks_kernel(
             threshold = _route(
                 COUNTS,
                 COSTS,
+                RESIDUAL,
                 scratch,
                 TILES,
                 TASK_SHARE,
                 DIRECT_STEP,
                 DIRECT_FIXED,
                 ROUTE_MODEL,
+                CORE,
             )
         if program < ORDER_CTAS:
             for width in fx.range_constexpr(len(SORT_WIDTHS)):
@@ -1195,9 +1513,11 @@ def _order_masks_kernel(
                     _order(
                         COUNTS,
                         COSTS,
+                        RESIDUAL,
                         ACTIVE,
                         ORDER,
                         DIRECT_FLAG,
+                        COUNTERS,
                         scratch,
                         program,
                         threshold,
@@ -1209,6 +1529,9 @@ def _order_masks_kernel(
                         SLICES,
                         WIDE,
                         width,
+                        SPLIT,
+                        CORE,
+                        CHUNKED,
                     )
         else:
             _direct_groups(
@@ -1249,6 +1572,7 @@ def _order_masks_launch(
     SLOTS: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
+    RESIDUAL: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
@@ -1261,6 +1585,7 @@ def _order_masks_launch(
     QUERY_TILES: fx.Tensor,
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    COUNTERS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1279,6 +1604,9 @@ def _order_masks_launch(
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
+    CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if TILES > 0:
@@ -1286,6 +1614,7 @@ def _order_masks_launch(
             SLOTS,
             COUNTS,
             COSTS,
+            RESIDUAL,
             ACTIVE,
             ORDER,
             DIRECT_FLAG,
@@ -1298,6 +1627,7 @@ def _order_masks_launch(
             QUERY_TILES,
             GROUP_META,
             GROUP_LIST,
+            COUNTERS,
             TASKS,
             GRID,
             SIZE,
@@ -1316,11 +1646,98 @@ def _order_masks_launch(
             ROUTE,
             ROUTE_MODEL,
             SLOTTED,
+            SPLIT,
+            CORE,
+            CHUNKED,
         ).launch(
             grid=(ORDER_CTAS + TILES + (GROUPS + THREADS - 1) // THREADS, 1, 1),
             block=(THREADS, 1, 1),
             stream=stream,
         )
+
+
+# K3b (CTAs of the FP8 pack launch, after K3): each row of an active core tile keeps only its
+# residual blocks (complete blocks outside the tile's core, ascending) at the front of its
+# block_indices row and their count in residual_rows; rows of other active tiles get count 0.
+# One CTA per tile: a bitmap of the core over the tile's causal blocks in LDS (RESIDUAL_WORDS
+# words cover the longest dense range), then a wave per row at a time, one bit test per block.
+RESIDUAL_WORDS = -(-((LDS_BUDGET - _scan_bytes(True)) // 4) // 32)
+
+
+@flyc.jit
+def _residual_row(ROWS, RESIDUAL_ROWS, shared, words, row, visible, lane, topk):
+    blocks = _resource(ROWS, topk * 4, fx.Int64(row) * topk)
+    complete = _min(visible >> 2, fx.Int32(topk))
+    ids = [_word(blocks, (k * 64 + lane) * 4) for k in range(topk // 64)]
+    keep = []
+    for k in fx.range_constexpr(topk // 64):
+        inside = k * 64 + lane < complete
+        word = _lds_load(shared + inside.select(_min(ids[k] >> 5, words - 1), 0) * 4)
+        core = ((word >> (ids[k] & 31)) & 1) != 0
+        keep.append(inside & ~core)
+    base = fx.Int32(0)
+    for k in fx.range_constexpr(topk // 64):
+        mask = _ballot(keep[k])
+        # Entries move only toward the front, after every lane loaded the row.
+        _put(blocks, keep[k].select(base + _below(mask), fx.Int32(topk)), ids[k])
+        base = base + _count(mask)
+    if lane == 0:
+        RESIDUAL_ROWS[row] = base
+
+
+@flyc.jit
+def residual_tile(
+    ROWS,
+    COUNTS,
+    UNION,
+    META,
+    ACTIVE,
+    RESIDUAL,
+    RESIDUAL_ROWS,
+    CAPACITY,
+    MAX_BLOCKS,
+    tile,
+    shared,
+    TOPK: fx.Constexpr[int],
+):
+    """K3b for one tile (a 256-thread CTA; shared: RESIDUAL_WORDS words of LDS, byte address)."""
+    tid = fx.Int32(fx.thread_idx.x)
+    wave, lane = _uniform(tid >> 6), tid & 63
+    first_row, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
+    position = _uniform(META[tile * 5 + 4])
+    active = _uniform(ACTIVE[tile]) != 0
+    if active & (_uniform(RESIDUAL[tile]) > 0):
+        count = _uniform(COUNTS[tile])
+        union = _resource(UNION, CAPACITY * 4, fx.Int64(tile) * fx.Int64(CAPACITY))
+        # Core blocks lie below the tile's causal end (K2's dense range).
+        words = (_min(MAX_BLOCKS, (position + rows + 3) >> 2) + 31) >> 5
+        for i in range(tid, words, fx.Int32(THREADS)):
+            _lds_store(shared + fx.Int32(i) * 4, fx.Int32(0))
+        _cta_sync()
+        for i in range(tid, count, fx.Int32(THREADS * 4)):
+            # Four core entries in flight per thread.
+            entries = [fx.Int32(i) + j * THREADS for j in range(4)]
+            loaded = [_word(union, _min(e, count - 1) * 4) for e in entries]
+            for j in fx.range_constexpr(4):
+                if entries[j] < count:
+                    block = loaded[j]
+                    _or(shared + (block >> 5) * 4, fx.Int32(1) << (block & 31), False)
+        _cta_sync()
+        for r in range(wave, rows, fx.Int32(THREADS // 64)):
+            r = fx.Int32(r)
+            _residual_row(
+                ROWS,
+                RESIDUAL_ROWS,
+                shared,
+                words,
+                first_row + r,
+                position + r + 1,
+                lane,
+                TOPK,
+            )
+    elif active:
+        for r in range(tid, rows, fx.Int32(THREADS)):
+            RESIDUAL_ROWS[first_row + fx.Int32(r)] = 0
 
 
 def _cdiv(a, b):
@@ -1335,7 +1752,7 @@ def upload(array, device) -> torch.Tensor:
 
 def scratch_specs(plan: SparsePlan) -> list:
     """(field, shape, dtype) of the per-call scratch; every launch rewrites what it reads."""
-    tiles, capacity = plan.num_tiles, plan.block_capacity
+    tiles, capacity = plan.union_tiles, plan.block_capacity
     members = torch.int64 if plan.query_tile > 32 else torch.int32
     specs = [
         ("blocks", (tiles, capacity), torch.int32),
@@ -1346,6 +1763,16 @@ def scratch_specs(plan: SparsePlan) -> list:
         specs += [
             ("pool_blocks", (tiles, capacity), torch.int32),
             ("tails", (tiles,), torch.int32),
+        ]
+    if plan.split > 1:
+        specs += [
+            ("partials", (SPLIT_SLOTS * SPLIT_PARTS, PARTIAL_FLOATS), torch.float32),
+            ("split_counters", (SPLIT_SLOTS,), torch.int32),
+        ]
+    if plan.core_ratio > 0:
+        specs += [
+            ("residual_rows", (plan.rows,), torch.int32),
+            ("lse", (plan.rows, plan.heads), torch.float32),
         ]
     return specs
 
@@ -1360,46 +1787,83 @@ def wide_tile_rows(query_tile: int) -> int:
     return math.ceil(query_tile * get_cu_num() * platform().wide_tiles_per_cu)
 
 
+def _tile_rows(group, query_tile, rows, full):
+    """Union tile rows for `rows` query rows; full: one KV head and no prefix."""
+    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
+    # established tiles for prefix/ragged work and prefills too small to fill the persistent grid.
+    if group == 6 and full and query_tile >= 21 and rows >= wide_tile_rows(21):
+        return 21
+    if group == 3 and full and query_tile == 32 and rows >= wide_tile_rows(42):
+        return 42
+    return min(
+        query_tile,
+        128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
+    )
+
+
+def packed_block_starts(query_lens, prefix_lens):
+    """Each request's first block in the FP8 pack's four-token blocks of every request with
+    queries (a request's ceil(length / 4) blocks, in request order)."""
+    q_lens = np.asarray(query_lens, dtype=np.int64)
+    lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
+    blocks = np.where(q_lens > 0, -(-lengths // 4), 0)
+    return np.cumsum(blocks) - blocks
+
+
 def allocate_plan(
-    *, inputs, query_tile: int, scratch: bool = True, slotted: bool = False
+    *,
+    inputs,
+    query_tile: int,
+    scratch: bool = True,
+    slotted: bool = False,
+    min_request_rows: int | None = None,
+    fp8=None,
 ) -> SparsePlan:
+    """Union plan of a layout. By default its decisions span the batch: every request's tiles
+    are union candidates, BQ21/BQ42 tiles serve only a single full prefill and K3 routes
+    over all tiles. min_request_rows makes them per request (batch-invariant): requests of at
+    least that many rows take union tiles of their own rows (the kernels compile for the
+    widest), the others direct-only tiles after them, and K3 does not route.
+
+    fp8 ("tensor" / "token") plans for the FP8 kernels: their route calibration, key-range
+    split of short prefills' long union tasks (not with min_request_rows: a split depends on
+    the whole batch's load) and core/residual tiles (H12/H6 without a split).
+    """
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
-    config = platform()
+    config = platform(fp8)
     num_cus = get_cu_num()
-    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
-    # established tiles for prefix/ragged work and batches too small to fill the persistent grid.
-    full = (
-        inputs.k.shape[1] == 1
-        and len(inputs.query_lens) == 1
-        and inputs.prefix_lens[0] == 0
-    )
-    if (
-        group == 6
-        and full
-        and query_tile >= 21
-        and inputs.query_lens[0] >= wide_tile_rows(21)
-    ):
-        query_tile = 21
-    elif (
-        group == 3
-        and full
-        and query_tile == 32
-        and inputs.query_lens[0] >= wide_tile_rows(42)
-    ):
-        query_tile = 42
-    else:
-        query_tile = min(
-            query_tile,
-            128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
-        )
+    hk = inputs.k.shape[1]
     q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
-    lengths = q_lens + np.asarray(inputs.prefix_lens, dtype=np.int64)
+    prefix = np.asarray(inputs.prefix_lens, dtype=np.int64)
+    lengths = q_lens + prefix
+    if min_request_rows is None:
+        full = hk == 1 and len(q_lens) == 1 and prefix[0] == 0
+        query_tile = _tile_rows(group, query_tile, int(q_lens[0]), full)
+        union = np.ones(len(q_lens), dtype=bool)
+        rows = np.full(len(q_lens), query_tile)
+        max_blocks = _cdiv(inputs.max_seqlen_k, 4)
+    else:
+        union = q_lens >= min_request_rows
+        rows = np.array(
+            [
+                _tile_rows(group, query_tile, int(n), hk == 1 and p == 0)
+                for n, p in zip(q_lens, prefix)
+            ],
+            dtype=np.int64,
+        )
+        query_tile = int(rows[union].max())
+        rows[~union] = query_tile
+        max_blocks = _cdiv(int(lengths[union].max()), 4)
     # Equal tiles per request, larger first: a tiny last tile would route its few rows direct, after union.
-    counts = -(-q_lens // query_tile)
-    request = np.repeat(np.arange(len(q_lens)), counts)
-    index = np.arange(len(request)) - np.repeat(np.cumsum(counts) - counts, counts)
+    # Union candidate requests' tiles come first.
+    order = np.concatenate((np.flatnonzero(union), np.flatnonzero(~union)))
+    counts = -(-q_lens // rows)
+    request = np.repeat(order, counts[order])
+    index = np.arange(len(request)) - np.repeat(
+        np.cumsum(counts[order]) - counts[order], counts[order]
+    )
     base = (q_lens // np.maximum(counts, 1))[request]
     extra = (q_lens % np.maximum(counts, 1))[request]
     local = index * base + np.minimum(index, extra)
@@ -1414,15 +1878,29 @@ def allocate_plan(
         ),
         axis=1,
     )
-    max_blocks = _cdiv(inputs.max_seqlen_k, 4)
+    tiles = len(request)
+    union_tiles = int(counts[union].sum())
+    query_tiles = np.empty(int(sizes.sum()), dtype=np.int64)
+    within = np.arange(len(query_tiles)) - np.repeat(np.cumsum(sizes) - sizes, sizes)
+    query_tiles[np.repeat(metadata[:, 0], sizes) + within] = np.repeat(
+        np.arange(tiles), sizes
+    )
     # A query adds at most topk blocks and its tail block.
     capacity = _cdiv(min(max_blocks, query_tile * (inputs.topk + 1)), 16) * 16
-    tiles = len(request)
-    hk = inputs.k.shape[1]
     slices = _cdiv(query_tile * group, 128)
     tasks = tiles * hk * slices
     # A union CTA (8 waves, 64 KiB LDS) fills a CU: a larger grid only adds dispatch rounds.
-    grid = min(tasks, num_cus)
+    grid = min(union_tiles * hk * slices, num_cus)
+    split = (
+        SPLIT_PARTS
+        if fp8 is not None
+        and min_request_rows is None
+        and 0 < tasks < min(num_cus, SPLIT_TASKS)
+        and tasks * SPLIT_PARTS <= THREADS * SORT_WIDTHS[-1]
+        else 1
+    )
+    # Split plans run every CU (parts of a task are separate slots).
+    launch_grid = num_cus if split > 1 else grid
     packed = int((-(-lengths // 4))[q_lens > 0].sum())
     # Per-layout terms of the route model: union step share per tile, direct cost per step, fixed direct cost.
     route_costs = (
@@ -1430,24 +1908,29 @@ def allocate_plan(
         config.direct_cu_step * hk / num_cus,
         config.direct_fixed + config.pack_block * packed * hk,
     )
+    # Core/residual tiles need the FP8 direct merge; KV-split (short) plans keep whole unions.
+    core_ratio = CORE_RATIOS.get(group, 0.0) if fp8 is not None and split == 1 else 0.0
     kwargs = {"dtype": torch.int32, "device": inputs.q.device}
     plan = SparsePlan(
         metadata=upload(metadata, inputs.q.device),
         blocks=None,
         membership=None,
         score_masks=None,
-        counts=torch.empty(tiles, **kwargs),
-        costs=torch.empty((tiles, 3), **kwargs),
-        active=torch.empty(tiles, **kwargs),
-        task_order=torch.empty(_cdiv(tasks, grid) * grid if grid else 0, **kwargs),
+        counts=torch.zeros(tiles, **kwargs),
+        costs=torch.zeros((tiles, 3), **kwargs),
+        active=torch.zeros(tiles, **kwargs),
+        task_order=torch.empty(
+            _cdiv(tasks * split, launch_grid) * launch_grid if grid else 0, **kwargs
+        ),
         direct_flag=torch.empty(2, **kwargs),
-        query_tiles=upload(np.repeat(np.arange(tiles), sizes), inputs.q.device),
+        query_tiles=upload(query_tiles, inputs.q.device),
         query_tile=query_tile,
         group_padded=group,
         block_capacity=capacity,
         max_blocks=max_blocks,
         num_tiles=tiles,
-        grid=grid,
+        union_tiles=union_tiles,
+        grid=launch_grid,
         route_costs=route_costs,
         route_model=(
             config.union_fixed,
@@ -1456,7 +1939,13 @@ def allocate_plan(
             config.route_margin,
         ),
         union_ratio=config.union_ratio,
+        routing=min_request_rows is None,
         slotted=slotted,
+        split=split,
+        core_ratio=core_ratio,
+        residual=torch.zeros(tiles, **kwargs),
+        rows=inputs.q.shape[0],
+        heads=inputs.q.shape[1],
     )
     if scratch:
         allocate_scratch(plan, scratch_specs(plan), inputs.q.device)
@@ -1499,7 +1988,8 @@ def _launches(inputs, plan, stream):
     members64 = plan.query_tile > 32
     # BQ > 21 tiles take the larger compact CTA.
     large = plan.query_tile > 21
-    lds_bytes, dense_limit = lds_layout(plan.max_blocks, members64)
+    core = plan.core_ratio > 0
+    lds_bytes, dense_limit = lds_layout(plan.max_blocks, members64, core)
     args = (
         inputs.block_indices.view(-1),
         plan.metadata.view(-1),
@@ -1507,32 +1997,41 @@ def _launches(inputs, plan, stream):
         plan.membership.view(torch.int32).view(-1),
         plan.counts,
         plan.costs.view(-1),
+        plan.residual,
         plan.direct_flag,
         plan.max_blocks,
         plan.block_capacity,
         plan.union_ratio,
+        plan.core_ratio,
         dense_limit,
         lds_bytes,
-        plan.num_tiles,
+        plan.union_tiles,
         members64,
         large,
+        core,
         inputs.topk,
         stream,
     )
-    yield _compiled(_compact_launch, args, 12, (members64, large, inputs.topk)), args
+    constants = (members64, large, core, inputs.topk)
+    yield _compiled(_compact_launch, args, 14, constants), args
     hk = inputs.k.shape[1]
     slices = _cdiv(plan.query_tile * plan.group_padded, 128)
+    # Order CTAs cover every tile (a direct-only tile publishes 0 and raises the direct flag);
+    # mask CTAs only the union tiles.
     tasks = plan.num_tiles * hk * slices
+    entries = tasks * plan.split
     numel = plan.task_order.numel()
-    # One order CTA sorts the whole task order up to the widest variant, else chunks of it.
+    # One order CTA sorts the whole task order up to the widest variant, else chunks of it
+    # (a split plan always fits one), runnable entries of every chunk first.
     size = min(THREADS * SORT_WIDTHS[-1], numel)
-    shift = max(1, (tasks - 1).bit_length())
-    wide = ((plan.block_capacity // 16) << shift) + tasks - 1 >= 2**31
+    shift = max(1, (entries - 1).bit_length())
+    wide = ((plan.block_capacity // 16) << shift) + entries - 1 >= 2**31
     standin = plan.counts  # slot-table tensors K3 does not read without a slot table
     args = (
         inputs.kv_slots if plan.slotted else standin,
         plan.counts,
         plan.costs.view(-1),
+        plan.residual,
         plan.active,
         plan.task_order,
         plan.direct_flag,
@@ -1545,6 +2044,7 @@ def _launches(inputs, plan, stream):
         plan.query_tiles,
         plan.direct_meta.view(-1) if plan.direct_groups else standin,
         plan.direct_list if plan.direct_groups else standin,
+        plan.split_counters if plan.split > 1 else standin,
         tasks,
         plan.grid,
         size,
@@ -1552,7 +2052,7 @@ def _launches(inputs, plan, stream):
         _cdiv(numel, size),
         plan.query_tile,
         plan.block_capacity,
-        plan.num_tiles,
+        plan.union_tiles,
         plan.direct_groups,
         *plan.route_costs,
         hk,
@@ -1561,6 +2061,9 @@ def _launches(inputs, plan, stream):
         plan.routing,
         plan.route_model,
         plan.slotted,
+        plan.split,
+        core,
+        numel > size,
         stream,
     )
     constants = (
@@ -1571,8 +2074,11 @@ def _launches(inputs, plan, stream):
         plan.route_model,
         members64,
         plan.slotted,
+        plan.split,
+        core,
+        numel > size,
     )
-    yield _compiled(_order_masks_launch, args, 22, constants), args
+    yield _compiled(_order_masks_launch, args, 24, constants), args
 
 
 def run(*, inputs, plan):

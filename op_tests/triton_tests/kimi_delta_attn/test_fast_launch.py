@@ -135,7 +135,9 @@ def _wrapped():
         fk._seg_scan_prefetch_fast,
     ]
     if fk._GLUON_ARCH_OK:
-        pkg = f"aiter.ops.triton._gluon_kernels.{fk.DEVICE_ARCH}.kimi_delta_attn"
+        # gfx1250-strict runs the gfx1250 Gluon kernels; there is no gfx1250-strict package.
+        gluon_arch = "gfx1250" if fk._IS_GFX1250_FAMILY else fk.DEVICE_ARCH
+        pkg = f"aiter.ops.triton._gluon_kernels.{gluon_arch}.kimi_delta_attn"
         k1 = importlib.import_module(f"{pkg}.flash_kda_k1")
         k2 = importlib.import_module(f"{pkg}.flash_kda_k2")
         candidates += [k1._k1_fast, k2.k2_ab_fused_fast, getattr(k2, "k2_c_fast", None)]
