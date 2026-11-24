@@ -7,6 +7,7 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
+import inspect
 import subprocess
 import sys
 from functools import partial
@@ -20,6 +21,28 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.quant import dynamic_per_token_scaled_quant, per_1x32_f4_quant
 from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_pa_decode_reducer_query_map_has_separate_abi(arch):
+    from aiter.ops.flydsl.kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+
+    common = {
+        "architecture": arch,
+        "max_context_partition_num": 64,
+        "head_size": 128,
+        "output_dtype_str": "bf16",
+        "logits_dtype_str": "bf16",
+        "sink_dtype_str": "bf16",
+        "use_sinks": False,
+        "query_group_size": 16,
+    }
+    standard = compile_pa_decode_ps_reduce(**common, query_map=False)["kernel"]
+    varlen = compile_pa_decode_ps_reduce(**common, query_map=True)["kernel"]
+    standard_args = inspect.signature(standard._func).parameters
+    varlen_args = inspect.signature(varlen._func).parameters
+    assert "query_map_ptr" not in standard_args
+    assert "query_map_ptr" in varlen_args
 
 
 @pytest.fixture
