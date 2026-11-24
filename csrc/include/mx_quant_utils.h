@@ -108,6 +108,27 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };
 
+// The compile target's hardware fp8 e4m3: gfx942 ships e4m3fnuz (max_pos=240), gfx950 and later
+// OCP e4m3fn (max_pos=448).
+constexpr MxDtype kHwFp8MxDtype =
+#if defined(__gfx942__)
+    MxDtype::FP8_E4M3_FNUZ;
+#else
+    MxDtype::FP8_E4M3;
+#endif
+
+// An MXFP8 group holding an Inf (the amax skips NaN) gets the largest finite scale, 2^127 (0xFE).
+__device__ __forceinline__ float mxfp8_cap_scale(float scale) { return fminf(scale, 0x1.0p127f); }
+
+// Biased exponent of ceil_pow2(|x|), with 0xFF (Inf/NaN) kept: adding the mantissa mask
+// carries into the exponent exactly when the mantissa is nonzero. Same result as
+// `e + (e < 0xFF && mantissa != 0)` for every input, without the compare pair.
+__device__ __forceinline__ uint32_t e8m0_ceil_exponent(uint32_t u32)
+{
+    const uint32_t exponent = ((u32 & 0x7FFFFFFFu) + 0x7FFFFFu) >> 23;
+    return exponent < 0xFFu ? exponent : 0xFFu;
+}
+
 // Generic E8M0 dequant scale computation.
 //
 // Returns the *dequantization* scale as an f32 with a power-of-2 bit
@@ -136,11 +157,8 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     if constexpr (rmode == MxScaleRoundMode::RoundUp)
     {
         // ceil_pow2(amax / max_pos): NV / DSv4 / FlashInfer / torchao RCEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
     else if constexpr (rmode == MxScaleRoundMode::RoundDown)
     {
@@ -152,11 +170,8 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     else if constexpr (rmode == MxScaleRoundMode::Ceil)
     {
         // ceil_pow2(amax) / 2^target_max_pow2: torchao CEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
     else if constexpr (rmode == MxScaleRoundMode::Even)
     {
@@ -176,11 +191,33 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 }
 
 // Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus
-// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* (1 / dq_scale)``;
+// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* inv_scale()``;
 // store ``byte`` into the block-scale buffer.
 struct E8m0BlockScale {
     uint8_t byte;
     float   dq_scale;
+
+    // Reciprocal of the dequant scale. `v_rcp_f32` -- neither a true divide nor
+    // an exponent flip:
+    //
+    //  * `1.0f / dq_scale` lowers to the full IEEE sequence (v_div_scale x2,
+    //    v_rcp, three v_fma, v_div_fmas, v_div_fixup, plus s_denorm_mode
+    //    toggles) to get the last ulp right on operands this never sees.
+    //  * The exponent flip `bit_cast((254u - byte) << 23)` drops the divide but
+    //    answers three of the 256 bytes wrong: byte 0 (dq_scale is +0.0, so the
+    //    reciprocal is +inf), byte 254 (needs the subnormal 2^-127, which no
+    //    exponent field encodes), and byte 255 (254-255 wraps unsigned, giving
+    //    -inf instead of +0). Present callers floor the group amax and cannot
+    //    reach those, but this is a public method on a shared struct.
+    //
+    // dq_scale is 2^(byte-127) by construction -- mantissa zero -- so the
+    // reciprocal is exactly representable and the hardware approximation lands
+    // on it. Checked on gfx1250 against `1.0f / dq_scale` for all 256 bytes:
+    // bit-identical except byte 254, where rcp flushes the subnormal to +0.
+    __device__ __forceinline__ float inv_scale() const
+    {
+        return __builtin_amdgcn_rcpf(dq_scale);
+    }
 };
 
 // One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant

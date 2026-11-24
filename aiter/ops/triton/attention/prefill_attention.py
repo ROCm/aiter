@@ -50,7 +50,10 @@ def context_attention_fwd(
         None. Results written in-place to o.
     """
     _LOGGER.info(
-        f"PREFILL_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "PREFILL_ATTENTION: q=%s k=%s v=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
     )
 
     BLOCK = 128

@@ -55,7 +55,13 @@ def fused_gemm_a8w8_blockscale_a16w16(
     **scale_n = (N_fp8 + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        f"FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp8={tuple(x_fp8.shape)} w_fp8={tuple(w_fp8.shape)} x_fp8_scale={tuple(x_fp8_scale.shape)} w_scale={tuple(w_fp8_scale.shape)} x_bf16={tuple(x_bf16.shape)} w_bf16={tuple(w_bf16.shape)}"
+        "FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp8=%s w_fp8=%s x_fp8_scale=%s w_scale=%s x_bf16=%s w_bf16=%s",
+        tuple(x_fp8.shape),
+        tuple(w_fp8.shape),
+        tuple(x_fp8_scale.shape),
+        tuple(w_fp8_scale.shape),
+        tuple(x_bf16.shape),
+        tuple(w_bf16.shape),
     )
 
     M, K = x_fp8.shape

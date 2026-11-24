@@ -1,0 +1,1140 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Offline tile tuner for FlyDSL conv3d.
+
+Reads an untuned CSV, sweeps ``conv3d_policy`` configs, writes winners to a
+per-model tuned CSV. One backend (``libtype=flydsl``), explicit tile columns
+(not solidx). Pass ``-i``/``-o``; the canonical pair is header-only.
+
+Every candidate is timed NDHWC in and NDHWC out, the layout the VAEs run end
+to end, so the tables are tuned for that call. The table has no layout column:
+an NCDHW caller gets the same row, picked for the NDHWC-output kernel, and
+pays a pre-transpose on top that no tile choice affects.
+
+    python3 csrc/flydsl_conv3d/conv3d_tune.py \\
+        -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
+"""
+
+import functools
+import itertools
+import os
+import time
+from typing import Any, ClassVar
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+from aiter import dtypes, logger
+from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    _clamp_num_buffers,
+    _resolve_splitk_gfx1250,
+    prepare_operands_gfx1250,
+    run_conv3d_gfx1250,
+)
+from aiter.ops.flydsl.conv3d_policy import (
+    get_flydsl_conv3d_configs,
+    max_lds_bytes,
+    tile_kernel_name,
+)
+from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
+    get_flydsl_conv3d_configs_gfx1250,
+    is_legal_tile_gfx1250,
+    lds_bytes_patch,
+    lds_bytes_tap,
+    tile_kernel_name_gfx1250,
+)
+from aiter.ops.flydsl.conv_kernels import (
+    LIBTYPE_FLYDSL,
+    TUNED_BLOCK_ROWS_COLUMN,
+    TUNED_DEVICE_COLUMNS,
+    TUNED_KEY_COLUMNS,
+    TUNED_LIBTYPE_COLUMN,
+    TUNED_PIPELINE_COLUMNS,
+    TUNED_RESULT_COLUMNS,
+    _check_supported_arch,
+    _implicit_param_from_problem,
+    _is_matmul_fast_path,
+    _pad_channels,
+    _parse_tuned_bool,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
+    make_conv_geometry,
+    make_tile_config,
+    out_extent,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
+    patch_unsupported_gfx1250,
+    tile_k_unsupported_gfx1250,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
+    make_im2col_plan,
+    plan_lds_bytes,
+)
+from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.mp_tuner import mp_tuner
+
+# The runtime lookup's key columns are the tuning key, and the untuned CSV
+# header must equal them; TunerCommon prefixes the device columns on top.
+SHAPE_KEYS = list(TUNED_KEY_COLUMNS)
+KEYS = [*TUNED_DEVICE_COLUMNS, *SHAPE_KEYS]
+
+RESULT_LIST = [
+    # Ahead of the config columns it qualifies, where the GEMM tables put it.
+    # This tuner only enumerates FlyDSL candidates, so it always writes that.
+    TUNED_LIBTYPE_COLUMN,
+    *TUNED_RESULT_COLUMNS,
+    TUNED_BLOCK_ROWS_COLUMN,
+    *TUNED_PIPELINE_COLUMNS,
+    "splitK",
+    "us",
+    "kernelName",
+    "err_ratio",
+    "tflops",
+    "bw",
+]
+
+# Readings per shape in the compare benchmark; the gate keeps the fastest.
+RUN_CONFIG_REPS = 3
+
+# gfx1250 (num_buffers, main_loop_unroll) every tile is timed with by default.
+DEFAULT_PIPELINES = ((2, False),)
+# gfx1250 K tile widths every tile is timed with by default.
+DEFAULT_TILE_KS = (32,)
+# gfx1250 kH x kW patch reuse settings every tile is timed with by default.
+DEFAULT_PATCHES = (False,)
+
+
+def _parse_patches(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        if item not in ("0", "1"):
+            raise ValueError(f"--patches takes 0 and/or 1, got {item!r}")
+        if (item == "1") not in out:
+            out.append(item == "1")
+    if not out:
+        raise ValueError("--patches needs at least one of 0, 1")
+    return tuple(out)
+
+
+def _parse_tile_ks(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        tk = int(item)
+        if tk < 32 or tk % 32:
+            raise ValueError(f"tile_k must be a positive multiple of 32, got {item!r}")
+        if tk not in out:
+            out.append(tk)
+    if not out:
+        raise ValueError("--tile_ks needs at least one width")
+    return tuple(out)
+
+
+def _parse_pipelines(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        nb, _, unroll = item.partition(":")
+        pair = (int(nb), unroll.strip() in ("1", "true", "True"))
+        if not 2 <= pair[0] <= 8:
+            raise ValueError(f"num_buffers must be in [2, 8], got {item!r}")
+        if pair not in out:
+            out.append(pair)
+    if not out:
+        raise ValueError("--pipelines needs at least one num_buffers:unroll pair")
+    return tuple(out)
+
+
+# Output-block widths swept for kH x kW reuse: each tile also runs with
+# block_rows = TILE_M / cols for every cols here that divides it (rows >= 2),
+# where make_im2col_plan takes the 2D block up.
+BLOCK_COLS = (32, 64, 128)
+
+# Same tolerance and reference as op_tests/test_flydsl_conv_implicit.py and the
+# GEMM tuners: computed in fp32 (bias included) and rounded to bf16 once, the
+# way the kernel accumulates and stores.
+RTOL = ATOL = 2e-2
+
+# The layout both sides of every timed call use; see the module docstring.
+LAYOUT = "NDHWC"
+
+
+# Taken from the kernel rather than restated: this is what decides npq, and a
+# tuner that sized the GEMM by its own copy would report the wrong M and hand
+# conv3d_policy the wrong shape to enumerate against.
+_out_extent = out_extent
+
+
+def _row_params(row):
+    """Normalize one CSV row into the kwargs conv3d_implicit takes."""
+    return {
+        "stride": (int(row["stride_d"]), int(row["stride_h"]), int(row["stride_w"])),
+        "padding": (int(row["pad_d"]), int(row["pad_h"]), int(row["pad_w"])),
+        "dilation": (int(row["dil_d"]), int(row["dil_h"]), int(row["dil_w"])),
+        "groups": int(row["groups"]),
+    }
+
+
+def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device=None):
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(seed)
+    x = torch.randn((n, d, h, w, c), device=device, dtype=dtypes.bf16)
+    weight = torch.randn((k, c // groups, kt, kh, kw), device=device, dtype=dtypes.bf16)
+    bias = torch.randn((k,), device=device, dtype=dtypes.fp32) if has_bias else None
+    return {"x": x, "weight": weight, "bias": bias}
+
+
+def generate_data_gfx1250(
+    n,
+    c,
+    d,
+    h,
+    w,
+    k,
+    kt,
+    kh,
+    kw,
+    groups,
+    has_bias,
+    padding,
+    out_dhw=None,
+    seed=0,
+    device=None,
+):
+    """``generate_data`` plus the operands run_conv3d_gfx1250 prepares per call.
+
+    The timed call gets them ready-made, as the GEMM and MoE tuners get their
+    quantized and shuffled operands, so ``us`` leaves out the host-side pad,
+    channel pad and weight pack; ``x``/``weight`` stay raw for the reference.
+
+    With ``out_dhw`` = (Do, Ho, Wo), ``out`` is the NDHWC result buffer every
+    candidate of the shape writes into. It is preallocated so mp_tuner can
+    NaN-fill it before each candidate (``output_keys``): an output the op
+    allocated itself can be handed the previous candidate's correct result,
+    which hides elements a kernel never writes.
+    """
+    data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed, device)
+    x_tune, w_tune, w_packed = prepare_operands_gfx1250(
+        data["x"], data["weight"], padding, groups
+    )
+    out = None
+    if out_dhw is not None:
+        out = torch.empty((n, *out_dhw, k), device=x_tune.device, dtype=dtypes.bf16)
+    data.update(x_tune=x_tune, w_tune=w_tune, w_packed=w_packed, out=out)
+    return data
+
+
+def run_flydsl_conv3d_gfx1250(
+    x_tune,
+    w_tune,
+    w_packed,
+    bias,
+    out,
+    params,
+    tile,
+    wgm,
+    splitk,
+    block_rows,
+    num_buffers=2,
+    main_loop_unroll=False,
+    tile_k=32,
+    patch=False,
+):
+    # Pin the final legal split-K recorded in the candidate metadata and CSV.
+    del wgm
+    return run_conv3d_gfx1250(
+        x_tune,
+        w_tune,
+        bias=bias,
+        stride=params["stride"],
+        padding=0,
+        dilation=params["dilation"],
+        groups=params["groups"],
+        padding_mode="zeros",
+        tile=tile,
+        splitk=splitk,
+        block_rows=block_rows,
+        input_layout="NDHWC",
+        output_layout="NDHWC",
+        packed_weight=w_packed,
+        out=out,
+        num_buffers=num_buffers,
+        main_loop_unroll=main_loop_unroll,
+        tile_k=tile_k,
+        patch_reuse=patch,
+    )
+
+
+def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=1):
+    # splitk is pinned rather than re-derived by the dispatch, so the CSV column
+    # is the value that was timed and AOT compiles the artifact the runtime asks
+    # for.
+    return flydsl_conv_implicit(
+        x,
+        weight,
+        bias=bias,
+        tile=tile,
+        wgm=wgm,
+        block_rows=block_rows,
+        splitk=splitk,
+        input_layout=LAYOUT,
+        output_layout=LAYOUT,
+        **params,
+    )
+
+
+def conv3d_ref(x, weight, bias, params):
+    """fp32 ``F.conv3d`` on an NDHWC ``x``, returned NDHWC, contiguous, in x's dtype.
+
+    Contiguous and in the candidate's own shape: mp_tuner reshapes a result
+    whose shape differs from the reference by a flat view, which would compare
+    an NDHWC output against NCDHW memory without failing.
+    """
+    y = F.conv3d(
+        x.permute(0, 4, 1, 2, 3).float(),
+        weight.float(),
+        bias=bias.float() if bias is not None else None,
+        **params,
+    )
+    return y.permute(0, 2, 3, 4, 1).to(x.dtype).contiguous()
+
+
+def strict_compare(ref, res, msg="", printLog=False):
+    """1.0 if any element is outside RTOL/ATOL, else 0.0.
+
+    mp_tuner rounds the error ratio to 4 decimals, so a plain ratio under 5e-5
+    -- thousands of wrong elements on the larger VAE layers -- would pass
+    errRatio=0.
+    """
+    bad = int((~torch.isclose(res, ref, rtol=RTOL, atol=ATOL)).sum().item())
+    if bad and printLog:
+        logger.info(f"{msg}{bad} of {ref.numel()} elements outside tolerance")
+    return 1.0 if bad else 0.0
+
+
+def _top_tiles(profile_csv, topk):
+    """``{shape_key: [(tile_m, tile_n, wave_m, wave_n, block_rows), ...]}``.
+
+    The ``topk`` fastest distinct tiles per shape among a profile CSV's correct
+    (``err_ratio == 0``), timed gfx1250 rows.
+    """
+    df = pd.read_csv(profile_csv)
+    df.columns = df.columns.str.strip()
+    df = df[df["gfx"].astype(str).str.startswith("gfx1250")]
+    us = pd.to_numeric(df["us"], errors="coerce")
+    err = pd.to_numeric(df["err_ratio"], errors="coerce")
+    df = df[(us > 0) & (us < float("inf")) & (err == 0)].assign(_us=us)
+    out = {}
+    for row in df.sort_values("_us", kind="stable").itertuples(index=False):
+        key = _shape_key(tuple(getattr(row, c) for c in SHAPE_KEYS))
+        tile = tuple(
+            int(getattr(row, c))
+            for c in ("tile_m", "tile_n", "wave_m", "wave_n", TUNED_BLOCK_ROWS_COLUMN)
+        )
+        tiles = out.setdefault(key, [])
+        if tile not in tiles and len(tiles) < topk:
+            tiles.append(tile)
+    return out
+
+
+def _shape_key(row):
+    """One row's shape identity, normalized so both CSVs hash the same way."""
+    return tuple(
+        _parse_tuned_bool(v) if c == "bias" else int(v) for c, v in zip(SHAPE_KEYS, row)
+    )
+
+
+class Conv3dTuner(TunerCommon):
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **TunerCommon.ARG_DEFAULTS,
+        "sort": True,
+        # The canonical pair, as every other tuner defaults to. Both ship
+        # header-only, so a run without -i finds no shapes rather than tuning
+        # someone else's; a model's own table is passed explicitly.
+        "untune_file": "aiter/configs/bf16_untuned_conv3d.csv",
+        "tune_file": f"{AITER_CONFIG_CONV3D_BF16}",
+        "config_env_name": "AITER_CONFIG_CONV3D_BF16",
+        # Zero: a nonzero err_ratio is a wrong config, and the op test bars at 0.
+        "errRatio": 0.0,
+    }
+
+    def get_cu_num(self):
+        """CU stamp for tuned rows: ``chip_info.get_cu_num()``, matching runtime lookup."""
+        from aiter.jit.utils.chip_info import get_cu_num as _chip_get_cu_num
+
+        return _chip_get_cu_num()
+
+    def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--max_configs",
+            type=int,
+            default=96,
+            help="cap on enumerated candidates per shape (baseline tiles and the "
+            "tile the shape would borrow are always added on top, so the real "
+            "count is slightly higher)",
+        )
+        self.parser.add_argument(
+            "--pipelines",
+            type=_parse_pipelines,
+            default=DEFAULT_PIPELINES,
+            help="gfx1250: comma list of num_buffers:main_loop_unroll pairs every "
+            "tile is timed with, e.g. 2:0,3:0,3:1,4:0 (the gfx1250 GEMM tuner "
+            "sweeps stages and main_loop_unroll the same way). Default 2:0.",
+        )
+        self.parser.add_argument(
+            "--tile_ks",
+            type=_parse_tile_ks,
+            default=DEFAULT_TILE_KS,
+            help="gfx1250: comma list of K tile widths (channels per K step, "
+            "multiples of 32) every tile and pipeline is timed with; a width "
+            "that does not divide a shape's padded channels is skipped there. "
+            "Default 32.",
+        )
+        self.parser.add_argument(
+            "--patches",
+            type=_parse_patches,
+            default=DEFAULT_PATCHES,
+            help="gfx1250: 0, 1 or 0,1 -- time every tile without and/or with "
+            "kH x kW patch reuse (one TDM input patch per (kT, channel) group "
+            "shared by all kH * kW taps); 1 is skipped where the shape cannot "
+            "take it (kH * kW == 1, H/W stride > 1, split-K). Default 0.",
+        )
+        self.parser.add_argument(
+            "--tiles_from",
+            default="",
+            help="gfx1250: a profile CSV (-o2) of an earlier run; each shape then "
+            "sweeps --pipelines over only its --tiles_topk fastest correct tiles "
+            "there instead of the policy's candidates",
+        )
+        self.parser.add_argument(
+            "--tiles_topk",
+            type=int,
+            default=4,
+            help="tiles per shape taken from --tiles_from",
+        )
+
+    # -------------------------------------------------------------------
+    # Shape bookkeeping
+    # -------------------------------------------------------------------
+
+    def _gemm_dims(self, keys):
+        """(M, N, K) of the implicit GEMM this conv lowers to."""
+        kv = dict(zip(self.keys, keys))
+        do = _out_extent(
+            int(kv["D"]),
+            int(kv["pad_d"]),
+            int(kv["dil_d"]),
+            int(kv["kT"]),
+            int(kv["stride_d"]),
+        )
+        ho = _out_extent(
+            int(kv["H"]),
+            int(kv["pad_h"]),
+            int(kv["dil_h"]),
+            int(kv["kH"]),
+            int(kv["stride_h"]),
+        )
+        wo = _out_extent(
+            int(kv["W"]),
+            int(kv["pad_w"]),
+            int(kv["dil_w"]),
+            int(kv["kW"]),
+            int(kv["stride_w"]),
+        )
+        groups = int(kv["groups"])
+        m = int(kv["N"]) * do * ho * wo
+        n = int(kv["K"]) // groups
+        k = (int(kv["C"]) // groups) * int(kv["kT"]) * int(kv["kH"]) * int(kv["kW"])
+        return m, n, k, (do, ho, wo)
+
+    def _drop_matmul_fast_path(self):
+        if self.untunedf is None or self.untunedf.empty:
+            return
+        skip = self.untunedf.apply(_is_matmul_fast_path, axis=1)
+        n_matmul = int(skip.sum())
+        if n_matmul:
+            logger.info(
+                f"skipping {n_matmul} 1x1 stride-1 pad-0 shapes "
+                "(torch.matmul fast path; no kernel to tune)"
+            )
+            self.untunedf = self.untunedf[~skip].reset_index(drop=True)
+
+    def _check_shapes_expressible(self):
+        """Reject a row no candidate could run, naming the row rather than the task.
+
+        Nothing downstream says which row is at fault: the policy's last
+        relaxation still returns candidates for an impossible shape, and every
+        one of them then dies on ``_conv3d_impl``'s own assert inside an mp
+        worker, which surfaces as a screen of failed tasks.
+        """
+        if self.untunedf is None or self.untunedf.empty:
+            return
+        bad = []
+        suspect = []
+        for _, row in self.untunedf.iterrows():
+            keys = tuple(row[k] for k in self.keys)
+            kv = dict(zip(self.keys, keys))
+            c, k, groups = int(kv["C"]), int(kv["K"]), int(kv["groups"])
+            shape = ", ".join(f"{col}={row[col]}" for col in SHAPE_KEYS)
+            # Checked before the extents because _gemm_dims floor-divides by
+            # groups: an indivisible channel count would hand conv3d_policy a
+            # GEMM N that the convolution does not have, and enumerate against
+            # it, rather than failing here.
+            if groups < 1 or c % groups or k % groups:
+                bad.append(
+                    f"  {shape} -> groups={groups} must be >= 1 and divide both "
+                    f"C={c} and K={k}"
+                )
+                continue
+            # Also ahead of the extents: _gemm_dims divides by the stride, and a
+            # negative pad or zero dilation reaches _conv3d_impl's asserts intact.
+            p = _row_params(kv)
+            if min(p["stride"]) < 1 or min(p["dilation"]) < 1 or min(p["padding"]) < 0:
+                bad.append(
+                    f"  {shape} -> stride {p['stride']} and dilation "
+                    f"{p['dilation']} must be >= 1, padding {p['padding']} >= 0"
+                )
+                continue
+            try:
+                _parse_tuned_bool(kv["bias"])
+            except ValueError as exc:
+                bad.append(f"  {shape} -> bias: {exc}")
+                continue
+            _, _, _, extents = self._gemm_dims(keys)
+            if min(extents) < 1:
+                bad.append(
+                    f"  {shape} -> output {extents}: the dilated filter is larger "
+                    f"than the padded input"
+                )
+            # Legal, so only warned: a 2D conv written as kT=1, D=1 with pad_d
+            # left over tunes a depth-(1 + 2*pad_d) problem whose padded slices
+            # are bias only. Not rejected, because the row has to match what the
+            # model really calls with to be looked up at all.
+            elif int(row["kT"]) == 1 and int(row["D"]) == 1 and int(row["pad_d"]) > 0:
+                suspect.append(f"  {shape} -> output depth {extents[0]}")
+        if suspect:
+            logger.warning(
+                "row(s) with kT=1, D=1 but pad_d>0 tune a depth > 1 problem; "
+                "clear pad_d if a 2D conv was meant:\n" + "\n".join(suspect)
+            )
+        if bad:
+            raise ValueError(
+                "untuned CSV has row(s) this tuner cannot express:\n" + "\n".join(bad)
+            )
+
+    def pre_process(self, args):
+        """Load untuned shapes, stamp the device keys, drop already-tuned rows."""
+        _check_supported_arch()
+        self._untune_file = args.untune_file
+        if args.all:
+            self.get_retune_gemm_list(args)
+            self._drop_matmul_fast_path()
+            self._check_shapes_expressible()
+            return
+        self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+        self.untunedf["gfx"] = self.get_gfx()
+        self.untunedf["cu_num"] = self.get_cu_num()
+        self.untunedf = self.untunedf[self.keys]
+        self._drop_matmul_fast_path()
+        self._check_shapes_expressible()
+        self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+        if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+            self.tunedf.insert(0, "gfx", self.get_gfx())
+        if len(self.tunedf) != 0:
+            cols = self.untunedf.columns
+            mask = self.untunedf.apply(tuple, axis=1).isin(
+                self.tunedf[cols].apply(tuple, axis=1)
+            )
+            if args.verbose:
+                logger.info("skipped tuned shapes:")
+                print(self.untunedf[mask])
+            self.untunedf = self.untunedf[~mask].reset_index(drop=True)
+
+    # -------------------------------------------------------------------
+    # Tuning
+    # -------------------------------------------------------------------
+
+    def _shape_tasks(
+        self,
+        keys,
+        max_configs,
+        run_kwargs=None,
+        pipelines=DEFAULT_PIPELINES,
+        tiles=None,
+        tile_ks=DEFAULT_TILE_KS,
+        patches=DEFAULT_PATCHES,
+    ):
+        """Candidate tasks for one shape.
+
+        gfx1250 times every tile with each ``pipelines`` pair, each ``tile_ks``
+        width and each ``patches`` setting that fits the shape; ``tiles``, as
+        ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
+        tile candidates (see ``--tiles_from``).
+        """
+        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
+
+        kv = dict(zip(self.keys, keys))
+        n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
+        k, kt, kh, kw = (int(kv[x]) for x in ("K", "kT", "kH", "kW"))
+        groups = int(kv["groups"])
+        has_bias = _parse_tuned_bool(kv["bias"])
+        params = _row_params(kv)
+        m_gemm, n_gemm, _k_gemm, out_dhw = self._gemm_dims(keys)
+        gfx = self.get_gfx()
+        is_1250 = str(gfx).startswith("gfx1250")
+
+        # crs is built from the *padded* per-group channel count, matching what
+        # the kernel computes; splitK divisibility depends on it.
+        # gfx1250 aligns C/groups to 32 (CGP_ALIGN); gfx950 uses LDG_VEC via
+        # _pad_channels.
+        if is_1250:
+            from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
+
+            cgp = (c // groups + CGP_ALIGN - 1) // CGP_ALIGN * CGP_ALIGN
+        else:
+            cgp = _pad_channels(c // groups)
+        crs = cgp * kt * kh * kw
+
+        def splitk_for(tile, block_rows):
+            # Use the policy's CU count and the runtime's final legality gate.
+            if is_1250:
+                return _resolve_splitk_gfx1250(
+                    None,
+                    m_gemm,
+                    crs,
+                    k,
+                    None,
+                    tile,
+                    groups,
+                    block_rows,
+                    out_dhw[1],
+                    out_dhw[2],
+                    num_cu=self.get_cu_num(),
+                )
+            return _resolve_splitk(
+                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
+            )
+
+        def plan_for(tile, block_rows):
+            param = _implicit_param_from_problem(
+                n, c, d, h, w, k, kt, kh, kw,
+                *params["stride"], *params["padding"], *params["dilation"],
+                groups, has_bias, splitk_for(tile, block_rows), tile, 1, True,
+                block_rows=block_rows,
+            )  # fmt: skip
+            try:
+                return make_im2col_plan(
+                    param, make_conv_geometry(param), make_tile_config(tile)
+                )
+            except AssertionError:
+                return None  # the gather cannot reach this tile's span
+
+        @functools.cache
+        def block_rows_options(tile):
+            # (block_rows, plan): 1 (consecutive rows), plus every 2D output
+            # block the plan takes up. Cached: the policy's relaxation passes and
+            # the candidate filter below ask for the same tiles.
+            opts = [(1, plan_for(tile, 1))]
+            for cols in BLOCK_COLS:
+                rows = tile[0] // cols
+                if rows >= 2 and rows * cols == tile[0]:
+                    plan = plan_for(tile, rows)
+                    if plan is not None and plan.kh_reuse:
+                        opts.append((rows, plan))
+            return opts
+
+        def lds_bytes_fn(tile):
+            # The LDS the runtime will allocate for this tile on this shape:
+            # the kW / kH x kW reuse layouts differ from the default path's.
+            sizes = [
+                plan_lds_bytes(p) for _, p in block_rows_options(tile) if p is not None
+            ]
+            return min(sizes) if sizes else float("inf")
+
+        if is_1250 and tiles is not None:
+            candidates = [(tm, tn, wm, wn, 1, br) for tm, tn, wm, wn, br in tiles]
+        elif is_1250:
+            # The gfx1250 policy already sweeps block_rows per tile.
+            candidates = get_flydsl_conv3d_configs_gfx1250(
+                m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+            )
+        else:
+            configs = get_flydsl_conv3d_configs(
+                m_gemm,
+                n_gemm,
+                groups,
+                self.get_cu_num(),
+                max_configs=max_configs,
+                lds_bytes_fn=lds_bytes_fn,
+            )
+            candidates = [
+                (*cfg5, r)
+                for cfg5 in configs
+                for r, plan in block_rows_options(tuple(cfg5[:4]))
+                if r == 1 or plan_lds_bytes(plan) <= max_lds_bytes()
+            ]
+        # BASELINE_TILES covers the heuristic default but not a borrowed one: a
+        # tile tuned at another resolution of this layer can fall outside this
+        # npq's max_configs cut, and the runtime serves it until this row exists.
+        borrowed = (
+            None
+            if tiles is not None
+            else _borrow_tuned_tile(
+                (gfx, self.get_cu_num()),
+                _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
+            )
+        )
+        if borrowed is not None:
+            b = (*borrowed[0], borrowed[1], borrowed[3])
+            legal = not is_1250 or is_legal_tile_gfx1250(*b[:4], b[5])
+            if legal and b not in candidates:
+                candidates.append(b)
+
+        tasks = []
+        for tile_m, tile_n, wave_m, wave_n, wgm, block_rows in candidates:
+            tile = (tile_m, tile_n, wave_m, wave_n)
+            # splitK is derived, not swept. A split only buys occupancy where
+            # the M/N grid alone cannot fill the device, and measured against
+            # the heuristic's own 3/4*CU bar that is 1 of the 76 shipped rows --
+            # the rest would spend tuning time confirming splitK=1 while paying
+            # an fp32 staging buffer and an atomic reduce to do it. It is still
+            # pinned rather than re-derived at dispatch, so the column records
+            # the value that ran and AOT compiles the artifact the runtime asks
+            # for.
+            sk = splitk_for(tile, block_rows)
+            shape_args = (n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
+            if is_1250:
+                base_name = tile_kernel_name_gfx1250(
+                    tile_m, tile_n, wave_m, wave_n, block_rows
+                )
+                gen = generate_data_gfx1250
+                gen_args = (*shape_args, params["padding"], tuple(out_dhw))
+                fn = run_flydsl_conv3d_gfx1250
+                fn_keys = ["x_tune", "w_tune", "w_packed", "bias", "out"]
+                output_keys = ("out",)
+                # The runtime clamps num_buffers to LDS and the K-tile count;
+                # time and record the value that runs, once.
+                sh, sw = params["stride"][1:]
+                dh, dw = params["dilation"][1:]
+                variants = []
+                for tk, (nb0, unroll), patch in itertools.product(
+                    tile_ks, pipelines, patches
+                ):
+                    if tile_k_unsupported_gfx1250(tk, cgp, sk) is not None:
+                        continue
+                    tiles_per_split = (crs // tk) // max(1, sk)
+                    if patch:
+                        nb0 = min(nb0, kh * kw)
+                        if patch_unsupported_gfx1250(kh, kw, sh, sw, sk, nb0):
+                            continue
+                        unroll = False  # the patch loop unrolls the taps
+                    nb = _clamp_num_buffers(
+                        nb0,
+                        tiles_per_split,
+                        tile,
+                        block_rows,
+                        tile_k=tk,
+                        patch=(kh, kw, dh, dw) if patch else None,
+                    )
+                    if patch and nb == 2 and tk > CGP_ALIGN:
+                        # The only patch variants that spilled VGPRs on the
+                        # Wan2.1 hot layers (42 of 500); spilling is slow. The
+                        # kernel compiles them with disable-post-ra, or LLVM's
+                        # post-RA scheduler can move a last-use spill reload
+                        # above another reload of the same slot (stale data).
+                        continue
+                    # The clamp stops at 2 buffers; a wide K tile can still
+                    # overflow LDS there.
+                    if patch:
+                        lds = lds_bytes_patch(
+                            tile_m,
+                            tile_n,
+                            block_rows,
+                            kh,
+                            kw,
+                            dh,
+                            dw,
+                            num_buffers=nb,
+                            num_warps=wave_m * wave_n,
+                            tile_k=tk,
+                        )
+                    else:
+                        lds = lds_bytes_tap(tile_m, tile_n, num_buffers=nb, tile_k=tk)
+                    if lds > get_lds_capacity_bytes():
+                        continue
+                    if (nb, unroll, tk, patch) not in variants:
+                        variants.append((nb, unroll, tk, patch))
+            else:
+                base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
+                    f"_r{block_rows}" if block_rows > 1 else ""
+                )
+                gen, gen_args = generate_data, shape_args
+                fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
+                output_keys = None
+                variants = [(None, None, None, None)]
+            for nb, unroll, tk, patch in variants:
+                kname = base_name
+                fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
+                if is_1250:
+                    fn_args = (*fn_args, nb, unroll, tk, patch)
+                    if (nb, unroll) != (2, False):
+                        kname += f"_b{nb}" + ("_u" if unroll else "")
+                    if tk != CGP_ALIGN:
+                        kname += f"_k{tk}"
+                    if patch:
+                        kname += "_p"
+                info = (
+                    keys,
+                    tile_m,
+                    tile_n,
+                    wave_m,
+                    wave_n,
+                    wgm,
+                    sk,
+                    block_rows,
+                    nb,
+                    unroll,
+                    tk,
+                    patch,
+                    kname,
+                )
+                tasks.append(
+                    (
+                        info,
+                        gen,
+                        gen_args,
+                        fn,
+                        fn_args,
+                        dict(run_kwargs or {}),
+                        conv3d_ref,
+                        (["x", "weight", "bias"], params),
+                        {},
+                        None,
+                        RTOL,
+                        ATOL,
+                        strict_compare,
+                        None,  # max_abs_delta
+                        output_keys,
+                    )
+                )
+        return tasks
+
+    def tune(self, untunedf, tunedf, args):
+        run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        top_tiles = (
+            _top_tiles(args.tiles_from, args.tiles_topk) if args.tiles_from else {}
+        )
+        tasks = []
+        in_datas = []
+        for _, row in untunedf.iterrows():
+            keys = tuple(row[k] for k in self.keys)
+            tiles = None
+            if args.tiles_from:
+                tiles = top_tiles.get(_shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]))
+                if not tiles:
+                    logger.warning(
+                        f"{keys} has no correct tile in {args.tiles_from}; "
+                        "sweeping the policy's candidates instead"
+                    )
+            shape_tasks = self._shape_tasks(
+                keys,
+                args.max_configs,
+                run_kwargs,
+                args.pipelines,
+                tiles,
+                args.tile_ks,
+                args.patches,
+            )
+            if not shape_tasks:
+                logger.warning(f"no legal candidate for {keys}")
+                continue
+            m, n, k, _ = self._gemm_dims(keys)
+            logger.info(
+                f"conv3d candidates for M={m}, N={n}, K={k}: {len(shape_tasks)}"
+            )
+            tasks.extend(shape_tasks)
+            in_datas.append((len(shape_tasks), ()))
+        if not tasks:
+            return []
+        return mp_tuner(
+            tasks,
+            in_datas,
+            args.mp,
+            False,
+            True,  # shape_grouped: keep one shape's candidates on one GPU
+            args.errRatio,
+            args.timeout,
+            args.verbose,
+        )
+
+    # -------------------------------------------------------------------
+    # Results
+    # -------------------------------------------------------------------
+
+    def getKernelName(self, kernel_id):
+        return kernel_id if isinstance(kernel_id, str) else str(kernel_id)
+
+    def calculate(self, results, bpes=(2, 2, 2)):
+        """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
+
+        On gfx1250 the timed call gets prepared operands, so ``us`` is the
+        kernel alone. On gfx950 it is an end-to-end time: NDHWC in and out
+        leaves no layout transpose in it, but the entry point still runs two
+        steps outside the kernel: the weight repack, which run_perftest redoes
+        on every timed call because it rotates as many weight copies as it runs
+        iterations -- about 5.5us at the median, and up to ~40% of us on the
+        smallest rows -- and, where C/groups is not a multiple of LDG_VEC, a
+        channel pad that copies the whole input on every call -- the C=3 input
+        conv of both VAEs. Neither depends on the tile, so the ranking holds,
+        but there both figures are a floor on the kernel's own.
+        """
+        info, time, _err = results
+        if time == self.INVALID_TIME or time in (0, self.INF_TIME):
+            return 0, 0
+        keys = info[0]
+        m, n, k, (do, ho, wo) = self._gemm_dims(keys)
+        kv = dict(zip(self.keys, keys))
+        tflops = round(m * n * k * 2 / (time * 1e6), 2)
+
+        in_bpe, w_bpe, out_bpe = bpes
+        x_elems = (
+            int(kv["N"]) * int(kv["C"]) * int(kv["D"]) * int(kv["H"]) * int(kv["W"])
+        )
+        w_elems = (
+            int(kv["K"])
+            * (int(kv["C"]) // int(kv["groups"]))
+            * int(kv["kT"])
+            * int(kv["kH"])
+            * int(kv["kW"])
+        )
+        y_elems = int(kv["N"]) * int(kv["K"]) * do * ho * wo
+        moved = x_elems * in_bpe + w_elems * w_bpe + y_elems * out_bpe
+        bw = round(moved / (time * 1e-6) / 1e9, 2)
+        return tflops, bw
+
+    def result_to_df(self, results):
+        rows = []
+        for el in results:
+            info, time, err_ratio = el
+            (
+                keys,
+                tile_m,
+                tile_n,
+                wave_m,
+                wave_n,
+                wgm,
+                splitk,
+                block_rows,
+                num_buffers,
+                main_loop_unroll,
+                tile_k,
+                patch,
+                kernel_name,
+            ) = info
+            tflops, bw = self.calculate(el)
+            row = dict(zip(self.keys, keys))
+            row.update(
+                {
+                    TUNED_LIBTYPE_COLUMN: LIBTYPE_FLYDSL,
+                    "tile_m": tile_m,
+                    "tile_n": tile_n,
+                    "wave_m": wave_m,
+                    "wave_n": wave_n,
+                    "wgm": wgm,
+                    TUNED_BLOCK_ROWS_COLUMN: block_rows,
+                    "num_buffers": num_buffers,
+                    "main_loop_unroll": (
+                        None if main_loop_unroll is None else int(main_loop_unroll)
+                    ),
+                    "tile_k": tile_k,
+                    "patch": None if patch is None else int(patch),
+                    "splitK": splitk,
+                    "us": time,
+                    "kernelName": kernel_name,
+                    "err_ratio": err_ratio,
+                    "tflops": tflops,
+                    "bw": bw,
+                }
+            )
+            if len(results) == self.topk:
+                print(
+                    f"Tuning result for {str(dict(zip(self.keys, keys))).strip('{}')} "
+                    f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
+                    f"block_rows={block_rows} num_buffers={num_buffers} "
+                    f"main_loop_unroll={main_loop_unroll} tile_k={tile_k} "
+                    f"patch={patch} "
+                    f"splitK={splitk}, {time}us, "
+                    f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                )
+            rows.append(row)
+        return pd.DataFrame(rows, columns=self.columns)
+
+    def sortResults(self, tune_file, issorted, values):
+        """Keep tuned rows in the untuned CSV's order."""
+        super().sortResults(tune_file, issorted, values)
+
+        path = getattr(self, "_untune_file", None)
+        if not path or not os.path.exists(path):
+            return
+        untunedf = pd.read_csv(path)
+        untunedf.columns = untunedf.columns.str.strip()
+        tunedf = pd.read_csv(tune_file)
+        tunedf.columns = tunedf.columns.str.strip()
+        if any(c not in df.columns for df in (untunedf, tunedf) for c in SHAPE_KEYS):
+            return
+
+        order = {
+            _shape_key(row): i
+            for i, row in enumerate(untunedf[SHAPE_KEYS].itertuples(index=False))
+        }
+        rank = [
+            order.get(_shape_key(row), len(order))
+            for row in tunedf[SHAPE_KEYS].itertuples(index=False)
+        ]
+        tunedf = (
+            tunedf.assign(_rank=rank)
+            .sort_values("_rank", kind="stable")
+            .drop(columns="_rank")
+        )
+        tunedf.to_csv(tune_file, index=False)
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        old_df = self.get_tuned_gemm_list(file)
+        bad = (resultdf["us"] == self.INVALID_TIME) | (resultdf["us"] == self.INF_TIME)
+        self.failed = pd.concat([self.failed, resultdf[bad]], ignore_index=True)
+        self.success = pd.concat([self.success, resultdf[~bad]], ignore_index=True)
+        good = resultdf[~bad]
+        if not concat:
+            out = self.update_tunedf(old_df, good)
+        else:
+            out = pd.concat([old_df, good], ignore_index=True)
+        out.to_csv(file, index=False, na_rep="Null")
+
+    def _clear_op_caches(self):
+        from aiter.ops.flydsl import conv_kernels
+
+        conv_kernels._load_tuned_table.cache_clear()
+        # Built from the table above, so it goes stale with it: a borrow after
+        # the config swap would still pick among the old table's rows.
+        conv_kernels._tuned_rows_by_layer.cache_clear()
+        conv_kernels._TUNED_LOOKUP_LOGGED.clear()
+
+    def _restore_config_env(self, env_name, old_val, old_rebuild=0):
+        """Also drop what the swapped-in table left cached.
+
+        The base restores the env var only, so with ``--batch`` below the shape
+        count the next batch's pre-tune baseline would still read the previous
+        batch's candidate table.
+        """
+        from aiter.jit.core import AITER_CONFIGS
+
+        super()._restore_config_env(env_name, old_val, old_rebuild)
+        AITER_CONFIGS.get_config_file.cache_clear()
+        self._clear_op_caches()
+
+    @staticmethod
+    def _ramp_clocks(seconds=2.0):
+        """Busy-wait so pre/post-tune clocks match."""
+        a = torch.randn((4096, 4096), device="cuda", dtype=torch.bfloat16)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            for _ in range(20):
+                a = torch.mm(a, a).clamp_(-1.0, 1.0)
+            torch.cuda.synchronize()
+        del a
+        torch.cuda.empty_cache()
+
+    def run_config(self, args):
+        """Benchmark the production entry point (no explicit tile) per shape.
+
+        NDHWC in and out, the layout every candidate is timed in.
+        """
+        from aiter.test_common import run_perftest
+
+        self._clear_op_caches()
+        self._ramp_clocks()
+        results = []
+        for _, row in self.untunedf.iterrows():
+            keys = tuple(row[k] for k in self.keys)
+            kv = dict(zip(self.keys, keys))
+            n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
+            k, kt, kh, kw = (int(kv[x]) for x in ("K", "kT", "kH", "kW"))
+            groups = int(kv["groups"])
+            has_bias = _parse_tuned_bool(kv["bias"])
+            params = _row_params(kv)
+            shape = f"{n}x{c}x{d}x{h}x{w}->{k} {kt}x{kh}x{kw}"
+            # With --run_config <tuned_csv> the row carries its tuned `us`, the
+            # kernel alone on gfx1250; reported next to e2e as the MoE tuner does.
+            kernel_us = None
+            if "us" in row and pd.notna(row["us"]):
+                try:
+                    kernel_us = float(row["us"])
+                except (TypeError, ValueError):
+                    kernel_us = None
+            try:
+                data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
+                # Best of a few, not a single reading: the gate's threshold is
+                # 3%, so a one-shot measurement whose own spread exceeds that
+                # decides by noise.
+                out, us = None, float("inf")
+                for _ in range(RUN_CONFIG_REPS):
+                    out_i, us_i = run_perftest(
+                        flydsl_conv_implicit,
+                        data["x"],
+                        data["weight"],
+                        bias=data["bias"],
+                        input_layout=LAYOUT,
+                        output_layout=LAYOUT,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                        **params,
+                    )
+                    if us_i < us:
+                        out, us = out_i, us_i
+                ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
+                # Strict pass/fail: historical CSV error cannot excuse a mismatch.
+                err_ratio = strict_compare(ref, out, msg=f"run_config {shape} ")
+                # e2e: run_perftest includes the host-side pads and the weight
+                # pack, which the gfx1250 tuned us leaves out.
+                status = (
+                    "ok"
+                    if err_ratio == 0
+                    else f"mismatch:err_ratio={err_ratio:.6g}(strict_compare requires 0)"
+                )
+                results.append(
+                    {
+                        "shape": shape,
+                        "e2e_us": round(us, 4),
+                        "kernel_us": kernel_us,
+                        "status": status,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {
+                        "shape": shape,
+                        "e2e_us": -1,
+                        "kernel_us": kernel_us,
+                        "status": f"error:{exc}",
+                    }
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
+
+
+if __name__ == "__main__":
+    tuner = Conv3dTuner(
+        "bf16_tuned_conv3d",
+        KEYS,
+        RESULT_LIST,
+        description="FlyDSL implicit-GEMM conv3d bf16 tile tuner",
+    )
+    args = tuner.parse_args()
+    # tune_summary() already exits non-zero when a shape failed or went untuned.
+    tuner.run(args, False)

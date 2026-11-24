@@ -9,12 +9,22 @@ static constexpr int nextPow2(unsigned int num)
   return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }
 
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
 extern "C" __attribute__((visibility("default")))
+#endif
 int getPaddedM(int M, int N, int K, int gl) {
     int padded_m = M;
     // granularity level, gl = 0, Fine-grained search
     if (gl == 0) {
-        if(M <= 256)
+        // below one 16-row step the next power of two is the finer bucket: a
+        // tuned M = 4 / 8 row, not M = 16, serves M = 3 / 5..7
+        if(M > 0 && M < 16)
+        {
+            padded_m = nextPow2(M);
+        }
+        else if(M <= 256)
         {
             padded_m = (M + 15) / 16 * 16;
         }

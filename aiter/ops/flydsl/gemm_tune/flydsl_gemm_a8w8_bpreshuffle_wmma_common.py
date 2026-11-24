@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 NAME_PREFIX = "flydsl_bpreshuffle_wmma"
 
 WMMA = 16  # WMMA M/N tile granularity
-LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
+LDS_BYTES = get_lds_capacity_bytes(get_gfx())
 _MAX_WARP_TILE = 128
 _MAX_BLOCK_THREADS = 1024  # m_warp * n_warp * WAVE(32)
 
@@ -135,7 +135,9 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
-    if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
+    # K=128 with two buffers needs no steady-loop iteration.
+    min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
+    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).

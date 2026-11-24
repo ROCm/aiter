@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "deepgemm.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     DEEPGEMM_PYBIND;
 }

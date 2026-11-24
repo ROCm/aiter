@@ -208,6 +208,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
     using D_A = typename T::D_A;
     using D_B = typename T::D_B;
     using D_C = typename T::D_C;
+    using D_WS = typename T::D_WS;
+    using D_STORE = std::conditional_t<IS_SPLITK, D_WS, D_C>;
     using D_ACC = typename T::D_ACC;
 
     static_assert(T::BLOCK_SIZE == 256);
@@ -274,7 +276,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
         ((kargs.n - col) * kargs.stride_b - k_start) * sizeof(D_B));
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
+            return make_gmem(opus_gfx942_uniform_ws_ptr<D_WS>(kargs.ptr_ws)
                              + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id * kargs.stride_ws_batch
                              + (size_t)row * kargs.stride_ws
@@ -300,7 +302,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
     // 136 bf16 columns keeps C-stage rows 16B aligned while avoiding the
     // slower 128-column LDS drain pattern on this shape.
     constexpr int C_LDS_STRIDE = T::HALF_B_N + 8;
-    constexpr int c_stage_byte = T::HALF_B_M * C_LDS_STRIDE * sizeof(D_C);
+    constexpr int c_stage_byte = T::HALF_B_M * C_LDS_STRIDE * sizeof(D_STORE);
     constexpr int smem_bytes = ab_stage_byte > c_stage_byte ? ab_stage_byte : c_stage_byte;
     static_assert(smem_bytes <= 64 * 1024);
 
@@ -568,10 +570,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
     };
 
     auto read_acc_for_store = [](const float16_acc* acc) {
-        if constexpr (std::is_same_v<D_C, __bf16>) {
+        if constexpr (std::is_same_v<D_STORE, __bf16>) {
             return agpr_to_bf16_vgpr_trunc<4>(acc);
         } else {
-            return cast<D_C>(agpr_to_vgpr<4>(acc));
+            return cast<D_STORE>(agpr_to_vgpr<4>(acc));
         }
     };
 
@@ -591,17 +593,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
     auto do_full_tile_store = [&]() {
         using LT_C = layout_load_traits<decltype(u_gc), T::VEC_C>;
         constexpr auto r_elem_c = LT_C::r_elem;
-        constexpr index_t c_chunk = T::VEC_C * vector_traits<D_C>::size();
+        constexpr index_t c_chunk = T::VEC_C * vector_traits<D_STORE>::size();
         constexpr int HALF_TILE_ELEMS = T::HALF_B_M * T::HALF_B_N;
         constexpr int THREAD_TILE_VEC = HALF_TILE_ELEMS / T::BLOCK_SIZE;
         static_assert(THREAD_TILE_VEC * T::BLOCK_SIZE == HALF_TILE_ELEMS);
-        constexpr int MAX_STORE_VEC = 16 / sizeof(D_C);
+        constexpr int MAX_STORE_VEC = 16 / sizeof(D_STORE);
         constexpr int STORE_VEC = THREAD_TILE_VEC < MAX_STORE_VEC ? THREAD_TILE_VEC : MAX_STORE_VEC;
         static_assert(THREAD_TILE_VEC % STORE_VEC == 0);
         constexpr int STORE_ITERS = THREAD_TILE_VEC / STORE_VEC;
         constexpr int LDS_STRIDE = C_LDS_STRIDE;
 
-        smem<D_C> s_c = make_smem(reinterpret_cast<D_C*>(smem_storage));
+        smem<D_STORE> s_c = make_smem(reinterpret_cast<D_STORE*>(smem_storage));
         auto u_lds_c = partition_layout_c<T::VEC_C>(mma,
             opus::make_tuple(opus::number<LDS_STRIDE>{}, 1_I), p_coord_c);
         auto offsets_lds = layout_to_offsets<T::VEC_C>(u_lds_c);
@@ -626,7 +628,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
         auto store_one_quadrant = [&](auto& vc, int hm, int hn) {
             #pragma unroll
             for (index_t i = 0; i < r_elem_c.value; i++) {
-                vector_t<D_C, c_chunk> chunk;
+                vector_t<D_STORE, c_chunk> chunk;
                 #pragma unroll
                 for (index_t j = 0; j < c_chunk; j++) {
                     chunk[j] = vc[i * c_chunk + j];

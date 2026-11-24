@@ -1,0 +1,20 @@
+{
+    "M_LEQ_2048": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "num_warps": 8,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
+    },
+    "any": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "num_warps": 8,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
+    }
+}

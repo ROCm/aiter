@@ -64,8 +64,37 @@ def make_generator(seed, device="cuda"):
 # --------------------------------------------------------------------------- #
 # DATA
 # --------------------------------------------------------------------------- #
-def _sample_f32(shape, dist, gen, *, lo, hi, device):
-    """Sample an f32 tensor for the requested continuous DATA distribution."""
+# Cap on the f32 staging buffer. The low-precision buffers are built by sampling
+# f32 and narrowing, so a perf shape like (1048576, 16384) would ask for a single
+# 64 GiB intermediate before anything shrinks. Generate it in row chunks instead.
+_STAGE_ELEMS = 1 << 28  # 256M f32 = 1 GiB per chunk
+
+
+def _row_chunks(rows, cols):
+    """Row slices whose f32 staging stays around _STAGE_ELEMS elements."""
+    step = max(_STAGE_ELEMS // max(cols, 1), 1)
+    for start in range(0, rows, step):
+        yield start, min(start + step, rows)
+
+
+def _trig_phase(dist, gen, device):
+    """Draw trig's phase once, outside the chunk loop.
+
+    Sampling it per chunk would both consume the generator a chunk-count-
+    dependent number of times and make the pattern depend on how the rows were
+    split -- same seed, different buffer.
+    """
+    if dist != "trig":
+        return None
+    return torch.rand(1, generator=gen, device=device).item() * (2.0 * math.pi)
+
+
+def _sample_f32(shape, dist, gen, *, lo, hi, device, phase=None, idx_offset=0):
+    """Sample an f32 tensor for the requested continuous DATA distribution.
+
+    ``idx_offset`` is the flat index this chunk starts at, so a row-chunked
+    caller reproduces the same trig pattern as a single full-size call.
+    """
     if dist == "uniform":
         return torch.empty(shape, dtype=torch.float32, device=device).uniform_(
             lo, hi, generator=gen
@@ -80,8 +109,11 @@ def _sample_f32(shape, dist, gen, *, lo, hi, device):
         n = 1
         for s in shape:
             n *= s
-        idx = torch.arange(n, dtype=torch.float32, device=device)
-        phase = torch.rand(1, generator=gen, device=device).item() * (2.0 * math.pi)
+        if phase is None:
+            phase = _trig_phase(dist, gen, device)
+        idx = torch.arange(
+            idx_offset, idx_offset + n, dtype=torch.float32, device=device
+        )
         return (2.0 * torch.sin(0.017 * idx + phase)).reshape(shape)
     raise ValueError(f"data dist {dist!r} is not continuous; use fill_* dispatch")
 
@@ -102,8 +134,22 @@ def fill_fp4(shape, dist, gen, *, uniform=FP4_UNIFORM, device="cuda"):
     # Local import: fp4_utils pulls in triton; keep module import cheap.
     from aiter.utility import fp4_utils
 
-    v = _sample_f32(shape, dist, gen, lo=uniform[0], hi=uniform[1], device=device)
-    return fp4_utils.f32_to_mxfp4(v).view(torch.uint8)
+    out = torch.empty((rows, cols // 2), dtype=torch.uint8, device=device)
+    phase = _trig_phase(dist, gen, device)
+    for r0, r1 in _row_chunks(rows, cols):
+        v = _sample_f32(
+            (r1 - r0, cols),
+            dist,
+            gen,
+            lo=uniform[0],
+            hi=uniform[1],
+            device=device,
+            phase=phase,
+            idx_offset=r0 * cols,
+        )
+        out[r0:r1] = fp4_utils.f32_to_mxfp4(v).view(torch.uint8)
+        del v
+    return out
 
 
 def fill_fp8(shape, dist, gen, *, uniform=FP8_UNIFORM, device="cuda"):
@@ -119,8 +165,27 @@ def fill_fp8(shape, dist, gen, *, uniform=FP8_UNIFORM, device="cuda"):
         b[b == _E4M3_NAN_POS] = 0x00  # +NaN -> +0
         b[b == _E4M3_NAN_NEG] = 0x80  # -NaN -> -0
         return b.view(FP8_E4M3)
-    v = _sample_f32(shape, dist, gen, lo=uniform[0], hi=uniform[1], device=device)
-    return v.to(FP8_E4M3)
+    if len(shape) != 2:
+        v = _sample_f32(shape, dist, gen, lo=uniform[0], hi=uniform[1], device=device)
+        return v.to(FP8_E4M3)
+
+    rows, cols = shape
+    out = torch.empty(shape, dtype=FP8_E4M3, device=device)
+    phase = _trig_phase(dist, gen, device)
+    for r0, r1 in _row_chunks(rows, cols):
+        v = _sample_f32(
+            (r1 - r0, cols),
+            dist,
+            gen,
+            lo=uniform[0],
+            hi=uniform[1],
+            device=device,
+            phase=phase,
+            idx_offset=r0 * cols,
+        )
+        out[r0:r1] = v.to(FP8_E4M3)
+        del v
+    return out
 
 
 # --------------------------------------------------------------------------- #

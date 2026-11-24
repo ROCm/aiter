@@ -17,11 +17,16 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 from mori.shmem import mori_shmem_create_tensor
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+from ..communication_ops_host_utils import build_p2p_table
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
     make_dispatch_jit,
 )
+from .kernels_common import ceildiv
+from .tensor_shim import _preload_compiled
 
 # Reject unsupported token dtypes at construction, not deep in JIT codegen.
 _SUPPORTED_TOK_DTYPES = (
@@ -33,6 +38,8 @@ _SUPPORTED_TOK_DTYPES = (
 )
 
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
+# "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
+# (mega_moe_gfx1250/recipe.py).
 _SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
@@ -47,8 +54,16 @@ _DEFAULT_COMBINE_WARP_NUM = 8
 
 logger = logging.getLogger(__name__)
 
-# Per-shape tuning JSONs (schema: flydsl_{arch}_{model}_{kernel}_ep{n}.json).
-_TUNING_CONFIGS_DIR = Path(__file__).resolve().parent / "mega_moe_tuning_config"
+
+def _zeroed_sym(shape, dtype):
+    """A zeroed mori symmetric tensor."""
+    t = mori_shmem_create_tensor(shape, dtype)
+    t.zero_()
+    return t
+
+
+# Launch-geometry tuned CSV lives under ``aiter/configs/`` and is resolved via
+# ``AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE``.
 
 
 @functools.cache
@@ -138,36 +153,17 @@ def _detect_gpu_model(device_index=0):
 def resolve_tuning_config_path(
     ep_size, *, kernel_type="IntraNode", gpu_arch=None, gpu_model=None
 ):
-    if not _TUNING_CONFIGS_DIR.is_dir():
-        return None
-    if gpu_arch is None:
-        try:
-            gpu_arch = str(get_rocm_arch() or "")
-        except Exception:  # noqa: BLE001
-            gpu_arch = None
-    if gpu_model is None:
-        gpu_model = _detect_gpu_model()
-    suffix = f"_{kernel_type}_ep{ep_size}.json"
-    candidates = [
-        p for p in _TUNING_CONFIGS_DIR.glob(f"flydsl_*{suffix}") if p.is_file()
-    ]
-    if not candidates:
-        return None
+    """Resolved tuned CSV path (``kernel_type`` / ``ep_size`` kept for API compat)."""
+    del ep_size, kernel_type
+    from aiter.jit.core import AITER_CONFIGS
 
-    def _score(p):
-        n = p.name
-        return (
-            1 if (gpu_arch and gpu_arch in n) else 0,
-            1 if (gpu_model and gpu_model in n) else 0,
-        )
-
-    candidates.sort(key=lambda p: (_score(p), p.name), reverse=True)
-    return candidates[0]
+    path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
+    return path if path.is_file() else None
 
 
 def build_geometry_tuning_table_for_config(cfg, path=None):
-    """Build a :class:`GeometryTuningTable` for ``cfg``'s shape (tuning JSON
-    auto-resolved from ``cfg.world_size`` when ``path`` omitted); None on miss."""
+    """Build a :class:`GeometryTuningTable` for ``cfg``'s shape (tuning CSV
+    auto-resolved when ``path`` omitted); None on miss."""
     if path is None:
         path = resolve_tuning_config_path(cfg.world_size)
     if path is None or not Path(path).is_file():
@@ -176,8 +172,15 @@ def build_geometry_tuning_table_for_config(cfg, path=None):
         dispatch_dtype_name = dtype_to_tuning_name(cfg.dispatch_dtype)
     except ValueError:
         return None
+    try:
+        gfx = str(get_rocm_arch() or "")
+    except Exception:  # noqa: BLE001
+        gfx = None
     table = GeometryTuningTable.from_tuning_file(
         str(path),
+        ep_size=cfg.world_size,
+        gfx=gfx.split(":")[0] if gfx else None,
+        gpu_model=_detect_gpu_model(),
         dtype=dispatch_dtype_name,
         hidden_dim=cfg.hidden_dim,
         zero_copy=cfg.zero_copy,
@@ -264,6 +267,7 @@ class FlyDSLDispatchCombineConfig:
     gm_unit_size: int = 0
     gm_scheme: str = "fixedslot"
     gm_compact: bool = False
+    gm_indexed_payload: bool = False
 
     def __post_init__(self):
         if self.data_type is not None and (
@@ -363,12 +367,67 @@ class FlyDSLDispatchCombineConfig:
         return self.scale_dim * self.scale_type_size
 
 
-def build_p2p_table(t, rank, npes, dev):
-    """i64[npes] table of intra-node P2P pointers to ``t`` on every peer (self incl.)."""
-    tbl = torch.zeros(npes, dtype=torch.int64, device=dev)
-    for pe in range(npes):
-        tbl[pe] = ms.shmem_ptr_p2p(t.data_ptr(), rank, pe)
-    return tbl
+def group_major_capacity(
+    *,
+    world_size,
+    hidden_dim,
+    max_tok_per_rank,
+    experts_per_rank,
+    topk,
+    data_type,
+    unit_size,
+    scale_dim,
+    scale_type_size=1,
+    compact=False,
+    indexed_payload=False,
+):
+    """Row capacities of a group-major op: (num_valid_max, payload_rows_max, row_bytes, scale_n_i32)."""
+    # Fixed-slot capacity covers the all-to-one routing case.
+    ll_cap = ceildiv(world_size * max_tok_per_rank, unit_size) * unit_size
+    # Compact fanout may materialize the shared pair as two independently
+    # padded expert sections in addition to every normal expert section.
+    if compact:
+        num_valid_max = (
+            world_size * max_tok_per_rank * topk + (experts_per_rank + 2) * unit_size
+        )
+    else:
+        num_valid_max = experts_per_rank * ll_cap + 256
+    # Route metadata remains expert-major.  Activations and scales use one
+    # deterministic row per (source rank, source token), plus a sentinel.
+    payload_rows_max = (
+        world_size * max_tok_per_rank + 1 if indexed_payload else num_valid_max
+    )
+    scale_bytes = scale_dim * scale_type_size
+    scale_n_i32 = ceildiv(scale_bytes, 4)
+    return (
+        int(num_valid_max),
+        int(payload_rows_max),
+        _token_bytes_for(data_type, hidden_dim),
+        scale_n_i32,
+    )
+
+
+class GroupMajorPayloadArena:
+    """Symmetric payload storage shared by group-major ops whose calls never overlap.
+
+    Holds the activation rows, their scales, the route weights and the source
+    map -- data every MegaMoE route rewrites or masks before it reads it and
+    finishes reading before its call's closing all-rank barrier, so one call's
+    route can reuse what another route's earlier call left there. Counters,
+    epochs and ready flags are not shared.
+    """
+
+    def __init__(self, capacities):
+        """``capacities``: the group_major_capacity() of every op that will view this arena."""
+        self.rx_bytes = max(rows * row_bytes for _, rows, row_bytes, _ in capacities)
+        self.scale_i32 = max(
+            max(1, rows * scale_n) for _, rows, _, scale_n in capacities
+        )
+        self.route_rows = max(nvm for nvm, _, _, _ in capacities)
+        self.rx = _zeroed_sym((self.rx_bytes,), torch.int8)
+        self.scale = _zeroed_sym((self.scale_i32,), torch.int32)
+        self.wts = _zeroed_sym((self.route_rows,), torch.float32)
+        self.srcmap = _zeroed_sym((self.route_rows,), torch.int32)
 
 
 class FlyDSLDispatchGroupMajorOp:
@@ -388,10 +447,19 @@ class FlyDSLDispatchGroupMajorOp:
         scale_dim,
         scale_type_size=1,
         compact=False,
+        indexed_payload=False,
+        payload_arena=None,
     ):
+        """``payload_arena``: a GroupMajorPayloadArena to view instead of allocating
+        the activation, scale, route-weight and source-map buffers."""
         assert world_size <= 8
         # Compact mode uses a count-first layout without per-expert reservations.
         self.compact = bool(compact)
+        self.indexed_payload = bool(indexed_payload)
+        if self.indexed_payload and not self.compact:
+            raise ValueError(
+                "indexed payload storage requires compact group-major mode"
+            )
         self.rank = rank
         self.npes = world_size
         self.hidden = hidden_dim
@@ -408,41 +476,62 @@ class FlyDSLDispatchGroupMajorOp:
         self.scale_dim = scale_dim
         self.scale_type_size = scale_type_size
         self.scale_bytes = scale_dim * scale_type_size
-        self.scale_n_i32 = (self.scale_bytes + 3) // 4 if self.scale_bytes > 0 else 0
         self._dev = torch.device("cuda", rank)
-        self.row_bytes = _token_bytes_for(data_type, hidden_dim)
         self.row_view = _token_view_dim_for(data_type, hidden_dim)
-
-        # Compact capacity includes worst-case routes plus per-expert padding.
-        if self.compact:
-            num_valid_max = (
-                world_size * max_tok_per_rank * topk + experts_per_rank * unit_size
-            )
-        else:
-            num_valid_max = experts_per_rank * self.ll_cap + 256
-        self.num_valid_max = int(num_valid_max)
-        self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
+        (
+            self.num_valid_max,
+            self.payload_rows_max,
+            self.row_bytes,
+            self.scale_n_i32,
+        ) = group_major_capacity(
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            max_tok_per_rank=max_tok_per_rank,
+            experts_per_rank=experts_per_rank,
+            topk=topk,
+            data_type=data_type,
+            unit_size=unit_size,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            compact=self.compact,
+            indexed_payload=self.indexed_payload,
+        )
+        self.max_blocks = ceildiv(self.num_valid_max, unit_size)
+        self.payload_arena = payload_arena
 
         self._alloc()
         ms.shmem_barrier_all()
         self._build_p2p()
 
-    def _sym(self, shape, dtype):
-        t = mori_shmem_create_tensor(shape, dtype)
-        t.zero_()
-        return t
-
     def _alloc(self):
         npes, epr = self.npes, self.epr
         nvm = self.num_valid_max
-        self.done2 = self._sym((npes,), torch.int32)
-        self.running = self._sym((epr,), torch.int32)
-        self.ll_count = self._sym((epr,), torch.int32)
-        self.rx_em = self._sym((nvm * self.row_bytes,), torch.int8)
-        self.scale_em = self._sym((max(1, nvm * self.scale_n_i32),), torch.int32)
-        self.idx_em = self._sym((nvm,), torch.int32)
-        self.wts_em = self._sym((nvm,), torch.float32)
-        self.srcmap_em = self._sym((nvm,), torch.int32)
+        payload_rows = self.payload_rows_max
+        self.done2 = _zeroed_sym((npes,), torch.int32)
+        self.running = _zeroed_sym((epr,), torch.int32)
+        self.ll_count = _zeroed_sym((epr,), torch.int32)
+        rx_bytes = payload_rows * self.row_bytes
+        scale_i32 = max(1, payload_rows * self.scale_n_i32)
+        arena = self.payload_arena
+        if arena is None:
+            self.rx_em = _zeroed_sym((rx_bytes,), torch.int8)
+            self.scale_em = _zeroed_sym((scale_i32,), torch.int32)
+        else:
+            if (
+                rx_bytes > arena.rx_bytes
+                or scale_i32 > arena.scale_i32
+                or nvm > arena.route_rows
+            ):
+                raise ValueError("the payload arena is smaller than this op needs")
+            self.rx_em = arena.rx[:rx_bytes]
+            self.scale_em = arena.scale[:scale_i32]
+        self.idx_em = _zeroed_sym((nvm,), torch.int32)
+        if arena is None:
+            self.wts_em = _zeroed_sym((nvm,), torch.float32)
+            self.srcmap_em = _zeroed_sym((nvm,), torch.int32)
+        else:
+            self.wts_em = arena.wts[:nvm]
+            self.srcmap_em = arena.srcmap[:nvm]
         self.gb1 = torch.zeros(1, dtype=torch.int64, device=self._dev)
         self.sorted_expert_ids = torch.zeros(
             self.max_blocks, dtype=torch.int32, device=self._dev
@@ -458,7 +547,7 @@ class FlyDSLDispatchGroupMajorOp:
         self.dest_ctr = torch.zeros(
             self.npes, dtype=torch.int32, device=self._dev
         )  # local send-count/dest
-        self.recv_num = self._sym(
+        self.recv_num = _zeroed_sym(
             (self.npes,), torch.int32
         )  # symmetric: peers signal here
         self.compact_base = None
@@ -467,10 +556,10 @@ class FlyDSLDispatchGroupMajorOp:
         self.meta2 = None
         self.write_cursor = None
         if self.compact:
-            self.compact_base = self._sym(
+            self.compact_base = _zeroed_sym(
                 (epr,), torch.int32
             )  # dense prefix-sum base per local expert
-            self.done2c = self._sym(
+            self.done2c = _zeroed_sym(
                 (npes,), torch.int32
             )  # COUNT cross-PE done-barrier (vs done2 WRITE)
             self.gb_cnt = torch.zeros(
@@ -479,18 +568,22 @@ class FlyDSLDispatchGroupMajorOp:
             self.meta2 = torch.zeros(
                 1, dtype=torch.int32, device=self._dev
             )  # payload-ready flag
-            self.write_cursor = self._sym(
+            self.write_cursor = _zeroed_sym(
                 (epr,), torch.int32
             )  # phase-2 write cursor (reset only at kernel end)
-            self.done2cb = self._sym(
+            self.done2cb = _zeroed_sym(
                 (npes,), torch.int32
             )  # cross-PE#1b: gate compact_base read in phase-2
             _te = npes * epr
             self.local_hist = torch.zeros(
                 _te, dtype=torch.int32, device=self._dev
             )  # per-launch reset
-            self.bigcnt = self._sym((npes * _te,), torch.int32)  # [src][ge] all-gather
-            self.cnt_done = self._sym((npes,), torch.int32)  # all-gather epoch barrier
+            self.bigcnt = _zeroed_sym(
+                (npes * _te,), torch.int32
+            )  # [src][ge] all-gather
+            self.cnt_done = _zeroed_sym(
+                (npes,), torch.int32
+            )  # all-gather epoch barrier
             self.my_base = torch.zeros(
                 _te, dtype=torch.int32, device=self._dev
             )  # my tokens' base in each dest
@@ -526,11 +619,15 @@ class FlyDSLDispatchGroupMajorOp:
 
     def _ll_views(self):
         rx_dtype = torch.float4_e2m1fn_x2 if _is_fp4_dtype(self.dtype) else self.dtype
-        rx_em_view = self.rx_em.view(rx_dtype).view(self.num_valid_max, self.row_view)
+        rx_em_view = self.rx_em.view(rx_dtype).view(
+            self.payload_rows_max, self.row_view
+        )
         scale_em_view = self.scale_em.view(torch.uint8).view(
-            self.num_valid_max, max(1, self.scale_n_i32 * 4)
+            self.payload_rows_max, max(1, self.scale_n_i32 * 4)
         )[:, : self.scale_bytes]
-        scale_em_i32 = self.scale_em.view(self.num_valid_max, max(1, self.scale_n_i32))
+        scale_em_i32 = self.scale_em.view(
+            self.payload_rows_max, max(1, self.scale_n_i32)
+        )
         return {
             "rx_em": rx_em_view,
             "scale_em": scale_em_view,
@@ -546,8 +643,12 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-
-    def __init__(self, config):
+    def __init__(self, config, *, gm_payload_arena=None, combine_input=None):
+        """``gm_payload_arena``: GroupMajorPayloadArena for the group-major op's payload.
+        ``combine_input``: (token int16, weight float32) symmetric combine-input buffers
+        of another op whose calls never overlap this op's, to view instead of allocating.
+        """
+        self._shared_combine_input = combine_input
         self.cfg = config
         self._check_config()
         if config.tuning_table is None:
@@ -641,6 +742,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
                 compact=config.gm_compact,
+                indexed_payload=config.gm_indexed_payload,
+                payload_arena=gm_payload_arena,
             )
             # Fused dispatch and combine share one receive-count buffer.
             self._gm.total_recv = self.total_recv
@@ -649,10 +752,44 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._fx_tis = self._fx_out_shmem_tok_id_to_src
         ms.shmem_barrier_all()
 
+    def combine_output(self, rows):
+        """The first ``rows`` rows of the combine output buffer, as [rows, token view dim]."""
+        cfg = self.cfg
+        return (
+            self.shmem_comb_out_tok.view(torch.int8)[: rows * cfg.combine_token_bytes]
+            .view(cfg.combine_dtype)
+            .view(rows, cfg.combine_token_view_dim)
+        )
+
     def load_tuning_config(self, path=None):
         """Build and attach the geometry tuning table for this op's shape."""
         self.cfg.tuning_table = build_geometry_tuning_table_for_config(self.cfg, path)
         return self.cfg.tuning_table
+
+    @staticmethod
+    def _legacy_token_bytes(cfg):
+        return (
+            cfg.hidden_dim * cfg.max_token_type_size
+            if cfg.max_token_type_size > 0
+            else 0
+        )
+
+    @classmethod
+    def combine_input_numel(cls, cfg):
+        """Elements of the (int16 token, float32 weight) combine input for ``cfg``."""
+        k = cfg.num_experts_per_token
+        mr_worst = cfg.max_recv
+        # Size combine input for both sender-major and fused dest_lid*topk layouts.
+        mr_worst_inp = max(mr_worst, cfg.max_num_inp_token_per_rank * k)
+        comb_tb = max(cfg.combine_token_bytes, cls._legacy_token_bytes(cfg))
+        return (mr_worst_inp * comb_tb + 1) // 2, mr_worst * k
+
+    @classmethod
+    def allocate_combine_input(cls, cfgs):
+        """A zeroed symmetric combine input large enough for every config in ``cfgs``,
+        for ops whose calls never overlap to share (``combine_input=``)."""
+        tok, wts = (max(n) for n in zip(*(cls.combine_input_numel(c) for c in cfgs)))
+        return _zeroed_sym((tok,), torch.int16), _zeroed_sym((wts,), torch.float32)
 
     def _alloc_buffers(self):
         cfg = self.cfg
@@ -660,22 +797,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
         k = cfg.num_experts_per_token
         mt = cfg.max_num_inp_token_per_rank
         mr = cfg.effective_max_recv
-        mr_worst = cfg.max_recv
 
-        # Size combine input for both sender-major and fused dest_lid*topk layouts.
-        mr_worst_inp = max(mr_worst, mt * k)
-
-        legacy_tb = (
-            cfg.hidden_dim * cfg.max_token_type_size
-            if cfg.max_token_type_size > 0
-            else 0
-        )
+        legacy_tb = self._legacy_token_bytes(cfg)
         disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
         comb_tb = max(cfg.combine_token_bytes, legacy_tb)
         tok_i16_mr = (mr * disp_tb + 1) // 2  # dispatch output (dispatch_dtype)
-        tok_i16_mr_worst = (
-            mr_worst_inp * comb_tb + 1
-        ) // 2  # combine input, worst-case (combine_dtype)
+        tok_i16_mr_worst, wts_mr_worst = self.combine_input_numel(cfg)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
 
         self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
@@ -686,12 +813,21 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
         self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
         self.shmem_tok_id_to_src = mori_shmem_create_tensor((mr,), torch.int32)
-        self.shmem_comb_inp_tok = mori_shmem_create_tensor(
-            (tok_i16_mr_worst,), torch.int16
-        )
-        self.shmem_comb_inp_wts = mori_shmem_create_tensor(
-            (mr_worst * k,), torch.float32
-        )
+        if self._shared_combine_input is None:
+            self.shmem_comb_inp_tok = mori_shmem_create_tensor(
+                (tok_i16_mr_worst,), torch.int16
+            )
+            self.shmem_comb_inp_wts = mori_shmem_create_tensor(
+                (wts_mr_worst,), torch.float32
+            )
+        else:
+            tok, wts = self._shared_combine_input
+            if tok.numel() < tok_i16_mr_worst or wts.numel() < wts_mr_worst:
+                raise ValueError(
+                    "the shared combine input is smaller than this op needs"
+                )
+            self.shmem_comb_inp_tok = tok[:tok_i16_mr_worst]
+            self.shmem_comb_inp_wts = wts[:wts_mr_worst]
         self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
@@ -880,8 +1016,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
 
     def _check_lds_capacity(self):
         """Reject configs whose combine-kernel LDS overflows the GPU."""
-        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
-
         cfg = self.cfg
 
         # Mirror make_combine_jit's LDS layout: two 8B-aligned i64[npes] tables.
@@ -894,8 +1028,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
         lds_bytes = max(_align(ptr, 128), 128)
 
         arch = get_rocm_arch()
-        limit = SMEM_CAPACITY_MAP.get(arch)
-        if limit is not None and lds_bytes > limit:
+        try:
+            limit = get_lds_capacity_bytes(arch)
+        except ValueError:
+            return
+        if lds_bytes > limit:
             raise RuntimeError(
                 f"combine kernel LDS needs {lds_bytes} B "
                 f"(2 x i64[world_size={cfg.world_size}] P2P tables + 128 B arena), "
@@ -1232,7 +1369,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream
+        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream, tok_map=None
     ):
         """Compile once and reuse the cached combine launcher."""
         fixed = (
@@ -1240,7 +1377,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_comb_out,
             self._fx_xdb_mem,
             self._fx_xdev_flag,
-            self._fx_tok_map,
+            self._fx_tok_map if tok_map is None else tok_map,
             self._fx_comb_bar,
             self._fx_trecv,
             self._fx_out_shmem_tok_id_to_src,
@@ -1307,6 +1444,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"Supported: {_SUPPORTED_STAGE2_P2P_QUANT_TYPES}"
             )
         blockwise_fp8 = skip_stage1 and p2p_quant == "fp8_blockwise_1x32"
+        # Fused-upstream combine: top-k ids mask never-dispatched (-1) slots.
+        mask_topk_ids = skip_stage1 and indices is not None and not cfg.zero_copy
+        if mask_topk_ids and (
+            indices.dtype != torch.int32 or not indices.is_contiguous()
+        ):
+            raise ValueError("combine_no_stage1 indices must be contiguous int32")
         if skip_stage1:
             # placeholder input: pre-cast to fp8 so the kernel dtype + out view match.
             if fp8_dc and input.dtype != torch.float8_e4m3fn:
@@ -1367,6 +1510,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bn,
             wpb,
             bool(skip_stage1),
+            bool(mask_topk_ids),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1387,6 +1531,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
             )
             self._comb_jit_cache[key] = fn
         self._run_combine_kernel(
@@ -1398,6 +1543,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             prx_ptr,
             _cur_tok,
             stream,
+            # Masking reads the caller's top-k ids in place of the dispatch tok_map.
+            tok_map=fx.Int64(indices.data_ptr()) if mask_topk_ids else None,
         )
 
         mt = cfg.max_num_inp_token_per_rank
@@ -1444,7 +1591,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights: bool = True,
         stage2_p2p_quant=None,
     ):
-        """Run combine after fused GEMM2 has populated the P2P input."""
+        """Run combine after fused GEMM2 has populated the P2P input.
+
+        ``indices``: optional int32 [cur_tok, topk] top-k ids; slots with id -1
+        (never dispatched) are skipped instead of summing a stale partial.
+        """
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
             raise NotImplementedError(
                 "combine_no_stage1 is reserved for the fused GEMM2+combine "
@@ -1462,6 +1613,106 @@ class FlyDSLDispatchCombineIntraNodeOp:
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
         )
+
+    def preload_combine_no_stage1(
+        self,
+        input,
+        *,
+        cur_tok,
+        enable_weights: bool = False,
+        stage2_p2p_quant=None,
+        mask_topk_ids: bool = False,
+    ):
+        """Compile and load one fused-Stage2 combine geometry without launching it."""
+        if not type(self)._ENABLE_COMBINE_NO_STAGE1:
+            raise NotImplementedError("combine_no_stage1 preload is not enabled")
+        cfg = self.cfg
+        self._check_combine_inputs(input, None, None, None, strict_input_dtype=False)
+        p2p_quant = (
+            cfg.stage2_p2p_quant if stage2_p2p_quant is None else stage2_p2p_quant
+        )
+        if p2p_quant not in _SUPPORTED_STAGE2_P2P_QUANT_TYPES:
+            raise ValueError(f"unsupported stage2_p2p_quant={p2p_quant!r}")
+        fp8_dc = (
+            cfg.combine_quant_type == "fp8_direct_cast"
+            and input.dtype == torch.bfloat16
+        )
+        blockwise_fp8 = p2p_quant == "fp8_blockwise_1x32"
+        c_dtype = torch.float8_e4m3fn if fp8_dc else input.dtype
+        _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
+        block_num, warp_num = _resolve_launch_geometry(
+            "combine",
+            cfg.combine_block_num,
+            cfg.combine_warp_num_per_block,
+            cfg.tuning_table,
+            _cur_tok,
+            _DEFAULT_COMBINE_BLOCK_NUM,
+            _DEFAULT_COMBINE_WARP_NUM,
+        )
+        _check_block_num_resident("combine", block_num)
+        key = (
+            c_dtype,
+            bool(cfg.zero_copy),
+            bool(enable_weights),
+            bool(fp8_dc),
+            bool(blockwise_fp8),
+            block_num,
+            warp_num,
+            True,
+            bool(mask_topk_ids),
+        )
+        fn = self._comb_jit_cache.get(key)
+        if fn is None:
+            fn = make_combine_jit(
+                rank=cfg.rank,
+                npes=cfg.world_size,
+                experts_per_token=cfg.num_experts_per_token,
+                hidden_dim=cfg.hidden_dim,
+                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                block_num=block_num,
+                warp_num_per_block=warp_num,
+                data_type=c_dtype,
+                enable_weights=bool(enable_weights),
+                enable_std_moe=cfg.enable_std_moe,
+                zero_copy=cfg.zero_copy,
+                skip_stage1=True,
+                fp8_direct_cast=bool(fp8_dc),
+                blockwise_fp8_transport=bool(blockwise_fp8),
+                max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
+            )
+            self._comb_jit_cache[key] = fn
+        fixed = (
+            self._fx_comb_inp,
+            self._fx_comb_out,
+            self._fx_xdb_mem,
+            self._fx_xdev_flag,
+            self._fx_tok_map,
+            self._fx_comb_bar,
+            self._fx_trecv,
+            self._fx_out_shmem_tok_id_to_src,
+            self._fx_p2p_comb_inp,
+            self._fx_p2p_xdb_mem,
+        )
+        tail = (
+            self._fx_comb_inp_wts,
+            self._fx_comb_out_wts,
+            self._fx_p2p_comb_inp_wts,
+        )
+        std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
+        compiled = _preload_compiled(
+            fn,
+            fx.Int64(input.data_ptr()),
+            *fixed,
+            fx.Int64(self.shmem_disp_out_wts.data_ptr()),
+            *tail,
+            fx.Int64(0),
+            *std,
+            _cur_tok,
+            torch.cuda.current_stream(),
+        )
+        self._comb_compiled_cache[key] = compiled
+        return compiled
 
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()

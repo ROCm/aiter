@@ -4,14 +4,6 @@
 
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-// todo: remove this to use aiterTensor dtype
-// c10 half/bfloat16 are only needed for the t2opus<c10::*> specializations
-// below. Torch-free translation units (which use hip2opus instead) can define
-// AITER_NO_TORCH_TYPES before including this header to drop the torch include.
-#ifndef AITER_NO_TORCH_TYPES
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
-#endif
 #include <hip/hip_bf16.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -59,7 +51,7 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
-    defined(__gfx1201__) || defined(__gfx1250__)
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -74,6 +66,32 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
 }
 
+// The power of two that divides by `scale`, a normal power of two, as an ldexp exponent.
+// Its reciprocal can be the fp32 denormal 2^-127 (scale 2^127, the MXFP8 Inf-group
+// scale), which -fgpu-flush-denormals-to-zero turns into 0; ldexp has no such step.
+OPUS_D int pow2_div_exponent(float scale)
+{
+    const uint32_t bits = __builtin_bit_cast(uint32_t, scale);
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    return 127 - static_cast<int>(exponent);
+}
+
+// fp32x2 / scale -> fp8x2, no clamp: NaN and anything past +-max convert to NaN.
+// For MX scales, which are powers of two and keep finite values in range.
+OPUS_D fp8x2_t fp32_to_fp8_div_x2_noclamp(fp32x2_t s, int div_exponent)
+{
+    const float a = __builtin_amdgcn_ldexpf(s[0], div_exponent);
+    const float b = __builtin_amdgcn_ldexpf(s[1], div_exponent);
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
+    int w;
+    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(a), "v"(b));
+    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    (void)a; (void)b; return fp8x2_t{};
+#endif
+}
+
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 {
@@ -81,6 +99,34 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
     auto hi = fp32_to_fp8_scaled_x2(fp32x2_t{s[2], s[3]}, inverted_scale);
     return fp8x4_t{lo[0], lo[1], hi[0], hi[1]};
 }
+
+// bf16x8 / fp16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_{bf16,f16}, 1 instr)
+// Scale semantics: result[i] = s[i] / scale. Finite overflow is not saturated.
+// The caller's inverted_scale = 1/row_scale, so we pass 1/inverted_scale = row_scale.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
+OPUS_D decltype(auto) to_fp8_scalef32_x8(const S& s, float scale)
+{
+    typedef unsigned int __attribute__((ext_vector_type(2))) u2;
+    u2 r;
+    if constexpr(std::is_same_v<S, bf16x8_t>)
+        r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
+    else
+        r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f16(s, scale);
+    return __builtin_bit_cast(vector_t<fp8_t, 8>, r);
+}
+
+// bf16x8 / fp16x8 -> 8 packed fp4 (gfx1250: v_cvt_scalef32_pk8_fp4_{bf16,f16}, 1 instr),
+// with the same scale operand as v_cvt_scalef32_pk8_fp4_f32.
+template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
+OPUS_D u32_t to_fp4_scalef32_x8(const S& s, float scale)
+{
+    if constexpr(std::is_same_v<S, bf16x8_t>)
+        return __builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(s, scale);
+    else
+        return __builtin_amdgcn_cvt_scalef32_pk8_fp4_f16(s, scale);
+}
+#endif
 
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_bf8_f32
@@ -91,7 +137,7 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
-    defined(__gfx1201__) || defined(__gfx1250__)
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -588,6 +634,76 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
     return scaled_cast<D>(fp32_vec, inverted_scale);
 }
 
+// scaled_cast_div: same conversion, but `scale` is the DIVISOR (row scale) rather than
+// its reciprocal.
+//
+// CALLER CONTRACT: `scale` MUST be an exact power of two. On gfx1250 this lowers to
+// v_cvt_scalef32_pk8_fp8_bf16, whose scale operand is an MX E8M0 factor: the hardware
+// reads only the 8 exponent bits and DISCARDS the mantissa. Passing a general fp32 scale
+// silently quantizes it down to the enclosing power of two -- e.g. 0.006975 is applied as
+// 2^-8, a 1.79x error, which overflows the large codes to NaN. Only the e8m0 quant path
+// (where the row scale is ceil_pow2 by construction) may use this.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+template <typename D,
+          typename S,
+          std::enable_if_t<is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
+                               std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0),
+                           bool> = true>
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    constexpr index_t N = size<S>();
+    vector_t<fp8_t, N> out;
+    static_for<N / 8>([&](auto i) {
+        vector_t<get_value_t<S>, 8> chunk;
+        static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
+        auto pk = to_fp8_scalef32_x8(chunk, scale);
+        static_for<8>([&](auto j) { out[i.value * 8 + j.value] = pk[j.value]; });
+    });
+    return out;
+}
+#endif
+
+// Fallback: no hardware divide-by-scale convert for this type/arch. The division is an
+// ldexp, not a multiply by 1 / scale; see pow2_div_exponent.
+template <typename D,
+          typename S,
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+          std::enable_if_t<!(is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
+                             std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0)),
+                           bool> = true>
+#else
+          bool = true>
+#endif
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    constexpr index_t N = size<S>();
+    const int e         = pow2_div_exponent(scale);
+    vector_t<fp32_t, N> divided;
+    static_for<N>([&](auto i) {
+        divided[i.value] = __builtin_amdgcn_ldexpf(static_cast<float>(s[i.value]), e);
+    });
+    return scaled_cast<D>(divided, 1.0f);
+}
+
+// fp8 s / scale without the +-max clamp, `scale` a power of two; see
+// fp32_to_fp8_div_x2_noclamp.
+template <typename S>
+OPUS_D decltype(auto) scaled_cast_fp8_noclamp_div(const S& s, float scale)
+{
+    constexpr index_t N = size<S>();
+    static_assert(N % 2 == 0);
+    const int e = pow2_div_exponent(scale);
+    vector_t<fp8_t, N> out;
+    static_for<N / 2>([&](auto i) {
+        auto pair = fp32_to_fp8_div_x2_noclamp(
+            fp32x2_t{static_cast<float>(s[i.value * 2]), static_cast<float>(s[i.value * 2 + 1])},
+            e);
+        out[i.value * 2]     = pair[0];
+        out[i.value * 2 + 1] = pair[1];
+    });
+    return out;
+}
+
 // fp4 target: any fp32 vector size via x2 loop
 template <
     typename D,
@@ -619,9 +735,26 @@ template <typename D,
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 {
     constexpr index_t N = size<S>();
-    vector_t<fp32_t, N> fp32_vec;
-    static_for<N>([&](auto i) { fp32_vec[i.value] = static_cast<float>(s[i.value]); });
-    return scaled_cast<D>(fp32_vec, inverted_scale);
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    // Eight values per convert straight from bf16/fp16, instead of widening to fp32 and
+    // converting two at a time.
+    if constexpr(is_any_of_v<get_value_t<S>, bf16_t, fp16_t> && N % 8 == 0)
+    {
+        vector_t<u32_t, N / 8> words;
+        static_for<N / 8>([&](auto i) {
+            vector_t<get_value_t<S>, 8> chunk;
+            static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
+            words[i.value] = to_fp4_scalef32_x8(chunk, inverted_scale);
+        });
+        return __builtin_bit_cast(array<fp4_t, N>, words);
+    }
+    else
+#endif
+    {
+        vector_t<fp32_t, N> fp32_vec;
+        static_for<N>([&](auto i) { fp32_vec[i.value] = static_cast<float>(s[i.value]); });
+        return scaled_cast<D>(fp32_vec, inverted_scale);
+    }
 }
 
 // general fallback: fp32 source -> any non-quantized target with scale
@@ -753,7 +886,9 @@ template <typename T,
           int aux                    = 0,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false,
+          bool fp8_noclamp           = false>
 __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                                     const opus::vector_t<DTYPE_I, vec_size>& vec,
                                     int row_offset,
@@ -801,7 +936,15 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
             else
             {
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
-                chunk_convert           = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
+                if constexpr(fp8_noclamp)
+                {
+                    static_assert(std::is_same_v<T_R, opus::fp8_t> && scale_is_divisor);
+                    chunk_convert = scaled_cast_fp8_noclamp_div(*chunk_ptr, inverted_scale);
+                }
+                else if constexpr(scale_is_divisor)
+                    chunk_convert = scaled_cast_div<T_R>(*chunk_ptr, inverted_scale);
+                else
+                    chunk_convert = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
                 store<store_chunk_size_elements>(
                     buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
@@ -832,7 +975,9 @@ template <typename T,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
           int num_repeat             = 1,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false,
+          bool fp8_noclamp           = false>
 __device__ void store_vector(opus::gmem<T>& buffer,
                              const opus::vector_t<DTYPE_I, vec_size>& vec,
                              int row_offset,
@@ -842,17 +987,17 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     static constexpr index_t store_bytes      = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes (logical type T_R)
     if constexpr((store_bytes / num_store_repeat) % 16 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 8 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 4 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else
@@ -870,7 +1015,7 @@ __device__ void store_vector(opus::gmem<T>& buffer,
 template <index_t load_cnt, index_t async_load_cnt>
 OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     if constexpr(load_cnt >= 0)
         s_wait_loadcnt(number<load_cnt>{});
     if constexpr(async_load_cnt >= 0)
@@ -891,44 +1036,13 @@ OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
 {
     if constexpr(ds_cnt >= 0)
     {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         s_wait_dscnt(number<ds_cnt>{});
 #else
         s_waitcnt_lgkmcnt(number<ds_cnt>{});
 #endif
     }
 }
-
-// todo: edit this to use aiterTensor dtype
-template <typename T>
-struct t2opus;
-template <>
-struct t2opus<float>
-{
-    using type = float;
-};
-#ifndef AITER_NO_TORCH_TYPES
-template <>
-struct t2opus<c10::Half>
-{
-    using type = opus::fp16_t;
-};
-template <>
-struct t2opus<c10::BFloat16>
-{
-    using type = opus::bf16_t;
-};
-#endif
-template <>
-struct t2opus<int32_t>
-{
-    using type = int32_t;
-};
-template <>
-struct t2opus<int8_t>
-{
-    using type = opus::i8_t;
-};
 
 // HIP native type -> opus type mapping
 template <typename T> struct hip2opus;

@@ -5,7 +5,17 @@
 
 #include "aiter_tensor.h"
 
+#include <optional>
 #include <string>
+
+// Private capability probe used by fused_moe dispatch. This is intentionally
+// not a public quant/MoE API.
+bool mxfp4_moe_sort_internal_is_supported(
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB,
+    bool zero_init);
 
 void mxfp4_moe_sort_quant_kernel(
     aiter_tensor_t& a_input,
@@ -43,7 +53,8 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue);  // 0 = inline_quant, 1 = threestage
+    int64_t prologue,  // 0 = inline_quant, 1 = threestage
+    std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
 
 void mxfp4_moe_quant_kernel(
     aiter_tensor_t& a_input,

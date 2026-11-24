@@ -12,10 +12,39 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..plugin import route as _route
 from ..utility.dtypes import get_dtype_fp8
 
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
 SCALE_LAYOUTS = {"row": 0, "mfma_tile": 1, "n32k4": 2}
+
+# The two padded layouts have disjoint consumers -- mfma_tile feeds CDNA's
+# V_MFMA_SCALE_F32_16x16x128_F8, n32k4 feeds RDNA's WMMA scaleB -- so the module
+# only builds each for the family that can launch it (AITER_INVERSE_ROPE_MFMA_TILE
+# / _N32K4 in csrc/kernels/inverse_rope_group_quant.cu). The kernel's host pass
+# refuses the wrong-family layout too, but AITER_CHECK aborts the process; catch
+# it here first so a bad `scale_layout` argument raises like every other one.
+_LAYOUT_REQUIRES_CDNA = {"mfma_tile": True, "n32k4": False}
+
+
+def _check_layout_arch(scale_layout: str) -> None:
+    wants_cdna = _LAYOUT_REQUIRES_CDNA.get(scale_layout)
+    if wants_cdna is None:
+        return
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    # Mirrors is_cdna_arch() in the kernel: everything gfx9 is CDNA here.
+    if gfx.startswith("gfx9") is wants_cdna:
+        return
+    other = "n32k4" if wants_cdna else "mfma_tile"
+    consumer = (
+        "CDNA's V_MFMA_SCALE_F32_16x16x128_F8" if wants_cdna else "RDNA's WMMA scaleB"
+    )
+    raise ValueError(
+        f"scale_layout={scale_layout!r} feeds {consumer} and has no consumer on "
+        f"{gfx}, so it is not built there -- use {other!r} instead"
+    )
 
 
 @compile_ops(
@@ -60,7 +89,7 @@ def scale_shape(
     return (s, num_groups, scale_groups)
 
 
-def inverse_rope_group_quant(
+def _inverse_rope_group_quant_native(
     o: Tensor,
     positions: Tensor,
     cos_cache: Tensor,
@@ -76,7 +105,9 @@ def inverse_rope_group_quant(
     Args:
         o: ``[S, H, head_dim]`` bf16/fp16 attention output before inverse RoPE.
         positions: ``[S]`` absolute positions.
-        cos_cache/sin_cache: ``[max_pos, rd//2]``.
+        cos_cache/sin_cache: ``[max_pos, rd//2]``, the dtype of ``o``, or fp32
+            with ``scale_layout="row"`` (a model keeping its table in fp32, as
+            DeepSeek-V4.1 does; the rotation is fp32 either way).
         num_groups: output-LoRA local groups ``G``.
         quant_group_size: quant block along ``D``; V4 wo_a path uses 128.
         scale_layout: e8m0 scale storage:
@@ -86,6 +117,10 @@ def inverse_rope_group_quant(
               ``V_MFMA_SCALE_F32_16x16x128_F8``.
             * ``"n32k4"``: ``[ceil(S,32)/32, G, Ks*32]``, for gfx1250's WMMA
               scaleB. Requires ``quant_group_size == 32``.
+
+            The two padded layouts are built only for the family that consumes
+            them, so ``"mfma_tile"`` is CDNA-only and ``"n32k4"`` is RDNA-only;
+            asking for the other raises ``ValueError``. ``"row"`` runs anywhere.
 
         The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
         ``Ks`` up to its chunk width, 2 at ``quant_group_size == 128`` and 8
@@ -99,6 +134,7 @@ def inverse_rope_group_quant(
     assert (
         scale_layout in SCALE_LAYOUTS
     ), f"scale_layout must be one of {sorted(SCALE_LAYOUTS)}, got {scale_layout!r}"
+    _check_layout_arch(scale_layout)
     assert o.dim() == 3, f"o must be [S,H,Dh], got {tuple(o.shape)}"
     S, H, head_dim = o.shape
     assert (
@@ -115,6 +151,16 @@ def inverse_rope_group_quant(
         assert cache.dim() == 2, (
             f"{name} must be 2D [max_pos, rd//2], got {tuple(cache.shape)}; "
             "reshape a cache carrying singleton batch/head dims at the call site"
+        )
+    # Raised here rather than left to the kernel's AITER_CHECK, which aborts.
+    if sin_cache.dtype != cos_cache.dtype or not (
+        cos_cache.dtype == o.dtype
+        or (cos_cache.dtype == torch.float32 and scale_layout == "row")
+    ):
+        raise ValueError(
+            f"cos/sin must share the dtype of o ({o.dtype}), or be fp32 with "
+            f"scale_layout='row'; got {cos_cache.dtype}/{sin_cache.dtype} "
+            f"with {scale_layout!r}"
         )
 
     from .. import dtypes
@@ -168,3 +214,131 @@ def inverse_rope_group_quant(
         SCALE_LAYOUTS[scale_layout],
     )
     return x_fp8, x_scale
+
+
+def _inverse_rope_group_quant_contract_fake(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+) -> tuple[Tensor, Tensor]:
+    """The two tensors the v2 contract returns, shaped but not filled.
+
+    Allocating rather than handing back arguments is the whole reason v2
+    carries no output buffers: see :func:`inverse_rope_group_quant`.
+    """
+    from .. import dtypes
+
+    s, h, head_dim = o.shape
+    d = (h * head_dim) // num_groups
+    scale_groups = d // quant_group_size
+    return (
+        torch.empty((s, num_groups, d), dtype=get_dtype_fp8(), device=o.device),
+        torch.empty(
+            scale_shape(s, num_groups, scale_groups, scale_layout, quant_group_size),
+            dtype=dtypes.fp8_e8m0,
+            device=o.device,
+        ),
+    )
+
+
+# v2 drops the ``x_fp8=`` and ``x_scale=`` buffers v1 carried. The older version
+# stays acceptable: the only change is removing OPTIONAL output buffers, so a v1
+# provider handed a v2 call sees both as None and allocates -- which is v2's
+# semantics exactly. (`rmsnorm` v1 was left out of its own supersedes for the
+# opposite reason: a v1 kernel handed a v2 call writes the caller's INPUT.)
+@_route(
+    op="inverse_rope_group_quant",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_inverse_rope_group_quant_contract_fake,
+    mutates_args=[],
+)
+def _inverse_rope_group_quant_routed(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+) -> tuple[Tensor, Tensor]:
+    """Inverse-RoPE V4 attention output and FP8 group-quant rows -- the routed
+    contract.
+
+    Arguments and meanings are those of :func:`inverse_rope_group_quant`, minus
+    its output buffers.
+
+    Returns a newly allocated ``(x_fp8, x_scale)``. It writes through none of
+    its arguments: a provider serving this contract must allocate both results
+    too, and a caller that wants them in buffers it owns passes ``x_fp8=`` or
+    ``x_scale=``, which does not route.
+    """
+    return _inverse_rope_group_quant_native(
+        o,
+        positions,
+        cos_cache,
+        sin_cache,
+        num_groups,
+        quant_group_size,
+        scale_layout,
+        None,
+        None,
+    )
+
+
+def inverse_rope_group_quant(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+    x_fp8: Tensor | None = None,
+    x_scale: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Inverse-RoPE V4 attention output and emit FP8 group-quant rows.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_inverse_rope_group_quant_routed`, and
+    :func:`_inverse_rope_group_quant_native` for the shape rules and the
+    undefined-padding note.
+
+    ``x_fp8`` and ``x_scale`` are pre-allocated output buffers, and passing
+    either one bypasses routing. The reason is a schema one rather than a policy
+    one: with a buffer this op RETURNS the tensor it was given, while the schema
+    a custom op is registered under declares that its results do not alias its
+    inputs. `opcheck` reports the contradiction, and under compile both ways of
+    resolving it are wrong -- a fake that allocates leaves the caller's buffer
+    UNWRITTEN while still returning the right value, with nothing to say so.
+
+    Leaving the buffers out of the contract removes the contradiction instead of
+    picking a side of it. A provider therefore serves the allocating form only;
+    the buffered form runs AITER's own kernel, which is what naming a buffer
+    asked for.
+    """
+    if x_fp8 is None and x_scale is None:
+        return _inverse_rope_group_quant_routed(
+            o,
+            positions,
+            cos_cache,
+            sin_cache,
+            num_groups,
+            quant_group_size,
+            scale_layout,
+        )
+    return _inverse_rope_group_quant_native(
+        o,
+        positions,
+        cos_cache,
+        sin_cache,
+        num_groups,
+        quant_group_size,
+        scale_layout,
+        x_fp8,
+        x_scale,
+    )

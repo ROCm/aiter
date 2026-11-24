@@ -5,17 +5,27 @@ from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     attnres_fwd_kernel,
 )
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
+    _mhc_asymmetric_sinkhorn_kernel,
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
+    _mhc_head_kernel,
     _mhc_post_kernel,
     _mhc_post_pre_reduce_apply_kernel,
     _mhc_post_pre_split_kernel,
     _mhc_reduce_apply_kernel,
 )
+from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+    _mhc_fused_post_pre_delayed_rmsnorm_main_kernel,
+    _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel,
+)
 
 __all__ = [
+    "_mhc_asymmetric_sinkhorn_kernel",
     "_mhc_fused_kernel",
+    "_mhc_fused_post_pre_delayed_rmsnorm_main_kernel",
+    "_mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel",
     "_mhc_fused_split_kernel",
+    "_mhc_head_kernel",
     "_mhc_post_kernel",
     "_mhc_post_pre_reduce_apply_kernel",
     "_mhc_post_pre_split_kernel",

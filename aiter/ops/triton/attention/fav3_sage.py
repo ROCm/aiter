@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 
@@ -13,6 +15,56 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+    resolve_config_dir,
+)
+
+_CONFIG_NAME = "FAV3_SAGE"
+# Arches with no tuned fav3_sage table of their own read the gfx942 file
+_FALLBACK_ARCH = "gfx942"
+
+
+def _load_sage_fwd_tables() -> dict[str, dict]:
+    """Every shipped FAV3_SAGE table, keyed by architecture.
+
+    Read once, at import. ``get_sage_fwd_configs()`` is traced by Dynamo under
+    ``torch.compile(fullgraph=True)`` -- see
+    op_tests/triton_tests/attention/test_fav3_sage_compile.py -- and Dynamo
+    cannot trace the ``open()`` inside ``load_config_json()``. Its ``lru_cache``
+    does not help either: Dynamo ignores the wrapper and traces the function
+    body. So the read has to happen off the traced path, leaving
+    ``get_sage_fwd_configs()`` a plain dict lookup.
+
+    Every arch is loaded rather than just the running one, so the running
+    architecture is not baked into import-time state.
+    """
+    tables = {}
+    for entry in sorted(os.scandir(AITER_TRITON_CONFIGS_PATH), key=lambda e: e.name):
+        if not entry.is_dir():
+            continue
+        cfg_dir = resolve_config_dir(
+            "attention", _CONFIG_NAME, backend="triton", arch=entry.name
+        )
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+        if table is not None:
+            tables[entry.name] = table
+
+    # get_sage_fwd_configs() falls back to this table for every arch that ships
+    # none of its own, and dict.get() evaluates its default eagerly, so a
+    # missing gfx942 file would raise KeyError on *every* arch rather than only
+    # the untuned ones. Fail here instead, naming the file that is absent.
+    assert _FALLBACK_ARCH in tables, (
+        f"no {_CONFIG_NAME} table for the fallback architecture "
+        f"{_FALLBACK_ARCH!r}: expected "
+        f"{resolve_config_dir('attention', _CONFIG_NAME, backend='triton', arch=_FALLBACK_ARCH)}"
+        "/DEFAULT.json"
+    )
+    return tables
+
+
+_SAGE_FWD_TABLES = _load_sage_fwd_tables()
 
 
 def get_sage_fwd_configs(
@@ -29,34 +81,11 @@ def get_sage_fwd_configs(
     (num_warps=4, waves_per_eu=2). Numerics match the default launch params;
     use this when long sequences (e.g. Qwen edit ~8400 tokens) are register-bound.
     """
-    arch = arch_info.get_arch()
-    if arch == "gfx950":
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 3,
-            "num_warps": 8,
-        }
-    elif arch == "gfx942":
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
-    else:
-        base = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
+    config = _SAGE_FWD_TABLES.get(
+        arch_info.get_arch(), _SAGE_FWD_TABLES[_FALLBACK_ARCH]
+    )
+    # The tables are shared module state; copy before mutating.
+    base = dict(config["fwd"])
     if block_m is not None:
         base["BLOCK_M"] = block_m
     if block_n is not None:
@@ -64,8 +93,7 @@ def get_sage_fwd_configs(
 
     # Optional MI308/gfx942 perf preset; off by default so callers keep upstream behaviour.
     if a3_tuned:
-        base["num_warps"] = 4
-        base["waves_per_eu"] = 2
+        base.update(config["fwd_a3_tuned"])
     return base
 
 
@@ -77,7 +105,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
     the quantization internally, maintaining backward compatibility with
     high-precision training workflows.
 
-    Forward: BF16/FP32 -> Int8 (Q & K) + FP16 V -> sage_attn -> FP32 output
+    Forward: BF16/FP32 -> Int8 (Q & K) + FP8 or 16-bit V -> sage_attn -> FP32 output
     Backward: not supported yet
     """
 
@@ -103,6 +131,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         hadamard_rotation: bool = False,
         R: torch.Tensor | None = None,
         BLOCK_R: int | None = None,
+        v_dtype: torch.dtype | None = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -145,15 +174,23 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         # 3. Quantization
         # Note: softmax_scale is integrated into quantization descaling
         softmax_scale = softmax_scale or (head_dim**-0.5)
-        fp8_dtype = aiter.dtypes.fp8
-        fp8_max = torch.finfo(fp8_dtype).max
+        if v_dtype is None:
+            # Without FP8 matrix cores (RDNA3), Triton converts FP8 V to FP16
+            # in software. Keep V in FP16 there: it is faster and more accurate.
+            v_dtype = aiter.dtypes.fp8 if arch_info.is_fp8_avail() else torch.float16
+        if v_dtype in (torch.float16, torch.bfloat16):
+            v_dtype_max = None  # V is passed through, not scaled
+        elif v_dtype.is_floating_point and v_dtype.itemsize == 1:
+            v_dtype_max = torch.finfo(v_dtype).max
+        else:
+            raise ValueError(f"v_dtype must be FP8, FP16 or BF16, got {v_dtype}")
 
         sq_result = sage_quant(
             q,
             k,
             v,
-            fp8_dtype,
-            fp8_max,
+            v_dtype,
+            v_dtype_max,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
@@ -165,7 +202,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             R=R,
             BLOCK_R=BLOCK_R,
         )
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result[:6]
+        q_int8, q_descale, k_int8, k_descale, v_out, v_descale = sq_result[:6]
         rest = sq_result[6:]
         delta_s = None
         sage_lse_delta = None
@@ -193,7 +230,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         out, softmax_lse = fav3_sage_func(
             q_int8,
             k_int8,
-            v_fp8,
+            v_out,
             q_descale,
             k_descale,
             v_descale,
@@ -246,6 +283,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # hadamard_rotation
             None,  # R
             None,  # BLOCK_R
+            None,  # v_dtype
         )
 
 
@@ -269,6 +307,7 @@ def fav3_sage_wrapper_func(
     hadamard_rotation: bool = False,
     R: torch.Tensor | None = None,
     BLOCK_R: int | None = None,
+    v_dtype: torch.dtype | None = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -304,6 +343,13 @@ def fav3_sage_wrapper_func(
         hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
         R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
         BLOCK_R: Hadamard tile size when hadamard_rotation=True and R is None
+        v_dtype: Type of V in the P*V product. With FP8 (``aiter.dtypes.fp8``)
+                V is quantized with a per-channel scale. With FP16 or BF16, V
+                is passed through without scaling (cast if needed). Default
+                None: FP8 when the arch has FP8 (``arch_info.is_fp8_avail()``),
+                otherwise FP16. The gfx942 table is sized for FP8 V; a 16-bit
+                V there needs a smaller tile, e.g.
+                ``config=get_sage_fwd_configs(block_n=64)``.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -355,6 +401,7 @@ def fav3_sage_wrapper_func(
         hadamard_rotation,
         R,
         BLOCK_R,
+        v_dtype,
     )
 
 

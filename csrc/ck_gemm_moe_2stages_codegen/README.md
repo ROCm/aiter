@@ -30,6 +30,39 @@ If you have built moe kernels before tuning new MoE shapes, please add `AITER_RE
 
 ### Tuning Scope
 
+#### `--mxfp4-flydsl` and `--mxfp4-search-mode`
+
+Use `--mxfp4-flydsl` for gfx950 A4W4 MoE tuning. Choose a search mode with
+`--mxfp4-search-mode`:
+
+- `staged` (default): prune GEMM1 by `M_est = ceil(token * topk / expert)`,
+  screen both stages, and validate shortlisted pairs end to end.
+  `--mxfp4-screen-topk` keeps the fastest candidates per group (default 2).
+- `full`: validate all compatible GEMM1/GEMM2 pairs without M_est pruning.
+
+Staged search validates all pruned pairs when `M_est < 4`. Otherwise, a group
+falls back to a full search of its pruned pairs if no shortlist is available
+or every shortlisted pair fails. The fastest pair passing `--errRatio` wins.
+Each shape runs in a fresh process, including with `--mp 1`.
+
+Input (`-i`) and output (`-o`) must refer to different files. Existing configured
+shapes are skipped; use `--all` to retune them or choose a new output file.
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full --all
+```
+
+With `--fast-scan`, an omitted mode scans every pruned pair; `full` scans all
+pairs. `--fast-scan` cannot be combined with explicit `staged` search.
+
+Staged screening can miss a faster pair. Use `full` to check the selected
+kernel, and keep activation limits and stage2 settings consistent across
+tuning, AOT and production; see [MXFP4 settings](../../aiter/aot/flydsl/README.md#mxfp4-activation-and-stage2-settings).
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -46,6 +79,8 @@ If you have built moe kernels before tuning new MoE shapes, please add `AITER_RE
 - **Type**: String
 - **Default**: `""` (empty string)
 - **Description**: Optional output file to store **all** tuning results (not just the best ones). Useful for profiling and analyzing all kernel candidates.
+
+This option applies to ordinary fMoE tuning.
 
 **Example**:
 ```bash
@@ -135,6 +170,61 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i aiter/configs/untuned_fmoe.csv --run_config
 ```
 
+#### Fast MXFP4 FlyDSL scan
+
+Use `--fast-scan` with `--mxfp4-flydsl` to scan coupled G1/G2 candidates
+(pruned by default, or all with `--mxfp4-search-mode full`) using the
+profiler-summed active GPU-kernel time, excluding launch
+overhead and idle gaps. The scan prepares one input fixture per shape and
+builds one shared torch reference. Candidates that exceed
+`--errRatio`, return a non-finite error, or fail to launch are rejected
+individually, and the remaining candidates continue. A shared
+`--fast-scan-warmup-accuracy-checks` control (default 1) runs an untimed launch
+and validates its output before the coarse stage. The remaining candidates are
+profiled for `--fast-scan-iters` launches (default 10, for 11 coarse launches
+including warm-up; the value must be at least 2). The five lowest-latency
+`--fast-scan-finalists` candidates (default 5), always including the coarse
+global fastest candidate, plus the most accurate candidate not already in that
+performance set are revalidated and retimed for `--fast-scan-final-iters`
+profiled launches (default 100; the value must be at least 2) without another
+warm-up. If a finalist fails final accuracy validation, the next-lowest-latency
+unselected coarse survivor is retimed as a backfill until the target number of
+successful final retimes is reached or the candidate pool is exhausted. The
+accuracy-bucket ordering is diagnostic only: it ranks the printed summary but
+never reorders the latency-ordered backfill queue. The accuracy promotion
+itself is not diagnostic, and picks the most accurate unselected coarse
+survivor by the unrounded error, with latency breaking an exact tie. If the
+globally most accurate candidate is already a performance finalist, the
+next-most-accurate unselected candidate is promoted instead, so one independent
+accuracy candidate always reaches the final stage when one is available. Every
+requested profiler sample counts toward the active-kernel average except the
+warm-up iterations and, once the sample count exceeds 30, the IQR outliers that
+`get_trace_perf` drops. With `AITER_MXFP4_TUNE_SWIGLU_LIMIT` set, the limit is
+applied to the shared reference, to every candidate launch, and to the parallel
+precompile, so the scan neither compares different clamps nor JITs during
+scoring. The final measured output is checked after timing as an additional
+stability guard. Final-winner selection finds the globally fastest finalist,
+includes every finalist within 1% of that latency, and selects the lowest
+worst-case cosine error in that global performance-equivalent set. Latency
+breaks an exact accuracy tie. A shape is marked failed only when no candidate
+survives its accuracy and launch checks; otherwise the best valid final retime
+is emitted.
+
+The funnel checks kernel-level correctness at every stage. Still validate the
+selected rows through the production operator before using or committing the
+table, because that also covers runtime dispatch and integration:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i aiter/configs/model_configs/model_fp4_untuned_fmoe.csv \
+  -o aiter/configs/model_configs/model_fp4_tuned_fmoe.csv \
+  --mxfp4-flydsl --fast-scan --mp 1 --batch 1
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --mxfp4-flydsl \
+  --run_config aiter/configs/model_configs/model_fp4_tuned_fmoe.csv
+```
+
 #### `--compare`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -188,8 +278,10 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 
 #### `--timeout`
 - **Type**: Integer
-- **Default**: `None`
-- **Description**: Timeout in seconds for each task group.
+- **Default**: `1800`
+- **Description**: Per-task watchdog for ordinary tuners. MXFP4 uses a
+  best-effort SIGALRM timeout per operation; a permanent GPU hang may wait
+  indefinitely.
 
 **Example**:
 ```bash
@@ -214,4 +306,3 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - Only G1U1 (gate-up fused) MoE configurations are currently supported for tuning
 - Supported quantization types include: per_Token, per_1x128 (blockscale), per_1x32 (MXFP4, gfx950 only)
 - If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build moe kernels in tuned csv by default. If you want to use the new result of moe tuning, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
-

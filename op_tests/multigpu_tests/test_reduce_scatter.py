@@ -28,54 +28,19 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def reduce_scatter(
-    tp_size,
-    pp_size,
-    rankID,
-    x,
-    dim=0,
-    use_custom=False,
-    distributed_init_method: str | None = None,
-    force_fallback=False,
-):
-    """Per-rank worker. Runs reduce_scatter on x with the given dim and
-    returns (output, per-call latency in us).
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
 
-    force_fallback: set AITER_CUSTOM_AR_MAX_SIZE=0 so the custom kernel is
-    disabled and every reduce_scatter takes the pynccl fallback path in
-    CudaCommunicator.reduce_scatter. This exercises the non-zero-dim fallback
-    that used to mis-lay-out its result (movedim direction + discarded
-    reshape/movedim); must be set before the group's CustomAllreduce is built."""
-    device = torch.device(f"cuda:{rankID}")
-    torch.cuda.set_device(device)
-    if force_fallback:
-        os.environ["AITER_CUSTOM_AR_MAX_SIZE"] = "0"
-    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
-
-    # warmup + barrier so the timing on first call isn't polluted.
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
     torch.cuda.synchronize()
-
-    @perftest()
-    def run_ca(x):
-        return tensor_model_parallel_reduce_scatter(x, use_custom=use_custom, dim=dim)
-
-    out = run_ca(x)
-
-    if dist.is_initialized():
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        torch.cuda.empty_cache()
-    return out
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def _build_input(shape, dtype, tp_size, rand_seed):
@@ -102,95 +67,182 @@ def _ref_output(input_tensor, dim, rank, tp_size):
     return out.to(input_tensor.dtype)
 
 
-def run_reduce_scatter_parallel(
+class _TorchDistributedReduceScatters:
+    """Counts the torch.distributed reduce-scatters issued inside the block."""
+
+    def __enter__(self):
+        self.count = 0
+        self._reduce_scatter_tensor = dist.reduce_scatter_tensor
+
+        def counted(*args, **kwargs):
+            self.count += 1
+            return self._reduce_scatter_tensor(*args, **kwargs)
+
+        dist.reduce_scatter_tensor = counted
+        return self
+
+    def __exit__(self, *exc):
+        dist.reduce_scatter_tensor = self._reduce_scatter_tensor
+
+
+def _run_reduce_scatter_case(rankID, tp_size, case_idx, shape, dim, dtype, use_custom):
+    """Run one reduce_scatter case on an initialized rank and compare its
+    output against the analytic reference.
+
+    Every rank draws the same ``rand_seed`` from the ``case_idx`` seed, so
+    each builds the identical input and its own reference slice locally;
+    only the error scalars and latency go back to the parent.
+
+    Without use_custom the case also compiles the call with fullgraph=True:
+    dynamo traces torch.distributed's reduce-scatter, not PyNccl's ctypes
+    call, so the group has to keep torch.distributed while it traces."""
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    rand_seed = torch.randint(
+        1, 16, (tp_size,), dtype=dtype, device="cuda", generator=gen
+    )
+    x = _build_input(shape, dtype, tp_size, rand_seed)
+    ref = _ref_output(x, dim, rankID, tp_size)
+
+    def reduce_scatter(x):
+        return tensor_model_parallel_reduce_scatter(x, use_custom=use_custom, dim=dim)
+
+    @perftest()
+    def run_ca(x):
+        return reduce_scatter(x)
+
+    with _TorchDistributedReduceScatters() as reduce_scatters:
+        out, us = run_ca(x)
+    diff = (out.float() - ref.float()).abs()
+    result = {
+        "us": us,
+        "max_abs_err": diff.max().item(),
+        "mean_abs_err": diff.mean().item(),
+        "torch_distributed": reduce_scatters.count > 0,
+    }
+    if not use_custom:
+        torch._dynamo.reset()
+        compiled = torch.compile(reduce_scatter, fullgraph=True, backend="eager")
+        result["compiled_equal"] = torch.equal(compiled(x), out)
+    return result
+
+
+def reduce_scatter_sweep(
     tp_size,
     pp_size,
-    shape,
-    dim,
+    rankID,
+    cases,
     dtype,
-    rand_seed,
-    use_custom,
-    distributed_init_method,
+    distributed_init_method: str | None = None,
     force_fallback=False,
+    use_custom=True,
 ):
-    """Spawn tp_size processes, each running one reduce_scatter call.
-    Returns list of (out, us) per rank."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    rets = []
-    for i in range(tp_size):
-        x = _build_input(shape, dtype, tp_size, rand_seed)
-        rets.append(
-            pool.apply_async(
-                reduce_scatter,
-                args=(
-                    tp_size,
-                    pp_size,
-                    i,
-                    x,
-                    dim,
-                    use_custom,
-                    distributed_init_method,
-                    force_fallback,
-                ),
-            )
+    """Per-rank worker. Runs every ``(label, shape, dim)`` case inside a
+    single distributed init and returns one result dict per case.
+
+    Setting up the TP group dominates a single case (seconds vs. microseconds
+    of kernel time), so the group is created and torn down once. Results are
+    returned rather than asserted here: every rank must walk the full case
+    list so the collectives stay aligned across ranks.
+
+    force_fallback: set AITER_CUSTOM_RS_MAX_SIZE=0 so the custom kernel is
+    disabled and every reduce_scatter takes the pynccl fallback path in
+    CudaCommunicator.reduce_scatter. This exercises the non-zero-dim fallback
+    that used to mis-lay-out its result (movedim direction + discarded
+    reshape/movedim); must be set before the group's CustomAllreduce is built,
+    so custom and fallback cases cannot share one init."""
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    if force_fallback:
+        os.environ["AITER_CUSTOM_RS_MAX_SIZE"] = "0"
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+
+    # warmup + barrier so the timing on first call isn't polluted.
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    results = [
+        _run_reduce_scatter_case(
+            rankID, tp_size, case_idx, shape, dim, dtype, use_custom
         )
-    pool.close()
-    pool.join()
-    return [el.get() for el in rets]
+        for case_idx, (_label, shape, dim) in enumerate(cases)
+    ]
+
+    if dist.is_initialized():
+        barrier_before_teardown()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return results
 
 
-def run_case(
-    label, shape, dim, dtype, tp_size, init_method_factory, force_fallback=False
-):
-    """End-to-end one case: spawn the custom run, compute accuracy against
-    the analytic PyTorch reference, collect latency. Returns one row for
-    the summary table.
+def run_suite(cases, dtype, tp_size, force_fallback=False, use_custom=True):
+    """End-to-end one suite: spawn tp_size processes that share one TP group
+    and run every case, then fold the per-rank accuracy against the analytic
+    PyTorch reference and the latency into one summary row per case.
 
     force_fallback routes every reduce_scatter through the pynccl fallback
-    (custom AR disabled) instead of the custom kernel.
+    (custom AR disabled) instead of the custom kernel. use_custom=False takes
+    GroupCoordinator's NCCL path, which runs on the TP group's PyNccl.
 
     No external-library comparison — other libs (torch.distributed /
     pynccl) don't support scatter on non-zero dims, so latency-vs-them
     isn't meaningful for the new kernels."""
-    rand_seed = torch.randint(1, 16, (tp_size,), dtype=dtype, device="cuda")
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
+            pool.apply_async(
+                reduce_scatter_sweep,
+                args=(
+                    tp_size,
+                    1,
+                    rank,
+                    cases,
+                    dtype,
+                    init_method,
+                    force_fallback,
+                    use_custom,
+                ),
+            )
+            for rank in range(tp_size)
+        ]
+        per_rank = [el.get() for el in rets]
 
-    custom_rets = run_reduce_scatter_parallel(
-        tp_size,
-        1,
-        shape,
-        dim,
-        dtype,
-        rand_seed,
-        True,
-        init_method_factory(),
-        force_fallback,
-    )
-
-    # Analytic reference vs each rank's output.
-    ref_input = _build_input(shape, dtype, tp_size, rand_seed)
-    max_err = 0.0
-    mean_err = 0.0
-    for rank, (out, _us) in enumerate(custom_rets):
-        ref = _ref_output(ref_input, dim, rank, tp_size).cpu()
-        diff = (out.cpu().float() - ref.float()).abs()
-        max_err = max(max_err, diff.max().item())
-        # Use max-over-ranks for mean too, so a single bad rank shows up.
-        mean_err = max(mean_err, diff.mean().item())
-    custom_us = [us for _, us in custom_rets]
-
-    return {
-        "case": label,
-        "path": "fallback" if force_fallback else "custom",
-        "shape": str(tuple(shape)),
-        "dim": dim,
-        "dtype": str(dtype).split(".")[-1],
-        "max_abs_err": max_err,
-        "mean_abs_err": mean_err,
-        "min_us": min(custom_us),
-        "max_us": max(custom_us),
-    }
+    path = "fallback" if force_fallback else "custom" if use_custom else "nccl"
+    rows = []
+    for i, (label, shape, dim) in enumerate(cases):
+        rank_results = [results[i] for results in per_rank]
+        custom_us = [r["us"] for r in rank_results]
+        rows.append(
+            {
+                "case": label,
+                "path": path,
+                "shape": str(tuple(shape)),
+                "dim": dim,
+                "dtype": str(dtype).split(".")[-1],
+                "max_abs_err": max(r["max_abs_err"] for r in rank_results),
+                # Use max-over-ranks for mean too, so a single bad rank shows up.
+                "mean_abs_err": max(r["mean_abs_err"] for r in rank_results),
+                "min_us": min(custom_us),
+                "max_us": max(custom_us),
+                "torch_distributed": any(r["torch_distributed"] for r in rank_results),
+                "compiled_equal": (
+                    None
+                    if use_custom
+                    else all(r["compiled_equal"] for r in rank_results)
+                ),
+            }
+        )
+    return rows
 
 
 def build_cases(tp_size, dtype):
@@ -257,7 +309,9 @@ def build_fallback_cases(tp_size, dtype):
     results, so it returned a transposed (garbage) tensor for non-zero dims.
 
     Only the requirement shape[dim] % tp_size == 0 matters here (no pack/vec
-    alignment gates on the fallback), so keep the shapes small."""
+    alignment gates on the fallback), so keep the shapes small. The nccl suite
+    (use_custom=False) scatters the same shapes through GroupCoordinator's
+    own movedim and PyNccl call."""
     return [
         ("fallback_dim0", (4 * tp_size, 8, 6), 0),
         ("fallback_dim1_mid", (5, 4 * tp_size, 6), 1),
@@ -295,14 +349,16 @@ parser.add_argument(
     "-s",
     "--suite",
     type=str,
-    choices=["custom", "fallback", "all"],
+    choices=["custom", "fallback", "nccl", "all"],
     default="all",
-    help="which kernel path to test: custom kernel, pynccl fallback, or both",
+    help="which kernel path to test: custom kernel, pynccl fallback, "
+    "use_custom=False (nccl), or all",
 )
 
-# The fallback path uses int-valued bf16 inputs whose reduced sum is exact, so a
-# correct result matches the reference to the bit; any nonzero error means the
-# non-zero-dim fallback mis-laid-out its output (the bug this guards against).
+# The fallback and nccl paths use int-valued bf16 inputs whose reduced sum is
+# exact, so a correct result matches the reference to the bit; any nonzero error
+# means the non-zero-dim path mis-laid-out its output (the bug this guards
+# against).
 FALLBACK_TOL = 1e-6
 
 
@@ -316,38 +372,33 @@ if __name__ == "__main__":
 
     tp_size = args.tp_size
 
-    def init_method_factory():
-        return get_distributed_init_method(get_ip(), get_open_port())
-
     rows = []
     failures = []
     for dtype in dtypes_to_run:
-        # (case-list, force_fallback) per selected suite.
+        # (case-list, force_fallback, use_custom) per selected suite; one TP
+        # group each.
         suites = []
         if args.suite in ("custom", "all"):
-            suites.append((build_cases(tp_size, dtype), False))
+            suites.append((build_cases(tp_size, dtype), False, True))
         if args.suite in ("fallback", "all"):
-            suites.append((build_fallback_cases(tp_size, dtype), True))
+            suites.append((build_fallback_cases(tp_size, dtype), True, True))
+        if args.suite in ("nccl", "all"):
+            suites.append((build_fallback_cases(tp_size, dtype), False, False))
 
-        for all_cases, force_fallback in suites:
+        for all_cases, force_fallback, use_custom in suites:
             if args.case is None:
                 cases_to_run = all_cases
             else:
                 cases_to_run = [c for c in all_cases if c[0] == args.case]
-            for label, shape, dim in cases_to_run:
-                path = "fallback" if force_fallback else "custom"
+            if not cases_to_run:
+                continue
+            suite_rows = run_suite(
+                cases_to_run, dtype, tp_size, force_fallback, use_custom
+            )
+            for (label, shape, dim), row in zip(cases_to_run, suite_rows):
                 print(
-                    f"\n=== [{path}] {label}  shape={shape}  dim={dim}  "
+                    f"\n=== [{row['path']}] {label}  shape={shape}  dim={dim}  "
                     f"dtype={dtype}  tp={tp_size} ==="
-                )
-                row = run_case(
-                    label,
-                    shape,
-                    dim,
-                    dtype,
-                    tp_size,
-                    init_method_factory,
-                    force_fallback,
                 )
                 print(
                     f"  max_abs_err={row['max_abs_err']:.4g}  "
@@ -355,17 +406,27 @@ if __name__ == "__main__":
                     f"latency={row['min_us']:.2f}-{row['max_us']:.2f}us"
                 )
                 rows.append(row)
-                # Fallback cases have an exact reference -> any error is a bug.
-                if force_fallback and row["max_abs_err"] > FALLBACK_TOL:
+                # Fallback and nccl cases have an exact reference -> any error
+                # is a bug.
+                if (force_fallback or not use_custom) and row[
+                    "max_abs_err"
+                ] > FALLBACK_TOL:
                     failures.append(
-                        f"{label} (dim={dim}): max_abs_err={row['max_abs_err']:.4g}"
+                        f"[{row['path']}] {label} (dim={dim}): "
+                        f"max_abs_err={row['max_abs_err']:.4g}"
+                    )
+                # The NCCL path runs on PyNccl, except while dynamo traces.
+                if not use_custom and (
+                    row["torch_distributed"] or not row["compiled_equal"]
+                ):
+                    failures.append(
+                        f"[nccl] {label} (dim={dim}): went through "
+                        f"torch.distributed={row['torch_distributed']}, "
+                        f"compiled result equal={row['compiled_equal']}"
                     )
 
     df = pd.DataFrame(rows)
     print("\n=== reduce_scatter summary ===")
     print(df.to_markdown(index=False, floatfmt=".4g"))
 
-    assert not failures, (
-        "reduce_scatter fallback produced wrong results (non-zero-dim layout bug):\n  "
-        + "\n  ".join(failures)
-    )
+    assert not failures, "reduce_scatter failed:\n  " + "\n  ".join(failures)

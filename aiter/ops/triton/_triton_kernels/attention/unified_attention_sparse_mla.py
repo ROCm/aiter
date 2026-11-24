@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def cdiv_fn(x, y):
@@ -38,7 +40,23 @@ def find_seq_idx(
     return left - 1
 
 
-@triton.jit
+_kernel_unified_attention_sparse_mla_2d_repr = make_kernel_repr(
+    "_kernel_unified_attention_sparse_mla_2d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "topk_count",
+        "BLOCK_M",
+        "ROPE_RANK",
+        "KV_LORA_RANK",
+        "TILE_SIZE",
+        "ALL_DECODE",
+    ],
+)
+
+
+@triton.jit(repr=_kernel_unified_attention_sparse_mla_2d_repr)
 def _kernel_unified_attention_sparse_mla_2d(
     output_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     query_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]

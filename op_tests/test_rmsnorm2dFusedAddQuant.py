@@ -333,7 +333,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048, 3584, 4096, 8192],
+        # 5120 and 6144 cover the n in (4096, 6144] band, which dispatches to
+        # thread_data_size=24; without them no shape here exercises a group quant
+        # whose group_size is not a multiple of the per-thread chunk.
+        default=[1024, 2048, 3584, 4096, 5120, 6144, 8192],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",

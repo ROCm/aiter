@@ -9,6 +9,8 @@ try:
     import triton
     import triton.language as tl
 
+    from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
     _HAVE_TRITON = True
 except ImportError:
     _HAVE_TRITON = False
@@ -132,7 +134,7 @@ def _v_kvtab_dev(device, direct_p: bool):
     kvtab = _V_KVTAB_CACHE.get(key)
     if kvtab is None:
         table = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
-        kvtab = torch.from_numpy(table.reshape(-1)).to(device)
+        kvtab = torch.as_tensor(table.reshape(-1), dtype=torch.int32, device=device)
         _V_KVTAB_CACHE[key] = kvtab
     return kvtab
 
@@ -162,9 +164,11 @@ def quantize_fp6_v_clean_triton(
         v_fp8.stride(1),
         v_fp8.stride(2),
         v_fp8.stride(3),
+        sk,
         h_kv,
         nT,
         n_blocks,
+        CLAMP_TAIL=False,
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=False,
         BLOCK_N=BLOCK_N,
@@ -178,8 +182,8 @@ def quantize_fp6_v_data_scale_triton(
     """Pack F8F6 V directly into its separate data and scale ABI buffers."""
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v_fp8.shape
-    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
-    nT = sk // tile
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nT = (sk + tile - 1) // tile
     n_blocks = b * h_kv * nT * 128 * 4
     data = torch.empty(
         b * h_kv * nT * 12288 + 256, dtype=torch.uint8, device=v_fp8.device
@@ -197,9 +201,11 @@ def quantize_fp6_v_data_scale_triton(
         v_fp8.stride(1),
         v_fp8.stride(2),
         v_fp8.stride(3),
+        sk,
         h_kv,
         nT,
         n_blocks,
+        CLAMP_TAIL=sk % tile != 0,
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=True,
         BLOCK_N=BLOCK_N,
@@ -274,7 +280,17 @@ if _HAVE_TRITON:
         sign = (value.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
         return magnitude_code | sign
 
-    @triton.jit
+    _pack_v_fp6_repr = make_kernel_repr(
+        "_pack_v_fp6_kernel",
+        [
+            "CLAMP_TAIL",
+            "FIXED_E8M0",
+            "SEPARATE_OUTPUT",
+            "BLOCK_N",
+        ],
+    )
+
+    @triton.jit(repr=_pack_v_fp6_repr)
     def _pack_v_fp6_kernel(
         v_ptr,  # fp8 V [b, sk, h_kv, d] (any strides)
         out_ptr,  # uint8 [b*h_kv*nT*12800]
@@ -284,9 +300,11 @@ if _HAVE_TRITON:
         stride_vs,
         stride_vh,
         stride_vd,
+        sk,
         h_kv,
         nT,
         n_blocks,  # total 32-kv MX blocks
+        CLAMP_TAIL: tl.constexpr,
         FIXED_E8M0: tl.constexpr,
         SEPARATE_OUTPUT: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -310,6 +328,8 @@ if _HAVE_TRITON:
         f = tl.arange(0, 32)
         kt = tl.load(kvtab_ptr + L[:, None] * 32 + f[None, :])  # [BN,32]
         kv = (t * 128 + k * 64)[:, None] + kt  # [BN,32] kv-in-tile
+        if CLAMP_TAIL:
+            kv = tl.minimum(kv, sk - 1)
         voff = (
             bb[:, None] * stride_vb
             + kv * stride_vs
@@ -368,7 +388,15 @@ def _qk_field_perm() -> np.ndarray:
 
 if _HAVE_TRITON:
 
-    @triton.jit
+    _pack_qk_fp6_repr = make_kernel_repr(
+        "_pack_qk_fp6_kernel",
+        [
+            "BLOCK_N",
+            "num_warps",
+        ],
+    )
+
+    @triton.jit(repr=_pack_qk_fp6_repr)
     def _pack_qk_fp6_kernel(
         x_ptr,  # float [N, D] row-major (D % 32 == 0)
         packed_ptr,  # uint8 [N, NB*24]
@@ -416,7 +444,15 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
-    @triton.jit
+    _gather_k_lds_repr = make_kernel_repr(
+        "_gather_k_lds_kernel",
+        [
+            "DATA_TILE_BYTES",
+            "BLOCK",
+        ],
+    )
+
+    @triton.jit(repr=_gather_k_lds_repr)
     def _gather_k_lds_kernel(
         packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
         buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
@@ -450,7 +486,16 @@ if _HAVE_TRITON:
         )
         tl.store(buf_ptr + dst_addr, byte)
 
-    @triton.jit
+    _fill_k_scale_tail_repr = make_kernel_repr(
+        "_fill_k_scale_tail_kernel",
+        [
+            "TILE_BYTES",
+            "SCALE_TAIL_OFFSET",
+            "BLOCK",
+        ],
+    )
+
+    @triton.jit(repr=_fill_k_scale_tail_repr)
     def _fill_k_scale_tail_kernel(
         scale_ptr,  # uint8 scale [b, sk, h, 4] flattened
         buf_ptr,  # uint8 packed K buffer [b,h,nt*17408] flattened
@@ -491,7 +536,7 @@ def _qk_field_perm_dev(device):
     """Cache the last-dimension FP6 field permutation on each device."""
     cperm = _QK_FIELD_PERM_CACHE.get(device)
     if cperm is None:
-        cperm = torch.from_numpy(_qk_field_perm()).to(device)
+        cperm = torch.as_tensor(_qk_field_perm(), dtype=torch.int32, device=device)
         _QK_FIELD_PERM_CACHE[device] = cperm
     return cperm
 
@@ -571,6 +616,42 @@ def _k_lds_src_within(nt: int, total: int, h: int, device):
     return g
 
 
+def fill_fp6_k_scale_tails(buf: "torch.Tensor", scale: "torch.Tensor") -> None:
+    """Write every 128-token tile's 1024B K-scale tail of a flat MXFP6 K buffer, in place.
+
+    buf : contiguous 1D uint8 buffer of [b, h, n_tiles * FP6_K_TILE_BYTES] K tiles, laid out as
+          reorder_fp6_k_lds_order_triton lays them out; trailing slack may follow.
+    scale : contiguous uint8 E8M0 K scales [b, sk, h, 4], the plain image the tails gather from.
+    Each tail is Region A (unshifted) + Region B (pre-shifted +1 byte, so the kernel MFMA op_sel
+    picks dblk1/dblk3 with no runtime shift); rows past sk read as zero.
+    """
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, groups = scale.shape
+    assert groups == FP6_K_SCALE_VALUES_PER_TOKEN, scale.shape
+    assert scale.dtype == torch.uint8 and scale.is_contiguous(), (
+        scale.dtype,
+        scale.stride(),
+    )
+    assert buf.dim() == 1 and buf.dtype == torch.uint8 and buf.is_contiguous(), (
+        buf.shape,
+        buf.dtype,
+    )
+    assert buf.device == scale.device, (buf.device, scale.device)
+    nt = (sk + _K_TILE_TOKENS - 1) // _K_TILE_TOKENS
+    assert buf.numel() >= b * h * nt * _K_TILE_BYTES, (buf.numel(), b, h, nt)
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.view(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
+        BLOCK=1024,
+        num_warps=4,
+    )
+
+
 def reorder_fp6_k_lds_order_triton(
     packed: "torch.Tensor",
     scale: "torch.Tensor",
@@ -639,20 +720,9 @@ def reorder_fp6_k_lds_order_triton(
         BLOCK=BLOCK,
         num_warps=4,
     )
-    # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
-    # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
-    # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
-    _fill_k_scale_tail_kernel[(b * h * nt,)](
-        scale.reshape(-1),
-        buf,
-        sk,
-        h,
-        nt,
-        TILE_BYTES=_K_TILE_BYTES,
-        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
-        BLOCK=1024,
-        num_warps=4,
-    )
+    # Fill the per-tile 1024B scale tail. The B pre-shift reads 1 byte past the last token's scale
+    # on the final tile -> the +256 buf slack keeps it mapped.
+    fill_fp6_k_scale_tails(buf, scale)
     k_view = buf.as_strided(
         (b, sk, h, _K_PACKED_ROW_BYTES),
         (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
@@ -867,10 +937,6 @@ def pack_fp6_v_data_scale_views(
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v.shape
     n_tiles = (sk + tile - 1) // tile
-    sk_pad = n_tiles * tile
-    if sk_pad != sk:
-        tail = v[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
-        v = torch.cat([v, tail], dim=1)
 
     data_flat, scale_flat = quantize_fp6_v_data_scale_triton(
         v, tile=tile, fixed_e8m0=fixed_e8m0

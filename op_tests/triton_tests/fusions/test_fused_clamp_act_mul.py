@@ -4,8 +4,10 @@ import torch.nn.functional as F
 
 import aiter
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    _get_config,
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 from aiter.utility import fp4_utils
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
@@ -13,18 +15,39 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     upcast,
 )
 
+_TORCH_ACTIVATIONS = {
+    "silu": F.silu,
+    "gelu": F.gelu,
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "relu": F.relu,
+    "relu6": lambda x: F.hardtanh(x, 0.0, 6.0),
+}
 
-def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
+
+def _check_backend(backend):
+    """Run only the backend the card actually uses: gluon on gfx1250, triton
+    everywhere else, so gfx1250 skips the triton cases and vice versa."""
+    on_gfx1250 = get_arch() in ("gfx1250", "gfx1250-strict")
+    if backend == "gluon" and not on_gfx1250:
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and on_gfx1250:
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+
+def _torch_reference(inp, swiglu_limit, weights, dtype_quant, activation="silu"):
     gate, up = inp.chunk(2, dim=-1)
+    gate = gate.float()
+    up = up.float()
     if swiglu_limit > 0:
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         gate = torch.clamp(gate, max=swiglu_limit)
-    y = F.silu(gate) * up
+    act_fn = _TORCH_ACTIVATIONS[activation]
+    y = act_fn(gate) * up
     if weights is not None:
-        y = weights * y
+        y = weights.float() * y
     if dtype_quant is None:
         return y.to(inp.dtype)
-    return per_token_fp8_group_quant(y.float(), dtype_quant, 128)
+    return per_token_fp8_group_quant(y, dtype_quant, 128)
 
 
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 32])
@@ -36,9 +59,19 @@ def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
     [(False, False), (True, True), (True, False)],
 )
 @pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul(
-    M, D, swiglu_limit, transpose_scale, with_weights, weight_broadcast, dtype_quant
+    M,
+    D,
+    swiglu_limit,
+    transpose_scale,
+    with_weights,
+    weight_broadcast,
+    dtype_quant,
+    backend,
 ):
+
+    _check_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     if with_weights:
@@ -71,6 +104,7 @@ def test_fused_clamp_act_mul(
             activation="silu",
             dtype_quant=dtype_quant,
             transpose_scale=transpose_scale,
+            backend=backend,
         )
 
         ref_q, ref_s = _torch_reference(inp, swiglu_limit, w, dtype_quant)
@@ -98,11 +132,152 @@ def test_fused_clamp_act_mul(
             weights=w,
             activation="silu",
             dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, swiglu_limit, w, None)
 
         assert out.dtype == inp.dtype
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M, n_half", [(4096, 512), (8192, 512)])
+@pytest.mark.parametrize("weight_broadcast", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_weights_multirow_tile(
+    M, n_half, weight_broadcast, backend
+):
+    """Weights must be applied per row when a tile stages BLOCK_SIZE_M > 1 rows."""
+
+    _check_backend(backend)
+
+    config = _get_config(M, n_half, n_half, backend)
+    block_m = config.get("BLOCK_SIZE_M", 1)
+    if block_m <= 1:
+        pytest.skip(f"shape stages one row per tile (BLOCK_SIZE_M={block_m})")
+
+    torch.manual_seed(0)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+
+    row_w = 1.0 + (torch.arange(M, device="cuda", dtype=torch.float32) % 4) * 0.5
+    if weight_broadcast:
+        w = row_w[:, None]
+    else:
+        col_w = torch.linspace(0.5, 1.5, n_half, device="cuda", dtype=torch.float32)
+        w = row_w[:, None] * col_w[None, :]
+
+    out = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=0.0,
+        weights=w,
+        activation="silu",
+        dtype_quant=None,
+        backend=backend,
+    )
+    ref = _torch_reference(inp, 0.0, w, None)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M, n_half", [(4096, 512), (128, 1024)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_broadcast_matches_expanded(M, n_half, backend):
+    """A [M, 1] broadcast weight must equal the same values expanded to [M, N].
+
+    The two take different code paths so testing if they match, and checked with
+    torch.
+    """
+    _check_backend(backend)
+
+    torch.manual_seed(3)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    w_col = torch.randn(M, 1, device="cuda", dtype=torch.float32) * 0.5
+
+    out_broadcast = fused_clamp_act_mul(
+        inp, swiglu_limit=0.0, weights=w_col, activation="silu", backend=backend
+    )
+    out_full = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=0.0,
+        weights=w_col.expand(M, n_half).contiguous(),
+        activation="silu",
+        backend=backend,
+    )
+
+    # check match
+    torch.testing.assert_close(out_broadcast, out_full, atol=0.0, rtol=0.0)
+
+    # check torch
+    ref = _torch_reference(inp, 0.0, w_col, None)
+    torch.testing.assert_close(out_broadcast, ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out_full, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M, n_half", [(4096, 512), (128, 1024)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_full_weights_vary_along_n(M, n_half, backend):
+    """Per-element weights must vary across N, not just across M.
+
+    A kernel that collapsed [M, N] weights to one value per row would still
+    pass a broadcast-only test, so every column has a distinct factor.
+    """
+    _check_backend(backend)
+
+    torch.manual_seed(4)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    col_w = torch.linspace(0.25, 2.0, n_half, device="cuda", dtype=torch.float32)
+    row_w = 1.0 + (torch.arange(M, device="cuda", dtype=torch.float32) % 4) * 0.5
+    w = row_w[:, None] * col_w[None, :]
+
+    out = fused_clamp_act_mul(
+        inp, swiglu_limit=0.0, weights=w, activation="silu", backend=backend
+    )
+    ref = _torch_reference(inp, 0.0, w, None)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M, n_half", [(4096, 512)])
+@pytest.mark.parametrize("weight_broadcast", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_weights_with_quant(M, n_half, weight_broadcast, backend):
+    """Weights must be applied before the group scale is computed.
+
+    The quant path derives the scale from the weighted values, so a weight
+    indexing bug shows up in the scales as well, and this is
+    the path the multi-row tuned configs are actually used on.
+    """
+
+    _check_backend(backend)
+
+    torch.manual_seed(6)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    row_w = 1.0 + (torch.arange(M, device="cuda", dtype=torch.float32) % 4) * 0.5
+    if weight_broadcast:
+        w = row_w[:, None]
+    else:
+        col_w = torch.linspace(0.5, 1.5, n_half, device="cuda", dtype=torch.float32)
+        w = row_w[:, None] * col_w[None, :]
+
+    out_buf = torch.empty((M, n_half), dtype=aiter.dtypes.fp8, device="cuda")
+    scale = torch.empty((M, (n_half + 127) // 128), dtype=torch.float32, device="cuda")
+    out_q, scale = fused_clamp_act_mul(
+        inp,
+        out_buf,
+        scale,
+        0.0,
+        weights=w,
+        activation="silu",
+        dtype_quant=aiter.dtypes.fp8,
+        backend=backend,
+    )
+    ref_q, ref_s = _torch_reference(inp, 0.0, w, aiter.dtypes.fp8)
+
+    torch.testing.assert_close(
+        upcast(out_q, scale, torch.bfloat16),
+        upcast(ref_q, ref_s, torch.bfloat16),
+        atol=0.1,
+        rtol=0.1,
+    )
 
 
 def _torch_reference_ue8m0(inp, swiglu_limit, weights, dtype_quant, quant_block_size):
@@ -140,10 +315,15 @@ def _torch_reference_ue8m0(inp, swiglu_limit, weights, dtype_quant, quant_block_
 @pytest.mark.parametrize("swiglu_limit", [0.0, 7.0])
 @pytest.mark.parametrize("with_weights", [False, True])
 @pytest.mark.parametrize("shuffle_scale", [False, True])
-def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_scale):
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_ue8m0(
+    M, D, swiglu_limit, with_weights, shuffle_scale, backend
+):
     """ue8m0 group quant. The fp8 output and e8m0 scales must match the torch
     reference; when ``shuffle_scale`` is set the kernel must lay the scales out
     exactly like ``fp4_utils.e8m0_shuffle`` applied to the unshuffled scales."""
+
+    _check_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     quant_block_size = 32
@@ -164,6 +344,7 @@ def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_sca
         quant_block_size=quant_block_size,
         scale_dtype_fmt="ue8m0",
         shuffle_scale=shuffle_scale,
+        backend=backend,
     )
 
     ref_out, ref_scale = _torch_reference_ue8m0(
@@ -189,3 +370,342 @@ def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_sca
         assert torch.equal(got, ref_scale)
     else:
         assert torch.equal(scale[:M, :num_blocks], ref_scale)
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "relu", "relu6"])
+@pytest.mark.parametrize("M", [1, 4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend):
+    """Every activation path must match the torch reference."""
+    _check_backend(backend)
+
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation=activation,
+            dtype_quant=dtype_quant,
+            backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant, activation)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1,
+            rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation=activation,
+            dtype_quant=None,
+            backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None, activation)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, n_half",
+    [
+        # N=4096 config: any → BLOCK_SIZE_M=1, ROWS_PER_PROG=1
+        (16384, 4096),
+        # N=8192 config: any → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
+        (8192, 8192),
+        # N=8192 config: any → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
+        (16384, 8192),
+    ],
+)
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_large_n_configs(M, n_half, dtype_quant, backend):
+    """Exercise tuned configs at N=4096 and N=8192 with ROWS_PER_PROG > 1."""
+    _check_backend(backend)
+
+    torch.manual_seed(7)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1,
+            rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+def test_fused_clamp_act_mul_backend_auto(M, D, dtype_quant):
+    """backend=None must pick the right backend and produce correct results."""
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=None,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1,
+            rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=None,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# multiple rows per program according to config
+@pytest.mark.parametrize(
+    "M, n_half",
+    [
+        (13, 512),
+        (4099, 512),
+        (8195, 8192),
+        (16387, 4096),
+    ],
+)
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
+    """Partial last tile: M not divisible by BLOCK_SIZE_M * ROWS_PER_PROG."""
+    _check_backend(backend)
+
+    torch.manual_seed(99)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1,
+            rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [1, 4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
+    """float16 inputs must work identically to bfloat16."""
+    _check_backend(backend)
+
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.float16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1,
+            rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        assert out.dtype == inp.dtype
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _torch_mx_reference(inp, swiglu_limit, dtype_quant):
+    """fp32 act(gate) * up, then E4M3 with group-32 E8M0 scales rounded up to a
+    power of two, as the kernels compute it. Returns (fp8, scale exponents)."""
+    gate, up = inp.float().chunk(2, dim=-1)
+    if swiglu_limit > 0:
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        gate = torch.clamp(gate, max=swiglu_limit)
+    y = F.silu(gate) * up
+    M, N = y.shape
+    groups = y.view(M, N // 32, 32)
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    bits = (amax / torch.finfo(dtype_quant).max).view(torch.int32)
+    exp = (bits + 0x007FFFFF) & 0x7F800000
+    scale = exp.view(torch.float32)
+    q = torch.where(scale == 0, 0.0, groups / torch.where(scale == 0, 1.0, scale))
+    return q.view(M, N).to(dtype_quant), (exp >> 23).to(torch.uint8).view(M, N // 32)
+
+
+@pytest.mark.parametrize("M", [1, 8, 48, 97])
+@pytest.mark.parametrize("n_half", [288, 576, 1152, 2304])
+@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_mx_partial_width(M, n_half, swiglu_limit, backend):
+    """Native MX (ue8m0, group 32) quant on rows that are whole groups but not a
+    multiple of 128: the shared expert's intermediate at TP4 (576) and TP8 (288).
+    The tile is the next power of two, so every row has masked columns."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    dtype_quant = aiter.dtypes.fp8
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16) * 4
+    inp[0, :32] = 0  # an all-zero group: scale exponent 0, data 0
+
+    out, scale = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=dtype_quant,
+        quant_block_size=32,
+        scale_dtype_fmt="ue8m0",
+        backend=backend,
+    )
+    assert out.shape == (M, n_half) and scale.shape == (M, n_half // 32)
+
+    ref_q, ref_e = _torch_mx_reference(inp, swiglu_limit, dtype_quant)
+    # A 1-ulp difference in silu can move the group max across a power of two or
+    # a value across an E4M3 rounding boundary; anything more is a real bug.
+    scale_diff = (scale.int() - ref_e.int()).abs()
+    assert scale_diff.max().item() <= 1
+    assert (scale_diff != 0).float().mean().item() < 1e-3
+    deq = out.float().view(M, -1, 32) * torch.exp2(scale.float() - 127)[..., None]
+    ref = ref_q.float().view(M, -1, 32) * torch.exp2(ref_e.float() - 127)[..., None]
+    torch.testing.assert_close(
+        deq.view(M, n_half), ref.view(M, n_half), atol=1e-6, rtol=0.13
+    )
+    assert torch.all(out[0, :32].float() == 0)
+
+
+@pytest.mark.parametrize("M", [1, 8, 97])
+@pytest.mark.parametrize("n_half", [32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_narrow_rows_unquantized(M, n_half, backend):
+    """Rows narrower than the default quant group (128) with no quant: the
+    kernel must not need the unused group to fit the tile."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    out = fused_clamp_act_mul(
+        inp, swiglu_limit=0.0, activation="silu", dtype_quant=None, backend=backend
+    )
+    assert out.shape == (M, n_half) and out.dtype == inp.dtype
+    ref = _torch_reference(inp, 0.0, None, None)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [1, 8, 97])
+@pytest.mark.parametrize("n_half, quant_block_size", [(384, 256), (576, 128)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_partial_last_group(M, n_half, quant_block_size, backend):
+    """FP8 with fp32 scales where the last group is partial: 384 / 256 (accepted
+    before N_HALF_MULTIPLE) and 576 / 128. The columns past n_half read as zero,
+    so the last group's scale is the amax of its real columns."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + quant_block_size + M)
+    dtype_quant = aiter.dtypes.fp8
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16) * 4
+    out, scale = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=0.0,
+        activation="silu",
+        dtype_quant=dtype_quant,
+        quant_block_size=quant_block_size,
+        backend=backend,
+    )
+    groups = -(-n_half // quant_block_size)
+    assert out.shape == (M, n_half) and scale.shape == (M, groups)
+
+    gate, up = inp.float().chunk(2, dim=-1)
+    y = F.silu(gate) * up
+    padded = F.pad(y, (0, groups * quant_block_size - n_half))
+    amax = padded.view(M, groups, quant_block_size).abs().amax(dim=-1)
+    torch.testing.assert_close(
+        scale, amax / torch.finfo(dtype_quant).max, rtol=1e-2, atol=1e-12
+    )
+    group_amax = amax.repeat_interleave(quant_block_size, dim=-1)[:, :n_half]
+    deq = out.float() * scale.repeat_interleave(quant_block_size, dim=-1)[:, :n_half]
+    # E4M3 keeps 3 mantissa bits: a correct value sits within 2 ** -4 of its
+    # group's amax; a scale taken over the wrong columns is far outside it.
+    assert ((deq - y).abs() <= group_amax * 2.0**-4 + 1e-6).all()
+
+
+@pytest.mark.parametrize("M", [8])
+@pytest.mark.parametrize("n_half", [32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_quant_group_wider_than_tile_raises(M, n_half, backend):
+    """A quant group wider than the compute tile (n_half <= quant_block_size / 2)
+    must raise a clean AssertionError on both backends rather than reach the
+    kernel with NUM_QUANT_BLOCKS = BLOCK_SIZE_N // QUANT_BLOCK_SIZE == 0. The
+    Triton path, whose tile is exactly next_power_of_2(n_half), lost this guard
+    when the whole-group requirement was relaxed; the Gluon path always had it."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="must be a multiple of"):
+        fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=aiter.dtypes.fp8,
+            quant_block_size=128,
+            backend=backend,
+        )

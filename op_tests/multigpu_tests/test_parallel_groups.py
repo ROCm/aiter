@@ -68,6 +68,21 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
+
+
 def _worker(
     world_size,
     tp_size,
@@ -85,7 +100,9 @@ def _worker(
       1. Initializes distributed env with the given parallel config.
       2. Verifies group topology (sizes and member ranks).
       3. Runs all-reduce on TP / EP / DP groups via communication_op wrappers.
-      4. Returns results for the main process to verify correctness.
+      4. Sends its input to the next rank of its TP group (GroupCoordinator
+         send/recv).
+      5. Returns results for the main process to verify correctness.
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -135,14 +152,27 @@ def _worker(
     ep_out = expert_parallel_all_reduce(x.clone()).cpu()
     dp_out = data_parallel_all_reduce(x.clone()).cpu()
 
+    # Even ranks send first, odd ranks receive first, so the ring cannot block.
+    tp_recv = None
+    if tp_size > 1:
+        if tp_grp.rank_in_group % 2 == 0:
+            tp_grp.send(x)
+            tp_recv = tp_grp.recv(x.shape, x.dtype)
+        else:
+            tp_recv = tp_grp.recv(x.shape, x.dtype)
+            tp_grp.send(x)
+        tp_recv = tp_recv.cpu()
+
     results = {
         "group_info": group_info,
         "tp_out": tp_out,
         "ep_out": ep_out,
         "dp_out": dp_out,
+        "tp_recv": tp_recv,
     }
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -347,6 +377,16 @@ def test_parallel_groups(
     else:
         print("\n  [FAIL] Some checks failed!")
     print()
+
+    # ---- Verify send/recv over the TP group: each rank holds its predecessor's input
+    if tp_size > 1:
+        for rank, res in enumerate(results):
+            tp_ranks = res["group_info"]["tp_ranks"]
+            prev = tp_ranks[(tp_ranks.index(rank) - 1) % tp_size]
+            assert torch.equal(
+                res["tp_recv"], all_inputs[prev]
+            ), f"Rank {rank}: TP recv does not hold rank {prev}'s input"
+        print("  [PASS] TP send/recv ring.\n")
 
 
 parser = argparse.ArgumentParser(description="Test TP/EP/DP/PP parallel groups")

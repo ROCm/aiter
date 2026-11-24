@@ -1,0 +1,16 @@
+{
+    "T_LEQ_512": {
+        "HEADS_PER_PROGRAM": 8,
+        "ROWS_PER_STEP": 8,
+        "waves_per_eu": 5,
+        "cache_modifier": null,
+        "num_warps": 1
+    },
+    "any": {
+        "HEADS_PER_PROGRAM": 8,
+        "ROWS_PER_STEP": 4,
+        "waves_per_eu": 6,
+        "cache_modifier": null,
+        "num_warps": 1
+    }
+}

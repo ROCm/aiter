@@ -88,25 +88,41 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, hea
                                const std::string& scale_fmt,
                                bool preshuffle = false);
 
+// Supplying q_scale_out and kv_cache_scale switches the op from its default FP8
+// output to the packed e2m1 + e8m0 layout that flydsl_pa_mqa_logits_fp4 reads.
+// weights_out changes meaning with the mode: fp32 with the per-(token, head)
+// q_scale folded in for FP8, q's dtype and unscaled for FP4, because the FP4
+// MQA-logits kernel applies the per-group Q scale itself.
 void indexer_qk_rope_quant_and_cache(
     aiter_tensor_t& q,            // [num_tokens, n_heads, head_dim]
-    aiter_tensor_t& q_out,        // [num_tokens, n_heads, head_dim]
+    aiter_tensor_t& q_out,        // [num_tokens, n_heads, head_dim] | fp4 [..., head_dim / 2]
     aiter_tensor_t& weights,      // [num_tokens, n_heads]
     aiter_tensor_t& weights_out,  // [num_tokens, n_heads]
     aiter_tensor_t& k,            // [num_tokens, head_dim]
     aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
+                                  // | fp4 [num_blocks, k_tiles, 4, kv_block_size, 16]
     aiter_tensor_t& slot_mapping, // [num_tokens]
     aiter_tensor_t& norm_weight,  // [head_dim]
     aiter_tensor_t& norm_bias,    // [head_dim]
-    aiter_tensor_t& positions,    // [num_tokens]
-    aiter_tensor_t& cos_cache,    // [max_position, ..., rope_dim / 2]
-    aiter_tensor_t& sin_cache,    // [max_position, ..., rope_dim / 2]
+    std::optional<aiter_tensor_t> positions, // unused for rope_dim=0
+    std::optional<aiter_tensor_t> cos_cache,
+    std::optional<aiter_tensor_t> sin_cache,
     double epsilon,
     int64_t quant_block_size,
     const std::string& scale_fmt,
     double weights_scale,
     bool preshuffle = false,
-    bool is_neox = true);
+    bool is_neox = true,
+    // false: slot<0 skips Q and K; true (DCP): compute Q for every row and
+    // guard only the owner-specific K-cache write.
+    bool compute_all_q_rope = false,
+    // [num_tokens, k_tiles, 4, 16, round_up(n_heads / 16, 4)] u8 e8m0
+    std::optional<aiter_tensor_t> q_scale_out = std::nullopt,
+    // [num_blocks, k_tiles, 4, kv_block_size] u8 e8m0
+    std::optional<aiter_tensor_t> kv_cache_scale = std::nullopt,
+    // OPUS: Q scales [T,2,32,H/16], K [pages,4,64,16], K scales [pages,2,32,4].
+    const std::string& scale_layout = "flydsl",
+    int64_t rope_dim = 64);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
@@ -134,6 +150,23 @@ void fused_qk_rope_concat_and_cache_mla(
     // compute_all_q_rope: false (default, non-DCP) restores slot<0 early-return;
     // true (DCP) forces Q RoPE for every token (needed after head all-gather).
     bool compute_all_q_rope = false);
+
+// NoPE form of fused_qk_rope_concat_and_cache_mla: concatenate and quantize Q,
+// concatenate and quantize K into the cache, without positions or rotation.
+// The optimized path currently supports the Kimi MLA layout: rank 512, PE 64,
+// one KV head and fp16/bf16 input.
+void fused_qk_concat_and_cache_mla(
+    aiter_tensor_t& q_nope,
+    aiter_tensor_t& q_pe,
+    aiter_tensor_t& kv_c,
+    aiter_tensor_t& k_pe,
+    aiter_tensor_t& kv_cache,
+    aiter_tensor_t& q_out,
+    aiter_tensor_t& slot_mapping,
+    aiter_tensor_t& k_scale,
+    aiter_tensor_t& q_scale,
+    bool is_nope_first,
+    bool compute_all_q = false);
 
 // DeepSeek V3.1 MLA: fused QK RoPE(pe) + static FP8 quant + segmented paged KV
 // cache write (no RMSNorm). kv_cache is flat [num_blocks, page_size*kv_lora +

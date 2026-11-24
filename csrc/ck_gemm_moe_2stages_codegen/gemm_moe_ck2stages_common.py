@@ -18,8 +18,9 @@ sys.path.insert(0, AITER_CORE_DIR)
 from chip_info import get_gfx
 
 # CK stage1 activation op values. swiglu (OAI swiglu_oai) maps to CK act value 3;
-# value 2 is intentionally skipped (reserved for a future activation variant).
-ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglu": 3}
+# gelutanh (gelu_tanh_and_mul) maps to CK act value 4; value 2 is intentionally
+# skipped (reserved for a future activation variant).
+ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglu": 3, "gelutanh": 4}
 ACT_OP_NAME = {v: k for k, v in ACT_OP_MAP.items()}
 
 
@@ -274,6 +275,10 @@ a8w8_gemm2_kernels_list_gfx950= {
     #  4: kernelInstanceGEMM2(       256,        64,       128,       256,     1,       4,         3,),
      5: kernelInstanceGEMM2(       256,       128,       128,       128,     1,       4,         3,),
      6: kernelInstanceGEMM2(       256,       256,       128,       128,     1,       4,         3,),
+    # K=128 for the small row tiles. The gfx950 fp8 16x16 MFMA consumes 128
+    # K elements, so inter_dim such as 384 cannot use the K=256 tiles above.
+     7: kernelInstanceGEMM2(       256,        32,       128,       128,     1,       4,         1,),
+     8: kernelInstanceGEMM2(       256,        64,       128,       128,     1,       4,         1,),
     # inter_dim=192 default instances with KPerBlock=64
     # disabled currently due to gfx950 fp8 mfma instruction used in CK not supporting these cases
     #  10: kernelInstanceGEMM2(       256,        32,        64,       64,     1,       4,         1,),

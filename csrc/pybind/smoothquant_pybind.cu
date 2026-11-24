@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "smoothquant.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     SMOOTHQUANT_PYBIND;
 }

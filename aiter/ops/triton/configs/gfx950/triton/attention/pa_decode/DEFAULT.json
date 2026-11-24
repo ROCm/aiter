@@ -1,0 +1,15 @@
+{
+    "dispatch": {
+        "bf16": {
+            "v1_max_partitions": 1
+        },
+        "fp16": {
+            "v1_max_partitions": 1
+        }
+    },
+    "launch": {
+        "v1_w_dot": {
+            "any": {"num_stages": 1, "waves_per_eu": 3}
+        }
+    }
+}
