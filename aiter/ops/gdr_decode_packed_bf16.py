@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -65,7 +67,7 @@ def gdr_decode_packed_bf16(
     expected_scale = HEAD_K_DIM**-0.5
     if scale is None:
         scale = expected_scale
-    if abs(float(scale) - expected_scale) > 1e-12:
+    if not math.isfinite(float(scale)) or abs(float(scale) - expected_scale) > 1e-12:
         raise ValueError(f"expected scale={expected_scale}, got {scale}")
 
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[1] != QKV_DIM:

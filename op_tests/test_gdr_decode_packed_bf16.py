@@ -274,6 +274,10 @@ def _bad_scale(inputs: dict[str, torch.Tensor]) -> dict[str, object]:
     return {"scale": 1.0}
 
 
+def _nan_scale(inputs: dict[str, torch.Tensor]) -> dict[str, object]:
+    return {"scale": float("nan")}
+
+
 def _bad_indices_dtype(inputs: dict[str, torch.Tensor]) -> dict[str, object]:
     return {"indices": torch.arange(2, device="cuda", dtype=torch.int64)}
 
@@ -293,7 +297,13 @@ def _bad_out_layout(inputs: dict[str, torch.Tensor]) -> dict[str, object]:
 
 @pytest.mark.parametrize(
     "mutation",
-    [_bad_scale, _bad_indices_dtype, _bad_state_layout, _bad_out_layout],
+    [
+        _bad_scale,
+        _nan_scale,
+        _bad_indices_dtype,
+        _bad_state_layout,
+        _bad_out_layout,
+    ],
 )
 def test_validation_errors(
     mutation: Callable[[dict[str, torch.Tensor]], dict[str, object]],
