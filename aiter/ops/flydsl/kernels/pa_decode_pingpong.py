@@ -20,52 +20,24 @@ from functools import cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from .pa_decode.op_lds import PaDecodeLds
 from .pa_decode.traits import KV_COMPUTE_BLOCK, LOG2E, WAVE
 from .tensor_shim import buf_base_i64, buf_copy_store, buf_scalar_load, ptr_buf_tensor
-
-
-def _pin(value):
-    # Tied empty asm materializes the value here; LLVM otherwise sinks the
-    # softmax past the stagger barrier into the MFMA phase. FlyDSL has no stable
-    # optimization barrier.
-    value = fx.Vector(value)
-    words = value.bitcast(fx.Int32) if value.dtype.width < 32 else value
-    tied = fx.Vector(
-        llvm.inline_asm(
-            words.ir_value().type, [words.ir_value()], "", "=v,0", has_side_effects=True
-        )
-    )
-    return tied.bitcast(value.dtype) if value.dtype.width < 32 else tied
+from .utils import (
+    afn_rcp_f32 as _rcp,
+    pin_vector as _pin,
+    uniform_i32 as _uni,
+    uniform_i64 as _uni64,
+)
 
 
 TILE = 64
 # Scores may exceed the row's reference max by 2**RESCALE_LOG2 before P is
 # rescaled; BF16 P and f32 l and O hold that range.
 RESCALE_LOG2 = 8.0
-
-
-def _rcp(x):
-    # afn 1 / x lowers to v_rcp_f32.
-    with fx.arith.fastmath("afn"):
-        return fx.Float32(1.0) / fx.Float32(x)
-
-
-def _uni(v):
-    # readfirstlane makes v wave-uniform to LLVM, so the DMA address math on it
-    # stays on the SALU. FlyDSL has no stable readfirstlane.
-    return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(v)))
-
-
-def _uni64(v):
-    v = fx.Int64(v)
-    lo = _uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
-    hi = _uni(fx.Int32(v >> 32))
-    return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
 
 def _aux(value):
@@ -243,6 +215,9 @@ def compile_pa_decode_pingpong(
         tid = fx.Int32(fx.thread_idx.x)
         warp = _uni(tid // WAVE)
         lane = tid % WAVE
+        # Explicit MFMA operand-B lane coordinates: a lane is (four 16-lane
+        # groups, one row within a group). Keeping these scalars avoids
+        # materializing a layout transform in the staggered schedule.
         g = lane // 16
         l16 = lane % 16
         ts = warp // R
@@ -311,7 +286,9 @@ def compile_pa_decode_pingpong(
             t_split = t_begin
 
         # DMA copy i of a stage writes LDS bytes [1024 i, 1024 i + 1024); lane l
-        # fetches the global chunk the swizzle stores at chunk 64 i + l.
+        # fetches the global chunk the swizzle stores at chunk 64 i + l. K rows
+        # have 24 chunks, so FlyDSL's power-of-two SwizzleType cannot express
+        # this map; V uses the matching explicit map to share one DMA schedule.
         def dma_offsets(copies, cpr, tok_bytes, swizzle):
             offs = []
             for j in range_constexpr(copies):
@@ -326,7 +303,9 @@ def compile_pa_decode_pingpong(
         def dma_fire(addr, nbytes, voffs, copies, lds_off):
             # Raw LDS DMA: cdna4.BufferLoadAsyncLDS fixes the cache policy at 0
             # and tracks completion by asyncmark, while the paged KV stream is
-            # non-temporal (aux 2) and its issuer groups wait on vmcnt.
+            # non-temporal (aux 2) and its issuer groups wait on vmcnt. No copy
+            # atom exposes both that CPOL field and the partial-vmcnt schedule,
+            # so the byte offsets above intentionally remain explicit.
             rs = fx.rocdl.get_buffer_rsrc(
                 fx.get_iter(ptr_buf_tensor(addr, num_records_bytes=fx.Int64(nbytes)))
             )

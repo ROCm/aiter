@@ -94,6 +94,30 @@ def buf_base_i64(base):
     return fx.Int64(llvm.PtrToIntOp(T.i64, aligned).result)
 
 
+def cdna_raw_buffer_resource(addr, num_records_bytes):
+    """Build a gfx9/CDNA V# without masking the address's high word.
+
+    ``make_buffer_rsrc`` reserves bits 63:48 of the address word for a stride.
+    These kernels use unstrided byte resources and gfx950 device addresses are
+    below 2**48, so preserving the raw high word avoids extra mask instructions.
+    The final word is CDNA's DATA_FORMAT=7, NUM_FORMAT=4 descriptor flags.
+    """
+    from aiter.ops.flydsl.kernels.buffer_ops import CDNA_BUFFER_FLAGS
+
+    addr = fx.Int64(addr)
+    words = fx.Vector.from_elements(
+        [
+            fx.Int32(addr & fx.Int64(0xFFFFFFFF)),
+            fx.Int32(addr >> 32),
+            fx.Int32(num_records_bytes),
+            fx.Int32(CDNA_BUFFER_FLAGS),
+        ],
+        dtype=fx.Int32,
+    )
+    descriptor = llvm.bitcast(ir.IntegerType.get_signless(128), words.ir_value())
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<8>"), descriptor)
+
+
 def ptr_buf_tensor(
     ptr,
     elem=fx.Int32,

@@ -33,13 +33,26 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from .kernels.pa_decode_plan import build_query_block_map
-from .kernels.tensor_shim import _run_compiled, buf_base_i64, ptr_arg, ptr_buf_tensor
+from .kernels.tensor_shim import (
+    _run_compiled,
+    buf_base_i64,
+    cdna_raw_buffer_resource,
+    ptr_arg,
+    ptr_buf_tensor,
+)
+from .kernels.utils import (
+    afn_rcp_f32 as rcp_f32,
+    opaque_i32 as opaque,
+    permlane16_swap_i32 as permlane16_swap,
+    pin_vector as _pin,
+    uniform_i32 as uniform,
+    uniform_i64 as uniform64,
+)
 
 __all__ = ["run", "workspace_requirements"]
 
@@ -86,70 +99,10 @@ SUM_LIMIT = float(2**SUM_LOG2)
 NREF_UNSET = float(2.0**126)
 
 
-def rcp_f32(value):
-    # afn 1 / x lowers to v_rcp_f32.
-    with fx.arith.fastmath("afn"):
-        return fx.Float32(1.0) / fx.Float32(value)
-
-
 def shared_ptr(elem_ty):
     """LDS pointer type of elem_ty with its element alignment (a byte-base recast drops it)."""
     return fx.PointerType.get(
         elem_ty.ir_type, fx.AddressSpace.Shared, dsl_size_of(elem_ty)
-    )
-
-
-def _pin(value):
-    # Tied empty asm materializes the value here; LLVM otherwise sinks the softmax
-    # past the stagger barrier into the MFMA phase (6-12% slower). FlyDSL has no
-    # stable optimization barrier.
-    value = fx.Vector(value)
-    words = value.bitcast(fx.Int32) if value.dtype.width < 32 else value
-    tied = fx.Vector(
-        llvm.inline_asm(
-            words.ir_value().type, [words.ir_value()], "", "=v,0", has_side_effects=True
-        )
-    )
-    return tied.bitcast(value.dtype) if value.dtype.width < 32 else tied
-
-
-def uniform(v):
-    """v through readfirstlane: wave-uniform to LLVM, so it and the address math on it
-    stay in SGPRs. Without it the kernel spills 34-51 VGPRs; 0.5.0 has no stable
-    readfirstlane."""
-    return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(v)))
-
-
-def uniform64(v):
-    v = fx.Int64(v)
-    lo = uniform(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
-    hi = uniform(fx.Int32(v >> 32))
-    return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
-
-
-def permlane16_swap(x, y):
-    """v_permlane16_swap of two i32 values: (x, y) with lanes 16-31 of x swapped for
-    lanes 0-15 of y, and lanes 48-63 of x for lanes 32-47 of y. 0.5.0 has no stable
-    form."""
-    sw = fx.rocdl.permlane16_swap(
-        ir.Type.parse("!llvm.struct<(i32, i32)>"),
-        x.ir_value(),
-        y.ir_value(),
-        False,
-        False,
-    )
-    return fx.Int32(llvm.extractvalue(T.i32, sw, [0])), fx.Int32(
-        llvm.extractvalue(T.i32, sw, [1])
-    )
-
-
-def opaque(x):
-    """x through an empty asm, so LLVM cannot fold a known constant into it. FlyDSL
-    has no stable optimization barrier."""
-    return fx.Int32(
-        llvm.inline_asm(
-            T.i32, [fx.Int32(x).ir_value()], "", "=v,0", has_side_effects=False
-        )
     )
 
 
@@ -242,6 +195,9 @@ def compile_tile_kernel(block_size, softmax_scale):
         tid = fx.Int32(fx.thread_idx.x)
         warp = uniform(tid // WAVE)
         lane = tid % WAVE
+        # Explicit MFMA operand-B lane coordinates: four 16-lane groups and
+        # one row within each group. Layout algebra would add a transform
+        # between the buffer loads and this fixed staggered MFMA schedule.
         g = lane // 16
         l16 = lane % 16
         # The wave's token slot and row block. ts is always 0 and rb the wave, but
@@ -361,21 +317,6 @@ def compile_tile_kernel(block_size, softmax_scale):
         ]
         lim = uniform((context < t_end * TILE).select(context, t_end * TILE))
 
-        def raw_rsrc(addr, nrec):
-            """V# from its four words, without make_buffer_rsrc's stride mask on the
-            high address word (a device address is below 2**48, so bits 48-63, the
-            stride, are already 0)."""
-            addr = fx.Int64(addr)
-            words = [
-                fx.Int32(addr & fx.Int64(0xFFFFFFFF)),
-                fx.Int32(addr >> 32),
-                fx.Int32(nrec),
-                fx.Int32((7 << 12) | (4 << 15)),
-            ]
-            vec = fx.Vector.from_elements(words, dtype=fx.Int32)
-            i128 = llvm.bitcast(ir.IntegerType.get_signless(128), vec.ir_value())
-            return llvm.inttoptr(ir.Type.parse("!llvm.ptr<8>"), i128)
-
         def load_phys(tile):
             """The block table's page of tile, clamped to the last tile so the read
             stays in the sequence's row."""
@@ -419,7 +360,9 @@ def compile_tile_kernel(block_size, softmax_scale):
                 # VALU v_med3.
                 nrec = rows * row
                 nrec = uniform((nrec > 0).select(nrec, 0))
-                rs = raw_rsrc(uniform64(base + zext(ptile) * (row * TILE)), nrec)
+                rs = cdna_raw_buffer_resource(
+                    uniform64(base + zext(ptile) * (row * TILE)), nrec
+                )
                 for j in range_constexpr(copies):
                     loads.append(
                         lambda j=j: load_kv_tile(rs, stage_off + lds8[j], voffs[j])
@@ -789,7 +732,6 @@ def compile_tile_kernel(block_size, softmax_scale):
             fx.rocdl.s_waitcnt(vmcnt=TILE_LOADS, lgkmcnt=0)
             gpu.barrier()
             # The wave in its MFMA phase wins issue over the sibling's softmax.
-            # 0.5.0 has no stable s_setprio.
             fx.rocdl.s_setprio(1)
             # The last tile's lookahead QK reads a stale stage; it is unused.
             state = pv_accumulate(

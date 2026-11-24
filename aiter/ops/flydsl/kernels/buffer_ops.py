@@ -47,6 +47,8 @@ _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (
     is inspect.Parameter.KEYWORD_ONLY
 )
 
+CDNA_BUFFER_FLAGS = (7 << 12) | (4 << 15)
+
 
 def _get_buffer_flags(arch=None):
     """Get AMD buffer resource descriptor (V#) flags word (bits 127:96).
@@ -78,7 +80,7 @@ def _get_buffer_flags(arch=None):
 
     if arch is None:
         arch = os.environ.get("FLYDSL_GPU_ARCH")
-    flags = (7 << 12) | (4 << 15)
+    flags = CDNA_BUFFER_FLAGS
     if is_rdna_arch(arch):
         flags |= 1 << 24  # reserved bit, must be 1 on RDNA
         flags |= 2 << 28  # OOB_SELECT = 2 (no bounds checking)
@@ -86,6 +88,7 @@ def _get_buffer_flags(arch=None):
 
 
 __all__ = [
+    "CDNA_BUFFER_FLAGS",
     "buffer_load",
     "buffer_store",
     "create_buffer_resource",
