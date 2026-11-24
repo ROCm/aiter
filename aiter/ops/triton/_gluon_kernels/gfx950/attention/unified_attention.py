@@ -1821,20 +1821,8 @@ def _unified_attention_gluon_kernel(
 
     if not ALL_DECODE:
         if ONE_Q_BLOCK:
-            # The grid holds one query block per sequence, so the sequence is
-            # program_id(1). The search over the index returns it unchanged,
-            # but without the loop the fp8 head-128 kernel compiles to 264
-            # VGPRs, one wave per SIMD instead of two.
-            target = gl.program_id(1)
-            left = 0
-            right = num_seqs
-            while left < right:
-                mid = (left + right) // 2
-                if mid <= target:
-                    left = mid + 1
-                else:
-                    right = mid
-            seq_idx = left - 1
+            # the grid holds one query block per sequence
+            seq_idx = gl.program_id(1)
         else:
             seq_idx = find_seq_idx(
                 query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
