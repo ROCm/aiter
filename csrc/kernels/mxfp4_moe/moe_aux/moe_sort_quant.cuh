@@ -48,20 +48,33 @@ __device__ __forceinline__ void zero_init_bytes_impl(
     }
 }
 
+// Inclusive prefix sum across one hardware wavefront (WARP_SIZE lanes).
 __device__ __forceinline__ int dpp_inclusive_scan_wave(int x) {
     int t;
-    t = __builtin_amdgcn_mov_dpp(x, 0x111, 0xF, 0xF, true);
+    t = __builtin_amdgcn_mov_dpp(x, 0x111, 0xF, 0xF, true); // row_shr:1
     x += t;
-    t = __builtin_amdgcn_mov_dpp(x, 0x112, 0xF, 0xF, true);
+    t = __builtin_amdgcn_mov_dpp(x, 0x112, 0xF, 0xF, true); // row_shr:2
     x += t;
-    t = __builtin_amdgcn_mov_dpp(x, 0x114, 0xF, 0xF, true);
+    t = __builtin_amdgcn_mov_dpp(x, 0x114, 0xF, 0xF, true); // row_shr:4
     x += t;
-    t = __builtin_amdgcn_mov_dpp(x, 0x118, 0xF, 0xF, true);
+    t = __builtin_amdgcn_mov_dpp(x, 0x118, 0xF, 0xF, true); // row_shr:8
     x += t;
-    t = __builtin_amdgcn_update_dpp(0, x, 0x142, 0xA, 0xF, true);
+#if defined(__GFX9__)
+    t = __builtin_amdgcn_update_dpp(0, x, 0x142, 0xA, 0xF, true); // row_bcast:15
     x += t;
-    t = __builtin_amdgcn_update_dpp(0, x, 0x143, 0xC, 0xF, true);
+    t = __builtin_amdgcn_update_dpp(0, x, 0x143, 0xC, 0xF, true); // row_bcast:31
     x += t;
+#else
+    // GFX10+ (gfx1250) has no DPP row_bcast: add the totals of the preceding
+    // 16-lane rows, read from the last lane of each row.
+    const int row = static_cast<int>(__lane_id()) >> 4;
+    int carry = row > 0 ? __builtin_amdgcn_readlane(x, 15) : 0;
+    if constexpr (WARP_SIZE == 64) {
+        carry += row > 1 ? __builtin_amdgcn_readlane(x, 31) : 0;
+        carry += row > 2 ? __builtin_amdgcn_readlane(x, 47) : 0;
+    }
+    x += carry;
+#endif
     return x;
 }
 
