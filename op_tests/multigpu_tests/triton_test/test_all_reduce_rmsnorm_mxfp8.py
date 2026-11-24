@@ -29,6 +29,9 @@ SHAPES = [
     (2880, True, [7, 64, 130]),
     (4096, False, [2, 128]),
 ]
+# The sentinel and time-out checks use the comm size of the first shape, so they launch
+# a kernel that each rank has already compiled.
+MAX_TOKENS = max(SHAPES[0][2])
 
 SKIP = arch_info.get_arch() != "gfx950"
 pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
@@ -220,7 +223,7 @@ def _check_sentinel(rank, device, tp, failures):
         tokens, hidden, True, 7, rank, device, tp.device_group
     )
     x.view(torch.int16)[tokens - 1, 5] = -1  # 0xFFFF
-    comm = AllReduceRmsnormMxfp8(tp.cpu_group, tokens, hidden)
+    comm = AllReduceRmsnormMxfp8(tp.cpu_group, MAX_TOKENS, hidden)
     try:
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
@@ -290,10 +293,12 @@ def _check_timeout(rank, device, tp, failures):
     x, residual, weight, ref = _inputs(
         tokens, hidden, True, 9, rank, device, tp.device_group
     )
-    comm = AllReduceRmsnormMxfp8(tp.cpu_group, tokens, hidden, timeout_s=0.05)
+    comm = AllReduceRmsnormMxfp8(tp.cpu_group, MAX_TOKENS, hidden)
+    limit = comm.timeout_us
     try:
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
+        comm.timeout_us = 50_000  # 50 ms for the launch that the last rank skips
         if rank != comm.world - 1:
             fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm, gemma=True)
         torch.cuda.synchronize()
@@ -301,6 +306,9 @@ def _check_timeout(rank, device, tp, failures):
         record = comm.error()
         if record[0] != 1 or record[3] not in (1, 2):
             failures.append(f"rank {rank}: error record {record} after a time-out")
+        # The launch after reset has the default limit: a rank that starts late must
+        # not stop the others.
+        comm.timeout_us = limit
         comm.reset()
         out = fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm, gemma=True)
         msgs = _diff(out, ref)
@@ -316,14 +324,21 @@ def _worker(rank, world_size, init_method):
     aiter.init_dist_env(world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
     failures = []
+    # 8 ranks run only the first shape and the checks that launch its kernel. Each other
+    # kernel variant compiles on all 8 ranks, which takes most of the CI time. 2 and 4
+    # ranks run all checks.
+    full = world_size < 8
     try:
-        for i, (hidden, gemma, token_counts) in enumerate(SHAPES):
+        for i, (hidden, gemma, token_counts) in enumerate(
+            SHAPES if full else SHAPES[:1]
+        ):
             _check_shape(
                 rank, device, tp, hidden, gemma, token_counts, i == 0, failures
             )
         _check_sentinel(rank, device, tp, failures)
-        _check_scales(rank, device, tp, failures)
         _check_timeout(rank, device, tp, failures)
+        if full:
+            _check_scales(rank, device, tp, failures)
         return failures
     finally:
         aiter.destroy_dist_env()
