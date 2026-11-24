@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
         "--gqa_ratio",
         type=int,
         nargs="+",
-        # choices=[1, 8],
+        choices=[1, 2, 4, 6, 8],
         default=[1, 8],
         help="""gqa ratio.
     e.g. -gr 1""",
