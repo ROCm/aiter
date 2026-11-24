@@ -1498,45 +1498,22 @@ def test_mhc_prefill_launchers_raise():
     wrong shape must not end the process."""
     from aiter.ops import mhc as mhc_ops
 
-    m = 4096
+    m, eps = 4096, 1e-6
+    f32, b16, i32 = dtypes.fp32, dtypes.bf16, torch.int32
 
-    def zeros(shape, dtype):
+    def z(dtype, *shape):
         return torch.zeros(shape, dtype=dtype, device="cuda")
 
-    f32, b16 = dtypes.fp32, dtypes.bf16
     # hidden 4096 where the producer takes 7168, and a (m, 4, 2) post mix
-    calls = {
-        "mhc_post_project_gfx950": lambda: mhc_ops.mhc_post_project_gfx950(
-            zeros((4, m, 32), f32),
-            zeros((4, m, 4), f32),
-            zeros((m, 4, 4096), b16),
-            zeros((m, 4096), b16),
-            zeros((m, 4, 4096), b16),
-            zeros((24, 4 * 4096), torch.int32),
-            zeros((m, 4), f32),
-            zeros((m, 4, 4), f32),
-        ),
-        "mhc_finalize_gfx950": lambda: mhc_ops.mhc_finalize_gfx950(
-            zeros((m, 4, 2), f32),
-            zeros((m, 4, 4), f32),
-            zeros((m, 7168), b16),
-            zeros((4, m, 32), f32),
-            zeros((4, m, 4), f32),
-            zeros((3,), f32),
-            zeros((24,), f32),
-            zeros((m, 4, 7168), b16),
-            zeros((7168,), b16),
-            1e-6,
-            1e-6,
-            1e-6,
-            1e-6,
-            2.0,
-            20,
-        ),
-    }
-    for name, call in calls.items():
+    producer = [z(f32, 4, m, 32), z(f32, 4, m, 4), z(b16, m, 4, 4096), z(b16, m, 4096)]
+    producer += [z(b16, m, 4, 4096), z(i32, 24, 16384), z(f32, m, 4), z(f32, m, 4, 4)]
+    finisher = [z(f32, m, 4, 2), z(f32, m, 4, 4), z(b16, m, 7168), z(f32, 4, m, 32)]
+    finisher += [z(f32, 4, m, 4), z(f32, 3), z(f32, 24), z(b16, m, 4, 7168)]
+    finisher += [z(b16, 7168), eps, eps, eps, eps, 2.0, 20]
+    calls = {"mhc_post_project_gfx950": producer, "mhc_finalize_gfx950": finisher}
+    for name, args in calls.items():
         try:
-            call()
+            getattr(mhc_ops, name)(*args)
         except RuntimeError as e:
             assert "mHC gfx950" in str(e), str(e)
         else:

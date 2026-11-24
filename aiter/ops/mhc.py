@@ -1228,14 +1228,9 @@ def _mhc_post_pre_gfx950_supported(
     scale: Tensor,
     base: Tensor,
     norm_weight: Tensor | None,
-    w_preshuffle_bf16: bool = False,
 ) -> bool:
-    # The row count comes first, as in the caller.
+    # The caller has tested the row count and the packed weights.
     m = layer_input.shape[0]
-    if not (
-        w_preshuffle_bf16 and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
-    ):
-        return False
     # Fixed launch tuning is qualified only for an unmasked 256-CU device.
     if (
         norm_weight is None
@@ -1687,34 +1682,14 @@ def _mhc_fused_post_pre_native(
         and not force_fused
         and not res_preshuffle
         and sinkhorn_repeat > 0
-        and _mhc_post_pre_gfx950_supported(
-            layer_input,
-            residual_in,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            w_preshuffle_bf16,
-        )
     ):
-        return _mhc_post_pre_gfx950(
-            layer_input,
-            residual_in,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            norm_weight,
-            norm_eps,
-        )
+        tensors = (layer_input, residual_in, post_layer_mix, comb_res_mix, fn)
+        tensors += (hc_scale, hc_base)
+        if _mhc_post_pre_gfx950_supported(*tensors, norm_weight):
+            scalars = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value)
+            return _mhc_post_pre_gfx950(
+                *tensors, *scalars, sinkhorn_repeat, norm_weight, norm_eps
+            )
 
     # At the shared bound the input is already in ordinary layout.
     if (
