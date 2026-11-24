@@ -17,6 +17,10 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 
 _launch = fast_launch(_replayssm_kda_fwd_cta_kernel)
 
+# Checkpoint dtypes replayssm_sigmoid_gating_delta_rule takes. Callers that
+# route by dtype (ATOM's ReplaySSM dispatch) read this instead of assuming FP32.
+CKPT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
 
 @functools.lru_cache(maxsize=8)
 def _config(arch, cu_num):
@@ -100,7 +104,7 @@ def replayssm_sigmoid_gating_delta_rule(
         raise ValueError("activations and k/u records must use BF16, FP16 or FP32")
     if any(x.dtype != torch.float32 for x in (A_log, dt_bias, buf_g)):
         raise ValueError("gates and g records must use FP32")
-    if ckpt.dtype not in floating:
+    if ckpt.dtype not in CKPT_DTYPES:
         raise ValueError("the checkpoint must use FP32, FP16 or BF16")
     if ckpt.ndim != 4 or ckpt.shape[1:] != (HV, V, K):
         raise ValueError("ckpt must have shape [slots, HV, V, K]")

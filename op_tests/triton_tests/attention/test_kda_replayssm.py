@@ -5,7 +5,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention.kda_replayssm import replayssm_sigmoid_gating_delta_rule
+from aiter.ops.triton.attention.kda_replayssm import (
+    CKPT_DTYPES,
+    replayssm_sigmoid_gating_delta_rule,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 pytestmark = pytest.mark.skipif(
@@ -338,6 +341,7 @@ def test_capture_and_side_stream(ckpt_dtype):
 
 
 def test_reject_fp64_checkpoint():
+    assert CKPT_DTYPES == (torch.float32, torch.float16, torch.bfloat16)
     inputs, _ = make_inputs(1, "spec_verify", pad_rows=0)
     inputs["ckpt"] = inputs["ckpt"].double()
     with pytest.raises(ValueError, match="checkpoint"):
