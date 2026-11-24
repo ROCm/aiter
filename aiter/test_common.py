@@ -87,6 +87,14 @@ def perftest(
 
             rotate_args = input_copies(args, kwargs, num, pristine, num_iters)
             del pristine
+            # Warm up on every copy so none is first used inside the timed loop, then
+            # (auto mode) flush_llc below re-colds the cache before timing:
+            #
+            #   warm-up   c0 c1 .. cN    every copy pays its first-use cost here
+            #   flush                    evicts what the warm-up left in the LLC
+            #   timed     c0 c1 .. cN    no first use, cold cache
+            #
+            # Warming only the caller's inputs would time each copy's first use.
             num_warmup_calls = num_warmup
             if len(rotate_args) > 1:
                 num_warmup_calls = max(num_warmup, len(rotate_args))
