@@ -581,10 +581,11 @@ def run_gemm_a8w8_mxfp8_gfx950(
     padding): the kernel stages them through LDS itself. w_scale is
     [N, K // 32] for a 1x32 ``w_scale_block`` or [N // 32, K // 32] for 32x32;
     None reads the block off its shape. ``kernel_name`` is a tuned
-    row's mxpsh or 8-wave kernelName, else the heuristic picks an mxpsh tile.
+    row's mxpsh, 8-wave or 4-wave kernelName, else the heuristic picks an mxpsh tile.
     """
     from ..gemm_op_common import mxscale_w_scale_block
     from .gemm_a8w8_mxfp8_8wave import NAME_PREFIX as MXFP8_8WAVE_PREFIX
+    from .gemm_a8w8_mxfp8_4wave import NAME_PREFIX as MXFP8_4WAVE_PREFIX
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
 
     if w_scale_block is None:
@@ -598,7 +599,18 @@ def run_gemm_a8w8_mxfp8_gfx950(
             f"supported: {sorted(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK)}"
         )
 
-    if kernel_name is not None and kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
+    warn_untuned = False
+    if kernel_name is not None and kernel_name.startswith(f"{MXFP8_4WAVE_PREFIX}_"):
+        if Out.dtype == torch.bfloat16 and w_scale_block == "1x32":
+            from .gemm_a8w8_mxfp8_4wave import run_gemm_a8w8_mxfp8_4wave
+
+            return run_gemm_a8w8_mxfp8_4wave(
+                XQ, WQ, x_scale, w_scale, Out, kernel_name, w_scale_block
+            )
+        # The 4-wave kernel writes bf16 and reads 1x32 w_scales only; any other
+        # call runs the mxpsh heuristic tile for this (tuned) shape instead.
+        kernel_name = None
+    elif kernel_name is not None and kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
         if Out.dtype == torch.bfloat16:
             from .gemm_a8w8_mxfp8_8wave import run_gemm_a8w8_mxfp8_8wave
 
@@ -608,7 +620,6 @@ def run_gemm_a8w8_mxfp8_gfx950(
         # The 8-wave kernel writes bf16 only; any other Out runs the mxpsh
         # heuristic tile for this (tuned) shape instead.
         kernel_name = None
-        warn_untuned = False
     else:
         warn_untuned = kernel_name is None
 
