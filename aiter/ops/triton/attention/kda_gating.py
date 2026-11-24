@@ -26,6 +26,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 _launch = fast_launch(kda_gating_kernel)
 _ACT_DTYPES = (torch.bfloat16, torch.float16)
+_STATE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 _HEAD_DIM = 128
 
 
@@ -39,15 +40,15 @@ def supports(
 ) -> bool:
     """Whether ``kda_gating_decode`` takes a model with this setup on this GPU.
 
-    The kernel needs the lower-bounded gate, an FP32 state, ``head_k_dim =
-    head_v_dim = 128``, BF16 or FP16 activations and a gfx1250 GPU. Its config
-    tables are keyed by the exact arch, as all tuned configs are, and only
-    gfx1250 has them, so a gfx1250-strict GPU is not supported.
+    The kernel needs the lower-bounded gate, an FP32, FP16 or BF16 state,
+    ``head_k_dim = head_v_dim = 128``, BF16 or FP16 activations and a gfx1250
+    GPU. Its config tables are keyed by the exact arch, as all tuned configs
+    are, and only gfx1250 has them, so a gfx1250-strict GPU is not supported.
     ``kda_gating_decode`` checks the other limits on each call.
     """
     return (
         lower_bound is not None
-        and state_dtype == torch.float32
+        and state_dtype in _STATE_DTYPES
         and head_k_dim == _HEAD_DIM
         and head_v_dim == _HEAD_DIM
         and act_dtype in _ACT_DTYPES
@@ -87,10 +88,12 @@ def kda_gating_decode(
     in their last two dimensions. ``A_log`` has HV values and ``dt_bias``
     HV * K, both contiguous.
 
-    ``initial_state`` is the FP32 state pool ``[slots, HV, V, K]``. Each slot
-    is dense, and the slot stride can have any value. The kernel updates the
-    pool in place and L2-normalizes q and k, so it needs
-    ``inplace_final_state`` and ``use_qk_l2norm_in_kernel``.
+    ``initial_state`` is the FP32, FP16 or BF16 state pool ``[slots, HV, V,
+    K]``. Each slot is dense, and the slot stride can have any value. The
+    recurrence runs in FP32 whatever the pool stores; each written state is
+    rounded to the pool dtype. The kernel updates the pool in place and
+    L2-normalizes q and k, so it needs ``inplace_final_state`` and
+    ``use_qk_l2norm_in_kernel``.
 
     ``cu_seqlens`` is int32. ``ssm_state_indices`` is the int32 write-slot
     table. ``ssm_state_indices_in`` is the read-slot table, with the shape and
@@ -264,7 +267,7 @@ def kda_gating_decode(
         return o, state
     if scale is None:
         scale = K**-0.5
-    config = get_kda_gating_config(n_seq * HV, multi_token)
+    config = get_kda_gating_config(n_seq * HV, multi_token, state.element_size())
     num_warps = config.pop("num_warps")
     _launch[(n_seq * HV * (V // config["BV"]),)](
         q_ptr=q,

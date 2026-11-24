@@ -29,7 +29,13 @@ K3_SETUP = {
 
 
 def _inputs(
-    tokens, slots, heads=H, value_heads=None, dtype=torch.bfloat16, strided_beta=False
+    tokens,
+    slots,
+    heads=H,
+    value_heads=None,
+    dtype=torch.bfloat16,
+    strided_beta=False,
+    state_dtype=torch.float32,
 ):
     hv = value_heads or heads
     qkv = {
@@ -43,6 +49,7 @@ def _inputs(
     else:
         qkv["b"] = torch.randn((1, tokens, hv), dtype=dtype, device="cuda")
     state = torch.randn((slots, hv, K, K), dtype=torch.float32, device="cuda")
+    state = state.to(state_dtype)
     return qkv | {
         "A_log": torch.randn((hv,), dtype=torch.float32, device="cuda") * 0.1,
         "dt_bias": torch.randn((hv, K), dtype=torch.float32, device="cuda") * 0.1,
@@ -51,7 +58,15 @@ def _inputs(
     }
 
 
-def _gating_case(mode, lens, seed, heads=H, value_heads=None, dtype=torch.bfloat16):
+def _gating_case(
+    mode,
+    lens,
+    seed,
+    heads=H,
+    value_heads=None,
+    dtype=torch.bfloat16,
+    state_dtype=torch.float32,
+):
     """Inputs for one call with Kimi-K3's strided beta and distinct slots.
 
     ``mode`` is ``decode`` (a separate read table with the write slots),
@@ -66,7 +81,15 @@ def _gating_case(mode, lens, seed, heads=H, value_heads=None, dtype=torch.bfloat
     width = 1 if mode in ("decode", "fork") else SPEC_WIDTH
     tokens = sequences * width
     slots = 2 * tokens + 8
-    inputs = _inputs(tokens, slots, heads, value_heads, dtype, strided_beta=True)
+    inputs = _inputs(
+        tokens,
+        slots,
+        heads,
+        value_heads,
+        dtype,
+        strided_beta=True,
+        state_dtype=state_dtype,
+    )
     perm = torch.randperm(slots, device="cuda").to(torch.int32)
     cu = torch.zeros(sequences + 1, dtype=torch.int32, device="cuda")
     cu[1:] = torch.cumsum(torch.tensor(lens, device="cuda"), 0)
@@ -182,9 +205,20 @@ def _reference(inputs, indices, indices_in, cu, accepted, state, out):
                 state[dest] = current
 
 
+# State tolerance by pool dtype. The kernel and the reference both run the
+# recurrence in FP32 and round each stored state to the pool dtype, so a 16-bit
+# pool may differ by one unit in the last place.
+_STATE_TOL = {
+    torch.float32: (1e-4, 1e-4),
+    torch.float16: (1e-3, 1e-3),
+    torch.bfloat16: (1e-2, 1e-2),
+}
+
+
 def _assert_close(out, state, expected_out, expected_state):
+    atol, rtol = _STATE_TOL[state.dtype]
     torch.testing.assert_close(out, expected_out, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(state, expected_state, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(state, expected_state, atol=atol, rtol=rtol)
 
 
 def test_same_slots_match_single_index_kernel():
@@ -344,19 +378,30 @@ def test_output_may_be_none_or_have_the_shape_of_v(given):
 
 
 @pytest.mark.parametrize(
-    "change",
+    "change,expected",
     [
-        {},
-        {"lower_bound": None},
-        {"state_dtype": torch.bfloat16},
-        {"head_k_dim": 64},
-        {"head_v_dim": 64},
-        {"act_dtype": torch.float32},
+        ({}, True),
+        ({"state_dtype": torch.float16}, True),
+        ({"state_dtype": torch.bfloat16}, True),
+        ({"lower_bound": None}, False),
+        ({"state_dtype": torch.float64}, False),
+        ({"head_k_dim": 64}, False),
+        ({"head_v_dim": 64}, False),
+        ({"act_dtype": torch.float32}, False),
     ],
-    ids=["kimi-k3", "no-lower-bound", "bf16-state", "k64", "v64", "fp32-activations"],
+    ids=[
+        "kimi-k3",
+        "fp16-state",
+        "bf16-state",
+        "no-lower-bound",
+        "fp64-state",
+        "k64",
+        "v64",
+        "fp32-activations",
+    ],
 )
-def test_supports_checks_the_model_setup(change):
-    assert supports(**(K3_SETUP | change)) is (change == {})
+def test_supports_checks_the_model_setup(change, expected):
+    assert supports(**(K3_SETUP | change)) is expected
 
 
 def test_supports_needs_gfx1250_config_tables(monkeypatch):
@@ -432,11 +477,54 @@ def test_gating_kernel_matches_reference(mode, sequences, heads, value_heads, dt
     _assert_close(out, state, expected_out, expected_state)
 
 
+# (mode, sequences, q/k heads, value heads) for a 16-bit state pool: each mode,
+# a large decode batch at H = 12, Kimi-K3's 96 heads of one rank at TP1, and
+# grouped value heads.
+GATING_CASES_16BIT_STATE = [
+    ("decode", 1, 12, 12),
+    ("decode", 16, 12, 12),
+    ("decode", 384, 12, 12),
+    ("decode", 64, 96, 96),
+    ("fork", 16, 12, 12),
+    ("fork", 384, 12, 12),
+    ("fork", 16, 96, 96),
+    ("spec", 9, 12, 12),
+    ("spec", 9, 96, 96),
+    ("multi", 9, 12, 12),
+    ("fork", 16, 12, 24),
+    ("spec", 9, 12, 24),
+]
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode,sequences,heads,value_heads", GATING_CASES_16BIT_STATE)
+def test_16bit_state_matches_reference(
+    mode, sequences, heads, value_heads, state_dtype
+):
+    inputs, indices, indices_in, cu, accepted = _gating_case(
+        mode,
+        _gating_lens(mode, sequences),
+        sequences,
+        heads,
+        value_heads,
+        state_dtype=state_dtype,
+    )
+    expected_state = inputs["initial_state"].clone()
+    expected_out = inputs["o"].clone()
+    _reference(inputs, indices, indices_in, cu, accepted, expected_state, expected_out)
+    out, state = _call(inputs, indices, indices_in, cu, accepted)
+    assert state.dtype == state_dtype
+    _assert_close(out, state, expected_out, expected_state)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("mode,sequences", [("decode", 16), ("spec", 9)])
-def test_cuda_graph_replay_follows_new_slots_and_lengths(mode, sequences):
+def test_cuda_graph_replay_follows_new_slots_and_lengths(mode, sequences, state_dtype):
     width = SPEC_WIDTH if mode == "spec" else 1
-    first = _gating_case(mode, [width] * sequences, seed=10)
-    second = _gating_case(mode, _gating_lens(mode, sequences), seed=11)
+    first = _gating_case(mode, [width] * sequences, seed=10, state_dtype=state_dtype)
+    second = _gating_case(
+        mode, _gating_lens(mode, sequences), seed=11, state_dtype=state_dtype
+    )
     inputs, indices, indices_in, cu, accepted = first
     _call(inputs, indices, indices_in, cu, accepted)
     torch.cuda.synchronize()
@@ -482,7 +570,7 @@ def _unsupported(case, inputs, indices):
         "not_in_place": {"inplace_final_state": False},
         "no_l2norm": {"use_qk_l2norm_in_kernel": False},
         "no_lower_bound": {"lower_bound": None},
-        "bf16_state": {"initial_state": inputs["initial_state"].bfloat16()},
+        "fp64_state": {"initial_state": inputs["initial_state"].double()},
         "k_dim_64": {"q": inputs["q"][..., :64]},
         "v_dim_64": {"v": inputs["v"][..., :64]},
         "fp32_activations": {n: inputs[n].float() for n in ("q", "k", "v", "a", "b")},
@@ -532,7 +620,7 @@ def _unsupported(case, inputs, indices):
         "not_in_place",
         "no_l2norm",
         "no_lower_bound",
-        "bf16_state",
+        "fp64_state",
         "k_dim_64",
         "v_dim_64",
         "fp32_activations",
