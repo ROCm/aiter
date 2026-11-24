@@ -12,22 +12,32 @@ Usage:
         -M 1,1024,12288,16384,32768 --metric time
 """
 
-import argparse
+import functools
 
-import torch
 import triton
 
 from aiter.ops.triton.attention.fused_attention_qk_norm_rope import (
     fused_attention_qk_norm_rope,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_fused_attention_qk_norm_rope import (
+    HEAD_DIM,
+    QUERY_HEADS,
+    _make_inputs,
+)
 
-QUERY_HEADS = 4
-HEAD_DIM = 256
-ROTARY_DIM = 64
-PACKED = (QUERY_HEADS + 1) * 512
+_POOL_KEYS = ["packed", "q_norm", "k_norm", "positions", "cos_sin_cache"]
 
 
 def parse_int_or_list(value):
@@ -41,29 +51,13 @@ def get_x_vals(args):
     return [(tokens,) for tokens in token_counts]
 
 
-def benchmark_prologue(tokens, metric, args, **_):
-    device = torch.device("cuda")
-    packed = torch.randn(tokens, PACKED, dtype=torch.bfloat16, device=device)
-    q_norm = torch.randn(HEAD_DIM, dtype=torch.float32, device=device)
-    k_norm = torch.randn(HEAD_DIM, dtype=torch.float32, device=device)
-    positions = torch.arange(tokens, dtype=torch.int64, device=device)
-    cos_sin_cache = torch.randn(
-        tokens + 8, ROTARY_DIM, dtype=torch.float32, device=device
-    )
+def benchmark_prologue(tokens, metric, bencher, **_):
+    bencher.build_pool([functools.partial(_make_inputs, tokens)], [_POOL_KEYS])
 
-    def run():
+    def run(packed, q_norm, k_norm, positions, cos_sin_cache):
         fused_attention_qk_norm_rope(packed, q_norm, k_norm, positions, cos_sin_cache)
 
-    # Capture a CUDA graph and time replay only. This matches the
-    # graph-captured integration and keeps the output allocation and launch
-    # setup out of the measured latency.
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    torch.cuda.synchronize()
-    time_ms = triton.testing.do_bench(graph.replay, warmup=25, rep=100)
+    time_ms = bencher.bench(run)
     if metric == "time":
         return time_ms
     if metric == "bandwidth":
@@ -85,7 +79,12 @@ def run_benchmark(args):
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric, "args": args},
+        args={
+            "metric": args.metric,
+            "bencher": RotatingBufferBench.from_dict(
+                {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+            ),
+        },
     )
     triton.testing.perf_report([benchmark])(benchmark_prologue).run(
         save_path="." if args.output else None,
@@ -94,17 +93,17 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused attention Q/K norm + RoPE")
+    parser.description = __doc__
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
         default=[1, 1024, 8192, 12288, 14336, 16384, 24576, 32768],
         help="token counts to sweep (comma-separated)",
     )
-    parser.add_argument("--metric", choices=["time", "bandwidth"], default="time")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
+    )
     parser.add_argument("--output", action="store_true", help="save the plot")
     run_benchmark(parser.parse_args())
 

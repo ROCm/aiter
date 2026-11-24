@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -17,13 +18,18 @@ from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_ungated import (
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     model_benchmark_shapes,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     generate_ff_inputs,
@@ -80,7 +86,13 @@ def get_model_benchmark_object(
     return benchmark
 
 
+# generate_ff_inputs returns (x, w1, w2, out_dtype, intermediate, y). out_dtype is
+# not a tensor and the wrappers do not read intermediate, so drop both.
+_POOL_KEYS = ["x", "w1", "w2", "_", "_", "y"]
+
+
 def bench_fn(
+    bencher: RotatingBufferBench,
     batch: int,
     hidden_dim: int,
     intermediate_dim: int,
@@ -93,15 +105,22 @@ def bench_fn(
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w1, w2, _out_dtype, _, y = generate_ff_inputs(
-        batch,
-        hidden_dim,
-        intermediate_dim,
-        c_dtype,
-        layout=layout,
-        gating=gating,
-        output=True,
+    bencher.build_pool(
+        [
+            functools.partial(
+                generate_ff_inputs,
+                batch,
+                hidden_dim,
+                intermediate_dim,
+                c_dtype,
+                layout=layout,
+                gating=gating,
+                output=True,
+            )
+        ],
+        [_POOL_KEYS],
     )
+    elem = c_dtype.itemsize
 
     # flops
     if gating:
@@ -118,15 +137,14 @@ def bench_fn(
 
     # memory transfer
     if gating:
-        mem_read = (batch * intermediate_dim) * x.element_size() + (
+        mem_read = (batch * intermediate_dim) * elem + (
             hidden_dim * intermediate_dim * 2
-        ) * w1.element_size()
+        ) * elem
     else:
         mem_read = (
-            batch * intermediate_dim * x.element_size()
-            + (hidden_dim * intermediate_dim) * w1.element_size()
+            batch * intermediate_dim * elem + (hidden_dim * intermediate_dim) * elem
         )
-    mem_write = (batch * hidden_dim) * x.element_size()
+    mem_write = (batch * hidden_dim) * elem
     mem = mem_read + mem_write
 
     if e2e_fused:
@@ -134,11 +152,10 @@ def bench_fn(
     else:
         fn = ff_a16w16_gated if gating else ff_a16w16_nogate
 
-    ms = triton.testing.do_bench(
-        lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
-        warmup=25,
-        rep=100,
-    )
+    def kernel_fn(x, w1, w2, y):
+        fn(x, w1, w2, c_dtype, y=y, activation=activation)
+
+    ms = bencher.bench(kernel_fn)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -153,7 +170,7 @@ def bench_fn(
         raise ValueError("Unknown metric: " + metric)
 
 
-def run_model_benchmark(args):
+def run_model_benchmark(args, bencher):
     """
     Runs benchmark given a --model argument.
     """
@@ -168,6 +185,7 @@ def run_model_benchmark(args):
         intermediate_dim = math.ceil(intermediate_dim / args.tp)
 
         return bench_fn(
+            bencher,
             M,
             hidden_dim,
             intermediate_dim,
@@ -181,7 +199,7 @@ def run_model_benchmark(args):
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args):
+def run_shape_benchmark(args, bencher):
     """
     Runs a benchmark with given tensor shapes.
     """
@@ -196,6 +214,7 @@ def run_shape_benchmark(args):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_fn(
+            bencher,
             M,
             N,
             K,
@@ -213,6 +232,9 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -220,7 +242,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args)
+        run_model_benchmark(args, bencher)
     else:
         unsupported_args = []
         for arg in unsupported_args:
@@ -228,7 +250,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args)
+        run_shape_benchmark(args, bencher)
 
 
 def parse_args():
