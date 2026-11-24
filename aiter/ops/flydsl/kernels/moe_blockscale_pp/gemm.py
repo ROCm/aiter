@@ -30,7 +30,9 @@ at a time). What changes:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
@@ -42,7 +44,6 @@ from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
 )
 from aiter.ops.flydsl.kernels.mxfp8_gemm_8wave import (
     MxMfma,
-    StoreBf16,
     barrier_if_zero,
 )
 
@@ -76,6 +77,73 @@ def _load_i32_lane(div, idx):
     reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(div, (None, fx.Int32(idx))), reg)
     return fx.Int32(reg.load()[0])
+
+
+class StoreBf16Rows:
+    """bf16 stores of the swapped-operand accumulators, 16 bytes per lane.
+
+    With the weights as the MFMA's A operand, lane ``l`` of a 16x16 tile holds
+    output row ``l % 16`` at columns ``4 * (l // 16) + [0, 4)``. One
+    ``permlane16_swap`` between the two N-tiles of a pair gives every lane
+    eight consecutive columns: even 16-lane rows q get tile 0's columns
+    ``4q .. 4q + 7``, odd ones tile 1's ``4(q - 1) .. 4(q - 1) + 7`` (HK's
+    ``store_acc_rows``).
+    """
+
+    def __init__(self, C, c_rows, ldc):
+        self.ldc = ldc
+        lane = fx.thread_idx.x % 64
+        self.lane_row = lane % 16
+        q = lane // 16
+        self.lane_col = (q % 2 == 1).select(16 + 4 * (q - 1), 4 * q)
+        gC = fx.rocdl.make_buffer_tensor(
+            C, max_size=False, num_records_bytes=c_rows * ldc * 2
+        )
+        i32_ptr = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type,
+            address_space=rocdl.TargetAddressSpace.BufferDesc,
+            alignment=16,
+        )
+        self.c_div = fx.logical_divide(
+            fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(i32_ptr, fx.get_iter(gC)),
+                    fx.make_layout(c_rows * (ldc // 2), 1),
+                )
+            ),
+            fx.make_layout(1, 1),
+        )
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        self.reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+
+    def store(self, c_frag, base_row, base_col):
+        """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
+        i32 = fx.Int32.ir_type
+        for i in range_constexpr(N_TILES_A):
+            x = Vec(c_frag[i]).to(fx.BFloat16).bitcast(fx.Int32)
+            y = Vec(c_frag[N_TILES_A + i]).to(fx.BFloat16).bitcast(fx.Int32)
+            words = []
+            for w in range_constexpr(2):
+                # No fx-level cross-lane swap; this is one v_permlane16_swap_b32.
+                pair = rocdl.permlane16_swap(
+                    _llvm.StructType.get_literal([i32, i32]),
+                    x[w].ir_value(),
+                    y[w].ir_value(),
+                    False,
+                    False,
+                )
+                words.append(
+                    [fx.Int32(_llvm.extractvalue(i32, pair, [h])) for h in (0, 1)]
+                )
+            fx.memref_store_vec(
+                Vec.from_elements(
+                    [words[0][0], words[1][0], words[0][1], words[1][1]], fx.Int32
+                ),
+                self.reg,
+            )
+            row = base_row + i * 16 + self.lane_row
+            idx = (row * self.ldc + base_col + self.lane_col) // 2  # in i32 words
+            fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
 
 
 class MoeScaleLds:
@@ -285,10 +353,12 @@ def compile_moe_bs_gemm_8w(
         sc_row = (wave_id % 4) * 64 + lane_id
         sc_col = [step * 2 + wave_id // 4 for step in range_constexpr(2)]
 
-        mfma = MxMfma(N_TILES_A, N_TILES_B, paired_tiles=False)
+        # Operands swapped (weights as the MFMA's A): a lane then holds four
+        # consecutive output columns of one row, which pack into wide stores.
+        mfma = MxMfma(N_TILES_B, N_TILES_A, paired_tiles=False)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreBf16(C, m_pad, N, N, mfma.idx, N_TILES_A, N_TILES_B)
+        store_c = StoreBf16Rows(C, m_pad, N)
 
         def run_tile(tile):
             m_blk = tile // NB
@@ -422,26 +492,26 @@ def compile_moe_bs_gemm_8w(
                 rocdl.s_barrier()
                 scale_chunk_dma(k)
 
-                c00 = mfma.call(a0_frag, b0_frag, c00, sa0, sb0, k_pack=0)
+                c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
                 sb1 = scale_read(k, "b1")
                 b1_frag = b_s2r.load(b_cur1, preshuffled=True)
                 b_g2s.load(b_cur0, B0_off + (k + 2) * B_K_STEP)
                 rocdl.s_barrier()
 
-                c01 = mfma.call(a0_frag, b1_frag, c01, sa0, sb1, k_pack=0)
+                c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
 
                 sa1 = scale_read(k, "a1")
                 a1_frag = a_s2r.load(a_cur1)
                 a_load(0, a_cur0, k + 2)
                 wait_barrier(4 * N_LDS_STEPS)
 
-                c10 = mfma.call(a1_frag, b0_frag, c10, sa1, sb0, k_pack=0)
+                c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
                 b_g2s.load(b_cur1, B1_off + (k + 2) * B_K_STEP)
                 wait_barrier(3 * N_LDS_STEPS)
 
-                c11 = mfma.call(a1_frag, b1_frag, c11, sa1, sb1, k_pack=0)
+                c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
 
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
@@ -455,25 +525,25 @@ def compile_moe_bs_gemm_8w(
             a0_frag = a_s2r.load(a_cur0)
             wait_barrier(0)
 
-            c00 = mfma.call(a0_frag, b0_frag, c00, sa0, sb0, k_pack=0)
+            c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
             sb1 = scale_read(k, "b1")
             b1_frag = b_s2r.load(b_cur1, preshuffled=True)
             rocdl.s_barrier()
 
-            c01 = mfma.call(a0_frag, b1_frag, c01, sa0, sb1, k_pack=0)
+            c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
 
             sa1 = scale_read(k, "a1")
             a1_frag = a_s2r.load(a_cur1)
             a_load(1, a_next1, K_ITERS - 1)
             rocdl.s_barrier()
 
-            c10 = mfma.call(a1_frag, b0_frag, c10, sa1, sb0, k_pack=0)
+            c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
             b0_frag = b_s2r.load(b_next0, preshuffled=True)
             rocdl.s_barrier()
 
-            c11 = mfma.call(a1_frag, b1_frag, c11, sa1, sb1, k_pack=0)
+            c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
@@ -485,13 +555,13 @@ def compile_moe_bs_gemm_8w(
             a0_frag = a_s2r.load(a_cur0)
             wait_barrier(0)
 
-            c00 = mfma.call(a0_frag, b0_frag, c00, sa0, sb0, k_pack=0)
+            c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
             sb1 = scale_read(k, "b1")
             b1_frag = b_s2r.load(b_cur1, preshuffled=True)
             rocdl.s_barrier()
 
-            c01 = mfma.call(a0_frag, b1_frag, c01, sa0, sb1, k_pack=0)
+            c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
 
             sa1 = scale_read(k, "a1")
             a1_frag = a_s2r.load(a_cur1)
@@ -502,8 +572,8 @@ def compile_moe_bs_gemm_8w(
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
-            c10 = mfma.call(a1_frag, b0_frag, c10, sa1, sb0, k_pack=0, set_prio=False)
-            c11 = mfma.call(a1_frag, b1_frag, c11, sa1, sb1, k_pack=0, set_prio=False)
+            c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0, set_prio=False)
+            c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0, set_prio=False)
             rocdl.s_setprio(0)
             # Pairs the lagging group's last barrier above (see the dense kernel).
             barrier_if_zero(rocdl.readfirstlane(fx.Int32.ir_type, wave_m))
