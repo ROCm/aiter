@@ -15,6 +15,40 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 _FINALIZE_THREADS = 256
 
 
+def _herd_drop(ids, values, pops, routed_scaling_factor, renormalize=True):
+    """Pick the one candidate of a row that HERD drops: the least popular,
+    then the lowest value, then the lowest expert id.
+
+    Returns the dropped candidate's index and expert id, and the scale of the
+    kept values. Every HERD kernel drops with this, so their routes and
+    weights agree bit for bit.
+    """
+    kp1 = len(ids)
+    drop = Int32(0)
+    drop_id = ids[0]
+    drop_value = values[0]
+    drop_pop = pops[0]
+    for j in range_constexpr(1, kp1):
+        take = (pops[j] < drop_pop) | (
+            (pops[j] == drop_pop)
+            & (
+                (values[j] < drop_value)
+                | ((values[j] == drop_value) & (ids[j] < drop_id))
+            )
+        )
+        drop = take.select(Int32(j), drop)
+        drop_id = take.select(ids[j], drop_id)
+        drop_value = take.select(values[j], drop_value)
+        drop_pop = take.select(pops[j], drop_pop)
+    if not renormalize:
+        return drop, drop_id, routed_scaling_factor
+
+    kept_sum = Float32(0.0)
+    for j in range_constexpr(kp1):
+        kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
+    return drop, drop_id, routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
+
+
 @cache
 def build_herd_finalize_module(
     topk: int,
@@ -96,31 +130,9 @@ def build_herd_finalize_module(
             ids = [candidate_ids[row, j] for j in range_constexpr(kp1)]
             values = [candidate_values[row, j] for j in range_constexpr(kp1)]
             pops = [popularity[ids[j]] for j in range_constexpr(kp1)]
-
-            drop = Int32(0)
-            drop_id = ids[0]
-            drop_value = values[0]
-            drop_pop = pops[0]
-            for j in range_constexpr(1, kp1):
-                take = (pops[j] < drop_pop) | (
-                    (pops[j] == drop_pop)
-                    & (
-                        (values[j] < drop_value)
-                        | ((values[j] == drop_value) & (ids[j] < drop_id))
-                    )
-                )
-                drop = take.select(Int32(j), drop)
-                drop_id = take.select(ids[j], drop_id)
-                drop_value = take.select(values[j], drop_value)
-                drop_pop = take.select(pops[j], drop_pop)
-
-            kept_sum = Float32(0.0)
-            for j in range_constexpr(kp1):
-                kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
-            if const_expr(renormalize):
-                scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
-            else:
-                scale = routed_scaling_factor
+            drop, _, scale = _herd_drop(
+                ids, values, pops, routed_scaling_factor, renormalize
+            )
 
             for j in range_constexpr(kp1):
                 keep = drop != Int32(j)
@@ -169,28 +181,8 @@ def build_herd_finalize_module(
 
 def _kept_routes(ids, values, pops, routed_scaling_factor):
     kp1 = len(ids)
-    drop = Int32(0)
-    drop_id = ids[0]
-    drop_value = values[0]
-    drop_pop = pops[0]
-    for j in range_constexpr(1, kp1):
-        take = (pops[j] < drop_pop) | (
-            (pops[j] == drop_pop)
-            & (
-                (values[j] < drop_value)
-                | ((values[j] == drop_value) & (ids[j] < drop_id))
-            )
-        )
-        drop = take.select(Int32(j), drop)
-        drop_id = take.select(ids[j], drop_id)
-        drop_value = take.select(values[j], drop_value)
-        drop_pop = take.select(pops[j], drop_pop)
+    drop, _, scale = _herd_drop(ids, values, pops, routed_scaling_factor)
     keeps = [drop != Int32(j) for j in range_constexpr(kp1)]
-
-    kept_sum = Float32(0.0)
-    for j in range_constexpr(kp1):
-        kept_sum = kept_sum + keeps[j].select(values[j], Float32(0.0))
-    scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
 
     ranks = []
     for j in range_constexpr(kp1):

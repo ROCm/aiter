@@ -4,10 +4,10 @@ def _sanitize_constexpr_value(value):
     if isinstance(value, bool):
         return str(int(value))
     if isinstance(value, int):
-        return str(value)
+        return str(value).replace("-", "NEG_")
     if isinstance(value, float):
         if value.is_integer():
-            return str(int(value))
+            return str(int(value)).replace("-", "NEG_")
         return str(value).replace("-", "NEG_").replace("+", "POS_").replace(".", "_")
 
     # for lists, tuples, sets - recursively join each
