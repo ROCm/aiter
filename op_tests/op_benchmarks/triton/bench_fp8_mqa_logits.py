@@ -203,8 +203,8 @@ def main():
         "--long_kv_cases",
         action="store_true",
         help="Benchmark the H32/D128 shapes of LONG_KV_CASES: calls on each side of "
-        "the gfx950 eight-row gate, and prefill chunks with 1 to 64 KV splits. "
-        "Uses --layout and ignores the other shape options",
+        "the gfx950 eight-row gate, and prefill chunks with 2 to 342 KV splits. "
+        "Ignores the other shape options",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
