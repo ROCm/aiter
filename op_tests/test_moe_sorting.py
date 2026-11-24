@@ -176,6 +176,144 @@ def run_torch_moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
+def _onewg_pair_keys(ids, weights, eids, num_rows, block_size, topk, M, topk_weights):
+    """(expert, packed id) of every real pair of a sorted table, after checking the padding rows and weights."""
+    rows = ids[:num_rows]
+    expert = eids[: num_rows // block_size].repeat_interleave(block_size)
+    real = rows != (topk << 24 | M)
+    tok, slot = rows[real] & 0x00FFFFFF, rows[real] >> 24
+    assert bool((tok < M).all()) and bool(
+        (slot < topk).all()
+    ), "pad sentinel must be (topk << 24) | M"
+    assert torch.equal(
+        weights[:num_rows][real], topk_weights[tok.long(), slot.long()]
+    ), "sorted_weights must follow their ids"
+    return (expert[real].long() << 32) | rows[real].long()
+
+
+def test_moe_sorting_onewg():
+    """One-workgroup sort (``moe_sorting(unordered=True)``): same table as the reference up to the pair order
+    inside an expert, for E=128 up to 512 tokens."""
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    E = 128
+    for topk, block_size, M, case in itertools.product(
+        (4, 8),
+        (16, 32, 64),
+        (1, 2, 8, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512),
+        ("random", "skewed", "one_expert_set"),
+    ):
+        score = torch.rand(M, E, device="cuda", generator=gen)
+        if case == "skewed":
+            score[:, :8] += 2.0
+        elif case == "one_expert_set":
+            score[:, :] = torch.rand(1, E, device="cuda", generator=gen)
+        topk_ids = score.topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
+        topk_weights = torch.rand(M, topk, device="cuda", generator=gen)
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            4096,
+            torch.bfloat16,
+            block_size,
+            accumulate=False,
+            unordered=True,
+        )
+        used = fm._flydsl_moe_sorting_onewg(topk_ids, topk_weights, E, block_size)
+        if (
+            used is None
+        ):  # topk=8 at the largest M does not fit one workgroup's LDS: normal path, exact
+            _compare_moe_sorting_outputs(ref, out, topk, M)
+            continue
+        ids, w, eids, nv = out[:4]
+        assert (
+            nv.tolist() == ref[3].tolist()
+        ), f"num_valid_ids {nv.tolist()} vs {ref[3].tolist()}"
+        n = nv[0].item()
+        assert ids.shape == ref[0].shape and eids.shape == ref[2].shape
+        assert torch.equal(eids[: n // block_size], ref[2][: n // block_size])
+        got = _onewg_pair_keys(ids, w, eids, n, block_size, topk, M, topk_weights)
+        want = _onewg_pair_keys(
+            ref[0],
+            torch.where(ref[0] != (topk << 24 | M), 1.0, 0.0),
+            ref[2],
+            n,
+            block_size,
+            topk,
+            M,
+            torch.ones(M + 1, topk, device="cuda"),
+        )
+        assert torch.equal(
+            got.sort().values, want.sort().values
+        ), f"pairs differ: topk={topk} bm={block_size} M={M} {case}"
+        assert not (ids[:n] == (topk << 24 | M)).all() or M == 0
+    # CUDA-graph capture + replay with fresh routing
+    topk_ids = (
+        torch.rand(48, E, device="cuda")
+        .topk(4, dim=1)
+        .indices.to(dtypes.i32)
+        .contiguous()
+    )
+    topk_weights = torch.rand(48, 4, device="cuda")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            4096,
+            torch.bfloat16,
+            32,
+            accumulate=False,
+            unordered=True,
+        )
+    for _ in range(3):
+        topk_ids.copy_(
+            torch.rand(48, E, device="cuda").topk(4, dim=1).indices.to(dtypes.i32)
+        )
+        g.replay()
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, 32)
+        n = out[3][0].item()
+        assert n == ref[3][0].item()
+        assert torch.equal(
+            _onewg_pair_keys(out[0], out[1], out[2], n, 32, 4, 48, topk_weights)
+            .sort()
+            .values,
+            _onewg_pair_keys(
+                ref[0],
+                torch.where(ref[0] != (4 << 24 | 48), 1.0, 0.0),
+                ref[2],
+                n,
+                32,
+                4,
+                48,
+                torch.ones(49, 4, device="cuda"),
+            )
+            .sort()
+            .values,
+        )
+
+
+def test_moe_slots_shared_reduce():
+    """moe_slots_shared_reduce == fp32 sequential sum of the slots then the shared expert, rounded once to bf16
+    (bitwise), and == the generic FlyDSL topk reduction over a [M, topk + 1, H] buffer.
+    """
+    from aiter.ops.flydsl.kernels.moe_slots_shared_reduce import moe_slots_shared_reduce
+
+    for M, topk, H in itertools.product((1, 7, 16, 33, 128, 512), (4, 6), (2048, 6144)):
+        parts = (torch.randn(M, topk, H, device="cuda") * 3).bfloat16()
+        shared = (torch.randn(M, H, device="cuda") * 3).bfloat16()
+        acc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+        for k in range(topk):
+            acc += parts[:, k].float()
+        ref = (acc + shared.float()).bfloat16()
+        out = moe_slots_shared_reduce(parts, shared)
+        assert torch.equal(
+            out, ref
+        ), f"slots+shared reduce mismatch M={M} topk={topk} H={H}"
+
+
 def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
     max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
@@ -927,6 +1065,8 @@ def main():
     routing_cases = args.routing_case if args.routing_case is not None else ["valid"]
 
     test_moe_sorting_opus_host_dispatch_boundaries()
+    test_moe_sorting_onewg()
+    test_moe_slots_shared_reduce()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
     for dtype in args.dtype:
