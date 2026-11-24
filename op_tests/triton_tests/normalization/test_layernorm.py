@@ -168,6 +168,23 @@ def test_layernorm(M, N, dtype_str, eps=1e-5):
     torch.testing.assert_close(dw_triton, dw_torch, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("layout", ["col_step", "transposed"])
+def test_layernorm_non_contiguous(layout, dtype_str, eps=1e-5):
+    # Inputs with a column stride other than 1.
+    dtype = str_to_torch_dtype[dtype_str]
+    torch.manual_seed(0)
+    if layout == "col_step":
+        x = torch.randn(4, 128, dtype=dtype, device="cuda")[:, ::2]
+    else:
+        x = torch.randn(64, 4, dtype=dtype, device="cuda").t()
+    w = torch.rand(x.shape[1], dtype=dtype, device="cuda")
+    b = torch.rand(x.shape[1], dtype=dtype, device="cuda")
+    y_torch, *_ = run_torch(x, w, b, eps)
+    y_triton, *_ = run_triton(x, w, b, eps)
+    torch.testing.assert_close(y_triton, y_torch, atol=1e-2, rtol=1e-2)
+
+
 # pytest
 @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(

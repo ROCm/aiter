@@ -13,11 +13,16 @@ def softmax(x):
 
     Args:
         x (torch.Tensor): Input tensor with shape (n_rows, n_cols). Must be on GPU.
+            An x whose column stride is not 1 is copied to a contiguous tensor first.
 
     Returns:
         torch.Tensor: Output with same shape as x, softmax applied along last dimension.
     """
     _LOGGER.info("SOFTMAX: x=%s", tuple(x.shape))
+    # The kernel reads each row with a unit column stride; a row stride
+    # (e.g. a slice of a wider tensor) needs no copy.
+    if x.stride(1) != 1:
+        x = x.contiguous()
     n_rows, n_cols = x.shape
 
     MAX_FUSED_SIZE = 65536 // x.element_size()
