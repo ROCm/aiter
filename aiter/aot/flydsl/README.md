@@ -96,13 +96,21 @@ variant of the profile's bundle plan.
   process group or mori install is needed.
 - The device reports itself as an MI355X, because the combine launch geometry
   is tuned per GPU model.
-- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
-  fixed-slot `forward` and the per-stage benchmarks call it.
-- The MTPR 8192 jobs build the instance with `AITER_MEGA_SMALL_M=1` and
-  `AITER_MEGA_LARGE_M=1`. Where the runtime's eligibility checks accept the
-  profile (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` then also loads
-  the small-input kernel of every token bucket (MTPR 256 and 512) and the
-  large-input persistent kernel.
+- The input quant kernel is replayed too (through `quantize()`):
+  `preload_aot_bundles()` leaves it out, but fixed-slot `forward`, `quantize()`
+  and the per-stage benchmarks launch it.
+- The instance builds every route of its plan. Where the layout supports the
+  fused routes (`FUSED_LAYOUTS`: DeepSeek-V4-Pro EP8 and DeepSeek-V4.1-Flash
+  EP8 / EP4 / EP2, a8w4), `preload_aot_bundles()` also loads the small-input
+  kernel of every token bucket of each reachable small-input capacity (256 and
+  512), and, for an MTPR in `large_m_mtprs_for()` of the layout (1024..16384
+  for V4-Pro EP8, 8192 and 16384 for every V4.1-Flash layout), the
+  large-input persistent kernel. The default build covers the V4.1-Flash EP4,
+  EP2 and EP8 profiles at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`:
+  128, 8192, 16384; the large-input kernel at 8192 and 16384); one MTPR of the
+  EP4 profile alone:
+  `python -m aiter.aot.flydsl.mega_moe --world-size 4 --model-dim 5120
+  --inter-dim 2304 --experts-per-rank 96 --mtpr 8192 --quant a8w4`.
 - `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
   replay reaches but the cache lacks fails the job, which tests that the runtime's
   cache keys hit the artifacts the build produced.
@@ -139,9 +147,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   (about 15K M instead of 2.27M for the default tables, and the same kernels
   as identifying every M). Then one M per set of kernels the
   row's own replay did not build is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
-  would miss kernels there, since the gfx1250 GEMMs fit cluster_m to the
-  number of M tiles and specialize a ragged last tile: M=5120 and M=6144 can
-  request one kernel and M=5632 another. Rows of other archs are replayed at
+  would miss kernels there, since the gfx1250 GEMMs' kernels follow M's tile
+  counts (the heuristics' picks; a compute kernel is one binary for every
+  cluster_m, except that a launch fitting to one workgroup runs the plain
+  kernel), so two sizes that request one kernel can bound a size that requests
+  another. Rows of other archs are replayed at
   both ends and bisected between them where they request different kernels
   (`[BISECT]`). Either way this reaches the FlyDSL heuristic kernels the
   runtime falls back to below a shape's smallest tuned M; the scan also
@@ -276,9 +286,11 @@ GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 ```
 
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
-(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
-count is part of the compiled ABI, so one profile cannot safely reuse another
-profile's bundle.
+(`experts_per_rank=48/52/56`), Kimi-K3 (`experts_per_rank=112`) and
+DeepSeek-V4.1-Flash EP4 / EP2 / EP8 (`world_size=4/2/8`,
+`experts_per_rank=96/192/48`, a8w4, MTPR 128/8192/16384 unless `--mtpr` is
+given). The expert count is part of the
+compiled ABI, so one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments
 

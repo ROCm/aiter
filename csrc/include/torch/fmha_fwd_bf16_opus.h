@@ -3,12 +3,12 @@
 //
 // Shared public API for the OPUS gfx950 bf16 flash-attention forward kernels.
 // A single entry point dispatches (by head dim, inferred from the tensors) to:
-//   * the symmetric  D_QK=128 / D_V=128 kernel (gqa_d128_kernel), batch + group, and
-//     the only one with a sliding window, or
+//   * the symmetric  D_QK = D_V in {64, 128} kernel (gqa_d128_kernel), batch + group,
+//     plus the only sliding window (D=128), or
 //   * the asymmetric D_QK=192 / D_V=128 kernel (gqa_d192_v128_kernel), batch + group.
 //
-// This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
-// logic for D=128 is unchanged (only moved under this shared entry point).
+// This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`; the historical
+// `gqa_d128` implementation is traits-parameterized for both symmetric head dims.
 #pragma once
 #include <torch/extension.h>
 #include <optional>
@@ -20,8 +20,8 @@
 //   Group mode  : q [total_q, H, D_QK]  k [total_k, H_KV, D_QK]  v [total_k, H_KV, D_V]
 //                 out [total_q, H, D_V]   (packed / varlen; group = num sequences)
 //
-// Supported head dims: (D_QK, D_V) in {(128,128), (192,128)}. Both support batch and
-// group mode.
+// Supported head dims: (D_QK, D_V) in {(64,64), (128,128), (192,128)}. Every one of them
+// supports batch and group mode; only the symmetric kernels accept `sink`.
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
@@ -29,14 +29,18 @@
 // `window_size_left` bounds the causal mask on the left: a query at KV-coordinate j sees
 // keys [j - window_size_left, j]. -1 (the default) is unbounded, i.e. plain causal. Needs
 // `causal`; a window wider than seqlen_kv is folded back to -1 (plain causal) by the launch
-// layer. Only the D=128 kernel implements it; a window on (192,128) is rejected. There is
-// no right-hand window.
+// layer. Only the D=128 kernel implements it; a window on (64,64) or (192,128) is
+// rejected. There is no right-hand window.
 //
 // `lse` (optional) receives the log-sum-exp of the scaled scores in natural log,
 // float32, contiguous along the query dim:
 //   batch mode: [B, H, N]        group mode: [H, total_q]
-// Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, matching
-// torch.logsumexp. Pass std::nullopt to skip it (the kernel then stores nothing).
+// Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, or the sink logit
+// when a sink is supplied. Pass std::nullopt to skip it (the kernel stores nothing).
+//
+// `sink` (optional) is an attention sink: one fp32 logit per query head, [H], contiguous.
+// It joins the softmax denominator as a valueless extra key, attenuating O and raising
+// lse. Symmetric head dims only, and not together with a sliding window.
 //
 // Group / varlen (all four seqstart tensors are int32, length num_groups+1; pass
 // std::nullopt for batch mode):
@@ -57,4 +61,5 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q                         = 0,
                             int max_seqlen_k                         = 0,
-                            int window_size_left                     = -1);
+                            int window_size_left                     = -1,
+                            std::optional<at::Tensor> sink           = std::nullopt);
