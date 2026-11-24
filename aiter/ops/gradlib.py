@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from enum import IntEnum
 
 import torch
 
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
-from ..jit.core import compile_ops
+from ..jit.core import AITER_ROOT_DIR, compile_ops
 from ..jit.utils.torch_guard import torch_compile_guard
 
 
@@ -221,6 +222,81 @@ def _hipb_w4a16_is_supported(
 ) -> bool: ...
 
 
+@compile_ops("module_hipbsolgemm", fc_name="hipb_w4a16_set_table")
+def _hipb_w4a16_set_table(path: str) -> None: ...
+
+
+def hipb_w4a16_load_table(path: str | None = None) -> bool:
+    """Pick ``hipb_w4a16_mm``'s kernels from a tuned table instead of hipBLASLt's heuristic.
+
+    The table (``aiter/configs/hipb_w4a16_table_<arch>.csv`` by default) gives, for known
+    layers, the kernel measured fastest at each batch among every kernel hipBLASLt accepts;
+    other problems keep the heuristic's pick. Returns whether a table was loaded; ``""``
+    restores the heuristic. The default is loaded on first use when it exists for the arch;
+    ``AITER_HIPB_W4A16_TABLE=0`` keeps hipBLASLt's heuristic.
+    """
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    if path is None:
+        path = (
+            f"{AITER_ROOT_DIR}/aiter/configs/hipb_w4a16_table_{get_gfx_runtime()}.csv"
+        )
+        if not os.path.exists(path):
+            return False
+    _hipb_w4a16_set_table(path)
+    return bool(path)
+
+
+@compile_ops("module_hipbsolgemm", fc_name="hipb_w4a16_kernel_name")
+def _hipb_w4a16_kernel_name(
+    bf16: bool,
+    m: int,
+    n: int,
+    k: int,
+    lda: int,
+    ldb: int,
+    ldd: int,
+    group_size: int,
+    has_zp: bool,
+    int4_encoding: int,
+) -> str: ...
+
+
+def hipb_w4a16_kernel_name(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    group_size: int,
+    has_zp: bool = False,
+    out: torch.Tensor | None = None,
+    int4_encoding: int = int(HipblasLtInt4Encoding.UNSIGNED_BIAS8),
+) -> str:
+    """Name of the hipBLASLt kernel ``hipb_w4a16_mm`` launches for these arguments ("" if none)."""
+    _hipb_w4a16_auto_table()
+    return _hipb_w4a16_kernel_name(
+        x.dtype == torch.bfloat16,
+        x.size(0),
+        w_q.size(0),
+        x.size(1),
+        w_q.stride(0) * 2,
+        x.stride(0),
+        w_q.size(0) if out is None else out.stride(0),
+        group_size,
+        has_zp,
+        int(int4_encoding),
+    )
+
+
+_hipb_w4a16_table_checked = False
+
+
+def _hipb_w4a16_auto_table() -> None:
+    global _hipb_w4a16_table_checked
+    if not _hipb_w4a16_table_checked:
+        _hipb_w4a16_table_checked = True
+        if os.getenv("AITER_HIPB_W4A16_TABLE", "1") == "1":
+            hipb_w4a16_load_table()
+
+
 def hipb_w4a16_is_supported(
     dtype: torch.dtype,
     n: int,
@@ -246,6 +322,7 @@ def hipb_w4a16_is_supported(
     """
     if dtype not in (torch.float16, torch.bfloat16):
         return False
+    _hipb_w4a16_auto_table()
     return _hipb_w4a16_is_supported(
         dtype == torch.bfloat16,
         n,
@@ -336,6 +413,7 @@ def _hipb_w4a16_mm_out(
     has_zp: bool,
     int4_encoding: int,
 ) -> None:
+    _hipb_w4a16_auto_table()
     # Stream-K kernels keep partial sums in the workspace. Taking it from torch's
     # allocator per call ties it to the current stream, so launches on different
     # streams never share scratch memory.

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import re
+
 import pytest
 import torch
 
@@ -28,6 +30,18 @@ def requires_w4a16(hipb_extension):
         )
 
 
+@pytest.fixture(params=["heuristic", "table"])
+def kernel_choice(request, requires_w4a16):
+    """Runs the test with hipBLASLt's heuristic and, where this arch ships one, the tuned
+    kernel table."""
+    if request.param == "heuristic":
+        aiter.hipb_w4a16_load_table("")
+    elif not aiter.hipb_w4a16_load_table():
+        pytest.skip("no W4A16 kernel table for this arch")
+    yield request.param
+    aiter.hipb_w4a16_load_table("")
+
+
 def pack_int4_k_order(q: torch.Tensor, row_pad: int = 0) -> torch.Tensor:
     """[N, K] values in [0, 15] -> [N, K // 2] uint8, rows `row_pad` bytes apart extra."""
     packed = (q[:, 0::2] | (q[:, 1::2] << 4)).to(torch.uint8)
@@ -50,7 +64,7 @@ def pack_zeros_along_n(zp: torch.Tensor) -> torch.Tensor:
     return words.to(torch.uint32).view(torch.int32)
 
 
-@pytest.mark.usefixtures("requires_w4a16")
+@pytest.mark.usefixtures("requires_w4a16", "kernel_choice")
 @pytest.mark.parametrize("dtype", [dtypes.bf16, dtypes.fp16])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
 @pytest.mark.parametrize("has_zp", [False, True])
@@ -308,3 +322,43 @@ def test_hipb_w4a16_rejects_other_current_device():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.usefixtures("requires_w4a16")
+def test_hipb_w4a16_load_table_rejects_malformed_file(tmp_path):
+    bad = tmp_path / "select.csv"
+    bad.write_text("model,MT32x16x128_SK,1,2\n")
+    with pytest.raises(RuntimeError, match="bad line"):
+        aiter.hipb_w4a16_load_table(str(bad))
+    aiter.hipb_w4a16_load_table("")
+
+
+@pytest.mark.usefixtures("requires_w4a16")
+def test_hipb_w4a16_table_picks_kernel_per_batch(tmp_path):
+    """A layer row sets the kernel of each batch interval; other layers keep the heuristic."""
+
+    def cfg(name):
+        return re.search(r"MT\d+x\d+x\d+", name).group(0) + (
+            "_SK" if "_SK" in name else ""
+        )
+
+    w_q = torch.zeros(N, K // 2, device="cuda", dtype=torch.uint8)
+    x = {m: torch.randn(m, K, device="cuda", dtype=dtypes.bf16) for m in (16, 300, 301)}
+    aiter.hipb_w4a16_load_table("")
+    heuristic = {m: aiter.hipb_w4a16_kernel_name(x[m], w_q, 128) for m in x}
+    if heuristic[16] == heuristic[300]:
+        pytest.skip("the heuristic picks one kernel for both batches")
+    other_n = torch.zeros(N + 64, K // 2, device="cuda", dtype=torch.uint8)
+    other_heuristic = aiter.hipb_w4a16_kernel_name(x[300], other_n, 128)
+    table = tmp_path / "select.csv"
+    table.write_text(
+        f"layer,bf16_zp0_g128_e1,{N},{K},{K},{K},{N},"
+        f"299:{cfg(heuristic[301])} 300:{cfg(heuristic[16])} 16384:{cfg(heuristic[301])}\n"
+    )
+    aiter.hipb_w4a16_load_table(str(table))
+    try:
+        assert aiter.hipb_w4a16_kernel_name(x[300], w_q, 128) == heuristic[16]
+        assert aiter.hipb_w4a16_kernel_name(x[301], w_q, 128) == heuristic[301]
+        assert aiter.hipb_w4a16_kernel_name(x[300], other_n, 128) == other_heuristic
+    finally:
+        aiter.hipb_w4a16_load_table("")

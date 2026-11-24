@@ -89,6 +89,23 @@ bool hipb_w4a16_is_supported(bool bf16,
                              int64_t int4_encoding,
                              const std::vector<int64_t>& batch_sizes);
 
+// Loads a table of tuned kernels for known layers (see aiter/configs/hipb_w4a16_table_*.csv)
+// that replaces hipBLASLt's heuristic choice for hipb_w4a16_mm on them; an empty path restores
+// the heuristic.
+void hipb_w4a16_set_table(const std::string& path);
+
+// Name of the kernel hipb_w4a16_mm launches for this problem; "" when hipBLASLt has none.
+std::string hipb_w4a16_kernel_name(bool bf16,
+                                   int64_t m,
+                                   int64_t n,
+                                   int64_t k,
+                                   int64_t lda,
+                                   int64_t ldb,
+                                   int64_t ldd,
+                                   int64_t group_size,
+                                   bool has_zp,
+                                   int64_t int4_encoding);
+
 // Bytes of workspace hipb_w4a16_mm needs for these tensors (0 when none).
 int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
                                   const aiter_tensor_t& w_q,
