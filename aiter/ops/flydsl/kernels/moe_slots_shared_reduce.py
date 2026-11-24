@@ -28,7 +28,8 @@ CHUNK = THREADS * VEC  # columns per workgroup
 
 
 @functools.lru_cache(maxsize=32)
-def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int):
+def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int, device: int = 0):
+    # ``device`` only keys the cache: a compiled handle is bound to the device it was built on.
     assert model_dim % CHUNK == 0, f"model_dim must be a multiple of {CHUNK}"
     chunks = model_dim // CHUNK
 
@@ -93,7 +94,10 @@ def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int):
 def moe_slots_shared_reduce(parts, shared, out=None):
     """``parts`` [M, topk, model_dim] bf16 and ``shared`` [M, model_dim] bf16 -> [M, model_dim] bf16."""
     M, topk, model_dim = parts.shape
+    assert parts.is_cuda and parts.device == shared.device
     assert parts.dtype == shared.dtype == torch.bfloat16
+    # the buffer resources and element offsets are 32-bit bytes
+    assert parts.numel() * 2 < 2**31, "parts must be smaller than 2 GiB"
     assert (
         parts.is_contiguous()
         and shared.is_contiguous()
@@ -102,18 +106,22 @@ def moe_slots_shared_reduce(parts, shared, out=None):
     if out is None:
         out = torch.empty_like(shared)
     assert (
-        out.dtype == torch.bfloat16
+        out.device == parts.device
+        and out.dtype == torch.bfloat16
         and out.is_contiguous()
         and out.shape == shared.shape
     )
     if M == 0:
         return out
-    _run_compiled(
-        compile_moe_slots_shared_reduce(topk=topk, model_dim=model_dim),
-        parts.view(-1),
-        shared.view(-1),
-        out.view(-1),
-        M,
-        torch.cuda.current_stream(parts.device),
-    )
+    with torch.cuda.device(parts.device):
+        _run_compiled(
+            compile_moe_slots_shared_reduce(
+                topk=topk, model_dim=model_dim, device=torch.cuda.current_device()
+            ),
+            parts.view(-1),
+            shared.view(-1),
+            out.view(-1),
+            M,
+            torch.cuda.current_stream(parts.device),
+        )
     return out

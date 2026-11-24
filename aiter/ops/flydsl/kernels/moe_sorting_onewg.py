@@ -126,9 +126,12 @@ def onewg_supported(M, num_experts, topk, unit_size, has_mask=False, moe_buf_num
 
 @functools.lru_cache(maxsize=64)
 def compile_moe_sorting_onewg(
-    *, topk: int, block_m: int, max_tokens: int, rank: bool = True
+    *, topk: int, block_m: int, max_tokens: int, rank: bool = True, device: int = 0
 ):
-    """Histogram, padded-count scan and placement in one workgroup, no cross-CTA state."""
+    """Histogram, padded-count scan and placement in one workgroup, no cross-CTA state.
+
+    ``device`` only keys the cache: a compiled handle is bound to the device it was built on.
+    """
     E = NUM_EXPERTS
     threads = THREADS
     assert (block_m & (block_m - 1)) == 0 and threads >= E
@@ -343,22 +346,24 @@ def moe_sorting_onewg(
     ), "moe_sorting_onewg: unsupported shape"
     if rank is None:
         rank = M >= RANK_FROM_TOKENS
-    launch = compile_moe_sorting_onewg(
-        topk=topk,
-        block_m=unit_size,
-        max_tokens=next(t for t in TOKEN_TIERS if M <= t),
-        rank=rank,
-    )
-    # through the cached handle: a direct @flyc.jit call enters the JIT (a full trace) on every call
-    _run_compiled(
-        launch,
-        topk_ids.view(-1),
-        topk_weights.view(-1),
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        int(M),
-        torch.cuda.current_stream(topk_ids.device),
-    )
+    with torch.cuda.device(topk_ids.device):
+        launch = compile_moe_sorting_onewg(
+            topk=topk,
+            block_m=unit_size,
+            max_tokens=next(t for t in TOKEN_TIERS if M <= t),
+            rank=rank,
+            device=torch.cuda.current_device(),
+        )
+        # through the cached handle: a direct @flyc.jit call enters the JIT (a full trace) on every call
+        _run_compiled(
+            launch,
+            topk_ids.view(-1),
+            topk_weights.view(-1),
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            int(M),
+            torch.cuda.current_stream(topk_ids.device),
+        )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids

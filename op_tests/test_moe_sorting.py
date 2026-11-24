@@ -297,8 +297,7 @@ def test_moe_sorting_onewg():
 
 def test_moe_slots_shared_reduce():
     """moe_slots_shared_reduce == fp32 sequential sum of the slots then the shared expert, rounded once to bf16
-    (bitwise), and == the generic FlyDSL topk reduction over a [M, topk + 1, H] buffer.
-    """
+    (bitwise), against a torch reference."""
     from aiter.ops.flydsl.kernels.moe_slots_shared_reduce import moe_slots_shared_reduce
 
     for M, topk, H in itertools.product((1, 7, 16, 33, 128, 512), (4, 6), (2048, 6144)):
