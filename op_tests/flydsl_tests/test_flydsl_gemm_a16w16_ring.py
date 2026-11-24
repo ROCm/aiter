@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Correctness and perf of the gfx950 small-M BF16 ring GEMM (aiter.ops.flydsl.gemm_a16w16_ring).
+
+pytest op_tests/flydsl_tests/test_flydsl_gemm_a16w16_ring.py
+python op_tests/flydsl_tests/test_flydsl_gemm_a16w16_ring.py
+"""
+
+import argparse
+import itertools
+
+import pandas as pd
+import pytest
+import torch
+
+pytest.importorskip("flydsl")
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.gemm_a16w16_ring import (
+    gemm_a16w16_ring,
+    ring_supported,
+    shuffle_weight_ring,
+    unshuffle_weight_ring,
+)
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.tuned_gemm import tgemm
+
+# (N, K): a 200064-vocab lm_head shard at TP4 (the production shape), and two other legal shapes.
+_SHAPES = ((50016, 6144), (32000, 4096), (24576, 7168))
+_ROWS = (1, 7, 8, 16, 17, 32, 48, 64, 65, 96, 97, 128)
+
+_SKIP = pytest.mark.skipif(
+    get_gfx_runtime() != "gfx950", reason="gfx950 and FlyDSL are required"
+)
+
+
+def run_torch(x, w):
+    return (x.float() @ w.float().T).to(dtypes.bf16)
+
+
+def _inputs(m, n, k, seed=0):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(seed + 7919 * m)
+    x = (torch.randn(m, k, device="cuda", generator=g) * 0.05).to(dtypes.bf16)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.02).to(dtypes.bf16)
+    return x, w
+
+
+@_SKIP
+@pytest.mark.parametrize("n,k", _SHAPES)
+@pytest.mark.parametrize("m", _ROWS)
+def test_ring_matches_torch(m, n, k):
+    x, w = _inputs(m, n, k)
+    ref = run_torch(x, w)
+    ws = shuffle_weight_ring(w)
+    out = gemm_a16w16_ring(x, ws)
+    # fp32 accumulation in a different K order than torch: allow a bf16 ulp of the output.
+    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-2)
+    # The layout and the output buffer do not change a bit of the result.
+    out_rm = torch.empty_like(out)
+    gemm_a16w16_ring(x, w, out=out_rm, shuffled=False)
+    assert torch.equal(out, out_rm)
+
+
+@_SKIP
+def test_ring_rows_tier_invariant():
+    """A row's result does not depend on how many rows ride with it (one M half vs two, 1..128 rows)."""
+    n, k = _SHAPES[0]
+    x, w = _inputs(128, n, k)
+    ws = shuffle_weight_ring(w)
+    full = gemm_a16w16_ring(x, ws)
+    for m in (1, 7, 16, 33, 64, 65, 100):
+        assert torch.equal(gemm_a16w16_ring(x[:m].contiguous(), ws), full[:m])
+
+
+@_SKIP
+def test_ring_graph_replay():
+    n, k = _SHAPES[0]
+    x, w = _inputs(32, n, k)
+    ws = shuffle_weight_ring(w)
+    eager = gemm_a16w16_ring(x, ws)
+    out = torch.empty_like(eager)
+    gemm_a16w16_ring(x, ws, out=out)  # compile outside the capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        gemm_a16w16_ring(x, ws, out=out)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def test_ring_shuffle_roundtrip():
+    w = torch.randn(512 * 16, 128, dtype=dtypes.bf16)
+    assert torch.equal(unshuffle_weight_ring(shuffle_weight_ring(w)), w)
+
+
+@benchmark()
+def bench_ring(m, n, k):
+    x, w = _inputs(m, n, k)
+    ws = shuffle_weight_ring(w)
+    ref = run_torch(x, w)
+    out_ring, us_ring = run_perftest(
+        gemm_a16w16_ring, x, ws, num_iters=50, num_warmup=10
+    )
+    out_tg, us_tg = run_perftest(tgemm.mm, x, w, None, num_iters=50, num_warmup=10)
+    flops = 2.0 * m * n * k
+    traffic = (m * k + n * k + m * n) * 2
+    ret = {}
+    for name, us, o in (("ring", us_ring, out_ring), ("tgemm", us_tg, out_tg)):
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = traffic / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            ref.float(), o.float(), atol=2e-3, rtol=2e-2, msg=name
+        )
+    return ret
+
+
+def main():
+    parser = argparse.ArgumentParser(description="BF16 small-M ring GEMM")
+    parser.add_argument(
+        "-m", "--rows", type=int, nargs="*", default=[8, 16, 32, 64, 96, 128]
+    )
+    parser.add_argument(
+        "-s",
+        "--nk",
+        type=int,
+        nargs=2,
+        action="append",
+        metavar=("N", "K"),
+        default=None,
+    )
+    args = parser.parse_args()
+    if get_gfx_runtime() != "gfx950":
+        aiter.logger.info("ring GEMM needs gfx950; skipped")
+        return
+    shapes = [tuple(s) for s in args.nk] if args.nk else [_SHAPES[0]]
+    rows = [
+        bench_ring(m, n, k)
+        for (n, k), m in itertools.product(shapes, args.rows)
+        if ring_supported(m, n, k)
+    ]
+    df = pd.DataFrame(rows)
+    aiter.logger.info("gemm_a16w16_ring summary:\n%s", df.to_markdown(index=False))
+
+
+if __name__ == "__main__":
+    main()
