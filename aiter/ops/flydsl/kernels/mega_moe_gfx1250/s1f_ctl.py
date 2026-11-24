@@ -74,11 +74,13 @@ _S1F_MAX_RECV = 4096
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+#: DSR1 EP4 with a local shared replica uses top-9 and the same wide plan.
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
+    (4, 9): 1 << 30,
 }
 
 
@@ -119,7 +121,7 @@ def s1f_prefill_config(
     stage1_fused: bool,
     activation,
 ) -> dict | None:
-    """Shared plan/GEMM defaults for the pinned Flash EP4 prefill geometry.
+    """Shared plan/GEMM defaults for pinned Flash and DSR1 EP4 prefill.
 
     This uses host metadata only, including the unrounded receive bound. A
     manual tile or APRE selection keeps the existing CSV/env path. Buffer,
@@ -131,7 +133,7 @@ def s1f_prefill_config(
         or dispatch_wire != "fp4"
         or activation != ActivationType.Silu
         or (hidden_dim, inter_dim, experts_per_rank, topk, world_size)
-        != (5120, 2304, 96, 6, 4)
+        not in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4))
         or int(recv_bound) < 16384
         or os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0") != "1"
     ):
@@ -583,7 +585,7 @@ class _Stage1Fusion:
                 a_preshuffled
                 and num_buffers == 3
                 and int(recv_bound) >= 16384
-                and config.combine_slot_stride_for(0) == 10240
+                and config.combine_slot_stride_for(0) in (10240, 14336)
             )
             else 1
         )

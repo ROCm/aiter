@@ -349,7 +349,7 @@ def build_gemm_a8w4_tdm_task(
         assert cluster_n == 1 or all(
             (
                 cluster_n == 2,
-                K == 5120,
+                K == 5120 or (K, n_experts) == (7168, 65),
                 not a_preshuffled,
                 row_major_ascale,
                 tile_m == tile_n == tile_k == 256,
@@ -467,7 +467,7 @@ def build_gemm_a8w4_tdm_task(
         and tile_m == tile_n == tile_k == 256
         and m_warp == n_warp == 2
     )
-    # The pinned Flash EP scatter ABI supplies a fixed output width.
+    # Pinned EP4 scatter ABIs supply a fixed output width.
     # The expert estimate is checked against live device prefix bounds.
     fixed_n_ep = bool(
         explicit_vgpr_partition
@@ -476,9 +476,8 @@ def build_gemm_a8w4_tdm_task(
         and enable_ep_scatter
         and not ep_quant_bits
         and ep_world_size == 4
-        and ep_slot_stride_bytes == 10240
-        and n_experts == 96
-        and K == 2304
+        and (static_n, K, n_experts, ep_slot_stride_bytes)
+        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
         and tile_m == tile_n == tile_k == 256
         and m_warp == n_warp == 2
         and num_buffers == 4
@@ -489,7 +488,6 @@ def build_gemm_a8w4_tdm_task(
         and k_waves == cluster_m == cluster_n == 1
         and not row_major_ascale
         and persistent_workers in (0, 4096)
-        and static_n == 5120
     )
     assert static_n >= 0 and (not static_n or fixed_n_ep)
     streaming_ep_rows = fixed_n_ep
@@ -576,7 +574,7 @@ def build_gemm_a8w4_tdm_task(
         and k_waves == 1
         and cluster_m == 1
         and cluster_n in (1, 2)
-        and K == 5120
+        and (K == 5120 or (K, n_experts) == (7168, 65))
     )
     native_mma_order = native_schedule or row_major_mma_reuse
     # Keep EP scatter on its established input and output schedule.
@@ -604,7 +602,7 @@ def build_gemm_a8w4_tdm_task(
         and m_warp == n_warp == 2
         and num_buffers in (3, 4)
         and cluster_m == 1
-        and K in (5120, 2304)
+        and (K in (5120, 2304) or (K, n_experts) in ((7168, 65), (2048, 65)))
     )
     compact_skip_empty_wave = all(
         (
@@ -615,10 +613,10 @@ def build_gemm_a8w4_tdm_task(
             cluster_m == 1,
             stage1_act == 1,
             bool(stage1_quant_out),
-            K == 5120,
+            K == 5120 or (K, n_experts) == (7168, 65),
         )
     )
-    # Full GEMM2 bodies avoid duplicating its K loop on the Flash EP4 geometry;
+    # Full GEMM2 bodies avoid duplicating the K loop on pinned EP4 geometries;
     # its input and scatter masks still suppress every padded output row.
     compact_ep_prefill = all(
         (
@@ -627,8 +625,7 @@ def build_gemm_a8w4_tdm_task(
             bool(enable_ep_scatter),
             not ep_quant_bits,
             ep_world_size == 4,
-            n_experts == 96,
-            K == 2304,
+            (K, n_experts) in ((2304, 96), (2048, 65)),
             tile_m == tile_n == tile_k == 256,
             m_warp == n_warp == 2,
             num_buffers == 4,
@@ -640,7 +637,9 @@ def build_gemm_a8w4_tdm_task(
     # The instance can replay a smaller tile or a non-APRE step on the same
     # arena, so address validity must not depend on its compute tuning gate.
     dense_ep_stride = bool(
-        enable_ep_scatter and not ep_quant_bits and ep_slot_stride_bytes == 10240
+        enable_ep_scatter
+        and not ep_quant_bits
+        and ep_slot_stride_bytes in (10240, 14336)
     )
     partial_m_variants = compact_m_variants and not compact_ep_prefill
     # The short-tile K loop has no separate drain phase. Its S1F hook must
@@ -650,9 +649,13 @@ def build_gemm_a8w4_tdm_task(
         or compact_m_variants
         or (item_hooks is not None and (tile_m <= 32 or num_buffers <= 2))
     )
-    s1f_flash_prefill = row_major_mma_reuse and bool(explicit_tile) and n_experts == 96
-    # The fixed Flash S1F APRE payload permits a shared lane base.
-    s1f_packed_payload = s1f_flash_prefill and bool(quant_payload_preshuffled)
+    s1f_pinned_prefill = (
+        row_major_mma_reuse
+        and bool(explicit_tile)
+        and (K, n_experts) in ((5120, 96), (7168, 65))
+    )
+    # The fixed S1F APRE payload permits a shared lane base.
+    s1f_packed_payload = s1f_pinned_prefill and bool(quant_payload_preshuffled)
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -841,7 +844,7 @@ def build_gemm_a8w4_tdm_task(
     _drain = "_rolleddrain" if rolled_drain else ""
     _g1opt = ""
     _g1opt += "_epidxscale2" if s1f_packed_payload else ""
-    _g1opt += "_g1arb_stagebases" if s1f_flash_prefill else ""
+    _g1opt += "_g1arb_stagebases" if s1f_pinned_prefill else ""
     _g1opt += "_g1lds_stagebases" if row_major_mma_reuse else ""
     _early_timeout = "_et0" if not tdm_early_timeout else ""
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
@@ -850,7 +853,7 @@ def build_gemm_a8w4_tdm_task(
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{'_silu16' if s1f_flash_prefill else ''}"
+        f"{'_silu16' if s1f_pinned_prefill else ''}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}"
         f"{_next_stage}{_as_prologue}"
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
@@ -1338,7 +1341,7 @@ def build_gemm_a8w4_tdm_task(
                 tail_inner = inner * (KWS_TAIL * WMMA_K if on_i32 else K_TAIL) // tile_k
                 global_inner = inner * (K_TILES - 1) + tail_inner
             local_coordinates = bool(
-                (use_spec_prefill_opt or s1f_flash_prefill)
+                (use_spec_prefill_opt or s1f_pinned_prefill)
                 and not HAS_K_TAIL
                 and k_adv
                 and k_adv * K_TILES < 2**31
@@ -2546,9 +2549,9 @@ def build_gemm_a8w4_tdm_task(
 
         if has_work:
             # Shader Programming Guide 4.3.7.4.2: bit 2 permits back-to-back
-            # WMMA issue. Reuse the existing G2 setting for Flash S1F;
+            # WMMA issue. Reuse the existing G2 setting for pinned EP4 S1F;
             # DEP_MODE and all compiler/TDM/WG dependency waits are retained.
-            if const_expr(use_spec_prefill_opt or s1f_flash_prefill):
+            if const_expr(use_spec_prefill_opt or s1f_pinned_prefill):
                 llvm_dialect.InlineAsmOp(
                     res=None,
                     operands_=[],
@@ -3254,7 +3257,7 @@ def build_gemm_a8w4_tdm_task(
                                     act_pairs = pairs[
                                         act_begin : act_begin + activation_chunk
                                     ]
-                                    if const_expr(s1f_flash_prefill):
+                                    if const_expr(s1f_pinned_prefill):
                                         all_vals += batched_silu_swiglu(
                                             act_pairs,
                                             swiglu=is_swiglu,

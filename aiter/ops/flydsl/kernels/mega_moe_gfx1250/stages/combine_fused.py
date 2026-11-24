@@ -87,7 +87,7 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
 
 
 def _bf16_prefill_threads(config, token_count, quant_bits, shared_add):
-    """Use the four-wave reduce for dense Flash prefill from T4096 per rank."""
+    """Use the four-wave reduce for pinned EP4 prefill from T4096 per rank."""
     if (
         quant_bits == 0
         and shared_add is None
@@ -96,8 +96,8 @@ def _bf16_prefill_threads(config, token_count, quant_bits, shared_add):
         and config.stage1_fused
         and (config.hidden_dim, config.geometry.inter_dim,
              config.experts_per_rank, config.topk, config.world_size)
-        == (5120, 2304, 96, 6, 4)
-        and config.combine_slot_stride_for(0) == 10240
+        in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4))
+        and config.combine_slot_stride_for(0) == 2 * config.hidden_dim
     ):
         return 128
     return 0

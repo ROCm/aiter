@@ -511,7 +511,7 @@ class MegaMoEConfig:
     def combine_slot_stride_for(self, quant_bits: int) -> int:
         """Slot pitch on the ``quant_bits`` wire, covering the whole payload.
 
-        The pinned Flash EP4 S1F instance uses a dense BF16 pitch and a 2-KiB
+        Pinned Flash and DSR1 EP4 S1F instances use a dense BF16 pitch and a 2-KiB
         TDM address unit. Other instances round to a power of two so one row
         index addresses both peer and slot directly.
 

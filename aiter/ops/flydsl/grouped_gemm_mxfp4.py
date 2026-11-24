@@ -325,8 +325,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         and SUPPORT_EXPLICIT_VGPR_PARTITION
         and not stage2_scatter.combine_quant_bits
         and stage2_scatter.world_size == 4
-        and stage2_scatter.slot_stride_bytes == 10240
-        and (N, K, n_experts) == (5120, 2304, 96)
+        and (N, K, n_experts, stage2_scatter.slot_stride_bytes)
+        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
         and a_is_fp4
         and a_preshuffled
         and not persistent_workers
@@ -339,7 +339,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         and cluster_m == cluster_n == k_waves == 1
         and tdm_spec[2] == 1
     )
-    # Flash prefill steps use a bounded live-route grid from T4096 per rank.
+    # Pinned EP4 prefill steps use a live-route grid from T4096 per rank.
     # Explicit worker overrides keep their requested dispatch.
     if (
         fixed_n_ep

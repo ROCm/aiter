@@ -131,19 +131,19 @@ class Stage2ScatterContext:
         # fields before the grouped helper restores the live compact context.
         # Validate the dense pitch by its wire/arena geometry; compact_layout
         # is not available at that intermediate construction boundary.
-        dense_flash_bf16 = (
+        dense_ep4_bf16 = (
             self.combine_quant_bits == 0
             and self.world_size == 4
             and self.max_tokens_per_rank >= 4096
-            and self.slot_stride_bytes == 10240
+            and self.slot_stride_bytes in (10240, 14336)
         )
         if self.slot_stride_bytes <= 0 or (
             self.slot_stride_bytes & (self.slot_stride_bytes - 1)
-            and not dense_flash_bf16
+            and not dense_ep4_bf16
         ):
             raise ValueError(
                 "slot_stride_bytes must be a positive power of two or the "
-                "dense Flash EP4 BF16 pitch"
+                "dense Flash or DSR1 EP4 BF16 pitch"
             )
         if self.max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive")

@@ -170,7 +170,7 @@ MB_LD_INFL = 3
 #: Mailbox spins (s_sleep 1 each) before a wait traps.
 MB_SPIN = 1 << 26
 
-#: Producer ring: four slots; pinned Flash prefill uses eight below.
+#: Producer ring: four slots; pinned EP4 prefill uses eight below.
 S1F_SLOTS = 4
 S1F_DEPTH = 3
 _MD_STRIDE = 128
@@ -592,7 +592,7 @@ def make_s1f_stage1(
     for every variant sharing one control block. ``ctas_per_cu``: how many
     CTAs of this grid share a CU, for the LDS residency check.
 
-    ``pair_cluster_n=2`` pairs two eligible Flash prefill CTAs on adjacent
+    ``pair_cluster_n=2`` pairs two eligible EP4 prefill CTAs on adjacent
     N panels. A shared atomic ticket and cluster rendezvous keep their A
     multicast matched; producer roles and all completion waits are retained.
     """
@@ -600,17 +600,17 @@ def make_s1f_stage1(
         raise ValueError("S1F requires gfx1250 wave32")
     if pair_cluster_n not in (1, 2):
         raise ValueError("pair_cluster_n must be 1 or 2")
-    # Pinned Flash consumes row-major wire and writes APRE A2. Keep its
+    # Pinned EP4 prefill consumes row-major wire and writes APRE A2. Keep its
     # accepted eight-slot, three-store pipeline and smaller variants' defaults.
-    flash_prefill = bool(
+    pinned_prefill = bool(
         a_preshuffled
         and (tile_m, tile_n, tile_k, m_warp, n_warp) == (256, 256, 256, 2, 2)
         and (model_dim, inter_dim, experts_per_rank, topk, npes)
-        == (5120, 2304, 96, 6, 4)
+        in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4))
         and num_buffers == 3
         and os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0") == "1"
     )
-    R, S, D = int(run_rows), (8 if flash_prefill else S1F_SLOTS), int(depth)
+    R, S, D = int(run_rows), (8 if pinned_prefill else S1F_SLOTS), int(depth)
     if not 1 <= R <= 15:
         raise ValueError(f"run_rows={R} must fit the plan's 4-bit run field")
     if not (1 <= D and S >= D + 1):
@@ -682,11 +682,8 @@ def make_s1f_stage1(
                 num_buffers == 3,
                 m_warp == n_warp == 2,
                 a_preshuffled == 1,
-                model_dim == 5120,
-                inter_dim == 2304,
-                epr == 96,
-                npes == 4,
-                topk == 6,
+                (model_dim, inter_dim, epr, topk, npes)
+                in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4)),
             )
         )
         else 1
@@ -849,10 +846,11 @@ def make_s1f_stage1(
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
         ARENA = int(lay["arena"])
-        # The ring lives inside the GEMM arena, so a producer CTA's LDS
-        # footprint is the GEMM1 arena and residency is unchanged.
+        # Producer and GEMM phases alias the arena. DSR1's eight-slot ring
+        # needs 251520 B (8 * 8 * 3840 + metadata), above GEMM1's 221184 B.
+        # Pinned M256 uses one CTA per CU; retain the residency check below.
         prod_lds = MB_END
-        ARENA_LDS = ARENA
+        ARENA_LDS = max(ARENA, prod_lds) if pinned_prefill else ARENA
         if prod_lds > ARENA_LDS:
             raise ValueError(
                 f"producer LDS {prod_lds} B exceeds the GEMM arena {ARENA} B"
