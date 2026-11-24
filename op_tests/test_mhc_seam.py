@@ -8,8 +8,9 @@ The op runs ASM kernels on gfx942 with 4 residual streams and hidden_size 5120 a
 no other path; on other archs this test is skipped. Per case (checkAllclose; the err
 columns are its mismatch ratios):
 
-  residual_out  bit-exact (atol = rtol = 0) against ``aiter.mhc_post`` (same fp32
-                order, bf16 truncation)
+  residual_out  ``aiter.mhc_post``'s fp32 value truncated to bf16: every element equal
+                to mhc_post's output or one bf16 ulp below it in magnitude (mhc_post
+                rounds to nearest even; the ASM kernels truncate)
   layer_input   bit-exact against a torch collapse of that residual: fp32 multiply and
                 add over streams 0..3 from 0, rounded to nearest even
   post, comb    atol = GATE_ATOL against fp64 gates of that residual (the op computes
@@ -154,17 +155,32 @@ def max_diff(a, b):
     return (a.float() - b.float()).abs().max().item() if a.numel() else 0.0
 
 
+def truncated_mismatch(out, res_rne, tag):
+    """Share of elements of out that are not the bf16 truncation of the value res_rne
+    rounds to nearest even: equal to res_rne, or one ulp below it in magnitude with the
+    same sign (the bf16 bit patterns are sign-magnitude)."""
+    a = out.view(torch.int16).to(torch.int32)
+    b = res_rne.view(torch.int16).to(torch.int32)
+    same_sign = (a < 0) == (b < 0)
+    step = (b & 0x7FFF) - (a & 0x7FFF)
+    bad = ~(same_sign & ((step == 0) | (step == 1)))
+    ratio = bad.float().mean().item() if bad.numel() else 0.0
+    if ratio:
+        aiter.logger.error("%sresidual_out vs truncated mhc_post: %.2e", tag, ratio)
+    return ratio
+
+
 def check_outputs(out, res_ref, pre_ref, g_ref, tag):
-    """checkAllclose mismatch ratios of the op's outputs: residual_out and layer_input
-    bit-exact, the gates within GATE_ATOL / PRE_ATOL of the fp64 gates g_ref."""
+    """Mismatch ratios of the op's outputs: residual_out the truncation of mhc_post's
+    value (res_ref), layer_input bit-exact against the collapse of the op's own
+    residual_out, the gates within GATE_ATOL / PRE_ATOL of the fp64 gates g_ref (of the
+    op's own residual_out)."""
     residual_out, post_mix, comb_mix, layer_input, next_pre = out
     return {
-        "residual_out err": checkAllclose(
-            residual_out, res_ref, atol=0, rtol=0, msg=tag + "residual_out vs mhc_post "
-        ),
+        "residual_out err": truncated_mismatch(residual_out, res_ref, tag),
         "layer_input err": checkAllclose(
             layer_input,
-            collapse_ref(res_ref, pre_ref),
+            collapse_ref(residual_out, pre_ref),
             atol=0,
             rtol=0,
             msg=tag + "layer_input vs fp32 collapse ",
@@ -287,9 +303,10 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
     out_t, triton_us = run_perftest(seam_triton_rmsnorm, *args, pre_mix, w)
     _, post_mix, comb_mix, _, next_pre = out
 
-    g_ref = gates_ref(res_a, inp["fn"], inp["hc_scale"], inp["hc_base"])
-    diff_post_a = max_diff(post_a, g_ref[0])
-    diff_comb_a = max_diff(comb_a, g_ref[1])
+    g_ref = gates_ref(out[0], inp["fn"], inp["hc_scale"], inp["hc_base"])
+    g_ref_a = gates_ref(res_a, inp["fn"], inp["hc_scale"], inp["hc_base"])
+    diff_post_a = max_diff(post_a, g_ref_a[0])
+    diff_comb_a = max_diff(comb_a, g_ref_a[1])
     tag = f"m={m} identity_pre={identity_pre} "
     err = check_outputs(out, res_a, pre_ref, g_ref, tag)
 
@@ -537,9 +554,7 @@ def check_loader_errors(aiter_mhc):
     args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
     res_a = seam_aiter_unfused(*args)[0]
     residual_out = seam_new(*args, inp["pre_mix"])[0]
-    if checkAllclose(
-        residual_out, res_a, atol=0, rtol=0, msg="seam after loader errors "
-    ):
+    if truncated_mismatch(residual_out, res_a, "seam after loader errors "):
         failed += 1
     return failed
 
@@ -643,7 +658,7 @@ def check_against_refs(out, inp, pre_mix, tag):
     )
     m = res_ref.shape[0]
     pre_ref = identity_gate(m) if pre_mix is None else pre_mix
-    g_ref = gates_ref(res_ref, inp["fn"], inp["hc_scale"], inp["hc_base"])
+    g_ref = gates_ref(out[0], inp["fn"], inp["hc_scale"], inp["hc_base"])
     err = check_outputs(out, res_ref, pre_ref, g_ref, tag)
     return sum(e != 0 for e in err.values())
 

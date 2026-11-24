@@ -2195,7 +2195,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DAITER_FUSED_AR_MHC_MODULE'"
+            "'-DAITER_FUSED_AR_MHC_MODULE'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -2264,7 +2265,9 @@
             "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

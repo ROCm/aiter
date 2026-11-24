@@ -1582,8 +1582,8 @@ namespace aiter {
         return sa.first < sb.second && sb.first < sa.second;
     }
 
-    // FP32 -> DTYPE_I rounded to nearest even on every arch (opus::cast truncates
-    // BF16 on gfx942 by default).
+    // FP32 -> DTYPE_I rounded to nearest even on every arch, whatever
+    // OPUS_FP32_to_BF16_DEFAULT the module is built with.
     template <typename T>
     __device__ __forceinline__ T mhc_post_round_rne(float v)
     {
@@ -1736,7 +1736,8 @@ namespace aiter {
             }
             // Round the reduced value to nearest even, as a cast of the FP32
             // reduction does. (The streams above keep mhc_post's own store
-            // rounding, which truncates BF16 on gfx942.)
+            // rounding: OPUS_FP32_to_BF16_DEFAULT, nearest even unless the module
+            // is built to truncate.)
             opus::vector_t<DTYPE_I, reduce_vec> reduced;
             for(int k = 0; k < reduce_vec; k++) {
                 reduced[k] = mhc_post_round_rne<DTYPE_I>(acc[k]);
