@@ -580,6 +580,94 @@ built on every call:
 The HGEMM row is a launcher of the HGEMM's argument shape run on gfx942; it
 gives the same results on both paths for row- and column-major tensors.
 
+### 5.5 gfx942 / gfx950: the planner, GDN, conv and FP8 attention replays
+
+The other replays a build runs (`aiter/aot/flydsl/common.py`, `AOT_MODULES`)
+precompile these launchers, which now launch through this cache on gfx942
+and gfx950:
+
+| Replay | Arch | Cache | Launcher | How |
+|---|---|---|---|---|
+| `pa_decode_plan` | gfx942, gfx950 | `pa_decode_plan` | `kernels/pa_decode_plan.py:compile_pa_decode_plan` | `aot_factory`, `plan_pa_decode` launches `.lazy(...)` |
+| `chunk_gdn_h` | gfx942 | `chunk_gated_delta_h` | `linear_attention_prefill_kernels._get_or_compile_opt` | `aot_factory` + `.lazy`; the flags the caller passes are coerced with `bool()` |
+| `gdn_fused_prefill` | gfx950 | `gdn_fused_prefill` | `kernels/gdr_prefill/gdn_fused_prefill.py:compile_gdn_fused_prefill` | `aot_factory` + `.lazy` |
+| `conv` | gfx950 | `conv3d_implicit_gfx950` | `kernels/conv/conv3d_implicit_gfx950.py:compile_conv3d_implicit` | `bind_aot`, keyed by the fields of its `Conv3dImplicitParam`; a variable-resolution kernel leaves `d`/`h`/`w` out and keys the constants it closes over (`_dyn_hw_closure_key`); rerouted |
+| `conv` | gfx950 | `conv3d_transpose_ncdhw_ndhwc` | `kernels/conv/conv3d_transpose.py:compile_transpose_ncdhw_ndhwc` | `bind_aot` under `(n, c, BIG)`: `s` is a launch argument, and the kernel bakes only whether `n*c*s` needs 64-bit offsets; rerouted |
+| `fmha_fp8` | gfx950 | `flash_attn_fp8_gfx950` | `kernels/flash_attn_func_fp8_gfx950.py:_build_fp8` | `bind_aot` of the builder's `@flyc.jit` launcher (now `_launch.launcher`) under `_build_fp8`'s arguments |
+
+Each cache declares the files its builder runs as sources (the conv plans in
+`conv3d_im2col.py`, the FMHA traits in `fmha_gfx950/`; §4.2). The conv wrapper
+launched through its own cache (`exe.compile`, then the `CompiledFunction`
+kept on the builder's result); `conv_kernels._dispatch` now calls `_run_compiled` on
+the `@flyc.jit` launcher, under the same (empty) `CONV_COMPILE_HINTS`.
+`op_tests/test_flydsl_pa_decode.py` spies on `compile_pa_decode_plan`; its
+spy now wraps `.lazy`.
+
+No key needed a value moved to the caller: every value these factories read
+is one of their arguments (tuned BV, tile, split count, the gfx942 schedule
+flag), the arch, or a variable under `aiter/ops/flydsl` read by name.
+`AITER_CONV3D_KW_REUSE` and `AITER_CONV3D_DYN_HW` are read by the conv
+wrapper and reach the kernel as the `kw_reuse` and `dyn_hw` fields of its
+key, so no cache declares them in `env`.
+
+Validated compile-only on gfx942 (MI308X, FlyDSL 0.5.3), each replay run
+twice on one cache directory, then under `verify`, recording every
+`flyc.compile`; then again under `AITER_FLYDSL_AOT_CACHE=0` with its own
+FlyDSL cache:
+
+| Replay | Entries | Second run builds | JIT-path compiles | `verify` | FlyDSL `.pkl`, mode 0 = mode 1 |
+|---|--:|--:|--:|---|--:|
+| `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.pa_decode_plan` | 96 | 0 | 0 | passes | 96/96 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan` | 96 | 0 | 0 | passes | 96/96 |
+| `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.chunk_gdn_h` | 198 | 0 | 0 | passes | 198/198 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gdn_fused_prefill` | 88 | 0 | 0 | passes | 88/88 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.conv` | 140 + 9 | 0 | 0 | passes | 139/139 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.fmha_fp8` | 92 | 0 | 0 | passes | 92/92 |
+
+The conv replay launches 304 convs and 304 transposes. Resolutions of one
+variable-resolution kernel share an entry (140 entries for 130 FlyDSL
+artifacts),
+and so do the spatial sizes of one transpose (9 entries, 9 artifacts). Key
+completeness was checked by re-exporting the launcher on every launch of
+each replay above and comparing objects per disk digest: no digest of any
+of the six caches produced two different objects.
+
+Also checked on these caches: an edited comment in a kernel file rebuilds
+that cache's entries only, and reverting it finds the first variants again;
+two replays started together on an empty directory build each entry once,
+leave no `.tmp-*` directory, and a third builds nothing. On gfx942,
+`op_tests/test_flydsl_pa_decode.py`, `op_tests/test_flydsl_linear_attention_prefill.py`
+and `op_tests/test_gated_delta_rule.py` give the same results under modes
+`0`, `1` (twice) and `verify` (except `test_chunk_opt_vk_indice[...-hip]`,
+the HIP backend, which fails intermittently in every mode), and
+`tests/test_flydsl_aot_launch.py` compares the outputs of the planner and
+the GDN hidden-state kernel bitwise across mode `0`, a miss and a hit. The
+gfx950-only kernels are validated compile-only; their runtime on gfx950 is
+still to be checked.
+
+Host time of one launch on MI308X, minimum of five fresh-process runs, the
+arguments built on every call (the gfx950 rows are empty kernels of the
+same argument shape run on gfx942):
+
+| Launch arguments | Launcher | JIT path | this cache |
+|---|---|--:|--:|
+| 3 typed pointers, 4 ints, torch stream | `pa_decode_plan` (real) | 16.9 us | 17.2 us |
+| 12 tensors (1-D to 5-D), 5 ints, torch stream | `chunk_gated_delta_h` (real) | 22.9 us | 25.1 us |
+| 12 flat tensors, 7 ints, torch stream | `gdn_fused_prefill` | 14.3 us | 17.9 us |
+| 11 flat tensors, 6 ints, a float, `fx.Stream` | `flash_attn_fp8_gfx950` | 14.1 us | 17.0 us |
+| 4 tensors (5-D, 5-D, 2-D, 1-D), 14 `Int64`, through `_dispatch` | variable-resolution conv3d | 13.9 us | 14.5 us |
+| 4 tensors, through `_dispatch` | fixed-resolution conv3d | 12.1 us | 12.7 us |
+| 2 5-D tensors, an `Int32`, through `_dispatch` | conv transpose | 10.6 us | 10.9 us |
+
+A loaded object fills each tensor slot with FlyDSL's generic fill (§7, issue
+3), about 0.25 us per tensor more than the JIT path's generated fills, so
+the launchers with 11 or 12 tensors pay 2 to 3.5 us; they run for tens of
+microseconds or more. The conv `_dispatch` costs about 3.5 us more than it
+did before on either path (8.4 us fixed-resolution, 10.2 us variable,
+7.1 us transpose): it called the `CompiledFunction` it kept on the launcher
+directly, and now pays `_run_compiled` and the `compile_hints` context
+(1.3 us) on every launch.
+
 ## 6. Adopting it for another op
 
 Opt in at the launcher factory, not at the call site:
@@ -687,12 +775,15 @@ path's). Issue 4 is in the JIT path and remains.
   `moe_gfx942_sorted_sum`, `moe_gfx942_absmax`, `moe_gfx942_quant_per_tensor`):
   `aiter.aot.flydsl.moe` builds only the 2-stage ones for gfx942. Until one
   does, they take the JIT path.
-- Only the launchers in §5 are converted: the GEMMs and the 2-stage MoE of
-  gfx942 and gfx950. Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
-  the attention kernels, MegaMoE and the a8w4 `comm_fused_moe`, still trace
-  and compile on their first call in each process. (`moe_reduction` is not
+- Only the launchers in §5 are converted: those of the AOT replays on gfx942
+  and gfx950 (GEMMs, 2-stage MoE, the paged-attention planner, the GDN
+  prefill kernels, conv3d and the gfx950 FP8 attention), except MegaMoE,
+  whose replay still compiles every launcher on the JIT path. Other FlyDSL
+  kernels, e.g. the gfx1250 GEMMs and MoE, the other attention kernels
+  and the a8w4 `comm_fused_moe`, still trace and compile on their
+  first call in each process. (`moe_reduction` is not
   specific to an arch, so a gfx1250 MoE that calls it launches it through the
-  cache; that is not validated.)
+  cache, and so does `plan_pa_decode` on gfx1250; neither is validated.)
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
   24136 rows) writes about 5240 entries, 180 MB, in 15 to 20 minutes. Rows
   tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to
