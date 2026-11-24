@@ -157,6 +157,7 @@ Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
 | IPC buffers of a gfx950 Gluon multi-GPU op | `comms/ipc_buffers.py::IpcCommBuffers` |
 | Architecture checks | `utils/_triton/arch_info.py::get_arch` |
 | Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
+| Launches without Triton's per-call dispatch | `utils/fast_launch.py::fast_launch` |
 | Logging in library code | `utils/logger.py::AiterTritonLogger`, level from `AITER_TRITON_LOG_LEVEL` |
 | Logging in tests and benchmarks | `from aiter import logger`, level from `AITER_LOG_LEVEL` |
 
