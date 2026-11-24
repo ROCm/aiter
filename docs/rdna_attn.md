@@ -11,6 +11,7 @@ Decode and prefill attention over the paged KV cache for gfx1150..gfx1153
 | Argument checks and launches | `csrc/py_itfs_cu/rdna_attn.cu` |
 | Lookup, scratch, batch plans, encoder attention | `aiter/ops/rdna_attn.py` |
 | Tests | `op_tests/test_rdna_attn.py` |
+| Tuning and timing tools | `op_tests/op_benchmarks/rdna_attn/` |
 
 ## What it serves
 
@@ -87,11 +88,11 @@ built.
 
 ## Tables
 
-The tables are tuned per GPU family with the tools of ROCm/vllm
-(`benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py`), which write
-`csrc/rocm/rdna_*_configs.h` there. The headers here are copies: to add or
-retune a shape, tune it in vLLM and copy the four headers over. The kernel
-sources must match the ones the tables were tuned on.
+The tables are tuned per GPU family with the tools of
+`op_tests/op_benchmarks/rdna_attn` (see its README): `tune.py` searches the
+launch knobs of a configuration and writes the headers, and `matrix.py` times
+the shapes against their roofline. A table's entries must be tuned on the
+kernel sources they are built from; `tune.py --apply` refuses the others.
 
 ## Test
 

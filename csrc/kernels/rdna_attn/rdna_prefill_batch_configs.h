@@ -25,8 +25,8 @@ struct PrefillBatchConfig {
 };
 
 // One table per Arch (rdna_attn_types.h), each complete; a GPU family's
-// entries are built for its archs only. Tuned in ROCm/vllm
-// (benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py --apply), one entry per
+// entries are built for its archs only. Written by
+// op_tests/op_benchmarks/rdna_attn/tune.py --apply, one entry per
 // line in PrefillBatchConfig order.
 // clang-format off
 inline constexpr PrefillBatchConfig kGfx1151PrefillBatchConfigs[] = {

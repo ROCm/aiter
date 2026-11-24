@@ -11,7 +11,8 @@
 
 namespace rdna {
 
-// Raw pointers keep the tensor types out of the kernels.
+// Raw pointers keep the tensor types out of the kernels. Mirrored by
+// op_tests/op_benchmarks/rdna_attn/jit.py.
 struct LaunchArgs {
   const void* q;
   const void* kv;
