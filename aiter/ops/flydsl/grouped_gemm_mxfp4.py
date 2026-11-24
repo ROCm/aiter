@@ -262,6 +262,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     enable_ep_scatter = stage2_scatter is not None
     ep_scatter_overlap = _select_bool_env("AITER_FLYDSL_EP_SCATTER_OVERLAP", 1)
+    ep_scatter_prologue_gathers = int(
+        os.environ.get("AITER_FLYDSL_EP_SCATTER_PROLOGUE_GATHERS", "8")
+    )
+    ep_scatter_common.scatter_schedule(ep_scatter_prologue_gathers)
     if ep_scatter_overlap and ep_scatter_common.can_overlap_scatter(
         enable_ep_scatter=enable_ep_scatter,
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
@@ -420,6 +424,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         loc_group or 1,
         int(quant_out_preshuffled),
         ep_scatter_overlap,
+        ep_scatter_prologue_gathers,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -430,6 +435,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             loc_group,
             int(quant_out_preshuffled),
             ep_scatter_overlap,
+            ep_scatter_prologue_gathers,
         ),
     )
     return out

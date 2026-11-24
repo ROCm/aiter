@@ -543,3 +543,111 @@ def test_compact_preshuffle_validates_before_launch(overrides, message):
         moe.flydsl_moe_scatter_copy_compact(
             data[:, :64], data[:, 64:68], rowmap, **kwargs
         )
+
+
+@pytest.mark.parametrize("first", [6, 7, 8])
+@pytest.mark.parametrize("wave", [2, 3])
+def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave):
+    """Execute callbacks with scalar CPU stubs to audit nonaligned tails."""
+    from aiter.ops.flydsl.kernels import ep_scatter_common as scatter
+
+    monkeypatch.setattr(scatter.flyc, "jit", lambda function: function)
+    monkeypatch.setattr(scatter.fx, "Int32", int)
+    monkeypatch.setattr(scatter, "range_constexpr", range)
+    monkeypatch.setattr(scatter, "const_expr", bool)
+    monkeypatch.setattr(scatter.tdm_ops, "tensor_wait", lambda _: None)
+    monkeypatch.setattr(scatter, "workgroup_barrier", lambda: None)
+    monkeypatch.setattr(scatter.rocdl, "s_nop", lambda _: None)
+    emitted = []
+
+    def callbacks(state, last):
+        return scatter.make_overlap_callbacks(
+            lambda group, index, lane_pass, offset: emitted.append(
+                (group, index, lane_pass, offset)
+            ),
+            wave,
+            wave - 2,
+            state,
+            last,
+            lambda *_: None,
+            lambda: None,
+            lambda _: None,
+            0,
+            lambda _: None,
+            first,
+        )
+
+    vectors = (100, 200, 300, 400)
+    _, epilogue, _ = callbacks((0, 0, 0, 0, 0), 0)
+    state = epilogue(vectors, 512)
+    expected = [
+        (wave - 2 + gather * 2, vectors[gather // 4], gather % 4, 512)
+        for gather in range(16)
+    ]
+    assert emitted == expected[:first]
+    prologue, _, skip = callbacks(state, 0)
+    prologue(False)
+    assert emitted == expected
+    emitted.clear()
+    skip()
+    assert emitted == expected[first:]
+    emitted.clear()
+    _, final_epilogue, _ = callbacks((0, 0, 0, 0, 0), 1)
+    final_state = final_epilogue(vectors, 512)
+    assert emitted == expected
+    assert final_state[-1] == 0
+
+
+@pytest.mark.parametrize("first", [6, 7, 8])
+def test_scatter_pending_rows_do_not_alias_inputs(first):
+    """A next-task input write must not overwrite a deferred output row."""
+    from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels import ep_scatter_common as scatter
+
+    input_end = 32768 + 3 * 65536
+    stage2_start = 32768 + 2 * 65536
+    offset = scatter.overlap_output_offset(input_end, stage2_start, 528, first)
+    assert offset >= stage2_start
+    assert offset % 512 == 0
+    assert offset + first * 2 * 8 * 528 >= input_end
+    assert offset + 256 * 528 <= get_lds_capacity_bytes("gfx1250")
+    if first == 8:
+        assert offset == stage2_start
+
+
+def test_scatter_split_override_separates_cached_launches(dispatch, monkeypatch):
+    """Each gather split must select its own compiled handle."""
+    compiled, launches = dispatch
+    data = torch.empty((256, 1024), dtype=torch.uint8, device="meta")
+    ids = torch.empty(64, dtype=torch.int32, device="meta")
+    scatter = Stage2ScatterContext(123456, 0, 16384, 8192, 4, ids)
+    for first in ("8", "6", "7", "8"):
+        monkeypatch.setenv("AITER_FLYDSL_EP_SCATTER_PROLOGUE_GATHERS", first)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            data,
+            data,
+            data,
+            data,
+            data,
+            ids,
+            n_experts=64,
+            contiguous_m=256,
+            N=1024,
+            K=2048,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            num_buffers=3,
+            next_stage_prefetch=1,
+            cluster_m=1,
+            cluster_n=4,
+            persistent_workers=512,
+            stream=0,
+            stage2_scatter=scatter,
+        )
+    assert len(compiled) == 3
+    assert len(launches) == 4
