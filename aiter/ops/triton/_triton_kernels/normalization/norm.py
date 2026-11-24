@@ -163,6 +163,8 @@ def _fused_add_layernorm_kernel(
     # how much to increase `x_ptr` by to get the element one row down.
     x_row_stride,
     y_row_stride,
+    res_in_row_stride,
+    res_out_row_stride,
     # Matrix dimensions
     n_rows,
     n_cols,
@@ -190,8 +192,8 @@ def _fused_add_layernorm_kernel(
     row = tl.program_id(0)
     x_ptr_start = x_ptr + (row * x_row_stride)
     y_ptr_start = y_ptr + (row * y_row_stride)
-    res_in_ptr_start = res_in_ptr + (row * x_row_stride)
-    res_out_ptr_start = res_out_ptr + (row * x_row_stride)
+    res_in_ptr_start = res_in_ptr + (row * res_in_row_stride)
+    res_out_ptr_start = res_out_ptr + (row * res_out_row_stride)
 
     loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
 
@@ -463,6 +465,8 @@ def _quant_fused_add_layernorm_kernel(
     x_row_stride,
     y_row_stride,
     aux_row_stride,
+    res_in_row_stride,
+    res_out_row_stride,
     # Matrix dimensions
     n_rows,
     n_cols,
@@ -494,8 +498,8 @@ def _quant_fused_add_layernorm_kernel(
     row = tl.program_id(0)
     x_ptr_start = x_ptr + (row * x_row_stride)
     y_ptr_start = y_ptr + (row * y_row_stride)
-    res_in_ptr_start = res_in_ptr + (row * x_row_stride)
-    res_out_ptr_start = res_out_ptr + (row * x_row_stride)
+    res_in_ptr_start = res_in_ptr + (row * res_in_row_stride)
+    res_out_ptr_start = res_out_ptr + (row * res_out_row_stride)
     aux_ptr_start = aux_ptr + (row * aux_row_stride)
 
     loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
