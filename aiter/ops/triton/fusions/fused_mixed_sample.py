@@ -83,7 +83,7 @@ def fused_mixed_sample(
 
     Limits:
         V must be at least 1 and smaller than 2**31. The tuned configs are for
-        gfx942 and gfx950. Without ``config``, other archs raise
+        gfx942, gfx950 and gfx1250. Without ``config``, other archs raise
         ``FileNotFoundError``.
     """
     if input.dim() != 2 or exponentials.shape != input.shape:

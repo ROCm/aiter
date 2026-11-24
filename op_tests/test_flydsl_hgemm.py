@@ -641,6 +641,7 @@ def test_hgemm_memory(
         )
         assert err == 0, f"K tile coverage mismatch: {err}"
 
+    captured_exact = exact.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         candidates["flydsl_memory"]()
@@ -648,15 +649,29 @@ def test_hgemm_memory(
     out.fill_(8192)
     graph.replay()
     exact = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
-    err = checkAllclose(
-        exact.float(),
-        out.float(),
-        rtol=0,
-        atol=0,
-        msg="changed-input graph",
-        tol_err_ratio=0,
-    )
-    assert err == 0, f"graph replay mismatch: {err}"
+    if out_dtype == dtypes.bf16 and split_k > 1:
+        # Packed BF16 atomic split-K may add the same partials in a different
+        # order during graph replay. Accept only the two adjacent BF16 values;
+        # the exact launches above still catch missing or repeated K tiles.
+        lower = torch.nextafter(exact, torch.full_like(exact, -float("inf")))
+        upper = torch.nextafter(exact, torch.full_like(exact, float("inf")))
+        within_one_ulp = (out == exact) | (out == lower) | (out == upper)
+        assert torch.isfinite(out).all(), "graph replay produced a non-finite value"
+        assert within_one_ulp.all(), (
+            "graph replay exceeded one BF16 ULP: "
+            f"{(~within_one_ulp).sum().item()} mismatched elements"
+        )
+    else:
+        err = checkAllclose(
+            exact.float(),
+            out.float(),
+            rtol=0,
+            atol=0,
+            msg="changed-input graph",
+            tol_err_ratio=0,
+        )
+        assert err == 0, f"graph replay mismatch: {err}"
+    assert torch.any(out != captured_exact), "graph replay reused the captured input"
     return ret
 
 
