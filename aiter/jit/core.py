@@ -751,6 +751,7 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
+    flags_hip_exclude=None,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -854,6 +855,9 @@ def build_module(
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
+        if flags_hip_exclude:
+            # Default HIP flags the module opts out of.
+            flags_hip = [el for el in flags_hip if el not in flags_hip_exclude]
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
@@ -1062,6 +1066,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
         # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
         # leaving dispatcher / pybind TUs untouched.
         "flags_extra_hip_per_source": {},
+        # Optional default HIP flags (the ones build_module adds to every
+        # module) to leave out, each spelled as build_module adds it, e.g.
+        # "-mllvm --lsr-drop-solution=1". For kernels tuned without them.
+        "flags_hip_exclude": [],
     }
 
     def convert(d_ops: dict):
@@ -1212,6 +1220,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args["torch_exclude"],
                 d_args.get("third_party", []),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+                flags_hip_exclude=d_args.get("flags_hip_exclude", []),
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
@@ -1501,6 +1510,7 @@ def compile_ops(
                         third_party,
                         hipify,
                         flags_extra_hip_per_source=flags_extra_hip_per_source,
+                        flags_hip_exclude=d_args.get("flags_hip_exclude", []),
                     )
 
                     if hip_clang_path is not None:
