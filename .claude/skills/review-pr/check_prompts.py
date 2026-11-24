@@ -229,9 +229,20 @@ def check_runner_label_exclusive():
     others = sorted(q.name for q in WORKFLOW.parent.glob("*.y*ml")
                     if q != WORKFLOW and label in q.read_text(encoding="utf-8"))
     if others:
-        print(f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
-              "check only sees aiter-review-bot runs and would page about a busy, healthy box")
-        return 1
+        # A warning, not a refusal. run_one.sh takes any non-zero from this file as fatal,
+        # so refusing here stops every review in the repo -- and what it is guarding against
+        # is one notification that may be wrong. That trade is backwards: a watchdog that
+        # pages about a busy, healthy box is a nuisance; a review bot that will not run is
+        # an outage. It was one: a scheduled job adopted this label on 2026-11-18 and every
+        # review since aborted, under a message about prompt drift, because run_one reports
+        # all of this file's checks under that one name.
+        #
+        # The box being shared is still worth saying, so it is said. Fixing the watchdog so
+        # it does not need the exclusivity is ATOM#3562; this is only the trade, corrected.
+        print(f"\u26a0\ufe0f  runner label '{label}' is also targeted by {others}; the watchdog's "
+              "busy check only sees aiter-review-bot runs and may page about a busy, "
+              "healthy box")
+        return 0
     print(f"\u2705 runner label '{label}' is exclusive to aiter-review-bot.yml")
     return 0
 
