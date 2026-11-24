@@ -208,7 +208,10 @@ def dry_run(
     _register_stream_stub()
     stream = _Stream(torch.device("cuda", 0))
     properties = SimpleNamespace(
-        name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
+        name=name or arch,
+        gcnArchName=arch,
+        multi_processor_count=cu_num,
+        warp_size=32 if arch.startswith("gfx1") else 64,
     )
     real_data_ptr = torch.Tensor.data_ptr
 

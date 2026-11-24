@@ -72,6 +72,46 @@ _MAX_PSEUDO_SEQS = 40000
 _MIN_AUTO_UNIFORM_WORK = 49152
 
 
+@functools.cache
+def _tuning(path: str) -> dict:
+    import json
+
+    with open(path) as f:
+        tuning = json.load(f)
+    unknown = set(tuning) - {"reduce_partitions", "min_uniform_work"}
+    if unknown:
+        raise ValueError(f"{path}: unknown FlyDSL unified-attention keys {unknown}")
+    rungs = tuning.get("reduce_partitions")
+    if rungs is not None and (
+        not rungs or any(type(r) is not int or r < 1 for r in rungs)
+    ):
+        raise ValueError(f"{path}: reduce_partitions must be positive ints")
+    return tuning
+
+
+def _tuned(key, default):
+    """``key`` of the ``AITER_UNIFIED_ATTN_FLYDSL_TUNING`` JSON file, else ``default``.
+
+    The file is read once per path. AOT builds must see the same file: its
+    values select kernels, so a serving process with another file compiles.
+    """
+    path = os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_TUNING")
+    if not path:
+        return default
+    return _tuning(path).get(key, default)
+
+
+def _reduce_partitions(bound, num_cu):
+    """Partition count the reducer compiles for: ``bound``, or with tuned
+    ``reduce_partitions`` the smallest rung at or above it (capped at the CU
+    count). Rounding up is exact: partitions past a sequence's live count are
+    zero-filled."""
+    rungs = _tuned("reduce_partitions", None)
+    if rungs is None:
+        return bound
+    return min(num_cu, min((r for r in rungs if r >= bound), default=bound))
+
+
 def _sliding_window(window_size) -> int | None:
     """Keys a query sees including its own (0: all), as Triton's 1 + left; None if unsupported."""
     if window_size is None:
@@ -691,7 +731,9 @@ def _unified_attention_varlen(
             query_seq_len=query_block,
             query_group_size=group,
             head_size=_VALUE_DIM,
-            max_partitions=max(1, min(max_partitions, -(-int(max_seqlen_k) // 256))),
+            max_partitions=_reduce_partitions(
+                max(1, min(max_partitions, -(-int(max_seqlen_k) // 256))), num_cu
+            ),
             stream=stream,
             reduce_info=plan.reduce_info,
             query_map=query_map,
@@ -826,7 +868,9 @@ def _unified_attention_uniform(
             query_seq_len=query_length,
             query_group_size=group,
             head_size=_VALUE_DIM,
-            max_partitions=max(1, min(num_cu, capacity, -(-int(max_seqlen_k) // 256))),
+            max_partitions=_reduce_partitions(
+                max(1, min(num_cu, capacity, -(-int(max_seqlen_k) // 256))), num_cu
+            ),
             stream=stream,
             reduce_info=plan.reduce_info,
         )
@@ -1025,7 +1069,8 @@ def unified_attention_flydsl(
     if (
         route == "uniform"
         and not explicit
-        and q.shape[0] * k.shape[2] * int(max_seqlen_k) < _MIN_AUTO_UNIFORM_WORK
+        and q.shape[0] * k.shape[2] * int(max_seqlen_k)
+        < _tuned("min_uniform_work", _MIN_AUTO_UNIFORM_WORK)
     ):
         return None
     if route in ("window", "window_varlen"):
