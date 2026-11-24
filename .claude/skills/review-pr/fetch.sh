@@ -958,6 +958,71 @@ else
     | tee "$WORK/merge_target.txt"
 fi
 
+# ---- Size + reviewer roster: Step 7.8's inputs. Size comes from pr_meta.json's files
+# list (the design gate recomputes it from the same source, so this file is for the
+# reviewer to read, not to trust). The roster is this PR's reviewers plus the authors who
+# last touched the changed paths, read from the merge-target worktree at BASE_SHA -- the
+# people whose code this PR edits, not whoever a drifted CODEOWNERS file names.
+# noreply.github.com emails reduce to handles. The PR author is excluded: routing a review
+# back to its author is a no-op the design gate rejects. Both files are advisory; a
+# failure here degrades Step 7.8 to "no roster to route to", so it must not kill the run.
+python3 - "$WORK/pr_meta.json" > "$WORK/size.txt" <<'PYEOF' || echo "0 lines / 0 files (size unavailable)" > "$WORK/size.txt"
+import json, sys
+files = json.load(open(sys.argv[1])).get("files") or []
+lines = sum(f.get("additions", 0) + f.get("deletions", 0) for f in files)
+print(f"{lines} lines / {len(files)} files")
+PYEOF
+{
+  echo "# Candidate reviewers for the Human routing line (Step 7.8)."
+  echo "# This PR's reviewers + authors of the changed paths at the merge target."
+  echo "# One person per line; the design gate matches routed names against these lines."
+  python3 - "$WORK/pr_meta.json" "$TARGET_WT" <<'PYEOF' || echo "# (roster unavailable)"
+import json, os, re, subprocess, sys
+meta = json.load(open(sys.argv[1]))
+wt = sys.argv[2]
+a = meta.get("author")
+author = a.get("login", "") if isinstance(a, dict) else str(a or "")
+seen, out = set(), []
+def add(name):
+    name = (name or "").strip().lstrip("@")
+    # A routed design question lands in a bot's void: copilot-pull-request-reviewer
+    # "reviews" PRs on this repo, so it rides in through the reviews field and a roster
+    # that admits it green-lights routing the judgment to nobody. Same filter the
+    # inline-comment collector already uses.
+    if name and name.lower() not in ("ghost", "invalid-email-address", author.lower()) \
+       and "copilot" not in name.lower() and "bot" not in name.lower() \
+       and "[bot]" not in name.lower() and name.lower() not in seen and len(out) < 30:
+        seen.add(name.lower())
+        out.append(name)
+for r in meta.get("reviews") or []:
+    ra = r.get("author")
+    add(ra.get("login") if isinstance(ra, dict) else str(ra or ""))
+paths = [f.get("path") for f in (meta.get("files") or []) if f.get("path")]
+
+def log_authors(path_args):
+    p = subprocess.run(
+        ["git", "-C", wt, "log", "--format=%an|%ae", "-n", "200", "--"] + path_args,
+        capture_output=True, text=True, check=False)
+    for line in (p.stdout or "").splitlines():
+        name, _, email = line.partition("|")
+        m = re.match(r"(\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$", email.strip())
+        add(m.group(2) if m else name.strip())
+
+if wt and os.path.isdir(wt) and paths:
+    log_authors(paths)
+    if not out:
+        # A brand-new file has no git-log authors, so a PR that is all new files routes
+        # nowhere exactly when it is newest (found on a 10-PR dry-run: two new kernel
+        # files, no reviews, empty roster). Widen to the parents -- the authors of the
+        # code this PR sits among are the next-best judges of its design.
+        parents = sorted({os.path.dirname(p) for p in paths if os.path.dirname(p)})
+        if parents:
+            log_authors(parents)
+for name in out:
+    print(name)
+PYEOF
+} > "$WORK/reviewers.txt"
+
 echo
 echo "WORK=$WORK"
 # Naming a file that was not written sends the reviewer looking for it. evidence.txt is
@@ -965,6 +1030,6 @@ echo "WORK=$WORK"
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
 guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
-flydsl_bounds.txt aot_pairing.txt \
+flydsl_bounds.txt aot_pairing.txt size.txt reviewers.txt \
 validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"
