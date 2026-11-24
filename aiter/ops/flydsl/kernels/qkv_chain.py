@@ -18,7 +18,9 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from . import mxfp8_gemm_decode_splitk as _splitk
 from .qkv_chain_cooperative import CNT_STRIDE, HEADS, KS, compile_qkv_cooperative
+from .qkv_reduce_insert import compile_qkv_reduce_insert
 
 N, K = 2560, 6144
 ROT = 64
@@ -31,8 +33,26 @@ _POOL: dict = {}
 _COUNTERS: dict = {}
 
 
+SPLIT_ROWS = _splitk.ROWS  # (65, 128): split-3 GEMM launch + reduce-insert launch
+
+
 def supported(m: int) -> bool:
     return COOP_ROWS[0] <= m <= COOP_ROWS[1]
+
+
+def supported_split(m: int) -> bool:
+    return _splitk.supported(m)
+
+
+def chain_supported(m: int) -> bool:
+    """Rows 17-128 are served by ``qkv_chain_insert``."""
+    return supported(m) or supported_split(m)
+
+
+def code_rows(m: int) -> int:
+    """Rows of (16, 16)-layout activation codes ``qkv_chain_insert`` reads at ``m`` rows: pass this as the quantizer's
+    block (``mxfp8_quantize_shuffled(x, code_rows(m))``)."""
+    return (m + 15) // 16 * 16 if supported(m) else _splitk.code_rows(m)
 
 
 def tile_rows(m: int) -> int:
@@ -200,3 +220,95 @@ def qkv_chain_cooperative_insert(
         struct.unpack("<i", struct.pack("<f", eps))[0],
         torch.cuda.current_stream(),
     )
+
+
+def qkv_chain_split_insert(
+    activation: torch.Tensor,  # e4m3 codes, (16, 16) layout, ``code_rows(m)`` rows
+    activation_scale: torch.Tensor,  # AITER-shuffled E8M0 scales [ceil(rows / 32) * 32, K / 32]
+    weight: torch.Tensor,  # [2560, 6144] preshuffled (16, 16) e4m3 codes
+    weight_scale: torch.Tensor,  # its AITER-shuffled E8M0 scales
+    m: int,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    index_q_norm_weight: torch.Tensor,
+    index_k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,  # [max_pos, 64] bf16
+    positions: torch.Tensor,  # [m] int64
+    slot_mapping: torch.Tensor,  # [m] int64, -1 skips the token
+    index_slot_mapping: torch.Tensor,  # [m] int64, -1 skips the token
+    kv_cache: torch.Tensor,  # [blocks, 2, 128, 72] uint8
+    index_cache: torch.Tensor,  # [blocks, 128, 72] uint8
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q_out: torch.Tensor,  # [m, 2048] bf16
+    index_q_out: torch.Tensor,  # [m, 128] e4m3, row stride free
+    *,
+    num_heads: int = 16,
+    num_kv_heads: int = 1,
+    num_index_heads: int = 1,
+    eps: float,
+) -> None:
+    """65-128 rows in two launches: the split-3 decode GEMM (fp32 K-third slabs) and ``qkv_reduce_insert`` (sum, bf16
+    round, norm, RoPE, NVFP4 K / V / index-K inserts). Bitwise the unfused split-3 chain.
+    """
+    assert supported_split(m), f"qkv split chain: {m} rows outside {SPLIT_ROWS}"
+    assert (num_heads, num_kv_heads, num_index_heads) == (16, 1, 1)
+    assert cos_sin_cache.shape[1] == ROT
+    assert eps >= 2.0**-126  # the kernel's rsqrt skips ocml's denormal scaling
+    assert (
+        positions.numel() >= m
+        and slot_mapping.numel() >= m
+        and index_slot_mapping.numel() >= m
+    )
+    assert q_out.dtype == torch.bfloat16 and q_out.is_contiguous()
+    assert (
+        index_q_out.dtype == torch.float8_e4m3fn
+        and index_q_out.stride(1) == 1
+        and index_q_out.stride(0) % 4 == 0
+    )
+    assert (
+        kv_cache.shape[1:] == (2, 128, 72)
+        and kv_cache.stride(1) == 128 * 72
+        and kv_cache.stride(3) == 1
+    )
+    assert (
+        index_cache.shape[1:] == (128, 72)
+        and index_cache.stride(1) == 72
+        and index_cache.stride(2) == 1
+    )
+    slab = _splitk.mxfp8_gemm_decode_splitk(
+        activation, activation_scale, weight, weight_scale, m
+    )
+    _run_compiled(
+        compile_qkv_reduce_insert(),
+        slab.data_ptr(),
+        q_out.data_ptr(),
+        index_q_out.data_ptr(),
+        q_norm_weight.data_ptr(),
+        k_norm_weight.data_ptr(),
+        index_q_norm_weight.data_ptr(),
+        index_k_norm_weight.data_ptr(),
+        cos_sin_cache.data_ptr(),
+        positions.data_ptr(),
+        slot_mapping.data_ptr(),
+        index_slot_mapping.data_ptr(),
+        kv_cache.data_ptr(),
+        index_cache.data_ptr(),
+        k_scale.data_ptr(),
+        v_scale.data_ptr(),
+        m,
+        index_q_out.stride(0),
+        kv_cache.stride(0),
+        index_cache.stride(0),
+        cos_sin_cache.shape[0],
+        struct.unpack("<i", struct.pack("<f", eps))[0],
+        torch.cuda.current_stream(),
+    )
+
+
+def qkv_chain_insert(*args, **kwargs) -> None:
+    """The QKV front chain at 17-128 decode rows: one launch up to 64 rows, two launches above."""
+    m = args[4]
+    if supported(m):
+        return qkv_chain_cooperative_insert(*args, **kwargs)
+    return qkv_chain_split_insert(*args, **kwargs)

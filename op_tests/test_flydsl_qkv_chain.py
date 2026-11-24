@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One-launch QKV front chain (MiniMax-M3.1 TP4, 17-64 decode rows) against the unfused public path.
+"""QKV front chain (MiniMax-M3.1 TP4, 17-128 decode rows: one launch to 64 rows, split-3 GEMM + reduce-insert above) against the
+unfused public path.
 
 Reference: the same bf16 activation through aiter's MXFP8 quantizer + ``gemm_a8w8_blockscale`` + ``fused_qknorm_idxrqknorm``
 (NVFP4 K / V / index-K pages). The chain's GEMM sums the K in three fp32 thirds, the reference GEMM in another order, so
@@ -69,10 +70,12 @@ needs_gfx950 = pytest.mark.skipif(get_gfx_runtime() != "gfx950", reason="gfx950 
 
 @needs_gfx950
 @pytest.mark.parametrize("skip", [0, 3])
-@pytest.mark.parametrize("m", [17, 24, 32, 40, 48, 56, 64])
+@pytest.mark.parametrize(
+    "m", [17, 24, 32, 40, 48, 56, 64, 65, 72, 80, 81, 96, 97, 112, 128]
+)
 def test_chain_matches_public_path(m, skip):
     from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
-    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_cooperative_insert
+    from aiter.ops.flydsl.kernels.qkv_chain import code_rows, qkv_chain_insert
 
     wsh, w_scale, chain_scale, qw, kw, iqw, ikw, cs, ks, vs = _weights()
     x, pos, slot = make_inputs(m, m + skip, skip)
@@ -124,8 +127,8 @@ def test_chain_matches_public_path(m, skip):
                 skip_index_branch=False,
             )
         else:
-            codes, sc = mxfp8_quantize_shuffled(x, 16 * ((m + 15) // 16))
-            qkv_chain_cooperative_insert(
+            codes, sc = mxfp8_quantize_shuffled(x, code_rows(m))
+            qkv_chain_insert(
                 codes,
                 sc,
                 wsh,
@@ -164,12 +167,12 @@ def test_chain_matches_public_path(m, skip):
 
 
 @needs_gfx950
-def test_chain_graph_replay_matches_eager():
+@pytest.mark.parametrize("m", [40, 72, 112])
+def test_chain_graph_replay_matches_eager(m):
     from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
-    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_cooperative_insert
+    from aiter.ops.flydsl.kernels.qkv_chain import code_rows, qkv_chain_insert
 
     wsh, _, chain_scale, qw, kw, iqw, ikw, cs, ks, vs = _weights()
-    m = 40
     x, pos, slot = make_inputs(m, 123)
     xs_ = [x, make_inputs(m, 124)[0]]
     kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8)
@@ -179,8 +182,8 @@ def test_chain_graph_replay_matches_eager():
     xin = x.clone()
 
     def call():
-        codes, sc = mxfp8_quantize_shuffled(xin, 48)
-        qkv_chain_cooperative_insert(
+        codes, sc = mxfp8_quantize_shuffled(xin, code_rows(m))
+        qkv_chain_insert(
             codes,
             sc,
             wsh,
